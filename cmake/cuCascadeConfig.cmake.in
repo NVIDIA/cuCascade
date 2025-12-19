@@ -1,0 +1,27 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Find required dependencies
+find_dependency(CUDAToolkit REQUIRED)
+find_dependency(Threads REQUIRED)
+find_dependency(rmm REQUIRED CONFIG)
+find_dependency(cudf REQUIRED CONFIG)
+find_dependency(fmt REQUIRED CONFIG)
+
+# Include the targets file
+include("${CMAKE_CURRENT_LIST_DIR}/cuCascadeTargets.cmake")
+
+# Provide a default target alias for convenience
+# Users can link to cuCascade::cucascade, cuCascade::cucascade_static, or cuCascade::cucascade_shared
+if(TARGET cuCascade::cucascade_shared)
+  if(NOT TARGET cuCascade::cucascade)
+    add_library(cuCascade::cucascade ALIAS cuCascade::cucascade_shared)
+  endif()
+elseif(TARGET cuCascade::cucascade_static)
+  if(NOT TARGET cuCascade::cucascade)
+    add_library(cuCascade::cucascade ALIAS cuCascade::cucascade_static)
+  endif()
+endif()
+
+check_required_components(cuCascade)

@@ -1,150 +1,153 @@
-# __NVIDIA_OSS__ Standard Repo Template
+# cuCascade
 
-- Files (org-wide templates in the NVIDIA .github org repo; per-repo overrides allowed)
-
-   - Root 
-     - README.md skeleton (CTA + Quickstart + Support/Security/Governance links) 
-     - LICENSE (Apache 2.0 by default)
-        - For other licenses, see the [Confluence page](https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816) for other licenses
-        - CLA.md file (delete if not using MIT or BSD licenses)
-     - CODE_OF_CONDUCT.md 
-     - SECURITY.md (vuln reporting path) 
-     - CONTRIBUTING.md (base; repo can add specifics)
-     - SUPPORT.md (Support levels/channels)
-     - GOVERNANCE.md (baseline; repo may extend)
-     - CITATION.md (for projects that need citation)
-
-   - .github/ 
-     - ISSUE_TEMPLATE/ (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository>)
-       - bug.yml, feature.yml, task.yml, config.yml 
-     - PULL_REQUEST_TEMPLATE.md (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/creating-a-pull-request-template-for-your-repository>)
-     - workflows/
-     - Note: workflow-templates/ for starter workflows should live in the org-level .github repo, not per-repo
-
-   - Repo-specific (not org-template, maintained by the team)
-     - CODEOWNERS (place at .github/CODEOWNERS or repo root)
-     - CHANGELOG.md (or RELEASE.md) 
-     - ROADMAP.md 
-     - MAINTAINERS.md 
-     - NOTICE or THIRD_PARTY_NOTICES / THIRD_PARTY_LICENSES (dependency specific)
-     - Build/package files (CMake, pyproject, Dockerfile, etc.)
-
-   - Recommended structure and hygiene
-     - docs/
-     - examples/
-     - tests/
-     - scripts/
-     - Container/dev env: Dockerfile, docker/, .devcontainer/ (optional)
-     - Build/package (language-specific):
-       - Python: pyproject.toml, setup.cfg/setup.py, requirements.txt, environment.yml
-       - C++: CMakeLists.txt, cmake/, vcpkg.json
-     - Repo hygiene: .gitignore, .gitattributes, .editorconfig, .pre-commit-config.yaml, .clang-format
-
-
-## Usage for NVIDIA OSS repos
-
-1. Clone this repo
-2. Find/replace all in the clone of `___PROJECT___` and `__PROJECT_NAME__` and replace with the name of the new library
-3. Inspect all files to make sure all replacements work and update text as needed
-
-
-**What you can reuse immediately**
-- CODE_OF_CONDUCT.md
-- SECURITY.md
-- CONTRIBUTING.md (base)
-- .github/ISSUE_TEMPLATE/.yml (bug/feature/task + config.yml)
-- .github/PULL_REQUEST_TEMPLATE.md
-- Reusable workflows 
-
-**What you must customize per repo**
-- README.md: copy the skeleton and fill in product-specific details (Quickstart, Requirements, Usage, Support level, links)
-- LICENSE: check file is correct, update year, consult Confluence for alternatives https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816, add CLA.md only if your license/process requires it
-- CODEOWNERS: replace <TEAM> with your GitHub team handle(s). Place at .github/CODEOWNERS (or repo root)
-- MAINTAINERS.md: list maintainers names/roles, escalation path
-- CHANGELOG.md (or RELEASE.md): track releases/changes
-- SUPPORT.md: Update for your project
-- ROADMAP.md (optional): upcoming milestones
-- NOTICE / THIRD_PARTY_NOTICES (if you ship third‑party content)
-- Build/package files (CMake/pyproject/Dockerfile/etc.), tests/, docs/, examples/, scripts/ as appropriate
-- Workflows: Edit if you need custom behavior 
-
-
-4. Change git origin to point to new repo and push
-5. Remove the line break below and everything above it
-
-## Usage for existing NVIDIA OSS repos
-
-1. Follow the steps above, but add the files to your existing repo and merge
-
-<!-- REMOVE THE LINE BELOW AND EVERYTHING ABOVE -->
------------------------------------------
-# [Project Title]
-One-sentence value proposition for users. Who is it for, and why it matters. 
+A high-performance GPU memory management library for data-intensive applications requiring intelligent tiered memory allocation across GPU, host, and disk storage.
 
 # Overview
-What the project does? Why the project is useful?
-Provide a brief overview, highlighting key features or problem-solving capabilities.
+
+
+
+**Key Features:**
+- **Tiered Memory Management**: Seamlessly manage GPU (fastest), pinned host (medium), and disk (largest capacity) memory tiers, provides numa aware allocators
+- **Memory Reservation System**: Avoid oversubscribing your GPU by making reservations and using allocators that respect reservations
+- **Hardware Topology Discovery**: Automatic detection of NUMA regions and GPU-CPU affinity for optimal memory placement
+- ****
+- **cuDF Integration**: Native support for GPU DataFrames with batch processing capabilities and spilling to Host or Disk
+- **Pluggable Policies**: Control what happens when you OOM, try to allocate more than a reservation, how you pick what data to spill, by creating policies that plug into the system.
 
 # Getting Started
-Guide users on how they can get started with the project. This should include basic installation step, quick-start examples 
+
 ```bash
-# Option A: Package manager (pip/conda/npm/etc.)
-<copy-paste install>
+# Option A: Using Pixi (recommended)
+curl -fsSL https://pixi.sh/install.sh | bash
+git clone https://github.com/nvidia/cuCascade.git
+cd cuCascade
+pixi install
+pixi run build
 
-# Option B: Container
-docker run <image> <args>
+# Option B: Using CMake directly
+git clone https://github.com/nvidia/cuCascade.git
+cd cuCascade
+cmake --preset release
+cmake --build build/release
 
-# Verify (hello world)
-<one-liner or ~10-line example>
+# Verify installation
+cd build/release && ctest --output-on-failure
 ```
+
 # Requirements
-Include a list of pre-requisites. 
-- OS/Arch: <summary or link to full matrix>
-- Runtime/Compiler: <versions>
-- GPU/Drivers (if applicable): CUDA <ver>, driver <ver>, etc.
+
+- **OS/Arch**: Linux (x86_64, aarch64)
+- **Compiler**: C++20 compatible compiler
+- **Build Tools**: CMake 4.1+, Ninja
+- **GPU/Drivers**: CUDA 13+, compatible NVIDIA driver
+- **Dependencies**: libcudf 25.10+
 
 # Usage
-```bash
-# Minimal runnable snippet (≤20 lines)
-<code>
+
+```cpp
+#include <memory/memory_reservation_manager.hpp>
+#include <memory/topology_discovery.hpp>
+
+// Discover hardware topology
+auto topology = cucascade::discover_topology();
+
+// Create memory reservation manager
+auto manager = cucascade::MemoryReservationManager(topology);
+
+// Reserve GPU memory
+auto gpu_reservation = manager.reserve(cucascade::MemoryTier::GPU, size_bytes);
+
+// Reserve host memory with NUMA awareness
+auto host_reservation = manager.reserve(cucascade::MemoryTier::HOST, size_bytes);
 ```
-- More examples/tutorials: <link>
-- API reference: <link>
 
-# Performance (Optional)
-Summary of benchmarks; link to detailed results and hardware used.
+- More examples: See `test/` directory for comprehensive usage examples
 
-## Releases & Roadmap 
-- Releases/Changelog: <link>
-- (Optional) Next milestones or link to `ROADMAP.md`.
-  
 # Contribution Guidelines
+
 - Start here: `CONTRIBUTING.md`
 - Code of Conduct: `CODE_OF_CONDUCT.md`
-- Development quickstart (build/test):
+- Development quickstart:
+
 ```bash
-<clone> && <deps> && <build/test>
+git clone https://github.com/nvidia/cuCascade.git
+cd cuCascade
+pixi install
+pixi run build
+pixi run test
 ```
-## Governance & Maintainers
-- Governance: `GOVERNANCE.md`
-- Maintainers: <team/handles>
-- Labeling/triage policy: <link>
+
+## Pre-commit Hooks
+
+This project uses [pre-commit](https://pre-commit.com/) for code quality checks including C++/CUDA formatting (clang-format), CMake linting, spell checking, and more.
+
+```bash
+# Run all checks manually
+pixi run lint
+
+# Install hooks to run automatically on every commit
+pixi run lint-install
+
+# Update hook versions
+pre-commit autoupdate
+```
 
 ## Security
+
 - Vulnerability disclosure: `SECURITY.md`
 - Do not file public issues for security reports.
+- Report vulnerabilities via: https://www.nvidia.com/object/submit-security-vulnerability.html
 
 ## Support
-- Level: <Experimental | Maintained | Stable>
-- How to get help: Issues/Discussions/<channel link>
-- Response expectations (if any).
 
-# Community
-Provide the channel for community communications.
+- Level: Experimental
+- How to get help: GitHub Issues
+- For NVIDIA product security concerns: https://www.nvidia.com/en-us/security
+
+# Project Structure
+
+```
+cuCascade/
+├── include/
+│   ├── data/                      # Data representation headers
+│   │   ├── common.hpp             # Common data utilities
+│   │   ├── data_batch.hpp         # Batch processing for data
+│   │   ├── data_repository.hpp    # Data storage abstraction
+│   │   ├── data_repository_manager.hpp
+│   │   ├── cpu_data_representation.hpp
+│   │   └── gpu_data_representation.hpp
+│   └── memory/                    # Memory management headers
+│       ├── common.hpp             # Tier enum, memory_space_id, utilities
+│       ├── memory_reservation_manager.hpp  # Central reservation coordinator
+│       ├── memory_reservation.hpp # Reservation types and policies
+│       ├── memory_space.hpp       # Memory space abstraction
+│       ├── reservation_aware_resource_adaptor.hpp  # GPU memory resource
+│       ├── fixed_size_host_memory_resource.hpp     # Host memory resource
+│       ├── disk_access_limiter.hpp                 # Disk tier limiter
+│       ├── reservation_manager_configurator.hpp    # Builder for config
+│       ├── topology_discovery.hpp # Hardware topology detection
+│       ├── numa_region_pinned_host_allocator.hpp   # NUMA-aware allocator
+│       ├── notification_channel.hpp   # Cross-reservation signaling
+│       ├── stream_pool.hpp        # CUDA stream management
+│       └── oom_handling_policy.hpp    # OOM handling strategies
+├── src/
+│   ├── data/                      # Data representation implementation
+│   └── memory/                    # Memory management implementation
+├── test/
+│   ├── data/                      # Data module tests
+│   ├── memory/                    # Memory module tests
+│   └── utils/                     # Test utilities (cuDF helpers)
+├── cmake/                         # CMake configuration modules
+├── CMakeLists.txt                 # Main CMake configuration
+├── CMakePresets.json              # CMake presets for build configurations
+└── pixi.toml                      # Pixi dependency management
+```
 
 # References
-Provide a list of related references
+
+- [RAPIDS cuDF](https://github.com/rapidsai/cudf) - GPU DataFrame library
+- [Pixi](https://pixi.sh/) - Package management tool
 
 # License
-This project is licensed under the [NAME HERE] License - see the LICENSE.md file for details
-- License: <link>
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE.md](LICENSE.md) file for details.
