@@ -50,8 +50,8 @@ class borrowed_stream {
  private:
   borrowed_stream(rmm::cuda_stream s, std::function<void(rmm::cuda_stream&&)> release_fn) noexcept;
 
-  rmm::cuda_stream stream_;
-  std::function<void(rmm::cuda_stream&&)> release_fn_;
+  rmm::cuda_stream _stream;
+  std::function<void(rmm::cuda_stream&&)> _release_fn;
 };
 
 class exclusive_stream_pool {
@@ -94,11 +94,11 @@ class exclusive_stream_pool {
  private:
   void release_stream(rmm::cuda_stream&& s) noexcept;
 
-  mutable std::mutex mutex_;
-  std::condition_variable cv_;
-  rmm::cuda_device_id device_id_;
-  rmm::cuda_stream::flags flags_;
-  std::vector<rmm::cuda_stream> streams_;
+  mutable std::mutex _mutex;
+  std::condition_variable _cv;
+  rmm::cuda_device_id _device_id;
+  rmm::cuda_stream::flags _flags;
+  std::vector<rmm::cuda_stream> _streams;
 };
 
 }  // namespace memory

@@ -53,7 +53,7 @@ memory_space::memory_space(Tier tier,
     _stop_downgrading_memory_threshold(stop_downgrading_memory_threshold),
     _capacity(capacity),
     _allocator(std::move(allocator)),
-    stream_pool_{[&]() -> std::unique_ptr<rmm::cuda_stream_pool> {
+    _stream_pool{[&]() -> std::unique_ptr<rmm::cuda_stream_pool> {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id(device_id)};
       if (tier == Tier::GPU) { return std::make_unique<rmm::cuda_stream_pool>(16); }
       return nullptr;
@@ -70,7 +70,7 @@ memory_space::memory_space(Tier tier,
   } else if (tier == Tier::DISK) {
     _reservation_allocator = std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity);
   }
-  notification_channel_ = std::make_shared<notification_channel>();
+  _notification_channel = std::make_shared<notification_channel>();
 }
 
 memory_space::~memory_space() = default;
@@ -89,13 +89,13 @@ std::unique_ptr<reservation> memory_space::make_reservation_or_null(size_t size)
 {
   std::unique_ptr<reserved_arena> arena = std::visit(
     cucascade::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
-                            return mr->reserve(size, notification_channel_->get_notifier());
+                            return mr->reserve(size, _notification_channel->get_notifier());
                           },
                           [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
-                            return mr->reserve(size, notification_channel_->get_notifier());
+                            return mr->reserve(size, _notification_channel->get_notifier());
                           },
                           [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
-                            return mr->reserve(size, notification_channel_->get_notifier());
+                            return mr->reserve(size, _notification_channel->get_notifier());
                           }},
     _reservation_allocator);
   return reservation::create(*this, std::move(arena));
@@ -105,13 +105,13 @@ std::unique_ptr<reservation> memory_space::make_reservation_upto(size_t size)
 {
   std::unique_ptr<reserved_arena> arena = std::visit(
     cucascade::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
-                            return mr->reserve_upto(size, notification_channel_->get_notifier());
+                            return mr->reserve_upto(size, _notification_channel->get_notifier());
                           },
                           [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
-                            return mr->reserve_upto(size, notification_channel_->get_notifier());
+                            return mr->reserve_upto(size, _notification_channel->get_notifier());
                           },
                           [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
-                            return mr->reserve_upto(size, notification_channel_->get_notifier());
+                            return mr->reserve_upto(size, _notification_channel->get_notifier());
                           }},
     _reservation_allocator);
   return reservation::create(*this, std::move(arena));
@@ -121,7 +121,7 @@ std::unique_ptr<reservation> memory_space::make_reservation(size_t size)
 {
   std::unique_ptr<reservation> res = make_reservation_or_null(size);
   while (!res) {
-    auto status = notification_channel_->wait();
+    auto status = _notification_channel->wait();
     if (status == notification_channel::wait_status::SHUTDOWN) { return nullptr; }
     if (status == notification_channel::wait_status::IDLE) { return make_reservation_upto(size); }
     res = make_reservation_or_null(size);
@@ -131,10 +131,10 @@ std::unique_ptr<reservation> memory_space::make_reservation(size_t size)
 
 rmm::cuda_stream_view memory_space::acquire_stream() const
 {
-  if (!stream_pool_) {
+  if (!_stream_pool) {
     throw std::runtime_error("Stream pool is not available for non-GPU memory spaces");
   }
-  return stream_pool_->get_stream();
+  return _stream_pool->get_stream();
 }
 
 std::size_t memory_space::get_active_reservation_count() const
@@ -242,7 +242,7 @@ std::string memory_space::to_string() const
 
 void memory_space::shutdown()
 {
-  if (notification_channel_) { notification_channel_->shutdown(); }
+  if (_notification_channel) { _notification_channel->shutdown(); }
 }
 
 //===----------------------------------------------------------------------===//

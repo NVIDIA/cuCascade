@@ -4,13 +4,15 @@ A high-performance GPU memory management library for data-intensive applications
 
 # Overview
 
-cuCascade provides a robust memory management and data representation framework extracted from the Sirius project. It enables efficient allocation and reservation across multiple memory tiers while automatically discovering hardware topology for optimal data placement.
+
 
 **Key Features:**
-- **Tiered Memory Management**: Seamlessly manage GPU (fastest), pinned host (medium), and disk (largest capacity) memory tiers
+- **Tiered Memory Management**: Seamlessly manage GPU (fastest), pinned host (medium), and disk (largest capacity) memory tiers, provides numa aware allocators
+- **Memory Reservation System**: Avoid oversubscribing your GPU by making reservations and using allocators that respect reservations
 - **Hardware Topology Discovery**: Automatic detection of NUMA regions and GPU-CPU affinity for optimal memory placement
-- **Thread-Safe Operations**: Lock-free memory reservation and data batch management
-- **cuDF Integration**: Native support for GPU DataFrames with batch processing capabilities
+- ****
+- **cuDF Integration**: Native support for GPU DataFrames with batch processing capabilities and spilling to Host or Disk
+- **Pluggable Policies**: Control what happens when you OOM, try to allocate more than a reservation, how you pick what data to spill, by creating policies that plug into the system.
 
 # Getting Started
 
@@ -107,17 +109,38 @@ pre-commit autoupdate
 ```
 cuCascade/
 ├── include/
-│   ├── data/           # Data representation headers
-│   ├── memory/         # Memory management headers
-│   ├── log/            # Logging utilities
-│   └── helper/         # Common helper headers
+│   ├── data/                      # Data representation headers
+│   │   ├── common.hpp             # Common data utilities
+│   │   ├── data_batch.hpp         # Batch processing for data
+│   │   ├── data_repository.hpp    # Data storage abstraction
+│   │   ├── data_repository_manager.hpp
+│   │   ├── cpu_data_representation.hpp
+│   │   └── gpu_data_representation.hpp
+│   └── memory/                    # Memory management headers
+│       ├── common.hpp             # Tier enum, memory_space_id, utilities
+│       ├── memory_reservation_manager.hpp  # Central reservation coordinator
+│       ├── memory_reservation.hpp # Reservation types and policies
+│       ├── memory_space.hpp       # Memory space abstraction
+│       ├── reservation_aware_resource_adaptor.hpp  # GPU memory resource
+│       ├── fixed_size_host_memory_resource.hpp     # Host memory resource
+│       ├── disk_access_limiter.hpp                 # Disk tier limiter
+│       ├── reservation_manager_configurator.hpp    # Builder for config
+│       ├── topology_discovery.hpp # Hardware topology detection
+│       ├── numa_region_pinned_host_allocator.hpp   # NUMA-aware allocator
+│       ├── notification_channel.hpp   # Cross-reservation signaling
+│       ├── stream_pool.hpp        # CUDA stream management
+│       └── oom_handling_policy.hpp    # OOM handling strategies
 ├── src/
-│   ├── data/           # Data representation implementation
-│   └── memory/         # Memory management implementation
-├── test/               # Unit tests
-├── CMakeLists.txt      # Main CMake configuration
-├── CMakePresets.json   # CMake presets for build configurations
-└── pixi.toml           # Pixi dependency management
+│   ├── data/                      # Data representation implementation
+│   └── memory/                    # Memory management implementation
+├── test/
+│   ├── data/                      # Data module tests
+│   ├── memory/                    # Memory module tests
+│   └── utils/                     # Test utilities (cuDF helpers)
+├── cmake/                         # CMake configuration modules
+├── CMakeLists.txt                 # Main CMake configuration
+├── CMakePresets.json              # CMake presets for build configurations
+└── pixi.toml                      # Pixi dependency management
 ```
 
 # References

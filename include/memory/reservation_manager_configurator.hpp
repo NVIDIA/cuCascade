@@ -150,17 +150,17 @@ class reservation_manager_configurator {
   std::vector<int> extract_host_ids(const std::vector<int>& gpu_ids,
                                     const system_topology_info* topology) const;
 
-  bool ignore_topology_{false};
-  std::variant<std::size_t, std::vector<int>, std::unordered_map<int, int>> n_gpus_or_gpu_ids_{1UL};
-  std::variant<std::size_t, double> gpu_usage_limit_or_ratio_{
+  bool _ignore_topology{false};
+  std::variant<std::size_t, std::vector<int>, std::unordered_map<int, int>> _n_gpus_or_gpu_ids{1UL};
+  std::variant<std::size_t, double> _gpu_usage_limit_or_ratio{
     static_cast<std::size_t>(1UL << 30)};          // uses 1GB of gpu memory
-  double gpu_reservation_limit_ratio_{0.75};       // limit to 75% of GPU usagel limit
-  std::size_t capacity_per_numa_node_{8UL << 30};  // 8GB per NUMA node by default
+  double _gpu_reservation_limit_ratio{0.75};       // limit to 75% of GPU usagel limit
+  std::size_t _capacity_per_numa_node{8UL << 30};  // 8GB per NUMA node by default
   std::variant<std::monostate, std::vector<int>, std::unordered_map<int, int>>
-    auto_binding_or_numa_ids_{};
-  double cpu_reservation_limit_ratio_{0.75};  // 75% limit per NUMA node by default
-  mutable DeviceMemoryResourceFactoryFn gpu_mr_fn_ = make_default_gpu_memory_resource;
-  mutable DeviceMemoryResourceFactoryFn cpu_mr_fn_ = make_default_host_memory_resource;
+    _auto_binding_or_numa_ids{};
+  double _cpu_reservation_limit_ratio{0.75};  // 75% limit per NUMA node by default
+  mutable DeviceMemoryResourceFactoryFn _gpu_mr_fn = make_default_gpu_memory_resource;
+  mutable DeviceMemoryResourceFactoryFn _cpu_mr_fn = make_default_host_memory_resource;
 };
 
 }  // namespace memory

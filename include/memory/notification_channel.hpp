@@ -42,13 +42,13 @@ struct notification_channel : std::enable_shared_from_this<notification_channel>
 
   wait_status wait()
   {
-    std::unique_lock lock(mutex_);
+    std::unique_lock lock(_mutex);
     bool notified = false;
-    cv_.wait(lock, [&, self = shared_from_this()] {
-      notified = std::exchange(has_been_notified_, false);
-      return notified || (n_active_notifiers_ == 0) || not is_running_;
+    _cv.wait(lock, [&, self = shared_from_this()] {
+      notified = std::exchange(_has_been_notified, false);
+      return notified || (_n_active_notifiers == 0) || not _is_running;
     });
-    return !is_running_ ? wait_status::SHUTDOWN
+    return !_is_running ? wait_status::SHUTDOWN
            : (notified) ? wait_status::NOTIFIED
                         : wait_status::IDLE;
   }
@@ -57,50 +57,50 @@ struct notification_channel : std::enable_shared_from_this<notification_channel>
 
   void shutdown()
   {
-    std::lock_guard lock(mutex_);
-    is_running_ = false;
-    cv_.notify_one();
+    std::lock_guard lock(_mutex);
+    _is_running = false;
+    _cv.notify_one();
   }
 
  private:
   void notify()
   {
-    std::lock_guard lock(mutex_);
-    has_been_notified_ = true;
-    cv_.notify_one();
+    std::lock_guard lock(_mutex);
+    _has_been_notified = true;
+    _cv.notify_one();
   }
 
   void release_notifier()
   {
-    std::lock_guard lock(mutex_);
-    n_active_notifiers_--;
-    if (n_active_notifiers_ == 0) { cv_.notify_all(); }
+    std::lock_guard lock(_mutex);
+    _n_active_notifiers--;
+    if (_n_active_notifiers == 0) { _cv.notify_all(); }
   }
 
-  mutable std::mutex mutex_;
-  std::condition_variable cv_;
-  bool has_been_notified_{false};
-  std::size_t n_active_notifiers_{0};
-  bool is_running_{true};
+  mutable std::mutex _mutex;
+  std::condition_variable _cv;
+  bool _has_been_notified{false};
+  std::size_t _n_active_notifiers{0};
+  bool _is_running{true};
 };
 
 using event_notifier = notification_channel::event_notifier;
 
 struct notify_on_exit {
-  explicit notify_on_exit(std::unique_ptr<event_notifier> notifier) : notifer_(std::move(notifier))
+  explicit notify_on_exit(std::unique_ptr<event_notifier> notifier) : _notifier(std::move(notifier))
   {
   }
 
   ~notify_on_exit() noexcept
   {
     try {
-      if (notifer_) notifer_->post();
+      if (_notifier) _notifier->post();
     } catch (...) {
     }
   }
 
  private:
-  std::unique_ptr<event_notifier> notifer_;
+  std::unique_ptr<event_notifier> _notifier;
 };
 
 }  // namespace memory

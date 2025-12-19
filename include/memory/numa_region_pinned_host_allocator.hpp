@@ -36,7 +36,7 @@ namespace memory {
 
 class numa_region_pinned_host_memory_resource final : public rmm::mr::device_memory_resource {
  public:
-  explicit numa_region_pinned_host_memory_resource(int numa_node) : numa_node_(numa_node) {}
+  explicit numa_region_pinned_host_memory_resource(int numa_node) : _numa_node(numa_node) {}
   ~numa_region_pinned_host_memory_resource()                                              = default;
   numa_region_pinned_host_memory_resource(numa_region_pinned_host_memory_resource const&) = default;
   numa_region_pinned_host_memory_resource(numa_region_pinned_host_memory_resource&&)      = default;
@@ -67,12 +67,12 @@ class numa_region_pinned_host_memory_resource final : public rmm::mr::device_mem
     // don't allocate anything if the user requested zero bytes
     if (0 == bytes) { return nullptr; }
 
-    if (numa_node_ == -1) {
+    if (_numa_node == -1) {
       void* ptr{nullptr};
       RMM_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault), bytes);
       return ptr;
     } else {
-      void* ptr = numa_alloc_onnode(bytes, numa_node_);
+      void* ptr = numa_alloc_onnode(bytes, _numa_node);
       if (ptr == nullptr) { throw rmm::bad_alloc(std::strerror(errno)); }
       RMM_CUDA_TRY_ALLOC(cudaHostRegister(ptr, bytes, cudaHostRegisterMapped), bytes);
       return ptr;
@@ -94,7 +94,7 @@ class numa_region_pinned_host_memory_resource final : public rmm::mr::device_mem
                      [[maybe_unused]] rmm::cuda_stream_view stream) noexcept override
   {
     RMM_FUNC_RANGE();
-    if (numa_node_ == -1) {
+    if (_numa_node == -1) {
       RMM_ASSERT_CUDA_SUCCESS(cudaFreeHost(ptr));
     } else {
       cudaHostUnregister(ptr);
@@ -116,7 +116,7 @@ class numa_region_pinned_host_memory_resource final : public rmm::mr::device_mem
     const rmm::mr::device_memory_resource& other) const noexcept override
   {
     auto* mr_ptr = dynamic_cast<numa_region_pinned_host_memory_resource const*>(&other);
-    return mr_ptr == this && mr_ptr->numa_node_ == this->numa_node_;
+    return mr_ptr == this && mr_ptr->_numa_node == this->_numa_node;
   }
 
   /**
@@ -139,7 +139,7 @@ class numa_region_pinned_host_memory_resource final : public rmm::mr::device_mem
   {
   }
 
-  int numa_node_{-1};
+  int _numa_node{-1};
 };
 
 }  // namespace memory

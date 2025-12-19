@@ -318,7 +318,7 @@ bool reservation_aware_resource_adaptor::attach_reservation_to_tracker(
   _allocation_tracker->assign_reservation_to_tracker(
     stream,
     std::unique_ptr<device_reserved_arena>(
-      dynamic_cast<device_reserved_arena*>(reserved_bytes->arena_.release())),
+      dynamic_cast<device_reserved_arena*>(reserved_bytes->_arena.release())),
     std::move(stream_reservation_policy),
     std::move(stream_oom_policy));
 
@@ -351,7 +351,7 @@ bool reservation_aware_resource_adaptor::grow_reservation_by(device_reserved_are
                                                              std::size_t bytes)
 {
   if (do_reserve(bytes, _memory_limit)) {
-    arena.size_ += static_cast<int64_t>(bytes);
+    arena._size += static_cast<int64_t>(bytes);
     return true;
   }
   return false;
@@ -361,7 +361,7 @@ void reservation_aware_resource_adaptor::shrink_reservation_to_fit(device_reserv
 {
   auto current_bytes = std::max(int64_t{0}, arena.allocated_bytes.load());
   if (current_bytes < arena.size()) {
-    auto reclaimed_bytes = std::exchange(arena.size_, current_bytes) - current_bytes;
+    auto reclaimed_bytes = std::exchange(arena._size, current_bytes) - current_bytes;
     _total_allocated_bytes.sub(static_cast<std::size_t>(reclaimed_bytes));
   }
 }

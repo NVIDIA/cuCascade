@@ -148,7 +148,7 @@ void expect_cudf_tables_equal_on_stream(const cudf::table& left,
 // Simple logging adaptor to print all RMM device allocations/frees with pointers/sizes/stream/tid
 class logging_device_resource : public rmm::mr::device_memory_resource {
  public:
-  explicit logging_device_resource(rmm::mr::device_memory_resource* upstream) : upstream_(upstream)
+  explicit logging_device_resource(rmm::mr::device_memory_resource* upstream) : _upstream(upstream)
   {
   }
 
@@ -157,7 +157,7 @@ class logging_device_resource : public rmm::mr::device_memory_resource {
  private:
   void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
   {
-    void* ptr = upstream_->allocate(bytes, stream);
+    void* ptr = _upstream->allocate(bytes, stream);
     std::ostringstream oss;
     oss << "[rmm-alloc] ptr=" << ptr << " size=" << bytes << " stream=" << stream.value()
         << " tid=" << std::this_thread::get_id();
@@ -171,7 +171,7 @@ class logging_device_resource : public rmm::mr::device_memory_resource {
     oss << "[rmm-free ] ptr=" << ptr << " size=" << bytes << " stream=" << stream.value()
         << " tid=" << std::this_thread::get_id();
     std::cout << oss.str() << std::endl << std::flush;
-    upstream_->deallocate(ptr, bytes, stream);
+    _upstream->deallocate(ptr, bytes, stream);
   }
 
   bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override
@@ -179,7 +179,7 @@ class logging_device_resource : public rmm::mr::device_memory_resource {
     return this == &other;
   }
 
-  rmm::mr::device_memory_resource* upstream_;
+  rmm::mr::device_memory_resource* _upstream;
 };
 
 // Install the logging resource once per process (wraps whatever the current device resource is)

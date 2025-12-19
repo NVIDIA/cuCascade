@@ -106,17 +106,17 @@ class topology_discovery {
    * @return system_topology_info structure containing all topology data.
    * @note `discover()` must be called first.
    */
-  [[nodiscard]] system_topology_info const& get_topology() const { return topology_.value(); }
+  [[nodiscard]] system_topology_info const& get_topology() const { return _topology.value(); }
 
   /**
    * @brief Check if topology has been discovered.
    *
    * @return true if `discover()` has been called successfully.
    */
-  [[nodiscard]] bool is_discovered() const { return topology_.has_value(); }
+  [[nodiscard]] bool is_discovered() const { return _topology.has_value(); }
 
  private:
-  std::optional<system_topology_info> topology_;  ///< Discovered topology information.
+  std::optional<system_topology_info> _topology;  ///< Discovered topology information.
 };
 
 }  // namespace cucascade::memory

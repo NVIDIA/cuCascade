@@ -139,12 +139,12 @@ class memory_space {
                                               std::unique_ptr<fixed_size_host_memory_resource>,
                                               std::unique_ptr<disk_access_limiter>>;
 
-  std::shared_ptr<notification_channel> notification_channel_;
+  std::shared_ptr<notification_channel> _notification_channel;
 
   // Memory resources owned by this memory_space
   std::unique_ptr<rmm::mr::device_memory_resource> _allocator;
   reserving_adaptor_type _reservation_allocator;
-  std::unique_ptr<rmm::cuda_stream_pool> stream_pool_;
+  std::unique_ptr<rmm::cuda_stream_pool> _stream_pool;
 };
 
 /**

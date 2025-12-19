@@ -80,7 +80,7 @@ bool disk_access_limiter::grow_reservation_by(reserved_arena& arena, std::size_t
 {
   auto* disk_reservation = dynamic_cast<disk_reserved_arena*>(&arena);
   if (do_reserve(bytes, _memory_limit)) {
-    disk_reservation->size_ += static_cast<int64_t>(bytes);
+    disk_reservation->_size += static_cast<int64_t>(bytes);
     update_peak_allocated_bytes();
     return true;
   }
@@ -91,7 +91,7 @@ void disk_access_limiter::shrink_reservation_to_fit(reserved_arena& arena)
 {
   auto size_to_release = static_cast<std::size_t>(std::max(int64_t{0}, arena.size()));
   _total_allocated_bytes.fetch_sub(size_to_release);
-  arena.size_ = 0;
+  arena._size = 0;
 }
 
 std::size_t disk_access_limiter::get_active_reservation_count() const noexcept
@@ -130,7 +130,7 @@ void disk_access_limiter::do_release_reservation(disk_reserved_arena* arena) noe
   auto size_to_release = static_cast<std::size_t>(std::max(int64_t{0}, arena->size()));
   _total_allocated_bytes.fetch_sub(size_to_release);
   _total_reservation_count.fetch_sub(1);
-  arena->size_ = 0;
+  arena->_size = 0;
 }
 
 void disk_access_limiter::update_peak_allocated_bytes() noexcept

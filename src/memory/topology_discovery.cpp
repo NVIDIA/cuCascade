@@ -622,7 +622,7 @@ bool topology_discovery::discover()
 
   if (nvml_available) { nvml.p_nvmlShutdown(); }
 
-  topology_ = std::move(topology);
+  _topology = std::move(topology);
   return true;
 }
 

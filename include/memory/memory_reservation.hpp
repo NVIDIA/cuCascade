@@ -181,7 +181,7 @@ struct reserved_arena {
   friend class disk_access_limiter;
 
   explicit reserved_arena(int64_t len, std::unique_ptr<event_notifier> release_notifer = nullptr)
-    : size_(len), on_exit_(std::move(release_notifer))
+    : _size(len), _on_exit(std::move(release_notifer))
   {
   }
 
@@ -191,11 +191,11 @@ struct reserved_arena {
 
   virtual void shrink_to_fit() = 0;
 
-  [[gnu::always_inline]] int64_t size() const noexcept { return size_; }
+  [[gnu::always_inline]] int64_t size() const noexcept { return _size; }
 
  private:
-  int64_t size_;
-  const notify_on_exit on_exit_;
+  int64_t _size;
+  const notify_on_exit _on_exit;
 };
 
 /**
@@ -263,8 +263,8 @@ struct reservation {
  private:
   explicit reservation(const memory_space* space, std::unique_ptr<reserved_arena> arena);
 
-  const memory_space* space_;
-  std::unique_ptr<reserved_arena> arena_;
+  const memory_space* _space;
+  std::unique_ptr<reserved_arena> _arena;
 };
 
 }  // namespace memory

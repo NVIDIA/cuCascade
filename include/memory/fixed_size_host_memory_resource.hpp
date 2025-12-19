@@ -73,21 +73,21 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
                                    std::size_t bytes,
                                    std::unique_ptr<event_notifier> notify_on_exit)
       : reserved_arena(static_cast<int64_t>(bytes), std::move(notify_on_exit)),
-        mr_(&mr),
-        uuid_(create_uid())
+        _mr(&mr),
+        _uuid(create_uid())
     {
     }
 
-    ~chunked_reserved_area() noexcept { mr_->release_reservation(this); }
+    ~chunked_reserved_area() noexcept { _mr->release_reservation(this); }
 
-    std::size_t uuid() const noexcept { return uuid_; }
+    std::size_t uuid() const noexcept { return _uuid; }
 
     bool grow_by(std::size_t additional_bytes) final
     {
-      return mr_->grow_reservation_by(*this, additional_bytes);
+      return _mr->grow_reservation_by(*this, additional_bytes);
     }
 
-    void shrink_to_fit() final { mr_->shrink_reservation_to_fit(*this); }
+    void shrink_to_fit() final { _mr->shrink_reservation_to_fit(*this); }
 
    private:
     static std::size_t create_uid()
@@ -96,8 +96,8 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
       return uid_counter.fetch_add(1) + 1;
     }
 
-    fixed_size_host_memory_resource* mr_;
-    const std::size_t uuid_;
+    fixed_size_host_memory_resource* _mr;
+    const std::size_t _uuid;
   };
 
   /**
@@ -120,8 +120,8 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
 
     ~multiple_blocks_allocation()
     {
-      if (mr_ && !blocks_.empty()) {
-        mr_->return_allocated_chunks(std::move(blocks_), reseved_memory_);
+      if (_mr && !_blocks.empty()) {
+        _mr->return_allocated_chunks(std::move(_blocks), _reseved_memory);
       }
     }
 
@@ -131,45 +131,45 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
     multiple_blocks_allocation(multiple_blocks_allocation&&)                 = delete;
     multiple_blocks_allocation& operator=(multiple_blocks_allocation&&)      = delete;
 
-    std::size_t size_bytes() const noexcept { return blocks_.size() * block_size_; }
+    std::size_t size_bytes() const noexcept { return _blocks.size() * _block_size; }
 
-    std::size_t size() const noexcept { return blocks_.size(); }
+    std::size_t size() const noexcept { return _blocks.size(); }
 
-    std::span<std::byte*> get_blocks() noexcept { return blocks_; }
+    std::span<std::byte*> get_blocks() noexcept { return _blocks; }
 
     std::span<std::byte> operator[](std::size_t i) const
     {
-      return std::span<std::byte>{blocks_.at(i), block_size_};
+      return std::span<std::byte>{_blocks.at(i), _block_size};
     }
 
     std::span<std::byte> at(std::size_t i) const
     {
-      return std::span<std::byte>{blocks_.at(i), block_size_};
+      return std::span<std::byte>{_blocks.at(i), _block_size};
     }
 
-    std::size_t block_size() const noexcept { return block_size_; }
+    std::size_t block_size() const noexcept { return _block_size; }
 
    private:
     explicit multiple_blocks_allocation(std::vector<std::byte*> buffers,
                                         fixed_size_host_memory_resource* m,
                                         reservation* res)
-      : blocks_(std::move(buffers)),
-        mr_(m),
-        block_size_(m ? m->get_block_size() : 0),
-        reseved_memory_(nullptr)
+      : _blocks(std::move(buffers)),
+        _mr(m),
+        _block_size(m ? m->get_block_size() : 0),
+        _reseved_memory(nullptr)
     {
       if (res) {
-        auto* h_res = dynamic_cast<chunked_reserved_area*>(res->arena_.get());
+        auto* h_res = dynamic_cast<chunked_reserved_area*>(res->_arena.get());
         if (!h_res)
           throw std::invalid_argument("need host reservation for allocation multiple blocks");
-        reseved_memory_ = h_res;
+        _reseved_memory = h_res;
       }
     }
 
-    std::vector<std::byte*> blocks_;
-    fixed_size_host_memory_resource* mr_;
-    std::size_t block_size_;
-    chunked_reserved_area* reseved_memory_;
+    std::vector<std::byte*> _blocks;
+    fixed_size_host_memory_resource* _mr;
+    std::size_t _block_size;
+    chunked_reserved_area* _reseved_memory;
   };
 
   using fixed_multiple_blocks_allocation = std::unique_ptr<multiple_blocks_allocation>;
@@ -204,7 +204,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
 
   [[nodiscard]] std::size_t get_total_allocated_bytes() const noexcept
   {
-    return allocated_bytes_.load();
+    return _allocated_bytes.load();
   }
 
   /**
@@ -362,17 +362,17 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
    */
   void return_allocated_chunks(std::vector<std::byte*> chunks, chunked_reserved_area* res);
 
-  memory_space_id space_id_;
-  std::size_t memory_limit_;
-  std::size_t memory_capacity_;
-  std::size_t block_size_;                        ///< Size of each block
-  std::size_t pool_size_;                         ///< Number of blocks in pool
-  rmm::mr::device_memory_resource* upstream_mr_;  ///< Upstream memory resource (optional)
-  std::vector<void*> allocated_blocks_;           ///< All allocated blocks
-  std::vector<void*> free_blocks_;                ///< Currently free blocks
-  mutable std::mutex mutex_;
-  atomic_bounded_counter<size_t> allocated_bytes_{0};
-  atomic_peak_tracker<size_t> peak_allocated_bytes_{0};
+  memory_space_id _space_id;
+  std::size_t _memory_limit;
+  std::size_t _memory_capacity;
+  std::size_t _block_size;                        ///< Size of each block
+  std::size_t _pool_size;                         ///< Number of blocks in pool
+  rmm::mr::device_memory_resource* _upstream_mr;  ///< Upstream memory resource (optional)
+  std::vector<void*> _allocated_blocks;           ///< All allocated blocks
+  std::vector<void*> _free_blocks;                ///< Currently free blocks
+  mutable std::mutex _mutex;
+  atomic_bounded_counter<size_t> _allocated_bytes{0};
+  atomic_peak_tracker<size_t> _peak_allocated_bytes{0};
 
   struct allocation_tracker {
     explicit allocation_tracker(std::size_t uid) : uuid(uid) {}
@@ -380,7 +380,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
     const std::size_t uuid;
     std::atomic<int64_t> allocated_bytes{0};
   };
-  std::unordered_map<chunked_reserved_area*, allocation_tracker> active_reservations_;
+  std::unordered_map<chunked_reserved_area*, allocation_tracker> _active_reservations;
 };
 
 using fixed_multiple_blocks_allocation =

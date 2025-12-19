@@ -40,32 +40,32 @@ std::unique_ptr<reservation> reservation::create(memory_space& space,
 }
 
 reservation::reservation(const memory_space* space, std::unique_ptr<reserved_arena> arena)
-  : space_(space), arena_(std::move(arena))
+  : _space(space), _arena(std::move(arena))
 {
-  assert(arena_ != nullptr && "Release callback must be provided");
+  assert(_arena != nullptr && "Release callback must be provided");
 }
 
 reservation::~reservation() = default;
 
 rmm::mr::device_memory_resource* reservation::get_memory_resource() const noexcept
 {
-  return space_->get_default_allocator();
+  return _space->get_default_allocator();
 }
 
-const memory_space& reservation::get_memory_space() const noexcept { return *space_; }
+const memory_space& reservation::get_memory_space() const noexcept { return *_space; }
 
 size_t reservation::size() const noexcept
 {
-  return static_cast<std::size_t>(std::max(int64_t{0}, arena_->size()));
+  return static_cast<std::size_t>(std::max(int64_t{0}, _arena->size()));
 }
 
-[[nodiscard]] Tier reservation::tier() const noexcept { return space_->get_tier(); }
+[[nodiscard]] Tier reservation::tier() const noexcept { return _space->get_tier(); }
 
-[[nodiscard]] int reservation::device_id() const noexcept { return space_->get_device_id(); }
+[[nodiscard]] int reservation::device_id() const noexcept { return _space->get_device_id(); }
 
-bool reservation::grow_by(size_t additional_bytes) { return arena_->grow_by(additional_bytes); }
+bool reservation::grow_by(size_t additional_bytes) { return _arena->grow_by(additional_bytes); }
 
-void reservation::shrink_to_fit() { return arena_->shrink_to_fit(); }
+void reservation::shrink_to_fit() { return _arena->shrink_to_fit(); }
 
 //===----------------------------------------------------------------------===//
 // Reservation Limit Policy Implementations

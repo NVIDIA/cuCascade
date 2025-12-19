@@ -60,18 +60,18 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
     explicit device_reserved_arena(reservation_aware_resource_adaptor& mr,
                                    std::size_t bytes,
                                    std::unique_ptr<event_notifier> notifier)
-      : reserved_arena(static_cast<int64_t>(bytes), std::move(notifier)), mr_(&mr)
+      : reserved_arena(static_cast<int64_t>(bytes), std::move(notifier)), _mr(&mr)
     {
     }
 
-    ~device_reserved_arena() noexcept { mr_->do_release_reservation(this); }
+    ~device_reserved_arena() noexcept { _mr->do_release_reservation(this); }
 
     bool grow_by(std::size_t additional_bytes) final
     {
-      return mr_->grow_reservation_by(*this, additional_bytes);
+      return _mr->grow_reservation_by(*this, additional_bytes);
     }
 
-    void shrink_to_fit() final { mr_->shrink_reservation_to_fit(*this); }
+    void shrink_to_fit() final { _mr->shrink_reservation_to_fit(*this); }
 
     [[nodiscard]] std::size_t get_available_memory() const noexcept
     {
@@ -84,7 +84,7 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
     atomic_peak_tracker<std::int64_t> peak_allocated_bytes{0LL};
 
    private:
-    reservation_aware_resource_adaptor* mr_;
+    reservation_aware_resource_adaptor* _mr;
   };
 
   /**

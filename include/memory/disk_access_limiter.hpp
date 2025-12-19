@@ -40,22 +40,22 @@ class disk_access_limiter {
                                  std::string_view base_fname,
                                  std::unique_ptr<event_notifier> notifier)
       : reserved_arena(static_cast<int64_t>(bytes), std::move(notifier)),
-        base_name_(base_fname.data(), base_fname.size()),
-        mr_(&mr)
+        _base_name(base_fname.data(), base_fname.size()),
+        _mr(&mr)
     {
     }
 
-    ~disk_reserved_arena() noexcept { mr_->do_release_reservation(this); }
+    ~disk_reserved_arena() noexcept { _mr->do_release_reservation(this); }
 
-    std::string_view base_name() const noexcept { return base_name_; }
+    std::string_view base_name() const noexcept { return _base_name; }
 
     bool grow_by(std::size_t) final { return false; }
 
     void shrink_to_fit() final {}
 
    private:
-    std::string base_name_;
-    disk_access_limiter* mr_;
+    std::string _base_name;
+    disk_access_limiter* _mr;
   };
 
   explicit disk_access_limiter(memory_space_id space_id, std::size_t capacity);

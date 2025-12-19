@@ -53,11 +53,11 @@ struct reservation;
 //===----------------------------------------------------------------------===//
 
 struct reservation_request_strategy {
-  explicit reservation_request_strategy(bool strong_ordering) : strong_ordering_(strong_ordering) {}
+  explicit reservation_request_strategy(bool strong_ordering) : _strong_ordering(strong_ordering) {}
 
   virtual std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const = 0;
 
-  [[nodiscard]] bool has_strong_ordering() const noexcept { return strong_ordering_; }
+  [[nodiscard]] bool has_strong_ordering() const noexcept { return _strong_ordering; }
 
  protected:
   static std::span<memory_space*> get_all_memory_resource(memory_reservation_manager& manager);
@@ -69,7 +69,7 @@ struct reservation_request_strategy {
 
   static std::vector<memory_space*> get_memory_resource(std::span<memory_space_id> source_ids);
 
-  bool strong_ordering_{false};
+  bool _strong_ordering{false};
 };
 
 /**
