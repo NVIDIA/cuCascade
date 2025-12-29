@@ -126,8 +126,9 @@ cudaError_t performGpuMemoryWork(void* gpu_ptr, size_t size_bytes, uint64_t* res
   // Copy result back to host
   err = cudaMemcpy(result_checksum, d_result, sizeof(uint64_t), cudaMemcpyDeviceToHost);
 
-  // Clean up
-  cudaFree(d_result);
+  // Clean up - check for error but don't overwrite previous error
+  cudaError_t free_err = cudaFree(d_result);
+  if (err == cudaSuccess) { err = free_err; }
 
   return err;
 }
@@ -177,8 +178,9 @@ cudaError_t verifyGpuMemoryWork(void* gpu_ptr, size_t size_bytes, uint64_t* veri
   // Copy result back to host
   err = cudaMemcpy(verification_checksum, d_checksum, sizeof(uint64_t), cudaMemcpyDeviceToHost);
 
-  // Clean up
-  cudaFree(d_checksum);
+  // Clean up - check for error but don't overwrite previous error
+  cudaError_t free_err = cudaFree(d_checksum);
+  if (err == cudaSuccess) { err = free_err; }
 
   return err;
 }

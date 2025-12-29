@@ -28,6 +28,7 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/detail/error.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -103,10 +104,10 @@ TEST_CASE("host_table_representation converts to GPU and preserves contents",
     size_t remain = packed.gpu_data->size() - copied;
     size_t bytes  = std::min(remain, block_size - block_off);
     void* dst_ptr = reinterpret_cast<uint8_t*>((*allocation)[block_idx].data()) + block_off;
-    cudaMemcpy(dst_ptr,
-               static_cast<const uint8_t*>(packed.gpu_data->data()) + copied,
-               bytes,
-               cudaMemcpyDeviceToHost);
+    RMM_CUDA_TRY(cudaMemcpy(dst_ptr,
+                            static_cast<const uint8_t*>(packed.gpu_data->data()) + copied,
+                            bytes,
+                            cudaMemcpyDeviceToHost));
     copied += bytes;
     block_off += bytes;
     if (block_off == block_size) {

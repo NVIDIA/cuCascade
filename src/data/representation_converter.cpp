@@ -22,6 +22,7 @@
 #include "data/gpu_data_representation.hpp"
 #include "memory/host_table.hpp"
 
+#include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
@@ -64,17 +65,22 @@ std::unique_ptr<idata_representation> representation_converter_registry::convert
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream) const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  representation_converter_fn converter;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
 
-  auto it = _converters.find(key);
-  if (it == _converters.end()) {
-    std::ostringstream oss;
-    oss << "No converter registered for source type '" << key.source_type.name()
-        << "' to target type '" << key.target_type.name() << "'";
-    throw std::runtime_error(oss.str());
+    auto it = _converters.find(key);
+    if (it == _converters.end()) {
+      std::ostringstream oss;
+      oss << "No converter registered for source type '" << key.source_type.name()
+          << "' to target type '" << key.target_type.name() << "'";
+      throw std::runtime_error(oss.str());
+    }
+
+    converter = it->second;
   }
 
-  return it->second(source, target_memory_space, stream);
+  return converter(source, target_memory_space, stream);
 }
 
 std::unique_ptr<idata_representation> representation_converter_registry::convert(
@@ -125,22 +131,22 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   // Acquire a stream that belongs to the target GPU device
   auto target_stream = target_memory_space->acquire_stream();
 
-  cudaSetDevice(target_device_id);
+  RMM_CUDA_TRY(cudaSetDevice(target_device_id));
   rmm::device_uvector<uint8_t> dst_uvector(bytes_to_copy, target_stream, mr);
   target_stream.synchronize();
   // Restore previous device before peer copy
-  cudaSetDevice(source_device_id);
+  RMM_CUDA_TRY(cudaSetDevice(source_device_id));
 
   // Asynchronously copy device->device across GPUs
-  cudaMemcpyPeerAsync(dst_uvector.data(),
-                      target_device_id,
-                      static_cast<const uint8_t*>(packed_data.gpu_data->data()),
-                      source_device_id,
-                      bytes_to_copy,
-                      stream.value());
+  RMM_CUDA_TRY(cudaMemcpyPeerAsync(dst_uvector.data(),
+                                   target_device_id,
+                                   static_cast<const uint8_t*>(packed_data.gpu_data->data()),
+                                   source_device_id,
+                                   bytes_to_copy,
+                                   stream.value()));
   stream.synchronize();
   // Unpack on target device to build a cudf::table that lives on the target GPU
-  cudaSetDevice(target_device_id);
+  RMM_CUDA_TRY(cudaSetDevice(target_device_id));
   rmm::device_buffer dst_buffer = std::move(dst_uvector).release();
   // Unpack using pointer-based API and construct an owning cudf::table
   auto new_metadata = std::move(packed_data.metadata);
@@ -150,7 +156,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto new_table = cudf::table(new_table_view, target_stream, mr);
   // Restore previous device
   target_stream.synchronize();
-  cudaSetDevice(source_device_id);
+  RMM_CUDA_TRY(cudaSetDevice(source_device_id));
 
   return std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
@@ -178,11 +184,12 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
     size_t remaining_bytes         = packed_data.gpu_data->size() - source_offset;
     size_t bytes_to_copy           = std::min(remaining_bytes, block_size - block_offset);
     std::span<std::byte> block_ptr = allocation->at(block_index);
-    cudaMemcpyAsync(block_ptr.data() + block_offset,
-                    static_cast<const uint8_t*>(packed_data.gpu_data->data()) + source_offset,
-                    bytes_to_copy,
-                    cudaMemcpyDeviceToHost,
-                    stream.value());
+    RMM_CUDA_TRY(
+      cudaMemcpyAsync(block_ptr.data() + block_offset,
+                      static_cast<const uint8_t*>(packed_data.gpu_data->data()) + source_offset,
+                      bytes_to_copy,
+                      cudaMemcpyDeviceToHost,
+                      stream.value()));
     source_offset += bytes_to_copy;
     block_offset += bytes_to_copy;
     if (block_offset == block_size) {
@@ -211,8 +218,8 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
 
   auto mr             = target_memory_space->get_default_allocator();
   int previous_device = -1;
-  cudaGetDevice(&previous_device);
-  cudaSetDevice(target_memory_space->get_device_id());
+  RMM_CUDA_TRY(cudaGetDevice(&previous_device));
+  RMM_CUDA_TRY(cudaSetDevice(target_memory_space->get_device_id()));
 
   rmm::device_buffer dst_buffer(data_size, stream, mr);
   size_t src_block_index      = 0;
@@ -224,11 +231,11 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
     size_t bytes_available_in_src_block = src_block_size - src_block_offset;
     size_t bytes_to_copy                = std::min(remaining_bytes, bytes_available_in_src_block);
     auto src_block                      = host_table->allocation->at(src_block_index);
-    cudaMemcpyAsync(static_cast<uint8_t*>(dst_buffer.data()) + dst_offset,
-                    src_block.data() + src_block_offset,
-                    bytes_to_copy,
-                    cudaMemcpyHostToDevice,
-                    stream.value());
+    RMM_CUDA_TRY(cudaMemcpyAsync(static_cast<uint8_t*>(dst_buffer.data()) + dst_offset,
+                                 src_block.data() + src_block_offset,
+                                 bytes_to_copy,
+                                 cudaMemcpyHostToDevice,
+                                 stream.value()));
     dst_offset += bytes_to_copy;
     src_block_offset += bytes_to_copy;
     if (src_block_offset == src_block_size) {
@@ -244,7 +251,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
   auto new_table = cudf::table(new_table_view, stream, mr);
   stream.synchronize();
 
-  cudaSetDevice(previous_device);
+  RMM_CUDA_TRY(cudaSetDevice(previous_device));
   return std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
 }

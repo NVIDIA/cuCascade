@@ -52,7 +52,7 @@ void numa_region_pinned_host_memory_resource::do_deallocate(
   if (_numa_node == -1) {
     RMM_ASSERT_CUDA_SUCCESS(cudaFreeHost(ptr));
   } else {
-    cudaHostUnregister(ptr);
+    RMM_ASSERT_CUDA_SUCCESS(cudaHostUnregister(ptr));
     numa_free(ptr, bytes);
   }
 }
