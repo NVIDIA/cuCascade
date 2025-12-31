@@ -112,6 +112,20 @@ class idata_repository {
     return {PtrType{}, data_batch_processing_handle{}};
   }
 
+  /**
+   * @brief Check if there are any data batches available in the repository.
+   *
+   * @return true If there is at least one data batch
+   * @return false If the repository is empty
+   *
+   * @note Thread-safe operation protected by internal mutex
+   */
+  virtual bool check_data_batch_availability()
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return !_data_batches.empty();
+  }
+
  protected:
   std::mutex _mutex;                   ///< Mutex for thread-safe access to repository operations
   std::vector<PtrType> _data_batches;  ///< Container for data batch pointers

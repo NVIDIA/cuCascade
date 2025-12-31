@@ -574,3 +574,337 @@ TEST_CASE("shared_data_repository Cannot Pull During Downgrade", "[data_reposito
   auto [pulled, handle] = repository.pull_data_batch();
   REQUIRE(pulled == nullptr);
 }
+
+// =============================================================================
+// Tests for check_data_batch_availability()
+// =============================================================================
+
+// Test check_data_batch_availability on empty shared repository
+TEST_CASE("shared_data_repository check_data_batch_availability Empty", "[data_repository]")
+{
+  shared_data_repository repository;
+
+  // Initially empty
+  REQUIRE(repository.check_data_batch_availability() == false);
+}
+
+// Test check_data_batch_availability after adding batches to shared repository
+TEST_CASE("shared_data_repository check_data_batch_availability After Adding", "[data_repository]")
+{
+  shared_data_repository repository;
+
+  // Initially empty
+  REQUIRE(repository.check_data_batch_availability() == false);
+
+  // Add one batch
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  repository.add_data_batch(batch);
+
+  // Should now have batches available
+  REQUIRE(repository.check_data_batch_availability() == true);
+
+  // Add more batches
+  for (int i = 2; i <= 5; ++i) {
+    auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto batch2 = std::make_shared<data_batch>(i, std::move(data2));
+    repository.add_data_batch(batch2);
+  }
+
+  // Should still have batches available
+  REQUIRE(repository.check_data_batch_availability() == true);
+}
+
+// Test check_data_batch_availability after pulling batches from shared repository
+TEST_CASE("shared_data_repository check_data_batch_availability After Pulling", "[data_repository]")
+{
+  shared_data_repository repository;
+
+  // Add multiple batches
+  for (int i = 1; i <= 5; ++i) {
+    auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto batch = std::make_shared<data_batch>(i, std::move(data));
+    repository.add_data_batch(batch);
+  }
+
+  REQUIRE(repository.check_data_batch_availability() == true);
+
+  // Pull batches one by one
+  for (int i = 1; i <= 4; ++i) {
+    auto [batch, handle] = repository.pull_data_batch();
+    REQUIRE(batch != nullptr);
+    // Should still have batches available
+    REQUIRE(repository.check_data_batch_availability() == true);
+  }
+
+  // Pull the last batch
+  auto [last_batch, last_handle] = repository.pull_data_batch();
+  REQUIRE(last_batch != nullptr);
+
+  // Now should be empty
+  REQUIRE(repository.check_data_batch_availability() == false);
+}
+
+// Test check_data_batch_availability with interleaved operations on shared repository
+TEST_CASE("shared_data_repository check_data_batch_availability Interleaved Operations",
+          "[data_repository]")
+{
+  shared_data_repository repository;
+
+  REQUIRE(repository.check_data_batch_availability() == false);
+
+  for (int cycle = 0; cycle < 10; ++cycle) {
+    // Add some batches
+    for (int i = 0; i < 3; ++i) {
+      auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+      auto batch = std::make_shared<data_batch>(cycle * 3 + i, std::move(data));
+      repository.add_data_batch(batch);
+    }
+
+    REQUIRE(repository.check_data_batch_availability() == true);
+
+    // Pull one batch
+    auto [batch, handle] = repository.pull_data_batch();
+    REQUIRE(batch != nullptr);
+
+    // Should still have batches (added 3, pulled 1)
+    REQUIRE(repository.check_data_batch_availability() == true);
+  }
+
+  // Pull all remaining batches
+  while (repository.check_data_batch_availability()) {
+    auto [batch, handle] = repository.pull_data_batch();
+    REQUIRE(batch != nullptr);
+  }
+
+  // Should be empty now
+  REQUIRE(repository.check_data_batch_availability() == false);
+}
+
+// Test check_data_batch_availability on empty unique repository
+TEST_CASE("unique_data_repository check_data_batch_availability Empty", "[data_repository]")
+{
+  unique_data_repository repository;
+
+  // Initially empty
+  REQUIRE(repository.check_data_batch_availability() == false);
+}
+
+// Test check_data_batch_availability after adding batches to unique repository
+TEST_CASE("unique_data_repository check_data_batch_availability After Adding", "[data_repository]")
+{
+  unique_data_repository repository;
+
+  // Initially empty
+  REQUIRE(repository.check_data_batch_availability() == false);
+
+  // Add one batch
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_unique<data_batch>(1, std::move(data));
+  repository.add_data_batch(std::move(batch));
+
+  // Should now have batches available
+  REQUIRE(repository.check_data_batch_availability() == true);
+
+  // Add more batches
+  for (int i = 2; i <= 5; ++i) {
+    auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto batch2 = std::make_unique<data_batch>(i, std::move(data2));
+    repository.add_data_batch(std::move(batch2));
+  }
+
+  // Should still have batches available
+  REQUIRE(repository.check_data_batch_availability() == true);
+}
+
+// Test check_data_batch_availability after pulling batches from unique repository
+TEST_CASE("unique_data_repository check_data_batch_availability After Pulling", "[data_repository]")
+{
+  unique_data_repository repository;
+
+  // Add multiple batches
+  for (int i = 1; i <= 5; ++i) {
+    auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto batch = std::make_unique<data_batch>(i, std::move(data));
+    repository.add_data_batch(std::move(batch));
+  }
+
+  REQUIRE(repository.check_data_batch_availability() == true);
+
+  // Pull batches one by one
+  for (int i = 1; i <= 4; ++i) {
+    auto [batch, handle] = repository.pull_data_batch();
+    REQUIRE(batch != nullptr);
+    // Should still have batches available
+    REQUIRE(repository.check_data_batch_availability() == true);
+  }
+
+  // Pull the last batch
+  auto [last_batch, last_handle] = repository.pull_data_batch();
+  REQUIRE(last_batch != nullptr);
+
+  // Now should be empty
+  REQUIRE(repository.check_data_batch_availability() == false);
+}
+
+// Test check_data_batch_availability with interleaved operations on unique repository
+TEST_CASE("unique_data_repository check_data_batch_availability Interleaved Operations",
+          "[data_repository]")
+{
+  unique_data_repository repository;
+
+  REQUIRE(repository.check_data_batch_availability() == false);
+
+  for (int cycle = 0; cycle < 10; ++cycle) {
+    // Add some batches
+    for (int i = 0; i < 3; ++i) {
+      auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+      auto batch = std::make_unique<data_batch>(cycle * 3 + i, std::move(data));
+      repository.add_data_batch(std::move(batch));
+    }
+
+    REQUIRE(repository.check_data_batch_availability() == true);
+
+    // Pull one batch
+    auto [batch, handle] = repository.pull_data_batch();
+    REQUIRE(batch != nullptr);
+
+    // Should still have batches (added 3, pulled 1)
+    REQUIRE(repository.check_data_batch_availability() == true);
+  }
+
+  // Pull all remaining batches
+  while (repository.check_data_batch_availability()) {
+    auto [batch, handle] = repository.pull_data_batch();
+    REQUIRE(batch != nullptr);
+  }
+
+  // Should be empty now
+  REQUIRE(repository.check_data_batch_availability() == false);
+}
+
+// Test check_data_batch_availability thread-safety on shared repository
+TEST_CASE("shared_data_repository check_data_batch_availability Thread-Safe", "[data_repository]")
+{
+  shared_data_repository repository;
+
+  constexpr int num_threads        = 10;
+  constexpr int batches_per_thread = 100;
+
+  std::vector<std::thread> threads;
+  std::atomic<int> availability_check_count{0};
+
+  // Launch threads that add batches and check availability
+  for (int i = 0; i < num_threads; ++i) {
+    threads.emplace_back([&, i]() {
+      for (int j = 0; j < batches_per_thread; ++j) {
+        auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+        uint64_t batch_id = i * batches_per_thread + j;
+        auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+        repository.add_data_batch(batch);
+
+        // Check availability after adding
+        if (repository.check_data_batch_availability()) { ++availability_check_count; }
+      }
+    });
+  }
+
+  // Wait for all threads to complete
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // All checks should have returned true since we were always adding
+  REQUIRE(availability_check_count == num_threads * batches_per_thread);
+
+  // Verify repository is not empty
+  REQUIRE(repository.check_data_batch_availability() == true);
+}
+
+// Test check_data_batch_availability thread-safety on unique repository
+TEST_CASE("unique_data_repository check_data_batch_availability Thread-Safe", "[data_repository]")
+{
+  unique_data_repository repository;
+
+  constexpr int num_threads        = 10;
+  constexpr int batches_per_thread = 100;
+
+  std::vector<std::thread> threads;
+  std::atomic<int> availability_check_count{0};
+
+  // Launch threads that add batches and check availability
+  for (int i = 0; i < num_threads; ++i) {
+    threads.emplace_back([&, i]() {
+      for (int j = 0; j < batches_per_thread; ++j) {
+        auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+        uint64_t batch_id = i * batches_per_thread + j;
+        auto batch        = std::make_unique<data_batch>(batch_id, std::move(data));
+        repository.add_data_batch(std::move(batch));
+
+        // Check availability after adding
+        if (repository.check_data_batch_availability()) { ++availability_check_count; }
+      }
+    });
+  }
+
+  // Wait for all threads to complete
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // All checks should have returned true since we were always adding
+  REQUIRE(availability_check_count == num_threads * batches_per_thread);
+
+  // Verify repository is not empty
+  REQUIRE(repository.check_data_batch_availability() == true);
+}
+
+// Test check_data_batch_availability with concurrent add and pull operations
+TEST_CASE("shared_data_repository check_data_batch_availability Concurrent Operations",
+          "[data_repository]")
+{
+  shared_data_repository repository;
+
+  constexpr int num_add_threads  = 5;
+  constexpr int num_pull_threads = 5;
+  constexpr int operations       = 100;
+
+  std::vector<std::thread> threads;
+  std::atomic<bool> stop{false};
+
+  // Launch adding threads
+  for (int i = 0; i < num_add_threads; ++i) {
+    threads.emplace_back([&, i]() {
+      for (int j = 0; j < operations; ++j) {
+        auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+        uint64_t batch_id = i * operations + j;
+        auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+        repository.add_data_batch(batch);
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+      }
+    });
+  }
+
+  // Launch pulling threads that also check availability
+  for (int i = 0; i < num_pull_threads; ++i) {
+    threads.emplace_back([&]() {
+      int pulled = 0;
+      while (pulled < operations) {
+        if (repository.check_data_batch_availability()) {
+          auto [batch, handle] = repository.pull_data_batch();
+          if (batch) { ++pulled; }
+        } else {
+          std::this_thread::yield();
+        }
+      }
+    });
+  }
+
+  // Wait for all threads to complete
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // Repository should be empty after all operations
+  REQUIRE(repository.check_data_batch_availability() == false);
+}
