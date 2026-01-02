@@ -576,25 +576,25 @@ TEST_CASE("shared_data_repository Cannot Pull During Downgrade", "[data_reposito
 }
 
 // =============================================================================
-// Tests for check_data_batch_availability()
+// Tests for size()
 // =============================================================================
 
-// Test check_data_batch_availability on empty shared repository
-TEST_CASE("shared_data_repository check_data_batch_availability Empty", "[data_repository]")
+// Test size on empty shared repository
+TEST_CASE("shared_data_repository size Empty", "[data_repository]")
 {
   shared_data_repository repository;
 
   // Initially empty
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 }
 
-// Test check_data_batch_availability after adding batches to shared repository
-TEST_CASE("shared_data_repository check_data_batch_availability After Adding", "[data_repository]")
+// Test size after adding batches to shared repository
+TEST_CASE("shared_data_repository size After Adding", "[data_repository]")
 {
   shared_data_repository repository;
 
   // Initially empty
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 
   // Add one batch
   auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
@@ -602,7 +602,7 @@ TEST_CASE("shared_data_repository check_data_batch_availability After Adding", "
   repository.add_data_batch(batch);
 
   // Should now have batches available
-  REQUIRE(repository.check_data_batch_availability() == true);
+  REQUIRE(repository.size() == 1);
 
   // Add more batches
   for (int i = 2; i <= 5; ++i) {
@@ -612,11 +612,11 @@ TEST_CASE("shared_data_repository check_data_batch_availability After Adding", "
   }
 
   // Should still have batches available
-  REQUIRE(repository.check_data_batch_availability() == true);
+  REQUIRE(repository.size() == 5);
 }
 
-// Test check_data_batch_availability after pulling batches from shared repository
-TEST_CASE("shared_data_repository check_data_batch_availability After Pulling", "[data_repository]")
+// Test size after pulling batches from shared repository
+TEST_CASE("shared_data_repository size After Pulling", "[data_repository]")
 {
   shared_data_repository repository;
 
@@ -627,14 +627,14 @@ TEST_CASE("shared_data_repository check_data_batch_availability After Pulling", 
     repository.add_data_batch(batch);
   }
 
-  REQUIRE(repository.check_data_batch_availability() == true);
+  REQUIRE(repository.size() == 5);
 
   // Pull batches one by one
   for (int i = 1; i <= 4; ++i) {
     auto [batch, handle] = repository.pull_data_batch();
     REQUIRE(batch != nullptr);
     // Should still have batches available
-    REQUIRE(repository.check_data_batch_availability() == true);
+    REQUIRE(repository.size() == (5 - i));
   }
 
   // Pull the last batch
@@ -642,16 +642,16 @@ TEST_CASE("shared_data_repository check_data_batch_availability After Pulling", 
   REQUIRE(last_batch != nullptr);
 
   // Now should be empty
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 }
 
-// Test check_data_batch_availability with interleaved operations on shared repository
-TEST_CASE("shared_data_repository check_data_batch_availability Interleaved Operations",
+// Test size with interleaved operations on shared repository
+TEST_CASE("shared_data_repository size Interleaved Operations",
           "[data_repository]")
 {
   shared_data_repository repository;
 
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 
   for (int cycle = 0; cycle < 10; ++cycle) {
     // Add some batches
@@ -661,42 +661,42 @@ TEST_CASE("shared_data_repository check_data_batch_availability Interleaved Oper
       repository.add_data_batch(batch);
     }
 
-    REQUIRE(repository.check_data_batch_availability() == true);
+    REQUIRE(repository.size() == (cycle * 2 + 3));
 
     // Pull one batch
     auto [batch, handle] = repository.pull_data_batch();
     REQUIRE(batch != nullptr);
 
     // Should still have batches (added 3, pulled 1)
-    REQUIRE(repository.check_data_batch_availability() == true);
+    REQUIRE(repository.size() == (cycle * 2 + 2));
   }
 
   // Pull all remaining batches
-  while (repository.check_data_batch_availability()) {
+  while (repository.size() > 0) {
     auto [batch, handle] = repository.pull_data_batch();
     REQUIRE(batch != nullptr);
   }
 
   // Should be empty now
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 }
 
-// Test check_data_batch_availability on empty unique repository
-TEST_CASE("unique_data_repository check_data_batch_availability Empty", "[data_repository]")
+// Test size on empty unique repository
+TEST_CASE("unique_data_repository size Empty", "[data_repository]")
 {
   unique_data_repository repository;
 
   // Initially empty
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 }
 
-// Test check_data_batch_availability after adding batches to unique repository
-TEST_CASE("unique_data_repository check_data_batch_availability After Adding", "[data_repository]")
+// Test size after adding batches to unique repository
+TEST_CASE("unique_data_repository size After Adding", "[data_repository]")
 {
   unique_data_repository repository;
 
   // Initially empty
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 
   // Add one batch
   auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
@@ -704,7 +704,7 @@ TEST_CASE("unique_data_repository check_data_batch_availability After Adding", "
   repository.add_data_batch(std::move(batch));
 
   // Should now have batches available
-  REQUIRE(repository.check_data_batch_availability() == true);
+  REQUIRE(repository.size() == 1);
 
   // Add more batches
   for (int i = 2; i <= 5; ++i) {
@@ -714,11 +714,11 @@ TEST_CASE("unique_data_repository check_data_batch_availability After Adding", "
   }
 
   // Should still have batches available
-  REQUIRE(repository.check_data_batch_availability() == true);
+  REQUIRE(repository.size() == 5);
 }
 
-// Test check_data_batch_availability after pulling batches from unique repository
-TEST_CASE("unique_data_repository check_data_batch_availability After Pulling", "[data_repository]")
+// Test size after pulling batches from unique repository
+TEST_CASE("unique_data_repository size After Pulling", "[data_repository]")
 {
   unique_data_repository repository;
 
@@ -729,14 +729,14 @@ TEST_CASE("unique_data_repository check_data_batch_availability After Pulling", 
     repository.add_data_batch(std::move(batch));
   }
 
-  REQUIRE(repository.check_data_batch_availability() == true);
+  REQUIRE(repository.size() == 5);
 
   // Pull batches one by one
   for (int i = 1; i <= 4; ++i) {
     auto [batch, handle] = repository.pull_data_batch();
     REQUIRE(batch != nullptr);
     // Should still have batches available
-    REQUIRE(repository.check_data_batch_availability() == true);
+    REQUIRE(repository.size() == (5 - i));
   }
 
   // Pull the last batch
@@ -744,16 +744,16 @@ TEST_CASE("unique_data_repository check_data_batch_availability After Pulling", 
   REQUIRE(last_batch != nullptr);
 
   // Now should be empty
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 }
 
-// Test check_data_batch_availability with interleaved operations on unique repository
-TEST_CASE("unique_data_repository check_data_batch_availability Interleaved Operations",
+// Test size with interleaved operations on unique repository
+TEST_CASE("unique_data_repository size Interleaved Operations",
           "[data_repository]")
 {
   unique_data_repository repository;
 
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 
   for (int cycle = 0; cycle < 10; ++cycle) {
     // Add some batches
@@ -763,28 +763,28 @@ TEST_CASE("unique_data_repository check_data_batch_availability Interleaved Oper
       repository.add_data_batch(std::move(batch));
     }
 
-    REQUIRE(repository.check_data_batch_availability() == true);
+    REQUIRE(repository.size() == (cycle * 2 + 3));
 
     // Pull one batch
     auto [batch, handle] = repository.pull_data_batch();
     REQUIRE(batch != nullptr);
 
     // Should still have batches (added 3, pulled 1)
-    REQUIRE(repository.check_data_batch_availability() == true);
+    REQUIRE(repository.size() == (cycle * 2 + 2));
   }
 
   // Pull all remaining batches
-  while (repository.check_data_batch_availability()) {
+  while (repository.size() > 0) {
     auto [batch, handle] = repository.pull_data_batch();
     REQUIRE(batch != nullptr);
   }
 
   // Should be empty now
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 }
 
-// Test check_data_batch_availability thread-safety on shared repository
-TEST_CASE("shared_data_repository check_data_batch_availability Thread-Safe", "[data_repository]")
+// Test size thread-safety on shared repository
+TEST_CASE("shared_data_repository size Thread-Safe", "[data_repository]")
 {
   shared_data_repository repository;
 
@@ -804,7 +804,7 @@ TEST_CASE("shared_data_repository check_data_batch_availability Thread-Safe", "[
         repository.add_data_batch(batch);
 
         // Check availability after adding
-        if (repository.check_data_batch_availability()) { ++availability_check_count; }
+        if (repository.size() > 0) { ++availability_check_count; }
       }
     });
   }
@@ -818,11 +818,11 @@ TEST_CASE("shared_data_repository check_data_batch_availability Thread-Safe", "[
   REQUIRE(availability_check_count == num_threads * batches_per_thread);
 
   // Verify repository is not empty
-  REQUIRE(repository.check_data_batch_availability() == true);
+  REQUIRE(repository.size() > 0);
 }
 
-// Test check_data_batch_availability thread-safety on unique repository
-TEST_CASE("unique_data_repository check_data_batch_availability Thread-Safe", "[data_repository]")
+// Test size thread-safety on unique repository
+TEST_CASE("unique_data_repository size Thread-Safe", "[data_repository]")
 {
   unique_data_repository repository;
 
@@ -842,7 +842,7 @@ TEST_CASE("unique_data_repository check_data_batch_availability Thread-Safe", "[
         repository.add_data_batch(std::move(batch));
 
         // Check availability after adding
-        if (repository.check_data_batch_availability()) { ++availability_check_count; }
+        if (repository.size() > 0) { ++availability_check_count; }
       }
     });
   }
@@ -856,11 +856,11 @@ TEST_CASE("unique_data_repository check_data_batch_availability Thread-Safe", "[
   REQUIRE(availability_check_count == num_threads * batches_per_thread);
 
   // Verify repository is not empty
-  REQUIRE(repository.check_data_batch_availability() == true);
+  REQUIRE(repository.size() > 0);
 }
 
-// Test check_data_batch_availability with concurrent add and pull operations
-TEST_CASE("shared_data_repository check_data_batch_availability Concurrent Operations",
+// Test size with concurrent add and pull operations
+TEST_CASE("shared_data_repository size Concurrent Operations",
           "[data_repository]")
 {
   shared_data_repository repository;
@@ -890,7 +890,7 @@ TEST_CASE("shared_data_repository check_data_batch_availability Concurrent Opera
     threads.emplace_back([&]() {
       int pulled = 0;
       while (pulled < operations) {
-        if (repository.check_data_batch_availability()) {
+        if (repository.size() > 0) {
           auto [batch, handle] = repository.pull_data_batch();
           if (batch) { ++pulled; }
         } else {
@@ -906,5 +906,5 @@ TEST_CASE("shared_data_repository check_data_batch_availability Concurrent Opera
   }
 
   // Repository should be empty after all operations
-  REQUIRE(repository.check_data_batch_availability() == false);
+  REQUIRE(repository.size() == 0);
 }

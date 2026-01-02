@@ -115,15 +115,26 @@ class idata_repository {
   /**
    * @brief Check if there are any data batches available in the repository.
    *
-   * @return true If there is at least one data batch
-   * @return false If the repository is empty
+   * @return std::size_t The number of data batches currently stored in the repository.
    *
    * @note Thread-safe operation protected by internal mutex
    */
-  virtual bool check_data_batch_availability()
+  std::size_t size()
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    return !_data_batches.empty();
+    return _data_batches.size();
+  }
+
+  /**
+   * @brief Check if the repository is empty.
+   *
+   * @return true if the repository has no data batches, false otherwise.
+   *
+   * @note Thread-safe operation protected by internal mutex
+   */
+  bool empty()
+  {
+    return size() == 0;
   }
 
  protected:
