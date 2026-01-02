@@ -58,15 +58,15 @@ cucascade_out_of_memory::cucascade_out_of_memory(std::string_view message,
 {
 }
 
-std::unique_ptr<rmm::mr::device_memory_resource> make_default_gpu_memory_resource(
-  int device_id, [[maybe_unused]] size_t limit, size_t capacity)
+std::unique_ptr<rmm::mr::device_memory_resource> make_default_gpu_memory_resource(int device_id,
+                                                                                  size_t capacity)
 {
   rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{device_id});
   return std::make_unique<rmm::mr::cuda_async_memory_resource>(capacity);
 }
 
 std::unique_ptr<rmm::mr::device_memory_resource> make_default_host_memory_resource(
-  int numa_node_id, [[maybe_unused]] size_t limit, [[maybe_unused]] size_t capacity)
+  int numa_node_id, [[maybe_unused]] size_t capacity)
 {
   return std::make_unique<cucascade::memory::numa_region_pinned_host_memory_resource>(numa_node_id);
 }
@@ -78,7 +78,7 @@ DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)
   } else if (tier == Tier::HOST) {
     return make_default_host_memory_resource;
   } else {
-    return [](int, size_t, size_t) { return std::make_unique<null_device_memory_resource>(); };
+    return [](int, size_t) { return std::make_unique<null_device_memory_resource>(); };
   }
 }
 

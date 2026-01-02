@@ -209,14 +209,13 @@ std::pair<std::vector<int>, std::vector<int>> reservation_manager_configurator::
       gpu_ids.push_back(gpu_id);
       _gpu_mr_fn = [device_to_gpu_map, current_mr_fn = _gpu_mr_fn](
                      int tier_id,
-                     size_t limit,
                      size_t capacity) -> std::unique_ptr<rmm::mr::device_memory_resource> {
         auto it = device_to_gpu_map.find(tier_id);
         if (it == device_to_gpu_map.end()) {
           throw std::runtime_error("GPU ID not found in device to GPU map");
         }
         int gpu_id = it->second;
-        return current_mr_fn(gpu_id, limit, capacity);
+        return current_mr_fn(gpu_id, capacity);
       };
     };
     return {gpu_ids, tier_ids};
@@ -274,12 +273,13 @@ std::vector<int> reservation_manager_configurator::extract_host_ids(
       host_numa_ids.push_back(host_id);
     }
     auto current_mr_fn = _cpu_mr_fn;
-    _cpu_mr_fn = [host_to_numa_maps, current_mr_fn](int host_id, size_t limit, size_t capacity)
-      -> std::unique_ptr<rmm::mr::device_memory_resource> {
+    _cpu_mr_fn         = [host_to_numa_maps, current_mr_fn](
+                   int host_id,
+                   size_t capacity) -> std::unique_ptr<rmm::mr::device_memory_resource> {
       auto it = host_to_numa_maps.find(host_id);
       if (it != host_to_numa_maps.end()) {
         int numa_id = it->second;
-        return current_mr_fn(numa_id, limit, capacity);
+        return current_mr_fn(numa_id, capacity);
       } else {
         throw std::runtime_error("NUMA ID not found in host to NUMA maps");
       }

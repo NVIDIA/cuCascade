@@ -196,14 +196,14 @@ struct atomic_bounded_counter {
 };
 
 using DeviceMemoryResourceFactoryFn =
-  std::function<std::unique_ptr<rmm::mr::device_memory_resource>(
-    int device_id, std::size_t limit, std::size_t capacity)>;
+  std::function<std::unique_ptr<rmm::mr::device_memory_resource>(int device_id,
+                                                                 std::size_t capacity)>;
 
 std::unique_ptr<rmm::mr::device_memory_resource> make_default_gpu_memory_resource(
-  int device_id, std::size_t limit, std::size_t capacity);
+  int device_id, std::size_t capacity);
 
 std::unique_ptr<rmm::mr::device_memory_resource> make_default_host_memory_resource(
-  int device_id, std::size_t limit, std::size_t capacity);
+  int device_id, std::size_t capacity);
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier);
 
