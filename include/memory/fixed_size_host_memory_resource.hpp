@@ -18,8 +18,10 @@
 #pragma once
 
 #include "memory/common.hpp"
+#include "memory/error.hpp"
 #include "memory/memory_reservation.hpp"
 #include "memory/notification_channel.hpp"
+#include "utils/atomics.hpp"
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
@@ -371,8 +373,8 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   std::vector<void*> _allocated_blocks;           ///< All allocated blocks
   std::vector<void*> _free_blocks;                ///< Currently free blocks
   mutable std::mutex _mutex;
-  atomic_bounded_counter<size_t> _allocated_bytes{0};
-  atomic_peak_tracker<size_t> _peak_allocated_bytes{0};
+  utils::atomic_bounded_counter<size_t> _allocated_bytes{0};
+  utils::atomic_peak_tracker<size_t> _peak_allocated_bytes{0};
 
   struct allocation_tracker {
     explicit allocation_tracker(std::size_t uid) : uuid(uid) {}

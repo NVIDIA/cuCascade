@@ -27,37 +27,6 @@ namespace cucascade {
 
 namespace memory {
 
-const char* memory_error_category::name() const noexcept { return "cuCascadeMemorySystem"; }
-
-std::string memory_error_category::message(int ev) const
-{
-  switch (static_cast<MemoryError>(ev)) {
-    case MemoryError::SUCCESS: return "Success";
-    case MemoryError::ALLOCATION_FAILED: return "System allocation failed";
-    case MemoryError::LIMIT_EXCEEDED: return "Reservation limit exceeded";
-    case MemoryError::POOL_EXHAUSTED: return "Internal memory pool exhausted";
-    default: return "Unknown memory error";
-  }
-}
-
-const memory_error_category& memory_category()
-{
-  static const memory_error_category instance;
-  return instance;
-}
-
-std::error_code make_error_code(MemoryError e)
-{
-  return std::error_code(static_cast<int>(e), memory_category());
-}
-
-cucascade_out_of_memory::cucascade_out_of_memory(std::string_view message,
-                                                 std::size_t requested_bytes,
-                                                 std::size_t global_usage)
-  : rmm::out_of_memory(message.data()), requested_bytes(requested_bytes), global_usage(global_usage)
-{
-}
-
 std::unique_ptr<rmm::mr::device_memory_resource> make_default_gpu_memory_resource(int device_id,
                                                                                   size_t capacity)
 {

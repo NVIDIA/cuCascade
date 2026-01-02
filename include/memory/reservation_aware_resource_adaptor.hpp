@@ -29,9 +29,11 @@
 
 // Include existing reservation system
 #include "memory/common.hpp"
+#include "memory/error.hpp"
 #include "memory/memory_reservation.hpp"
 #include "memory/notification_channel.hpp"
 #include "memory/oom_handling_policy.hpp"
+#include "utils/atomics.hpp"
 
 namespace cucascade {
 namespace memory {
@@ -80,8 +82,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
       return current < sz ? static_cast<std::size_t>(sz - current) : 0UL;
     }
 
-    atomic_bounded_counter<std::int64_t> allocated_bytes{0LL};
-    atomic_peak_tracker<std::int64_t> peak_allocated_bytes{0LL};
+    utils::atomic_bounded_counter<std::int64_t> allocated_bytes{0LL};
+    utils::atomic_peak_tracker<std::int64_t> peak_allocated_bytes{0LL};
 
    private:
     reservation_aware_resource_adaptor* _mr;
@@ -419,8 +421,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
   /// Global totals for efficiency
   std::atomic<size_t> _total_reserved_bytes{0UL};
   std::atomic<size_t> _number_of_allocations{0UL};
-  atomic_bounded_counter<std::size_t> _total_allocated_bytes{0UL};
-  atomic_peak_tracker<std::size_t> _peak_total_allocated_bytes{0UL};
+  utils::atomic_bounded_counter<std::size_t> _total_allocated_bytes{0UL};
+  utils::atomic_peak_tracker<std::size_t> _peak_total_allocated_bytes{0UL};
 
   /// Default policy for new streams
   std::unique_ptr<reservation_limit_policy> _default_reservation_policy;
