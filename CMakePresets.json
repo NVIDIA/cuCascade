@@ -11,7 +11,11 @@
             "hidden": true,
             "generator": "Ninja",
             "cacheVariables": {
-                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_PREFIX_PATH": {
+                    "type": "PATH",
+                    "value": "$env{CMAKE_PREFIX_PATH}"
+                }
             }
         },
         {
