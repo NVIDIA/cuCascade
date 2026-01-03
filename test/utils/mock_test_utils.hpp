@@ -23,6 +23,7 @@
 #include "memory/memory_reservation_manager.hpp"
 #include "memory/memory_space.hpp"
 #include "memory/null_device_memory_resource.hpp"
+#include "memory/reservation_manager_configurator.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -99,18 +100,16 @@ class mock_data_representation : private mock_memory_space_holder, public idata_
 /**
  * @brief Create memory manager configs for conversion tests (one GPU(0) and one HOST(0)).
  *
- * @return std::vector<memory::memory_reservation_manager::memory_space_config> The configs
+ * @return std::vector<memory::memory_space_config> The configs
  */
-inline std::vector<memory::memory_reservation_manager::memory_space_config>
-create_conversion_test_configs()
+inline std::vector<memory::memory_space_config> create_conversion_test_configs()
 {
-  using namespace cucascade::memory;
-  std::vector<memory_reservation_manager::memory_space_config> configs;
-  configs.emplace_back(
-    Tier::GPU, 0, 2048ull * 1024 * 1024, make_default_allocator_for_tier(Tier::GPU));
-  configs.emplace_back(
-    Tier::HOST, 0, 4096ull * 1024 * 1024, make_default_allocator_for_tier(Tier::HOST));
-  return configs;
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2048ull * 1024 * 1024)
+    .use_gpu_ids_as_host()
+    .set_capacity_per_numa_node(4096ull * 1024 * 1024);
+  return builder.build_with_topology();
 }
 
 /**

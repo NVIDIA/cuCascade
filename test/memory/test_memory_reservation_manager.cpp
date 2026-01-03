@@ -60,7 +60,7 @@ std::unique_ptr<memory_reservation_manager> createSingleDeviceMemoryManager()
   builder.set_gpu_usage_limit(expected_gpu_capacity);  // 2 GB
   builder.set_reservation_limit_ratio_per_gpu(limit_ratio);
   builder.set_capacity_per_numa_node(expected_host_capacity);  //  4 GB
-  builder.set_host_id_to_numa_maps({{0, -1}});
+  builder.use_gpu_ids_as_host();
   builder.set_reservation_limit_ratio_per_numa_node(limit_ratio);
 
   auto space_configs = builder.build_with_topology();
@@ -73,8 +73,8 @@ std::unique_ptr<memory_reservation_manager> createDualGpuMemoryManager()
   builder.set_gpu_usage_limit(expected_gpu_capacity);  // 2 GB
   builder.set_reservation_limit_ratio_per_gpu(limit_ratio);
   builder.set_capacity_per_numa_node(expected_host_capacity);  //  4 GB
-  builder.set_host_id_to_numa_maps({{0, -1}});
   builder.set_device_tier_id_to_gpu_id_map({{0, 0}, {1, 0}});
+  builder.set_host_ids({0, 1});
   builder.set_reservation_limit_ratio_per_numa_node(limit_ratio);
 
   auto space_configs = builder.build_with_topology();

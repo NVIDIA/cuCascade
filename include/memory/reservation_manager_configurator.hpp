@@ -22,6 +22,7 @@
 #include "memory/memory_space.hpp"
 #include "memory/topology_discovery.hpp"
 
+#include <list>
 #include <span>
 #include <unordered_map>
 #include <variant>
@@ -61,8 +62,7 @@ namespace memory {
  */
 class reservation_manager_configurator {
  public:
-  using builder_reference   = reservation_manager_configurator;
-  using memory_space_config = memory_reservation_manager::memory_space_config;
+  using builder_reference = reservation_manager_configurator;
 
   /// either set gpu ids or number of gpus
 
@@ -94,12 +94,15 @@ class reservation_manager_configurator {
   /// @param numa_ids Vector of NUMA node IDs to configure.
   builder_reference& set_numa_ids(const std::vector<int>& numa_ids);
 
-  // either set host ids or create as many host tiers as numa nodes of gpus create by this builder
-  /// @brief set host id to numa maps
-  /// @param host_to_numa_maps Vector of pairs mapping host IDs to NUMA node IDs.
-  /// @note this is meant to be used for testing purpose only
-  builder_reference& set_host_id_to_numa_maps(
-    const std::unordered_map<int, int>& host_to_numa_maps);
+  /// @brief set host ids
+  /// @param host_ids Vector of host ids.
+  /// @note this is meant to be used for testing purpose only, host ids will be mapped to numa ids
+  builder_reference& set_host_ids(const std::vector<int>& host_ids);
+
+  /// @brief set host ids
+  /// @param host_ids Vector of host ids.
+  /// @note this is meant to be used for testing purpose only, host ids will be mapped to numa ids
+  builder_reference& use_gpu_ids_as_host();
 
   /// @brief automatically bind cpu tiers to gpus based on topology
   builder_reference& bind_cpu_tier_to_gpus();
@@ -156,7 +159,9 @@ class reservation_manager_configurator {
     static_cast<std::size_t>(1UL << 30)};          // uses 1GB of gpu memory
   double _gpu_reservation_limit_ratio{0.75};       // limit to 75% of GPU usagel limit
   std::size_t _capacity_per_numa_node{8UL << 30};  // 8GB per NUMA node by default
-  std::variant<std::monostate, std::vector<int>, std::unordered_map<int, int>>
+  struct same_ids_tag {};
+  struct bind_cpu_to_gpu {};
+  std::variant<bind_cpu_to_gpu, std::vector<int>, same_ids_tag, std::list<int>>
     _auto_binding_or_numa_ids{};
   double _cpu_reservation_limit_ratio{0.75};  // 75% limit per NUMA node by default
   mutable DeviceMemoryResourceFactoryFn _gpu_mr_fn = make_default_gpu_memory_resource;

@@ -18,7 +18,7 @@
 #pragma once
 
 #include "memory/common.hpp"
-#include "memory/memory_reservation_manager.hpp"
+#include "memory/config.hpp"
 #include "memory/memory_space.hpp"
 
 #include <rmm/cuda_device.hpp>

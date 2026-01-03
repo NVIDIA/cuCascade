@@ -30,4 +30,5 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/reservation_aware_resource_adaptor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/reservation_manager_configurator.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/stream_pool.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/error.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/topology_discovery.cpp)
