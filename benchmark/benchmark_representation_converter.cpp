@@ -171,7 +171,8 @@ BENCHMARK(BM_ConvertGpuToHost)
   ->Args({1000, 8})     // 1K rows, 8 columns
   ->Args({10000, 8})    // 10K rows, 8 columns
   ->Args({100000, 8})   // 100K rows, 8 columns
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 // =============================================================================
 // HOST to GPU Conversion Benchmarks
@@ -232,7 +233,8 @@ BENCHMARK(BM_ConvertHostToGpu)
   ->Args({1000, 8})     // 1K rows, 8 columns
   ->Args({10000, 8})    // 10K rows, 8 columns
   ->Args({100000, 8})   // 100K rows, 8 columns
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 // =============================================================================
 // Roundtrip Conversion Benchmarks
@@ -292,7 +294,8 @@ BENCHMARK(BM_RoundtripGpuHostGpu)
   ->Args({1000, 4})    // 1K rows, 4 columns
   ->Args({10000, 4})   // 10K rows, 4 columns
   ->Args({100000, 4})  // 100K rows, 4 columns
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 // =============================================================================
 // HOST to HOST Conversion Benchmarks (Cross-device on CPU)
@@ -353,7 +356,8 @@ BENCHMARK(BM_ConvertHostToHost)
   ->Args({1000, 4})     // 1K rows, 4 columns
   ->Args({10000, 4})    // 10K rows, 4 columns
   ->Args({100000, 4})   // 100K rows, 4 columns
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 // =============================================================================
 // Memory Throughput Benchmarks
@@ -407,7 +411,8 @@ BENCHMARK(BM_GpuToHostThroughput)
   ->Arg(100)   // 100 MB
   ->Arg(500)   // 500 MB
   ->Arg(1000)  // 1 GB
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 /**
  * @brief Benchmark HOST to GPU conversion focusing on memory bandwidth.
@@ -459,6 +464,7 @@ BENCHMARK(BM_HostToGpuThroughput)
   ->Arg(100)   // 100 MB
   ->Arg(500)   // 500 MB
   ->Arg(1000)  // 1 GB
-  ->Unit(benchmark::kMillisecond);
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
 
 }  // namespace
