@@ -435,7 +435,7 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
   if (success) {
     _peak_total_allocated_bytes.update_peak(post_allocation_size);
     try {
-      return _upstream.allocate_async(allocation_bytes, stream);
+      return _upstream.allocate(stream, allocation_bytes);
     } catch (std::exception& e) {
       _total_allocated_bytes.sub(tracking_bytes);
       throw cucascade_out_of_memory(e.what(), allocation_bytes, post_allocation_size);
@@ -468,7 +468,11 @@ void reservation_aware_resource_adaptor::do_deallocate(void* ptr,
         static_cast<std::size_t>(reservation_size - post_deallocation_size);
     }
   }
-  _upstream.deallocate_async(ptr, bytes, stream);
+// Suppress false-positive null-dereference warnings from CCCL library code
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnull-dereference"
+  _upstream.deallocate(stream, ptr, bytes);
+#pragma GCC diagnostic pop
   _total_allocated_bytes.sub(upstream_reclaimed_bytes);
 }
 
@@ -479,7 +483,11 @@ bool reservation_aware_resource_adaptor::do_is_equal(
   const auto* other_adaptor = dynamic_cast<const reservation_aware_resource_adaptor*>(&other);
   if (other_adaptor == nullptr) { return false; }
 
+// Suppress false-positive null-dereference warnings from CCCL library code
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnull-dereference"
   return _upstream == other_adaptor->get_upstream_resource();
+#pragma GCC diagnostic pop
 }
 
 bool reservation_aware_resource_adaptor::do_reserve(std::size_t size_bytes, std::size_t limit_bytes)
