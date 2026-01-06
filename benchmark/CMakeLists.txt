@@ -38,10 +38,6 @@ FetchContent_MakeAvailable(benchmark)
 
 # Set include directories for benchmarks
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
-include_directories(${CMAKE_SOURCE_DIR}/test/utils)
-
-# Collect benchmark utility sources from test/utils
-set(BENCHMARK_UTIL_SOURCES ${CMAKE_SOURCE_DIR}/test/utils/cudf_test_utils.cpp)
 
 # Collect all benchmark sources
 set(BENCHMARK_SOURCES
@@ -49,14 +45,12 @@ set(BENCHMARK_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_main.cpp)
 
 # Create benchmark executable
-add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES}
-                                    ${BENCHMARK_UTIL_SOURCES})
+add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})
 
 # Set include directories
 target_include_directories(
-  cucascade_benchmarks
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/test/utils
-          ${benchmark_SOURCE_DIR}/include)
+  cucascade_benchmarks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                               ${benchmark_SOURCE_DIR}/include)
 
 # Apply warning flags to benchmark executable
 target_compile_options(
