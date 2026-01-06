@@ -25,7 +25,6 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/error.hpp>
 
 #include <cuda_runtime_api.h>
@@ -100,7 +99,7 @@ cudf::table create_benchmark_table(int64_t num_rows, int num_columns = 4)
     if (num_rows > 0) {
       auto view      = col->mutable_view();
       auto type_size = cudf::size_of(dtype);
-      auto bytes     = static_cast<size_t>(num_rows) * static_cast<size_t>(type_size);
+      auto bytes     = static_cast<size_t>(num_rows) * (type_size);
       RMM_CUDA_TRY(cudaMemset(const_cast<void*>(view.head()), fill_value, bytes));
     }
 
@@ -111,13 +110,13 @@ cudf::table create_benchmark_table(int64_t num_rows, int num_columns = 4)
 }
 
 // =============================================================================
-// GPU to HOST Conversion Benchmarks
+// GPU <-> HOST Conversion Benchmarks
 // =============================================================================
 
 /**
  * @brief Benchmark GPU to HOST conversion with varying data sizes.
  */
-static void BM_ConvertGpuToHost(benchmark::State& state)
+void BM_ConvertGpuToHost(benchmark::State& state)
 {
   int64_t num_rows = state.range(0);
   int num_columns  = static_cast<int>(state.range(1));
@@ -145,13 +144,11 @@ static void BM_ConvertGpuToHost(benchmark::State& state)
 
   size_t bytes_transferred = gpu_repr->get_size_in_bytes();
 
-  // Benchmark loop
   for (auto _ : state) {
     auto host_result = registry->convert<host_table_representation>(*gpu_repr, host_space, stream);
     stream.synchronize();
   }
 
-  // Report metrics
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
                           static_cast<int64_t>(bytes_transferred));
   state.counters["rows"]    = static_cast<double>(num_rows);
@@ -159,21 +156,16 @@ static void BM_ConvertGpuToHost(benchmark::State& state)
   state.counters["bytes"]   = static_cast<double>(bytes_transferred);
 }
 
-// Register benchmark with different data sizes
 BENCHMARK(BM_ConvertGpuToHost)
-  ->Ranges({{1000, 1000000}, {2, 8}})  // rows: 1K-1M, columns: 2-8
   ->RangeMultiplier(10)
+  ->Ranges({{10000, 1000000}, {1, 100}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
-
-// =============================================================================
-// HOST to GPU Conversion Benchmarks
-// =============================================================================
 
 /**
  * @brief Benchmark HOST to GPU conversion with varying data sizes.
  */
-static void BM_ConvertHostToGpu(benchmark::State& state)
+void BM_ConvertHostToGpu(benchmark::State& state)
 {
   int64_t num_rows = state.range(0);
   int num_columns  = static_cast<int>(state.range(1));
@@ -199,24 +191,20 @@ static void BM_ConvertHostToGpu(benchmark::State& state)
 
   size_t bytes_transferred = host_repr->get_size_in_bytes();
 
-  // Benchmark loop
   for (auto _ : state) {
     auto gpu_result = registry->convert<gpu_table_representation>(*host_repr, gpu_space, stream);
     stream.synchronize();
   }
 
-  // Report metrics
-  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
-                          static_cast<int64_t>(bytes_transferred));
+  state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(bytes_transferred));
   state.counters["rows"]    = static_cast<double>(num_rows);
   state.counters["columns"] = static_cast<double>(num_columns);
   state.counters["bytes"]   = static_cast<double>(bytes_transferred);
 }
 
-// Register benchmark with different data sizes
 BENCHMARK(BM_ConvertHostToGpu)
-  ->Ranges({{1000, 1000000}, {2, 8}})  // rows: 1K-1M, columns: 2-8
   ->RangeMultiplier(10)
+  ->Ranges({{10000, 1000000}, {1, 100}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
@@ -227,7 +215,7 @@ BENCHMARK(BM_ConvertHostToGpu)
 /**
  * @brief Benchmark roundtrip GPU->HOST->GPU conversion.
  */
-static void BM_RoundtripGpuHostGpu(benchmark::State& state)
+void BM_RoundtripGpuHostGpu(benchmark::State& state)
 {
   int64_t num_rows = state.range(0);
   int num_columns  = static_cast<int>(state.range(1));
@@ -255,36 +243,28 @@ static void BM_RoundtripGpuHostGpu(benchmark::State& state)
 
   size_t bytes_transferred = gpu_repr->get_size_in_bytes() * 2;  // Both directions
 
-  // Benchmark loop
   for (auto _ : state) {
     auto host_result = registry->convert<host_table_representation>(*gpu_repr, host_space, stream);
     auto gpu_result  = registry->convert<gpu_table_representation>(*host_result, gpu_space, stream);
     stream.synchronize();
   }
 
-  // Report metrics
-  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
-                          static_cast<int64_t>(bytes_transferred));
+  state.SetBytesProcessed((state.iterations()) * static_cast<int64_t>(bytes_transferred));
   state.counters["rows"]    = static_cast<double>(num_rows);
   state.counters["columns"] = static_cast<double>(num_columns);
   state.counters["bytes"]   = static_cast<double>(bytes_transferred);
 }
 
-// Register benchmark with different data sizes
 BENCHMARK(BM_RoundtripGpuHostGpu)
-  ->Ranges({{1000, 100000}, {2, 4}})  // rows: 1K-100K, columns: 2-4
   ->RangeMultiplier(10)
+  ->Ranges({{10000, 100000}, {1, 100}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
-// =============================================================================
-// HOST to HOST Conversion Benchmarks (Cross-device on CPU)
-// =============================================================================
-
 /**
- * @brief Benchmark HOST to HOST conversion (simulated cross-device on same host).
+ * @brief Benchmark HOST to HOST conversion
  */
-static void BM_ConvertHostToHost(benchmark::State& state)
+void BM_ConvertHostToHost(benchmark::State& state)
 {
   int64_t num_rows = state.range(0);
   int num_columns  = static_cast<int>(state.range(1));
@@ -312,14 +292,12 @@ static void BM_ConvertHostToHost(benchmark::State& state)
 
   size_t bytes_transferred = host_repr_source->get_size_in_bytes();
 
-  // Benchmark loop
   for (auto _ : state) {
     auto host_result =
       registry->convert<host_table_representation>(*host_repr_source, host_space, stream);
     stream.synchronize();
   }
 
-  // Report metrics
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
                           static_cast<int64_t>(bytes_transferred));
   state.counters["rows"]    = static_cast<double>(num_rows);
@@ -327,10 +305,9 @@ static void BM_ConvertHostToHost(benchmark::State& state)
   state.counters["bytes"]   = static_cast<double>(bytes_transferred);
 }
 
-// Register benchmark with different data sizes
 BENCHMARK(BM_ConvertHostToHost)
-  ->Ranges({{1000, 1000000}, {2, 4}})  // rows: 1K-1M, columns: 2-4
   ->RangeMultiplier(10)
+  ->Ranges({{10000, 1000000}, {1, 100}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
@@ -341,82 +318,67 @@ BENCHMARK(BM_ConvertHostToHost)
 /**
  * @brief Benchmark GPU to HOST memory bandwidth.
  */
-static void BM_GpuToHostThroughput(benchmark::State& state)
+void BM_GpuToHostThroughput(benchmark::State& state)
 {
   uint64_t total_bytes = static_cast<uint64_t>(state.range(0)) * 1024ull;  // Convert KiB to bytes
 
   rmm::cuda_stream stream;
-
-  // Allocate raw buffers
   void* d_buffer = nullptr;
   void* h_buffer = nullptr;
 
   RMM_CUDA_TRY(cudaMalloc(&d_buffer, total_bytes));
   RMM_CUDA_TRY(cudaMallocHost(&h_buffer, total_bytes));
-
-  // Initialize GPU buffer with data
   RMM_CUDA_TRY(cudaMemset(d_buffer, 0x42, total_bytes));
 
-  // Benchmark loop
   for (auto _ : state) {
     RMM_CUDA_TRY(
       cudaMemcpyAsync(h_buffer, d_buffer, total_bytes, cudaMemcpyDeviceToHost, stream.value()));
     stream.synchronize();
   }
 
-  // Cleanup
   RMM_CUDA_TRY(cudaFree(d_buffer));
   RMM_CUDA_TRY(cudaFreeHost(h_buffer));
 
-  // Report metrics
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
                           static_cast<int64_t>(total_bytes));
   state.counters["MB"] = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
 }
 
-// Register throughput benchmark with different data sizes
 BENCHMARK(BM_GpuToHostThroughput)
-  ->Range(128, 1024 * 1024)  // 128 KiB to 1 GiB
+  ->Range(128, 1024 * 1024)
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 /**
  * @brief Benchmark HOST to GPU memory bandwidth.
  */
-static void BM_HostToGpuThroughput(benchmark::State& state)
+void BM_HostToGpuThroughput(benchmark::State& state)
 {
   uint64_t total_bytes = static_cast<uint64_t>(state.range(0)) * 1024ull;  // Convert KiB to bytes
 
   rmm::cuda_stream stream;
-
-  // Allocate raw buffers
   void* d_buffer = nullptr;
   void* h_buffer = nullptr;
 
   RMM_CUDA_TRY(cudaMalloc(&d_buffer, total_bytes));
   RMM_CUDA_TRY(cudaMallocHost(&h_buffer, total_bytes));
 
-  // Initialize host buffer with data
   std::memset(h_buffer, 0x42, total_bytes);
 
-  // Benchmark loop
   for (auto _ : state) {
     RMM_CUDA_TRY(
       cudaMemcpyAsync(d_buffer, h_buffer, total_bytes, cudaMemcpyHostToDevice, stream.value()));
     stream.synchronize();
   }
 
-  // Cleanup
   RMM_CUDA_TRY(cudaFree(d_buffer));
   RMM_CUDA_TRY(cudaFreeHost(h_buffer));
 
-  // Report metrics
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
                           static_cast<int64_t>(total_bytes));
   state.counters["MB"] = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
 }
 
-// Register throughput benchmark with different data sizes
 BENCHMARK(BM_HostToGpuThroughput)
   ->Range(128, 1024 * 1024)  // 128 KiB to 1 GiB
   ->Unit(benchmark::kMillisecond)
