@@ -156,12 +156,6 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   state.counters["bytes"]   = static_cast<double>(bytes_transferred);
 }
 
-BENCHMARK(BM_ConvertGpuToHost)
-  ->RangeMultiplier(10)
-  ->Ranges({{10000, 1000000}, {1, 100}})
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
-
 /**
  * @brief Benchmark HOST to GPU conversion with varying data sizes.
  */
@@ -201,12 +195,6 @@ void BM_ConvertHostToGpu(benchmark::State& state)
   state.counters["columns"] = static_cast<double>(num_columns);
   state.counters["bytes"]   = static_cast<double>(bytes_transferred);
 }
-
-BENCHMARK(BM_ConvertHostToGpu)
-  ->RangeMultiplier(10)
-  ->Ranges({{10000, 1000000}, {1, 100}})
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
 
 // =============================================================================
 // Roundtrip Conversion Benchmarks
@@ -255,12 +243,6 @@ void BM_RoundtripGpuHostGpu(benchmark::State& state)
   state.counters["bytes"]   = static_cast<double>(bytes_transferred);
 }
 
-BENCHMARK(BM_RoundtripGpuHostGpu)
-  ->RangeMultiplier(10)
-  ->Ranges({{10000, 100000}, {1, 100}})
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
-
 /**
  * @brief Benchmark HOST to HOST conversion
  */
@@ -304,13 +286,6 @@ void BM_ConvertHostToHost(benchmark::State& state)
   state.counters["columns"] = static_cast<double>(num_columns);
   state.counters["bytes"]   = static_cast<double>(bytes_transferred);
 }
-
-BENCHMARK(BM_ConvertHostToHost)
-  ->RangeMultiplier(10)
-  ->Ranges({{10000, 1000000}, {1, 100}})
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
-
 // =============================================================================
 // Memory Throughput Benchmarks
 // =============================================================================
@@ -344,11 +319,6 @@ void BM_GpuToHostThroughput(benchmark::State& state)
   state.counters["MB"] = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
 }
 
-BENCHMARK(BM_GpuToHostThroughput)
-  ->Range(128, 1024 * 1024)
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
-
 /**
  * @brief Benchmark HOST to GPU memory bandwidth.
  */
@@ -379,7 +349,38 @@ void BM_HostToGpuThroughput(benchmark::State& state)
   state.counters["MB"] = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
 }
 
+BENCHMARK(BM_ConvertGpuToHost)
+  ->RangeMultiplier(10)
+  ->Ranges({{10000, 1000000}, {1, 100}})
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
+BENCHMARK(BM_ConvertHostToGpu)
+  ->RangeMultiplier(10)
+  ->Ranges({{10000, 1000000}, {1, 100}})
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
+BENCHMARK(BM_RoundtripGpuHostGpu)
+  ->RangeMultiplier(10)
+  ->Ranges({{10000, 100000}, {1, 100}})
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
+BENCHMARK(BM_ConvertHostToHost)
+  ->RangeMultiplier(10)
+  ->Ranges({{10000, 1000000}, {1, 100}})
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
+BENCHMARK(BM_GpuToHostThroughput)
+  ->RangeMultiplier(2)
+  ->Range(128, 1024 * 1024)
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
 BENCHMARK(BM_HostToGpuThroughput)
+  ->RangeMultiplier(2)
   ->Range(128, 1024 * 1024)  // 128 KiB to 1 GiB
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
