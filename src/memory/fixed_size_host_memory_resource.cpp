@@ -23,7 +23,7 @@
 
 #include <rmm/aligned.hpp>
 #include <rmm/error.hpp>
-#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 
 #include <memory>
 #include <mutex>

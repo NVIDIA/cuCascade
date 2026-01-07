@@ -18,7 +18,7 @@
 #pragma once
 
 #include <rmm/error.hpp>
-#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 
 #include <atomic>
 #include <concepts>
