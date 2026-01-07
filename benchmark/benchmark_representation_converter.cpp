@@ -196,98 +196,6 @@ void BM_ConvertHostToGpu(benchmark::State& state)
 }
 
 // =============================================================================
-// Roundtrip Conversion Benchmarks
-// =============================================================================
-
-/**
- * @brief Benchmark roundtrip GPU->HOST->GPU conversion.
- * @param state.range(0) Total bytes
- * @param state.range(1) Number of columns
- */
-void BM_RoundtripGpuHostGpu(benchmark::State& state)
-{
-  int64_t total_bytes = state.range(0);
-  int num_columns     = static_cast<int>(state.range(1));
-  auto mgr            = std::make_unique<memory_reservation_manager>(create_benchmark_configs());
-  auto registry       = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
-  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* host_space = mgr->get_memory_space(Tier::HOST, 0);
-
-  rmm::cuda_stream stream;
-
-  // Create source data
-  auto table    = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table),
-                                                             *const_cast<memory_space*>(gpu_space));
-
-  // Warm-up
-  auto warmup_table = create_benchmark_table_from_bytes(1 * KiB, 2);
-  auto warmup_repr  = std::make_unique<gpu_table_representation>(
-    std::move(warmup_table), *const_cast<memory_space*>(gpu_space));
-  auto warmup_host = registry->convert<host_table_representation>(*warmup_repr, host_space, stream);
-  auto warmup_gpu  = registry->convert<gpu_table_representation>(*warmup_host, gpu_space, stream);
-  stream.synchronize();
-
-  size_t bytes_transferred = gpu_repr->get_size_in_bytes() * 2;  // Both directions
-
-  for (auto _ : state) {
-    auto host_result = registry->convert<host_table_representation>(*gpu_repr, host_space, stream);
-    auto gpu_result  = registry->convert<gpu_table_representation>(*host_result, gpu_space, stream);
-    stream.synchronize();
-  }
-
-  state.SetBytesProcessed((state.iterations()) * static_cast<int64_t>(bytes_transferred));
-  state.counters["columns"] = static_cast<double>(num_columns);
-  state.counters["bytes"]   = static_cast<double>(bytes_transferred);
-}
-
-/**
- * @brief Benchmark HOST to HOST conversion
- * @param state.range(0) Total bytes
- * @param state.range(1) Number of columns
- */
-void BM_ConvertHostToHost(benchmark::State& state)
-{
-  int64_t total_bytes = state.range(0);
-  int num_columns     = static_cast<int>(state.range(1));
-  auto mgr            = std::make_unique<memory_reservation_manager>(create_benchmark_configs());
-  auto registry       = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
-  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* host_space = mgr->get_memory_space(Tier::HOST, 0);
-
-  rmm::cuda_stream stream;
-
-  // Create source HOST data via GPU->HOST conversion
-  auto table         = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_repr_temp = std::make_unique<gpu_table_representation>(
-    std::move(table), *const_cast<memory_space*>(gpu_space));
-  auto host_repr_source =
-    registry->convert<host_table_representation>(*gpu_repr_temp, host_space, stream);
-  stream.synchronize();
-
-  // Warm-up
-  auto warmup_result =
-    registry->convert<host_table_representation>(*host_repr_source, host_space, stream);
-  stream.synchronize();
-
-  size_t bytes_transferred = host_repr_source->get_size_in_bytes();
-
-  for (auto _ : state) {
-    auto host_result =
-      registry->convert<host_table_representation>(*host_repr_source, host_space, stream);
-    stream.synchronize();
-  }
-
-  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
-                          static_cast<int64_t>(bytes_transferred));
-  state.counters["columns"] = static_cast<double>(num_columns);
-  state.counters["bytes"]   = static_cast<double>(bytes_transferred);
-}
-// =============================================================================
 // Memory Throughput Benchmarks
 // =============================================================================
 
@@ -351,22 +259,14 @@ void BM_HostToGpuThroughput(benchmark::State& state)
 }
 
 BENCHMARK(BM_ConvertGpuToHost)
-  ->Ranges({{256 * KiB, 1 * GiB}, {1, 100}})
+  ->RangeMultiplier(4)
+  ->Ranges({{256 * KiB, 1 * GiB}, {1, 64}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 BENCHMARK(BM_ConvertHostToGpu)
-  ->Ranges({{256 * KiB, 1 * GiB}, {1, 100}})
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
-
-BENCHMARK(BM_RoundtripGpuHostGpu)
-  ->Ranges({{256 * KiB, 1 * GiB}, {1, 100}})
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
-
-BENCHMARK(BM_ConvertHostToHost)
-  ->Ranges({{256 * KiB, 1 * GiB}, {1, 100}})
+  ->RangeMultiplier(4)
+  ->Ranges({{256 * KiB, 1 * GiB}, {1, 64}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
