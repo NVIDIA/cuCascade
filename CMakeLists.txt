@@ -116,6 +116,17 @@ target_include_directories(
 target_link_libraries(cucascade_objects PUBLIC rmm::rmm cudf::cudf CUDA::cudart
                                                CUDA::nvml Threads::Threads numa)
 
+# OBJECT libraries need explicit include directory propagation
+# Get include directories from linked targets and add them explicitly
+get_target_property(_rmm_includes rmm::rmm INTERFACE_INCLUDE_DIRECTORIES)
+get_target_property(_cudf_includes cudf::cudf INTERFACE_INCLUDE_DIRECTORIES)
+if(_rmm_includes)
+  target_include_directories(cucascade_objects PRIVATE ${_rmm_includes})
+endif()
+if(_cudf_includes)
+  target_include_directories(cucascade_objects PRIVATE ${_cudf_includes})
+endif()
+
 # Position independent code (required for shared library)
 set_target_properties(cucascade_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
