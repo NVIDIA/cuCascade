@@ -44,6 +44,9 @@ constexpr uint64_t KiB = 1024ULL;
 constexpr uint64_t MiB = 1024ULL * KiB;
 constexpr uint64_t GiB = 1024ULL * MiB;
 
+// Global shared memory manager - managed via setup/teardown functions
+static std::shared_ptr<memory_reservation_manager> g_shared_memory_manager;
+
 /**
  * @brief Create memory manager configs for benchmarking (one GPU and one HOST).
  */
@@ -54,6 +57,34 @@ std::vector<memory_reservation_manager::memory_space_config> create_benchmark_co
   configs.emplace_back(Tier::GPU, 0, 4 * GiB, make_default_allocator_for_tier(Tier::GPU));
   configs.emplace_back(Tier::HOST, 0, 8 * GiB, make_default_allocator_for_tier(Tier::HOST));
   return configs;
+}
+
+/**
+ * @brief Get shared memory reservation manager.
+ */
+std::shared_ptr<memory_reservation_manager> get_shared_memory_manager()
+{
+  return g_shared_memory_manager;
+}
+
+/**
+ * @brief Setup function called before benchmarks.
+ */
+void DoSetup([[maybe_unused]] const benchmark::State& state)
+{
+  if (!g_shared_memory_manager) {
+    g_shared_memory_manager =
+      std::make_shared<memory_reservation_manager>(create_benchmark_configs());
+  }
+}
+
+/**
+ * @brief Teardown function called after benchmarks.
+ */
+void DoTeardown(const benchmark::State& state)
+{
+  // Only teardown after all threads are done
+  if (state.thread_index() == 0) { g_shared_memory_manager.reset(); }
 }
 
 /**
@@ -119,8 +150,11 @@ void BM_ConvertGpuToHost(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   int num_columns     = static_cast<int>(state.range(1));
-  auto mgr            = std::make_unique<memory_reservation_manager>(create_benchmark_configs());
-  auto registry       = std::make_unique<representation_converter_registry>();
+
+  // Use shared memory manager across all threads
+  auto mgr = get_shared_memory_manager();
+
+  auto registry = std::make_unique<representation_converter_registry>();
   register_builtin_converters(*registry);
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
@@ -163,8 +197,11 @@ void BM_ConvertHostToGpu(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   int num_columns     = static_cast<int>(state.range(1));
-  auto mgr            = std::make_unique<memory_reservation_manager>(create_benchmark_configs());
-  auto registry       = std::make_unique<representation_converter_registry>();
+
+  // Use shared memory manager across all threads
+  auto mgr = get_shared_memory_manager();
+
+  auto registry = std::make_unique<representation_converter_registry>();
   register_builtin_converters(*registry);
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
@@ -259,27 +296,38 @@ void BM_HostToGpuThroughput(benchmark::State& state)
 }
 
 BENCHMARK(BM_ConvertGpuToHost)
+  ->Setup(DoSetup)
+  ->Teardown(DoTeardown)
   ->RangeMultiplier(4)
   ->Ranges({{256 * KiB, 1 * GiB}, {1, 64}})
   ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
+  ->UseRealTime()
+  ->ThreadRange(1, 4);
 
 BENCHMARK(BM_ConvertHostToGpu)
+  ->Setup(DoSetup)
+  ->Teardown(DoTeardown)
   ->RangeMultiplier(4)
   ->Ranges({{256 * KiB, 1 * GiB}, {1, 64}})
   ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
+  ->UseRealTime()
+  ->ThreadRange(1, 4);
 
 BENCHMARK(BM_GpuToHostThroughput)
   ->RangeMultiplier(2)
   ->Range(64 * KiB, 1 * GiB)
   ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
+  ->UseRealTime()
+  ->ThreadRange(1, 4);
 
 BENCHMARK(BM_HostToGpuThroughput)
   ->RangeMultiplier(2)
   ->Range(128 * KiB, 1 * GiB)
   ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
+  ->UseRealTime()
+  ->ThreadRange(1, 4);
 
 }  // namespace
+
+// Use Google Benchmark's default main
+BENCHMARK_MAIN();

@@ -41,8 +41,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 # Collect all benchmark sources
 set(BENCHMARK_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_representation_converter.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_main.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_representation_converter.cpp)
 
 # Create benchmark executable
 add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})
