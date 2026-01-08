@@ -64,6 +64,7 @@ class exclusive_stream_pool {
    * @brief Construct a new cuda stream pool object of the given non-zero size
    *
    * @throws logic_error if `pool_size` is zero
+   * @param device_id The device ID to create streams on
    * @param pool_size The number of streams in the pool
    * @param flags Flags used when creating streams in the pool.
    */

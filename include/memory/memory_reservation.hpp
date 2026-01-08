@@ -86,7 +86,6 @@ class reservation_limit_policy {
    * 2. Increase the reservation and allow the allocation (increase policy)
    * 3. Throw an exception to prevent the allocation (fail policy)
    *
-   * @param adaptor Reference to the tracking resource adaptor
    * @param stream The stream that would exceed its reservation
    * @param requested_bytes Number of bytes being requested
    * @param current_allocated Number of bytes currently allocated
@@ -247,8 +246,6 @@ struct reservation {
 
   /**
    * @brief Attempts to shrink this reservation to a new smaller size.
-   * @param new_size The new size for the reservation (must be smaller than current size)
-   * @return true if the reservation was successfully shrunk, false otherwise
    */
   void shrink_to_fit();
 

@@ -179,7 +179,10 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   /**
    * @brief Construct with custom upstream resource.
    *
+   * @param device_id The device ID associated with this resource
    * @param upstream_mr Upstream memory resource to use
+   * @param mem_limit The memory limit for reservations
+   * @param capacity The total capacity of the resource
    * @param block_size Size of each block in bytes
    * @param pool_size Number of blocks to pre-allocate
    * @param initial_pools Number of pools to pre-allocate
@@ -252,7 +255,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   /**
    * @brief makes reservations
    * @param bytes the size of reservation
-   * @param on_release used to hook callbacks for when the reservation is released
+   * @param notifier used to hook callbacks for when the reservation is released
    */
   std::unique_ptr<reserved_arena> reserve(std::size_t bytes,
                                           std::unique_ptr<event_notifier> notifier = nullptr);
@@ -260,7 +263,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   /**
    * @brief makes reservations upto the given size
    * @param bytes the size of reservation
-   * @param on_release used to hook callbacks for when the reservation is released
+   * @param notifier used to hook callbacks for when the reservation is released
    */
   std::unique_ptr<reserved_arena> reserve_upto(std::size_t bytes,
                                                std::unique_ptr<event_notifier> notifier = nullptr);
@@ -278,6 +281,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
    * when it goes out of scope, preventing memory leaks.
    *
    * @param total_bytes Total size in bytes to allocate across multiple blocks
+   * @param res Optional reservation to allocate from
    * @return multiple_blocks_allocation RAII wrapper for the allocated blocks
    * @throws rmm::out_of_memory if insufficient blocks are available or upstream allocation fails
    */
@@ -347,13 +351,13 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
 
   /**
    * @brief registers reservation with the memory resource
-   * @param reservation reserved bytes that is registered with the memory resource
+   * @param res reserved bytes that is registered with the memory resource
    */
   void register_reservation(chunked_reserved_area* res);
 
   /**
    * @brief release reservation and returns the unused bytes to back to the memory resource
-   * @param reservation reserved bytes that is registered with the memory resource
+   * @param res reserved bytes that is registered with the memory resource
    */
   void release_reservation(chunked_reserved_area* res);
 

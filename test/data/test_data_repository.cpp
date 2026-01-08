@@ -646,8 +646,7 @@ TEST_CASE("shared_data_repository size After Pulling", "[data_repository]")
 }
 
 // Test size with interleaved operations on shared repository
-TEST_CASE("shared_data_repository size Interleaved Operations",
-          "[data_repository]")
+TEST_CASE("shared_data_repository size Interleaved Operations", "[data_repository]")
 {
   shared_data_repository repository;
 
@@ -748,8 +747,7 @@ TEST_CASE("unique_data_repository size After Pulling", "[data_repository]")
 }
 
 // Test size with interleaved operations on unique repository
-TEST_CASE("unique_data_repository size Interleaved Operations",
-          "[data_repository]")
+TEST_CASE("unique_data_repository size Interleaved Operations", "[data_repository]")
 {
   unique_data_repository repository;
 
@@ -860,8 +858,7 @@ TEST_CASE("unique_data_repository size Thread-Safe", "[data_repository]")
 }
 
 // Test size with concurrent add and pull operations
-TEST_CASE("shared_data_repository size Concurrent Operations",
-          "[data_repository]")
+TEST_CASE("shared_data_repository size Concurrent Operations", "[data_repository]")
 {
   shared_data_repository repository;
 

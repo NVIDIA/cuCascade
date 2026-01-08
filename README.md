@@ -10,7 +10,7 @@ A high-performance GPU memory management library for data-intensive applications
 - **Tiered Memory Management**: Seamlessly manage GPU (fastest), pinned host (medium), and disk (largest capacity) memory tiers, provides numa aware allocators
 - **Memory Reservation System**: Avoid oversubscribing your GPU by making reservations and using allocators that respect reservations
 - **Hardware Topology Discovery**: Automatic detection of NUMA regions and GPU-CPU affinity for optimal memory placement
-- ****
+- **Stream-Aware Tracking**: Per-stream memory usage tracking and reservation enforcement
 - **cuDF Integration**: Native support for GPU DataFrames with batch processing capabilities and spilling to Host or Disk
 - **Pluggable Policies**: Control what happens when you OOM, try to allocate more than a reservation, how you pick what data to spill, by creating policies that plug into the system.
 
@@ -46,22 +46,50 @@ cd build/release && ctest --output-on-failure
 
 ```cpp
 #include <memory/memory_reservation_manager.hpp>
+#include <memory/reservation_manager_configurator.hpp>
 #include <memory/topology_discovery.hpp>
 
-// Discover hardware topology
-auto topology = cucascade::discover_topology();
+using namespace cucascade::memory;
 
-// Create memory reservation manager
-auto manager = cucascade::MemoryReservationManager(topology);
+// 1. Discover hardware topology
+topology_discovery discovery;
+if (!discovery.discover()) {
+    // Handle discovery failure
+}
+auto const& topology = discovery.get_topology();
 
-// Reserve GPU memory
-auto gpu_reservation = manager.reserve(cucascade::MemoryTier::GPU, size_bytes);
+// 2. Configure the memory reservation manager
+reservation_manager_configurator configurator;
+configurator.set_gpu_usage_limit(4ULL << 30)                // 4GB per GPU
+            .set_reservation_limit_ratio_per_gpu(0.8)       // Reserve up to 80%
+            .set_capacity_per_numa_node(16ULL << 30)        // 16GB per NUMA node
+            .bind_cpu_tier_to_gpus();                       // Bind CPU tiers to GPUs
 
-// Reserve host memory with NUMA awareness
-auto host_reservation = manager.reserve(cucascade::MemoryTier::HOST, size_bytes);
+// 3. Create the manager with the discovered topology
+auto configs = configurator.build(topology);
+memory_reservation_manager manager(std::move(configs));
+
+// 4. Request reservations using strategies
+// Request 1GB on any available GPU
+auto gpu_res = manager.request_reservation(any_memory_space_in_tier(Tier::GPU), 1ULL << 30);
+
+// Request 2GB on a specific host NUMA node
+auto host_res = manager.request_reservation(specific_memory_space(Tier::HOST, 0), 2ULL << 30);
 ```
 
 - More examples: See `test/` directory for comprehensive usage examples
+
+# Documentation
+
+Comprehensive documentation is available in the `docs/` directory:
+
+- **[Architecture Overview](docs/ARCHITECTURE.md)**: High-level description of the library's design, core components, and intended usage flows with Mermaid diagrams.
+- **[API Reference](docs/API_REFERENCE.md)**: Detailed API documentation and class hierarchies automatically generated from code comments.
+
+To regenerate the documentation:
+```bash
+pixi run docs
+```
 
 # Contribution Guidelines
 

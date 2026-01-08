@@ -61,6 +61,8 @@ class memory_space {
    * @param tier The memory tier (GPU, HOST, DISK)
    * @param device_id The device identifier within the tier
    * @param memory_limit Maximum memory capacity in bytes
+   * @param start_downgrading_memory_threshold Threshold to start downgrading memory
+   * @param stop_downgrading_memory_threshold Threshold to stop downgrading memory
    * @param capacity Total memory capacity in bytes (optional [default: device capacity])
    * @param allocator RMM memory allocator (must be non-empty)
    */

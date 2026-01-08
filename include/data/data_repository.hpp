@@ -132,10 +132,7 @@ class idata_repository {
    *
    * @note Thread-safe operation protected by internal mutex
    */
-  bool empty() const
-  {
-    return size() == 0;
-  }
+  bool empty() const { return size() == 0; }
 
  protected:
   mutable std::mutex _mutex;           ///< Mutex for thread-safe access to repository operations
