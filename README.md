@@ -30,8 +30,11 @@ cd cuCascade
 cmake --preset release
 cmake --build build/release
 
-# Verify installation
+# Run tests
 cd build/release && ctest --output-on-failure
+
+# Run benchmarks (optional)
+cd build/release && ./benchmark/cucascade_benchmarks
 ```
 
 # Requirements
@@ -75,6 +78,9 @@ cd cuCascade
 pixi install
 pixi run build
 pixi run test
+
+# Run benchmarks
+cd build/release && ./benchmark/cucascade_benchmarks
 ```
 
 ## Pre-commit Hooks
@@ -137,6 +143,9 @@ cuCascade/
 │   ├── data/                      # Data module tests
 │   ├── memory/                    # Memory module tests
 │   └── utils/                     # Test utilities (cuDF helpers)
+├── benchmark/                     # Performance benchmarks
+│   ├── benchmark_representation_converter.cpp  # Converter benchmarks
+│   └── README.md                  # Benchmark documentation
 ├── cmake/                         # CMake configuration modules
 ├── CMakeLists.txt                 # Main CMake configuration
 ├── CMakePresets.json              # CMake presets for build configurations
