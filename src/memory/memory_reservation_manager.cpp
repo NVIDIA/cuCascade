@@ -21,6 +21,7 @@
 #include "memory/memory_reservation.hpp"
 #include "memory/memory_space.hpp"
 #include "memory/numa_region_pinned_host_allocator.hpp"
+#include "utils/overloaded.hpp"
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
@@ -29,6 +30,7 @@
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
+#include <variant>
 
 namespace cucascade {
 namespace memory {
@@ -127,18 +129,14 @@ memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_
 
   // Create memory_space instances
   for (auto& config : configs) {
-    // Move the allocators from config to the memory_space
-    auto mem_space = std::make_unique<memory_space>(
-      config.tier,
-      config.device_id,
-      config.memory_limit,
-      static_cast<std::size_t>(config.downgrade_tigger_threshold *
-                               static_cast<float>(config.memory_capacity)),
-      static_cast<std::size_t>(config.downgrade_stop_threshold *
-                               static_cast<float>(config.memory_capacity)),
-      config.memory_capacity,
-      config.mr_factory_fn(config.device_id, config.memory_capacity));
-    _memory_spaces.push_back(std::move(mem_space));
+    std::visit(utils::overloaded{
+                 [&](auto&& specific_config) {
+                   _memory_spaces.emplace_back(std::make_unique<memory_space>(specific_config));
+                 },
+                 [](std::monostate&) {
+                   throw std::invalid_argument("Unknown memory_space configuration type");
+                 }},
+               config);
   }
 
   // Build lookup tables
@@ -173,6 +171,11 @@ const memory_space* memory_reservation_manager::get_memory_space(Tier tier, int3
   memory_space_id id(tier, device_id);
   auto it = _memory_space_lookup.find(id);
   return (it != _memory_space_lookup.end()) ? it->second : nullptr;
+}
+
+memory_space* memory_reservation_manager::get_memory_space(Tier tier, int32_t device_id)
+{
+  return get_mutable_memory_space(tier, device_id);
 }
 
 std::span<const memory_space*> memory_reservation_manager::get_memory_spaces_for_tier(

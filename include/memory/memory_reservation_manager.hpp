@@ -221,6 +221,12 @@ class memory_reservation_manager {
   const memory_space* get_memory_space(Tier tier, int32_t device_id) const;
 
   /**
+   * Get a specific memory_space by tier and device ID.
+   * Returns nullptr if no such space exists.
+   */
+  memory_space* get_memory_space(Tier tier, int32_t device_id);
+
+  /**
    * Get all memory_spaces for a specific tier.
    * Returns empty vector if no spaces exist for that tier.
    */
