@@ -299,33 +299,33 @@ BENCHMARK(BM_ConvertGpuToHost)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
   ->RangeMultiplier(4)
-  ->Ranges({{256 * KiB, 1 * GiB}, {1, 64}})
+  ->Ranges({{64 * KiB, 1 * GiB}, {1, 64}})
   ->Unit(benchmark::kMillisecond)
-  ->UseRealTime()
-  ->ThreadRange(1, 4);
+  ->Iterations(1)
+  ->UseRealTime();
 
 BENCHMARK(BM_ConvertHostToGpu)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
   ->RangeMultiplier(4)
-  ->Ranges({{256 * KiB, 1 * GiB}, {1, 64}})
+  ->Ranges({{64 * KiB, 1 * GiB}, {1, 64}})
   ->Unit(benchmark::kMillisecond)
-  ->UseRealTime()
-  ->ThreadRange(1, 4);
+  ->Iterations(1)
+  ->UseRealTime();
 
 BENCHMARK(BM_GpuToHostThroughput)
   ->RangeMultiplier(2)
   ->Range(64 * KiB, 1 * GiB)
   ->Unit(benchmark::kMillisecond)
-  ->UseRealTime()
-  ->ThreadRange(1, 4);
+  ->Iterations(1)
+  ->UseRealTime();
 
 BENCHMARK(BM_HostToGpuThroughput)
   ->RangeMultiplier(2)
-  ->Range(128 * KiB, 1 * GiB)
+  ->Range(64 * KiB, 1 * GiB)
   ->Unit(benchmark::kMillisecond)
-  ->UseRealTime()
-  ->ThreadRange(1, 4);
+  ->Iterations(1)
+  ->UseRealTime();
 
 }  // namespace
 
