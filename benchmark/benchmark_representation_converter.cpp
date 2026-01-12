@@ -33,6 +33,7 @@
 
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -54,8 +55,8 @@ std::vector<memory_reservation_manager::memory_space_config> create_benchmark_co
 {
   std::vector<memory_reservation_manager::memory_space_config> configs;
   // Large memory limits for benchmarking
-  configs.emplace_back(Tier::GPU, 0, 4 * GiB, make_default_allocator_for_tier(Tier::GPU));
-  configs.emplace_back(Tier::HOST, 0, 8 * GiB, make_default_allocator_for_tier(Tier::HOST));
+  configs.emplace_back(Tier::GPU, 0, 8 * GiB, make_default_allocator_for_tier(Tier::GPU));
+  configs.emplace_back(Tier::HOST, 0, 16 * GiB, make_default_allocator_for_tier(Tier::HOST));
   return configs;
 }
 
@@ -81,10 +82,10 @@ void DoSetup([[maybe_unused]] const benchmark::State& state)
 /**
  * @brief Teardown function called after benchmarks.
  */
-void DoTeardown(const benchmark::State& state)
+void DoTeardown([[maybe_unused]] const benchmark::State& state)
 {
-  // Only teardown after all threads are done
-  if (state.thread_index() == 0) { g_shared_memory_manager.reset(); }
+  // Reset the shared memory manager after benchmark
+  g_shared_memory_manager.reset();
 }
 
 /**
@@ -145,11 +146,13 @@ cudf::table create_benchmark_table_from_bytes(int64_t total_bytes, int num_colum
  * @brief Benchmark GPU to HOST conversion with varying data sizes.
  * @param state.range(0) Total bytes
  * @param state.range(1) Number of columns
+ * @param state.range(2) Manual thread count
  */
 void BM_ConvertGpuToHost(benchmark::State& state)
 {
-  int64_t total_bytes = state.range(0);
-  int num_columns     = static_cast<int>(state.range(1));
+  int64_t total_bytes   = state.range(0);
+  int num_columns       = static_cast<int>(state.range(1));
+  uint64_t thread_count = static_cast<uint64_t>(state.range(2));
 
   // Use shared memory manager across all threads
   auto mgr = get_shared_memory_manager();
@@ -160,43 +163,67 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, 0);
 
-  rmm::cuda_stream stream;
+  // Create separate table and representation for each thread BEFORE warmup
+  std::vector<std::unique_ptr<gpu_table_representation>> thread_gpu_reprs;
+  thread_gpu_reprs.reserve(thread_count);
 
-  // Create source data
-  auto table    = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table),
-                                                             *const_cast<memory_space*>(gpu_space));
+  for (uint64_t t = 0; t < thread_count; ++t) {
+    auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
+    thread_gpu_reprs.push_back(std::make_unique<gpu_table_representation>(
+      std::move(table), *const_cast<memory_space*>(gpu_space)));
+  }
 
   // Warm-up
+  rmm::cuda_stream warmup_stream;
   auto warmup_table = create_benchmark_table_from_bytes(1 * KiB, 2);
   auto warmup_repr  = std::make_unique<gpu_table_representation>(
     std::move(warmup_table), *const_cast<memory_space*>(gpu_space));
   auto warmup_result =
-    registry->convert<host_table_representation>(*warmup_repr, host_space, stream);
-  stream.synchronize();
+    registry->convert<host_table_representation>(*warmup_repr, host_space, warmup_stream);
+  warmup_stream.synchronize();
 
-  size_t bytes_transferred = gpu_repr->get_size_in_bytes();
+  size_t bytes_transferred = thread_gpu_reprs[0]->get_size_in_bytes() * thread_count;
 
+  // Benchmark loop
   for (auto _ : state) {
-    auto host_result = registry->convert<host_table_representation>(*gpu_repr, host_space, stream);
-    stream.synchronize();
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+
+    // Create threads
+    for (uint64_t t = 0; t < thread_count; ++t) {
+      threads.emplace_back([&, t]() {
+        rmm::cuda_stream stream;
+        auto host_result =
+          registry->convert<host_table_representation>(*thread_gpu_reprs[t], host_space, stream);
+        stream.synchronize();
+      });
+    }
+
+    // Join all threads
+    for (auto& thread : threads) {
+      thread.join();
+    }
   }
 
+  // Update counters in main thread after loop
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
                           static_cast<int64_t>(bytes_transferred));
-  state.counters["columns"] = static_cast<double>(num_columns);
-  state.counters["bytes"]   = static_cast<double>(bytes_transferred);
+  state.counters["columns"]     = static_cast<double>(num_columns);
+  state.counters["bytes"]       = static_cast<double>(bytes_transferred);
+  state.counters["num_threads"] = static_cast<double>(thread_count);
 }
 
 /**
  * @brief Benchmark HOST to GPU conversion with varying data sizes.
  * @param state.range(0) Total bytes
  * @param state.range(1) Number of columns
+ * @param state.range(2) Manual thread count
  */
 void BM_ConvertHostToGpu(benchmark::State& state)
 {
-  int64_t total_bytes = state.range(0);
-  int num_columns     = static_cast<int>(state.range(1));
+  int64_t total_bytes   = state.range(0);
+  int num_columns       = static_cast<int>(state.range(1));
+  uint64_t thread_count = static_cast<uint64_t>(state.range(2));
 
   // Use shared memory manager across all threads
   auto mgr = get_shared_memory_manager();
@@ -207,29 +234,56 @@ void BM_ConvertHostToGpu(benchmark::State& state)
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, 0);
 
-  rmm::cuda_stream stream;
+  // Create separate table and representation for each thread BEFORE warmup
+  std::vector<std::unique_ptr<host_table_representation>> thread_host_reprs;
+  thread_host_reprs.reserve(thread_count);
 
-  // Create source data: first make GPU repr, then convert to HOST
-  auto table         = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_repr_temp = std::make_unique<gpu_table_representation>(
-    std::move(table), *const_cast<memory_space*>(gpu_space));
-  auto host_repr = registry->convert<host_table_representation>(*gpu_repr_temp, host_space, stream);
-  stream.synchronize();
-
-  // Warm-up
-  auto warmup_result = registry->convert<gpu_table_representation>(*host_repr, gpu_space, stream);
-  stream.synchronize();
-
-  size_t bytes_transferred = host_repr->get_size_in_bytes();
-
-  for (auto _ : state) {
-    auto gpu_result = registry->convert<gpu_table_representation>(*host_repr, gpu_space, stream);
-    stream.synchronize();
+  rmm::cuda_stream setup_stream;
+  for (uint64_t t = 0; t < thread_count; ++t) {
+    auto table         = create_benchmark_table_from_bytes(total_bytes, num_columns);
+    auto gpu_repr_temp = std::make_unique<gpu_table_representation>(
+      std::move(table), *const_cast<memory_space*>(gpu_space));
+    auto host_repr =
+      registry->convert<host_table_representation>(*gpu_repr_temp, host_space, setup_stream);
+    setup_stream.synchronize();
+    thread_host_reprs.push_back(std::move(host_repr));
   }
 
-  state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(bytes_transferred));
-  state.counters["columns"] = static_cast<double>(num_columns);
-  state.counters["bytes"]   = static_cast<double>(bytes_transferred);
+  // Warm-up
+  rmm::cuda_stream warmup_stream;
+  auto warmup_result =
+    registry->convert<gpu_table_representation>(*thread_host_reprs[0], gpu_space, warmup_stream);
+  warmup_stream.synchronize();
+
+  size_t bytes_transferred = thread_host_reprs[0]->get_size_in_bytes() * thread_count;
+
+  // Benchmark loop
+  for (auto _ : state) {
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+
+    // Create threads
+    for (uint64_t t = 0; t < thread_count; ++t) {
+      threads.emplace_back([&, t]() {
+        rmm::cuda_stream stream;
+        auto gpu_result =
+          registry->convert<gpu_table_representation>(*thread_host_reprs[t], gpu_space, stream);
+        stream.synchronize();
+      });
+    }
+
+    // Join all threads
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+
+  // Update counters in main thread after loop
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
+                          static_cast<int64_t>(bytes_transferred));
+  state.counters["columns"]     = static_cast<double>(num_columns);
+  state.counters["bytes"]       = static_cast<double>(bytes_transferred);
+  state.counters["num_threads"] = static_cast<double>(thread_count);
 }
 
 // =============================================================================
@@ -238,68 +292,121 @@ void BM_ConvertHostToGpu(benchmark::State& state)
 
 /**
  * @brief Benchmark GPU to HOST memory bandwidth.
+ * @param state.range(0) Total bytes
+ * @param state.range(1) Manual thread count
  */
 void BM_GpuToHostThroughput(benchmark::State& state)
 {
-  uint64_t total_bytes = static_cast<uint64_t>(state.range(0));
+  uint64_t total_bytes  = static_cast<uint64_t>(state.range(0));
+  uint64_t thread_count = static_cast<uint64_t>(state.range(1));
 
-  rmm::cuda_stream stream;
-  void* d_buffer = nullptr;
-  void* h_buffer = nullptr;
+  // Create separate buffers for each thread BEFORE benchmark loop
+  std::vector<void*> d_buffers(thread_count);
+  std::vector<void*> h_buffers(thread_count);
 
-  RMM_CUDA_TRY(cudaMalloc(&d_buffer, total_bytes));
-  RMM_CUDA_TRY(cudaMallocHost(&h_buffer, total_bytes));
-  RMM_CUDA_TRY(cudaMemset(d_buffer, 0x42, total_bytes));
-
-  for (auto _ : state) {
-    RMM_CUDA_TRY(
-      cudaMemcpyAsync(h_buffer, d_buffer, total_bytes, cudaMemcpyDeviceToHost, stream.value()));
-    stream.synchronize();
+  for (uint64_t t = 0; t < thread_count; ++t) {
+    RMM_CUDA_TRY(cudaMalloc(&d_buffers[t], total_bytes));
+    RMM_CUDA_TRY(cudaMallocHost(&h_buffers[t], total_bytes));
+    RMM_CUDA_TRY(cudaMemset(d_buffers[t], 0x42, total_bytes));
   }
 
-  RMM_CUDA_TRY(cudaFree(d_buffer));
-  RMM_CUDA_TRY(cudaFreeHost(h_buffer));
+  uint64_t total_bytes_transferred = total_bytes * thread_count;
 
+  // Benchmark loop
+  for (auto _ : state) {
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+
+    // Create threads
+    for (uint64_t t = 0; t < thread_count; ++t) {
+      threads.emplace_back([&, t]() {
+        rmm::cuda_stream stream;
+        RMM_CUDA_TRY(cudaMemcpyAsync(
+          h_buffers[t], d_buffers[t], total_bytes, cudaMemcpyDeviceToHost, stream.value()));
+        stream.synchronize();
+      });
+    }
+
+    // Join all threads
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+
+  // Cleanup buffers
+  for (uint64_t t = 0; t < thread_count; ++t) {
+    RMM_CUDA_TRY(cudaFree(d_buffers[t]));
+    RMM_CUDA_TRY(cudaFreeHost(h_buffers[t]));
+  }
+
+  // Update counters in main thread after loop
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
-                          static_cast<int64_t>(total_bytes));
-  state.counters["MB"] = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
+                          static_cast<int64_t>(total_bytes_transferred));
+  state.counters["MB"]          = static_cast<double>(total_bytes_transferred) / (1024.0 * 1024.0);
+  state.counters["num_threads"] = static_cast<double>(thread_count);
 }
 
 /**
  * @brief Benchmark HOST to GPU memory bandwidth.
+ * @param state.range(0) Total bytes
+ * @param state.range(1) Manual thread count
  */
 void BM_HostToGpuThroughput(benchmark::State& state)
 {
-  uint64_t total_bytes = static_cast<uint64_t>(state.range(0));
+  uint64_t total_bytes  = static_cast<uint64_t>(state.range(0));
+  uint64_t thread_count = static_cast<uint64_t>(state.range(1));
 
-  rmm::cuda_stream stream;
-  void* d_buffer = nullptr;
-  void* h_buffer = nullptr;
+  // Create separate buffers for each thread BEFORE benchmark loop
+  std::vector<void*> d_buffers(thread_count);
+  std::vector<void*> h_buffers(thread_count);
 
-  RMM_CUDA_TRY(cudaMalloc(&d_buffer, total_bytes));
-  RMM_CUDA_TRY(cudaMallocHost(&h_buffer, total_bytes));
-
-  std::memset(h_buffer, 0x42, total_bytes);
-
-  for (auto _ : state) {
-    RMM_CUDA_TRY(
-      cudaMemcpyAsync(d_buffer, h_buffer, total_bytes, cudaMemcpyHostToDevice, stream.value()));
-    stream.synchronize();
+  for (uint64_t t = 0; t < thread_count; ++t) {
+    RMM_CUDA_TRY(cudaMalloc(&d_buffers[t], total_bytes));
+    RMM_CUDA_TRY(cudaMallocHost(&h_buffers[t], total_bytes));
+    std::memset(h_buffers[t], 0x42, total_bytes);
   }
 
-  RMM_CUDA_TRY(cudaFree(d_buffer));
-  RMM_CUDA_TRY(cudaFreeHost(h_buffer));
+  uint64_t total_bytes_transferred = total_bytes * thread_count;
 
+  // Benchmark loop
+  for (auto _ : state) {
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+
+    // Create threads
+    for (uint64_t t = 0; t < thread_count; ++t) {
+      threads.emplace_back([&, t]() {
+        rmm::cuda_stream stream;
+        RMM_CUDA_TRY(cudaMemcpyAsync(
+          d_buffers[t], h_buffers[t], total_bytes, cudaMemcpyHostToDevice, stream.value()));
+        stream.synchronize();
+      });
+    }
+
+    // Join all threads
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+
+  // Cleanup buffers
+  for (uint64_t t = 0; t < thread_count; ++t) {
+    RMM_CUDA_TRY(cudaFree(d_buffers[t]));
+    RMM_CUDA_TRY(cudaFreeHost(h_buffers[t]));
+  }
+
+  // Update counters in main thread after loop
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
-                          static_cast<int64_t>(total_bytes));
-  state.counters["MB"] = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
+                          static_cast<int64_t>(total_bytes_transferred));
+  state.counters["MB"]          = static_cast<double>(total_bytes_transferred) / (1024.0 * 1024.0);
+  state.counters["num_threads"] = static_cast<double>(thread_count);
 }
 
 BENCHMARK(BM_ConvertGpuToHost)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->RangeMultiplier(4)
-  ->Ranges({{64 * KiB, 1 * GiB}, {1, 64}})
+  ->RangeMultiplier(2)
+  ->Ranges({{128 * KiB, 512 * MiB}, {1, 64}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
   ->Iterations(1)
   ->UseRealTime();
@@ -307,22 +414,22 @@ BENCHMARK(BM_ConvertGpuToHost)
 BENCHMARK(BM_ConvertHostToGpu)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->RangeMultiplier(4)
-  ->Ranges({{64 * KiB, 1 * GiB}, {1, 64}})
+  ->RangeMultiplier(2)
+  ->Ranges({{128 * KiB, 512 * MiB}, {1, 64}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
   ->Iterations(1)
   ->UseRealTime();
 
 BENCHMARK(BM_GpuToHostThroughput)
   ->RangeMultiplier(2)
-  ->Range(64 * KiB, 1 * GiB)
+  ->Ranges({{128 * KiB, 512 * MiB}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
   ->Iterations(1)
   ->UseRealTime();
 
 BENCHMARK(BM_HostToGpuThroughput)
   ->RangeMultiplier(2)
-  ->Range(64 * KiB, 1 * GiB)
+  ->Ranges({{128 * KiB, 512 * MiB}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
   ->Iterations(1)
   ->UseRealTime();
