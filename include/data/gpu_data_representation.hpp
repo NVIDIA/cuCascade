@@ -44,6 +44,7 @@ class gpu_table_representation : public idata_representation {
    * @brief Construct a new gpu_table_representation object
    *
    * @param table The actual cuDF table with the data
+   * @param memory_space The memory space where the GPU table resides
    */
   gpu_table_representation(cudf::table table, cucascade::memory::memory_space& memory_space);
 

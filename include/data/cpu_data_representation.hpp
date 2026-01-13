@@ -39,9 +39,8 @@ class host_table_representation : public idata_representation {
   /**
    * @brief Construct a new host_table_representation object
    *
-   * @param allocation_blocks The underlying allocation owning the actual data
-   * @param meta Metadata required to reconstruct the cuDF columns (using cudf::unpack())
-   * @param size The size of the actual data in bytes
+   * @param host_table The underlying allocation owning the actual data
+   * @param memory_space The memory space where the host table resides
    */
   host_table_representation(std::unique_ptr<cucascade::memory::host_table_allocation> host_table,
                             cucascade::memory::memory_space* memory_space);
