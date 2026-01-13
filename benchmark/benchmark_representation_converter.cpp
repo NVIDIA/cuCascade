@@ -45,6 +45,10 @@ constexpr uint64_t KiB = 1024ULL;
 constexpr uint64_t MiB = 1024ULL * KiB;
 constexpr uint64_t GiB = 1024ULL * MiB;
 
+// For non-NUMA systems, this should be -1, causing the allocator to use cudaHostAlloc instead of
+// cudaHostRegister
+constexpr int hostDevId = -1;
+
 // Global shared memory manager - managed via setup/teardown functions
 static std::shared_ptr<memory_reservation_manager> g_shared_memory_manager;
 
@@ -56,7 +60,8 @@ std::vector<memory_reservation_manager::memory_space_config> create_benchmark_co
   std::vector<memory_reservation_manager::memory_space_config> configs;
   // Large memory limits for benchmarking
   configs.emplace_back(Tier::GPU, 0, 8 * GiB, make_default_allocator_for_tier(Tier::GPU));
-  configs.emplace_back(Tier::HOST, 0, 16 * GiB, make_default_allocator_for_tier(Tier::HOST));
+  configs.emplace_back(
+    Tier::HOST, hostDevId, 16 * GiB, make_default_allocator_for_tier(Tier::HOST));
   return configs;
 }
 
@@ -161,7 +166,7 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   register_builtin_converters(*registry);
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* host_space = mgr->get_memory_space(Tier::HOST, 0);
+  const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
 
   // Create separate table and representation for each thread BEFORE warmup
   std::vector<std::unique_ptr<gpu_table_representation>> thread_gpu_reprs;
@@ -232,7 +237,7 @@ void BM_ConvertHostToGpu(benchmark::State& state)
   register_builtin_converters(*registry);
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* host_space = mgr->get_memory_space(Tier::HOST, 0);
+  const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
 
   // Create separate table and representation for each thread BEFORE warmup
   std::vector<std::unique_ptr<host_table_representation>> thread_host_reprs;
