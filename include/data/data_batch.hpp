@@ -1,10 +1,4 @@
-/**
- * @brief Result of attempting to lock a batch for processing.
- */
-struct lock_for_processing_result {
-  bool success{false};
-  data_batch_processing_handle handle{};
-};
+
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -29,11 +23,13 @@ struct lock_for_processing_result {
 
 #include <cudf/table/table.hpp>
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 namespace cucascade {
@@ -60,8 +56,9 @@ enum class batch_state {
   in_transit     ///< Batch is currently being moved to a different memory tier
 };
 
-// Forward declaration
+// Forward declarations
 class data_batch;
+class data_batch_processing_handle;
 
 /**
  * @brief RAII handle that manages processing state for a data_batch.
@@ -129,6 +126,26 @@ class data_batch_processing_handle {
 
  private:
   data_batch* _batch;  ///< Non-owning pointer to the managed data_batch
+};
+
+/**
+ * @brief Result of attempting to lock a batch for processing.
+ */
+struct lock_for_processing_result {
+  bool success{false};
+  data_batch_processing_handle handle{};
+
+  lock_for_processing_result() = default;
+  lock_for_processing_result(bool success, data_batch_processing_handle&& handle)
+    : success(success), handle(std::move(handle))
+  {
+  }
+
+  // Move-only to mirror handle semantics
+  lock_for_processing_result(lock_for_processing_result&&) noexcept            = default;
+  lock_for_processing_result& operator=(lock_for_processing_result&&) noexcept = default;
+  lock_for_processing_result(const lock_for_processing_result&)                = delete;
+  lock_for_processing_result& operator=(const lock_for_processing_result&)     = delete;
 };
 
 /**
@@ -231,6 +248,12 @@ class data_batch {
    */
   cucascade::memory::memory_space* get_memory_space() const;
 
+  /**
+   * @brief Set a condition variable to be notified on state changes.
+   *
+   * The CV is notified outside of the batch mutex.
+   */
+  void set_state_change_cv(std::condition_variable* cv);
   /**
    * @brief Replace the underlying data representation.
    *        Requires no active processing.
@@ -336,10 +359,11 @@ class data_batch {
 
   mutable std::mutex _mutex;  ///< Mutex for thread-safe access to state and processing count
   uint64_t _batch_id;         ///< Unique identifier for this data batch
-  std::unique_ptr<idata_representation> _data;     ///< Pointer to the actual data representation
-  size_t _processing_count   = 0;                  ///< Count of active processing handles
-  size_t _task_created_count = 0;                  ///< Count of pending task_created requests
-  batch_state _state         = batch_state::idle;  ///< Current state of the batch
+  std::unique_ptr<idata_representation> _data;    ///< Pointer to the actual data representation
+  size_t _processing_count                  = 0;  ///< Count of active processing handles
+  size_t _task_created_count                = 0;  ///< Count of pending task_created requests
+  batch_state _state                        = batch_state::idle;  ///< Current state of the batch
+  std::condition_variable* _state_change_cv = nullptr;  ///< Optional CV to notify on state change
 };
 
 // Template implementation

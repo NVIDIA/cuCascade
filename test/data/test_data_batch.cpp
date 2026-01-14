@@ -453,7 +453,7 @@ TEST_CASE("data_batch Smart Pointer Lifecycle", "[data_batch]")
     REQUIRE(r.success == true);
     REQUIRE(batch_copy->get_processing_count() == 1);
 
-    REQUIRE(batch->get_processing_count() == 0);
+    REQUIRE(batch->get_processing_count() == 1);
   }
 
   // Test with unique_ptr
@@ -485,6 +485,7 @@ TEST_CASE("data_batch_processing_handle Move Semantics", "[data_batch]")
   REQUIRE(batch.get_processing_count() == 1);
 
   {
+    REQUIRE(batch.try_to_create_task() == true);
     auto r1 = batch.try_to_lock_for_processing();
     REQUIRE(r1.success == true);
     auto handle1 = std::move(r1.handle);
@@ -494,10 +495,15 @@ TEST_CASE("data_batch_processing_handle Move Semantics", "[data_batch]")
 
     REQUIRE(handle1.valid() == false);
     REQUIRE(handle2.valid() == true);
-    REQUIRE(batch.get_processing_count() == 1);  // Still 1, not decremented
+    REQUIRE(batch.get_processing_count() == 2);  // Two active handles (outer h + handle2)
 
   }  // handle2 goes out of scope, should decrement
 
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch.get_state() == batch_state::processing);
+
+  // Explicitly release the original handle to return to idle
+  h.release();
   REQUIRE(batch.get_processing_count() == 0);
   REQUIRE(batch.get_state() == batch_state::idle);
 }

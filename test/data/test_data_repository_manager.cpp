@@ -1138,9 +1138,7 @@ TEST_CASE("shared_data_repository_manager Rapid Add Pull Cycles", "[data_reposit
     manager.add_data_batch(batch, operator_ports);
 
     // Pull the batch
-    auto r = repo->pull_data_batch(batch_state::task_created);
-    REQUIRE(r.success == true);
-    auto pulled = std::move(r.batch);
+    auto pulled = repo->pull_data_batch(batch_state::task_created);
     REQUIRE(pulled != nullptr);
   }
 

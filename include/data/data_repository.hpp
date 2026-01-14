@@ -72,6 +72,7 @@ class idata_repository {
   {
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      if (batch) { batch->set_state_change_cv(&_cv); }
       _data_batches.push_back(std::move(batch));
     }
     _cv.notify_all();
