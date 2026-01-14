@@ -171,6 +171,7 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   // Create separate table and representation for each thread BEFORE warmup
   std::vector<std::unique_ptr<gpu_table_representation>> thread_gpu_reprs;
   thread_gpu_reprs.reserve(thread_count);
+  std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
     auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
@@ -197,10 +198,9 @@ void BM_ConvertGpuToHost(benchmark::State& state)
     // Create threads
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
-        rmm::cuda_stream stream;
-        auto host_result =
-          registry->convert<host_table_representation>(*thread_gpu_reprs[t], host_space, stream);
-        stream.synchronize();
+        auto host_result = registry->convert<host_table_representation>(
+          *thread_gpu_reprs[t], host_space, streams[t]);
+        streams[t].synchronize();
       });
     }
 
@@ -242,6 +242,7 @@ void BM_ConvertHostToGpu(benchmark::State& state)
   // Create separate table and representation for each thread BEFORE warmup
   std::vector<std::unique_ptr<host_table_representation>> thread_host_reprs;
   thread_host_reprs.reserve(thread_count);
+  std::vector<rmm::cuda_stream> streams(thread_count);
 
   rmm::cuda_stream setup_stream;
   for (uint64_t t = 0; t < thread_count; ++t) {
@@ -270,10 +271,9 @@ void BM_ConvertHostToGpu(benchmark::State& state)
     // Create threads
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
-        rmm::cuda_stream stream;
         auto gpu_result =
-          registry->convert<gpu_table_representation>(*thread_host_reprs[t], gpu_space, stream);
-        stream.synchronize();
+          registry->convert<gpu_table_representation>(*thread_host_reprs[t], gpu_space, streams[t]);
+        streams[t].synchronize();
       });
     }
 
@@ -305,9 +305,10 @@ void BM_GpuToHostThroughput(benchmark::State& state)
   uint64_t total_bytes  = static_cast<uint64_t>(state.range(0));
   uint64_t thread_count = static_cast<uint64_t>(state.range(1));
 
-  // Create separate buffers for each thread BEFORE benchmark loop
+  // Create separate buffers and streams for each thread BEFORE benchmark loop
   std::vector<void*> d_buffers(thread_count);
   std::vector<void*> h_buffers(thread_count);
+  std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
     RMM_CUDA_TRY(cudaMalloc(&d_buffers[t], total_bytes));
@@ -325,10 +326,9 @@ void BM_GpuToHostThroughput(benchmark::State& state)
     // Create threads
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
-        rmm::cuda_stream stream;
         RMM_CUDA_TRY(cudaMemcpyAsync(
-          h_buffers[t], d_buffers[t], total_bytes, cudaMemcpyDeviceToHost, stream.value()));
-        stream.synchronize();
+          h_buffers[t], d_buffers[t], total_bytes, cudaMemcpyDeviceToHost, streams[t].value()));
+        streams[t].synchronize();
       });
     }
 
@@ -361,9 +361,10 @@ void BM_HostToGpuThroughput(benchmark::State& state)
   uint64_t total_bytes  = static_cast<uint64_t>(state.range(0));
   uint64_t thread_count = static_cast<uint64_t>(state.range(1));
 
-  // Create separate buffers for each thread BEFORE benchmark loop
+  // Create separate buffers and streams for each thread BEFORE benchmark loop
   std::vector<void*> d_buffers(thread_count);
   std::vector<void*> h_buffers(thread_count);
+  std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
     RMM_CUDA_TRY(cudaMalloc(&d_buffers[t], total_bytes));
@@ -381,10 +382,9 @@ void BM_HostToGpuThroughput(benchmark::State& state)
     // Create threads
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
-        rmm::cuda_stream stream;
         RMM_CUDA_TRY(cudaMemcpyAsync(
-          d_buffers[t], h_buffers[t], total_bytes, cudaMemcpyHostToDevice, stream.value()));
-        stream.synchronize();
+          d_buffers[t], h_buffers[t], total_bytes, cudaMemcpyHostToDevice, streams[t].value()));
+        streams[t].synchronize();
       });
     }
 
