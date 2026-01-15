@@ -20,6 +20,7 @@
 
 #include "data/common.hpp"
 #include "data/representation_converter.hpp"
+#include "memory/common.hpp"
 
 #include <cudf/table/table.hpp>
 
@@ -131,13 +132,25 @@ class data_batch_processing_handle {
 /**
  * @brief Result of attempting to lock a batch for processing.
  */
+enum class lock_for_processing_status {
+  success,
+  task_not_created,
+  invalid_state,
+  memory_space_mismatch,
+  missing_data,
+  not_attempted
+};
+
 struct lock_for_processing_result {
   bool success{false};
   data_batch_processing_handle handle{};
+  lock_for_processing_status status{lock_for_processing_status::not_attempted};
 
   lock_for_processing_result() = default;
-  lock_for_processing_result(bool success, data_batch_processing_handle&& handle)
-    : success(success), handle(std::move(handle))
+  lock_for_processing_result(bool success,
+                             data_batch_processing_handle&& handle,
+                             lock_for_processing_status status)
+    : success(success), handle(std::move(handle)), status(status)
   {
   }
 
@@ -319,12 +332,17 @@ class data_batch {
    * If successful, decrements task_created_counter, increments processing count,
    * and transitions to processing state (if not already processing).
    *
-   * @return lock_for_processing_result success=true with handle on success; success=false if
-   *         batch is not in a lockable state.
+   * @param requested_memory_space The memory space the caller expects to process from. If the
+   *        batch is not currently in this space, locking fails with
+   *        lock_for_processing_status::memory_space_mismatch.
+   *
+   * @return lock_for_processing_result success=true with handle on success; success=false otherwise
+   *         with a status describing the failure.
    * @throws std::runtime_error if task_created_count is zero (try_to_create_task() must be
    *         called before this method) while in a lockable state.
    */
-  lock_for_processing_result try_to_lock_for_processing();
+  lock_for_processing_result try_to_lock_for_processing(
+    memory::memory_space_id requested_memory_space);
 
   /**
    * @brief Attempt to lock this batch for in-transit operations (e.g., downgrade).

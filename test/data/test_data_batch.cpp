@@ -96,13 +96,15 @@ TEST_CASE("data_batch Processing State Management", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   REQUIRE(batch.get_processing_count() == 0);
   REQUIRE(batch.get_state() == batch_state::idle);
 
   // Cannot lock for processing directly from idle - must create task first
-  auto bad_idle = batch.try_to_lock_for_processing();
+  auto bad_idle = batch.try_to_lock_for_processing(space_id);
   REQUIRE(bad_idle.success == false);
+  REQUIRE(bad_idle.status == lock_for_processing_status::task_not_created);
   REQUIRE(batch.get_processing_count() == 0);
   REQUIRE(batch.get_state() == batch_state::idle);
 
@@ -111,7 +113,7 @@ TEST_CASE("data_batch Processing State Management", "[data_batch]")
   REQUIRE(batch.get_state() == batch_state::task_created);
 
   // Now lock for processing
-  auto r1 = batch.try_to_lock_for_processing();
+  auto r1 = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r1.success == true);
   auto h1 = std::move(r1.handle);
   REQUIRE(h1.valid() == true);
@@ -120,7 +122,7 @@ TEST_CASE("data_batch Processing State Management", "[data_batch]")
 
   // Lock again while already processing
   REQUIRE(batch.try_to_create_task() == true);
-  auto r2 = batch.try_to_lock_for_processing();
+  auto r2 = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r2.success == true);
   auto h2 = std::move(r2.handle);
   REQUIRE(h2.valid() == true);
@@ -128,11 +130,34 @@ TEST_CASE("data_batch Processing State Management", "[data_batch]")
   REQUIRE(batch.get_state() == batch_state::processing);
 
   REQUIRE(batch.try_to_create_task() == true);
-  auto r3 = batch.try_to_lock_for_processing();
+  auto r3 = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r3.success == true);
   auto h3 = std::move(r3.handle);
   REQUIRE(h3.valid() == true);
   REQUIRE(batch.get_processing_count() == 3);
+}
+
+TEST_CASE("data_batch Lock For Processing Requires Matching Memory Space", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+  auto correct_space = batch.get_memory_space()->get_id();
+  auto wrong_space   = memory::memory_space_id{memory::Tier::HOST, correct_space.device_id};
+
+  REQUIRE(batch.try_to_create_task() == true);
+
+  auto wrong = batch.try_to_lock_for_processing(wrong_space);
+  REQUIRE(wrong.success == false);
+  REQUIRE(wrong.status == lock_for_processing_status::memory_space_mismatch);
+  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch.get_state() == batch_state::task_created);
+
+  auto right = batch.try_to_lock_for_processing(correct_space);
+  REQUIRE(right.success == true);
+  REQUIRE(right.status == lock_for_processing_status::success);
+  auto handle = std::move(right.handle);
+  REQUIRE(handle.valid());
+  REQUIRE(batch.get_processing_count() == 1);
 }
 
 // Test data_batch_processing_handle RAII behavior
@@ -140,6 +165,7 @@ TEST_CASE("data_batch_processing_handle RAII", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   REQUIRE(batch.get_processing_count() == 0);
   REQUIRE(batch.get_state() == batch_state::idle);
@@ -147,7 +173,7 @@ TEST_CASE("data_batch_processing_handle RAII", "[data_batch]")
   {
     // Create task first, then lock for processing
     REQUIRE(batch.try_to_create_task() == true);
-    auto r = batch.try_to_lock_for_processing();
+    auto r = batch.try_to_lock_for_processing(space_id);
     REQUIRE(r.success == true);
     auto handle = std::move(r.handle);
 
@@ -157,7 +183,7 @@ TEST_CASE("data_batch_processing_handle RAII", "[data_batch]")
     {
       // Create another handle (can lock while already processing)
       REQUIRE(batch.try_to_create_task() == true);
-      auto r2 = batch.try_to_lock_for_processing();
+      auto r2 = batch.try_to_lock_for_processing(space_id);
       REQUIRE(r2.success == true);
       auto handle2 = std::move(r2.handle);
 
@@ -177,6 +203,7 @@ TEST_CASE("data_batch In Transit Blocks Processing", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   REQUIRE(batch.get_state() == batch_state::idle);
 
@@ -189,8 +216,9 @@ TEST_CASE("data_batch In Transit Blocks Processing", "[data_batch]")
   REQUIRE(batch.get_state() == batch_state::in_transit);
 
   // Try to lock for processing should fail while in_transit
-  auto in_transit = batch.try_to_lock_for_processing();
+  auto in_transit = batch.try_to_lock_for_processing(space_id);
   REQUIRE(in_transit.success == false);
+  REQUIRE(in_transit.status == lock_for_processing_status::invalid_state);
   REQUIRE(batch.get_processing_count() == 0);
 
   // Release the in_transit lock
@@ -203,10 +231,11 @@ TEST_CASE("data_batch Cannot Go In Transit While Processing", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   // Create task and start processing
   REQUIRE(batch.try_to_create_task() == true);
-  auto r = batch.try_to_lock_for_processing();
+  auto r = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto handle = std::move(r.handle);
 
@@ -266,6 +295,7 @@ TEST_CASE("data_batch Thread-Safe Processing Count", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   constexpr int num_threads      = 10;
   constexpr int locks_per_thread = 100;
@@ -275,11 +305,11 @@ TEST_CASE("data_batch Thread-Safe Processing Count", "[data_batch]")
 
   // Launch threads to lock for processing
   for (int i = 0; i < num_threads; ++i) {
-    threads.emplace_back([&batch, &thread_handles, i]() {
+    threads.emplace_back([&batch, &thread_handles, i, space_id]() {
       for (int j = 0; j < locks_per_thread; ++j) {
         // Create task first so threads can lock for processing
         REQUIRE(batch.try_to_create_task() == true);
-        auto r = batch.try_to_lock_for_processing();
+        auto r = batch.try_to_lock_for_processing(space_id);
         REQUIRE(r.success == true);
         thread_handles[i].push_back(std::move(r.handle));
       }
@@ -327,6 +357,7 @@ TEST_CASE("data_batch Zero Processing Count", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   // Starting processing count should be zero
   REQUIRE(batch.get_processing_count() == 0);
@@ -335,7 +366,7 @@ TEST_CASE("data_batch Zero Processing Count", "[data_batch]")
   // Create task and lock for processing
   REQUIRE(batch.try_to_create_task() == true);
   {
-    auto r = batch.try_to_lock_for_processing();
+    auto r = batch.try_to_lock_for_processing(space_id);
     REQUIRE(r.success == true);
     auto handle = std::move(r.handle);
     REQUIRE(handle.valid());
@@ -349,7 +380,7 @@ TEST_CASE("data_batch Zero Processing Count", "[data_batch]")
 
   // Can create task and lock again from idle
   REQUIRE(batch.try_to_create_task() == true);
-  auto r2 = batch.try_to_lock_for_processing();
+  auto r2 = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r2.success == true);
   auto handle2 = std::move(r2.handle);
   REQUIRE(handle2.valid());
@@ -379,8 +410,9 @@ TEST_CASE("data_batch Move Requires Zero Processing Count", "[data_batch]")
   {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     data_batch batch1(1, std::move(data));
+    auto space_id = batch1.get_memory_space()->get_id();
     batch1.try_to_create_task();
-    auto r = batch1.try_to_lock_for_processing();
+    auto r = batch1.try_to_lock_for_processing(space_id);
     REQUIRE(r.success == true);
     auto handle = std::move(r.handle);
 
@@ -406,6 +438,7 @@ TEST_CASE("data_batch Rapid Processing Cycles", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   // Perform many cycles of lock and unlock via handles
   for (int cycle = 0; cycle < 100; ++cycle) {
@@ -414,7 +447,7 @@ TEST_CASE("data_batch Rapid Processing Cycles", "[data_batch]")
     std::vector<data_batch_processing_handle> handles;
     for (int i = 0; i < 10; ++i) {
       REQUIRE(batch.try_to_create_task() == true);
-      auto r = batch.try_to_lock_for_processing();
+      auto r = batch.try_to_lock_for_processing(space_id);
       REQUIRE(r.success == true);
       handles.push_back(std::move(r.handle));
     }
@@ -449,7 +482,8 @@ TEST_CASE("data_batch Smart Pointer Lifecycle", "[data_batch]")
 
     // Both point to the same batch
     batch->try_to_create_task();
-    auto r = batch->try_to_lock_for_processing();
+    auto space_id = batch->get_memory_space()->get_id();
+    auto r        = batch->try_to_lock_for_processing(space_id);
     REQUIRE(r.success == true);
     REQUIRE(batch_copy->get_processing_count() == 1);
 
@@ -476,9 +510,10 @@ TEST_CASE("data_batch_processing_handle Move Semantics", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   REQUIRE(batch.try_to_create_task() == true);
-  auto r = batch.try_to_lock_for_processing();
+  auto r = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto h = std::move(r.handle);
   REQUIRE(h.valid());
@@ -486,7 +521,7 @@ TEST_CASE("data_batch_processing_handle Move Semantics", "[data_batch]")
 
   {
     REQUIRE(batch.try_to_create_task() == true);
-    auto r1 = batch.try_to_lock_for_processing();
+    auto r1 = batch.try_to_lock_for_processing(space_id);
     REQUIRE(r1.success == true);
     auto handle1 = std::move(r1.handle);
 
@@ -513,9 +548,10 @@ TEST_CASE("data_batch_processing_handle Explicit Release", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
 
   REQUIRE(batch.try_to_create_task() == true);
-  auto r = batch.try_to_lock_for_processing();
+  auto r = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto handle = std::move(r.handle);
 
@@ -575,7 +611,7 @@ TEST_CASE("data_batch Task Created State Transitions", "[data_batch]")
   REQUIRE(batch.get_state() == batch_state::task_created);
 
   // Go to processing
-  auto r = batch.try_to_lock_for_processing();
+  auto r = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto handle = std::move(r.handle);
   REQUIRE(handle.valid());

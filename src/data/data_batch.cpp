@@ -166,17 +166,33 @@ bool data_batch::try_to_cancel_task()
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
 }
-lock_for_processing_result data_batch::try_to_lock_for_processing()
+lock_for_processing_result data_batch::try_to_lock_for_processing(
+  memory::memory_space_id requested_memory_space)
 {
   std::condition_variable* cv_to_notify = nullptr;
   bool should_notify                    = false;
-  lock_for_processing_result result{false, data_batch_processing_handle{}};
+  lock_for_processing_result result{
+    false, data_batch_processing_handle{}, lock_for_processing_status::not_attempted};
   {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    if (_task_created_count == 0) { return result; }
+    if (_data == nullptr) {
+      result.status = lock_for_processing_status::missing_data;
+      return result;
+    }
+
+    if (_data->get_memory_space().get_id() != requested_memory_space) {
+      result.status = lock_for_processing_status::memory_space_mismatch;
+      return result;
+    }
+
+    if (_task_created_count == 0) {
+      result.status = lock_for_processing_status::task_not_created;
+      return result;
+    }
 
     if (!(_state == batch_state::task_created || _state == batch_state::processing)) {
+      result.status = lock_for_processing_status::invalid_state;
       return result;
     }
     --_task_created_count;
@@ -184,7 +200,7 @@ lock_for_processing_result data_batch::try_to_lock_for_processing()
     _state        = batch_state::processing;
     should_notify = true;
     cv_to_notify  = _state_change_cv;
-    result        = {true, data_batch_processing_handle{this}};
+    result        = {true, data_batch_processing_handle{this}, lock_for_processing_status::success};
   }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return result;
