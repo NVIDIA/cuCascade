@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -361,8 +362,11 @@ class data_batch {
    *
    * @return true if the batch was successfully transitioned to idle
    * @return false if the batch is not in in_transit state
+   *
+   * @param target_state Optional state to transition to when releasing in_transit. If not set,
+   *        the batch returns to idle.
    */
-  bool try_to_release_in_transit();
+  bool try_to_release_in_transit(std::optional<batch_state> target_state = std::nullopt);
 
  private:
   friend class data_batch_processing_handle;

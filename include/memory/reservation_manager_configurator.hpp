@@ -99,8 +99,7 @@ class reservation_manager_configurator {
   /// @note this is meant to be used for testing purpose only, host ids will be mapped to numa ids
   builder_reference& set_host_ids(const std::vector<int>& host_ids);
 
-  /// @brief set host ids
-  /// @param host_ids Vector of host ids.
+  /// @brief uses the gpu ids as host ids
   /// @note this is meant to be used for testing purpose only, host ids will be mapped to numa ids
   builder_reference& use_gpu_ids_as_host();
 

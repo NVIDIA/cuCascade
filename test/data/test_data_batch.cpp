@@ -218,7 +218,7 @@ TEST_CASE("data_batch In Transit Blocks Processing", "[data_batch]")
   // Try to lock for processing should fail while in_transit
   auto in_transit = batch.try_to_lock_for_processing(space_id);
   REQUIRE(in_transit.success == false);
-  REQUIRE(in_transit.status == lock_for_processing_status::invalid_state);
+  REQUIRE(in_transit.status == lock_for_processing_status::task_not_created);
   REQUIRE(batch.get_processing_count() == 0);
 
   // Release the in_transit lock
@@ -597,8 +597,12 @@ TEST_CASE("data_batch Task Created State Transitions", "[data_batch]")
   REQUIRE(batch.try_to_create_task() == true);
   REQUIRE(batch.get_state() == batch_state::task_created);
 
-  // Cannot lock for in_transit while in task_created state
-  REQUIRE(batch.try_to_lock_for_in_transit() == false);
+  // Can lock for in_transit while in task_created state (to move data)
+  REQUIRE(batch.try_to_lock_for_in_transit() == true);
+  REQUIRE(batch.get_state() == batch_state::in_transit);
+
+  // Release in_transit returns to task_created since the task is still pending
+  REQUIRE(batch.try_to_release_in_transit(batch_state::task_created) == true);
   REQUIRE(batch.get_state() == batch_state::task_created);
 
   // Can cancel task and go back to idle
@@ -610,6 +614,7 @@ TEST_CASE("data_batch Task Created State Transitions", "[data_batch]")
   REQUIRE(batch.try_to_create_task() == true);
   REQUIRE(batch.get_state() == batch_state::task_created);
 
+  auto space_id = batch.get_memory_space()->get_id();
   // Go to processing
   auto r = batch.try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
@@ -645,11 +650,27 @@ TEST_CASE("data_batch In Transit State Transitions", "[data_batch]")
   // Cannot cancel task (not in task_created state)
   REQUIRE(batch.try_to_cancel_task() == false);
 
-  // Release in_transit lock
+  // Release in_transit lock (defaults to idle)
   REQUIRE(batch.try_to_release_in_transit() == true);
   REQUIRE(batch.get_state() == batch_state::idle);
 
   // Cannot release in_transit again (already idle)
   REQUIRE(batch.try_to_release_in_transit() == false);
   REQUIRE(batch.get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch In Transit From Task Created Returns To Task Created", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+
+  REQUIRE(batch.try_to_create_task() == true);
+  REQUIRE(batch.get_state() == batch_state::task_created);
+
+  REQUIRE(batch.try_to_lock_for_in_transit() == true);
+  REQUIRE(batch.get_state() == batch_state::in_transit);
+
+  // Release should go back to task_created because a task is pending
+  REQUIRE(batch.try_to_release_in_transit(batch_state::task_created) == true);
+  REQUIRE(batch.get_state() == batch_state::task_created);
 }

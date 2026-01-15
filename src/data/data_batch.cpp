@@ -213,7 +213,9 @@ bool data_batch::try_to_lock_for_in_transit()
   bool success                          = false;
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    if (_processing_count == 0 && _state == batch_state::idle) {
+    if (_processing_count == 0 &&
+        ((_state == batch_state::idle) ||
+         (_state == batch_state::task_created && _task_created_count > 0))) {
       _state        = batch_state::in_transit;
       should_notify = true;
       cv_to_notify  = _state_change_cv;
@@ -224,7 +226,7 @@ bool data_batch::try_to_lock_for_in_transit()
   return success;
 }
 
-bool data_batch::try_to_release_in_transit()
+bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_state)
 {
   std::condition_variable* cv_to_notify = nullptr;
   bool should_notify                    = false;
@@ -232,7 +234,12 @@ bool data_batch::try_to_release_in_transit()
   {
     std::lock_guard<std::mutex> lock(_mutex);
     if (_state == batch_state::in_transit) {
-      _state        = batch_state::idle;
+      // Caller can explicitly choose the state to return to; default is idle.
+      if (target_state.has_value()) {
+        _state = *target_state;
+      } else {
+        _state = batch_state::idle;
+      }
       should_notify = true;
       cv_to_notify  = _state_change_cv;
       success       = true;
