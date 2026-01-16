@@ -1119,4 +1119,11 @@ TEST_CASE("shared_data_repository using get_data_batch_by_id Multiple Partitions
 
 }
 
+// test unique_data_repository throws an error when trying to get a batch by id
+TEST_CASE("unique_data_repository throws an error when trying to get a batch by id", "[data_repository]")
+{
+  unique_data_repository repository;
+  REQUIRE_THROWS_WITH(repository.get_data_batch_by_id(0, batch_state::task_created, 0), "get_data_batch_by_id is not supported for unique_ptr repositories. Use pop_data_batch to move ownership instead.");
+}
+
 
