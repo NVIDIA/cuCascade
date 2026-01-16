@@ -23,9 +23,9 @@ namespace cucascade {
 template class idata_repository<std::shared_ptr<data_batch>>;
 template class idata_repository<std::unique_ptr<data_batch>>;
 
-// Explicit specialization of get_data_batch for shared_ptr (copies the pointer)
+// Explicit specialization of get_data_batch_by_id for shared_ptr (copies the pointer)
 template <>
-std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_data_batch(
+std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_data_batch_by_id(
   uint64_t batch_id, std::optional<batch_state> target_state, size_t partition_idx)
 {
   std::unique_lock<std::mutex> lock(_mutex);
@@ -60,7 +60,7 @@ std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_d
           case batch_state::task_created: can_transition = batch_ptr->try_to_create_task(); break;
           case batch_state::processing:
             throw std::runtime_error(
-              "get_data_batch cannot transition directly to processing; "
+              "get_data_batch_by_id cannot transition directly to processing; "
               "use pop_data_batch with task_created and call try_to_lock_for_processing() on the batch");
           case batch_state::in_transit:
             can_transition = batch_ptr->try_to_lock_for_in_transit();
@@ -90,13 +90,13 @@ std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_d
   }
 }
 
-// Explicit specialization of get_data_batch for unique_ptr (not supported)
+// Explicit specialization of get_data_batch_by_id for unique_ptr (not supported)
 template <>
-std::unique_ptr<data_batch> idata_repository<std::unique_ptr<data_batch>>::get_data_batch(
+std::unique_ptr<data_batch> idata_repository<std::unique_ptr<data_batch>>::get_data_batch_by_id(
   uint64_t /*batch_id*/, std::optional<batch_state> /*target_state*/, size_t /*partition_idx*/)
 {
   throw std::runtime_error(
-    "get_data_batch is not supported for unique_ptr repositories. "
+    "get_data_batch_by_id is not supported for unique_ptr repositories. "
     "Use pop_data_batch to move ownership instead.");
 }
 

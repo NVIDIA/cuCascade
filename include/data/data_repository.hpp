@@ -271,7 +271,7 @@ class idata_repository {
    * @throws std::runtime_error if target_state is batch_state::processing or if called on unique_ptr repository
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType get_data_batch(uint64_t batch_id, std::optional<batch_state> target_state, size_t partition_idx = 0);
+  virtual PtrType get_data_batch_by_id(uint64_t batch_id, std::optional<batch_state> target_state, size_t partition_idx = 0);
 
   /**
    * @brief Get all batch IDs from a partition.

@@ -1077,8 +1077,8 @@ TEST_CASE("shared_data_repository pop Multiple Partitions with Non-existent Batc
   REQUIRE(batch == nullptr);
 }
 
-// Test case using get_data_batch
-TEST_CASE("shared_data_repository using get_data_batch Multiple Partitions", "[data_repository]")
+// Test case using get_data_batch_by_id
+TEST_CASE("shared_data_repository using get_data_batch_by_id Multiple Partitions", "[data_repository]")
 {
   shared_data_repository repository;
   // add some batches
@@ -1091,13 +1091,13 @@ TEST_CASE("shared_data_repository using get_data_batch Multiple Partitions", "[d
 
   // lets iterate through all batches and get them by id and check if they are the same
   for (auto& batch : batches) {
-    auto batch_from_repo = repository.get_data_batch(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
+    auto batch_from_repo = repository.get_data_batch_by_id(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
     REQUIRE(batch_from_repo != nullptr);
     REQUIRE(batch_from_repo->get_batch_id() == batch->get_batch_id());
     REQUIRE(batch_from_repo == batch);
 
     // get the same batch again
-    auto batch_from_repo2 = repository.get_data_batch(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
+    auto batch_from_repo2 = repository.get_data_batch_by_id(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
     REQUIRE(batch_from_repo2 != nullptr);
     REQUIRE(batch_from_repo2->get_batch_id() == batch->get_batch_id());
     REQUIRE(batch_from_repo2 == batch);
@@ -1112,7 +1112,7 @@ TEST_CASE("shared_data_repository using get_data_batch Multiple Partitions", "[d
     REQUIRE(batch_from_repo3 == batch_from_repo2);
 
     // now lets get the batch again and it should be nullptr
-    auto batch_from_repo4 = repository.get_data_batch(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
+    auto batch_from_repo4 = repository.get_data_batch_by_id(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
     REQUIRE(batch_from_repo4 == nullptr);
   }
   REQUIRE(repository.total_size() == 0);
