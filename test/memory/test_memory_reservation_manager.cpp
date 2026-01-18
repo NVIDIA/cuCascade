@@ -29,18 +29,17 @@
  * - Run all tests: ./test_executable "[memory_space]"
  */
 
-#include "memory/common.hpp"
-#include "memory/fixed_size_host_memory_resource.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/memory_reservation_manager.hpp"
-#include "memory/reservation_aware_resource_adaptor.hpp"
-#include "memory/reservation_manager_configurator.hpp"
-
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/device/cuda_memory_resource.hpp>
 
 #include <catch2/catch.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <algorithm>
 #include <cstdlib>

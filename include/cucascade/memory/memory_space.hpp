@@ -17,10 +17,10 @@
 
 #pragma once
 
-#include "memory/common.hpp"
-#include "memory/config.hpp"
-#include "memory/disk_access_limiter.hpp"
-#include "memory/notification_channel.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/disk_access_limiter.hpp>
+#include <cucascade/memory/notification_channel.hpp>
 
 #include <concepts>
 #include <cstdint>

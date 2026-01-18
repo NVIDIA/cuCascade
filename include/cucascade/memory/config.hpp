@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "memory/common.hpp"
+#include <cucascade/memory/common.hpp>
 
 #include <variant>
 

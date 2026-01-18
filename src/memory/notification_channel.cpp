@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "memory/notification_channel.hpp"
+#include <cucascade/memory/notification_channel.hpp>
 
 namespace cucascade {
 namespace memory {

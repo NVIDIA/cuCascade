@@ -17,15 +17,6 @@
 
 #pragma once
 
-#include "data/common.hpp"
-#include "data/representation_converter.hpp"
-#include "memory/common.hpp"
-#include "memory/memory_reservation_manager.hpp"
-#include "memory/memory_space.hpp"
-#include "memory/null_device_memory_resource.hpp"
-#include "memory/numa_region_pinned_host_allocator.hpp"
-#include "memory/reservation_manager_configurator.hpp"
-
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
@@ -35,6 +26,15 @@
 #include <rmm/mr/device/cuda_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
+
+#include <cucascade/data/common.hpp>
+#include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/null_device_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <memory>
 #include <vector>

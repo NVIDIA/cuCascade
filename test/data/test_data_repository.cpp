@@ -15,11 +15,11 @@
  * limitations under the License.
  */
 
-#include "data/data_batch.hpp"
-#include "data/data_repository.hpp"
 #include "utils/mock_test_utils.hpp"
 
 #include <catch2/catch.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
 #include <map>

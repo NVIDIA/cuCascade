@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "memory/oom_handling_policy.hpp"
+#include <cucascade/memory/oom_handling_policy.hpp>
 
 namespace cucascade {
 namespace memory {

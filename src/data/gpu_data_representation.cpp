@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-#include "data/gpu_data_representation.hpp"
-
 #include <cudf/utilities/traits.hpp>
+
+#include <cucascade/data/gpu_data_representation.hpp>
 
 namespace cucascade {
 

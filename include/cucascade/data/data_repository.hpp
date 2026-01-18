@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "data_batch.hpp"
+#include <cucascade/data/data_batch.hpp>
 
 #include <condition_variable>
 #include <memory>

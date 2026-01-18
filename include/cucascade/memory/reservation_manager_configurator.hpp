@@ -17,10 +17,10 @@
 
 #pragma once
 
-#include "memory/common.hpp"
-#include "memory/memory_reservation_manager.hpp"
-#include "memory/memory_space.hpp"
-#include "memory/topology_discovery.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <list>
 #include <span>

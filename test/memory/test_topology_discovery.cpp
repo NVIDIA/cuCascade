@@ -29,9 +29,8 @@
  * - Run all tests: ./test_executable "[memory_space]"
  */
 
-#include "memory/topology_discovery.hpp"
-
 #include <catch2/catch.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <cstdlib>
 #include <vector>

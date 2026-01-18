@@ -17,11 +17,11 @@
 
 #pragma once
 
-#include "memory/common.hpp"
-#include "memory/config.hpp"
-#include "memory/memory_space.hpp"
-
 #include <rmm/cuda_device.hpp>
+
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <condition_variable>
 #include <filesystem>

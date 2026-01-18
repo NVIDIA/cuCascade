@@ -17,10 +17,10 @@
 
 #pragma once
 
-#include "data/common.hpp"
-#include "memory/memory_space.hpp"
-
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cucascade/data/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <functional>
 #include <memory>

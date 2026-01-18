@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
-#include "data/cpu_data_representation.hpp"
-#include "data/gpu_data_representation.hpp"
-#include "data/representation_converter.hpp"
-#include "memory/memory_reservation_manager.hpp"
+#include "cucascade/data/cpu_data_representation.hpp"
+#include "cucascade/data/gpu_data_representation.hpp"
+#include "cucascade/data/representation_converter.hpp"
+#include "cucascade/memory/memory_reservation_manager.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "data/data_repository.hpp"
+#include <cucascade/data/data_repository.hpp>
 
 namespace cucascade {
 

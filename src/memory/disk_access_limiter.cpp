@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "memory/disk_access_limiter.hpp"
+#include <cucascade/memory/disk_access_limiter.hpp>
 
 namespace cucascade {
 namespace memory {

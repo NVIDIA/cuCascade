@@ -15,16 +15,15 @@
  * limitations under the License.
  */
 
-#include "memory/memory_reservation_manager.hpp"
-
-#include "memory/common.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/memory_space.hpp"
-#include "memory/numa_region_pinned_host_allocator.hpp"
-#include "utils/overloaded.hpp"
-
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
+
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <cucascade/utils/overloaded.hpp>
 
 #include <algorithm>
 #include <cstdint>

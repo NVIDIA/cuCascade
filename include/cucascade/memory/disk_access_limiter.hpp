@@ -24,10 +24,10 @@
 #include <string_view>
 
 // Include existing reservation system
-#include "memory/common.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/notification_channel.hpp"
-#include "utils/atomics.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/notification_channel.hpp>
+#include <cucascade/utils/atomics.hpp>
 
 namespace cucascade {
 namespace memory {

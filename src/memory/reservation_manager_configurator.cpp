@@ -15,15 +15,13 @@
  * limitations under the License.
  */
 
-#include "memory/reservation_manager_configurator.hpp"
-
-#include "memory/common.hpp"
-#include "memory/config.hpp"
-#include "memory/topology_discovery.hpp"
-
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 #include <numa.h>
 
 #include <algorithm>

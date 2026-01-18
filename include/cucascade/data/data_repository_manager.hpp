@@ -17,8 +17,8 @@
 
 #pragma once
 
-#include "data/data_repository.hpp"
-#include "data_batch.hpp"
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
 #include <map>
