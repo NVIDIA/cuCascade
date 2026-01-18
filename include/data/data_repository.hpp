@@ -19,6 +19,7 @@
 
 #include "data_batch.hpp"
 
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -69,47 +70,88 @@ class idata_repository {
    */
   virtual void add_data_batch(PtrType batch)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _data_batches.push_back(std::move(batch));
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (batch) { batch->set_state_change_cv(&_cv); }
+      _data_batches.push_back(std::move(batch));
+    }
+    _cv.notify_all();
   }
 
   /**
-   * @brief Remove and return a data batch from this repository according to eviction policy.
+   * @brief Notify waiting threads that a batch state may have changed.
    *
-   * The specific data batch returned depends on the implementation's eviction strategy:
-   * - FIFO: Returns the oldest batch
-   * - LRU: Returns the least recently used batch
-   * - Priority: Returns the lowest priority batch
-   *
-   * This method attempts to lock the batch for processing before returning it.
-   * If the batch cannot be locked (e.g., it's being downgraded), it returns an
-   * empty pair.
-   *
-   * @return std::pair<PtrType, data_batch_processing_handle> The data batch and a processing
-   *         handle that will decrement the processing count when destroyed. Returns empty
-   *         pair if repository is empty or batch cannot be locked for processing.
-   *
-   * @note Thread-safe operation protected by internal mutex
+   * Call this method when a batch's state changes outside the repository
+   * (e.g., after releasing a processing handle) to wake up threads blocked
+   * in pull_data_batch().
    */
-  virtual std::pair<PtrType, data_batch_processing_handle> pull_data_batch()
+  void notify_state_change() { _cv.notify_all(); }
+
+  /**
+   * @brief Remove and return a data batch that can transition to the target state.
+   *
+   * Searches for a batch that can successfully transition to the specified target state.
+   * The specific batch returned depends on the implementation's eviction strategy:
+   * - FIFO: Searches from oldest to newest
+   * - LRU: Searches from least recently used
+   * - Priority: Searches from lowest priority
+   *
+   * State transition behavior:
+   * - task_created: Calls try_to_create_task() on the batch. Succeeds for idle,
+   *   task_created, or processing batches. Processing batches stay in processing state.
+   * - processing: Not allowed here; an exception is thrown. Callers should pull with
+   *   task_created and then manually call try_to_lock_for_processing() on the returned batch.
+   * - in_transit: Calls try_to_lock_for_in_transit() on the batch. Succeeds only
+   *   for idle batches with no active processing.
+   *
+   * If no batch can transition to the target state, this method blocks until either:
+   * - A new batch is added to the repository
+   * - notify_state_change() is called
+   *
+   * @param target_state The state to transition the batch to (must not be processing)
+   * @return PtrType The data batch that was successfully transitioned, or nullptr
+   *         if the repository is empty after waiting.
+   *
+   * @note Thread-safe operation protected by internal mutex and condition variable
+   * @throws std::runtime_error if target_state is batch_state::processing
+   */
+  virtual PtrType pull_data_batch(batch_state target_state)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (_data_batches.empty()) { return {PtrType{}, data_batch_processing_handle{}}; }
+    std::unique_lock<std::mutex> lock(_mutex);
 
-    auto batch = std::move(_data_batches.front());
-    _data_batches.erase(_data_batches.begin());
+    while (true) {
+      if (_data_batches.empty()) { return PtrType{}; }
 
-    // Get raw pointer for the handle (works for both shared_ptr and unique_ptr)
-    data_batch* batch_ptr = batch.get();
+      // Search for a batch that can transition to the target state
+      for (auto it = _data_batches.begin(); it != _data_batches.end(); ++it) {
+        data_batch* batch_ptr = it->get();
+        bool can_transition   = false;
 
-    // Try to lock for processing
-    if (batch_ptr && batch_ptr->try_to_lock_for_processing()) {
-      return {std::move(batch), data_batch_processing_handle{batch_ptr}};
+        switch (target_state) {
+          case batch_state::task_created: can_transition = batch_ptr->try_to_create_task(); break;
+          case batch_state::processing:
+            throw std::runtime_error(
+              "pull_data_batch cannot transition directly to processing; "
+              "pull with task_created and call try_to_lock_for_processing() on the batch");
+          case batch_state::in_transit:
+            can_transition = batch_ptr->try_to_lock_for_in_transit();
+            break;
+          case batch_state::idle:
+            // Cannot transition to idle via pull - idle is a terminal state
+            can_transition = false;
+            break;
+        }
+
+        if (can_transition) {
+          auto batch = std::move(*it);
+          _data_batches.erase(it);
+          return batch;
+        }
+      }
+
+      // No batch could transition - wait for new batches or state changes
+      _cv.wait(lock);
     }
-
-    // Could not lock for processing - put it back and return empty
-    _data_batches.insert(_data_batches.begin(), std::move(batch));
-    return {PtrType{}, data_batch_processing_handle{}};
   }
 
   /**
@@ -132,13 +174,11 @@ class idata_repository {
    *
    * @note Thread-safe operation protected by internal mutex
    */
-  bool empty() const
-  {
-    return size() == 0;
-  }
+  bool empty() const { return size() == 0; }
 
  protected:
   mutable std::mutex _mutex;           ///< Mutex for thread-safe access to repository operations
+  std::condition_variable _cv;         ///< Condition variable for blocking pull operations
   std::vector<PtrType> _data_batches;  ///< Container for data batch pointers
 };
 

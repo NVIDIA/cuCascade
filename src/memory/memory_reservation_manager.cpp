@@ -137,7 +137,7 @@ memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_
       static_cast<std::size_t>(config.downgrade_stop_threshold *
                                static_cast<float>(config.memory_capacity)),
       config.memory_capacity,
-      config.mr_factory_fn(config.device_id, config.memory_limit, config.memory_capacity));
+      config.mr_factory_fn(config.device_id, config.memory_capacity));
     _memory_spaces.push_back(std::move(mem_space));
   }
 
@@ -146,28 +146,6 @@ memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_
 }
 
 memory_reservation_manager::~memory_reservation_manager() { shutdown(); }
-
-memory_reservation_manager::memory_space_config::memory_space_config(
-  Tier t, int dev_id, size_t mem_limit, DeviceMemoryResourceFactoryFn mr_fn)
-  : memory_space_config(t, dev_id, mem_limit, mem_limit, std::move(mr_fn))
-{
-}
-
-memory_reservation_manager::memory_space_config::memory_space_config(
-  Tier t,
-  int dev_id,
-  size_t mem_limit,
-  std::size_t mem_capacity,
-  DeviceMemoryResourceFactoryFn mr_fn)
-  : tier(t),
-    device_id(dev_id),
-    memory_limit(mem_limit),
-    memory_capacity(mem_capacity),
-    mr_factory_fn(std::move(mr_fn))
-{
-  assert(memory_limit <= memory_capacity && "Memory limit cannot exceed device capacity");
-  if (mr_factory_fn == nullptr) { mr_factory_fn = make_default_allocator_for_tier(t); }
-}
 
 std::unique_ptr<reservation> memory_reservation_manager::request_reservation(
   const reservation_request_strategy& request, size_t size)

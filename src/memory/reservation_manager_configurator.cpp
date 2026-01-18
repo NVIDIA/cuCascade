@@ -30,12 +30,12 @@
 #include <numeric>
 #include <set>
 #include <variant>
+#include <vector>
 
 namespace cucascade {
 namespace memory {
 
-using builder_reference   = reservation_manager_configurator::builder_reference;
-using memory_space_config = reservation_manager_configurator::memory_space_config;
+using builder_reference = reservation_manager_configurator::builder_reference;
 
 builder_reference& reservation_manager_configurator::set_number_of_gpus(std::size_t n_gpus)
 {
@@ -118,16 +118,23 @@ builder_reference& reservation_manager_configurator::set_numa_ids(const std::vec
   return *this;
 }
 
-builder_reference& reservation_manager_configurator::bind_cpu_tier_to_gpus()
+builder_reference& reservation_manager_configurator::set_host_ids(const std::vector<int>& host_ids)
 {
-  _auto_binding_or_numa_ids = std::monostate{};
+  assert(!host_ids.empty() && "NUMA IDs list cannot be empty");
+  std::list<int> ids(host_ids.begin(), host_ids.end());
+  _auto_binding_or_numa_ids = std::move(ids);
   return *this;
 }
 
-builder_reference& reservation_manager_configurator::set_host_id_to_numa_maps(
-  const std::unordered_map<int, int>& host_to_numa_maps)
+builder_reference& reservation_manager_configurator::use_gpu_ids_as_host()
 {
-  _auto_binding_or_numa_ids = host_to_numa_maps;
+  _auto_binding_or_numa_ids = same_ids_tag{};
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::bind_cpu_tier_to_gpus()
+{
+  _auto_binding_or_numa_ids = bind_cpu_to_gpu{};
   return *this;
 }
 
@@ -209,14 +216,13 @@ std::pair<std::vector<int>, std::vector<int>> reservation_manager_configurator::
       gpu_ids.push_back(gpu_id);
       _gpu_mr_fn = [device_to_gpu_map, current_mr_fn = _gpu_mr_fn](
                      int tier_id,
-                     size_t limit,
                      size_t capacity) -> std::unique_ptr<rmm::mr::device_memory_resource> {
         auto it = device_to_gpu_map.find(tier_id);
         if (it == device_to_gpu_map.end()) {
           throw std::runtime_error("GPU ID not found in device to GPU map");
         }
         int gpu_id = it->second;
-        return current_mr_fn(gpu_id, limit, capacity);
+        return current_mr_fn(gpu_id, capacity);
       };
     };
     return {gpu_ids, tier_ids};
@@ -257,7 +263,7 @@ std::vector<int> reservation_manager_configurator::extract_host_ids(
   const std::vector<int>& gpu_ids, const system_topology_info* topology) const
 {
   std::vector<int> host_numa_ids;
-  if (std::holds_alternative<std::monostate>(_auto_binding_or_numa_ids)) {
+  if (std::holds_alternative<bind_cpu_to_gpu>(_auto_binding_or_numa_ids)) {
     assert(topology != nullptr && "Topology must be provided when auto-binding to NUMA nodes");
     std::set<int> gpu_numa_ids;
     for (int gpu_id : gpu_ids) {
@@ -268,23 +274,20 @@ std::vector<int> reservation_manager_configurator::extract_host_ids(
   } else if (std::holds_alternative<std::vector<int>>(_auto_binding_or_numa_ids)) {
     host_numa_ids = std::get<std::vector<int>>(_auto_binding_or_numa_ids);
   } else {
-    const auto& host_to_numa_maps =
-      std::get<std::unordered_map<int, int>>(_auto_binding_or_numa_ids);
-    for (const auto& [host_id, numa_id] : host_to_numa_maps) {
-      host_numa_ids.push_back(host_id);
+    if (std::holds_alternative<same_ids_tag>(_auto_binding_or_numa_ids)) {
+      host_numa_ids = gpu_ids;
+    } else if (std::holds_alternative<std::list<int>>(_auto_binding_or_numa_ids)) {
+      const auto& ids = std::get<std::list<int>>(_auto_binding_or_numa_ids);
+      host_numa_ids.insert(host_numa_ids.end(), ids.begin(), ids.end());
     }
     auto current_mr_fn = _cpu_mr_fn;
-    _cpu_mr_fn = [host_to_numa_maps, current_mr_fn](int host_id, size_t limit, size_t capacity)
-      -> std::unique_ptr<rmm::mr::device_memory_resource> {
-      auto it = host_to_numa_maps.find(host_id);
-      if (it != host_to_numa_maps.end()) {
-        int numa_id = it->second;
-        return current_mr_fn(numa_id, limit, capacity);
-      } else {
-        throw std::runtime_error("NUMA ID not found in host to NUMA maps");
-      }
-    };
+    _cpu_mr_fn         = [current_mr_fn]([[maybe_unused]] int host_id, size_t capacity)
+      -> std::unique_ptr<rmm::mr::device_memory_resource> { return current_mr_fn(-1, capacity); };
   }
+
+  std::sort(host_numa_ids.begin(), host_numa_ids.end());
+  host_numa_ids.erase(std::unique(host_numa_ids.begin(), host_numa_ids.end()), host_numa_ids.end());
+
   return host_numa_ids;
 }
 

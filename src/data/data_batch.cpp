@@ -94,6 +94,12 @@ cucascade::memory::memory_space* data_batch::get_memory_space() const
   return &_data->get_memory_space();
 }
 
+void data_batch::set_state_change_cv(std::condition_variable* cv)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  _state_change_cv = cv;
+}
+
 void data_batch::set_data(std::unique_ptr<idata_representation> data)
 {
   std::lock_guard<std::mutex> lock(_mutex);
@@ -103,38 +109,169 @@ void data_batch::set_data(std::unique_ptr<idata_representation> data)
   _data = std::move(data);
 }
 
-bool data_batch::try_to_lock_for_processing()
+bool data_batch::try_to_create_task()
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-  if (_state == batch_state::at_rest || _state == batch_state::processing) {
-    _processing_count += 1;
-    _state = batch_state::processing;
-    return true;
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  bool success                          = false;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_state == batch_state::idle) {
+      _state = batch_state::task_created;
+      ++_task_created_count;
+      should_notify = true;
+      cv_to_notify  = _state_change_cv;
+      success       = true;
+    } else if (_state == batch_state::task_created) {
+      ++_task_created_count;
+      success = true;
+    } else if (_state == batch_state::processing) {
+      // Batch is already processing, increment counter but stay in processing state
+      ++_task_created_count;
+      success = true;
+    }
   }
-  return false;
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  return success;
 }
 
-bool data_batch::try_to_lock_for_downgrade()
+size_t data_batch::get_task_created_count() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
-  if (_processing_count == 0 && _state == batch_state::at_rest) {
-    _state = batch_state::downgrading;
-    return true;
+  return _task_created_count;
+}
+
+bool data_batch::try_to_cancel_task()
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  bool success                          = false;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_state == batch_state::task_created || _state == batch_state::processing) {
+      if (_task_created_count == 0) {
+        throw std::runtime_error(
+          "Cannot cancel task: task_created_count is zero. "
+          "try_to_create_task() must be called before try_to_cancel_task()");
+      }
+      --_task_created_count;
+      if (_task_created_count == 0 && _processing_count == 0) {
+        _state        = batch_state::idle;
+        should_notify = true;
+        cv_to_notify  = _state_change_cv;
+      }
+      success = true;
+    }
   }
-  return false;
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  return success;
+}
+lock_for_processing_result data_batch::try_to_lock_for_processing(
+  memory::memory_space_id requested_memory_space)
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  lock_for_processing_result result{
+    false, data_batch_processing_handle{}, lock_for_processing_status::not_attempted};
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (_data == nullptr) {
+      result.status = lock_for_processing_status::missing_data;
+      return result;
+    }
+
+    if (_data->get_memory_space().get_id() != requested_memory_space) {
+      result.status = lock_for_processing_status::memory_space_mismatch;
+      return result;
+    }
+
+    if (_task_created_count == 0) {
+      result.status = lock_for_processing_status::task_not_created;
+      return result;
+    }
+
+    if (!(_state == batch_state::task_created || _state == batch_state::processing)) {
+      result.status = lock_for_processing_status::invalid_state;
+      return result;
+    }
+    --_task_created_count;
+    ++_processing_count;
+    _state        = batch_state::processing;
+    should_notify = true;
+    cv_to_notify  = _state_change_cv;
+    result        = {true, data_batch_processing_handle{this}, lock_for_processing_status::success};
+  }
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  return result;
+}
+
+bool data_batch::try_to_lock_for_in_transit()
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  bool success                          = false;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_processing_count == 0 &&
+        ((_state == batch_state::idle) ||
+         (_state == batch_state::task_created && _task_created_count > 0))) {
+      _state        = batch_state::in_transit;
+      should_notify = true;
+      cv_to_notify  = _state_change_cv;
+      success       = true;
+    }
+  }
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  return success;
+}
+
+bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_state)
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  bool success                          = false;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_state == batch_state::in_transit) {
+      // Caller can explicitly choose the state to return to; default is idle.
+      if (target_state.has_value()) {
+        _state = *target_state;
+      } else {
+        _state = batch_state::idle;
+      }
+      should_notify = true;
+      cv_to_notify  = _state_change_cv;
+      success       = true;
+    }
+  }
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  return success;
 }
 
 void data_batch::decrement_processing_count()
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-  if (_state != batch_state::processing) {
-    throw std::runtime_error("Cannot decrement processing count: batch is not in processing state");
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_state != batch_state::processing) {
+      throw std::runtime_error(
+        "Cannot decrement processing count: batch is not in processing state");
+    }
+    if (_processing_count == 0) {
+      throw std::runtime_error(
+        "Cannot decrement processing count: processing count is already zero");
+    }
+    _processing_count -= 1;
+    if (_processing_count == 0) {
+      // Preserve pending task_created intent if any remain
+      _state        = (_task_created_count > 0) ? batch_state::task_created : batch_state::idle;
+      should_notify = true;
+      cv_to_notify  = _state_change_cv;
+    }
   }
-  if (_processing_count == 0) {
-    throw std::runtime_error("Cannot decrement processing count: processing count is already zero");
-  }
-  _processing_count -= 1;
-  if (_processing_count == 0) { _state = batch_state::at_rest; }
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
 }  // namespace cucascade

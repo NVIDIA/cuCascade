@@ -20,25 +20,12 @@
 #include <rmm/error.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
 
-#include <atomic>
-#include <concepts>
 #include <cstdint>
 #include <cstring>
 #include <functional>
-#include <memory>
-#include <system_error>
 #include <utility>
 
 namespace cucascade {
-
-template <class... Ts>
-struct overloaded : Ts... {
-  using Ts::operator()...;
-};
-// explicit deduction guide (not needed as of C++20)
-template <class... Ts>
-overloaded(Ts...) -> overloaded<Ts...>;
-
 namespace memory {
 /**
  * Memory tier enumeration representing different types of memory storage.
@@ -72,138 +59,15 @@ class memory_space_id {
   }
 };
 
-enum class MemoryError { SUCCESS, ALLOCATION_FAILED, LIMIT_EXCEEDED, POOL_EXHAUSTED, SIZE };
-
-struct memory_error_category : std::error_category {
-  const char* name() const noexcept final;
-
-  std::string message(int ev) const final;
-};
-
-const memory_error_category& memory_category();
-
-inline std::error_code make_error_code(MemoryError e);
-
-struct cucascade_out_of_memory : public rmm::out_of_memory {
-  explicit cucascade_out_of_memory(std::string_view message,
-                                   std::size_t requested_bytes,
-                                   std::size_t global_usage);
-
-  const std::size_t requested_bytes;
-  const std::size_t global_usage;
-};
-
-template <std::integral T>
-struct atomic_peak_tracker {
-  explicit atomic_peak_tracker(T initial_peak = 0) noexcept : _peak(initial_peak) {}
-
-  void reset(T new_peak = 0) noexcept { _peak.store(new_peak); }
-
-  [[nodiscard]] T peak() const noexcept { return _peak.load(); }
-
-  void update_peak(T current_value)
-  {
-    auto peak_value = _peak.load();
-    while (current_value > peak_value && !_peak.compare_exchange_weak(peak_value, current_value)) {}
-  }
-
- private:
-  std::atomic<T> _peak{0};
-};
-
-template <std::integral T>
-struct atomic_bounded_counter {
-  explicit atomic_bounded_counter(T initial = 0) : _value(initial) {}
-
-  std::atomic<T>& native_handle() noexcept { return _value; }
-
-  std::atomic<T> const& native_handle() const noexcept { return _value; }
-
-  std::atomic<T>& operator*() noexcept { return native_handle(); }
-
-  std::atomic<T> const& operator*() const noexcept { return native_handle(); }
-
-  std::atomic<T>* operator->() noexcept { return &_value; }
-
-  std::atomic<T> const* operator->() const noexcept { return &_value; }
-
-  [[nodiscard]] T value(std::memory_order order = std::memory_order_seq_cst) const noexcept
-  {
-    return _value.load(order);
-  }
-
-  [[nodiscard]] T load(std::memory_order order = std::memory_order_seq_cst) const noexcept
-  {
-    return _value.load(order);
-  }
-
-  /// \@brief return updated value
-  T add(T diff, std::memory_order order = std::memory_order_seq_cst) noexcept
-  {
-    return _value.fetch_add(diff, order) + diff;
-  }
-
-  [[nodiscard]] std::pair<bool, T> try_add(T diff, T upper_bound)
-  {
-    auto current = _value.load();
-    while (true) {
-      if (upper_bound < current || (upper_bound - current) < diff) { return {false, current}; }
-      if (_value.compare_exchange_weak(current, current + diff)) { return {true, current + diff}; }
-    }
-  }
-
-  [[nodiscard]] T add_bounded(T& diff, T upper_bound)
-  {
-    auto current = _value.load();
-    while (current < upper_bound) {
-      T space_left = upper_bound - current;
-      diff         = std::min(diff, space_left);
-      if (_value.compare_exchange_weak(current, current + diff)) { return current + diff; }
-    }
-    diff = 0;
-    return current;
-  }
-
-  T sub(T diff, std::memory_order order = std::memory_order_seq_cst) noexcept
-  {
-    return _value.fetch_sub(diff, order) - diff;
-  }
-
-  [[nodiscard]] std::pair<bool, T> try_sub(T diff, T lower_bound)
-  {
-    auto current = _value.load();
-    while (true) {
-      if (current < lower_bound || (current - lower_bound) < diff) { return {false, current}; }
-      if (_value.compare_exchange_weak(current, current - diff)) { return {true, current - diff}; }
-    }
-  }
-
-  [[nodiscard]] T sub_bounded(T& diff, T lower_bound)
-  {
-    auto current = _value.load();
-    while (current > lower_bound) {
-      T space_above = current - lower_bound;
-      diff          = std::min(diff, space_above);
-
-      if (_value.compare_exchange_weak(current, current - diff)) { return current - diff; }
-    }
-    diff = 0;
-    return current;
-  }
-
- private:
-  std::atomic<T> _value{0};
-};
-
 using DeviceMemoryResourceFactoryFn =
-  std::function<std::unique_ptr<rmm::mr::device_memory_resource>(
-    int device_id, std::size_t limit, std::size_t capacity)>;
+  std::function<std::unique_ptr<rmm::mr::device_memory_resource>(int device_id,
+                                                                 std::size_t capacity)>;
 
 std::unique_ptr<rmm::mr::device_memory_resource> make_default_gpu_memory_resource(
-  int device_id, std::size_t limit, std::size_t capacity);
+  int device_id, std::size_t capacity);
 
 std::unique_ptr<rmm::mr::device_memory_resource> make_default_host_memory_resource(
-  int device_id, std::size_t limit, std::size_t capacity);
+  int device_id, std::size_t capacity);
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier);
 
@@ -216,8 +80,5 @@ template <>
 struct hash<cucascade::memory::memory_space_id> {
   size_t operator()(const cucascade::memory::memory_space_id& p) const;
 };
-
-template <>
-struct is_error_code_enum<cucascade::memory::MemoryError> : true_type {};
 
 }  // namespace std

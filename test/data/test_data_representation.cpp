@@ -18,6 +18,7 @@
 #include "data/cpu_data_representation.hpp"
 #include "data/gpu_data_representation.hpp"
 #include "data/representation_converter.hpp"
+#include "memory/config.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
 #include "memory/host_table.hpp"
 #include "memory/memory_reservation_manager.hpp"
@@ -260,7 +261,7 @@ static std::unique_ptr<memory::memory_reservation_manager> create_multi_gpu_mana
                                                                                     int dev_b)
 {
   using namespace cucascade::memory;
-  std::vector<memory_reservation_manager::memory_space_config> configs;
+  std::vector<memory_space_config> configs;
   configs.emplace_back(Tier::GPU, dev_a, 2048ull * 1024 * 1024);
   configs.emplace_back(Tier::GPU, dev_b, 2048ull * 1024 * 1024);
   return std::make_unique<memory_reservation_manager>(std::move(configs));

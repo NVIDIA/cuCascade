@@ -29,9 +29,11 @@
 
 // Include existing reservation system
 #include "memory/common.hpp"
+#include "memory/error.hpp"
 #include "memory/memory_reservation.hpp"
 #include "memory/notification_channel.hpp"
 #include "memory/oom_handling_policy.hpp"
+#include "utils/atomics.hpp"
 
 namespace cucascade {
 namespace memory {
@@ -80,8 +82,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
       return current < sz ? static_cast<std::size_t>(sz - current) : 0UL;
     }
 
-    atomic_bounded_counter<std::int64_t> allocated_bytes{0LL};
-    atomic_peak_tracker<std::int64_t> peak_allocated_bytes{0LL};
+    utils::atomic_bounded_counter<std::int64_t> allocated_bytes{0LL};
+    utils::atomic_peak_tracker<std::int64_t> peak_allocated_bytes{0LL};
 
    private:
     reservation_aware_resource_adaptor* _mr;
@@ -147,8 +149,11 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
   /**
    * @brief Constructs a per-stream tracking resource adaptor.
    *
+   * @param space_id The unique identifier for this memory space
    * @param upstream The upstream memory resource to wrap
    * @param capacity The total capacity for allocations
+   * @param stream_reservation_policy The default reservation policy for streams
+   * @param default_oom_policy The default OOM handling policy
    * @param tracking_scope [default: PER_STREAM] The scope of allocation tracking (per-stream,
    * per-thread)
    */
@@ -163,9 +168,12 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
   /**
    * @brief Constructs a per-stream tracking resource adaptor.
    *
+   * @param space_id The unique identifier for this memory space
    * @param upstream The upstream memory resource to wrap
-   * @param capacity The total capacity for allocations
    * @param memory_limit The memory limit for reservations
+   * @param capacity The total capacity for allocations
+   * @param stream_reservation_policy The default reservation policy for streams
+   * @param default_oom_policy The default OOM handling policy
    * @param tracking_scope [default: PER_STREAM] The scope of allocation tracking (per-stream,
    * per-thread)
    */
@@ -259,7 +267,7 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
   /**
    * @brief makes reservations
    * @param bytes the size of reservation
-   * @param on_release_notifer used to hook callbacks for when the reservation is released
+   * @param release_notifer used to hook callbacks for when the reservation is released
    */
   std::unique_ptr<reserved_arena> reserve(
     std::size_t bytes, std::unique_ptr<event_notifier> release_notifer = nullptr);
@@ -267,7 +275,7 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
   /**
    * @brief makes reservations
    * @param bytes the size of reservation
-   * @param on_release_notifer used to hook callbacks for when the reservation is released
+   * @param release_notifer used to hook callbacks for when the reservation is released
    */
   std::unique_ptr<reserved_arena> reserve_upto(
     std::size_t bytes, std::unique_ptr<event_notifier> release_notifer = nullptr);
@@ -281,6 +289,7 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
    * @brief Sets the memory reservation for a specific stream by requesting from the memory manager.
    * @param stream The CUDA stream to set reservation for
    * @param reserved_bytes The reservation object (0 = remove reservation)
+   * @param stream_reservation_policy The reservation policy for the stream
    * @param stream_oom_policy The OOM policy for the stream
    * @return true if reservation was successfully set, false otherwise
    */
@@ -317,14 +326,14 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
  private:
   /**
    * @brief grows reservation by a `bytes` size
-   * @param res current_reservation
+   * @param arena current_reservation
    * @param bytes the size of reservation
    */
   bool grow_reservation_by(device_reserved_arena& arena, std::size_t bytes);
 
   /**
    * @brief grows reservation by a `bytes` size
-   * @param res current_reservation
+   * @param arena current_reservation
    */
   void shrink_reservation_to_fit(device_reserved_arena& arena);
 
@@ -343,6 +352,7 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
    * handled by the oom handler.
    *
    * @param bytes The number of bytes to allocate
+   * @param state The tracker state for the stream
    * @param stream The CUDA stream to use for the allocation
    * @return Pointer to allocated memory
    */
@@ -365,13 +375,15 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
 
   /**
    * @brief releases reservations and returns the unused reservation back to allocator
-   * @param reservation pointer to the reservation being released
+   * @param size_bytes requested size in bytes
+   * @param limit_bytes limit in bytes
    */
   bool do_reserve(std::size_t size_bytes, std::size_t limit_bytes);
 
   /**
    * @brief releases reservations and returns the unused reservation back to allocator
-   * @param reservation pointer to the reservation being released
+   * @param size_bytes requested size in bytes
+   * @param limit_bytes limit in bytes
    */
   std::size_t do_reserve_upto(std::size_t size_bytes, std::size_t limit_bytes);
 
@@ -419,8 +431,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
   /// Global totals for efficiency
   std::atomic<size_t> _total_reserved_bytes{0UL};
   std::atomic<size_t> _number_of_allocations{0UL};
-  atomic_bounded_counter<std::size_t> _total_allocated_bytes{0UL};
-  atomic_peak_tracker<std::size_t> _peak_total_allocated_bytes{0UL};
+  utils::atomic_bounded_counter<std::size_t> _total_allocated_bytes{0UL};
+  utils::atomic_peak_tracker<std::size_t> _peak_total_allocated_bytes{0UL};
 
   /// Default policy for new streams
   std::unique_ptr<reservation_limit_policy> _default_reservation_policy;

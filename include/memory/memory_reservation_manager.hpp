@@ -18,7 +18,7 @@
 #pragma once
 
 #include "memory/common.hpp"
-#include "memory/memory_reservation_manager.hpp"
+#include "memory/config.hpp"
 #include "memory/memory_space.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -183,33 +183,6 @@ class memory_reservation_manager {
   //===----------------------------------------------------------------------===//
   // Configuration and Initialization
   //===----------------------------------------------------------------------===//
-
-  /**
-   * Configuration for a single memory_space.
-   * Contains all parameters needed to create a memory_space instance.
-   */
-  struct memory_space_config {
-    Tier tier;
-    int device_id;
-    size_t memory_limit;
-    float downgrade_tigger_threshold{0.75};
-    float downgrade_stop_threshold{0.65f};
-    std::size_t memory_capacity;  // Optional total capacity, defaults to device capacity
-    DeviceMemoryResourceFactoryFn mr_factory_fn;
-
-    // Constructor - allocators must be explicitly provided
-    memory_space_config(Tier t,
-                        int dev_id,
-                        size_t mem_limit,
-                        DeviceMemoryResourceFactoryFn mr_fn = nullptr);
-
-    // Constructor - allocators must be explicitly provided
-    memory_space_config(Tier t,
-                        int dev_id,
-                        size_t mem_limit,
-                        size_t mem_capacity,
-                        DeviceMemoryResourceFactoryFn mr_fn = nullptr);
-  };
 
   /**
    * Construct a memory_reservation_manager with the given memory space configurations.

@@ -1,3 +1,4 @@
+
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -19,14 +20,18 @@
 
 #include "data/common.hpp"
 #include "data/representation_converter.hpp"
+#include "memory/common.hpp"
 
 #include <cudf/table/table.hpp>
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 namespace cucascade {
@@ -39,22 +44,30 @@ namespace cucascade {
 
 /**
  * @brief Represents the current state of a data_batch.
+ *
+ * State transitions allowed:
+ * - idle -> in_transit, task_created
+ * - task_created -> processing, idle
+ * - processing -> idle
+ * - in_transit -> idle
  */
 enum class batch_state {
-  at_rest,     ///< Batch is idle, not being processed or downgraded
-  processing,  ///< Batch is currently being processed
-  downgrading  ///< Batch is currently being downgraded to a lower memory tier
+  idle,          ///< Batch is idle, not being processed or in transit
+  task_created,  ///< A task has been created for this batch, pending processing
+  processing,    ///< Batch is currently being processed
+  in_transit     ///< Batch is currently being moved to a different memory tier
 };
 
-// Forward declaration
+// Forward declarations
 class data_batch;
+class data_batch_processing_handle;
 
 /**
  * @brief RAII handle that manages processing state for a data_batch.
  *
  * When this handle goes out of scope, it decrements the processing count of the
  * associated data_batch. If the processing count drops to zero, the batch state
- * transitions from processing back to at_rest.
+ * transitions from processing back to idle.
  *
  * @note This class is move-only to ensure proper ownership semantics.
  */
@@ -118,6 +131,38 @@ class data_batch_processing_handle {
 };
 
 /**
+ * @brief Result of attempting to lock a batch for processing.
+ */
+enum class lock_for_processing_status {
+  success,
+  task_not_created,
+  invalid_state,
+  memory_space_mismatch,
+  missing_data,
+  not_attempted
+};
+
+struct lock_for_processing_result {
+  bool success{false};
+  data_batch_processing_handle handle{};
+  lock_for_processing_status status{lock_for_processing_status::not_attempted};
+
+  lock_for_processing_result() = default;
+  lock_for_processing_result(bool success,
+                             data_batch_processing_handle&& handle,
+                             lock_for_processing_status status)
+    : success(success), handle(std::move(handle)), status(status)
+  {
+  }
+
+  // Move-only to mirror handle semantics
+  lock_for_processing_result(lock_for_processing_result&&) noexcept            = default;
+  lock_for_processing_result& operator=(lock_for_processing_result&&) noexcept = default;
+  lock_for_processing_result(const lock_for_processing_result&)                = delete;
+  lock_for_processing_result& operator=(const lock_for_processing_result&)     = delete;
+};
+
+/**
  * @brief A data batch represents a collection of data that can be moved between different memory
  * tiers.
  *
@@ -129,7 +174,7 @@ class data_batch_processing_handle {
  * Key characteristics:
  * - Move-only semantics (no copy constructor/assignment)
  * - Processing counting for safe shared access and eviction prevention
- * - State management (at_rest, processing, downgrading) for lifecycle tracking
+ * - State management (idle, task_created, processing, in_transit) for lifecycle tracking
  * - Delegated tier management to underlying idata_representation
  * - Unique batch ID for tracking and debugging purposes
  * - Lifecycle managed by smart pointers (std::shared_ptr or std::unique_ptr)
@@ -187,7 +232,7 @@ class data_batch {
   /**
    * @brief Get the current state of this batch.
    *
-   * @return batch_state The current state (at_rest, processing, or downgrading)
+   * @return batch_state The current state (idle, task_created, processing, or in_transit)
    */
   batch_state get_state() const;
 
@@ -218,6 +263,12 @@ class data_batch {
   cucascade::memory::memory_space* get_memory_space() const;
 
   /**
+   * @brief Set a condition variable to be notified on state changes.
+   *
+   * The CV is notified outside of the batch mutex.
+   */
+  void set_state_change_cv(std::condition_variable* cv);
+  /**
    * @brief Replace the underlying data representation.
    *        Requires no active processing.
    */
@@ -243,23 +294,79 @@ class data_batch {
                   rmm::cuda_stream_view stream);
 
   /**
-   * @brief Attempt to lock this batch for processing operations.
+   * @brief Attempt to create a task for this batch.
    *
-   * Returns true if the batch is either at_rest or already processing.
-   * If successful, increments the processing count and transitions to processing state.
+   * Transitions the batch from idle to task_created state and increments task_created_counter.
+   * If the batch is already in task_created state, only increments task_created_counter.
+   * If the batch is in processing state, increments task_created_counter but stays in processing.
+   * This must be called before try_to_lock_for_processing().
    *
-   * @return true if the batch was successfully locked for processing
-   * @return false if the batch is currently being downgraded
+   * @return true if the batch is in idle, task_created, or processing state
+   * @return false if the batch is in in_transit state
    */
-  bool try_to_lock_for_processing();
+  bool try_to_create_task();
 
   /**
-   * @brief Attempt to lock this batch for downgrade operations.
+   * @brief Get the current task_created counter (mutex-protected).
    *
-   * @return true if the batch was successfully locked (processing_count == 0 and state is at_rest)
+   * This counter tracks how many task_created requests are pending for this batch.
+   * It is incremented by try_to_create_task() and decremented by try_to_lock_for_processing().
+   *
+   * @return size_t The number of pending task_created requests
+   */
+  size_t get_task_created_count() const;
+
+  /**
+   * @brief Cancel a created task and return to idle state.
+   *
+   * Transitions the batch from task_created back to idle state.
+   *
+   * @return true if the batch was successfully transitioned to idle
+   * @return false if the batch is not in task_created state
+   */
+  bool try_to_cancel_task();
+
+  /**
+   * @brief Attempt to lock this batch for processing operations.
+   *
+   * Returns a processing handle if the batch is in task_created state or already processing.
+   * If successful, decrements task_created_counter, increments processing count,
+   * and transitions to processing state (if not already processing).
+   *
+   * @param requested_memory_space The memory space the caller expects to process from. If the
+   *        batch is not currently in this space, locking fails with
+   *        lock_for_processing_status::memory_space_mismatch.
+   *
+   * @return lock_for_processing_result success=true with handle on success; success=false otherwise
+   *         with a status describing the failure.
+   * @throws std::runtime_error if task_created_count is zero (try_to_create_task() must be
+   *         called before this method) while in a lockable state.
+   */
+  lock_for_processing_result try_to_lock_for_processing(
+    memory::memory_space_id requested_memory_space);
+
+  /**
+   * @brief Attempt to lock this batch for in-transit operations (e.g., downgrade).
+   *
+   * Transitions the batch from idle to in_transit state.
+   *
+   * @return true if the batch was successfully locked (processing_count == 0 and state is idle)
    * @return false if the batch could not be locked
    */
-  bool try_to_lock_for_downgrade();
+  bool try_to_lock_for_in_transit();
+
+  /**
+   * @brief Release the in-transit lock and return to idle state.
+   *
+   * Transitions the batch from in_transit back to idle state.
+   *
+   * @return true if the batch was successfully transitioned to idle
+   * @return false if the batch is not in in_transit state
+   *
+   * @param target_state Optional state to transition to when releasing in_transit. If not set,
+   *        the batch returns to idle.
+   */
+  bool try_to_release_in_transit(std::optional<batch_state> target_state = std::nullopt);
 
  private:
   friend class data_batch_processing_handle;
@@ -268,15 +375,17 @@ class data_batch {
    * @brief Decrement processing count and potentially transition state.
    *
    * Called by data_batch_processing_handle when it goes out of scope.
-   * If processing count drops to zero, transitions from processing to at_rest.
+   * If processing count drops to zero, transitions from processing to idle.
    */
   void decrement_processing_count();
 
   mutable std::mutex _mutex;  ///< Mutex for thread-safe access to state and processing count
   uint64_t _batch_id;         ///< Unique identifier for this data batch
-  std::unique_ptr<idata_representation> _data;      ///< Pointer to the actual data representation
-  size_t _processing_count = 0;                     ///< Count of active processing handles
-  batch_state _state       = batch_state::at_rest;  ///< Current state of the batch
+  std::unique_ptr<idata_representation> _data;    ///< Pointer to the actual data representation
+  size_t _processing_count                  = 0;  ///< Count of active processing handles
+  size_t _task_created_count                = 0;  ///< Count of pending task_created requests
+  batch_state _state                        = batch_state::idle;  ///< Current state of the batch
+  std::condition_variable* _state_change_cv = nullptr;  ///< Optional CV to notify on state change
 };
 
 // Template implementation

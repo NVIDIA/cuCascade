@@ -41,7 +41,7 @@ TEST_CASE("shared_data_repository Construction", "[data_repository]")
   shared_data_repository repository;
 
   // Repository should be empty initially
-  auto [batch, handle] = repository.pull_data_batch();
+  auto batch = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(batch == nullptr);
 }
 
@@ -58,14 +58,12 @@ TEST_CASE("shared_data_repository Add and Pull Single Batch", "[data_repository]
   repository.add_data_batch(batch);
 
   // Pull from repository
-  auto [pulled_batch, handle] = repository.pull_data_batch();
+  auto pulled_batch = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(pulled_batch != nullptr);
   REQUIRE(pulled_batch->get_batch_id() == 1);
-  REQUIRE(pulled_batch->get_processing_count() == 1);
-  REQUIRE(pulled_batch->get_state() == batch_state::processing);
 
   // Repository should now be empty
-  auto [empty, empty_handle] = repository.pull_data_batch();
+  auto empty = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(empty == nullptr);
 }
 
@@ -83,13 +81,13 @@ TEST_CASE("shared_data_repository FIFO Order", "[data_repository]")
 
   // Pull them back and verify FIFO order
   for (uint64_t i = 1; i <= 5; ++i) {
-    auto [pulled_batch, handle] = repository.pull_data_batch();
+    auto pulled_batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(pulled_batch != nullptr);
     REQUIRE(pulled_batch->get_batch_id() == i);
   }
 
   // Repository should be empty
-  auto [empty, empty_handle] = repository.pull_data_batch();
+  auto empty = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(empty == nullptr);
 }
 
@@ -110,9 +108,9 @@ TEST_CASE("shared_data_repository Same Batch Multiple Repositories", "[data_repo
   repo3.add_data_batch(batch);
 
   // All repositories should have the same batch
-  auto [pulled1, handle1] = repo1.pull_data_batch();
-  auto [pulled2, handle2] = repo2.pull_data_batch();
-  auto [pulled3, handle3] = repo3.pull_data_batch();
+  auto pulled1 = repo1.pull_data_batch(batch_state::task_created);
+  auto pulled2 = repo2.pull_data_batch(batch_state::task_created);
+  auto pulled3 = repo3.pull_data_batch(batch_state::task_created);
 
   REQUIRE(pulled1 != nullptr);
   REQUIRE(pulled2 != nullptr);
@@ -126,9 +124,6 @@ TEST_CASE("shared_data_repository Same Batch Multiple Repositories", "[data_repo
   // The pointers should be the same
   REQUIRE(pulled1.get() == pulled2.get());
   REQUIRE(pulled2.get() == pulled3.get());
-
-  // Processing count should be 3 (one for each pull)
-  REQUIRE(pulled1->get_processing_count() == 3);
 }
 
 // Test pulling from empty repository
@@ -138,7 +133,7 @@ TEST_CASE("shared_data_repository Pull From Empty", "[data_repository]")
 
   // Pull from empty repository multiple times
   for (int i = 0; i < 10; ++i) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(batch == nullptr);
   }
 }
@@ -173,7 +168,7 @@ TEST_CASE("shared_data_repository Thread-Safe Adding", "[data_repository]")
   // Pull all batches and count
   int count = 0;
   while (true) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     if (!batch) break;
     ++count;
   }
@@ -204,7 +199,7 @@ TEST_CASE("shared_data_repository Thread-Safe Pulling", "[data_repository]")
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
       while (true) {
-        auto [batch, handle] = repository.pull_data_batch();
+        auto batch = repository.pull_data_batch(batch_state::task_created);
         if (!batch) break;
         ++thread_counts[i];
       }
@@ -226,7 +221,7 @@ TEST_CASE("shared_data_repository Thread-Safe Pulling", "[data_repository]")
   REQUIRE(total_count == num_batches);
 
   // Repository should be empty
-  auto [empty, empty_handle] = repository.pull_data_batch();
+  auto empty = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(empty == nullptr);
 }
 
@@ -240,7 +235,7 @@ TEST_CASE("unique_data_repository Construction", "[data_repository]")
   unique_data_repository repository;
 
   // Repository should be empty initially
-  auto [batch, handle] = repository.pull_data_batch();
+  auto batch = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(batch == nullptr);
 }
 
@@ -257,12 +252,12 @@ TEST_CASE("unique_data_repository Add and Pull Single Batch", "[data_repository]
   repository.add_data_batch(std::move(batch));
 
   // Pull from repository
-  auto [pulled_batch, handle] = repository.pull_data_batch();
+  auto pulled_batch = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(pulled_batch != nullptr);
   REQUIRE(pulled_batch->get_batch_id() == 1);
 
   // Repository should now be empty
-  auto [empty, empty_handle] = repository.pull_data_batch();
+  auto empty = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(empty == nullptr);
 }
 
@@ -280,13 +275,13 @@ TEST_CASE("unique_data_repository FIFO Order", "[data_repository]")
 
   // Pull them back and verify FIFO order
   for (uint64_t i = 1; i <= 5; ++i) {
-    auto [pulled_batch, handle] = repository.pull_data_batch();
+    auto pulled_batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(pulled_batch != nullptr);
     REQUIRE(pulled_batch->get_batch_id() == i);
   }
 
   // Repository should be empty
-  auto [empty, empty_handle] = repository.pull_data_batch();
+  auto empty = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(empty == nullptr);
 }
 
@@ -307,7 +302,7 @@ TEST_CASE("unique_data_repository Large Number of Batches", "[data_repository]")
   // Pull all batches
   int count = 0;
   while (true) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     if (!batch) break;
     ++count;
   }
@@ -329,14 +324,14 @@ TEST_CASE("unique_data_repository Interleaved Add and Pull", "[data_repository]"
     }
 
     // Pull one batch
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(batch != nullptr);
   }
 
   // Pull remaining batches
   int remaining = 0;
   while (true) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     if (!batch) break;
     ++remaining;
   }
@@ -375,7 +370,7 @@ TEST_CASE("unique_data_repository Thread-Safe Adding", "[data_repository]")
   // Pull all batches and count
   int count = 0;
   while (true) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     if (!batch) break;
     ++count;
   }
@@ -406,7 +401,7 @@ TEST_CASE("unique_data_repository Thread-Safe Pulling", "[data_repository]")
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
       while (true) {
-        auto [batch, handle] = repository.pull_data_batch();
+        auto batch = repository.pull_data_batch(batch_state::task_created);
         if (!batch) break;
         ++thread_counts[i];
       }
@@ -428,7 +423,7 @@ TEST_CASE("unique_data_repository Thread-Safe Pulling", "[data_repository]")
   REQUIRE(total_count == num_batches);
 
   // Repository should be empty
-  auto [empty, empty_handle] = repository.pull_data_batch();
+  auto empty = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(empty == nullptr);
 }
 
@@ -464,7 +459,7 @@ TEST_CASE("unique_data_repository Concurrent Add and Pull", "[data_repository]")
     threads.emplace_back([&]() {
       int local_count = 0;
       while (local_count < batches_per_thread) {
-        auto [batch, handle] = repository.pull_data_batch();
+        auto batch = repository.pull_data_batch(batch_state::task_created);
         if (batch) {
           ++local_count;
           ++pulled_count;
@@ -509,7 +504,7 @@ TEST_CASE("unique_data_repository High Contention", "[data_repository]")
         ++total_added;
 
         // Immediately try to pull a batch (might be ours or someone else's)
-        auto [pulled, handle] = repository.pull_data_batch();
+        auto pulled = repository.pull_data_batch(batch_state::task_created);
         if (pulled) { ++total_pulled; }
       }
     });
@@ -525,7 +520,7 @@ TEST_CASE("unique_data_repository High Contention", "[data_repository]")
 
   // Clean up remaining batches
   while (true) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     if (!batch) break;
     ++total_pulled;
   }
@@ -534,8 +529,8 @@ TEST_CASE("unique_data_repository High Contention", "[data_repository]")
   REQUIRE(total_pulled == total_added);
 }
 
-// Test that processing handle properly releases count
-TEST_CASE("shared_data_repository Processing Handle Release", "[data_repository]")
+// Test that pull_data_batch transitions batch to the requested state
+TEST_CASE("shared_data_repository Pull Transitions State", "[data_repository]")
 {
   shared_data_repository repository;
 
@@ -543,36 +538,40 @@ TEST_CASE("shared_data_repository Processing Handle Release", "[data_repository]
   auto batch = std::make_shared<data_batch>(1, std::move(data));
   repository.add_data_batch(batch);
 
-  {
-    auto [pulled_batch, handle] = repository.pull_data_batch();
-    REQUIRE(pulled_batch != nullptr);
-    REQUIRE(pulled_batch->get_processing_count() == 1);
-    REQUIRE(pulled_batch->get_state() == batch_state::processing);
-  }  // handle goes out of scope
+  auto pulled_batch = repository.pull_data_batch(batch_state::task_created);
+  REQUIRE(pulled_batch != nullptr);
 
-  // Since we still have the original batch shared_ptr, we can check state
-  REQUIRE(batch->get_processing_count() == 0);
-  REQUIRE(batch->get_state() == batch_state::at_rest);
+  // Batch state should be task_created after pulling with that target state
+  REQUIRE(pulled_batch->get_state() == batch_state::task_created);
+  REQUIRE(pulled_batch->get_task_created_count() == 1);
+  REQUIRE(pulled_batch->get_processing_count() == 0);
 }
 
-// Test that batch cannot be pulled if it's being downgraded
-TEST_CASE("shared_data_repository Cannot Pull During Downgrade", "[data_repository]")
+// Test that in_transit batches are skipped when pulling with task_created target
+TEST_CASE("shared_data_repository Pull Skips In Transit Batch", "[data_repository]")
 {
   shared_data_repository repository;
 
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  // Add first batch and mark it as in_transit
+  auto data1  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch1 = std::make_shared<data_batch>(1, std::move(data1));
+  REQUIRE(batch1->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch1->get_state() == batch_state::in_transit);
+  repository.add_data_batch(batch1);
 
-  // Lock for downgrade before adding to repository
-  REQUIRE(batch->try_to_lock_for_downgrade() == true);
-  REQUIRE(batch->get_state() == batch_state::downgrading);
+  // Add second batch in idle state
+  auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch2 = std::make_shared<data_batch>(2, std::move(data2));
+  repository.add_data_batch(batch2);
 
-  // Add to repository while downgrading
-  repository.add_data_batch(batch);
+  // Pull should skip the in_transit batch and return the idle one
+  auto pulled = repository.pull_data_batch(batch_state::task_created);
+  REQUIRE(pulled != nullptr);
+  REQUIRE(pulled->get_batch_id() == 2);  // Should get batch2, not batch1
+  REQUIRE(pulled->get_state() == batch_state::task_created);
 
-  // Pull should fail because batch is downgrading
-  auto [pulled, handle] = repository.pull_data_batch();
-  REQUIRE(pulled == nullptr);
+  // Repository should still have the in_transit batch
+  REQUIRE(repository.size() == 1);
 }
 
 // =============================================================================
@@ -631,14 +630,14 @@ TEST_CASE("shared_data_repository size After Pulling", "[data_repository]")
 
   // Pull batches one by one
   for (int i = 1; i <= 4; ++i) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(batch != nullptr);
     // Should still have batches available
     REQUIRE(repository.size() == (5 - i));
   }
 
   // Pull the last batch
-  auto [last_batch, last_handle] = repository.pull_data_batch();
+  auto last_batch = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(last_batch != nullptr);
 
   // Now should be empty
@@ -646,8 +645,7 @@ TEST_CASE("shared_data_repository size After Pulling", "[data_repository]")
 }
 
 // Test size with interleaved operations on shared repository
-TEST_CASE("shared_data_repository size Interleaved Operations",
-          "[data_repository]")
+TEST_CASE("shared_data_repository size Interleaved Operations", "[data_repository]")
 {
   shared_data_repository repository;
 
@@ -664,7 +662,7 @@ TEST_CASE("shared_data_repository size Interleaved Operations",
     REQUIRE(repository.size() == (cycle * 2 + 3));
 
     // Pull one batch
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(batch != nullptr);
 
     // Should still have batches (added 3, pulled 1)
@@ -673,7 +671,7 @@ TEST_CASE("shared_data_repository size Interleaved Operations",
 
   // Pull all remaining batches
   while (repository.size() > 0) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(batch != nullptr);
   }
 
@@ -733,14 +731,14 @@ TEST_CASE("unique_data_repository size After Pulling", "[data_repository]")
 
   // Pull batches one by one
   for (int i = 1; i <= 4; ++i) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(batch != nullptr);
     // Should still have batches available
     REQUIRE(repository.size() == (5 - i));
   }
 
   // Pull the last batch
-  auto [last_batch, last_handle] = repository.pull_data_batch();
+  auto last_batch = repository.pull_data_batch(batch_state::task_created);
   REQUIRE(last_batch != nullptr);
 
   // Now should be empty
@@ -748,8 +746,7 @@ TEST_CASE("unique_data_repository size After Pulling", "[data_repository]")
 }
 
 // Test size with interleaved operations on unique repository
-TEST_CASE("unique_data_repository size Interleaved Operations",
-          "[data_repository]")
+TEST_CASE("unique_data_repository size Interleaved Operations", "[data_repository]")
 {
   unique_data_repository repository;
 
@@ -766,7 +763,7 @@ TEST_CASE("unique_data_repository size Interleaved Operations",
     REQUIRE(repository.size() == (cycle * 2 + 3));
 
     // Pull one batch
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(batch != nullptr);
 
     // Should still have batches (added 3, pulled 1)
@@ -775,7 +772,7 @@ TEST_CASE("unique_data_repository size Interleaved Operations",
 
   // Pull all remaining batches
   while (repository.size() > 0) {
-    auto [batch, handle] = repository.pull_data_batch();
+    auto batch = repository.pull_data_batch(batch_state::task_created);
     REQUIRE(batch != nullptr);
   }
 
@@ -860,8 +857,7 @@ TEST_CASE("unique_data_repository size Thread-Safe", "[data_repository]")
 }
 
 // Test size with concurrent add and pull operations
-TEST_CASE("shared_data_repository size Concurrent Operations",
-          "[data_repository]")
+TEST_CASE("shared_data_repository size Concurrent Operations", "[data_repository]")
 {
   shared_data_repository repository;
 
@@ -891,7 +887,7 @@ TEST_CASE("shared_data_repository size Concurrent Operations",
       int pulled = 0;
       while (pulled < operations) {
         if (repository.size() > 0) {
-          auto [batch, handle] = repository.pull_data_batch();
+          auto batch = repository.pull_data_batch(batch_state::task_created);
           if (batch) { ++pulled; }
         } else {
           std::this_thread::yield();

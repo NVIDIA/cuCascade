@@ -63,11 +63,9 @@ class disk_access_limiter {
   /**
    * @brief Constructs a per-stream tracking resource adaptor.
    *
-   * @param upstream The upstream memory resource to wrap
-   * @param capacity The total capacity for allocations
+   * @param space_id The unique identifier for this memory space
    * @param memory_limit The memory limit for reservations
-   * @param tracking_scope [default: PER_STREAM] The scope of allocation tracking (per-stream,
-   * per-thread)
+   * @param capacity The total capacity for allocations
    */
   explicit disk_access_limiter(memory_space_id space_id,
                                std::size_t memory_limit,
@@ -102,7 +100,7 @@ class disk_access_limiter {
   /**
    * @brief makes reservations
    * @param bytes the size of reservation
-   * @param on_release_notifer used to hook callbacks for when the reservation is released
+   * @param release_notifer used to hook callbacks for when the reservation is released
    */
   std::unique_ptr<reserved_arena> reserve(
     std::size_t bytes, std::unique_ptr<event_notifier> release_notifer = nullptr);
@@ -110,7 +108,7 @@ class disk_access_limiter {
   /**
    * @brief makes reservations
    * @param bytes the size of reservation
-   * @param on_release_notifer used to hook callbacks for when the reservation is released
+   * @param release_notifer used to hook callbacks for when the reservation is released
    */
   std::unique_ptr<reserved_arena> reserve_upto(
     std::size_t bytes, std::unique_ptr<event_notifier> release_notifer = nullptr);
@@ -123,13 +121,15 @@ class disk_access_limiter {
  private:
   /**
    * @brief releases reservations and returns the unused reservation back to allocator
-   * @param reservation pointer to the reservation being released
+   * @param size_bytes requested size in bytes
+   * @param limit_bytes limit in bytes
    */
   bool do_reserve(std::size_t size_bytes, std::size_t limit_bytes);
 
   /**
    * @brief releases reservations and returns the unused reservation back to allocator
-   * @param reservation pointer to the reservation being released
+   * @param size_bytes requested size in bytes
+   * @param limit_bytes limit in bytes
    */
   std::size_t do_reserve_upto(std::size_t size_bytes, std::size_t limit_bytes);
 
