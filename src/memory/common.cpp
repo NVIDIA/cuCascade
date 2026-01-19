@@ -15,12 +15,12 @@
  * limitations under the License.
  */
 
-#include <rmm/cuda_device.hpp>
-#include <rmm/mr/device/cuda_async_memory_resource.hpp>
-
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/null_device_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/mr/device/cuda_async_memory_resource.hpp>
 
 namespace cucascade {
 

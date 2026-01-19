@@ -15,10 +15,6 @@
  * limitations under the License.
  */
 
-#include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_pool.hpp>
-#include <rmm/cuda_stream_view.hpp>
-
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -27,6 +23,10 @@
 #include <cucascade/memory/null_device_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/utils/overloaded.hpp>
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream_pool.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <mutex>
 #include <optional>

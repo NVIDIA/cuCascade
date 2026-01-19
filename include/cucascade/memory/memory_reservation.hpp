@@ -17,13 +17,13 @@
 
 #pragma once
 
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/notification_channel.hpp>
+
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/error.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
-
-#include <cucascade/memory/common.hpp>
-#include <cucascade/memory/notification_channel.hpp>
 
 #include <concepts>
 #include <memory>

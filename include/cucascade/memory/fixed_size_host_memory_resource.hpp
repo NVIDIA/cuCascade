@@ -17,18 +17,18 @@
 
 #pragma once
 
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/error.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/notification_channel.hpp>
+#include <cucascade/utils/atomics.hpp>
+
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/nvtx/ranges.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
-
-#include <cucascade/memory/common.hpp>
-#include <cucascade/memory/error.hpp>
-#include <cucascade/memory/memory_reservation.hpp>
-#include <cucascade/memory/notification_channel.hpp>
-#include <cucascade/utils/atomics.hpp>
 
 #include <cstddef>
 #include <memory>

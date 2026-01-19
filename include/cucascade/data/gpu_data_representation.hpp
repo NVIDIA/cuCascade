@@ -17,10 +17,10 @@
 
 #pragma once
 
-#include <cudf/table/table.hpp>
-
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
+
+#include <cudf/table/table.hpp>
 
 #include <memory>
 #include <vector>

@@ -4,6 +4,7 @@
  */
 
 #include <cucascade/memory/topology_discovery.hpp>
+
 #include <dlfcn.h>
 #include <nvml.h>
 #include <unistd.h>

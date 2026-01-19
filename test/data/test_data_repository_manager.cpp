@@ -17,10 +17,11 @@
 
 #include "utils/mock_test_utils.hpp"
 
-#include <catch2/catch.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
+
+#include <catch2/catch.hpp>
 
 #include <atomic>
 #include <map>

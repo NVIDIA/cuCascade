@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-#include <rmm/aligned.hpp>
-#include <rmm/error.hpp>
-#include <rmm/mr/device/device_memory_resource.hpp>
-
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/notification_channel.hpp>
+
+#include <rmm/aligned.hpp>
+#include <rmm/error.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
 
 #include <memory>
 #include <mutex>

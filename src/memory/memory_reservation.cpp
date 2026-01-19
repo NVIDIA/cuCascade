@@ -15,12 +15,12 @@
  * limitations under the License.
  */
 
-#include <rmm/cuda_device.hpp>
-
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 namespace cucascade {
 namespace memory {

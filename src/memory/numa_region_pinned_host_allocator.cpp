@@ -15,9 +15,10 @@
  * limitations under the License.
  */
 
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+
 #include <rmm/detail/nvtx/ranges.hpp>
 
-#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <numa.h>
 
 #include <cstring>

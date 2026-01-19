@@ -18,13 +18,14 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/data/representation_converter.hpp>
+
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <catch2/catch.hpp>
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/data/representation_converter.hpp>
 
 #include <memory>
 #include <vector>

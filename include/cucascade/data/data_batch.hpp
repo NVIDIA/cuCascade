@@ -18,11 +18,11 @@
 
 #pragma once
 
-#include <cudf/table/table.hpp>
-
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
+
+#include <cudf/table/table.hpp>
 
 #include <condition_variable>
 #include <cstddef>

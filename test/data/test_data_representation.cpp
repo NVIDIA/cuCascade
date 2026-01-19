@@ -18,6 +18,14 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/host_table.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+
 #include <cudf/contiguous_split.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -27,13 +35,6 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch.hpp>
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/data/representation_converter.hpp>
-#include <cucascade/memory/config.hpp>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/host_table.hpp>
-#include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <memory>
 #include <vector>

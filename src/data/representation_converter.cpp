@@ -17,16 +17,16 @@
 
 #include "cudf/contiguous_split.hpp"
 
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/host_table.hpp>
+
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <cuda_runtime_api.h>
-
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/data/representation_converter.hpp>
-#include <cucascade/memory/host_table.hpp>
 
 #include <algorithm>
 #include <cstring>
