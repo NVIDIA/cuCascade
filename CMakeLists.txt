@@ -35,6 +35,7 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Options
 option(BUILD_TESTS "Build the test suite" ON)
+option(BUILD_BENCHMARKS "Build the benchmark suite" ON)
 option(BUILD_SHARED_LIBS "Build shared library" ON)
 option(BUILD_STATIC_LIBS "Build static library" ON)
 
@@ -238,4 +239,11 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfig.cmake
 if(BUILD_TESTS)
   enable_testing()
   add_subdirectory(test)
+endif()
+
+# =============================================================================
+# Benchmarks
+# =============================================================================
+if(BUILD_BENCHMARKS)
+  add_subdirectory(benchmark)
 endif()
