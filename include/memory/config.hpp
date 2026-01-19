@@ -19,47 +19,102 @@
 
 #include "memory/common.hpp"
 
+#include <variant>
+
 namespace cucascade {
 namespace memory {
+
+static constexpr std::size_t default_block_size = 1 << 20;  ///< Default block size (1MB)
+static constexpr std::size_t default_pool_size  = 128;      ///< Default number of blocks in pool
+static constexpr std::size_t default_initial_number_pools =
+  4;  ///< Default number of pools to pre-allocate
+
+struct gpu_memory_space_config {
+  int device_id{-1};
+  double reservation_limit_fraction{0.9};
+  double downgrade_trigger_fraction{0.75};
+  double downgrade_stop_fraction{0.65};
+  std::size_t memory_capacity{0};
+  bool per_stream_reservation{true};
+  DeviceMemoryResourceFactoryFn mr_factory_fn{nullptr};
+
+  [[nodiscard]] Tier tier() const { return Tier::GPU; }
+
+  [[nodiscard]] std::size_t reservation_limit() const
+  {
+    return static_cast<std::size_t>(static_cast<double>(memory_capacity) *
+                                    reservation_limit_fraction);
+  }
+
+  [[nodiscard]] std::size_t downgrade_trigger_threshold() const
+  {
+    return static_cast<std::size_t>(static_cast<double>(memory_capacity) *
+                                    downgrade_trigger_fraction);
+  }
+
+  [[nodiscard]] std::size_t downgrade_stop_threshold() const
+  {
+    return static_cast<std::size_t>(static_cast<double>(memory_capacity) * downgrade_stop_fraction);
+  }
+};
+
+struct host_memory_space_config {
+  int numa_id{-1};
+  double reservation_limit_fraction{0.9};
+  double downgrade_trigger_fraction{0.75};
+  double downgrade_stop_fraction{0.65};
+  std::size_t memory_capacity{0};
+  std::size_t block_size           = default_block_size;
+  std::size_t pool_size            = default_pool_size;
+  std::size_t initial_number_pools = default_initial_number_pools;
+
+  DeviceMemoryResourceFactoryFn mr_factory_fn{nullptr};
+
+  [[nodiscard]] Tier tier() const { return Tier::HOST; }
+
+  [[nodiscard]] std::size_t reservation_limit() const
+  {
+    return static_cast<std::size_t>(static_cast<double>(memory_capacity) *
+                                    reservation_limit_fraction);
+  }
+
+  [[nodiscard]] std::size_t downgrade_trigger_threshold() const
+  {
+    return static_cast<std::size_t>(static_cast<double>(memory_capacity) *
+                                    downgrade_trigger_fraction);
+  }
+
+  [[nodiscard]] std::size_t downgrade_stop_threshold() const
+  {
+    return static_cast<std::size_t>(static_cast<double>(memory_capacity) * downgrade_stop_fraction);
+  }
+};
+
+struct disk_memory_space_config {
+  int disk_id{-1};
+  std::size_t memory_capacity{0};
+  std::string mount_paths;
+
+  [[nodiscard]] Tier tier() const { return Tier::DISK; }
+
+  [[nodiscard]] std::size_t reservation_limit() const { return memory_capacity; }
+
+  [[nodiscard]] std::size_t downgrade_trigger_threshold() const { return memory_capacity; }
+
+  [[nodiscard]] std::size_t downgrade_stop_threshold() const
+  {
+    return static_cast<std::size_t>(static_cast<double>(memory_capacity) * 0.99);
+  }
+};
 
 /**
  * Configuration for a single memory_space.
  * Contains all parameters needed to create a memory_space instance.
  */
-struct memory_space_config {
-  Tier tier;
-  int device_id;
-  size_t memory_limit;
-  float downgrade_tigger_threshold{0.75};
-  float downgrade_stop_threshold{0.65f};
-  std::size_t memory_capacity;  // Optional total capacity, defaults to device capacity
-  DeviceMemoryResourceFactoryFn mr_factory_fn;
-
-  // Constructor - allocators must be explicitly provided
-  memory_space_config(Tier t,
-                      int dev_id,
-                      size_t mem_limit,
-                      DeviceMemoryResourceFactoryFn mr_fn = nullptr)
-    : memory_space_config(t, dev_id, mem_limit, mem_limit, std::move(mr_fn))
-  {
-  }
-
-  // Constructor - allocators must be explicitly provided
-  memory_space_config(Tier t,
-                      int dev_id,
-                      size_t mem_limit,
-                      size_t mem_capacity,
-                      DeviceMemoryResourceFactoryFn mr_fn = nullptr)
-    : tier(t),
-      device_id(dev_id),
-      memory_limit(mem_limit),
-      memory_capacity(mem_capacity),
-      mr_factory_fn(std::move(mr_fn))
-  {
-    assert(memory_limit <= memory_capacity && "Memory limit cannot exceed device capacity");
-    if (mr_factory_fn == nullptr) { mr_factory_fn = make_default_allocator_for_tier(t); }
-  }
-};
+using memory_space_config = std::variant<std::monostate,
+                                         gpu_memory_space_config,
+                                         host_memory_space_config,
+                                         disk_memory_space_config>;
 
 }  // namespace memory
 }  // namespace cucascade
