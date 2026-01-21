@@ -55,13 +55,21 @@ static std::shared_ptr<memory_reservation_manager> g_shared_memory_manager;
 /**
  * @brief Create memory manager configs for benchmarking (one GPU and one HOST).
  */
-std::vector<memory_reservation_manager::memory_space_config> create_benchmark_configs()
+std::vector<memory_space_config> create_benchmark_configs()
 {
-  std::vector<memory_reservation_manager::memory_space_config> configs;
+  std::vector<memory_space_config> configs;
   // Large memory limits for benchmarking
-  configs.emplace_back(Tier::GPU, 0, 8 * GiB, make_default_allocator_for_tier(Tier::GPU));
-  configs.emplace_back(
-    Tier::HOST, hostDevId, 16 * GiB, make_default_allocator_for_tier(Tier::HOST));
+  gpu_memory_space_config gpu_config;
+  gpu_config.device_id       = 0;
+  gpu_config.memory_capacity = 8 * GiB;
+  gpu_config.mr_factory_fn   = make_default_allocator_for_tier(Tier::GPU);
+  configs.emplace_back(gpu_config);
+
+  host_memory_space_config host_config;
+  host_config.numa_id         = hostDevId;
+  host_config.memory_capacity = 16 * GiB;
+  host_config.mr_factory_fn   = make_default_allocator_for_tier(Tier::HOST);
+  configs.emplace_back(host_config);
   return configs;
 }
 

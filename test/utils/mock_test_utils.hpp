@@ -125,9 +125,9 @@ inline std::vector<memory::memory_space_config> create_conversion_test_configs()
   cucascade::memory::reservation_manager_configurator builder;
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
-    .use_gpu_ids_as_host()
-    .set_capacity_per_numa_node(4096ull * 1024 * 1024);
-  return builder.build_with_topology();
+    .use_host_per_gpu()
+    .set_per_host_capacity(4096ull * 1024 * 1024);
+  return builder.build();
 }
 
 /**
