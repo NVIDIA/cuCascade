@@ -1,0 +1,17 @@
+# Doxyfile for cuCascade
+PROJECT_NAME           = "cuCascade"
+OUTPUT_DIRECTORY       = "build/docs"
+GENERATE_LATEX         = NO
+GENERATE_MAN           = NO
+GENERATE_RTF           = NO
+GENERATE_HTML          = YES
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+INPUT                  = include/
+RECURSIVE              = YES
+FILE_PATTERNS          = *.hpp *.h
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
