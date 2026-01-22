@@ -26,7 +26,7 @@ jobs:
         run: pixi run build
 
       - name: Package build artifacts
-        run: tar -C build -czf build-release.tgz release
+        run: tar -czf build-release.tgz build/release
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
