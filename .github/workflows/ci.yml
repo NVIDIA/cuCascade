@@ -25,11 +25,14 @@ jobs:
       - name: Build cuCascade
         run: pixi run build
 
+      - name: Package build artifacts
+        run: tar -C build -czf build-release.tgz release
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: build-release
-          path: build/release
+          path: build-release.tgz
           if-no-files-found: error
 
   test:
@@ -44,7 +47,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: build-release
-          path: build/release
+          path: .
+
+      - name: Extract build artifacts
+        run: tar -xzf build-release.tgz
 
       - name: Install pixi
         run: |
@@ -69,7 +75,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: build-release
-          path: build/release
+          path: .
+
+      - name: Extract build artifacts
+        run: tar -xzf build-release.tgz
 
       - name: Install pixi
         run: |
