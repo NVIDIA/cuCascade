@@ -31,7 +31,7 @@ cmake --preset release
 cmake --build build/release
 
 # Run tests
-cd build/release && ctest --output-on-failure
+pixi run test
 
 # Run benchmarks (optional)
 pixi run benchmarks
