@@ -138,7 +138,7 @@ jobs:
             --benchmark_format=json \
             --benchmark_out="${GITHUB_WORKSPACE}/bench_main.json"
 
-      - name: Compare benchmark totals
+      - name: Compare benchmark tests
         if: steps.main_run.outputs.has_baseline == 'true'
         env:
           BENCHMARK_REGRESSION_PCT: "10"
