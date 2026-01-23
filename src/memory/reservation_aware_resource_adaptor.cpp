@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-#include "memory/reservation_aware_resource_adaptor.hpp"
-
-#include "memory/common.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/notification_channel.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/notification_channel.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>

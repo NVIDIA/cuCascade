@@ -18,9 +18,9 @@
 
 #pragma once
 
-#include "data/common.hpp"
-#include "data/representation_converter.hpp"
-#include "memory/common.hpp"
+#include <cucascade/data/common.hpp>
+#include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/common.hpp>
 
 #include <cudf/table/table.hpp>
 

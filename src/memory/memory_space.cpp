@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-#include "memory/memory_space.hpp"
-
-#include "memory/common.hpp"
-#include "memory/disk_access_limiter.hpp"
-#include "memory/fixed_size_host_memory_resource.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/reservation_aware_resource_adaptor.hpp"
-#include "utils/overloaded.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/disk_access_limiter.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/null_device_memory_resource.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+#include <cucascade/utils/overloaded.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_pool.hpp>
@@ -41,37 +41,68 @@ namespace memory {
 // memory_space Implementation
 //===----------------------------------------------------------------------===//
 
-memory_space::memory_space(Tier tier,
-                           int device_id,
-                           size_t memory_limit,
-                           size_t start_downgrading_memory_threshold,
-                           size_t stop_downgrading_memory_threshold,
-                           size_t capacity,
-                           std::unique_ptr<rmm::mr::device_memory_resource> allocator)
-  : _id(tier, device_id),
-    _memory_limit(memory_limit),
-    _start_downgrading_memory_threshold(start_downgrading_memory_threshold),
-    _stop_downgrading_memory_threshold(stop_downgrading_memory_threshold),
-    _capacity(capacity),
-    _allocator(std::move(allocator)),
+memory_space::memory_space(const gpu_memory_space_config& config)
+  : _id(config.tier(), config.device_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(config.mr_factory_fn
+                 ? config.mr_factory_fn(config.device_id, config.memory_capacity)
+                 : make_default_gpu_memory_resource(config.device_id, config.memory_capacity)),
     _stream_pool{[&]() -> std::unique_ptr<rmm::cuda_stream_pool> {
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id(device_id)};
-      if (tier == Tier::GPU) { return std::make_unique<rmm::cuda_stream_pool>(16); }
-      return nullptr;
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id(config.device_id)};
+      return std::make_unique<rmm::cuda_stream_pool>(16);
     }()}
 {
-  if (memory_limit == 0) { throw std::invalid_argument("Memory limit must be greater than 0"); }
   if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
-  if (tier == Tier::GPU) {
-    _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
-      _id, *_allocator, _memory_limit, _capacity);
-  } else if (tier == Tier::HOST) {
-    _reservation_allocator = std::make_unique<fixed_size_host_memory_resource>(
-      _id.device_id, *_allocator, _memory_limit, _capacity);
-  } else if (tier == Tier::DISK) {
-    _reservation_allocator = std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity);
+
+  _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
+    _id,
+    *_allocator,
+    _memory_limit,
+    _capacity,
+    nullptr,
+    nullptr,
+    config.per_stream_reservation
+      ? reservation_aware_resource_adaptor::AllocationTrackingScope::PER_STREAM
+      : reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD);
+}
+
+memory_space::memory_space(const host_memory_space_config& config)
+  : _id(config.tier(), config.numa_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(config.mr_factory_fn
+                 ? config.mr_factory_fn(config.numa_id, config.memory_capacity)
+                 : make_default_host_memory_resource(config.numa_id, config.memory_capacity))
+{
+  if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
+  _reservation_allocator =
+    std::make_unique<fixed_size_host_memory_resource>(_id.device_id,
+                                                      *_allocator,
+                                                      _memory_limit,
+                                                      _capacity,
+                                                      config.block_size,
+                                                      config.pool_size,
+                                                      config.initial_number_pools);
+}
+
+memory_space::memory_space(const disk_memory_space_config& config)
+  : _id(config.tier(), config.disk_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(std::make_unique<null_device_memory_resource>())
+{
+  if (config.mount_paths.empty()) {
+    throw std::invalid_argument("Mount path must be provided for disk memory space");
   }
-  _notification_channel = std::make_shared<notification_channel>();
+  _reservation_allocator =
+    std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
 }
 
 memory_space::~memory_space() = default;

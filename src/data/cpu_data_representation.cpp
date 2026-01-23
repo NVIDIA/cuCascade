@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "data/cpu_data_representation.hpp"
+#include <cucascade/data/cpu_data_representation.hpp>
 
 namespace cucascade {
 

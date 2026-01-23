@@ -15,9 +15,8 @@
  * limitations under the License.
  */
 
-#include "data/data_repository_manager.hpp"
-
-#include "data/data_batch.hpp"
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
 
 // Template class implementation is in the header file.
 // This file is kept for build system compatibility and explicit template instantiations.

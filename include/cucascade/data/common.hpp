@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "memory/memory_space.hpp"
+#include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device_memory_resource.hpp>

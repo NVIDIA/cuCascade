@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-#include "memory/memory_reservation.hpp"
-
-#include "memory/common.hpp"
-#include "memory/memory_reservation_manager.hpp"
-#include "memory/memory_space.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_device.hpp>
 

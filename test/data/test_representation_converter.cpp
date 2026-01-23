@@ -15,11 +15,12 @@
  * limitations under the License.
  */
 
-#include "data/cpu_data_representation.hpp"
-#include "data/gpu_data_representation.hpp"
-#include "data/representation_converter.hpp"
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
+
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/data/representation_converter.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
@@ -32,7 +33,7 @@
 using namespace cucascade;
 using cucascade::test::create_conversion_test_configs;
 using cucascade::test::create_simple_cudf_table;
-using cucascade::test::mock_memory_space;
+using cucascade::test::make_mock_memory_space;
 
 // =============================================================================
 // Test Fixtures and Helpers
@@ -78,7 +79,7 @@ TEST_CASE("representation_converter_registry register custom converter",
           "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   SECTION("Register a new converter succeeds")
   {
@@ -120,7 +121,7 @@ TEST_CASE("representation_converter_registry register custom converter",
 TEST_CASE("representation_converter_registry has_converter", "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   SECTION("Returns false for unregistered converter")
   {
@@ -165,7 +166,7 @@ TEST_CASE("representation_converter_registry has_converter_for runtime lookup",
           "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   registry.register_converter<custom_test_representation, another_test_representation>(
     [](idata_representation& source,
@@ -176,7 +177,7 @@ TEST_CASE("representation_converter_registry has_converter_for runtime lookup",
         static_cast<double>(src.get_value()), *const_cast<memory::memory_space*>(target_space));
     });
 
-  custom_test_representation source_repr(42, mock_space);
+  custom_test_representation source_repr(42, *mock_space);
 
   SECTION("Returns true for registered source instance")
   {
@@ -192,7 +193,7 @@ TEST_CASE("representation_converter_registry has_converter_for runtime lookup",
 TEST_CASE("representation_converter_registry unregister_converter", "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   SECTION("Unregister returns false for non-existent converter")
   {
@@ -250,7 +251,7 @@ TEST_CASE("representation_converter_registry convert with custom types",
           "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   // Register a converter that doubles the value
   registry.register_converter<custom_test_representation, another_test_representation>(
@@ -264,9 +265,9 @@ TEST_CASE("representation_converter_registry convert with custom types",
 
   SECTION("Conversion produces expected result")
   {
-    custom_test_representation source(21, mock_space);
-    auto result =
-      registry.convert<another_test_representation>(source, &mock_space, rmm::cuda_stream_default);
+    custom_test_representation source(21, *mock_space);
+    auto result = registry.convert<another_test_representation>(
+      source, mock_space.get(), rmm::cuda_stream_default);
 
     REQUIRE(result != nullptr);
     REQUIRE(result->get_value() == 42.0);  // 21 * 2
@@ -274,18 +275,18 @@ TEST_CASE("representation_converter_registry convert with custom types",
 
   SECTION("Conversion throws for unregistered type pair")
   {
-    another_test_representation source(3.14, mock_space);
+    another_test_representation source(3.14, *mock_space);
 
-    REQUIRE_THROWS_AS(
-      registry.convert<custom_test_representation>(source, &mock_space, rmm::cuda_stream_default),
-      std::runtime_error);
+    REQUIRE_THROWS_AS(registry.convert<custom_test_representation>(
+                        source, mock_space.get(), rmm::cuda_stream_default),
+                      std::runtime_error);
   }
 }
 
 TEST_CASE("representation_converter_registry convert with type_index", "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   registry.register_converter<custom_test_representation, another_test_representation>(
     [](idata_representation& source,
@@ -296,12 +297,12 @@ TEST_CASE("representation_converter_registry convert with type_index", "[represe
         static_cast<double>(src.get_value()), *const_cast<memory::memory_space*>(target_space));
     });
 
-  custom_test_representation source(100, mock_space);
+  custom_test_representation source(100, *mock_space);
 
   SECTION("Runtime type_index conversion works")
   {
     std::type_index target_type = typeid(another_test_representation);
-    auto result = registry.convert(source, target_type, &mock_space, rmm::cuda_stream_default);
+    auto result = registry.convert(source, target_type, mock_space.get(), rmm::cuda_stream_default);
 
     REQUIRE(result != nullptr);
     auto& typed_result = result->cast<another_test_representation>();
@@ -311,8 +312,9 @@ TEST_CASE("representation_converter_registry convert with type_index", "[represe
   SECTION("Runtime conversion throws for unregistered pair")
   {
     std::type_index wrong_target = typeid(custom_test_representation);
-    REQUIRE_THROWS_AS(registry.convert(source, wrong_target, &mock_space, rmm::cuda_stream_default),
-                      std::runtime_error);
+    REQUIRE_THROWS_AS(
+      registry.convert(source, wrong_target, mock_space.get(), rmm::cuda_stream_default),
+      std::runtime_error);
   }
 }
 
@@ -360,7 +362,7 @@ TEST_CASE("Built-in GPU to HOST conversion works", "[representation_converter][b
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
-  auto table = create_simple_cudf_table(50);
+  auto table = create_simple_cudf_table(50, gpu_space->get_default_allocator());
   gpu_table_representation gpu_repr(std::move(table),
                                     *const_cast<memory::memory_space*>(gpu_space));
 
@@ -384,7 +386,7 @@ TEST_CASE("Built-in HOST to GPU conversion works", "[representation_converter][b
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
   // First create a GPU repr then convert to host to get a valid host_table_representation
-  auto table = create_simple_cudf_table(50);
+  auto table = create_simple_cudf_table(50, gpu_space->get_default_allocator());
   gpu_table_representation gpu_repr(std::move(table),
                                     *const_cast<memory::memory_space*>(gpu_space));
 
@@ -412,7 +414,7 @@ TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
-  auto original_table = create_simple_cudf_table(100);
+  auto original_table = create_simple_cudf_table(100, gpu_space->get_default_allocator());
   gpu_table_representation original_repr(std::move(original_table),
                                          *const_cast<memory::memory_space*>(gpu_space));
 
@@ -440,8 +442,8 @@ TEST_CASE("Converter preserves memory space properties", "[representation_conver
 {
   representation_converter_registry registry;
 
-  mock_memory_space source_space(memory::Tier::GPU, 0);
-  mock_memory_space target_space(memory::Tier::HOST, 1);
+  auto source_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto target_space = make_mock_memory_space(memory::Tier::HOST, 1);
 
   registry.register_converter<custom_test_representation, another_test_representation>(
     [](idata_representation& source,
@@ -452,10 +454,10 @@ TEST_CASE("Converter preserves memory space properties", "[representation_conver
         static_cast<double>(src.get_value()), *const_cast<memory::memory_space*>(target_space));
     });
 
-  custom_test_representation source(42, source_space);
+  custom_test_representation source(42, *source_space);
 
-  auto result =
-    registry.convert<another_test_representation>(source, &target_space, rmm::cuda_stream_default);
+  auto result = registry.convert<another_test_representation>(
+    source, target_space.get(), rmm::cuda_stream_default);
 
   REQUIRE(result->get_current_tier() == memory::Tier::HOST);
   REQUIRE(result->get_device_id() == 1);
@@ -464,7 +466,7 @@ TEST_CASE("Converter preserves memory space properties", "[representation_conver
 TEST_CASE("Multiple independent converters can coexist", "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   // Register forward converter (custom -> another)
   registry.register_converter<custom_test_representation, another_test_representation>(
@@ -491,26 +493,27 @@ TEST_CASE("Multiple independent converters can coexist", "[representation_conver
   REQUIRE(registry.has_converter<another_test_representation, custom_test_representation>());
 
   // Test forward conversion
-  custom_test_representation custom_src(10, mock_space);
+  custom_test_representation custom_src(10, *mock_space);
   auto another_result = registry.convert<another_test_representation>(
-    custom_src, &mock_space, rmm::cuda_stream_default);
+    custom_src, mock_space.get(), rmm::cuda_stream_default);
   REQUIRE(another_result->get_value() == 10.0);
 
   // Test reverse conversion
-  another_test_representation another_src(25.7, mock_space);
+  another_test_representation another_src(25.7, *mock_space);
   auto custom_result = registry.convert<custom_test_representation>(
-    another_src, &mock_space, rmm::cuda_stream_default);
+    another_src, mock_space.get(), rmm::cuda_stream_default);
   REQUIRE(custom_result->get_value() == 25);  // truncated to int
 }
 
 TEST_CASE("Converter error message includes type names", "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
-  custom_test_representation source(42, mock_space);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  custom_test_representation source(42, *mock_space);
 
   try {
-    registry.convert<another_test_representation>(source, &mock_space, rmm::cuda_stream_default);
+    registry.convert<another_test_representation>(
+      source, mock_space.get(), rmm::cuda_stream_default);
     FAIL("Expected exception to be thrown");
   } catch (const std::runtime_error& e) {
     std::string msg = e.what();
@@ -522,7 +525,7 @@ TEST_CASE("Converter error message includes type names", "[representation_conver
 TEST_CASE("Duplicate registration error message includes type names", "[representation_converter]")
 {
   representation_converter_registry registry;
-  mock_memory_space mock_space(memory::Tier::GPU, 0);
+  auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   registry.register_converter<custom_test_representation, another_test_representation>(
     [](idata_representation&,

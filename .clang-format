@@ -75,13 +75,13 @@ IncludeBlocks: Regroup
 IncludeCategories:
   - Regex: '^"' # quoted includes
     Priority: 1
-  - Regex: "^<(benchmarks|tests)/" # benchmark includes
+  - Regex: "^<(benchmarks|test)/" # benchmark includes
     Priority: 2
-  - Regex: "^<cudf_test/" # cuDF includes
+  - Regex: "^<cudf_test/" # cuDF test includes
     Priority: 3
-  - Regex: "^<cudf/" # cuDF includes
+  - Regex: "^<cucascade/" # cucascade includes
     Priority: 4
-  - Regex: "^<(nvtext|cudf_kafka)" # other libcudf includes
+  - Regex: "^<(cudf|nvtext|cudf_kafka)" # cuDF includes
     Priority: 5
   - Regex: "^<(cugraph|cuml|raft|kvikio)" # Other RAPIDS includes
     Priority: 6

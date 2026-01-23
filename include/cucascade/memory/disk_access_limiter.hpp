@@ -21,11 +21,13 @@
 
 #include <atomic>
 #include <memory>
+#include <string_view>
 
 // Include existing reservation system
-#include "memory/common.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/notification_channel.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/notification_channel.hpp>
+#include <cucascade/utils/atomics.hpp>
 
 namespace cucascade {
 namespace memory {
@@ -58,7 +60,9 @@ class disk_access_limiter {
     disk_access_limiter* _mr;
   };
 
-  explicit disk_access_limiter(memory_space_id space_id, std::size_t capacity);
+  explicit disk_access_limiter(memory_space_id space_id,
+                               std::size_t capacity,
+                               std::string_view mount_path);
 
   /**
    * @brief Constructs a per-stream tracking resource adaptor.
@@ -69,7 +73,8 @@ class disk_access_limiter {
    */
   explicit disk_access_limiter(memory_space_id space_id,
                                std::size_t memory_limit,
-                               std::size_t capacity);
+                               std::size_t capacity,
+                               std::string_view mount_path);
 
   /**
    * @brief Destructor.
@@ -79,19 +84,19 @@ class disk_access_limiter {
   /**
    * @brief Returns the available memory left in the resource
    */
-  std::size_t get_available_memory() const noexcept;
+  [[nodiscard]] std::size_t get_available_memory() const noexcept;
 
   /**
    * @brief Gets the total reserved bytes across all streams.
    * @return The total reserved bytes
    */
-  std::size_t get_total_reserved_bytes() const;
+  [[nodiscard]] std::size_t get_total_reserved_bytes() const;
 
   /**
    * @brief Gets the total reserved bytes across all streams.
    * @return The total reserved bytes
    */
-  std::size_t get_peak_reserved_bytes() const;
+  [[nodiscard]] std::size_t get_peak_reserved_bytes() const;
 
   //===----------------------------------------------------------------------===//
   // Reservation Management
@@ -139,8 +144,6 @@ class disk_access_limiter {
    */
   void do_release_reservation(disk_reserved_arena* reservation) noexcept;
 
-  void update_peak_allocated_bytes() noexcept;
-
   /**
    * @brief grows reservation by a `bytes` size
    * @param res current_reservation
@@ -161,9 +164,10 @@ class disk_access_limiter {
   const std::size_t _capacity;
 
   /// Global totals for efficiency
-  std::atomic<std::size_t> _total_allocated_bytes{0};
-  std::atomic<std::size_t> _peak_total_allocated_bytes{0};
+  utils::atomic_bounded_counter<std::size_t> _total_allocated_bytes{0};
+  utils::atomic_peak_tracker<std::size_t> _peak_total_allocated_bytes{0};
   std::atomic<std::size_t> _total_reservation_count{0};
+  std::string mounting_path_;
 };
 
 }  // namespace memory

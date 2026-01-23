@@ -17,19 +17,22 @@
 
 #pragma once
 
-#include "data/common.hpp"
-#include "data/representation_converter.hpp"
-#include "memory/common.hpp"
-#include "memory/memory_reservation_manager.hpp"
-#include "memory/memory_space.hpp"
-#include "memory/null_device_memory_resource.hpp"
-#include "memory/reservation_manager_configurator.hpp"
+#include <cucascade/data/common.hpp>
+#include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/null_device_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/detail/error.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/device/cuda_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -45,19 +48,34 @@ namespace test {
  * This is a lightweight memory space that can be used in tests that don't need
  * actual memory allocation functionality.
  */
-class mock_memory_space : public memory::memory_space {
- public:
-  mock_memory_space(memory::Tier tier, size_t device_id = 0)
-    : memory::memory_space(tier,
-                           static_cast<int>(device_id),
-                           1024 * 1024 * 1024,                      // memory_limit
-                           (1024ULL * 1024ULL * 1024ULL) * 8 / 10,  // start_downgrading_threshold
-                           (1024ULL * 1024ULL * 1024ULL) / 2,       // stop_downgrading_threshold
-                           1024 * 1024 * 1024,                      // capacity
-                           std::make_unique<memory::null_device_memory_resource>())
-  {
+
+inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier tier,
+                                                                    size_t device_id = 0)
+{
+  if (tier == memory::Tier::GPU) {
+    memory::gpu_memory_space_config config;
+    config.device_id       = static_cast<int>(device_id);
+    config.memory_capacity = 1024 * 1024 * 1024;
+    config.mr_factory_fn   = [](int, size_t) {
+      return std::make_unique<rmm::mr::cuda_memory_resource>();
+    };
+    return std::make_shared<memory::memory_space>(config);
+  } else if (tier == memory::Tier::HOST) {
+    memory::host_memory_space_config config;
+    config.numa_id              = device_id;
+    config.memory_capacity      = 1024 * 1024 * 1024;
+    config.initial_number_pools = 0;
+    config.mr_factory_fn        = [](int, size_t) {
+      return std::make_unique<cucascade::memory::numa_region_pinned_host_memory_resource>(-1);
+    };
+    return std::make_shared<memory::memory_space>(config);
+  } else if (tier == memory::Tier::DISK) {
+    return std::make_shared<memory::memory_space>(
+      memory::disk_memory_space_config{static_cast<int>(device_id), 1024 * 1024 * 1024, "/tmp"});
+  } else {
+    throw std::invalid_argument("Unsupported tier for mock memory space");
   }
-};
+}
 
 /**
  * @brief Helper base class to hold memory_space - initialized before idata_representation.
@@ -66,10 +84,10 @@ class mock_memory_space : public memory::memory_space {
  * before the idata_representation base class that requires it.
  */
 struct mock_memory_space_holder {
-  std::shared_ptr<mock_memory_space> space;
+  std::shared_ptr<memory::memory_space> space;
 
   mock_memory_space_holder(memory::Tier tier, size_t device_id)
-    : space(std::make_shared<mock_memory_space>(tier, device_id))
+    : space{make_mock_memory_space(tier, device_id)}
   {
   }
 };
@@ -107,9 +125,9 @@ inline std::vector<memory::memory_space_config> create_conversion_test_configs()
   cucascade::memory::reservation_manager_configurator builder;
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
-    .use_gpu_ids_as_host()
-    .set_capacity_per_numa_node(4096ull * 1024 * 1024);
-  return builder.build_with_topology();
+    .use_host_per_gpu()
+    .set_per_host_capacity(4096ull * 1024 * 1024);
+  return builder.build();
 }
 
 /**
@@ -122,13 +140,17 @@ inline std::vector<memory::memory_space_config> create_conversion_test_configs()
  * When num_columns == 1: Creates a single INT32 column filled with 0x42
  * When num_columns == 2: Creates INT32 (0x11) and INT64 (0x22) columns
  */
-inline cudf::table create_simple_cudf_table(int num_rows = 100, int num_columns = 2)
+inline cudf::table create_simple_cudf_table(
+  int num_rows,
+  int num_columns,
+  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
+  rmm::cuda_stream_view stream        = rmm::cuda_stream_default)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
 
   // First column: INT32
   auto col1 = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::UNALLOCATED);
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
   if (num_rows > 0) {
     auto view  = col1->mutable_view();
     auto bytes = static_cast<size_t>(num_rows) * sizeof(int32_t);
@@ -140,7 +162,7 @@ inline cudf::table create_simple_cudf_table(int num_rows = 100, int num_columns 
   // Second column: INT64 (only if num_columns >= 2)
   if (num_columns >= 2) {
     auto col2 = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT64}, num_rows, cudf::mask_state::UNALLOCATED);
+      cudf::data_type{cudf::type_id::INT64}, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
     if (num_rows > 0) {
       auto view  = col2->mutable_view();
       auto bytes = static_cast<size_t>(num_rows) * sizeof(int64_t);
@@ -150,6 +172,21 @@ inline cudf::table create_simple_cudf_table(int num_rows = 100, int num_columns 
   }
 
   return cudf::table(std::move(columns));
+}
+
+inline cudf::table create_simple_cudf_table(
+  int num_rows,
+  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
+  rmm::cuda_stream_view stream        = rmm::cuda_stream_default)
+{
+  return create_simple_cudf_table(num_rows, 2, mr, stream);
+}
+
+inline cudf::table create_simple_cudf_table(
+  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
+  rmm::cuda_stream_view stream        = rmm::cuda_stream_default)
+{
+  return create_simple_cudf_table(100, 2, mr, stream);
 }
 
 }  // namespace test

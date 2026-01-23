@@ -15,12 +15,12 @@
  * limitations under the License.
  */
 
-#include "data/representation_converter.hpp"
-
 #include "cudf/contiguous_split.hpp"
-#include "data/cpu_data_representation.hpp"
-#include "data/gpu_data_representation.hpp"
-#include "memory/host_table.hpp"
+
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/host_table.hpp>
 
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>

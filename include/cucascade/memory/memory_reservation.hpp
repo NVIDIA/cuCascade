@@ -17,8 +17,8 @@
 
 #pragma once
 
-#include "memory/common.hpp"
-#include "memory/notification_channel.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/notification_channel.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>

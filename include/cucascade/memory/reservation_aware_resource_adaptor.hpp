@@ -28,12 +28,12 @@
 #include <set>
 
 // Include existing reservation system
-#include "memory/common.hpp"
-#include "memory/error.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/notification_channel.hpp"
-#include "memory/oom_handling_policy.hpp"
-#include "utils/atomics.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/error.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/notification_channel.hpp>
+#include <cucascade/memory/oom_handling_policy.hpp>
+#include <cucascade/utils/atomics.hpp>
 
 namespace cucascade {
 namespace memory {

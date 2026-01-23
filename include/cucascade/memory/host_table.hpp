@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "fixed_size_host_memory_resource.hpp"
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <cstdint>
 #include <memory>

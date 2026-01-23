@@ -17,9 +17,9 @@
 
 #pragma once
 
-#include "memory/common.hpp"
-#include "memory/config.hpp"
-#include "memory/memory_space.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -219,6 +219,12 @@ class memory_reservation_manager {
    * Returns nullptr if no such space exists.
    */
   const memory_space* get_memory_space(Tier tier, int32_t device_id) const;
+
+  /**
+   * Get a specific memory_space by tier and device ID.
+   * Returns nullptr if no such space exists.
+   */
+  memory_space* get_memory_space(Tier tier, int32_t device_id);
 
   /**
    * Get all memory_spaces for a specific tier.

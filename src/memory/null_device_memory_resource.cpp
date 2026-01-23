@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "memory/null_device_memory_resource.hpp"
+#include <cucascade/memory/null_device_memory_resource.hpp>
 
 namespace cucascade {
 namespace memory {

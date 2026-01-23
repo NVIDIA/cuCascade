@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "memory/topology_discovery.hpp"
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <dlfcn.h>
 #include <nvml.h>

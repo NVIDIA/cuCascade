@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-#include "memory/fixed_size_host_memory_resource.hpp"
-
-#include "memory/common.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/notification_channel.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/notification_channel.hpp>
 
 #include <rmm/aligned.hpp>
 #include <rmm/error.hpp>

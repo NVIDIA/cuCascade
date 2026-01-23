@@ -29,12 +29,12 @@
  * - Run all tests: ./test_executable "[memory_space]"
  */
 
-#include "memory/common.hpp"
-#include "memory/fixed_size_host_memory_resource.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/memory_reservation_manager.hpp"
-#include "memory/reservation_aware_resource_adaptor.hpp"
-#include "memory/reservation_manager_configurator.hpp"
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -58,12 +58,12 @@ std::unique_ptr<memory_reservation_manager> createSingleDeviceMemoryManager()
 {
   reservation_manager_configurator builder;
   builder.set_gpu_usage_limit(expected_gpu_capacity);  // 2 GB
-  builder.set_reservation_limit_ratio_per_gpu(limit_ratio);
-  builder.set_capacity_per_numa_node(expected_host_capacity);  //  4 GB
-  builder.use_gpu_ids_as_host();
-  builder.set_reservation_limit_ratio_per_numa_node(limit_ratio);
+  builder.set_reservation_fraction_per_gpu(limit_ratio);
+  builder.set_per_host_capacity(expected_host_capacity);  //  4 GB
+  builder.use_host_per_gpu();
+  builder.set_reservation_fraction_per_host(limit_ratio);
 
-  auto space_configs = builder.build_with_topology();
+  auto space_configs = builder.build();
   return std::make_unique<memory_reservation_manager>(std::move(space_configs));
 }
 
@@ -71,13 +71,13 @@ std::unique_ptr<memory_reservation_manager> createDualGpuMemoryManager()
 {
   reservation_manager_configurator builder;
   builder.set_gpu_usage_limit(expected_gpu_capacity);  // 2 GB
-  builder.set_reservation_limit_ratio_per_gpu(limit_ratio);
-  builder.set_capacity_per_numa_node(expected_host_capacity);  //  4 GB
-  builder.set_device_tier_id_to_gpu_id_map({{0, 0}, {1, 0}});
-  builder.set_host_ids({0, 1});
-  builder.set_reservation_limit_ratio_per_numa_node(limit_ratio);
+  builder.set_reservation_fraction_per_gpu(limit_ratio);
+  builder.set_per_host_capacity(expected_host_capacity);  //  4 GB
+  builder.set_number_of_gpus(2);
+  builder.use_host_per_gpu();
+  builder.set_reservation_fraction_per_host(limit_ratio);
 
-  auto space_configs = builder.build_with_topology();
+  auto space_configs = builder.build();
   return std::make_unique<memory_reservation_manager>(std::move(space_configs));
 }
 

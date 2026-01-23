@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "memory/stream_pool.hpp"
+#include <cucascade/memory/stream_pool.hpp>
 
 #include <rmm/cuda_device.hpp>
 

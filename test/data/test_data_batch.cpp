@@ -15,8 +15,9 @@
  * limitations under the License.
  */
 
-#include "data/data_batch.hpp"
 #include "utils/mock_test_utils.hpp"
+
+#include <cucascade/data/data_batch.hpp>
 
 #include <catch2/catch.hpp>
 
