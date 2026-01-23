@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "utils/test_memory_resources.hpp"
+
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
@@ -30,8 +32,8 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/detail/error.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/detail/error.hpp>
 #include <rmm/mr/device/cuda_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
@@ -125,6 +127,8 @@ inline std::vector<memory::memory_space_config> create_conversion_test_configs()
   cucascade::memory::reservation_manager_configurator builder;
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
+    // Use shared pooled allocator initialized once for all tests.
+    .set_gpu_memory_resource_factory(make_shared_current_device_resource)
     .use_host_per_gpu()
     .set_per_host_capacity(4096ull * 1024 * 1024);
   return builder.build();

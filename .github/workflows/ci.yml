@@ -96,20 +96,38 @@ jobs:
             --benchmark_out="${GITHUB_WORKSPACE}/bench_pr.json"
 
       - name: Checkout main for baseline
-        uses: actions/checkout@v4
+        uses: actions/github-script@v7
+        id: main_run
         with:
-          ref: main
-          path: baseline-src
+          script: |
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              branch: 'main',
+              status: 'success',
+              per_page: 1
+            });
+            if (!data.workflow_runs.length) {
+              core.setFailed('No successful main workflow runs found');
+              return;
+            }
+            core.setOutput('run_id', data.workflow_runs[0].id);
 
-      - name: Install dependencies (baseline)
-        run: cd baseline-src && pixi install
+      - name: Download baseline build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-release
+          path: baseline-build
+          run-id: ${{ steps.main_run.outputs.run_id }}
+          github-token: ${{ github.token }}
 
-      - name: Build baseline
-        run: cd baseline-src && pixi run build
+      - name: Extract baseline build artifacts
+        run: tar -xzf baseline-build/build-release.tgz -C baseline-build
 
       - name: Run benchmarks (baseline)
         run: |
-          cd baseline-src/build/release
+          cd baseline-build/build/release
           ./benchmark/cucascade_benchmarks \
             --benchmark_format=json \
             --benchmark_out="${GITHUB_WORKSPACE}/bench_main.json"
