@@ -33,7 +33,7 @@ python = "*"
 jinja2 = "*"
 
 [tasks]
-build = "cmake --preset release && cmake --build build/release && pixi run docs"
+build = "cmake --preset release && cmake --build build/release"
 test = "cd build/release && ctest --output-on-failure"
 lint = "pre-commit run -a"
 lint-install = "pre-commit install"
