@@ -34,9 +34,41 @@
 #include <catch2/catch.hpp>
 
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 using namespace cucascade::memory;
+
+namespace {
+struct ScopedEnvVar {
+  explicit ScopedEnvVar(std::string name, std::string value) : name_(std::move(name))
+  {
+    const char* existing = std::getenv(name_.c_str());
+    if (existing) {
+      had_value_ = true;
+      old_value_ = existing;
+    }
+    setenv(name_.c_str(), value.c_str(), 1);
+  }
+
+  ~ScopedEnvVar()
+  {
+    if (had_value_) {
+      setenv(name_.c_str(), old_value_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+  ScopedEnvVar(ScopedEnvVar const&)            = delete;
+  ScopedEnvVar& operator=(ScopedEnvVar const&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_value_;
+  bool had_value_ = false;
+};
+}  // namespace
 
 // Test topology discovery
 TEST_CASE("Topology Discovery", "[hw_topology]")
@@ -82,4 +114,21 @@ TEST_CASE("Topology Discovery", "[hw_topology]")
     // NUMA node may be -1 if unknown
     REQUIRE(net_dev.numa_node >= -1);
   }
+}
+
+TEST_CASE("Topology Discovery rejects out-of-range CUDA_VISIBLE_DEVICES", "[hw_topology]")
+{
+  ScopedEnvVar env("CUDA_VISIBLE_DEVICES", "99999999");
+
+  topology_discovery discovery;
+  REQUIRE_THROWS_WITH(discovery.discover(), "CUDA_VISIBLE_DEVICES entry 99999999 is out of range");
+}
+
+TEST_CASE("Topology Discovery rejects overflow CUDA_VISIBLE_DEVICES", "[hw_topology]")
+{
+  ScopedEnvVar env("CUDA_VISIBLE_DEVICES", "999999999999999999999999999999");
+
+  topology_discovery discovery;
+  REQUIRE_THROWS_WITH(discovery.discover(),
+                      "Invalid numeric CUDA_VISIBLE_DEVICES entry: 999999999999999999999999999999");
 }
