@@ -5,6 +5,8 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <dlfcn.h>
 #include <nvml.h>
 #include <unistd.h>
@@ -16,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -567,57 +570,97 @@ bool topology_discovery::discover()
   // Collect GPU information
   topology.gpus.clear();
 
-  for (unsigned int i = 0; i < device_count; ++i) {
-    nvmlDevice_t device;
-    result = nvml.p_nvmlDeviceGetHandleByIndex_v2(i, &device);
-    if (result != NVML_SUCCESS) {
-      std::cerr << "Warning: Failed to get handle for GPU " << i << ": "
-                << nvml.p_nvmlErrorString(result) << std::endl;
-      continue;
-    }
+  std::unordered_map<std::string, gpu_topology_info> nvml_gpus_by_pci;
+  if (nvml_available) {
+    for (unsigned int i = 0; i < device_count; ++i) {
+      nvmlDevice_t device;
+      result = nvml.p_nvmlDeviceGetHandleByIndex_v2(i, &device);
+      if (result != NVML_SUCCESS) {
+        std::cerr << "Warning: Failed to get handle for GPU " << i << ": "
+                  << nvml.p_nvmlErrorString(result) << std::endl;
+        continue;
+      }
 
-    gpu_topology_info gpu;
-    gpu.id = i;
+      gpu_topology_info gpu;
+      gpu.id = i;
 
-    // Get device name, PCI bus ID and UUID
-    std::array<char, NVML_DEVICE_NAME_BUFFER_SIZE> name{};
-    result = nvml.p_nvmlDeviceGetName(device, name.data(), NVML_DEVICE_NAME_BUFFER_SIZE);
-    if (result == NVML_SUCCESS) {
-      gpu.name = std::string(name.data());
-    } else {
-      gpu.name = "Unknown";
-    }
+      // Get device name, PCI bus ID and UUID
+      std::array<char, NVML_DEVICE_NAME_BUFFER_SIZE> name{};
+      result   = nvml.p_nvmlDeviceGetName(device, name.data(), NVML_DEVICE_NAME_BUFFER_SIZE);
+      gpu.name = (result == NVML_SUCCESS) ? std::string(name.data()) : "Unknown";
 
-    nvmlPciInfo_t pci_info;
-    result = nvml.p_nvmlDeviceGetPciInfo_v3(device, &pci_info);
-    if (result == NVML_SUCCESS) {
+      nvmlPciInfo_t pci_info;
+      result = nvml.p_nvmlDeviceGetPciInfo_v3(device, &pci_info);
+      if (result != NVML_SUCCESS) {
+        std::cerr << "Warning: Failed to get PCI info for GPU " << i << std::endl;
+        continue;
+      }
       gpu.pci_bus_id = std::string(pci_info.busId);
-    } else {
-      std::cerr << "Warning: Failed to get PCI info for GPU " << i << std::endl;
-      continue;
+
+      std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
+      result   = nvml.p_nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
+      gpu.uuid = (result == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
+
+      // Get NUMA node and CPU affinity from /sys
+      gpu.numa_node         = get_numa_node_from_sys(gpu.pci_bus_id);
+      gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
+      gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
+
+      // Memory binding is typically the same as NUMA node
+      if (gpu.numa_node >= 0) { gpu.memory_binding.push_back(gpu.numa_node); }
+
+      // Map network devices to this GPU using PCIe topology
+      gpu.network_devices =
+        map_network_devices_to_gpu(gpu.pci_bus_id, gpu.numa_node, topology.network_devices);
+
+      nvml_gpus_by_pci.emplace(normalize_pci_bus_id(gpu.pci_bus_id), std::move(gpu));
     }
+  }
 
-    std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
-    result = nvml.p_nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
-    if (result == NVML_SUCCESS) {
-      gpu.uuid = std::string(uuid.data());
-    } else {
-      gpu.uuid = "Unknown";
+  int cuda_device_count = 0;
+  bool cuda_available   = (cudaGetDeviceCount(&cuda_device_count) == cudaSuccess);
+  if (cuda_available && cuda_device_count > 0) {
+    topology.num_gpus = static_cast<unsigned int>(cuda_device_count);
+    for (int cuda_idx = 0; cuda_idx < cuda_device_count; ++cuda_idx) {
+      gpu_topology_info gpu;
+      gpu.id = static_cast<unsigned int>(cuda_idx);
+
+      cudaDeviceProp prop{};
+      if (cudaGetDeviceProperties(&prop, cuda_idx) == cudaSuccess) {
+        gpu.name = prop.name;
+      } else {
+        gpu.name = "Unknown";
+      }
+
+      char pci_bus_id[16] = {};
+      if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuda_idx) == cudaSuccess) {
+        gpu.pci_bus_id = pci_bus_id;
+      }
+
+      auto normalized_pci = normalize_pci_bus_id(gpu.pci_bus_id);
+      auto nvml_it        = nvml_gpus_by_pci.find(normalized_pci);
+      if (nvml_it != nvml_gpus_by_pci.end()) {
+        auto nvml_gpu = nvml_it->second;
+        nvml_gpu.id   = gpu.id;
+        topology.gpus.push_back(std::move(nvml_gpu));
+        continue;
+      }
+
+      // Fallback to /sys for NUMA and affinity
+      gpu.numa_node         = get_numa_node_from_sys(gpu.pci_bus_id);
+      gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
+      gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
+      if (gpu.numa_node >= 0) { gpu.memory_binding.push_back(gpu.numa_node); }
+      gpu.network_devices =
+        map_network_devices_to_gpu(gpu.pci_bus_id, gpu.numa_node, topology.network_devices);
+
+      topology.gpus.push_back(std::move(gpu));
     }
-
-    // Get NUMA node and CPU affinity from /sys
-    gpu.numa_node         = get_numa_node_from_sys(gpu.pci_bus_id);
-    gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
-    gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
-
-    // Memory binding is typically the same as NUMA node
-    if (gpu.numa_node >= 0) { gpu.memory_binding.push_back(gpu.numa_node); }
-
-    // Map network devices to this GPU using PCIe topology
-    gpu.network_devices =
-      map_network_devices_to_gpu(gpu.pci_bus_id, gpu.numa_node, topology.network_devices);
-
-    topology.gpus.push_back(gpu);
+  } else {
+    // Fallback to NVML-only results when CUDA runtime is unavailable.
+    for (auto& [_, gpu] : nvml_gpus_by_pci) {
+      topology.gpus.push_back(std::move(gpu));
+    }
   }
 
   if (nvml_available) { nvml.p_nvmlShutdown(); }
