@@ -90,11 +90,9 @@ jobs:
           comment-on-alert: true
           alert-threshold: "110%"
 
-      - run: mkdir -p .cache && mv benchmark_result.json .cache/benchmark_result.json
-
       - name: Save baseline benchmark data
         uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
-        # if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
+        if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
         with:
           key: benchmark-linux-amd64-gpu-t4-latest-1
           path: .cache/benchmark_result.json
