@@ -1,4 +1,4 @@
-name: CI
+name: ci
 
 on:
   push:
@@ -11,16 +11,13 @@ jobs:
     runs-on: linux-amd64-cpu4
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Setup pixi
-        uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
         with:
-          cache-write: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
+          cache: false
 
-      - name: Build cuCascade
-        run: pixi run build
+      - run: pixi run build
 
       - name: Package build artifacts
         run: tar -cf build-release.tar build/release/
@@ -37,11 +34,11 @@ jobs:
     runs-on: linux-amd64-gpu-t4-latest-1
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Setup pixi
-        uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+        with:
+          cache: false
 
       - name: Download build artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -51,19 +48,18 @@ jobs:
       - name: Extract build artifacts
         run: tar -xf build-release.tar
 
-      - name: Run tests
-        run: pixi run test
+      - run: pixi run test
 
   benchmark:
     needs: build
     runs-on: linux-amd64-gpu-t4-latest-1
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Setup pixi
-        uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+        with:
+          cache: false
 
       - name: Download build artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -73,7 +69,7 @@ jobs:
       - name: Extract build artifacts
         run: tar -xf build-release.tar
 
-      - name: Run benchmarks (PR)
+      - name: Run benchmarks
         working-directory: build/release/benchmark/
         run: ./cucascade_benchmarks --benchmark_format=json --benchmark_out=${{ github.workspace }}/benchmark_result.json
 
@@ -93,6 +89,8 @@ jobs:
           summary-always: true
           comment-on-alert: true
           alert-threshold: "110%"
+
+      - run: mkdir -p .cache && mv benchmark_result.json .cache/benchmark_result.json
 
       - name: Save baseline benchmark data
         uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
