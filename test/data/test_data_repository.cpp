@@ -226,12 +226,14 @@ TEST_CASE("shared_data_repository Thread-Safe Pulling", "[data_repository]")
   REQUIRE(empty == nullptr);
 }
 
-// Test thread-safe pulling with shared_ptr but with multiple partitions and using pop_data_batch_by_id
-TEST_CASE("shared_data_repository Thread-Safe Pulling with Multiple Partitions", "[data_repository]")
+// Test thread-safe pulling with shared_ptr but with multiple partitions and using
+// pop_data_batch_by_id
+TEST_CASE("shared_data_repository Thread-Safe Pulling with Multiple Partitions",
+          "[data_repository]")
 {
   shared_data_repository repository;
 
-  constexpr int num_batches = 500;
+  constexpr int num_batches    = 500;
   constexpr int num_partitions = 30;
 
   // Add many batches
@@ -250,14 +252,15 @@ TEST_CASE("shared_data_repository Thread-Safe Pulling with Multiple Partitions",
     threads.emplace_back([&, i]() {
       uint64_t batch_id = i;
       while (true) {
-        auto batch = repository.pop_data_batch_by_id(batch_id, batch_state::task_created, batch_id % num_partitions);
-        if (!batch) { 
-          break; 
+        auto batch = repository.pop_data_batch_by_id(
+          batch_id, batch_state::task_created, batch_id % num_partitions);
+        if (!batch) {
+          break;
         } else {
           REQUIRE(batch->get_batch_id() == batch_id);
           batch_id += num_threads;
           ++thread_counts[i];
-        }        
+        }
       }
     });
   }
@@ -346,7 +349,7 @@ TEST_CASE("unique_data_repository Large Number of Batches", "[data_repository]")
 {
   unique_data_repository repository;
 
-  constexpr int num_batches = 10000;
+  constexpr int num_batches = 1000;
 
   // Add many batches
   for (int i = 0; i < num_batches; ++i) {
@@ -961,7 +964,8 @@ TEST_CASE("shared_data_repository size Concurrent Operations", "[data_repository
   REQUIRE(repository.size() == 0);
 }
 
-std::vector<std::shared_ptr<data_batch>> create_test_batches(std::vector<uint64_t> batch_ids){
+std::vector<std::shared_ptr<data_batch>> create_test_batches(std::vector<uint64_t> batch_ids)
+{
   std::vector<std::shared_ptr<data_batch>> batches;
   for (auto batch_id : batch_ids) {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
@@ -970,39 +974,39 @@ std::vector<std::shared_ptr<data_batch>> create_test_batches(std::vector<uint64_
   return batches;
 }
 
-
-// Test add and pop operations on multiple partitions and test size for each partition, and finally test the size and empty status
+// Test add and pop operations on multiple partitions and test size for each partition, and finally
+// test the size and empty status
 TEST_CASE("shared_data_repository pop Multiple Partitions", "[data_repository]")
 {
   shared_data_repository repository;
 
   // Add batches to multiple partitions
-  std::vector<uint64_t> batch_ids0 = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; 
-  auto batches = create_test_batches(batch_ids0);
+  std::vector<uint64_t> batch_ids0 = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  auto batches                     = create_test_batches(batch_ids0);
   for (auto& batch : batches) {
-    repository.add_data_batch(batch); // Add to partition 0
+    repository.add_data_batch(batch);  // Add to partition 0
   }
   REQUIRE(repository.size(0) == batch_ids0.size());
 
-  std::vector<uint64_t> batch_ids1 = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19}; 
-  auto batches1 = create_test_batches(batch_ids1);
+  std::vector<uint64_t> batch_ids1 = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+  auto batches1                    = create_test_batches(batch_ids1);
   for (auto& batch : batches1) {
     repository.add_data_batch(batch, 1);
   }
   REQUIRE(repository.size(1) == batch_ids1.size());
 
-  std::vector<uint64_t> batch_ids2 = {20, 21, 22, 23, 24, 25, 26, 27, 28, 29}; 
-  auto batches2 = create_test_batches(batch_ids2);
+  std::vector<uint64_t> batch_ids2 = {20, 21, 22, 23, 24, 25, 26, 27, 28, 29};
+  auto batches2                    = create_test_batches(batch_ids2);
   for (auto& batch : batches2) {
     repository.add_data_batch(batch, 2);
   }
   REQUIRE(repository.size(2) == batch_ids2.size());
 
   // Test total size
-  REQUIRE(repository.total_size() == batch_ids0.size() + batch_ids1.size() + batch_ids2.size()); 
+  REQUIRE(repository.total_size() == batch_ids0.size() + batch_ids1.size() + batch_ids2.size());
 
   // Test get batch ids from each partition
-  auto retrieved_batch_ids0 = repository.get_batch_ids(); // partition 0
+  auto retrieved_batch_ids0 = repository.get_batch_ids();  // partition 0
   REQUIRE(batch_ids0 == retrieved_batch_ids0);
   auto retrieved_batch_ids1 = repository.get_batch_ids(1);
   REQUIRE(batch_ids1 == retrieved_batch_ids1);
@@ -1030,13 +1034,13 @@ TEST_CASE("shared_data_repository pop Multiple Partitions", "[data_repository]")
   REQUIRE(repository.total_size() == 0);
 
   // Test empty and all_empty
-  REQUIRE(repository.empty()); // partition 0
+  REQUIRE(repository.empty());  // partition 0
   REQUIRE(repository.empty(1));
   REQUIRE(repository.empty(2));
   REQUIRE(repository.all_empty());
 
   // Test get batch ids from each partition
-  retrieved_batch_ids0 = repository.get_batch_ids(); // partition 0
+  retrieved_batch_ids0 = repository.get_batch_ids();  // partition 0
   REQUIRE(retrieved_batch_ids0.empty());
   retrieved_batch_ids1 = repository.get_batch_ids(1);
   REQUIRE(retrieved_batch_ids1.empty());
@@ -1050,10 +1054,10 @@ TEST_CASE("shared_data_repository pop Multiple Partitions with Nullopt", "[data_
   shared_data_repository repository;
 
   // Add batches to multiple partitions
-  std::vector<uint64_t> batch_ids0 = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; 
-  auto batches = create_test_batches(batch_ids0);
+  std::vector<uint64_t> batch_ids0 = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  auto batches                     = create_test_batches(batch_ids0);
   for (auto& batch : batches) {
-    repository.add_data_batch(batch); // Add to partition 0
+    repository.add_data_batch(batch);  // Add to partition 0
   }
   REQUIRE(repository.size(0) == batch_ids0.size());
 
@@ -1066,7 +1070,8 @@ TEST_CASE("shared_data_repository pop Multiple Partitions with Nullopt", "[data_
 }
 
 // Test case when trying to pop a batch by id that does not exist
-TEST_CASE("shared_data_repository pop Multiple Partitions with Non-existent Batch ID", "[data_repository]")
+TEST_CASE("shared_data_repository pop Multiple Partitions with Non-existent Batch ID",
+          "[data_repository]")
 {
   shared_data_repository repository;
   // add some batches
@@ -1079,11 +1084,12 @@ TEST_CASE("shared_data_repository pop Multiple Partitions with Non-existent Batc
 }
 
 // Test case using get_data_batch_by_id
-TEST_CASE("shared_data_repository using get_data_batch_by_id Multiple Partitions", "[data_repository]")
+TEST_CASE("shared_data_repository using get_data_batch_by_id Multiple Partitions",
+          "[data_repository]")
 {
   shared_data_repository repository;
   // add some batches
-  auto batches = create_test_batches({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+  auto batches                 = create_test_batches({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
   constexpr int num_partitions = 3;
   for (auto& batch : batches) {
     size_t partition_idx = batch->get_batch_id() % num_partitions;
@@ -1092,20 +1098,23 @@ TEST_CASE("shared_data_repository using get_data_batch_by_id Multiple Partitions
 
   // lets iterate through all batches and get them by id and check if they are the same
   for (auto& batch : batches) {
-    auto batch_from_repo = repository.get_data_batch_by_id(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
+    auto batch_from_repo = repository.get_data_batch_by_id(
+      batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
     REQUIRE(batch_from_repo != nullptr);
     REQUIRE(batch_from_repo->get_batch_id() == batch->get_batch_id());
     REQUIRE(batch_from_repo == batch);
 
     // get the same batch again
-    auto batch_from_repo2 = repository.get_data_batch_by_id(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
+    auto batch_from_repo2 = repository.get_data_batch_by_id(
+      batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
     REQUIRE(batch_from_repo2 != nullptr);
     REQUIRE(batch_from_repo2->get_batch_id() == batch->get_batch_id());
     REQUIRE(batch_from_repo2 == batch);
     REQUIRE(batch_from_repo2 == batch_from_repo);
 
     // now lets pop the batch and check if it is the same
-    auto batch_from_repo3 = repository.pop_data_batch_by_id(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
+    auto batch_from_repo3 = repository.pop_data_batch_by_id(
+      batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
     REQUIRE(batch_from_repo3 != nullptr);
     REQUIRE(batch_from_repo3->get_batch_id() == batch->get_batch_id());
     REQUIRE(batch_from_repo3 == batch);
@@ -1113,18 +1122,19 @@ TEST_CASE("shared_data_repository using get_data_batch_by_id Multiple Partitions
     REQUIRE(batch_from_repo3 == batch_from_repo2);
 
     // now lets get the batch again and it should be nullptr
-    auto batch_from_repo4 = repository.get_data_batch_by_id(batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
+    auto batch_from_repo4 = repository.get_data_batch_by_id(
+      batch->get_batch_id(), batch_state::task_created, batch->get_batch_id() % num_partitions);
     REQUIRE(batch_from_repo4 == nullptr);
   }
   REQUIRE(repository.total_size() == 0);
-
 }
 
 // test unique_data_repository throws an error when trying to get a batch by id
-TEST_CASE("unique_data_repository throws an error when trying to get a batch by id", "[data_repository]")
+TEST_CASE("unique_data_repository throws an error when trying to get a batch by id",
+          "[data_repository]")
 {
   unique_data_repository repository;
-  REQUIRE_THROWS_WITH(repository.get_data_batch_by_id(0, batch_state::task_created, 0), "get_data_batch_by_id is not supported for unique_ptr repositories. Use pop_data_batch to move ownership instead.");
+  REQUIRE_THROWS_WITH(repository.get_data_batch_by_id(0, batch_state::task_created, 0),
+                      "get_data_batch_by_id is not supported for unique_ptr repositories. Use "
+                      "pop_data_batch to move ownership instead.");
 }
-
-

@@ -11,11 +11,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -28,14 +33,18 @@ struct NvmlLoader {
   void* handle = nullptr;
 
   // Function pointers
-  nvmlReturn_t (*p_nvmlInit_v2)()                                              = nullptr;
-  nvmlReturn_t (*p_nvmlShutdown)()                                             = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetCount_v2)(unsigned int*)                       = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetHandleByIndex_v2)(unsigned int, nvmlDevice_t*) = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int)       = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetPciInfo_v3)(nvmlDevice_t, nvmlPciInfo_t*)      = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetUUID)(nvmlDevice_t, char*, unsigned int)       = nullptr;
-  const char* (*p_nvmlErrorString)(nvmlReturn_t)                               = nullptr;
+  nvmlReturn_t (*p_nvmlInit_v2)()                                               = nullptr;
+  nvmlReturn_t (*p_nvmlShutdown)()                                              = nullptr;
+  nvmlReturn_t (*p_nvmlDeviceGetCount_v2)(unsigned int*)                        = nullptr;
+  nvmlReturn_t (*p_nvmlDeviceGetHandleByIndex_v2)(unsigned int, nvmlDevice_t*)  = nullptr;
+  nvmlReturn_t (*p_nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int)        = nullptr;
+  nvmlReturn_t (*p_nvmlDeviceGetPciInfo_v3)(nvmlDevice_t, nvmlPciInfo_t*)       = nullptr;
+  nvmlReturn_t (*p_nvmlDeviceGetUUID)(nvmlDevice_t, char*, unsigned int)        = nullptr;
+  nvmlReturn_t (*p_nvmlDeviceGetHandleByUUID)(const char*, nvmlDevice_t*)       = nullptr;
+  nvmlReturn_t (*p_nvmlDeviceIsMigDeviceHandle)(nvmlDevice_t, unsigned int*)    = nullptr;
+  nvmlReturn_t (*p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle)(nvmlDevice_t,
+                                                                 nvmlDevice_t*) = nullptr;
+  const char* (*p_nvmlErrorString)(nvmlReturn_t)                                = nullptr;
 
   NvmlLoader() { load(); }
 
@@ -64,6 +73,13 @@ struct NvmlLoader {
       dlsym(handle, "nvmlDeviceGetPciInfo_v3"));
     p_nvmlDeviceGetUUID = reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, char*, unsigned int)>(
       dlsym(handle, "nvmlDeviceGetUUID"));
+    p_nvmlDeviceGetHandleByUUID = reinterpret_cast<nvmlReturn_t (*)(const char*, nvmlDevice_t*)>(
+      dlsym(handle, "nvmlDeviceGetHandleByUUID"));
+    p_nvmlDeviceIsMigDeviceHandle = reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, unsigned int*)>(
+      dlsym(handle, "nvmlDeviceIsMigDeviceHandle"));
+    p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle =
+      reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, nvmlDevice_t*)>(
+        dlsym(handle, "nvmlDeviceGetDeviceHandleFromMigDeviceHandle"));
     p_nvmlErrorString =
       reinterpret_cast<const char* (*)(nvmlReturn_t)>(dlsym(handle, "nvmlErrorString"));
     // If any required symbol is missing, treat NVML as unavailable
@@ -71,15 +87,18 @@ struct NvmlLoader {
         !p_nvmlDeviceGetHandleByIndex_v2 || !p_nvmlDeviceGetName || !p_nvmlDeviceGetPciInfo_v3 ||
         !p_nvmlDeviceGetUUID || !p_nvmlErrorString) {
       dlclose(handle);
-      handle                          = nullptr;
-      p_nvmlInit_v2                   = nullptr;
-      p_nvmlShutdown                  = nullptr;
-      p_nvmlDeviceGetCount_v2         = nullptr;
-      p_nvmlDeviceGetHandleByIndex_v2 = nullptr;
-      p_nvmlDeviceGetName             = nullptr;
-      p_nvmlDeviceGetPciInfo_v3       = nullptr;
-      p_nvmlDeviceGetUUID             = nullptr;
-      p_nvmlErrorString               = nullptr;
+      handle                                         = nullptr;
+      p_nvmlInit_v2                                  = nullptr;
+      p_nvmlShutdown                                 = nullptr;
+      p_nvmlDeviceGetCount_v2                        = nullptr;
+      p_nvmlDeviceGetHandleByIndex_v2                = nullptr;
+      p_nvmlDeviceGetName                            = nullptr;
+      p_nvmlDeviceGetPciInfo_v3                      = nullptr;
+      p_nvmlDeviceGetUUID                            = nullptr;
+      p_nvmlDeviceGetHandleByUUID                    = nullptr;
+      p_nvmlDeviceIsMigDeviceHandle                  = nullptr;
+      p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle = nullptr;
+      p_nvmlErrorString                              = nullptr;
     }
   }
 
@@ -187,6 +206,118 @@ std::string normalize_pci_bus_id(std::string const& pci_bus_id)
   std::ranges::transform(normalized_id, normalized_id.begin(), ::tolower);
 
   return normalized_id;
+}
+
+std::string trim_copy(std::string const& input)
+{
+  size_t start = 0;
+  while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start])) != 0) {
+    ++start;
+  }
+  size_t end = input.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1])) != 0) {
+    --end;
+  }
+  return input.substr(start, end - start);
+}
+
+std::vector<std::string> split_csv(std::string const& input)
+{
+  std::vector<std::string> tokens;
+  std::string token;
+  std::istringstream iss(input);
+  while (std::getline(iss, token, ',')) {
+    tokens.push_back(trim_copy(token));
+  }
+  return tokens;
+}
+
+bool is_numeric_token(std::string const& token)
+{
+  return !token.empty() &&
+         std::ranges::all_of(token, [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
+std::vector<size_t> resolve_visible_gpu_indices(
+  NvmlLoader& nvml,
+  std::vector<gpu_topology_info> const& nvml_gpus,
+  std::unordered_map<std::string, size_t> const& index_by_pci,
+  std::unordered_map<std::string, size_t> const& index_by_uuid)
+{
+  std::vector<size_t> indices;
+  std::unordered_set<size_t> seen;
+
+  char const* env_value = std::getenv("CUDA_VISIBLE_DEVICES");
+  if (!env_value) {
+    indices.reserve(nvml_gpus.size());
+    for (size_t i = 0; i < nvml_gpus.size(); ++i) {
+      indices.push_back(i);
+    }
+    return indices;
+  }
+
+  std::string env_str(env_value);
+  auto tokens = split_csv(env_str);
+  for (auto const& token : tokens) {
+    if (token.empty()) { continue; }
+
+    bool matched = false;
+    if (is_numeric_token(token)) {
+      size_t idx = 0;
+      try {
+        idx = static_cast<size_t>(std::stoul(token));
+      } catch (std::exception const& e) {
+        throw std::invalid_argument("Invalid numeric CUDA_VISIBLE_DEVICES entry: " + token);
+      }
+      if (idx < nvml_gpus.size()) {
+        if (seen.insert(idx).second) { indices.push_back(idx); }
+        matched = true;
+      } else {
+        throw std::invalid_argument("CUDA_VISIBLE_DEVICES entry " + token + " is out of range");
+      }
+    } else if (token.starts_with("GPU-") || token.starts_with("MIG-")) {
+      nvmlDevice_t handle;
+      if (nvml.p_nvmlDeviceGetHandleByUUID &&
+          nvml.p_nvmlDeviceGetHandleByUUID(token.c_str(), &handle) == NVML_SUCCESS) {
+        unsigned int is_mig = 0;
+        if (nvml.p_nvmlDeviceIsMigDeviceHandle &&
+            nvml.p_nvmlDeviceIsMigDeviceHandle(handle, &is_mig) == NVML_SUCCESS && is_mig &&
+            nvml.p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle) {
+          nvmlDevice_t parent_handle;
+          if (nvml.p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle(handle, &parent_handle) ==
+              NVML_SUCCESS) {
+            handle = parent_handle;
+          }
+        }
+
+        nvmlPciInfo_t pci_info;
+        if (nvml.p_nvmlDeviceGetPciInfo_v3 &&
+            nvml.p_nvmlDeviceGetPciInfo_v3(handle, &pci_info) == NVML_SUCCESS) {
+          std::string normalized = normalize_pci_bus_id(pci_info.busId);
+          auto it                = index_by_pci.find(normalized);
+          if (it != index_by_pci.end()) {
+            if (seen.insert(it->second).second) { indices.push_back(it->second); }
+            matched = true;
+          }
+        }
+      }
+
+      if (!matched && token.starts_with("GPU-")) {
+        auto it = index_by_uuid.find(token);
+        if (it != index_by_uuid.end()) {
+          if (seen.insert(it->second).second) { indices.push_back(it->second); }
+          matched = true;
+        }
+      }
+    }
+
+    if (!matched) {
+      std::cerr << "Warning: CUDA_VISIBLE_DEVICES entry '" << token
+                << "' does not map to an NVML device" << std::endl;
+    }
+  }
+
+  return indices;
 }
 
 /**
@@ -567,57 +698,69 @@ bool topology_discovery::discover()
   // Collect GPU information
   topology.gpus.clear();
 
-  for (unsigned int i = 0; i < device_count; ++i) {
-    nvmlDevice_t device;
-    result = nvml.p_nvmlDeviceGetHandleByIndex_v2(i, &device);
-    if (result != NVML_SUCCESS) {
-      std::cerr << "Warning: Failed to get handle for GPU " << i << ": "
-                << nvml.p_nvmlErrorString(result) << std::endl;
-      continue;
-    }
+  std::vector<gpu_topology_info> nvml_gpus;
+  std::unordered_map<std::string, size_t> nvml_index_by_pci;
+  std::unordered_map<std::string, size_t> nvml_index_by_uuid;
+  if (nvml_available) {
+    for (unsigned int i = 0; i < device_count; ++i) {
+      nvmlDevice_t device;
+      result = nvml.p_nvmlDeviceGetHandleByIndex_v2(i, &device);
+      if (result != NVML_SUCCESS) {
+        std::cerr << "Warning: Failed to get handle for GPU " << i << ": "
+                  << nvml.p_nvmlErrorString(result) << std::endl;
+        continue;
+      }
 
-    gpu_topology_info gpu;
-    gpu.id = i;
+      gpu_topology_info gpu;
+      gpu.id = i;
 
-    // Get device name, PCI bus ID and UUID
-    std::array<char, NVML_DEVICE_NAME_BUFFER_SIZE> name{};
-    result = nvml.p_nvmlDeviceGetName(device, name.data(), NVML_DEVICE_NAME_BUFFER_SIZE);
-    if (result == NVML_SUCCESS) {
-      gpu.name = std::string(name.data());
-    } else {
-      gpu.name = "Unknown";
-    }
+      // Get device name, PCI bus ID and UUID
+      std::array<char, NVML_DEVICE_NAME_BUFFER_SIZE> name{};
+      result   = nvml.p_nvmlDeviceGetName(device, name.data(), NVML_DEVICE_NAME_BUFFER_SIZE);
+      gpu.name = (result == NVML_SUCCESS) ? std::string(name.data()) : "Unknown";
 
-    nvmlPciInfo_t pci_info;
-    result = nvml.p_nvmlDeviceGetPciInfo_v3(device, &pci_info);
-    if (result == NVML_SUCCESS) {
+      nvmlPciInfo_t pci_info;
+      result = nvml.p_nvmlDeviceGetPciInfo_v3(device, &pci_info);
+      if (result != NVML_SUCCESS) {
+        std::cerr << "Warning: Failed to get PCI info for GPU " << i << std::endl;
+        continue;
+      }
       gpu.pci_bus_id = std::string(pci_info.busId);
-    } else {
-      std::cerr << "Warning: Failed to get PCI info for GPU " << i << std::endl;
-      continue;
+
+      std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
+      result   = nvml.p_nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
+      gpu.uuid = (result == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
+
+      // Get NUMA node and CPU affinity from /sys
+      gpu.numa_node         = get_numa_node_from_sys(gpu.pci_bus_id);
+      gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
+      gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
+
+      // Memory binding is typically the same as NUMA node
+      if (gpu.numa_node >= 0) { gpu.memory_binding.push_back(gpu.numa_node); }
+
+      // Map network devices to this GPU using PCIe topology
+      gpu.network_devices =
+        map_network_devices_to_gpu(gpu.pci_bus_id, gpu.numa_node, topology.network_devices);
+
+      nvml_gpus.push_back(std::move(gpu));
+      nvml_index_by_pci.emplace(normalize_pci_bus_id(nvml_gpus.back().pci_bus_id),
+                                nvml_gpus.size() - 1);
+      if (!nvml_gpus.back().uuid.empty()) {
+        nvml_index_by_uuid.emplace(nvml_gpus.back().uuid, nvml_gpus.size() - 1);
+      }
     }
+  }
 
-    std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
-    result = nvml.p_nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
-    if (result == NVML_SUCCESS) {
-      gpu.uuid = std::string(uuid.data());
-    } else {
-      gpu.uuid = "Unknown";
-    }
-
-    // Get NUMA node and CPU affinity from /sys
-    gpu.numa_node         = get_numa_node_from_sys(gpu.pci_bus_id);
-    gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
-    gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
-
-    // Memory binding is typically the same as NUMA node
-    if (gpu.numa_node >= 0) { gpu.memory_binding.push_back(gpu.numa_node); }
-
-    // Map network devices to this GPU using PCIe topology
-    gpu.network_devices =
-      map_network_devices_to_gpu(gpu.pci_bus_id, gpu.numa_node, topology.network_devices);
-
-    topology.gpus.push_back(gpu);
+  auto visible_indices =
+    resolve_visible_gpu_indices(nvml, nvml_gpus, nvml_index_by_pci, nvml_index_by_uuid);
+  topology.num_gpus = static_cast<unsigned int>(visible_indices.size());
+  for (size_t visible_idx = 0; visible_idx < visible_indices.size(); ++visible_idx) {
+    size_t nvml_idx = visible_indices[visible_idx];
+    if (nvml_idx >= nvml_gpus.size()) { continue; }
+    auto gpu = nvml_gpus[nvml_idx];
+    gpu.id   = static_cast<unsigned int>(visible_idx);
+    topology.gpus.push_back(std::move(gpu));
   }
 
   if (nvml_available) { nvml.p_nvmlShutdown(); }
