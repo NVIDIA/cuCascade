@@ -23,7 +23,7 @@ jobs:
         run: pixi run build
 
       - name: Package build artifacts
-        run: tar -cvf build-release.tar build/release/
+        run: tar -cf build-release.tar build/release/
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -49,7 +49,7 @@ jobs:
           name: build-release
 
       - name: Extract build artifacts
-        run: tar -xvf build-release.tar
+        run: tar -xf build-release.tar
 
       - name: Run tests
         run: pixi run test
@@ -71,7 +71,7 @@ jobs:
           name: build-release
 
       - name: Extract build artifacts
-        run: tar -xvf build-release.tar
+        run: tar -xf build-release.tar
 
       - name: Run benchmarks (PR)
         working-directory: build/release/
