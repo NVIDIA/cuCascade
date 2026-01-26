@@ -22,11 +22,14 @@ jobs:
       - name: Build cuCascade
         run: pixi run build
 
+      - name: Package build artifacts
+        run: tar -cvf build-release.tar build/release/
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: build-release
-          path: build/release/
+          path: build-release.tar
           if-no-files-found: error
 
   test:
@@ -44,7 +47,9 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: build-release
-          path: build/release/
+
+      - name: Extract build artifacts
+        run: tar -xvf build-release.tar
 
       - name: Run tests
         run: pixi run test
@@ -64,7 +69,9 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: build-release
-          path: build/release/
+
+      - name: Extract build artifacts
+        run: tar -xvf build-release.tar
 
       - name: Run benchmarks (PR)
         working-directory: build/release/
