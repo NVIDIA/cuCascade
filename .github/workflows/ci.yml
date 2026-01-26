@@ -85,7 +85,7 @@ jobs:
           tool: googlecpp
           output-file-path: ${{ github.workspace }}/benchmark_result.json
           github-token: ${{ github.token }}
-          external-data-json-path: ./cache/benchmark_result.json
+          external-data-json-path: .cache/benchmark_result.json
           summary-always: true
           comment-on-alert: true
           alert-threshold: "110%"
