@@ -1,4 +1,4 @@
-name: Build and Test
+name: CI
 
 on:
   push:
@@ -54,7 +54,7 @@ jobs:
       - name: Run tests
         run: pixi run test
 
-  benchmarks:
+  benchmark:
     needs: build
     runs-on: linux-amd64-gpu-t4-latest-1
 
@@ -74,61 +74,29 @@ jobs:
         run: tar -xf build-release.tar
 
       - name: Run benchmarks (PR)
-        working-directory: build/release/
-        run: |
-          ./benchmark/cucascade_benchmarks \
-            --benchmark_format=json \
-            --benchmark_out="${GITHUB_WORKSPACE}/bench_pr.json"
+        working-directory: build/release/benchmark/
+        run: ./cucascade_benchmarks --benchmark_format=json --benchmark_out=${{ github.workspace }}/benchmark_result.json
 
-      - name: Locate main baseline run
-        uses: actions/github-script@v7
-        id: main_run
+      - name: Restore baseline benchmark data
+        uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
-          script: |
-            const { data } = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'ci.yml',
-              branch: 'main',
-              status: 'success',
-              per_page: 1
-            });
-            if (!data.workflow_runs.length) {
-              core.notice('No successful main workflow runs found; skipping baseline comparison.');
-              core.setOutput('run_id', '');
-              core.setOutput('has_baseline', 'false');
-              return;
-            }
-            core.setOutput('run_id', data.workflow_runs[0].id);
-            core.setOutput('has_baseline', 'true');
+          key: benchmark-linux-amd64-gpu-t4-latest-1
+          path: .cache/benchmark_result.json
 
-      - name: Download baseline build artifacts
-        uses: actions/download-artifact@v4
-        if: steps.main_run.outputs.has_baseline == 'true'
+      - name: Compare benchmark results
+        uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1.20.7
         with:
-          name: build-release
-          path: baseline-build
-          run-id: ${{ steps.main_run.outputs.run_id }}
+          tool: googlecpp
+          output-file-path: ${{ github.workspace }}/benchmark_result.json
           github-token: ${{ github.token }}
+          external-data-json-path: ./cache/benchmark_result.json
+          summary-always: true
+          comment-on-alert: true
+          alert-threshold: "110%"
 
-      - name: Extract baseline build artifacts
-        if: steps.main_run.outputs.has_baseline == 'true'
-        run: tar -xzf baseline-build/build-release.tgz -C baseline-build
-
-      - name: Run benchmarks (baseline)
-        if: steps.main_run.outputs.has_baseline == 'true'
-        run: |
-          cd baseline-build/build/release
-          ./benchmark/cucascade_benchmarks \
-            --benchmark_format=json \
-            --benchmark_out="${GITHUB_WORKSPACE}/bench_main.json"
-
-      - name: Compare benchmark tests
-        if: steps.main_run.outputs.has_baseline == 'true'
-        env:
-          BENCHMARK_REGRESSION_PCT: "10"
-        run: |
-          pixi run python scripts/compare_benchmarks.py \
-            --baseline "${GITHUB_WORKSPACE}/bench_main.json" \
-            --current "${GITHUB_WORKSPACE}/bench_pr.json" \
-            --max-regression-pct "${BENCHMARK_REGRESSION_PCT}"
+      - name: Save baseline benchmark data
+        uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        # if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
+        with:
+          key: benchmark-linux-amd64-gpu-t4-latest-1
+          path: .cache/benchmark_result.json
