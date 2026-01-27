@@ -419,7 +419,7 @@ BENCHMARK(BM_ConvertGpuToHost)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
   ->RangeMultiplier(4)
-  ->Ranges({{32 * MiB, 512 * MiB}, {2, 8}, {1, 4}})
+  ->Ranges({{64 * KiB, 512 * MiB}, {2, 8}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
@@ -427,19 +427,19 @@ BENCHMARK(BM_ConvertHostToGpu)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
   ->RangeMultiplier(4)
-  ->Ranges({{32 * MiB, 512 * MiB}, {2, 8}, {1, 4}})
+  ->Ranges({{64 * KiB, 512 * MiB}, {2, 8}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 BENCHMARK(BM_GpuToHostThroughput)
   ->RangeMultiplier(4)
-  ->Ranges({{32 * MiB, 512 * MiB}, {1, 4}})
+  ->Ranges({{64 * KiB, 512 * MiB}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 BENCHMARK(BM_HostToGpuThroughput)
   ->RangeMultiplier(4)
-  ->Ranges({{32 * MiB, 512 * MiB}, {1, 4}})
+  ->Ranges({{64 * KiB, 512 * MiB}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
