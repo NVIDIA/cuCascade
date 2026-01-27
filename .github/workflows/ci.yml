@@ -6,12 +6,11 @@ on:
       - "main"
       - "pull-request/[0-9]+"
 
-env:
-  SCCACHE_GHA_ENABLED: true
-
 jobs:
   build:
     runs-on: linux-amd64-cpu4
+    env:
+      SCCACHE_GHA_ENABLED: true
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -84,6 +83,7 @@ jobs:
 
       - name: Restore baseline benchmark data
         uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        id: benchmark-data
         with:
           key: benchmark_result-linux-amd64-gpu-t4-latest-1
           path: .cache/benchmark_result.json
@@ -103,5 +103,5 @@ jobs:
         uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         # if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
         with:
-          key: benchmark_result-linux-amd64-gpu-t4-latest-1
+          key: ${{ steps.benchmark-data.outputs.cache-primary-key }}
           path: .cache/benchmark_result.json
