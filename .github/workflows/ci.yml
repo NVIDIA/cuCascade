@@ -32,6 +32,7 @@ jobs:
           name: build-release
           path: build-release.tar
           if-no-files-found: error
+          retention-days: 1
 
   test:
     needs: build
@@ -82,7 +83,7 @@ jobs:
             --benchmark_out=${{ github.workspace }}/benchmark_result.json
 
       - name: Restore baseline benchmark data
-        uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         id: benchmark-data
         with:
           key: benchmark_result-linux-amd64-gpu-t4-latest-1
@@ -99,9 +100,9 @@ jobs:
           comment-on-alert: true
           alert-threshold: "110%"
 
-      - name: Save baseline benchmark data
-        uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
-        # if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
-        with:
-          key: ${{ steps.benchmark-data.outputs.cache-primary-key }}
-          path: .cache/benchmark_result.json
+      # - name: Save baseline benchmark data
+      #   uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+      #   # if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
+      #   with:
+      #     key: ${{ steps.benchmark-data.outputs.cache-primary-key }}
+      #     path: .cache/benchmark_result.json
