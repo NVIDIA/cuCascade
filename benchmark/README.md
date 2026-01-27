@@ -47,8 +47,8 @@ To run only specific benchmarks, use filters:
 Located in `benchmark_representation_converter.cpp`:
 
 1. **BM_ConvertGpuToHost**: Benchmarks GPU to HOST memory conversion with varying data sizes
-   - Tests with different row counts (1K to 1M rows)
-   - Tests with different column counts (2, 4, 8 columns)
+   - Tests with different data sizes
+   - Tests with different column counts
    - Reports throughput in bytes/second
 
 2. **BM_ConvertHostToGpu**: Benchmarks HOST to GPU memory conversion
@@ -56,12 +56,12 @@ Located in `benchmark_representation_converter.cpp`:
    - Measures upload performance
 
 5. **BM_GpuToHostThroughput**: Focuses on memory bandwidth for GPU→HOST transfers
-   - Tests with data sizes from 1 MB to 1 GB
-   - Reports throughput in GB/s
+   - Tests with data sizes
+   - Reports throughput in GiB/s
 
 6. **BM_HostToGpuThroughput**: Focuses on memory bandwidth for HOST→GPU transfers
    - Similar parameterization as GPU to HOST throughput
-   - Reports throughput in GB/s
+   - Reports throughput in GiB/s
 
 All benchmarks measure different thread counts.
 The multi-threading is explicitly implemented instead of relying on googlebenchmark's built-in threading functionality,

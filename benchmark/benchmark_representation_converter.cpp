@@ -418,33 +418,29 @@ void BM_HostToGpuThroughput(benchmark::State& state)
 BENCHMARK(BM_ConvertGpuToHost)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->RangeMultiplier(2)
-  ->Ranges({{128 * KiB, 512 * MiB}, {1, 64}, {1, 4}})
+  ->RangeMultiplier(4)
+  ->Ranges({{64 * KiB, 512 * MiB}, {2, 8}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
-  ->Iterations(1)
   ->UseRealTime();
 
 BENCHMARK(BM_ConvertHostToGpu)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->RangeMultiplier(2)
-  ->Ranges({{128 * KiB, 512 * MiB}, {1, 64}, {1, 4}})
+  ->RangeMultiplier(4)
+  ->Ranges({{64 * KiB, 512 * MiB}, {2, 8}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
-  ->Iterations(1)
   ->UseRealTime();
 
 BENCHMARK(BM_GpuToHostThroughput)
-  ->RangeMultiplier(2)
-  ->Ranges({{128 * KiB, 512 * MiB}, {1, 4}})
+  ->RangeMultiplier(4)
+  ->Ranges({{64 * KiB, 512 * MiB}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
-  ->Iterations(1)
   ->UseRealTime();
 
 BENCHMARK(BM_HostToGpuThroughput)
-  ->RangeMultiplier(2)
-  ->Ranges({{128 * KiB, 512 * MiB}, {1, 4}})
+  ->RangeMultiplier(4)
+  ->Ranges({{64 * KiB, 512 * MiB}, {1, 4}})
   ->Unit(benchmark::kMillisecond)
-  ->Iterations(1)
   ->UseRealTime();
 
 }  // namespace
