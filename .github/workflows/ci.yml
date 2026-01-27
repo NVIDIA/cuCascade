@@ -6,6 +6,9 @@ on:
       - "main"
       - "pull-request/[0-9]+"
 
+env:
+  SCCACHE_GHA_ENABLED: true
+
 jobs:
   build:
     runs-on: linux-amd64-cpu4
@@ -16,6 +19,8 @@ jobs:
       - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
         with:
           cache: false
+
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - run: pixi run build
 
@@ -96,7 +101,7 @@ jobs:
 
       - name: Save baseline benchmark data
         uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
-        if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
+        # if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
         with:
           key: benchmark_result-linux-amd64-gpu-t4-latest-1
           path: .cache/benchmark_result.json
