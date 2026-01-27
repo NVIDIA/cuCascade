@@ -73,16 +73,11 @@ jobs:
         working-directory: build/release/benchmark/
         run: ./cucascade_benchmarks --benchmark_out_format=json --benchmark_out=${{ github.workspace }}/benchmark_result.json
 
-      - uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+      - name: Restore baseline benchmark data
+        uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
           key: benchmark_result-linux-amd64-gpu-t4-latest-1
           path: .cache/benchmark_result.json
-
-      # - name: Restore baseline benchmark data
-      #   uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
-      #   with:
-      #     key: benchmark_result-linux-amd64-gpu-t4-latest-1
-      #     path: .cache/benchmark_result.json
 
       - name: Compare benchmark results
         uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1.20.7
@@ -95,9 +90,9 @@ jobs:
           comment-on-alert: true
           alert-threshold: "110%"
 
-      # - name: Save baseline benchmark data
-      #   uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
-      #   if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
-      #   with:
-      #     key: benchmark_result-linux-amd64-gpu-t4-latest-1
-      #     path: .cache/benchmark_result.json
+      - name: Save baseline benchmark data
+        uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        if: ${{ github.event_name == 'push' && github.ref_name == 'main' }}
+        with:
+          key: benchmark_result-linux-amd64-gpu-t4-latest-1
+          path: .cache/benchmark_result.json
