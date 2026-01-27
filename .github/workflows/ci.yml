@@ -86,7 +86,7 @@ jobs:
         uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         id: benchmark-data
         with:
-          key: benchmark_result-linux-amd64-gpu-t4-latest-1
+          key: benchmark_result-linux-amd64-gpu-t4-latest-1-v1
           path: .cache/benchmark_result.json
 
       - name: Compare benchmark results
