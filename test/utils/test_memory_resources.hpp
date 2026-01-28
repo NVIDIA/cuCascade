@@ -34,12 +34,12 @@ class shared_device_resource : public rmm::mr::device_memory_resource {
  private:
   void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
   {
-    return upstream_->allocate(bytes, stream);
+    return upstream_->allocate(stream, bytes);
   }
 
-  void do_deallocate(void* p, std::size_t bytes, rmm::cuda_stream_view stream) override
+  void do_deallocate(void* p, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override
   {
-    upstream_->deallocate(p, bytes, stream);
+    upstream_->deallocate(stream, p, bytes);
   }
 
   bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override
