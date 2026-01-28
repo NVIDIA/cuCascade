@@ -160,7 +160,7 @@ class logging_device_resource : public rmm::mr::device_memory_resource {
  private:
   void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
   {
-    void* ptr = _upstream->allocate(bytes, stream);
+    void* ptr = _upstream->allocate(stream, bytes);
     std::ostringstream oss;
     oss << "[rmm-alloc] ptr=" << ptr << " size=" << bytes << " stream=" << stream.value()
         << " tid=" << std::this_thread::get_id();
@@ -174,7 +174,7 @@ class logging_device_resource : public rmm::mr::device_memory_resource {
     oss << "[rmm-free ] ptr=" << ptr << " size=" << bytes << " stream=" << stream.value()
         << " tid=" << std::this_thread::get_id();
     std::cout << oss.str() << std::endl << std::flush;
-    _upstream->deallocate(ptr, bytes, stream);
+    _upstream->deallocate(stream, ptr, bytes);
   }
 
   bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override

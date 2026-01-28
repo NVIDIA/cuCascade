@@ -22,7 +22,7 @@
 
 #include <rmm/aligned.hpp>
 #include <rmm/error.hpp>
-#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 
 #include <memory>
 #include <mutex>
@@ -57,7 +57,7 @@ fixed_size_host_memory_resource::~fixed_size_host_memory_resource()
   std::lock_guard<std::mutex> lock(_mutex);
   for (auto& block : _allocated_blocks) {
     const std::size_t dealloc_size = _block_size * _pool_size;
-    _upstream_mr->deallocate(block, dealloc_size);
+    _upstream_mr->deallocate(rmm::cuda_stream_view{}, block, dealloc_size);
   }
   _allocated_blocks.clear();
   _free_blocks.clear();
@@ -248,7 +248,7 @@ void fixed_size_host_memory_resource::expand_pool()
 {
   const std::size_t total_size = _block_size * _pool_size;
 
-  void* large_allocation = _upstream_mr->allocate(total_size);
+  void* large_allocation = _upstream_mr->allocate(rmm::cuda_stream_view{}, total_size);
 
   _allocated_blocks.push_back(large_allocation);
 
