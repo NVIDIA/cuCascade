@@ -223,6 +223,12 @@ TEST_CASE("gpu_table_representation device_id", "[gpu_data_representation]")
 
   SECTION("Device 1")
   {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+      SUCCEED("Single GPU or CUDA not available; skipping device 1 section");
+      return;
+    }
+
     auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 1);
     auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
     gpu_table_representation repr(std::move(table), *gpu_space);

@@ -35,6 +35,7 @@ jinja2 = "*"
 [tasks]
 build = "cmake --preset release && cmake --build build/release && pixi run docs"
 test = "cd build/release && ctest --output-on-failure"
+benchmarks = "cd build/release && ./benchmark/cucascade_benchmarks"
 lint = "pre-commit run -a"
 lint-install = "pre-commit install"
 docs = "doxygen Doxyfile && python scripts/generate_api_docs.py build/docs/xml docs/API_REFERENCE.md"

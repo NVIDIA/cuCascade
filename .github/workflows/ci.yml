@@ -25,11 +25,14 @@ jobs:
       - name: Build cuCascade
         run: pixi run build
 
+      - name: Package build artifacts
+        run: tar -czf build-release.tgz build/release
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: build-release
-          path: build/release
+          path: build-release.tgz
           if-no-files-found: error
 
   test:
@@ -46,6 +49,9 @@ jobs:
           name: build-release
           path: .
 
+      - name: Extract build artifacts
+        run: tar -xzf build-release.tgz
+
       - name: Install pixi
         run: |
           curl -fsSL https://pixi.sh/install.sh | bash
@@ -56,3 +62,88 @@ jobs:
 
       - name: Run tests
         run: pixi run test
+
+  benchmarks:
+    needs: build
+    runs-on: linux-amd64-gpu-t4-latest-1
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-release
+          path: .
+
+      - name: Extract build artifacts
+        run: tar -xzf build-release.tgz
+
+      - name: Install pixi
+        run: |
+          curl -fsSL https://pixi.sh/install.sh | bash
+          echo "$HOME/.pixi/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: pixi install
+
+      - name: Run benchmarks (PR)
+        run: |
+          cd build/release
+          ./benchmark/cucascade_benchmarks \
+            --benchmark_format=json \
+            --benchmark_out="${GITHUB_WORKSPACE}/bench_pr.json"
+
+      - name: Locate main baseline run
+        uses: actions/github-script@v7
+        id: main_run
+        with:
+          script: |
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              branch: 'main',
+              status: 'success',
+              per_page: 1
+            });
+            if (!data.workflow_runs.length) {
+              core.notice('No successful main workflow runs found; skipping baseline comparison.');
+              core.setOutput('run_id', '');
+              core.setOutput('has_baseline', 'false');
+              return;
+            }
+            core.setOutput('run_id', data.workflow_runs[0].id);
+            core.setOutput('has_baseline', 'true');
+
+      - name: Download baseline build artifacts
+        uses: actions/download-artifact@v4
+        if: steps.main_run.outputs.has_baseline == 'true'
+        with:
+          name: build-release
+          path: baseline-build
+          run-id: ${{ steps.main_run.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Extract baseline build artifacts
+        if: steps.main_run.outputs.has_baseline == 'true'
+        run: tar -xzf baseline-build/build-release.tgz -C baseline-build
+
+      - name: Run benchmarks (baseline)
+        if: steps.main_run.outputs.has_baseline == 'true'
+        run: |
+          cd baseline-build/build/release
+          ./benchmark/cucascade_benchmarks \
+            --benchmark_format=json \
+            --benchmark_out="${GITHUB_WORKSPACE}/bench_main.json"
+
+      - name: Compare benchmark tests
+        if: steps.main_run.outputs.has_baseline == 'true'
+        env:
+          BENCHMARK_REGRESSION_PCT: "10"
+        run: |
+          pixi run python scripts/compare_benchmarks.py \
+            --baseline "${GITHUB_WORKSPACE}/bench_main.json" \
+            --current "${GITHUB_WORKSPACE}/bench_pr.json" \
+            --max-regression-pct "${BENCHMARK_REGRESSION_PCT}"

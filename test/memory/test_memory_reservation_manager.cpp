@@ -29,6 +29,8 @@
  * - Run all tests: ./test_executable "[memory_space]"
  */
 
+#include "utils/test_memory_resources.hpp"
+
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -42,7 +44,6 @@
 
 #include <catch2/catch.hpp>
 
-#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <vector>
@@ -58,6 +59,7 @@ std::unique_ptr<memory_reservation_manager> createSingleDeviceMemoryManager()
 {
   reservation_manager_configurator builder;
   builder.set_gpu_usage_limit(expected_gpu_capacity);  // 2 GB
+  builder.set_gpu_memory_resource_factory(cucascade::test::make_shared_current_device_resource);
   builder.set_reservation_fraction_per_gpu(limit_ratio);
   builder.set_per_host_capacity(expected_host_capacity);  //  4 GB
   builder.use_host_per_gpu();
@@ -71,6 +73,7 @@ std::unique_ptr<memory_reservation_manager> createDualGpuMemoryManager()
 {
   reservation_manager_configurator builder;
   builder.set_gpu_usage_limit(expected_gpu_capacity);  // 2 GB
+  builder.set_gpu_memory_resource_factory(cucascade::test::make_shared_current_device_resource);
   builder.set_reservation_fraction_per_gpu(limit_ratio);
   builder.set_per_host_capacity(expected_host_capacity);  //  4 GB
   builder.set_number_of_gpus(2);
