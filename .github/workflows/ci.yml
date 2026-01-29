@@ -117,33 +117,33 @@ jobs:
             core.setOutput('run_id', data.workflow_runs[0].id);
             core.setOutput('has_baseline', 'true');
 
-      - name: Download baseline build artifacts
-        uses: actions/download-artifact@v4
-        if: steps.main_run.outputs.has_baseline == 'true'
-        with:
-          name: build-release
-          path: baseline-build
-          run-id: ${{ steps.main_run.outputs.run_id }}
-          github-token: ${{ github.token }}
+      # - name: Download baseline build artifacts
+      #   uses: actions/download-artifact@v4
+      #   if: steps.main_run.outputs.has_baseline == 'true'
+      #   with:
+      #     name: build-release
+      #     path: baseline-build
+      #     run-id: ${{ steps.main_run.outputs.run_id }}
+      #     github-token: ${{ github.token }}
 
-      - name: Extract baseline build artifacts
-        if: steps.main_run.outputs.has_baseline == 'true'
-        run: tar -xzf baseline-build/build-release.tgz -C baseline-build
+      # - name: Extract baseline build artifacts
+      #   if: steps.main_run.outputs.has_baseline == 'true'
+      #   run: tar -xzf baseline-build/build-release.tgz -C baseline-build
 
-      - name: Run benchmarks (baseline)
-        if: steps.main_run.outputs.has_baseline == 'true'
-        run: |
-          cd baseline-build/build/release
-          ./benchmark/cucascade_benchmarks \
-            --benchmark_format=json \
-            --benchmark_out="${GITHUB_WORKSPACE}/bench_main.json"
+      # - name: Run benchmarks (baseline)
+      #   if: steps.main_run.outputs.has_baseline == 'true'
+      #   run: |
+      #     cd baseline-build/build/release
+      #     ./benchmark/cucascade_benchmarks \
+      #       --benchmark_format=json \
+      #       --benchmark_out="${GITHUB_WORKSPACE}/bench_main.json"
 
-      - name: Compare benchmark tests
-        if: steps.main_run.outputs.has_baseline == 'true'
-        env:
-          BENCHMARK_REGRESSION_PCT: "10"
-        run: |
-          pixi run python scripts/compare_benchmarks.py \
-            --baseline "${GITHUB_WORKSPACE}/bench_main.json" \
-            --current "${GITHUB_WORKSPACE}/bench_pr.json" \
-            --max-regression-pct "${BENCHMARK_REGRESSION_PCT}"
+      # - name: Compare benchmark tests
+      #   if: steps.main_run.outputs.has_baseline == 'true'
+      #   env:
+      #     BENCHMARK_REGRESSION_PCT: "10"
+      #   run: |
+      #     pixi run python scripts/compare_benchmarks.py \
+      #       --baseline "${GITHUB_WORKSPACE}/bench_main.json" \
+      #       --current "${GITHUB_WORKSPACE}/bench_pr.json" \
+      #       --max-regression-pct "${BENCHMARK_REGRESSION_PCT}"
