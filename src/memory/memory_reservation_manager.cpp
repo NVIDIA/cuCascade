@@ -23,7 +23,7 @@
 #include <cucascade/utils/overloaded.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/mr/device/cuda_async_memory_resource.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
 
 #include <algorithm>
 #include <cstdint>
