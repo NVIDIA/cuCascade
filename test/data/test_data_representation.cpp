@@ -88,8 +88,10 @@ TEST_CASE("host_table_representation converts to GPU and preserves contents",
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
 
   // Start from a known cudf table; pack it and build a host_table_representation
-  auto original = create_simple_cudf_table(128, gpu_space->get_default_allocator());
+  // Use the same stream for table creation and packing to avoid stream-ordered races
   rmm::cuda_stream pack_stream;
+  auto original =
+    create_simple_cudf_table(128, 2, gpu_space->get_default_allocator(), pack_stream.view());
   auto view   = original.view();
   auto packed = cudf::pack(view, pack_stream.view());
   pack_stream.synchronize();
@@ -246,13 +248,14 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
-  auto table = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+  // Use one stream for table creation and both conversions to enforce order
+  // and avoid stream-ordered races
+  auto chain_stream = gpu_space->acquire_stream();
+  auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), chain_stream);
   gpu_table_representation repr(std::move(table), *const_cast<memory::memory_space*>(gpu_space));
 
-  // Use one stream for both conversions to enforce order
-  auto chain_stream = gpu_space->acquire_stream();
-  auto cpu_any      = registry.convert<host_table_representation>(repr, host_space, chain_stream);
-  auto gpu_any      = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
+  auto cpu_any = registry.convert<host_table_representation>(repr, host_space, chain_stream);
+  auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
 
   auto& back = *gpu_any;
   chain_stream.synchronize();
@@ -296,15 +299,16 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
   REQUIRE(src_space != nullptr);
   REQUIRE(dst_space != nullptr);
 
+  // Use a single stream for table creation and peer copy to avoid stream-ordered races
+  auto xfer_stream = src_space->acquire_stream();
+
   // Build a simple cudf table on source GPU and wrap it
-  auto table = create_simple_cudf_table(256, src_space->get_default_allocator());
+  auto table = create_simple_cudf_table(256, 2, src_space->get_default_allocator(), xfer_stream);
   gpu_table_representation src_repr(std::move(table),
                                     *const_cast<memory::memory_space*>(src_space));
 
-  // Use a single stream for the peer copy
-  auto xfer_stream = src_space->acquire_stream();
-  auto dst_any     = registry.convert<gpu_table_representation>(src_repr, dst_space, xfer_stream);
-  auto& dst_repr   = *dst_any;
+  auto dst_any   = registry.convert<gpu_table_representation>(src_repr, dst_space, xfer_stream);
+  auto& dst_repr = *dst_any;
 
   // Compare content equality using the same stream used for transfer
   cucascade::test::expect_cudf_tables_equal_on_stream(
@@ -520,11 +524,13 @@ TEST_CASE("host_table_representation clone creates independent copy", "[cpu_data
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
 
   // Create a host_table_representation via conversion from GPU
-  auto original = create_simple_cudf_table(128, gpu_space->get_default_allocator());
+  // Use the same stream for table creation and conversion to avoid stream-ordered races
+  rmm::cuda_stream stream;
+  auto original =
+    create_simple_cudf_table(128, 2, gpu_space->get_default_allocator(), stream.view());
   gpu_table_representation gpu_repr(std::move(original),
                                     *const_cast<memory::memory_space*>(gpu_space));
 
-  rmm::cuda_stream stream;
   auto host_repr_ptr = registry.convert<host_table_representation>(gpu_repr, host_space, stream);
   stream.synchronize();
 

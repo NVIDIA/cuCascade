@@ -119,6 +119,10 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
 {
+  // Synchronize the stream to ensure any prior operations (like table creation)
+  // are complete before we read from the source table
+  stream.synchronize();
+
   auto& gpu_source = source.cast<gpu_table_representation>();
   auto packed_data = cudf::pack(gpu_source.get_table(), stream);
 
@@ -170,6 +174,10 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
 {
+  // Synchronize the stream to ensure any prior operations (like table creation)
+  // are complete before we read from the source table
+  stream.synchronize();
+
   auto& gpu_source = source.cast<gpu_table_representation>();
   auto packed_data = cudf::pack(gpu_source.get_table(), stream);
 

@@ -372,11 +372,11 @@ TEST_CASE("Built-in GPU to HOST conversion works", "[representation_converter][b
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
-  auto table = create_simple_cudf_table(50, gpu_space->get_default_allocator());
+  // Use the same stream for table creation and conversion to avoid stream-ordered races
+  rmm::cuda_stream stream;
+  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
   gpu_table_representation gpu_repr(std::move(table),
                                     *const_cast<memory::memory_space*>(gpu_space));
-
-  rmm::cuda_stream stream;
 
   auto host_result = registry.convert<host_table_representation>(gpu_repr, host_space, stream);
   stream.synchronize();
@@ -395,12 +395,13 @@ TEST_CASE("Built-in HOST to GPU conversion works", "[representation_converter][b
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
+  // Use the same stream for table creation and conversions to avoid stream-ordered races
+  rmm::cuda_stream stream;
+
   // First create a GPU repr then convert to host to get a valid host_table_representation
-  auto table = create_simple_cudf_table(50, gpu_space->get_default_allocator());
+  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
   gpu_table_representation gpu_repr(std::move(table),
                                     *const_cast<memory::memory_space*>(gpu_space));
-
-  rmm::cuda_stream stream;
 
   auto host_repr = registry.convert<host_table_representation>(gpu_repr, host_space, stream);
   stream.synchronize();
@@ -424,11 +425,13 @@ TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
-  auto original_table = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+  // Use the same stream for table creation and conversions to avoid stream-ordered races
+  rmm::cuda_stream stream;
+
+  auto original_table =
+    create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream.view());
   gpu_table_representation original_repr(std::move(original_table),
                                          *const_cast<memory::memory_space*>(gpu_space));
-
-  rmm::cuda_stream stream;
 
   // GPU -> HOST
   auto host_repr = registry.convert<host_table_representation>(original_repr, host_space, stream);
