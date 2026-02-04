@@ -368,6 +368,20 @@ class data_batch {
    */
   bool try_to_release_in_transit(std::optional<batch_state> target_state = std::nullopt);
 
+  /**
+   * @brief Create a deep copy of this data batch.
+   *
+   * Creates a new data_batch with the specified batch_id and a cloned copy of
+   * the underlying data representation. The new batch will be in idle state with
+   * no active processing.
+   *
+   * @param new_batch_id The batch ID for the cloned batch
+   * @return std::shared_ptr<data_batch> A new data_batch with copied data
+   * @throws std::runtime_error if there is active processing on this batch
+   * @throws std::runtime_error if the underlying data is null
+   */
+  std::shared_ptr<data_batch> clone(uint64_t new_batch_id);
+
  private:
   friend class data_batch_processing_handle;
 

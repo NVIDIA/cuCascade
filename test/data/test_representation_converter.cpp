@@ -49,6 +49,11 @@ class custom_test_representation : public idata_representation {
 
   std::size_t get_size_in_bytes() const override { return sizeof(_value); }
 
+  std::unique_ptr<idata_representation> clone() override
+  {
+    return std::make_unique<custom_test_representation>(_value, get_memory_space());
+  }
+
   int get_value() const { return _value; }
 
  private:
@@ -64,6 +69,11 @@ class another_test_representation : public idata_representation {
   }
 
   std::size_t get_size_in_bytes() const override { return sizeof(_value); }
+
+  std::unique_ptr<idata_representation> clone() override
+  {
+    return std::make_unique<another_test_representation>(_value, get_memory_space());
+  }
 
   double get_value() const { return _value; }
 

@@ -273,4 +273,23 @@ void data_batch::decrement_processing_count()
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
+std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+
+  if (_processing_count != 0) {
+    throw std::runtime_error("Cannot clone data_batch while there is active processing");
+  }
+
+  if (_data == nullptr) {
+    throw std::runtime_error("Cannot clone data_batch: underlying data is null");
+  }
+
+  // Clone the underlying data representation
+  auto cloned_data = _data->clone();
+
+  // Create a new data_batch with the cloned data
+  return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
+}
+
 }  // namespace cucascade

@@ -675,3 +675,162 @@ TEST_CASE("data_batch In Transit From Task Created Returns To Task Created", "[d
   REQUIRE(batch.try_to_release_in_transit(batch_state::task_created) == true);
   REQUIRE(batch.get_state() == batch_state::task_created);
 }
+
+// =============================================================================
+// Clone Tests
+// =============================================================================
+
+TEST_CASE("data_batch clone creates independent copy", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
+  data_batch batch(42, std::move(data));
+
+  // Clone the batch with a new ID
+  auto cloned = batch.clone(100);
+
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_batch_id() == 100);
+  REQUIRE(cloned->get_current_tier() == memory::Tier::GPU);
+  REQUIRE(cloned->get_processing_count() == 0);
+  REQUIRE(cloned->get_state() == batch_state::idle);
+
+  // Original batch should be unchanged
+  REQUIRE(batch.get_batch_id() == 42);
+  REQUIRE(batch.get_current_tier() == memory::Tier::GPU);
+  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch.get_state() == batch_state::idle);
+
+  // Verify data size matches
+  REQUIRE(cloned->get_data()->get_size_in_bytes() == batch.get_data()->get_size_in_bytes());
+
+  // Verify the data representations are different objects
+  REQUIRE(cloned->get_data() != batch.get_data());
+}
+
+TEST_CASE("data_batch clone with different batch IDs", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
+  data_batch batch(1, std::move(data));
+
+  // Clone with same ID as original (allowed)
+  auto clone1 = batch.clone(1);
+  REQUIRE(clone1->get_batch_id() == 1);
+
+  // Clone with different IDs
+  auto clone2 = batch.clone(0);
+  REQUIRE(clone2->get_batch_id() == 0);
+
+  auto clone3 = batch.clone(UINT64_MAX);
+  REQUIRE(clone3->get_batch_id() == UINT64_MAX);
+}
+
+TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
+{
+  SECTION("GPU tier")
+  {
+    auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    data_batch batch(1, std::move(data));
+    auto cloned = batch.clone(2);
+
+    REQUIRE(cloned->get_current_tier() == memory::Tier::GPU);
+  }
+
+  SECTION("HOST tier")
+  {
+    auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
+    data_batch batch(1, std::move(data));
+    auto cloned = batch.clone(2);
+
+    REQUIRE(cloned->get_current_tier() == memory::Tier::HOST);
+  }
+
+  SECTION("DISK tier")
+  {
+    auto data = std::make_unique<mock_data_representation>(memory::Tier::DISK, 1024);
+    data_batch batch(1, std::move(data));
+    auto cloned = batch.clone(2);
+
+    REQUIRE(cloned->get_current_tier() == memory::Tier::DISK);
+  }
+}
+
+TEST_CASE("data_batch clone fails with active processing", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
+
+  // Start processing
+  REQUIRE(batch.try_to_create_task() == true);
+  auto r = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(r.success == true);
+  auto handle = std::move(r.handle);
+
+  REQUIRE(batch.get_processing_count() == 1);
+
+  // Clone should fail while processing
+  REQUIRE_THROWS_AS(batch.clone(2), std::runtime_error);
+
+  // Release processing handle
+  handle.release();
+  REQUIRE(batch.get_processing_count() == 0);
+
+  // Now clone should succeed
+  auto cloned = batch.clone(2);
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_batch_id() == 2);
+}
+
+TEST_CASE("data_batch clone returns shared_ptr", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+
+  std::shared_ptr<data_batch> cloned = batch.clone(2);
+
+  REQUIRE(cloned.use_count() == 1);
+
+  // Make a copy of the shared_ptr
+  std::shared_ptr<data_batch> cloned_copy = cloned;
+  REQUIRE(cloned.use_count() == 2);
+  REQUIRE(cloned_copy.use_count() == 2);
+
+  // Both point to the same batch
+  REQUIRE(cloned->get_batch_id() == cloned_copy->get_batch_id());
+  REQUIRE(cloned.get() == cloned_copy.get());
+}
+
+TEST_CASE("data_batch clone can be independently processed", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
+
+  auto cloned          = batch.clone(2);
+  auto cloned_space_id = cloned->get_memory_space()->get_id();
+
+  // Process original batch
+  REQUIRE(batch.try_to_create_task() == true);
+  auto r1 = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(r1.success == true);
+  auto handle1 = std::move(r1.handle);
+
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(cloned->get_processing_count() == 0);
+
+  // Process cloned batch independently
+  REQUIRE(cloned->try_to_create_task() == true);
+  auto r2 = cloned->try_to_lock_for_processing(cloned_space_id);
+  REQUIRE(r2.success == true);
+  auto handle2 = std::move(r2.handle);
+
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(cloned->get_processing_count() == 1);
+
+  // Release handles
+  handle1.release();
+  handle2.release();
+
+  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(cloned->get_processing_count() == 0);
+}

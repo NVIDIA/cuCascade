@@ -53,6 +53,16 @@ class host_table_representation : public idata_representation {
   std::size_t get_size_in_bytes() const override;
 
   /**
+   * @brief Create a deep copy of this host table representation.
+   *
+   * The cloned representation will have its own copy of the underlying host table,
+   * residing in the same memory space as the original.
+   *
+   * @return std::unique_ptr<idata_representation> A new host_table_representation with copied data
+   */
+  std::unique_ptr<idata_representation> clone() override;
+
+  /**
    * @brief Get the underlying host table allocation
    *
    * @return std::unique_ptr<cucascade::memory::table_allocation> The underlying host table

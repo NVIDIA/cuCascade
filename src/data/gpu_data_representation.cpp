@@ -17,6 +17,7 @@
 
 #include <cucascade/data/gpu_data_representation.hpp>
 
+#include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
 
 namespace cucascade {
@@ -41,5 +42,12 @@ std::size_t gpu_table_representation::get_size_in_bytes() const
 }
 
 const cudf::table& gpu_table_representation::get_table() const { return _table; }
+
+std::unique_ptr<idata_representation> gpu_table_representation::clone()
+{
+  // Create a deep copy of the cuDF table
+  auto table_copy = std::make_unique<cudf::table>(_table.view());
+  return std::make_unique<gpu_table_representation>(std::move(*table_copy), get_memory_space());
+}
 
 }  // namespace cucascade

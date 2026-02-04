@@ -89,6 +89,16 @@ class idata_representation {
   virtual std::size_t get_size_in_bytes() const = 0;
 
   /**
+   * @brief Create a deep copy of this data representation.
+   *
+   * The cloned representation will have its own copy of the underlying data,
+   * residing in the same memory space as the original.
+   *
+   * @return std::unique_ptr<idata_representation> A new data representation with copied data
+   */
+  virtual std::unique_ptr<idata_representation> clone() = 0;
+
+  /**
    * @brief Safely casts this interface to a specific derived type
    *
    * @tparam TargetType The target type to cast to
