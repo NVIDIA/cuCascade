@@ -145,7 +145,7 @@ TEST_CASE("gpu_table_representation Construction", "[gpu_data_representation]")
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
   auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
 
-  gpu_table_representation repr(std::move(table), *gpu_space);
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
   REQUIRE(repr.get_current_tier() == memory::Tier::GPU);
   REQUIRE(repr.get_device_id() == 0);
@@ -159,7 +159,7 @@ TEST_CASE("gpu_table_representation get_size_in_bytes", "[gpu_data_representatio
   SECTION("100 rows")
   {
     auto table = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::move(table), *gpu_space);
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
     // Size should be at least 100 rows * (4 bytes for INT32 + 8 bytes for INT64)
     std::size_t expected_min_size = 100 * (4 + 8);
@@ -169,7 +169,7 @@ TEST_CASE("gpu_table_representation get_size_in_bytes", "[gpu_data_representatio
   SECTION("1000 rows")
   {
     auto table = create_simple_cudf_table(1000, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::move(table), *gpu_space);
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
     // Size should be at least 1000 rows * (4 bytes for INT32 + 8 bytes for INT64)
     std::size_t expected_min_size = 1000 * (4 + 8);
@@ -179,7 +179,7 @@ TEST_CASE("gpu_table_representation get_size_in_bytes", "[gpu_data_representatio
   SECTION("Empty table")
   {
     auto table = create_simple_cudf_table(0, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::move(table), *gpu_space);
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
     REQUIRE(repr.get_size_in_bytes() == 0);
   }
@@ -193,7 +193,7 @@ TEST_CASE("gpu_table_representation get_table", "[gpu_data_representation]")
   // Store the number of columns before moving the table
   auto num_columns = table.num_columns();
 
-  gpu_table_representation repr(std::move(table), *gpu_space);
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
   const cudf::table& retrieved_table = repr.get_table();
   REQUIRE(retrieved_table.num_columns() == num_columns);
@@ -206,7 +206,7 @@ TEST_CASE("gpu_table_representation memory tier", "[gpu_data_representation]")
   {
     auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
     auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::move(table), *gpu_space);
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
     REQUIRE(repr.get_current_tier() == memory::Tier::GPU);
   }
@@ -218,7 +218,7 @@ TEST_CASE("gpu_table_representation device_id", "[gpu_data_representation]")
   {
     auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
     auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::move(table), *gpu_space);
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
     REQUIRE(repr.get_device_id() == 0);
   }
@@ -233,7 +233,7 @@ TEST_CASE("gpu_table_representation device_id", "[gpu_data_representation]")
 
     auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 1);
     auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::move(table), *gpu_space);
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
     REQUIRE(repr.get_device_id() == 1);
   }
@@ -252,7 +252,8 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
   // and avoid stream-ordered races
   auto chain_stream = gpu_space->acquire_stream();
   auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), chain_stream);
-  gpu_table_representation repr(std::move(table), *const_cast<memory::memory_space*>(gpu_space));
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                *const_cast<memory::memory_space*>(gpu_space));
 
   auto cpu_any = registry.convert<host_table_representation>(repr, host_space, chain_stream);
   auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
@@ -304,7 +305,7 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
 
   // Build a simple cudf table on source GPU and wrap it
   auto table = create_simple_cudf_table(256, 2, src_space->get_default_allocator(), xfer_stream);
-  gpu_table_representation src_repr(std::move(table),
+  gpu_table_representation src_repr(std::make_unique<cudf::table>(std::move(table)),
                                     *const_cast<memory::memory_space*>(src_space));
 
   auto dst_any   = registry.convert<gpu_table_representation>(src_repr, dst_space, xfer_stream);
@@ -327,7 +328,7 @@ TEST_CASE("idata_representation cast functionality",
   {
     auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
     auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::move(table), *gpu_space);
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
     idata_representation* base_ptr = &repr;
 
@@ -347,7 +348,7 @@ TEST_CASE("idata_representation const cast functionality",
   {
     auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
     auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr(std::move(table), *gpu_space);
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
     const idata_representation* base_ptr = &repr;
 
@@ -379,10 +380,10 @@ TEST_CASE("Multiple representations on same memory space",
     auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
     auto table1 = create_simple_cudf_table(100, gpu_space->get_default_allocator());
-    gpu_table_representation repr1(std::move(table1), *gpu_space);
+    gpu_table_representation repr1(std::make_unique<cudf::table>(std::move(table1)), *gpu_space);
 
     auto table2 = create_simple_cudf_table(200, gpu_space->get_default_allocator());
-    gpu_table_representation repr2(std::move(table2), *gpu_space);
+    gpu_table_representation repr2(std::make_unique<cudf::table>(std::move(table2)), *gpu_space);
 
     REQUIRE(repr1.get_current_tier() == repr2.get_current_tier());
     REQUIRE(repr1.get_device_id() == repr2.get_device_id());
@@ -407,7 +408,7 @@ TEST_CASE("gpu_table_representation with single column", "[gpu_data_representati
                                        gpu_space->get_default_allocator());
   columns.push_back(std::move(col));
 
-  cudf::table table(std::move(columns));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
   gpu_table_representation repr(std::move(table), *gpu_space);
 
   REQUIRE(repr.get_table().num_columns() == 1);
@@ -442,7 +443,7 @@ TEST_CASE("gpu_table_representation with multiple column types", "[gpu_data_repr
   columns.push_back(std::move(col3));
   columns.push_back(std::move(col4));
 
-  cudf::table table(std::move(columns));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
   gpu_table_representation repr(std::move(table), *gpu_space);
 
   REQUIRE(repr.get_table().num_columns() == 4);
@@ -467,7 +468,7 @@ TEST_CASE("gpu_table_representation clone creates independent copy", "[gpu_data_
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
   auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
 
-  gpu_table_representation repr(std::move(table), *gpu_space);
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
   // Clone the representation
   auto cloned_base = repr.clone();
@@ -503,7 +504,7 @@ TEST_CASE("gpu_table_representation clone empty table", "[gpu_data_representatio
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
   auto table     = create_simple_cudf_table(0, gpu_space->get_default_allocator());
 
-  gpu_table_representation repr(std::move(table), *gpu_space);
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
   auto cloned_base = repr.clone();
   REQUIRE(cloned_base != nullptr);
@@ -528,7 +529,7 @@ TEST_CASE("host_table_representation clone creates independent copy", "[cpu_data
   rmm::cuda_stream stream;
   auto original =
     create_simple_cudf_table(128, 2, gpu_space->get_default_allocator(), stream.view());
-  gpu_table_representation gpu_repr(std::move(original),
+  gpu_table_representation gpu_repr(std::make_unique<cudf::table>(std::move(original)),
                                     *const_cast<memory::memory_space*>(gpu_space));
 
   auto host_repr_ptr = registry.convert<host_table_representation>(gpu_repr, host_space, stream);

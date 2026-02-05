@@ -43,10 +43,11 @@ class gpu_table_representation : public idata_representation {
   /**
    * @brief Construct a new gpu_table_representation object
    *
-   * @param table The actual cuDF table with the data
+   * @param table Unique pointer to the cuDF table with the data (ownership is transferred)
    * @param memory_space The memory space where the GPU table resides
    */
-  gpu_table_representation(cudf::table table, cucascade::memory::memory_space& memory_space);
+  gpu_table_representation(std::unique_ptr<cudf::table> table,
+                           cucascade::memory::memory_space& memory_space);
 
   /**
    * @brief Get the size of the data representation in bytes
@@ -73,7 +74,8 @@ class gpu_table_representation : public idata_representation {
   const cudf::table& get_table() const;
 
  private:
-  cudf::table _table;  ///< The actual cuDF table with the data
+  std::unique_ptr<cudf::table>
+    _table;  ///< cudf::table is the underlying representation of the data
 };
 
 }  // namespace cucascade

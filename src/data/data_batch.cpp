@@ -275,20 +275,22 @@ void data_batch::decrement_processing_count()
 
 std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-
-  if (_processing_count != 0) {
-    throw std::runtime_error("Cannot clone data_batch while there is active processing");
+  // Create a task and lock for processing to protect data during clone
+  if (!try_to_create_task()) {
+    throw std::runtime_error(
+      "Cannot clone data_batch: failed to create task (batch may be in transit)");
   }
 
-  if (_data == nullptr) {
-    throw std::runtime_error("Cannot clone data_batch: underlying data is null");
+  auto space_id = _data->get_memory_space().get_id();
+  auto result   = try_to_lock_for_processing(space_id);
+  if (!result.success) {
+    throw std::runtime_error("Cannot clone data_batch: failed to lock for processing");
   }
 
-  // Clone the underlying data representation
+  // Clone the data while holding the processing lock
   auto cloned_data = _data->clone();
 
-  // Create a new data_batch with the cloned data
+  // Handle destructor will decrement processing count when result goes out of scope
   return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
 }
 

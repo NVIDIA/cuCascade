@@ -22,7 +22,7 @@
 
 namespace cucascade {
 
-gpu_table_representation::gpu_table_representation(cudf::table table,
+gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
                                                    cucascade::memory::memory_space& memory_space)
   : idata_representation(memory_space), _table(std::move(table))
 {
@@ -33,7 +33,7 @@ std::size_t gpu_table_representation::get_size_in_bytes() const
   // TODO: Implement proper size calculation
   // This should return the total size of all columns in the table
   std::size_t total_size = 0;
-  for (auto const& col : _table.view()) {
+  for (auto const& col : _table->view()) {
     // For now, we can calculate a rough estimate based on column size
     // This will need to be refined to account for all buffers (data, validity, offsets, etc.)
     total_size += static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
@@ -41,13 +41,13 @@ std::size_t gpu_table_representation::get_size_in_bytes() const
   return total_size;
 }
 
-const cudf::table& gpu_table_representation::get_table() const { return _table; }
+const cudf::table& gpu_table_representation::get_table() const { return *_table; }
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone()
 {
   // Create a deep copy of the cuDF table
-  auto table_copy = std::make_unique<cudf::table>(_table.view());
-  return std::make_unique<gpu_table_representation>(std::move(*table_copy), get_memory_space());
+  auto table_copy = std::make_unique<cudf::table>(_table->view());
+  return std::make_unique<gpu_table_representation>(std::move(table_copy), get_memory_space());
 }
 
 }  // namespace cucascade

@@ -157,7 +157,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto new_gpu_data = std::make_unique<rmm::device_buffer>(std::move(dst_buffer));
   auto new_table_view =
     cudf::unpack(new_metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
-  auto new_table = cudf::table(new_table_view, target_stream, mr);
+  auto new_table = std::make_unique<cudf::table>(new_table_view, target_stream, mr);
   // Restore previous device
   target_stream.synchronize();
   RMM_CUDA_TRY(cudaSetDevice(source_device_id));
@@ -256,7 +256,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
   auto new_gpu_data = std::make_unique<rmm::device_buffer>(std::move(dst_buffer));
   auto new_table_view =
     cudf::unpack(new_metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
-  auto new_table = cudf::table(new_table_view, stream, mr);
+  auto new_table = std::make_unique<cudf::table>(new_table_view, stream, mr);
   stream.synchronize();
 
   RMM_CUDA_TRY(cudaSetDevice(previous_device));

@@ -754,7 +754,7 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
   }
 }
 
-TEST_CASE("data_batch clone fails with active processing", "[data_batch]")
+TEST_CASE("data_batch clone succeeds with active processing", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
@@ -767,13 +767,38 @@ TEST_CASE("data_batch clone fails with active processing", "[data_batch]")
   auto handle = std::move(r.handle);
 
   REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch.get_state() == batch_state::processing);
 
-  // Clone should fail while processing
-  REQUIRE_THROWS_AS(batch.clone(2), std::runtime_error);
+  // Clone should succeed even while processing
+  auto cloned = batch.clone(2);
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_batch_id() == 2);
+
+  // Original batch should still be processing with original count
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch.get_state() == batch_state::processing);
 
   // Release processing handle
   handle.release();
   REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch.get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch clone fails when in_transit", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+
+  // Lock for in-transit
+  REQUIRE(batch.try_to_lock_for_in_transit() == true);
+  REQUIRE(batch.get_state() == batch_state::in_transit);
+
+  // Clone should fail while in_transit
+  REQUIRE_THROWS_AS(batch.clone(2), std::runtime_error);
+
+  // Release in-transit lock
+  REQUIRE(batch.try_to_release_in_transit() == true);
+  REQUIRE(batch.get_state() == batch_state::idle);
 
   // Now clone should succeed
   auto cloned = batch.clone(2);
