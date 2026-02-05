@@ -27,18 +27,7 @@ gpu_table_representation::gpu_table_representation(cudf::table table,
 {
 }
 
-std::size_t gpu_table_representation::get_size_in_bytes() const
-{
-  // TODO: Implement proper size calculation
-  // This should return the total size of all columns in the table
-  std::size_t total_size = 0;
-  for (auto const& col : _table.view()) {
-    // For now, we can calculate a rough estimate based on column size
-    // This will need to be refined to account for all buffers (data, validity, offsets, etc.)
-    total_size += static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
-  }
-  return total_size;
-}
+std::size_t gpu_table_representation::get_size_in_bytes() const { return _table.alloc_size(); }
 
 const cudf::table& gpu_table_representation::get_table() const { return _table; }
 
