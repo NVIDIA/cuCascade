@@ -73,6 +73,15 @@ class gpu_table_representation : public idata_representation {
    */
   const cudf::table& get_table() const;
 
+  /**
+   * @brief Release ownership of the underlying cuDF table
+   *
+   * After calling this method, this representation no longer owns the table.
+   *
+   * @return std::unique_ptr<cudf::table> The cuDF table
+   */
+  std::unique_ptr<cudf::table> release_table();
+
  private:
   std::unique_ptr<cudf::table>
     _table;  ///< cudf::table is the underlying representation of the data

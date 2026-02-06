@@ -43,6 +43,8 @@ std::size_t gpu_table_representation::get_size_in_bytes() const
 
 const cudf::table& gpu_table_representation::get_table() const { return *_table; }
 
+std::unique_ptr<cudf::table> gpu_table_representation::release_table() { return std::move(_table); }
+
 std::unique_ptr<idata_representation> gpu_table_representation::clone()
 {
   // Create a deep copy of the cuDF table
