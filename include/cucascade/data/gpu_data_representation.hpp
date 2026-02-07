@@ -43,10 +43,11 @@ class gpu_table_representation : public idata_representation {
   /**
    * @brief Construct a new gpu_table_representation object
    *
-   * @param table The actual cuDF table with the data
+   * @param table Unique pointer to the cuDF table with the data (ownership is transferred)
    * @param memory_space The memory space where the GPU table resides
    */
-  gpu_table_representation(cudf::table table, cucascade::memory::memory_space& memory_space);
+  gpu_table_representation(std::unique_ptr<cudf::table> table,
+                           cucascade::memory::memory_space& memory_space);
 
   /**
    * @brief Get the size of the data representation in bytes
@@ -56,14 +57,34 @@ class gpu_table_representation : public idata_representation {
   std::size_t get_size_in_bytes() const override;
 
   /**
+   * @brief Create a deep copy of this GPU table representation.
+   *
+   * The cloned representation will have its own copy of the underlying cuDF table,
+   * residing in the same memory space as the original.
+   *
+   * @return std::unique_ptr<idata_representation> A new gpu_table_representation with copied data
+   */
+  std::unique_ptr<idata_representation> clone() override;
+
+  /**
    * @brief Get the underlying cuDF table
    *
    * @return const cudf::table& Reference to the cuDF table
    */
   const cudf::table& get_table() const;
 
+  /**
+   * @brief Release ownership of the underlying cuDF table
+   *
+   * After calling this method, this representation no longer owns the table.
+   *
+   * @return std::unique_ptr<cudf::table> The cuDF table
+   */
+  std::unique_ptr<cudf::table> release_table();
+
  private:
-  cudf::table _table;  ///< The actual cuDF table with the data
+  std::unique_ptr<cudf::table>
+    _table;  ///< cudf::table is the underlying representation of the data
 };
 
 }  // namespace cucascade

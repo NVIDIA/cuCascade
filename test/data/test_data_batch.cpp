@@ -15,9 +15,13 @@
  * limitations under the License.
  */
 
+#include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <catch2/catch.hpp>
 
@@ -28,6 +32,9 @@
 #include <vector>
 
 using namespace cucascade;
+using cucascade::test::create_simple_cudf_table;
+using cucascade::test::expect_cudf_tables_equal_on_stream;
+using cucascade::test::make_mock_memory_space;
 using cucascade::test::mock_data_representation;
 
 // Test basic construction
@@ -674,4 +681,425 @@ TEST_CASE("data_batch In Transit From Task Created Returns To Task Created", "[d
   // Release should go back to task_created because a task is pending
   REQUIRE(batch.try_to_release_in_transit(batch_state::task_created) == true);
   REQUIRE(batch.get_state() == batch_state::task_created);
+}
+
+// =============================================================================
+// Clone Tests
+// =============================================================================
+
+TEST_CASE("data_batch clone creates independent copy", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
+  data_batch batch(42, std::move(data));
+
+  // Clone the batch with a new ID
+  auto cloned = batch.clone(100);
+
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_batch_id() == 100);
+  REQUIRE(cloned->get_current_tier() == memory::Tier::GPU);
+  REQUIRE(cloned->get_processing_count() == 0);
+  REQUIRE(cloned->get_state() == batch_state::idle);
+
+  // Original batch should be unchanged
+  REQUIRE(batch.get_batch_id() == 42);
+  REQUIRE(batch.get_current_tier() == memory::Tier::GPU);
+  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch.get_state() == batch_state::idle);
+
+  // Verify data size matches
+  REQUIRE(cloned->get_data()->get_size_in_bytes() == batch.get_data()->get_size_in_bytes());
+
+  // Verify the data representations are different objects
+  REQUIRE(cloned->get_data() != batch.get_data());
+}
+
+TEST_CASE("data_batch clone with different batch IDs", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
+  data_batch batch(1, std::move(data));
+
+  // Clone with same ID as original (allowed)
+  auto clone1 = batch.clone(1);
+  REQUIRE(clone1->get_batch_id() == 1);
+
+  // Clone with different IDs
+  auto clone2 = batch.clone(0);
+  REQUIRE(clone2->get_batch_id() == 0);
+
+  auto clone3 = batch.clone(UINT64_MAX);
+  REQUIRE(clone3->get_batch_id() == UINT64_MAX);
+}
+
+TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
+{
+  SECTION("GPU tier")
+  {
+    auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    data_batch batch(1, std::move(data));
+    auto cloned = batch.clone(2);
+
+    REQUIRE(cloned->get_current_tier() == memory::Tier::GPU);
+  }
+
+  SECTION("HOST tier")
+  {
+    auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
+    data_batch batch(1, std::move(data));
+    auto cloned = batch.clone(2);
+
+    REQUIRE(cloned->get_current_tier() == memory::Tier::HOST);
+  }
+
+  SECTION("DISK tier")
+  {
+    auto data = std::make_unique<mock_data_representation>(memory::Tier::DISK, 1024);
+    data_batch batch(1, std::move(data));
+    auto cloned = batch.clone(2);
+
+    REQUIRE(cloned->get_current_tier() == memory::Tier::DISK);
+  }
+}
+
+TEST_CASE("data_batch clone succeeds with active processing", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
+
+  // Start processing
+  REQUIRE(batch.try_to_create_task() == true);
+  auto r = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(r.success == true);
+  auto handle = std::move(r.handle);
+
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch.get_state() == batch_state::processing);
+
+  // Clone should succeed even while processing
+  auto cloned = batch.clone(2);
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_batch_id() == 2);
+
+  // Original batch should still be processing with original count
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch.get_state() == batch_state::processing);
+
+  // Release processing handle
+  handle.release();
+  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch.get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch clone fails when in_transit", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+
+  // Lock for in-transit
+  REQUIRE(batch.try_to_lock_for_in_transit() == true);
+  REQUIRE(batch.get_state() == batch_state::in_transit);
+
+  // Clone should fail while in_transit
+  REQUIRE_THROWS_AS(batch.clone(2), std::runtime_error);
+
+  // Release in-transit lock
+  REQUIRE(batch.try_to_release_in_transit() == true);
+  REQUIRE(batch.get_state() == batch_state::idle);
+
+  // Now clone should succeed
+  auto cloned = batch.clone(2);
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_batch_id() == 2);
+}
+
+TEST_CASE("data_batch clone returns shared_ptr", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+
+  std::shared_ptr<data_batch> cloned = batch.clone(2);
+
+  REQUIRE(cloned.use_count() == 1);
+
+  // Make a copy of the shared_ptr
+  std::shared_ptr<data_batch> cloned_copy = cloned;
+  REQUIRE(cloned.use_count() == 2);
+  REQUIRE(cloned_copy.use_count() == 2);
+
+  // Both point to the same batch
+  REQUIRE(cloned->get_batch_id() == cloned_copy->get_batch_id());
+  REQUIRE(cloned.get() == cloned_copy.get());
+}
+
+TEST_CASE("data_batch clone can be independently processed", "[data_batch]")
+{
+  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  data_batch batch(1, std::move(data));
+  auto space_id = batch.get_memory_space()->get_id();
+
+  auto cloned          = batch.clone(2);
+  auto cloned_space_id = cloned->get_memory_space()->get_id();
+
+  // Process original batch
+  REQUIRE(batch.try_to_create_task() == true);
+  auto r1 = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(r1.success == true);
+  auto handle1 = std::move(r1.handle);
+
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(cloned->get_processing_count() == 0);
+
+  // Process cloned batch independently
+  REQUIRE(cloned->try_to_create_task() == true);
+  auto r2 = cloned->try_to_lock_for_processing(cloned_space_id);
+  REQUIRE(r2.success == true);
+  auto handle2 = std::move(r2.handle);
+
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(cloned->get_processing_count() == 1);
+
+  // Release handles
+  handle1.release();
+  handle2.release();
+
+  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(cloned->get_processing_count() == 0);
+}
+
+// =============================================================================
+// Real GPU Data Clone Tests
+// =============================================================================
+
+TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  // Create a real cudf table with known data
+  auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream.view());
+  auto original_rows    = table.num_rows();
+  auto original_columns = table.num_columns();
+
+  // Create gpu_table_representation and wrap in data_batch
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+  data_batch batch(1, std::move(gpu_repr));
+
+  // Clone the batch
+  auto cloned = batch.clone(2);
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_batch_id() == 2);
+
+  // Verify the cloned data has correct structure
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
+  REQUIRE(original_repr != nullptr);
+  REQUIRE(cloned_repr != nullptr);
+
+  // Verify table shape matches
+  REQUIRE(cloned_repr->get_table().num_rows() == original_rows);
+  REQUIRE(cloned_repr->get_table().num_columns() == original_columns);
+
+  // Verify actual data content matches
+  stream.synchronize();
+  expect_cudf_tables_equal_on_stream(
+    original_repr->get_table(), cloned_repr->get_table(), stream.view());
+}
+
+TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+  data_batch batch(1, std::move(gpu_repr));
+
+  auto cloned = batch.clone(2);
+
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
+
+  // Verify the data representations are different objects
+  REQUIRE(batch.get_data() != cloned->get_data());
+
+  // Verify the underlying cudf tables are different objects
+  REQUIRE(&original_repr->get_table() != &cloned_repr->get_table());
+
+  // Verify each column points to different memory
+  for (cudf::size_type i = 0; i < original_repr->get_table().num_columns(); ++i) {
+    REQUIRE(original_repr->get_table().view().column(i).head() !=
+            cloned_repr->get_table().view().column(i).head());
+  }
+}
+
+TEST_CASE("data_batch clone with real GPU data while processing", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto table = create_simple_cudf_table(75, 2, gpu_space->get_default_allocator(), stream.view());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+  data_batch batch(1, std::move(gpu_repr));
+  auto space_id = batch.get_memory_space()->get_id();
+
+  // Start processing on the original batch
+  REQUIRE(batch.try_to_create_task() == true);
+  auto r = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(r.success == true);
+  auto handle = std::move(r.handle);
+  REQUIRE(batch.get_processing_count() == 1);
+
+  // Clone while processing - should succeed and data should be valid
+  auto cloned = batch.clone(2);
+  REQUIRE(cloned != nullptr);
+
+  // Verify data integrity after clone during processing
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
+
+  stream.synchronize();
+  expect_cudf_tables_equal_on_stream(
+    original_repr->get_table(), cloned_repr->get_table(), stream.view());
+
+  // Original should still be processing
+  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch.get_state() == batch_state::processing);
+
+  // Release handle
+  handle.release();
+  REQUIRE(batch.get_processing_count() == 0);
+}
+
+TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto table = create_simple_cudf_table(30, 2, gpu_space->get_default_allocator(), stream.view());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+  data_batch batch(1, std::move(gpu_repr));
+
+  // Create multiple clones
+  auto clone1 = batch.clone(10);
+  auto clone2 = batch.clone(20);
+  auto clone3 = batch.clone(30);
+
+  // Verify all have correct batch IDs
+  REQUIRE(clone1->get_batch_id() == 10);
+  REQUIRE(clone2->get_batch_id() == 20);
+  REQUIRE(clone3->get_batch_id() == 30);
+
+  // Verify all have independent data
+  REQUIRE(batch.get_data() != clone1->get_data());
+  REQUIRE(batch.get_data() != clone2->get_data());
+  REQUIRE(batch.get_data() != clone3->get_data());
+  REQUIRE(clone1->get_data() != clone2->get_data());
+  REQUIRE(clone1->get_data() != clone3->get_data());
+  REQUIRE(clone2->get_data() != clone3->get_data());
+
+  // Verify all data content matches original
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* clone1_repr   = dynamic_cast<gpu_table_representation*>(clone1->get_data());
+  auto* clone2_repr   = dynamic_cast<gpu_table_representation*>(clone2->get_data());
+  auto* clone3_repr   = dynamic_cast<gpu_table_representation*>(clone3->get_data());
+
+  stream.synchronize();
+  expect_cudf_tables_equal_on_stream(
+    original_repr->get_table(), clone1_repr->get_table(), stream.view());
+  expect_cudf_tables_equal_on_stream(
+    original_repr->get_table(), clone2_repr->get_table(), stream.view());
+  expect_cudf_tables_equal_on_stream(
+    original_repr->get_table(), clone3_repr->get_table(), stream.view());
+}
+
+TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  // Create an empty table
+  auto table    = create_simple_cudf_table(0, 2, gpu_space->get_default_allocator(), stream.view());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+  data_batch batch(1, std::move(gpu_repr));
+
+  auto cloned = batch.clone(2);
+  REQUIRE(cloned != nullptr);
+
+  auto* cloned_repr = dynamic_cast<gpu_table_representation*>(cloned->get_data());
+  REQUIRE(cloned_repr != nullptr);
+  REQUIRE(cloned_repr->get_table().num_rows() == 0);
+  REQUIRE(cloned_repr->get_table().num_columns() == 2);
+}
+
+TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  // Create a larger table
+  auto table =
+    create_simple_cudf_table(10000, 2, gpu_space->get_default_allocator(), stream.view());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+  data_batch batch(1, std::move(gpu_repr));
+
+  auto cloned = batch.clone(2);
+  REQUIRE(cloned != nullptr);
+
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
+
+  // Verify structure
+  REQUIRE(cloned_repr->get_table().num_rows() == 10000);
+  REQUIRE(cloned_repr->get_table().num_columns() == 2);
+
+  // Verify data integrity
+  stream.synchronize();
+  expect_cudf_tables_equal_on_stream(
+    original_repr->get_table(), cloned_repr->get_table(), stream.view());
+
+  // Verify independence
+  for (cudf::size_type i = 0; i < original_repr->get_table().num_columns(); ++i) {
+    REQUIRE(original_repr->get_table().view().column(i).head() !=
+            cloned_repr->get_table().view().column(i).head());
+  }
+}
+
+TEST_CASE("data_batch clone state transitions correctly", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+  data_batch batch(1, std::move(gpu_repr));
+
+  SECTION("Clone from idle state returns to idle")
+  {
+    REQUIRE(batch.get_state() == batch_state::idle);
+    auto cloned = batch.clone(2);
+    REQUIRE(cloned != nullptr);
+    REQUIRE(batch.get_state() == batch_state::idle);
+    REQUIRE(cloned->get_state() == batch_state::idle);
+  }
+
+  SECTION("Clone from task_created state returns to task_created")
+  {
+    REQUIRE(batch.try_to_create_task() == true);
+    REQUIRE(batch.get_state() == batch_state::task_created);
+
+    auto cloned = batch.clone(2);
+    REQUIRE(cloned != nullptr);
+
+    // Original should return to task_created (has pending task)
+    REQUIRE(batch.get_state() == batch_state::task_created);
+    REQUIRE(cloned->get_state() == batch_state::idle);
+  }
 }
