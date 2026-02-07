@@ -28,7 +28,7 @@ gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> 
 {
 }
 
-std::size_t gpu_table_representation::get_size_in_bytes() const { return _table.alloc_size(); }
+std::size_t gpu_table_representation::get_size_in_bytes() const { return _table->alloc_size(); }
 
 const cudf::table& gpu_table_representation::get_table() const { return *_table; }
 
