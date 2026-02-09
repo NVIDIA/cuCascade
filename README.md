@@ -24,6 +24,9 @@ cd cuCascade
 pixi install
 pixi run build
 
+# Build in debug mode
+pixi run build-debug
+
 # Option B: Using CMake directly
 git clone https://github.com/nvidia/cuCascade.git
 cd cuCascade
@@ -105,6 +108,7 @@ git clone https://github.com/nvidia/cuCascade.git
 cd cuCascade
 pixi install
 pixi run build
+pixi run build-debug  # Debug mode
 pixi run test
 
 # Run benchmarks

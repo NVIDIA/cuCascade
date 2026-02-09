@@ -23,11 +23,15 @@ jobs:
 
       - run: pixi run build
 
+      - name: Stop sccache
+        if: always()
+        run: sccache --stop-server || true
+
       - name: Package build artifacts
         run: tar -cf build-release.tar build/release/
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@ab7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: build-release
           path: build-release.tar
