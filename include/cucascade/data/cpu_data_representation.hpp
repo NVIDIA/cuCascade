@@ -58,9 +58,10 @@ class host_table_representation : public idata_representation {
    * The cloned representation will have its own copy of the underlying host table,
    * residing in the same memory space as the original.
    *
+   * @param stream CUDA stream (unused for host-side copies)
    * @return std::unique_ptr<idata_representation> A new host_table_representation with copied data
    */
-  std::unique_ptr<idata_representation> clone() override;
+  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the underlying host table allocation

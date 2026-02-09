@@ -34,10 +34,10 @@ const cudf::table& gpu_table_representation::get_table() const { return *_table;
 
 std::unique_ptr<cudf::table> gpu_table_representation::release_table() { return std::move(_table); }
 
-std::unique_ptr<idata_representation> gpu_table_representation::clone()
+std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)
 {
-  // Create a deep copy of the cuDF table
-  auto table_copy = std::make_unique<cudf::table>(_table->view());
+  // Create a deep copy of the cuDF table using the provided stream
+  auto table_copy = std::make_unique<cudf::table>(_table->view(), stream);
   return std::make_unique<gpu_table_representation>(std::move(table_copy), get_memory_space());
 }
 

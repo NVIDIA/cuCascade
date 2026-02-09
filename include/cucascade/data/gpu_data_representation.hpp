@@ -62,9 +62,10 @@ class gpu_table_representation : public idata_representation {
    * The cloned representation will have its own copy of the underlying cuDF table,
    * residing in the same memory space as the original.
    *
+   * @param stream CUDA stream for memory operations
    * @return std::unique_ptr<idata_representation> A new gpu_table_representation with copied data
    */
-  std::unique_ptr<idata_representation> clone() override;
+  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the underlying cuDF table

@@ -693,7 +693,7 @@ TEST_CASE("data_batch clone creates independent copy", "[data_batch]")
   data_batch batch(42, std::move(data));
 
   // Clone the batch with a new ID
-  auto cloned = batch.clone(100);
+  auto cloned = batch.clone(100, rmm::cuda_stream_view{});
 
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 100);
@@ -720,14 +720,14 @@ TEST_CASE("data_batch clone with different batch IDs", "[data_batch]")
   data_batch batch(1, std::move(data));
 
   // Clone with same ID as original (allowed)
-  auto clone1 = batch.clone(1);
+  auto clone1 = batch.clone(1, rmm::cuda_stream_view{});
   REQUIRE(clone1->get_batch_id() == 1);
 
   // Clone with different IDs
-  auto clone2 = batch.clone(0);
+  auto clone2 = batch.clone(0, rmm::cuda_stream_view{});
   REQUIRE(clone2->get_batch_id() == 0);
 
-  auto clone3 = batch.clone(UINT64_MAX);
+  auto clone3 = batch.clone(UINT64_MAX, rmm::cuda_stream_view{});
   REQUIRE(clone3->get_batch_id() == UINT64_MAX);
 }
 
@@ -737,7 +737,7 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
   {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     data_batch batch(1, std::move(data));
-    auto cloned = batch.clone(2);
+    auto cloned = batch.clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::GPU);
   }
@@ -746,7 +746,7 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
   {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
     data_batch batch(1, std::move(data));
-    auto cloned = batch.clone(2);
+    auto cloned = batch.clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::HOST);
   }
@@ -755,7 +755,7 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
   {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::DISK, 1024);
     data_batch batch(1, std::move(data));
-    auto cloned = batch.clone(2);
+    auto cloned = batch.clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::DISK);
   }
@@ -777,7 +777,7 @@ TEST_CASE("data_batch clone succeeds with active processing", "[data_batch]")
   REQUIRE(batch.get_state() == batch_state::processing);
 
   // Clone should succeed even while processing
-  auto cloned = batch.clone(2);
+  auto cloned = batch.clone(2, rmm::cuda_stream_view{});
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 2);
 
@@ -801,14 +801,14 @@ TEST_CASE("data_batch clone fails when in_transit", "[data_batch]")
   REQUIRE(batch.get_state() == batch_state::in_transit);
 
   // Clone should fail while in_transit
-  REQUIRE_THROWS_AS(batch.clone(2), std::runtime_error);
+  REQUIRE_THROWS_AS(batch.clone(2, rmm::cuda_stream_view{}), std::runtime_error);
 
   // Release in-transit lock
   REQUIRE(batch.try_to_release_in_transit() == true);
   REQUIRE(batch.get_state() == batch_state::idle);
 
   // Now clone should succeed
-  auto cloned = batch.clone(2);
+  auto cloned = batch.clone(2, rmm::cuda_stream_view{});
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 2);
 }
@@ -818,7 +818,7 @@ TEST_CASE("data_batch clone returns shared_ptr", "[data_batch]")
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   data_batch batch(1, std::move(data));
 
-  std::shared_ptr<data_batch> cloned = batch.clone(2);
+  std::shared_ptr<data_batch> cloned = batch.clone(2, rmm::cuda_stream_view{});
 
   REQUIRE(cloned.use_count() == 1);
 
@@ -838,7 +838,7 @@ TEST_CASE("data_batch clone can be independently processed", "[data_batch]")
   data_batch batch(1, std::move(data));
   auto space_id = batch.get_memory_space()->get_id();
 
-  auto cloned          = batch.clone(2);
+  auto cloned          = batch.clone(2, rmm::cuda_stream_view{});
   auto cloned_space_id = cloned->get_memory_space()->get_id();
 
   // Process original batch
@@ -887,7 +887,7 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
   data_batch batch(1, std::move(gpu_repr));
 
   // Clone the batch
-  auto cloned = batch.clone(2);
+  auto cloned = batch.clone(2, stream.view());
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 2);
 
@@ -917,7 +917,7 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
   data_batch batch(1, std::move(gpu_repr));
 
-  auto cloned = batch.clone(2);
+  auto cloned = batch.clone(2, stream.view());
 
   auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
   auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
@@ -954,7 +954,7 @@ TEST_CASE("data_batch clone with real GPU data while processing", "[data_batch][
   REQUIRE(batch.get_processing_count() == 1);
 
   // Clone while processing - should succeed and data should be valid
-  auto cloned = batch.clone(2);
+  auto cloned = batch.clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
   // Verify data integrity after clone during processing
@@ -985,9 +985,9 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
   data_batch batch(1, std::move(gpu_repr));
 
   // Create multiple clones
-  auto clone1 = batch.clone(10);
-  auto clone2 = batch.clone(20);
-  auto clone3 = batch.clone(30);
+  auto clone1 = batch.clone(10, stream.view());
+  auto clone2 = batch.clone(20, stream.view());
+  auto clone3 = batch.clone(30, stream.view());
 
   // Verify all have correct batch IDs
   REQUIRE(clone1->get_batch_id() == 10);
@@ -1028,7 +1028,7 @@ TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
   data_batch batch(1, std::move(gpu_repr));
 
-  auto cloned = batch.clone(2);
+  auto cloned = batch.clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
   auto* cloned_repr = dynamic_cast<gpu_table_representation*>(cloned->get_data());
@@ -1049,7 +1049,7 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
   data_batch batch(1, std::move(gpu_repr));
 
-  auto cloned = batch.clone(2);
+  auto cloned = batch.clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
   auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
@@ -1084,7 +1084,7 @@ TEST_CASE("data_batch clone state transitions correctly", "[data_batch][gpu]")
   SECTION("Clone from idle state returns to idle")
   {
     REQUIRE(batch.get_state() == batch_state::idle);
-    auto cloned = batch.clone(2);
+    auto cloned = batch.clone(2, stream.view());
     REQUIRE(cloned != nullptr);
     REQUIRE(batch.get_state() == batch_state::idle);
     REQUIRE(cloned->get_state() == batch_state::idle);
@@ -1095,7 +1095,7 @@ TEST_CASE("data_batch clone state transitions correctly", "[data_batch][gpu]")
     REQUIRE(batch.try_to_create_task() == true);
     REQUIRE(batch.get_state() == batch_state::task_created);
 
-    auto cloned = batch.clone(2);
+    auto cloned = batch.clone(2, stream.view());
     REQUIRE(cloned != nullptr);
 
     // Original should return to task_created (has pending task)

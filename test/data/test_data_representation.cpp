@@ -471,7 +471,7 @@ TEST_CASE("gpu_table_representation clone creates independent copy", "[gpu_data_
   gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
   // Clone the representation
-  auto cloned_base = repr.clone();
+  auto cloned_base = repr.clone(rmm::cuda_stream_default);
   REQUIRE(cloned_base != nullptr);
 
   // Verify it's a gpu_table_representation
@@ -506,7 +506,7 @@ TEST_CASE("gpu_table_representation clone empty table", "[gpu_data_representatio
 
   gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
-  auto cloned_base = repr.clone();
+  auto cloned_base = repr.clone(rmm::cuda_stream_default);
   REQUIRE(cloned_base != nullptr);
 
   auto* cloned = dynamic_cast<gpu_table_representation*>(cloned_base.get());
@@ -536,7 +536,7 @@ TEST_CASE("host_table_representation clone creates independent copy", "[cpu_data
   stream.synchronize();
 
   // Clone the host representation
-  auto cloned_base = host_repr_ptr->clone();
+  auto cloned_base = host_repr_ptr->clone(stream.view());
   REQUIRE(cloned_base != nullptr);
 
   auto* cloned = dynamic_cast<host_table_representation*>(cloned_base.get());

@@ -379,11 +379,12 @@ class data_batch {
    * the data from eviction, and decremented after the clone completes.
    *
    * @param new_batch_id The batch ID for the cloned batch
+   * @param stream CUDA stream for memory operations
    * @return std::shared_ptr<data_batch> A new data_batch with copied data
    * @throws std::runtime_error if the batch is in in_transit state
    * @throws std::runtime_error if the underlying data is null
    */
-  std::shared_ptr<data_batch> clone(uint64_t new_batch_id);
+  std::shared_ptr<data_batch> clone(uint64_t new_batch_id, rmm::cuda_stream_view stream);
 
  private:
   friend class data_batch_processing_handle;

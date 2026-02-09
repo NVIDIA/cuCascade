@@ -273,7 +273,7 @@ void data_batch::decrement_processing_count()
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
-std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id)
+std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id, rmm::cuda_stream_view stream)
 {
   // Create a task and lock for processing to protect data during clone
   if (!try_to_create_task()) {
@@ -288,7 +288,7 @@ std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id)
   }
 
   // Clone the data while holding the processing lock
-  auto cloned_data = _data->clone();
+  auto cloned_data = _data->clone(stream);
 
   // Handle destructor will decrement processing count when result goes out of scope
   return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));

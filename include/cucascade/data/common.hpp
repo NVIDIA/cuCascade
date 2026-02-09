@@ -94,9 +94,10 @@ class idata_representation {
    * The cloned representation will have its own copy of the underlying data,
    * residing in the same memory space as the original.
    *
+   * @param stream CUDA stream for memory operations
    * @return std::unique_ptr<idata_representation> A new data representation with copied data
    */
-  virtual std::unique_ptr<idata_representation> clone() = 0;
+  virtual std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Safely casts this interface to a specific derived type

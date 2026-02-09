@@ -34,6 +34,7 @@ jinja2 = "*"
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"
+build-debug = "cmake --preset debug && cmake --build build/debug"
 test = "cd build/release && ctest --output-on-failure"
 benchmarks = "cd build/release && ./benchmark/cucascade_benchmarks"
 lint = "pre-commit run -a"
