@@ -70,6 +70,10 @@ class reservation_manager_configurator {
   /// @param n_gpus Number of GPUs to configure.
   builder_reference& set_number_of_gpus(std::size_t n_gpus);
 
+  /// @brief set gpu ids
+  /// @param gpu_ids Vector of GPU ids to use.
+  builder_reference& set_gpu_ids(const std::vector<int>& gpu_ids);
+
   // either set space capacity or set a ratio of gpu total capacity
   /// @brief set gpu usage limit in bytes (i.e. capacity)
   /// @param bytes Memory usage limit in bytes.
@@ -199,7 +203,7 @@ class reservation_manager_configurator {
     std::variant<double, std::size_t> _fraction_or_size_value;
   };
 
-  size_t _num_gpus{1};
+  std::variant<std::size_t, std::vector<int>> _gpu_ids_or_num_gpus{size_t{1}};
   bool _per_stream_gpu_reservation{true};
   fraction_or_size _gpu_capacity{static_cast<std::size_t>(1UL << 30)};  // uses 1GB of gpu memory
   fraction_or_size _gpu_reservation{0.85};                              // uses 85% of capacity

@@ -41,7 +41,14 @@ using builder_reference = reservation_manager_configurator::builder_reference;
 builder_reference& reservation_manager_configurator::set_number_of_gpus(std::size_t n_gpus)
 {
   assert(n_gpus > 0 && "Number of GPUs must be positive");
-  _num_gpus = n_gpus;
+  _gpu_ids_or_num_gpus = n_gpus;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_gpu_ids(const std::vector<int>& gpu_ids)
+{
+  assert(!gpu_ids.empty() && "GPU IDs vector must not be empty");
+  _gpu_ids_or_num_gpus = gpu_ids;
   return *this;
 }
 
@@ -252,15 +259,26 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
 std::vector<reservation_manager_configurator::gpu_info>
 reservation_manager_configurator::extract_gpu_ids(const system_topology_info& topology) const
 {
-  if (_num_gpus > topology.gpus.size()) {
+  size_t num_gpus = 0;
+  std::vector<int> gpu_ids;
+  if (std::holds_alternative<std::vector<int>>(_gpu_ids_or_num_gpus)) {
+    num_gpus = std::get<std::vector<int>>(_gpu_ids_or_num_gpus).size();
+    gpu_ids  = std::get<std::vector<int>>(_gpu_ids_or_num_gpus);
+  } else {
+    num_gpus = std::get<std::size_t>(_gpu_ids_or_num_gpus);
+    gpu_ids.resize(num_gpus);
+    std::iota(gpu_ids.begin(), gpu_ids.end(), 0);
+  }
+
+  if (num_gpus > topology.gpus.size()) {
     throw std::runtime_error("Requested number of GPUs exceeds available GPUs");
   }
 
-  size_t num_gpus = _num_gpus;
-  if (num_gpus == 0) { num_gpus = topology.gpus.size(); }
-
-  std::vector<int> gpu_ids(num_gpus);
-  std::iota(gpu_ids.begin(), gpu_ids.end(), 0);
+  if (num_gpus == 0) {
+    num_gpus = topology.gpus.size();
+    gpu_ids.resize(num_gpus);
+    std::iota(gpu_ids.begin(), gpu_ids.end(), 0);
+  }
 
   std::unordered_map<int, std::pair<size_t, int>> available_gpu_ids;
   for (const auto& gpu : topology.gpus) {
