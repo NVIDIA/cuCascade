@@ -171,6 +171,38 @@ class data_repository_manager {
   uint64_t get_next_data_batch_id() { return _next_data_batch_id++; }
 
   /**
+   * @brief Info about leaked batches in a single repository after clear.
+   */
+  struct leaked_repository_info {
+    size_t operator_id;
+    std::string port_id;
+    std::size_t count;
+  };
+
+  /**
+   * @brief Clear all repositories and report any that still contained data.
+   *
+   * Should be called between queries to reset state. If any repository still has
+   * un-consumed data batches, this is a bug — it means some operator didn't fully
+   * drain its input.
+   *
+   * @return Per-repository info for each repository that still had un-consumed batches.
+   */
+  std::vector<leaked_repository_info> clear_all_repositories()
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<leaked_repository_info> leaked;
+    for (auto& [key, repo] : _repositories) {
+      if (repo) {
+        auto count = repo->total_size();
+        if (count > 0) { leaked.push_back({key.operator_id, key.port_id, count}); }
+      }
+    }
+    _repositories.clear();
+    return leaked;
+  }
+
+  /**
    * @brief Get N batches from the specified repositories for downgrade.
    *
    * @param memory_space_id The memory space id to get the data batches from

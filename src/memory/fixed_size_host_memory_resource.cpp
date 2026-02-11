@@ -302,6 +302,10 @@ void fixed_size_host_memory_resource::return_allocated_chunks(std::vector<std::b
       reclaimed_bytes = static_cast<std::size_t>(pre_reclaimation_size - reservation_size);
     }
   }
+  // Return blocks to the free list so they can be reused
+  for (auto* block : chunks) {
+    _free_blocks.push_back(block);
+  }
   _allocated_bytes.sub(reclaimed_bytes);
 }
 
