@@ -130,6 +130,7 @@ std::unique_ptr<reservation> memory_space::make_reservation_or_null(size_t size)
                                    return mr->reserve(size, _notification_channel->get_notifier());
                                  }},
                _reservation_allocator);
+  if (arena == nullptr) return nullptr;
   return reservation::create(*this, std::move(arena));
 }
 

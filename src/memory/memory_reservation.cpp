@@ -41,7 +41,10 @@ std::unique_ptr<reservation> reservation::create(memory_space& space,
 reservation::reservation(const memory_space* space, std::unique_ptr<reserved_arena> arena)
   : _space(space), _arena(std::move(arena))
 {
-  assert(_arena != nullptr && "Release callback must be provided");
+  if (_arena == nullptr) {
+    throw std::runtime_error(
+      "cuCascade::memory::reservation: trying to create reservation without a reserved arena\n");
+  }
 }
 
 reservation::~reservation() = default;

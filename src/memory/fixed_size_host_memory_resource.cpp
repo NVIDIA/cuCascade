@@ -114,7 +114,7 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
   if (res) {
     auto* h_reservation_slot = dynamic_cast<chunked_reserved_area*>(res->_arena.get());
     if (h_reservation_slot == nullptr) {
-      throw std::runtime_error("cannot make allocation with other reservation type");
+      throw std::runtime_error("Missing or unexpected type of reservation");
     }
     auto iter = _active_reservations.find(h_reservation_slot);
     if (iter == _active_reservations.end()) {
@@ -188,6 +188,11 @@ std::unique_ptr<reserved_arena> fixed_size_host_memory_resource::reserve(
   std::size_t bytes, std::unique_ptr<event_notifier> on_release)
 {
   bytes = rmm::align_up(bytes, _block_size);
+  if (bytes > _memory_limit) {
+    throw std::runtime_error(
+      "cuCascade::memory::fixed_size_host_memory_resource: reservation size " +
+      std::to_string(bytes) + " exceeds memory limit " + std::to_string(_memory_limit));
+  }
   if (do_reserve(bytes, _memory_limit)) {
     auto host_slot = std::make_unique<chunked_reserved_area>(*this, bytes, std::move(on_release));
     this->register_reservation(host_slot.get());
