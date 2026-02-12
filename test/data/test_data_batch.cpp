@@ -103,155 +103,155 @@ TEST_CASE("data_batch Self Move Assignment", "[data_batch]")
 TEST_CASE("data_batch Processing State Management", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Cannot lock for processing directly from idle - must create task first
-  auto bad_idle = batch.try_to_lock_for_processing(space_id);
+  auto bad_idle = batch->try_to_lock_for_processing(space_id);
   REQUIRE(bad_idle.success == false);
   REQUIRE(bad_idle.status == lock_for_processing_status::task_not_created);
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Create task first
-  REQUIRE(batch.try_to_create_task() == true);
-  REQUIRE(batch.get_state() == batch_state::task_created);
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
 
   // Now lock for processing
-  auto r1 = batch.try_to_lock_for_processing(space_id);
+  auto r1 = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r1.success == true);
   auto h1 = std::move(r1.handle);
   REQUIRE(h1.valid() == true);
-  REQUIRE(batch.get_processing_count() == 1);
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 1);
+  REQUIRE(batch->get_state() == batch_state::processing);
 
   // Lock again while already processing
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r2 = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r2 = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r2.success == true);
   auto h2 = std::move(r2.handle);
   REQUIRE(h2.valid() == true);
-  REQUIRE(batch.get_processing_count() == 2);
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 2);
+  REQUIRE(batch->get_state() == batch_state::processing);
 
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r3 = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r3 = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r3.success == true);
   auto h3 = std::move(r3.handle);
   REQUIRE(h3.valid() == true);
-  REQUIRE(batch.get_processing_count() == 3);
+  REQUIRE(batch->get_processing_count() == 3);
 }
 
 TEST_CASE("data_batch Lock For Processing Requires Matching Memory Space", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto correct_space = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto correct_space = batch->get_memory_space()->get_id();
   auto wrong_space   = memory::memory_space_id{memory::Tier::HOST, correct_space.device_id};
 
-  REQUIRE(batch.try_to_create_task() == true);
+  REQUIRE(batch->try_to_create_task() == true);
 
-  auto wrong = batch.try_to_lock_for_processing(wrong_space);
+  auto wrong = batch->try_to_lock_for_processing(wrong_space);
   REQUIRE(wrong.success == false);
   REQUIRE(wrong.status == lock_for_processing_status::memory_space_mismatch);
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::task_created);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::task_created);
 
-  auto right = batch.try_to_lock_for_processing(correct_space);
+  auto right = batch->try_to_lock_for_processing(correct_space);
   REQUIRE(right.success == true);
   REQUIRE(right.status == lock_for_processing_status::success);
   auto handle = std::move(right.handle);
   REQUIRE(handle.valid());
-  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch->get_processing_count() == 1);
 }
 
 // Test data_batch_processing_handle RAII behavior
 TEST_CASE("data_batch_processing_handle RAII", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   {
     // Create task first, then lock for processing
-    REQUIRE(batch.try_to_create_task() == true);
-    auto r = batch.try_to_lock_for_processing(space_id);
+    REQUIRE(batch->try_to_create_task() == true);
+    auto r = batch->try_to_lock_for_processing(space_id);
     REQUIRE(r.success == true);
     auto handle = std::move(r.handle);
 
-    REQUIRE(batch.get_processing_count() == 1);
-    REQUIRE(batch.get_state() == batch_state::processing);
+    REQUIRE(batch->get_processing_count() == 1);
+    REQUIRE(batch->get_state() == batch_state::processing);
 
     {
       // Create another handle (can lock while already processing)
-      REQUIRE(batch.try_to_create_task() == true);
-      auto r2 = batch.try_to_lock_for_processing(space_id);
+      REQUIRE(batch->try_to_create_task() == true);
+      auto r2 = batch->try_to_lock_for_processing(space_id);
       REQUIRE(r2.success == true);
       auto handle2 = std::move(r2.handle);
 
-      REQUIRE(batch.get_processing_count() == 2);
+      REQUIRE(batch->get_processing_count() == 2);
     }  // handle2 goes out of scope
 
-    REQUIRE(batch.get_processing_count() == 1);
-    REQUIRE(batch.get_state() == batch_state::processing);
+    REQUIRE(batch->get_processing_count() == 1);
+    REQUIRE(batch->get_state() == batch_state::processing);
   }  // handle goes out of scope
 
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 }
 
 // Test try_to_lock_for_in_transit blocks processing
 TEST_CASE("data_batch In Transit Blocks Processing", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Lock for in_transit
-  REQUIRE(batch.try_to_lock_for_in_transit() == true);
-  REQUIRE(batch.get_state() == batch_state::in_transit);
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
 
   // Try to create task should fail while in_transit
-  REQUIRE(batch.try_to_create_task() == false);
-  REQUIRE(batch.get_state() == batch_state::in_transit);
+  REQUIRE(batch->try_to_create_task() == false);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
 
   // Try to lock for processing should fail while in_transit
-  auto in_transit = batch.try_to_lock_for_processing(space_id);
+  auto in_transit = batch->try_to_lock_for_processing(space_id);
   REQUIRE(in_transit.success == false);
   REQUIRE(in_transit.status == lock_for_processing_status::task_not_created);
-  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch->get_processing_count() == 0);
 
   // Release the in_transit lock
-  REQUIRE(batch.try_to_release_in_transit() == true);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->try_to_release_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::idle);
 }
 
 // Test try_to_lock_for_in_transit fails when processing
 TEST_CASE("data_batch Cannot Go In Transit While Processing", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
   // Create task and start processing
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto handle = std::move(r.handle);
 
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->get_state() == batch_state::processing);
 
   // Try to lock for in_transit should fail
-  REQUIRE(batch.try_to_lock_for_in_transit() == false);
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->try_to_lock_for_in_transit() == false);
+  REQUIRE(batch->get_state() == batch_state::processing);
 }
 
 // Test multiple batches with different IDs
@@ -302,8 +302,8 @@ TEST_CASE("data_batch get_current_tier Delegation", "[data_batch]")
 TEST_CASE("data_batch Thread-Safe Processing Count", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
   constexpr int num_threads      = 10;
   constexpr int locks_per_thread = 100;
@@ -313,11 +313,11 @@ TEST_CASE("data_batch Thread-Safe Processing Count", "[data_batch]")
 
   // Launch threads to lock for processing
   for (int i = 0; i < num_threads; ++i) {
-    threads.emplace_back([&batch, &thread_handles, i, space_id]() {
+    threads.emplace_back([batch, &thread_handles, i, space_id]() {
       for (int j = 0; j < locks_per_thread; ++j) {
         // Create task first so threads can lock for processing
-        REQUIRE(batch.try_to_create_task() == true);
-        auto r = batch.try_to_lock_for_processing(space_id);
+        REQUIRE(batch->try_to_create_task() == true);
+        auto r = batch->try_to_lock_for_processing(space_id);
         REQUIRE(r.success == true);
         thread_handles[i].push_back(std::move(r.handle));
       }
@@ -330,7 +330,7 @@ TEST_CASE("data_batch Thread-Safe Processing Count", "[data_batch]")
   }
 
   // Verify final count
-  REQUIRE(batch.get_processing_count() == num_threads * locks_per_thread);
+  REQUIRE(batch->get_processing_count() == num_threads * locks_per_thread);
 
   // Clear all handles to release processing locks
   for (auto& handles : thread_handles) {
@@ -338,8 +338,8 @@ TEST_CASE("data_batch Thread-Safe Processing Count", "[data_batch]")
   }
 
   // Verify final count is back to zero
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 }
 
 // Test batch ID uniqueness in practice
@@ -364,35 +364,35 @@ TEST_CASE("data_batch Unique IDs", "[data_batch]")
 TEST_CASE("data_batch Zero Processing Count", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
   // Starting processing count should be zero
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Create task and lock for processing
-  REQUIRE(batch.try_to_create_task() == true);
+  REQUIRE(batch->try_to_create_task() == true);
   {
-    auto r = batch.try_to_lock_for_processing(space_id);
+    auto r = batch->try_to_lock_for_processing(space_id);
     REQUIRE(r.success == true);
     auto handle = std::move(r.handle);
     REQUIRE(handle.valid());
-    REQUIRE(batch.get_processing_count() == 1);
-    REQUIRE(batch.get_state() == batch_state::processing);
+    REQUIRE(batch->get_processing_count() == 1);
+    REQUIRE(batch->get_state() == batch_state::processing);
   }  // Handle goes out of scope
 
   // Should be back to idle
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Can create task and lock again from idle
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r2 = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r2 = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r2.success == true);
   auto handle2 = std::move(r2.handle);
   REQUIRE(handle2.valid());
-  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch->get_processing_count() == 1);
 }
 
 // Test with different data sizes
@@ -417,14 +417,14 @@ TEST_CASE("data_batch Move Requires Zero Processing Count", "[data_batch]")
   // Test that moving with active processing throws
   {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-    data_batch batch1(1, std::move(data));
-    auto space_id = batch1.get_memory_space()->get_id();
-    batch1.try_to_create_task();
-    auto r = batch1.try_to_lock_for_processing(space_id);
+    auto batch1 = std::make_shared<data_batch>(1, std::move(data));
+    auto space_id = batch1->get_memory_space()->get_id();
+    batch1->try_to_create_task();
+    auto r = batch1->try_to_lock_for_processing(space_id);
     REQUIRE(r.success == true);
     auto handle = std::move(r.handle);
 
-    REQUIRE_THROWS_AS([&]() { data_batch batch2(std::move(batch1)); }(), std::runtime_error);
+    REQUIRE_THROWS_AS([&]() { data_batch batch2(std::move(*batch1)); }(), std::runtime_error);
   }
 
   // Test that moving with zero counts succeeds
@@ -445,8 +445,8 @@ TEST_CASE("data_batch Move Requires Zero Processing Count", "[data_batch]")
 TEST_CASE("data_batch Rapid Processing Cycles", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
   // Perform many cycles of lock and unlock via handles
   for (int cycle = 0; cycle < 100; ++cycle) {
@@ -454,23 +454,23 @@ TEST_CASE("data_batch Rapid Processing Cycles", "[data_batch]")
 
     std::vector<data_batch_processing_handle> handles;
     for (int i = 0; i < 10; ++i) {
-      REQUIRE(batch.try_to_create_task() == true);
-      auto r = batch.try_to_lock_for_processing(space_id);
+      REQUIRE(batch->try_to_create_task() == true);
+      auto r = batch->try_to_lock_for_processing(space_id);
       REQUIRE(r.success == true);
       handles.push_back(std::move(r.handle));
     }
-    REQUIRE(batch.get_processing_count() == 10);
-    REQUIRE(batch.get_state() == batch_state::processing);
+    REQUIRE(batch->get_processing_count() == 10);
+    REQUIRE(batch->get_state() == batch_state::processing);
 
     handles.clear();  // Release all handles
 
-    REQUIRE(batch.get_processing_count() == 0);
-    REQUIRE(batch.get_state() == batch_state::idle);
+    REQUIRE(batch->get_processing_count() == 0);
+    REQUIRE(batch->get_state() == batch_state::idle);
   }
 
   // Final state should be idle with zero count
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 }
 
 // Test smart pointer lifecycle management
@@ -517,19 +517,19 @@ TEST_CASE("data_batch Smart Pointer Lifecycle", "[data_batch]")
 TEST_CASE("data_batch_processing_handle Move Semantics", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto h = std::move(r.handle);
   REQUIRE(h.valid());
-  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch->get_processing_count() == 1);
 
   {
-    REQUIRE(batch.try_to_create_task() == true);
-    auto r1 = batch.try_to_lock_for_processing(space_id);
+    REQUIRE(batch->try_to_create_task() == true);
+    auto r1 = batch->try_to_lock_for_processing(space_id);
     REQUIRE(r1.success == true);
     auto handle1 = std::move(r1.handle);
 
@@ -538,42 +538,42 @@ TEST_CASE("data_batch_processing_handle Move Semantics", "[data_batch]")
 
     REQUIRE(handle1.valid() == false);
     REQUIRE(handle2.valid() == true);
-    REQUIRE(batch.get_processing_count() == 2);  // Two active handles (outer h + handle2)
+    REQUIRE(batch->get_processing_count() == 2);  // Two active handles (outer h + handle2)
 
   }  // handle2 goes out of scope, should decrement
 
-  REQUIRE(batch.get_processing_count() == 1);
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 1);
+  REQUIRE(batch->get_state() == batch_state::processing);
 
   // Explicitly release the original handle to return to idle
   h.release();
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 }
 
 // Test data_batch_processing_handle explicit release
 TEST_CASE("data_batch_processing_handle Explicit Release", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto handle = std::move(r.handle);
 
-  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch->get_processing_count() == 1);
 
   // Explicitly release
   handle.release();
 
-  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch->get_processing_count() == 0);
   REQUIRE(handle.valid() == false);
 
   // Double release should be safe (no-op)
   handle.release();
-  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch->get_processing_count() == 0);
 }
 
 // Test empty handle
@@ -593,46 +593,46 @@ TEST_CASE("data_batch_processing_handle Empty Handle", "[data_batch]")
 TEST_CASE("data_batch Task Created State Transitions", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
 
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Create task
-  REQUIRE(batch.try_to_create_task() == true);
-  REQUIRE(batch.get_state() == batch_state::task_created);
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
 
   // Can call try_to_create_task again while already in task_created state (idempotent)
-  REQUIRE(batch.try_to_create_task() == true);
-  REQUIRE(batch.get_state() == batch_state::task_created);
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
 
   // Can lock for in_transit while in task_created state (to move data)
-  REQUIRE(batch.try_to_lock_for_in_transit() == true);
-  REQUIRE(batch.get_state() == batch_state::in_transit);
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
 
   // Release in_transit returns to task_created since the task is still pending
-  REQUIRE(batch.try_to_release_in_transit(batch_state::task_created) == true);
-  REQUIRE(batch.get_state() == batch_state::task_created);
+  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
 
   // Can cancel task and go back to idle
-  REQUIRE(batch.try_to_cancel_task() == true);
-  REQUIRE(batch.try_to_cancel_task() == true);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->try_to_cancel_task() == true);
+  REQUIRE(batch->try_to_cancel_task() == true);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Create task again
-  REQUIRE(batch.try_to_create_task() == true);
-  REQUIRE(batch.get_state() == batch_state::task_created);
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
 
-  auto space_id = batch.get_memory_space()->get_id();
+  auto space_id = batch->get_memory_space()->get_id();
   // Go to processing
-  auto r = batch.try_to_lock_for_processing(space_id);
+  auto r = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto handle = std::move(r.handle);
   REQUIRE(handle.valid());
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->get_state() == batch_state::processing);
 
   // Can call try_to_create_task while processing (idempotent)
-  REQUIRE(batch.try_to_create_task() == true);
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::processing);
 }
 
 // Test in_transit state transitions
@@ -690,10 +690,10 @@ TEST_CASE("data_batch In Transit From Task Created Returns To Task Created", "[d
 TEST_CASE("data_batch clone creates independent copy", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
-  data_batch batch(42, std::move(data));
+  auto batch = std::make_shared<data_batch>(42, std::move(data));
 
   // Clone the batch with a new ID
-  auto cloned = batch.clone(100, rmm::cuda_stream_view{});
+  auto cloned = batch->clone(100, rmm::cuda_stream_view{});
 
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 100);
@@ -702,32 +702,32 @@ TEST_CASE("data_batch clone creates independent copy", "[data_batch]")
   REQUIRE(cloned->get_state() == batch_state::idle);
 
   // Original batch should be unchanged
-  REQUIRE(batch.get_batch_id() == 42);
-  REQUIRE(batch.get_current_tier() == memory::Tier::GPU);
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_batch_id() == 42);
+  REQUIRE(batch->get_current_tier() == memory::Tier::GPU);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Verify data size matches
-  REQUIRE(cloned->get_data()->get_size_in_bytes() == batch.get_data()->get_size_in_bytes());
+  REQUIRE(cloned->get_data()->get_size_in_bytes() == batch->get_data()->get_size_in_bytes());
 
   // Verify the data representations are different objects
-  REQUIRE(cloned->get_data() != batch.get_data());
+  REQUIRE(cloned->get_data() != batch->get_data());
 }
 
 TEST_CASE("data_batch clone with different batch IDs", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
-  data_batch batch(1, std::move(data));
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
 
   // Clone with same ID as original (allowed)
-  auto clone1 = batch.clone(1, rmm::cuda_stream_view{});
+  auto clone1 = batch->clone(1, rmm::cuda_stream_view{});
   REQUIRE(clone1->get_batch_id() == 1);
 
   // Clone with different IDs
-  auto clone2 = batch.clone(0, rmm::cuda_stream_view{});
+  auto clone2 = batch->clone(0, rmm::cuda_stream_view{});
   REQUIRE(clone2->get_batch_id() == 0);
 
-  auto clone3 = batch.clone(UINT64_MAX, rmm::cuda_stream_view{});
+  auto clone3 = batch->clone(UINT64_MAX, rmm::cuda_stream_view{});
   REQUIRE(clone3->get_batch_id() == UINT64_MAX);
 }
 
@@ -736,8 +736,8 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
   SECTION("GPU tier")
   {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
-    auto cloned = batch.clone(2, rmm::cuda_stream_view{});
+    auto batch = std::make_shared<data_batch>(1, std::move(data));
+    auto cloned = batch->clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::GPU);
   }
@@ -745,8 +745,8 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
   SECTION("HOST tier")
   {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
-    data_batch batch(1, std::move(data));
-    auto cloned = batch.clone(2, rmm::cuda_stream_view{});
+    auto batch = std::make_shared<data_batch>(1, std::move(data));
+    auto cloned = batch->clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::HOST);
   }
@@ -754,8 +754,8 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
   SECTION("DISK tier")
   {
     auto data = std::make_unique<mock_data_representation>(memory::Tier::DISK, 1024);
-    data_batch batch(1, std::move(data));
-    auto cloned = batch.clone(2, rmm::cuda_stream_view{});
+    auto batch = std::make_shared<data_batch>(1, std::move(data));
+    auto cloned = batch->clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::DISK);
   }
@@ -764,51 +764,51 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
 TEST_CASE("data_batch clone succeeds with active processing", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
   // Start processing
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto handle = std::move(r.handle);
 
-  REQUIRE(batch.get_processing_count() == 1);
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 1);
+  REQUIRE(batch->get_state() == batch_state::processing);
 
   // Clone should succeed even while processing
-  auto cloned = batch.clone(2, rmm::cuda_stream_view{});
+  auto cloned = batch->clone(2, rmm::cuda_stream_view{});
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 2);
 
   // Original batch should still be processing with original count
-  REQUIRE(batch.get_processing_count() == 1);
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 1);
+  REQUIRE(batch->get_state() == batch_state::processing);
 
   // Release processing handle
   handle.release();
-  REQUIRE(batch.get_processing_count() == 0);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 }
 
 TEST_CASE("data_batch clone fails when in_transit", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
 
   // Lock for in-transit
-  REQUIRE(batch.try_to_lock_for_in_transit() == true);
-  REQUIRE(batch.get_state() == batch_state::in_transit);
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
 
   // Clone should fail while in_transit
-  REQUIRE_THROWS_AS(batch.clone(2, rmm::cuda_stream_view{}), std::runtime_error);
+  REQUIRE_THROWS_AS(batch->clone(2, rmm::cuda_stream_view{}), std::runtime_error);
 
   // Release in-transit lock
-  REQUIRE(batch.try_to_release_in_transit() == true);
-  REQUIRE(batch.get_state() == batch_state::idle);
+  REQUIRE(batch->try_to_release_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   // Now clone should succeed
-  auto cloned = batch.clone(2, rmm::cuda_stream_view{});
+  auto cloned = batch->clone(2, rmm::cuda_stream_view{});
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 2);
 }
@@ -816,9 +816,9 @@ TEST_CASE("data_batch clone fails when in_transit", "[data_batch]")
 TEST_CASE("data_batch clone returns shared_ptr", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
 
-  std::shared_ptr<data_batch> cloned = batch.clone(2, rmm::cuda_stream_view{});
+  std::shared_ptr<data_batch> cloned = batch->clone(2, rmm::cuda_stream_view{});
 
   REQUIRE(cloned.use_count() == 1);
 
@@ -835,19 +835,19 @@ TEST_CASE("data_batch clone returns shared_ptr", "[data_batch]")
 TEST_CASE("data_batch clone can be independently processed", "[data_batch]")
 {
   auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  data_batch batch(1, std::move(data));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
 
-  auto cloned          = batch.clone(2, rmm::cuda_stream_view{});
+  auto cloned          = batch->clone(2, rmm::cuda_stream_view{});
   auto cloned_space_id = cloned->get_memory_space()->get_id();
 
   // Process original batch
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r1 = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r1 = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r1.success == true);
   auto handle1 = std::move(r1.handle);
 
-  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch->get_processing_count() == 1);
   REQUIRE(cloned->get_processing_count() == 0);
 
   // Process cloned batch independently
@@ -856,14 +856,14 @@ TEST_CASE("data_batch clone can be independently processed", "[data_batch]")
   REQUIRE(r2.success == true);
   auto handle2 = std::move(r2.handle);
 
-  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch->get_processing_count() == 1);
   REQUIRE(cloned->get_processing_count() == 1);
 
   // Release handles
   handle1.release();
   handle2.release();
 
-  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch->get_processing_count() == 0);
   REQUIRE(cloned->get_processing_count() == 0);
 }
 
@@ -884,15 +884,15 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
   // Create gpu_table_representation and wrap in data_batch
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  data_batch batch(1, std::move(gpu_repr));
+  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
 
   // Clone the batch
-  auto cloned = batch.clone(2, stream.view());
+  auto cloned = batch->clone(2, stream.view());
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 2);
 
   // Verify the cloned data has correct structure
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch->get_data());
   auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
   REQUIRE(original_repr != nullptr);
   REQUIRE(cloned_repr != nullptr);
@@ -915,15 +915,15 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
   auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  data_batch batch(1, std::move(gpu_repr));
+  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
 
-  auto cloned = batch.clone(2, stream.view());
+  auto cloned = batch->clone(2, stream.view());
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch->get_data());
   auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
 
   // Verify the data representations are different objects
-  REQUIRE(batch.get_data() != cloned->get_data());
+  REQUIRE(batch->get_data() != cloned->get_data());
 
   // Verify the underlying cudf tables are different objects
   REQUIRE(&original_repr->get_table() != &cloned_repr->get_table());
@@ -943,22 +943,22 @@ TEST_CASE("data_batch clone with real GPU data while processing", "[data_batch][
   auto table = create_simple_cudf_table(75, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  data_batch batch(1, std::move(gpu_repr));
-  auto space_id = batch.get_memory_space()->get_id();
+  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
+  auto space_id = batch->get_memory_space()->get_id();
 
   // Start processing on the original batch
-  REQUIRE(batch.try_to_create_task() == true);
-  auto r = batch.try_to_lock_for_processing(space_id);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r = batch->try_to_lock_for_processing(space_id);
   REQUIRE(r.success == true);
   auto handle = std::move(r.handle);
-  REQUIRE(batch.get_processing_count() == 1);
+  REQUIRE(batch->get_processing_count() == 1);
 
   // Clone while processing - should succeed and data should be valid
-  auto cloned = batch.clone(2, stream.view());
+  auto cloned = batch->clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
   // Verify data integrity after clone during processing
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch->get_data());
   auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
 
   stream.synchronize();
@@ -966,12 +966,12 @@ TEST_CASE("data_batch clone with real GPU data while processing", "[data_batch][
     original_repr->get_table(), cloned_repr->get_table(), stream.view());
 
   // Original should still be processing
-  REQUIRE(batch.get_processing_count() == 1);
-  REQUIRE(batch.get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 1);
+  REQUIRE(batch->get_state() == batch_state::processing);
 
   // Release handle
   handle.release();
-  REQUIRE(batch.get_processing_count() == 0);
+  REQUIRE(batch->get_processing_count() == 0);
 }
 
 TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
@@ -982,12 +982,12 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
   auto table = create_simple_cudf_table(30, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  data_batch batch(1, std::move(gpu_repr));
+  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
 
   // Create multiple clones
-  auto clone1 = batch.clone(10, stream.view());
-  auto clone2 = batch.clone(20, stream.view());
-  auto clone3 = batch.clone(30, stream.view());
+  auto clone1 = batch->clone(10, stream.view());
+  auto clone2 = batch->clone(20, stream.view());
+  auto clone3 = batch->clone(30, stream.view());
 
   // Verify all have correct batch IDs
   REQUIRE(clone1->get_batch_id() == 10);
@@ -995,15 +995,15 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
   REQUIRE(clone3->get_batch_id() == 30);
 
   // Verify all have independent data
-  REQUIRE(batch.get_data() != clone1->get_data());
-  REQUIRE(batch.get_data() != clone2->get_data());
-  REQUIRE(batch.get_data() != clone3->get_data());
+  REQUIRE(batch->get_data() != clone1->get_data());
+  REQUIRE(batch->get_data() != clone2->get_data());
+  REQUIRE(batch->get_data() != clone3->get_data());
   REQUIRE(clone1->get_data() != clone2->get_data());
   REQUIRE(clone1->get_data() != clone3->get_data());
   REQUIRE(clone2->get_data() != clone3->get_data());
 
   // Verify all data content matches original
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch->get_data());
   auto* clone1_repr   = dynamic_cast<gpu_table_representation*>(clone1->get_data());
   auto* clone2_repr   = dynamic_cast<gpu_table_representation*>(clone2->get_data());
   auto* clone3_repr   = dynamic_cast<gpu_table_representation*>(clone3->get_data());
@@ -1026,9 +1026,9 @@ TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
   auto table    = create_simple_cudf_table(0, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  data_batch batch(1, std::move(gpu_repr));
+  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
 
-  auto cloned = batch.clone(2, stream.view());
+  auto cloned = batch->clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
   auto* cloned_repr = dynamic_cast<gpu_table_representation*>(cloned->get_data());
@@ -1047,12 +1047,12 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
     create_simple_cudf_table(10000, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  data_batch batch(1, std::move(gpu_repr));
+  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
 
-  auto cloned = batch.clone(2, stream.view());
+  auto cloned = batch->clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch.get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch->get_data());
   auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
 
   // Verify structure
@@ -1079,27 +1079,27 @@ TEST_CASE("data_batch clone state transitions correctly", "[data_batch][gpu]")
   auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  data_batch batch(1, std::move(gpu_repr));
+  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
 
   SECTION("Clone from idle state returns to idle")
   {
-    REQUIRE(batch.get_state() == batch_state::idle);
-    auto cloned = batch.clone(2, stream.view());
+    REQUIRE(batch->get_state() == batch_state::idle);
+    auto cloned = batch->clone(2, stream.view());
     REQUIRE(cloned != nullptr);
-    REQUIRE(batch.get_state() == batch_state::idle);
+    REQUIRE(batch->get_state() == batch_state::idle);
     REQUIRE(cloned->get_state() == batch_state::idle);
   }
 
   SECTION("Clone from task_created state returns to task_created")
   {
-    REQUIRE(batch.try_to_create_task() == true);
-    REQUIRE(batch.get_state() == batch_state::task_created);
+    REQUIRE(batch->try_to_create_task() == true);
+    REQUIRE(batch->get_state() == batch_state::task_created);
 
-    auto cloned = batch.clone(2, stream.view());
+    auto cloned = batch->clone(2, stream.view());
     REQUIRE(cloned != nullptr);
 
     // Original should return to task_created (has pending task)
-    REQUIRE(batch.get_state() == batch_state::task_created);
+    REQUIRE(batch->get_state() == batch_state::task_created);
     REQUIRE(cloned->get_state() == batch_state::idle);
   }
 }

@@ -70,20 +70,25 @@ class data_batch_processing_handle;
  * transitions from processing back to idle.
  *
  * @note This class is move-only to ensure proper ownership semantics.
+ * @note Uses a weak_ptr so the handle does not keep the batch alive; if the batch
+ *       is destroyed before release(), release() is a no-op.
  */
 class data_batch_processing_handle {
  public:
   /**
    * @brief Default constructor creates an empty handle.
    */
-  data_batch_processing_handle() : _batch(nullptr) {}
+  data_batch_processing_handle() = default;
 
   /**
-   * @brief Construct a handle for the given data_batch.
+   * @brief Construct a handle from a shared_ptr (stores weak_ptr; does not keep batch alive).
    *
-   * @param batch Pointer to the data_batch to manage (non-owning)
+   * @param batch shared_ptr to the data_batch to manage
    */
-  explicit data_batch_processing_handle(data_batch* batch) : _batch(batch) {}
+  explicit data_batch_processing_handle(std::shared_ptr<data_batch> batch)
+    : _batch(batch ? std::optional<std::weak_ptr<data_batch>>(std::move(batch)) : std::nullopt)
+  {
+  }
 
   /**
    * @brief Destructor decrements processing count and potentially transitions state.
@@ -97,9 +102,9 @@ class data_batch_processing_handle {
   /**
    * @brief Move constructor - transfers ownership of the handle.
    */
-  data_batch_processing_handle(data_batch_processing_handle&& other) noexcept : _batch(other._batch)
+  data_batch_processing_handle(data_batch_processing_handle&& other) noexcept
+    : _batch(std::exchange(other._batch, std::nullopt))
   {
-    other._batch = nullptr;
   }
 
   /**
@@ -108,10 +113,8 @@ class data_batch_processing_handle {
   data_batch_processing_handle& operator=(data_batch_processing_handle&& other) noexcept
   {
     if (this != &other) {
-      // Release current batch if any
       release();
-      _batch       = other._batch;
-      other._batch = nullptr;
+      _batch = std::exchange(other._batch, std::nullopt);
     }
     return *this;
   }
@@ -119,7 +122,7 @@ class data_batch_processing_handle {
   /**
    * @brief Check if this handle is valid (managing a batch).
    */
-  bool valid() const { return _batch != nullptr; }
+  bool valid() const { return _batch.has_value(); }
 
   /**
    * @brief Explicitly release the handle, decrementing the processing count.
@@ -127,7 +130,7 @@ class data_batch_processing_handle {
   void release();
 
  private:
-  data_batch* _batch;  ///< Non-owning pointer to the managed data_batch
+  std::optional<std::weak_ptr<data_batch>> _batch;  ///< Weak reference to the managed data_batch
 };
 
 /**
@@ -182,7 +185,7 @@ struct lock_for_processing_result {
  * @note This class is not thread-safe for construction/destruction, but the state management
  *       operations are protected by an internal mutex and thread-safe.
  */
-class data_batch {
+class data_batch : public std::enable_shared_from_this<data_batch> {
  public:
   /**
    * @brief Construct a new data_batch with the given ID and data representation.
