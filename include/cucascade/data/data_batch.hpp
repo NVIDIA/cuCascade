@@ -122,7 +122,7 @@ class data_batch_processing_handle {
   /**
    * @brief Check if this handle is valid (managing a batch).
    */
-  bool valid() const { return _batch.has_value() && !_batch.expired(); }
+  bool valid() const { return _batch.has_value() && !_batch->expired(); }
 
   /**
    * @brief Explicitly release the handle, decrementing the processing count.
