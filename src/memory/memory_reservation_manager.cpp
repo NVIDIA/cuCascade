@@ -86,7 +86,6 @@ std::vector<memory_space*> any_memory_space_in_tier::get_candidates(
 std::vector<memory_space*> any_memory_space_in_tiers::get_candidates(
   memory_reservation_manager& manager) const
 {
-  auto cs = this->get_all_memory_resource(manager);
   std::vector<memory_space*> candidates;
   for (Tier t : tiers) {
     for (auto candidate : this->get_all_memory_resource(manager, t)) {

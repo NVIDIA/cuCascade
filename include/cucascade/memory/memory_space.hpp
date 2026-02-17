@@ -40,9 +40,9 @@ namespace cucascade {
 namespace memory {
 
 // Forward declaration
-struct reservation;
-struct reservation_aware_resource_adaptor;
-struct fixed_size_host_memory_resource;
+class reservation;
+class reservation_aware_resource_adaptor;
+class fixed_size_host_memory_resource;
 
 /**
  * memory_space represents a specific memory location identified by a tier and device ID.
@@ -121,7 +121,7 @@ class memory_space {
   void shutdown();
 
  protected:
-  friend struct reservation;
+  friend class reservation;
 
   const memory_space_id _id;
   const size_t _capacity;
