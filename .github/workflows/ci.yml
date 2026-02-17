@@ -23,10 +23,6 @@ jobs:
 
       - run: pixi run build
 
-      - name: Stop sccache
-        if: always()
-        run: sccache --stop-server || true
-
       - name: Package build artifacts
         run: tar -cf build-release.tar build/release/
 
