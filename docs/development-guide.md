@@ -114,6 +114,7 @@ cuCascade/
 │   │   ├── error.hpp
 │   │   ├── numa_region_pinned_host_allocator.hpp
 │   │   ├── host_table.hpp
+│   │   ├── host_table_packed.hpp
 │   │   └── null_device_memory_resource.hpp
 │   └── utils/                   # Utility headers
 │       ├── atomics.hpp          # atomic_peak_tracker, atomic_bounded_counter
@@ -381,7 +382,7 @@ This runs:
 2. **`scripts/generate_api_docs.py`** -- converts Doxygen XML to Markdown with Mermaid class hierarchy diagrams
 
 Output:
-- HTML: `build/docs/html/` (browseable API docs)
+- HTML: `build/docs/html/` (browsable API docs)
 - XML: `build/docs/xml/` (intermediate)
 - Markdown: `docs/API_REFERENCE.md` (generated)
 

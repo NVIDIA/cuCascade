@@ -92,7 +92,7 @@ struct converter_key_hash {
  * The registry is thread-safe for concurrent registration and lookup.
  *
  * @note Built-in converters between gpu_table_representation and
- * host_table_representation are registered via register_builtin_converters().
+ * host_data_packed_representation are registered via register_builtin_converters().
  */
 class representation_converter_registry {
  public:
@@ -248,7 +248,7 @@ class representation_converter_registry {
  * @brief Initialize the built-in representation converters.
  *
  * This function registers the default converters between gpu_table_representation
- * and host_table_representation.
+ * and host_data_packed_representation.
  *
  * @param registry The converter registry to register converters with.
  */
