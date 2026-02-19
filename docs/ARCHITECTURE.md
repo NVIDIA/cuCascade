@@ -48,7 +48,7 @@ graph TB
         DB[data_batch]
         RC[representation_converter_registry]
         GPU_REP[gpu_table_representation]
-        HOST_REP[host_table_representation]
+        HOST_REP[host_data_representation / host_data_packed_representation]
     end
 
     subgraph "Memory Module"
@@ -254,10 +254,15 @@ The `representation_converter_registry` provides type-indexed conversion between
 
 | Source | Target | Method |
 |--------|--------|--------|
-| GPU table | Host table | `cudf::pack()` -> `cudaMemcpyAsync` (D2H) -> multi-block host allocation |
-| Host table | GPU table | `cudaMemcpyAsync` (H2D) -> `cudf::unpack()` on device |
+| GPU table | Host (direct) | `cudaMemcpyBatchAsync` (D2H) — copies column buffers directly; ~99% PCIe bandwidth |
+| Host (direct) | GPU table | `cudaMemcpyBatchAsync` (H2D) — reconstructs `cudf::column` tree from metadata |
+| GPU table | Host (packed) | `cudf::pack()` -> `cudaMemcpyAsync` (D2H) -> multi-block host allocation |
+| Host (packed) | GPU table | `cudaMemcpyAsync` (H2D) -> `cudf::unpack()` on device |
 | GPU table | GPU table | `cudf::pack()` -> `cudaMemcpyPeerAsync` -> `cudf::unpack()` (cross-device) |
-| Host table | Host table | Block-by-block `std::memcpy` (cross-NUMA) |
+| Host (packed) | Host (packed) | Block-by-block `std::memcpy` (cross-NUMA) |
+
+"Host (direct)" = `host_data_representation` — preferred, no intermediate GPU allocation.
+"Host (packed)" = `host_data_packed_representation` — uses cudf's pack/unpack serialization.
 
 ### Topology Discovery
 
@@ -299,7 +304,7 @@ A typical lifecycle of data through cuCascade:
 4. MEMORY PRESSURE (downgrade)
    memory_space.should_downgrade_memory()  [threshold exceeded]
    batch.try_to_lock_for_in_transit()      [idle -> in_transit]
-   converter_registry.convert<host_table_representation>(...)
+   converter_registry.convert<host_data_representation>(...)
    batch.set_data(new_representation)      [data now on HOST]
    batch.try_to_release_in_transit()       [in_transit -> idle]
 
@@ -376,7 +381,8 @@ Key synchronization primitives:
 | `include/cucascade/memory/oom_handling_policy.hpp` | OOM handling strategies |
 | `include/cucascade/memory/error.hpp` | Custom error types and exceptions |
 | `include/cucascade/memory/numa_region_pinned_host_allocator.hpp` | NUMA-aware pinned host allocation |
-| `include/cucascade/memory/host_table.hpp` | Serialized cuDF table storage on host |
+| `include/cucascade/memory/host_table.hpp` | `host_table_allocation` + `column_metadata` for direct-copy host representations |
+| `include/cucascade/memory/host_table_packed.hpp` | `host_table_packed_allocation` for packed (cudf::pack) host representations |
 | `include/cucascade/memory/null_device_memory_resource.hpp` | No-op resource for disk tier |
 
 ### Data Module
@@ -389,6 +395,6 @@ Key synchronization primitives:
 | `include/cucascade/data/data_repository_manager.hpp` | Multi-pipeline repository coordination |
 | `include/cucascade/data/representation_converter.hpp` | Type-indexed converter registry |
 | `include/cucascade/data/gpu_data_representation.hpp` | GPU-resident cuDF table wrapper |
-| `include/cucascade/data/cpu_data_representation.hpp` | Host-resident multi-block table wrapper |
+| `include/cucascade/data/cpu_data_representation.hpp` | `host_data_representation` (direct buffer copy) and `host_data_packed_representation` (cudf::pack) |
 | `include/cucascade/utils/atomics.hpp` | `atomic_peak_tracker`, `atomic_bounded_counter` |
 | `include/cucascade/utils/overloaded.hpp` | Variant visitor helper |

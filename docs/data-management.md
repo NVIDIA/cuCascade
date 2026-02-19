@@ -8,7 +8,8 @@ A deep dive into cuCascade's data lifecycle, batch state machine, repositories, 
 - [Data Representations](#data-representations)
   - [Interface: idata_representation](#interface-idata_representation)
   - [GPU Table Representation](#gpu-table-representation)
-  - [Host Table Representation](#host-table-representation)
+  - [Host Table Representation (Direct Copy)](#host-table-representation-direct-copy)
+  - [Host Table Representation (Packed)](#host-table-representation-packed)
 - [Data Batch Lifecycle](#data-batch-lifecycle)
   - [States](#states)
   - [State Transitions](#state-transitions)
@@ -91,18 +92,20 @@ public:
 - `clone()` performs a deep copy using `cudf::table(table.view(), stream)`
 - Owns the `cudf::table` object but not the underlying GPU memory (managed by the allocator)
 
-### Host Table Representation
+### Host Table Representation (Direct Copy)
 
 **File**: `include/cucascade/data/cpu_data_representation.hpp`
 
-Wraps a `host_table_allocation` -- a multi-block allocation from `fixed_size_host_memory_resource`:
+The preferred host representation. Directly copies each column's GPU device buffers into pinned
+host memory without an intermediate GPU-side contiguous allocation. Column layout is described by
+custom per-column `column_metadata` structs, enabling reconstruction without cudf's pack format.
 
 ```cpp
-class host_table_representation : public idata_representation {
+class host_data_representation : public idata_representation {
     std::unique_ptr<memory::host_table_allocation> _host_table;
 
 public:
-    const std::unique_ptr<host_table_allocation>& get_host_table() const;
+    const std::unique_ptr<memory::host_table_allocation>& get_host_table() const;
 
     std::size_t get_size_in_bytes() const override;
     std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
@@ -111,10 +114,44 @@ public:
 
 A `host_table_allocation` (`include/cucascade/memory/host_table.hpp`) contains:
 - `allocation` -- `multiple_blocks_allocation` (vector of fixed-size pinned memory blocks)
-- `metadata` -- serialized cuDF table metadata from `cudf::pack()` (for reconstruction)
+- `columns` -- per-column `column_metadata` trees describing buffer offsets, sizes, and nesting
+- `data_size` -- total bytes stored across all blocks
+
+Each `column_metadata` node captures `type_id`, `num_rows`, `null_count`, `scale` (for decimals),
+plus buffer offsets/sizes for the null mask and data buffer, and recursive `children` for nested
+types (LIST, STRUCT, STRING, DICTIONARY32).
+
+This representation avoids the extra GPU allocation and GPU-to-GPU copy that `cudf::pack` performs.
+`cudaMemcpyBatchAsync` is used to transfer all column buffers in a single driver call per direction,
+achieving ~99% of raw PCIe bandwidth even with multiple concurrent threads.
+
+`clone()` copies data block-by-block with `std::memcpy` and duplicates the column metadata tree.
+
+### Host Table Representation (Packed)
+
+**File**: `include/cucascade/data/cpu_data_representation.hpp`
+
+A legacy representation that uses `cudf::pack()` to serialize the table to a contiguous GPU buffer
+before copying it to host memory. Useful when cudf's serialization format is required.
+
+```cpp
+class host_data_packed_representation : public idata_representation {
+    std::unique_ptr<memory::host_table_packed_allocation> _host_table;
+
+public:
+    const std::unique_ptr<memory::host_table_packed_allocation>& get_host_table() const;
+
+    std::size_t get_size_in_bytes() const override;
+    std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+};
+```
+
+A `host_table_packed_allocation` (`include/cucascade/memory/host_table_packed.hpp`) contains:
+- `allocation` -- `multiple_blocks_allocation` (vector of fixed-size pinned memory blocks)
+- `metadata` -- serialized cuDF table metadata from `cudf::pack()` (for reconstruction via `cudf::unpack()`)
 - `data_size` -- actual data size in bytes
 
-`clone()` copies data block-by-block with `std::memcpy` and duplicates the metadata.
+`clone()` copies data block-by-block with `std::memcpy` and duplicates the metadata vector.
 
 ---
 
@@ -216,16 +253,16 @@ The `representation_converter_registry` stores conversion functions indexed by `
 
 ```cpp
 // Register a custom converter
-registry.register_converter<gpu_table_representation, host_table_representation>(
+registry.register_converter<gpu_table_representation, host_data_representation>(
     [](idata_representation& source, const memory_space* target, rmm::cuda_stream_view stream)
         -> std::unique_ptr<idata_representation> {
-        // Convert GPU table to host table
+        // Convert GPU table to host (direct copy)
         return ...;
     }
 );
 
 // Convert data
-auto host_data = registry.convert<host_table_representation>(
+auto host_data = registry.convert<host_data_representation>(
     *gpu_data, target_host_space, stream);
 ```
 
@@ -237,32 +274,54 @@ Registered via `register_builtin_converters()`:
 
 | Source | Target | Method |
 |--------|--------|--------|
-| `gpu_table_representation` | `host_table_representation` | `cudf::pack()` on GPU -> `cudaMemcpyAsync` (D2H) to multi-block host allocation |
-| `host_table_representation` | `gpu_table_representation` | `cudaMemcpyAsync` (H2D) from host blocks -> `cudf::unpack()` on device |
+| `gpu_table_representation` | `host_data_representation` | `cudaMemcpyBatchAsync` (D2H) — copies each column's buffers directly to pinned host blocks; ~99% PCIe bandwidth |
+| `host_data_representation` | `gpu_table_representation` | Allocates `rmm::device_buffer` per column buffer, `cudaMemcpyBatchAsync` (H2D), reconstructs `cudf::column` tree |
+| `gpu_table_representation` | `host_data_packed_representation` | `cudf::pack()` on GPU -> `cudaMemcpyAsync` (D2H) to multi-block host allocation |
+| `host_data_packed_representation` | `gpu_table_representation` | `cudaMemcpyAsync` (H2D) from host blocks -> `cudf::unpack()` on device |
 | `gpu_table_representation` | `gpu_table_representation` | `cudf::pack()` -> `cudaMemcpyPeerAsync` -> `cudf::unpack()` (cross-device copy) |
-| `host_table_representation` | `host_table_representation` | Block-by-block `std::memcpy` + metadata copy (cross-NUMA copy) |
+| `host_data_packed_representation` | `host_data_packed_representation` | Block-by-block `std::memcpy` + metadata copy (cross-NUMA copy) |
 
 ### Conversion Flow
 
-GPU to HOST example:
+GPU to HOST (direct copy — preferred):
 
 ```mermaid
 sequenceDiagram
     participant Caller
     participant Registry as converter_registry
     participant GPU as gpu_table_representation
-    participant Host as host_table_representation
+    participant Host as host_data_representation
     participant HostMR as fixed_size_host_memory_resource
 
-    Caller->>Registry: convert<host_table_representation>(gpu_data, host_space, stream)
+    Caller->>Registry: convert<host_data_representation>(gpu_data, host_space, stream)
+    Registry->>HostMR: allocate_multiple_blocks(total_column_bytes)
+    Note over HostMR: Returns vector of 1MB pinned host blocks
+    Registry->>Registry: Traverse column tree, compute buffer offsets into host blocks
+    Registry->>Registry: cudaMemcpyBatchAsync(all_bufs_in_one_call, D2H, stream)
+    Note over Registry: Single driver call for all column buffers
+    Registry->>Host: Create host_data_representation(blocks, column_metadata_tree)
+    Registry-->>Caller: unique_ptr<host_data_representation>
+```
+
+GPU to HOST (packed — uses cudf serialization):
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Registry as converter_registry
+    participant GPU as gpu_table_representation
+    participant Host as host_data_packed_representation
+    participant HostMR as fixed_size_host_memory_resource
+
+    Caller->>Registry: convert<host_data_packed_representation>(gpu_data, host_space, stream)
     Registry->>GPU: cudf::pack(table)
     Note over GPU: Serializes table to contiguous buffer + metadata
     Registry->>HostMR: allocate_multiple_blocks(data_size)
     Note over HostMR: Returns vector of 1MB pinned host blocks
     Registry->>Registry: cudaMemcpyAsync(host_blocks, gpu_buffer, D2H, stream)
     Note over Registry: Copies data block by block
-    Registry->>Host: Create host_table_representation(blocks, metadata)
-    Registry-->>Caller: unique_ptr<host_table_representation>
+    Registry->>Host: Create host_data_packed_representation(blocks, metadata)
+    Registry-->>Caller: unique_ptr<host_data_packed_representation>
 ```
 
 ---
@@ -414,7 +473,9 @@ Application
 | `include/cucascade/data/data_repository_manager.hpp` | `data_repository_manager`, `operator_port_key` |
 | `include/cucascade/data/representation_converter.hpp` | `representation_converter_registry`, `converter_key` |
 | `include/cucascade/data/gpu_data_representation.hpp` | `gpu_table_representation` wrapping `cudf::table` |
-| `include/cucascade/data/cpu_data_representation.hpp` | `host_table_representation` wrapping `host_table_allocation` |
+| `include/cucascade/data/cpu_data_representation.hpp` | `host_data_representation` (direct buffer copy) and `host_data_packed_representation` (cudf::pack) |
+| `include/cucascade/memory/host_table.hpp` | `host_table_allocation` and `column_metadata` for direct-copy host representations |
+| `include/cucascade/memory/host_table_packed.hpp` | `host_table_packed_allocation` for packed (cudf::pack) host representations |
 | `include/cucascade/utils/atomics.hpp` | `atomic_peak_tracker`, `atomic_bounded_counter` |
 | `include/cucascade/utils/overloaded.hpp` | Variant visitor helper |
 | `docs/data_batch_state_transitions.md` | Complete state machine reference |
