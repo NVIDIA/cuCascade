@@ -46,7 +46,7 @@ namespace memory {
 class memory_reservation_manager;
 class reservation_aware_resource_adaptor;
 class fixed_size_host_memory_resource;
-struct reservation;
+class reservation;
 
 //===----------------------------------------------------------------------===//
 // Reservation Request Strategies
@@ -176,7 +176,7 @@ struct any_memory_space_to_upgrade : public reservation_request_strategy {
  * (specific space, tier-based, multi-tier fallback).
  */
 class memory_reservation_manager {
-  friend struct reservation;
+  friend class reservation;
   friend struct reservation_request_strategy;
 
  public:

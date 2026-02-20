@@ -401,8 +401,14 @@ struct BatchCopyAccumulator {
     attr.srcAccessOrder = src_order;
     attr.flags          = cudaMemcpyFlagDefault;
     // Single-attribute template overload (cuda_runtime.h): deduces direction from pointer types.
+    // CUDA 12.x has a failIdx parameter that was removed in CUDA 13.
+#if CUDART_VERSION < 13000
+    RMM_CUDA_TRY(cudaMemcpyBatchAsync(
+      dsts.data(), srcs.data(), sizes.data(), count(), attr, nullptr, stream.value()));
+#else
     RMM_CUDA_TRY(
       cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), count(), attr, stream.value()));
+#endif
   }
 };
 

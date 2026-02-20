@@ -37,7 +37,7 @@ namespace memory {
 class reservation_aware_resource_adaptor;
 class fixed_size_host_memory_resource;
 class disk_access_limiter;
-struct reservation;
+class reservation;
 struct reserved_arena;
 class memory_space;
 
@@ -164,7 +164,7 @@ class increase_reservation_limit_policy : public reservation_limit_policy {
   std::string get_policy_name() const override;
 
  private:
-  double _padding_factor{1.25f};               ///< Padding factor when increasing reservations
+  double _padding_factor{1.25};                ///< Padding factor when increasing reservations
   bool allow_reservation_beyond_limit{false};  ///< Allow reservation beyond limit
 };
 
@@ -202,7 +202,8 @@ struct reserved_arena {
  * Contains only the essential identifying information (tier, device_id, size).
  * The actual memory_space can be obtained through the memory_reservation_manager.
  */
-struct reservation {
+class reservation {
+ public:
   friend class reservation_aware_resource_adaptor;
   friend class fixed_size_host_memory_resource;
   friend class disk_access_limiter;

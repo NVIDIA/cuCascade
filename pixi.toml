@@ -4,19 +4,13 @@ name = "cuCascade"
 platforms = ["linux-64", "linux-aarch64"]
 requires-pixi = ">=0.59"
 
-[system-requirements]
-cuda = "13"
-
 [activation.env]
 LIBCUDF_ENV_PREFIX = "$CONDA_PREFIX"
-# Following https://github.com/rapidsai/rapids-cmake/blob/84f8cf8386ac56e3f4f9400f44e752345d8c2997/rapids-cmake/cuda/set_architectures.cmake#L62
-CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
 
 [dependencies]
 cmake = "4.1.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
-cuda-version = "13.*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
@@ -31,6 +25,32 @@ numactl = "*"
 doxygen = "*"
 python = "*"
 jinja2 = "*"
+
+# CUDA 13 environment
+[feature.cuda-13.system-requirements]
+cuda = "13"
+
+[feature.cuda-13.dependencies]
+cuda-version = "13.*"
+
+[feature.cuda-13.activation.env]
+# Following https://github.com/rapidsai/rapids-cmake/blob/84f8cf8386ac56e3f4f9400f44e752345d8c2997/rapids-cmake/cuda/set_architectures.cmake#L62
+CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
+
+# CUDA 12 environment
+[feature.cuda-12.system-requirements]
+cuda = "12.9"
+
+[feature.cuda-12.dependencies]
+cuda-version = "12.9.*"
+
+[feature.cuda-12.activation.env]
+CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real"
+
+[environments]
+default = ["cuda-13"]
+cuda-13 = ["cuda-13"]
+cuda-12 = ["cuda-12"]
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"
