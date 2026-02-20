@@ -397,6 +397,7 @@ struct BatchCopyAccumulator {
   void flush(rmm::cuda_stream_view stream, cudaMemcpySrcAccessOrder src_order)
   {
     if (count() == 0) { return; }
+#if CUDART_VERSION >= 12080
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = src_order;
     attr.flags          = cudaMemcpyFlagDefault;
@@ -408,6 +409,13 @@ struct BatchCopyAccumulator {
 #else
     RMM_CUDA_TRY(
       cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), count(), attr, stream.value()));
+#endif
+#else
+    // cudaMemcpyBatchAsync requires CUDA 12.8+; fall back to individual copies.
+    (void)sort_order;
+    for (std::size_t i = 0; i < count(); ++i) {
+      RMM_CUDA_TRY(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.value()));
+    }
 #endif
   }
 };
