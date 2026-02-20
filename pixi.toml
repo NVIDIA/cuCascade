@@ -49,6 +49,7 @@ CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real"
 
 [environments]
 default = ["cuda-13"]
+cuda-13 = ["cuda-13"]
 cuda-12 = ["cuda-12"]
 
 [tasks]
