@@ -26,6 +26,7 @@ compile_commands.json
 # Pixi
 .pixi/*
 !.pixi/config.toml
+pixi.lock
 
 # Logs
 logs/
