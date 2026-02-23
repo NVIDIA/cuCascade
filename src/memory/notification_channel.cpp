@@ -27,11 +27,18 @@ namespace memory {
 notification_channel::event_notifier::event_notifier(notification_channel& channel)
   : _channel(channel.shared_from_this())
 {
+  _channel->acquire_notifier();
 }
 
 notification_channel::event_notifier::~event_notifier() { _channel->release_notifier(); }
 
 void notification_channel::event_notifier::post() { _channel->notify(); }
+
+void notification_channel::acquire_notifier()
+{
+  std::lock_guard lock(_mutex);
+  _n_active_notifiers++;
+}
 
 //===----------------------------------------------------------------------===//
 // notification_channel
