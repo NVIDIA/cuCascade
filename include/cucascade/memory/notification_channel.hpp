@@ -51,6 +51,8 @@ struct notification_channel : std::enable_shared_from_this<notification_channel>
 
   void release_notifier();
 
+  void acquire_notifier();
+
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   bool _has_been_notified{false};

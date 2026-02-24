@@ -202,6 +202,11 @@ std::unique_ptr<reserved_arena> fixed_size_host_memory_resource::reserve(
   std::size_t bytes, std::unique_ptr<event_notifier> on_release)
 {
   bytes = rmm::align_up(bytes, _block_size);
+  if (bytes > _memory_limit) {
+    throw std::runtime_error(
+      "cuCascade::memory::fixed_size_host_memory_resource: reservation size " +
+      std::to_string(bytes) + " exceeds memory limit " + std::to_string(_memory_limit));
+  }
   if (do_reserve(bytes, _memory_limit)) {
     auto host_slot = std::make_unique<chunked_reserved_area>(*this, bytes, std::move(on_release));
     this->register_reservation(host_slot.get());
