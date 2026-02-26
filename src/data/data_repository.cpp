@@ -37,7 +37,8 @@ std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_d
 
   // If no target_state specified, just find and return a copy of the batch pointer
   if (!target_state.has_value()) {
-    for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end(); ++it) {
+    for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
+         ++it) {
       if ((*it)->get_batch_id() == batch_id) {
         return *it;  // Return a copy of the shared_ptr
       }
@@ -50,9 +51,10 @@ std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_d
   while (true) {
     // Search for the batch with the matching batch_id
     bool batch_found = false;
-    for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end(); ++it) {
+    for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
+         ++it) {
       if ((*it)->get_batch_id() == batch_id) {
-        batch_found = true;
+        batch_found           = true;
         data_batch* batch_ptr = it->get();
         bool can_transition   = false;
 
@@ -61,7 +63,8 @@ std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_d
           case batch_state::processing:
             throw std::runtime_error(
               "get_data_batch_by_id cannot transition directly to processing; "
-              "use pop_data_batch with task_created and call try_to_lock_for_processing() on the batch");
+              "use pop_data_batch with task_created and call try_to_lock_for_processing() on the "
+              "batch");
           case batch_state::in_transit:
             can_transition = batch_ptr->try_to_lock_for_in_transit();
             break;
@@ -81,9 +84,7 @@ std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_d
     }
 
     // If batch was not found, return nullptr
-    if (!batch_found) {
-      return nullptr;
-    }
+    if (!batch_found) { return nullptr; }
 
     // Batch exists but cannot transition - wait for state changes
     _cv.wait(lock);
