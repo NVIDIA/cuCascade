@@ -69,6 +69,10 @@ std::vector<memory_space_config> create_benchmark_configs()
   host_config.numa_id         = hostDevId;
   host_config.memory_capacity = 16 * GiB;
   host_config.mr_factory_fn   = make_default_allocator_for_tier(Tier::HOST);
+  // Pre-allocate enough pinned blocks for the largest benchmark case (512 MiB × 4 threads = 2 GiB)
+  // so that expand_pool() is never called during timed iterations.
+  // Each pool = pool_size (128) × block_size (1 MiB) = 128 MiB; 16 pools = 2 GiB.
+  host_config.initial_number_pools = 16;
   configs.emplace_back(host_config);
   return configs;
 }
@@ -193,7 +197,7 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   auto warmup_repr  = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(warmup_table)), *const_cast<memory_space*>(gpu_space));
   auto warmup_result =
-    registry->convert<host_table_representation>(*warmup_repr, host_space, warmup_stream);
+    registry->convert<host_data_packed_representation>(*warmup_repr, host_space, warmup_stream);
   warmup_stream.synchronize();
 
   size_t bytes_transferred = thread_gpu_reprs[0]->get_size_in_bytes() * thread_count;
@@ -206,7 +210,7 @@ void BM_ConvertGpuToHost(benchmark::State& state)
     // Create threads
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
-        auto host_result = registry->convert<host_table_representation>(
+        auto host_result = registry->convert<host_data_packed_representation>(
           *thread_gpu_reprs[t], host_space, streams[t]);
         streams[t].synchronize();
       });
@@ -248,7 +252,7 @@ void BM_ConvertHostToGpu(benchmark::State& state)
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
 
   // Create separate table and representation for each thread BEFORE warmup
-  std::vector<std::unique_ptr<host_table_representation>> thread_host_reprs;
+  std::vector<std::unique_ptr<host_data_packed_representation>> thread_host_reprs;
   thread_host_reprs.reserve(thread_count);
   std::vector<rmm::cuda_stream> streams(thread_count);
 
@@ -258,7 +262,7 @@ void BM_ConvertHostToGpu(benchmark::State& state)
     auto gpu_repr_temp = std::make_unique<gpu_table_representation>(
       std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space));
     auto host_repr =
-      registry->convert<host_table_representation>(*gpu_repr_temp, host_space, setup_stream);
+      registry->convert<host_data_packed_representation>(*gpu_repr_temp, host_space, setup_stream);
     setup_stream.synchronize();
     thread_host_reprs.push_back(std::move(host_repr));
   }
@@ -292,6 +296,142 @@ void BM_ConvertHostToGpu(benchmark::State& state)
   }
 
   // Update counters in main thread after loop
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
+                          static_cast<int64_t>(bytes_transferred));
+  state.counters["columns"]     = static_cast<double>(num_columns);
+  state.counters["bytes"]       = static_cast<double>(bytes_transferred);
+  state.counters["num_threads"] = static_cast<double>(thread_count);
+}
+
+// =============================================================================
+// GPU <-> HOST_FAST Conversion Benchmarks (fast path: no cudf::pack)
+// =============================================================================
+
+/**
+ * @brief Benchmark GPU to HOST_FAST conversion (fast path, no cudf::pack).
+ * @param state.range(0) Total bytes
+ * @param state.range(1) Number of columns
+ * @param state.range(2) Manual thread count
+ */
+void BM_ConvertGpuToHostFast(benchmark::State& state)
+{
+  int64_t total_bytes   = state.range(0);
+  int num_columns       = static_cast<int>(state.range(1));
+  uint64_t thread_count = static_cast<uint64_t>(state.range(2));
+
+  auto mgr = get_shared_memory_manager();
+
+  auto registry = std::make_unique<representation_converter_registry>();
+  register_builtin_converters(*registry);
+
+  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
+  const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
+
+  std::vector<std::unique_ptr<gpu_table_representation>> thread_gpu_reprs;
+  thread_gpu_reprs.reserve(thread_count);
+  std::vector<rmm::cuda_stream> streams(thread_count);
+
+  for (uint64_t t = 0; t < thread_count; ++t) {
+    auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
+    thread_gpu_reprs.push_back(std::make_unique<gpu_table_representation>(
+      std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space)));
+  }
+
+  // Warm-up: small transfer to prime CUDA driver
+  rmm::cuda_stream warmup_stream;
+  auto warmup_table = create_benchmark_table_from_bytes(1 * KiB, 2);
+  auto warmup_repr  = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(warmup_table)), *const_cast<memory_space*>(gpu_space));
+  auto warmup_result =
+    registry->convert<host_data_representation>(*warmup_repr, host_space, warmup_stream);
+  warmup_stream.synchronize();
+
+  size_t bytes_transferred = thread_gpu_reprs[0]->get_size_in_bytes() * thread_count;
+
+  for (auto _ : state) {
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+
+    for (uint64_t t = 0; t < thread_count; ++t) {
+      threads.emplace_back([&, t]() {
+        auto host_result =
+          registry->convert<host_data_representation>(*thread_gpu_reprs[t], host_space, streams[t]);
+        streams[t].synchronize();
+      });
+    }
+
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
+                          static_cast<int64_t>(bytes_transferred));
+  state.counters["columns"]     = static_cast<double>(num_columns);
+  state.counters["bytes"]       = static_cast<double>(bytes_transferred);
+  state.counters["num_threads"] = static_cast<double>(thread_count);
+}
+
+/**
+ * @brief Benchmark HOST_FAST to GPU conversion (fast path, no cudf::unpack).
+ * @param state.range(0) Total bytes
+ * @param state.range(1) Number of columns
+ * @param state.range(2) Manual thread count
+ */
+void BM_ConvertHostFastToGpu(benchmark::State& state)
+{
+  int64_t total_bytes   = state.range(0);
+  int num_columns       = static_cast<int>(state.range(1));
+  uint64_t thread_count = static_cast<uint64_t>(state.range(2));
+
+  auto mgr = get_shared_memory_manager();
+
+  auto registry = std::make_unique<representation_converter_registry>();
+  register_builtin_converters(*registry);
+
+  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
+  const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
+
+  std::vector<std::unique_ptr<host_data_representation>> thread_host_reprs;
+  thread_host_reprs.reserve(thread_count);
+  std::vector<rmm::cuda_stream> streams(thread_count);
+
+  rmm::cuda_stream setup_stream;
+  for (uint64_t t = 0; t < thread_count; ++t) {
+    auto table         = create_benchmark_table_from_bytes(total_bytes, num_columns);
+    auto gpu_repr_temp = std::make_unique<gpu_table_representation>(
+      std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space));
+    auto host_repr =
+      registry->convert<host_data_representation>(*gpu_repr_temp, host_space, setup_stream);
+    setup_stream.synchronize();
+    thread_host_reprs.push_back(std::move(host_repr));
+  }
+
+  // Warm-up
+  rmm::cuda_stream warmup_stream;
+  auto warmup_result =
+    registry->convert<gpu_table_representation>(*thread_host_reprs[0], gpu_space, warmup_stream);
+  warmup_stream.synchronize();
+
+  size_t bytes_transferred = thread_host_reprs[0]->get_size_in_bytes() * thread_count;
+
+  for (auto _ : state) {
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+
+    for (uint64_t t = 0; t < thread_count; ++t) {
+      threads.emplace_back([&, t]() {
+        auto gpu_result =
+          registry->convert<gpu_table_representation>(*thread_host_reprs[t], gpu_space, streams[t]);
+        streams[t].synchronize();
+      });
+    }
+
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
                           static_cast<int64_t>(bytes_transferred));
   state.counters["columns"]     = static_cast<double>(num_columns);
@@ -424,6 +564,22 @@ BENCHMARK(BM_ConvertGpuToHost)
   ->UseRealTime();
 
 BENCHMARK(BM_ConvertHostToGpu)
+  ->Setup(DoSetup)
+  ->Teardown(DoTeardown)
+  ->RangeMultiplier(4)
+  ->Ranges({{64 * KiB, 512 * MiB}, {2, 8}, {1, 4}})
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
+BENCHMARK(BM_ConvertGpuToHostFast)
+  ->Setup(DoSetup)
+  ->Teardown(DoTeardown)
+  ->RangeMultiplier(4)
+  ->Ranges({{64 * KiB, 512 * MiB}, {2, 8}, {1, 4}})
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
+BENCHMARK(BM_ConvertHostFastToGpu)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
   ->RangeMultiplier(4)
