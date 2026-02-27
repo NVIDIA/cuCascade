@@ -71,7 +71,7 @@ class exclusive_stream_pool {
   explicit exclusive_stream_pool(
     rmm::cuda_device_id device_id = {},
     std::size_t pool_size         = default_size,
-    rmm::cuda_stream::flags flags = rmm::cuda_stream::flags::sync_default);
+    rmm::cuda_stream::flags flags = rmm::cuda_stream::flags::non_blocking);
 
   ~exclusive_stream_pool() = default;
 
