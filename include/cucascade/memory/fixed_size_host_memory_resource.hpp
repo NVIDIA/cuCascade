@@ -162,6 +162,22 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
       }
     }
 
+    /// Return excess blocks beyond `needed_bytes`, freeing them back to the memory pool.
+    /// This allows the scan to pre-allocate for the worst case but release unused blocks
+    /// after the actual data size is known.
+    void trim_to(std::size_t needed_bytes)
+    {
+      if (!_mr || _blocks.empty()) return;
+      std::size_t needed_blocks = (needed_bytes + _block_size - 1) / _block_size;
+      if (needed_blocks >= _blocks.size()) return;
+      // Extract excess blocks
+      std::vector<std::byte*> excess(_blocks.begin() + static_cast<std::ptrdiff_t>(needed_blocks),
+                                     _blocks.end());
+      _blocks.resize(needed_blocks);
+      // Return them to the memory resource
+      _mr->return_allocated_chunks(std::move(excess), _reseved_memory);
+    }
+
    private:
     explicit multiple_blocks_allocation(std::vector<std::byte*> buffers,
                                         fixed_size_host_memory_resource* m,
