@@ -199,9 +199,8 @@ lock_for_processing_result data_batch::try_to_lock_for_processing(
     _state        = batch_state::processing;
     should_notify = true;
     cv_to_notify  = _state_change_cv;
-    result = {true,
-              data_batch_processing_handle{shared_from_this()},
-              lock_for_processing_status::success};
+    result        = {
+      true, data_batch_processing_handle{shared_from_this()}, lock_for_processing_status::success};
   }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return result;
@@ -258,7 +257,8 @@ void data_batch::decrement_processing_count()
     std::lock_guard<std::mutex> lock(_mutex);
     if (_state != batch_state::processing) {
       throw std::runtime_error(
-        "Cannot decrement processing count: batch is not in processing state. state: " + std::to_string((int)_state));
+        "Cannot decrement processing count: batch is not in processing state. state: " +
+        std::to_string((int)_state));
     }
     if (_processing_count == 0) {
       throw std::runtime_error(
@@ -286,7 +286,7 @@ std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id, rmm::cuda_s
   auto space_id = _data->get_memory_space().get_id();
   std::unique_ptr<idata_representation> cloned_data;
   {
-    auto result   = try_to_lock_for_processing(space_id);
+    auto result = try_to_lock_for_processing(space_id);
     if (!result.success) {
       throw std::runtime_error("Cannot clone data_batch: failed to lock for processing");
     }

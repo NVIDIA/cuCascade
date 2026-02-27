@@ -81,7 +81,7 @@ class idata_repository {
       std::lock_guard<std::mutex> lock(_mutex);
       // Ensure partition exists
       if (batch) { batch->set_state_change_cv(&_cv); }
-      
+
       if (static_cast<std::size_t>(partition_idx) >= _data_batches.size()) {
         _data_batches.resize(partition_idx + 1);
       }
@@ -142,7 +142,8 @@ class idata_repository {
       if (_data_batches[partition_idx].empty()) { return PtrType{}; }
 
       // Search for a batch that can transition to the target state
-      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end(); ++it) {
+      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
+           ++it) {
         data_batch* batch_ptr = it->get();
         bool can_transition   = try_transition_batch_for_pop(batch_ptr, target_state);
 
@@ -162,10 +163,10 @@ class idata_repository {
    * @brief Remove and return a data batch by its batch ID, optionally with state transition.
    *
    * Searches for a batch with the specified batch_id within the given partition.
-   * 
+   *
    * If target_state is std::nullopt:
    * - Returns the batch immediately if found, without state transition
-   * 
+   *
    * If target_state has a value:
    * - Attempts to transition the batch to the target state
    * - If the batch exists but cannot transition, this method blocks until either:
@@ -179,7 +180,8 @@ class idata_repository {
    * - in_transit: Calls try_to_lock_for_in_transit() on the batch
    *
    * @param batch_id The unique identifier of the batch to retrieve
-   * @param target_state Optional state to transition the batch to (std::nullopt to skip state check)
+   * @param target_state Optional state to transition the batch to (std::nullopt to skip state
+   * check)
    * @param partition_idx Index of the partition to search (default: 0)
    * @return PtrType The data batch with the matching batch_id, or nullptr if not found
    *
@@ -187,7 +189,9 @@ class idata_repository {
    * @throws std::runtime_error if target_state is batch_state::processing
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType pop_data_batch_by_id(uint64_t batch_id, std::optional<batch_state> target_state, size_t partition_idx = 0)
+  virtual PtrType pop_data_batch_by_id(uint64_t batch_id,
+                                       std::optional<batch_state> target_state,
+                                       size_t partition_idx = 0)
   {
     std::unique_lock<std::mutex> lock(_mutex);
 
@@ -198,7 +202,8 @@ class idata_repository {
 
     // If no target_state specified, just find and return the batch
     if (!target_state.has_value()) {
-      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end(); ++it) {
+      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
+           ++it) {
         if (it->get()->get_batch_id() == batch_id) {
           auto batch = std::move(*it);
           _data_batches[partition_idx].erase(it);
@@ -213,11 +218,12 @@ class idata_repository {
     while (true) {
       // Search for the batch with the matching batch_id
       bool batch_found = false;
-      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end(); ++it) {
+      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
+           ++it) {
         if (it->get()->get_batch_id() == batch_id) {
-          batch_found = true;
+          batch_found           = true;
           data_batch* batch_ptr = it->get();
-          bool can_transition = try_transition_batch_for_pop(batch_ptr, *target_state);
+          bool can_transition   = try_transition_batch_for_pop(batch_ptr, *target_state);
 
           if (can_transition) {
             auto batch = std::move(*it);
@@ -231,9 +237,7 @@ class idata_repository {
       }
 
       // If batch was not found, return nullptr
-      if (!batch_found) {
-        return PtrType{};
-      }
+      if (!batch_found) { return PtrType{}; }
 
       // Batch exists but cannot transition - wait for state changes
       _cv.wait(lock);
@@ -245,10 +249,10 @@ class idata_repository {
    *
    * Searches for a batch with the specified batch_id within the given partition
    * and returns a copy of the pointer (does not remove from repository).
-   * 
+   *
    * If target_state is std::nullopt:
    * - Returns a copy of the batch pointer immediately if found, without state transition
-   * 
+   *
    * If target_state has a value:
    * - Attempts to transition the batch to the target state
    * - If the batch exists but cannot transition, this method blocks until either:
@@ -262,16 +266,21 @@ class idata_repository {
    * - in_transit: Calls try_to_lock_for_in_transit() on the batch
    *
    * @param batch_id The unique identifier of the batch to retrieve
-   * @param target_state Optional state to transition the batch to (std::nullopt to skip state check)
+   * @param target_state Optional state to transition the batch to (std::nullopt to skip state
+   * check)
    * @param partition_idx Index of the partition to search (default: 0)
-   * @return PtrType A copy of the data batch pointer with the matching batch_id, or nullptr if not found
+   * @return PtrType A copy of the data batch pointer with the matching batch_id, or nullptr if not
+   * found
    *
    * @note Thread-safe operation protected by internal mutex and condition variable
    * @note Only supported for shared_ptr repositories. Will throw for unique_ptr repositories.
-   * @throws std::runtime_error if target_state is batch_state::processing or if called on unique_ptr repository
+   * @throws std::runtime_error if target_state is batch_state::processing or if called on
+   * unique_ptr repository
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType get_data_batch_by_id(uint64_t batch_id, std::optional<batch_state> target_state, size_t partition_idx = 0);
+  virtual PtrType get_data_batch_by_id(uint64_t batch_id,
+                                       std::optional<batch_state> target_state,
+                                       size_t partition_idx = 0);
 
   /**
    * @brief Get all batch IDs from a partition.
@@ -360,9 +369,7 @@ class idata_repository {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     for (const auto& partition : _data_batches) {
-      if (!partition.empty()) {
-        return false;
-      }
+      if (!partition.empty()) { return false; }
     }
     return true;
   }
@@ -380,7 +387,7 @@ class idata_repository {
     return _data_batches.size();
   }
 
-private:
+ private:
   /**
    * @brief Helper function to attempt state transition on a batch when poping.
    *
@@ -392,14 +399,12 @@ private:
   bool try_transition_batch_for_pop(data_batch* batch_ptr, batch_state target_state) const
   {
     switch (target_state) {
-      case batch_state::task_created:
-        return batch_ptr->try_to_create_task();
+      case batch_state::task_created: return batch_ptr->try_to_create_task();
       case batch_state::processing:
         throw std::runtime_error(
           "Pop operation cannot transition directly to processing; "
           "Pop with task_created and call try_to_lock_for_processing() on the batch");
-      case batch_state::in_transit:
-        return batch_ptr->try_to_lock_for_in_transit();
+      case batch_state::in_transit: return batch_ptr->try_to_lock_for_in_transit();
       case batch_state::idle:
         // Cannot transition to idle via pop - idle is a terminal state
         return false;
@@ -407,11 +412,11 @@ private:
     return false;
   }
 
-
  protected:
-  mutable std::mutex _mutex;           ///< Mutex for thread-safe access to repository operations
-  std::condition_variable _cv;         ///< Condition variable for blocking pop operations
-  std::vector<std::vector<PtrType>> _data_batches;  ///< Container for data batch pointers (partitioned)
+  mutable std::mutex _mutex;    ///< Mutex for thread-safe access to repository operations
+  std::condition_variable _cv;  ///< Condition variable for blocking pop operations
+  std::vector<std::vector<PtrType>>
+    _data_batches;  ///< Container for data batch pointers (partitioned)
 };
 
 using shared_data_repository = idata_repository<std::shared_ptr<data_batch>>;
