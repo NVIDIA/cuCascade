@@ -463,8 +463,7 @@ void reservation_aware_resource_adaptor::do_deallocate(void* ptr,
       upstream_reclaimed_bytes = 0;
     } else if (post_deallocation_size < reservation_size) {
       // if it was partially made using the reserved space
-      upstream_reclaimed_bytes =
-        static_cast<std::size_t>(reservation_size - post_deallocation_size);
+      upstream_reclaimed_bytes = static_cast<std::size_t>(pre_deallocation_size - reservation_size);
     }
   }
 // Suppress false-positive null-dereference warnings from CCCL library code
@@ -519,7 +518,7 @@ void reservation_aware_resource_adaptor::do_release_reservation(
   int64_t arena_size         = arena->size();
   std::size_t released_bytes = 0;
   if (arena_size > allocation_size) {
-    released_bytes = static_cast<std::size_t>(arena_size - std::max(int64_t{0}, allocation_size));
+    released_bytes = static_cast<std::size_t>(arena_size - allocation_size);
   }
 
   _number_of_allocations.fetch_sub(1);

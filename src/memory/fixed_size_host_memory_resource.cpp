@@ -104,18 +104,30 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
 {
   RMM_FUNC_RANGE();
 
-  if (total_bytes == 0) { return multiple_blocks_allocation::empty(); }
+  chunked_reserved_area* h_reservation_slot = nullptr;
+  if (res) {
+    h_reservation_slot = dynamic_cast<chunked_reserved_area*>(res->_arena.get());
+    if (h_reservation_slot == nullptr) {
+      throw std::runtime_error("cannot make allocation with other reservation type");
+    }
+  }
+  auto buffers = allocate_multiple_blocks_internal(total_bytes, h_reservation_slot);
+  return multiple_blocks_allocation::create(std::move(buffers), *this, res);
+}
+
+std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_blocks_internal(
+  std::size_t total_bytes, chunked_reserved_area* h_reservation_slot)
+{
+  RMM_FUNC_RANGE();
+
+  if (total_bytes == 0) { return {}; }
 
   total_bytes                        = rmm::align_up(total_bytes, _block_size);
   size_t num_blocks                  = total_bytes / _block_size;
   std::size_t upstream_tracked_bytes = total_bytes;
   allocation_tracker* tracker        = nullptr;
   std::lock_guard<std::mutex> lock(_mutex);
-  if (res) {
-    auto* h_reservation_slot = dynamic_cast<chunked_reserved_area*>(res->_arena.get());
-    if (h_reservation_slot == nullptr) {
-      throw std::runtime_error("cannot make allocation with other reservation type");
-    }
+  if (h_reservation_slot) {
     auto iter = _active_reservations.find(h_reservation_slot);
     if (iter == _active_reservations.end()) {
       throw std::runtime_error("reservation has been freed already");
@@ -158,11 +170,13 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
       allocated_blocks.push_back(ptr);
     }
     _peak_allocated_bytes.update_peak(post_allocation_size);
-    return multiple_blocks_allocation::create(std::move(allocated_blocks), *this, res);
+    return allocated_blocks;
   } else {
     if (tracker) tracker->allocated_bytes.fetch_sub(static_cast<int64_t>(total_bytes));
+    throw rmm::out_of_memory(
+      "Not enough free blocks available in fixed_size_host_memory_resource.");
   }
-  return std::unique_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation>(nullptr);
+  return {};
 }
 
 void* fixed_size_host_memory_resource::do_allocate(std::size_t /*bytes*/,
@@ -188,6 +202,11 @@ std::unique_ptr<reserved_arena> fixed_size_host_memory_resource::reserve(
   std::size_t bytes, std::unique_ptr<event_notifier> on_release)
 {
   bytes = rmm::align_up(bytes, _block_size);
+  if (bytes > _memory_limit) {
+    throw std::runtime_error(
+      "cuCascade::memory::fixed_size_host_memory_resource: reservation size " +
+      std::to_string(bytes) + " exceeds memory limit " + std::to_string(_memory_limit));
+  }
   if (do_reserve(bytes, _memory_limit)) {
     auto host_slot = std::make_unique<chunked_reserved_area>(*this, bytes, std::move(on_release));
     this->register_reservation(host_slot.get());

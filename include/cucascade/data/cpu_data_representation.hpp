@@ -20,6 +20,7 @@
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/host_table.hpp>
+#include <cucascade/memory/host_table_packed.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <memory>
@@ -28,22 +29,70 @@
 namespace cucascade {
 
 /**
- * @brief Data representation for a table being stored in host memory.
+ * @brief Data representation for a table stored in host memory using direct buffer copies.
  *
- * This represents a table whose data is stored across multiple blocks (not necessarily contiguous)
- * in host memory. The host_table_representation doesn't own the actual data but is instead owned by
- * the multiple_blocks_allocation.
+ * Directly copies each column's GPU device buffers to pinned host memory without an intermediate
+ * GPU-side contiguous allocation. The column layout is described by custom per-column metadata
+ * stored in host_table_allocation, enabling reconstruction without cudf's pack format.
+ *
+ * This avoids the extra GPU allocation and GPU-to-GPU copy that cudf::pack performs when
+ * serializing a table, at the cost of managing per-column buffer metadata ourselves.
  */
-class host_table_representation : public idata_representation {
+class host_data_representation : public idata_representation {
  public:
   /**
-   * @brief Construct a new host_table_representation object
+   * @brief Construct a host_data_representation.
+   *
+   * @param host_table Allocation owning the copied column buffers and their layout metadata
+   * @param memory_space The host memory space where the data resides
+   */
+  host_data_representation(std::unique_ptr<memory::host_table_allocation> host_table,
+                           memory::memory_space* memory_space);
+
+  /**
+   * @brief Get the total number of bytes occupied by this representation.
+   *
+   * @return std::size_t The number of data bytes stored in the host allocation
+   */
+  std::size_t get_size_in_bytes() const override;
+
+  /**
+   * @brief Create a deep copy of this representation in the same memory space.
+   *
+   * @param stream CUDA stream (unused for host-side copies)
+   * @return std::unique_ptr<idata_representation> A new host_data_representation
+   */
+  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+
+  /**
+   * @brief Access the underlying host table allocation.
+   *
+   * @return const reference to the unique_ptr owning the allocation
+   */
+  const std::unique_ptr<memory::host_table_allocation>& get_host_table() const;
+
+ private:
+  std::unique_ptr<memory::host_table_allocation> _host_table;
+};
+
+/**
+ * @brief Data representation for a table being stored in host memory using cudf::pack.
+ *
+ * This represents a table whose data is stored across multiple blocks (not necessarily contiguous)
+ * in host memory. The host_data_packed_representation doesn't own the actual data but is instead
+ * owned by the multiple_blocks_allocation.
+ */
+class host_data_packed_representation : public idata_representation {
+ public:
+  /**
+   * @brief Construct a new host_data_packed_representation object
    *
    * @param host_table The underlying allocation owning the actual data
    * @param memory_space The memory space where the host table resides
    */
-  host_table_representation(std::unique_ptr<cucascade::memory::host_table_allocation> host_table,
-                            cucascade::memory::memory_space* memory_space);
+  host_data_packed_representation(
+    std::unique_ptr<cucascade::memory::host_table_packed_allocation> host_table,
+    cucascade::memory::memory_space* memory_space);
 
   /**
    * @brief Get the size of the data representation in bytes
@@ -59,20 +108,20 @@ class host_table_representation : public idata_representation {
    * residing in the same memory space as the original.
    *
    * @param stream CUDA stream (unused for host-side copies)
-   * @return std::unique_ptr<idata_representation> A new host_table_representation with copied data
+   * @return std::unique_ptr<idata_representation> A new host_data_packed_representation with
+   * copied data
    */
   std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the underlying host table allocation
    *
-   * @return std::unique_ptr<cucascade::memory::table_allocation> The underlying host table
-   * allocation
+   * @return const reference to the unique_ptr owning the allocation
    */
-  const std::unique_ptr<cucascade::memory::host_table_allocation>& get_host_table() const;
+  const std::unique_ptr<cucascade::memory::host_table_packed_allocation>& get_host_table() const;
 
  private:
-  std::unique_ptr<cucascade::memory::host_table_allocation>
+  std::unique_ptr<cucascade::memory::host_table_packed_allocation>
     _host_table;  ///< The allocation where the actual data resides
 };
 

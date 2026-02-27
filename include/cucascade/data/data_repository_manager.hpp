@@ -21,6 +21,7 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -217,6 +218,23 @@ class data_repository_manager {
     // Note: Implementation would iterate through repositories and collect batches
     // This is a placeholder - actual implementation depends on how batches are tracked
     return data_batches;
+  }
+
+  /**
+   * @brief Iterate over all repositories, calling the visitor for each one.
+   *
+   * The visitor receives a raw pointer to each repository. The visitor must not
+   * remove or add repositories during iteration.
+   *
+   * @param visitor Callback invoked for each repository
+   * @note Thread-safe — holds the manager mutex for the duration of iteration.
+   */
+  void for_each_repository(std::function<void(repository_type*)> visitor)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (auto& [key, repo] : _repositories) {
+      if (repo) { visitor(repo.get()); }
+    }
   }
 
  private:

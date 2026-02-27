@@ -151,6 +151,33 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
 
     std::size_t block_size() const noexcept { return _block_size; }
 
+    bool grow_by(std::size_t additional_bytes) noexcept
+    {
+      try {
+        auto blocks = _mr->allocate_multiple_blocks_internal(additional_bytes, _reseved_memory);
+        _blocks.insert(_blocks.end(), blocks.begin(), blocks.end());
+        return true;
+      } catch (const std::exception& e) {
+        return false;
+      }
+    }
+
+    /// Return excess blocks beyond `needed_bytes`, freeing them back to the memory pool.
+    /// This allows the scan to pre-allocate for the worst case but release unused blocks
+    /// after the actual data size is known.
+    void trim_to(std::size_t needed_bytes)
+    {
+      if (!_mr || _blocks.empty()) return;
+      std::size_t needed_blocks = (needed_bytes + _block_size - 1) / _block_size;
+      if (needed_blocks >= _blocks.size()) return;
+      // Extract excess blocks
+      std::vector<std::byte*> excess(_blocks.begin() + static_cast<std::ptrdiff_t>(needed_blocks),
+                                     _blocks.end());
+      _blocks.resize(needed_blocks);
+      // Return them to the memory resource
+      _mr->return_allocated_chunks(std::move(excess), _reseved_memory);
+    }
+
    private:
     explicit multiple_blocks_allocation(std::vector<std::byte*> buffers,
                                         fixed_size_host_memory_resource* m,
@@ -367,6 +394,21 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
    * @param res is the reserved memory bytes use to allocate the chunks from
    */
   void return_allocated_chunks(std::vector<std::byte*> chunks, chunked_reserved_area* res);
+
+  /**
+   * @brief Allocate multiple blocks to satisfy a large allocation request.
+   *
+   * This method allocates the minimum number of blocks needed to satisfy the requested size.
+   * The blocks are returned as a RAII wrapper that automatically deallocates all blocks
+   * when it goes out of scope, preventing memory leaks.
+   *
+   * @param total_bytes Total size in bytes to allocate across multiple blocks
+   * @param res Optional reservation to allocate from
+   * @return multiple_blocks_allocation RAII wrapper for the allocated blocks
+   * @throws rmm::out_of_memory if insufficient blocks are available or upstream allocation fails
+   */
+  [[nodiscard]] std::vector<std::byte*> allocate_multiple_blocks_internal(
+    std::size_t total_bytes, chunked_reserved_area* h_reservation_slot);
 
   memory_space_id _space_id;
   std::size_t _memory_limit;
