@@ -102,8 +102,8 @@ TEST_CASE("data_batch Self Move Assignment", "[data_batch]")
 // Test processing state management with try_to_lock_for_processing
 TEST_CASE("data_batch Processing State Management", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   REQUIRE(batch->get_processing_count() == 0);
@@ -147,8 +147,8 @@ TEST_CASE("data_batch Processing State Management", "[data_batch]")
 
 TEST_CASE("data_batch Lock For Processing Requires Matching Memory Space", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data          = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch         = std::make_shared<data_batch>(1, std::move(data));
   auto correct_space = batch->get_memory_space()->get_id();
   auto wrong_space   = memory::memory_space_id{memory::Tier::HOST, correct_space.device_id};
 
@@ -171,8 +171,8 @@ TEST_CASE("data_batch Lock For Processing Requires Matching Memory Space", "[dat
 // Test data_batch_processing_handle RAII behavior
 TEST_CASE("data_batch_processing_handle RAII", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   REQUIRE(batch->get_processing_count() == 0);
@@ -209,8 +209,8 @@ TEST_CASE("data_batch_processing_handle RAII", "[data_batch]")
 // Test try_to_lock_for_in_transit blocks processing
 TEST_CASE("data_batch In Transit Blocks Processing", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   REQUIRE(batch->get_state() == batch_state::idle);
@@ -237,8 +237,8 @@ TEST_CASE("data_batch In Transit Blocks Processing", "[data_batch]")
 // Test try_to_lock_for_in_transit fails when processing
 TEST_CASE("data_batch Cannot Go In Transit While Processing", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   // Create task and start processing
@@ -301,8 +301,8 @@ TEST_CASE("data_batch get_current_tier Delegation", "[data_batch]")
 // Test thread-safe processing count
 TEST_CASE("data_batch Thread-Safe Processing Count", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   constexpr int num_threads      = 10;
@@ -363,8 +363,8 @@ TEST_CASE("data_batch Unique IDs", "[data_batch]")
 // Test edge case: zero processing count operations
 TEST_CASE("data_batch Zero Processing Count", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   // Starting processing count should be zero
@@ -416,8 +416,8 @@ TEST_CASE("data_batch Move Requires Zero Processing Count", "[data_batch]")
 {
   // Test that moving with active processing throws
   {
-    auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-    auto batch1 = std::make_shared<data_batch>(1, std::move(data));
+    auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto batch1   = std::make_shared<data_batch>(1, std::move(data));
     auto space_id = batch1->get_memory_space()->get_id();
     batch1->try_to_create_task();
     auto r = batch1->try_to_lock_for_processing(space_id);
@@ -444,8 +444,8 @@ TEST_CASE("data_batch Move Requires Zero Processing Count", "[data_batch]")
 // Test multiple rapid processing lock/unlock cycles
 TEST_CASE("data_batch Rapid Processing Cycles", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   // Perform many cycles of lock and unlock via handles
@@ -516,8 +516,8 @@ TEST_CASE("data_batch Smart Pointer Lifecycle", "[data_batch]")
 // Test data_batch_processing_handle move semantics
 TEST_CASE("data_batch_processing_handle Move Semantics", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   REQUIRE(batch->try_to_create_task() == true);
@@ -554,8 +554,8 @@ TEST_CASE("data_batch_processing_handle Move Semantics", "[data_batch]")
 // Test data_batch_processing_handle explicit release
 TEST_CASE("data_batch_processing_handle Explicit Release", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   REQUIRE(batch->try_to_create_task() == true);
@@ -592,7 +592,7 @@ TEST_CASE("data_batch_processing_handle Empty Handle", "[data_batch]")
 // Test task_created state transitions
 TEST_CASE("data_batch Task Created State Transitions", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   auto batch = std::make_shared<data_batch>(1, std::move(data));
 
   REQUIRE(batch->get_state() == batch_state::idle);
@@ -689,7 +689,7 @@ TEST_CASE("data_batch In Transit From Task Created Returns To Task Created", "[d
 
 TEST_CASE("data_batch clone creates independent copy", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
   auto batch = std::make_shared<data_batch>(42, std::move(data));
 
   // Clone the batch with a new ID
@@ -716,7 +716,7 @@ TEST_CASE("data_batch clone creates independent copy", "[data_batch]")
 
 TEST_CASE("data_batch clone with different batch IDs", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
   auto batch = std::make_shared<data_batch>(1, std::move(data));
 
   // Clone with same ID as original (allowed)
@@ -735,8 +735,8 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
 {
   SECTION("GPU tier")
   {
-    auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-    auto batch = std::make_shared<data_batch>(1, std::move(data));
+    auto data   = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto batch  = std::make_shared<data_batch>(1, std::move(data));
     auto cloned = batch->clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::GPU);
@@ -744,8 +744,8 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
 
   SECTION("HOST tier")
   {
-    auto data = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
-    auto batch = std::make_shared<data_batch>(1, std::move(data));
+    auto data   = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
+    auto batch  = std::make_shared<data_batch>(1, std::move(data));
     auto cloned = batch->clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::HOST);
@@ -753,8 +753,8 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
 
   SECTION("DISK tier")
   {
-    auto data = std::make_unique<mock_data_representation>(memory::Tier::DISK, 1024);
-    auto batch = std::make_shared<data_batch>(1, std::move(data));
+    auto data   = std::make_unique<mock_data_representation>(memory::Tier::DISK, 1024);
+    auto batch  = std::make_shared<data_batch>(1, std::move(data));
     auto cloned = batch->clone(2, rmm::cuda_stream_view{});
 
     REQUIRE(cloned->get_current_tier() == memory::Tier::DISK);
@@ -763,8 +763,8 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
 
 TEST_CASE("data_batch clone succeeds with active processing", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   // Start processing
@@ -793,7 +793,7 @@ TEST_CASE("data_batch clone succeeds with active processing", "[data_batch]")
 
 TEST_CASE("data_batch clone fails when in_transit", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   auto batch = std::make_shared<data_batch>(1, std::move(data));
 
   // Lock for in-transit
@@ -815,7 +815,7 @@ TEST_CASE("data_batch clone fails when in_transit", "[data_batch]")
 
 TEST_CASE("data_batch clone returns shared_ptr", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   auto batch = std::make_shared<data_batch>(1, std::move(data));
 
   std::shared_ptr<data_batch> cloned = batch->clone(2, rmm::cuda_stream_view{});
@@ -834,8 +834,8 @@ TEST_CASE("data_batch clone returns shared_ptr", "[data_batch]")
 
 TEST_CASE("data_batch clone can be independently processed", "[data_batch]")
 {
-  auto data = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
   auto space_id = batch->get_memory_space()->get_id();
 
   auto cloned          = batch->clone(2, rmm::cuda_stream_view{});
@@ -943,7 +943,7 @@ TEST_CASE("data_batch clone with real GPU data while processing", "[data_batch][
   auto table = create_simple_cudf_table(75, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
+  auto batch    = std::make_shared<data_batch>(1, std::move(gpu_repr));
   auto space_id = batch->get_memory_space()->get_id();
 
   // Start processing on the original batch

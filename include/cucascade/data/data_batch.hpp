@@ -297,6 +297,22 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
                   rmm::cuda_stream_view stream);
 
   /**
+   * @brief Clones the underlying representation and returns a new data_batch with the cloned data.
+   *        Requires no active processing.
+   *
+   * @param new_batch_id The batch ID for the cloned batch
+   * @param target_memory_space The memory space where the new representation will be allocated
+   * @param stream CUDA stream for memory operations
+   * @return std::shared_ptr<data_batch> A new data_batch with cloned data
+   * @throws std::runtime_error if there is active processing on this batch
+   */
+  template <typename TargetRepresentation>
+  std::shared_ptr<data_batch> clone_to(representation_converter_registry& registry,
+                                       uint64_t new_batch_id,
+                                       const cucascade::memory::memory_space* target_memory_space,
+                                       rmm::cuda_stream_view stream);
+
+  /**
    * @brief Attempt to create a task for this batch.
    *
    * Transitions the batch from idle to task_created state and increments task_created_counter.
@@ -424,6 +440,24 @@ void data_batch::convert_to(representation_converter_registry& registry,
   auto new_representation =
     registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
   _data = std::move(new_representation);
+}
+
+template <typename TargetRepresentation>
+std::shared_ptr<data_batch> data_batch::clone_to(
+  representation_converter_registry& registry,
+  uint64_t new_batch_id,
+  const cucascade::memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+
+  if (_processing_count != 0) {
+    throw std::runtime_error("Cannot convert representation while there is active processing");
+  }
+
+  auto new_representation =
+    registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
+  return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
 }
 
 }  // namespace cucascade
