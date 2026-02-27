@@ -171,7 +171,8 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
       std::size_t needed_blocks = (needed_bytes + _block_size - 1) / _block_size;
       if (needed_blocks >= _blocks.size()) return;
       // Extract excess blocks
-      std::vector<std::byte*> excess(_blocks.begin() + needed_blocks, _blocks.end());
+      std::vector<std::byte*> excess(_blocks.begin() + static_cast<std::ptrdiff_t>(needed_blocks),
+                                     _blocks.end());
       _blocks.resize(needed_blocks);
       // Return them to the memory resource
       _mr->return_allocated_chunks(std::move(excess), _reseved_memory);
