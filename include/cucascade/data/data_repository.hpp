@@ -389,7 +389,7 @@ class idata_repository {
 
  private:
   /**
-   * @brief Helper function to attempt state transition on a batch when poping.
+   * @brief Helper function to attempt state transition on a batch when popping.
    *
    * @param batch_ptr Pointer to the batch to transition
    * @param target_state The state to transition to
