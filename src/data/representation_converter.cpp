@@ -402,6 +402,7 @@ struct BatchCopyAccumulator {
     attr.srcAccessOrder = src_order;
     attr.flags          = cudaMemcpyFlagDefault;
     // Single-attribute template overload (cuda_runtime.h): deduces direction from pointer types.
+    // NOTE: cudaMemcpyBatchAsync requires a real (non-default) CUDA stream.
     // CUDA 12.x has a failIdx parameter that was removed in CUDA 13.
 #if CUDART_VERSION < 13000
     RMM_CUDA_TRY(cudaMemcpyBatchAsync(
@@ -412,7 +413,7 @@ struct BatchCopyAccumulator {
 #endif
 #else
     // cudaMemcpyBatchAsync requires CUDA 12.8+; fall back to individual copies.
-    (void)sort_order;
+    (void)src_order;
     for (std::size_t i = 0; i < count(); ++i) {
       RMM_CUDA_TRY(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.value()));
     }
@@ -727,7 +728,8 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   for (const auto& col_meta : fast_table->columns) {
     gpu_columns.push_back(reconstruct_column(col_meta, fast_table->allocation, stream, mr, batch));
   }
-  batch.flush(stream, cudaMemcpySrcAccessOrderStream);
+  // Source is CPU-written pinned host memory: fully prepared before this call.
+  batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   stream.synchronize();
@@ -735,6 +737,59 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   RMM_CUDA_TRY(cudaSetDevice(previous_device));
   return std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
+}
+
+/**
+ * @brief Convert host_data_representation to host_data_representation (cross-host copy)
+ */
+std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
+  idata_representation& source,
+  const memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view /*stream*/)
+{
+  auto& host_source    = source.cast<host_data_representation>();
+  auto& host_table     = host_source.get_host_table();
+  auto const data_size = host_table->data_size;
+
+  assert(source.get_device_id() != target_memory_space->get_device_id());
+  auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
+  if (mr == nullptr) {
+    throw std::runtime_error(
+      "Target HOST memory_space does not have a fixed_size_host_memory_resource");
+  }
+  auto dst_allocation         = mr->allocate_multiple_blocks(data_size);
+  size_t src_block_index      = 0;
+  size_t src_block_offset     = 0;
+  size_t dst_block_index      = 0;
+  size_t dst_block_offset     = 0;
+  size_t const src_block_size = host_table->allocation->block_size();
+  size_t const dst_block_size = dst_allocation->block_size();
+  size_t copied               = 0;
+  while (copied < data_size) {
+    size_t remaining     = data_size - copied;
+    size_t src_avail     = src_block_size - src_block_offset;
+    size_t dst_avail     = dst_block_size - dst_block_offset;
+    size_t bytes_to_copy = std::min(remaining, std::min(src_avail, dst_avail));
+    auto* src_ptr        = host_table->allocation->at(src_block_index).data() + src_block_offset;
+    auto* dst_ptr        = dst_allocation->at(dst_block_index).data() + dst_block_offset;
+    std::memcpy(dst_ptr, src_ptr, bytes_to_copy);
+    copied += bytes_to_copy;
+    src_block_offset += bytes_to_copy;
+    dst_block_offset += bytes_to_copy;
+    if (src_block_offset == src_block_size) {
+      src_block_index++;
+      src_block_offset = 0;
+    }
+    if (dst_block_offset == dst_block_size) {
+      dst_block_index++;
+      dst_block_offset = 0;
+    }
+  }
+  std::vector<memory::column_metadata> columns_copy = host_table->columns;
+  auto new_host_table = std::make_unique<memory::host_table_allocation>(
+    std::move(dst_allocation), std::move(columns_copy), data_size);
+  return std::make_unique<host_data_representation>(
+    std::move(new_host_table), const_cast<memory::memory_space*>(target_memory_space));
 }
 
 }  // namespace
@@ -764,6 +819,10 @@ void register_builtin_converters(representation_converter_registry& registry)
   // HOST FAST -> GPU
   registry.register_converter<host_data_representation, gpu_table_representation>(
     convert_host_fast_to_gpu);
+
+  // HOST FAST -> HOST FAST (cross-device copy)
+  registry.register_converter<host_data_representation, host_data_representation>(
+    convert_host_fast_to_host_fast);
 }
 
 }  // namespace cucascade
