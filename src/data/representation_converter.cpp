@@ -42,6 +42,7 @@
 #include <cassert>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 
 namespace cucascade {
 
@@ -615,6 +616,10 @@ static rmm::device_buffer alloc_and_schedule_h2d(memory::fixed_multiple_blocks_a
 {
   rmm::device_buffer buf(size, stream, mr);
   if (size == 0) { return buf; }
+  if (!alloc || alloc->size() == 0) {
+    throw std::invalid_argument(
+      "alloc_and_schedule_h2d: allocation is null or empty but copy size is non-zero");
+  }
 
   const std::size_t block_size = alloc->block_size();
   std::size_t block_idx        = alloc_offset / block_size;
@@ -660,6 +665,10 @@ static std::unique_ptr<cudf::column> reconstruct_column(
   const cudf::size_type null_count = meta.has_null_mask ? meta.null_count : 0;
 
   if (meta.type_id == cudf::type_id::STRING) {
+    if (meta.children.size() < 1) {
+      throw std::invalid_argument(
+        "reconstruct_column: STRING column metadata must have at least one child (offsets)");
+    }
     return cudf::make_strings_column(
       meta.num_rows,
       reconstruct_column(meta.children[0], alloc, stream, mr, batch),
@@ -671,6 +680,10 @@ static std::unique_ptr<cudf::column> reconstruct_column(
   }
 
   if (meta.type_id == cudf::type_id::LIST) {
+    if (meta.children.size() < 2) {
+      throw std::invalid_argument(
+        "reconstruct_column: LIST column metadata must have two children (offsets, values)");
+    }
     return cudf::make_lists_column(meta.num_rows,
                                    reconstruct_column(meta.children[0], alloc, stream, mr, batch),
                                    reconstruct_column(meta.children[1], alloc, stream, mr, batch),
@@ -713,6 +726,12 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
 {
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
+  if (!fast_table) {
+    throw std::runtime_error("convert_host_fast_to_gpu: host table is null");
+  }
+  if (!fast_table->allocation) {
+    throw std::runtime_error("convert_host_fast_to_gpu: host table allocation is null");
+  }
 
   int previous_device = -1;
   RMM_CUDA_TRY(cudaGetDevice(&previous_device));
