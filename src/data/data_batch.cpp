@@ -130,8 +130,30 @@ bool data_batch::try_to_create_task()
       success = true;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
+}
+
+void data_batch::wait_to_create_task()
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _internal_cv.wait(lock, [&] { return _state != batch_state::in_transit; });
+    if (_state == batch_state::idle) {
+      _state = batch_state::task_created;
+      ++_task_created_count;
+      should_notify = true;
+      cv_to_notify  = _state_change_cv;
+    } else {
+      // task_created or processing: just increment counter
+      ++_task_created_count;
+    }
+  }
+  if (should_notify) { _internal_cv.notify_all(); }
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
 size_t data_batch::get_task_created_count() const
@@ -162,8 +184,34 @@ bool data_batch::try_to_cancel_task()
       success = true;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
+}
+
+void data_batch::wait_to_cancel_task()
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _internal_cv.wait(lock, [&] {
+      return _state == batch_state::task_created || _state == batch_state::processing;
+    });
+    if (_task_created_count == 0) {
+      throw std::runtime_error(
+        "Cannot cancel task: task_created_count is zero. "
+        "try_to_create_task() must be called before wait_to_cancel_task()");
+    }
+    --_task_created_count;
+    if (_task_created_count == 0 && _processing_count == 0) {
+      _state        = batch_state::idle;
+      should_notify = true;
+      cv_to_notify  = _state_change_cv;
+    }
+  }
+  if (should_notify) { _internal_cv.notify_all(); }
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
 lock_for_processing_result data_batch::try_to_lock_for_processing(
   memory::memory_space_id requested_memory_space)
@@ -202,7 +250,55 @@ lock_for_processing_result data_batch::try_to_lock_for_processing(
     result        = {
       true, data_batch_processing_handle{shared_from_this()}, lock_for_processing_status::success};
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  return result;
+}
+
+lock_for_processing_result data_batch::wait_to_lock_for_processing(
+  memory::memory_space_id requested_memory_space)
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  lock_for_processing_result result{
+    false, data_batch_processing_handle{}, lock_for_processing_status::not_attempted};
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+
+    // Return immediately for failures that cannot be resolved by waiting
+    if (_data == nullptr) {
+      result.status = lock_for_processing_status::missing_data;
+      return result;
+    }
+    if (_data->get_memory_space().get_id() != requested_memory_space) {
+      result.status = lock_for_processing_status::memory_space_mismatch;
+      return result;
+    }
+
+    // Wait until the state allows locking for processing
+    _internal_cv.wait(lock, [&] {
+      return (_state == batch_state::task_created || _state == batch_state::processing) &&
+             _task_created_count > 0;
+    });
+
+    // Re-check non-waitable conditions after waking (data may have changed)
+    if (_data == nullptr) {
+      result.status = lock_for_processing_status::missing_data;
+      return result;
+    }
+    if (_data->get_memory_space().get_id() != requested_memory_space) {
+      result.status = lock_for_processing_status::memory_space_mismatch;
+      return result;
+    }
+
+    --_task_created_count;
+    ++_processing_count;
+    _state       = batch_state::processing;
+    cv_to_notify = _state_change_cv;
+    result       = {
+      true, data_batch_processing_handle{shared_from_this()}, lock_for_processing_status::success};
+  }
+  _internal_cv.notify_all();
+  if (cv_to_notify) { cv_to_notify->notify_all(); }
   return result;
 }
 
@@ -222,8 +318,26 @@ bool data_batch::try_to_lock_for_in_transit()
       success       = true;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
+}
+
+void data_batch::wait_to_lock_for_in_transit()
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _internal_cv.wait(lock, [&] {
+      return _processing_count == 0 &&
+             ((_state == batch_state::idle) ||
+              (_state == batch_state::task_created && _task_created_count > 0));
+    });
+    _state       = batch_state::in_transit;
+    cv_to_notify = _state_change_cv;
+  }
+  _internal_cv.notify_all();
+  if (cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
 bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_state)
@@ -245,8 +359,22 @@ bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_sta
       success       = true;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
+}
+
+void data_batch::wait_to_release_in_transit(std::optional<batch_state> target_state)
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _internal_cv.wait(lock, [&] { return _state == batch_state::in_transit; });
+    _state       = target_state.has_value() ? *target_state : batch_state::idle;
+    cv_to_notify = _state_change_cv;
+  }
+  _internal_cv.notify_all();
+  if (cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
 void data_batch::decrement_processing_count()
@@ -272,6 +400,7 @@ void data_batch::decrement_processing_count()
       cv_to_notify  = _state_change_cv;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
 

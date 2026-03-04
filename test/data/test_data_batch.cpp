@@ -25,6 +25,8 @@
 
 #include <catch2/catch.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1102,4 +1104,544 @@ TEST_CASE("data_batch clone state transitions correctly", "[data_batch][gpu]")
     REQUIRE(batch->get_state() == batch_state::task_created);
     REQUIRE(cloned->get_state() == batch_state::idle);
   }
+}
+
+// =============================================================================
+// Blocking wait_to_* method tests
+// =============================================================================
+
+// Helper: wait for a flag with a short timeout, used to confirm blocking
+static void wait_for_flag(const std::atomic<bool>& flag)
+{
+  for (int i = 0; i < 200; ++i) {
+    if (flag.load()) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+// --- wait_to_create_task ---
+
+TEST_CASE("data_batch wait_to_create_task from idle succeeds immediately", "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->get_state() == batch_state::idle);
+  batch->wait_to_create_task();
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 1);
+}
+
+TEST_CASE("data_batch wait_to_create_task from task_created increments counter",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_task_created_count() == 1);
+
+  batch->wait_to_create_task();
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 2);
+}
+
+TEST_CASE("data_batch wait_to_create_task from processing increments counter",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r = batch->try_to_lock_for_processing(space_id);
+  REQUIRE(r.success == true);
+  auto handle = std::move(r.handle);
+  REQUIRE(batch->get_state() == batch_state::processing);
+
+  batch->wait_to_create_task();
+  REQUIRE(batch->get_state() == batch_state::processing);
+  REQUIRE(batch->get_task_created_count() == 1);
+}
+
+TEST_CASE("data_batch wait_to_create_task blocks while in_transit then succeeds",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+
+  std::atomic<bool> wait_started{false};
+  std::atomic<bool> wait_done{false};
+
+  std::thread waiter([batch, &wait_started, &wait_done]() {
+    wait_started.store(true);
+    batch->wait_to_create_task();
+    wait_done.store(true);
+  });
+
+  wait_for_flag(wait_started);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);  // still blocked
+
+  REQUIRE(batch->try_to_release_in_transit() == true);
+  waiter.join();
+
+  REQUIRE(wait_done.load() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 1);
+}
+
+// --- wait_to_cancel_task ---
+
+TEST_CASE("data_batch wait_to_cancel_task from task_created returns to idle",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+
+  batch->wait_to_cancel_task();
+  REQUIRE(batch->get_state() == batch_state::idle);
+  REQUIRE(batch->get_task_created_count() == 0);
+}
+
+TEST_CASE("data_batch wait_to_cancel_task with multiple tasks only decrements by one",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_task_created_count() == 2);
+
+  batch->wait_to_cancel_task();
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 1);
+}
+
+TEST_CASE("data_batch wait_to_cancel_task from processing decrements counter",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r = batch->try_to_lock_for_processing(space_id);
+  REQUIRE(r.success == true);
+  auto handle = std::move(r.handle);
+  REQUIRE(batch->get_state() == batch_state::processing);
+  REQUIRE(batch->get_task_created_count() == 1);
+
+  batch->wait_to_cancel_task();
+  REQUIRE(batch->get_state() == batch_state::processing);
+  REQUIRE(batch->get_task_created_count() == 0);
+}
+
+TEST_CASE("data_batch wait_to_cancel_task blocks in idle until task is created",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  // Pre-create a task so cancel has something to cancel (count > 0 after unblocking)
+  REQUIRE(batch->try_to_create_task() == true);
+  // Force it back to in_transit so wait_to_cancel_task has to wait
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+
+  std::atomic<bool> wait_started{false};
+  std::atomic<bool> wait_done{false};
+
+  std::thread waiter([batch, &wait_started, &wait_done]() {
+    wait_started.store(true);
+    batch->wait_to_cancel_task();
+    wait_done.store(true);
+  });
+
+  wait_for_flag(wait_started);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);  // still blocked
+
+  // Release in_transit back to task_created so the cancel can proceed
+  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
+  waiter.join();
+
+  REQUIRE(wait_done.load() == true);
+  REQUIRE(batch->get_state() == batch_state::idle);
+  REQUIRE(batch->get_task_created_count() == 0);
+}
+
+// --- wait_to_lock_for_processing ---
+
+TEST_CASE("data_batch wait_to_lock_for_processing from task_created succeeds immediately",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  REQUIRE(batch->try_to_create_task() == true);
+
+  auto result = batch->wait_to_lock_for_processing(space_id);
+  REQUIRE(result.success == true);
+  REQUIRE(result.status == lock_for_processing_status::success);
+  REQUIRE(result.handle.valid() == true);
+  REQUIRE(batch->get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 1);
+  REQUIRE(batch->get_task_created_count() == 0);
+}
+
+TEST_CASE("data_batch wait_to_lock_for_processing returns immediately for missing_data",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  batch->set_data(nullptr);
+
+  // Fabricate a space_id; doesn't matter since it should fail before checking state
+  auto dummy_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto dummy_id    = dummy_space->get_id();
+
+  auto result = batch->wait_to_lock_for_processing(dummy_id);
+  REQUIRE(result.success == false);
+  REQUIRE(result.status == lock_for_processing_status::missing_data);
+}
+
+TEST_CASE("data_batch wait_to_lock_for_processing returns immediately for memory_space_mismatch",
+          "[data_batch][blocking]")
+{
+  auto data        = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch       = std::make_shared<data_batch>(1, std::move(data));
+  auto wrong_space = make_mock_memory_space(memory::Tier::HOST, 0);
+
+  auto result = batch->wait_to_lock_for_processing(wrong_space->get_id());
+  REQUIRE(result.success == false);
+  REQUIRE(result.status == lock_for_processing_status::memory_space_mismatch);
+}
+
+TEST_CASE("data_batch wait_to_lock_for_processing blocks in idle until task is created",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  REQUIRE(batch->get_state() == batch_state::idle);
+
+  std::atomic<bool> wait_started{false};
+  std::atomic<bool> wait_done{false};
+  lock_for_processing_result result;
+
+  std::thread waiter([batch, space_id, &wait_started, &wait_done, &result]() {
+    wait_started.store(true);
+    result = batch->wait_to_lock_for_processing(space_id);
+    wait_done.store(true);
+  });
+
+  wait_for_flag(wait_started);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);  // still blocked
+
+  REQUIRE(batch->try_to_create_task() == true);
+  waiter.join();
+
+  REQUIRE(wait_done.load() == true);
+  REQUIRE(result.success == true);
+  REQUIRE(result.status == lock_for_processing_status::success);
+  REQUIRE(batch->get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 1);
+}
+
+TEST_CASE("data_batch wait_to_lock_for_processing blocks in in_transit until released",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+
+  std::atomic<bool> wait_started{false};
+  std::atomic<bool> wait_done{false};
+  lock_for_processing_result result;
+
+  std::thread waiter([batch, space_id, &wait_started, &wait_done, &result]() {
+    wait_started.store(true);
+    result = batch->wait_to_lock_for_processing(space_id);
+    wait_done.store(true);
+  });
+
+  wait_for_flag(wait_started);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);  // still blocked
+
+  // Release transit back to task_created (count is still 1)
+  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
+  waiter.join();
+
+  REQUIRE(wait_done.load() == true);
+  REQUIRE(result.success == true);
+  REQUIRE(batch->get_state() == batch_state::processing);
+}
+
+// --- wait_to_lock_for_in_transit ---
+
+TEST_CASE("data_batch wait_to_lock_for_in_transit from idle succeeds immediately",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->get_state() == batch_state::idle);
+  batch->wait_to_lock_for_in_transit();
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+}
+
+TEST_CASE("data_batch wait_to_lock_for_in_transit from task_created succeeds immediately",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 1);
+
+  batch->wait_to_lock_for_in_transit();
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+}
+
+TEST_CASE("data_batch wait_to_lock_for_in_transit blocks while processing then succeeds",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r = batch->try_to_lock_for_processing(space_id);
+  REQUIRE(r.success == true);
+  auto handle = std::move(r.handle);
+  REQUIRE(batch->get_state() == batch_state::processing);
+  REQUIRE(batch->get_processing_count() == 1);
+
+  std::atomic<bool> wait_started{false};
+  std::atomic<bool> wait_done{false};
+
+  std::thread waiter([batch, &wait_started, &wait_done]() {
+    wait_started.store(true);
+    batch->wait_to_lock_for_in_transit();
+    wait_done.store(true);
+  });
+
+  wait_for_flag(wait_started);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);  // still blocked
+
+  handle.release();  // decrement processing count → idle
+  waiter.join();
+
+  REQUIRE(wait_done.load() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+  REQUIRE(batch->get_processing_count() == 0);
+}
+
+TEST_CASE("data_batch wait_to_lock_for_in_transit blocks with multiple processing handles",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  // Acquire two processing handles
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_create_task() == true);
+  auto r1 = batch->try_to_lock_for_processing(space_id);
+  auto r2 = batch->try_to_lock_for_processing(space_id);
+  REQUIRE(r1.success == true);
+  REQUIRE(r2.success == true);
+  auto h1 = std::move(r1.handle);
+  auto h2 = std::move(r2.handle);
+  REQUIRE(batch->get_processing_count() == 2);
+
+  std::atomic<bool> wait_started{false};
+  std::atomic<bool> wait_done{false};
+
+  std::thread waiter([batch, &wait_started, &wait_done]() {
+    wait_started.store(true);
+    batch->wait_to_lock_for_in_transit();
+    wait_done.store(true);
+  });
+
+  wait_for_flag(wait_started);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);
+
+  h1.release();  // count → 1, still blocked
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);
+
+  h2.release();  // count → 0, unblocks
+  waiter.join();
+
+  REQUIRE(wait_done.load() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+}
+
+// --- wait_to_release_in_transit ---
+
+TEST_CASE("data_batch wait_to_release_in_transit from in_transit returns to idle",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+
+  batch->wait_to_release_in_transit();
+  REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch wait_to_release_in_transit with explicit target_state",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+
+  batch->wait_to_release_in_transit(batch_state::task_created);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+}
+
+TEST_CASE("data_batch wait_to_release_in_transit blocks until in_transit", "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->get_state() == batch_state::idle);
+
+  std::atomic<bool> wait_started{false};
+  std::atomic<bool> wait_done{false};
+
+  std::thread waiter([batch, &wait_started, &wait_done]() {
+    wait_started.store(true);
+    batch->wait_to_release_in_transit();
+    wait_done.store(true);
+  });
+
+  wait_for_flag(wait_started);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);  // still blocked
+
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  waiter.join();
+
+  REQUIRE(wait_done.load() == true);
+  REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch wait_to_release_in_transit blocks until in_transit with target_state",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  std::atomic<bool> wait_done{false};
+
+  std::thread waiter([batch, &wait_done]() {
+    batch->wait_to_release_in_transit(batch_state::task_created);
+    wait_done.store(true);
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(wait_done.load() == false);
+
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  waiter.join();
+
+  REQUIRE(wait_done.load() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+}
+
+// --- Full state-machine round trips using blocking calls ---
+
+TEST_CASE("data_batch blocking calls full round trip idle->task_created->processing->idle",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  REQUIRE(batch->get_state() == batch_state::idle);
+
+  batch->wait_to_create_task();
+  REQUIRE(batch->get_state() == batch_state::task_created);
+
+  auto result = batch->wait_to_lock_for_processing(space_id);
+  REQUIRE(result.success == true);
+  REQUIRE(batch->get_state() == batch_state::processing);
+
+  result.handle.release();
+  REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch blocking calls full round trip idle->in_transit->idle",
+          "[data_batch][blocking]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->get_state() == batch_state::idle);
+
+  batch->wait_to_lock_for_in_transit();
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+
+  batch->wait_to_release_in_transit();
+  REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch concurrent wait_to_create_task and wait_to_lock_for_processing",
+          "[data_batch][blocking]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  constexpr int num_rounds = 50;
+  std::vector<data_batch_processing_handle> handles;
+  handles.reserve(num_rounds);
+
+  for (int i = 0; i < num_rounds; ++i) {
+    std::atomic<bool> creator_done{false};
+
+    std::thread creator([batch, &creator_done]() {
+      batch->wait_to_create_task();
+      creator_done.store(true);
+    });
+
+    auto result = batch->wait_to_lock_for_processing(space_id);
+    creator.join();
+
+    REQUIRE(result.success == true);
+    handles.push_back(std::move(result.handle));
+  }
+
+  REQUIRE(batch->get_processing_count() == num_rounds);
+  handles.clear();
+  REQUIRE(batch->get_processing_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
 }
