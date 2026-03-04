@@ -31,10 +31,11 @@
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/memory_resource>
+
 #include <cstddef>
 #include <memory>
 #include <mutex>
-#include <rapids/cuda/memory_resource>
 #include <span>
 #include <stdexcept>
 #include <unordered_map>
