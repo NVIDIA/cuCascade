@@ -689,8 +689,9 @@ static std::unique_ptr<cudf::column> reconstruct_column(
       meta.num_rows, std::move(fields), null_count, std::move(null_mask));
   }
 
-  // Fixed-width types and DECIMAL (scale stored in meta.scale)
-  const cudf::data_type dtype{meta.type_id, meta.scale};
+  const cudf::data_type dtype = cudf::is_fixed_point(cudf::data_type{meta.type_id})
+                                  ? cudf::data_type{meta.type_id, meta.scale}
+                                  : cudf::data_type{meta.type_id};
   return std::make_unique<cudf::column>(
     dtype,
     meta.num_rows,

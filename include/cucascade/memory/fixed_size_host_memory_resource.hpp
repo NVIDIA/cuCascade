@@ -29,6 +29,9 @@
 #include <rmm/detail/nvtx/ranges.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
+#include <rmm/resource_ref.hpp>
+
+#include <cuda/memory_resource>
 
 #include <cstddef>
 #include <memory>
@@ -216,7 +219,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
    */
   explicit fixed_size_host_memory_resource(
     int device_id,
-    rmm::mr::device_memory_resource& upstream_mr,
+    rmm::device_async_resource_ref upstream_mr,
     std::size_t mem_limit,
     std::size_t capacity,
     std::size_t block_size    = default_block_size,
@@ -268,10 +271,9 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   /**
    * @brief Get the upstream memory resource.
    *
-   * @return rmm::mr::host_memory_resource* Pointer to upstream resource (nullptr if using pinned
-   * host)
+   * @return rmm::device_async_resource_ref Reference to the upstream resource
    */
-  [[nodiscard]] rmm::mr::device_memory_resource* get_upstream_resource() const noexcept;
+  [[nodiscard]] rmm::device_async_resource_ref get_upstream_resource() noexcept;
 
   /**
    * @brief Get total reserved bytes.
@@ -413,11 +415,11 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   memory_space_id _space_id;
   std::size_t _memory_limit;
   std::size_t _memory_capacity;
-  std::size_t _block_size;                        ///< Size of each block
-  std::size_t _pool_size;                         ///< Number of blocks in pool
-  rmm::mr::device_memory_resource* _upstream_mr;  ///< Upstream memory resource (optional)
-  std::vector<void*> _allocated_blocks;           ///< All allocated blocks
-  std::vector<void*> _free_blocks;                ///< Currently free blocks
+  std::size_t _block_size;                      ///< Size of each block
+  std::size_t _pool_size;                       ///< Number of blocks in pool
+  rmm::device_async_resource_ref _upstream_mr;  ///< Upstream memory resource
+  std::vector<void*> _allocated_blocks;         ///< All allocated blocks
+  std::vector<void*> _free_blocks;              ///< Currently free blocks
   mutable std::mutex _mutex;
   utils::atomic_bounded_counter<size_t> _allocated_bytes{0};
   utils::atomic_peak_tracker<size_t> _peak_allocated_bytes{0};

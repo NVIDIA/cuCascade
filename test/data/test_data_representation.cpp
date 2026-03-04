@@ -1778,7 +1778,7 @@ TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
   rmm::cuda_stream stream;
 
   constexpr int N = 64;
-  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+  auto col        = cudf::make_numeric_column(cudf::data_type(cudf::type_id::INT32),
                                        N,
                                        cudf::mask_state::UNALLOCATED,
                                        stream.view(),

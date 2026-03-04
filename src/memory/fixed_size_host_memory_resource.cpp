@@ -23,6 +23,7 @@
 #include <rmm/aligned.hpp>
 #include <rmm/error.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <memory>
 #include <mutex>
@@ -31,9 +32,13 @@
 namespace cucascade {
 namespace memory {
 
+// cccl_async_resource_ref copy-construction goes through __basic_any virtual dispatch,
+// which GCC incorrectly flags as a potential null dereference (false positive).
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnull-dereference"
 fixed_size_host_memory_resource::fixed_size_host_memory_resource(
   int device_id,
-  rmm::mr::device_memory_resource& upstream_mr,
+  rmm::device_async_resource_ref upstream_mr,
   std::size_t memory_limit,
   std::size_t memory_capacity,
   std::size_t block_size,
@@ -44,21 +49,25 @@ fixed_size_host_memory_resource::fixed_size_host_memory_resource(
     _memory_capacity(memory_capacity),
     _block_size(rmm::align_up(block_size, alignof(std::max_align_t))),
     _pool_size(pool_size),
-    _upstream_mr(&upstream_mr)
+    _upstream_mr(upstream_mr)
 {
-  assert(_upstream_mr);
   for (std::size_t i = 0; i < initial_pools; ++i) {
     expand_pool();
   }
 }
+#pragma GCC diagnostic pop
 
 fixed_size_host_memory_resource::~fixed_size_host_memory_resource()
 {
   std::lock_guard<std::mutex> lock(_mutex);
+// See constructor for explanation of this suppression.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnull-dereference"
   for (auto& block : _allocated_blocks) {
     const std::size_t dealloc_size = _block_size * _pool_size;
-    _upstream_mr->deallocate(rmm::cuda_stream_view{}, block, dealloc_size);
+    _upstream_mr.deallocate(rmm::cuda_stream_view{}, block, dealloc_size);
   }
+#pragma GCC diagnostic pop
   _allocated_blocks.clear();
   _free_blocks.clear();
 }
@@ -93,8 +102,7 @@ std::size_t fixed_size_host_memory_resource::get_total_blocks() const noexcept
   return _allocated_blocks.size() * _pool_size;
 }
 
-rmm::mr::device_memory_resource* fixed_size_host_memory_resource::get_upstream_resource()
-  const noexcept
+rmm::device_async_resource_ref fixed_size_host_memory_resource::get_upstream_resource() noexcept
 {
   return _upstream_mr;
 }
@@ -267,7 +275,11 @@ void fixed_size_host_memory_resource::expand_pool()
 {
   const std::size_t total_size = _block_size * _pool_size;
 
-  void* large_allocation = _upstream_mr->allocate(rmm::cuda_stream_view{}, total_size);
+  // See constructor for explanation of this suppression.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnull-dereference"
+  void* large_allocation = _upstream_mr.allocate(rmm::cuda_stream_view{}, total_size);
+#pragma GCC diagnostic pop
 
   _allocated_blocks.push_back(large_allocation);
 
