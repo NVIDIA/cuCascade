@@ -33,6 +33,7 @@ set(TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/utils/cudf_test_utils.cpp
     # Memory tests
     ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_memory_reservation_manager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_small_pinned_host_memory_resource.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_topology_discovery.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_gpu_kernels.cu
     # Data tests
