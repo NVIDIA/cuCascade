@@ -271,6 +271,56 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * The CV is notified outside of the batch mutex.
    */
   void set_state_change_cv(std::condition_variable* cv);
+
+  /**
+   * @brief Blocking call: wait until the batch can accept a new task, then create it.
+   *
+   * Blocks until the batch leaves in_transit state, then performs the same transition
+   * as try_to_create_task(). Always succeeds when it returns.
+   */
+  void wait_to_create_task();
+
+  /**
+   * @brief Blocking call: wait until a created task can be cancelled, then cancel it.
+   *
+   * Blocks until the batch is in task_created or processing state, then performs
+   * the same transition as try_to_cancel_task(). Always succeeds when it returns.
+   */
+  void wait_to_cancel_task();
+
+  /**
+   * @brief Blocking call: wait until the batch can be locked for processing, then lock it.
+   *
+   * Blocks until the batch is in task_created or processing state with a pending
+   * task_created_count. Non-waitable failures (missing_data, memory_space_mismatch)
+   * are returned immediately with the appropriate status.
+   *
+   * @param requested_memory_space The memory space the caller expects to process from.
+   * @return lock_for_processing_result success=true with handle on success; success=false
+   *         with status describing non-waitable failure.
+   */
+  lock_for_processing_result wait_to_lock_for_processing(
+    memory::memory_space_id requested_memory_space);
+
+  /**
+   * @brief Blocking call: wait until the batch can be locked for in-transit, then lock it.
+   *
+   * Blocks until processing_count == 0 and the batch is in idle or task_created state,
+   * then performs the same transition as try_to_lock_for_in_transit(). Always succeeds
+   * when it returns.
+   */
+  void wait_to_lock_for_in_transit();
+
+  /**
+   * @brief Blocking call: wait until the batch is in in_transit state, then release it.
+   *
+   * Blocks until the batch is in in_transit state, then performs the same transition
+   * as try_to_release_in_transit(). Always succeeds when it returns.
+   *
+   * @param target_state Optional state to transition to when releasing in_transit. If not set,
+   *        the batch returns to idle.
+   */
+  void wait_to_release_in_transit(std::optional<batch_state> target_state = std::nullopt);
   /**
    * @brief Replace the underlying data representation.
    *        Requires no active processing.
@@ -417,7 +467,8 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   void decrement_processing_count();
 
   mutable std::mutex _mutex;  ///< Mutex for thread-safe access to state and processing count
-  uint64_t _batch_id;         ///< Unique identifier for this data batch
+  std::condition_variable _internal_cv;           ///< CV used by blocking wait_to_* calls
+  uint64_t _batch_id;                             ///< Unique identifier for this data batch
   std::unique_ptr<idata_representation> _data;    ///< Pointer to the actual data representation
   size_t _processing_count                  = 0;  ///< Count of active processing handles
   size_t _task_created_count                = 0;  ///< Count of pending task_created requests
