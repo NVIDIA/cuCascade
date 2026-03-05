@@ -18,6 +18,8 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
+#include <optional>
+
 namespace cucascade {
 
 // data_batch_processing_handle implementation
@@ -34,9 +36,13 @@ void data_batch_processing_handle::release()
 
 // data_batch implementation
 
-data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
-  : _batch_id(batch_id), _data(std::move(data))
+data_batch::data_batch(uint64_t batch_id,
+                       std::unique_ptr<idata_representation> data,
+                       std::unique_ptr<idata_batch_probe> probe)
+  : _batch_id(batch_id), _data(std::move(data)), _probe(std::move(probe))
 {
+  std::lock_guard<std::mutex> lock(_mutex);
+  update_state_to(batch_state::idle, lock);
 }
 
 data_batch::data_batch(data_batch&& other)
@@ -116,8 +122,8 @@ bool data_batch::try_to_create_task()
   {
     std::lock_guard<std::mutex> lock(_mutex);
     if (_state == batch_state::idle) {
-      _state = batch_state::task_created;
       ++_task_created_count;
+      update_state_to(batch_state::task_created, lock);
       should_notify = true;
       cv_to_notify  = _state_change_cv;
       success       = true;
@@ -155,7 +161,7 @@ bool data_batch::try_to_cancel_task()
       }
       --_task_created_count;
       if (_task_created_count == 0 && _processing_count == 0) {
-        _state        = batch_state::idle;
+        update_state_to(batch_state::idle, lock);
         should_notify = true;
         cv_to_notify  = _state_change_cv;
       }
@@ -196,7 +202,7 @@ lock_for_processing_result data_batch::try_to_lock_for_processing(
     }
     --_task_created_count;
     ++_processing_count;
-    _state        = batch_state::processing;
+    update_state_to(batch_state::processing, lock);
     should_notify = true;
     cv_to_notify  = _state_change_cv;
     result        = {
@@ -216,7 +222,7 @@ bool data_batch::try_to_lock_for_in_transit()
     if (_processing_count == 0 &&
         ((_state == batch_state::idle) ||
          (_state == batch_state::task_created && _task_created_count > 0))) {
-      _state        = batch_state::in_transit;
+      update_state_to(batch_state::in_transit, lock);
       should_notify = true;
       cv_to_notify  = _state_change_cv;
       success       = true;
@@ -236,9 +242,16 @@ bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_sta
     if (_state == batch_state::in_transit) {
       // Caller can explicitly choose the state to return to; default is idle.
       if (target_state.has_value()) {
-        _state = *target_state;
+        if (*target_state == batch_state::idle) {
+          update_state_to(batch_state::idle, lock);
+        } else {
+          // first transition to idle
+          update_state_to(batch_state::idle, lock);
+          // then to the next state, maintaining FSM invariants
+          update_state_to(*target_state, lock);
+        }
       } else {
-        _state = batch_state::idle;
+        update_state_to(batch_state::idle, lock);
       }
       should_notify = true;
       cv_to_notify  = _state_change_cv;
@@ -267,7 +280,8 @@ void data_batch::decrement_processing_count()
     _processing_count -= 1;
     if (_processing_count == 0) {
       // Preserve pending task_created intent if any remain
-      _state        = (_task_created_count > 0) ? batch_state::task_created : batch_state::idle;
+      update_state_to((_task_created_count > 0) ? batch_state::task_created : batch_state::idle,
+                      lock);
       should_notify = true;
       cv_to_notify  = _state_change_cv;
     }
@@ -275,7 +289,10 @@ void data_batch::decrement_processing_count()
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
-std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id, rmm::cuda_stream_view stream)
+std::shared_ptr<data_batch> data_batch::clone(
+  uint64_t new_batch_id,
+  rmm::cuda_stream_view stream,
+  std::optional<std::unique_ptr<idata_batch_probe>> probe)
 {
   // Create a task and lock for processing to protect data during clone
   if (!try_to_create_task()) {
@@ -295,7 +312,17 @@ std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id, rmm::cuda_s
     cloned_data = _data->clone(stream);
   }
   // Handle destructor will decrement processing count when result goes out of scope
-  return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
+  return std::make_shared<data_batch>(
+    new_batch_id,
+    std::move(cloned_data),
+    probe ? std::move(*probe) : std::make_unique<idata_batch_probe>());
+}
+
+void data_batch::update_state_to(batch_state new_state, const std::lock_guard<std::mutex>& /*lock*/)
+{
+  _state = new_state;
+  _probe->state_transitioned_to(
+    _state, _batch_id, *(this->get_data()), _processing_count, _task_created_count);
 }
 
 }  // namespace cucascade
