@@ -44,10 +44,10 @@ dependencies = { "libcudf" = "26.02.*" }
 
 [environments]
 default = ["cuda-13", "cudf-nightly"]
-cuda-13 = ["cuda-13", "cudf-nightly"]
-cuda-12 = ["cuda-12", "cudf-nightly"]
-cuda-13-cudf-stable = ["cuda-13", "cudf-stable"]
-cuda-12-cudf-stable = ["cuda-12", "cudf-stable"]
+cuda-13-nightly = ["cuda-13", "cudf-nightly"]
+cuda-12-nightly = ["cuda-12", "cudf-nightly"]
+cuda-13-stable = ["cuda-13", "cudf-stable"]
+cuda-12-stable = ["cuda-12", "cudf-stable"]
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"
