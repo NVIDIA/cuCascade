@@ -123,11 +123,13 @@ bool data_batch::try_to_create_task()
       success       = true;
     } else if (_state == batch_state::task_created) {
       ++_task_created_count;
-      success = true;
+      should_notify = true;
+      success       = true;
     } else if (_state == batch_state::processing) {
       // Batch is already processing, increment counter but stay in processing state
       ++_task_created_count;
-      success = true;
+      should_notify = true;
+      success       = true;
     }
   }
   if (should_notify) { _internal_cv.notify_all(); }
@@ -138,22 +140,19 @@ bool data_batch::try_to_create_task()
 void data_batch::wait_to_create_task()
 {
   std::condition_variable* cv_to_notify = nullptr;
-  bool should_notify                    = false;
   {
     std::unique_lock<std::mutex> lock(_mutex);
     _internal_cv.wait(lock, [&] { return _state != batch_state::in_transit; });
     if (_state == batch_state::idle) {
-      _state = batch_state::task_created;
-      ++_task_created_count;
-      should_notify = true;
-      cv_to_notify  = _state_change_cv;
-    } else {
-      // task_created or processing: just increment counter
-      ++_task_created_count;
+      _state       = batch_state::task_created;
+      cv_to_notify = _state_change_cv;
     }
+    // Always increment and always notify: wait_to_lock_for_processing waits on
+    // _internal_cv checking _task_created_count > 0, so it must be woken here.
+    ++_task_created_count;
   }
-  if (should_notify) { _internal_cv.notify_all(); }
-  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  _internal_cv.notify_all();
+  if (cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
 size_t data_batch::get_task_created_count() const
@@ -213,6 +212,7 @@ void data_batch::wait_to_cancel_task()
   if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
+
 lock_for_processing_result data_batch::try_to_lock_for_processing(
   memory::memory_space_id requested_memory_space)
 {
