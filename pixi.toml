@@ -17,11 +17,10 @@ ninja = "*"
 sccache = "*"
 unzip = "*"
 
-libcudf = "26.04.*"
 libcurand-dev = "*"
 pre-commit = "*"
 fmt = "*"
-numactl-devel-cos7-x86_64 = "*"
+numactl = "*"
 doxygen = "*"
 python = "*"
 jinja2 = "*"
@@ -47,14 +46,28 @@ cuda-version = "12.9.*"
 [feature.cuda-12.activation.env]
 CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real"
 
+# cuDF 26.04 (nightly channel, default)
+[feature.cudf-2604.dependencies]
+libcudf = "26.04.*"
+
+# cuDF 26.02 (stable release channel)
+[feature.cudf-2602]
+channels = ["rapidsai", "conda-forge", "nvidia"]
+
+[feature.cudf-2602.dependencies]
+libcudf = "26.02.*"
+
 [environments]
-default = ["cuda-13"]
-cuda-13 = ["cuda-13"]
-cuda-12 = ["cuda-12"]
+default = ["cuda-13", "cudf-2604"]
+cuda-13 = ["cuda-13", "cudf-2604"]
+cuda-12 = ["cuda-12", "cudf-2604"]
+cuda-13-cudf-2602 = ["cuda-13", "cudf-2602"]
+cuda-12-cudf-2602 = ["cuda-12", "cudf-2602"]
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"
 build-debug = "cmake --preset debug && cmake --build build/debug"
+clean = "rm -rf build"
 test = "cd build/release && ctest --output-on-failure"
 benchmarks = "cd build/release && ./benchmark/cucascade_benchmarks"
 lint = "pre-commit run -a"
