@@ -52,7 +52,7 @@ memory_space::memory_space(const gpu_memory_space_config& config)
                  : make_default_gpu_memory_resource(config.device_id, config.memory_capacity)),
     _stream_pool{[&]() -> std::unique_ptr<rmm::cuda_stream_pool> {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id(config.device_id)};
-      return std::make_unique<rmm::cuda_stream_pool>(16);
+      return std::make_unique<rmm::cuda_stream_pool>(16, rmm::cuda_stream::flags::non_blocking);
     }()}
 {
   if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
