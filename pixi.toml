@@ -1,68 +1,53 @@
 [workspace]
-channels = ["rapidsai-nightly", "conda-forge", "nvidia" ]
+channels = ["rapidsai-nightly", "conda-forge" ]
 name = "cuCascade"
 platforms = ["linux-64", "linux-aarch64"]
 requires-pixi = ">=0.59"
 
-[activation.env]
-LIBCUDF_ENV_PREFIX = "$CONDA_PREFIX"
-
 [dependencies]
-cmake = "4.1.*"
+cmake = "4.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
 cxx-compiler = "*"
+doxygen = "*"
+fmt = "*"
+jinja2 = "*"
+libcurand-dev = "*"
 make = "*"
 ninja = "*"
+numactl = "*"
+pre-commit = "*"
+python = "*"
 sccache = "*"
 unzip = "*"
 
-libcurand-dev = "*"
-pre-commit = "*"
-fmt = "*"
-numactl = "*"
-doxygen = "*"
-python = "*"
-jinja2 = "*"
+# CUDA 13
+[feature.cuda-13]
+system-requirements = { cuda = "13" }
+dependencies = { "cuda-version" = "13.*" }
+activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120" } }
 
-# CUDA 13 environment
-[feature.cuda-13.system-requirements]
-cuda = "13"
+# CUDA 12
+[feature.cuda-12]
+system-requirements = { cuda = "12.9" }
+dependencies = { "cuda-version" = "12.9.*" }
+activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" } }
 
-[feature.cuda-13.dependencies]
-cuda-version = "13.*"
-
-[feature.cuda-13.activation.env]
-# Following https://github.com/rapidsai/rapids-cmake/blob/84f8cf8386ac56e3f4f9400f44e752345d8c2997/rapids-cmake/cuda/set_architectures.cmake#L62
-CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
-
-# CUDA 12 environment
-[feature.cuda-12.system-requirements]
-cuda = "12.9"
-
-[feature.cuda-12.dependencies]
-cuda-version = "12.9.*"
-
-[feature.cuda-12.activation.env]
-CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real"
-
-# cuDF 26.04 (nightly channel, default)
-[feature.cudf-2604.dependencies]
+# cuDF (nightly channel, default)
+[feature.cudf-nightly.dependencies]
 libcudf = "26.04.*"
 
-# cuDF 26.02 (stable release channel)
-[feature.cudf-2602]
-channels = ["rapidsai", "conda-forge", "nvidia"]
-
-[feature.cudf-2602.dependencies]
-libcudf = "26.02.*"
+# cuDF (stable release channel)
+[feature.cudf-stable]
+channels = ["rapidsai", "conda-forge"]
+dependencies = { "libcudf" = "26.02.*" }
 
 [environments]
-default = ["cuda-13", "cudf-2604"]
-cuda-13 = ["cuda-13", "cudf-2604"]
-cuda-12 = ["cuda-12", "cudf-2604"]
-cuda-13-cudf-2602 = ["cuda-13", "cudf-2602"]
-cuda-12-cudf-2602 = ["cuda-12", "cudf-2602"]
+default = ["cuda-13", "cudf-nightly"]
+cuda-13 = ["cuda-13", "cudf-nightly"]
+cuda-12 = ["cuda-12", "cudf-nightly"]
+cuda-13-cudf-stable = ["cuda-13", "cudf-stable"]
+cuda-12-cudf-stable = ["cuda-12", "cudf-stable"]
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"
