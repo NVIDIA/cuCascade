@@ -41,14 +41,14 @@ data_batch::data_batch(uint64_t batch_id,
                        std::unique_ptr<idata_batch_probe> probe)
   : _batch_id(batch_id), _data(std::move(data)), _probe(std::move(probe))
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::mutex> lock(_mutex);
   update_state_to(batch_state::idle, lock);
 }
 
 data_batch::data_batch(data_batch&& other)
   : _batch_id(other._batch_id), _data(std::move(other._data))
 {
-  std::lock_guard<std::mutex> lock(other._mutex);
+  std::unique_lock<std::mutex> lock(other._mutex);
   size_t other_processing_count = other._processing_count;
   if (other_processing_count != 0) {
     throw std::runtime_error(
@@ -61,7 +61,7 @@ data_batch::data_batch(data_batch&& other)
 data_batch& data_batch::operator=(data_batch&& other)
 {
   if (this != &other) {
-    std::lock_guard<std::mutex> lock(other._mutex);
+    std::unique_lock<std::mutex> lock(other._mutex);
     size_t other_processing_count = other._processing_count;
     if (other_processing_count != 0) {
       throw std::runtime_error(
@@ -81,13 +81,13 @@ uint64_t data_batch::get_batch_id() const { return _batch_id; }
 
 batch_state data_batch::get_state() const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::mutex> lock(_mutex);
   return _state;
 }
 
 size_t data_batch::get_processing_count() const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::mutex> lock(_mutex);
   return _processing_count;
 }
 
@@ -101,13 +101,13 @@ cucascade::memory::memory_space* data_batch::get_memory_space() const
 
 void data_batch::set_state_change_cv(std::condition_variable* cv)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::mutex> lock(_mutex);
   _state_change_cv = cv;
 }
 
 void data_batch::set_data(std::unique_ptr<idata_representation> data)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::mutex> lock(_mutex);
   if (_processing_count != 0) {
     throw std::runtime_error("Cannot set data while there is active processing");
   }
@@ -120,7 +120,7 @@ bool data_batch::try_to_create_task()
   bool should_notify                    = false;
   bool success                          = false;
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex);
     if (_state == batch_state::idle) {
       ++_task_created_count;
       update_state_to(batch_state::task_created, lock);
@@ -129,20 +129,41 @@ bool data_batch::try_to_create_task()
       success       = true;
     } else if (_state == batch_state::task_created) {
       ++_task_created_count;
-      success = true;
+      should_notify = true;
+      success       = true;
     } else if (_state == batch_state::processing) {
       // Batch is already processing, increment counter but stay in processing state
       ++_task_created_count;
-      success = true;
+      should_notify = true;
+      success       = true;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
 }
 
+void data_batch::wait_to_create_task()
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _internal_cv.wait(lock, [&] { return _state != batch_state::in_transit; });
+    if (_state == batch_state::idle) {
+      update_state_to(batch_state::task_created, lock);
+      cv_to_notify = _state_change_cv;
+    }
+    // Always increment and always notify: wait_to_lock_for_processing waits on
+    // _internal_cv checking _task_created_count > 0, so it must be woken here.
+    ++_task_created_count;
+  }
+  _internal_cv.notify_all();
+  if (cv_to_notify) { cv_to_notify->notify_all(); }
+}
+
 size_t data_batch::get_task_created_count() const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::mutex> lock(_mutex);
   return _task_created_count;
 }
 
@@ -152,7 +173,7 @@ bool data_batch::try_to_cancel_task()
   bool should_notify                    = false;
   bool success                          = false;
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex);
     if (_state == batch_state::task_created || _state == batch_state::processing) {
       if (_task_created_count == 0) {
         throw std::runtime_error(
@@ -168,9 +189,36 @@ bool data_batch::try_to_cancel_task()
       success = true;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
 }
+
+void data_batch::wait_to_cancel_task()
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  bool should_notify                    = false;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _internal_cv.wait(lock, [&] {
+      return _state == batch_state::task_created || _state == batch_state::processing;
+    });
+    if (_task_created_count == 0) {
+      throw std::runtime_error(
+        "Cannot cancel task: task_created_count is zero. "
+        "try_to_create_task() must be called before wait_to_cancel_task()");
+    }
+    --_task_created_count;
+    if (_task_created_count == 0 && _processing_count == 0) {
+      update_state_to(batch_state::idle, lock);
+      should_notify = true;
+      cv_to_notify  = _state_change_cv;
+    }
+  }
+  if (should_notify) { _internal_cv.notify_all(); }
+  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+}
+
 lock_for_processing_result data_batch::try_to_lock_for_processing(
   memory::memory_space_id requested_memory_space)
 {
@@ -179,7 +227,7 @@ lock_for_processing_result data_batch::try_to_lock_for_processing(
   lock_for_processing_result result{
     false, data_batch_processing_handle{}, lock_for_processing_status::not_attempted};
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex);
 
     if (_data == nullptr) {
       result.status = lock_for_processing_status::missing_data;
@@ -208,7 +256,55 @@ lock_for_processing_result data_batch::try_to_lock_for_processing(
     result        = {
       true, data_batch_processing_handle{shared_from_this()}, lock_for_processing_status::success};
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  return result;
+}
+
+lock_for_processing_result data_batch::wait_to_lock_for_processing(
+  memory::memory_space_id requested_memory_space)
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  lock_for_processing_result result{
+    false, data_batch_processing_handle{}, lock_for_processing_status::not_attempted};
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+
+    // Return immediately for failures that cannot be resolved by waiting
+    if (_data == nullptr) {
+      result.status = lock_for_processing_status::missing_data;
+      return result;
+    }
+    if (_data->get_memory_space().get_id() != requested_memory_space) {
+      result.status = lock_for_processing_status::memory_space_mismatch;
+      return result;
+    }
+
+    // Wait until the state allows locking for processing
+    _internal_cv.wait(lock, [&] {
+      return (_state == batch_state::task_created || _state == batch_state::processing) &&
+             _task_created_count > 0;
+    });
+
+    // Re-check non-waitable conditions after waking (data may have changed)
+    if (_data == nullptr) {
+      result.status = lock_for_processing_status::missing_data;
+      return result;
+    }
+    if (_data->get_memory_space().get_id() != requested_memory_space) {
+      result.status = lock_for_processing_status::memory_space_mismatch;
+      return result;
+    }
+
+    --_task_created_count;
+    ++_processing_count;
+    update_state_to(batch_state::processing, lock);
+    cv_to_notify = _state_change_cv;
+    result       = {
+      true, data_batch_processing_handle{shared_from_this()}, lock_for_processing_status::success};
+  }
+  _internal_cv.notify_all();
+  if (cv_to_notify) { cv_to_notify->notify_all(); }
   return result;
 }
 
@@ -218,7 +314,7 @@ bool data_batch::try_to_lock_for_in_transit()
   bool should_notify                    = false;
   bool success                          = false;
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex);
     if (_processing_count == 0 &&
         ((_state == batch_state::idle) ||
          (_state == batch_state::task_created && _task_created_count > 0))) {
@@ -228,8 +324,26 @@ bool data_batch::try_to_lock_for_in_transit()
       success       = true;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
+}
+
+void data_batch::wait_to_lock_for_in_transit()
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _internal_cv.wait(lock, [&] {
+      return _processing_count == 0 &&
+             ((_state == batch_state::idle) ||
+              (_state == batch_state::task_created && _task_created_count > 0));
+    });
+    update_state_to(batch_state::in_transit, lock);
+    cv_to_notify = _state_change_cv;
+  }
+  _internal_cv.notify_all();
+  if (cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
 bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_state)
@@ -238,7 +352,7 @@ bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_sta
   bool should_notify                    = false;
   bool success                          = false;
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex);
     if (_state == batch_state::in_transit) {
       // Caller can explicitly choose the state to return to; default is idle.
       if (target_state.has_value()) {
@@ -258,8 +372,34 @@ bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_sta
       success       = true;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
   return success;
+}
+
+void data_batch::wait_to_release_in_transit(std::optional<batch_state> target_state)
+{
+  std::condition_variable* cv_to_notify = nullptr;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _internal_cv.wait(lock, [&] { return _state == batch_state::in_transit; });
+    // Caller can explicitly choose the state to return to; default is idle.
+    if (target_state.has_value()) {
+      if (*target_state == batch_state::idle) {
+        update_state_to(batch_state::idle, lock);
+      } else {
+        // first transition to idle
+        update_state_to(batch_state::idle, lock);
+        // then to the next state, maintaining FSM invariants
+        update_state_to(*target_state, lock);
+      }
+    } else {
+      update_state_to(batch_state::idle, lock);
+    }
+    cv_to_notify = _state_change_cv;
+  }
+  _internal_cv.notify_all();
+  if (cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
 void data_batch::decrement_processing_count()
@@ -267,7 +407,7 @@ void data_batch::decrement_processing_count()
   std::condition_variable* cv_to_notify = nullptr;
   bool should_notify                    = false;
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex);
     if (_state != batch_state::processing) {
       throw std::runtime_error(
         "Cannot decrement processing count: batch is not in processing state. state: " +
@@ -286,6 +426,7 @@ void data_batch::decrement_processing_count()
       cv_to_notify  = _state_change_cv;
     }
   }
+  if (should_notify) { _internal_cv.notify_all(); }
   if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
@@ -318,7 +459,8 @@ std::shared_ptr<data_batch> data_batch::clone(
     probe ? std::move(*probe) : std::make_unique<idata_batch_probe>());
 }
 
-void data_batch::update_state_to(batch_state new_state, const std::lock_guard<std::mutex>& /*lock*/)
+void data_batch::update_state_to(batch_state new_state,
+                                 const std::unique_lock<std::mutex>& /*lock*/)
 {
   _state = new_state;
   _probe->state_transitioned_to(
