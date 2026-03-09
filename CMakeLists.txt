@@ -24,26 +24,18 @@ project(
   LANGUAGES C CXX CUDA
   DESCRIPTION "GPU memory management and data representation library")
 
-# C++ standard
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
-# CUDA standard
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
 # Options
 option(BUILD_TESTS "Build the test suite" ON)
 option(BUILD_BENCHMARKS "Build the benchmark suite" ON)
-option(BUILD_SHARED_LIBS "Build shared library" ON)
-option(BUILD_STATIC_LIBS "Build static library" ON)
+option(CUCASCADE_BUILD_SHARED_LIBS "Build shared library" ON)
+option(CUCASCADE_BUILD_STATIC_LIBS "Build static library" ON)
 
 # At least one library type must be built
-if(NOT BUILD_SHARED_LIBS AND NOT BUILD_STATIC_LIBS)
+if(NOT CUCASCADE_BUILD_SHARED_LIBS AND NOT CUCASCADE_BUILD_STATIC_LIBS)
   message(
     FATAL_ERROR
-      "At least one of BUILD_SHARED_LIBS or BUILD_STATIC_LIBS must be ON")
+      "At least one of CUCASCADE_BUILD_SHARED_LIBS or CUCASCADE_BUILD_STATIC_LIBS must be ON"
+  )
 endif()
 
 # Find required packages
@@ -55,6 +47,10 @@ find_package(rmm REQUIRED CONFIG)
 
 # Find cudf for data representation support
 find_package(cudf REQUIRED CONFIG)
+
+# Find numa (provided by numactl-devel or libnuma-dev depending on the package
+# manager)
+find_library(NUMA_LIB numa REQUIRED)
 
 # Set CUDA architectures
 if(NOT CMAKE_CUDA_ARCHITECTURES)
@@ -107,15 +103,30 @@ target_compile_options(
 add_subdirectory(src/memory)
 add_subdirectory(src/data)
 
+# Common usage requirements shared by the object library and installable targets
+set(CUCASCADE_PUBLIC_INCLUDE_DIRS
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+
+set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart CUDA::nvml
+                               Threads::Threads ${NUMA_LIB})
+
+# C++ and CUDA standards propagated to consumers via PUBLIC compile features
+set(CUCASCADE_PUBLIC_COMPILE_FEATURES cxx_std_20 cuda_std_20)
+
 # Set include directories for the object library
-target_include_directories(
-  cucascade_objects
-  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-         $<INSTALL_INTERFACE:include>)
+target_include_directories(cucascade_objects
+                           PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
 
 # Link dependencies to object library
-target_link_libraries(cucascade_objects PUBLIC rmm::rmm cudf::cudf CUDA::cudart
-                                               CUDA::nvml Threads::Threads numa)
+target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+
+# Standards — PUBLIC so consumers inherit the requirement
+target_compile_features(cucascade_objects
+                        PUBLIC ${CUCASCADE_PUBLIC_COMPILE_FEATURES})
+
+# Disable compiler-specific extensions (GNU extensions etc.)
+set_target_properties(cucascade_objects PROPERTIES CXX_EXTENSIONS OFF)
 
 # Position independent code (required for shared library)
 set_target_properties(cucascade_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -123,18 +134,15 @@ set_target_properties(cucascade_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # =============================================================================
 # Static library
 # =============================================================================
-if(BUILD_STATIC_LIBS)
+if(CUCASCADE_BUILD_STATIC_LIBS)
   add_library(cucascade_static STATIC $<TARGET_OBJECTS:cucascade_objects>)
   add_library(cuCascade::cucascade_static ALIAS cucascade_static)
 
-  target_include_directories(
-    cucascade_static
-    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-           $<INSTALL_INTERFACE:include>)
-
-  target_link_libraries(
-    cucascade_static PUBLIC rmm::rmm cudf::cudf CUDA::cudart CUDA::nvml
-                            Threads::Threads numa)
+  target_include_directories(cucascade_static
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_link_libraries(cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+  target_compile_features(cucascade_static
+                          PUBLIC ${CUCASCADE_PUBLIC_COMPILE_FEATURES})
 
   set_target_properties(
     cucascade_static PROPERTIES OUTPUT_NAME cucascade EXPORT_NAME
@@ -144,18 +152,15 @@ endif()
 # =============================================================================
 # Shared library
 # =============================================================================
-if(BUILD_SHARED_LIBS)
+if(CUCASCADE_BUILD_SHARED_LIBS)
   add_library(cucascade_shared SHARED $<TARGET_OBJECTS:cucascade_objects>)
   add_library(cuCascade::cucascade_shared ALIAS cucascade_shared)
 
-  target_include_directories(
-    cucascade_shared
-    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-           $<INSTALL_INTERFACE:include>)
-
-  target_link_libraries(
-    cucascade_shared PUBLIC rmm::rmm cudf::cudf CUDA::cudart CUDA::nvml
-                            Threads::Threads numa)
+  target_include_directories(cucascade_shared
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_link_libraries(cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+  target_compile_features(cucascade_shared
+                          PUBLIC ${CUCASCADE_PUBLIC_COMPILE_FEATURES})
 
   set_target_properties(
     cucascade_shared
@@ -167,11 +172,11 @@ endif()
 # =============================================================================
 # Default target alias (prefer shared if available, else static)
 # =============================================================================
-if(BUILD_SHARED_LIBS)
+if(CUCASCADE_BUILD_SHARED_LIBS)
   add_library(cuCascade::cucascade ALIAS cucascade_shared)
   # For backwards compatibility, also create 'cucascade' as an alias
   add_library(cucascade ALIAS cucascade_shared)
-elseif(BUILD_STATIC_LIBS)
+elseif(CUCASCADE_BUILD_STATIC_LIBS)
   add_library(cuCascade::cucascade ALIAS cucascade_static)
   add_library(cucascade ALIAS cucascade_static)
 endif()
@@ -192,10 +197,10 @@ install(
 
 # Collect targets to install
 set(CUCASCADE_INSTALL_TARGETS)
-if(BUILD_STATIC_LIBS)
+if(CUCASCADE_BUILD_STATIC_LIBS)
   list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_static)
 endif()
-if(BUILD_SHARED_LIBS)
+if(CUCASCADE_BUILD_SHARED_LIBS)
   list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared)
 endif()
 
