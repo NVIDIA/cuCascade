@@ -22,6 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
 
+#include <concepts>
 #include <cstddef>
 #include <memory>
 
@@ -100,27 +101,33 @@ class idata_representation {
   virtual std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) = 0;
 
   /**
-   * @brief Safely casts this interface to a specific derived type
+   * @brief Casts this interface to a specific derived type.
    *
-   * @tparam TargetType The target type to cast to
-   * @return TargetType& Reference to the casted object
+   * @tparam TargetType The target derived type to cast to. Must be a subclass of
+   *         `idata_representation` — enforced at compile time.
+   * @return TargetType& Reference to the derived object.
+   * @throws std::bad_cast if the runtime type of this object is not `TargetType`.
    */
   template <class TargetType>
+    requires std::derived_from<TargetType, idata_representation>
   TargetType& cast()
   {
-    return reinterpret_cast<TargetType&>(*this);
+    return dynamic_cast<TargetType&>(*this);
   }
 
   /**
-   * @brief Safely casts this interface to a specific derived type (const version)
+   * @brief Casts this interface to a specific derived type (const version).
    *
-   * @tparam TargetType The target type to cast to
-   * @return const TargetType& Const reference to the casted object
+   * @tparam TargetType The target derived type to cast to. Must be a subclass of
+   *         `idata_representation` — enforced at compile time.
+   * @return const TargetType& Const reference to the derived object.
+   * @throws std::bad_cast if the runtime type of this object is not `TargetType`.
    */
   template <class TargetType>
+    requires std::derived_from<TargetType, idata_representation>
   const TargetType& cast() const
   {
-    return reinterpret_cast<const TargetType&>(*this);
+    return dynamic_cast<const TargetType&>(*this);
   }
 
  private:
