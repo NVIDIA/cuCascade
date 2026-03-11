@@ -27,6 +27,8 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
 #include <mutex>
 #include <optional>
@@ -57,6 +59,13 @@ memory_space::memory_space(const gpu_memory_space_config& config)
 {
   if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
 
+  cudaMemPool_t pool_handle{nullptr};
+  if (auto* r = dynamic_cast<rmm::mr::cuda_async_memory_resource*>(_allocator.get())) {
+    pool_handle = r->pool_handle();
+  } else if (auto* r = dynamic_cast<rmm::mr::cuda_async_view_memory_resource*>(_allocator.get())) {
+    pool_handle = r->pool_handle();
+  }
+
   _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
     _id,
     *_allocator,
@@ -66,7 +75,8 @@ memory_space::memory_space(const gpu_memory_space_config& config)
     nullptr,
     config.per_stream_reservation
       ? reservation_aware_resource_adaptor::AllocationTrackingScope::PER_STREAM
-      : reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD);
+      : reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD,
+    pool_handle);
 }
 
 memory_space::memory_space(const host_memory_space_config& config)

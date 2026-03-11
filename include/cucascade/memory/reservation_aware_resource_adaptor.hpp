@@ -163,7 +163,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
     std::size_t capacity,
     std::unique_ptr<reservation_limit_policy> stream_reservation_policy = nullptr,
     std::unique_ptr<oom_handling_policy> default_oom_policy             = nullptr,
-    AllocationTrackingScope tracking_scope = AllocationTrackingScope::PER_STREAM);
+    AllocationTrackingScope tracking_scope                              = AllocationTrackingScope::PER_STREAM,
+    cudaMemPool_t pool_handle                                           = nullptr);
 
   /**
    * @brief Constructs a per-stream tracking resource adaptor.
@@ -176,6 +177,7 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
    * @param default_oom_policy The default OOM handling policy
    * @param tracking_scope [default: PER_STREAM] The scope of allocation tracking (per-stream,
    * per-thread)
+   * @param pool_handle Optional CUDA memory pool handle for accurate OOM diagnostics
    */
   explicit reservation_aware_resource_adaptor(
     memory_space_id space_id,
@@ -184,7 +186,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
     std::size_t capacity,
     std::unique_ptr<reservation_limit_policy> stream_reservation_policy = nullptr,
     std::unique_ptr<oom_handling_policy> default_oom_policy             = nullptr,
-    AllocationTrackingScope tracking_scope = AllocationTrackingScope::PER_STREAM);
+    AllocationTrackingScope tracking_scope                              = AllocationTrackingScope::PER_STREAM,
+    cudaMemPool_t pool_handle                                           = nullptr);
 
   /**
    * @brief Destructor.
@@ -423,6 +426,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
 
   /// The upstream memory resource
   rmm::device_async_resource_ref _upstream;
+  /// Optional CUDA memory pool handle for accurate OOM diagnostics
+  cudaMemPool_t _pool_handle{nullptr};
   const std::size_t _memory_limit;
   const std::size_t _capacity;
 

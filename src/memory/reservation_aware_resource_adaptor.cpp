@@ -44,12 +44,13 @@ using device_reserved_arena = reservation_aware_resource_adaptor::device_reserve
 
 namespace {
 
-std::pair<std::size_t, std::size_t> query_mempool_stats()
+std::pair<std::size_t, std::size_t> query_mempool_stats(cudaMemPool_t pool)
 {
-  int device{};
-  if (cudaGetDevice(&device) != cudaSuccess) { return {0, 0}; }
-  cudaMemPool_t pool{};
-  if (cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess) { return {0, 0}; }
+  if (pool == nullptr) {
+    int device{};
+    if (cudaGetDevice(&device) != cudaSuccess) { return {0, 0}; }
+    if (cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess) { return {0, 0}; }
+  }
   cuuint64_t usage{0};
   cuuint64_t capacity{0};
   cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &usage);
@@ -192,9 +193,11 @@ reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
   std::size_t capacity,
   std::unique_ptr<reservation_limit_policy> default_reservation_policy,
   std::unique_ptr<oom_handling_policy> default_oom_policy,
-  AllocationTrackingScope tracking_scope)
+  AllocationTrackingScope tracking_scope,
+  cudaMemPool_t pool_handle)
   : _space_id(space_id),
     _upstream(std::move(upstream)),
+    _pool_handle(pool_handle),
     _memory_limit(capacity),
     _capacity(capacity),
     _allocation_tracker([&]() -> std::unique_ptr<allocation_tracker_iface> {
@@ -219,9 +222,11 @@ reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
   std::size_t capacity,
   std::unique_ptr<reservation_limit_policy> default_reservation_policy,
   std::unique_ptr<oom_handling_policy> default_oom_policy,
-  AllocationTrackingScope tracking_scope)
+  AllocationTrackingScope tracking_scope,
+  cudaMemPool_t pool_handle)
   : _space_id(space_id),
     _upstream(std::move(upstream)),
+    _pool_handle(pool_handle),
     _memory_limit(memory_limit),
     _capacity(capacity),
     _allocation_tracker([&]() -> std::unique_ptr<allocation_tracker_iface> {
@@ -453,7 +458,7 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
       return _upstream.allocate(stream, allocation_bytes);
     } catch (std::exception& e) {
       _total_allocated_bytes.sub(tracking_bytes);
-      auto [pool_usage, pool_capacity] = query_mempool_stats();
+      auto [pool_usage, pool_capacity] = query_mempool_stats(_pool_handle);
       throw cucascade_out_of_memory(e.what(),
                                     MemoryError::ALLOCATION_FAILED,
                                     allocation_bytes,
@@ -462,7 +467,7 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
                                     pool_capacity);
     }
   } else {
-    auto [pool_usage, pool_capacity] = query_mempool_stats();
+    auto [pool_usage, pool_capacity] = query_mempool_stats(_pool_handle);
     throw cucascade_out_of_memory("not enough capacity to allocate memory",
                                   MemoryError::POOL_EXHAUSTED,
                                   allocation_bytes,
