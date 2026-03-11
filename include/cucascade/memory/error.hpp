@@ -40,11 +40,17 @@ inline std::error_code make_error_code(MemoryError e);
 
 struct cucascade_out_of_memory : public rmm::out_of_memory {
   explicit cucascade_out_of_memory(std::string_view message,
+                                   MemoryError error_kind,
                                    std::size_t requested_bytes,
-                                   std::size_t global_usage);
+                                   std::size_t global_usage,
+                                   std::size_t pool_usage,
+                                   std::size_t pool_capacity);
 
+  const MemoryError error_kind;
   const std::size_t requested_bytes;
   const std::size_t global_usage;
+  const std::size_t pool_usage;
+  const std::size_t pool_capacity;
 };
 
 }  // namespace memory

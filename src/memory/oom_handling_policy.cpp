@@ -30,6 +30,19 @@ void* throw_on_oom_policy::do_handle_oom([[maybe_unused]] std::size_t bytes,
 
 std::string throw_on_oom_policy::get_policy_name() const noexcept { return "rethrow"; }
 
+void* defragment_on_oom_policy::do_handle_oom([[maybe_unused]] std::size_t bytes,
+                                              [[maybe_unused]] rmm::cuda_stream_view stream,
+                                              std::exception_ptr eptr,
+                                              [[maybe_unused]] RetryFunc retry_function)
+{
+  std::rethrow_exception(eptr);
+}
+
+std::string defragment_on_oom_policy::get_policy_name() const noexcept
+{
+  return "defragment_on_oom";
+}
+
 std::unique_ptr<oom_handling_policy> make_default_oom_policy()
 {
   return std::make_unique<throw_on_oom_policy>();
