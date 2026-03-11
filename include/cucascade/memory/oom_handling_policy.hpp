@@ -60,16 +60,6 @@ class throw_on_oom_policy final : public oom_handling_policy {
   std::string get_policy_name() const noexcept override;
 };
 
-class defragment_on_oom_policy final : public oom_handling_policy {
- protected:
-  void* do_handle_oom(std::size_t bytes,
-                      rmm::cuda_stream_view stream,
-                      std::exception_ptr eptr,
-                      RetryFunc retry_function) final;
-
-  std::string get_policy_name() const noexcept override;
-};
-
 std::unique_ptr<oom_handling_policy> make_default_oom_policy();
 
 }  // namespace memory
