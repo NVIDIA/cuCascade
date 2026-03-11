@@ -10,6 +10,7 @@ jobs:
   build:
     runs-on: linux-amd64-cpu4
     strategy:
+      fail-fast: false
       matrix:
         cuda: [12, 13]
         rapids: [nightly, stable]
