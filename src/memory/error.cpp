@@ -17,6 +17,8 @@
 
 #include <cucascade/memory/error.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <system_error>
 
 namespace cucascade {
@@ -47,9 +49,15 @@ std::error_code make_error_code(MemoryError e)
 }
 
 cucascade_out_of_memory::cucascade_out_of_memory(std::string_view message,
+                                                 MemoryError error_kind,
                                                  std::size_t requested_bytes,
-                                                 std::size_t global_usage)
-  : rmm::out_of_memory(message.data()), requested_bytes(requested_bytes), global_usage(global_usage)
+                                                 std::size_t global_usage,
+                                                 cudaMemPool_t pool_handle)
+  : rmm::out_of_memory(message.data()),
+    error_kind(error_kind),
+    requested_bytes(requested_bytes),
+    global_usage(global_usage),
+    pool_handle(pool_handle)
 {
 }
 

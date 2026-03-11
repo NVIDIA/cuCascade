@@ -22,6 +22,8 @@
 
 #include <cucascade/cuda_utils.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
@@ -41,6 +43,7 @@ using stream_ordered_tracker_state =
 using device_reserved_arena = reservation_aware_resource_adaptor::device_reserved_arena;
 
 namespace {
+
 
 struct stream_ordered_allocation_tracker
   : public reservation_aware_resource_adaptor::allocation_tracker_iface {
@@ -177,9 +180,11 @@ reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
   std::size_t capacity,
   std::unique_ptr<reservation_limit_policy> default_reservation_policy,
   std::unique_ptr<oom_handling_policy> default_oom_policy,
-  AllocationTrackingScope tracking_scope)
+  AllocationTrackingScope tracking_scope,
+  cudaMemPool_t pool_handle)
   : _space_id(space_id),
     _upstream(std::move(upstream)),
+    _pool_handle(pool_handle),
     _memory_limit(capacity),
     _capacity(capacity),
     _allocation_tracker([&]() -> std::unique_ptr<allocation_tracker_iface> {
@@ -204,9 +209,11 @@ reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
   std::size_t capacity,
   std::unique_ptr<reservation_limit_policy> default_reservation_policy,
   std::unique_ptr<oom_handling_policy> default_oom_policy,
-  AllocationTrackingScope tracking_scope)
+  AllocationTrackingScope tracking_scope,
+  cudaMemPool_t pool_handle)
   : _space_id(space_id),
     _upstream(std::move(upstream)),
+    _pool_handle(pool_handle),
     _memory_limit(memory_limit),
     _capacity(capacity),
     _allocation_tracker([&]() -> std::unique_ptr<allocation_tracker_iface> {
@@ -438,11 +445,15 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
       return _upstream.allocate(stream, allocation_bytes);
     } catch (std::exception& e) {
       _total_allocated_bytes.sub(tracking_bytes);
-      throw cucascade_out_of_memory(e.what(), allocation_bytes, post_allocation_size);
+      throw cucascade_out_of_memory(
+        e.what(), MemoryError::ALLOCATION_FAILED, allocation_bytes, post_allocation_size, _pool_handle);
     }
   } else {
-    throw cucascade_out_of_memory(
-      "not enough capacity to allocate memory", allocation_bytes, post_allocation_size);
+    throw cucascade_out_of_memory("not enough capacity to allocate memory",
+                                  MemoryError::POOL_EXHAUSTED,
+                                  allocation_bytes,
+                                  post_allocation_size,
+                                  _pool_handle);
   }
 }
 

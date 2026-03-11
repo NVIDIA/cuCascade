@@ -27,7 +27,8 @@
 namespace cucascade {
 namespace memory {
 
-struct oom_handling_policy {
+class oom_handling_policy {
+ public:
   virtual ~oom_handling_policy() = default;
 
   using RetryFunc = std::function<void*(std::size_t, rmm::cuda_stream_view)>;
@@ -49,7 +50,7 @@ struct oom_handling_policy {
                               RetryFunc retry_function) = 0;
 };
 
-struct throw_on_oom_policy final : public oom_handling_policy {
+class throw_on_oom_policy final : public oom_handling_policy {
  protected:
   void* do_handle_oom(std::size_t bytes,
                       rmm::cuda_stream_view stream,
