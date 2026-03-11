@@ -47,12 +47,8 @@ set(TEST_SOURCES
 
 # Create test executable
 add_executable(cucascade_tests ${TEST_SOURCES})
-set_target_properties(cucascade_tests PROPERTIES CXX_STANDARD 20
-                                                 CXX_STANDARD_REQUIRED ON
-                                                 CUDA_STANDARD 20
-                                                 CUDA_STANDARD_REQUIRED ON
-                                                 CUDA_ARCHITECTURES
-                                                 "${CMAKE_CUDA_ARCHITECTURES}")
+set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
+                                                 CUDA_STANDARD_REQUIRED ON)
 
 # Set include directories
 target_include_directories(

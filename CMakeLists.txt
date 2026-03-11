@@ -25,8 +25,8 @@ project(
   DESCRIPTION "GPU memory management and data representation library")
 
 # Options
-option(BUILD_TESTS "Build the test suite" ON)
-option(BUILD_BENCHMARKS "Build the benchmark suite" ON)
+option(CUCASCADE_BUILD_TESTS "Build the test suite" ON)
+option(CUCASCADE_BUILD_BENCHMARKS "Build the benchmark suite" ON)
 option(CUCASCADE_BUILD_SHARED_LIBS "Build shared library" ON)
 option(CUCASCADE_BUILD_STATIC_LIBS "Build static library" ON)
 
@@ -60,7 +60,7 @@ endif()
 # =============================================================================
 # Compiler warnings
 # =============================================================================
-option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(CUCASCADE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 
 # Warning flags for C/C++
 set(CUCASCADE_CXX_WARNING_FLAGS
@@ -118,16 +118,14 @@ target_include_directories(cucascade_objects
 # Link dependencies to object library
 target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
 
-# Language standards set via properties (not compile features) to avoid
-# propagating cuda_std_* requirements to consumers without CUDA enabled.
-set_target_properties(cucascade_objects PROPERTIES CXX_STANDARD 20
-                                                   CXX_STANDARD_REQUIRED ON
-                                                   CXX_EXTENSIONS OFF
-                                                   CUDA_STANDARD 20
-                                                   CUDA_STANDARD_REQUIRED ON)
+# cxx_std_20 is PUBLIC so consumers know they need C++20 to use our headers.
+# cuda_std_20 is kept separate and applied PRIVATE to cucascade_objects to avoid
+# propagating it to consumers that have no CUDA compiler requirement.
+target_compile_features(cucascade_objects PUBLIC cxx_std_20)
+target_compile_features(cucascade_objects PRIVATE cuda_std_20)
 
-# Position independent code (required for shared library)
-set_target_properties(cucascade_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(cucascade_objects PROPERTIES CXX_EXTENSIONS OFF
+                                                   POSITION_INDEPENDENT_CODE ON)
 
 # =============================================================================
 # Static library
@@ -139,8 +137,7 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
   target_include_directories(cucascade_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_link_libraries(cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
-  target_compile_features(cucascade_static
-                          PUBLIC ${CUCASCADE_PUBLIC_COMPILE_FEATURES})
+  target_compile_features(cucascade_static PUBLIC cxx_std_20)
 
   set_target_properties(
     cucascade_static PROPERTIES OUTPUT_NAME cucascade EXPORT_NAME
@@ -157,8 +154,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
   target_include_directories(cucascade_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_link_libraries(cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
-  target_compile_features(cucascade_shared
-                          PUBLIC ${CUCASCADE_PUBLIC_COMPILE_FEATURES})
+  target_compile_features(cucascade_shared PUBLIC cxx_std_20)
 
   set_target_properties(
     cucascade_shared
@@ -239,7 +235,7 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfig.cmake
 # =============================================================================
 # Tests
 # =============================================================================
-if(BUILD_TESTS)
+if(CUCASCADE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(test)
 endif()
@@ -247,6 +243,6 @@ endif()
 # =============================================================================
 # Benchmarks
 # =============================================================================
-if(BUILD_BENCHMARKS)
+if(CUCASCADE_BUILD_BENCHMARKS)
   add_subdirectory(benchmark)
 endif()
