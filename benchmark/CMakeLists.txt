@@ -45,8 +45,6 @@ set(BENCHMARK_SOURCES
 
 # Create benchmark executable
 add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})
-set_target_properties(cucascade_benchmarks PROPERTIES CXX_STANDARD 20
-                                                      CXX_STANDARD_REQUIRED ON)
 
 # Set include directories
 target_include_directories(

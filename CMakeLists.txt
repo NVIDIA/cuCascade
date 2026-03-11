@@ -111,6 +111,11 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
 set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart CUDA::nvml
                                Threads::Threads ${NUMA_LIB})
 
+# cxx_std_20 is PUBLIC so consumers know they need C++20 to use our headers.
+# cuda_std_20 is kept separate and applied PRIVATE to cucascade_objects to avoid
+# propagating it to consumers that have no CUDA compiler requirement.
+set(CUCASCADE_PUBLIC_COMPILE_FEATURES cxx_std_20)
+
 # Set include directories for the object library
 target_include_directories(cucascade_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
@@ -118,18 +123,12 @@ target_include_directories(cucascade_objects
 # Link dependencies to object library
 target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
 
-# Language standards set via properties (not compile features) to avoid
-# propagating cuda_std_* requirements to consumers without CUDA enabled.
-set_target_properties(
-  cucascade_objects
-  PROPERTIES CXX_STANDARD 20
-             CXX_STANDARD_REQUIRED ON
-             CXX_EXTENSIONS OFF
-             CUDA_STANDARD 20
-             CUDA_STANDARD_REQUIRED ON)
+target_compile_features(cucascade_objects
+                        PUBLIC ${CUCASCADE_PUBLIC_COMPILE_FEATURES})
+target_compile_features(cucascade_objects PRIVATE cuda_std_20)
 
-# Position independent code (required for shared library)
-set_target_properties(cucascade_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(cucascade_objects PROPERTIES CXX_EXTENSIONS OFF
+                                                   POSITION_INDEPENDENT_CODE ON)
 
 # =============================================================================
 # Static library
