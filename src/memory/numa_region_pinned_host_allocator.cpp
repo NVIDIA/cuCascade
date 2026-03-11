@@ -17,7 +17,7 @@
 
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
-#include <rmm/detail/nvtx/ranges.hpp>
+#include <cucascade/cuda_utils.hpp>
 
 #include <numa.h>
 
@@ -29,18 +29,18 @@ namespace memory {
 void* numa_region_pinned_host_memory_resource::do_allocate(
   std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream)
 {
-  RMM_FUNC_RANGE();
+  CUCASCADE_FUNC_RANGE();
   // don't allocate anything if the user requested zero bytes
   if (0 == bytes) { return nullptr; }
 
   if (_numa_node == -1) {
     void* ptr{nullptr};
-    RMM_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault), bytes);
+    CUCASCADE_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault), bytes);
     return ptr;
   } else {
     void* ptr = numa_alloc_onnode(bytes, _numa_node);
     if (ptr == nullptr) { throw rmm::bad_alloc(std::strerror(errno)); }
-    RMM_CUDA_TRY_ALLOC(cudaHostRegister(ptr, bytes, cudaHostRegisterMapped), bytes);
+    CUCASCADE_CUDA_TRY_ALLOC(cudaHostRegister(ptr, bytes, cudaHostRegisterMapped), bytes);
     return ptr;
   }
 }
@@ -48,11 +48,11 @@ void* numa_region_pinned_host_memory_resource::do_allocate(
 void numa_region_pinned_host_memory_resource::do_deallocate(
   void* ptr, std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream) noexcept
 {
-  RMM_FUNC_RANGE();
+  CUCASCADE_FUNC_RANGE();
   if (_numa_node == -1) {
-    RMM_ASSERT_CUDA_SUCCESS(cudaFreeHost(ptr));
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaFreeHost(ptr));
   } else {
-    RMM_ASSERT_CUDA_SUCCESS(cudaHostUnregister(ptr));
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaHostUnregister(ptr));
     numa_free(ptr, bytes);
   }
 }

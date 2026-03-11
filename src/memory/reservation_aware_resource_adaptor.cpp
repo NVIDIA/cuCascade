@@ -20,9 +20,10 @@
 #include <cucascade/memory/notification_channel.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <cucascade/cuda_utils.hpp>
+
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/detail/error.hpp>
 
 #include <atomic>
 #include <exception>

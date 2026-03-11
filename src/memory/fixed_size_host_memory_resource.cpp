@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda_utils.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -110,7 +111,7 @@ rmm::device_async_resource_ref fixed_size_host_memory_resource::get_upstream_res
 fixed_size_host_memory_resource::fixed_multiple_blocks_allocation
 fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_bytes, reservation* res)
 {
-  RMM_FUNC_RANGE();
+  CUCASCADE_FUNC_RANGE();
 
   chunked_reserved_area* h_reservation_slot = nullptr;
   if (res) {
@@ -126,7 +127,7 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
 std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_blocks_internal(
   std::size_t total_bytes, chunked_reserved_area* h_reservation_slot)
 {
-  RMM_FUNC_RANGE();
+  CUCASCADE_FUNC_RANGE();
 
   if (total_bytes == 0) { return {}; }
 
