@@ -508,12 +508,12 @@ static memory::column_metadata plan_column_copy(const cudf::column_view& col,
     memory::column_metadata offsets_meta{};
     offsets_meta.type_id       = cudf::type_id::INT32;
     offsets_meta.num_rows      = 1;  // one offset value (0) for 0 strings
-    offsets_meta.null_count   = 0;
+    offsets_meta.null_count    = 0;
     offsets_meta.has_null_mask = false;
-    offsets_meta.has_data     = true;
-    offsets_meta.data_size    = sizeof(int32_t);
-    current_offset            = align_up_fast(current_offset, 8u);
-    offsets_meta.data_offset  = current_offset;
+    offsets_meta.has_data      = true;
+    offsets_meta.data_size     = sizeof(int32_t);
+    current_offset             = align_up_fast(current_offset, 8u);
+    offsets_meta.data_offset   = current_offset;
     current_offset += offsets_meta.data_size;
     offsets_meta.is_synthetic_empty_offsets = true;
     meta.children.push_back(std::move(offsets_meta));
@@ -558,11 +558,12 @@ static void collect_d2h_ops(const void* src,
 }
 
 /**
- * @brief Zero a region in the host allocation (used for synthetic STRING offsets with no device source).
+ * @brief Zero a region in the host allocation (used for synthetic STRING offsets with no device
+ * source).
  */
 static void zero_region(memory::fixed_multiple_blocks_allocation& alloc,
-                       std::size_t alloc_offset,
-                       std::size_t size)
+                        std::size_t alloc_offset,
+                        std::size_t size)
 {
   if (size == 0 || !alloc || alloc->size() == 0) { return; }
   const std::size_t block_size = alloc->block_size();
@@ -787,9 +788,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
 {
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
-  if (!fast_table) {
-    throw std::runtime_error("convert_host_fast_to_gpu: host table is null");
-  }
+  if (!fast_table) { throw std::runtime_error("convert_host_fast_to_gpu: host table is null"); }
   if (!fast_table->allocation) {
     throw std::runtime_error("convert_host_fast_to_gpu: host table allocation is null");
   }
