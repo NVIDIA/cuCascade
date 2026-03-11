@@ -19,6 +19,8 @@
 
 #include <rmm/error.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <cstring>
 #include <string_view>
 #include <system_error>
@@ -44,13 +46,15 @@ struct cucascade_out_of_memory : public rmm::out_of_memory {
                                    std::size_t requested_bytes,
                                    std::size_t global_usage,
                                    std::size_t pool_usage,
-                                   std::size_t pool_capacity);
+                                   std::size_t pool_capacity,
+                                   cudaMemPool_t pool_handle);
 
   const MemoryError error_kind;
   const std::size_t requested_bytes;
   const std::size_t global_usage;
   const std::size_t pool_usage;
   const std::size_t pool_capacity;
+  const cudaMemPool_t pool_handle;
 };
 
 }  // namespace memory

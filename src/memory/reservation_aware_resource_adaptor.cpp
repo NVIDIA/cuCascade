@@ -464,7 +464,8 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
                                     allocation_bytes,
                                     post_allocation_size,
                                     pool_usage,
-                                    pool_capacity);
+                                    pool_capacity,
+                                    _pool_handle);
     }
   } else {
     auto [pool_usage, pool_capacity] = query_mempool_stats(_pool_handle);
@@ -473,7 +474,8 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
                                   allocation_bytes,
                                   post_allocation_size,
                                   pool_usage,
-                                  pool_capacity);
+                                  pool_capacity,
+                                  _pool_handle);
   }
 }
 
