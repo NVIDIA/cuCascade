@@ -22,6 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/cccl_adaptors.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/version_config.hpp>
 
 #include <array>
 #include <cstddef>
@@ -137,9 +138,17 @@ class small_pinned_host_memory_resource : public rmm::mr::device_memory_resource
   std::vector<fixed_multiple_blocks_allocation> owned_allocations_;
 };
 
+// rmm::detail::polyfill::async_resource_with was removed in RMM 26.x;
+// use cuda::mr::resource_with directly for newer versions.
+#if RMM_VERSION_MAJOR >= 26
+static_assert(cuda::mr::resource_with<small_pinned_host_memory_resource,
+                                      cuda::mr::device_accessible,
+                                      cuda::mr::host_accessible>);
+#else
 static_assert(rmm::detail::polyfill::async_resource_with<small_pinned_host_memory_resource,
                                                          cuda::mr::device_accessible,
                                                          cuda::mr::host_accessible>);
+#endif
 
 }  // namespace memory
 }  // namespace cucascade
