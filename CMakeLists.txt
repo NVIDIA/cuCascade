@@ -25,8 +25,8 @@ project(
   DESCRIPTION "GPU memory management and data representation library")
 
 # Options
-option(BUILD_TESTS "Build the test suite" ON)
-option(BUILD_BENCHMARKS "Build the benchmark suite" ON)
+option(CUCASCADE_BUILD_TESTS "Build the test suite" ON)
+option(CUCASCADE_BUILD_BENCHMARKS "Build the benchmark suite" ON)
 option(CUCASCADE_BUILD_SHARED_LIBS "Build shared library" ON)
 option(CUCASCADE_BUILD_STATIC_LIBS "Build static library" ON)
 
@@ -60,7 +60,7 @@ endif()
 # =============================================================================
 # Compiler warnings
 # =============================================================================
-option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(CUCASCADE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 
 # Warning flags for C/C++
 set(CUCASCADE_CXX_WARNING_FLAGS
@@ -120,11 +120,13 @@ target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
 
 # Language standards set via properties (not compile features) to avoid
 # propagating cuda_std_* requirements to consumers without CUDA enabled.
-set_target_properties(cucascade_objects PROPERTIES CXX_STANDARD 20
-                                                   CXX_STANDARD_REQUIRED ON
-                                                   CXX_EXTENSIONS OFF
-                                                   CUDA_STANDARD 20
-                                                   CUDA_STANDARD_REQUIRED ON)
+set_target_properties(
+  cucascade_objects
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_EXTENSIONS OFF
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON)
 
 # Position independent code (required for shared library)
 set_target_properties(cucascade_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
