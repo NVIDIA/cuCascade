@@ -18,9 +18,10 @@
 #include <cudf/contiguous_split.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/cuda_utils.hpp>
+
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime_api.h>
@@ -112,8 +113,8 @@ bool cudf_tables_have_equal_contents_on_stream(const cudf::table& left,
     std::vector<uint8_t> left_data(data_bytes);
     std::vector<uint8_t> right_data(data_bytes);
 
-    RMM_CUDA_TRY(cudaMemcpy(left_data.data(), left_col.head(), data_bytes, cudaMemcpyDeviceToHost));
-    RMM_CUDA_TRY(
+    CUCASCADE_CUDA_TRY(cudaMemcpy(left_data.data(), left_col.head(), data_bytes, cudaMemcpyDeviceToHost));
+    CUCASCADE_CUDA_TRY(
       cudaMemcpy(right_data.data(), right_col.head(), data_bytes, cudaMemcpyDeviceToHost));
 
     if (!host_mem_equal(left_data.data(), right_data.data(), data_bytes)) {

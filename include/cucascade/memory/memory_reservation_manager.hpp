@@ -34,9 +34,7 @@
 #include <utility>
 #include <vector>
 
-// RMM includes for memory resource management
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/detail/error.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
 
 namespace cucascade {

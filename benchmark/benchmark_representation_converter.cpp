@@ -24,8 +24,9 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+#include <cucascade/cuda_utils.hpp>
+
 #include <rmm/cuda_stream.hpp>
-#include <rmm/detail/error.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -146,7 +147,7 @@ cudf::table create_benchmark_table_from_bytes(int64_t total_bytes, int num_colum
       auto view      = col->mutable_view();
       auto type_size = cudf::size_of(dtype);
       auto bytes     = static_cast<size_t>(num_rows) * (type_size);
-      RMM_CUDA_TRY(cudaMemset(const_cast<void*>(view.head()), fill_value, bytes));
+      CUCASCADE_CUDA_TRY(cudaMemset(const_cast<void*>(view.head()), fill_value, bytes));
     }
 
     columns.push_back(std::move(col));
@@ -459,9 +460,9 @@ void BM_GpuToHostThroughput(benchmark::State& state)
   std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
-    RMM_CUDA_TRY(cudaMalloc(&d_buffers[t], total_bytes));
-    RMM_CUDA_TRY(cudaMallocHost(&h_buffers[t], total_bytes));
-    RMM_CUDA_TRY(cudaMemset(d_buffers[t], 0x42, total_bytes));
+    CUCASCADE_CUDA_TRY(cudaMalloc(&d_buffers[t], total_bytes));
+    CUCASCADE_CUDA_TRY(cudaMallocHost(&h_buffers[t], total_bytes));
+    CUCASCADE_CUDA_TRY(cudaMemset(d_buffers[t], 0x42, total_bytes));
   }
 
   uint64_t total_bytes_transferred = total_bytes * thread_count;
@@ -474,7 +475,7 @@ void BM_GpuToHostThroughput(benchmark::State& state)
     // Create threads
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
-        RMM_CUDA_TRY(cudaMemcpyAsync(
+        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
           h_buffers[t], d_buffers[t], total_bytes, cudaMemcpyDeviceToHost, streams[t].value()));
         streams[t].synchronize();
       });
@@ -488,8 +489,8 @@ void BM_GpuToHostThroughput(benchmark::State& state)
 
   // Cleanup buffers
   for (uint64_t t = 0; t < thread_count; ++t) {
-    RMM_CUDA_TRY(cudaFree(d_buffers[t]));
-    RMM_CUDA_TRY(cudaFreeHost(h_buffers[t]));
+    CUCASCADE_CUDA_TRY(cudaFree(d_buffers[t]));
+    CUCASCADE_CUDA_TRY(cudaFreeHost(h_buffers[t]));
   }
 
   // Update counters in main thread after loop
@@ -515,8 +516,8 @@ void BM_HostToGpuThroughput(benchmark::State& state)
   std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
-    RMM_CUDA_TRY(cudaMalloc(&d_buffers[t], total_bytes));
-    RMM_CUDA_TRY(cudaMallocHost(&h_buffers[t], total_bytes));
+    CUCASCADE_CUDA_TRY(cudaMalloc(&d_buffers[t], total_bytes));
+    CUCASCADE_CUDA_TRY(cudaMallocHost(&h_buffers[t], total_bytes));
     std::memset(h_buffers[t], 0x42, total_bytes);
   }
 
@@ -530,7 +531,7 @@ void BM_HostToGpuThroughput(benchmark::State& state)
     // Create threads
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
-        RMM_CUDA_TRY(cudaMemcpyAsync(
+        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
           d_buffers[t], h_buffers[t], total_bytes, cudaMemcpyHostToDevice, streams[t].value()));
         streams[t].synchronize();
       });
@@ -544,8 +545,8 @@ void BM_HostToGpuThroughput(benchmark::State& state)
 
   // Cleanup buffers
   for (uint64_t t = 0; t < thread_count; ++t) {
-    RMM_CUDA_TRY(cudaFree(d_buffers[t]));
-    RMM_CUDA_TRY(cudaFreeHost(h_buffers[t]));
+    CUCASCADE_CUDA_TRY(cudaFree(d_buffers[t]));
+    CUCASCADE_CUDA_TRY(cudaFreeHost(h_buffers[t]));
   }
 
   // Update counters in main thread after loop

@@ -32,8 +32,9 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+#include <cucascade/cuda_utils.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/detail/error.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
@@ -164,7 +165,7 @@ inline cudf::table create_simple_cudf_table(
   if (num_rows > 0) {
     auto view  = col1->mutable_view();
     auto bytes = static_cast<size_t>(num_rows) * sizeof(int32_t);
-    RMM_CUDA_TRY(
+    CUCASCADE_CUDA_TRY(
       cudaMemset(const_cast<void*>(view.head()), (num_columns == 1) ? 0x42 : 0x11, bytes));
   }
   columns.push_back(std::move(col1));
@@ -176,7 +177,7 @@ inline cudf::table create_simple_cudf_table(
     if (num_rows > 0) {
       auto view  = col2->mutable_view();
       auto bytes = static_cast<size_t>(num_rows) * sizeof(int64_t);
-      RMM_CUDA_TRY(cudaMemset(const_cast<void*>(view.head()), 0x22, bytes));
+      CUCASCADE_CUDA_TRY(cudaMemset(const_cast<void*>(view.head()), 0x22, bytes));
     }
     columns.push_back(std::move(col2));
   }
