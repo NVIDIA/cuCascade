@@ -52,15 +52,11 @@ cucascade_out_of_memory::cucascade_out_of_memory(std::string_view message,
                                                  MemoryError error_kind,
                                                  std::size_t requested_bytes,
                                                  std::size_t global_usage,
-                                                 std::size_t pool_usage,
-                                                 std::size_t pool_capacity,
                                                  cudaMemPool_t pool_handle)
   : rmm::out_of_memory(message.data()),
     error_kind(error_kind),
     requested_bytes(requested_bytes),
     global_usage(global_usage),
-    pool_usage(pool_usage),
-    pool_capacity(pool_capacity),
     pool_handle(pool_handle)
 {
 }

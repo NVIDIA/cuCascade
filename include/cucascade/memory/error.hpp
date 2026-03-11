@@ -45,15 +45,11 @@ struct cucascade_out_of_memory : public rmm::out_of_memory {
                                    MemoryError error_kind,
                                    std::size_t requested_bytes,
                                    std::size_t global_usage,
-                                   std::size_t pool_usage,
-                                   std::size_t pool_capacity,
                                    cudaMemPool_t pool_handle);
 
   const MemoryError error_kind;
   const std::size_t requested_bytes;
   const std::size_t global_usage;
-  const std::size_t pool_usage;
-  const std::size_t pool_capacity;
   const cudaMemPool_t pool_handle;
 };
 
