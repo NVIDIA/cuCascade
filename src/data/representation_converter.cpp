@@ -503,23 +503,6 @@ static memory::column_metadata plan_column_copy(const cudf::column_view& col,
     meta.children.push_back(plan_column_copy(col.child(i), current_offset, stream));
   }
 
-  // STRING columns with 0 children (e.g. empty or degenerate) need a synthetic offsets child
-  // so that reconstruct_column can build a valid cudf strings column.
-  if (meta.type_id == cudf::type_id::STRING && meta.children.empty()) {
-    memory::column_metadata offsets_meta{};
-    offsets_meta.type_id       = cudf::type_id::INT32;
-    offsets_meta.num_rows      = 1;  // one offset value (0) for 0 strings
-    offsets_meta.null_count    = 0;
-    offsets_meta.has_null_mask = false;
-    offsets_meta.has_data      = true;
-    offsets_meta.data_size     = sizeof(int32_t);
-    current_offset             = align_up_fast(current_offset, 8u);
-    offsets_meta.data_offset   = current_offset;
-    current_offset += offsets_meta.data_size;
-    offsets_meta.is_synthetic_empty_offsets = true;
-    meta.children.push_back(std::move(offsets_meta));
-  }
-
   return meta;
 }
 
@@ -555,44 +538,6 @@ static void collect_d2h_ops(const void* src,
       ++block_idx;
       block_off = 0;
     }
-  }
-}
-
-/**
- * @brief Zero a region in the host allocation (used for synthetic STRING offsets with no device
- * source).
- */
-static void zero_region(memory::fixed_multiple_blocks_allocation& alloc,
-                        std::size_t alloc_offset,
-                        std::size_t size)
-{
-  if (size == 0 || !alloc || alloc->size() == 0) { return; }
-  const std::size_t block_size = alloc->block_size();
-  std::size_t block_idx        = alloc_offset / block_size;
-  std::size_t block_off        = alloc_offset % block_size;
-  std::size_t remaining        = size;
-  while (remaining > 0) {
-    std::size_t space_in_block = block_size - block_off;
-    std::size_t bytes_to_zero  = std::min(remaining, space_in_block);
-    auto block                 = alloc->at(block_idx);
-    std::memset(block.data() + block_off, 0, bytes_to_zero);
-    remaining -= bytes_to_zero;
-    ++block_idx;
-    block_off = 0;
-  }
-}
-
-/**
- * @brief Recursively zero host regions for any column_metadata with is_synthetic_empty_offsets.
- */
-static void zero_synthetic_regions(const memory::column_metadata& meta,
-                                   memory::fixed_multiple_blocks_allocation& alloc)
-{
-  for (const auto& child : meta.children) {
-    if (child.is_synthetic_empty_offsets && child.has_data && child.data_size > 0) {
-      zero_region(alloc, child.data_offset, child.data_size);
-    }
-    zero_synthetic_regions(child, alloc);
   }
 }
 
@@ -649,11 +594,6 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   }
   batch.flush(stream, cudaMemcpySrcAccessOrderStream);
   stream.synchronize();
-
-  // Zero host regions for synthetic STRING offsets (no device source was copied).
-  for (const auto& col_meta : columns) {
-    zero_synthetic_regions(col_meta, allocation);
-  }
 
   auto host_alloc = std::make_unique<memory::host_table_allocation>(
     std::move(allocation), std::move(columns), total_size);
@@ -789,7 +729,9 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
 {
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
-  if (!fast_table) { throw std::runtime_error("convert_host_fast_to_gpu: host table is null"); }
+  if (!fast_table) {
+    throw std::runtime_error("convert_host_fast_to_gpu: host table is null");
+  }
   if (!fast_table->allocation) {
     throw std::runtime_error("convert_host_fast_to_gpu: host table allocation is null");
   }
