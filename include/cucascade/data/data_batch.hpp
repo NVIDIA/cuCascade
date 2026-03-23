@@ -32,7 +32,6 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
-#include <variant>
 
 namespace cucascade {
 namespace memory {
@@ -76,11 +75,11 @@ class idata_batch_probe {
    *       this function is called in a thread-safe manner, and will block other mutating changes
    *       while this executes. Primarily intended for bookkeeping purposes.
    */
-  virtual void state_transitioned_to([[maybe_unused]] const batch_state& new_state,
-                                     [[maybe_unused]] const uint64_t& batch_id,
+  virtual void state_transitioned_to([[maybe_unused]] const batch_state new_state,
+                                     [[maybe_unused]] const uint64_t batch_id,
                                      [[maybe_unused]] const idata_representation& data,
-                                     [[maybe_unused]] const size_t& processing_count,
-                                     [[maybe_unused]] const size_t& task_created_count)
+                                     [[maybe_unused]] const size_t processing_count,
+                                     [[maybe_unused]] const size_t task_created_count)
   {
     // The default impl is no-op.
   }
@@ -508,7 +507,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @brief Handle a state transition by updating _state and invoking the probe callback.
    *
    * Must be called while the caller holds _mutex. Passes all member fields except _mutex
-   * and _state_change_cv as const references to the probe callback.
+   * and _state_change_cv in immutable forms to the probe callback.
    *
    * @param new_state The state to transition to
    * @param lock Reference to the lock proving the mutex is held
@@ -516,13 +515,13 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   void update_state_to(batch_state new_state, const std::unique_lock<std::mutex>& lock);
 
   mutable std::mutex _mutex;  ///< Mutex for thread-safe access to state and processing count
-  std::condition_variable _internal_cv;           ///< CV used by blocking wait_to_* calls
-  uint64_t _batch_id;                             ///< Unique identifier for this data batch
-  std::unique_ptr<idata_representation> _data;    ///< Pointer to the actual data representation
-  size_t _processing_count                  = 0;  ///< Count of active processing handles
-  size_t _task_created_count                = 0;  ///< Count of pending task_created requests
-  batch_state _state                        = batch_state::idle;  ///< Current state of the batch
-  std::unique_ptr<idata_batch_probe> _probe;      ///< Probe for observing state transitions
+  std::condition_variable _internal_cv;            ///< CV used by blocking wait_to_* calls
+  uint64_t _batch_id;                              ///< Unique identifier for this data batch
+  std::unique_ptr<idata_representation> _data;     ///< Pointer to the actual data representation
+  size_t _processing_count   = 0;                  ///< Count of active processing handles
+  size_t _task_created_count = 0;                  ///< Count of pending task_created requests
+  batch_state _state         = batch_state::idle;  ///< Current state of the batch
+  std::unique_ptr<idata_batch_probe> _probe;       ///< Probe for observing state transitions
   std::condition_variable* _state_change_cv = nullptr;  ///< Optional CV to notify on state change
 };
 
