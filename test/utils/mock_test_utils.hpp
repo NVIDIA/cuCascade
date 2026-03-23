@@ -114,6 +114,8 @@ class mock_data_representation : private mock_memory_space_holder, public idata_
 
   std::size_t get_size_in_bytes() const override { return _size; }
 
+  std::size_t get_logical_data_size_in_bytes() const override { return _size; }
+
   std::unique_ptr<idata_representation> clone(
     [[maybe_unused]] rmm::cuda_stream_view stream) override
   {

@@ -90,6 +90,17 @@ class idata_representation {
   virtual std::size_t get_size_in_bytes() const = 0;
 
   /**
+   * @brief Get the logical (uncompressed) data size in bytes
+   *
+   * For representations that store data in a compressed format (e.g. Parquet), this returns
+   * the uncompressed data size. For uncompressed representations, this returns the same value
+   * as get_size_in_bytes().
+   *
+   * @return std::size_t The logical data size in bytes
+   */
+  virtual std::size_t get_logical_data_size_in_bytes() const = 0;
+
+  /**
    * @brief Create a deep copy of this data representation.
    *
    * The cloned representation will have its own copy of the underlying data,
