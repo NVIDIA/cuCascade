@@ -17,7 +17,10 @@
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <cstdlib>
+#include <stdexcept>
 
 namespace cucascade {
 namespace memory {
@@ -40,8 +43,18 @@ void* small_pinned_host_memory_resource::do_allocate(std::size_t bytes,
   if (bytes == 0) { return nullptr; }
   // cuDF calls get_pinned_memory_resource() directly from some code paths (e.g. join/sort
   // staging buffers) that bypass the allocate_host_as_pinned threshold check.  Serve those
-  // with pageable memory via std::malloc.
-  if (bytes > MAX_SLAB_SIZE) { return std::malloc(bytes); }
+  // with cudaMallocHost so the
+  // memory remains pinned and device-accessible.  cuDF 26.04+ may access
+  // hostdevice_vector memory directly from GPU kernels (e.g. detect_malformed_pages),
+  // so returning pageable memory here would cause cudaErrorIllegalAddress.
+  if (bytes > MAX_SLAB_SIZE) {
+    void* ptr = nullptr;
+    auto err  = ::cudaMallocHost(&ptr, bytes);
+    if (err != cudaSuccess) {
+      throw std::bad_alloc{};
+    }
+    return ptr;
+  }
 
   std::size_t idx = slab_index_for(bytes);
   std::lock_guard<std::mutex> lock(mutex_);
@@ -56,7 +69,7 @@ void small_pinned_host_memory_resource::do_deallocate(
 {
   if (ptr == nullptr || bytes == 0) { return; }
   if (bytes > MAX_SLAB_SIZE) {
-    std::free(ptr);
+    ::cudaFreeHost(ptr);
     return;
   }
 

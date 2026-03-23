@@ -35,9 +35,10 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <cucascade/cuda_utils.hpp>
+
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime_api.h>
@@ -118,7 +119,7 @@ TEST_CASE("host_data_packed_representation converts to GPU and preserves content
     size_t remain = packed.gpu_data->size() - copied;
     size_t bytes  = std::min(remain, block_size - block_off);
     void* dst_ptr = reinterpret_cast<uint8_t*>((*allocation)[block_idx].data()) + block_off;
-    RMM_CUDA_TRY(cudaMemcpy(dst_ptr,
+    CUCASCADE_CUDA_TRY(cudaMemcpy(dst_ptr,
                             static_cast<const uint8_t*>(packed.gpu_data->data()) + copied,
                             bytes,
                             cudaMemcpyDeviceToHost));
@@ -605,7 +606,7 @@ static std::vector<uint8_t> gpu_bytes(const void* ptr, std::size_t size)
 {
   std::vector<uint8_t> result(size);
   if (size > 0 && ptr != nullptr) {
-    RMM_CUDA_TRY(cudaMemcpy(result.data(), ptr, size, cudaMemcpyDeviceToHost));
+    CUCASCADE_CUDA_TRY(cudaMemcpy(result.data(), ptr, size, cudaMemcpyDeviceToHost));
   }
   return result;
 }
@@ -720,7 +721,7 @@ TEST_CASE("Fast converter copies INT32 data bytes correctly", "[fast][data_integ
                                        cudf::mask_state::UNALLOCATED,
                                        stream.view(),
                                        gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(
+  CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream.value()));
   const void* gpu_ptr = col->view().data<int32_t>();
 
@@ -751,7 +752,7 @@ TEST_CASE("Fast converter copies FLOAT64 data bytes correctly", "[fast][data_int
                                        cudf::mask_state::UNALLOCATED,
                                        stream.view(),
                                        gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(
+  CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(col->mutable_view().head(), 0xCD, N * sizeof(double), stream.value()));
   const void* gpu_ptr = col->view().data<double>();
 
@@ -819,7 +820,7 @@ TEST_CASE("Fast converter: nullable INT64 — both null mask and data bytes are 
                                        cudf::mask_state::ALL_VALID,
                                        stream.view(),
                                        gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(
+  CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(col->mutable_view().head(), 0x77, N * sizeof(int64_t), stream.value()));
   const void* data_ptr = col->view().data<int64_t>();
   const void* mask_ptr = col->view().null_mask();
@@ -1677,7 +1678,7 @@ TEST_CASE("host_data_representation clone: same bytes, independent allocation", 
                                        cudf::mask_state::UNALLOCATED,
                                        stream.view(),
                                        gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(
+  CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(col->mutable_view().head(), 0x55, N * sizeof(int32_t), stream.value()));
 
   auto repr = wrap_column(std::move(col), *const_cast<memory::memory_space*>(gpu_space));
@@ -1783,7 +1784,7 @@ TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
                                        cudf::mask_state::UNALLOCATED,
                                        stream.view(),
                                        gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(
+  CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream.view()));
 
   auto orig_repr = wrap_column(std::move(col), *const_cast<memory::memory_space*>(gpu_space));
@@ -1819,7 +1820,7 @@ TEST_CASE("Round-trip fast: nullable INT64 null mask preserved", "[fast][roundtr
                                        cudf::mask_state::ALL_VALID,
                                        stream.view(),
                                        gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(
+  CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(col->mutable_view().head(), 0x77, N * sizeof(int64_t), stream.view()));
   stream.synchronize();
 
@@ -1855,7 +1856,7 @@ TEST_CASE("Round-trip fast: FLOAT64 byte integrity", "[fast][roundtrip]")
                                        cudf::mask_state::UNALLOCATED,
                                        stream.view(),
                                        gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(
+  CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(col->mutable_view().head(), 0xCD, N * sizeof(double), stream.view()));
 
   auto orig_repr = wrap_column(std::move(col), *const_cast<memory::memory_space*>(gpu_space));
@@ -1952,7 +1953,7 @@ TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]
                                               cudf::mask_state::UNALLOCATED,
                                               stream.view(),
                                               gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(cudaMemsetAsync(
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(
     values_col->mutable_view().head(), 0x33, num_values * sizeof(int32_t), stream.view()));
   stream.synchronize();
 
@@ -1997,9 +1998,9 @@ TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][rou
                                       cudf::mask_state::UNALLOCATED,
                                       stream.view(),
                                       gpu_space->get_default_allocator());
-  RMM_CUDA_TRY(
+  CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(f0->mutable_view().head(), 0x11, N * sizeof(int32_t), stream.view()));
-  RMM_CUDA_TRY(cudaMemsetAsync(f1->mutable_view().head(), 0x22, N * sizeof(double), stream.view()));
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(f1->mutable_view().head(), 0x22, N * sizeof(double), stream.view()));
   stream.synchronize();
 
   std::vector<std::unique_ptr<cudf::column>> fields;

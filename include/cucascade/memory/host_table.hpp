@@ -50,10 +50,6 @@ struct column_metadata {
   std::size_t data_size;    ///< Size of the data buffer in bytes
 
   std::vector<column_metadata> children;  ///< Metadata for child columns (nested types)
-
-  /// True if this child was synthesized for STRING columns with 0 children (empty offsets).
-  /// The host region must be zeroed after D2H copy since no device data was copied.
-  bool is_synthetic_empty_offsets = false;
 };
 
 /**

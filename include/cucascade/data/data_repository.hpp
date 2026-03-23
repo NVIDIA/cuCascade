@@ -149,6 +149,7 @@ class idata_repository {
 
         if (can_transition) {
           auto batch = std::move(*it);
+          batch->set_state_change_cv(nullptr);  // No longer in this repo; avoid use-after-free
           _data_batches[partition_idx].erase(it);
           return batch;
         }
@@ -206,6 +207,7 @@ class idata_repository {
            ++it) {
         if (it->get()->get_batch_id() == batch_id) {
           auto batch = std::move(*it);
+          batch->set_state_change_cv(nullptr);
           _data_batches[partition_idx].erase(it);
           return batch;
         }
@@ -227,6 +229,7 @@ class idata_repository {
 
           if (can_transition) {
             auto batch = std::move(*it);
+            batch->set_state_change_cv(nullptr);
             _data_batches[partition_idx].erase(it);
             return batch;
           }

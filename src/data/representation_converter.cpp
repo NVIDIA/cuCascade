@@ -32,7 +32,8 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <rmm/detail/error.hpp>
+#include <cucascade/cuda_utils.hpp>
+
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
@@ -147,14 +148,14 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   // Acquire a stream that belongs to the target GPU device
   auto target_stream = target_memory_space->acquire_stream();
 
-  RMM_CUDA_TRY(cudaSetDevice(target_device_id));
+  CUCASCADE_CUDA_TRY(cudaSetDevice(target_device_id));
   rmm::device_uvector<uint8_t> dst_uvector(bytes_to_copy, target_stream, mr);
   target_stream.synchronize();
   // Restore previous device before peer copy
-  RMM_CUDA_TRY(cudaSetDevice(source_device_id));
+  CUCASCADE_CUDA_TRY(cudaSetDevice(source_device_id));
 
   // Asynchronously copy device->device across GPUs
-  RMM_CUDA_TRY(cudaMemcpyPeerAsync(dst_uvector.data(),
+  CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(dst_uvector.data(),
                                    target_device_id,
                                    static_cast<const uint8_t*>(packed_data.gpu_data->data()),
                                    source_device_id,
@@ -162,7 +163,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
                                    stream.value()));
   stream.synchronize();
   // Unpack on target device to build a cudf::table that lives on the target GPU
-  RMM_CUDA_TRY(cudaSetDevice(target_device_id));
+  CUCASCADE_CUDA_TRY(cudaSetDevice(target_device_id));
   rmm::device_buffer dst_buffer = std::move(dst_uvector).release();
   // Unpack using pointer-based API and construct an owning cudf::table
   auto new_metadata = std::move(packed_data.metadata);
@@ -172,7 +173,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto new_table = std::make_unique<cudf::table>(new_table_view, target_stream, mr);
   // Restore previous device
   target_stream.synchronize();
-  RMM_CUDA_TRY(cudaSetDevice(source_device_id));
+  CUCASCADE_CUDA_TRY(cudaSetDevice(source_device_id));
 
   return std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
@@ -204,7 +205,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
     size_t remaining_bytes         = packed_data.gpu_data->size() - source_offset;
     size_t bytes_to_copy           = std::min(remaining_bytes, block_size - block_offset);
     std::span<std::byte> block_ptr = allocation->at(block_index);
-    RMM_CUDA_TRY(
+    CUCASCADE_CUDA_TRY(
       cudaMemcpyAsync(block_ptr.data() + block_offset,
                       static_cast<const uint8_t*>(packed_data.gpu_data->data()) + source_offset,
                       bytes_to_copy,
@@ -239,8 +240,8 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
 
   auto mr             = target_memory_space->get_default_allocator();
   int previous_device = -1;
-  RMM_CUDA_TRY(cudaGetDevice(&previous_device));
-  RMM_CUDA_TRY(cudaSetDevice(target_memory_space->get_device_id()));
+  CUCASCADE_CUDA_TRY(cudaGetDevice(&previous_device));
+  CUCASCADE_CUDA_TRY(cudaSetDevice(target_memory_space->get_device_id()));
 
   rmm::device_buffer dst_buffer(data_size, stream, mr);
   size_t src_block_index      = 0;
@@ -252,7 +253,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
     size_t bytes_available_in_src_block = src_block_size - src_block_offset;
     size_t bytes_to_copy                = std::min(remaining_bytes, bytes_available_in_src_block);
     auto src_block                      = host_table->allocation->at(src_block_index);
-    RMM_CUDA_TRY(cudaMemcpyAsync(static_cast<uint8_t*>(dst_buffer.data()) + dst_offset,
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(static_cast<uint8_t*>(dst_buffer.data()) + dst_offset,
                                  src_block.data() + src_block_offset,
                                  bytes_to_copy,
                                  cudaMemcpyHostToDevice,
@@ -273,7 +274,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
   auto new_table = std::make_unique<cudf::table>(new_table_view, stream, mr);
   stream.synchronize();
 
-  RMM_CUDA_TRY(cudaSetDevice(previous_device));
+  CUCASCADE_CUDA_TRY(cudaSetDevice(previous_device));
   return std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
 }
@@ -406,17 +407,17 @@ struct BatchCopyAccumulator {
     // NOTE: cudaMemcpyBatchAsync requires a real (non-default) CUDA stream.
     // CUDA 12.x has a failIdx parameter that was removed in CUDA 13.
 #if CUDART_VERSION < 13000
-    RMM_CUDA_TRY(cudaMemcpyBatchAsync(
+    CUCASCADE_CUDA_TRY(cudaMemcpyBatchAsync(
       dsts.data(), srcs.data(), sizes.data(), count(), attr, nullptr, stream.value()));
 #else
-    RMM_CUDA_TRY(
+    CUCASCADE_CUDA_TRY(
       cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), count(), attr, stream.value()));
 #endif
 #else
     // cudaMemcpyBatchAsync requires CUDA 12.8+; fall back to individual copies.
     (void)src_order;
     for (std::size_t i = 0; i < count(); ++i) {
-      RMM_CUDA_TRY(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.value()));
+      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.value()));
     }
 #endif
   }
@@ -502,23 +503,6 @@ static memory::column_metadata plan_column_copy(const cudf::column_view& col,
     meta.children.push_back(plan_column_copy(col.child(i), current_offset, stream));
   }
 
-  // STRING columns with 0 children (e.g. empty or degenerate) need a synthetic offsets child
-  // so that reconstruct_column can build a valid cudf strings column.
-  if (meta.type_id == cudf::type_id::STRING && meta.children.empty()) {
-    memory::column_metadata offsets_meta{};
-    offsets_meta.type_id       = cudf::type_id::INT32;
-    offsets_meta.num_rows      = 1;  // one offset value (0) for 0 strings
-    offsets_meta.null_count    = 0;
-    offsets_meta.has_null_mask = false;
-    offsets_meta.has_data      = true;
-    offsets_meta.data_size     = sizeof(int32_t);
-    current_offset             = align_up_fast(current_offset, 8u);
-    offsets_meta.data_offset   = current_offset;
-    current_offset += offsets_meta.data_size;
-    offsets_meta.is_synthetic_empty_offsets = true;
-    meta.children.push_back(std::move(offsets_meta));
-  }
-
   return meta;
 }
 
@@ -554,44 +538,6 @@ static void collect_d2h_ops(const void* src,
       ++block_idx;
       block_off = 0;
     }
-  }
-}
-
-/**
- * @brief Zero a region in the host allocation (used for synthetic STRING offsets with no device
- * source).
- */
-static void zero_region(memory::fixed_multiple_blocks_allocation& alloc,
-                        std::size_t alloc_offset,
-                        std::size_t size)
-{
-  if (size == 0 || !alloc || alloc->size() == 0) { return; }
-  const std::size_t block_size = alloc->block_size();
-  std::size_t block_idx        = alloc_offset / block_size;
-  std::size_t block_off        = alloc_offset % block_size;
-  std::size_t remaining        = size;
-  while (remaining > 0) {
-    std::size_t space_in_block = block_size - block_off;
-    std::size_t bytes_to_zero  = std::min(remaining, space_in_block);
-    auto block                 = alloc->at(block_idx);
-    std::memset(block.data() + block_off, 0, bytes_to_zero);
-    remaining -= bytes_to_zero;
-    ++block_idx;
-    block_off = 0;
-  }
-}
-
-/**
- * @brief Recursively zero host regions for any column_metadata with is_synthetic_empty_offsets.
- */
-static void zero_synthetic_regions(const memory::column_metadata& meta,
-                                   memory::fixed_multiple_blocks_allocation& alloc)
-{
-  for (const auto& child : meta.children) {
-    if (child.is_synthetic_empty_offsets && child.has_data && child.data_size > 0) {
-      zero_region(alloc, child.data_offset, child.data_size);
-    }
-    zero_synthetic_regions(child, alloc);
   }
 }
 
@@ -648,11 +594,6 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   }
   batch.flush(stream, cudaMemcpySrcAccessOrderStream);
   stream.synchronize();
-
-  // Zero host regions for synthetic STRING offsets (no device source was copied).
-  for (const auto& col_meta : columns) {
-    zero_synthetic_regions(col_meta, allocation);
-  }
 
   auto host_alloc = std::make_unique<memory::host_table_allocation>(
     std::move(allocation), std::move(columns), total_size);
@@ -788,14 +729,16 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
 {
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
-  if (!fast_table) { throw std::runtime_error("convert_host_fast_to_gpu: host table is null"); }
+  if (!fast_table) {
+    throw std::runtime_error("convert_host_fast_to_gpu: host table is null");
+  }
   if (!fast_table->allocation) {
     throw std::runtime_error("convert_host_fast_to_gpu: host table allocation is null");
   }
 
   int previous_device = -1;
-  RMM_CUDA_TRY(cudaGetDevice(&previous_device));
-  RMM_CUDA_TRY(cudaSetDevice(target_memory_space->get_device_id()));
+  CUCASCADE_CUDA_TRY(cudaGetDevice(&previous_device));
+  CUCASCADE_CUDA_TRY(cudaSetDevice(target_memory_space->get_device_id()));
 
   auto mr = target_memory_space->get_default_allocator();
 
@@ -812,7 +755,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   stream.synchronize();
 
-  RMM_CUDA_TRY(cudaSetDevice(previous_device));
+  CUCASCADE_CUDA_TRY(cudaSetDevice(previous_device));
   return std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
 }
