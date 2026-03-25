@@ -115,6 +115,9 @@ class memory_space {
     return get_memory_resource_as<typename tier_memory_resource_trait<TIER>::type>();
   }
 
+  /** @brief Get the mount path for a DISK tier memory space. Throws if not DISK tier. */
+  [[nodiscard]] std::string_view get_disk_mount_path() const;
+
   // Utility methods
   std::string to_string() const;
 

@@ -269,6 +269,15 @@ rmm::mr::device_memory_resource* memory_space::get_default_allocator() const noe
     _reservation_allocator);
 }
 
+std::string_view memory_space::get_disk_mount_path() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("get_disk_mount_path called on non-DISK memory space");
+  }
+  auto& limiter = std::get<std::unique_ptr<disk_access_limiter>>(_reservation_allocator);
+  return limiter->get_mount_path();
+}
+
 std::string memory_space::to_string() const
 {
   std::ostringstream oss;

@@ -18,8 +18,13 @@
 #include "cudf/contiguous_split.hpp"
 
 #include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/data/disk_file_format.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/disk_access_limiter.hpp>
+#include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/host_table.hpp>
 #include <cucascade/memory/host_table_packed.hpp>
 
@@ -42,6 +47,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
 
@@ -813,9 +819,348 @@ std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
     std::move(new_host_table), const_cast<memory::memory_space*>(target_memory_space));
 }
 
+// =============================================================================
+// Disk <-> Host converters
+// =============================================================================
+
+/**
+ * @brief RAII guard that deletes a file on destruction unless released.
+ *
+ * Ensures partial files are cleaned up if an exception occurs during writing.
+ */
+struct disk_file_guard {
+  std::string path;
+  bool released{false};
+  ~disk_file_guard()
+  {
+    if (!released && !path.empty()) {
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    }
+  }
+  void release() { released = true; }
+};
+
+/**
+ * @brief Write data from a host block allocation to a disk file, handling block-boundary spanning.
+ */
+static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_allocation& alloc,
+                                      std::size_t alloc_offset,
+                                      std::size_t size,
+                                      const std::string& file_path,
+                                      std::size_t file_offset,
+                                      idisk_io_backend& backend)
+{
+  const std::size_t block_size = alloc->block_size();
+  std::size_t block_idx        = alloc_offset / block_size;
+  std::size_t block_off        = alloc_offset % block_size;
+  std::size_t written          = 0;
+  while (written < size) {
+    std::size_t remaining = size - written;
+    std::size_t avail     = block_size - block_off;
+    std::size_t chunk     = std::min(remaining, avail);
+    auto block            = alloc->at(block_idx);
+    backend.write_host(file_path, block.data() + block_off, chunk, file_offset + written);
+    written += chunk;
+    block_off += chunk;
+    if (block_off == block_size) {
+      ++block_idx;
+      block_off = 0;
+    }
+  }
+}
+
+/**
+ * @brief Read data from a disk file into a host block allocation, handling block-boundary spanning.
+ */
+static void read_disk_buffer_to_host(const std::string& file_path,
+                                     std::size_t file_offset,
+                                     std::size_t size,
+                                     memory::fixed_multiple_blocks_allocation& alloc,
+                                     std::size_t alloc_offset,
+                                     idisk_io_backend& backend)
+{
+  const std::size_t block_size = alloc->block_size();
+  std::size_t block_idx        = alloc_offset / block_size;
+  std::size_t block_off        = alloc_offset % block_size;
+  std::size_t read_total       = 0;
+  while (read_total < size) {
+    std::size_t remaining = size - read_total;
+    std::size_t avail     = block_size - block_off;
+    std::size_t chunk     = std::min(remaining, avail);
+    auto block            = alloc->at(block_idx);
+    backend.read_host(file_path, block.data() + block_off, chunk, file_offset + read_total);
+    read_total += chunk;
+    block_off += chunk;
+    if (block_off == block_size) {
+      ++block_idx;
+      block_off = 0;
+    }
+  }
+}
+
+/**
+ * @brief Recompute column_metadata offsets for 4KB-aligned disk file layout.
+ *
+ * Copies all non-offset fields from src, then assigns null_mask_offset and data_offset
+ * to 4KB-aligned positions within the file. The cursor is advanced past each buffer.
+ */
+static memory::column_metadata recompute_file_offsets(const memory::column_metadata& src,
+                                                      std::size_t& cursor)
+{
+  memory::column_metadata dst{};
+  dst.type_id    = src.type_id;
+  dst.num_rows   = src.num_rows;
+  dst.null_count = src.null_count;
+  dst.scale      = src.scale;
+
+  dst.has_null_mask  = src.has_null_mask;
+  dst.null_mask_size = src.null_mask_size;
+  if (src.has_null_mask && src.null_mask_size > 0) {
+    cursor             = align_up(cursor, DISK_FILE_ALIGNMENT);
+    dst.null_mask_offset = cursor;
+    cursor += src.null_mask_size;
+  } else {
+    dst.null_mask_offset = 0;
+  }
+
+  dst.has_data  = src.has_data;
+  dst.data_size = src.data_size;
+  if (src.has_data && src.data_size > 0) {
+    cursor          = align_up(cursor, DISK_FILE_ALIGNMENT);
+    dst.data_offset = cursor;
+    cursor += src.data_size;
+  } else {
+    dst.data_offset = 0;
+  }
+
+  dst.children.reserve(src.children.size());
+  for (const auto& child : src.children) {
+    dst.children.push_back(recompute_file_offsets(child, cursor));
+  }
+  return dst;
+}
+
+/**
+ * @brief Recursively write column buffers from host blocks to disk at computed file offsets.
+ */
+static void write_column_buffers(const memory::column_metadata& src_meta,
+                                 const memory::column_metadata& disk_meta,
+                                 const memory::fixed_multiple_blocks_allocation& alloc,
+                                 const std::string& file_path,
+                                 idisk_io_backend& backend)
+{
+  if (src_meta.has_null_mask && src_meta.null_mask_size > 0) {
+    write_host_buffer_to_disk(
+      alloc, src_meta.null_mask_offset, src_meta.null_mask_size, file_path, disk_meta.null_mask_offset, backend);
+  }
+  if (src_meta.has_data && src_meta.data_size > 0) {
+    write_host_buffer_to_disk(
+      alloc, src_meta.data_offset, src_meta.data_size, file_path, disk_meta.data_offset, backend);
+  }
+  for (std::size_t i = 0; i < src_meta.children.size(); ++i) {
+    write_column_buffers(src_meta.children[i], disk_meta.children[i], alloc, file_path, backend);
+  }
+}
+
+/**
+ * @brief Recompute column_metadata offsets for 8-byte-aligned host block layout.
+ *
+ * Used when reconstructing host_table_allocation from disk data.
+ */
+static memory::column_metadata recompute_host_offsets(const memory::column_metadata& src,
+                                                      std::size_t& cursor)
+{
+  memory::column_metadata dst{};
+  dst.type_id    = src.type_id;
+  dst.num_rows   = src.num_rows;
+  dst.null_count = src.null_count;
+  dst.scale      = src.scale;
+
+  dst.has_null_mask  = src.has_null_mask;
+  dst.null_mask_size = src.null_mask_size;
+  if (src.has_null_mask && src.null_mask_size > 0) {
+    cursor               = align_up_fast(cursor, 8u);
+    dst.null_mask_offset = cursor;
+    cursor += src.null_mask_size;
+  } else {
+    dst.null_mask_offset = 0;
+  }
+
+  dst.has_data  = src.has_data;
+  dst.data_size = src.data_size;
+  if (src.has_data && src.data_size > 0) {
+    cursor          = align_up_fast(cursor, 8u);
+    dst.data_offset = cursor;
+    cursor += src.data_size;
+  } else {
+    dst.data_offset = 0;
+  }
+
+  dst.children.reserve(src.children.size());
+  for (const auto& child : src.children) {
+    dst.children.push_back(recompute_host_offsets(child, cursor));
+  }
+  return dst;
+}
+
+/**
+ * @brief Recursively read column buffers from disk into host blocks.
+ */
+static void read_column_buffers(const memory::column_metadata& disk_meta,
+                                const memory::column_metadata& host_meta,
+                                const std::string& file_path,
+                                memory::fixed_multiple_blocks_allocation& alloc,
+                                idisk_io_backend& backend)
+{
+  if (disk_meta.has_null_mask && disk_meta.null_mask_size > 0) {
+    read_disk_buffer_to_host(
+      file_path, disk_meta.null_mask_offset, disk_meta.null_mask_size, alloc, host_meta.null_mask_offset, backend);
+  }
+  if (disk_meta.has_data && disk_meta.data_size > 0) {
+    read_disk_buffer_to_host(
+      file_path, disk_meta.data_offset, disk_meta.data_size, alloc, host_meta.data_offset, backend);
+  }
+  for (std::size_t i = 0; i < disk_meta.children.size(); ++i) {
+    read_column_buffers(disk_meta.children[i], host_meta.children[i], file_path, alloc, backend);
+  }
+}
+
+/**
+ * @brief Convert host_data_representation to disk_data_representation.
+ *
+ * Writes a complete disk file: header + serialized column_metadata + 4KB-aligned column data.
+ * An RAII file guard ensures partial files are cleaned up on exception.
+ */
+static std::unique_ptr<idata_representation> convert_host_data_to_disk(
+  idata_representation& source,
+  const memory::memory_space* target_memory_space,
+  [[maybe_unused]] rmm::cuda_stream_view stream,
+  idisk_io_backend& backend)
+{
+  auto& host_source      = source.cast<host_data_representation>();
+  const auto& host_table = host_source.get_host_table();
+
+  // Generate unique file path under the disk memory space's mount directory
+  auto mount_path = target_memory_space->get_disk_mount_path();
+  auto file_path  = memory::generate_disk_file_path(mount_path);
+
+  disk_file_guard guard{file_path};
+
+  // Recompute column metadata with 4KB-aligned file offsets
+  // Cursor starts at data_offset which we compute after header + metadata
+  auto metadata_bytes_for_sizing = serialize_column_metadata(host_table->columns);
+  std::size_t data_offset_in_file =
+    align_up(sizeof(disk_file_header) + metadata_bytes_for_sizing.size(), DISK_FILE_ALIGNMENT);
+
+  std::size_t cursor = data_offset_in_file;
+  std::vector<memory::column_metadata> disk_columns;
+  disk_columns.reserve(host_table->columns.size());
+  for (const auto& col : host_table->columns) {
+    disk_columns.push_back(recompute_file_offsets(col, cursor));
+  }
+  std::size_t total_file_data_size = cursor - data_offset_in_file;
+
+  // Build header
+  disk_file_header header{};
+  header.num_columns = static_cast<uint32_t>(disk_columns.size());
+  auto metadata_bytes = serialize_column_metadata(disk_columns);
+  header.metadata_size = metadata_bytes.size();
+  header.data_offset   = data_offset_in_file;
+
+  // Write header
+  backend.write_host(file_path, &header, sizeof(header), 0);
+
+  // Write serialized metadata
+  if (!metadata_bytes.empty()) {
+    backend.write_host(file_path, metadata_bytes.data(), metadata_bytes.size(), sizeof(disk_file_header));
+  }
+
+  // Write column data buffers
+  for (std::size_t i = 0; i < host_table->columns.size(); ++i) {
+    write_column_buffers(host_table->columns[i], disk_columns[i], host_table->allocation, file_path, backend);
+  }
+
+  guard.release();
+
+  auto disk_table = std::make_unique<memory::disk_table_allocation>(
+    std::move(file_path), std::move(disk_columns), total_file_data_size);
+  return std::make_unique<disk_data_representation>(
+    std::move(disk_table), const_cast<memory::memory_space&>(*target_memory_space));
+}
+
+/**
+ * @brief Convert disk_data_representation to host_data_representation.
+ *
+ * Reads a disk file, validates the header, deserializes column metadata,
+ * allocates host blocks, and reads data buffers into them.
+ */
+static std::unique_ptr<idata_representation> convert_disk_to_host_data(
+  idata_representation& source,
+  const memory::memory_space* target_memory_space,
+  [[maybe_unused]] rmm::cuda_stream_view stream,
+  idisk_io_backend& backend)
+{
+  auto& disk_source      = source.cast<disk_data_representation>();
+  const auto& disk_table = disk_source.get_disk_table();
+  const auto& file_path  = disk_table.file_path;
+
+  // Read and validate header
+  disk_file_header header{};
+  backend.read_host(file_path, &header, sizeof(header), 0);
+
+  if (header.magic != DISK_FILE_MAGIC) {
+    throw std::runtime_error("Invalid disk file magic number");
+  }
+  if (header.version != DISK_FILE_FORMAT_VERSION) {
+    throw std::runtime_error("Unsupported disk file format version");
+  }
+
+  // Read serialized metadata
+  std::vector<uint8_t> metadata_bytes(header.metadata_size);
+  if (header.metadata_size > 0) {
+    backend.read_host(file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
+  }
+
+  auto disk_columns = deserialize_column_metadata(metadata_bytes.data(), metadata_bytes.size());
+
+  // Compute host allocation size with 8-byte alignment
+  std::size_t host_cursor = 0;
+  std::vector<memory::column_metadata> host_columns;
+  host_columns.reserve(disk_columns.size());
+  for (const auto& col : disk_columns) {
+    host_columns.push_back(recompute_host_offsets(col, host_cursor));
+  }
+  std::size_t total_host_size = host_cursor;
+
+  // Allocate host blocks
+  auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
+  if (mr == nullptr) {
+    throw std::runtime_error(
+      "Target HOST memory_space does not have a fixed_size_host_memory_resource");
+  }
+  auto allocation = mr->allocate_multiple_blocks(total_host_size);
+
+  // Read column data from file into host blocks
+  for (std::size_t i = 0; i < disk_columns.size(); ++i) {
+    read_column_buffers(disk_columns[i], host_columns[i], file_path, allocation, backend);
+  }
+
+  auto host_alloc = std::make_unique<memory::host_table_allocation>(
+    std::move(allocation), std::move(host_columns), total_host_size);
+  return std::make_unique<host_data_representation>(
+    std::move(host_alloc), const_cast<memory::memory_space*>(target_memory_space));
+}
+
 }  // namespace
 
 void register_builtin_converters(representation_converter_registry& registry)
+{
+  register_builtin_converters(registry, make_io_backend(io_backend_type::KVIKIO));
+}
+
+void register_builtin_converters(representation_converter_registry& registry,
+                                 std::shared_ptr<idisk_io_backend> backend)
 {
   // GPU -> GPU (cross-device copy)
   registry.register_converter<gpu_table_representation, gpu_table_representation>(
@@ -844,6 +1189,22 @@ void register_builtin_converters(representation_converter_registry& registry)
   // HOST FAST -> HOST FAST (cross-device copy)
   registry.register_converter<host_data_representation, host_data_representation>(
     convert_host_fast_to_host_fast);
+
+  // HOST DATA -> DISK
+  registry.register_converter<host_data_representation, disk_data_representation>(
+    [backend](idata_representation& source,
+              const memory::memory_space* target_memory_space,
+              rmm::cuda_stream_view stream) {
+      return convert_host_data_to_disk(source, target_memory_space, stream, *backend);
+    });
+
+  // DISK -> HOST DATA
+  registry.register_converter<disk_data_representation, host_data_representation>(
+    [backend](idata_representation& source,
+              const memory::memory_space* target_memory_space,
+              rmm::cuda_stream_view stream) {
+      return convert_disk_to_host_data(source, target_memory_space, stream, *backend);
+    });
 }
 
 }  // namespace cucascade
