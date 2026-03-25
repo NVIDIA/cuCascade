@@ -603,3 +603,48 @@ TEST_CASE("gpu disk round-trip sliced column with nulls", "[disk][gpu-converter]
 
   gpu_disk_round_trip_test(std::move(compacted));
 }
+
+// =============================================================================
+// I/O backend selection tests (TEST-10)
+// =============================================================================
+
+TEST_CASE("gpu disk round-trip with explicit kvikio backend", "[disk][gpu-converter][backend][kvikio]")
+{
+  rmm::cuda_stream stream;
+  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+
+  auto backend = make_io_backend(io_backend_type::KVIKIO);
+  representation_converter_registry registry;
+  register_builtin_converters(registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  // Simple INT32 column, 100 rows
+  auto table = make_typed_table(cudf::type_id::INT32, 100);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+
+  auto disk_rep =
+    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), stream.view());
+  auto gpu_rep2 =
+    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), stream.view());
+
+  test::expect_cudf_tables_equal_on_stream(
+    gpu_rep->get_table(), gpu_rep2->get_table(), stream.view());
+}
+
+TEST_CASE("gpu disk round-trip with gds backend throws", "[disk][gpu-converter][backend][gds]")
+{
+  rmm::cuda_stream stream;
+  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+
+  auto backend = make_io_backend(io_backend_type::GDS);
+  representation_converter_registry registry;
+  register_builtin_converters(registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  auto table = make_typed_table(cudf::type_id::INT32, 100);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+
+  // GDS backend is a stub that throws on all I/O methods
+  REQUIRE_THROWS(
+    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), stream.view()));
+}
