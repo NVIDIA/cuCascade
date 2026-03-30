@@ -137,6 +137,12 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   stream.synchronize();
 
   auto& gpu_source = source.cast<gpu_table_representation>();
+
+  // Same-device case: clone via source's own clone() method.
+  if (source.get_device_id() == target_memory_space->get_device_id()) {
+    return source.clone(stream);
+  }
+
   auto packed_data = cudf::pack(gpu_source.get_table(), stream);
 
   assert(source.get_device_id() != target_memory_space->get_device_id());
