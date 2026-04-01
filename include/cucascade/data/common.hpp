@@ -98,7 +98,7 @@ class idata_representation {
    *
    * @return std::size_t The logical data size in bytes
    */
-  virtual std::size_t get_logical_data_size_in_bytes() const = 0;
+  virtual std::size_t get_uncompressed_data_size_in_bytes() const = 0;
 
   /**
    * @brief Create a deep copy of this data representation.

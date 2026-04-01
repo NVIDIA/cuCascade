@@ -59,7 +59,7 @@ class host_data_representation : public idata_representation {
   /**
    * @copydoc idata_representation::get_logical_data_size_in_bytes
    */
-  std::size_t get_logical_data_size_in_bytes() const override;
+  std::size_t get_uncompressed_data_size_in_bytes() const override;
 
   /**
    * @brief Create a deep copy of this representation in the same memory space.
@@ -109,7 +109,7 @@ class host_data_packed_representation : public idata_representation {
   /**
    * @copydoc idata_representation::get_logical_data_size_in_bytes
    */
-  std::size_t get_logical_data_size_in_bytes() const override;
+  std::size_t get_uncompressed_data_size_in_bytes() const override;
 
   /**
    * @brief Create a deep copy of this host table representation.

@@ -34,7 +34,7 @@ host_data_representation::host_data_representation(
 
 std::size_t host_data_representation::get_size_in_bytes() const { return _host_table->data_size; }
 
-std::size_t host_data_representation::get_logical_data_size_in_bytes() const
+std::size_t host_data_representation::get_uncompressed_data_size_in_bytes() const
 {
   return get_size_in_bytes();
 }
@@ -92,7 +92,7 @@ std::size_t host_data_packed_representation::get_size_in_bytes() const
   return _host_table->data_size;
 }
 
-std::size_t host_data_packed_representation::get_logical_data_size_in_bytes() const
+std::size_t host_data_packed_representation::get_uncompressed_data_size_in_bytes() const
 {
   return get_size_in_bytes();
 }
