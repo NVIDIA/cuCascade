@@ -36,7 +36,6 @@
 #include <benchmark/benchmark.h>
 #include <unistd.h>
 
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -60,19 +59,16 @@ constexpr double GDSIO_READ_GIBS  = 13.35;
 constexpr double GIBS_TO_BYTES    = 1024.0 * 1024.0 * 1024.0;
 
 /**
- * @brief Ensure kvikIO uses O_DIRECT (no page cache) for fair comparison with GDS.
+ * @brief Create a converter registry with the default (Pipeline) backend using O_DIRECT.
  *
- * Sets KVIKIO_COMPAT_MODE=OFF which forces kvikIO to open files with O_DIRECT,
- * bypassing the OS page cache. This makes kvikIO and GDS benchmarks comparable
- * since both hit disk directly.
+ * All benchmarks must bypass the OS page cache to measure real disk throughput.
  */
-void ensure_kvikio_direct_io()
+std::unique_ptr<representation_converter_registry> make_benchmark_registry()
 {
-  static bool set = false;
-  if (!set) {
-    ::setenv("KVIKIO_COMPAT_MODE", "OFF", 1);
-    set = true;
-  }
+  auto backend  = make_io_backend(io_backend_type::PIPELINE, /*direct_io=*/true);
+  auto registry = std::make_unique<representation_converter_registry>();
+  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+  return registry;
 }
 
 // For non-NUMA systems, this should be -1, causing the allocator to use cudaHostAlloc instead of
@@ -124,7 +120,6 @@ std::shared_ptr<memory_reservation_manager> get_shared_memory_manager()
  */
 void DoSetup([[maybe_unused]] const benchmark::State& state)
 {
-  ensure_kvikio_direct_io();
   if (!g_shared_memory_manager) {
     g_shared_memory_manager =
       std::make_shared<memory_reservation_manager>(create_benchmark_configs());
@@ -369,8 +364,7 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
+  auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -419,8 +413,7 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
+  auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -563,8 +556,7 @@ void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
+  auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -604,8 +596,7 @@ void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
+  auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -645,8 +636,7 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
+  auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);

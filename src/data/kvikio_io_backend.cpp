@@ -51,7 +51,9 @@ class kvikio_io_backend : public idisk_io_backend {
   {
     kvikio::defaults::set_thread_pool_nthreads(KVIKIO_NUM_THREADS);
     kvikio::defaults::set_task_size(KVIKIO_TASK_SIZE);
-    if (!direct_io) { kvikio::defaults::set_compat_mode(kvikio::CompatMode::ON); }
+    // OFF = force O_DIRECT (bypass page cache), ON = force POSIX (use page cache)
+    kvikio::defaults::set_compat_mode(direct_io ? kvikio::CompatMode::OFF
+                                                : kvikio::CompatMode::ON);
   }
 
   void write_device(const std::string& path,
