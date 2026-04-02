@@ -633,3 +633,122 @@ TEST_CASE("gpu disk round-trip with explicit kvikio backend", "[disk][gpu-conver
 // on all dev machines. Re-enable when testing on GDS-capable hardware.
 // TEST_CASE("gpu disk round-trip with gds backend throws", "[disk][gpu-converter][backend][gds]")
 // {}
+
+TEST_CASE("gpu disk round-trip with explicit pipeline backend",
+          "[disk][gpu-converter][backend][pipeline]")
+{
+  rmm::cuda_stream stream;
+  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+
+  auto backend = make_io_backend(io_backend_type::PIPELINE);
+  representation_converter_registry registry;
+  register_builtin_converters(registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  auto table = make_typed_table(cudf::type_id::INT32, 100);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+
+  auto disk_rep =
+    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), stream.view());
+  auto gpu_rep2 =
+    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), stream.view());
+
+  test::expect_cudf_tables_equal_on_stream(
+    gpu_rep->get_table(), gpu_rep2->get_table(), stream.view());
+}
+
+TEST_CASE("gpu disk round-trip with pipeline direct_io=true",
+          "[disk][gpu-converter][backend][pipeline][direct-io]")
+{
+  rmm::cuda_stream stream;
+  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+
+  auto backend = make_io_backend(io_backend_type::PIPELINE, /*direct_io=*/true);
+  representation_converter_registry registry;
+  register_builtin_converters(registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  auto table = make_typed_table(cudf::type_id::INT32, 100);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+
+  auto disk_rep =
+    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), stream.view());
+  auto gpu_rep2 =
+    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), stream.view());
+
+  test::expect_cudf_tables_equal_on_stream(
+    gpu_rep->get_table(), gpu_rep2->get_table(), stream.view());
+}
+
+TEST_CASE("gpu disk round-trip with kvikio direct_io=true",
+          "[disk][gpu-converter][backend][kvikio][direct-io]")
+{
+  rmm::cuda_stream stream;
+  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+
+  auto backend = make_io_backend(io_backend_type::KVIKIO, /*direct_io=*/true);
+  representation_converter_registry registry;
+  register_builtin_converters(registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  auto table = make_typed_table(cudf::type_id::INT32, 100);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+
+  auto disk_rep =
+    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), stream.view());
+  auto gpu_rep2 =
+    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), stream.view());
+
+  test::expect_cudf_tables_equal_on_stream(
+    gpu_rep->get_table(), gpu_rep2->get_table(), stream.view());
+}
+
+TEST_CASE("gpu disk round-trip pipeline direct_io with multiple types",
+          "[disk][gpu-converter][backend][pipeline][direct-io]")
+{
+  rmm::cuda_stream stream;
+  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+
+  auto backend = make_io_backend(io_backend_type::PIPELINE, /*direct_io=*/true);
+  representation_converter_registry registry;
+  register_builtin_converters(registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  // Test with multiple numeric types to verify O_DIRECT alignment padding works
+  auto type_id = GENERATE(cudf::type_id::INT32, cudf::type_id::INT64, cudf::type_id::FLOAT64);
+  auto table   = make_typed_table(type_id, 1000);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+
+  auto disk_rep =
+    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), stream.view());
+
+  REQUIRE(disk_rep->get_size_in_bytes() > 0);
+  REQUIRE(disk_rep->get_uncompressed_data_size_in_bytes() == disk_rep->get_size_in_bytes());
+
+  auto gpu_rep2 =
+    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), stream.view());
+
+  test::expect_cudf_tables_equal_on_stream(
+    gpu_rep->get_table(), gpu_rep2->get_table(), stream.view());
+}
+
+TEST_CASE("disk_data_representation get_uncompressed_data_size_in_bytes",
+          "[disk][representation]")
+{
+  rmm::cuda_stream stream;
+  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  auto table = make_typed_table(cudf::type_id::INT64, 1000);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+  auto original_size = gpu_rep->get_size_in_bytes();
+
+  auto disk_rep =
+    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), stream.view());
+
+  REQUIRE(disk_rep->get_size_in_bytes() > 0);
+  REQUIRE(disk_rep->get_uncompressed_data_size_in_bytes() == disk_rep->get_size_in_bytes());
+}
