@@ -39,6 +39,16 @@ namespace {
 /// Each pinned buffer is 64 MB — matches NVMe optimal I/O size
 constexpr std::size_t PIPELINE_BUF_SIZE = 64ULL * 1024 * 1024;
 
+/// O_DIRECT alignment requirement (512 bytes for NVMe, 4096 for some filesystems)
+constexpr std::size_t DIRECT_IO_ALIGNMENT = 512;
+
+/// Check if O_DIRECT is safe for this transfer (offset, size, and buffer must be aligned)
+bool can_use_direct_io(std::size_t file_offset, std::size_t size, const void* buf)
+{
+  return (file_offset % DIRECT_IO_ALIGNMENT == 0) && (size % DIRECT_IO_ALIGNMENT == 0) &&
+         (reinterpret_cast<uintptr_t>(buf) % DIRECT_IO_ALIGNMENT == 0);
+}
+
 // =============================================================================
 // pipeline_io_backend — double-buffered pinned host memory pipeline
 //
@@ -90,8 +100,10 @@ class pipeline_io_backend : public idisk_io_backend {
     CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
     CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
 
-    int flags = O_CREAT | O_WRONLY;
-    if (_direct_io) { flags |= O_DIRECT; }
+    // Use O_DIRECT only when alignment requirements are met (pinned buffers are always aligned)
+    bool use_dio = _direct_io && can_use_direct_io(file_offset, size, _buf[0]);
+    int flags    = O_CREAT | O_WRONLY;
+    if (use_dio) { flags |= O_DIRECT; }
     int fd = ::open(path.c_str(), flags, 0644);
     if (fd < 0) {
       CUCASCADE_FAIL("pipeline write_device: open failed: " + std::string(std::strerror(errno)));
@@ -153,8 +165,9 @@ class pipeline_io_backend : public idisk_io_backend {
     CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
     CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
 
-    int flags = O_RDONLY;
-    if (_direct_io) { flags |= O_DIRECT; }
+    bool use_dio = _direct_io && can_use_direct_io(file_offset, size, _buf[0]);
+    int flags    = O_RDONLY;
+    if (use_dio) { flags |= O_DIRECT; }
     int fd = ::open(path.c_str(), flags, 0);
     if (fd < 0) {
       CUCASCADE_FAIL("pipeline read_device: open failed: " + std::string(std::strerror(errno)));
@@ -281,8 +294,18 @@ class pipeline_io_backend : public idisk_io_backend {
     CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
     CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
 
+    // For batch writes, check alignment of all entries. Any unaligned entry disables O_DIRECT.
+    bool use_dio = _direct_io;
+    if (use_dio) {
+      for (const auto& entry : entries) {
+        if (entry.size > 0 && !can_use_direct_io(entry.file_offset, entry.size, _buf[0])) {
+          use_dio = false;
+          break;
+        }
+      }
+    }
     int flags = O_CREAT | O_WRONLY;
-    if (_direct_io) { flags |= O_DIRECT; }
+    if (use_dio) { flags |= O_DIRECT; }
     int fd = ::open(path.c_str(), flags, 0644);
     if (fd < 0) {
       CUCASCADE_FAIL("pipeline write_device_batch: open failed: " +

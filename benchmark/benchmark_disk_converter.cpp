@@ -929,4 +929,271 @@ BENCHMARK(BM_ConvertGpuToDiskPipeline)
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
+// =============================================================================
+// BENCH-04: Backend read comparison (Disk -> GPU)
+// =============================================================================
+
+/**
+ * @brief Helper: create a backend-specific registry and write a GPU table to disk,
+ *        returning the disk representation for read benchmarks.
+ */
+std::unique_ptr<disk_data_representation> write_table_to_disk(
+  io_backend_type backend_type,
+  cudf::table&& table,
+  const memory_space* gpu_space,
+  const memory_space* disk_space,
+  rmm::cuda_stream_view stream)
+{
+  auto backend  = make_io_backend(backend_type, /*direct_io=*/true);
+  auto registry = std::make_unique<representation_converter_registry>();
+  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space));
+  auto disk_rep = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
+  stream.synchronize();
+  return disk_rep;
+}
+
+void BM_ConvertDiskToGpuKvikIO(benchmark::State& state)
+{
+  int64_t total_bytes = state.range(0);
+  int num_columns     = static_cast<int>(state.range(1));
+
+  auto mgr = get_shared_memory_manager();
+
+  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
+  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+
+  rmm::cuda_stream stream;
+
+  auto disk_rep = write_table_to_disk(
+    io_backend_type::KVIKIO, create_benchmark_table_from_bytes(total_bytes, num_columns),
+    gpu_space, disk_space, stream.view());
+
+  auto backend  = make_io_backend(io_backend_type::KVIKIO, /*direct_io=*/true);
+  auto registry = std::make_unique<representation_converter_registry>();
+  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  size_t bytes_transferred = disk_rep->get_size_in_bytes();
+
+  for ([[maybe_unused]] auto _ : state) {
+    auto gpu_result =
+      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream.view());
+    stream.synchronize();
+  }
+
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
+                          static_cast<int64_t>(bytes_transferred));
+  state.counters["columns"]          = static_cast<double>(num_columns);
+  state.counters["bytes"]            = static_cast<double>(bytes_transferred);
+  state.counters["gdsio_write_GiBs"] = GDSIO_WRITE_GIBS;
+  state.counters["gdsio_read_GiBs"]  = GDSIO_READ_GIBS;
+  state.counters["backend"]          = 0;
+}
+
+void BM_ConvertDiskToGpuPipeline(benchmark::State& state)
+{
+  int64_t total_bytes = state.range(0);
+  int num_columns     = static_cast<int>(state.range(1));
+
+  auto mgr = get_shared_memory_manager();
+
+  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
+  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+
+  rmm::cuda_stream stream;
+
+  auto disk_rep = write_table_to_disk(
+    io_backend_type::PIPELINE, create_benchmark_table_from_bytes(total_bytes, num_columns),
+    gpu_space, disk_space, stream.view());
+
+  auto backend  = make_io_backend(io_backend_type::PIPELINE, /*direct_io=*/true);
+  auto registry = std::make_unique<representation_converter_registry>();
+  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  size_t bytes_transferred = disk_rep->get_size_in_bytes();
+
+  for ([[maybe_unused]] auto _ : state) {
+    auto gpu_result =
+      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream.view());
+    stream.synchronize();
+  }
+
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
+                          static_cast<int64_t>(bytes_transferred));
+  state.counters["columns"]          = static_cast<double>(num_columns);
+  state.counters["bytes"]            = static_cast<double>(bytes_transferred);
+  state.counters["gdsio_write_GiBs"] = GDSIO_WRITE_GIBS;
+  state.counters["gdsio_read_GiBs"]  = GDSIO_READ_GIBS;
+  state.counters["backend"]          = 2;
+}
+
+BENCHMARK(BM_ConvertDiskToGpuKvikIO)
+  ->Setup(DoSetup)
+  ->Teardown(DoTeardown)
+  ->Args({1 * MiB, 4})
+  ->Args({64 * MiB, 4})
+  ->Args({512 * MiB, 4})
+  ->Args({4 * GiB, 4})
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
+BENCHMARK(BM_ConvertDiskToGpuPipeline)
+  ->Setup(DoSetup)
+  ->Teardown(DoTeardown)
+  ->Args({1 * MiB, 4})
+  ->Args({64 * MiB, 4})
+  ->Args({512 * MiB, 4})
+  ->Args({4 * GiB, 4})
+  ->Unit(benchmark::kMillisecond)
+  ->UseRealTime();
+
+// =============================================================================
+// BENCH-05: Column type sweep — backend comparison (write + read, 64 MiB)
+// =============================================================================
+
+/**
+ * @brief Helper: backend write benchmark for a given table creation function.
+ */
+template <typename TableFactory>
+void backend_write_benchmark(benchmark::State& state,
+                             io_backend_type backend_type,
+                             int backend_id,
+                             TableFactory table_factory)
+{
+  int64_t total_bytes = state.range(0);
+  int num_columns     = static_cast<int>(state.range(1));
+
+  auto mgr = get_shared_memory_manager();
+
+  auto backend  = make_io_backend(backend_type, /*direct_io=*/true);
+  auto registry = std::make_unique<representation_converter_registry>();
+  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
+  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+
+  rmm::cuda_stream stream;
+
+  auto table   = table_factory(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space));
+
+  size_t bytes_transferred = gpu_rep->get_size_in_bytes();
+
+  for ([[maybe_unused]] auto _ : state) {
+    auto disk_result =
+      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream.view());
+    stream.synchronize();
+  }
+
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
+                          static_cast<int64_t>(bytes_transferred));
+  state.counters["columns"]          = static_cast<double>(num_columns);
+  state.counters["bytes"]            = static_cast<double>(bytes_transferred);
+  state.counters["gdsio_write_GiBs"] = GDSIO_WRITE_GIBS;
+  state.counters["gdsio_read_GiBs"]  = GDSIO_READ_GIBS;
+  state.counters["backend"]          = static_cast<double>(backend_id);
+}
+
+/**
+ * @brief Helper: backend read benchmark for a given table creation function.
+ */
+template <typename TableFactory>
+void backend_read_benchmark(benchmark::State& state,
+                            io_backend_type backend_type,
+                            int backend_id,
+                            TableFactory table_factory)
+{
+  int64_t total_bytes = state.range(0);
+  int num_columns     = static_cast<int>(state.range(1));
+
+  auto mgr = get_shared_memory_manager();
+
+  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
+  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+
+  rmm::cuda_stream stream;
+
+  auto disk_rep = write_table_to_disk(
+    backend_type, table_factory(total_bytes, num_columns),
+    gpu_space, disk_space, stream.view());
+
+  auto backend  = make_io_backend(backend_type, /*direct_io=*/true);
+  auto registry = std::make_unique<representation_converter_registry>();
+  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+
+  size_t bytes_transferred = disk_rep->get_size_in_bytes();
+
+  for ([[maybe_unused]] auto _ : state) {
+    auto gpu_result =
+      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream.view());
+    stream.synchronize();
+  }
+
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
+                          static_cast<int64_t>(bytes_transferred));
+  state.counters["columns"]          = static_cast<double>(num_columns);
+  state.counters["bytes"]            = static_cast<double>(bytes_transferred);
+  state.counters["gdsio_write_GiBs"] = GDSIO_WRITE_GIBS;
+  state.counters["gdsio_read_GiBs"]  = GDSIO_READ_GIBS;
+  state.counters["backend"]          = static_cast<double>(backend_id);
+}
+
+// --- Numeric write/read per backend ---
+void BM_WriteNumericKvikIO(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_benchmark_table_from_bytes); }
+void BM_WriteNumericPipeline(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_benchmark_table_from_bytes); }
+void BM_ReadNumericKvikIO(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_benchmark_table_from_bytes); }
+void BM_ReadNumericPipeline(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_benchmark_table_from_bytes); }
+
+// --- String write/read per backend ---
+void BM_WriteStringKvikIO(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_string_benchmark_table); }
+void BM_WriteStringPipeline(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_string_benchmark_table); }
+void BM_ReadStringKvikIO(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_string_benchmark_table); }
+void BM_ReadStringPipeline(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_string_benchmark_table); }
+
+// --- List write/read per backend ---
+void BM_WriteListKvikIO(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_list_benchmark_table); }
+void BM_WriteListPipeline(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_list_benchmark_table); }
+void BM_ReadListKvikIO(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_list_benchmark_table); }
+void BM_ReadListPipeline(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_list_benchmark_table); }
+
+// --- Struct write/read per backend ---
+void BM_WriteStructKvikIO(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_struct_benchmark_table); }
+void BM_WriteStructPipeline(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_struct_benchmark_table); }
+void BM_ReadStructKvikIO(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_struct_benchmark_table); }
+void BM_ReadStructPipeline(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_struct_benchmark_table); }
+
+// Size sweep args for backend comparison
+#define DISK_BACKEND_ARGS \
+  ->Setup(DoSetup) \
+  ->Teardown(DoTeardown) \
+  ->Args({64 * MiB, 4}) \
+  ->Args({512 * MiB, 4}) \
+  ->Args({4 * GiB, 4}) \
+  ->Unit(benchmark::kMillisecond) \
+  ->UseRealTime()
+
+// Register all backend x type x direction benchmarks
+BENCHMARK(BM_WriteNumericKvikIO) DISK_BACKEND_ARGS;
+BENCHMARK(BM_WriteNumericPipeline) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadNumericKvikIO) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadNumericPipeline) DISK_BACKEND_ARGS;
+
+BENCHMARK(BM_WriteStringKvikIO) DISK_BACKEND_ARGS;
+BENCHMARK(BM_WriteStringPipeline) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadStringKvikIO) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadStringPipeline) DISK_BACKEND_ARGS;
+
+BENCHMARK(BM_WriteListKvikIO) DISK_BACKEND_ARGS;
+BENCHMARK(BM_WriteListPipeline) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadListKvikIO) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadListPipeline) DISK_BACKEND_ARGS;
+
+BENCHMARK(BM_WriteStructKvikIO) DISK_BACKEND_ARGS;
+BENCHMARK(BM_WriteStructPipeline) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadStructKvikIO) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadStructPipeline) DISK_BACKEND_ARGS;
+
 }  // namespace
