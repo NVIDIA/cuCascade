@@ -35,6 +35,7 @@
 
 #include <benchmark/benchmark.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -51,6 +52,37 @@ using namespace cucascade::memory;
 constexpr uint64_t KiB = 1024ULL;
 constexpr uint64_t MiB = 1024ULL * KiB;
 constexpr uint64_t GiB = 1024ULL * MiB;
+
+/// Fraction of GPU memory that must remain free after allocating the benchmark table.
+/// Leave headroom for cudf internals, RMM pool overhead, and converter temporaries.
+constexpr double GPU_MEMORY_SAFETY_FACTOR = 0.75;
+
+/**
+ * @brief Skip the benchmark if the requested data size exceeds available GPU memory.
+ *
+ * Queries free GPU memory via cudaMemGetInfo and skips (with a message) if the
+ * benchmark's data allocation would exceed the safety threshold.
+ *
+ * @return true if the benchmark should be skipped.
+ */
+bool skip_if_oom(benchmark::State& state, int64_t total_bytes)
+{
+  std::size_t free_bytes = 0;
+  std::size_t total_gpu  = 0;
+  cudaMemGetInfo(&free_bytes, &total_gpu);
+
+  auto available = static_cast<int64_t>(static_cast<double>(free_bytes) * GPU_MEMORY_SAFETY_FACTOR);
+  if (total_bytes > available) {
+    state.SkipWithMessage("OOM: need " + std::to_string(total_bytes / static_cast<int64_t>(MiB)) +
+                          " MiB but only " + std::to_string(available / static_cast<int64_t>(MiB)) +
+                          " MiB available (GPU has " +
+                          std::to_string(free_bytes / static_cast<std::size_t>(MiB)) +
+                          " MiB free, " + std::to_string(static_cast<int>(GPU_MEMORY_SAFETY_FACTOR * 100)) +
+                          "% safety)");
+    return true;
+  }
+  return false;
+}
 
 // Hardware baselines from gdsio on /dev/nvme1n1 (/mnt/disk_2, ext4)
 // Measured: gdsio -D /mnt/disk_2/gdsio_test -d 0 -w 4 -s 4G -x 0 -I 1
@@ -102,15 +134,21 @@ std::vector<memory_space_config> create_benchmark_configs()
 {
   std::vector<memory_space_config> configs;
 
+  // Query actual GPU memory and use 90% of it (leave room for driver/OS)
+  std::size_t free_bytes = 0;
+  std::size_t total_gpu  = 0;
+  cudaMemGetInfo(&free_bytes, &total_gpu);
+  auto gpu_capacity = static_cast<uint64_t>(static_cast<double>(free_bytes) * 0.9);
+
   gpu_memory_space_config gpu_config;
   gpu_config.device_id       = 0;
-  gpu_config.memory_capacity = 16 * GiB;
+  gpu_config.memory_capacity = gpu_capacity;
   gpu_config.mr_factory_fn   = make_default_allocator_for_tier(Tier::GPU);
   configs.emplace_back(gpu_config);
 
   host_memory_space_config host_config;
   host_config.numa_id              = hostDevId;
-  host_config.memory_capacity      = 16 * GiB;
+  host_config.memory_capacity      = gpu_capacity;  // match GPU capacity
   host_config.mr_factory_fn        = make_default_allocator_for_tier(Tier::HOST);
   host_config.initial_number_pools = 16;
   configs.emplace_back(host_config);
@@ -118,7 +156,7 @@ std::vector<memory_space_config> create_benchmark_configs()
   disk_memory_space_config disk_config;
   disk_config.disk_id         = 0;
   disk_config.memory_capacity = 32 * GiB;
-  disk_config.mount_paths     = "/mnt/disk_2";
+  disk_config.mount_paths = "/tmp";
   configs.emplace_back(disk_config);
 
   return configs;
@@ -377,6 +415,7 @@ cudf::table create_struct_benchmark_table(int64_t total_bytes, int num_columns)
 void BM_ConvertGpuToDisk(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -427,6 +466,7 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
 void BM_ConvertDiskToGpu(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -471,6 +511,7 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
 void BM_ConvertHostToDisk(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -518,6 +559,7 @@ void BM_ConvertHostToDisk(benchmark::State& state)
 void BM_ConvertDiskToHost(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -571,6 +613,7 @@ void BM_ConvertDiskToHost(benchmark::State& state)
 void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -612,6 +655,7 @@ void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
 void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -653,6 +697,7 @@ void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
 void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -698,6 +743,7 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 void BM_ConvertGpuToDiskKvikIO(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -746,6 +792,7 @@ void BM_ConvertGpuToDiskKvikIO(benchmark::State& state)
 void BM_ConvertGpuToDiskGDS(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -898,6 +945,7 @@ BENCHMARK(BM_ConvertGpuToDiskGDS)
 void BM_ConvertGpuToDiskPipeline(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -973,6 +1021,7 @@ std::unique_ptr<disk_data_representation> write_table_to_disk(
 void BM_ConvertDiskToGpuKvikIO(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -1012,6 +1061,7 @@ void BM_ConvertDiskToGpuKvikIO(benchmark::State& state)
 void BM_ConvertDiskToGpuPipeline(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -1082,6 +1132,7 @@ void backend_write_benchmark(benchmark::State& state,
                              TableFactory table_factory)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
@@ -1128,6 +1179,7 @@ void backend_read_benchmark(benchmark::State& state,
                             TableFactory table_factory)
 {
   int64_t total_bytes = state.range(0);
+  if (skip_if_oom(state, total_bytes)) return;
   int num_columns     = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
