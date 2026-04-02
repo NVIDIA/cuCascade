@@ -34,6 +34,11 @@ host_data_representation::host_data_representation(
 
 std::size_t host_data_representation::get_size_in_bytes() const { return _host_table->data_size; }
 
+std::size_t host_data_representation::get_uncompressed_data_size_in_bytes() const
+{
+  return get_size_in_bytes();
+}
+
 const std::unique_ptr<memory::host_table_allocation>& host_data_representation::get_host_table()
   const
 {
@@ -85,6 +90,11 @@ host_data_packed_representation::host_data_packed_representation(
 std::size_t host_data_packed_representation::get_size_in_bytes() const
 {
   return _host_table->data_size;
+}
+
+std::size_t host_data_packed_representation::get_uncompressed_data_size_in_bytes() const
+{
+  return get_size_in_bytes();
 }
 
 const std::unique_ptr<cucascade::memory::host_table_packed_allocation>&

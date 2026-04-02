@@ -57,6 +57,11 @@ class host_data_representation : public idata_representation {
   std::size_t get_size_in_bytes() const override;
 
   /**
+   * @copydoc idata_representation::get_logical_data_size_in_bytes
+   */
+  std::size_t get_uncompressed_data_size_in_bytes() const override;
+
+  /**
    * @brief Create a deep copy of this representation in the same memory space.
    *
    * @param stream CUDA stream (unused for host-side copies)
@@ -100,6 +105,11 @@ class host_data_packed_representation : public idata_representation {
    * @return std::size_t The number of bytes used to store this representation
    */
   std::size_t get_size_in_bytes() const override;
+
+  /**
+   * @copydoc idata_representation::get_logical_data_size_in_bytes
+   */
+  std::size_t get_uncompressed_data_size_in_bytes() const override;
 
   /**
    * @brief Create a deep copy of this host table representation.

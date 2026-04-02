@@ -57,6 +57,11 @@ class gpu_table_representation : public idata_representation {
   std::size_t get_size_in_bytes() const override;
 
   /**
+   * @copydoc idata_representation::get_logical_data_size_in_bytes
+   */
+  std::size_t get_uncompressed_data_size_in_bytes() const override;
+
+  /**
    * @brief Create a deep copy of this GPU table representation.
    *
    * The cloned representation will have its own copy of the underlying cuDF table,
