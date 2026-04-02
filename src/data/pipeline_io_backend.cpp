@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <string>
@@ -39,14 +40,13 @@ namespace {
 /// Each pinned buffer is 64 MB — matches NVMe optimal I/O size
 constexpr std::size_t PIPELINE_BUF_SIZE = 64ULL * 1024 * 1024;
 
-/// O_DIRECT alignment requirement (512 bytes for NVMe, 4096 for some filesystems)
+/// O_DIRECT alignment requirement (512 bytes for NVMe)
 constexpr std::size_t DIRECT_IO_ALIGNMENT = 512;
 
-/// Check if O_DIRECT is safe for this transfer (offset, size, and buffer must be aligned)
-bool can_use_direct_io(std::size_t file_offset, std::size_t size, const void* buf)
+/// Round up to O_DIRECT alignment boundary
+std::size_t align_up_dio(std::size_t n)
 {
-  return (file_offset % DIRECT_IO_ALIGNMENT == 0) && (size % DIRECT_IO_ALIGNMENT == 0) &&
-         (reinterpret_cast<uintptr_t>(buf) % DIRECT_IO_ALIGNMENT == 0);
+  return (n + DIRECT_IO_ALIGNMENT - 1) & ~(DIRECT_IO_ALIGNMENT - 1);
 }
 
 // =============================================================================
@@ -100,10 +100,8 @@ class pipeline_io_backend : public idisk_io_backend {
     CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
     CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
 
-    // Use O_DIRECT only when alignment requirements are met (pinned buffers are always aligned)
-    bool use_dio = _direct_io && can_use_direct_io(file_offset, size, _buf[0]);
-    int flags    = O_CREAT | O_WRONLY;
-    if (use_dio) { flags |= O_DIRECT; }
+    int flags = O_CREAT | O_WRONLY;
+    if (_direct_io) { flags |= O_DIRECT; }
     int fd = ::open(path.c_str(), flags, 0644);
     if (fd < 0) {
       CUCASCADE_FAIL("pipeline write_device: open failed: " + std::string(std::strerror(errno)));
@@ -130,10 +128,16 @@ class pipeline_io_backend : public idisk_io_backend {
       if (write_future.valid()) { write_future.get(); }
 
       // Launch async disk write for current buffer
-      auto* buf_ptr   = _buf[cur];
-      auto write_off  = dest_offset;
-      auto write_size = chunk;
-      auto write_fd   = fd;
+      // O_DIRECT requires size aligned to 512; pad up (pinned buf has room)
+      auto* buf_ptr    = _buf[cur];
+      auto write_off   = dest_offset;
+      auto write_size  = _direct_io ? align_up_dio(chunk) : chunk;
+      auto actual_size = chunk;
+      auto write_fd    = fd;
+      // Zero padding bytes to avoid writing uninitialized memory
+      if (write_size > actual_size) {
+        std::memset(static_cast<char*>(buf_ptr) + actual_size, 0, write_size - actual_size);
+      }
       write_future = std::async(std::launch::async, [buf_ptr, write_size, write_off, write_fd]() {
         auto written = ::pwrite(write_fd, buf_ptr, write_size, static_cast<off_t>(write_off));
         if (written < 0 || static_cast<std::size_t>(written) != write_size) {
@@ -165,9 +169,8 @@ class pipeline_io_backend : public idisk_io_backend {
     CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
     CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
 
-    bool use_dio = _direct_io && can_use_direct_io(file_offset, size, _buf[0]);
-    int flags    = O_RDONLY;
-    if (use_dio) { flags |= O_DIRECT; }
+    int flags = O_RDONLY;
+    if (_direct_io) { flags |= O_DIRECT; }
     int fd = ::open(path.c_str(), flags, 0);
     if (fd < 0) {
       CUCASCADE_FAIL("pipeline read_device: open failed: " + std::string(std::strerror(errno)));
@@ -181,10 +184,12 @@ class pipeline_io_backend : public idisk_io_backend {
     std::future<void> copy_future;
 
     // Pre-read first chunk into buffer 0
-    std::size_t first_chunk = std::min(remaining, PIPELINE_BUF_SIZE);
+    // O_DIRECT requires aligned size; read more, H2D copy only what's needed
+    std::size_t first_chunk    = std::min(remaining, PIPELINE_BUF_SIZE);
+    std::size_t first_read_sz  = _direct_io ? align_up_dio(first_chunk) : first_chunk;
     {
-      auto bytes_read = ::pread(fd, _buf[0], first_chunk, static_cast<off_t>(src_offset));
-      if (bytes_read < 0 || static_cast<std::size_t>(bytes_read) != first_chunk) {
+      auto bytes_read = ::pread(fd, _buf[0], first_read_sz, static_cast<off_t>(src_offset));
+      if (bytes_read < 0 || static_cast<std::size_t>(bytes_read) < first_chunk) {
         ::close(fd);
         CUCASCADE_FAIL("pipeline pread failed");
       }
@@ -195,7 +200,7 @@ class pipeline_io_backend : public idisk_io_backend {
     // Pipeline: H2D copy current buffer while reading next chunk into other buffer
     std::size_t chunks_to_copy = first_chunk;
     while (chunks_to_copy > 0 || remaining > 0) {
-      // Start H2D copy from current buffer
+      // Start H2D copy from current buffer (exact size, not aligned)
       if (chunks_to_copy > 0) {
         CUCASCADE_CUDA_TRY(cudaMemcpyAsync(static_cast<char*>(dev_ptr) + dst_offset,
                                            _buf[cur],
@@ -208,18 +213,22 @@ class pipeline_io_backend : public idisk_io_backend {
       // Simultaneously read next chunk into other buffer
       std::size_t next_chunk = 0;
       if (remaining > 0) {
-        next_chunk    = std::min(remaining, PIPELINE_BUF_SIZE);
-        int other     = 1 - cur;
-        auto* buf_ptr = _buf[other];
-        auto read_off = src_offset;
-        auto read_sz  = next_chunk;
-        auto read_fd  = fd;
-        read_future   = std::async(std::launch::async, [buf_ptr, read_sz, read_off, read_fd]() {
-          auto bytes_read = ::pread(read_fd, buf_ptr, read_sz, static_cast<off_t>(read_off));
-          if (bytes_read < 0 || static_cast<std::size_t>(bytes_read) != read_sz) {
-            throw std::runtime_error("pipeline pread failed");
-          }
-        });
+        next_chunk     = std::min(remaining, PIPELINE_BUF_SIZE);
+        auto read_sz   = _direct_io ? align_up_dio(next_chunk) : next_chunk;
+        int other      = 1 - cur;
+        auto* buf_ptr  = _buf[other];
+        auto read_off  = src_offset;
+        auto actual_sz = next_chunk;
+        auto read_fd   = fd;
+        read_future    = std::async(std::launch::async,
+                                    [buf_ptr, read_sz, actual_sz, read_off, read_fd]() {
+                                   auto bytes_read =
+                                     ::pread(read_fd, buf_ptr, read_sz, static_cast<off_t>(read_off));
+                                   if (bytes_read < 0 ||
+                                       static_cast<std::size_t>(bytes_read) < actual_sz) {
+                                     throw std::runtime_error("pipeline pread failed");
+                                   }
+                                 });
         remaining -= next_chunk;
         src_offset += next_chunk;
       }
@@ -294,18 +303,8 @@ class pipeline_io_backend : public idisk_io_backend {
     CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
     CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
 
-    // For batch writes, check alignment of all entries. Any unaligned entry disables O_DIRECT.
-    bool use_dio = _direct_io;
-    if (use_dio) {
-      for (const auto& entry : entries) {
-        if (entry.size > 0 && !can_use_direct_io(entry.file_offset, entry.size, _buf[0])) {
-          use_dio = false;
-          break;
-        }
-      }
-    }
     int flags = O_CREAT | O_WRONLY;
-    if (use_dio) { flags |= O_DIRECT; }
+    if (_direct_io) { flags |= O_DIRECT; }
     int fd = ::open(path.c_str(), flags, 0644);
     if (fd < 0) {
       CUCASCADE_FAIL("pipeline write_device_batch: open failed: " +
@@ -343,10 +342,15 @@ class pipeline_io_backend : public idisk_io_backend {
       if (write_future.valid()) { write_future.get(); }
 
       // Launch async disk write for current buffer
-      auto* wbuf   = _buf[cur];
-      auto wsz     = c.size;
-      auto woff    = c.file_offset;
-      auto wfd     = fd;
+      // O_DIRECT requires aligned size; pad up (pinned buf has room)
+      auto* wbuf       = _buf[cur];
+      auto wsz         = _direct_io ? align_up_dio(c.size) : c.size;
+      auto actual_size = c.size;
+      auto woff        = c.file_offset;
+      auto wfd         = fd;
+      if (wsz > actual_size) {
+        std::memset(static_cast<char*>(wbuf) + actual_size, 0, wsz - actual_size);
+      }
       write_future = std::async(std::launch::async, [wbuf, wsz, woff, wfd]() {
         auto written = ::pwrite(wfd, wbuf, wsz, static_cast<off_t>(woff));
         if (written < 0 || static_cast<std::size_t>(written) != wsz) {
