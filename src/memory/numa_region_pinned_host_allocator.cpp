@@ -15,9 +15,8 @@
  * limitations under the License.
  */
 
-#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
-
 #include <cucascade/cuda_utils.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <numa.h>
 
@@ -26,8 +25,9 @@
 namespace cucascade {
 namespace memory {
 
-void* numa_region_pinned_host_memory_resource::do_allocate(
-  std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream)
+void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+                                                        std::size_t bytes,
+                                                        [[maybe_unused]] std::size_t alignment)
 {
   CUCASCADE_FUNC_RANGE();
   // don't allocate anything if the user requested zero bytes
@@ -45,8 +45,11 @@ void* numa_region_pinned_host_memory_resource::do_allocate(
   }
 }
 
-void numa_region_pinned_host_memory_resource::do_deallocate(
-  void* ptr, std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream) noexcept
+void numa_region_pinned_host_memory_resource::deallocate(
+  [[maybe_unused]] cuda::stream_ref stream,
+  void* ptr,
+  std::size_t bytes,
+  [[maybe_unused]] std::size_t alignment) noexcept
 {
   CUCASCADE_FUNC_RANGE();
   if (_numa_node == -1) {
@@ -57,11 +60,22 @@ void numa_region_pinned_host_memory_resource::do_deallocate(
   }
 }
 
-bool numa_region_pinned_host_memory_resource::do_is_equal(
-  const rmm::mr::device_memory_resource& other) const noexcept
+void* numa_region_pinned_host_memory_resource::allocate_sync(std::size_t bytes,
+                                                             [[maybe_unused]] std::size_t alignment)
 {
-  auto* mr_ptr = dynamic_cast<numa_region_pinned_host_memory_resource const*>(&other);
-  return mr_ptr == this && mr_ptr->_numa_node == this->_numa_node;
+  return allocate(cuda::stream_ref{}, bytes, alignment);
+}
+
+void numa_region_pinned_host_memory_resource::deallocate_sync(
+  void* ptr, std::size_t bytes, [[maybe_unused]] std::size_t alignment) noexcept
+{
+  deallocate(cuda::stream_ref{}, ptr, bytes, alignment);
+}
+
+bool numa_region_pinned_host_memory_resource::operator==(
+  numa_region_pinned_host_memory_resource const& other) const noexcept
+{
+  return this == &other && _numa_node == other._numa_node;
 }
 
 }  // namespace memory

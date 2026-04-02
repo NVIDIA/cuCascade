@@ -17,6 +17,7 @@
 
 #include "cudf/contiguous_split.hpp"
 
+#include <cucascade/cuda_utils.hpp>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
@@ -32,10 +33,9 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <cucascade/cuda_utils.hpp>
-
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
 
@@ -156,11 +156,11 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   // Asynchronously copy device->device across GPUs
   CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(dst_uvector.data(),
-                                   target_device_id,
-                                   static_cast<const uint8_t*>(packed_data.gpu_data->data()),
-                                   source_device_id,
-                                   bytes_to_copy,
-                                   stream.value()));
+                                         target_device_id,
+                                         static_cast<const uint8_t*>(packed_data.gpu_data->data()),
+                                         source_device_id,
+                                         bytes_to_copy,
+                                         stream.value()));
   stream.synchronize();
   // Unpack on target device to build a cudf::table that lives on the target GPU
   CUCASCADE_CUDA_TRY(cudaSetDevice(target_device_id));
@@ -254,10 +254,10 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
     size_t bytes_to_copy                = std::min(remaining_bytes, bytes_available_in_src_block);
     auto src_block                      = host_table->allocation->at(src_block_index);
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(static_cast<uint8_t*>(dst_buffer.data()) + dst_offset,
-                                 src_block.data() + src_block_offset,
-                                 bytes_to_copy,
-                                 cudaMemcpyHostToDevice,
-                                 stream.value()));
+                                       src_block.data() + src_block_offset,
+                                       bytes_to_copy,
+                                       cudaMemcpyHostToDevice,
+                                       stream.value()));
     dst_offset += bytes_to_copy;
     src_block_offset += bytes_to_copy;
     if (src_block_offset == src_block_size) {
@@ -417,7 +417,8 @@ struct BatchCopyAccumulator {
     // cudaMemcpyBatchAsync requires CUDA 12.8+; fall back to individual copies.
     (void)src_order;
     for (std::size_t i = 0; i < count(); ++i) {
-      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.value()));
+      CUCASCADE_CUDA_TRY(
+        cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.value()));
     }
 #endif
   }
@@ -613,7 +614,7 @@ static rmm::device_buffer alloc_and_schedule_h2d(memory::fixed_multiple_blocks_a
                                                  std::size_t alloc_offset,
                                                  std::size_t size,
                                                  rmm::cuda_stream_view stream,
-                                                 rmm::mr::device_memory_resource* mr,
+                                                 rmm::device_async_resource_ref mr,
                                                  BatchCopyAccumulator& batch)
 {
   rmm::device_buffer buf(size, stream, mr);
@@ -655,7 +656,7 @@ static std::unique_ptr<cudf::column> reconstruct_column(
   const memory::column_metadata& meta,
   memory::fixed_multiple_blocks_allocation& alloc,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr,
+  rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
   // Null mask (shared by all type categories)
@@ -729,9 +730,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
 {
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
-  if (!fast_table) {
-    throw std::runtime_error("convert_host_fast_to_gpu: host table is null");
-  }
+  if (!fast_table) { throw std::runtime_error("convert_host_fast_to_gpu: host table is null"); }
   if (!fast_table->allocation) {
     throw std::runtime_error("convert_host_fast_to_gpu: host table allocation is null");
   }

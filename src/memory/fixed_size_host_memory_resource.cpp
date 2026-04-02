@@ -23,7 +23,6 @@
 
 #include <rmm/aligned.hpp>
 #include <rmm/error.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <memory>
@@ -188,21 +187,23 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
   return {};
 }
 
-void* fixed_size_host_memory_resource::do_allocate(std::size_t /*bytes*/,
-                                                   rmm::cuda_stream_view /*stream*/)
+void* fixed_size_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+                                                [[maybe_unused]] std::size_t bytes,
+                                                [[maybe_unused]] std::size_t alignment)
 {
   throw rmm::logic_error(
     "fixed_size_host_memory_resource doesn't support allocate, use allocate_multiple_blocks");
 }
 
-void fixed_size_host_memory_resource::do_deallocate(void* /*ptr*/,
-                                                    std::size_t /*bytes*/,
-                                                    rmm::cuda_stream_view /*stream*/) noexcept
+void fixed_size_host_memory_resource::deallocate([[maybe_unused]] cuda::stream_ref stream,
+                                                 [[maybe_unused]] void* ptr,
+                                                 [[maybe_unused]] std::size_t bytes,
+                                                 [[maybe_unused]] std::size_t alignment) noexcept
 {
 }
 
-bool fixed_size_host_memory_resource::do_is_equal(
-  const rmm::mr::device_memory_resource& other) const noexcept
+bool fixed_size_host_memory_resource::operator==(
+  fixed_size_host_memory_resource const& other) const noexcept
 {
   return this == &other;
 }

@@ -49,26 +49,25 @@ memory_space::memory_space(const gpu_memory_space_config& config)
     _memory_limit(config.reservation_limit()),
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
-    _allocator(config.mr_factory_fn
-                 ? config.mr_factory_fn(config.device_id, config.memory_capacity)
-                 : make_default_gpu_memory_resource(config.device_id, config.memory_capacity)),
     _stream_pool{[&]() -> std::unique_ptr<rmm::cuda_stream_pool> {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id(config.device_id)};
       return std::make_unique<rmm::cuda_stream_pool>(16, rmm::cuda_stream::flags::non_blocking);
     }()}
 {
-  if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
-
   cudaMemPool_t pool_handle{nullptr};
-  if (auto* r = dynamic_cast<rmm::mr::cuda_async_memory_resource*>(_allocator.get())) {
-    pool_handle = r->pool_handle();
-  } else if (auto* r = dynamic_cast<rmm::mr::cuda_async_view_memory_resource*>(_allocator.get())) {
-    pool_handle = r->pool_handle();
+
+  if (config.mr_factory_fn) {
+    _allocator = config.mr_factory_fn(config.device_id, config.memory_capacity);
+  } else {
+    rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
+    rmm::mr::cuda_async_memory_resource concrete_mr(config.memory_capacity);
+    pool_handle = concrete_mr.pool_handle();
+    _allocator  = cuda::mr::any_resource<cuda::mr::device_accessible>(std::move(concrete_mr));
   }
 
   _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
     _id,
-    *_allocator,
+    rmm::device_async_resource_ref(_allocator),
     _memory_limit,
     _capacity,
     nullptr,
@@ -89,10 +88,9 @@ memory_space::memory_space(const host_memory_space_config& config)
                  ? config.mr_factory_fn(config.numa_id, config.memory_capacity)
                  : make_default_host_memory_resource(config.numa_id, config.memory_capacity))
 {
-  if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
   _reservation_allocator =
     std::make_unique<fixed_size_host_memory_resource>(_id.device_id,
-                                                      *_allocator,
+                                                      rmm::device_async_resource_ref(_allocator),
                                                       _memory_limit,
                                                       _capacity,
                                                       config.block_size,
@@ -106,7 +104,7 @@ memory_space::memory_space(const disk_memory_space_config& config)
     _memory_limit(config.reservation_limit()),
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
-    _allocator(std::make_unique<null_device_memory_resource>())
+    _allocator(null_device_memory_resource{})
 {
   if (config.mount_paths.empty()) {
     throw std::invalid_argument("Mount path must be provided for disk memory space");
@@ -257,16 +255,10 @@ size_t memory_space::get_total_reserved_memory() const
 
 size_t memory_space::get_max_memory() const noexcept { return _memory_limit; }
 
-rmm::mr::device_memory_resource* memory_space::get_default_allocator() const noexcept
+rmm::device_async_resource_ref memory_space::get_default_allocator() const noexcept
 {
-  return std::visit(
-    utils::overloaded{[this]([[maybe_unused]] const std::unique_ptr<disk_access_limiter>& other)
-                        -> rmm::mr::device_memory_resource* { return _allocator.get(); },
-                      [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr)
-                        -> rmm::mr::device_memory_resource* { return mr.get(); },
-                      [](const std::unique_ptr<fixed_size_host_memory_resource>& mr)
-                        -> rmm::mr::device_memory_resource* { return mr.get(); }},
-    _reservation_allocator);
+  return rmm::device_async_resource_ref(
+    const_cast<cuda::mr::any_resource<cuda::mr::device_accessible>&>(_allocator));
 }
 
 std::string memory_space::to_string() const

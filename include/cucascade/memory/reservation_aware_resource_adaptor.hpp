@@ -18,9 +18,9 @@
 #pragma once
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
 
 #include <atomic>
@@ -54,7 +54,7 @@ namespace memory {
  *
  * Based on RMM's tracking_resource_adaptor but extended for per-stream tracking.
  */
-class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resource {
+class reservation_aware_resource_adaptor {
  public:
   struct device_reserved_arena : public reserved_arena {
     friend class reservation_aware_resource_adaptor;
@@ -163,8 +163,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
     std::size_t capacity,
     std::unique_ptr<reservation_limit_policy> stream_reservation_policy = nullptr,
     std::unique_ptr<oom_handling_policy> default_oom_policy             = nullptr,
-    AllocationTrackingScope tracking_scope                              = AllocationTrackingScope::PER_STREAM,
-    cudaMemPool_t pool_handle                                           = nullptr);
+    AllocationTrackingScope tracking_scope = AllocationTrackingScope::PER_STREAM,
+    cudaMemPool_t pool_handle              = nullptr);
 
   /**
    * @brief Constructs a per-stream tracking resource adaptor.
@@ -186,13 +186,13 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
     std::size_t capacity,
     std::unique_ptr<reservation_limit_policy> stream_reservation_policy = nullptr,
     std::unique_ptr<oom_handling_policy> default_oom_policy             = nullptr,
-    AllocationTrackingScope tracking_scope                              = AllocationTrackingScope::PER_STREAM,
-    cudaMemPool_t pool_handle                                           = nullptr);
+    AllocationTrackingScope tracking_scope = AllocationTrackingScope::PER_STREAM,
+    cudaMemPool_t pool_handle              = nullptr);
 
   /**
    * @brief Destructor.
    */
-  ~reservation_aware_resource_adaptor() override = default;
+  ~reservation_aware_resource_adaptor() = default;
 
   // Non-copyable and non-movable to ensure resource stability
   reservation_aware_resource_adaptor(const reservation_aware_resource_adaptor&)            = delete;
@@ -326,6 +326,34 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
    */
   const oom_handling_policy& get_default_oom_handling_policy() const;
 
+  void* allocate(cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t));
+
+  void deallocate(cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept;
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    return allocate(cuda::stream_ref{}, bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(cuda::stream_ref{}, ptr, bytes, alignment);
+  }
+
+  bool operator==(reservation_aware_resource_adaptor const& other) const noexcept;
+
+  friend void get_property(reservation_aware_resource_adaptor const&,
+                           cuda::mr::device_accessible) noexcept
+  {
+  }
+
  private:
   /**
    * @brief grows reservation by a `bytes` size
@@ -395,32 +423,6 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
    * @param reservation pointer to the reservation being released
    */
   void do_release_reservation(device_reserved_arena* reservation) noexcept;
-
-  /**
-   * @brief Allocates memory from the upstream resource and tracks it.
-   *
-   * @param bytes The number of bytes to allocate
-   * @param stream The CUDA stream to use for the allocation
-   * @return Pointer to allocated memory
-   */
-  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override;
-
-  /**
-   * @brief Deallocates previously allocated memory and updates tracking.
-   *
-   * @param ptr Pointer to memory to deallocate
-   * @param bytes The number of bytes that were allocated
-   * @param stream The CUDA stream to use for the deallocation
-   */
-  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override;
-
-  /**
-   * @brief Checks equality with another memory resource.
-   *
-   * @param other The other memory resource to compare with
-   * @return true if this resource is the same as other
-   */
-  bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override;
 
   memory_space_id _space_id;
 

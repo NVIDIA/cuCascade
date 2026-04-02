@@ -26,8 +26,6 @@
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
-#include <rmm/mr/pinned_host_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
@@ -65,7 +63,7 @@ namespace memory {
  * Modified to derive from device_memory_resource instead of host_memory_resource for RMM
  * compatibility.
  */
-class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
+class fixed_size_host_memory_resource {
  public:
   static constexpr std::size_t default_block_size = 1 << 20;  ///< Default block size (1MB)
   static constexpr std::size_t default_pool_size  = 128;      ///< Default number of blocks in pool
@@ -234,7 +232,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   /**
    * @brief Destructor - frees all allocated blocks.
    */
-  ~fixed_size_host_memory_resource() override;
+  ~fixed_size_host_memory_resource();
 
   [[nodiscard]] std::size_t get_total_allocated_bytes() const noexcept
   {
@@ -322,6 +320,34 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
    */
   std::size_t get_peak_total_allocated_bytes() const;
 
+  void* allocate(cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t));
+
+  void deallocate(cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept;
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    return allocate(cuda::stream_ref{}, bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(cuda::stream_ref{}, ptr, bytes, alignment);
+  }
+
+  [[nodiscard]] bool operator==(fixed_size_host_memory_resource const& other) const noexcept;
+
+  friend void get_property(fixed_size_host_memory_resource const&,
+                           cuda::mr::device_accessible) noexcept
+  {
+  }
+
  protected:
   /**
    * @brief grows reservation by a `bytes` size
@@ -339,35 +365,6 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   bool do_reserve(std::size_t bytes, std::size_t mem_limit);
 
   std::size_t do_reserve_upto(std::size_t bytes, std::size_t mem_limit);
-
-  /**
-   * @brief Allocate memory of the specified size.
-   *
-   * @param bytes Size in bytes (must be <= block_size_)
-   * @param stream CUDA stream (ignored for host memory)
-   * @return void* Pointer to allocated memory
-   * @throws rmm::logic_error if allocation size exceeds block size
-   * @throws rmm::out_of_memory if no free blocks are available and upstream allocation fails
-   */
-  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override;
-
-  /**
-   * @brief Deallocate memory.
-   *
-   * @param ptr Pointer to deallocate
-   * @param bytes Size in bytes (must be <= block_size_)
-   * @param stream CUDA stream (ignored for host memory)
-   */
-  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override;
-
-  /**
-   * @brief Check if this resource is equal to another.
-   *
-   * @param other Other resource to compare
-   * @return bool True if equal
-   */
-  [[nodiscard]] bool do_is_equal(
-    const rmm::mr::device_memory_resource& other) const noexcept override;
 
  private:
   /**

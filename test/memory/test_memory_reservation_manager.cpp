@@ -491,8 +491,7 @@ SCENARIO("Reservation On Multi Gpu System", "[memory_space][.multi-device]")
   GIVEN("Dual gpu manager")
   {
     auto* gpu_space = manager->get_memory_space(Tier::GPU, 0);
-    auto* mr =
-      dynamic_cast<reservation_aware_resource_adaptor*>(gpu_space->get_default_allocator());
+    auto* mr        = gpu_space->get_memory_resource_as<reservation_aware_resource_adaptor>();
     REQUIRE(mr != nullptr);
 
     WHEN("a reservation doesn't fit on gpu 0 but fits on gpu 1")

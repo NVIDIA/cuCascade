@@ -15,17 +15,16 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda_utils.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/notification_channel.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
-#include <cucascade/cuda_utils.hpp>
-
-#include <cuda_runtime_api.h>
-
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <atomic>
 #include <exception>
@@ -43,7 +42,6 @@ using stream_ordered_tracker_state =
 using device_reserved_arena = reservation_aware_resource_adaptor::device_reserved_arena;
 
 namespace {
-
 
 struct stream_ordered_allocation_tracker
   : public reservation_aware_resource_adaptor::allocation_tracker_iface {
@@ -378,14 +376,16 @@ std::size_t reservation_aware_resource_adaptor::get_active_reservation_count() c
   return _number_of_allocations.load();
 }
 
-void* reservation_aware_resource_adaptor::do_allocate(std::size_t bytes,
-                                                      rmm::cuda_stream_view stream)
+void* reservation_aware_resource_adaptor::allocate(cuda::stream_ref stream,
+                                                   std::size_t bytes,
+                                                   [[maybe_unused]] std::size_t alignment)
 {
-  auto* reservation_state = _allocation_tracker->get_tracker_state(stream);
+  rmm::cuda_stream_view stream_view(stream.get());
+  auto* reservation_state = _allocation_tracker->get_tracker_state(stream_view);
   if (reservation_state != nullptr) {
-    return do_allocate_managed(bytes, reservation_state, stream);
+    return do_allocate_managed(bytes, reservation_state, stream_view);
   } else {
-    return do_allocate_managed(bytes, stream);
+    return do_allocate_managed(bytes, stream_view);
   }
 }
 
@@ -445,8 +445,11 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
       return _upstream.allocate(stream, allocation_bytes);
     } catch (std::exception& e) {
       _total_allocated_bytes.sub(tracking_bytes);
-      throw cucascade_out_of_memory(
-        e.what(), MemoryError::ALLOCATION_FAILED, allocation_bytes, post_allocation_size, _pool_handle);
+      throw cucascade_out_of_memory(e.what(),
+                                    MemoryError::ALLOCATION_FAILED,
+                                    allocation_bytes,
+                                    post_allocation_size,
+                                    _pool_handle);
     }
   } else {
     throw cucascade_out_of_memory("not enough capacity to allocate memory",
@@ -457,13 +460,15 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
   }
 }
 
-void reservation_aware_resource_adaptor::do_deallocate(void* ptr,
-                                                       std::size_t bytes,
-                                                       rmm::cuda_stream_view stream) noexcept
+void reservation_aware_resource_adaptor::deallocate(cuda::stream_ref stream,
+                                                    void* ptr,
+                                                    std::size_t bytes,
+                                                    [[maybe_unused]] std::size_t alignment) noexcept
 {
+  rmm::cuda_stream_view stream_view(stream.get());
   auto tracking_bytes           = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
   auto upstream_reclaimed_bytes = tracking_bytes;
-  auto* reservation_state       = _allocation_tracker->get_tracker_state(stream);
+  auto* reservation_state       = _allocation_tracker->get_tracker_state(stream_view);
   if (reservation_state != nullptr) {
     auto* reservation     = reservation_state->memory_reservation.get();
     auto reservation_size = static_cast<int64_t>(reservation->size());
@@ -481,22 +486,18 @@ void reservation_aware_resource_adaptor::do_deallocate(void* ptr,
 // Suppress false-positive null-dereference warnings from CCCL library code
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  _upstream.deallocate(stream, ptr, bytes);
+  _upstream.deallocate(stream_view, ptr, bytes);
 #pragma GCC diagnostic pop
   _total_allocated_bytes.sub(upstream_reclaimed_bytes);
 }
 
-bool reservation_aware_resource_adaptor::do_is_equal(
-  const rmm::mr::device_memory_resource& other) const noexcept
+bool reservation_aware_resource_adaptor::operator==(
+  reservation_aware_resource_adaptor const& other) const noexcept
 {
-  // Check if it's the same type
-  const auto* other_adaptor = dynamic_cast<const reservation_aware_resource_adaptor*>(&other);
-  if (other_adaptor == nullptr) { return false; }
-
 // Suppress false-positive null-dereference warnings from CCCL library code
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  return _upstream == other_adaptor->get_upstream_resource();
+  return _upstream == other.get_upstream_resource();
 #pragma GCC diagnostic pop
 }
 
