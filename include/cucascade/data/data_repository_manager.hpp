@@ -240,7 +240,7 @@ class data_repository_manager {
  private:
   // Implementation for shared_ptr - can copy to multiple repositories
   template <typename T = PtrType>
-  typename std::enable_if<std::is_same<T, std::shared_ptr<data_batch>>::value>::type
+  typename std::enable_if<std::is_same<T, std::shared_ptr<synchronized_data_batch>>::value>::type
   add_data_batch_impl(T batch, std::vector<std::pair<size_t, std::string_view>>& ops)
   {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -251,7 +251,7 @@ class data_repository_manager {
 
   // Implementation for unique_ptr - can only add to one repository (moves the batch)
   template <typename T = PtrType>
-  typename std::enable_if<std::is_same<T, std::unique_ptr<data_batch>>::value>::type
+  typename std::enable_if<std::is_same<T, std::unique_ptr<synchronized_data_batch>>::value>::type
   add_data_batch_impl(T batch, std::vector<std::pair<size_t, std::string_view>>& ops)
   {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -276,7 +276,9 @@ class data_repository_manager {
 };
 
 // Type aliases for common use cases
-using shared_data_repository_manager = data_repository_manager<std::shared_ptr<data_batch>>;
-using unique_data_repository_manager = data_repository_manager<std::unique_ptr<data_batch>>;
+using shared_data_repository_manager =
+  data_repository_manager<std::shared_ptr<synchronized_data_batch>>;
+using unique_data_repository_manager =
+  data_repository_manager<std::unique_ptr<synchronized_data_batch>>;
 
 }  // namespace cucascade

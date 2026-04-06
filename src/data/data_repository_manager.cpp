@@ -24,7 +24,7 @@
 namespace cucascade {
 
 // Explicit template instantiations for common pointer types
-template class data_repository_manager<std::shared_ptr<data_batch>>;
-template class data_repository_manager<std::unique_ptr<data_batch>>;
+template class data_repository_manager<std::shared_ptr<synchronized_data_batch>>;
+template class data_repository_manager<std::unique_ptr<synchronized_data_batch>>;
 
 }  // namespace cucascade

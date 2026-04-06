@@ -18,453 +18,158 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
-#include <optional>
-
 namespace cucascade {
 
-// data_batch_processing_handle implementation
+// =============================================================================
+// data_batch (inner) implementation
+// =============================================================================
 
-data_batch_processing_handle::~data_batch_processing_handle() { release(); }
-
-void data_batch_processing_handle::release()
+synchronized_data_batch::data_batch::data_batch(uint64_t batch_id,
+                                                std::unique_ptr<idata_representation> data)
+  : _batch_id(batch_id), _data(std::move(data))
 {
-  if (_batch.has_value()) {
-    if (auto b = _batch->lock()) { b->decrement_processing_count(); }
-    _batch = std::nullopt;
-  }
 }
 
-// data_batch implementation
+uint64_t synchronized_data_batch::data_batch::get_batch_id() const { return _batch_id; }
 
-data_batch::data_batch(uint64_t batch_id,
-                       std::unique_ptr<idata_representation> data,
-                       std::unique_ptr<idata_batch_probe> probe)
-  : _batch_id(batch_id), _data(std::move(data)), _probe(std::move(probe))
+memory::Tier synchronized_data_batch::data_batch::get_current_tier() const
 {
-  std::unique_lock<std::mutex> lock(_mutex);
-  update_state_to(batch_state::idle, lock);
+  return _data->get_current_tier();
 }
 
-data_batch::data_batch(data_batch&& other)
-  : _batch_id(other._batch_id), _data(std::move(other._data))
-{
-  std::unique_lock<std::mutex> lock(other._mutex);
-  size_t other_processing_count = other._processing_count;
-  if (other_processing_count != 0) {
-    throw std::runtime_error(
-      "Cannot move data_batch with active processing (processing_count != 0)");
-  }
-  other._batch_id = 0;
-  other._data     = nullptr;
-}
+idata_representation* synchronized_data_batch::data_batch::get_data() const { return _data.get(); }
 
-data_batch& data_batch::operator=(data_batch&& other)
-{
-  if (this != &other) {
-    std::unique_lock<std::mutex> lock(other._mutex);
-    size_t other_processing_count = other._processing_count;
-    if (other_processing_count != 0) {
-      throw std::runtime_error(
-        "Cannot move data_batch with active processing (processing_count != 0)");
-    }
-    _batch_id       = other._batch_id;
-    _data           = std::move(other._data);
-    other._batch_id = 0;
-    other._data     = nullptr;
-  }
-  return *this;
-}
-
-memory::Tier data_batch::get_current_tier() const { return _data->get_current_tier(); }
-
-uint64_t data_batch::get_batch_id() const { return _batch_id; }
-
-batch_state data_batch::get_state() const
-{
-  std::unique_lock<std::mutex> lock(_mutex);
-  return _state;
-}
-
-size_t data_batch::get_processing_count() const
-{
-  std::unique_lock<std::mutex> lock(_mutex);
-  return _processing_count;
-}
-
-idata_representation* data_batch::get_data() const { return _data.get(); }
-
-cucascade::memory::memory_space* data_batch::get_memory_space() const
+cucascade::memory::memory_space* synchronized_data_batch::data_batch::get_memory_space() const
 {
   if (_data == nullptr) { return nullptr; }
   return &_data->get_memory_space();
 }
 
-void data_batch::set_state_change_cv(std::condition_variable* cv)
+void synchronized_data_batch::data_batch::set_data(std::unique_ptr<idata_representation> data)
 {
-  std::unique_lock<std::mutex> lock(_mutex);
-  _state_change_cv = cv;
-}
-
-void data_batch::set_data(std::unique_ptr<idata_representation> data)
-{
-  std::unique_lock<std::mutex> lock(_mutex);
-  if (_processing_count != 0) {
-    throw std::runtime_error("Cannot set data while there is active processing");
-  }
   _data = std::move(data);
 }
 
-bool data_batch::try_to_create_task()
+// =============================================================================
+// read_only_data_batch implementation
+// =============================================================================
+
+synchronized_data_batch::read_only_data_batch
+synchronized_data_batch::read_only_data_batch::from_mutable(mutable_data_batch&& rw)
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  bool should_notify                    = false;
-  bool success                          = false;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    if (_state == batch_state::idle) {
-      ++_task_created_count;
-      update_state_to(batch_state::task_created, lock);
-      should_notify = true;
-      cv_to_notify  = _state_change_cv;
-      success       = true;
-    } else if (_state == batch_state::task_created) {
-      ++_task_created_count;
-      should_notify = true;
-      success       = true;
-    } else if (_state == batch_state::processing) {
-      // Batch is already processing, increment counter but stay in processing state
-      ++_task_created_count;
-      should_notify = true;
-      success       = true;
-    }
-  }
-  if (should_notify) { _internal_cv.notify_all(); }
-  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
-  return success;
+  auto* parent = rw.parent_;
+  auto* mtx    = rw.lock_.mutex();
+  rw.lock_.unlock();
+  std::shared_lock<std::shared_mutex> lock(*mtx);
+  return read_only_data_batch(parent, std::move(lock));
 }
 
-void data_batch::wait_to_create_task()
+// =============================================================================
+// mutable_data_batch implementation
+// =============================================================================
+
+synchronized_data_batch::mutable_data_batch
+synchronized_data_batch::mutable_data_batch::from_read_only(read_only_data_batch&& ro)
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _internal_cv.wait(lock, [&] { return _state != batch_state::in_transit; });
-    if (_state == batch_state::idle) {
-      update_state_to(batch_state::task_created, lock);
-      cv_to_notify = _state_change_cv;
-    }
-    // Always increment and always notify: wait_to_lock_for_processing waits on
-    // _internal_cv checking _task_created_count > 0, so it must be woken here.
-    ++_task_created_count;
-  }
-  _internal_cv.notify_all();
-  if (cv_to_notify) { cv_to_notify->notify_all(); }
+  auto* parent = ro.parent_;
+  auto* mtx    = ro.lock_.mutex();
+  ro.lock_.unlock();
+  std::unique_lock<std::shared_mutex> lock(*mtx);
+  return mutable_data_batch(parent, std::move(lock));
 }
 
-size_t data_batch::get_task_created_count() const
+// =============================================================================
+// synchronized_data_batch implementation
+// =============================================================================
+
+synchronized_data_batch::synchronized_data_batch(uint64_t batch_id,
+                                                 std::unique_ptr<idata_representation> data)
+  : _batch(batch_id, std::move(data))
 {
-  std::unique_lock<std::mutex> lock(_mutex);
-  return _task_created_count;
 }
 
-bool data_batch::try_to_cancel_task()
+synchronized_data_batch::synchronized_data_batch(synchronized_data_batch&& other)
+  : _batch(std::move(other._batch))
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  bool should_notify                    = false;
-  bool success                          = false;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    if (_state == batch_state::task_created || _state == batch_state::processing) {
-      if (_task_created_count == 0) {
-        throw std::runtime_error(
-          "Cannot cancel task: task_created_count is zero. "
-          "try_to_create_task() must be called before try_to_cancel_task()");
-      }
-      --_task_created_count;
-      if (_task_created_count == 0 && _processing_count == 0) {
-        update_state_to(batch_state::idle, lock);
-        should_notify = true;
-        cv_to_notify  = _state_change_cv;
-      }
-      success = true;
-    }
-  }
-  if (should_notify) { _internal_cv.notify_all(); }
-  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
-  return success;
 }
 
-void data_batch::wait_to_cancel_task()
+synchronized_data_batch& synchronized_data_batch::operator=(synchronized_data_batch&& other)
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  bool should_notify                    = false;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _internal_cv.wait(lock, [&] {
-      return _state == batch_state::task_created || _state == batch_state::processing;
-    });
-    if (_task_created_count == 0) {
-      throw std::runtime_error(
-        "Cannot cancel task: task_created_count is zero. "
-        "try_to_create_task() must be called before wait_to_cancel_task()");
-    }
-    --_task_created_count;
-    if (_task_created_count == 0 && _processing_count == 0) {
-      update_state_to(batch_state::idle, lock);
-      should_notify = true;
-      cv_to_notify  = _state_change_cv;
-    }
-  }
-  if (should_notify) { _internal_cv.notify_all(); }
-  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  if (this != &other) { _batch = std::move(other._batch); }
+  return *this;
 }
 
-lock_for_processing_result data_batch::try_to_lock_for_processing(
-  memory::memory_space_id requested_memory_space)
+// Lock acquisition (blocking)
+
+synchronized_data_batch::read_only_data_batch synchronized_data_batch::get_read_only()
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  bool should_notify                    = false;
-  lock_for_processing_result result{
-    false, data_batch_processing_handle{}, lock_for_processing_status::not_attempted};
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-
-    if (_data == nullptr) {
-      result.status = lock_for_processing_status::missing_data;
-      return result;
-    }
-
-    if (_data->get_memory_space().get_id() != requested_memory_space) {
-      result.status = lock_for_processing_status::memory_space_mismatch;
-      return result;
-    }
-
-    if (_task_created_count == 0) {
-      result.status = lock_for_processing_status::task_not_created;
-      return result;
-    }
-
-    if (!(_state == batch_state::task_created || _state == batch_state::processing)) {
-      result.status = lock_for_processing_status::invalid_state;
-      return result;
-    }
-    --_task_created_count;
-    ++_processing_count;
-    update_state_to(batch_state::processing, lock);
-    should_notify = true;
-    cv_to_notify  = _state_change_cv;
-    result        = {
-      true, data_batch_processing_handle{shared_from_this()}, lock_for_processing_status::success};
-  }
-  if (should_notify) { _internal_cv.notify_all(); }
-  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
-  return result;
+  std::shared_lock<std::shared_mutex> lock(_rw_mutex);
+  return read_only_data_batch(this, std::move(lock));
 }
 
-lock_for_processing_result data_batch::wait_to_lock_for_processing(
-  memory::memory_space_id requested_memory_space)
+synchronized_data_batch::mutable_data_batch synchronized_data_batch::get_mutable()
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  lock_for_processing_result result{
-    false, data_batch_processing_handle{}, lock_for_processing_status::not_attempted};
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-
-    // Return immediately for failures that cannot be resolved by waiting
-    if (_data == nullptr) {
-      result.status = lock_for_processing_status::missing_data;
-      return result;
-    }
-    if (_data->get_memory_space().get_id() != requested_memory_space) {
-      result.status = lock_for_processing_status::memory_space_mismatch;
-      return result;
-    }
-
-    // Wait until the state allows locking for processing
-    _internal_cv.wait(lock, [&] {
-      return (_state == batch_state::task_created || _state == batch_state::processing) &&
-             _task_created_count > 0;
-    });
-
-    // Re-check non-waitable conditions after waking (data may have changed)
-    if (_data == nullptr) {
-      result.status = lock_for_processing_status::missing_data;
-      return result;
-    }
-    if (_data->get_memory_space().get_id() != requested_memory_space) {
-      result.status = lock_for_processing_status::memory_space_mismatch;
-      return result;
-    }
-
-    --_task_created_count;
-    ++_processing_count;
-    update_state_to(batch_state::processing, lock);
-    cv_to_notify = _state_change_cv;
-    result       = {
-      true, data_batch_processing_handle{shared_from_this()}, lock_for_processing_status::success};
-  }
-  _internal_cv.notify_all();
-  if (cv_to_notify) { cv_to_notify->notify_all(); }
-  return result;
+  std::unique_lock<std::shared_mutex> lock(_rw_mutex);
+  return mutable_data_batch(this, std::move(lock));
 }
 
-bool data_batch::try_to_lock_for_in_transit()
+// Lock acquisition (non-blocking)
+
+std::optional<synchronized_data_batch::read_only_data_batch>
+synchronized_data_batch::try_get_read_only()
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  bool should_notify                    = false;
-  bool success                          = false;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    if (_processing_count == 0 &&
-        ((_state == batch_state::idle) ||
-         (_state == batch_state::task_created && _task_created_count > 0))) {
-      update_state_to(batch_state::in_transit, lock);
-      should_notify = true;
-      cv_to_notify  = _state_change_cv;
-      success       = true;
-    }
-  }
-  if (should_notify) { _internal_cv.notify_all(); }
-  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
-  return success;
+  std::shared_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) { return std::nullopt; }
+  return read_only_data_batch(this, std::move(lock));
 }
 
-void data_batch::wait_to_lock_for_in_transit()
+std::optional<synchronized_data_batch::mutable_data_batch>
+synchronized_data_batch::try_get_mutable()
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _internal_cv.wait(lock, [&] {
-      return _processing_count == 0 &&
-             ((_state == batch_state::idle) ||
-              (_state == batch_state::task_created && _task_created_count > 0));
-    });
-    update_state_to(batch_state::in_transit, lock);
-    cv_to_notify = _state_change_cv;
-  }
-  _internal_cv.notify_all();
-  if (cv_to_notify) { cv_to_notify->notify_all(); }
+  std::unique_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) { return std::nullopt; }
+  return mutable_data_batch(this, std::move(lock));
 }
 
-bool data_batch::try_to_release_in_transit(std::optional<batch_state> target_state)
+// Immutable field (lock-free)
+
+uint64_t synchronized_data_batch::get_batch_id() const { return _batch._batch_id; }
+
+// Subscriber count
+
+bool synchronized_data_batch::subscribe()
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  bool should_notify                    = false;
-  bool success                          = false;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    if (_state == batch_state::in_transit) {
-      // Caller can explicitly choose the state to return to; default is idle.
-      if (target_state.has_value()) {
-        if (*target_state == batch_state::idle) {
-          update_state_to(batch_state::idle, lock);
-        } else {
-          // first transition to idle
-          update_state_to(batch_state::idle, lock);
-          // then to the next state, maintaining FSM invariants
-          update_state_to(*target_state, lock);
-        }
-      } else {
-        update_state_to(batch_state::idle, lock);
-      }
-      should_notify = true;
-      cv_to_notify  = _state_change_cv;
-      success       = true;
-    }
-  }
-  if (should_notify) { _internal_cv.notify_all(); }
-  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
-  return success;
+  _subscriber_count.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
-void data_batch::wait_to_release_in_transit(std::optional<batch_state> target_state)
+void synchronized_data_batch::unsubscribe()
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _internal_cv.wait(lock, [&] { return _state == batch_state::in_transit; });
-    // Caller can explicitly choose the state to return to; default is idle.
-    if (target_state.has_value()) {
-      if (*target_state == batch_state::idle) {
-        update_state_to(batch_state::idle, lock);
-      } else {
-        // first transition to idle
-        update_state_to(batch_state::idle, lock);
-        // then to the next state, maintaining FSM invariants
-        update_state_to(*target_state, lock);
-      }
-    } else {
-      update_state_to(batch_state::idle, lock);
-    }
-    cv_to_notify = _state_change_cv;
+  size_t prev = _subscriber_count.fetch_sub(1, std::memory_order_relaxed);
+  if (prev == 0) {
+    _subscriber_count.fetch_add(1, std::memory_order_relaxed);
+    throw std::runtime_error("Cannot unsubscribe: subscriber count is already zero");
   }
-  _internal_cv.notify_all();
-  if (cv_to_notify) { cv_to_notify->notify_all(); }
 }
 
-void data_batch::decrement_processing_count()
+size_t synchronized_data_batch::get_subscriber_count() const
 {
-  std::condition_variable* cv_to_notify = nullptr;
-  bool should_notify                    = false;
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    if (_state != batch_state::processing) {
-      throw std::runtime_error(
-        "Cannot decrement processing count: batch is not in processing state. state: " +
-        std::to_string((int)_state));
-    }
-    if (_processing_count == 0) {
-      throw std::runtime_error(
-        "Cannot decrement processing count: processing count is already zero");
-    }
-    _processing_count -= 1;
-    if (_processing_count == 0) {
-      // Preserve pending task_created intent if any remain
-      update_state_to((_task_created_count > 0) ? batch_state::task_created : batch_state::idle,
-                      lock);
-      should_notify = true;
-      cv_to_notify  = _state_change_cv;
-    }
-  }
-  if (should_notify) { _internal_cv.notify_all(); }
-  if (should_notify && cv_to_notify) { cv_to_notify->notify_all(); }
+  return _subscriber_count.load(std::memory_order_relaxed);
 }
 
-std::shared_ptr<data_batch> data_batch::clone(
-  uint64_t new_batch_id,
-  rmm::cuda_stream_view stream,
-  std::optional<std::unique_ptr<idata_batch_probe>> probe)
+// Clone
+
+std::shared_ptr<synchronized_data_batch> synchronized_data_batch::clone(
+  uint64_t new_batch_id, rmm::cuda_stream_view stream)
 {
-  // Create a task and lock for processing to protect data during clone
-  if (!try_to_create_task()) {
-    throw std::runtime_error(
-      "Cannot clone data_batch: failed to create task (batch may be in transit)");
+  std::shared_lock<std::shared_mutex> lock(_rw_mutex);
+
+  if (_batch._data == nullptr) {
+    throw std::runtime_error("Cannot clone: data is null");
   }
 
-  auto space_id = _data->get_memory_space().get_id();
-  std::unique_ptr<idata_representation> cloned_data;
-  {
-    auto result = try_to_lock_for_processing(space_id);
-    if (!result.success) {
-      throw std::runtime_error("Cannot clone data_batch: failed to lock for processing");
-    }
-
-    // Clone the data while holding the processing lock
-    cloned_data = _data->clone(stream);
-  }
-  // Handle destructor will decrement processing count when result goes out of scope
-  return std::make_shared<data_batch>(
-    new_batch_id,
-    std::move(cloned_data),
-    probe ? std::move(*probe) : std::make_unique<idata_batch_probe>());
-}
-
-void data_batch::update_state_to(batch_state new_state,
-                                 const std::unique_lock<std::mutex>& /*lock*/)
-{
-  _state = new_state;
-  _probe->state_transitioned_to(
-    _state, _batch_id, *(this->get_data()), _processing_count, _task_created_count);
+  auto cloned_data = _batch._data->clone(stream);
+  return std::make_shared<synchronized_data_batch>(new_batch_id, std::move(cloned_data));
 }
 
 }  // namespace cucascade

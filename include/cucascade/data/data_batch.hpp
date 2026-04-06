@@ -1,4 +1,3 @@
-
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -24,12 +23,12 @@
 
 #include <cudf/table/table.hpp>
 
-#include <condition_variable>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -42,526 +41,198 @@ class memory_space;
 namespace cucascade {
 
 /**
- * @brief Represents the current state of a data_batch.
+ * @brief Synchronized wrapper for data_batch that separates data from synchronization.
  *
- * State transitions allowed:
- * - idle -> in_transit, task_created
- * - task_created -> processing, idle
- * - processing -> idle
- * - in_transit -> idle
- */
-enum class batch_state {
-  idle,          ///< Batch is idle, not being processed or in transit
-  task_created,  ///< A task has been created for this batch, pending processing
-  processing,    ///< Batch is currently being processed
-  in_transit     ///< Batch is currently being moved to a different memory tier
-};
-
-/**
- * @brief Interface for probing the data_batch class.
- *
- * Applications may implement this interface to hold additional application specific
- * data_batch metadata while probing the data_batch by overriding the provided methods
- * that expose the data_batch state when certain events occur, like state transitions.
- */
-class idata_batch_probe {
- public:
-  virtual ~idata_batch_probe() = default;
-
-  /**
-   * @brief The function that is called everytime a data_batch transitions into a new batch_state.
-   *
-   * @note It is the implementer's responsibility that a call to this function returns quickly, as
-   *       this function is called in a thread-safe manner, and will block other mutating changes
-   *       while this executes. Primarily intended for bookkeeping purposes.
-   */
-  virtual void state_transitioned_to([[maybe_unused]] const batch_state new_state,
-                                     [[maybe_unused]] const uint64_t batch_id,
-                                     [[maybe_unused]] const idata_representation& data,
-                                     [[maybe_unused]] const size_t processing_count,
-                                     [[maybe_unused]] const size_t task_created_count)
-  {
-    // The default impl is no-op.
-  }
-};
-
-// Forward declarations
-class data_batch;
-class data_batch_processing_handle;
-
-/**
- * @brief RAII handle that manages processing state for a data_batch.
- *
- * When this handle goes out of scope, it decrements the processing count of the
- * associated data_batch. If the processing count drops to zero, the batch state
- * transitions from processing back to idle.
- *
- * @note This class is move-only to ensure proper ownership semantics.
- * @note Uses a weak_ptr so the handle does not keep the batch alive; if the batch
- *       is destroyed before release(), release() is a no-op.
- */
-class data_batch_processing_handle {
- public:
-  /**
-   * @brief Default constructor creates an empty handle.
-   */
-  data_batch_processing_handle() = default;
-
-  /**
-   * @brief Construct a handle from a shared_ptr (stores weak_ptr; does not keep batch alive).
-   *
-   * @param batch shared_ptr to the data_batch to manage
-   */
-  explicit data_batch_processing_handle(std::shared_ptr<data_batch> batch)
-    : _batch(batch ? std::optional<std::weak_ptr<data_batch>>(std::move(batch)) : std::nullopt)
-  {
-  }
-
-  /**
-   * @brief Destructor decrements processing count and potentially transitions state.
-   */
-  ~data_batch_processing_handle();
-
-  // Move-only semantics
-  data_batch_processing_handle(const data_batch_processing_handle&)            = delete;
-  data_batch_processing_handle& operator=(const data_batch_processing_handle&) = delete;
-
-  /**
-   * @brief Move constructor - transfers ownership of the handle.
-   */
-  data_batch_processing_handle(data_batch_processing_handle&& other) noexcept
-    : _batch(std::exchange(other._batch, std::nullopt))
-  {
-  }
-
-  /**
-   * @brief Move assignment operator - transfers ownership of the handle.
-   */
-  data_batch_processing_handle& operator=(data_batch_processing_handle&& other) noexcept
-  {
-    if (this != &other) {
-      release();
-      _batch = std::exchange(other._batch, std::nullopt);
-    }
-    return *this;
-  }
-
-  /**
-   * @brief Check if this handle is valid (managing a batch).
-   */
-  bool valid() const { return _batch.has_value() && !_batch->expired(); }
-
-  /**
-   * @brief Explicitly release the handle, decrementing the processing count.
-   */
-  void release();
-
- private:
-  std::optional<std::weak_ptr<data_batch>> _batch;  ///< Weak reference to the managed data_batch
-};
-
-/**
- * @brief Result of attempting to lock a batch for processing.
- */
-enum class lock_for_processing_status {
-  success,
-  task_not_created,
-  invalid_state,
-  memory_space_mismatch,
-  missing_data,
-  not_attempted
-};
-
-struct lock_for_processing_result {
-  bool success{false};
-  data_batch_processing_handle handle{};
-  lock_for_processing_status status{lock_for_processing_status::not_attempted};
-
-  lock_for_processing_result() = default;
-  lock_for_processing_result(bool success,
-                             data_batch_processing_handle&& handle,
-                             lock_for_processing_status status)
-    : success(success), handle(std::move(handle)), status(status)
-  {
-  }
-
-  // Move-only to mirror handle semantics
-  lock_for_processing_result(lock_for_processing_result&&) noexcept            = default;
-  lock_for_processing_result& operator=(lock_for_processing_result&&) noexcept = default;
-  lock_for_processing_result(const lock_for_processing_result&)                = delete;
-  lock_for_processing_result& operator=(const lock_for_processing_result&)     = delete;
-};
-
-/**
- * @brief A data batch represents a collection of data that can be moved between different memory
- * tiers.
- *
- * data_batch is the core unit of data management in cuCascade. It wraps an
- * idata_representation and provides processing counting functionality to track when data is being
- * actively used. This enables safe memory management and efficient data movement
- * between GPU memory, host memory, and storage tiers.
+ * synchronized_data_batch owns an inner data_batch (pure data, no locking) and a
+ * std::shared_mutex. Access to the inner data_batch is only possible through RAII accessor
+ * types (read_only_data_batch, mutable_data_batch) that bundle lock lifetime with data access.
  *
  * Key characteristics:
- * - Move-only semantics (no copy constructor/assignment)
- * - Processing counting for safe shared access and eviction prevention
- * - State management (idle, task_created, processing, in_transit) for lifecycle tracking
- * - Delegated tier management to underlying idata_representation
- * - Unique batch ID for tracking and debugging purposes
- * - Lifecycle managed by smart pointers (std::shared_ptr or std::unique_ptr)
- *
- * @note This class is not thread-safe for construction/destruction, but the state management
- *       operations are protected by an internal mutex and thread-safe.
+ * - Compiler-enforced read/write separation via accessor types
+ * - PtrType agnostic — works with shared_ptr, unique_ptr, or stack allocation
+ * - No enable_shared_from_this — accessors borrow via raw pointer
+ * - Independent atomic subscriber count for interest tracking
+ * - Unique batch ID exposed on wrapper (lock-free) for repository lookups
  */
-class data_batch : public std::enable_shared_from_this<data_batch> {
+class synchronized_data_batch {
  public:
-  /**
-   * @brief Construct a new data_batch with the given ID and data representation.
-   *
-   * @param batch_id Unique identifier for this batch
-   * @param data Ownership of the data representation is transferred to this batch
-   * @param probe @copydoc idata_batch_probe
-   */
-  data_batch(uint64_t batch_id,
-             std::unique_ptr<idata_representation> data,
-             std::unique_ptr<idata_batch_probe> probe = std::make_unique<idata_batch_probe>());
+  // Forward declarations for accessor types
+  class read_only_data_batch;
+  class mutable_data_batch;
 
   /**
-   * @brief Move constructor - transfers ownership of the batch and its data.
+   * @brief Inner data type — pure data, no synchronization.
    *
-   * Moves the batch_id and data from the other batch, then resets the other batch's
-   * batch_id to 0 and data pointer to nullptr.
-   *
-   * @param other The batch to move from (will have batch_id set to 0 and data set to nullptr)
-   * @throws std::runtime_error if the source batch has active processing (processing_count != 0)
+   * Only accessible through read_only_data_batch (const) or mutable_data_batch (non-const).
+   * Constructor is private — only synchronized_data_batch can create instances.
    */
-  data_batch(data_batch&& other);
+  class data_batch {
+   public:
+    uint64_t get_batch_id() const;
+    memory::Tier get_current_tier() const;
+    idata_representation* get_data() const;
+    cucascade::memory::memory_space* get_memory_space() const;
+
+    void set_data(std::unique_ptr<idata_representation> data);
+
+    template <typename TargetRepresentation>
+    void convert_to(representation_converter_registry& registry,
+                    const cucascade::memory::memory_space* target_memory_space,
+                    rmm::cuda_stream_view stream);
+
+   private:
+    friend class synchronized_data_batch;
+    data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data);
+
+    uint64_t _batch_id;
+    std::unique_ptr<idata_representation> _data;
+  };
 
   /**
-   * @brief Move assignment operator - transfers ownership of the batch and its data.
+   * @brief RAII read-only accessor. Borrows the parent, does not extend lifetime.
    *
-   * Performs self-assignment check, then moves the batch_id and data from the other batch.
-   * Resets the other batch's batch_id to 0 and data pointer to nullptr.
-   *
-   * @param other The batch to move from (will have batch_id set to 0 and data set to nullptr)
-   * @return data_batch& Reference to this batch
-   * @throws std::runtime_error if the source batch has active processing (processing_count != 0)
+   * operator-> returns const data_batch* — mutating methods are not callable.
+   * Multiple read_only_data_batch instances can coexist for the same synchronized_data_batch.
+   * Move-only. The shared lock is released when this object is destroyed or moved-from.
    */
-  data_batch& operator=(data_batch&& other);
+  class read_only_data_batch {
+   public:
+    const data_batch* operator->() const { return &(parent_->_batch); }
+    const data_batch& operator*() const { return parent_->_batch; }
+
+    /**
+     * @brief Downgrade from mutable → read-only.
+     * Internally releases unique lock, then blocks until shared lock acquired.
+     */
+    static read_only_data_batch from_mutable(mutable_data_batch&& rw);
+
+    read_only_data_batch(read_only_data_batch&&) noexcept            = default;
+    read_only_data_batch& operator=(read_only_data_batch&&) noexcept = default;
+    read_only_data_batch(const read_only_data_batch&)                = delete;
+    read_only_data_batch& operator=(const read_only_data_batch&)     = delete;
+
+   private:
+    friend class synchronized_data_batch;
+    friend class mutable_data_batch;
+    read_only_data_batch(synchronized_data_batch* parent,
+                         std::shared_lock<std::shared_mutex> lock)
+      : parent_(parent), lock_(std::move(lock))
+    {
+    }
+
+    synchronized_data_batch* parent_;
+    std::shared_lock<std::shared_mutex> lock_;
+  };
 
   /**
-   * @brief Get the current memory tier where this batch's data resides.
+   * @brief RAII mutable accessor. Borrows the parent, does not extend lifetime.
    *
-   * @return Tier The memory tier (GPU, HOST, or STORAGE)
+   * operator-> returns data_batch* — both read and write methods are callable.
+   * Only one mutable_data_batch can exist at a time for a given synchronized_data_batch.
+   * Move-only. The unique lock is released when this object is destroyed or moved-from.
    */
-  memory::Tier get_current_tier() const;
+  class mutable_data_batch {
+   public:
+    data_batch* operator->() { return &(parent_->_batch); }
+    data_batch& operator*() { return parent_->_batch; }
 
-  /**
-   * @brief Get the unique identifier for this data batch.
-   *
-   * @return uint64_t The batch ID assigned during construction
-   */
+    /**
+     * @brief Upgrade from read-only → mutable.
+     * Internally releases shared lock, then blocks until unique lock acquired.
+     */
+    static mutable_data_batch from_read_only(read_only_data_batch&& ro);
+
+    mutable_data_batch(mutable_data_batch&&) noexcept            = default;
+    mutable_data_batch& operator=(mutable_data_batch&&) noexcept = default;
+    mutable_data_batch(const mutable_data_batch&)                = delete;
+    mutable_data_batch& operator=(const mutable_data_batch&)     = delete;
+
+   private:
+    friend class synchronized_data_batch;
+    friend class read_only_data_batch;
+    mutable_data_batch(synchronized_data_batch* parent,
+                       std::unique_lock<std::shared_mutex> lock)
+      : parent_(parent), lock_(std::move(lock))
+    {
+    }
+
+    synchronized_data_batch* parent_;
+    std::unique_lock<std::shared_mutex> lock_;
+  };
+
+  // -- Construction --
+
+  synchronized_data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data);
+
+  synchronized_data_batch(synchronized_data_batch&& other);
+  synchronized_data_batch& operator=(synchronized_data_batch&& other);
+
+  synchronized_data_batch(const synchronized_data_batch&)            = delete;
+  synchronized_data_batch& operator=(const synchronized_data_batch&) = delete;
+
+  // -- Lock acquisition (blocking) --
+
+  read_only_data_batch get_read_only();
+  mutable_data_batch get_mutable();
+
+  // -- Lock acquisition (non-blocking) --
+
+  std::optional<read_only_data_batch> try_get_read_only();
+  std::optional<mutable_data_batch> try_get_mutable();
+
+  // -- Immutable field exposed on wrapper (lock-free, for repository lookups) --
+
   uint64_t get_batch_id() const;
 
-  /**
-   * @brief Get the current state of this batch.
-   *
-   * @return batch_state The current state (idle, task_created, processing, or in_transit)
-   */
-  batch_state get_state() const;
+  // -- Subscriber count (independent atomic, no lock needed) --
 
-  /**
-   * @brief Get the current processing count (mutex-protected).
-   *
-   * @return size_t The number of active processing handles
-   */
-  size_t get_processing_count() const;
+  bool subscribe();
+  void unsubscribe();
+  size_t get_subscriber_count() const;
 
-  /**
-   * @brief Get the underlying data representation.
-   *
-   * Returns a pointer to the idata_representation that holds the actual data.
-   * This allows access to tier-specific operations and data access methods.
-   *
-   * @return idata_representation* Pointer to the data representation (non-owning)
-   */
-  idata_representation* get_data() const;
+  // -- Clone (acquires read lock internally) --
 
-  /**
-   * @brief Get the memory_space where this batch currently resides.
-   *
-   * Delegates to the underlying idata_representation to determine the memory space.
-   *
-   * @return cucascade::memory::memory_space* Pointer to the memory space
-   */
-  cucascade::memory::memory_space* get_memory_space() const;
+  std::shared_ptr<synchronized_data_batch> clone(uint64_t new_batch_id,
+                                                 rmm::cuda_stream_view stream);
 
-  /**
-   * @brief Set a condition variable to be notified on state changes.
-   *
-   * The CV is notified outside of the batch mutex.
-   */
-  void set_state_change_cv(std::condition_variable* cv);
-
-  /**
-   * @brief Blocking call: wait until the batch can accept a new task, then create it.
-   *
-   * Blocks until the batch leaves in_transit state, then performs the same transition
-   * as try_to_create_task(). Always succeeds when it returns.
-   */
-  void wait_to_create_task();
-
-  /**
-   * @brief Blocking call: wait until a created task can be cancelled, then cancel it.
-   *
-   * Blocks until the batch is in task_created or processing state, then performs
-   * the same transition as try_to_cancel_task(). Always succeeds when it returns.
-   */
-  void wait_to_cancel_task();
-
-  /**
-   * @brief Blocking call: wait until the batch can be locked for processing, then lock it.
-   *
-   * Blocks until the batch is in task_created or processing state with a pending
-   * task_created_count. Non-waitable failures (missing_data, memory_space_mismatch)
-   * are returned immediately with the appropriate status.
-   *
-   * @param requested_memory_space The memory space the caller expects to process from.
-   * @return lock_for_processing_result success=true with handle on success; success=false
-   *         with status describing non-waitable failure.
-   */
-  lock_for_processing_result wait_to_lock_for_processing(
-    memory::memory_space_id requested_memory_space);
-
-  /**
-   * @brief Blocking call: wait until the batch can be locked for in-transit, then lock it.
-   *
-   * Blocks until processing_count == 0 and the batch is in idle or task_created state,
-   * then performs the same transition as try_to_lock_for_in_transit(). Always succeeds
-   * when it returns.
-   */
-  void wait_to_lock_for_in_transit();
-
-  /**
-   * @brief Blocking call: wait until the batch is in in_transit state, then release it.
-   *
-   * Blocks until the batch is in in_transit state, then performs the same transition
-   * as try_to_release_in_transit(). Always succeeds when it returns.
-   *
-   * @param target_state Optional state to transition to when releasing in_transit. If not set,
-   *        the batch returns to idle.
-   */
-  void wait_to_release_in_transit(std::optional<batch_state> target_state = std::nullopt);
-  /**
-   * @brief Replace the underlying data representation.
-   *        Requires no active processing.
-   */
-  void set_data(std::unique_ptr<idata_representation> data);
-
-  /**
-   * @brief Convert the underlying representation to the target representation type.
-   *        Requires no active processing.
-   *
-   * Uses the provided representation_converter_registry to look up the appropriate converter
-   * from the current representation type to the target type.
-   *
-   * @tparam TargetRepresentation The target idata_representation type to convert to
-   * @param registry The converter registry to use for looking up converters
-   * @param target_memory_space The memory space where the new representation will be allocated
-   * @param stream CUDA stream for memory operations
-   * @throws std::runtime_error if no converter is registered for the type pair
-   * @throws std::runtime_error if there is active processing on this batch
-   */
   template <typename TargetRepresentation>
-  void convert_to(representation_converter_registry& registry,
-                  const cucascade::memory::memory_space* target_memory_space,
-                  rmm::cuda_stream_view stream);
-
-  /**
-   * @brief Clones the underlying representation and returns a new data_batch with the cloned data.
-   *        Requires no active processing.
-   *
-   * @param new_batch_id The batch ID for the cloned batch
-   * @param target_memory_space The memory space where the new representation will be allocated
-   * @param stream CUDA stream for memory operations
-   * @param probe Optional @copydoc idata_batch_probe
-   * @return std::shared_ptr<data_batch> A new data_batch with cloned data
-   * @throws std::runtime_error if there is active processing on this batch
-   */
-  template <typename TargetRepresentation>
-  std::shared_ptr<data_batch> clone_to(
+  std::shared_ptr<synchronized_data_batch> clone_to(
     representation_converter_registry& registry,
     uint64_t new_batch_id,
     const cucascade::memory::memory_space* target_memory_space,
-    rmm::cuda_stream_view stream,
-    std::optional<std::unique_ptr<idata_batch_probe>> probe = std::nullopt);
-
-  /**
-   * @brief Attempt to create a task for this batch.
-   *
-   * Transitions the batch from idle to task_created state and increments task_created_counter.
-   * If the batch is already in task_created state, only increments task_created_counter.
-   * If the batch is in processing state, increments task_created_counter but stays in processing.
-   * This must be called before try_to_lock_for_processing().
-   *
-   * @return true if the batch is in idle, task_created, or processing state
-   * @return false if the batch is in in_transit state
-   */
-  bool try_to_create_task();
-
-  /**
-   * @brief Get the current task_created counter (mutex-protected).
-   *
-   * This counter tracks how many task_created requests are pending for this batch.
-   * It is incremented by try_to_create_task() and decremented by try_to_lock_for_processing().
-   *
-   * @return size_t The number of pending task_created requests
-   */
-  size_t get_task_created_count() const;
-
-  /**
-   * @brief Cancel a created task and return to idle state.
-   *
-   * Transitions the batch from task_created back to idle state.
-   *
-   * @return true if the batch was successfully transitioned to idle
-   * @return false if the batch is not in task_created state
-   */
-  bool try_to_cancel_task();
-
-  /**
-   * @brief Attempt to lock this batch for processing operations.
-   *
-   * Returns a processing handle if the batch is in task_created state or already processing.
-   * If successful, decrements task_created_counter, increments processing count,
-   * and transitions to processing state (if not already processing).
-   *
-   * @param requested_memory_space The memory space the caller expects to process from. If the
-   *        batch is not currently in this space, locking fails with
-   *        lock_for_processing_status::memory_space_mismatch.
-   *
-   * @return lock_for_processing_result success=true with handle on success; success=false otherwise
-   *         with a status describing the failure.
-   * @throws std::runtime_error if task_created_count is zero (try_to_create_task() must be
-   *         called before this method) while in a lockable state.
-   */
-  lock_for_processing_result try_to_lock_for_processing(
-    memory::memory_space_id requested_memory_space);
-
-  /**
-   * @brief Attempt to lock this batch for in-transit operations (e.g., downgrade).
-   *
-   * Transitions the batch from idle to in_transit state.
-   *
-   * @return true if the batch was successfully locked (processing_count == 0 and state is idle)
-   * @return false if the batch could not be locked
-   */
-  bool try_to_lock_for_in_transit();
-
-  /**
-   * @brief Release the in-transit lock and return to idle state.
-   *
-   * Transitions the batch from in_transit back to idle state.
-   *
-   * @return true if the batch was successfully transitioned to idle
-   * @return false if the batch is not in in_transit state
-   *
-   * @param target_state Optional state to transition to when releasing in_transit. If not set,
-   *        the batch returns to idle.
-   */
-  bool try_to_release_in_transit(std::optional<batch_state> target_state = std::nullopt);
-
-  /**
-   * @brief Create a deep copy of this data batch.
-   *
-   * Creates a new data_batch with the specified batch_id and a cloned copy of
-   * the underlying data representation. The new batch will be in idle state with
-   * no active processing.
-   *
-   * During the clone operation, the processing count is incremented to protect
-   * the data from eviction, and decremented after the clone completes.
-   *
-   * @param new_batch_id The batch ID for the cloned batch
-   * @param stream CUDA stream for memory operations
-   * @param probe Optional @copydoc idata_batch_probe
-   * @return std::shared_ptr<data_batch> A new data_batch with copied data
-   * @throws std::runtime_error if the batch is in in_transit state
-   * @throws std::runtime_error if the underlying data is null
-   */
-  std::shared_ptr<data_batch> clone(
-    uint64_t new_batch_id,
-    rmm::cuda_stream_view stream,
-    std::optional<std::unique_ptr<idata_batch_probe>> probe = std::nullopt);
+    rmm::cuda_stream_view stream);
 
  private:
-  friend class data_batch_processing_handle;
-
-  /**
-   * @brief Decrement processing count and potentially transition state.
-   *
-   * Called by data_batch_processing_handle when it goes out of scope.
-   * If processing count drops to zero, transitions from processing to idle.
-   */
-  void decrement_processing_count();
-
-  /**
-   * @brief Handle a state transition by updating _state and invoking the probe callback.
-   *
-   * Must be called while the caller holds _mutex. Passes all member fields except _mutex
-   * and _state_change_cv in immutable forms to the probe callback.
-   *
-   * @param new_state The state to transition to
-   * @param lock Reference to the lock proving the mutex is held
-   */
-  void update_state_to(batch_state new_state, const std::unique_lock<std::mutex>& lock);
-
-  mutable std::mutex _mutex;  ///< Mutex for thread-safe access to state and processing count
-  std::condition_variable _internal_cv;            ///< CV used by blocking wait_to_* calls
-  uint64_t _batch_id;                              ///< Unique identifier for this data batch
-  std::unique_ptr<idata_representation> _data;     ///< Pointer to the actual data representation
-  size_t _processing_count   = 0;                  ///< Count of active processing handles
-  size_t _task_created_count = 0;                  ///< Count of pending task_created requests
-  batch_state _state         = batch_state::idle;  ///< Current state of the batch
-  std::unique_ptr<idata_batch_probe> _probe;       ///< Probe for observing state transitions
-  std::condition_variable* _state_change_cv = nullptr;  ///< Optional CV to notify on state change
+  data_batch _batch;
+  mutable std::shared_mutex _rw_mutex;
+  std::atomic<size_t> _subscriber_count{0};
 };
 
-// Template implementation
+// Template implementations
+
 template <typename TargetRepresentation>
-void data_batch::convert_to(representation_converter_registry& registry,
-                            const cucascade::memory::memory_space* target_memory_space,
-                            rmm::cuda_stream_view stream)
+void synchronized_data_batch::data_batch::convert_to(
+  representation_converter_registry& registry,
+  const cucascade::memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-
-  if (_processing_count != 0) {
-    throw std::runtime_error("Cannot convert representation while there is active processing");
-  }
-
   auto new_representation =
     registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
   _data = std::move(new_representation);
 }
 
 template <typename TargetRepresentation>
-std::shared_ptr<data_batch> data_batch::clone_to(
+std::shared_ptr<synchronized_data_batch> synchronized_data_batch::clone_to(
   representation_converter_registry& registry,
   uint64_t new_batch_id,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
-  std::optional<std::unique_ptr<idata_batch_probe>> probe)
+  rmm::cuda_stream_view stream)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-
-  if (_processing_count != 0) {
-    throw std::runtime_error("Cannot convert representation while there is active processing");
-  }
+  std::shared_lock<std::shared_mutex> lock(_rw_mutex);
 
   auto new_representation =
-    registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
-  return std::make_shared<data_batch>(
-    new_batch_id,
-    std::move(new_representation),
-    probe ? std::move(*probe) : std::make_unique<idata_batch_probe>());
+    registry.convert<TargetRepresentation>(*_batch._data, target_memory_space, stream);
+  return std::make_shared<synchronized_data_batch>(new_batch_id, std::move(new_representation));
 }
 
 }  // namespace cucascade
