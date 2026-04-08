@@ -30,6 +30,11 @@ gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> 
 
 std::size_t gpu_table_representation::get_size_in_bytes() const { return _table->alloc_size(); }
 
+std::size_t gpu_table_representation::get_uncompressed_data_size_in_bytes() const
+{
+  return get_size_in_bytes();
+}
+
 const cudf::table& gpu_table_representation::get_table() const { return *_table; }
 
 std::unique_ptr<cudf::table> gpu_table_representation::release_table() { return std::move(_table); }

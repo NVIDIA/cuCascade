@@ -32,7 +32,6 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
-#include <variant>
 
 namespace cucascade {
 namespace memory {
@@ -56,6 +55,34 @@ enum class batch_state {
   task_created,  ///< A task has been created for this batch, pending processing
   processing,    ///< Batch is currently being processed
   in_transit     ///< Batch is currently being moved to a different memory tier
+};
+
+/**
+ * @brief Interface for probing the data_batch class.
+ *
+ * Applications may implement this interface to hold additional application specific
+ * data_batch metadata while probing the data_batch by overriding the provided methods
+ * that expose the data_batch state when certain events occur, like state transitions.
+ */
+class idata_batch_probe {
+ public:
+  virtual ~idata_batch_probe() = default;
+
+  /**
+   * @brief The function that is called everytime a data_batch transitions into a new batch_state.
+   *
+   * @note It is the implementer's responsibility that a call to this function returns quickly, as
+   *       this function is called in a thread-safe manner, and will block other mutating changes
+   *       while this executes. Primarily intended for bookkeeping purposes.
+   */
+  virtual void state_transitioned_to([[maybe_unused]] const batch_state new_state,
+                                     [[maybe_unused]] const uint64_t batch_id,
+                                     [[maybe_unused]] const idata_representation& data,
+                                     [[maybe_unused]] const size_t processing_count,
+                                     [[maybe_unused]] const size_t task_created_count)
+  {
+    // The default impl is no-op.
+  }
 };
 
 // Forward declarations
@@ -192,8 +219,11 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * @param batch_id Unique identifier for this batch
    * @param data Ownership of the data representation is transferred to this batch
+   * @param probe @copydoc idata_batch_probe
    */
-  data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data);
+  data_batch(uint64_t batch_id,
+             std::unique_ptr<idata_representation> data,
+             std::unique_ptr<idata_batch_probe> probe = std::make_unique<idata_batch_probe>());
 
   /**
    * @brief Move constructor - transfers ownership of the batch and its data.
@@ -353,14 +383,17 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @param new_batch_id The batch ID for the cloned batch
    * @param target_memory_space The memory space where the new representation will be allocated
    * @param stream CUDA stream for memory operations
+   * @param probe Optional @copydoc idata_batch_probe
    * @return std::shared_ptr<data_batch> A new data_batch with cloned data
    * @throws std::runtime_error if there is active processing on this batch
    */
   template <typename TargetRepresentation>
-  std::shared_ptr<data_batch> clone_to(representation_converter_registry& registry,
-                                       uint64_t new_batch_id,
-                                       const cucascade::memory::memory_space* target_memory_space,
-                                       rmm::cuda_stream_view stream);
+  std::shared_ptr<data_batch> clone_to(
+    representation_converter_registry& registry,
+    uint64_t new_batch_id,
+    const cucascade::memory::memory_space* target_memory_space,
+    rmm::cuda_stream_view stream,
+    std::optional<std::unique_ptr<idata_batch_probe>> probe = std::nullopt);
 
   /**
    * @brief Attempt to create a task for this batch.
@@ -449,11 +482,15 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * @param new_batch_id The batch ID for the cloned batch
    * @param stream CUDA stream for memory operations
+   * @param probe Optional @copydoc idata_batch_probe
    * @return std::shared_ptr<data_batch> A new data_batch with copied data
    * @throws std::runtime_error if the batch is in in_transit state
    * @throws std::runtime_error if the underlying data is null
    */
-  std::shared_ptr<data_batch> clone(uint64_t new_batch_id, rmm::cuda_stream_view stream);
+  std::shared_ptr<data_batch> clone(
+    uint64_t new_batch_id,
+    rmm::cuda_stream_view stream,
+    std::optional<std::unique_ptr<idata_batch_probe>> probe = std::nullopt);
 
  private:
   friend class data_batch_processing_handle;
@@ -466,13 +503,25 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   void decrement_processing_count();
 
+  /**
+   * @brief Handle a state transition by updating _state and invoking the probe callback.
+   *
+   * Must be called while the caller holds _mutex. Passes all member fields except _mutex
+   * and _state_change_cv in immutable forms to the probe callback.
+   *
+   * @param new_state The state to transition to
+   * @param lock Reference to the lock proving the mutex is held
+   */
+  void update_state_to(batch_state new_state, const std::unique_lock<std::mutex>& lock);
+
   mutable std::mutex _mutex;  ///< Mutex for thread-safe access to state and processing count
-  std::condition_variable _internal_cv;           ///< CV used by blocking wait_to_* calls
-  uint64_t _batch_id;                             ///< Unique identifier for this data batch
-  std::unique_ptr<idata_representation> _data;    ///< Pointer to the actual data representation
-  size_t _processing_count                  = 0;  ///< Count of active processing handles
-  size_t _task_created_count                = 0;  ///< Count of pending task_created requests
-  batch_state _state                        = batch_state::idle;  ///< Current state of the batch
+  std::condition_variable _internal_cv;            ///< CV used by blocking wait_to_* calls
+  uint64_t _batch_id;                              ///< Unique identifier for this data batch
+  std::unique_ptr<idata_representation> _data;     ///< Pointer to the actual data representation
+  size_t _processing_count   = 0;                  ///< Count of active processing handles
+  size_t _task_created_count = 0;                  ///< Count of pending task_created requests
+  batch_state _state         = batch_state::idle;  ///< Current state of the batch
+  std::unique_ptr<idata_batch_probe> _probe;       ///< Probe for observing state transitions
   std::condition_variable* _state_change_cv = nullptr;  ///< Optional CV to notify on state change
 };
 
@@ -498,7 +547,8 @@ std::shared_ptr<data_batch> data_batch::clone_to(
   representation_converter_registry& registry,
   uint64_t new_batch_id,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  std::optional<std::unique_ptr<idata_batch_probe>> probe)
 {
   std::lock_guard<std::mutex> lock(_mutex);
 
@@ -508,7 +558,10 @@ std::shared_ptr<data_batch> data_batch::clone_to(
 
   auto new_representation =
     registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
-  return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
+  return std::make_shared<data_batch>(
+    new_batch_id,
+    std::move(new_representation),
+    probe ? std::move(*probe) : std::make_unique<idata_batch_probe>());
 }
 
 }  // namespace cucascade
