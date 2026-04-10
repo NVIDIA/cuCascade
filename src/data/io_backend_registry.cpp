@@ -72,10 +72,6 @@ void io_backend_registry::clear()
 void register_builtin_io_backends(io_backend_registry& registry)
 {
   registry.register_backend(
-    "kvikio", []() -> std::shared_ptr<idisk_io_backend> { return make_kvikio_io_backend(); });
-  registry.register_backend(
-    "gds", []() -> std::shared_ptr<idisk_io_backend> { return make_gds_io_backend(); });
-  registry.register_backend(
     "pipeline", []() -> std::shared_ptr<idisk_io_backend> { return make_pipeline_io_backend(); });
 }
 

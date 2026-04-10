@@ -1303,7 +1303,7 @@ static void collect_gpu_column_io_entries(const cudf::column_view& col,
 /**
  * @brief Convert gpu_table_representation to disk_data_representation.
  *
- * Writes GPU table buffers directly to disk via write_device (GDS/kvikIO).
+ * Writes GPU table buffers directly to disk via write_device.
  * File format: disk_file_header + serialized column_metadata + 4KB-aligned column data.
  */
 static std::unique_ptr<idata_representation> convert_gpu_to_disk(
@@ -1520,7 +1520,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
 /**
  * @brief Convert disk_data_representation to gpu_table_representation.
  *
- * Reads a disk file directly into GPU device buffers via read_device (GDS/kvikIO).
+ * Reads a disk file directly into GPU device buffers via read_device.
  * Validates the header, deserializes metadata, then reconstructs each column on device.
  */
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(

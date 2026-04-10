@@ -260,7 +260,7 @@ void register_builtin_converters(representation_converter_registry& registry);
  * @brief Initialize the built-in representation converters with a specific disk I/O backend.
  *
  * This overload captures the provided backend in disk converter lambdas.
- * The original overload creates a default KVIKIO backend.
+ * The original overload creates a default pipeline backend.
  *
  * @param registry The converter registry to register converters with.
  * @param backend The disk I/O backend to use for disk converters.
@@ -272,7 +272,7 @@ void register_builtin_converters(representation_converter_registry& registry,
  * @brief Initialize the built-in representation converters using an I/O backend registry.
  *
  * This overload creates the default backend from the io_backend_registry
- * (using "kvikio") and registers all built-in converters.
+ * (using "pipeline") and registers all built-in converters.
  *
  * @param registry The converter registry to register converters with.
  * @param io_registry The I/O backend registry to create the disk backend from.

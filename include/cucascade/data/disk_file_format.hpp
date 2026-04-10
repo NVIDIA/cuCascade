@@ -32,7 +32,7 @@ static constexpr uint32_t DISK_FILE_MAGIC = 0x43554353u;
 static constexpr uint32_t DISK_FILE_FORMAT_VERSION = 1u;
 
 /// @brief Alignment boundary for column data buffers in disk files.
-/// 4KB alignment ensures GDS direct DMA without bounce buffers.
+/// 4KB alignment ensures direct DMA without bounce buffers.
 static constexpr std::size_t DISK_FILE_ALIGNMENT = 4096u;
 
 /**

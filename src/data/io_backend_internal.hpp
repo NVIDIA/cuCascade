@@ -23,12 +23,6 @@
 
 namespace cucascade {
 
-/// @brief Create a kvikIO I/O backend instance.
-std::unique_ptr<idisk_io_backend> make_kvikio_io_backend();
-
-/// @brief Create a GDS I/O backend instance.
-std::unique_ptr<idisk_io_backend> make_gds_io_backend();
-
 /// @brief Create a double-buffered pipeline I/O backend instance.
 /// @param direct_io When true, open data files with O_DIRECT (bypass page cache).
 std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io = false);

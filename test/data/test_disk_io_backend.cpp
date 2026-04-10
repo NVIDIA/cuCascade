@@ -35,34 +35,26 @@ using namespace cucascade;
 // I/O Backend Factory Tests
 // =============================================================================
 
-TEST_CASE("io_backend_registry creates kvikio backend", "[disk][io]")
+TEST_CASE("io_backend_registry creates pipeline backend", "[disk][io]")
 {
   io_backend_registry registry;
   register_builtin_io_backends(registry);
-  auto backend = registry.create_backend("kvikio");
-  REQUIRE(backend != nullptr);
-}
-
-TEST_CASE("io_backend_registry creates gds backend", "[disk][io]")
-{
-  io_backend_registry registry;
-  register_builtin_io_backends(registry);
-  auto backend = registry.create_backend("gds");
+  auto backend = registry.create_backend("pipeline");
   REQUIRE(backend != nullptr);
 }
 
 // =============================================================================
-// kvikIO Host I/O Round-Trip Tests
+// Pipeline Host I/O Round-Trip Tests
 // =============================================================================
 
-TEST_CASE("kvikio backend host write and read round-trip", "[disk][io][kvikio]")
+TEST_CASE("pipeline backend host write and read round-trip", "[disk][io][pipeline]")
 {
   io_backend_registry registry;
   register_builtin_io_backends(registry);
-  auto backend = registry.create_backend("kvikio");
+  auto backend = registry.create_backend("pipeline");
 
   auto tmp_dir   = std::filesystem::temp_directory_path();
-  auto file_path = (tmp_dir / "test_kvikio_host.bin").string();
+  auto file_path = (tmp_dir / "test_pipeline_host.bin").string();
 
   io_context ctx{};
 

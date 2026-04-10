@@ -49,9 +49,6 @@ find_package(rmm REQUIRED CONFIG)
 # Find cudf for data representation support
 find_package(cudf REQUIRED CONFIG)
 
-# Find kvikIO for disk I/O backend
-find_package(kvikio REQUIRED)
-
 # Find numa (provided by numactl-devel or libnuma-dev depending on the package
 # manager)
 find_library(NUMA_LIB numa REQUIRED)
@@ -134,25 +131,6 @@ target_include_directories(cucascade_objects
 
 # Link dependencies to object library
 target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
-target_link_libraries(cucascade_objects PRIVATE kvikio::kvikio)
-
-# cuFile (GDS) — required for the raw GDS I/O backend
-find_library(CUFILE_LIB cufile HINTS ${CUDAToolkit_LIBRARY_DIR}
-                                     ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
-if(CUFILE_LIB)
-  target_link_libraries(cucascade_objects PRIVATE ${CUFILE_LIB})
-  target_include_directories(cucascade_objects
-                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-else()
-  message(WARNING "libcufile not found — GDS backend will fail at runtime")
-endif()
-
-# Private link deps must also be added to shared/static targets since OBJECT
-# library PRIVATE deps do not propagate through $<TARGET_OBJECTS:>
-set(CUCASCADE_PRIVATE_LINK_LIBS kvikio::kvikio)
-if(CUFILE_LIB)
-  list(APPEND CUCASCADE_PRIVATE_LINK_LIBS ${CUFILE_LIB})
-endif()
 
 # cxx_std_20 is PUBLIC so consumers know they need C++20 to use our headers.
 # cuda_std_20 is kept separate and applied PRIVATE to cucascade_objects to avoid
@@ -173,7 +151,6 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
   target_include_directories(cucascade_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_link_libraries(cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
-  target_link_libraries(cucascade_static PRIVATE ${CUCASCADE_PRIVATE_LINK_LIBS})
   target_compile_features(cucascade_static PUBLIC cxx_std_20)
 
   set_target_properties(
@@ -191,7 +168,6 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
   target_include_directories(cucascade_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_link_libraries(cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
-  target_link_libraries(cucascade_shared PRIVATE ${CUCASCADE_PRIVATE_LINK_LIBS})
   target_compile_features(cucascade_shared PUBLIC cxx_std_20)
 
   set_target_properties(

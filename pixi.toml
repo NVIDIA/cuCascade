@@ -36,12 +36,11 @@ activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" 
 # cuDF (nightly channel, default)
 [feature.cudf-nightly.dependencies]
 libcudf = "26.06.*"
-libkvikio = "26.06.*"
 
 # cuDF (stable release channel)
 [feature.cudf-stable]
 channels = ["rapidsai", "conda-forge"]
-dependencies = { "libcudf" = "26.02.*", "libkvikio" = "26.02.*" }
+dependencies = { "libcudf" = "26.02.*" }
 
 [environments]
 default = ["cuda-13", "cudf-nightly"]

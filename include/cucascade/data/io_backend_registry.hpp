@@ -40,7 +40,7 @@ using io_backend_factory_fn = std::function<std::shared_ptr<idisk_io_backend>()>
  *
  * This class provides a central registry where I/O backends are registered by name
  * and created on demand via factory functions. This allows external users to implement
- * and register their own backends alongside the built-in ones (kvikio, gds, pipeline).
+ * and register their own backends alongside the built-in pipeline backend.
  *
  * The registry is thread-safe for concurrent registration and lookup.
  *
@@ -64,7 +64,7 @@ class io_backend_registry {
   /**
    * @brief Register an I/O backend factory under the given name.
    *
-   * @param name Unique name for the backend (e.g., "kvikio", "gds", "my_custom_backend").
+   * @param name Unique name for the backend (e.g., "pipeline", "my_custom_backend").
    * @param factory Factory function that creates a new backend instance.
    * @throws std::runtime_error if a backend with this name is already registered.
    */
@@ -106,7 +106,7 @@ class io_backend_registry {
 };
 
 /**
- * @brief Register the built-in I/O backends (kvikio, gds, pipeline).
+ * @brief Register the built-in I/O backends (pipeline).
  *
  * @param registry The registry to register backends with.
  */

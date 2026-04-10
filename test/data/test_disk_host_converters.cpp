@@ -20,7 +20,6 @@
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/host_table.hpp>

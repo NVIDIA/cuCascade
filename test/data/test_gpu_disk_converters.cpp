@@ -613,15 +613,15 @@ TEST_CASE("gpu disk round-trip sliced column with nulls", "[disk][gpu-converter]
 // I/O backend selection tests (TEST-10)
 // =============================================================================
 
-TEST_CASE("gpu disk round-trip with explicit kvikio backend",
-          "[disk][gpu-converter][backend][kvikio]")
+TEST_CASE("gpu disk round-trip with explicit pipeline backend",
+          "[disk][gpu-converter][backend][pipeline]")
 {
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
   auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
 
   io_backend_registry io_registry;
   register_builtin_io_backends(io_registry);
-  auto backend = io_registry.create_backend("kvikio");
+  auto backend = io_registry.create_backend("pipeline");
   representation_converter_registry registry;
   register_builtin_converters(registry, backend);
 

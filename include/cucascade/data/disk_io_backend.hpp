@@ -55,8 +55,8 @@ struct io_context {
  * @brief Abstract interface for disk I/O backends.
  *
  * Provides pure virtual methods for reading and writing data between disk files
- * and either device (GPU) or host memory. Concrete implementations (kvikIO, raw GDS,
- * pipeline, or user-defined) are registered via io_backend_registry and created by name.
+ * and either device (GPU) or host memory. Concrete implementations (pipeline
+ * or user-defined) are registered via io_backend_registry and created by name.
  */
 class idisk_io_backend {
  public:
@@ -129,7 +129,7 @@ class idisk_io_backend {
   /**
    * @brief Write multiple device memory buffers to a disk file in a single batch.
    *
-   * Enables backends to submit all I/O operations at once (e.g., cuFile batch API)
+   * Enables backends to submit all I/O operations at once
    * for higher throughput than individual write_device calls.
    *
    * Default implementation falls back to sequential write_device calls.
