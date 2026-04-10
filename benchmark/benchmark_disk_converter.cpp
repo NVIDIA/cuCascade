@@ -19,6 +19,7 @@
 #include "cucascade/data/disk_data_representation.hpp"
 #include "cucascade/data/disk_io_backend.hpp"
 #include "cucascade/data/gpu_data_representation.hpp"
+#include "cucascade/data/io_backend_registry.hpp"
 #include "cucascade/data/representation_converter.hpp"
 #include "cucascade/memory/config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
@@ -73,12 +74,11 @@ bool skip_if_oom(benchmark::State& state, int64_t total_bytes)
 
   auto available = static_cast<int64_t>(static_cast<double>(free_bytes) * GPU_MEMORY_SAFETY_FACTOR);
   if (total_bytes > available) {
-    state.SkipWithMessage("OOM: need " + std::to_string(total_bytes / static_cast<int64_t>(MiB)) +
-                          " MiB but only " + std::to_string(available / static_cast<int64_t>(MiB)) +
-                          " MiB available (GPU has " +
-                          std::to_string(free_bytes / static_cast<std::size_t>(MiB)) +
-                          " MiB free, " + std::to_string(static_cast<int>(GPU_MEMORY_SAFETY_FACTOR * 100)) +
-                          "% safety)");
+    state.SkipWithMessage(
+      "OOM: need " + std::to_string(total_bytes / static_cast<int64_t>(MiB)) + " MiB but only " +
+      std::to_string(available / static_cast<int64_t>(MiB)) + " MiB available (GPU has " +
+      std::to_string(free_bytes / static_cast<std::size_t>(MiB)) + " MiB free, " +
+      std::to_string(static_cast<int>(GPU_MEMORY_SAFETY_FACTOR * 100)) + "% safety)");
     return true;
   }
   return false;
@@ -156,7 +156,7 @@ std::vector<memory_space_config> create_benchmark_configs()
   disk_memory_space_config disk_config;
   disk_config.disk_id         = 0;
   disk_config.memory_capacity = 32 * GiB;
-  disk_config.mount_paths = "/tmp";
+  disk_config.mount_paths     = "/tmp";
   configs.emplace_back(disk_config);
 
   return configs;
@@ -416,7 +416,7 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -467,7 +467,7 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -512,7 +512,7 @@ void BM_ConvertHostToDisk(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -560,7 +560,7 @@ void BM_ConvertDiskToHost(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -614,7 +614,7 @@ void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -656,7 +656,7 @@ void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -698,7 +698,7 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -744,13 +744,15 @@ void BM_ConvertGpuToDiskKvikIO(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
-  auto backend  = make_io_backend(io_backend_type::KVIKIO, /*direct_io=*/true);
+  io_backend_registry io_registry;
+  register_builtin_io_backends(io_registry);
+  auto backend  = io_registry.create_backend("pipeline");
   auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+  register_builtin_converters(*registry, backend);
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -793,20 +795,22 @@ void BM_ConvertGpuToDiskGDS(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
-  std::unique_ptr<idisk_io_backend> backend;
+  io_backend_registry io_registry;
+  register_builtin_io_backends(io_registry);
+  std::shared_ptr<idisk_io_backend> backend;
   try {
-    backend = make_io_backend(io_backend_type::GDS);
+    backend = io_registry.create_backend("gds");
   } catch (const std::exception& e) {
     state.SkipWithMessage(std::string("GDS backend unavailable: ") + e.what());
     return;
   }
 
   auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+  register_builtin_converters(*registry, backend);
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -946,13 +950,15 @@ void BM_ConvertGpuToDiskPipeline(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
-  auto backend  = make_io_backend(io_backend_type::PIPELINE, /*direct_io=*/true);
+  io_backend_registry io_registry;
+  register_builtin_io_backends(io_registry);
+  auto backend  = io_registry.create_backend("pipeline");
   auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+  register_builtin_converters(*registry, backend);
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -1000,12 +1006,11 @@ BENCHMARK(BM_ConvertGpuToDiskPipeline)
  * @brief Helper: create a backend-specific registry and write a GPU table to disk,
  *        returning the disk representation for read benchmarks.
  */
-std::unique_ptr<disk_data_representation> write_table_to_disk(
-  io_backend_type backend_type,
-  cudf::table&& table,
-  const memory_space* gpu_space,
-  const memory_space* disk_space,
-  rmm::cuda_stream_view stream)
+std::unique_ptr<disk_data_representation> write_table_to_disk(io_backend_type backend_type,
+                                                              cudf::table&& table,
+                                                              const memory_space* gpu_space,
+                                                              const memory_space* disk_space,
+                                                              rmm::cuda_stream_view stream)
 {
   auto backend  = make_io_backend(backend_type, /*direct_io=*/true);
   auto registry = std::make_unique<representation_converter_registry>();
@@ -1022,7 +1027,7 @@ void BM_ConvertDiskToGpuKvikIO(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -1031,16 +1036,18 @@ void BM_ConvertDiskToGpuKvikIO(benchmark::State& state)
 
   rmm::cuda_stream stream;
 
-  auto disk_rep = write_table_to_disk(
-    io_backend_type::KVIKIO, create_benchmark_table_from_bytes(total_bytes, num_columns),
-    gpu_space, disk_space, stream.view());
+  auto disk_rep = write_table_to_disk(io_backend_type::KVIKIO,
+                                      create_benchmark_table_from_bytes(total_bytes, num_columns),
+                                      gpu_space,
+                                      disk_space,
+                                      stream.view());
 
   auto backend  = make_io_backend(io_backend_type::KVIKIO, /*direct_io=*/true);
   auto registry = std::make_unique<representation_converter_registry>();
   register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
 
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
-  const auto& disk_file   = disk_rep->get_disk_table().file_path;
+  const auto& disk_file    = disk_rep->get_disk_table().file_path;
 
   for ([[maybe_unused]] auto _ : state) {
     drop_os_cache(disk_file);
@@ -1062,7 +1069,7 @@ void BM_ConvertDiskToGpuPipeline(benchmark::State& state)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -1071,16 +1078,18 @@ void BM_ConvertDiskToGpuPipeline(benchmark::State& state)
 
   rmm::cuda_stream stream;
 
-  auto disk_rep = write_table_to_disk(
-    io_backend_type::PIPELINE, create_benchmark_table_from_bytes(total_bytes, num_columns),
-    gpu_space, disk_space, stream.view());
+  auto disk_rep = write_table_to_disk(io_backend_type::PIPELINE,
+                                      create_benchmark_table_from_bytes(total_bytes, num_columns),
+                                      gpu_space,
+                                      disk_space,
+                                      stream.view());
 
   auto backend  = make_io_backend(io_backend_type::PIPELINE, /*direct_io=*/true);
   auto registry = std::make_unique<representation_converter_registry>();
   register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
 
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
-  const auto& disk_file   = disk_rep->get_disk_table().file_path;
+  const auto& disk_file    = disk_rep->get_disk_table().file_path;
 
   for ([[maybe_unused]] auto _ : state) {
     drop_os_cache(disk_file);
@@ -1133,7 +1142,7 @@ void backend_write_benchmark(benchmark::State& state,
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -1180,7 +1189,7 @@ void backend_read_benchmark(benchmark::State& state,
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
-  int num_columns     = static_cast<int>(state.range(1));
+  int num_columns = static_cast<int>(state.range(1));
 
   auto mgr = get_shared_memory_manager();
 
@@ -1190,15 +1199,14 @@ void backend_read_benchmark(benchmark::State& state,
   rmm::cuda_stream stream;
 
   auto disk_rep = write_table_to_disk(
-    backend_type, table_factory(total_bytes, num_columns),
-    gpu_space, disk_space, stream.view());
+    backend_type, table_factory(total_bytes, num_columns), gpu_space, disk_space, stream.view());
 
   auto backend  = make_io_backend(backend_type, /*direct_io=*/true);
   auto registry = std::make_unique<representation_converter_registry>();
   register_builtin_converters(*registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
 
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
-  const auto& disk_file   = disk_rep->get_disk_table().file_path;
+  const auto& disk_file    = disk_rep->get_disk_table().file_path;
 
   for ([[maybe_unused]] auto _ : state) {
     drop_os_cache(disk_file);
@@ -1217,38 +1225,86 @@ void backend_read_benchmark(benchmark::State& state,
 }
 
 // --- Numeric write/read per backend ---
-void BM_WriteNumericKvikIO(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_benchmark_table_from_bytes); }
-void BM_WriteNumericPipeline(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_benchmark_table_from_bytes); }
-void BM_ReadNumericKvikIO(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_benchmark_table_from_bytes); }
-void BM_ReadNumericPipeline(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_benchmark_table_from_bytes); }
+void BM_WriteNumericKvikIO(benchmark::State& s)
+{
+  backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_benchmark_table_from_bytes);
+}
+void BM_WriteNumericPipeline(benchmark::State& s)
+{
+  backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_benchmark_table_from_bytes);
+}
+void BM_ReadNumericKvikIO(benchmark::State& s)
+{
+  backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_benchmark_table_from_bytes);
+}
+void BM_ReadNumericPipeline(benchmark::State& s)
+{
+  backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_benchmark_table_from_bytes);
+}
 
 // --- String write/read per backend ---
-void BM_WriteStringKvikIO(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_string_benchmark_table); }
-void BM_WriteStringPipeline(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_string_benchmark_table); }
-void BM_ReadStringKvikIO(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_string_benchmark_table); }
-void BM_ReadStringPipeline(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_string_benchmark_table); }
+void BM_WriteStringKvikIO(benchmark::State& s)
+{
+  backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_string_benchmark_table);
+}
+void BM_WriteStringPipeline(benchmark::State& s)
+{
+  backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_string_benchmark_table);
+}
+void BM_ReadStringKvikIO(benchmark::State& s)
+{
+  backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_string_benchmark_table);
+}
+void BM_ReadStringPipeline(benchmark::State& s)
+{
+  backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_string_benchmark_table);
+}
 
 // --- List write/read per backend ---
-void BM_WriteListKvikIO(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_list_benchmark_table); }
-void BM_WriteListPipeline(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_list_benchmark_table); }
-void BM_ReadListKvikIO(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_list_benchmark_table); }
-void BM_ReadListPipeline(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_list_benchmark_table); }
+void BM_WriteListKvikIO(benchmark::State& s)
+{
+  backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_list_benchmark_table);
+}
+void BM_WriteListPipeline(benchmark::State& s)
+{
+  backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_list_benchmark_table);
+}
+void BM_ReadListKvikIO(benchmark::State& s)
+{
+  backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_list_benchmark_table);
+}
+void BM_ReadListPipeline(benchmark::State& s)
+{
+  backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_list_benchmark_table);
+}
 
 // --- Struct write/read per backend ---
-void BM_WriteStructKvikIO(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_struct_benchmark_table); }
-void BM_WriteStructPipeline(benchmark::State& s) { backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_struct_benchmark_table); }
-void BM_ReadStructKvikIO(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_struct_benchmark_table); }
-void BM_ReadStructPipeline(benchmark::State& s) { backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_struct_benchmark_table); }
+void BM_WriteStructKvikIO(benchmark::State& s)
+{
+  backend_write_benchmark(s, io_backend_type::KVIKIO, 0, create_struct_benchmark_table);
+}
+void BM_WriteStructPipeline(benchmark::State& s)
+{
+  backend_write_benchmark(s, io_backend_type::PIPELINE, 2, create_struct_benchmark_table);
+}
+void BM_ReadStructKvikIO(benchmark::State& s)
+{
+  backend_read_benchmark(s, io_backend_type::KVIKIO, 0, create_struct_benchmark_table);
+}
+void BM_ReadStructPipeline(benchmark::State& s)
+{
+  backend_read_benchmark(s, io_backend_type::PIPELINE, 2, create_struct_benchmark_table);
+}
 
 // Size sweep args for backend comparison
-#define DISK_BACKEND_ARGS \
-  ->Setup(DoSetup) \
-  ->Teardown(DoTeardown) \
-  ->Args({64 * MiB, 4}) \
-  ->Args({512 * MiB, 4}) \
-  ->Args({4 * GiB, 4}) \
-  ->Unit(benchmark::kMillisecond) \
-  ->UseRealTime()
+#define DISK_BACKEND_ARGS           \
+  ->Setup(DoSetup)                  \
+    ->Teardown(DoTeardown)          \
+    ->Args({64 * MiB, 4})           \
+    ->Args({512 * MiB, 4})          \
+    ->Args({4 * GiB, 4})            \
+    ->Unit(benchmark::kMillisecond) \
+    ->UseRealTime()
 
 // Register all backend x type x direction benchmarks
 BENCHMARK(BM_WriteNumericKvikIO) DISK_BACKEND_ARGS;

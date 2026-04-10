@@ -88,7 +88,8 @@ class pipeline_io_backend : public idisk_io_backend {
   pipeline_io_backend(pipeline_io_backend&&)                 = delete;
   pipeline_io_backend& operator=(pipeline_io_backend&&)      = delete;
 
-  void write_device(const std::string& path,
+  void write_device([[maybe_unused]] const io_context& ctx,
+                    const std::string& path,
                     const void* dev_ptr,
                     std::size_t size,
                     std::size_t file_offset,
@@ -157,7 +158,8 @@ class pipeline_io_backend : public idisk_io_backend {
     ::close(fd);
   }
 
-  void read_device(const std::string& path,
+  void read_device([[maybe_unused]] const io_context& ctx,
+                   const std::string& path,
                    void* dev_ptr,
                    std::size_t size,
                    std::size_t file_offset,
@@ -185,8 +187,8 @@ class pipeline_io_backend : public idisk_io_backend {
 
     // Pre-read first chunk into buffer 0
     // O_DIRECT requires aligned size; read more, H2D copy only what's needed
-    std::size_t first_chunk    = std::min(remaining, PIPELINE_BUF_SIZE);
-    std::size_t first_read_sz  = _direct_io ? align_up_dio(first_chunk) : first_chunk;
+    std::size_t first_chunk   = std::min(remaining, PIPELINE_BUF_SIZE);
+    std::size_t first_read_sz = _direct_io ? align_up_dio(first_chunk) : first_chunk;
     {
       auto bytes_read = ::pread(fd, _buf[0], first_read_sz, static_cast<off_t>(src_offset));
       if (bytes_read < 0 || static_cast<std::size_t>(bytes_read) < first_chunk) {
@@ -220,15 +222,13 @@ class pipeline_io_backend : public idisk_io_backend {
         auto read_off  = src_offset;
         auto actual_sz = next_chunk;
         auto read_fd   = fd;
-        read_future    = std::async(std::launch::async,
-                                    [buf_ptr, read_sz, actual_sz, read_off, read_fd]() {
-                                   auto bytes_read =
-                                     ::pread(read_fd, buf_ptr, read_sz, static_cast<off_t>(read_off));
-                                   if (bytes_read < 0 ||
-                                       static_cast<std::size_t>(bytes_read) < actual_sz) {
-                                     throw std::runtime_error("pipeline pread failed");
-                                   }
-                                 });
+        read_future =
+          std::async(std::launch::async, [buf_ptr, read_sz, actual_sz, read_off, read_fd]() {
+            auto bytes_read = ::pread(read_fd, buf_ptr, read_sz, static_cast<off_t>(read_off));
+            if (bytes_read < 0 || static_cast<std::size_t>(bytes_read) < actual_sz) {
+              throw std::runtime_error("pipeline pread failed");
+            }
+          });
         remaining -= next_chunk;
         src_offset += next_chunk;
       }
@@ -247,7 +247,8 @@ class pipeline_io_backend : public idisk_io_backend {
     ::close(fd);
   }
 
-  void write_host(const std::string& path,
+  void write_host([[maybe_unused]] const io_context& ctx,
+                  const std::string& path,
                   const void* host_ptr,
                   std::size_t size,
                   std::size_t file_offset) override
@@ -266,7 +267,8 @@ class pipeline_io_backend : public idisk_io_backend {
     }
   }
 
-  void read_host(const std::string& path,
+  void read_host([[maybe_unused]] const io_context& ctx,
+                 const std::string& path,
                  void* host_ptr,
                  std::size_t size,
                  std::size_t file_offset) override
@@ -293,7 +295,8 @@ class pipeline_io_backend : public idisk_io_backend {
    * Single fd open for all entries. Entries processed in order with their
    * respective file offsets.
    */
-  void write_device_batch(const std::string& path,
+  void write_device_batch([[maybe_unused]] const io_context& ctx,
+                          const std::string& path,
                           const std::vector<io_batch_entry>& entries,
                           rmm::cuda_stream_view stream) override
   {

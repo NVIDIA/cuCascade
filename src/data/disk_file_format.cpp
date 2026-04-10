@@ -152,8 +152,7 @@ memory::column_metadata deserialize_one_column(const uint8_t*& cursor, const uin
 
 }  // namespace
 
-std::vector<uint8_t> serialize_column_metadata(
-  const std::vector<memory::column_metadata>& columns)
+std::vector<uint8_t> serialize_column_metadata(const std::vector<memory::column_metadata>& columns)
 {
   std::vector<uint8_t> buf;
 
@@ -171,7 +170,7 @@ std::vector<uint8_t> serialize_column_metadata(
 }
 
 std::vector<memory::column_metadata> deserialize_column_metadata(const uint8_t* data,
-                                                                  std::size_t size)
+                                                                 std::size_t size)
 {
   if (size < sizeof(uint32_t)) {
     CUCASCADE_FAIL("truncated column_metadata buffer: need at least 4 bytes for column count");

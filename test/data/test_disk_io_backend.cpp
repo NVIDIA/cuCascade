@@ -17,6 +17,7 @@
 
 #include <cucascade/data/disk_file_format.hpp>
 #include <cucascade/data/disk_io_backend.hpp>
+#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/disk_table.hpp>
 
 #include <catch2/catch.hpp>
@@ -34,15 +35,19 @@ using namespace cucascade;
 // I/O Backend Factory Tests
 // =============================================================================
 
-TEST_CASE("make_io_backend creates kvikio backend", "[disk][io]")
+TEST_CASE("io_backend_registry creates kvikio backend", "[disk][io]")
 {
-  auto backend = make_io_backend(io_backend_type::KVIKIO);
+  io_backend_registry registry;
+  register_builtin_io_backends(registry);
+  auto backend = registry.create_backend("kvikio");
   REQUIRE(backend != nullptr);
 }
 
-TEST_CASE("make_io_backend creates gds backend", "[disk][io]")
+TEST_CASE("io_backend_registry creates gds backend", "[disk][io]")
 {
-  auto backend = make_io_backend(io_backend_type::GDS);
+  io_backend_registry registry;
+  register_builtin_io_backends(registry);
+  auto backend = registry.create_backend("gds");
   REQUIRE(backend != nullptr);
 }
 
@@ -52,20 +57,24 @@ TEST_CASE("make_io_backend creates gds backend", "[disk][io]")
 
 TEST_CASE("kvikio backend host write and read round-trip", "[disk][io][kvikio]")
 {
-  auto backend = make_io_backend(io_backend_type::KVIKIO);
+  io_backend_registry registry;
+  register_builtin_io_backends(registry);
+  auto backend = registry.create_backend("kvikio");
 
   auto tmp_dir   = std::filesystem::temp_directory_path();
   auto file_path = (tmp_dir / "test_kvikio_host.bin").string();
+
+  io_context ctx{};
 
   // Write test data: 4096 bytes with sequential values
   std::vector<uint8_t> write_data(4096);
   std::iota(write_data.begin(), write_data.end(), static_cast<uint8_t>(0));
 
-  backend->write_host(file_path, write_data.data(), write_data.size(), 0);
+  backend->write_host(ctx, file_path, write_data.data(), write_data.size(), 0);
 
   // Read it back
   std::vector<uint8_t> read_data(4096, 0);
-  backend->read_host(file_path, read_data.data(), read_data.size(), 0);
+  backend->read_host(ctx, file_path, read_data.data(), read_data.size(), 0);
 
   REQUIRE(write_data == read_data);
 
@@ -95,53 +104,53 @@ TEST_CASE("column_metadata round-trip serialization", "[disk][format]")
 {
   // Create column_metadata with nested children (simulates STRUCT<STRING, LIST<INT32>>)
   cucascade::memory::column_metadata string_child{};
-  string_child.type_id       = cudf::type_id::STRING;
-  string_child.num_rows      = 10;
-  string_child.null_count    = 2;
-  string_child.scale         = 0;
-  string_child.has_null_mask = true;
+  string_child.type_id          = cudf::type_id::STRING;
+  string_child.num_rows         = 10;
+  string_child.null_count       = 2;
+  string_child.scale            = 0;
+  string_child.has_null_mask    = true;
   string_child.null_mask_offset = 0;
   string_child.null_mask_size   = 64;
-  string_child.has_data      = true;
-  string_child.data_offset   = 0;
-  string_child.data_size     = 128;
+  string_child.has_data         = true;
+  string_child.data_offset      = 0;
+  string_child.data_size        = 128;
 
   cucascade::memory::column_metadata int_child{};
-  int_child.type_id       = cudf::type_id::INT32;
-  int_child.num_rows      = 10;
-  int_child.null_count    = 0;
-  int_child.scale         = 0;
-  int_child.has_null_mask = false;
+  int_child.type_id          = cudf::type_id::INT32;
+  int_child.num_rows         = 10;
+  int_child.null_count       = 0;
+  int_child.scale            = 0;
+  int_child.has_null_mask    = false;
   int_child.null_mask_offset = 0;
   int_child.null_mask_size   = 0;
-  int_child.has_data      = true;
-  int_child.data_offset   = 0;
-  int_child.data_size     = 40;
+  int_child.has_data         = true;
+  int_child.data_offset      = 0;
+  int_child.data_size        = 40;
 
   cucascade::memory::column_metadata list_child{};
-  list_child.type_id       = cudf::type_id::LIST;
-  list_child.num_rows      = 10;
-  list_child.null_count    = 0;
-  list_child.scale         = 0;
-  list_child.has_null_mask = false;
+  list_child.type_id          = cudf::type_id::LIST;
+  list_child.num_rows         = 10;
+  list_child.null_count       = 0;
+  list_child.scale            = 0;
+  list_child.has_null_mask    = false;
   list_child.null_mask_offset = 0;
   list_child.null_mask_size   = 0;
-  list_child.has_data      = true;
-  list_child.data_offset   = 0;
-  list_child.data_size     = 44;  // offsets
+  list_child.has_data         = true;
+  list_child.data_offset      = 0;
+  list_child.data_size        = 44;  // offsets
   list_child.children.push_back(int_child);
 
   cucascade::memory::column_metadata struct_col{};
-  struct_col.type_id       = cudf::type_id::STRUCT;
-  struct_col.num_rows      = 10;
-  struct_col.null_count    = 0;
-  struct_col.scale         = 0;
-  struct_col.has_null_mask = false;
+  struct_col.type_id          = cudf::type_id::STRUCT;
+  struct_col.num_rows         = 10;
+  struct_col.null_count       = 0;
+  struct_col.scale            = 0;
+  struct_col.has_null_mask    = false;
   struct_col.null_mask_offset = 0;
   struct_col.null_mask_size   = 0;
-  struct_col.has_data      = false;
-  struct_col.data_offset   = 0;
-  struct_col.data_size     = 0;
+  struct_col.has_data         = false;
+  struct_col.data_offset      = 0;
+  struct_col.data_size        = 0;
   struct_col.children.push_back(string_child);
   struct_col.children.push_back(list_child);
 

@@ -282,7 +282,8 @@ class gds_io_backend : public idisk_io_backend {
   gds_io_backend(gds_io_backend&&)                 = delete;
   gds_io_backend& operator=(gds_io_backend&&)      = delete;
 
-  void write_device(const std::string& path,
+  void write_device([[maybe_unused]] const io_context& ctx,
+                    const std::string& path,
                     const void* dev_ptr,
                     std::size_t size,
                     std::size_t file_offset,
@@ -336,7 +337,8 @@ class gds_io_backend : public idisk_io_backend {
     }
   }
 
-  void read_device(const std::string& path,
+  void read_device([[maybe_unused]] const io_context& ctx,
+                   const std::string& path,
                    void* dev_ptr,
                    std::size_t size,
                    std::size_t file_offset,
@@ -393,7 +395,8 @@ class gds_io_backend : public idisk_io_backend {
   /**
    * @brief Write host memory via POSIX pwrite — no GDS overhead for small metadata.
    */
-  void write_host(const std::string& path,
+  void write_host([[maybe_unused]] const io_context& ctx,
+                  const std::string& path,
                   const void* host_ptr,
                   std::size_t size,
                   std::size_t file_offset) override
@@ -412,7 +415,8 @@ class gds_io_backend : public idisk_io_backend {
   /**
    * @brief Read into host memory via POSIX pread.
    */
-  void read_host(const std::string& path,
+  void read_host([[maybe_unused]] const io_context& ctx,
+                 const std::string& path,
                  void* host_ptr,
                  std::size_t size,
                  std::size_t file_offset) override
@@ -437,7 +441,8 @@ class gds_io_backend : public idisk_io_backend {
    *
    * Falls back to per-entry write_device if total exceeds staging buffer.
    */
-  void write_device_batch(const std::string& path,
+  void write_device_batch(const io_context& ctx,
+                          const std::string& path,
                           const std::vector<io_batch_entry>& entries,
                           rmm::cuda_stream_view stream) override
   {
@@ -457,7 +462,7 @@ class gds_io_backend : public idisk_io_backend {
     if (total_bytes > STAGING_BUFFER_SIZE) {
       // Fall back to sequential write_device
       for (const auto* e : valid) {
-        write_device(path, e->ptr, e->size, e->file_offset, stream);
+        write_device(ctx, path, e->ptr, e->size, e->file_offset, stream);
       }
       return;
     }
@@ -501,7 +506,8 @@ class gds_io_backend : public idisk_io_backend {
   /**
    * @brief Batch read: single batch submit into staging, scatter to destination buffers.
    */
-  void read_device_batch(const std::string& path,
+  void read_device_batch(const io_context& ctx,
+                         const std::string& path,
                          const std::vector<io_batch_entry>& entries,
                          rmm::cuda_stream_view stream) override
   {
@@ -520,7 +526,7 @@ class gds_io_backend : public idisk_io_backend {
 
     if (total_bytes > STAGING_BUFFER_SIZE) {
       for (const auto* e : valid) {
-        read_device(path, const_cast<void*>(e->ptr), e->size, e->file_offset, stream);
+        read_device(ctx, path, const_cast<void*>(e->ptr), e->size, e->file_offset, stream);
       }
       return;
     }

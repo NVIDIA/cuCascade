@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda_utils.hpp>
+
 #include <cudf/column/column_view.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/traits.hpp>
-
-#include <cucascade/cuda_utils.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
@@ -143,13 +143,13 @@ static bool columns_equal_recursive(const cudf::column_view& left,
 
   // Compare null masks (only significant bits, ignoring padding beyond num_rows)
   if (left.nullable() && right.nullable() && left.size() > 0) {
-    auto const num_bits        = static_cast<std::size_t>(left.size());
-    auto const num_full_bytes  = num_bits / 8;
-    auto const remaining_bits  = num_bits % 8;
-    auto const bytes_to_read   = num_full_bytes + (remaining_bits > 0 ? 1 : 0);
-    auto const alloc_bytes     = cudf::bitmask_allocation_size_bytes(left.size());
-    auto left_mask             = device_to_host(left.null_mask(), alloc_bytes);
-    auto right_mask            = device_to_host(right.null_mask(), alloc_bytes);
+    auto const num_bits       = static_cast<std::size_t>(left.size());
+    auto const num_full_bytes = num_bits / 8;
+    auto const remaining_bits = num_bits % 8;
+    auto const bytes_to_read  = num_full_bytes + (remaining_bits > 0 ? 1 : 0);
+    auto const alloc_bytes    = cudf::bitmask_allocation_size_bytes(left.size());
+    auto left_mask            = device_to_host(left.null_mask(), alloc_bytes);
+    auto right_mask           = device_to_host(right.null_mask(), alloc_bytes);
 
     // Compare full bytes
     if (num_full_bytes > 0 &&
@@ -184,8 +184,7 @@ static bool columns_equal_recursive(const cudf::column_view& left,
       auto left_offsets  = read_offsets_to_host(left_scv.offsets());
       auto right_offsets = read_offsets_to_host(right_scv.offsets());
       if (left_offsets != right_offsets) {
-        std::cout << "[cudf-equal] " << path << " STRING offsets differ" << std::endl
-                  << std::flush;
+        std::cout << "[cudf-equal] " << path << " STRING offsets differ" << std::endl << std::flush;
         return false;
       }
 

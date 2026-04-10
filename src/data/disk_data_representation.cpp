@@ -31,8 +31,7 @@ namespace cucascade {
 // =============================================================================
 
 disk_data_representation::disk_data_representation(
-  std::unique_ptr<memory::disk_table_allocation> disk_table,
-  memory::memory_space& memory_space)
+  std::unique_ptr<memory::disk_table_allocation> disk_table, memory::memory_space& memory_space)
   : idata_representation(memory_space), _disk_table(std::move(disk_table))
 {
 }
@@ -50,7 +49,7 @@ std::size_t disk_data_representation::get_size_in_bytes() const { return _disk_t
 
 std::size_t disk_data_representation::get_uncompressed_data_size_in_bytes() const
 {
-  return get_size_in_bytes();
+  return _disk_table->data_size;
 }
 
 std::unique_ptr<idata_representation> disk_data_representation::clone(
