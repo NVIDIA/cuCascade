@@ -19,6 +19,8 @@
 
 #include <cucascade/memory/host_table.hpp>
 
+#include <rmm/aligned.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -56,18 +58,6 @@ struct disk_file_header {
 };
 
 static_assert(sizeof(disk_file_header) == 32, "disk_file_header must be exactly 32 bytes");
-
-/**
- * @brief Align a value up to the specified power-of-two alignment.
- *
- * @param value The value to align.
- * @param alignment The alignment boundary (must be a power of two).
- * @return The smallest multiple of alignment >= value.
- */
-[[nodiscard]] constexpr std::size_t align_up(std::size_t value, std::size_t alignment) noexcept
-{
-  return (value + alignment - 1u) & ~(alignment - 1u);
-}
 
 /**
  * @brief Serialize a vector of column_metadata into a byte buffer.

@@ -75,11 +75,11 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
   // Create GPU representation from the original table
   auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(original_table), *gpu_space);
 
-  // GPU -> disk (direct via write_device)
+  // GPU -> disk (direct via write/write_batch)
   auto disk_rep =
     registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
 
-  // disk -> GPU (direct via read_device)
+  // disk -> GPU (direct via read)
   auto gpu_rep2 =
     registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
 

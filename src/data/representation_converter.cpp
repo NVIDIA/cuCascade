@@ -40,6 +40,7 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
@@ -940,7 +941,7 @@ struct disk_file_guard {
 static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_allocation& alloc,
                                       std::size_t alloc_offset,
                                       std::size_t size,
-                                      const std::string& file_path,
+                                      const std::filesystem::path& file_path,
                                       std::size_t file_offset,
                                       idisk_io_backend& backend)
 {
@@ -953,7 +954,7 @@ static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_alloca
     std::size_t avail     = block_size - block_off;
     std::size_t chunk     = std::min(remaining, avail);
     auto block            = alloc->at(block_idx);
-    backend.write_host(file_path, block.data() + block_off, chunk, file_offset + written);
+    backend.write(file_path, block.data() + block_off, chunk, file_offset + written);
     written += chunk;
     block_off += chunk;
     if (block_off == block_size) {
@@ -966,7 +967,7 @@ static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_alloca
 /**
  * @brief Read data from a disk file into a host block allocation, handling block-boundary spanning.
  */
-static void read_disk_buffer_to_host(const std::string& file_path,
+static void read_disk_buffer_to_host(const std::filesystem::path& file_path,
                                      std::size_t file_offset,
                                      std::size_t size,
                                      memory::fixed_multiple_blocks_allocation& alloc,
@@ -982,7 +983,7 @@ static void read_disk_buffer_to_host(const std::string& file_path,
     std::size_t avail     = block_size - block_off;
     std::size_t chunk     = std::min(remaining, avail);
     auto block            = alloc->at(block_idx);
-    backend.read_host(file_path, block.data() + block_off, chunk, file_offset + read_total);
+    backend.read(file_path, block.data() + block_off, chunk, file_offset + read_total);
     read_total += chunk;
     block_off += chunk;
     if (block_off == block_size) {
@@ -1010,7 +1011,7 @@ static memory::column_metadata recompute_file_offsets(const memory::column_metad
   dst.has_null_mask  = src.has_null_mask;
   dst.null_mask_size = src.null_mask_size;
   if (src.has_null_mask && src.null_mask_size > 0) {
-    cursor               = align_up(cursor, DISK_FILE_ALIGNMENT);
+    cursor               = rmm::align_up(cursor, DISK_FILE_ALIGNMENT);
     dst.null_mask_offset = cursor;
     cursor += src.null_mask_size;
   } else {
@@ -1020,7 +1021,7 @@ static memory::column_metadata recompute_file_offsets(const memory::column_metad
   dst.has_data  = src.has_data;
   dst.data_size = src.data_size;
   if (src.has_data && src.data_size > 0) {
-    cursor          = align_up(cursor, DISK_FILE_ALIGNMENT);
+    cursor          = rmm::align_up(cursor, DISK_FILE_ALIGNMENT);
     dst.data_offset = cursor;
     cursor += src.data_size;
   } else {
@@ -1040,7 +1041,7 @@ static memory::column_metadata recompute_file_offsets(const memory::column_metad
 static void write_column_buffers(const memory::column_metadata& src_meta,
                                  const memory::column_metadata& disk_meta,
                                  const memory::fixed_multiple_blocks_allocation& alloc,
-                                 const std::string& file_path,
+                                 const std::filesystem::path& file_path,
                                  idisk_io_backend& backend)
 {
   if (src_meta.has_null_mask && src_meta.null_mask_size > 0) {
@@ -1106,7 +1107,7 @@ static memory::column_metadata recompute_host_offsets(const memory::column_metad
  */
 static void read_column_buffers(const memory::column_metadata& disk_meta,
                                 const memory::column_metadata& host_meta,
-                                const std::string& file_path,
+                                const std::filesystem::path& file_path,
                                 memory::fixed_multiple_blocks_allocation& alloc,
                                 idisk_io_backend& backend)
 {
@@ -1152,7 +1153,7 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   // Cursor starts at data_offset which we compute after header + metadata
   auto metadata_bytes_for_sizing = serialize_column_metadata(host_table->columns);
   std::size_t data_offset_in_file =
-    align_up(sizeof(disk_file_header) + metadata_bytes_for_sizing.size(), DISK_FILE_ALIGNMENT);
+    rmm::align_up(sizeof(disk_file_header) + metadata_bytes_for_sizing.size(), DISK_FILE_ALIGNMENT);
 
   std::size_t cursor = data_offset_in_file;
   std::vector<memory::column_metadata> disk_columns;
@@ -1170,11 +1171,11 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   header.data_offset   = data_offset_in_file;
 
   // Write header
-  backend.write_host(file_path, &header, sizeof(header), 0);
+  backend.write(file_path, &header, sizeof(header), 0);
 
   // Write serialized metadata
   if (!metadata_bytes.empty()) {
-    backend.write_host(
+    backend.write(
       file_path, metadata_bytes.data(), metadata_bytes.size(), sizeof(disk_file_header));
   }
 
@@ -1210,7 +1211,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
 
   // Read and validate header
   disk_file_header header{};
-  backend.read_host(file_path, &header, sizeof(header), 0);
+  backend.read(file_path, &header, sizeof(header), 0);
 
   if (header.magic != DISK_FILE_MAGIC) {
     throw std::runtime_error("Invalid disk file magic number");
@@ -1222,8 +1223,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   // Read serialized metadata
   std::vector<uint8_t> metadata_bytes(header.metadata_size);
   if (header.metadata_size > 0) {
-    backend.read_host(
-      file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
+    backend.read(file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
   }
 
   auto disk_columns = deserialize_column_metadata(metadata_bytes.data(), metadata_bytes.size());
@@ -1264,7 +1264,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
  * @brief Recursively collect GPU column buffer I/O entries for batch submission.
  *
  * Instead of writing each buffer individually, collects all (ptr, size, file_offset)
- * tuples into a vector for a single batch write_device_batch call.
+ * tuples into a vector for a single batch write_batch call.
  */
 static void collect_gpu_column_io_entries(const cudf::column_view& col,
                                           const memory::column_metadata& disk_meta,
@@ -1285,7 +1285,7 @@ static void collect_gpu_column_io_entries(const cudf::column_view& col,
 /**
  * @brief Convert gpu_table_representation to disk_data_representation.
  *
- * Writes GPU table buffers directly to disk via write_device.
+ * Writes GPU table buffers directly to disk via write/write_batch.
  * File format: disk_file_header + serialized column_metadata + 4KB-aligned column data.
  */
 static std::unique_ptr<idata_representation> convert_gpu_to_disk(
@@ -1315,7 +1315,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   // Serialize metadata to compute its size, then compute data offset
   auto metadata_bytes_for_sizing = serialize_column_metadata(planned_columns);
   std::size_t data_offset_in_file =
-    align_up(sizeof(disk_file_header) + metadata_bytes_for_sizing.size(), DISK_FILE_ALIGNMENT);
+    rmm::align_up(sizeof(disk_file_header) + metadata_bytes_for_sizing.size(), DISK_FILE_ALIGNMENT);
 
   // Recompute with 4KB-aligned disk offsets
   std::size_t cursor = data_offset_in_file;
@@ -1334,7 +1334,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   header.data_offset   = data_offset_in_file;
 
   // Build a single header+metadata buffer and copy it to GPU so everything
-  // can go through write_device_batch in a single file open (avoids the 80ms
+  // can go through write_batch in a single file open (avoids the 80ms
   // page cache invalidation from mixing POSIX and O_DIRECT writes).
   std::size_t header_and_meta_size = sizeof(disk_file_header) + metadata_bytes.size();
   rmm::device_buffer header_dev_buf(header_and_meta_size, stream);
@@ -1362,7 +1362,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   }
 
   // Single file open, single batch submit for everything
-  backend.write_device_batch(file_path, io_entries, stream);
+  backend.write_batch(file_path, io_entries, stream);
 
   guard.release();
 
@@ -1375,7 +1375,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
 /**
  * @brief Allocate an rmm::device_buffer and read data from disk directly into it.
  */
-static rmm::device_buffer alloc_and_read_from_disk(const std::string& file_path,
+static rmm::device_buffer alloc_and_read_from_disk(const std::filesystem::path& file_path,
                                                    std::size_t file_offset,
                                                    std::size_t size,
                                                    rmm::cuda_stream_view stream,
@@ -1383,17 +1383,17 @@ static rmm::device_buffer alloc_and_read_from_disk(const std::string& file_path,
                                                    idisk_io_backend& backend)
 {
   rmm::device_buffer buf(size, stream, mr);
-  if (size > 0) { backend.read_device(file_path, buf.data(), size, file_offset, stream); }
+  if (size > 0) { backend.read(file_path, buf.data(), size, file_offset, stream); }
   return buf;
 }
 
 /**
  * @brief Recursively reconstruct a cudf::column from disk column_metadata, reading directly
- * from disk into device buffers via read_device.
+ * from disk into device buffers via read.
  */
 static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   const memory::column_metadata& meta,
-  const std::string& file_path,
+  const std::filesystem::path& file_path,
   rmm::cuda_stream_view stream,
   rmm::mr::device_memory_resource* mr,
   idisk_io_backend& backend)
@@ -1494,7 +1494,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
 /**
  * @brief Convert disk_data_representation to gpu_table_representation.
  *
- * Reads a disk file directly into GPU device buffers via read_device.
+ * Reads a disk file directly into GPU device buffers via read.
  * Validates the header, deserializes metadata, then reconstructs each column on device.
  */
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(
@@ -1509,7 +1509,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 
   // Read and validate header
   disk_file_header header{};
-  backend.read_host(file_path, &header, sizeof(header), 0);
+  backend.read(file_path, &header, sizeof(header), 0);
 
   if (header.magic != DISK_FILE_MAGIC) {
     throw std::runtime_error("Invalid disk file magic number");
@@ -1521,8 +1521,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   // Read serialized metadata
   std::vector<uint8_t> metadata_bytes(header.metadata_size);
   if (header.metadata_size > 0) {
-    backend.read_host(
-      file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
+    backend.read(file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
   }
 
   auto disk_columns = deserialize_column_metadata(metadata_bytes.data(), metadata_bytes.size());
