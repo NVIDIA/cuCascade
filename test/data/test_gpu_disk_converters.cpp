@@ -19,9 +19,7 @@
 #include "utils/mock_test_utils.hpp"
 
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/data/representation_converter.hpp>
 
 #include <cudf/column/column_factories.hpp>
@@ -619,11 +617,8 @@ TEST_CASE("gpu disk round-trip with explicit pipeline backend",
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
   auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
 
-  io_backend_registry io_registry;
-  register_builtin_io_backends(io_registry);
-  auto backend = io_registry.create_backend("pipeline");
   representation_converter_registry registry;
-  register_builtin_converters(registry, backend);
+  register_builtin_converters(registry);
 
   // Simple INT32 column, 100 rows
   auto table   = make_typed_table(cudf::type_id::INT32, 100);
@@ -644,11 +639,8 @@ TEST_CASE("gpu disk round-trip pipeline with multiple types",
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
   auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
 
-  io_backend_registry io_registry;
-  register_builtin_io_backends(io_registry);
-  auto backend = io_registry.create_backend("pipeline");
   representation_converter_registry registry;
-  register_builtin_converters(registry, std::shared_ptr<idisk_io_backend>(std::move(backend)));
+  register_builtin_converters(registry);
 
   // Test with multiple numeric types
   auto type_id = GENERATE(cudf::type_id::INT32, cudf::type_id::INT64, cudf::type_id::FLOAT64);

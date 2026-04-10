@@ -67,6 +67,29 @@ void io_backend_registry::clear()
 {
   std::lock_guard<std::mutex> lock(_mutex);
   _factories.clear();
+  _default_name = "pipeline";
+}
+
+void io_backend_registry::set_default(const std::string& name)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  if (_factories.find(name) == _factories.end()) {
+    std::ostringstream oss;
+    oss << "Cannot set default: no I/O backend registered with name '" << name << "'";
+    throw std::runtime_error(oss.str());
+  }
+  _default_name = name;
+}
+
+std::string io_backend_registry::get_default_name() const
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _default_name;
+}
+
+std::shared_ptr<idisk_io_backend> io_backend_registry::create_default_backend() const
+{
+  return create_backend(get_default_name());
 }
 
 void register_builtin_io_backends(io_backend_registry& registry)

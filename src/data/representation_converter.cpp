@@ -16,7 +16,6 @@
  */
 
 #include "cudf/contiguous_split.hpp"
-#include "io_backend_internal.hpp"
 
 #include <cucascade/cuda_utils.hpp>
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -24,7 +23,6 @@
 #include <cucascade/data/disk_file_format.hpp>
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/disk_table.hpp>
@@ -1138,9 +1136,9 @@ static void read_column_buffers(const memory::column_metadata& disk_meta,
 static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  [[maybe_unused]] rmm::cuda_stream_view stream,
-  idisk_io_backend& backend)
+  [[maybe_unused]] rmm::cuda_stream_view stream)
 {
+  auto& backend          = target_memory_space->get_io_backend();
   auto& host_source      = source.cast<host_data_representation>();
   const auto& host_table = host_source.get_host_table();
 
@@ -1203,9 +1201,9 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
 static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  [[maybe_unused]] rmm::cuda_stream_view stream,
-  idisk_io_backend& backend)
+  [[maybe_unused]] rmm::cuda_stream_view stream)
 {
+  auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
   const auto& file_path  = disk_table.file_path;
@@ -1293,9 +1291,9 @@ static void collect_gpu_column_io_entries(const cudf::column_view& col,
 static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
-  idisk_io_backend& backend)
+  rmm::cuda_stream_view stream)
 {
+  auto& backend       = target_memory_space->get_io_backend();
   auto& gpu_source    = source.cast<gpu_table_representation>();
   const auto& table   = gpu_source.get_table();
   cudf::table_view tv = table.view();
@@ -1502,9 +1500,9 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
-  idisk_io_backend& backend)
+  rmm::cuda_stream_view stream)
 {
+  auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
   const auto& file_path  = disk_table.file_path;
@@ -1556,12 +1554,6 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 
 void register_builtin_converters(representation_converter_registry& registry)
 {
-  register_builtin_converters(registry, make_pipeline_io_backend());
-}
-
-void register_builtin_converters(representation_converter_registry& registry,
-                                 std::shared_ptr<idisk_io_backend> backend)
-{
   // GPU -> GPU (cross-device copy)
   registry.register_converter<gpu_table_representation, gpu_table_representation>(
     convert_gpu_to_gpu);
@@ -1590,43 +1582,21 @@ void register_builtin_converters(representation_converter_registry& registry,
   registry.register_converter<host_data_representation, host_data_representation>(
     convert_host_fast_to_host_fast);
 
-  // HOST DATA -> DISK
+  // HOST DATA -> DISK (backend resolved from target disk memory_space)
   registry.register_converter<host_data_representation, disk_data_representation>(
-    [backend](idata_representation& source,
-              const memory::memory_space* target_memory_space,
-              rmm::cuda_stream_view stream) {
-      return convert_host_data_to_disk(source, target_memory_space, stream, *backend);
-    });
+    convert_host_data_to_disk);
 
-  // DISK -> HOST DATA
+  // DISK -> HOST DATA (backend resolved from source disk memory_space)
   registry.register_converter<disk_data_representation, host_data_representation>(
-    [backend](idata_representation& source,
-              const memory::memory_space* target_memory_space,
-              rmm::cuda_stream_view stream) {
-      return convert_disk_to_host_data(source, target_memory_space, stream, *backend);
-    });
+    convert_disk_to_host_data);
 
-  // GPU -> DISK (per CONV-01)
+  // GPU -> DISK (backend resolved from target disk memory_space)
   registry.register_converter<gpu_table_representation, disk_data_representation>(
-    [backend](idata_representation& source,
-              const memory::memory_space* target_memory_space,
-              rmm::cuda_stream_view stream) {
-      return convert_gpu_to_disk(source, target_memory_space, stream, *backend);
-    });
+    convert_gpu_to_disk);
 
-  // DISK -> GPU (per CONV-02)
+  // DISK -> GPU (backend resolved from source disk memory_space)
   registry.register_converter<disk_data_representation, gpu_table_representation>(
-    [backend](idata_representation& source,
-              const memory::memory_space* target_memory_space,
-              rmm::cuda_stream_view stream) {
-      return convert_disk_to_gpu(source, target_memory_space, stream, *backend);
-    });
-}
-
-void register_builtin_converters(representation_converter_registry& registry,
-                                 io_backend_registry& io_registry)
-{
-  register_builtin_converters(registry, io_registry.create_backend("pipeline"));
+    convert_disk_to_gpu);
 }
 
 }  // namespace cucascade

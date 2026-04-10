@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -37,6 +38,10 @@
 #include <variant>
 
 namespace cucascade {
+
+// Forward declaration — defined in src/data/pipeline_io_backend.cpp
+std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io = false);
+
 namespace memory {
 
 //===----------------------------------------------------------------------===//
@@ -106,10 +111,31 @@ memory_space::memory_space(const disk_memory_space_config& config)
     _memory_limit(config.reservation_limit()),
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
-    _allocator(std::make_unique<null_device_memory_resource>())
+    _allocator(std::make_unique<null_device_memory_resource>()),
+    _io_backend(cucascade::make_pipeline_io_backend())
 {
   if (config.mount_paths.empty()) {
     throw std::invalid_argument("Mount path must be provided for disk memory space");
+  }
+  _reservation_allocator =
+    std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
+}
+
+memory_space::memory_space(const disk_memory_space_config& config,
+                           std::shared_ptr<idisk_io_backend> io_backend)
+  : _id(config.tier(), config.disk_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(std::make_unique<null_device_memory_resource>()),
+    _io_backend(std::move(io_backend))
+{
+  if (config.mount_paths.empty()) {
+    throw std::invalid_argument("Mount path must be provided for disk memory space");
+  }
+  if (!_io_backend) {
+    throw std::invalid_argument("I/O backend must not be null for disk memory space");
   }
   _reservation_allocator =
     std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
@@ -282,6 +308,14 @@ std::string_view memory_space::get_disk_mount_path() const
   }
   auto& limiter = std::get<std::unique_ptr<disk_access_limiter>>(_reservation_allocator);
   return limiter->get_mount_path();
+}
+
+idisk_io_backend& memory_space::get_io_backend() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("get_io_backend called on non-DISK memory space");
+  }
+  return *_io_backend;
 }
 
 std::string memory_space::to_string() const

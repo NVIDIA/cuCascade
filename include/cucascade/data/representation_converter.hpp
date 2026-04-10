@@ -18,8 +18,6 @@
 #pragma once
 
 #include <cucascade/data/common.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
-#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -249,35 +247,12 @@ class representation_converter_registry {
 /**
  * @brief Initialize the built-in representation converters.
  *
- * This function registers the default converters between gpu_table_representation
- * and host_data_packed_representation.
+ * Registers converters between all supported representation types (GPU, HOST, DISK).
+ * Disk converters resolve the I/O backend from the disk memory_space at conversion time,
+ * so each disk memory_space can use a different backend.
  *
  * @param registry The converter registry to register converters with.
  */
 void register_builtin_converters(representation_converter_registry& registry);
-
-/**
- * @brief Initialize the built-in representation converters with a specific disk I/O backend.
- *
- * This overload captures the provided backend in disk converter lambdas.
- * The original overload creates a default pipeline backend.
- *
- * @param registry The converter registry to register converters with.
- * @param backend The disk I/O backend to use for disk converters.
- */
-void register_builtin_converters(representation_converter_registry& registry,
-                                 std::shared_ptr<idisk_io_backend> backend);
-
-/**
- * @brief Initialize the built-in representation converters using an I/O backend registry.
- *
- * This overload creates the default backend from the io_backend_registry
- * (using "pipeline") and registers all built-in converters.
- *
- * @param registry The converter registry to register converters with.
- * @param io_registry The I/O backend registry to create the disk backend from.
- */
-void register_builtin_converters(representation_converter_registry& registry,
-                                 io_backend_registry& io_registry);
 
 }  // namespace cucascade

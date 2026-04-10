@@ -19,6 +19,7 @@
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/disk_table.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <catch2/catch.hpp>
 
@@ -183,4 +184,87 @@ TEST_CASE("align_up rounds to 4KB boundaries", "[disk][format]")
   REQUIRE(cucascade::align_up(4096, 4096) == 4096);
   REQUIRE(cucascade::align_up(4097, 4096) == 8192);
   REQUIRE(cucascade::align_up(100, 8) == 104);
+}
+
+// =============================================================================
+// I/O Backend Registry Default Management Tests
+// =============================================================================
+
+TEST_CASE("io_backend_registry default name is pipeline", "[disk][io][registry]")
+{
+  io_backend_registry registry;
+  REQUIRE(registry.get_default_name() == "pipeline");
+}
+
+TEST_CASE("io_backend_registry set_default changes default", "[disk][io][registry]")
+{
+  io_backend_registry registry;
+  register_builtin_io_backends(registry);
+
+  // Register a second backend
+  registry.register_backend("custom",
+                            []() -> std::shared_ptr<idisk_io_backend> { return nullptr; });
+
+  registry.set_default("custom");
+  REQUIRE(registry.get_default_name() == "custom");
+
+  registry.set_default("pipeline");
+  REQUIRE(registry.get_default_name() == "pipeline");
+}
+
+TEST_CASE("io_backend_registry set_default throws for unregistered name", "[disk][io][registry]")
+{
+  io_backend_registry registry;
+  REQUIRE_THROWS_AS(registry.set_default("nonexistent"), std::runtime_error);
+}
+
+TEST_CASE("io_backend_registry create_default_backend creates pipeline", "[disk][io][registry]")
+{
+  io_backend_registry registry;
+  register_builtin_io_backends(registry);
+  auto backend = registry.create_default_backend();
+  REQUIRE(backend != nullptr);
+}
+
+TEST_CASE("io_backend_registry clear resets default name", "[disk][io][registry]")
+{
+  io_backend_registry registry;
+  register_builtin_io_backends(registry);
+  registry.register_backend("custom",
+                            []() -> std::shared_ptr<idisk_io_backend> { return nullptr; });
+  registry.set_default("custom");
+  REQUIRE(registry.get_default_name() == "custom");
+
+  registry.clear();
+  REQUIRE(registry.get_default_name() == "pipeline");
+}
+
+// =============================================================================
+// memory_space I/O Backend Tests
+// =============================================================================
+
+TEST_CASE("disk memory_space has default pipeline backend", "[disk][io][memory_space]")
+{
+  cucascade::memory::disk_memory_space_config config{0, 1024 * 1024 * 1024, "/tmp"};
+  cucascade::memory::memory_space space(config);
+  REQUIRE_NOTHROW(space.get_io_backend());
+}
+
+TEST_CASE("disk memory_space accepts custom backend", "[disk][io][memory_space]")
+{
+  io_backend_registry registry;
+  register_builtin_io_backends(registry);
+  auto backend = registry.create_backend("pipeline");
+
+  cucascade::memory::disk_memory_space_config config{0, 1024 * 1024 * 1024, "/tmp"};
+  cucascade::memory::memory_space space(config, backend);
+  REQUIRE(&space.get_io_backend() == backend.get());
+}
+
+TEST_CASE("disk memory_space rejects null backend", "[disk][io][memory_space]")
+{
+  cucascade::memory::disk_memory_space_config config{0, 1024 * 1024 * 1024, "/tmp"};
+  REQUIRE_THROWS_AS(
+    cucascade::memory::memory_space(config, std::shared_ptr<idisk_io_backend>(nullptr)),
+    std::invalid_argument);
 }

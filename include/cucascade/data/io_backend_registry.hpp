@@ -96,12 +96,41 @@ class io_backend_registry {
   bool unregister_backend(const std::string& name);
 
   /**
-   * @brief Clear all registered backends.
+   * @brief Clear all registered backends and reset the default name to "pipeline".
    */
   void clear();
 
+  /**
+   * @brief Set the default backend name.
+   *
+   * When creating disk memory spaces without specifying a backend, the default
+   * is used. The named backend must already be registered.
+   *
+   * @param name The name of a registered backend to use as default.
+   * @throws std::runtime_error if no backend is registered under this name.
+   */
+  void set_default(const std::string& name);
+
+  /**
+   * @brief Get the current default backend name.
+   *
+   * @return The name of the default backend (initially "pipeline").
+   */
+  [[nodiscard]] std::string get_default_name() const;
+
+  /**
+   * @brief Create a new instance of the default backend.
+   *
+   * Equivalent to `create_backend(get_default_name())`.
+   *
+   * @return A shared_ptr to the newly created default backend instance.
+   * @throws std::runtime_error if the default backend is not registered.
+   */
+  [[nodiscard]] std::shared_ptr<idisk_io_backend> create_default_backend() const;
+
  private:
   mutable std::mutex _mutex;
+  std::string _default_name{"pipeline"};
   std::unordered_map<std::string, io_backend_factory_fn> _factories;
 };
 

@@ -17,9 +17,7 @@
 
 #include "cucascade/data/cpu_data_representation.hpp"
 #include "cucascade/data/disk_data_representation.hpp"
-#include "cucascade/data/disk_io_backend.hpp"
 #include "cucascade/data/gpu_data_representation.hpp"
-#include "cucascade/data/io_backend_registry.hpp"
 #include "cucascade/data/representation_converter.hpp"
 #include "cucascade/memory/config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
@@ -108,15 +106,12 @@ void drop_os_cache(const std::string& path)
 }
 
 /**
- * @brief Create a converter registry with the Pipeline backend.
+ * @brief Create a converter registry with all built-in converters.
  */
 std::unique_ptr<representation_converter_registry> make_benchmark_registry()
 {
-  io_backend_registry io_registry;
-  register_builtin_io_backends(io_registry);
-  auto backend  = io_registry.create_backend("pipeline");
   auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry, backend);
+  register_builtin_converters(*registry);
   return registry;
 }
 
@@ -814,11 +809,8 @@ void BM_ConvertGpuToDiskPipeline(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  io_backend_registry io_registry;
-  register_builtin_io_backends(io_registry);
-  auto backend  = io_registry.create_backend("pipeline");
   auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry, backend);
+  register_builtin_converters(*registry);
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
