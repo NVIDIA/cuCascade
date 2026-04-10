@@ -1149,35 +1149,15 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
 
   disk_file_guard guard{file_path};
 
-  // Recompute column metadata with 4KB-aligned file offsets
-  // Cursor starts at data_offset which we compute after header + metadata
-  auto metadata_bytes_for_sizing = serialize_column_metadata(host_table->columns);
-  std::size_t data_offset_in_file =
-    rmm::align_up(sizeof(disk_file_header) + metadata_bytes_for_sizing.size(), DISK_FILE_ALIGNMENT);
-
-  std::size_t cursor = data_offset_in_file;
+  // Recompute column metadata with 4KB-aligned file offsets starting at offset 0.
+  // No header or serialized metadata is written — metadata stays in memory.
+  std::size_t cursor = 0;
   std::vector<memory::column_metadata> disk_columns;
   disk_columns.reserve(host_table->columns.size());
   for (const auto& col : host_table->columns) {
     disk_columns.push_back(recompute_file_offsets(col, cursor));
   }
-  std::size_t total_file_data_size = cursor - data_offset_in_file;
-
-  // Build header
-  disk_file_header header{};
-  header.num_columns   = static_cast<uint32_t>(disk_columns.size());
-  auto metadata_bytes  = serialize_column_metadata(disk_columns);
-  header.metadata_size = metadata_bytes.size();
-  header.data_offset   = data_offset_in_file;
-
-  // Write header
-  backend.write(file_path, &header, sizeof(header), 0);
-
-  // Write serialized metadata
-  if (!metadata_bytes.empty()) {
-    backend.write(
-      file_path, metadata_bytes.data(), metadata_bytes.size(), sizeof(disk_file_header));
-  }
+  std::size_t total_file_data_size = cursor;
 
   // Write column data buffers
   for (std::size_t i = 0; i < host_table->columns.size(); ++i) {
@@ -1196,8 +1176,8 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
 /**
  * @brief Convert disk_data_representation to host_data_representation.
  *
- * Reads a disk file, validates the header, deserializes column metadata,
- * allocates host blocks, and reads data buffers into them.
+ * Uses in-memory column metadata from the source disk representation,
+ * allocates host blocks, and reads data buffers from the disk file.
  */
 static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   idata_representation& source,
@@ -1209,24 +1189,8 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   const auto& disk_table = disk_source.get_disk_table();
   const auto& file_path  = disk_table.file_path;
 
-  // Read and validate header
-  disk_file_header header{};
-  backend.read(file_path, &header, sizeof(header), 0);
-
-  if (header.magic != DISK_FILE_MAGIC) {
-    throw std::runtime_error("Invalid disk file magic number");
-  }
-  if (header.version != DISK_FILE_FORMAT_VERSION) {
-    throw std::runtime_error("Unsupported disk file format version");
-  }
-
-  // Read serialized metadata
-  std::vector<uint8_t> metadata_bytes(header.metadata_size);
-  if (header.metadata_size > 0) {
-    backend.read(file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
-  }
-
-  auto disk_columns = deserialize_column_metadata(metadata_bytes.data(), metadata_bytes.size());
+  // Column metadata is already in memory — no file header or metadata to read
+  const auto& disk_columns = disk_table.columns;
 
   // Compute host allocation size with 8-byte alignment
   std::size_t host_cursor = 0;
@@ -1285,8 +1249,8 @@ static void collect_gpu_column_io_entries(const cudf::column_view& col,
 /**
  * @brief Convert gpu_table_representation to disk_data_representation.
  *
- * Writes GPU table buffers directly to disk via write/write_batch.
- * File format: disk_file_header + serialized column_metadata + 4KB-aligned column data.
+ * Writes GPU table buffers directly to disk via write_batch.
+ * File contains only 4KB-aligned column data — metadata stays in memory.
  */
 static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   idata_representation& source,
@@ -1312,56 +1276,24 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
     planned_columns.push_back(plan_column_copy(tv.column(i), plan_offset, stream));
   }
 
-  // Serialize metadata to compute its size, then compute data offset
-  auto metadata_bytes_for_sizing = serialize_column_metadata(planned_columns);
-  std::size_t data_offset_in_file =
-    rmm::align_up(sizeof(disk_file_header) + metadata_bytes_for_sizing.size(), DISK_FILE_ALIGNMENT);
-
-  // Recompute with 4KB-aligned disk offsets
-  std::size_t cursor = data_offset_in_file;
+  // Recompute with 4KB-aligned disk offsets starting at offset 0.
+  // No header or serialized metadata is written — metadata stays in memory.
+  std::size_t cursor = 0;
   std::vector<memory::column_metadata> disk_columns;
   disk_columns.reserve(planned_columns.size());
   for (const auto& col : planned_columns) {
     disk_columns.push_back(recompute_file_offsets(col, cursor));
   }
-  std::size_t total_file_data_size = cursor - data_offset_in_file;
+  std::size_t total_file_data_size = cursor;
 
-  // Build header
-  disk_file_header header{};
-  header.num_columns   = static_cast<uint32_t>(disk_columns.size());
-  auto metadata_bytes  = serialize_column_metadata(disk_columns);
-  header.metadata_size = metadata_bytes.size();
-  header.data_offset   = data_offset_in_file;
-
-  // Build a single header+metadata buffer and copy it to GPU so everything
-  // can go through write_batch in a single file open (avoids the 80ms
-  // page cache invalidation from mixing POSIX and O_DIRECT writes).
-  std::size_t header_and_meta_size = sizeof(disk_file_header) + metadata_bytes.size();
-  rmm::device_buffer header_dev_buf(header_and_meta_size, stream);
-  {
-    std::vector<uint8_t> header_buf(header_and_meta_size);
-    std::memcpy(header_buf.data(), &header, sizeof(header));
-    if (!metadata_bytes.empty()) {
-      std::memcpy(header_buf.data() + sizeof(header), metadata_bytes.data(), metadata_bytes.size());
-    }
-    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(header_dev_buf.data(),
-                                       header_buf.data(),
-                                       header_and_meta_size,
-                                       cudaMemcpyHostToDevice,
-                                       stream.value()));
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.value()));
-  }
-
-  // Collect all I/O entries: header+metadata first, then column data
+  // Collect column data I/O entries
   std::vector<io_batch_entry> io_entries;
-  io_entries.push_back({header_dev_buf.data(), header_and_meta_size, 0});
-
   for (cudf::size_type i = 0; i < tv.num_columns(); ++i) {
     collect_gpu_column_io_entries(
       tv.column(i), disk_columns[static_cast<std::size_t>(i)], io_entries);
   }
 
-  // Single file open, single batch submit for everything
+  // Single file open, single batch submit
   backend.write_batch(file_path, io_entries, stream);
 
   guard.release();
@@ -1494,8 +1426,8 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
 /**
  * @brief Convert disk_data_representation to gpu_table_representation.
  *
- * Reads a disk file directly into GPU device buffers via read.
- * Validates the header, deserializes metadata, then reconstructs each column on device.
+ * Reads column data directly from disk into GPU device buffers.
+ * Column metadata comes from the in-memory disk_table_allocation.
  */
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   idata_representation& source,
@@ -1507,24 +1439,8 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   const auto& disk_table = disk_source.get_disk_table();
   const auto& file_path  = disk_table.file_path;
 
-  // Read and validate header
-  disk_file_header header{};
-  backend.read(file_path, &header, sizeof(header), 0);
-
-  if (header.magic != DISK_FILE_MAGIC) {
-    throw std::runtime_error("Invalid disk file magic number");
-  }
-  if (header.version != DISK_FILE_FORMAT_VERSION) {
-    throw std::runtime_error("Unsupported disk file format version");
-  }
-
-  // Read serialized metadata
-  std::vector<uint8_t> metadata_bytes(header.metadata_size);
-  if (header.metadata_size > 0) {
-    backend.read(file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
-  }
-
-  auto disk_columns = deserialize_column_metadata(metadata_bytes.data(), metadata_bytes.size());
+  // Column metadata is already in memory — no file header or metadata to read
+  const auto& disk_columns = disk_table.columns;
 
   // Set CUDA device to target GPU
   int previous_device = -1;
