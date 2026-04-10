@@ -944,7 +944,6 @@ static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_alloca
                                       std::size_t size,
                                       const std::string& file_path,
                                       std::size_t file_offset,
-                                      const io_context& ctx,
                                       idisk_io_backend& backend)
 {
   const std::size_t block_size = alloc->block_size();
@@ -956,7 +955,7 @@ static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_alloca
     std::size_t avail     = block_size - block_off;
     std::size_t chunk     = std::min(remaining, avail);
     auto block            = alloc->at(block_idx);
-    backend.write_host(ctx, file_path, block.data() + block_off, chunk, file_offset + written);
+    backend.write_host(file_path, block.data() + block_off, chunk, file_offset + written);
     written += chunk;
     block_off += chunk;
     if (block_off == block_size) {
@@ -974,7 +973,6 @@ static void read_disk_buffer_to_host(const std::string& file_path,
                                      std::size_t size,
                                      memory::fixed_multiple_blocks_allocation& alloc,
                                      std::size_t alloc_offset,
-                                     const io_context& ctx,
                                      idisk_io_backend& backend)
 {
   const std::size_t block_size = alloc->block_size();
@@ -986,7 +984,7 @@ static void read_disk_buffer_to_host(const std::string& file_path,
     std::size_t avail     = block_size - block_off;
     std::size_t chunk     = std::min(remaining, avail);
     auto block            = alloc->at(block_idx);
-    backend.read_host(ctx, file_path, block.data() + block_off, chunk, file_offset + read_total);
+    backend.read_host(file_path, block.data() + block_off, chunk, file_offset + read_total);
     read_total += chunk;
     block_off += chunk;
     if (block_off == block_size) {
@@ -1045,7 +1043,6 @@ static void write_column_buffers(const memory::column_metadata& src_meta,
                                  const memory::column_metadata& disk_meta,
                                  const memory::fixed_multiple_blocks_allocation& alloc,
                                  const std::string& file_path,
-                                 const io_context& ctx,
                                  idisk_io_backend& backend)
 {
   if (src_meta.has_null_mask && src_meta.null_mask_size > 0) {
@@ -1054,21 +1051,14 @@ static void write_column_buffers(const memory::column_metadata& src_meta,
                               src_meta.null_mask_size,
                               file_path,
                               disk_meta.null_mask_offset,
-                              ctx,
                               backend);
   }
   if (src_meta.has_data && src_meta.data_size > 0) {
-    write_host_buffer_to_disk(alloc,
-                              src_meta.data_offset,
-                              src_meta.data_size,
-                              file_path,
-                              disk_meta.data_offset,
-                              ctx,
-                              backend);
+    write_host_buffer_to_disk(
+      alloc, src_meta.data_offset, src_meta.data_size, file_path, disk_meta.data_offset, backend);
   }
   for (std::size_t i = 0; i < src_meta.children.size(); ++i) {
-    write_column_buffers(
-      src_meta.children[i], disk_meta.children[i], alloc, file_path, ctx, backend);
+    write_column_buffers(src_meta.children[i], disk_meta.children[i], alloc, file_path, backend);
   }
 }
 
@@ -1120,7 +1110,6 @@ static void read_column_buffers(const memory::column_metadata& disk_meta,
                                 const memory::column_metadata& host_meta,
                                 const std::string& file_path,
                                 memory::fixed_multiple_blocks_allocation& alloc,
-                                const io_context& ctx,
                                 idisk_io_backend& backend)
 {
   if (disk_meta.has_null_mask && disk_meta.null_mask_size > 0) {
@@ -1129,21 +1118,14 @@ static void read_column_buffers(const memory::column_metadata& disk_meta,
                              disk_meta.null_mask_size,
                              alloc,
                              host_meta.null_mask_offset,
-                             ctx,
                              backend);
   }
   if (disk_meta.has_data && disk_meta.data_size > 0) {
-    read_disk_buffer_to_host(file_path,
-                             disk_meta.data_offset,
-                             disk_meta.data_size,
-                             alloc,
-                             host_meta.data_offset,
-                             ctx,
-                             backend);
+    read_disk_buffer_to_host(
+      file_path, disk_meta.data_offset, disk_meta.data_size, alloc, host_meta.data_offset, backend);
   }
   for (std::size_t i = 0; i < disk_meta.children.size(); ++i) {
-    read_column_buffers(
-      disk_meta.children[i], host_meta.children[i], file_path, alloc, ctx, backend);
+    read_column_buffers(disk_meta.children[i], host_meta.children[i], file_path, alloc, backend);
   }
 }
 
@@ -1161,8 +1143,6 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
 {
   auto& host_source      = source.cast<host_data_representation>();
   const auto& host_table = host_source.get_host_table();
-
-  io_context ctx{&source.get_memory_space(), target_memory_space};
 
   // Generate unique file path under the disk memory space's mount directory
   auto mount_path = target_memory_space->get_disk_mount_path();
@@ -1192,18 +1172,18 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   header.data_offset   = data_offset_in_file;
 
   // Write header
-  backend.write_host(ctx, file_path, &header, sizeof(header), 0);
+  backend.write_host(file_path, &header, sizeof(header), 0);
 
   // Write serialized metadata
   if (!metadata_bytes.empty()) {
     backend.write_host(
-      ctx, file_path, metadata_bytes.data(), metadata_bytes.size(), sizeof(disk_file_header));
+      file_path, metadata_bytes.data(), metadata_bytes.size(), sizeof(disk_file_header));
   }
 
   // Write column data buffers
   for (std::size_t i = 0; i < host_table->columns.size(); ++i) {
     write_column_buffers(
-      host_table->columns[i], disk_columns[i], host_table->allocation, file_path, ctx, backend);
+      host_table->columns[i], disk_columns[i], host_table->allocation, file_path, backend);
   }
 
   guard.release();
@@ -1230,11 +1210,9 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   const auto& disk_table = disk_source.get_disk_table();
   const auto& file_path  = disk_table.file_path;
 
-  io_context ctx{&source.get_memory_space(), target_memory_space};
-
   // Read and validate header
   disk_file_header header{};
-  backend.read_host(ctx, file_path, &header, sizeof(header), 0);
+  backend.read_host(file_path, &header, sizeof(header), 0);
 
   if (header.magic != DISK_FILE_MAGIC) {
     throw std::runtime_error("Invalid disk file magic number");
@@ -1247,7 +1225,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   std::vector<uint8_t> metadata_bytes(header.metadata_size);
   if (header.metadata_size > 0) {
     backend.read_host(
-      ctx, file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
+      file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
   }
 
   auto disk_columns = deserialize_column_metadata(metadata_bytes.data(), metadata_bytes.size());
@@ -1271,7 +1249,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
 
   // Read column data from file into host blocks
   for (std::size_t i = 0; i < disk_columns.size(); ++i) {
-    read_column_buffers(disk_columns[i], host_columns[i], file_path, allocation, ctx, backend);
+    read_column_buffers(disk_columns[i], host_columns[i], file_path, allocation, backend);
   }
 
   auto host_alloc = std::make_unique<memory::host_table_allocation>(
@@ -1321,8 +1299,6 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   auto& gpu_source    = source.cast<gpu_table_representation>();
   const auto& table   = gpu_source.get_table();
   cudf::table_view tv = table.view();
-
-  io_context ctx{&source.get_memory_space(), target_memory_space};
 
   // Generate unique file path under the disk memory space's mount directory
   auto mount_path = target_memory_space->get_disk_mount_path();
@@ -1388,7 +1364,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   }
 
   // Single file open, single batch submit for everything
-  backend.write_device_batch(ctx, file_path, io_entries, stream);
+  backend.write_device_batch(file_path, io_entries, stream);
 
   guard.release();
 
@@ -1406,11 +1382,10 @@ static rmm::device_buffer alloc_and_read_from_disk(const std::string& file_path,
                                                    std::size_t size,
                                                    rmm::cuda_stream_view stream,
                                                    rmm::mr::device_memory_resource* mr,
-                                                   const io_context& ctx,
                                                    idisk_io_backend& backend)
 {
   rmm::device_buffer buf(size, stream, mr);
-  if (size > 0) { backend.read_device(ctx, file_path, buf.data(), size, file_offset, stream); }
+  if (size > 0) { backend.read_device(file_path, buf.data(), size, file_offset, stream); }
   return buf;
 }
 
@@ -1423,14 +1398,13 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   const std::string& file_path,
   rmm::cuda_stream_view stream,
   rmm::mr::device_memory_resource* mr,
-  const io_context& ctx,
   idisk_io_backend& backend)
 {
   // Null mask (shared by all type categories)
   rmm::device_buffer null_mask{};
   if (meta.has_null_mask) {
     null_mask = alloc_and_read_from_disk(
-      file_path, meta.null_mask_offset, meta.null_mask_size, stream, mr, ctx, backend);
+      file_path, meta.null_mask_offset, meta.null_mask_size, stream, mr, backend);
   }
   const cudf::size_type null_count = meta.has_null_mask ? meta.null_count : 0;
 
@@ -1442,7 +1416,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
     }
     // Reconstruct offsets and cast to INT64 if needed (cudf 26.06+ requires INT64 offsets)
     auto offsets_col =
-      reconstruct_column_from_disk(meta.children[0], file_path, stream, mr, ctx, backend);
+      reconstruct_column_from_disk(meta.children[0], file_path, stream, mr, backend);
     if (offsets_col->type().id() == cudf::type_id::INT32) {
       offsets_col =
         cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
@@ -1451,8 +1425,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
       meta.num_rows,
       std::move(offsets_col),
       meta.has_data && meta.data_size > 0
-        ? alloc_and_read_from_disk(
-            file_path, meta.data_offset, meta.data_size, stream, mr, ctx, backend)
+        ? alloc_and_read_from_disk(file_path, meta.data_offset, meta.data_size, stream, mr, backend)
         : rmm::device_buffer{},
       null_count,
       std::move(null_mask));
@@ -1465,7 +1438,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
         "values)");
     }
     auto offsets_col =
-      reconstruct_column_from_disk(meta.children[0], file_path, stream, mr, ctx, backend);
+      reconstruct_column_from_disk(meta.children[0], file_path, stream, mr, backend);
     if (offsets_col->type().id() == cudf::type_id::INT32) {
       offsets_col =
         cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
@@ -1473,7 +1446,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
     return cudf::make_lists_column(
       meta.num_rows,
       std::move(offsets_col),
-      reconstruct_column_from_disk(meta.children[1], file_path, stream, mr, ctx, backend),
+      reconstruct_column_from_disk(meta.children[1], file_path, stream, mr, backend),
       null_count,
       std::move(null_mask));
   }
@@ -1482,8 +1455,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
     std::vector<std::unique_ptr<cudf::column>> fields;
     fields.reserve(meta.children.size());
     for (const auto& child_meta : meta.children) {
-      fields.push_back(
-        reconstruct_column_from_disk(child_meta, file_path, stream, mr, ctx, backend));
+      fields.push_back(reconstruct_column_from_disk(child_meta, file_path, stream, mr, backend));
     }
     return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRUCT},
                                           meta.num_rows,
@@ -1502,9 +1474,8 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
     // cudf DICTIONARY32 children order: [0]=indices, [1]=keys.
     // make_dictionary_column parameter order: (keys, indices, ...).
     auto indices_col =
-      reconstruct_column_from_disk(meta.children[0], file_path, stream, mr, ctx, backend);
-    auto keys_col =
-      reconstruct_column_from_disk(meta.children[1], file_path, stream, mr, ctx, backend);
+      reconstruct_column_from_disk(meta.children[0], file_path, stream, mr, backend);
+    auto keys_col = reconstruct_column_from_disk(meta.children[1], file_path, stream, mr, backend);
     return cudf::make_dictionary_column(
       std::move(keys_col), std::move(indices_col), std::move(null_mask), null_count);
   }
@@ -1516,8 +1487,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
     dtype,
     meta.num_rows,
     meta.has_data && meta.data_size > 0
-      ? alloc_and_read_from_disk(
-          file_path, meta.data_offset, meta.data_size, stream, mr, ctx, backend)
+      ? alloc_and_read_from_disk(file_path, meta.data_offset, meta.data_size, stream, mr, backend)
       : rmm::device_buffer{},
     std::move(null_mask),
     null_count);
@@ -1539,11 +1509,9 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   const auto& disk_table = disk_source.get_disk_table();
   const auto& file_path  = disk_table.file_path;
 
-  io_context ctx{&source.get_memory_space(), target_memory_space};
-
   // Read and validate header
   disk_file_header header{};
-  backend.read_host(ctx, file_path, &header, sizeof(header), 0);
+  backend.read_host(file_path, &header, sizeof(header), 0);
 
   if (header.magic != DISK_FILE_MAGIC) {
     throw std::runtime_error("Invalid disk file magic number");
@@ -1556,7 +1524,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   std::vector<uint8_t> metadata_bytes(header.metadata_size);
   if (header.metadata_size > 0) {
     backend.read_host(
-      ctx, file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
+      file_path, metadata_bytes.data(), header.metadata_size, sizeof(disk_file_header));
   }
 
   auto disk_columns = deserialize_column_metadata(metadata_bytes.data(), metadata_bytes.size());
@@ -1572,8 +1540,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(disk_columns.size());
   for (const auto& col_meta : disk_columns) {
-    gpu_columns.push_back(
-      reconstruct_column_from_disk(col_meta, file_path, stream, mr, ctx, backend));
+    gpu_columns.push_back(reconstruct_column_from_disk(col_meta, file_path, stream, mr, backend));
   }
 
   stream.synchronize();

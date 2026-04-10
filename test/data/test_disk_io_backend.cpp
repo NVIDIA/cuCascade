@@ -56,17 +56,15 @@ TEST_CASE("pipeline backend host write and read round-trip", "[disk][io][pipelin
   auto tmp_dir   = std::filesystem::temp_directory_path();
   auto file_path = (tmp_dir / "test_pipeline_host.bin").string();
 
-  io_context ctx{};
-
   // Write test data: 4096 bytes with sequential values
   std::vector<uint8_t> write_data(4096);
   std::iota(write_data.begin(), write_data.end(), static_cast<uint8_t>(0));
 
-  backend->write_host(ctx, file_path, write_data.data(), write_data.size(), 0);
+  backend->write_host(file_path, write_data.data(), write_data.size(), 0);
 
   // Read it back
   std::vector<uint8_t> read_data(4096, 0);
-  backend->read_host(ctx, file_path, read_data.data(), read_data.size(), 0);
+  backend->read_host(file_path, read_data.data(), read_data.size(), 0);
 
   REQUIRE(write_data == read_data);
 

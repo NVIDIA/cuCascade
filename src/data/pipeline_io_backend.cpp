@@ -88,8 +88,7 @@ class pipeline_io_backend : public idisk_io_backend {
   pipeline_io_backend(pipeline_io_backend&&)                 = delete;
   pipeline_io_backend& operator=(pipeline_io_backend&&)      = delete;
 
-  void write_device([[maybe_unused]] const io_context& ctx,
-                    const std::string& path,
+  void write_device(const std::string& path,
                     const void* dev_ptr,
                     std::size_t size,
                     std::size_t file_offset,
@@ -158,8 +157,7 @@ class pipeline_io_backend : public idisk_io_backend {
     ::close(fd);
   }
 
-  void read_device([[maybe_unused]] const io_context& ctx,
-                   const std::string& path,
+  void read_device(const std::string& path,
                    void* dev_ptr,
                    std::size_t size,
                    std::size_t file_offset,
@@ -247,8 +245,7 @@ class pipeline_io_backend : public idisk_io_backend {
     ::close(fd);
   }
 
-  void write_host([[maybe_unused]] const io_context& ctx,
-                  const std::string& path,
+  void write_host(const std::string& path,
                   const void* host_ptr,
                   std::size_t size,
                   std::size_t file_offset) override
@@ -267,8 +264,7 @@ class pipeline_io_backend : public idisk_io_backend {
     }
   }
 
-  void read_host([[maybe_unused]] const io_context& ctx,
-                 const std::string& path,
+  void read_host(const std::string& path,
                  void* host_ptr,
                  std::size_t size,
                  std::size_t file_offset) override
@@ -295,8 +291,7 @@ class pipeline_io_backend : public idisk_io_backend {
    * Single fd open for all entries. Entries processed in order with their
    * respective file offsets.
    */
-  void write_device_batch([[maybe_unused]] const io_context& ctx,
-                          const std::string& path,
+  void write_device_batch(const std::string& path,
                           const std::vector<io_batch_entry>& entries,
                           rmm::cuda_stream_view stream) override
   {

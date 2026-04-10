@@ -26,10 +26,6 @@
 
 namespace cucascade {
 
-namespace memory {
-class memory_space;
-}  // namespace memory
-
 /**
  * @brief Descriptor for a single I/O operation in a batch.
  */
@@ -37,18 +33,6 @@ struct io_batch_entry {
   const void* ptr;          ///< Device or host memory pointer
   std::size_t size;         ///< Number of bytes
   std::size_t file_offset;  ///< Byte offset in the file
-};
-
-/**
- * @brief Context for an I/O operation, providing source and target memory space information.
- *
- * Backends can use this to make topology-aware decisions in multi-GPU environments,
- * e.g., selecting per-GPU staging buffers or routing I/O through specific NICs.
- * Both pointers may be nullptr when memory space information is not available.
- */
-struct io_context {
-  const memory::memory_space* source_space{nullptr};  ///< Where the data is coming from
-  const memory::memory_space* target_space{nullptr};  ///< Where the data is going to
 };
 
 /**
@@ -65,15 +49,13 @@ class idisk_io_backend {
   /**
    * @brief Write data from device memory to a disk file.
    *
-   * @param ctx I/O context with source and target memory space information.
    * @param path File path to write to.
    * @param dev_ptr Pointer to device memory containing the data.
    * @param size Number of bytes to write.
    * @param file_offset Byte offset within the file to start writing at.
    * @param stream CUDA stream for synchronization.
    */
-  virtual void write_device(const io_context& ctx,
-                            const std::string& path,
+  virtual void write_device(const std::string& path,
                             const void* dev_ptr,
                             std::size_t size,
                             std::size_t file_offset,
@@ -82,15 +64,13 @@ class idisk_io_backend {
   /**
    * @brief Read data from a disk file into device memory.
    *
-   * @param ctx I/O context with source and target memory space information.
    * @param path File path to read from.
    * @param dev_ptr Pointer to device memory to read into.
    * @param size Number of bytes to read.
    * @param file_offset Byte offset within the file to start reading from.
    * @param stream CUDA stream for synchronization.
    */
-  virtual void read_device(const io_context& ctx,
-                           const std::string& path,
+  virtual void read_device(const std::string& path,
                            void* dev_ptr,
                            std::size_t size,
                            std::size_t file_offset,
@@ -99,14 +79,12 @@ class idisk_io_backend {
   /**
    * @brief Write data from host memory to a disk file.
    *
-   * @param ctx I/O context with source and target memory space information.
    * @param path File path to write to.
    * @param host_ptr Pointer to host memory containing the data.
    * @param size Number of bytes to write.
    * @param file_offset Byte offset within the file to start writing at.
    */
-  virtual void write_host(const io_context& ctx,
-                          const std::string& path,
+  virtual void write_host(const std::string& path,
                           const void* host_ptr,
                           std::size_t size,
                           std::size_t file_offset) = 0;
@@ -114,14 +92,12 @@ class idisk_io_backend {
   /**
    * @brief Read data from a disk file into host memory.
    *
-   * @param ctx I/O context with source and target memory space information.
    * @param path File path to read from.
    * @param host_ptr Pointer to host memory to read into.
    * @param size Number of bytes to read.
    * @param file_offset Byte offset within the file to start reading from.
    */
-  virtual void read_host(const io_context& ctx,
-                         const std::string& path,
+  virtual void read_host(const std::string& path,
                          void* host_ptr,
                          std::size_t size,
                          std::size_t file_offset) = 0;
@@ -134,37 +110,33 @@ class idisk_io_backend {
    *
    * Default implementation falls back to sequential write_device calls.
    *
-   * @param ctx I/O context with source and target memory space information.
    * @param path File path to write to.
    * @param entries Vector of I/O batch entries (device pointers, sizes, file offsets).
    * @param stream CUDA stream for synchronization.
    */
-  virtual void write_device_batch(const io_context& ctx,
-                                  const std::string& path,
+  virtual void write_device_batch(const std::string& path,
                                   const std::vector<io_batch_entry>& entries,
                                   rmm::cuda_stream_view stream)
   {
     for (const auto& entry : entries) {
-      write_device(ctx, path, entry.ptr, entry.size, entry.file_offset, stream);
+      write_device(path, entry.ptr, entry.size, entry.file_offset, stream);
     }
   }
 
   /**
    * @brief Read multiple buffers from a disk file into device memory in a single batch.
    *
-   * @param ctx I/O context with source and target memory space information.
    * @param path File path to read from.
    * @param entries Vector of I/O batch entries (device pointers, sizes, file offsets).
    *               The ptr fields point to destination device memory (non-const).
    * @param stream CUDA stream for synchronization.
    */
-  virtual void read_device_batch(const io_context& ctx,
-                                 const std::string& path,
+  virtual void read_device_batch(const std::string& path,
                                  const std::vector<io_batch_entry>& entries,
                                  rmm::cuda_stream_view stream)
   {
     for (const auto& entry : entries) {
-      read_device(ctx, path, const_cast<void*>(entry.ptr), entry.size, entry.file_offset, stream);
+      read_device(path, const_cast<void*>(entry.ptr), entry.size, entry.file_offset, stream);
     }
   }
 };
