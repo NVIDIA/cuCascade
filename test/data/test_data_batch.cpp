@@ -1764,3 +1764,90 @@ TEST_CASE(
 
   CUCASCADE_CUDA_TRY(cudaFreeHost(pinned_host));
 }
+
+// Host callback that blocks the CUDA stream for a fixed duration, used to
+// create a deterministic window during which stream.synchronize() is blocked.
+static void CUDART_CB stream_delay_callback(void* /*userData*/)
+{
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
+TEST_CASE(
+  "convert_to releases mutex before GPU-to-HOST stream sync allowing "
+  "concurrent access",
+  "[data_batch][convert_to]")
+{
+  rmm::cuda_stream stream;
+
+  constexpr std::size_t buf_size = 4 * 1024 * 1024;  // 4 MB
+  rmm::device_buffer gpu_buf(buf_size, stream.view());
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(gpu_buf.data(), 0xAB, buf_size, stream.value()));
+  stream.synchronize();
+
+  void* pinned_host = nullptr;
+  CUCASCADE_CUDA_TRY(cudaMallocHost(&pinned_host, buf_size));
+
+  conversion_sync_observer observer;
+  auto host_space = make_mock_memory_space(memory::Tier::HOST, 0);
+
+  // The converter signals when it returns so we know convert_to is about to
+  // unlock the mutex and enter the stream sync phase.
+  std::atomic<bool> converter_returned{false};
+
+  representation_converter_registry registry;
+  registry.register_converter<observed_gpu_representation, mock_data_representation>(
+    [&](idata_representation& source,
+        const memory::memory_space* /*target_space*/,
+        rmm::cuda_stream_view s) -> std::unique_ptr<idata_representation> {
+      auto& gpu_src = source.cast<observed_gpu_representation>();
+      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+        pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));
+      // Enqueue a host callback that sleeps for 50 ms, creating a large
+      // deterministic window during which stream.synchronize() blocks.
+      CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(s.value(), stream_delay_callback, nullptr));
+      // Record event AFTER the delay — it won't be complete until the
+      // callback finishes, regardless of GPU speed.
+      CUCASCADE_CUDA_TRY(cudaEventRecord(observer.event, s.value()));
+      converter_returned.store(true, std::memory_order_release);
+      return std::make_unique<mock_data_representation>(memory::Tier::HOST, buf_size);
+    });
+
+  auto gpu_data = std::make_unique<observed_gpu_representation>(std::move(gpu_buf), observer);
+  auto batch    = std::make_shared<data_batch>(1, std::move(gpu_data));
+
+  std::thread convert_thread([&]() {
+    batch->convert_to<mock_data_representation>(registry, host_space.get(), stream.view());
+  });
+
+  // Spin until the converter function has returned — convert_to is about to
+  // unlock the mutex and enter the stream.synchronize() phase.
+  while (!converter_returned.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  // Brief pause to let convert_to move past the unlock into the sync phase.
+  std::this_thread::sleep_for(std::chrono::microseconds(500));
+
+  // get_state() takes the mutex.  With the early-unlock optimisation it
+  // returns immediately while the stream sync is still running (the host
+  // callback sleeps for 50 ms).  If the mutex were held during the sync,
+  // we would be blocked for the full 50 ms.
+  auto state = batch->get_state();
+
+  // Check whether the stream work was still in progress when we read the
+  // batch state.  cudaErrorNotReady means the event (recorded after the 50 ms
+  // host callback) hasn't been reached yet, proving we got the mutex DURING
+  // the sync.
+  bool accessed_during_sync = (cudaEventQuery(observer.event) == cudaErrorNotReady);
+
+  convert_thread.join();
+
+  // With early unlock: the mutex is free while the stream syncs, so we
+  //   accessed the batch while stream work was still in-flight.
+  // With sync inside lock: the mutex is held until the sync finishes, so by
+  //   the time get_state() returns the event is already complete.
+  REQUIRE(accessed_during_sync);
+  REQUIRE(state == batch_state::idle);
+
+  CUCASCADE_CUDA_TRY(cudaFreeHost(pinned_host));
+}
