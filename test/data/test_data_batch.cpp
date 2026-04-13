@@ -22,6 +22,9 @@
 #include <cucascade/data/gpu_data_representation.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <catch2/catch.hpp>
 
@@ -1644,4 +1647,120 @@ TEST_CASE("data_batch concurrent wait_to_create_task and wait_to_lock_for_proces
   handles.clear();
   REQUIRE(batch->get_processing_count() == 0);
   REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+// =============================================================================
+// convert_to stream synchronization tests
+// =============================================================================
+
+// Tracks whether a CUDA event recorded after async work was complete at the
+// time the source representation was destroyed.
+struct conversion_sync_observer {
+  cudaEvent_t event{};
+  bool synced_before_destroy = false;
+
+  conversion_sync_observer()
+  {
+    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+  }
+  ~conversion_sync_observer() { cudaEventDestroy(event); }
+
+  conversion_sync_observer(const conversion_sync_observer&)            = delete;
+  conversion_sync_observer& operator=(const conversion_sync_observer&) = delete;
+};
+
+// GPU representation that checks whether pending stream work completed before
+// this object is destroyed.  The destructor queries the observer's CUDA event:
+// if the event is complete, the stream was synchronized first.
+class observed_gpu_representation : private cucascade::test::mock_memory_space_holder,
+                                    public idata_representation {
+ public:
+  observed_gpu_representation(rmm::device_buffer buf, conversion_sync_observer& observer)
+    : mock_memory_space_holder(memory::Tier::GPU, 0)
+    , idata_representation(*space)
+    , _buf(std::move(buf))
+    , _observer(observer)
+  {
+  }
+
+  ~observed_gpu_representation() override
+  {
+    _observer.synced_before_destroy = (cudaEventQuery(_observer.event) == cudaSuccess);
+  }
+
+  void const* data() const { return _buf.data(); }
+  std::size_t get_size_in_bytes() const override { return _buf.size(); }
+  std::size_t get_uncompressed_data_size_in_bytes() const override { return _buf.size(); }
+  std::unique_ptr<idata_representation> clone(
+    [[maybe_unused]] rmm::cuda_stream_view stream) override
+  {
+    return nullptr;
+  }
+
+ private:
+  rmm::device_buffer _buf;
+  conversion_sync_observer& _observer;
+};
+
+TEST_CASE(
+  "convert_to synchronizes stream before destroying GPU source on GPU-to-HOST "
+  "conversion",
+  "[data_batch][convert_to]")
+{
+  rmm::cuda_stream stream;
+
+  // Use a buffer large enough that the async D2H copy is still in-flight when
+  // the old representation would be destroyed without synchronization.
+  constexpr std::size_t buf_size = 4 * 1024 * 1024;  // 4 MB
+  rmm::device_buffer gpu_buf(buf_size, stream.view());
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(gpu_buf.data(), 0xAB, buf_size, stream.value()));
+  stream.synchronize();
+
+  // Pinned host memory so cudaMemcpyAsync is truly asynchronous
+  void* pinned_host = nullptr;
+  CUCASCADE_CUDA_TRY(cudaMallocHost(&pinned_host, buf_size));
+
+  conversion_sync_observer observer;
+  auto host_space = make_mock_memory_space(memory::Tier::HOST, 0);
+
+  // Register a converter that enqueues async D2H work WITHOUT synchronizing.
+  // This simulates a converter that relies on the caller to sync the stream
+  // before the source representation is destroyed.
+  representation_converter_registry registry;
+  registry.register_converter<observed_gpu_representation, mock_data_representation>(
+    [&](idata_representation& source,
+        const memory::memory_space* /*target_space*/,
+        rmm::cuda_stream_view s) -> std::unique_ptr<idata_representation> {
+      auto& gpu_src = source.cast<observed_gpu_representation>();
+      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+        pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));
+      // Record event after the async copy so we can check completion order
+      CUCASCADE_CUDA_TRY(cudaEventRecord(observer.event, s.value()));
+      // Deliberately NO stream.synchronize() — convert_to must handle this
+      return std::make_unique<mock_data_representation>(memory::Tier::HOST, buf_size);
+    });
+
+  auto gpu_data = std::make_unique<observed_gpu_representation>(std::move(gpu_buf), observer);
+  data_batch batch(1, std::move(gpu_data));
+
+  batch.convert_to<mock_data_representation>(registry, host_space.get(), stream.view());
+
+  // With the fix: convert_to synchronizes the stream before the old GPU
+  // representation is destroyed, so the CUDA event was already complete when
+  // the destructor queried it.
+  // Without the fix: the old representation is destroyed during the move-
+  // assignment to _data, before any sync, so the event is still pending.
+  REQUIRE(observer.synced_before_destroy);
+
+  // Verify the async copy captured correct data (would be unreliable without
+  // the sync since the source GPU memory could have been freed mid-copy).
+  auto* host_bytes = static_cast<uint8_t*>(pinned_host);
+  for (std::size_t i = 0; i < buf_size; ++i) {
+    if (host_bytes[i] != 0xAB) {
+      FAIL("Data mismatch at byte " << i << ": expected 0xAB, got 0x" << std::hex
+                                     << static_cast<int>(host_bytes[i]));
+    }
+  }
+
+  CUCASCADE_CUDA_TRY(cudaFreeHost(pinned_host));
 }
