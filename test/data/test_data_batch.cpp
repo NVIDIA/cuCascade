@@ -1703,13 +1703,12 @@ class observed_gpu_representation : private cucascade::test::mock_memory_space_h
 };
 
 TEST_CASE(
-  "convert_to synchronizes stream before destroying GPU source on GPU-to-HOST "
-  "conversion",
+  "convert_to synchronizes stream before destroying GPU source",
   "[data_batch][convert_to]")
 {
   rmm::cuda_stream stream;
 
-  // Use a buffer large enough that the async D2H copy is still in-flight when
+  // Use a buffer large enough that the async copy is still in-flight when
   // the old representation would be destroyed without synchronization.
   constexpr std::size_t buf_size = 4 * 1024 * 1024;  // 4 MB
   rmm::device_buffer gpu_buf(buf_size, stream.view());
@@ -1723,9 +1722,9 @@ TEST_CASE(
   conversion_sync_observer observer;
   auto host_space = make_mock_memory_space(memory::Tier::HOST, 0);
 
-  // Register a converter that enqueues async D2H work WITHOUT synchronizing.
-  // This simulates a converter that relies on the caller to sync the stream
-  // before the source representation is destroyed.
+  // Register a converter that enqueues async work reading from the source GPU
+  // buffer WITHOUT synchronizing.  convert_to must sync before destroying the
+  // source.
   representation_converter_registry registry;
   registry.register_converter<observed_gpu_representation, mock_data_representation>(
     [&](idata_representation& source,
@@ -1773,8 +1772,7 @@ static void CUDART_CB stream_delay_callback(void* /*userData*/)
 }
 
 TEST_CASE(
-  "convert_to releases mutex before GPU-to-HOST stream sync allowing "
-  "concurrent access",
+  "convert_to releases mutex before stream sync allowing concurrent access",
   "[data_batch][convert_to]")
 {
   rmm::cuda_stream stream;
