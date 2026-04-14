@@ -79,8 +79,6 @@ class idata_repository {
   {
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      // Ensure partition exists
-      if (batch) { batch->set_state_change_cv(&_cv); }
 
       if (static_cast<std::size_t>(partition_idx) >= _data_batches.size()) {
         _data_batches.resize(partition_idx + 1);
@@ -91,204 +89,89 @@ class idata_repository {
   }
 
   /**
-   * @brief Notify waiting threads that a batch state may have changed.
-   *
-   * Call this method when a batch's state changes outside the repository
-   * (e.g., after releasing a processing handle) to wake up threads blocked
-   * in pop_data_batch().
+   * @brief Notify waiting threads that a batch may be available.
    */
   void notify_state_change() { _cv.notify_all(); }
 
   /**
-   * @brief Remove and return a data batch that can transition to the target state.
+   * @brief Remove and return the next data batch from the repository.
    *
-   * Searches for a batch that can successfully transition to the specified target state.
-   * The specific batch returned depends on the implementation's eviction strategy:
-   * - FIFO: Searches from oldest to newest
-   * - LRU: Searches from least recently used
-   * - Priority: Searches from lowest priority
+   * Simple pop — returns the first batch in the partition with no state transition.
+   * If the partition is empty, returns a null pointer.
    *
-   * State transition behavior:
-   * - task_created: Calls try_to_create_task() on the batch. Succeeds for idle,
-   *   task_created, or processing batches. Processing batches stay in processing state.
-   * - processing: Not allowed here; an exception is thrown. Callers should pop with
-   *   task_created and then manually call try_to_lock_for_processing() on the returned batch.
-   * - in_transit: Calls try_to_lock_for_in_transit() on the batch. Succeeds only
-   *   for idle batches with no active processing.
-   *
-   * If no batch can transition to the target state, this method blocks until either:
-   * - A new batch is added to the repository
-   * - notify_state_change() is called
-   *
-   * @param target_state The state to transition the batch to (must not be processing)
    * @param partition_idx Index of the partition to pop from (default: 0)
-   * @return PtrType The data batch that was successfully transitioned, or nullptr
-   *         if the repository is empty after waiting.
+   * @return PtrType The data batch, or nullptr if the partition is empty.
    *
-   * @note Thread-safe operation protected by internal mutex and condition variable
-   * @throws std::runtime_error if target_state is batch_state::processing
+   * @note Thread-safe operation protected by internal mutex
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType pop_data_batch(batch_state target_state, size_t partition_idx = 0)
+  virtual PtrType pop_data_batch(size_t partition_idx = 0)
   {
     std::unique_lock<std::mutex> lock(_mutex);
 
-    // Validate partition index
     if (partition_idx >= _data_batches.size()) {
       throw std::out_of_range("partition_idx out of range");
     }
 
-    while (true) {
-      if (_data_batches[partition_idx].empty()) { return PtrType{}; }
+    if (_data_batches[partition_idx].empty()) { return PtrType{}; }
 
-      // Search for a batch that can transition to the target state
-      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
-           ++it) {
-        data_batch* batch_ptr = it->get();
-        bool can_transition   = try_transition_batch_for_pop(batch_ptr, target_state);
-
-        if (can_transition) {
-          auto batch = std::move(*it);
-          batch->set_state_change_cv(nullptr);  // No longer in this repo; avoid use-after-free
-          _data_batches[partition_idx].erase(it);
-          return batch;
-        }
-      }
-
-      // No batch could transition - wait for new batches or state changes
-      _cv.wait(lock);
-    }
+    auto batch = std::move(_data_batches[partition_idx].front());
+    _data_batches[partition_idx].erase(_data_batches[partition_idx].begin());
+    return batch;
   }
 
   /**
-   * @brief Remove and return a data batch by its batch ID, optionally with state transition.
+   * @brief Remove and return a data batch by its batch ID.
    *
    * Searches for a batch with the specified batch_id within the given partition.
-   *
-   * If target_state is std::nullopt:
-   * - Returns the batch immediately if found, without state transition
-   *
-   * If target_state has a value:
-   * - Attempts to transition the batch to the target state
-   * - If the batch exists but cannot transition, this method blocks until either:
-   *   - The batch can successfully transition to the target state
-   *   - notify_state_change() is called
-   *   - A new batch is added to the repository
-   *
-   * State transition behavior follows the same rules as pop_data_batch(batch_state):
-   * - task_created: Calls try_to_create_task() on the batch
-   * - processing: Not allowed; throws an exception
-   * - in_transit: Calls try_to_lock_for_in_transit() on the batch
+   * Returns the batch if found, nullptr otherwise.
    *
    * @param batch_id The unique identifier of the batch to retrieve
-   * @param target_state Optional state to transition the batch to (std::nullopt to skip state
-   * check)
    * @param partition_idx Index of the partition to search (default: 0)
    * @return PtrType The data batch with the matching batch_id, or nullptr if not found
    *
-   * @note Thread-safe operation protected by internal mutex and condition variable
-   * @throws std::runtime_error if target_state is batch_state::processing
+   * @note Thread-safe operation protected by internal mutex
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType pop_data_batch_by_id(uint64_t batch_id,
-                                       std::optional<batch_state> target_state,
-                                       size_t partition_idx = 0)
+  virtual PtrType pop_data_batch_by_id(uint64_t batch_id, size_t partition_idx = 0)
   {
     std::unique_lock<std::mutex> lock(_mutex);
 
-    // Validate partition index
     if (partition_idx >= _data_batches.size()) {
       throw std::out_of_range("partition_idx out of range");
     }
 
-    // If no target_state specified, just find and return the batch
-    if (!target_state.has_value()) {
-      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
-           ++it) {
-        if (it->get()->get_batch_id() == batch_id) {
-          auto batch = std::move(*it);
-          batch->set_state_change_cv(nullptr);
-          _data_batches[partition_idx].erase(it);
-          return batch;
-        }
+    for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
+         ++it) {
+      if (it->get()->get_batch_id() == batch_id) {
+        auto batch = std::move(*it);
+        _data_batches[partition_idx].erase(it);
+        return batch;
       }
-      // Batch not found
-      return PtrType{};
     }
 
-    // Target state specified - attempt state transition and wait if needed
-    while (true) {
-      // Search for the batch with the matching batch_id
-      bool batch_found = false;
-      for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
-           ++it) {
-        if (it->get()->get_batch_id() == batch_id) {
-          batch_found           = true;
-          data_batch* batch_ptr = it->get();
-          bool can_transition   = try_transition_batch_for_pop(batch_ptr, *target_state);
-
-          if (can_transition) {
-            auto batch = std::move(*it);
-            batch->set_state_change_cv(nullptr);
-            _data_batches[partition_idx].erase(it);
-            return batch;
-          }
-
-          // Batch found but cannot transition - wait for state change
-          break;
-        }
-      }
-
-      // If batch was not found, return nullptr
-      if (!batch_found) { return PtrType{}; }
-
-      // Batch exists but cannot transition - wait for state changes
-      _cv.wait(lock);
-    }
+    return PtrType{};
   }
 
   /**
-   * @brief Get a copy of a data batch by its batch ID, optionally with state transition.
+   * @brief Get a copy of a data batch by its batch ID (does not remove from repository).
    *
    * Searches for a batch with the specified batch_id within the given partition
-   * and returns a copy of the pointer (does not remove from repository).
-   *
-   * If target_state is std::nullopt:
-   * - Returns a copy of the batch pointer immediately if found, without state transition
-   *
-   * If target_state has a value:
-   * - Attempts to transition the batch to the target state
-   * - If the batch exists but cannot transition, this method blocks until either:
-   *   - The batch can successfully transition to the target state
-   *   - notify_state_change() is called
-   *   - A new batch is added to the repository
-   *
-   * State transition behavior follows the same rules as pop_data_batch(batch_state):
-   * - task_created: Calls try_to_create_task() on the batch
-   * - processing: Not allowed; throws an exception
-   * - in_transit: Calls try_to_lock_for_in_transit() on the batch
+   * and returns a copy of the pointer.
    *
    * @param batch_id The unique identifier of the batch to retrieve
-   * @param target_state Optional state to transition the batch to (std::nullopt to skip state
-   * check)
    * @param partition_idx Index of the partition to search (default: 0)
-   * @return PtrType A copy of the data batch pointer with the matching batch_id, or nullptr if not
-   * found
+   * @return PtrType A copy of the data batch pointer with the matching batch_id, or nullptr
    *
-   * @note Thread-safe operation protected by internal mutex and condition variable
+   * @note Thread-safe operation protected by internal mutex
    * @note Only supported for shared_ptr repositories. Will throw for unique_ptr repositories.
-   * @throws std::runtime_error if target_state is batch_state::processing or if called on
-   * unique_ptr repository
+   * @throws std::runtime_error if called on unique_ptr repository
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType get_data_batch_by_id(uint64_t batch_id,
-                                       std::optional<batch_state> target_state,
-                                       size_t partition_idx = 0);
+  virtual PtrType get_data_batch_by_id(uint64_t batch_id, size_t partition_idx = 0);
 
   /**
    * @brief Get all batch IDs from a partition.
-   *
-   * Retrieves the batch IDs of all batches currently stored in the specified partition.
    *
    * @param partition_idx Index of the partition to query (default: 0)
    * @return std::vector<uint64_t> Vector containing all batch IDs in the partition
@@ -300,7 +183,6 @@ class idata_repository {
   {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    // Validate partition index
     if (partition_idx >= _data_batches.size()) {
       throw std::out_of_range("partition_idx out of range");
     }
@@ -316,7 +198,7 @@ class idata_repository {
   }
 
   /**
-   * @brief Check if there are any data batches available in the repository.
+   * @brief Get the number of data batches in a partition.
    *
    * @param partition_idx Index of the partition to check (default: 0)
    * @return std::size_t The number of data batches currently stored in the specified partition.
@@ -388,31 +270,6 @@ class idata_repository {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     return _data_batches.size();
-  }
-
- private:
-  /**
-   * @brief Helper function to attempt state transition on a batch when popping.
-   *
-   * @param batch_ptr Pointer to the batch to transition
-   * @param target_state The state to transition to
-   * @return bool True if the transition succeeded, false otherwise
-   * @throws std::runtime_error if target_state is batch_state::processing
-   */
-  bool try_transition_batch_for_pop(data_batch* batch_ptr, batch_state target_state) const
-  {
-    switch (target_state) {
-      case batch_state::task_created: return batch_ptr->try_to_create_task();
-      case batch_state::processing:
-        throw std::runtime_error(
-          "Pop operation cannot transition directly to processing; "
-          "Pop with task_created and call try_to_lock_for_processing() on the batch");
-      case batch_state::in_transit: return batch_ptr->try_to_lock_for_in_transit();
-      case batch_state::idle:
-        // Cannot transition to idle via pop - idle is a terminal state
-        return false;
-    }
-    return false;
   }
 
  protected:
