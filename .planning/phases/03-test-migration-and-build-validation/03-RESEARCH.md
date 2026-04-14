@@ -415,17 +415,11 @@ std::vector<std::shared_ptr<data_batch>> create_test_batches(
 
 **Note on A2:** The phase success criteria say "TSan/ASan clean" but the standard `pixi run test` may not run with sanitizers enabled. The tests should be *correct* under sanitizers, meaning the code has no UB that sanitizers would flag. Whether sanitizers are actually run is a CI/build configuration concern outside this phase's scope.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **TSan/ASan build configuration**
-   - What we know: Tests must be "TSan/ASan clean" per TEST-02. The code must be correct (no UB).
-   - What's unclear: Whether the standard `pixi run test` runs with sanitizers, or if a separate build configuration is needed.
-   - Recommendation: Write the tests to be correct under sanitizers. If the standard build does not run sanitizers, note this as a follow-up. The destruction order test (Example 6) will catch the bug with or without sanitizers if the member order is wrong.
+1. **TSan/ASan build configuration** — RESOLVED: Write tests to be correct under sanitizers (no UB). Whether sanitizers are actually enabled in the standard `pixi run test` is a CI/build configuration concern outside this phase's scope. The destruction order test catches the bug via member declaration order regardless of sanitizer presence.
 
-2. **TEST-03 compile-time safety verification**
-   - What we know: Move semantics make moved-from `shared_ptr` null at runtime. The "compile-time safety" is that you cannot accidentally use the old variable because it has been moved.
-   - What's unclear: Whether the requirement expects `static_assert` or compile-error tests, or just runtime verification that moved-from pointers are null.
-   - Recommendation: Test at runtime that `batch == nullptr` after `to_read_only(std::move(batch))`. Compile-time enforcement is inherent in the API design (you cannot pass a moved-from pointer to another function because it is null). Add a comment documenting this.
+2. **TEST-03 compile-time safety verification** — RESOLVED: Test at runtime that `batch == nullptr` after `to_read_only(std::move(batch))`. Add `static_assert(!std::is_copy_constructible_v<data_batch>)` for the non-copyable/non-movable property. Compile-time enforcement of move semantics is inherent in the API design.
 
 ## Sources
 
