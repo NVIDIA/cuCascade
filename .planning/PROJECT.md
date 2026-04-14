@@ -24,30 +24,33 @@ Compile-time enforced data access safety: it must be impossible to read or mutat
 
 - [ ] **DB-01**: 3 flat classes: `data_batch`, `read_only_data_batch`, `mutable_data_batch` (no `synchronized_data_batch` wrapper)
 - [ ] **DB-02**: `data_batch` has minimal public API — no public access to data, tier, or memory space. Only way to access data is through an accessor type
-- [ ] **DB-03**: Accessors hold `shared_ptr<data_batch>` via `enable_shared_from_this` — accessors extend parent lifetime automatically
+- [ ] **DB-03**: PtrType-agnostic accessors — templated on PtrType (shared_ptr or unique_ptr), store PtrType parent for lifetime management
 - [ ] **DB-04**: All state transitions through `data_batch` static methods with move semantics — moved-from objects are compile-time invalid
-- [ ] **DB-05**: 6 static conversion methods on `data_batch`:
-  - `to_read_only(shared_ptr<data_batch>&&)` — idle to shared lock
-  - `to_mutable(shared_ptr<data_batch>&&)` — idle to exclusive lock
-  - `to_idle(read_only_data_batch&&)` — release shared lock, return batch
-  - `to_idle(mutable_data_batch&&)` — release exclusive lock, return batch
+- [ ] **DB-05**: 6 blocking static conversion methods + 2 try variants on `data_batch`:
+  - `to_read_only(PtrType&&)` — idle to shared lock
+  - `to_mutable(PtrType&&)` — idle to exclusive lock
+  - `to_idle(read_only_data_batch&&)` — release shared lock, return PtrType
+  - `to_idle(mutable_data_batch&&)` — release exclusive lock, return PtrType
   - `to_mutable(read_only_data_batch&&)` — release shared, acquire exclusive (through idle)
   - `to_read_only(mutable_data_batch&&)` — release exclusive, acquire shared (through idle)
-- [ ] **DB-06**: Non-blocking try variants for idle-to-locked transitions using mutable reference (`&`): `try_to_read_only(shared_ptr<data_batch>&)` and `try_to_mutable(shared_ptr<data_batch>&)` — nullifies source on success, unchanged on failure
-- [ ] **DB-07**: `data_batch::create(...)` factory returns `shared_ptr<data_batch>` — private constructor enforces shared_ptr management required by `enable_shared_from_this`
-- [ ] **DB-08**: `get_batch_id()` public and lock-free on `data_batch` — needed for repository lookups
-- [ ] **DB-09**: `const uint64_t _batch_id` — immutable after construction
-- [ ] **DB-10**: Atomic subscriber count (`subscribe()`, `unsubscribe()`, `get_subscriber_count()`) on `data_batch` — independent of lock state
+  - `try_to_read_only(PtrType&)` — non-blocking, nullifies on success, unchanged on failure
+  - `try_to_mutable(PtrType&)` — non-blocking, nullifies on success, unchanged on failure
+- [ ] **DB-06**: Public constructor on `data_batch` — no enable_shared_from_this needed (static methods receive PtrType as parameter)
+- [ ] **DB-07**: `get_batch_id()` public and lock-free on `data_batch` — needed for repository lookups
+- [ ] **DB-08**: `const uint64_t _batch_id` — immutable after construction
+- [ ] **DB-09**: Atomic subscriber count (`subscribe()`, `unsubscribe()`, `get_subscriber_count()`) on `data_batch` — independent of lock state
+- [ ] **DB-10**: Deleted move and copy operations on `data_batch` (fixes known move-without-lock bug)
 - [ ] **DB-11**: `read_only_data_batch` exposes: `get_batch_id()`, `get_current_tier()`, `get_data()`, `get_memory_space()`
 - [ ] **DB-12**: `mutable_data_batch` exposes: everything read_only has + `set_data()`, `convert_to<T>()`
-- [ ] **DB-13**: `clone()` and `clone_to<T>()` on `data_batch` — acquires read lock internally
-- [ ] **DB-14**: Update `idata_repository` to use `shared_ptr<data_batch>` — drop `unique_data_repository` or make it incompatible
+- [ ] **DB-13**: `clone()` and `clone_to<T>()` on `read_only_data_batch` (not internally-locking on data_batch — avoids shared_mutex deadlock)
+- [ ] **DB-14**: `idata_repository<PtrType>` stays templated — supports both shared_ptr and unique_ptr to data_batch
 - [ ] **DB-15**: Update all tests to exercise new 3-class API, state transitions, try variants, and compile-time safety
 - [ ] **DB-16**: Mutual friend relationships: `data_batch` <-> `read_only_data_batch`, `data_batch` <-> `mutable_data_batch`
+- [ ] **DB-17**: `[[nodiscard]]` on all transition and accessor-returning methods
 
 ### Out of Scope
 
-- `unique_data_repository` support — incompatible with `enable_shared_from_this` design; Sirius uses `shared_ptr` anyway
+- `enable_shared_from_this` — static methods receive PtrType as parameter, no need to obtain shared_ptr from inside the object
 - Probing/observability interface (`idata_batch_probe`) — dhruv flagged as future need, not blocking this refactor
 - Try variants for locked-to-locked conversions — complex return semantics (need variant or result type), not needed yet
 - Direct read_only <-> mutable conversion without going through idle — all conversions route through `data_batch` statics
@@ -57,15 +60,15 @@ Compile-time enforced data access safety: it must be impossible to read or mutat
 ## Context
 
 **PR #99 review feedback from @dhruv9vats:**
-1. Wants `enable_shared_from_this` so accessors extend parent lifetime (adopted)
-2. Wants `shared_ptr` only, not PtrType-agnostic (adopted)
+1. Wants `enable_shared_from_this` so accessors extend parent lifetime (not needed — static methods receive PtrType as parameter)
+2. Wants `shared_ptr` only, not PtrType-agnostic (kept PtrType agnostic — unique_ptr gets single reader, shared_ptr gets concurrent readers)
 3. Wants non-blocking try variants for lock acquisition (adopted for idle->locked)
 4. Wants `const` batch_id (adopted)
 5. Wants docstring for subscriber_count use case (will address)
 6. Notes `idata_batch_probe` needed for future observability (deferred)
 7. Suggests repository `try_pop` pattern (deferred as follow-up)
 
-**Known bug in current PR:** Move constructor/assignment of `synchronized_data_batch` doesn't lock the mutex on the source. The new design should either delete move operations or handle this correctly.
+**Known bug in current PR:** Move constructor/assignment of `synchronized_data_batch` doesn't lock the mutex on the source. New design deletes move/copy on `data_batch` entirely.
 
 **Existing codebase state:** cuCascade is a C++20 GPU-accelerated data caching library using libcudf, RMM, CUDA. Build system is CMake + pixi. Tests use Catch2 v2.
 
@@ -82,12 +85,14 @@ Compile-time enforced data access safety: it must be impossible to read or mutat
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
 | 3 flat classes instead of nested | Simpler mental model, no unnecessary indirection | -- Pending |
-| `enable_shared_from_this` (shared_ptr only) | Accessor lifetime safety outweighs unique_ptr flexibility | -- Pending |
+| No enable_shared_from_this | Static methods receive PtrType as param — no need to get shared_ptr from inside object | -- Pending |
+| PtrType-agnostic accessors | Keep unique_ptr support (single reader) alongside shared_ptr (concurrent readers) | -- Pending |
 | All conversions through data_batch statics | Centralizes lock management, state machine is explicit | -- Pending |
 | No direct locked-to-locked conversion | Forces explicit "back through idle" pattern, simpler API | -- Pending |
 | try variants use `&` not `&&` | Conditional move — nullifies on success, unchanged on failure | -- Pending |
-| Factory function with private constructor | Prevents stack/unique_ptr allocation that breaks shared_from_this | -- Pending |
-| Drop `unique_data_repository` | Incompatible with enable_shared_from_this; Sirius uses shared_ptr | -- Pending |
+| Public constructor, no passkey | Not needed without enable_shared_from_this — static methods enforce PtrType at lock acquisition | -- Pending |
+| Delete move/copy on data_batch | Fixes known move-without-lock bug; object is never moved, only PtrType to it is | -- Pending |
+| clone() on read_only_data_batch | Avoids recursive shared_mutex deadlock if clone() internally locked on data_batch | -- Pending |
 
 ## Evolution
 
@@ -107,4 +112,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after initialization*
+*Last updated: 2026-04-14 after design refinement (dropped enable_shared_from_this, kept PtrType agnostic)*
