@@ -60,10 +60,7 @@ memory::memory_space* data_batch::get_memory_space() const
   return &_data->get_memory_space();
 }
 
-void data_batch::set_data(std::unique_ptr<idata_representation> data)
-{
-  _data = std::move(data);
-}
+void data_batch::set_data(std::unique_ptr<idata_representation> data) { _data = std::move(data); }
 
 // ========== Explicit template instantiations ==========
 

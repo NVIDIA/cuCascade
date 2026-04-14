@@ -76,9 +76,9 @@ class data_batch {
   ~data_batch() = default;
 
   // -- Deleted move/copy (D-04/CORE-07) --
-  data_batch(data_batch&&)            = delete;
-  data_batch& operator=(data_batch&&) = delete;
-  data_batch(const data_batch&)       = delete;
+  data_batch(data_batch&&)                 = delete;
+  data_batch& operator=(data_batch&&)      = delete;
+  data_batch(const data_batch&)            = delete;
   data_batch& operator=(const data_batch&) = delete;
 
   // -- Lock-free public API --
@@ -195,8 +195,7 @@ class data_batch {
    *         std::nullopt if the lock could not be acquired immediately.
    */
   template <typename PtrType>
-  [[nodiscard]] static std::optional<mutable_data_batch<PtrType>> try_to_mutable(
-    PtrType& batch);
+  [[nodiscard]] static std::optional<mutable_data_batch<PtrType>> try_to_mutable(PtrType& batch);
 
  private:
   // -- Friend declarations (D-24/REPO-04) --
@@ -246,7 +245,7 @@ class data_batch {
                   rmm::cuda_stream_view stream);
 
   // -- Members --
-  const uint64_t _batch_id;                    ///< Immutable batch identifier
+  const uint64_t _batch_id;                     ///< Immutable batch identifier
   std::unique_ptr<idata_representation> _data;  ///< Owned data representation
   mutable std::shared_mutex _rw_mutex;          ///< Reader-writer mutex
   std::atomic<size_t> _subscriber_count{0};     ///< Atomic subscriber interest count
@@ -336,8 +335,8 @@ class read_only_data_batch {
   // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the shared lock first, then _batch drops the parent
   // reference. This prevents accessing a destroyed mutex.
-  PtrType _batch;                               ///< Parent lifetime (destroyed second)
-  std::shared_lock<std::shared_mutex> _lock;    ///< Shared lock (destroyed first)
+  PtrType _batch;                             ///< Parent lifetime (destroyed second)
+  std::shared_lock<std::shared_mutex> _lock;  ///< Shared lock (destroyed first)
 };
 
 /**
@@ -375,9 +374,7 @@ class mutable_data_batch {
    * @brief Replace the data representation.
    * @param data New data representation (takes ownership).
    */
-  void set_data(std::unique_ptr<idata_representation> data) {
-    _batch->set_data(std::move(data));
-  }
+  void set_data(std::unique_ptr<idata_representation> data) { _batch->set_data(std::move(data)); }
 
   /**
    * @brief Convert the data representation in-place.
@@ -390,7 +387,8 @@ class mutable_data_batch {
   template <typename TargetRepresentation>
   void convert_to(representation_converter_registry& registry,
                   const memory::memory_space* target_memory_space,
-                  rmm::cuda_stream_view stream) {
+                  rmm::cuda_stream_view stream)
+  {
     _batch->template convert_to<TargetRepresentation>(registry, target_memory_space, stream);
   }
 
@@ -414,8 +412,8 @@ class mutable_data_batch {
   // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the exclusive lock first, then _batch drops the parent
   // reference. This prevents accessing a destroyed mutex.
-  PtrType _batch;                               ///< Parent lifetime (destroyed second)
-  std::unique_lock<std::shared_mutex> _lock;    ///< Exclusive lock (destroyed first)
+  PtrType _batch;                             ///< Parent lifetime (destroyed second)
+  std::unique_lock<std::shared_mutex> _lock;  ///< Exclusive lock (destroyed first)
 };
 
 // =============================================================================
@@ -427,7 +425,8 @@ class mutable_data_batch {
 template <typename TargetRepresentation>
 void data_batch::convert_to(representation_converter_registry& registry,
                             const memory::memory_space* target_memory_space,
-                            rmm::cuda_stream_view stream) {
+                            rmm::cuda_stream_view stream)
+{
   auto new_representation =
     registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
   _data = std::move(new_representation);
@@ -436,7 +435,8 @@ void data_batch::convert_to(representation_converter_registry& registry,
 // -- data_batch::to_read_only (idle -> shared lock, TRANS-01) --
 
 template <typename PtrType>
-read_only_data_batch<PtrType> data_batch::to_read_only(PtrType&& batch) {
+read_only_data_batch<PtrType> data_batch::to_read_only(PtrType&& batch)
+{
   auto ptr = std::move(batch);
   std::shared_lock<std::shared_mutex> lock(ptr->_rw_mutex);
   return read_only_data_batch<PtrType>(std::move(ptr), std::move(lock));
@@ -445,7 +445,8 @@ read_only_data_batch<PtrType> data_batch::to_read_only(PtrType&& batch) {
 // -- data_batch::to_mutable (idle -> exclusive lock, TRANS-02) --
 
 template <typename PtrType>
-mutable_data_batch<PtrType> data_batch::to_mutable(PtrType&& batch) {
+mutable_data_batch<PtrType> data_batch::to_mutable(PtrType&& batch)
+{
   auto ptr = std::move(batch);
   std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
   return mutable_data_batch<PtrType>(std::move(ptr), std::move(lock));
@@ -454,7 +455,8 @@ mutable_data_batch<PtrType> data_batch::to_mutable(PtrType&& batch) {
 // -- data_batch::to_idle (release shared lock, TRANS-03) --
 
 template <typename PtrType>
-PtrType data_batch::to_idle(read_only_data_batch<PtrType>&& accessor) {
+PtrType data_batch::to_idle(read_only_data_batch<PtrType>&& accessor)
+{
   auto ptr = std::move(accessor._batch);
   accessor._lock.unlock();
   return ptr;
@@ -463,7 +465,8 @@ PtrType data_batch::to_idle(read_only_data_batch<PtrType>&& accessor) {
 // -- data_batch::to_idle (release exclusive lock, TRANS-04) --
 
 template <typename PtrType>
-PtrType data_batch::to_idle(mutable_data_batch<PtrType>&& accessor) {
+PtrType data_batch::to_idle(mutable_data_batch<PtrType>&& accessor)
+{
   auto ptr = std::move(accessor._batch);
   accessor._lock.unlock();
   return ptr;
@@ -472,12 +475,10 @@ PtrType data_batch::to_idle(mutable_data_batch<PtrType>&& accessor) {
 // -- data_batch::try_to_read_only (non-blocking, TRANS-05) --
 
 template <typename PtrType>
-std::optional<read_only_data_batch<PtrType>> data_batch::try_to_read_only(
-  PtrType& batch) {
+std::optional<read_only_data_batch<PtrType>> data_batch::try_to_read_only(PtrType& batch)
+{
   std::shared_lock<std::shared_mutex> lock(batch->_rw_mutex, std::try_to_lock);
-  if (!lock.owns_lock()) {
-    return std::nullopt;
-  }
+  if (!lock.owns_lock()) { return std::nullopt; }
   auto ptr = std::move(batch);
   return read_only_data_batch<PtrType>(std::move(ptr), std::move(lock));
 }
@@ -485,12 +486,10 @@ std::optional<read_only_data_batch<PtrType>> data_batch::try_to_read_only(
 // -- data_batch::try_to_mutable (non-blocking, TRANS-06) --
 
 template <typename PtrType>
-std::optional<mutable_data_batch<PtrType>> data_batch::try_to_mutable(
-  PtrType& batch) {
+std::optional<mutable_data_batch<PtrType>> data_batch::try_to_mutable(PtrType& batch)
+{
   std::unique_lock<std::shared_mutex> lock(batch->_rw_mutex, std::try_to_lock);
-  if (!lock.owns_lock()) {
-    return std::nullopt;
-  }
+  if (!lock.owns_lock()) { return std::nullopt; }
   auto ptr = std::move(batch);
   return mutable_data_batch<PtrType>(std::move(ptr), std::move(lock));
 }
@@ -498,11 +497,10 @@ std::optional<mutable_data_batch<PtrType>> data_batch::try_to_mutable(
 // -- read_only_data_batch::clone (deep copy, CLONE-01) --
 
 template <typename PtrType>
-PtrType read_only_data_batch<PtrType>::clone(
-  uint64_t new_batch_id, rmm::cuda_stream_view stream) const {
-  if (_batch->_data == nullptr) {
-    throw std::runtime_error("Cannot clone: data is null");
-  }
+PtrType read_only_data_batch<PtrType>::clone(uint64_t new_batch_id,
+                                             rmm::cuda_stream_view stream) const
+{
+  if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
   auto cloned_data = _batch->_data->clone(stream);
   if constexpr (std::is_same_v<PtrType, std::shared_ptr<data_batch>>) {
     return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
@@ -515,11 +513,11 @@ PtrType read_only_data_batch<PtrType>::clone(
 
 template <typename PtrType>
 template <typename TargetRepresentation>
-PtrType read_only_data_batch<PtrType>::clone_to(
-  representation_converter_registry& registry,
-  uint64_t new_batch_id,
-  const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream) const {
+PtrType read_only_data_batch<PtrType>::clone_to(representation_converter_registry& registry,
+                                                uint64_t new_batch_id,
+                                                const memory::memory_space* target_memory_space,
+                                                rmm::cuda_stream_view stream) const
+{
   auto new_representation =
     registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
   if constexpr (std::is_same_v<PtrType, std::shared_ptr<data_batch>>) {
@@ -532,15 +530,17 @@ PtrType read_only_data_batch<PtrType>::clone_to(
 // -- Accessor private constructors --
 
 template <typename PtrType>
-read_only_data_batch<PtrType>::read_only_data_batch(
-  PtrType parent, std::shared_lock<std::shared_mutex> lock)
-  : _batch(std::move(parent)), _lock(std::move(lock)) {
+read_only_data_batch<PtrType>::read_only_data_batch(PtrType parent,
+                                                    std::shared_lock<std::shared_mutex> lock)
+  : _batch(std::move(parent)), _lock(std::move(lock))
+{
 }
 
 template <typename PtrType>
-mutable_data_batch<PtrType>::mutable_data_batch(
-  PtrType parent, std::unique_lock<std::shared_mutex> lock)
-  : _batch(std::move(parent)), _lock(std::move(lock)) {
+mutable_data_batch<PtrType>::mutable_data_batch(PtrType parent,
+                                                std::unique_lock<std::shared_mutex> lock)
+  : _batch(std::move(parent)), _lock(std::move(lock))
+{
 }
 
 }  // namespace cucascade
