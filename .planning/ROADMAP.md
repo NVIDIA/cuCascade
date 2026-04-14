@@ -45,7 +45,7 @@ Plans:
 **Plans:** 1 plan
 
 Plans:
-- [ ] 02-01-PLAN.md -- Replace synchronized_data_batch with data_batch in 4 repository files, modernize SFINAE to if constexpr
+- [x] 02-01-PLAN.md -- Replace synchronized_data_batch with data_batch in 4 repository files, modernize SFINAE to if constexpr
 
 ### Phase 3: Test Migration and Build Validation
 **Goal**: All tests exercise the new 3-class API and the full build passes cleanly, proving the refactor is correct end-to-end
