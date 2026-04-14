@@ -59,9 +59,9 @@ Plans:
 **Plans:** 3 plans
 
 Plans:
-- [ ] 03-01-PLAN.md -- Rewrite test_data_batch.cpp for new 3-class API (transitions, try variants, destruction order, clone, concurrency)
-- [ ] 03-02-PLAN.md -- Replace synchronized_data_batch with data_batch in test_data_repository.cpp and test_data_repository_manager.cpp
-- [ ] 03-03-PLAN.md -- Full build and test validation (pixi run build + pixi run test)
+- [x] 03-01-PLAN.md -- Rewrite test_data_batch.cpp for new 3-class API (transitions, try variants, destruction order, clone, concurrency)
+- [x] 03-02-PLAN.md -- Replace synchronized_data_batch with data_batch in test_data_repository.cpp and test_data_repository_manager.cpp
+- [x] 03-03-PLAN.md -- Full build and test validation (pixi run build + pixi run test)
 
 ## Progress
 
