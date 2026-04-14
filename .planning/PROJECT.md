@@ -19,34 +19,27 @@ Compile-time enforced data access safety: it must be impossible to read or mutat
 - clone/clone_to operations for batch duplication -- existing
 - subscriber count tracking for interest management -- existing
 - batch ID system for repository lookups -- existing
+- [x] **DB-01**: 3 flat classes: `data_batch`, `read_only_data_batch`, `mutable_data_batch` -- Validated in Phase 01
+- [x] **DB-02**: `data_batch` minimal public API, data access only through accessor types -- Validated in Phase 01
+- [x] **DB-03**: PtrType-agnostic accessors templated on shared_ptr/unique_ptr -- Validated in Phase 01
+- [x] **DB-04**: All state transitions through `data_batch` static methods with move semantics -- Validated in Phase 01
+- [x] **DB-05**: 6 blocking static conversion methods + 2 try variants -- Validated in Phase 01, tested in Phase 03
+- [x] **DB-06**: Public constructor, no enable_shared_from_this -- Validated in Phase 01
+- [x] **DB-07**: `get_batch_id()` public and lock-free -- Validated in Phase 01
+- [x] **DB-08**: `const uint64_t _batch_id` immutable after construction -- Validated in Phase 01
+- [x] **DB-09**: Atomic subscriber count operations -- Validated in Phase 01, tested in Phase 03
+- [x] **DB-10**: Deleted move/copy on `data_batch` -- Validated in Phase 01, static_assert in Phase 03
+- [x] **DB-11**: `read_only_data_batch` exposes read-only accessors -- Validated in Phase 01
+- [x] **DB-12**: `mutable_data_batch` exposes read+write accessors -- Validated in Phase 01
+- [x] **DB-13**: `clone()` on `read_only_data_batch` (avoids shared_mutex deadlock) -- Validated in Phase 01, tested in Phase 03
+- [x] **DB-14**: `idata_repository<PtrType>` stays templated -- Validated in Phase 02
+- [x] **DB-15**: All tests exercise new 3-class API -- Validated in Phase 03 (full rewrite + build + test pass)
+- [x] **DB-16**: Mutual friend relationships between all 3 classes -- Validated in Phase 01
+- [x] **DB-17**: `[[nodiscard]]` on all transition/accessor methods -- Validated in Phase 01
 
 ### Active
 
-- [ ] **DB-01**: 3 flat classes: `data_batch`, `read_only_data_batch`, `mutable_data_batch` (no `synchronized_data_batch` wrapper)
-- [ ] **DB-02**: `data_batch` has minimal public API — no public access to data, tier, or memory space. Only way to access data is through an accessor type
-- [ ] **DB-03**: PtrType-agnostic accessors — templated on PtrType (shared_ptr or unique_ptr), store PtrType parent for lifetime management
-- [ ] **DB-04**: All state transitions through `data_batch` static methods with move semantics — moved-from objects are compile-time invalid
-- [ ] **DB-05**: 6 blocking static conversion methods + 2 try variants on `data_batch`:
-  - `to_read_only(PtrType&&)` — idle to shared lock
-  - `to_mutable(PtrType&&)` — idle to exclusive lock
-  - `to_idle(read_only_data_batch&&)` — release shared lock, return PtrType
-  - `to_idle(mutable_data_batch&&)` — release exclusive lock, return PtrType
-  - `to_mutable(read_only_data_batch&&)` — release shared, acquire exclusive (through idle)
-  - `to_read_only(mutable_data_batch&&)` — release exclusive, acquire shared (through idle)
-  - `try_to_read_only(PtrType&)` — non-blocking, nullifies on success, unchanged on failure
-  - `try_to_mutable(PtrType&)` — non-blocking, nullifies on success, unchanged on failure
-- [ ] **DB-06**: Public constructor on `data_batch` — no enable_shared_from_this needed (static methods receive PtrType as parameter)
-- [ ] **DB-07**: `get_batch_id()` public and lock-free on `data_batch` — needed for repository lookups
-- [ ] **DB-08**: `const uint64_t _batch_id` — immutable after construction
-- [ ] **DB-09**: Atomic subscriber count (`subscribe()`, `unsubscribe()`, `get_subscriber_count()`) on `data_batch` — independent of lock state
-- [ ] **DB-10**: Deleted move and copy operations on `data_batch` (fixes known move-without-lock bug)
-- [ ] **DB-11**: `read_only_data_batch` exposes: `get_batch_id()`, `get_current_tier()`, `get_data()`, `get_memory_space()`
-- [ ] **DB-12**: `mutable_data_batch` exposes: everything read_only has + `set_data()`, `convert_to<T>()`
-- [ ] **DB-13**: `clone()` and `clone_to<T>()` on `read_only_data_batch` (not internally-locking on data_batch — avoids shared_mutex deadlock)
-- [ ] **DB-14**: `idata_repository<PtrType>` stays templated — supports both shared_ptr and unique_ptr to data_batch
-- [ ] **DB-15**: Update all tests to exercise new 3-class API, state transitions, try variants, and compile-time safety
-- [ ] **DB-16**: Mutual friend relationships: `data_batch` <-> `read_only_data_batch`, `data_batch` <-> `mutable_data_batch`
-- [ ] **DB-17**: `[[nodiscard]]` on all transition and accessor-returning methods
+(none -- all requirements validated)
 
 ### Out of Scope
 
@@ -84,15 +77,15 @@ Compile-time enforced data access safety: it must be impossible to read or mutat
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| 3 flat classes instead of nested | Simpler mental model, no unnecessary indirection | -- Pending |
-| No enable_shared_from_this | Static methods receive PtrType as param — no need to get shared_ptr from inside object | -- Pending |
-| PtrType-agnostic accessors | Keep unique_ptr support (single reader) alongside shared_ptr (concurrent readers) | -- Pending |
-| All conversions through data_batch statics | Centralizes lock management, state machine is explicit | -- Pending |
-| No direct locked-to-locked conversion | Forces explicit "back through idle" pattern, simpler API | -- Pending |
-| try variants use `&` not `&&` | Conditional move — nullifies on success, unchanged on failure | -- Pending |
-| Public constructor, no passkey | Not needed without enable_shared_from_this — static methods enforce PtrType at lock acquisition | -- Pending |
-| Delete move/copy on data_batch | Fixes known move-without-lock bug; object is never moved, only PtrType to it is | -- Pending |
-| clone() on read_only_data_batch | Avoids recursive shared_mutex deadlock if clone() internally locked on data_batch | -- Pending |
+| 3 flat classes instead of nested | Simpler mental model, no unnecessary indirection | Confirmed (Phase 01) |
+| No enable_shared_from_this | Static methods receive PtrType as param — no need to get shared_ptr from inside object | Confirmed (Phase 01) |
+| PtrType-agnostic accessors | Keep unique_ptr support (single reader) alongside shared_ptr (concurrent readers) | Confirmed (Phase 01) |
+| All conversions through data_batch statics | Centralizes lock management, state machine is explicit | Confirmed (Phase 01) |
+| No direct locked-to-locked conversion | Forces explicit "back through idle" pattern, simpler API | Confirmed (Phase 01) |
+| try variants use `&` not `&&` | Conditional move — nullifies on success, unchanged on failure | Confirmed (Phase 01) |
+| Public constructor, no passkey | Not needed without enable_shared_from_this — static methods enforce PtrType at lock acquisition | Confirmed (Phase 01) |
+| Delete move/copy on data_batch | Fixes known move-without-lock bug; object is never moved, only PtrType to it is | Confirmed (Phase 01) |
+| clone() on read_only_data_batch | Avoids recursive shared_mutex deadlock if clone() internally locked on data_batch | Confirmed (Phase 01) |
 
 ## Evolution
 
@@ -112,4 +105,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after design refinement (dropped enable_shared_from_this, kept PtrType agnostic)*
+*Last updated: 2026-04-14 after Phase 03 completion — all requirements validated, all decisions confirmed, build+test passing*
