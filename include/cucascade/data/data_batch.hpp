@@ -543,13 +543,15 @@ void data_batch::convert_to(representation_converter_registry& registry,
   _data = std::move(new_representation);
 
   bool needs_sync =
-    old_representation != nullptr && old_representation->get_current_tier() == memory::Tier::GPU;
+    old_representation != nullptr &&
+    (old_representation->get_current_tier() == memory::Tier::GPU ||
+     _data->get_current_tier() == memory::Tier::GPU);
 
   lock.unlock();
 
   if (needs_sync) {
-    // Conversions from GPU may enqueue async operations on the provided stream
-    // that read from the source GPU memory.  Synchronize before the old
+    // Conversions involving GPU may enqueue async operations on the provided
+    // stream that read from the source memory.  Synchronize before the old
     // representation is destroyed to avoid use-after-free.
     stream.synchronize();
   }
