@@ -1,5 +1,5 @@
 [workspace]
-channels = ["rapidsai-nightly", "conda-forge" ]
+channels = ["conda-forge"]
 name = "cuCascade"
 platforms = ["linux-64", "linux-aarch64"]
 requires-pixi = ">=0.59"
@@ -34,13 +34,14 @@ dependencies = { "cuda-version" = "12.9.*" }
 activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" } }
 
 # cuDF (nightly channel, default)
-[feature.cudf-nightly.dependencies]
-libcudf = "26.06.*"
+[feature.cudf-nightly]
+channels = [{ channel = "rapidsai-nightly", priority = 1 }]
+dependencies = { "libcudf" = "26.06.*" }
 
 # cuDF (stable release channel)
 [feature.cudf-stable]
-channels = ["rapidsai", "conda-forge"]
-dependencies = { "libcudf" = "26.02.*" }
+channels = [{ channel = "rapidsai", priority = 1 }]
+dependencies = { "libcudf" = "26.04.*" }
 
 [environments]
 default = ["cuda-13", "cudf-nightly"]

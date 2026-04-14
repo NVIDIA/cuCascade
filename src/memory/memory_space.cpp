@@ -197,17 +197,23 @@ std::size_t memory_space::get_active_reservation_count() const
 
 bool memory_space::should_downgrade_memory() const
 {
-  return _memory_limit - get_available_memory() >= _start_downgrading_memory_threshold;
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return false; }
+  return _memory_limit - available_memory >= _start_downgrading_memory_threshold;
 }
 
 bool memory_space::should_stop_downgrading_memory() const
 {
-  return _memory_limit - get_available_memory() <= _stop_downgrading_memory_threshold;
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return true; }
+  return _memory_limit - available_memory <= _stop_downgrading_memory_threshold;
 }
 
 size_t memory_space::get_amount_to_downgrade() const
 {
-  size_t consumed = _memory_limit - get_available_memory();
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return 0; }
+  size_t consumed = _memory_limit - available_memory;
   if (consumed <= _stop_downgrading_memory_threshold) { return 0; }
   return consumed - _stop_downgrading_memory_threshold;
 }
