@@ -42,7 +42,10 @@ Plans:
   1. `idata_repository<PtrType>` compiles with both `shared_ptr<data_batch>` and `unique_ptr<data_batch>` -- no `synchronized_data_batch` references remain
   2. `shared_data_repository` and `unique_data_repository` type aliases resolve to the new `data_batch` type
   3. `data_repository_manager` compiles and routes batches through the new type system
-**Plans**: TBD
+**Plans:** 1 plan
+
+Plans:
+- [ ] 02-01-PLAN.md -- Replace synchronized_data_batch with data_batch in 4 repository files, modernize SFINAE to if constexpr
 
 ### Phase 3: Test Migration and Build Validation
 **Goal**: All tests exercise the new 3-class API and the full build passes cleanly, proving the refactor is correct end-to-end
@@ -63,5 +66,5 @@ Phases execute in numeric order: 1 -> 2 -> 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Core Type System | 0/2 | Planning complete | - |
-| 2. Repository Integration | 0/0 | Not started | - |
+| 2. Repository Integration | 0/1 | Planning complete | - |
 | 3. Test Migration and Build Validation | 0/0 | Not started | - |
