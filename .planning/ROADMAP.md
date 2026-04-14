@@ -28,7 +28,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. All 6 blocking transition methods and 2 try variants compile, are marked `[[nodiscard]]`, and enforce correct lock semantics (shared for read_only, exclusive for mutable, release-and-reacquire for cross-type)
   4. `clone()` and `clone_to<T>()` work from a `read_only_data_batch` without deadlocking (no internal lock acquisition on data_batch)
   5. `data_batch.hpp` compiles cleanly with the CUDA C++20 toolchain
-**Plans**: TBD
+**Plans:** 2 plans
+
+Plans:
+- [ ] 01-01-PLAN.md -- Write complete data_batch.hpp header (3 classes, transitions, clone, friends)
+- [ ] 01-02-PLAN.md -- Write data_batch.cpp (method bodies, template instantiations) and validate compilation
 
 ### Phase 2: Repository Integration
 **Goal**: The repository layer compiles and works with the new data_batch type, maintaining PtrType-agnostic template support
@@ -58,6 +62,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Core Type System | 0/0 | Not started | - |
+| 1. Core Type System | 0/2 | Planning complete | - |
 | 2. Repository Integration | 0/0 | Not started | - |
 | 3. Test Migration and Build Validation | 0/0 | Not started | - |
