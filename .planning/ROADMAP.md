@@ -31,8 +31,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans:** 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md -- Write complete data_batch.hpp header (3 classes, transitions, clone, friends)
-- [ ] 01-02-PLAN.md -- Write data_batch.cpp (method bodies, template instantiations) and validate compilation
+- [x] 01-01-PLAN.md -- Write complete data_batch.hpp header (3 classes, transitions, clone, friends)
+- [x] 01-02-PLAN.md -- Write data_batch.cpp (method bodies, template instantiations) and validate compilation
 
 ### Phase 2: Repository Integration
 **Goal**: The repository layer compiles and works with the new data_batch type, maintaining PtrType-agnostic template support
