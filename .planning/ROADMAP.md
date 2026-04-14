@@ -56,7 +56,12 @@ Plans:
   2. Tests verify destruction order safety (lock released before parent dropped) and are TSan/ASan clean
   3. Tests verify concurrent readers (shared_ptr path with multiple simultaneous `read_only_data_batch` instances) and serialized exclusive writers
   4. `pixi run build` compiles all 61 targets and `pixi run test` passes all tests with zero failures
-**Plans**: TBD
+**Plans:** 3 plans
+
+Plans:
+- [ ] 03-01-PLAN.md -- Rewrite test_data_batch.cpp for new 3-class API (transitions, try variants, destruction order, clone, concurrency)
+- [ ] 03-02-PLAN.md -- Replace synchronized_data_batch with data_batch in test_data_repository.cpp and test_data_repository_manager.cpp
+- [ ] 03-03-PLAN.md -- Full build and test validation (pixi run build + pixi run test)
 
 ## Progress
 
@@ -67,4 +72,4 @@ Phases execute in numeric order: 1 -> 2 -> 3
 |-------|----------------|--------|-----------|
 | 1. Core Type System | 0/2 | Planning complete | - |
 | 2. Repository Integration | 0/1 | Planning complete | - |
-| 3. Test Migration and Build Validation | 0/0 | Not started | - |
+| 3. Test Migration and Build Validation | 0/3 | Planning complete | - |
