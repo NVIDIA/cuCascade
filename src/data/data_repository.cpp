@@ -20,13 +20,12 @@
 namespace cucascade {
 
 // Explicit template instantiations for smart pointer types
-template class idata_repository<std::shared_ptr<synchronized_data_batch>>;
-template class idata_repository<std::unique_ptr<synchronized_data_batch>>;
+template class idata_repository<std::shared_ptr<data_batch>>;
+template class idata_repository<std::unique_ptr<data_batch>>;
 
 // Explicit specialization of get_data_batch_by_id for shared_ptr (copies the pointer)
 template <>
-std::shared_ptr<synchronized_data_batch>
-idata_repository<std::shared_ptr<synchronized_data_batch>>::get_data_batch_by_id(
+std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_data_batch_by_id(
   uint64_t batch_id, size_t partition_idx)
 {
   std::unique_lock<std::mutex> lock(_mutex);
@@ -47,8 +46,7 @@ idata_repository<std::shared_ptr<synchronized_data_batch>>::get_data_batch_by_id
 
 // Explicit specialization of get_data_batch_by_id for unique_ptr (not supported)
 template <>
-std::unique_ptr<synchronized_data_batch>
-idata_repository<std::unique_ptr<synchronized_data_batch>>::get_data_batch_by_id(
+std::unique_ptr<data_batch> idata_repository<std::unique_ptr<data_batch>>::get_data_batch_by_id(
   uint64_t /*batch_id*/, size_t /*partition_idx*/)
 {
   throw std::runtime_error(

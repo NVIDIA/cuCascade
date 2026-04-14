@@ -279,7 +279,7 @@ class idata_repository {
     _data_batches;  ///< Container for data batch pointers (partitioned)
 };
 
-using shared_data_repository = idata_repository<std::shared_ptr<synchronized_data_batch>>;
-using unique_data_repository = idata_repository<std::unique_ptr<synchronized_data_batch>>;
+using shared_data_repository = idata_repository<std::shared_ptr<data_batch>>;
+using unique_data_repository = idata_repository<std::unique_ptr<data_batch>>;
 
 }  // namespace cucascade
