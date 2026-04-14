@@ -98,13 +98,53 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| | | |
+| CORE-01 | Phase 1 | Pending |
+| CORE-02 | Phase 1 | Pending |
+| CORE-03 | Phase 1 | Pending |
+| CORE-04 | Phase 1 | Pending |
+| CORE-05 | Phase 1 | Pending |
+| CORE-06 | Phase 1 | Pending |
+| CORE-07 | Phase 1 | Pending |
+| ACC-01 | Phase 1 | Pending |
+| ACC-02 | Phase 1 | Pending |
+| ACC-03 | Phase 1 | Pending |
+| ACC-04 | Phase 1 | Pending |
+| ACC-05 | Phase 1 | Pending |
+| ACC-06 | Phase 1 | Pending |
+| ACC-07 | Phase 1 | Pending |
+| ACC-08 | Phase 1 | Pending |
+| TRANS-01 | Phase 1 | Pending |
+| TRANS-02 | Phase 1 | Pending |
+| TRANS-03 | Phase 1 | Pending |
+| TRANS-04 | Phase 1 | Pending |
+| TRANS-05 | Phase 1 | Pending |
+| TRANS-06 | Phase 1 | Pending |
+| TRANS-07 | Phase 1 | Pending |
+| TRANS-08 | Phase 1 | Pending |
+| TRANS-09 | Phase 1 | Pending |
+| TRANS-10 | Phase 1 | Pending |
+| CLONE-01 | Phase 1 | Pending |
+| CLONE-02 | Phase 1 | Pending |
+| REPO-01 | Phase 2 | Pending |
+| REPO-02 | Phase 2 | Pending |
+| REPO-03 | Phase 2 | Pending |
+| REPO-04 | Phase 1 | Pending |
+| TEST-01 | Phase 3 | Pending |
+| TEST-02 | Phase 3 | Pending |
+| TEST-03 | Phase 3 | Pending |
+| TEST-04 | Phase 3 | Pending |
+| TEST-05 | Phase 3 | Pending |
+| TEST-06 | Phase 3 | Pending |
+| TEST-07 | Phase 3 | Pending |
+| TEST-08 | Phase 3 | Pending |
+| TEST-09 | Phase 3 | Pending |
+| TEST-10 | Phase 3 | Pending |
 
 **Coverage:**
-- v1 requirements: 33 total
-- Mapped to phases: 0
-- Unmapped: 33 (pending roadmap creation)
+- v1 requirements: 41 total
+- Mapped to phases: 41
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-14*
-*Last updated: 2026-04-14 after initial definition*
+*Last updated: 2026-04-14 after roadmap creation (traceability populated)*
