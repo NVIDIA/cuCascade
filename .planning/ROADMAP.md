@@ -21,11 +21,11 @@ Decimal phases appear between their surrounding integers in numeric order.
 ### Phase 1: Core Type System
 **Goal**: The complete data_batch type system compiles and provides compile-time enforced data access safety through RAII accessor types and move-semantic state transitions
 **Depends on**: Nothing (first phase)
-**Requirements**: CORE-01, CORE-02, CORE-03, CORE-04, CORE-05, CORE-06, CORE-07, ACC-01, ACC-02, ACC-03, ACC-04, ACC-05, ACC-06, ACC-07, ACC-08, TRANS-01, TRANS-02, TRANS-03, TRANS-04, TRANS-05, TRANS-06, TRANS-07, TRANS-08, TRANS-09, TRANS-10, CLONE-01, CLONE-02, REPO-04
+**Requirements**: CORE-01, CORE-02, CORE-03, CORE-04, CORE-05, CORE-06, CORE-07, ACC-01, ACC-02, ACC-03, ACC-04, ACC-05, ACC-06, ACC-07, ACC-08, TRANS-01, TRANS-02, TRANS-03, TRANS-04, TRANS-05, TRANS-06, TRANS-07, TRANS-08, CLONE-01, CLONE-02, REPO-04
 **Success Criteria** (what must be TRUE):
   1. `data_batch` exposes only `get_batch_id()`, subscriber count operations, and deleted copy/move -- no public access to data, tier, or memory space
   2. `read_only_data_batch` and `mutable_data_batch` are move-only, PtrType-templated accessor types constructed exclusively through `data_batch` static methods that consume ownership via move semantics, with correct member declaration order (PtrType parent before lock guard)
-  3. All 6 blocking transition methods and 2 try variants compile, are marked `[[nodiscard]]`, and enforce correct lock semantics (shared for read_only, exclusive for mutable, release-and-reacquire for cross-type)
+  3. All 4 blocking transition methods (to_read_only, to_mutable, to_idle x2) and 2 try variants compile, are marked `[[nodiscard]]`, and enforce correct lock semantics (shared for read_only, exclusive for mutable) -- no locked-to-locked shortcuts
   4. `clone()` and `clone_to<T>()` work from a `read_only_data_batch` without deadlocking (no internal lock acquisition on data_batch)
   5. `data_batch.hpp` compiles cleanly with the CUDA C++20 toolchain
 **Plans:** 2 plans

@@ -32,12 +32,10 @@
 - [ ] **TRANS-02**: `data_batch::to_mutable(PtrType&&)` — idle to exclusive lock (blocking)
 - [ ] **TRANS-03**: `data_batch::to_idle(read_only_data_batch&&)` — release shared lock, return PtrType
 - [ ] **TRANS-04**: `data_batch::to_idle(mutable_data_batch&&)` — release exclusive lock, return PtrType
-- [ ] **TRANS-05**: `data_batch::to_mutable(read_only_data_batch&&)` — release shared, acquire exclusive (through idle internally)
-- [ ] **TRANS-06**: `data_batch::to_read_only(mutable_data_batch&&)` — release exclusive, acquire shared (through idle internally)
-- [ ] **TRANS-07**: `data_batch::try_to_read_only(PtrType&)` — non-blocking, nullifies source on success, unchanged on failure
-- [ ] **TRANS-08**: `data_batch::try_to_mutable(PtrType&)` — non-blocking, nullifies source on success, unchanged on failure
-- [ ] **TRANS-09**: All transitions use move semantics — moved-from objects are compile-time invalid
-- [ ] **TRANS-10**: `[[nodiscard]]` on all transition methods
+- [ ] **TRANS-05**: `data_batch::try_to_read_only(PtrType&)` — non-blocking, nullifies source on success, unchanged on failure
+- [ ] **TRANS-06**: `data_batch::try_to_mutable(PtrType&)` — non-blocking, nullifies source on success, unchanged on failure
+- [ ] **TRANS-07**: All transitions use move semantics — moved-from objects are compile-time invalid
+- [ ] **TRANS-08**: `[[nodiscard]]` on all transition methods
 
 ### Clone Operations
 
@@ -121,8 +119,6 @@
 | TRANS-06 | Phase 1 | Pending |
 | TRANS-07 | Phase 1 | Pending |
 | TRANS-08 | Phase 1 | Pending |
-| TRANS-09 | Phase 1 | Pending |
-| TRANS-10 | Phase 1 | Pending |
 | CLONE-01 | Phase 1 | Pending |
 | CLONE-02 | Phase 1 | Pending |
 | REPO-01 | Phase 2 | Pending |
@@ -141,8 +137,8 @@
 | TEST-10 | Phase 3 | Pending |
 
 **Coverage:**
-- v1 requirements: 41 total
-- Mapped to phases: 41
+- v1 requirements: 39 total
+- Mapped to phases: 39
 - Unmapped: 0
 
 ---
