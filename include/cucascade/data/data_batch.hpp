@@ -46,9 +46,9 @@ namespace cucascade {
  *
  * State transitions allowed:
  * - idle -> in_transit, task_created
- * - task_created -> processing, idle
+ * - task_created -> processing, idle, in_transit
  * - processing -> idle
- * - in_transit -> idle
+ * - in_transit -> idle, task_created
  */
 enum class batch_state {
   idle,          ///< Batch is idle, not being processed or in transit
@@ -450,9 +450,11 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   /**
    * @brief Attempt to lock this batch for in-transit operations (e.g., downgrade).
    *
-   * Transitions the batch from idle to in_transit state.
+   * Transitions the batch from idle or task_created to in_transit state.
+   * When transitioning from task_created, the task_created_count is preserved
+   * so the pending task remains valid after the data is moved.
    *
-   * @return true if the batch was successfully locked (processing_count == 0 and state is idle)
+   * @return true if the batch was successfully locked (processing_count == 0 and state is idle or task_created with task_created_count > 0)
    * @return false if the batch could not be locked
    */
   bool try_to_lock_for_in_transit();
@@ -462,11 +464,13 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * Transitions the batch from in_transit back to idle state.
    *
-   * @return true if the batch was successfully transitioned to idle
+   * @return true if the batch was successfully transitioned to the target state
    * @return false if the batch is not in in_transit state
    *
-   * @param target_state Optional state to transition to when releasing in_transit. If not set,
-   *        the batch returns to idle.
+   * @param target_state Optional state to transition to when releasing in_transit.
+   *        Supported target states: idle (default), task_created.
+   *        When restoring to task_created, the existing task_created_count is preserved,
+   *        allowing pending tasks to resume after data movement completes.
    */
   bool try_to_release_in_transit(std::optional<batch_state> target_state = std::nullopt);
 
