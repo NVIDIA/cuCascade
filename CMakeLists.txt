@@ -76,7 +76,8 @@ elseif(CUCASCADE_CUDA_RUNTIME_LIBRARY STREQUAL "Shared")
 else()
   message(
     FATAL_ERROR
-    "Unsupported CUDA runtime library: ${CUCASCADE_CUDA_RUNTIME_LIBRARY}"
+    "Unsupported CUDA runtime library: '${CUCASCADE_CUDA_RUNTIME_LIBRARY}'."
+    " Accepted values are 'Static' or 'Shared' (set via -DCMAKE_CUDA_RUNTIME_LIBRARY=<value>)."
   )
 endif()
 
@@ -160,11 +161,8 @@ target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
 target_compile_features(cucascade_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_objects PRIVATE cuda_std_20)
 
-set_target_properties(
-  cucascade_objects
-  PROPERTIES CXX_EXTENSIONS OFF
-             POSITION_INDEPENDENT_CODE ON
-             CUDA_RUNTIME_LIBRARY "${CUCASCADE_CUDA_RUNTIME_LIBRARY}")
+set_target_properties(cucascade_objects PROPERTIES CXX_EXTENSIONS OFF
+                                                   POSITION_INDEPENDENT_CODE ON)
 
 # =============================================================================
 # Static library
