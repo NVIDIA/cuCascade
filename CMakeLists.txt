@@ -122,8 +122,8 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
-set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart CUDA::nvml
-                               Threads::Threads ${NUMA_LIB})
+set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart Threads::Threads
+                               ${NUMA_LIB})
 
 # Set include directories for the object library
 target_include_directories(cucascade_objects
