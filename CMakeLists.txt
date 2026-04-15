@@ -58,6 +58,28 @@ if(NOT CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 75 80 86 90)
 endif()
 
+set(CUCASCADE_CUDA_RUNTIME_LIBRARY "${CMAKE_CUDA_RUNTIME_LIBRARY}")
+if(NOT CUCASCADE_CUDA_RUNTIME_LIBRARY)
+  set(CUCASCADE_CUDA_RUNTIME_LIBRARY Shared)
+endif()
+
+if(CUCASCADE_CUDA_RUNTIME_LIBRARY STREQUAL "Static")
+  if(NOT TARGET CUDA::cudart_static)
+    message(
+      FATAL_ERROR
+      "CMAKE_CUDA_RUNTIME_LIBRARY=Static was requested, but CUDA::cudart_static is unavailable"
+    )
+  endif()
+  set(CUCASCADE_CUDART_TARGET CUDA::cudart_static)
+elseif(CUCASCADE_CUDA_RUNTIME_LIBRARY STREQUAL "Shared")
+  set(CUCASCADE_CUDART_TARGET CUDA::cudart)
+else()
+  message(
+    FATAL_ERROR
+    "Unsupported CUDA runtime library: ${CUCASCADE_CUDA_RUNTIME_LIBRARY}"
+  )
+endif()
+
 # =============================================================================
 # Compiler warnings
 # =============================================================================
@@ -122,8 +144,8 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
-set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart Threads::Threads
-                               ${NUMA_LIB})
+set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf ${CUCASCADE_CUDART_TARGET}
+                               Threads::Threads ${NUMA_LIB})
 
 # Set include directories for the object library
 target_include_directories(cucascade_objects
@@ -138,8 +160,11 @@ target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
 target_compile_features(cucascade_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_objects PRIVATE cuda_std_20)
 
-set_target_properties(cucascade_objects PROPERTIES CXX_EXTENSIONS OFF
-                                                   POSITION_INDEPENDENT_CODE ON)
+set_target_properties(
+  cucascade_objects
+  PROPERTIES CXX_EXTENSIONS OFF
+             POSITION_INDEPENDENT_CODE ON
+             CUDA_RUNTIME_LIBRARY "${CUCASCADE_CUDA_RUNTIME_LIBRARY}")
 
 # =============================================================================
 # Static library
@@ -154,8 +179,10 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
   target_compile_features(cucascade_static PUBLIC cxx_std_20)
 
   set_target_properties(
-    cucascade_static PROPERTIES OUTPUT_NAME cucascade EXPORT_NAME
-                                                      cucascade_static)
+    cucascade_static
+    PROPERTIES OUTPUT_NAME cucascade
+               EXPORT_NAME cucascade_static
+               CUDA_RUNTIME_LIBRARY "${CUCASCADE_CUDA_RUNTIME_LIBRARY}")
 endif()
 
 # =============================================================================
@@ -173,6 +200,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
   set_target_properties(
     cucascade_shared
     PROPERTIES OUTPUT_NAME cucascade
+               CUDA_RUNTIME_LIBRARY "${CUCASCADE_CUDA_RUNTIME_LIBRARY}"
                VERSION ${PROJECT_VERSION}
                SOVERSION ${PROJECT_VERSION_MAJOR})
 endif()
