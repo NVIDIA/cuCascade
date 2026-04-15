@@ -72,12 +72,20 @@ if(CUCASCADE_CUDA_RUNTIME_LIBRARY STREQUAL "Static")
   endif()
   set(CUCASCADE_CUDART_TARGET CUDA::cudart_static)
 elseif(CUCASCADE_CUDA_RUNTIME_LIBRARY STREQUAL "Shared")
+  if(NOT TARGET CUDA::cudart)
+    message(
+      FATAL_ERROR
+      "CMAKE_CUDA_RUNTIME_LIBRARY=Shared was requested, but CUDA::cudart is unavailable"
+    )
+  endif()
   set(CUCASCADE_CUDART_TARGET CUDA::cudart)
+elseif(CUCASCADE_CUDA_RUNTIME_LIBRARY STREQUAL "None")
+  set(CUCASCADE_CUDART_TARGET)
 else()
   message(
     FATAL_ERROR
     "Unsupported CUDA runtime library: '${CUCASCADE_CUDA_RUNTIME_LIBRARY}'."
-    " Accepted values are 'Static' or 'Shared' (set via -DCMAKE_CUDA_RUNTIME_LIBRARY=<value>)."
+    " Accepted values are 'Static', 'Shared', or 'None' (set via -DCMAKE_CUDA_RUNTIME_LIBRARY=<value>)."
   )
 endif()
 
