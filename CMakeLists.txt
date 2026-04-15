@@ -79,13 +79,12 @@ elseif(CUCASCADE_CUDA_RUNTIME_LIBRARY STREQUAL "Shared")
     )
   endif()
   set(CUCASCADE_CUDART_TARGET CUDA::cudart)
-elseif(CUCASCADE_CUDA_RUNTIME_LIBRARY STREQUAL "None")
-  set(CUCASCADE_CUDART_TARGET)
 else()
   message(
     FATAL_ERROR
     "Unsupported CUDA runtime library: '${CUCASCADE_CUDA_RUNTIME_LIBRARY}'."
-    " Accepted values are 'Static', 'Shared', or 'None' (set via -DCMAKE_CUDA_RUNTIME_LIBRARY=<value>)."
+    " cuCascade requires the CUDA runtime library because it uses CUDA runtime APIs."
+    " Accepted values are 'Static' or 'Shared' (set via -DCMAKE_CUDA_RUNTIME_LIBRARY=<value>)."
   )
 endif()
 
