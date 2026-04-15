@@ -601,6 +601,3 @@ BENCHMARK(BM_HostToGpuThroughput)
   ->UseRealTime();
 
 }  // namespace
-
-// Use Google Benchmark's default main
-BENCHMARK_MAIN();

@@ -18,6 +18,9 @@
 target_sources(
   cucascade_objects
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpu_data_representation.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/disk_data_representation.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/io_backend_registry.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_io_backend.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/data_batch.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/data_repository.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/data_repository_manager.cpp

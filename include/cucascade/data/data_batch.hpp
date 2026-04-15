@@ -531,7 +531,7 @@ void data_batch::convert_to(representation_converter_registry& registry,
                             const cucascade::memory::memory_space* target_memory_space,
                             rmm::cuda_stream_view stream)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::mutex> lock(_mutex);
 
   if (_processing_count != 0) {
     throw std::runtime_error("Cannot convert representation while there is active processing");
@@ -539,7 +539,22 @@ void data_batch::convert_to(representation_converter_registry& registry,
 
   auto new_representation =
     registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
+  auto old_representation = std::move(_data);
   _data = std::move(new_representation);
+
+  bool needs_sync =
+    old_representation != nullptr &&
+    (old_representation->get_current_tier() == memory::Tier::GPU ||
+     _data->get_current_tier() == memory::Tier::GPU);
+
+  lock.unlock();
+
+  if (needs_sync) {
+    // Conversions involving GPU may enqueue async operations on the provided
+    // stream that read from the source memory.  Synchronize before the old
+    // representation is destroyed to avoid use-after-free.
+    stream.synchronize();
+  }
 }
 
 template <typename TargetRepresentation>

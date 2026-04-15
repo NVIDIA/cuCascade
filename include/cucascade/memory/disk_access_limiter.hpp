@@ -82,6 +82,11 @@ class disk_access_limiter {
   ~disk_access_limiter() = default;
 
   /**
+   * @brief Get the mount path for this disk access limiter.
+   */
+  [[nodiscard]] std::string_view get_mount_path() const noexcept { return mounting_path_; }
+
+  /**
    * @brief Returns the available memory left in the resource
    */
   [[nodiscard]] std::size_t get_available_memory() const noexcept;

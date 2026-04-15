@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -37,6 +38,10 @@
 #include <variant>
 
 namespace cucascade {
+
+// Forward declaration — defined in src/data/pipeline_io_backend.cpp
+std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io = false);
+
 namespace memory {
 
 //===----------------------------------------------------------------------===//
@@ -104,10 +109,31 @@ memory_space::memory_space(const disk_memory_space_config& config)
     _memory_limit(config.reservation_limit()),
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
-    _allocator(null_device_memory_resource{})
+    _allocator(null_device_memory_resource{}),
+    _io_backend(cucascade::make_pipeline_io_backend())
 {
   if (config.mount_paths.empty()) {
     throw std::invalid_argument("Mount path must be provided for disk memory space");
+  }
+  _reservation_allocator =
+    std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
+}
+
+memory_space::memory_space(const disk_memory_space_config& config,
+                           std::shared_ptr<idisk_io_backend> io_backend)
+  : _id(config.tier(), config.disk_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(std::make_unique<null_device_memory_resource>()),
+    _io_backend(std::move(io_backend))
+{
+  if (config.mount_paths.empty()) {
+    throw std::invalid_argument("Mount path must be provided for disk memory space");
+  }
+  if (!_io_backend) {
+    throw std::invalid_argument("I/O backend must not be null for disk memory space");
   }
   _reservation_allocator =
     std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
@@ -195,17 +221,23 @@ std::size_t memory_space::get_active_reservation_count() const
 
 bool memory_space::should_downgrade_memory() const
 {
-  return _memory_limit - get_available_memory() >= _start_downgrading_memory_threshold;
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return false; }
+  return _memory_limit - available_memory >= _start_downgrading_memory_threshold;
 }
 
 bool memory_space::should_stop_downgrading_memory() const
 {
-  return _memory_limit - get_available_memory() <= _stop_downgrading_memory_threshold;
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return true; }
+  return _memory_limit - available_memory <= _stop_downgrading_memory_threshold;
 }
 
 size_t memory_space::get_amount_to_downgrade() const
 {
-  size_t consumed = _memory_limit - get_available_memory();
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return 0; }
+  size_t consumed = _memory_limit - available_memory;
   if (consumed <= _stop_downgrading_memory_threshold) { return 0; }
   return consumed - _stop_downgrading_memory_threshold;
 }
@@ -259,6 +291,23 @@ rmm::device_async_resource_ref memory_space::get_default_allocator() const noexc
 {
   return rmm::device_async_resource_ref(
     const_cast<cuda::mr::any_resource<cuda::mr::device_accessible>&>(_allocator));
+}
+
+std::string_view memory_space::get_disk_mount_path() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("get_disk_mount_path called on non-DISK memory space");
+  }
+  auto& limiter = std::get<std::unique_ptr<disk_access_limiter>>(_reservation_allocator);
+  return limiter->get_mount_path();
+}
+
+idisk_io_backend& memory_space::get_io_backend() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("get_io_backend called on non-DISK memory space");
+  }
+  return *_io_backend;
 }
 
 std::string memory_space::to_string() const

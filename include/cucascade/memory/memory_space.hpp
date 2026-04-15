@@ -36,6 +36,10 @@
 #include <rmm/resource_ref.hpp>
 
 namespace cucascade {
+
+// Forward declaration for disk I/O backend owned by DISK-tier memory spaces
+class idisk_io_backend;
+
 namespace memory {
 
 // Forward declaration
@@ -63,6 +67,15 @@ class memory_space {
   explicit memory_space(const gpu_memory_space_config& config);
   explicit memory_space(const host_memory_space_config& config);
   explicit memory_space(const disk_memory_space_config& config);
+
+  /**
+   * Construct a DISK-tier memory_space with a specific I/O backend.
+   *
+   * @param config Configuration for the disk memory space
+   * @param io_backend The I/O backend to use for this disk space (must not be null)
+   */
+  memory_space(const disk_memory_space_config& config,
+               std::shared_ptr<idisk_io_backend> io_backend);
 
   // Disable copy/move to ensure stable addresses for reservations
   memory_space(const memory_space&)            = delete;
@@ -120,6 +133,12 @@ class memory_space {
     return get_memory_resource_as<typename tier_memory_resource_trait<TIER>::type>();
   }
 
+  /** @brief Get the mount path for a DISK tier memory space. Throws if not DISK tier. */
+  [[nodiscard]] std::string_view get_disk_mount_path() const;
+
+  /** @brief Get the I/O backend for a DISK tier memory space. Throws if not DISK tier. */
+  [[nodiscard]] idisk_io_backend& get_io_backend() const;
+
   // Utility methods
   std::string to_string() const;
 
@@ -144,6 +163,7 @@ class memory_space {
   cuda::mr::any_resource<cuda::mr::device_accessible> _allocator;
   reserving_adaptor_type _reservation_allocator;
   std::unique_ptr<rmm::cuda_stream_pool> _stream_pool;
+  std::shared_ptr<idisk_io_backend> _io_backend;  ///< I/O backend for DISK tier (null for others)
 };
 
 /**
