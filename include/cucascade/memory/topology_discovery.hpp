@@ -63,6 +63,18 @@ struct system_topology_info {
 };
 
 /**
+ * @brief Verification level for network device discovery.
+ *
+ * Controls how strictly network devices are validated before being included
+ * in the discovered topology.
+ */
+enum class NetworkDeviceVerification {
+  EXISTS_ACTIVE_IP = 0,  ///< Device exists, port is active, and has an IP address (default).
+  EXISTS_ACTIVE    = 1,  ///< Device exists and port is active.
+  EXISTS           = 2   ///< Device exists only (no port or IP checks).
+};
+
+/**
  * @brief PCIe topology path types.
  */
 enum class PciePathType {
@@ -96,9 +108,11 @@ class topology_discovery {
    * This method performs the actual discovery of GPUs, NUMA nodes, CPU affinity,
    * and network devices. It must be called before `get_topology()`.
    *
+   * @param net_verification Controls how strictly network devices are validated.
    * @return true if discovery was successful, false otherwise.
    */
-  [[nodiscard]] bool discover();
+  [[nodiscard]] bool discover(
+    NetworkDeviceVerification net_verification = NetworkDeviceVerification::EXISTS_ACTIVE_IP);
 
   /**
    * @brief Get the discovered topology information.

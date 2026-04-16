@@ -545,16 +545,18 @@ bool has_net_interface_with_ip(std::string const& device_path)
  * @brief Discover network devices (InfiniBand/RoCE).
  *
  * Scans /sys/class/infiniband and collects device name, NUMA node, and PCI bus ID.
- * Two checks filter out unusable devices:
- *   1. At least one port must be in the ACTIVE state (link is up).
- *   2. The associated net interface must have an IP address assigned (IPoIB/RoCE
- *      is configured).
+ * Depending on @p verification, additional checks filter out unusable devices:
+ *   - EXISTS: device must be present in /sys/class/infiniband.
+ *   - EXISTS_ACTIVE: additionally, at least one port must be in the ACTIVE state.
+ *   - EXISTS_ACTIVE_IP: additionally, the net interface must have an IP address.
  * If the directory does not exist or an error occurs during iteration, returns an
  * empty vector (a warning is logged for iteration errors).
  *
+ * @param verification Verification level for network devices.
  * @return Vector of discovered network devices; empty if none or on failure.
  */
-std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology()
+std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
+  NetworkDeviceVerification verification)
 {
   std::vector<NetworkDeviceWithTopology> devices;
   std::string ib_path = "/sys/class/infiniband";
@@ -565,8 +567,12 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology()
     for (auto const& entry : fs::directory_iterator(ib_path)) {
       if (!entry.is_directory()) { continue; }
 
-      if (!has_active_port(entry.path().string())) { continue; }
-      if (!has_net_interface_with_ip(entry.path().string())) { continue; }
+      if (verification <= NetworkDeviceVerification::EXISTS_ACTIVE) {
+        if (!has_active_port(entry.path().string())) { continue; }
+      }
+      if (verification <= NetworkDeviceVerification::EXISTS_ACTIVE_IP) {
+        if (!has_net_interface_with_ip(entry.path().string())) { continue; }
+      }
 
       NetworkDeviceWithTopology dev;
       dev.name = entry.path().filename().string();
@@ -732,7 +738,7 @@ int count_numa_nodes()
 
 }  // namespace
 
-bool topology_discovery::discover()
+bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 {
   system_topology_info topology;
   NvmlLoader& nvml    = get_nvml_loader();
@@ -764,7 +770,7 @@ bool topology_discovery::discover()
 
   // Discover network devices
   std::vector<NetworkDeviceWithTopology> network_devices_with_topology =
-    discover_network_devices_with_topology();
+    discover_network_devices_with_topology(net_verification);
 
   // Get system information
   topology.hostname            = get_hostname();
