@@ -442,7 +442,7 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
   if (success) {
     _peak_total_allocated_bytes.update_peak(post_allocation_size);
     try {
-      return _upstream.allocate(stream, allocation_bytes);
+      return _upstream.allocate(stream, allocation_bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
     } catch (std::exception& e) {
       _total_allocated_bytes.sub(tracking_bytes);
       throw cucascade_out_of_memory(e.what(),
@@ -486,7 +486,7 @@ void reservation_aware_resource_adaptor::deallocate(cuda::stream_ref stream,
 // Suppress false-positive null-dereference warnings from CCCL library code
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  _upstream.deallocate(stream_view, ptr, bytes);
+  _upstream.deallocate(stream_view, ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
 #pragma GCC diagnostic pop
   _total_allocated_bytes.sub(upstream_reclaimed_bytes);
 }

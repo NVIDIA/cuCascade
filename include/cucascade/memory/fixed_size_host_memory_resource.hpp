@@ -331,14 +331,14 @@ class fixed_size_host_memory_resource {
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return allocate(cuda::stream_ref{}, bytes, alignment);
+    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
   }
 
   void deallocate_sync(void* ptr,
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(cuda::stream_ref{}, ptr, bytes, alignment);
+    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
   }
 
   [[nodiscard]] bool operator==(fixed_size_host_memory_resource const& other) const noexcept;

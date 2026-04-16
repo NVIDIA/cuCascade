@@ -672,7 +672,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(memory::fixed_multiple_blocks_
                                                   std::size_t alloc_offset,
                                                   std::size_t size,
                                                   rmm::cuda_stream_view stream,
-                                                  rmm::mr::device_memory_resource* mr)
+                                                  rmm::device_async_resource_ref mr)
 {
   rmm::device_buffer buf(size, stream, mr);
   if (size == 0) { return buf; }
@@ -1305,7 +1305,7 @@ static rmm::device_buffer alloc_and_read_from_disk(const std::filesystem::path& 
                                                    std::size_t file_offset,
                                                    std::size_t size,
                                                    rmm::cuda_stream_view stream,
-                                                   rmm::mr::device_memory_resource* mr,
+                                                   rmm::device_async_resource_ref mr,
                                                    idisk_io_backend& backend)
 {
   rmm::device_buffer buf(size, stream, mr);
@@ -1321,7 +1321,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   const memory::column_metadata& meta,
   const std::filesystem::path& file_path,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr,
+  rmm::device_async_resource_ref mr,
   idisk_io_backend& backend)
 {
   // Null mask (shared by all type categories)

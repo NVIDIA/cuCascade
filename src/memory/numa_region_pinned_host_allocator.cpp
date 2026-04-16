@@ -63,13 +63,13 @@ void numa_region_pinned_host_memory_resource::deallocate(
 void* numa_region_pinned_host_memory_resource::allocate_sync(std::size_t bytes,
                                                              [[maybe_unused]] std::size_t alignment)
 {
-  return allocate(cuda::stream_ref{}, bytes, alignment);
+  return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
 }
 
 void numa_region_pinned_host_memory_resource::deallocate_sync(
   void* ptr, std::size_t bytes, [[maybe_unused]] std::size_t alignment) noexcept
 {
-  deallocate(cuda::stream_ref{}, ptr, bytes, alignment);
+  deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
 }
 
 bool numa_region_pinned_host_memory_resource::operator==(

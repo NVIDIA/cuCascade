@@ -126,7 +126,7 @@ memory_space::memory_space(const disk_memory_space_config& config,
     _memory_limit(config.reservation_limit()),
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
-    _allocator(std::make_unique<null_device_memory_resource>()),
+    _allocator(null_device_memory_resource{}),
     _io_backend(std::move(io_backend))
 {
   if (config.mount_paths.empty()) {
