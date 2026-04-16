@@ -40,6 +40,10 @@ class reservation;
 struct reserved_arena;
 class memory_space;
 
+namespace detail {
+class reservation_aware_resource_adaptor_impl;
+}  // namespace detail
+
 template <Tier TIER>
 struct tier_memory_resource_trait {
   Tier tier = TIER;
@@ -171,6 +175,7 @@ std::unique_ptr<reservation_limit_policy> make_default_reservation_limit_policy(
 
 struct reserved_arena {
   friend class reservation_aware_resource_adaptor;
+  friend class detail::reservation_aware_resource_adaptor_impl;
   friend class fixed_size_host_memory_resource;
   friend class disk_access_limiter;
 
@@ -200,6 +205,7 @@ struct reserved_arena {
 class reservation {
  public:
   friend class reservation_aware_resource_adaptor;
+  friend class detail::reservation_aware_resource_adaptor_impl;
   friend class fixed_size_host_memory_resource;
   friend class disk_access_limiter;
 

@@ -17,23 +17,15 @@
 
 #pragma once
 
+#include <cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
 
-#include <atomic>
 #include <memory>
-#include <set>
-
-// Include existing reservation system
-#include <cucascade/memory/common.hpp>
-#include <cucascade/memory/error.hpp>
-#include <cucascade/memory/memory_reservation.hpp>
-#include <cucascade/memory/notification_channel.hpp>
-#include <cucascade/memory/oom_handling_policy.hpp>
-#include <cucascade/utils/atomics.hpp>
 
 namespace cucascade {
 namespace memory {
@@ -53,98 +45,26 @@ namespace memory {
  * - Race condition handling for deallocations after reset
  *
  * Based on RMM's tracking_resource_adaptor but extended for per-stream tracking.
+ *
+ * This class inherits from cuda::mr::shared_resource, making it copyable and
+ * movable via reference counting. Copies share the same underlying state.
  */
-class reservation_aware_resource_adaptor {
+class reservation_aware_resource_adaptor
+  : public cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl> {
+  using shared_base = cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl>;
+  using impl_type   = detail::reservation_aware_resource_adaptor_impl;
+
  public:
-  struct device_reserved_arena : public reserved_arena {
-    friend class reservation_aware_resource_adaptor;
+  // Re-export nested types from impl for backward compatibility
+  using device_reserved_arena        = impl_type::device_reserved_arena;
+  using stream_ordered_tracker_state = impl_type::stream_ordered_tracker_state;
+  using allocation_tracker_iface     = impl_type::allocation_tracker_iface;
+  using AllocationTrackingScope      = impl_type::AllocationTrackingScope;
 
-    explicit device_reserved_arena(reservation_aware_resource_adaptor& mr,
-                                   std::size_t bytes,
-                                   std::unique_ptr<event_notifier> notifier)
-      : reserved_arena(static_cast<int64_t>(bytes), std::move(notifier)), _mr(&mr)
-    {
-    }
-
-    ~device_reserved_arena() noexcept { _mr->do_release_reservation(this); }
-
-    bool grow_by(std::size_t additional_bytes) final
-    {
-      return _mr->grow_reservation_by(*this, additional_bytes);
-    }
-
-    void shrink_to_fit() final { _mr->shrink_reservation_to_fit(*this); }
-
-    [[nodiscard]] std::size_t get_available_memory() const noexcept
-    {
-      auto current = allocated_bytes.value();
-      auto sz      = this->size();
-      return current < sz ? static_cast<std::size_t>(sz - current) : 0UL;
-    }
-
-    utils::atomic_bounded_counter<std::int64_t> allocated_bytes{0LL};
-    utils::atomic_peak_tracker<std::int64_t> peak_allocated_bytes{0LL};
-
-   private:
-    reservation_aware_resource_adaptor* _mr;
-  };
-
-  /**
-   * @brief Reservation state
-   */
-  struct stream_ordered_tracker_state {
-    std::unique_ptr<device_reserved_arena>
-      memory_reservation;  /// Stream memory reservation (may be null)
-    std::unique_ptr<reservation_limit_policy>
-      reservation_policy;                             /// Reservation policy for this stream
-    std::unique_ptr<oom_handling_policy> oom_policy;  /// out-of-memory handling policy
-
-    friend class reservation_aware_resource_adaptor;
-
-    explicit stream_ordered_tracker_state(
-      std::unique_ptr<device_reserved_arena> arena,
-      std::unique_ptr<reservation_limit_policy> reservation_policy,
-      std::unique_ptr<oom_handling_policy> oom_policy);
-
-    /**
-     * @brief Checks reservation and handles overflow for an allocation request.
-     *
-     * @param adaptor The reservation aware resource adaptor
-     * @param allocation_size The size of the allocation request
-     * @param stream The CUDA stream for the allocation
-     * @return The tracking size for the allocation
-     */
-    std::size_t check_reservation_and_handle_overflow(reservation_aware_resource_adaptor& adaptor,
-                                                      std::size_t allocation_size,
-                                                      rmm::cuda_stream_view stream);
-
-   private:
-    mutable std::mutex _arbitration_mutex;
-  };
-
-  /**
-   * @brief Container for reservation state management. [Per-stream or per-thread]
-   */
-  struct allocation_tracker_iface {
-    virtual ~allocation_tracker_iface() = default;
-
-    virtual void reset_tracker_state(rmm::cuda_stream_view stream) = 0;
-
-    virtual void assign_reservation_to_tracker(rmm::cuda_stream_view stream,
-                                               std::unique_ptr<device_reserved_arena> reservation,
-                                               std::unique_ptr<reservation_limit_policy> policy,
-                                               std::unique_ptr<oom_handling_policy> oom_policy) = 0;
-
-    virtual stream_ordered_tracker_state* get_tracker_state(rmm::cuda_stream_view stream) = 0;
-
-    virtual const stream_ordered_tracker_state* get_tracker_state(
-      rmm::cuda_stream_view stream) const = 0;
-  };
-
-  enum class AllocationTrackingScope {
-    PER_STREAM,  // Track allocations separately for each stream
-    PER_THREAD   // Track allocations separately for each host thread
-  };
+  friend void get_property(reservation_aware_resource_adaptor const&,
+                           cuda::mr::device_accessible) noexcept
+  {
+  }
 
   /**
    * @brief Constructs a per-stream tracking resource adaptor.
@@ -188,17 +108,6 @@ class reservation_aware_resource_adaptor {
     std::unique_ptr<oom_handling_policy> default_oom_policy             = nullptr,
     AllocationTrackingScope tracking_scope = AllocationTrackingScope::PER_STREAM,
     cudaMemPool_t pool_handle              = nullptr);
-
-  /**
-   * @brief Destructor.
-   */
-  ~reservation_aware_resource_adaptor() = default;
-
-  // Non-copyable and non-movable to ensure resource stability
-  reservation_aware_resource_adaptor(const reservation_aware_resource_adaptor&)            = delete;
-  reservation_aware_resource_adaptor& operator=(const reservation_aware_resource_adaptor&) = delete;
-  reservation_aware_resource_adaptor(reservation_aware_resource_adaptor&&)                 = delete;
-  reservation_aware_resource_adaptor& operator=(reservation_aware_resource_adaptor&&)      = delete;
 
   /**
    * @brief Gets the upstream memory resource.
@@ -326,124 +235,24 @@ class reservation_aware_resource_adaptor {
    */
   const oom_handling_policy& get_default_oom_handling_policy() const;
 
+  //===----------------------------------------------------------------------===//
+  // Convenience allocate/deallocate with default alignment
+  //===----------------------------------------------------------------------===//
+
   void* allocate(cuda::stream_ref stream,
                  std::size_t bytes,
-                 std::size_t alignment = alignof(std::max_align_t));
+                 std::size_t alignment = alignof(std::max_align_t))
+  {
+    return get().allocate(stream, bytes, alignment);
+  }
 
   void deallocate(cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
-                  std::size_t alignment = alignof(std::max_align_t)) noexcept;
-
-  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    get().deallocate(stream, ptr, bytes, alignment);
   }
-
-  void deallocate_sync(void* ptr,
-                       std::size_t bytes,
-                       std::size_t alignment = alignof(std::max_align_t)) noexcept
-  {
-    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
-  }
-
-  bool operator==(reservation_aware_resource_adaptor const& other) const noexcept;
-
-  friend void get_property(reservation_aware_resource_adaptor const&,
-                           cuda::mr::device_accessible) noexcept
-  {
-  }
-
- private:
-  /**
-   * @brief grows reservation by a `bytes` size
-   * @param arena current_reservation
-   * @param bytes the size of reservation
-   */
-  bool grow_reservation_by(device_reserved_arena& arena, std::size_t bytes);
-
-  /**
-   * @brief grows reservation by a `bytes` size
-   * @param arena current_reservation
-   */
-  void shrink_reservation_to_fit(device_reserved_arena& arena);
-
-  /**
-   * @brief Allocates memory from the upstream resource and tracks it, the oom in this method is not
-   * handled by the oom handler.
-   *
-   * @param bytes The number of bytes to allocate
-   * @param stream The CUDA stream to use for the allocation
-   * @return Pointer to allocated memory
-   */
-  void* do_allocate_managed(std::size_t bytes, rmm::cuda_stream_view stream);
-
-  /**
-   * @brief Allocates memory from the upstream resource and tracks it, the oom in this method is not
-   * handled by the oom handler.
-   *
-   * @param bytes The number of bytes to allocate
-   * @param state The tracker state for the stream
-   * @param stream The CUDA stream to use for the allocation
-   * @return Pointer to allocated memory
-   */
-  void* do_allocate_managed(std::size_t bytes,
-                            stream_ordered_tracker_state* state,
-                            rmm::cuda_stream_view stream);
-
-  /**
-   * @brief Allocates memory from the upstream resource and tracks it, the oom in this method is not
-   * handled by the oom handler.
-   *
-   * @param bytes The number of bytes to allocate
-   * @param tracking_bytes The number of bytes to track
-   * @param stream The CUDA stream to use for the allocation
-   * @return Pointer to allocated memory
-   */
-  void* do_allocate_unmanaged(std::size_t bytes,
-                              std::size_t tracking_bytes,
-                              rmm::cuda_stream_view stream);
-
-  /**
-   * @brief releases reservations and returns the unused reservation back to allocator
-   * @param size_bytes requested size in bytes
-   * @param limit_bytes limit in bytes
-   */
-  bool do_reserve(std::size_t size_bytes, std::size_t limit_bytes);
-
-  /**
-   * @brief releases reservations and returns the unused reservation back to allocator
-   * @param size_bytes requested size in bytes
-   * @param limit_bytes limit in bytes
-   */
-  std::size_t do_reserve_upto(std::size_t size_bytes, std::size_t limit_bytes);
-
-  /**
-   * @brief releases reservations and returns the unused reservation back to allocator
-   * @param reservation pointer to the reservation being released
-   */
-  void do_release_reservation(device_reserved_arena* reservation) noexcept;
-
-  memory_space_id _space_id;
-
-  /// The upstream memory resource
-  rmm::device_async_resource_ref _upstream;
-  /// Optional CUDA memory pool handle for accurate OOM diagnostics
-  cudaMemPool_t _pool_handle{nullptr};
-  const std::size_t _memory_limit;
-  const std::size_t _capacity;
-
-  std::unique_ptr<allocation_tracker_iface> _allocation_tracker;
-
-  /// Global totals for efficiency
-  std::atomic<size_t> _total_reserved_bytes{0UL};
-  std::atomic<size_t> _number_of_allocations{0UL};
-  utils::atomic_bounded_counter<std::size_t> _total_allocated_bytes{0UL};
-  utils::atomic_peak_tracker<std::size_t> _peak_total_allocated_bytes{0UL};
-
-  /// Default policy for new streams
-  std::unique_ptr<reservation_limit_policy> _default_reservation_policy;
-  std::unique_ptr<oom_handling_policy> _default_oom_policy;
 };
 
 }  // namespace memory
