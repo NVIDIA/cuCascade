@@ -714,3 +714,158 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
             cloned_repr->get_table().view().column(i).head());
   }
 }
+
+// =============================================================================
+// Observable state tests (batch_state)
+// =============================================================================
+
+TEST_CASE("data_batch initial state is idle", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch state transitions via static methods", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  SECTION("idle -> read_only -> idle")
+  {
+    auto ro   = data_batch::to_read_only(std::move(batch));
+    auto idle = data_batch::to_idle(std::move(ro));
+    REQUIRE(idle->get_state() == batch_state::idle);
+  }
+
+  SECTION("idle -> mutable_locked -> idle")
+  {
+    auto mut  = data_batch::to_mutable(std::move(batch));
+    auto idle = data_batch::to_idle(std::move(mut));
+    REQUIRE(idle->get_state() == batch_state::idle);
+  }
+
+  SECTION("try_to_read_only updates state on success")
+  {
+    auto result = data_batch::try_to_read_only(batch);
+    REQUIRE(result.has_value());
+    REQUIRE(batch == nullptr);
+
+    auto idle = data_batch::to_idle(std::move(*result));
+    REQUIRE(idle->get_state() == batch_state::idle);
+  }
+
+  SECTION("try_to_mutable updates state on success")
+  {
+    auto result = data_batch::try_to_mutable(batch);
+    REQUIRE(result.has_value());
+    REQUIRE(batch == nullptr);
+
+    auto idle = data_batch::to_idle(std::move(*result));
+    REQUIRE(idle->get_state() == batch_state::idle);
+  }
+}
+
+// =============================================================================
+// Non-static transition tests (shared_from_this)
+// =============================================================================
+
+TEST_CASE("data_batch non-static to_read_only does not consume caller pointer", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto accessor = batch->to_read_only();
+  REQUIRE(batch != nullptr);
+  REQUIRE(batch->get_batch_id() == 1);
+  REQUIRE(batch->get_state() == batch_state::read_only);
+  REQUIRE(accessor.get_batch_id() == 1);
+}
+
+TEST_CASE("data_batch non-static to_mutable does not consume caller pointer", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto accessor = batch->to_mutable();
+  REQUIRE(batch != nullptr);
+  REQUIRE(batch->get_batch_id() == 1);
+  REQUIRE(batch->get_state() == batch_state::mutable_locked);
+  REQUIRE(accessor.get_batch_id() == 1);
+}
+
+TEST_CASE("data_batch non-static try_to_read_only", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto result = batch->try_to_read_only();
+  REQUIRE(result.has_value());
+  REQUIRE(batch != nullptr);
+  REQUIRE(batch->get_state() == batch_state::read_only);
+}
+
+TEST_CASE("data_batch non-static try_to_mutable", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto result = batch->try_to_mutable();
+  REQUIRE(result.has_value());
+  REQUIRE(batch != nullptr);
+  REQUIRE(batch->get_state() == batch_state::mutable_locked);
+}
+
+TEST_CASE("data_batch non-static try_to_mutable fails when read-locked", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto ro     = batch->to_read_only();
+  auto result = batch->try_to_mutable();
+  REQUIRE_FALSE(result.has_value());
+}
+
+// =============================================================================
+// Locked-to-locked transition tests
+// =============================================================================
+
+TEST_CASE("data_batch readonly_to_mutable", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto ro  = data_batch::to_read_only(std::move(batch));
+  auto mut = data_batch::readonly_to_mutable(std::move(ro));
+  REQUIRE(mut.get_batch_id() == 1);
+
+  auto idle = data_batch::to_idle(std::move(mut));
+  REQUIRE(idle->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch mutable_to_readonly", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto mut = data_batch::to_mutable(std::move(batch));
+  auto ro  = data_batch::mutable_to_readonly(std::move(mut));
+  REQUIRE(ro.get_batch_id() == 1);
+
+  auto idle = data_batch::to_idle(std::move(ro));
+  REQUIRE(idle->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch full cycle: idle -> ro -> mutable -> ro -> idle", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto ro1  = data_batch::to_read_only(std::move(batch));
+  auto mut  = data_batch::readonly_to_mutable(std::move(ro1));
+  auto ro2  = data_batch::mutable_to_readonly(std::move(mut));
+  auto idle = data_batch::to_idle(std::move(ro2));
+
+  REQUIRE(idle->get_state() == batch_state::idle);
+  REQUIRE(idle->get_batch_id() == 1);
+}
