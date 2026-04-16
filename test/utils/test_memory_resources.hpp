@@ -43,6 +43,18 @@ class shared_device_resource {
     upstream_.deallocate(stream, p, bytes, alignment);
   }
 
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+  }
+
+  void deallocate_sync(void* p,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, p, bytes, alignment);
+  }
+
   bool operator==(shared_device_resource const&) const noexcept { return false; }
 
   friend void get_property(shared_device_resource const&, cuda::mr::device_accessible) noexcept {}

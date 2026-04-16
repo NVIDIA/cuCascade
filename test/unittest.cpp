@@ -50,12 +50,12 @@ class test_gpu_pool {
 
     pool_     = std::make_unique<rmm::mr::cuda_async_memory_resource>(initial_bytes, max_bytes);
     previous_ = rmm::mr::get_current_device_resource_ref();
-    rmm::mr::set_current_device_resource_ref(*pool_);
+    rmm::mr::set_current_device_resource(*pool_);
   }
 
   ~test_gpu_pool()
   {
-    if (pool_ != nullptr) { rmm::mr::set_current_device_resource_ref(previous_); }
+    if (pool_ != nullptr) { rmm::mr::set_current_device_resource(previous_); }
   }
 
  private:

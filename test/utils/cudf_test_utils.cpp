@@ -362,6 +362,18 @@ class logging_device_resource {
     _upstream.deallocate(stream, ptr, bytes, alignment);
   }
 
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+  }
+
   bool operator==(logging_device_resource const& other) const noexcept { return this == &other; }
 
   friend void get_property(logging_device_resource const&, cuda::mr::device_accessible) noexcept {}
@@ -377,8 +389,9 @@ static void install_rmm_logging_resource_once()
   static std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> logging_resource;
   if (!installed) {
     auto prev = rmm::mr::get_current_device_resource_ref();
-    logging_resource.emplace(logging_device_resource{prev});
-    rmm::mr::set_current_device_resource_ref(*logging_resource);
+    logging_resource =
+      cuda::mr::any_resource<cuda::mr::device_accessible>{logging_device_resource{prev}};
+    rmm::mr::set_current_device_resource(*logging_resource);
     installed = true;
     std::cout << "[rmm-log ] installed logging device resource adaptor" << std::endl << std::flush;
   }
