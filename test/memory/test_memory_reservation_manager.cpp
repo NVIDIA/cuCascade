@@ -285,7 +285,8 @@ SCENARIO("Peak Tracking On Streams with Reservation", "[memory_space][tracking]"
 
     WHEN("allocation within reservation on reserved stream, upstream peak doesn't change")
     {
-      ptrs.emplace_back(chunk_size, reserved_stream, mr);  // within reservation
+      ptrs.emplace_back(
+        chunk_size, reserved_stream, rmm::device_async_resource_ref{*mr});  // within reservation
 
       THEN("upstream peak allocated bytes remain the same, only stream peak changes")
       {
@@ -293,39 +294,44 @@ SCENARIO("Peak Tracking On Streams with Reservation", "[memory_space][tracking]"
         REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) == chunk_size);
         REQUIRE(mr->get_peak_allocated_bytes(other_streams) == 0);
       }
+    }
 
-      WHEN("allocation is larger than reservation on reserved stream, upstream tracks it")
+    WHEN("allocation exceeds reservation on reserved stream, upstream tracks overflow")
+    {
+      ptrs.emplace_back(
+        chunk_size, reserved_stream, rmm::device_async_resource_ref{*mr});  // within reservation
+      ptrs.emplace_back(
+        chunk_size, reserved_stream, rmm::device_async_resource_ref{*mr});  // fills reservation
+      ptrs.emplace_back(
+        chunk_size, reserved_stream, rmm::device_async_resource_ref{*mr});  // exceeds reservation
+
+      THEN("peak allocated bytes are tracked correctly")
       {
-        ptrs.emplace_back(chunk_size, reserved_stream, mr);  // within reservation
-        ptrs.emplace_back(chunk_size, reserved_stream, mr);  // exceeds reservation
+        // 3 x chunk_size on stream, but only chunk_size overflows beyond the reservation
+        auto total_allocated_bytes = mr->get_total_allocated_bytes();
+        REQUIRE(total_allocated_bytes == reservation_size + chunk_size);
+        REQUIRE(mr->get_peak_total_allocated_bytes() == total_allocated_bytes);
+        REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) == 3 * chunk_size);
+        REQUIRE(mr->get_peak_allocated_bytes(other_streams) == 0);
+      }
+
+      WHEN("allocations are freed")
+      {
+        std::size_t peak_stream_bytes = mr->get_peak_allocated_bytes(reserved_stream);
+
+        REQUIRE(mr->get_total_allocated_bytes() == reservation_size + chunk_size);
+        REQUIRE(mr->get_allocated_bytes(reserved_stream) == 3 * chunk_size);
+        mr->reset_stream_reservation(reserved_stream);
+        REQUIRE(mr->get_total_allocated_bytes() == reservation_size + chunk_size);
+        ptrs.clear();
+        REQUIRE(mr->get_total_allocated_bytes() == 0);
 
         THEN("peak allocated bytes are tracked correctly")
         {
-          auto total_allocated_bytes = mr->get_total_allocated_bytes();
-          REQUIRE(total_allocated_bytes == 3 * chunk_size);
-          REQUIRE(mr->get_peak_total_allocated_bytes() == total_allocated_bytes);
-          REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) == total_allocated_bytes);
-          REQUIRE(mr->get_peak_allocated_bytes(other_streams) == 0);
-        }
-
-        WHEN("allocations are freed")
-        {
-          std::size_t peak_stream_bytes = mr->get_peak_allocated_bytes(reserved_stream);
-
-          REQUIRE(mr->get_total_allocated_bytes() == 3 * chunk_size);
-          REQUIRE(mr->get_allocated_bytes(reserved_stream) == 3 * chunk_size);
-          mr->reset_stream_reservation(reserved_stream);
-          REQUIRE(mr->get_total_allocated_bytes() == 3 * chunk_size);
-          ptrs.clear();
-          REQUIRE(mr->get_total_allocated_bytes() == 0);
-
-          THEN("peak allocated bytes are tracked correctly")
-          {
-            REQUIRE(mr->get_peak_total_allocated_bytes() == peak_stream_bytes);
-            REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) ==
-                    0);                                     // doesn't have a tracker attached
-            REQUIRE(mr->get_total_allocated_bytes() == 0);  // doesn't have a tracker attached
-          }
+          REQUIRE(mr->get_peak_total_allocated_bytes() == peak_stream_bytes);
+          REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) ==
+                  0);                                     // doesn't have a tracker attached
+          REQUIRE(mr->get_total_allocated_bytes() == 0);  // doesn't have a tracker attached
         }
       }
     }
@@ -484,9 +490,9 @@ SCENARIO("Reservation On Multi Gpu System", "[memory_space][.multi-device]")
   auto host_0_allocator = host_numa_0->get_default_allocator();
 
   // Test that allocators are valid (basic smoke test)
-  REQUIRE(gpu_0_allocator != nullptr);
-  REQUIRE(gpu_1_allocator != nullptr);
-  REQUIRE(host_0_allocator != nullptr);
+  (void)gpu_0_allocator;
+  (void)gpu_1_allocator;
+  (void)host_0_allocator;
 
   GIVEN("Dual gpu manager")
   {
