@@ -39,6 +39,15 @@ class memory_space;
 
 namespace cucascade {
 
+/**
+ * @brief Observable state of a data_batch.
+ *
+ * Tracks whether the batch is idle, shared-locked (read_only), or
+ * exclusively-locked (mutable_locked). Updated atomically during
+ * state transitions.
+ */
+enum class batch_state { idle, read_only, mutable_locked };
+
 // Forward declarations -- required before data_batch because it friends them.
 template <typename PtrType>
 class read_only_data_batch;
@@ -60,7 +69,7 @@ class mutable_data_batch;
  * @note Non-copyable and non-movable. The object itself never moves; only the
  *       smart pointer to it is transferred between states.
  */
-class data_batch {
+class data_batch : public std::enable_shared_from_this<data_batch> {
  public:
   // -- Construction --
 
@@ -119,8 +128,17 @@ class data_batch {
    */
   size_t get_subscriber_count() const;
 
+  /**
+   * @brief Get the observable lock state of this batch.
+   *
+   * Atomic, lock-free. Returns the current state: idle, read_only, or
+   * mutable_locked. Updated during every state transition.
+   *
+   * @return The current batch_state.
+   */
+  batch_state get_state() const { return _state.load(std::memory_order_relaxed); }
+
   // -- Static transition methods (D-13/D-14/D-15/D-17) --
-  // All transitions go through idle -- no locked-to-locked shortcuts.
 
   /**
    * @brief Transition from idle to read-only (shared lock).
@@ -197,6 +215,76 @@ class data_batch {
   template <typename PtrType>
   [[nodiscard]] static std::optional<mutable_data_batch<PtrType>> try_to_mutable(PtrType& batch);
 
+  // -- Non-static transitions (shared_ptr only, via shared_from_this) --
+  // The caller's shared_ptr is NOT consumed. These only work when the
+  // data_batch is managed by a shared_ptr (throws bad_weak_ptr otherwise).
+
+  /**
+   * @brief Transition from idle to read-only (shared lock) without consuming the caller's pointer.
+   *
+   * Uses shared_from_this() to obtain a new shared_ptr. Blocks until the
+   * shared lock is acquired.
+   *
+   * @return A read_only_data_batch holding the shared lock.
+   */
+  [[nodiscard]] read_only_data_batch<std::shared_ptr<data_batch>> to_read_only();
+
+  /**
+   * @brief Transition from idle to mutable (exclusive lock) without consuming the caller's pointer.
+   *
+   * Uses shared_from_this() to obtain a new shared_ptr. Blocks until the
+   * exclusive lock is acquired.
+   *
+   * @return A mutable_data_batch holding the exclusive lock.
+   */
+  [[nodiscard]] mutable_data_batch<std::shared_ptr<data_batch>> to_mutable();
+
+  /**
+   * @brief Try to transition from idle to read-only (non-blocking, shared_ptr only).
+   *
+   * @return An optional containing the read-only accessor on success, or
+   *         std::nullopt if the lock could not be acquired immediately.
+   */
+  [[nodiscard]] std::optional<read_only_data_batch<std::shared_ptr<data_batch>>> try_to_read_only();
+
+  /**
+   * @brief Try to transition from idle to mutable (non-blocking, shared_ptr only).
+   *
+   * @return An optional containing the mutable accessor on success, or
+   *         std::nullopt if the lock could not be acquired immediately.
+   */
+  [[nodiscard]] std::optional<mutable_data_batch<std::shared_ptr<data_batch>>> try_to_mutable();
+
+  // -- Locked-to-locked static transitions --
+
+  /**
+   * @brief Transition from read-only to mutable (upgrade lock).
+   *
+   * Releases the shared lock, then acquires an exclusive lock (may block).
+   * The source accessor is consumed via move.
+   *
+   * @tparam PtrType Smart pointer type (shared_ptr or unique_ptr to data_batch).
+   * @param accessor Rvalue reference to the read-only accessor (consumed).
+   * @return A mutable_data_batch holding the exclusive lock.
+   */
+  template <typename PtrType>
+  [[nodiscard]] static mutable_data_batch<PtrType> readonly_to_mutable(
+    read_only_data_batch<PtrType>&& accessor);
+
+  /**
+   * @brief Transition from mutable to read-only (downgrade lock).
+   *
+   * Releases the exclusive lock, then acquires a shared lock (may block).
+   * The source accessor is consumed via move.
+   *
+   * @tparam PtrType Smart pointer type (shared_ptr or unique_ptr to data_batch).
+   * @param accessor Rvalue reference to the mutable accessor (consumed).
+   * @return A read_only_data_batch holding the shared lock.
+   */
+  template <typename PtrType>
+  [[nodiscard]] static read_only_data_batch<PtrType> mutable_to_readonly(
+    mutable_data_batch<PtrType>&& accessor);
+
  private:
   // -- Friend declarations (D-24/REPO-04) --
   template <typename PtrType>
@@ -245,10 +333,11 @@ class data_batch {
                   rmm::cuda_stream_view stream);
 
   // -- Members --
-  const uint64_t _batch_id;                     ///< Immutable batch identifier
-  std::unique_ptr<idata_representation> _data;  ///< Owned data representation
-  mutable std::shared_mutex _rw_mutex;          ///< Reader-writer mutex
-  std::atomic<size_t> _subscriber_count{0};     ///< Atomic subscriber interest count
+  const uint64_t _batch_id;                            ///< Immutable batch identifier
+  std::unique_ptr<idata_representation> _data;         ///< Owned data representation
+  mutable std::shared_mutex _rw_mutex;                 ///< Reader-writer mutex
+  std::atomic<size_t> _subscriber_count{0};            ///< Atomic subscriber interest count
+  std::atomic<batch_state> _state{batch_state::idle};  ///< Observable lock state
 };
 
 /**
@@ -454,6 +543,7 @@ read_only_data_batch<PtrType> data_batch::to_read_only(PtrType&& batch)
 {
   auto ptr = std::move(batch);
   std::shared_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+  ptr->_state.store(batch_state::read_only, std::memory_order_relaxed);
   return read_only_data_batch<PtrType>(std::move(ptr), std::move(lock));
 }
 
@@ -464,6 +554,7 @@ mutable_data_batch<PtrType> data_batch::to_mutable(PtrType&& batch)
 {
   auto ptr = std::move(batch);
   std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+  ptr->_state.store(batch_state::mutable_locked, std::memory_order_relaxed);
   return mutable_data_batch<PtrType>(std::move(ptr), std::move(lock));
 }
 
@@ -473,6 +564,7 @@ template <typename PtrType>
 PtrType data_batch::to_idle(read_only_data_batch<PtrType>&& accessor)
 {
   auto ptr = std::move(accessor._batch);
+  ptr->_state.store(batch_state::idle, std::memory_order_relaxed);
   accessor._lock.unlock();
   return ptr;
 }
@@ -483,6 +575,7 @@ template <typename PtrType>
 PtrType data_batch::to_idle(mutable_data_batch<PtrType>&& accessor)
 {
   auto ptr = std::move(accessor._batch);
+  ptr->_state.store(batch_state::idle, std::memory_order_relaxed);
   accessor._lock.unlock();
   return ptr;
 }
@@ -494,6 +587,7 @@ std::optional<read_only_data_batch<PtrType>> data_batch::try_to_read_only(PtrTyp
 {
   std::shared_lock<std::shared_mutex> lock(batch->_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
+  batch->_state.store(batch_state::read_only, std::memory_order_relaxed);
   auto ptr = std::move(batch);
   return read_only_data_batch<PtrType>(std::move(ptr), std::move(lock));
 }
@@ -505,8 +599,35 @@ std::optional<mutable_data_batch<PtrType>> data_batch::try_to_mutable(PtrType& b
 {
   std::unique_lock<std::shared_mutex> lock(batch->_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
+  batch->_state.store(batch_state::mutable_locked, std::memory_order_relaxed);
   auto ptr = std::move(batch);
   return mutable_data_batch<PtrType>(std::move(ptr), std::move(lock));
+}
+
+// -- data_batch::readonly_to_mutable (upgrade lock, TRANS-07) --
+
+template <typename PtrType>
+mutable_data_batch<PtrType> data_batch::readonly_to_mutable(
+  read_only_data_batch<PtrType>&& accessor)
+{
+  auto ptr = std::move(accessor._batch);
+  accessor._lock.unlock();
+  std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+  ptr->_state.store(batch_state::mutable_locked, std::memory_order_relaxed);
+  return mutable_data_batch<PtrType>(std::move(ptr), std::move(lock));
+}
+
+// -- data_batch::mutable_to_readonly (downgrade lock, TRANS-08) --
+
+template <typename PtrType>
+read_only_data_batch<PtrType> data_batch::mutable_to_readonly(
+  mutable_data_batch<PtrType>&& accessor)
+{
+  auto ptr = std::move(accessor._batch);
+  accessor._lock.unlock();
+  std::shared_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+  ptr->_state.store(batch_state::read_only, std::memory_order_relaxed);
+  return read_only_data_batch<PtrType>(std::move(ptr), std::move(lock));
 }
 
 // -- read_only_data_batch::clone (deep copy, CLONE-01) --
