@@ -460,9 +460,38 @@ PciePathType get_pcie_path_type(std::string const& gpu_pci_id, std::string const
 }
 
 /**
+ * @brief Check whether an InfiniBand/RoCE device has at least one active port.
+ *
+ * Iterates over /sys/class/infiniband/<device>/ports/<N>/state for every port.
+ * A port is considered active when its state string contains "ACTIVE".
+ *
+ * @param device_path Sysfs path to the InfiniBand device directory.
+ * @return true if at least one port is in the ACTIVE state.
+ */
+bool has_active_port(std::string const& device_path)
+{
+  fs::path ports_dir = fs::path(device_path) / "ports";
+  if (!fs::exists(ports_dir)) { return false; }
+
+  try {
+    for (auto const& port_entry : fs::directory_iterator(ports_dir)) {
+      if (!port_entry.is_directory()) { continue; }
+
+      std::string state = read_file_content((port_entry.path() / "state").string());
+      // The state file format is "<number>: <STATE_NAME>" (e.g. "4: ACTIVE").
+      if (state.find("ACTIVE") != std::string::npos) { return true; }
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+/**
  * @brief Discover network devices (InfiniBand/RoCE).
  *
  * Scans /sys/class/infiniband and collects device name, NUMA node, and PCI bus ID.
+ * Only devices that have at least one port in the ACTIVE state are included; devices
+ * whose ports are all DOWN/INIT/ARMED are skipped because they cannot carry traffic.
  * If the directory does not exist or an error occurs during iteration, returns an
  * empty vector (a warning is logged for iteration errors).
  *
@@ -478,6 +507,8 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology()
   try {
     for (auto const& entry : fs::directory_iterator(ib_path)) {
       if (!entry.is_directory()) { continue; }
+
+      if (!has_active_port(entry.path().string())) { continue; }
 
       NetworkDeviceWithTopology dev;
       dev.name = entry.path().filename().string();
