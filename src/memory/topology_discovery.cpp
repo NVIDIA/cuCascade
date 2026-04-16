@@ -6,7 +6,9 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <dlfcn.h>
+#include <ifaddrs.h>
 #include <nvml.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -487,11 +489,66 @@ bool has_active_port(std::string const& device_path)
 }
 
 /**
+ * @brief Check whether a network interface has at least one IP address (v4 or v6).
+ *
+ * Uses getifaddrs() to query all interface addresses and returns true as soon as
+ * an AF_INET or AF_INET6 entry matching @p iface_name is found.
+ *
+ * @param iface_name Name of the network interface (e.g. "ib0", "ibp26s0").
+ * @return true if the interface has at least one IP address assigned.
+ */
+bool interface_has_ip(std::string const& iface_name)
+{
+  struct ifaddrs* ifa_list = nullptr;
+  if (getifaddrs(&ifa_list) != 0) { return false; }
+
+  bool found = false;
+  for (struct ifaddrs* ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr) { continue; }
+    int family = ifa->ifa_addr->sa_family;
+    if ((family == AF_INET || family == AF_INET6) && iface_name == ifa->ifa_name) {
+      found = true;
+      break;
+    }
+  }
+
+  freeifaddrs(ifa_list);
+  return found;
+}
+
+/**
+ * @brief Check whether an InfiniBand device's associated net interface has an IP address.
+ *
+ * Looks up the net interface name from /sys/class/infiniband/<dev>/device/net/ and
+ * then checks for a configured IP address via getifaddrs().  Devices without IPoIB
+ * or RoCE networking configured (no IP) are unusable for IP-based transports.
+ *
+ * @param device_path Sysfs path to the InfiniBand device directory.
+ * @return true if the device has a net interface with at least one IP address.
+ */
+bool has_net_interface_with_ip(std::string const& device_path)
+{
+  fs::path net_dir = fs::path(device_path) / "device" / "net";
+  if (!fs::exists(net_dir)) { return false; }
+
+  try {
+    for (auto const& entry : fs::directory_iterator(net_dir)) {
+      if (!entry.is_directory()) { continue; }
+      if (interface_has_ip(entry.path().filename().string())) { return true; }
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+/**
  * @brief Discover network devices (InfiniBand/RoCE).
  *
  * Scans /sys/class/infiniband and collects device name, NUMA node, and PCI bus ID.
- * Only devices that have at least one port in the ACTIVE state are included; devices
- * whose ports are all DOWN/INIT/ARMED are skipped because they cannot carry traffic.
+ * Two checks filter out unusable devices:
+ *   1. At least one port must be in the ACTIVE state (link is up).
+ *   2. The associated net interface must have an IP address assigned (IPoIB/RoCE
+ *      is configured).
  * If the directory does not exist or an error occurs during iteration, returns an
  * empty vector (a warning is logged for iteration errors).
  *
@@ -509,6 +566,7 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology()
       if (!entry.is_directory()) { continue; }
 
       if (!has_active_port(entry.path().string())) { continue; }
+      if (!has_net_interface_with_ip(entry.path().string())) { continue; }
 
       NetworkDeviceWithTopology dev;
       dev.name = entry.path().filename().string();
