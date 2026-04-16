@@ -38,15 +38,15 @@
  * If the call does not return cudaSuccess, clears the error and throws
  * rmm::cuda_error with file/line context.
  */
-#define CUCASCADE_CUDA_TRY(call)                                                             \
-  do {                                                                                       \
-    cudaError_t const error = (call);                                                        \
-    if (cudaSuccess != error) {                                                              \
-      cudaGetLastError();                                                                    \
-      throw rmm::cuda_error{std::string{"CUDA error at: "} + __FILE__ + ":" +               \
-                            CUCASCADE_STRINGIFY(__LINE__) + ": " + cudaGetErrorName(error) +  \
-                            " " + cudaGetErrorString(error)};                                \
-    }                                                                                        \
+#define CUCASCADE_CUDA_TRY(call)                                                                   \
+  do {                                                                                             \
+    cudaError_t const error = (call);                                                              \
+    if (cudaSuccess != error) {                                                                    \
+      cudaGetLastError();                                                                          \
+      throw rmm::cuda_error{std::string{"CUDA error at: "} + __FILE__ + ":" +                      \
+                            CUCASCADE_STRINGIFY(__LINE__) + ": " + cudaGetErrorName(error) + " " + \
+                            cudaGetErrorString(error)};                                            \
+    }                                                                                              \
   } while (0)
 
 /**
@@ -59,37 +59,37 @@
  * - CUCASCADE_CUDA_TRY_ALLOC(cuda_call)
  * - CUCASCADE_CUDA_TRY_ALLOC(cuda_call, num_bytes)
  */
-#define CUCASCADE_CUDA_TRY_ALLOC(...)                                                              \
-  GET_CUCASCADE_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, CUCASCADE_CUDA_TRY_ALLOC_2,                      \
-                                     CUCASCADE_CUDA_TRY_ALLOC_1)                                   \
+#define CUCASCADE_CUDA_TRY_ALLOC(...)                                    \
+  GET_CUCASCADE_CUDA_TRY_ALLOC_MACRO(                                    \
+    __VA_ARGS__, CUCASCADE_CUDA_TRY_ALLOC_2, CUCASCADE_CUDA_TRY_ALLOC_1) \
   (__VA_ARGS__)
 #define GET_CUCASCADE_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
 
-#define CUCASCADE_CUDA_TRY_ALLOC_2(_call, num_bytes)                                             \
-  do {                                                                                           \
-    cudaError_t const error = (_call);                                                           \
-    if (cudaSuccess != error) {                                                                  \
-      cudaGetLastError();                                                                        \
-      auto const msg = std::string{"CUDA error (failed to allocate "} +                          \
-                       std::to_string(num_bytes) + " bytes) at: " + __FILE__ + ":" +             \
-                       CUCASCADE_STRINGIFY(__LINE__) + ": " + cudaGetErrorName(error) + " " +     \
-                       cudaGetErrorString(error);                                                \
-      if (cudaErrorMemoryAllocation == error) { throw rmm::out_of_memory{msg}; }                 \
-      throw rmm::bad_alloc{msg};                                                                 \
-    }                                                                                            \
+#define CUCASCADE_CUDA_TRY_ALLOC_2(_call, num_bytes)                                          \
+  do {                                                                                        \
+    cudaError_t const error = (_call);                                                        \
+    if (cudaSuccess != error) {                                                               \
+      cudaGetLastError();                                                                     \
+      auto const msg = std::string{"CUDA error (failed to allocate "} +                       \
+                       std::to_string(num_bytes) + " bytes) at: " + __FILE__ + ":" +          \
+                       CUCASCADE_STRINGIFY(__LINE__) + ": " + cudaGetErrorName(error) + " " + \
+                       cudaGetErrorString(error);                                             \
+      if (cudaErrorMemoryAllocation == error) { throw rmm::out_of_memory{msg}; }              \
+      throw rmm::bad_alloc{msg};                                                              \
+    }                                                                                         \
   } while (0)
 
-#define CUCASCADE_CUDA_TRY_ALLOC_1(_call)                                                          \
-  do {                                                                                             \
-    cudaError_t const error = (_call);                                                             \
-    if (cudaSuccess != error) {                                                                    \
-      cudaGetLastError();                                                                          \
-      auto const msg = std::string{"CUDA error at: "} + __FILE__ + ":" +                           \
-                       CUCASCADE_STRINGIFY(__LINE__) + ": " + cudaGetErrorName(error) + " " +       \
-                       cudaGetErrorString(error);                                                   \
-      if (cudaErrorMemoryAllocation == error) { throw rmm::out_of_memory{msg}; }                   \
-      throw rmm::bad_alloc{msg};                                                                   \
-    }                                                                                              \
+#define CUCASCADE_CUDA_TRY_ALLOC_1(_call)                                                     \
+  do {                                                                                        \
+    cudaError_t const error = (_call);                                                        \
+    if (cudaSuccess != error) {                                                               \
+      cudaGetLastError();                                                                     \
+      auto const msg = std::string{"CUDA error at: "} + __FILE__ + ":" +                      \
+                       CUCASCADE_STRINGIFY(__LINE__) + ": " + cudaGetErrorName(error) + " " + \
+                       cudaGetErrorString(error);                                             \
+      if (cudaErrorMemoryAllocation == error) { throw rmm::out_of_memory{msg}; }              \
+      throw rmm::bad_alloc{msg};                                                              \
+    }                                                                                         \
   } while (0)
 
 /**
@@ -104,15 +104,15 @@
     (_call);                                 \
   } while (0);
 #else
-#define CUCASCADE_ASSERT_CUDA_SUCCESS(_call)                                     \
-  do {                                                                           \
-    cudaError_t const status__ = (_call);                                        \
-    if (status__ != cudaSuccess) {                                               \
-      std::cerr << "CUDA Error detected. " << cudaGetErrorName(status__) << " "  \
-                << cudaGetErrorString(status__) << std::endl;                    \
-    }                                                                            \
-    /* NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay) */    \
-    assert(status__ == cudaSuccess);                                             \
+#define CUCASCADE_ASSERT_CUDA_SUCCESS(_call)                                    \
+  do {                                                                          \
+    cudaError_t const status__ = (_call);                                       \
+    if (status__ != cudaSuccess) {                                              \
+      std::cerr << "CUDA Error detected. " << cudaGetErrorName(status__) << " " \
+                << cudaGetErrorString(status__) << std::endl;                   \
+    }                                                                           \
+    /* NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay) */   \
+    assert(status__ == cudaSuccess);                                            \
   } while (0)
 #endif
 

@@ -26,12 +26,11 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cstring>
-
 #include <catch2/catch.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1678,10 +1677,10 @@ class observed_gpu_representation : private cucascade::test::mock_memory_space_h
                                     public idata_representation {
  public:
   observed_gpu_representation(rmm::device_buffer buf, conversion_sync_observer& observer)
-    : mock_memory_space_holder(memory::Tier::GPU, 0)
-    , idata_representation(*space)
-    , _buf(std::move(buf))
-    , _observer(observer)
+    : mock_memory_space_holder(memory::Tier::GPU, 0),
+      idata_representation(*space),
+      _buf(std::move(buf)),
+      _observer(observer)
   {
   }
 
@@ -1704,9 +1703,7 @@ class observed_gpu_representation : private cucascade::test::mock_memory_space_h
   conversion_sync_observer& _observer;
 };
 
-TEST_CASE(
-  "convert_to synchronizes stream before destroying GPU source",
-  "[data_batch][convert_to]")
+TEST_CASE("convert_to synchronizes stream before destroying GPU source", "[data_batch][convert_to]")
 {
   rmm::cuda_stream stream;
 
@@ -1733,8 +1730,8 @@ TEST_CASE(
         const memory::memory_space* /*target_space*/,
         rmm::cuda_stream_view s) -> std::unique_ptr<idata_representation> {
       auto& gpu_src = source.cast<observed_gpu_representation>();
-      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-        pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));
+      CUCASCADE_CUDA_TRY(
+        cudaMemcpyAsync(pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));
       // Record event after the async copy so we can check completion order
       CUCASCADE_CUDA_TRY(cudaEventRecord(observer.event, s.value()));
       // Deliberately NO stream.synchronize() — convert_to must handle this
@@ -1759,7 +1756,7 @@ TEST_CASE(
   for (std::size_t i = 0; i < buf_size; ++i) {
     if (host_bytes[i] != 0xAB) {
       FAIL("Data mismatch at byte " << i << ": expected 0xAB, got 0x" << std::hex
-                                     << static_cast<int>(host_bytes[i]));
+                                    << static_cast<int>(host_bytes[i]));
     }
   }
 
@@ -1772,12 +1769,14 @@ TEST_CASE(
 class observed_host_representation : private cucascade::test::mock_memory_space_holder,
                                      public idata_representation {
  public:
-  observed_host_representation(void* pinned_ptr, std::size_t size, conversion_sync_observer& observer)
-    : mock_memory_space_holder(memory::Tier::HOST, 0)
-    , idata_representation(*space)
-    , _pinned_ptr(pinned_ptr)
-    , _size(size)
-    , _observer(observer)
+  observed_host_representation(void* pinned_ptr,
+                               std::size_t size,
+                               conversion_sync_observer& observer)
+    : mock_memory_space_holder(memory::Tier::HOST, 0),
+      idata_representation(*space),
+      _pinned_ptr(pinned_ptr),
+      _size(size),
+      _observer(observer)
   {
   }
 
@@ -1801,9 +1800,8 @@ class observed_host_representation : private cucascade::test::mock_memory_space_
   conversion_sync_observer& _observer;
 };
 
-TEST_CASE(
-  "convert_to synchronizes stream before destroying HOST source when target is GPU",
-  "[data_batch][convert_to]")
+TEST_CASE("convert_to synchronizes stream before destroying HOST source when target is GPU",
+          "[data_batch][convert_to]")
 {
   rmm::cuda_stream stream;
 
@@ -1834,8 +1832,7 @@ TEST_CASE(
       return std::make_unique<mock_data_representation>(memory::Tier::GPU, buf_size);
     });
 
-  auto host_data =
-    std::make_unique<observed_host_representation>(pinned_host, buf_size, observer);
+  auto host_data = std::make_unique<observed_host_representation>(pinned_host, buf_size, observer);
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
   data_batch batch(1, std::move(host_data));
 
@@ -1856,9 +1853,8 @@ static void CUDART_CB stream_delay_callback(void* /*userData*/)
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
-TEST_CASE(
-  "convert_to releases mutex before stream sync allowing concurrent access",
-  "[data_batch][convert_to]")
+TEST_CASE("convert_to releases mutex before stream sync allowing concurrent access",
+          "[data_batch][convert_to]")
 {
   rmm::cuda_stream stream;
 
@@ -1883,8 +1879,8 @@ TEST_CASE(
         const memory::memory_space* /*target_space*/,
         rmm::cuda_stream_view s) -> std::unique_ptr<idata_representation> {
       auto& gpu_src = source.cast<observed_gpu_representation>();
-      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-        pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));
+      CUCASCADE_CUDA_TRY(
+        cudaMemcpyAsync(pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));
       // Enqueue a host callback that sleeps for 50 ms, creating a large
       // deterministic window during which stream.synchronize() blocks.
       CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(s.value(), stream_delay_callback, nullptr));

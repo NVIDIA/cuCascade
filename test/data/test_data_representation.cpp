@@ -18,6 +18,7 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
+#include <cucascade/cuda_utils.hpp>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
@@ -34,8 +35,6 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
-
-#include <cucascade/cuda_utils.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
@@ -120,9 +119,9 @@ TEST_CASE("host_data_packed_representation converts to GPU and preserves content
     size_t bytes  = std::min(remain, block_size - block_off);
     void* dst_ptr = reinterpret_cast<uint8_t*>((*allocation)[block_idx].data()) + block_off;
     CUCASCADE_CUDA_TRY(cudaMemcpy(dst_ptr,
-                            static_cast<const uint8_t*>(packed.gpu_data->data()) + copied,
-                            bytes,
-                            cudaMemcpyDeviceToHost));
+                                  static_cast<const uint8_t*>(packed.gpu_data->data()) + copied,
+                                  bytes,
+                                  cudaMemcpyDeviceToHost));
     copied += bytes;
     block_off += bytes;
     if (block_off == block_size) {
@@ -2000,7 +1999,8 @@ TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][rou
                                       gpu_space->get_default_allocator());
   CUCASCADE_CUDA_TRY(
     cudaMemsetAsync(f0->mutable_view().head(), 0x11, N * sizeof(int32_t), stream.view()));
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(f1->mutable_view().head(), 0x22, N * sizeof(double), stream.view()));
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(f1->mutable_view().head(), 0x22, N * sizeof(double), stream.view()));
   stream.synchronize();
 
   std::vector<std::unique_ptr<cudf::column>> fields;
