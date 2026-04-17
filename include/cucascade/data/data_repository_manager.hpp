@@ -210,6 +210,7 @@ class data_repository_manager {
    * @param amount_to_downgrade The amount of data in bytes to downgrade
    * @return std::vector<PtrType> A vector of data batches that are candidates for downgrade
    */
+   // WSM TODO: remove this?
   std::vector<PtrType> get_data_batches_for_downgrade(
     [[maybe_unused]] cucascade::memory::memory_space_id memory_space_id,
     [[maybe_unused]] size_t amount_to_downgrade)
@@ -235,6 +236,27 @@ class data_repository_manager {
     for (auto& [key, repo] : _repositories) {
       if (repo) { visitor(repo.get()); }
     }
+  }
+
+  /**
+   * @brief Get a snapshot of all current repository pointers.
+   *
+   * Returns a vector of raw pointers to each non-null repository. The vector
+   * is built under the manager mutex, so callers can iterate it externally
+   * without holding the lock (the repositories themselves remain thread-safe).
+   *
+   * @return std::vector<repository_type*> Snapshot of non-null repository pointers
+   * @note Thread-safe — holds the manager mutex for the duration of collection.
+   */
+  std::vector<repository_type*> get_repositories()
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<repository_type*> result;
+    result.reserve(_repositories.size());
+    for (auto& [key, repo] : _repositories) {
+      if (repo) { result.push_back(repo.get()); }
+    }
+    return result;
   }
 
  private:
