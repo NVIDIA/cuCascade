@@ -141,32 +141,6 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   // -- Static transition methods (D-13/D-14/D-15/D-17) --
 
   /**
-   * @brief Transition from idle to read-only (shared lock).
-   *
-   * Blocks until the shared lock is acquired. The source pointer is
-   * moved-from and becomes null.
-   *
-   * @tparam PtrType Smart pointer type (shared_ptr or unique_ptr to data_batch).
-   * @param batch Rvalue reference to the idle batch pointer (moved-from).
-   * @return A read_only_data_batch holding the shared lock.
-   */
-  template <typename PtrType>
-  [[nodiscard]] static read_only_data_batch<PtrType> to_read_only(PtrType&& batch);
-
-  /**
-   * @brief Transition from idle to mutable (exclusive lock).
-   *
-   * Blocks until the exclusive lock is acquired. The source pointer is
-   * moved-from and becomes null.
-   *
-   * @tparam PtrType Smart pointer type (shared_ptr or unique_ptr to data_batch).
-   * @param batch Rvalue reference to the idle batch pointer (moved-from).
-   * @return A mutable_data_batch holding the exclusive lock.
-   */
-  template <typename PtrType>
-  [[nodiscard]] static mutable_data_batch<PtrType> to_mutable(PtrType&& batch);
-
-  /**
    * @brief Transition from read-only back to idle (release shared lock).
    *
    * @tparam PtrType Smart pointer type (shared_ptr or unique_ptr to data_batch).
@@ -185,35 +159,6 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   template <typename PtrType>
   [[nodiscard]] static PtrType to_idle(mutable_data_batch<PtrType>&& accessor);
-
-  /**
-   * @brief Try to transition from idle to read-only (non-blocking).
-   *
-   * Attempts to acquire the shared lock without blocking. On success, the
-   * source pointer is nullified. On failure, the source pointer is unchanged.
-   *
-   * @tparam PtrType Smart pointer type (shared_ptr or unique_ptr to data_batch).
-   * @param batch Mutable lvalue reference to the idle batch pointer.
-   * @return An optional containing the read-only accessor on success, or
-   *         std::nullopt if the lock could not be acquired immediately.
-   */
-  template <typename PtrType>
-  [[nodiscard]] static std::optional<read_only_data_batch<PtrType>> try_to_read_only(
-    PtrType& batch);
-
-  /**
-   * @brief Try to transition from idle to mutable (non-blocking).
-   *
-   * Attempts to acquire the exclusive lock without blocking. On success, the
-   * source pointer is nullified. On failure, the source pointer is unchanged.
-   *
-   * @tparam PtrType Smart pointer type (shared_ptr or unique_ptr to data_batch).
-   * @param batch Mutable lvalue reference to the idle batch pointer.
-   * @return An optional containing the mutable accessor on success, or
-   *         std::nullopt if the lock could not be acquired immediately.
-   */
-  template <typename PtrType>
-  [[nodiscard]] static std::optional<mutable_data_batch<PtrType>> try_to_mutable(PtrType& batch);
 
   // -- Non-static transitions (shared_ptr only, via shared_from_this) --
   // The caller's shared_ptr is NOT consumed. These only work when the
@@ -319,19 +264,6 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   void set_data(std::unique_ptr<idata_representation> data);
 
-  /**
-   * @brief Convert the data representation in-place.
-   *
-   * @tparam TargetRepresentation Target representation type.
-   * @param registry   Converter registry for type-keyed dispatch.
-   * @param target_memory_space Target memory space for the new representation.
-   * @param stream     CUDA stream for memory operations.
-   */
-  template <typename TargetRepresentation>
-  void convert_to(representation_converter_registry& registry,
-                  const memory::memory_space* target_memory_space,
-                  rmm::cuda_stream_view stream);
-
   // -- Members --
   const uint64_t _batch_id;                            ///< Immutable batch identifier
   std::unique_ptr<idata_representation> _data;         ///< Owned data representation
@@ -433,7 +365,7 @@ class read_only_data_batch {
  *
  * Holds an exclusive lock on the parent data_batch's mutex, permitting a single
  * writer with no concurrent readers. Provides all read methods plus write methods
- * (set_data, convert_to) that delegate to data_batch's private interface.
+ * (set_data, convert_to) and clone operations (clone, clone_to).
  *
  * Move-only. The exclusive lock is released when this object is destroyed or moved-from.
  *
@@ -468,6 +400,10 @@ class mutable_data_batch {
   /**
    * @brief Convert the data representation in-place.
    *
+   * Replaces the held data with a new representation produced by the converter
+   * registry. If the conversion involves the GPU tier, synchronizes the stream
+   * before the old representation is destroyed to prevent use-after-free.
+   *
    * @tparam TargetRepresentation Target representation type.
    * @param registry           Converter registry for type-keyed dispatch.
    * @param target_memory_space Target memory space for the new representation.
@@ -476,10 +412,41 @@ class mutable_data_batch {
   template <typename TargetRepresentation>
   void convert_to(representation_converter_registry& registry,
                   const memory::memory_space* target_memory_space,
-                  rmm::cuda_stream_view stream)
-  {
-    _batch->template convert_to<TargetRepresentation>(registry, target_memory_space, stream);
-  }
+                  rmm::cuda_stream_view stream);
+
+  // -- Clone operations (CLONE-01/CLONE-02) --
+
+  /**
+   * @brief Create an independent deep copy of the batch data.
+   *
+   * The clone has a new batch ID and its own copy of the data representation,
+   * residing in the same memory space as the original.
+   *
+   * @param new_batch_id Batch ID for the cloned batch.
+   * @param stream       CUDA stream for memory operations.
+   * @return A new data_batch wrapped in PtrType.
+   * @throws std::runtime_error if the data is null.
+   */
+  [[nodiscard]] PtrType clone(uint64_t new_batch_id, rmm::cuda_stream_view stream) const;
+
+  /**
+   * @brief Create an independent deep copy with representation conversion.
+   *
+   * The clone has a new batch ID and its data is converted to TargetRepresentation
+   * using the provided converter registry.
+   *
+   * @tparam TargetRepresentation Target representation type.
+   * @param registry           Converter registry for type-keyed dispatch.
+   * @param new_batch_id       Batch ID for the cloned batch.
+   * @param target_memory_space Target memory space for the converted data.
+   * @param stream              CUDA stream for memory operations.
+   * @return A new data_batch wrapped in PtrType.
+   */
+  template <typename TargetRepresentation>
+  [[nodiscard]] PtrType clone_to(representation_converter_registry& registry,
+                                 uint64_t new_batch_id,
+                                 const memory::memory_space* target_memory_space,
+                                 rmm::cuda_stream_view stream) const;
 
   // -- Move-only (D-12/ACC-05/ACC-06) --
   mutable_data_batch(mutable_data_batch&&) noexcept            = default;
@@ -509,55 +476,6 @@ class mutable_data_batch {
 // Template implementations
 // =============================================================================
 
-// -- data_batch::convert_to --
-
-template <typename TargetRepresentation>
-void data_batch::convert_to(representation_converter_registry& registry,
-                            const memory::memory_space* target_memory_space,
-                            rmm::cuda_stream_view stream)
-{
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
-  auto old_representation = std::move(_data);
-  _data = std::move(new_representation);
-
-  bool needs_sync =
-    old_representation != nullptr &&
-    (old_representation->get_current_tier() == memory::Tier::GPU ||
-     _data->get_current_tier() == memory::Tier::GPU);
-
-  lock.unlock();
-
-  if (needs_sync) {
-    // Conversions involving GPU may enqueue async operations on the provided
-    // stream that read from the source memory.  Synchronize before the old
-    // representation is destroyed to avoid use-after-free.
-    stream.synchronize();
-  }
-}
-
-// -- data_batch::to_read_only (idle -> shared lock, TRANS-01) --
-
-template <typename PtrType>
-read_only_data_batch<PtrType> data_batch::to_read_only(PtrType&& batch)
-{
-  auto ptr = std::move(batch);
-  std::shared_lock<std::shared_mutex> lock(ptr->_rw_mutex);
-  ptr->_state.store(batch_state::read_only, std::memory_order_relaxed);
-  return read_only_data_batch<PtrType>(std::move(ptr), std::move(lock));
-}
-
-// -- data_batch::to_mutable (idle -> exclusive lock, TRANS-02) --
-
-template <typename PtrType>
-mutable_data_batch<PtrType> data_batch::to_mutable(PtrType&& batch)
-{
-  auto ptr = std::move(batch);
-  std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
-  ptr->_state.store(batch_state::mutable_locked, std::memory_order_relaxed);
-  return mutable_data_batch<PtrType>(std::move(ptr), std::move(lock));
-}
-
 // -- data_batch::to_idle (release shared lock, TRANS-03) --
 
 template <typename PtrType>
@@ -578,30 +496,6 @@ PtrType data_batch::to_idle(mutable_data_batch<PtrType>&& accessor)
   ptr->_state.store(batch_state::idle, std::memory_order_relaxed);
   accessor._lock.unlock();
   return ptr;
-}
-
-// -- data_batch::try_to_read_only (non-blocking, TRANS-05) --
-
-template <typename PtrType>
-std::optional<read_only_data_batch<PtrType>> data_batch::try_to_read_only(PtrType& batch)
-{
-  std::shared_lock<std::shared_mutex> lock(batch->_rw_mutex, std::try_to_lock);
-  if (!lock.owns_lock()) { return std::nullopt; }
-  batch->_state.store(batch_state::read_only, std::memory_order_relaxed);
-  auto ptr = std::move(batch);
-  return read_only_data_batch<PtrType>(std::move(ptr), std::move(lock));
-}
-
-// -- data_batch::try_to_mutable (non-blocking, TRANS-06) --
-
-template <typename PtrType>
-std::optional<mutable_data_batch<PtrType>> data_batch::try_to_mutable(PtrType& batch)
-{
-  std::unique_lock<std::shared_mutex> lock(batch->_rw_mutex, std::try_to_lock);
-  if (!lock.owns_lock()) { return std::nullopt; }
-  batch->_state.store(batch_state::mutable_locked, std::memory_order_relaxed);
-  auto ptr = std::move(batch);
-  return mutable_data_batch<PtrType>(std::move(ptr), std::move(lock));
 }
 
 // -- data_batch::readonly_to_mutable (upgrade lock, TRANS-07) --
@@ -653,6 +547,64 @@ PtrType read_only_data_batch<PtrType>::clone_to(representation_converter_registr
                                                 uint64_t new_batch_id,
                                                 const memory::memory_space* target_memory_space,
                                                 rmm::cuda_stream_view stream) const
+{
+  auto new_representation =
+    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+  if constexpr (std::is_same_v<PtrType, std::shared_ptr<data_batch>>) {
+    return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
+  } else {
+    return std::make_unique<data_batch>(new_batch_id, std::move(new_representation));
+  }
+}
+
+// -- mutable_data_batch::convert_to (in-place conversion, ACC-02) --
+
+template <typename PtrType>
+template <typename TargetRepresentation>
+void mutable_data_batch<PtrType>::convert_to(representation_converter_registry& registry,
+                                             const memory::memory_space* target_memory_space,
+                                             rmm::cuda_stream_view stream)
+{
+  auto new_representation =
+    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+  auto old_representation = std::move(_batch->_data);
+  _batch->_data           = std::move(new_representation);
+
+  bool needs_sync =
+    old_representation != nullptr && (old_representation->get_current_tier() == memory::Tier::GPU ||
+                                      _batch->_data->get_current_tier() == memory::Tier::GPU);
+
+  if (needs_sync) {
+    // Conversions involving GPU may enqueue async operations on the provided
+    // stream that read from the source memory.  Synchronize before the old
+    // representation is destroyed to avoid use-after-free.
+    stream.synchronize();
+  }
+}
+
+// -- mutable_data_batch::clone (deep copy, CLONE-01) --
+
+template <typename PtrType>
+PtrType mutable_data_batch<PtrType>::clone(uint64_t new_batch_id,
+                                           rmm::cuda_stream_view stream) const
+{
+  if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
+  auto cloned_data = _batch->_data->clone(stream);
+  if constexpr (std::is_same_v<PtrType, std::shared_ptr<data_batch>>) {
+    return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
+  } else {
+    return std::make_unique<data_batch>(new_batch_id, std::move(cloned_data));
+  }
+}
+
+// -- mutable_data_batch::clone_to (deep copy + conversion, CLONE-02) --
+
+template <typename PtrType>
+template <typename TargetRepresentation>
+PtrType mutable_data_batch<PtrType>::clone_to(representation_converter_registry& registry,
+                                              uint64_t new_batch_id,
+                                              const memory::memory_space* target_memory_space,
+                                              rmm::cuda_stream_view stream) const
 {
   auto new_representation =
     registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
