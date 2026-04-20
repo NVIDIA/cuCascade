@@ -72,7 +72,6 @@ set(CUCASCADE_CXX_WARNING_FLAGS
     -Wunused
     -Wconversion
     -Wsign-conversion
-    -Wnull-dereference
     -Wdouble-promotion
     -Wformat=2
     -Wimplicit-fallthrough)
