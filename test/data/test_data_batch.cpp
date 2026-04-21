@@ -215,8 +215,7 @@ TEST_CASE("data_batch mutable blocks until readonly released", "[data_batch]")
   auto batch = std::make_shared<data_batch>(1, std::move(data));
 
   // Acquire read-only on a heap-allocated accessor so we can control its lifetime
-  auto ro =
-    std::make_unique<read_only_data_batch<std::shared_ptr<data_batch>>>(batch->to_read_only());
+  auto ro = std::make_unique<read_only_data_batch>(batch->to_read_only());
 
   std::atomic<bool> got_mutable{false};
 

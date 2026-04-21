@@ -62,47 +62,110 @@ memory::memory_space* data_batch::get_memory_space() const
 
 void data_batch::set_data(std::unique_ptr<idata_representation> data) { _data = std::move(data); }
 
-// ========== Non-static transition methods (shared_ptr only) ==========
+// ========== Static transition methods ==========
 
-read_only_data_batch<std::shared_ptr<data_batch>> data_batch::to_read_only()
+std::shared_ptr<data_batch> data_batch::to_idle(read_only_data_batch&& accessor)
+{
+  auto ptr = std::move(accessor._batch);
+  ptr->_state.store(batch_state::idle, std::memory_order_relaxed);
+  accessor._lock.unlock();
+  return ptr;
+}
+
+std::shared_ptr<data_batch> data_batch::to_idle(mutable_data_batch&& accessor)
+{
+  auto ptr = std::move(accessor._batch);
+  ptr->_state.store(batch_state::idle, std::memory_order_relaxed);
+  accessor._lock.unlock();
+  return ptr;
+}
+
+// ========== Non-static transition methods ==========
+
+read_only_data_batch data_batch::to_read_only()
 {
   auto self = shared_from_this();
   std::shared_lock<std::shared_mutex> lock(_rw_mutex);
   _state.store(batch_state::read_only, std::memory_order_relaxed);
-  return read_only_data_batch<std::shared_ptr<data_batch>>(std::move(self), std::move(lock));
+  return read_only_data_batch(std::move(self), std::move(lock));
 }
 
-mutable_data_batch<std::shared_ptr<data_batch>> data_batch::to_mutable()
+mutable_data_batch data_batch::to_mutable()
 {
   auto self = shared_from_this();
   std::unique_lock<std::shared_mutex> lock(_rw_mutex);
   _state.store(batch_state::mutable_locked, std::memory_order_relaxed);
-  return mutable_data_batch<std::shared_ptr<data_batch>>(std::move(self), std::move(lock));
+  return mutable_data_batch(std::move(self), std::move(lock));
 }
 
-std::optional<read_only_data_batch<std::shared_ptr<data_batch>>> data_batch::try_to_read_only()
+std::optional<read_only_data_batch> data_batch::try_to_read_only()
 {
   std::shared_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
   _state.store(batch_state::read_only, std::memory_order_relaxed);
   auto self = shared_from_this();
-  return read_only_data_batch<std::shared_ptr<data_batch>>(std::move(self), std::move(lock));
+  return read_only_data_batch(std::move(self), std::move(lock));
 }
 
-std::optional<mutable_data_batch<std::shared_ptr<data_batch>>> data_batch::try_to_mutable()
+std::optional<mutable_data_batch> data_batch::try_to_mutable()
 {
   std::unique_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
   _state.store(batch_state::mutable_locked, std::memory_order_relaxed);
   auto self = shared_from_this();
-  return mutable_data_batch<std::shared_ptr<data_batch>>(std::move(self), std::move(lock));
+  return mutable_data_batch(std::move(self), std::move(lock));
 }
 
-// ========== Explicit template instantiations ==========
+// ========== Locked-to-locked static transitions ==========
 
-template class read_only_data_batch<std::shared_ptr<data_batch>>;
-template class read_only_data_batch<std::unique_ptr<data_batch>>;
-template class mutable_data_batch<std::shared_ptr<data_batch>>;
-template class mutable_data_batch<std::unique_ptr<data_batch>>;
+mutable_data_batch data_batch::readonly_to_mutable(read_only_data_batch&& accessor)
+{
+  auto ptr = std::move(accessor._batch);
+  accessor._lock.unlock();
+  std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+  ptr->_state.store(batch_state::mutable_locked, std::memory_order_relaxed);
+  return mutable_data_batch(std::move(ptr), std::move(lock));
+}
+
+read_only_data_batch data_batch::mutable_to_readonly(mutable_data_batch&& accessor)
+{
+  auto ptr = std::move(accessor._batch);
+  accessor._lock.unlock();
+  std::shared_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+  ptr->_state.store(batch_state::read_only, std::memory_order_relaxed);
+  return read_only_data_batch(std::move(ptr), std::move(lock));
+}
+
+// ========== read_only_data_batch ==========
+
+read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> parent,
+                                           std::shared_lock<std::shared_mutex> lock)
+  : _batch(std::move(parent)), _lock(std::move(lock))
+{
+}
+
+std::shared_ptr<data_batch> read_only_data_batch::clone(uint64_t new_batch_id,
+                                                        rmm::cuda_stream_view stream) const
+{
+  if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
+  auto cloned_data = _batch->_data->clone(stream);
+  return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
+}
+
+// ========== mutable_data_batch ==========
+
+mutable_data_batch::mutable_data_batch(std::shared_ptr<data_batch> parent,
+                                       std::unique_lock<std::shared_mutex> lock)
+  : _batch(std::move(parent)), _lock(std::move(lock))
+{
+}
+
+std::shared_ptr<data_batch> mutable_data_batch::clone(uint64_t new_batch_id,
+                                                      rmm::cuda_stream_view stream) const
+{
+  if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
+  auto cloned_data = _batch->_data->clone(stream);
+  return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
+}
 
 }  // namespace cucascade
