@@ -203,24 +203,7 @@ class data_repository_manager {
     return leaked;
   }
 
-  /**
-   * @brief Get N batches from the specified repositories for downgrade.
-   *
-   * @param memory_space_id The memory space id to get the data batches from
-   * @param amount_to_downgrade The amount of data in bytes to downgrade
-   * @return std::vector<PtrType> A vector of data batches that are candidates for downgrade
-   */
-   // WSM TODO: remove this?
-  std::vector<PtrType> get_data_batches_for_downgrade(
-    [[maybe_unused]] cucascade::memory::memory_space_id memory_space_id,
-    [[maybe_unused]] size_t amount_to_downgrade)
-  {
-    std::vector<PtrType> data_batches;
-    // Note: Implementation would iterate through repositories and collect batches
-    // This is a placeholder - actual implementation depends on how batches are tracked
-    return data_batches;
-  }
-
+  
   /**
    * @brief Iterate over all repositories, calling the visitor for each one.
    *
