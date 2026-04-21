@@ -46,7 +46,8 @@ class reservation_aware_resource_adaptor_impl;
 
 template <Tier TIER>
 struct tier_memory_resource_trait {
-  Tier tier = TIER;
+  using type = void;
+  Tier tier  = TIER;
 };
 
 template <>

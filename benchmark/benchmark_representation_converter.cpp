@@ -20,7 +20,7 @@
 #include "cucascade/data/representation_converter.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 
-#include <cucascade/cuda_utils.hpp>
+#include <cucascade/error.hpp>
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>

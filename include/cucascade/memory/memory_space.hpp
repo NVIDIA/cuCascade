@@ -22,6 +22,8 @@
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/notification_channel.hpp>
 
+#include <cuda/memory_resource>
+
 #include <concepts>
 #include <cstdint>
 #include <cstring>
@@ -115,6 +117,8 @@ class memory_space {
   [[nodiscard]] rmm::device_async_resource_ref get_default_allocator() const noexcept;
 
   template <typename T>
+    requires(cuda::mr::resource_with<T, cuda::mr::device_accessible> ||
+             std::same_as<T, disk_access_limiter>)
   T* get_memory_resource_as() const noexcept
   {
     T* result = nullptr;

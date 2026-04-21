@@ -234,22 +234,22 @@ SCENARIO("multi-reservation memory_resource mismatch", "[memory_space]")
       auto upstrem_leftover = mr->get_available_memory();
       REQUIRE(mr->get_available_memory(stream1) == upstrem_leftover + res_size);
       REQUIRE(mr->get_available_memory(stream2) == upstrem_leftover + res_size);
-      auto* buff1 = mr->allocate(stream1, small_alloc_size);
+      auto* buff1 = mr->allocate(stream1, small_alloc_size, alignof(std::max_align_t));
       REQUIRE(mr->get_allocated_bytes(stream1) == small_alloc_size);
       REQUIRE(mr->get_available_memory(stream1) ==
               mr->get_available_memory() + res_size - small_alloc_size);
 
-      auto* buff2 = mr->allocate(stream2, large_alloc_size);
+      auto* buff2 = mr->allocate(stream2, large_alloc_size, alignof(std::max_align_t));
       REQUIRE(mr->get_allocated_bytes(stream2) == large_alloc_size);
       REQUIRE(mr->get_available_memory(stream2) == mr->get_available_memory());
       THEN(
         "allocations from another memory resource is absorbed by other stream as extra reservation")
       {
-        mr->deallocate(stream1, buff2, large_alloc_size);
+        mr->deallocate(stream1, buff2, large_alloc_size, alignof(std::max_align_t));
         CHECK(mr->get_available_memory_print(stream1) ==
               mr->get_available_memory() + large_alloc_size + res_size - small_alloc_size);
 
-        mr->deallocate(stream2, buff1, small_alloc_size);
+        mr->deallocate(stream2, buff1, small_alloc_size, alignof(std::max_align_t));
         CHECK(mr->get_available_memory_print(stream2) == mr->get_available_memory());
       }
     }
@@ -375,7 +375,7 @@ SCENARIO("Reservation Concepts on Single Gpu Manager", "[memory_space]")
       THEN("allocation within the reservations are seen by upstream/other stream")
       {
         std::size_t allocation_size = 512;
-        void* ptr                   = mr->allocate(reserved_stream, allocation_size);
+        void* ptr = mr->allocate(reserved_stream, allocation_size, alignof(std::max_align_t));
         REQUIRE(mr->get_total_allocated_bytes() == reservation_size);
         REQUIRE(mr->get_available_memory(other_streams) ==
                 expected_gpu_capacity - reservation_size);
@@ -383,20 +383,20 @@ SCENARIO("Reservation Concepts on Single Gpu Manager", "[memory_space]")
         REQUIRE(mr->get_available_memory(reserved_stream) ==
                 expected_gpu_capacity - allocation_size);
         REQUIRE(mr->get_allocated_bytes(reserved_stream) == allocation_size);
-        mr->deallocate(reserved_stream, ptr, allocation_size);
+        mr->deallocate(reserved_stream, ptr, allocation_size, alignof(std::max_align_t));
       }
 
       THEN("allocation beyond the reservations are made from the upstream")
       {
         std::size_t allocation_size = reservation_size * 2;
-        void* ptr                   = mr->allocate(reserved_stream, allocation_size);
+        void* ptr = mr->allocate(reserved_stream, allocation_size, alignof(std::max_align_t));
         REQUIRE(mr->get_total_allocated_bytes() == allocation_size);
         REQUIRE(mr->get_available_memory(other_streams) == expected_gpu_capacity - allocation_size);
         REQUIRE(mr->get_allocated_bytes(other_streams) == 0);
         REQUIRE(mr->get_available_memory(reserved_stream) ==
                 expected_gpu_capacity - allocation_size);
         REQUIRE(mr->get_allocated_bytes(reserved_stream) == allocation_size);
-        mr->deallocate(reserved_stream, ptr, allocation_size);
+        mr->deallocate(reserved_stream, ptr, allocation_size, alignof(std::max_align_t));
       }
     }
   }
@@ -424,10 +424,10 @@ SCENARIO("Reservation Overflow Policy", "[memory_space][.overflow_policy]")
 
       THEN("total reservation doesn't change")
       {
-        auto* buffer = mr->allocate(stream, reservation_size * 2);
+        auto* buffer = mr->allocate(stream, reservation_size * 2, alignof(std::max_align_t));
         REQUIRE(mr->get_total_reserved_bytes() == reservation_size);
         REQUIRE(mr->get_total_allocated_bytes() == reservation_size * 2);
-        mr->deallocate(stream, buffer, reservation_size * 2);
+        mr->deallocate(stream, buffer, reservation_size * 2, alignof(std::max_align_t));
       }
     }
 
@@ -447,7 +447,8 @@ SCENARIO("Reservation Overflow Policy", "[memory_space][.overflow_policy]")
 
       THEN("oom on allocation")
       {
-        REQUIRE_THROWS_AS(mr->allocate(stream, reservation_size * 2), rmm::bad_alloc);
+        REQUIRE_THROWS_AS(mr->allocate(stream, reservation_size * 2, alignof(std::max_align_t)),
+                          rmm::bad_alloc);
       }
     }
 
@@ -467,10 +468,10 @@ SCENARIO("Reservation Overflow Policy", "[memory_space][.overflow_policy]")
 
       THEN("increased reservation on allocation")
       {
-        auto* buffer = mr->allocate(stream, reservation_size * 2);
+        auto* buffer = mr->allocate(stream, reservation_size * 2, alignof(std::max_align_t));
         REQUIRE(mr->get_total_reserved_bytes() >= reservation_size * 2);
         REQUIRE(mr->get_total_allocated_bytes() >= reservation_size * 2);
-        mr->deallocate(stream, buffer, reservation_size * 2);
+        mr->deallocate(stream, buffer, reservation_size * 2, alignof(std::max_align_t));
       }
     }
   }

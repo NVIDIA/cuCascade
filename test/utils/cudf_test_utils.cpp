@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cuda_utils.hpp>
+#include <cucascade/error.hpp>
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/contiguous_split.hpp>

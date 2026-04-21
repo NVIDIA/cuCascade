@@ -239,9 +239,7 @@ class reservation_aware_resource_adaptor
   // Convenience allocate/deallocate with default alignment
   //===----------------------------------------------------------------------===//
 
-  void* allocate(cuda::stream_ref stream,
-                 std::size_t bytes,
-                 std::size_t alignment = alignof(std::max_align_t))
+  void* allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
   {
     return get().allocate(stream, bytes, alignment);
   }
@@ -249,7 +247,7 @@ class reservation_aware_resource_adaptor
   void deallocate(cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
-                  std::size_t alignment = alignof(std::max_align_t)) noexcept
+                  std::size_t alignment) noexcept
   {
     get().deallocate(stream, ptr, bytes, alignment);
   }

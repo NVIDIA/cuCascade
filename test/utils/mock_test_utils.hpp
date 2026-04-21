@@ -19,9 +19,9 @@
 
 #include "utils/test_memory_resources.hpp"
 
-#include <cucascade/cuda_utils.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>

@@ -76,6 +76,12 @@ class small_pinned_host_memory_resource {
 
   /**
    * @brief Allocate pinned memory.
+   *
+   * For @p bytes <= MAX_SLAB_SIZE: rounds up to the next slab boundary
+   * (512 / 1 KB / 2 KB / 4 KB / 8 KB) and returns a pointer from the matching
+   * free list, expanding the pool from upstream if the list is empty.
+   *
+   * For @p bytes > MAX_SLAB_SIZE: falls back to cudaMallocHost (pinned).
    */
   void* allocate(cuda::stream_ref stream,
                  std::size_t bytes,
@@ -83,6 +89,10 @@ class small_pinned_host_memory_resource {
 
   /**
    * @brief Return memory to the appropriate pool.
+   *
+   * Slabs (@p bytes <= MAX_SLAB_SIZE) are returned to the free list.
+   * Pinned allocations (@p bytes > MAX_SLAB_SIZE) are freed via cudaFreeHost.
+   * @p bytes must equal the value passed to the corresponding allocate.
    */
   void deallocate(cuda::stream_ref stream,
                   void* ptr,
@@ -91,7 +101,9 @@ class small_pinned_host_memory_resource {
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(cudaStream_t{nullptr}));
+    return ptr;
   }
 
   void deallocate_sync(void* ptr,
@@ -99,6 +111,7 @@ class small_pinned_host_memory_resource {
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
     deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(cudaStream_t{nullptr}));
   }
 
   bool operator==(small_pinned_host_memory_resource const& other) const noexcept;

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cuda_utils.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/notification_channel.hpp>
@@ -39,10 +39,6 @@ namespace memory {
 using impl_type                    = detail::reservation_aware_resource_adaptor_impl;
 using stream_ordered_tracker_state = impl_type::stream_ordered_tracker_state;
 using device_reserved_arena        = impl_type::device_reserved_arena;
-
-//===----------------------------------------------------------------------===//
-// Allocation tracker implementations (file-local)
-//===----------------------------------------------------------------------===//
 
 namespace {
 
@@ -129,10 +125,6 @@ struct ptds_allocation_tracker : public impl_type::allocation_tracker_iface {
 };
 
 }  // namespace
-
-//===----------------------------------------------------------------------===//
-// impl_type (the impl class) method definitions
-//===----------------------------------------------------------------------===//
 
 stream_ordered_tracker_state::stream_ordered_tracker_state(
   std::unique_ptr<device_reserved_arena> arena,
@@ -370,12 +362,11 @@ void* impl_type::allocate(cuda::stream_ref stream,
                           std::size_t bytes,
                           [[maybe_unused]] std::size_t alignment)
 {
-  rmm::cuda_stream_view stream_view(stream.get());
-  auto* reservation_state = _allocation_tracker->get_tracker_state(stream_view);
+  auto* reservation_state = _allocation_tracker->get_tracker_state(stream);
   if (reservation_state != nullptr) {
-    return do_allocate_managed(bytes, reservation_state, stream_view);
+    return do_allocate_managed(bytes, reservation_state, stream);
   } else {
-    return do_allocate_managed(bytes, stream_view);
+    return do_allocate_managed(bytes, stream);
   }
 }
 
@@ -452,10 +443,9 @@ void impl_type::deallocate(cuda::stream_ref stream,
                            std::size_t bytes,
                            [[maybe_unused]] std::size_t alignment) noexcept
 {
-  rmm::cuda_stream_view stream_view(stream.get());
   auto tracking_bytes           = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
   auto upstream_reclaimed_bytes = tracking_bytes;
-  auto* reservation_state       = _allocation_tracker->get_tracker_state(stream_view);
+  auto* reservation_state       = _allocation_tracker->get_tracker_state(stream);
   if (reservation_state != nullptr) {
     auto* reservation     = reservation_state->memory_reservation.get();
     auto reservation_size = static_cast<int64_t>(reservation->size());
@@ -473,7 +463,7 @@ void impl_type::deallocate(cuda::stream_ref stream,
 // Suppress false-positive null-dereference warnings from CCCL library code
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  _upstream.deallocate(stream_view, ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+  _upstream.deallocate(stream, ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
 #pragma GCC diagnostic pop
   _total_allocated_bytes.sub(upstream_reclaimed_bytes);
 }
@@ -537,10 +527,6 @@ const oom_handling_policy& impl_type::get_default_oom_handling_policy() const
 {
   return *_default_oom_policy;
 }
-
-//===----------------------------------------------------------------------===//
-// Wrapper (reservation_aware_resource_adaptor) forwarding methods
-//===----------------------------------------------------------------------===//
 
 reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
   memory_space_id space_id,

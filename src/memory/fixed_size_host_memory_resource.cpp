@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cuda_utils.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>

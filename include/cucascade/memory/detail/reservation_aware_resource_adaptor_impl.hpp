@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -190,18 +191,18 @@ class reservation_aware_resource_adaptor_impl {
   // CCCL resource concept methods
   //===----------------------------------------------------------------------===//
 
-  void* allocate(cuda::stream_ref stream,
-                 std::size_t bytes,
-                 std::size_t alignment = alignof(std::max_align_t));
+  void* allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment);
 
   void deallocate(cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
-                  std::size_t alignment = alignof(std::max_align_t)) noexcept;
+                  std::size_t alignment) noexcept;
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(cudaStream_t{nullptr}));
+    return ptr;
   }
 
   void deallocate_sync(void* ptr,
@@ -209,6 +210,7 @@ class reservation_aware_resource_adaptor_impl {
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
     deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(cudaStream_t{nullptr}));
   }
 
   bool operator==(reservation_aware_resource_adaptor_impl const& other) const noexcept;

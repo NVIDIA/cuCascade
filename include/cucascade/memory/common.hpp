@@ -67,8 +67,8 @@ using DeviceMemoryResourceFactoryFn =
 cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_resource(
   int device_id, std::size_t capacity);
 
-cuda::mr::any_resource<cuda::mr::device_accessible> make_default_host_memory_resource(
-  int device_id, std::size_t capacity);
+cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
+make_default_host_memory_resource(int device_id, std::size_t capacity);
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier);
 

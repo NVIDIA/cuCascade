@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cuda_utils.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <numa.h>

@@ -17,13 +17,13 @@
 
 #include "cudf/contiguous_split.hpp"
 
-#include <cucascade/cuda_utils.hpp>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/disk_file_format.hpp>
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/host_table.hpp>
