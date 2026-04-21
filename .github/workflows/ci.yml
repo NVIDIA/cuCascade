@@ -9,11 +9,20 @@ on:
 jobs:
   build:
     runs-on: linux-amd64-cpu4
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         cuda: [12, 13]
-        rapids: [nightly, stable]
+        experimental: [false]
+        rapids: [stable]
+        include:
+          - cuda: 12
+            experimental: true
+            rapids: nightly
+          - cuda: 13
+            experimental: true
+            rapids: nightly
 
     env:
       SCCACHE_GHA_ENABLED: true
@@ -44,10 +53,19 @@ jobs:
   test:
     needs: build
     runs-on: linux-amd64-gpu-t4-latest-1
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       matrix:
         cuda: [12, 13]
-        rapids: [nightly, stable]
+        experimental: [false]
+        rapids: [stable]
+        include:
+          - cuda: 12
+            experimental: true
+            rapids: nightly
+          - cuda: 13
+            experimental: true
+            rapids: nightly
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -73,7 +91,7 @@ jobs:
     strategy:
       matrix:
         cuda: [13]
-        rapids: [nightly]
+        rapids: [stable]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
