@@ -88,8 +88,8 @@ The `discover()` method accepts a `NetworkDeviceVerification` parameter that con
 
 | Level | Enum Value | Checks Performed |
 |-------|------------|------------------|
-| **Strictest (default)** | `EXISTS_ACTIVE_IP` | Device exists, at least one port is ACTIVE, and the associated net interface has an IP address |
-| **Medium** | `EXISTS_ACTIVE` | Device exists and at least one port is ACTIVE |
+| **Strictest (default)** | `EXISTS_ACTIVE_IP` | Device exists, uverbs device node accessible, at least one port is ACTIVE, and the associated net interface has an IP address |
+| **Medium** | `EXISTS_ACTIVE` | Device exists, uverbs device node accessible, and at least one port is ACTIVE |
 | **Most permissive** | `EXISTS` | Device exists in `/sys/class/infiniband/` |
 
 ```cpp
@@ -105,7 +105,7 @@ discovery.discover(NetworkDeviceVerification::EXISTS_ACTIVE);
 discovery.discover(NetworkDeviceVerification::EXISTS);
 ```
 
-Port state is read from `/sys/class/infiniband/<device>/ports/<N>/state`. IP address presence is checked via `getifaddrs()` on the net interface found under `/sys/class/infiniband/<device>/device/net/`.
+Port state is read from `/sys/class/infiniband/<device>/ports/<N>/state`. The uverbs device node check verifies that `/dev/infiniband/uverbsN` exists for the device (in containerized environments sysfs may be mounted from the host while the device nodes are not passed through). IP address presence is checked via `getifaddrs()` on the net interface found under `/sys/class/infiniband/<device>/device/net/`.
 
 ### GPU-to-NUMA Affinity
 

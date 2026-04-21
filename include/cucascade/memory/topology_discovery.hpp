@@ -69,9 +69,10 @@ struct system_topology_info {
  * in the discovered topology.
  */
 enum class NetworkDeviceVerification {
-  EXISTS_ACTIVE_IP = 0,  ///< Device exists, port is active, and has an IP address (default).
-  EXISTS_ACTIVE    = 1,  ///< Device exists and port is active.
-  EXISTS           = 2   ///< Device exists only (no port or IP checks).
+  EXISTS_ACTIVE_IP = 0,  ///< Device exists, port is active, uverbs accessible, and has an IP
+                         ///< address (default).
+  EXISTS_ACTIVE = 1,     ///< Device exists, port is active, and uverbs device node is accessible.
+  EXISTS        = 2      ///< Device exists only (no port, uverbs, or IP checks).
 };
 
 /**

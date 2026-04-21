@@ -489,6 +489,34 @@ bool has_active_port(std::string const& device_path)
 }
 
 /**
+ * @brief Check whether an InfiniBand device has an accessible userspace verbs device node.
+ *
+ * Looks up the uverbs device name from
+ * /sys/class/infiniband/<device>/device/infiniband_verbs/ and then checks whether
+ * the corresponding /dev/infiniband/<uverbs> character device exists.  In containerized
+ * environments the sysfs entries may be mounted from the host while the /dev nodes
+ * are not passed through, leaving libibverbs unable to open the device.
+ *
+ * @param device_path Sysfs path to the InfiniBand device directory.
+ * @return true if the uverbs device node exists under /dev/infiniband/.
+ */
+bool has_uverbs_device(std::string const& device_path)
+{
+  fs::path verbs_dir = fs::path(device_path) / "device" / "infiniband_verbs";
+  if (!fs::exists(verbs_dir)) { return false; }
+
+  try {
+    for (auto const& entry : fs::directory_iterator(verbs_dir)) {
+      if (!entry.is_directory()) { continue; }
+      fs::path dev_node = fs::path("/dev/infiniband") / entry.path().filename();
+      if (fs::exists(dev_node)) { return true; }
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+/**
  * @brief Check whether a network interface has at least one IP address (v4 or v6).
  *
  * Uses getifaddrs() to query all interface addresses and returns true as soon as
@@ -547,7 +575,8 @@ bool has_net_interface_with_ip(std::string const& device_path)
  * Scans /sys/class/infiniband and collects device name, NUMA node, and PCI bus ID.
  * Depending on @p verification, additional checks filter out unusable devices:
  *   - EXISTS: device must be present in /sys/class/infiniband.
- *   - EXISTS_ACTIVE: additionally, at least one port must be in the ACTIVE state.
+ *   - EXISTS_ACTIVE: additionally, at least one port must be in the ACTIVE state
+ *     and the uverbs device node must exist under /dev/infiniband/.
  *   - EXISTS_ACTIVE_IP: additionally, the net interface must have an IP address.
  * If the directory does not exist or an error occurs during iteration, returns an
  * empty vector (a warning is logged for iteration errors).
@@ -569,6 +598,7 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
 
       if (verification <= NetworkDeviceVerification::EXISTS_ACTIVE) {
         if (!has_active_port(entry.path().string())) { continue; }
+        if (!has_uverbs_device(entry.path().string())) { continue; }
       }
       if (verification <= NetworkDeviceVerification::EXISTS_ACTIVE_IP) {
         if (!has_net_interface_with_ip(entry.path().string())) { continue; }
