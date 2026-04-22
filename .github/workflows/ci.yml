@@ -13,7 +13,6 @@ jobs:
       fail-fast: false
       matrix:
         cuda: [12, 13]
-        rapids: [nightly, stable]
 
     env:
       SCCACHE_GHA_ENABLED: true
@@ -24,11 +23,11 @@ jobs:
       - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
         with:
           cache: false
-          environments: ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }}
+          environments: cuda-${{ matrix.cuda }}
 
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      - run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} build
+      - run: pixi run -e cuda-${{ matrix.cuda }} build
 
       - name: Package build artifacts
         run: tar -cf build-release.tar build/release/
@@ -36,7 +35,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: build-release-cuda-${{ matrix.cuda }}-${{ matrix.rapids }}
+          name: build-release-cuda-${{ matrix.cuda }}
           path: build-release.tar
           if-no-files-found: error
           retention-days: 1
@@ -47,7 +46,6 @@ jobs:
     strategy:
       matrix:
         cuda: [12, 13]
-        rapids: [nightly, stable]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -55,25 +53,21 @@ jobs:
       - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
         with:
           cache: false
-          environments: ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }}
+          environments: cuda-${{ matrix.cuda }}
 
       - name: Download build artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: build-release-cuda-${{ matrix.cuda }}-${{ matrix.rapids }}
+          name: build-release-cuda-${{ matrix.cuda }}
 
       - name: Extract build artifacts
         run: tar -xf build-release.tar
 
-      - run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} test
+      - run: pixi run -e cuda-${{ matrix.cuda }} test
 
   benchmark:
     needs: build
     runs-on: linux-amd64-gpu-t4-latest-1
-    strategy:
-      matrix:
-        cuda: [13]
-        rapids: [nightly]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -81,12 +75,12 @@ jobs:
       - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
         with:
           cache: false
-          environments: ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }}
+          environments: cuda-13
 
       - name: Download build artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: build-release-cuda-${{ matrix.cuda }}-${{ matrix.rapids }}
+          name: build-release-cuda-13
 
       - name: Extract build artifacts
         run: tar -xf build-release.tar
