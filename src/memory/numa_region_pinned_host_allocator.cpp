@@ -35,12 +35,16 @@ void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::s
 
   if (_numa_node == -1) {
     void* ptr{nullptr};
-    CUCASCADE_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault), bytes);
+    // Portable: DMA-accessible from every CUDA context so multi-GPU consumers
+    // (e.g. cudf::io::read_parquet running on a non-allocating device) can
+    // memcpy from this memory without cudaErrorInvalidValue under CUDA 13+.
+    CUCASCADE_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable), bytes);
     return ptr;
   } else {
     void* ptr = numa_alloc_onnode(bytes, _numa_node);
     if (ptr == nullptr) { throw rmm::bad_alloc(std::strerror(errno)); }
-    CUCASCADE_CUDA_TRY_ALLOC(cudaHostRegister(ptr, bytes, cudaHostRegisterMapped), bytes);
+    CUCASCADE_CUDA_TRY_ALLOC(
+      cudaHostRegister(ptr, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped), bytes);
     return ptr;
   }
 }
