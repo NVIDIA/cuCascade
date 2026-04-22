@@ -134,6 +134,16 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   batch_state get_state() const { return _state.load(std::memory_order_relaxed); }
 
+  /**
+   * @brief Get the number of active read_only_data_batch instances holding this batch.
+   *
+   * Atomic, lock-free. Counts concurrent shared-lock holders. Transitions to zero
+   * when the last read_only_data_batch is destroyed (or moved-from).
+   *
+   * @return The current reader count.
+   */
+  size_t get_read_only_count() const { return _read_only_count.load(std::memory_order_acquire); }
+
   // -- Static transition methods (D-13/D-14/D-15/D-17) --
 
   /**
@@ -247,16 +257,6 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @param data New data representation (takes ownership).
    */
   void set_data(std::unique_ptr<idata_representation> data);
-
-  /**
-   * @brief Get the number of active read_only_data_batch instances holding this batch.
-   *
-   * Atomic, lock-free. Counts concurrent shared-lock holders. Transitions to zero
-   * when the last read_only_data_batch is destroyed (or moved-from).
-   *
-   * @return The current reader count.
-   */
-  size_t get_read_only_count() const { return _read_only_count.load(std::memory_order_acquire); }
 
   // -- Members --
   const uint64_t _batch_id;                            ///< Immutable batch identifier

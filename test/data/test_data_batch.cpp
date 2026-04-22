@@ -32,7 +32,9 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -852,4 +854,206 @@ TEST_CASE("data_batch full cycle: idle -> ro -> mutable -> ro -> idle", "[data_b
 
   REQUIRE(idle->get_state() == batch_state::idle);
   REQUIRE(idle->get_batch_id() == 1);
+}
+
+// =============================================================================
+// RAII lifecycle tests: _read_only_count tracking and destructor state transitions
+// =============================================================================
+
+TEST_CASE("data_batch read_only_count tracks concurrent readers", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE(batch->get_read_only_count() == 0);
+
+  // Create first reader
+  auto ro1 = batch->to_read_only();
+  REQUIRE(batch->get_read_only_count() == 1);
+
+  // Create second reader
+  auto ro2 = batch->to_read_only();
+  REQUIRE(batch->get_read_only_count() == 2);
+
+  // Create third reader
+  auto ro3 = batch->to_read_only();
+  REQUIRE(batch->get_read_only_count() == 3);
+
+  // Drop one reader via to_idle
+  auto idle = data_batch::to_idle(std::move(ro1));
+  REQUIRE(batch->get_read_only_count() == 2);
+
+  // Drop remaining readers via destructor (scope exit)
+  {
+    auto temp = std::move(ro2);
+    // temp destructor fires at end of scope
+  }
+  REQUIRE(batch->get_read_only_count() == 1);
+
+  // Last reader — should transition to idle
+  {
+    auto temp = std::move(ro3);
+  }
+  REQUIRE(batch->get_read_only_count() == 0);
+  REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch destructor transitions state to idle for read_only", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(batch->get_state() == batch_state::read_only);
+    // ro destructor fires here
+  }
+  REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch destructor transitions state to idle for mutable", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  {
+    auto mut = batch->to_mutable();
+    REQUIRE(batch->get_state() == batch_state::mutable_locked);
+    // mut destructor fires here
+  }
+  REQUIRE(batch->get_state() == batch_state::idle);
+}
+
+TEST_CASE("data_batch concurrent lifecycle: readers then mutable then readers", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  // Track event ordering
+  std::vector<std::string> events;
+  std::mutex events_mutex;
+  auto log_event = [&](const std::string& event) {
+    std::lock_guard<std::mutex> guard(events_mutex);
+    events.push_back(event);
+  };
+
+  // Phase 1: Create initial read_only on main thread
+  auto ro_initial = batch->to_read_only();
+  REQUIRE(batch->get_read_only_count() == 1);
+
+  std::atomic<bool> thread1_readers_created{false};
+  std::atomic<bool> thread1_readers_released{false};
+  std::atomic<bool> thread2_mutable_acquired{false};
+  std::atomic<bool> thread2_mutable_released{false};
+
+  // Thread 1: create 2 more read_only, then release all 3, then create 2 more after mutable done
+  std::thread t1([&]() {
+    // Create 2 more readers
+    auto ro_t1_a = batch->to_read_only();
+    auto ro_t1_b = batch->to_read_only();
+    log_event("t1: 3 readers active");
+    REQUIRE(batch->get_read_only_count() == 3);
+    thread1_readers_created.store(true);
+
+    // Wait a bit to let thread 2 try to acquire mutable (it will block)
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Move the initial reader into this scope and release all 3
+    auto ro_main = std::move(ro_initial);
+    {
+      auto temp1 = std::move(ro_main);
+      auto temp2 = std::move(ro_t1_a);
+      auto temp3 = std::move(ro_t1_b);
+      // All 3 destructors fire here
+    }
+    log_event("t1: all readers released");
+    thread1_readers_released.store(true);
+    REQUIRE(batch->get_read_only_count() == 0);
+
+    // Wait for thread 2 to acquire and release mutable
+    while (!thread2_mutable_released.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    // Create 2 new readers after mutable is done
+    auto ro_new_a = batch->to_read_only();
+    auto ro_new_b = batch->to_read_only();
+    log_event("t1: 2 new readers after mutable");
+    REQUIRE(batch->get_read_only_count() == 2);
+    REQUIRE(ro_new_a.get_batch_id() == 1);
+    REQUIRE(ro_new_b.get_batch_id() == 1);
+    // Let them go out of scope — destructors clean up
+  });
+
+  // Thread 2: wait for readers to be created, then acquire mutable (blocks until readers release)
+  std::thread t2([&]() {
+    // Wait for thread 1 to create its readers
+    while (!thread1_readers_created.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    // This will block until all read_only locks are released
+    log_event("t2: requesting mutable");
+    auto mut = batch->to_mutable();
+    log_event("t2: mutable acquired");
+    thread2_mutable_acquired.store(true);
+
+    REQUIRE(batch->get_state() == batch_state::mutable_locked);
+    REQUIRE(batch->get_read_only_count() == 0);
+    REQUIRE(mut.get_batch_id() == 1);
+
+    // Hold mutable briefly
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // Release via destructor
+    {
+      auto temp = std::move(mut);
+    }
+    log_event("t2: mutable released");
+    thread2_mutable_released.store(true);
+    REQUIRE(batch->get_state() == batch_state::idle);
+  });
+
+  t1.join();
+  t2.join();
+
+  // Validate ordering: readers released before mutable acquired, mutable released before new readers
+  {
+    std::lock_guard<std::mutex> guard(events_mutex);
+    auto find_idx = [&](const std::string& prefix) -> size_t {
+      for (size_t i = 0; i < events.size(); ++i) {
+        if (events[i].find(prefix) != std::string::npos) return i;
+      }
+      return events.size();  // not found
+    };
+
+    size_t idx_readers_released = find_idx("t1: all readers released");
+    size_t idx_mutable_acquired = find_idx("t2: mutable acquired");
+    size_t idx_mutable_released = find_idx("t2: mutable released");
+    size_t idx_new_readers      = find_idx("t1: 2 new readers after mutable");
+
+    REQUIRE(idx_readers_released < idx_mutable_acquired);
+    REQUIRE(idx_mutable_acquired < idx_mutable_released);
+    REQUIRE(idx_mutable_released < idx_new_readers);
+  }
+
+  // Final state: batch should be idle after everything
+  REQUIRE(batch->get_state() == batch_state::idle);
+  REQUIRE(batch->get_read_only_count() == 0);
+}
+
+TEST_CASE("data_batch move does not change read_only_count", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  auto ro1 = batch->to_read_only();
+  REQUIRE(batch->get_read_only_count() == 1);
+
+  // Move should not change count — ownership transferred, not a new reader
+  auto ro2 = std::move(ro1);
+  REQUIRE(batch->get_read_only_count() == 1);
+
+  // ro1 is now in moved-from state — its destructor fires at end of scope harmlessly
+  // ro2 destructor fires here and decrements count
 }
