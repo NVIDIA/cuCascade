@@ -35,10 +35,14 @@ void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::s
 
   if (_numa_node == -1) {
     void* ptr{nullptr};
-    // Portable: DMA-accessible from every CUDA context so multi-GPU consumers
-    // (e.g. cudf::io::read_parquet running on a non-allocating device) can
-    // memcpy from this memory without cudaErrorInvalidValue under CUDA 13+.
-    CUCASCADE_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable), bytes);
+    // Portable + Mapped: Portable makes this memory DMA-accessible from every
+    // CUDA context; Mapped makes the device-side pointer usable so that
+    // cudaMemcpyBatchAsync (used by cudf's copy_pinned() under CUDA 13+) can
+    // resolve the source location when a non-allocating GPU consumes this
+    // memory. Without these flags, cudaMemcpyBatchAsync rejects the source
+    // with cudaErrorInvalidValue under num_gpus>1.
+    CUCASCADE_CUDA_TRY_ALLOC(
+      cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped), bytes);
     return ptr;
   } else {
     void* ptr = numa_alloc_onnode(bytes, _numa_node);

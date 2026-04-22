@@ -53,7 +53,8 @@ void* small_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_
   // here would cause cudaErrorIllegalAddress.
   if (bytes > MAX_SLAB_SIZE) {
     void* ptr = nullptr;
-    auto err  = ::cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable);
+    // Portable + Mapped — see numa_region_pinned_host_allocator.cpp comment.
+    auto err = ::cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
     if (err != cudaSuccess) { throw std::bad_alloc{}; }
     return ptr;
   }

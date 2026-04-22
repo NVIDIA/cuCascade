@@ -146,10 +146,13 @@ class pipeline_io_backend : public idisk_io_backend {
  public:
   explicit pipeline_io_backend(bool direct_io) : _direct_io(direct_io)
   {
-    // cudaHostAllocPortable so buffers are DMA-accessible from every CUDA context;
-    // needed when disk I/O on one device feeds GPU consumers on another device.
-    CUCASCADE_CUDA_TRY(cudaHostAlloc(&_buf[0], PIPELINE_BUF_SIZE, cudaHostAllocPortable));
-    CUCASCADE_CUDA_TRY(cudaHostAlloc(&_buf[1], PIPELINE_BUF_SIZE, cudaHostAllocPortable));
+    // Portable + Mapped — buffers are DMA-accessible from every CUDA context AND
+    // their device-side pointer is usable so cudaMemcpyBatchAsync on a non-
+    // allocating GPU can resolve the source location (required under CUDA 13+).
+    CUCASCADE_CUDA_TRY(
+      cudaHostAlloc(&_buf[0], PIPELINE_BUF_SIZE, cudaHostAllocPortable | cudaHostAllocMapped));
+    CUCASCADE_CUDA_TRY(
+      cudaHostAlloc(&_buf[1], PIPELINE_BUF_SIZE, cudaHostAllocPortable | cudaHostAllocMapped));
     CUCASCADE_CUDA_TRY(cudaStreamCreate(&_copy_stream));
     CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&_order_event, cudaEventDisableTiming));
   }
