@@ -62,7 +62,12 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier
     config.device_id       = static_cast<int>(device_id);
     config.memory_capacity = 1024 * 1024 * 1024;
     config.mr_factory_fn   = [](int, size_t) {
+#if CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
       return cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}};
+#else
+      return cucascade::memory::wrap_legacy_rmm_resource(
+        std::make_shared<rmm::mr::cuda_memory_resource>());
+#endif
     };
     return std::make_shared<memory::memory_space>(config);
   } else if (tier == memory::Tier::HOST) {

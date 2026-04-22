@@ -65,9 +65,15 @@ memory_space::memory_space(const gpu_memory_space_config& config)
     _allocator = config.mr_factory_fn(config.device_id, config.memory_capacity);
   } else {
     rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
+#if CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
     rmm::mr::cuda_async_memory_resource concrete_mr(config.memory_capacity);
     pool_handle = concrete_mr.pool_handle();
     _allocator  = cuda::mr::any_resource<cuda::mr::device_accessible>(std::move(concrete_mr));
+#else
+    auto concrete_mr = std::make_shared<rmm::mr::cuda_async_memory_resource>(config.memory_capacity);
+    pool_handle      = concrete_mr->pool_handle();
+    _allocator       = wrap_legacy_rmm_resource(std::move(concrete_mr));
+#endif
   }
 
   _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(

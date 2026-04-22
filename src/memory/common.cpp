@@ -30,7 +30,12 @@ cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_reso
   int device_id, size_t capacity)
 {
   rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{device_id});
+#if CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
   return {rmm::mr::cuda_async_memory_resource(capacity)};
+#else
+  return wrap_legacy_rmm_resource(
+    std::make_shared<rmm::mr::cuda_async_memory_resource>(capacity));
+#endif
 }
 
 cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>

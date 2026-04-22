@@ -38,17 +38,16 @@ activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" 
 channels = [{ channel = "rapidsai-nightly", priority = 1 }]
 dependencies = { "libcudf" = "26.06.*" }
 
-# TODO: re-enable stable once it works with the current changes
-# [feature.cudf-stable]
-# channels = [{ channel = "rapidsai", priority = 1 }]
-# dependencies = { "libcudf" = "26.04.*" }
+[feature.cudf-stable]
+channels = [{ channel = "rapidsai", priority = 1 }]
+dependencies = { "libcudf" = "26.04.*" }
 
 [environments]
 default = ["cuda-13", "cudf-nightly"]
 cuda-13-nightly = ["cuda-13", "cudf-nightly"]
 cuda-12-nightly = ["cuda-12", "cudf-nightly"]
-# cuda-13-stable = ["cuda-13", "cudf-stable"]
-# cuda-12-stable = ["cuda-12", "cudf-stable"]
+cuda-13-stable = ["cuda-13", "cudf-stable"]
+cuda-12-stable = ["cuda-12", "cudf-stable"]
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"

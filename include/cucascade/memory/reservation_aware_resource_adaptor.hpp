@@ -244,6 +244,13 @@ class reservation_aware_resource_adaptor
     return get().allocate(stream, bytes, alignment);
   }
 
+#if !CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
+  void* allocate(rmm::cuda_stream_view stream, std::size_t bytes, std::size_t alignment)
+  {
+    return allocate(cuda::stream_ref{stream}, bytes, alignment);
+  }
+#endif
+
   void deallocate(cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
@@ -251,6 +258,16 @@ class reservation_aware_resource_adaptor
   {
     get().deallocate(stream, ptr, bytes, alignment);
   }
+
+#if !CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
+  void deallocate(rmm::cuda_stream_view stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    deallocate(cuda::stream_ref{stream}, ptr, bytes, alignment);
+  }
+#endif
 };
 
 }  // namespace memory

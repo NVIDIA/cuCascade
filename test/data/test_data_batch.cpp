@@ -321,9 +321,11 @@ TEST_CASE("data_batch Thread-Safe Processing Count", "[data_batch]")
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([batch, &thread_handles, i, space_id]() {
       for (int j = 0; j < locks_per_thread; ++j) {
-        // Create task first so threads can lock for processing
-        REQUIRE(batch->try_to_create_task() == true);
-        auto r = batch->try_to_lock_for_processing(space_id);
+        // Task creation is global to the batch; use the blocking API so each
+        // thread eventually consumes one created task without relying on
+        // per-thread ownership of it.
+        batch->wait_to_create_task();
+        auto r = batch->wait_to_lock_for_processing(space_id);
         REQUIRE(r.success == true);
         thread_handles[i].push_back(std::move(r.handle));
       }

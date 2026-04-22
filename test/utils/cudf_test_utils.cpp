@@ -391,7 +391,7 @@ static void install_rmm_logging_resource_once()
     auto prev = rmm::mr::get_current_device_resource_ref();
     logging_resource =
       cuda::mr::any_resource<cuda::mr::device_accessible>{logging_device_resource{prev}};
-    rmm::mr::set_current_device_resource(*logging_resource);
+    rmm::mr::set_current_device_resource_ref(*logging_resource);
     installed = true;
     std::cout << "[rmm-log ] installed logging device resource adaptor" << std::endl << std::flush;
   }
