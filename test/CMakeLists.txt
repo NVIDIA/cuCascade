@@ -37,6 +37,7 @@ set(TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_topology_discovery.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_gpu_kernels.cu
     # Data tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_bandwidth_profiler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_batch.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_repository.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_repository_manager.cpp
