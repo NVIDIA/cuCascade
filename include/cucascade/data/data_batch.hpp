@@ -248,12 +248,23 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   void set_data(std::unique_ptr<idata_representation> data);
 
+  /**
+   * @brief Get the number of active read_only_data_batch instances holding this batch.
+   *
+   * Atomic, lock-free. Counts concurrent shared-lock holders. Transitions to zero
+   * when the last read_only_data_batch is destroyed (or moved-from).
+   *
+   * @return The current reader count.
+   */
+  size_t get_read_only_count() const { return _read_only_count.load(std::memory_order_acquire); }
+
   // -- Members --
   const uint64_t _batch_id;                            ///< Immutable batch identifier
   std::unique_ptr<idata_representation> _data;         ///< Owned data representation
   mutable std::shared_mutex _rw_mutex;                 ///< Reader-writer mutex
   std::atomic<size_t> _subscriber_count{0};            ///< Atomic subscriber interest count
   std::atomic<batch_state> _state{batch_state::idle};  ///< Observable lock state
+  std::atomic<size_t> _read_only_count{0};  ///< Count of active read_only_data_batch instances
 };
 
 /**
@@ -319,10 +330,11 @@ class read_only_data_batch {
     rmm::cuda_stream_view stream) const;
 
   // -- Move-only (D-12/ACC-05/ACC-06) --
-  read_only_data_batch(read_only_data_batch&&) noexcept            = default;
-  read_only_data_batch& operator=(read_only_data_batch&&) noexcept = default;
-  read_only_data_batch(const read_only_data_batch&)                = delete;
-  read_only_data_batch& operator=(const read_only_data_batch&)     = delete;
+  read_only_data_batch(read_only_data_batch&& other) noexcept;
+  read_only_data_batch& operator=(read_only_data_batch&& other) noexcept;
+  ~read_only_data_batch();
+  read_only_data_batch(const read_only_data_batch&)            = delete;
+  read_only_data_batch& operator=(const read_only_data_batch&) = delete;
 
  private:
   friend class data_batch;
@@ -430,10 +442,11 @@ class mutable_data_batch {
     rmm::cuda_stream_view stream) const;
 
   // -- Move-only (D-12/ACC-05/ACC-06) --
-  mutable_data_batch(mutable_data_batch&&) noexcept            = default;
-  mutable_data_batch& operator=(mutable_data_batch&&) noexcept = default;
-  mutable_data_batch(const mutable_data_batch&)                = delete;
-  mutable_data_batch& operator=(const mutable_data_batch&)     = delete;
+  mutable_data_batch(mutable_data_batch&& other) noexcept;
+  mutable_data_batch& operator=(mutable_data_batch&& other) noexcept;
+  ~mutable_data_batch();
+  mutable_data_batch(const mutable_data_batch&)            = delete;
+  mutable_data_batch& operator=(const mutable_data_batch&) = delete;
 
  private:
   friend class data_batch;

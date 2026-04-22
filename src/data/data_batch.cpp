@@ -66,16 +66,24 @@ void data_batch::set_data(std::unique_ptr<idata_representation> data) { _data = 
 
 std::shared_ptr<data_batch> data_batch::to_idle(read_only_data_batch&& accessor)
 {
+  // Ownership-transfer pattern: steal _batch so the accessor's destructor becomes a no-op
+  // (nullptr check in destructor skips all cleanup). We then manually perform the cleanup
+  // that the destructor would have done: decrement read_only_count, set state, unlock.
+  // The lock is explicitly unlocked here because the accessor's shared_lock will NOT
+  // call unlock in its destructor after we call unlock() explicitly -- shared_lock tracks
+  // ownership and will skip the unlock if the lock is already released.
   auto ptr = std::move(accessor._batch);
-  ptr->_state.store(batch_state::idle, std::memory_order_relaxed);
+  ptr->_read_only_count.fetch_sub(1, std::memory_order_acq_rel);
+  ptr->_state.store(batch_state::idle, std::memory_order_release);
   accessor._lock.unlock();
   return ptr;
 }
 
 std::shared_ptr<data_batch> data_batch::to_idle(mutable_data_batch&& accessor)
 {
+  // Same ownership-transfer pattern as the read_only overload above.
   auto ptr = std::move(accessor._batch);
-  ptr->_state.store(batch_state::idle, std::memory_order_relaxed);
+  ptr->_state.store(batch_state::idle, std::memory_order_release);
   accessor._lock.unlock();
   return ptr;
 }
@@ -86,7 +94,8 @@ read_only_data_batch data_batch::to_read_only()
 {
   auto self = shared_from_this();
   std::shared_lock<std::shared_mutex> lock(_rw_mutex);
-  _state.store(batch_state::read_only, std::memory_order_relaxed);
+  _state.store(batch_state::read_only, std::memory_order_release);
+  // The read_only_data_batch constructor increments _read_only_count.
   return read_only_data_batch(std::move(self), std::move(lock));
 }
 
@@ -94,7 +103,7 @@ mutable_data_batch data_batch::to_mutable()
 {
   auto self = shared_from_this();
   std::unique_lock<std::shared_mutex> lock(_rw_mutex);
-  _state.store(batch_state::mutable_locked, std::memory_order_relaxed);
+  _state.store(batch_state::mutable_locked, std::memory_order_release);
   return mutable_data_batch(std::move(self), std::move(lock));
 }
 
@@ -102,8 +111,9 @@ std::optional<read_only_data_batch> data_batch::try_to_read_only()
 {
   std::shared_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
-  _state.store(batch_state::read_only, std::memory_order_relaxed);
+  _state.store(batch_state::read_only, std::memory_order_release);
   auto self = shared_from_this();
+  // The read_only_data_batch constructor increments _read_only_count.
   return read_only_data_batch(std::move(self), std::move(lock));
 }
 
@@ -111,7 +121,7 @@ std::optional<mutable_data_batch> data_batch::try_to_mutable()
 {
   std::unique_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
-  _state.store(batch_state::mutable_locked, std::memory_order_relaxed);
+  _state.store(batch_state::mutable_locked, std::memory_order_release);
   auto self = shared_from_this();
   return mutable_data_batch(std::move(self), std::move(lock));
 }
@@ -121,9 +131,11 @@ std::optional<mutable_data_batch> data_batch::try_to_mutable()
 mutable_data_batch data_batch::readonly_to_mutable(read_only_data_batch&& accessor)
 {
   auto ptr = std::move(accessor._batch);
+  // Decrement _read_only_count: we're removing a reader before re-locking as mutable.
+  ptr->_read_only_count.fetch_sub(1, std::memory_order_acq_rel);
   accessor._lock.unlock();
   std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
-  ptr->_state.store(batch_state::mutable_locked, std::memory_order_relaxed);
+  ptr->_state.store(batch_state::mutable_locked, std::memory_order_release);
   return mutable_data_batch(std::move(ptr), std::move(lock));
 }
 
@@ -132,7 +144,8 @@ read_only_data_batch data_batch::mutable_to_readonly(mutable_data_batch&& access
   auto ptr = std::move(accessor._batch);
   accessor._lock.unlock();
   std::shared_lock<std::shared_mutex> lock(ptr->_rw_mutex);
-  ptr->_state.store(batch_state::read_only, std::memory_order_relaxed);
+  ptr->_state.store(batch_state::read_only, std::memory_order_release);
+  // The read_only_data_batch constructor increments _read_only_count.
   return read_only_data_batch(std::move(ptr), std::move(lock));
 }
 
@@ -142,6 +155,45 @@ read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> parent,
                                            std::shared_lock<std::shared_mutex> lock)
   : _batch(std::move(parent)), _lock(std::move(lock))
 {
+  _batch->_read_only_count.fetch_add(1, std::memory_order_acq_rel);
+}
+
+read_only_data_batch::read_only_data_batch(read_only_data_batch&& other) noexcept
+  : _batch(std::move(other._batch)), _lock(std::move(other._lock))
+{
+  // other._batch is now nullptr — other's destructor will be a no-op.
+  // The read_only_count does NOT change: ownership was transferred, not a new reader created.
+}
+
+read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& other) noexcept
+{
+  if (this != &other) {
+    // Release the current state (same logic as destructor)
+    if (_batch) {
+      auto prev = _batch->_read_only_count.fetch_sub(1, std::memory_order_acq_rel);
+      if (prev == 1) { _batch->_state.store(batch_state::idle, std::memory_order_release); }
+      // _lock will be replaced below; its destructor fires when the old _lock is overwritten,
+      // releasing the shared lock. We release _lock explicitly here so the sequence is:
+      // decrement count -> set state (if last) -> release lock.
+      _lock.unlock();
+    }
+    _batch = std::move(other._batch);
+    _lock  = std::move(other._lock);
+  }
+  return *this;
+}
+
+read_only_data_batch::~read_only_data_batch()
+{
+  if (_batch) {
+    // Decrement the reader count. If we were the last reader, transition to idle.
+    // NOTE: Do NOT call _lock.unlock() here — the _lock member destructor handles that.
+    // The destructor body runs before member destructors, so _batch is still valid here.
+    // After this function returns, _lock destructor fires first (declared after _batch,
+    // destroyed in reverse order), releasing the shared lock. Then _batch destructor fires.
+    auto prev = _batch->_read_only_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1) { _batch->_state.store(batch_state::idle, std::memory_order_release); }
+  }
 }
 
 std::shared_ptr<data_batch> read_only_data_batch::clone(uint64_t new_batch_id,
@@ -158,6 +210,35 @@ mutable_data_batch::mutable_data_batch(std::shared_ptr<data_batch> parent,
                                        std::unique_lock<std::shared_mutex> lock)
   : _batch(std::move(parent)), _lock(std::move(lock))
 {
+}
+
+mutable_data_batch::mutable_data_batch(mutable_data_batch&& other) noexcept
+  : _batch(std::move(other._batch)), _lock(std::move(other._lock))
+{
+  // other._batch is now nullptr — other's destructor will be a no-op.
+}
+
+mutable_data_batch& mutable_data_batch::operator=(mutable_data_batch&& other) noexcept
+{
+  if (this != &other) {
+    // Release the current state (same logic as destructor)
+    if (_batch) {
+      _batch->_state.store(batch_state::idle, std::memory_order_release);
+      // Release the exclusive lock explicitly before taking ownership of the new one.
+      _lock.unlock();
+    }
+    _batch = std::move(other._batch);
+    _lock  = std::move(other._lock);
+  }
+  return *this;
+}
+
+mutable_data_batch::~mutable_data_batch()
+{
+  if (_batch) {
+    // Transition state to idle. The _lock member destructor handles releasing the exclusive lock.
+    _batch->_state.store(batch_state::idle, std::memory_order_release);
+  }
 }
 
 std::shared_ptr<data_batch> mutable_data_batch::clone(uint64_t new_batch_id,
