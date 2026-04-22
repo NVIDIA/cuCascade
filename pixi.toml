@@ -33,22 +33,15 @@ system-requirements = { cuda = "12.9" }
 dependencies = { "cuda-version" = "12.9.*" }
 activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" } }
 
-# cuDF (nightly channel, default)
-[feature.cudf-nightly]
-channels = [{ channel = "rapidsai-nightly", priority = 1 }]
-dependencies = { "libcudf" = "26.06.*" }
-
-# cuDF (stable release channel)
-[feature.cudf-stable]
+# cuDF 26.04 (stable release)
+[feature.cudf-26-04]
 channels = [{ channel = "rapidsai", priority = 1 }]
 dependencies = { "libcudf" = "26.04.*" }
 
 [environments]
-default = ["cuda-13", "cudf-nightly"]
-cuda-13-nightly = ["cuda-13", "cudf-nightly"]
-cuda-12-nightly = ["cuda-12", "cudf-nightly"]
-cuda-13-stable = ["cuda-13", "cudf-stable"]
-cuda-12-stable = ["cuda-12", "cudf-stable"]
+default = ["cuda-13", "cudf-26-04"]
+cuda-13 = ["cuda-13", "cudf-26-04"]
+cuda-12 = ["cuda-12", "cudf-26-04"]
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"
