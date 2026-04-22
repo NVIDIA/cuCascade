@@ -21,7 +21,6 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 
 #include <numa.h>
 
@@ -209,7 +208,7 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
       (info.space_id == info.hw_id)
         ? _gpu_mr_fn
         : [current_mr_fn = _gpu_mr_fn, hw_id = info.hw_id](
-            int, size_t capacity) -> std::unique_ptr<rmm::mr::device_memory_resource> {
+            int, size_t capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
       return current_mr_fn(hw_id, capacity);
     };
     config.reservation_limit_fraction = _gpu_reservation.get_fraction(info.gpu_capacity);
@@ -232,7 +231,7 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
       (info.space_id == info.numa_id)
         ? _cpu_mr_fn
         : [current_mr_fn = _cpu_mr_fn, numa_id = info.numa_id](
-            int, size_t capacity) -> std::unique_ptr<rmm::mr::device_memory_resource> {
+            int, size_t capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
       return current_mr_fn(numa_id, capacity);
     };
     config.reservation_limit_fraction = _cpu_reservation.get_fraction(per_host_capacity);

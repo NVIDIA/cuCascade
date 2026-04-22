@@ -26,17 +26,17 @@ namespace cucascade {
 
 namespace memory {
 
-std::unique_ptr<rmm::mr::device_memory_resource> make_default_gpu_memory_resource(int device_id,
-                                                                                  size_t capacity)
+cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_resource(
+  int device_id, size_t capacity)
 {
   rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{device_id});
-  return std::make_unique<rmm::mr::cuda_async_memory_resource>(capacity);
+  return {rmm::mr::cuda_async_memory_resource(capacity)};
 }
 
-std::unique_ptr<rmm::mr::device_memory_resource> make_default_host_memory_resource(
-  int numa_node_id, [[maybe_unused]] size_t capacity)
+cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
+make_default_host_memory_resource(int numa_node_id, [[maybe_unused]] size_t capacity)
 {
-  return std::make_unique<cucascade::memory::numa_region_pinned_host_memory_resource>(numa_node_id);
+  return {cucascade::memory::numa_region_pinned_host_memory_resource(numa_node_id)};
 }
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)
@@ -46,7 +46,9 @@ DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)
   } else if (tier == Tier::HOST) {
     return make_default_host_memory_resource;
   } else {
-    return [](int, size_t) { return std::make_unique<null_device_memory_resource>(); };
+    return [](int, size_t) {
+      return cuda::mr::any_resource<cuda::mr::device_accessible>{null_device_memory_resource{}};
+    };
   }
 }
 

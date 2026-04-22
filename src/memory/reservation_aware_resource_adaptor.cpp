@@ -15,17 +15,16 @@
  * limitations under the License.
  */
 
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/notification_channel.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
-#include <cucascade/cuda_utils.hpp>
-
-#include <cuda_runtime_api.h>
-
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <atomic>
 #include <exception>
@@ -37,16 +36,13 @@
 namespace cucascade {
 namespace memory {
 
-using stream_ordered_tracker_state =
-  reservation_aware_resource_adaptor::stream_ordered_tracker_state;
-
-using device_reserved_arena = reservation_aware_resource_adaptor::device_reserved_arena;
+using impl_type                    = detail::reservation_aware_resource_adaptor_impl;
+using stream_ordered_tracker_state = impl_type::stream_ordered_tracker_state;
+using device_reserved_arena        = impl_type::device_reserved_arena;
 
 namespace {
 
-
-struct stream_ordered_allocation_tracker
-  : public reservation_aware_resource_adaptor::allocation_tracker_iface {
+struct stream_ordered_allocation_tracker : public impl_type::allocation_tracker_iface {
   mutable std::mutex mutex;
   std::unordered_map<cudaStream_t, std::unique_ptr<stream_ordered_tracker_state>> stream_stats_map;
 
@@ -92,8 +88,7 @@ struct stream_ordered_allocation_tracker
   }
 };
 
-struct ptds_allocation_tracker
-  : public reservation_aware_resource_adaptor::allocation_tracker_iface {
+struct ptds_allocation_tracker : public impl_type::allocation_tracker_iface {
   static inline thread_local std::unique_ptr<stream_ordered_tracker_state> thread_reservation_state;
 
   ptds_allocation_tracker() = default;
@@ -141,11 +136,8 @@ stream_ordered_tracker_state::stream_ordered_tracker_state(
 {
 }
 
-std::size_t reservation_aware_resource_adaptor::stream_ordered_tracker_state::
-  check_reservation_and_handle_overflow(
-    [[maybe_unused]] reservation_aware_resource_adaptor& adaptor,
-    std::size_t allocation_size,
-    rmm::cuda_stream_view stream)
+std::size_t impl_type::stream_ordered_tracker_state::check_reservation_and_handle_overflow(
+  [[maybe_unused]] impl_type& adaptor, std::size_t allocation_size, rmm::cuda_stream_view stream)
 {
   int64_t stream_tracking_size       = static_cast<int64_t>(allocation_size);
   std::size_t upstream_tracking_size = allocation_size;
@@ -174,7 +166,7 @@ std::size_t reservation_aware_resource_adaptor::stream_ordered_tracker_state::
   return upstream_tracking_size;
 }
 
-reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
+impl_type::reservation_aware_resource_adaptor_impl(
   memory_space_id space_id,
   rmm::device_async_resource_ref upstream,
   std::size_t capacity,
@@ -202,7 +194,7 @@ reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
 {
 }
 
-reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
+impl_type::reservation_aware_resource_adaptor_impl(
   memory_space_id space_id,
   rmm::device_async_resource_ref upstream,
   std::size_t memory_limit,
@@ -231,20 +223,18 @@ reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
 {
 }
 
-rmm::device_async_resource_ref reservation_aware_resource_adaptor::get_upstream_resource()
-  const noexcept
+rmm::device_async_resource_ref impl_type::get_upstream_resource() const noexcept
 {
   return _upstream;
 }
 
-std::size_t reservation_aware_resource_adaptor::get_available_memory() const noexcept
+std::size_t impl_type::get_available_memory() const noexcept
 {
   auto current_bytes = _total_allocated_bytes.load();
   return _capacity > current_bytes ? _capacity - current_bytes : 0;
 }
 
-std::size_t reservation_aware_resource_adaptor::get_available_memory(
-  rmm::cuda_stream_view stream) const noexcept
+std::size_t impl_type::get_available_memory(rmm::cuda_stream_view stream) const noexcept
 {
   auto upstream_available_memory = get_available_memory();
   if (auto* state = _allocation_tracker->get_tracker_state(stream); state) {
@@ -253,8 +243,7 @@ std::size_t reservation_aware_resource_adaptor::get_available_memory(
   return upstream_available_memory;
 }
 
-std::size_t reservation_aware_resource_adaptor::get_available_memory_print(
-  rmm::cuda_stream_view stream) const noexcept
+std::size_t impl_type::get_available_memory_print(rmm::cuda_stream_view stream) const noexcept
 {
   auto upstream_available_memory = get_available_memory();
   if (auto* state = _allocation_tracker->get_tracker_state(stream); state) {
@@ -263,8 +252,7 @@ std::size_t reservation_aware_resource_adaptor::get_available_memory_print(
   return upstream_available_memory;
 }
 
-std::size_t reservation_aware_resource_adaptor::get_allocated_bytes(
-  rmm::cuda_stream_view stream) const
+std::size_t impl_type::get_allocated_bytes(rmm::cuda_stream_view stream) const
 {
   const auto* stats = _allocation_tracker->get_tracker_state(stream);
   return stats ? static_cast<std::size_t>(
@@ -272,8 +260,7 @@ std::size_t reservation_aware_resource_adaptor::get_allocated_bytes(
                : 0;
 }
 
-std::size_t reservation_aware_resource_adaptor::get_peak_allocated_bytes(
-  rmm::cuda_stream_view stream) const
+std::size_t impl_type::get_peak_allocated_bytes(rmm::cuda_stream_view stream) const
 {
   const auto* stats = _allocation_tracker->get_tracker_state(stream);
   return stats ? static_cast<std::size_t>(
@@ -281,33 +268,27 @@ std::size_t reservation_aware_resource_adaptor::get_peak_allocated_bytes(
                : 0;
 }
 
-std::size_t reservation_aware_resource_adaptor::get_total_allocated_bytes() const
-{
-  return _total_allocated_bytes.load();
-}
+std::size_t impl_type::get_total_allocated_bytes() const { return _total_allocated_bytes.load(); }
 
-std::size_t reservation_aware_resource_adaptor::get_peak_total_allocated_bytes() const
+std::size_t impl_type::get_peak_total_allocated_bytes() const
 {
   return _peak_total_allocated_bytes.peak();
 }
 
-void reservation_aware_resource_adaptor::reset_peak_allocated_bytes(rmm::cuda_stream_view stream)
+void impl_type::reset_peak_allocated_bytes(rmm::cuda_stream_view stream)
 {
   auto* stats = _allocation_tracker->get_tracker_state(stream);
   if (stats) { stats->memory_reservation->peak_allocated_bytes.reset(0); }
 }
 
-std::size_t reservation_aware_resource_adaptor::get_total_reserved_bytes() const
-{
-  return _total_reserved_bytes.load();
-}
+std::size_t impl_type::get_total_reserved_bytes() const { return _total_reserved_bytes.load(); }
 
-bool reservation_aware_resource_adaptor::is_stream_tracked(rmm::cuda_stream_view stream) const
+bool impl_type::is_stream_tracked(rmm::cuda_stream_view stream) const
 {
   return _allocation_tracker->get_tracker_state(stream) != nullptr;
 }
 
-bool reservation_aware_resource_adaptor::attach_reservation_to_tracker(
+bool impl_type::attach_reservation_to_tracker(
   rmm::cuda_stream_view stream,
   std::unique_ptr<reservation> reserved_bytes,
   std::unique_ptr<reservation_limit_policy> stream_reservation_policy,
@@ -331,13 +312,13 @@ bool reservation_aware_resource_adaptor::attach_reservation_to_tracker(
 
   return true;
 }
-void reservation_aware_resource_adaptor::reset_stream_reservation(rmm::cuda_stream_view stream)
+void impl_type::reset_stream_reservation(rmm::cuda_stream_view stream)
 {
   _allocation_tracker->reset_tracker_state(stream);
 }
 
-std::unique_ptr<reserved_arena> reservation_aware_resource_adaptor::reserve(
-  std::size_t bytes, std::unique_ptr<event_notifier> release_notifer)
+std::unique_ptr<reserved_arena> impl_type::reserve(std::size_t bytes,
+                                                   std::unique_ptr<event_notifier> release_notifer)
 {
   if (do_reserve(bytes, _memory_limit)) {
     _number_of_allocations.fetch_add(1);
@@ -346,7 +327,7 @@ std::unique_ptr<reserved_arena> reservation_aware_resource_adaptor::reserve(
   return nullptr;
 }
 
-std::unique_ptr<reserved_arena> reservation_aware_resource_adaptor::reserve_upto(
+std::unique_ptr<reserved_arena> impl_type::reserve_upto(
   std::size_t bytes, std::unique_ptr<event_notifier> release_notifer)
 {
   auto reserved_size = do_reserve_upto(bytes, _memory_limit);
@@ -354,8 +335,7 @@ std::unique_ptr<reserved_arena> reservation_aware_resource_adaptor::reserve_upto
   return std::make_unique<device_reserved_arena>(*this, reserved_size, std::move(release_notifer));
 }
 
-bool reservation_aware_resource_adaptor::grow_reservation_by(device_reserved_arena& arena,
-                                                             std::size_t bytes)
+bool impl_type::grow_reservation_by(device_reserved_arena& arena, std::size_t bytes)
 {
   if (do_reserve(bytes, _memory_limit)) {
     arena._size += static_cast<int64_t>(bytes);
@@ -364,7 +344,7 @@ bool reservation_aware_resource_adaptor::grow_reservation_by(device_reserved_are
   return false;
 }
 
-void reservation_aware_resource_adaptor::shrink_reservation_to_fit(device_reserved_arena& arena)
+void impl_type::shrink_reservation_to_fit(device_reserved_arena& arena)
 {
   auto current_bytes = std::max(int64_t{0}, arena.allocated_bytes.load());
   if (current_bytes < arena.size()) {
@@ -373,13 +353,14 @@ void reservation_aware_resource_adaptor::shrink_reservation_to_fit(device_reserv
   }
 }
 
-std::size_t reservation_aware_resource_adaptor::get_active_reservation_count() const noexcept
+std::size_t impl_type::get_active_reservation_count() const noexcept
 {
   return _number_of_allocations.load();
 }
 
-void* reservation_aware_resource_adaptor::do_allocate(std::size_t bytes,
-                                                      rmm::cuda_stream_view stream)
+void* impl_type::allocate(cuda::stream_ref stream,
+                          std::size_t bytes,
+                          [[maybe_unused]] std::size_t alignment)
 {
   auto* reservation_state = _allocation_tracker->get_tracker_state(stream);
   if (reservation_state != nullptr) {
@@ -389,28 +370,26 @@ void* reservation_aware_resource_adaptor::do_allocate(std::size_t bytes,
   }
 }
 
-void* reservation_aware_resource_adaptor::do_allocate_managed(std::size_t bytes,
-                                                              rmm::cuda_stream_view stream)
+void* impl_type::do_allocate_managed(std::size_t bytes, rmm::cuda_stream_view stream)
 {
   auto tracking_size = rmm::align_up(bytes, 256);
   try {
     return do_allocate_unmanaged(bytes, tracking_size, stream);
   } catch (...) {
-    return _default_oom_policy->handle_oom(
-      bytes,
-      stream,
-      std::current_exception(),
-      std::bind(&reservation_aware_resource_adaptor::do_allocate_unmanaged,
-                this,
-                std::placeholders::_1,
-                tracking_size,
-                std::placeholders::_2));
+    return _default_oom_policy->handle_oom(bytes,
+                                           stream,
+                                           std::current_exception(),
+                                           std::bind(&impl_type::do_allocate_unmanaged,
+                                                     this,
+                                                     std::placeholders::_1,
+                                                     tracking_size,
+                                                     std::placeholders::_2));
   }
 }
 
-void* reservation_aware_resource_adaptor::do_allocate_managed(std::size_t bytes,
-                                                              stream_ordered_tracker_state* state,
-                                                              rmm::cuda_stream_view stream)
+void* impl_type::do_allocate_managed(std::size_t bytes,
+                                     stream_ordered_tracker_state* state,
+                                     rmm::cuda_stream_view stream)
 {
   auto padded_bytes  = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
   auto tracking_size = state->check_reservation_and_handle_overflow(*this, padded_bytes, stream);
@@ -418,15 +397,14 @@ void* reservation_aware_resource_adaptor::do_allocate_managed(std::size_t bytes,
     return do_allocate_unmanaged(bytes, tracking_size, stream);
   } catch (...) {
     try {
-      return state->oom_policy->handle_oom(
-        bytes,
-        stream,
-        std::current_exception(),
-        std::bind(&reservation_aware_resource_adaptor::do_allocate_unmanaged,
-                  this,
-                  std::placeholders::_1,
-                  tracking_size,
-                  std::placeholders::_2));
+      return state->oom_policy->handle_oom(bytes,
+                                           stream,
+                                           std::current_exception(),
+                                           std::bind(&impl_type::do_allocate_unmanaged,
+                                                     this,
+                                                     std::placeholders::_1,
+                                                     tracking_size,
+                                                     std::placeholders::_2));
     } catch (...) {
       state->memory_reservation->allocated_bytes.sub(static_cast<int64_t>(padded_bytes));
       throw;
@@ -434,19 +412,22 @@ void* reservation_aware_resource_adaptor::do_allocate_managed(std::size_t bytes,
   }
 }
 
-void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allocation_bytes,
-                                                                std::size_t tracking_bytes,
-                                                                rmm::cuda_stream_view stream)
+void* impl_type::do_allocate_unmanaged(std::size_t allocation_bytes,
+                                       std::size_t tracking_bytes,
+                                       rmm::cuda_stream_view stream)
 {
   auto [success, post_allocation_size] = _total_allocated_bytes.try_add(tracking_bytes, _capacity);
   if (success) {
     _peak_total_allocated_bytes.update_peak(post_allocation_size);
     try {
-      return _upstream.allocate(stream, allocation_bytes);
+      return _upstream.allocate(stream, allocation_bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
     } catch (std::exception& e) {
       _total_allocated_bytes.sub(tracking_bytes);
-      throw cucascade_out_of_memory(
-        e.what(), MemoryError::ALLOCATION_FAILED, allocation_bytes, post_allocation_size, _pool_handle);
+      throw cucascade_out_of_memory(e.what(),
+                                    MemoryError::ALLOCATION_FAILED,
+                                    allocation_bytes,
+                                    post_allocation_size,
+                                    _pool_handle);
     }
   } else {
     throw cucascade_out_of_memory("not enough capacity to allocate memory",
@@ -457,9 +438,10 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
   }
 }
 
-void reservation_aware_resource_adaptor::do_deallocate(void* ptr,
-                                                       std::size_t bytes,
-                                                       rmm::cuda_stream_view stream) noexcept
+void impl_type::deallocate(cuda::stream_ref stream,
+                           void* ptr,
+                           std::size_t bytes,
+                           [[maybe_unused]] std::size_t alignment) noexcept
 {
   auto tracking_bytes           = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
   auto upstream_reclaimed_bytes = tracking_bytes;
@@ -481,26 +463,21 @@ void reservation_aware_resource_adaptor::do_deallocate(void* ptr,
 // Suppress false-positive null-dereference warnings from CCCL library code
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  _upstream.deallocate(stream, ptr, bytes);
+  _upstream.deallocate(stream, ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
 #pragma GCC diagnostic pop
   _total_allocated_bytes.sub(upstream_reclaimed_bytes);
 }
 
-bool reservation_aware_resource_adaptor::do_is_equal(
-  const rmm::mr::device_memory_resource& other) const noexcept
+bool impl_type::operator==(impl_type const& other) const noexcept
 {
-  // Check if it's the same type
-  const auto* other_adaptor = dynamic_cast<const reservation_aware_resource_adaptor*>(&other);
-  if (other_adaptor == nullptr) { return false; }
-
 // Suppress false-positive null-dereference warnings from CCCL library code
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  return _upstream == other_adaptor->get_upstream_resource();
+  return _upstream == other.get_upstream_resource();
 #pragma GCC diagnostic pop
 }
 
-bool reservation_aware_resource_adaptor::do_reserve(std::size_t size_bytes, std::size_t limit_bytes)
+bool impl_type::do_reserve(std::size_t size_bytes, std::size_t limit_bytes)
 {
   auto [success, post_increase_bytes] = _total_allocated_bytes.try_add(size_bytes, limit_bytes);
   if (success) {
@@ -510,8 +487,7 @@ bool reservation_aware_resource_adaptor::do_reserve(std::size_t size_bytes, std:
   return success;
 }
 
-std::size_t reservation_aware_resource_adaptor::do_reserve_upto(std::size_t size_bytes,
-                                                                std::size_t limit_bytes)
+std::size_t impl_type::do_reserve_upto(std::size_t size_bytes, std::size_t limit_bytes)
 {
   auto post_increase_bytes = _total_allocated_bytes.add_bounded(size_bytes, limit_bytes);
   if (post_increase_bytes > 0) {
@@ -521,8 +497,7 @@ std::size_t reservation_aware_resource_adaptor::do_reserve_upto(std::size_t size
   return size_bytes;
 }
 
-void reservation_aware_resource_adaptor::do_release_reservation(
-  device_reserved_arena* arena) noexcept
+void impl_type::do_release_reservation(device_reserved_arena* arena) noexcept
 {
   if (!arena) return;
 
@@ -536,6 +511,171 @@ void reservation_aware_resource_adaptor::do_release_reservation(
   _number_of_allocations.fetch_sub(1);
   _total_reserved_bytes.fetch_sub(static_cast<std::size_t>(std::max(int64_t{0}, arena_size)));
   _total_allocated_bytes.sub(released_bytes);
+}
+
+void impl_type::set_default_policy(std::unique_ptr<reservation_limit_policy> policy)
+{
+  _default_reservation_policy = std::move(policy);
+}
+
+const reservation_limit_policy& impl_type::get_default_reservation_policy() const
+{
+  return *_default_reservation_policy;
+}
+
+const oom_handling_policy& impl_type::get_default_oom_handling_policy() const
+{
+  return *_default_oom_policy;
+}
+
+reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
+  memory_space_id space_id,
+  rmm::device_async_resource_ref upstream,
+  std::size_t capacity,
+  std::unique_ptr<reservation_limit_policy> stream_reservation_policy,
+  std::unique_ptr<oom_handling_policy> default_oom_policy,
+  AllocationTrackingScope tracking_scope,
+  cudaMemPool_t pool_handle)
+  : shared_base(cuda::mr::make_shared_resource<impl_type>(space_id,
+                                                          std::move(upstream),
+                                                          capacity,
+                                                          std::move(stream_reservation_policy),
+                                                          std::move(default_oom_policy),
+                                                          tracking_scope,
+                                                          pool_handle))
+{
+}
+
+reservation_aware_resource_adaptor::reservation_aware_resource_adaptor(
+  memory_space_id space_id,
+  rmm::device_async_resource_ref upstream,
+  std::size_t memory_limit,
+  std::size_t capacity,
+  std::unique_ptr<reservation_limit_policy> stream_reservation_policy,
+  std::unique_ptr<oom_handling_policy> default_oom_policy,
+  AllocationTrackingScope tracking_scope,
+  cudaMemPool_t pool_handle)
+  : shared_base(cuda::mr::make_shared_resource<impl_type>(space_id,
+                                                          std::move(upstream),
+                                                          memory_limit,
+                                                          capacity,
+                                                          std::move(stream_reservation_policy),
+                                                          std::move(default_oom_policy),
+                                                          tracking_scope,
+                                                          pool_handle))
+{
+}
+
+rmm::device_async_resource_ref reservation_aware_resource_adaptor::get_upstream_resource()
+  const noexcept
+{
+  return get().get_upstream_resource();
+}
+
+std::size_t reservation_aware_resource_adaptor::get_available_memory() const noexcept
+{
+  return get().get_available_memory();
+}
+
+std::size_t reservation_aware_resource_adaptor::get_available_memory(
+  rmm::cuda_stream_view stream) const noexcept
+{
+  return get().get_available_memory(stream);
+}
+
+std::size_t reservation_aware_resource_adaptor::get_available_memory_print(
+  rmm::cuda_stream_view stream) const noexcept
+{
+  return get().get_available_memory_print(stream);
+}
+
+std::size_t reservation_aware_resource_adaptor::get_allocated_bytes(
+  rmm::cuda_stream_view stream) const
+{
+  return get().get_allocated_bytes(stream);
+}
+
+std::size_t reservation_aware_resource_adaptor::get_peak_allocated_bytes(
+  rmm::cuda_stream_view stream) const
+{
+  return get().get_peak_allocated_bytes(stream);
+}
+
+std::size_t reservation_aware_resource_adaptor::get_total_allocated_bytes() const
+{
+  return get().get_total_allocated_bytes();
+}
+
+std::size_t reservation_aware_resource_adaptor::get_peak_total_allocated_bytes() const
+{
+  return get().get_peak_total_allocated_bytes();
+}
+
+void reservation_aware_resource_adaptor::reset_peak_allocated_bytes(rmm::cuda_stream_view stream)
+{
+  get().reset_peak_allocated_bytes(stream);
+}
+
+std::size_t reservation_aware_resource_adaptor::get_total_reserved_bytes() const
+{
+  return get().get_total_reserved_bytes();
+}
+
+bool reservation_aware_resource_adaptor::is_stream_tracked(rmm::cuda_stream_view stream) const
+{
+  return get().is_stream_tracked(stream);
+}
+
+std::unique_ptr<reserved_arena> reservation_aware_resource_adaptor::reserve(
+  std::size_t bytes, std::unique_ptr<event_notifier> release_notifer)
+{
+  return get().reserve(bytes, std::move(release_notifer));
+}
+
+std::unique_ptr<reserved_arena> reservation_aware_resource_adaptor::reserve_upto(
+  std::size_t bytes, std::unique_ptr<event_notifier> release_notifer)
+{
+  return get().reserve_upto(bytes, std::move(release_notifer));
+}
+
+std::size_t reservation_aware_resource_adaptor::get_active_reservation_count() const noexcept
+{
+  return get().get_active_reservation_count();
+}
+
+bool reservation_aware_resource_adaptor::attach_reservation_to_tracker(
+  rmm::cuda_stream_view stream,
+  std::unique_ptr<reservation> reserved_bytes,
+  std::unique_ptr<reservation_limit_policy> stream_reservation_policy,
+  std::unique_ptr<oom_handling_policy> stream_oom_policy)
+{
+  return get().attach_reservation_to_tracker(stream,
+                                             std::move(reserved_bytes),
+                                             std::move(stream_reservation_policy),
+                                             std::move(stream_oom_policy));
+}
+
+void reservation_aware_resource_adaptor::reset_stream_reservation(rmm::cuda_stream_view stream)
+{
+  get().reset_stream_reservation(stream);
+}
+
+void reservation_aware_resource_adaptor::set_default_policy(
+  std::unique_ptr<reservation_limit_policy> policy)
+{
+  get().set_default_policy(std::move(policy));
+}
+
+const reservation_limit_policy& reservation_aware_resource_adaptor::get_default_reservation_policy()
+  const
+{
+  return get().get_default_reservation_policy();
+}
+
+const oom_handling_policy& reservation_aware_resource_adaptor::get_default_oom_handling_policy()
+  const
+{
+  return get().get_default_oom_handling_policy();
 }
 
 }  // namespace memory

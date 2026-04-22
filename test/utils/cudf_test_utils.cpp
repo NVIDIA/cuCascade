@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cuda_utils.hpp>
+#include <cucascade/error.hpp>
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/contiguous_split.hpp>
@@ -27,7 +27,10 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch.hpp>
@@ -37,6 +40,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -328,51 +332,66 @@ void expect_cudf_tables_equal_on_stream(const cudf::table& left,
 }
 
 // Simple logging adaptor to print all RMM device allocations/frees with pointers/sizes/stream/tid
-class logging_device_resource : public rmm::mr::device_memory_resource {
+class logging_device_resource {
  public:
-  explicit logging_device_resource(rmm::mr::device_memory_resource* upstream) : _upstream(upstream)
-  {
-  }
+  explicit logging_device_resource(rmm::device_async_resource_ref upstream) : _upstream(upstream) {}
 
-  ~logging_device_resource() override = default;
+  ~logging_device_resource() = default;
 
- private:
-  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
+  void* allocate(cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t))
   {
-    void* ptr = _upstream->allocate(stream, bytes);
+    void* ptr = _upstream.allocate(stream, bytes, alignment);
     std::ostringstream oss;
-    oss << "[rmm-alloc] ptr=" << ptr << " size=" << bytes << " stream=" << stream.value()
+    oss << "[rmm-alloc] ptr=" << ptr << " size=" << bytes << " stream=" << stream.get()
         << " tid=" << std::this_thread::get_id();
     std::cout << oss.str() << std::endl << std::flush;
     return ptr;
   }
 
-  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override
+  void deallocate(cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
     std::ostringstream oss;
-    oss << "[rmm-free ] ptr=" << ptr << " size=" << bytes << " stream=" << stream.value()
+    oss << "[rmm-free ] ptr=" << ptr << " size=" << bytes << " stream=" << stream.get()
         << " tid=" << std::this_thread::get_id();
     std::cout << oss.str() << std::endl << std::flush;
-    _upstream->deallocate(stream, ptr, bytes);
+    _upstream.deallocate(stream, ptr, bytes, alignment);
   }
 
-  bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return this == &other;
+    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
   }
 
-  rmm::mr::device_memory_resource* _upstream;
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+  }
+
+  bool operator==(logging_device_resource const& other) const noexcept { return this == &other; }
+
+  friend void get_property(logging_device_resource const&, cuda::mr::device_accessible) noexcept {}
+
+ private:
+  rmm::device_async_resource_ref _upstream;
 };
 
 // Install the logging resource once per process (wraps whatever the current device resource is)
 static void install_rmm_logging_resource_once()
 {
   static bool installed = false;
-  static std::unique_ptr<logging_device_resource> logging_resource;
+  static std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> logging_resource;
   if (!installed) {
-    auto* prev       = rmm::mr::get_current_device_resource();
-    logging_resource = std::make_unique<logging_device_resource>(prev);
-    rmm::mr::set_current_device_resource(logging_resource.get());
+    auto prev = rmm::mr::get_current_device_resource_ref();
+    logging_resource =
+      cuda::mr::any_resource<cuda::mr::device_accessible>{logging_device_resource{prev}};
+    rmm::mr::set_current_device_resource(*logging_resource);
     installed = true;
     std::cout << "[rmm-log ] installed logging device resource adaptor" << std::endl << std::flush;
   }

@@ -20,6 +20,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -48,15 +49,13 @@ class test_gpu_pool {
     if (initial_bytes > max_bytes) { initial_bytes = max_bytes; }
 
     pool_     = std::make_unique<rmm::mr::cuda_async_memory_resource>(initial_bytes, max_bytes);
-    previous_ = rmm::mr::get_current_device_resource();
-    rmm::mr::set_current_device_resource(pool_.get());
+    previous_ = rmm::mr::get_current_device_resource_ref();
+    rmm::mr::set_current_device_resource(*pool_);
   }
 
   ~test_gpu_pool()
   {
-    if (pool_ != nullptr && previous_ != nullptr) {
-      rmm::mr::set_current_device_resource(previous_);
-    }
+    if (pool_ != nullptr) { rmm::mr::set_current_device_resource(previous_); }
   }
 
  private:
@@ -75,7 +74,7 @@ class test_gpu_pool {
   static constexpr std::size_t default_max_bytes     = 10ULL * 1024 * 1024 * 1024;
 
   std::unique_ptr<rmm::mr::cuda_async_memory_resource> pool_;
-  rmm::mr::device_memory_resource* previous_{nullptr};
+  rmm::device_async_resource_ref previous_{rmm::mr::get_current_device_resource_ref()};
 };
 
 test_gpu_pool global_pool;

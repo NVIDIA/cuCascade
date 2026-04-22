@@ -37,8 +37,9 @@ small_pinned_host_memory_resource::~small_pinned_host_memory_resource()
   // free_lists_ entries are raw pointers into those blocks; no individual cleanup needed.
 }
 
-void* small_pinned_host_memory_resource::do_allocate(std::size_t bytes,
-                                                     [[maybe_unused]] rmm::cuda_stream_view stream)
+void* small_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+                                                  std::size_t bytes,
+                                                  [[maybe_unused]] std::size_t alignment)
 {
   if (bytes == 0) { return nullptr; }
   // cuDF calls get_pinned_memory_resource() directly from some code paths (e.g. join/sort
@@ -50,9 +51,7 @@ void* small_pinned_host_memory_resource::do_allocate(std::size_t bytes,
   if (bytes > MAX_SLAB_SIZE) {
     void* ptr = nullptr;
     auto err  = ::cudaMallocHost(&ptr, bytes);
-    if (err != cudaSuccess) {
-      throw std::bad_alloc{};
-    }
+    if (err != cudaSuccess) { throw std::bad_alloc{}; }
     return ptr;
   }
 
@@ -64,8 +63,10 @@ void* small_pinned_host_memory_resource::do_allocate(std::size_t bytes,
   return ptr;
 }
 
-void small_pinned_host_memory_resource::do_deallocate(
-  void* ptr, std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream) noexcept
+void small_pinned_host_memory_resource::deallocate([[maybe_unused]] cuda::stream_ref stream,
+                                                   void* ptr,
+                                                   std::size_t bytes,
+                                                   [[maybe_unused]] std::size_t alignment) noexcept
 {
   if (ptr == nullptr || bytes == 0) { return; }
   if (bytes > MAX_SLAB_SIZE) {
@@ -78,8 +79,8 @@ void small_pinned_host_memory_resource::do_deallocate(
   free_lists_[idx].push_back(ptr);
 }
 
-bool small_pinned_host_memory_resource::do_is_equal(
-  const rmm::mr::device_memory_resource& other) const noexcept
+bool small_pinned_host_memory_resource::operator==(
+  small_pinned_host_memory_resource const& other) const noexcept
 {
   return this == &other;
 }

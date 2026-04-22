@@ -21,6 +21,7 @@
 
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -32,11 +33,12 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-#include <cucascade/cuda_utils.hpp>
-
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
 
 #include <memory>
@@ -60,7 +62,7 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier
     config.device_id       = static_cast<int>(device_id);
     config.memory_capacity = 1024 * 1024 * 1024;
     config.mr_factory_fn   = [](int, size_t) {
-      return std::make_unique<rmm::mr::cuda_memory_resource>();
+      return cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}};
     };
     return std::make_shared<memory::memory_space>(config);
   } else if (tier == memory::Tier::HOST) {
@@ -69,7 +71,8 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier
     config.memory_capacity      = 1024 * 1024 * 1024;
     config.initial_number_pools = 0;
     config.mr_factory_fn        = [](int, size_t) {
-      return std::make_unique<cucascade::memory::numa_region_pinned_host_memory_resource>(-1);
+      return cuda::mr::any_resource<cuda::mr::device_accessible>{
+        cucascade::memory::numa_region_pinned_host_memory_resource{-1}};
     };
     return std::make_shared<memory::memory_space>(config);
   } else if (tier == memory::Tier::DISK) {
@@ -156,8 +159,8 @@ inline std::vector<memory::memory_space_config> create_conversion_test_configs()
 inline cudf::table create_simple_cudf_table(
   int num_rows,
   int num_columns,
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
-  rmm::cuda_stream_view stream        = rmm::cuda_stream_default)
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  rmm::cuda_stream_view stream      = rmm::cuda_stream_default)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
 
@@ -189,15 +192,15 @@ inline cudf::table create_simple_cudf_table(
 
 inline cudf::table create_simple_cudf_table(
   int num_rows,
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
-  rmm::cuda_stream_view stream        = rmm::cuda_stream_default)
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  rmm::cuda_stream_view stream      = rmm::cuda_stream_default)
 {
   return create_simple_cudf_table(num_rows, 2, mr, stream);
 }
 
 inline cudf::table create_simple_cudf_table(
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
-  rmm::cuda_stream_view stream        = rmm::cuda_stream_default)
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  rmm::cuda_stream_view stream      = rmm::cuda_stream_default)
 {
   return create_simple_cudf_table(100, 2, mr, stream);
 }
