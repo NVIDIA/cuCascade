@@ -89,13 +89,32 @@ struct stream_ordered_allocation_tracker : public impl_type::allocation_tracker_
 };
 
 struct ptds_allocation_tracker : public impl_type::allocation_tracker_iface {
-  static inline thread_local std::unique_ptr<stream_ordered_tracker_state> thread_reservation_state;
+  // Per-thread, per-instance reservation state. Previously this was a single
+  // `static inline thread_local` pointer at class scope — one storage across
+  // every adaptor instance on a given thread. That broke multi-adaptor
+  // setups (multi-GPU): adaptor A's assign_reservation would set the shared
+  // state, and a deallocation routed through adaptor B on the same thread
+  // would read A's arena, subtract from arena_A.allocated_bytes, and corrupt
+  // A's accounting. On release, do_release_reservation computed released =
+  // arena_size − arena.allocated (with arena.allocated gone negative),
+  // producing released > arena_size, which underflowed _total_allocated_bytes
+  // below zero.
+  //
+  // Keyed by `this` so each adaptor sees only the reservation state assigned
+  // to it. Thread-local storage keeps lookup lock-free within the thread.
+  using state_map =
+    std::unordered_map<ptds_allocation_tracker const*, std::unique_ptr<stream_ordered_tracker_state>>;
+  static state_map& tls_states() noexcept
+  {
+    thread_local state_map map;
+    return map;
+  }
 
   ptds_allocation_tracker() = default;
 
   void reset_tracker_state([[maybe_unused]] rmm::cuda_stream_view stream) override
   {
-    if (thread_reservation_state) { thread_reservation_state.reset(); }
+    tls_states().erase(this);
   }
 
   void assign_reservation_to_tracker([[maybe_unused]] rmm::cuda_stream_view stream,
@@ -103,24 +122,28 @@ struct ptds_allocation_tracker : public impl_type::allocation_tracker_iface {
                                      std::unique_ptr<reservation_limit_policy> policy,
                                      std::unique_ptr<oom_handling_policy> oom_policy) override
   {
-    if (thread_reservation_state) {
+    auto& slot = tls_states()[this];
+    if (slot) {
       throw rmm::logic_error("Thread already has reservation state set");
     }
-
-    thread_reservation_state = std::make_unique<stream_ordered_tracker_state>(
+    slot = std::make_unique<stream_ordered_tracker_state>(
       std::move(arena), std::move(policy), std::move(oom_policy));
   }
 
   stream_ordered_tracker_state* get_tracker_state(
     [[maybe_unused]] rmm::cuda_stream_view stream) override
   {
-    return thread_reservation_state.get();
+    auto& map = tls_states();
+    auto it   = map.find(this);
+    return (it == map.end()) ? nullptr : it->second.get();
   }
 
   const stream_ordered_tracker_state* get_tracker_state(
     [[maybe_unused]] rmm::cuda_stream_view stream) const override
   {
-    return thread_reservation_state.get();
+    auto& map = tls_states();
+    auto it   = map.find(this);
+    return (it == map.end()) ? nullptr : it->second.get();
   }
 };
 
