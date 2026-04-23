@@ -295,8 +295,21 @@ size_t memory_space::get_max_memory() const noexcept { return _memory_limit; }
 
 rmm::device_async_resource_ref memory_space::get_default_allocator() const noexcept
 {
-  return rmm::device_async_resource_ref(
-    const_cast<cuda::mr::any_resource<cuda::mr::device_accessible>&>(_allocator));
+  return std::visit(
+    utils::overloaded{
+      [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+        return rmm::device_async_resource_ref{
+          const_cast<reservation_aware_resource_adaptor&>(*mr)};
+      },
+      [&](const std::unique_ptr<fixed_size_host_memory_resource>&) {
+        return rmm::device_async_resource_ref{
+          const_cast<cuda::mr::any_resource<cuda::mr::device_accessible>&>(_allocator)};
+      },
+      [&](const std::unique_ptr<disk_access_limiter>&) {
+        return rmm::device_async_resource_ref{
+          const_cast<cuda::mr::any_resource<cuda::mr::device_accessible>&>(_allocator)};
+      }},
+    _reservation_allocator);
 }
 
 std::string_view memory_space::get_disk_mount_path() const
