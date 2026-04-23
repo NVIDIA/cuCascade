@@ -20,11 +20,11 @@
 #include "cucascade/data/representation_converter.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 
+#include <cucascade/error.hpp>
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
-
-#include <cucascade/cuda_utils.hpp>
 
 #include <rmm/cuda_stream.hpp>
 

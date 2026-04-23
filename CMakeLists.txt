@@ -72,12 +72,11 @@ set(CUCASCADE_CXX_WARNING_FLAGS
     -Wunused
     -Wconversion
     -Wsign-conversion
-    -Wnull-dereference
     -Wdouble-promotion
     -Wformat=2
     -Wimplicit-fallthrough)
 
-if(WARNINGS_AS_ERRORS)
+if(CUCASCADE_WARNINGS_AS_ERRORS)
   list(APPEND CUCASCADE_CXX_WARNING_FLAGS -Werror)
 endif()
 

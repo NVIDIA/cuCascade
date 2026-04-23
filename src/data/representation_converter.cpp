@@ -17,13 +17,13 @@
 
 #include "cudf/contiguous_split.hpp"
 
-#include <cucascade/cuda_utils.hpp>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/disk_file_format.hpp>
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/host_table.hpp>
@@ -40,10 +40,9 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <rmm/aligned.hpp>
-#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
 
@@ -630,7 +629,7 @@ static rmm::device_buffer alloc_and_schedule_h2d(memory::fixed_multiple_blocks_a
                                                  std::size_t alloc_offset,
                                                  std::size_t size,
                                                  rmm::cuda_stream_view stream,
-                                                 rmm::mr::device_memory_resource* mr,
+                                                 rmm::device_async_resource_ref mr,
                                                  BatchCopyAccumulator& batch)
 {
   rmm::device_buffer buf(size, stream, mr);
@@ -673,7 +672,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(memory::fixed_multiple_blocks_
                                                   std::size_t alloc_offset,
                                                   std::size_t size,
                                                   rmm::cuda_stream_view stream,
-                                                  rmm::mr::device_memory_resource* mr)
+                                                  rmm::device_async_resource_ref mr)
 {
   rmm::device_buffer buf(size, stream, mr);
   if (size == 0) { return buf; }
@@ -718,7 +717,7 @@ static std::unique_ptr<cudf::column> reconstruct_column(
   const memory::column_metadata& meta,
   memory::fixed_multiple_blocks_allocation& alloc,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr,
+  rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
   // Null mask — copied synchronously because cudf factories access it on construction
@@ -1306,7 +1305,7 @@ static rmm::device_buffer alloc_and_read_from_disk(const std::filesystem::path& 
                                                    std::size_t file_offset,
                                                    std::size_t size,
                                                    rmm::cuda_stream_view stream,
-                                                   rmm::mr::device_memory_resource* mr,
+                                                   rmm::device_async_resource_ref mr,
                                                    idisk_io_backend& backend)
 {
   rmm::device_buffer buf(size, stream, mr);
@@ -1322,7 +1321,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   const memory::column_metadata& meta,
   const std::filesystem::path& file_path,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr,
+  rmm::device_async_resource_ref mr,
   idisk_io_backend& backend)
 {
   // Null mask (shared by all type categories)

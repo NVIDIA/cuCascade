@@ -17,8 +17,7 @@
 
 #pragma once
 
-#include <rmm/mr/device_memory_resource.hpp>
-
+#include <cuda/memory_resource>
 #include <cuda/stream_ref>
 
 #include <cstddef>
@@ -26,7 +25,7 @@
 namespace cucascade {
 namespace memory {
 
-class numa_region_pinned_host_memory_resource final : public rmm::mr::device_memory_resource {
+class numa_region_pinned_host_memory_resource final {
  public:
   explicit numa_region_pinned_host_memory_resource(int numa_node) : _numa_node(numa_node) {}
   ~numa_region_pinned_host_memory_resource()                                              = default;
@@ -37,53 +36,32 @@ class numa_region_pinned_host_memory_resource final : public rmm::mr::device_mem
   numa_region_pinned_host_memory_resource& operator=(numa_region_pinned_host_memory_resource&&) =
     default;
 
- private:
   /**
    * @brief Allocates pinned host memory of size at least \p bytes bytes.
-   *
-   * @throws rmm::out_of_memory if the requested allocation could not be fulfilled due to a
-   * CUDA out of memory error.
-   * @throws rmm::bad_alloc if the requested allocation could not be fulfilled due to any other
-   * reason.
-   *
-   * The stream argument is ignored.
-   *
-   * @param bytes The size, in bytes, of the allocation.
-   * @param stream CUDA stream on which to perform the allocation (ignored).
-   *
-   * @return Pointer to the newly allocated memory.
    */
-  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override;
+  void* allocate(cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t));
 
   /**
    * @brief Deallocate memory pointed to by \p ptr.
-   *
-   * The stream argument is ignored.
-   *
-   * @param ptr Pointer to be deallocated
-   * @param bytes The size in bytes of the allocation. This must be equal to the
-   * value of `bytes` that was passed to the `allocate` call that returned `ptr`.
-   * @param stream This argument is ignored.
    */
-  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override;
+  void deallocate(cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
-  /**
-   * @brief Compare this resource to another.
-   *
-   * Two pinned_host_memory_resources always compare equal, because they can each
-   * deallocate memory allocated by the other.
-   *
-   * @param other The other resource to compare to
-   * @return true If the two resources are equivalent
-   * @return false If the two resources are not equal
-   */
-  [[nodiscard]] bool do_is_equal(
-    const rmm::mr::device_memory_resource& other) const noexcept override;
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t));
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept;
+
+  [[nodiscard]] bool operator==(
+    numa_region_pinned_host_memory_resource const& other) const noexcept;
 
   /**
    * @brief Enables the `cuda::mr::device_accessible` property
-   *
-   * This property declares that a `pinned_host_memory_resource` provides device accessible memory
    */
   friend void get_property(numa_region_pinned_host_memory_resource const&,
                            cuda::mr::device_accessible) noexcept
@@ -92,14 +70,13 @@ class numa_region_pinned_host_memory_resource final : public rmm::mr::device_mem
 
   /**
    * @brief Enables the `cuda::mr::host_accessible` property
-   *
-   * This property declares that a `pinned_host_memory_resource` provides host accessible memory
    */
   friend void get_property(numa_region_pinned_host_memory_resource const&,
                            cuda::mr::host_accessible) noexcept
   {
   }
 
+ private:
   int _numa_node{-1};
 };
 

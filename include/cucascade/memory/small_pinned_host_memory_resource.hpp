@@ -19,8 +19,8 @@
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
+#include <cuda/memory_resource>
+#include <cuda/stream_ref>
 
 #include <array>
 #include <cstddef>
@@ -53,7 +53,7 @@ namespace memory {
  * This eliminates the pageable H2D transfers that cuDF would otherwise issue
  * when building column_device_view metadata arrays for cudf::concatenate.
  */
-class small_pinned_host_memory_resource : public rmm::mr::device_memory_resource {
+class small_pinned_host_memory_resource {
  public:
   /// Maximum allocation size handled by the slab pools.
   /// Requests larger than this use pageable memory.
@@ -72,9 +72,8 @@ class small_pinned_host_memory_resource : public rmm::mr::device_memory_resource
   small_pinned_host_memory_resource(small_pinned_host_memory_resource&&)                 = delete;
   small_pinned_host_memory_resource& operator=(small_pinned_host_memory_resource&&)      = delete;
 
-  ~small_pinned_host_memory_resource() override;
+  ~small_pinned_host_memory_resource();
 
- private:
   /**
    * @brief Allocate pinned memory.
    *
@@ -82,25 +81,40 @@ class small_pinned_host_memory_resource : public rmm::mr::device_memory_resource
    * (512 / 1 KB / 2 KB / 4 KB / 8 KB) and returns a pointer from the matching
    * free list, expanding the pool from upstream if the list is empty.
    *
-   * For @p bytes > MAX_SLAB_SIZE: falls back to std::malloc (pageable).
-   * The cudf::set_allocate_host_as_pinned_threshold is set to MAX_SLAB_SIZE so
-   * that cuDF's make_host_vector path uses the slab pools for metadata buffers.
-   * Larger allocations (e.g. join/sort staging buffers that call
-   * get_pinned_memory_resource() directly) are served from pageable memory.
+   * For @p bytes > MAX_SLAB_SIZE: falls back to cudaMallocHost (pinned).
    */
-  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override;
+  void* allocate(cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t));
 
   /**
    * @brief Return memory to the appropriate pool.
    *
    * Slabs (@p bytes <= MAX_SLAB_SIZE) are returned to the free list.
-   * Pageable allocations (@p bytes > MAX_SLAB_SIZE) are freed via std::free.
-   * @p bytes must equal the value passed to the corresponding do_allocate.
+   * Pinned allocations (@p bytes > MAX_SLAB_SIZE) are freed via cudaFreeHost.
+   * @p bytes must equal the value passed to the corresponding allocate.
    */
-  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override;
+  void deallocate(cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
-  [[nodiscard]] bool do_is_equal(
-    const rmm::mr::device_memory_resource& other) const noexcept override;
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(cudaStream_t{nullptr}));
+    return ptr;
+  }
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(cudaStream_t{nullptr}));
+  }
+
+  bool operator==(small_pinned_host_memory_resource const& other) const noexcept;
 
   /**
    * @brief Declares that memory allocated here is accessible from GPU devices.

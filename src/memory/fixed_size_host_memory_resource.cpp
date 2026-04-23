@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cuda_utils.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -23,7 +23,6 @@
 
 #include <rmm/aligned.hpp>
 #include <rmm/error.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <memory>
@@ -66,7 +65,8 @@ fixed_size_host_memory_resource::~fixed_size_host_memory_resource()
 #pragma GCC diagnostic ignored "-Wnull-dereference"
   for (auto& block : _allocated_blocks) {
     const std::size_t dealloc_size = _block_size * _pool_size;
-    _upstream_mr.deallocate(rmm::cuda_stream_view{}, block, dealloc_size);
+    _upstream_mr.deallocate(
+      rmm::cuda_stream_view{}, block, dealloc_size, alignof(std::max_align_t));
   }
 #pragma GCC diagnostic pop
   _allocated_blocks.clear();
@@ -188,21 +188,23 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
   return {};
 }
 
-void* fixed_size_host_memory_resource::do_allocate(std::size_t /*bytes*/,
-                                                   rmm::cuda_stream_view /*stream*/)
+void* fixed_size_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+                                                [[maybe_unused]] std::size_t bytes,
+                                                [[maybe_unused]] std::size_t alignment)
 {
   throw rmm::logic_error(
     "fixed_size_host_memory_resource doesn't support allocate, use allocate_multiple_blocks");
 }
 
-void fixed_size_host_memory_resource::do_deallocate(void* /*ptr*/,
-                                                    std::size_t /*bytes*/,
-                                                    rmm::cuda_stream_view /*stream*/) noexcept
+void fixed_size_host_memory_resource::deallocate([[maybe_unused]] cuda::stream_ref stream,
+                                                 [[maybe_unused]] void* ptr,
+                                                 [[maybe_unused]] std::size_t bytes,
+                                                 [[maybe_unused]] std::size_t alignment) noexcept
 {
 }
 
-bool fixed_size_host_memory_resource::do_is_equal(
-  const rmm::mr::device_memory_resource& other) const noexcept
+bool fixed_size_host_memory_resource::operator==(
+  fixed_size_host_memory_resource const& other) const noexcept
 {
   return this == &other;
 }
@@ -279,7 +281,8 @@ void fixed_size_host_memory_resource::expand_pool()
   // See constructor for explanation of this suppression.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  void* large_allocation = _upstream_mr.allocate(rmm::cuda_stream_view{}, total_size);
+  void* large_allocation =
+    _upstream_mr.allocate(rmm::cuda_stream_view{}, total_size, alignof(std::max_align_t));
 #pragma GCC diagnostic pop
 
   _allocated_blocks.push_back(large_allocation);

@@ -18,7 +18,8 @@
 #pragma once
 
 #include <rmm/error.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
+
+#include <cuda/memory_resource>
 
 #include <cstdint>
 #include <cstring>
@@ -60,14 +61,14 @@ class memory_space_id {
 };
 
 using DeviceMemoryResourceFactoryFn =
-  std::function<std::unique_ptr<rmm::mr::device_memory_resource>(int device_id,
-                                                                 std::size_t capacity)>;
+  std::function<cuda::mr::any_resource<cuda::mr::device_accessible>(int device_id,
+                                                                    std::size_t capacity)>;
 
-std::unique_ptr<rmm::mr::device_memory_resource> make_default_gpu_memory_resource(
+cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_resource(
   int device_id, std::size_t capacity);
 
-std::unique_ptr<rmm::mr::device_memory_resource> make_default_host_memory_resource(
-  int device_id, std::size_t capacity);
+cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
+make_default_host_memory_resource(int device_id, std::size_t capacity);
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier);
 

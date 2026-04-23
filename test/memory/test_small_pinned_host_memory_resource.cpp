@@ -174,11 +174,11 @@ TEST_CASE("Freed slabs are reused", "[small_pinned]")
 TEST_CASE("do_is_equal identity check", "[small_pinned]")
 {
   test_fixture f;
-  REQUIRE(f.slab_mr.is_equal(f.slab_mr));
+  REQUIRE(f.slab_mr == f.slab_mr);
 
   // A second instance should not be equal
   small_pinned_host_memory_resource other{f.upstream};
-  REQUIRE_FALSE(f.slab_mr.is_equal(other));
+  REQUIRE_FALSE(f.slab_mr == other);
 }
 
 TEST_CASE("Concurrent allocations are thread-safe", "[small_pinned][threading]")

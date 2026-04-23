@@ -22,7 +22,7 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <concepts>
 #include <memory>
@@ -40,25 +40,26 @@ class reservation;
 struct reserved_arena;
 class memory_space;
 
+namespace detail {
+class reservation_aware_resource_adaptor_impl;
+}  // namespace detail
+
 template <Tier TIER>
 struct tier_memory_resource_trait {
-  using upstream_type = rmm::mr::device_memory_resource;
-  using type          = rmm::mr::device_memory_resource;
-  Tier tier           = TIER;
+  using type = void;
+  Tier tier  = TIER;
 };
 
 template <>
 struct tier_memory_resource_trait<Tier::HOST> {
-  using upstream_type = rmm::mr::device_memory_resource;
-  using type          = fixed_size_host_memory_resource;
-  Tier tier           = Tier::HOST;
+  using type = fixed_size_host_memory_resource;
+  Tier tier  = Tier::HOST;
 };
 
 template <>
 struct tier_memory_resource_trait<Tier::GPU> {
-  using upstream_type = rmm::mr::device_memory_resource;
-  using type          = reservation_aware_resource_adaptor;
-  Tier tier           = Tier::GPU;
+  using type = reservation_aware_resource_adaptor;
+  Tier tier  = Tier::GPU;
 };
 
 //===----------------------------------------------------------------------===//
@@ -175,6 +176,7 @@ std::unique_ptr<reservation_limit_policy> make_default_reservation_limit_policy(
 
 struct reserved_arena {
   friend class reservation_aware_resource_adaptor;
+  friend class detail::reservation_aware_resource_adaptor_impl;
   friend class fixed_size_host_memory_resource;
   friend class disk_access_limiter;
 
@@ -204,6 +206,7 @@ struct reserved_arena {
 class reservation {
  public:
   friend class reservation_aware_resource_adaptor;
+  friend class detail::reservation_aware_resource_adaptor_impl;
   friend class fixed_size_host_memory_resource;
   friend class disk_access_limiter;
 
@@ -216,22 +219,15 @@ class reservation {
 
   [[nodiscard]] int device_id() const noexcept;
 
-  [[nodiscard]] rmm::mr::device_memory_resource* get_memory_resource() const noexcept;
+  [[nodiscard]] rmm::device_async_resource_ref get_memory_resource() const noexcept;
 
   [[nodiscard]] const memory_space& get_memory_space() const noexcept;
 
   template <typename T>
-    requires std::derived_from<T, rmm::mr::device_memory_resource>
-  T* get_memory_resource_as() const noexcept
-  {
-    return dynamic_cast<T*>(get_memory_resource());
-  }
+  T* get_memory_resource_as() const noexcept;
 
   template <Tier TIER>
-  auto* get_memory_resource_of() const noexcept
-  {
-    return get_memory_resource_as<typename tier_memory_resource_trait<TIER>::type>();
-  }
+  auto* get_memory_resource_of() const noexcept;
 
   //===----------------------------------------------------------------------===//
   // Reservation Size Management

@@ -69,7 +69,7 @@ class idata_batch_probe {
   virtual ~idata_batch_probe() = default;
 
   /**
-   * @brief The function that is called everytime a data_batch transitions into a new batch_state.
+   * @brief The function that is called every time a data_batch transitions into a new batch_state.
    *
    * @note It is the implementer's responsibility that a call to this function returns quickly, as
    *       this function is called in a thread-safe manner, and will block other mutating changes
@@ -540,12 +540,11 @@ void data_batch::convert_to(representation_converter_registry& registry,
   auto new_representation =
     registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
   auto old_representation = std::move(_data);
-  _data = std::move(new_representation);
+  _data                   = std::move(new_representation);
 
   bool needs_sync =
-    old_representation != nullptr &&
-    (old_representation->get_current_tier() == memory::Tier::GPU ||
-     _data->get_current_tier() == memory::Tier::GPU);
+    old_representation != nullptr && (old_representation->get_current_tier() == memory::Tier::GPU ||
+                                      _data->get_current_tier() == memory::Tier::GPU);
 
   lock.unlock();
 
