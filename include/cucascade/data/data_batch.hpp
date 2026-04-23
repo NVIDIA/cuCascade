@@ -441,7 +441,7 @@ class mutable_data_batch {
     const memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream) const;
 
-  // -- Move-only (D-12/ACC-05/ACC-06) --
+  // -- Move-only --
   mutable_data_batch(mutable_data_batch&& other) noexcept;
   mutable_data_batch& operator=(mutable_data_batch&& other) noexcept;
   ~mutable_data_batch();

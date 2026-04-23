@@ -1057,3 +1057,93 @@ TEST_CASE("data_batch move does not change read_only_count", "[data_batch]")
   // ro1 is now in moved-from state — its destructor fires at end of scope harmlessly
   // ro2 destructor fires here and decrements count
 }
+
+// =============================================================================
+// task_created_count preserved across in_transit round-trip (STATE-01, STATE-02)
+// =============================================================================
+
+TEST_CASE("data_batch task_created_count preserved across in_transit round-trip single task",
+          "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  // Create one task
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 1);
+
+  // Lock for in_transit
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+  // task_created_count must still be 1 while in_transit
+  REQUIRE(batch->get_task_created_count() == 1);
+
+  // Release back to task_created
+  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  // task_created_count must still be 1 after round-trip
+  REQUIRE(batch->get_task_created_count() == 1);
+}
+
+TEST_CASE("data_batch task_created_count preserved across in_transit round-trip multiple tasks",
+          "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  // Create three tasks
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 3);
+
+  // Lock for in_transit
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->get_state() == batch_state::in_transit);
+  REQUIRE(batch->get_task_created_count() == 3);
+
+  // Release back to task_created
+  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 3);
+}
+
+TEST_CASE("data_batch can lock_for_processing after in_transit round-trip from task_created",
+          "[data_batch]")
+{
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(1, std::move(data));
+  auto space_id = batch->get_memory_space()->get_id();
+
+  // Create task, go through in_transit round-trip
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+  REQUIRE(batch->get_task_created_count() == 1);
+
+  // Should still be able to lock for processing
+  auto r = batch->try_to_lock_for_processing(space_id);
+  REQUIRE(r.success == true);
+  REQUIRE(batch->get_state() == batch_state::processing);
+}
+
+TEST_CASE("data_batch can cancel_task after in_transit round-trip from task_created",
+          "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  // Create task, go through in_transit round-trip
+  REQUIRE(batch->try_to_create_task() == true);
+  REQUIRE(batch->try_to_lock_for_in_transit() == true);
+  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
+  REQUIRE(batch->get_state() == batch_state::task_created);
+
+  // Should still be able to cancel task
+  REQUIRE(batch->try_to_cancel_task() == true);
+  REQUIRE(batch->get_state() == batch_state::idle);
+  REQUIRE(batch->get_task_created_count() == 0);
+}
