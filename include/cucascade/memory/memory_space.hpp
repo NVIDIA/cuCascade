@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -166,6 +167,8 @@ class memory_space {
   // Memory resources owned by this memory_space
   cuda::mr::any_resource<cuda::mr::device_accessible> _allocator;
   reserving_adaptor_type _reservation_allocator;
+  std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
+    _reservation_allocator_resource;
   std::unique_ptr<rmm::cuda_stream_pool> _stream_pool;
   std::shared_ptr<idisk_io_backend> _io_backend;  ///< I/O backend for DISK tier (null for others)
 };
