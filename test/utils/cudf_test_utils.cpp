@@ -29,6 +29,7 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
+#include <rmm/version_config.hpp>
 
 #include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
@@ -386,12 +387,19 @@ class logging_device_resource {
 static void install_rmm_logging_resource_once()
 {
   static bool installed = false;
+#if !(RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6))
   static std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> logging_resource;
+#endif
   if (!installed) {
     auto prev = rmm::mr::get_current_device_resource_ref();
+#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6)
+    rmm::mr::set_current_device_resource(
+      cuda::mr::any_resource<cuda::mr::device_accessible>{logging_device_resource{prev}});
+#else
     logging_resource =
       cuda::mr::any_resource<cuda::mr::device_accessible>{logging_device_resource{prev}};
     rmm::mr::set_current_device_resource_ref(*logging_resource);
+#endif
     installed = true;
     std::cout << "[rmm-log ] installed logging device resource adaptor" << std::endl << std::flush;
   }
