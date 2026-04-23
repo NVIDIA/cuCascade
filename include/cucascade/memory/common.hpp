@@ -21,7 +21,9 @@
 #include <rmm/version_config.hpp>
 
 #include <cuda/memory_resource>
+#include <cuda/stream_ref>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -102,7 +104,7 @@ class legacy_rmm_resource_adapter {
   void* allocate_sync(std::size_t bytes,
                       std::size_t alignment = alignof(std::max_align_t))
   {
-    auto* ptr = allocate(rmm::cuda_stream_default, bytes, alignment);
+    auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
     rmm::cuda_stream_default.synchronize();
     return ptr;
   }
@@ -111,7 +113,7 @@ class legacy_rmm_resource_adapter {
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(rmm::cuda_stream_default, ptr, bytes, alignment);
+    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
     rmm::cuda_stream_default.synchronize_no_throw();
   }
 
