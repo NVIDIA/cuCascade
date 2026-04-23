@@ -26,7 +26,7 @@ jobs:
           cache: false
           environments: ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }}
 
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} build
 
