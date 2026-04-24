@@ -33,6 +33,7 @@
 
 #include <catch2/catch.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -114,6 +115,71 @@ TEST_CASE("Topology Discovery", "[hw_topology]")
     // NUMA node may be -1 if unknown
     REQUIRE(net_dev.numa_node >= -1);
   }
+}
+
+TEST_CASE("Topology Discovery with all verification levels", "[hw_topology]")
+{
+  topology_discovery disc_ip;
+  topology_discovery disc_active;
+  topology_discovery disc_exists;
+
+  REQUIRE(disc_ip.discover(NetworkDeviceVerification::EXISTS_ACTIVE_IP));
+  REQUIRE(disc_active.discover(NetworkDeviceVerification::EXISTS_ACTIVE));
+  REQUIRE(disc_exists.discover(NetworkDeviceVerification::EXISTS));
+
+  auto const& topo_ip     = disc_ip.get_topology();
+  auto const& topo_active = disc_active.get_topology();
+  auto const& topo_exists = disc_exists.get_topology();
+
+  // Non-network fields must be identical across all levels.
+  REQUIRE(topo_ip.hostname == topo_active.hostname);
+  REQUIRE(topo_ip.hostname == topo_exists.hostname);
+  REQUIRE(topo_ip.num_gpus == topo_active.num_gpus);
+  REQUIRE(topo_ip.num_gpus == topo_exists.num_gpus);
+  REQUIRE(topo_ip.num_numa_nodes == topo_active.num_numa_nodes);
+  REQUIRE(topo_ip.num_numa_nodes == topo_exists.num_numa_nodes);
+
+  // Monotonicity: stricter levels yield fewer or equal network devices.
+  REQUIRE(topo_ip.num_network_devices <= topo_active.num_network_devices);
+  REQUIRE(topo_active.num_network_devices <= topo_exists.num_network_devices);
+
+  // Subset property: every device in a stricter set must appear in the more permissive set.
+  auto contains_device = [](std::vector<network_device_info> const& haystack,
+                            std::string const& name) {
+    return std::find_if(haystack.begin(), haystack.end(), [&](network_device_info const& d) {
+             return d.name == name;
+           }) != haystack.end();
+  };
+
+  for (auto const& dev : topo_ip.network_devices) {
+    REQUIRE(contains_device(topo_active.network_devices, dev.name));
+  }
+  for (auto const& dev : topo_active.network_devices) {
+    REQUIRE(contains_device(topo_exists.network_devices, dev.name));
+  }
+
+  // Per-GPU network devices must also respect monotonicity.
+  REQUIRE(topo_ip.gpus.size() == topo_exists.gpus.size());
+  for (size_t i = 0; i < topo_ip.gpus.size(); ++i) {
+    REQUIRE(topo_ip.gpus[i].network_devices.size() <= topo_active.gpus[i].network_devices.size());
+    REQUIRE(topo_active.gpus[i].network_devices.size() <=
+            topo_exists.gpus[i].network_devices.size());
+  }
+}
+
+TEST_CASE("Topology Discovery default uses strictest verification", "[hw_topology]")
+{
+  topology_discovery disc_default;
+  topology_discovery disc_explicit;
+
+  REQUIRE(disc_default.discover());
+  REQUIRE(disc_explicit.discover(NetworkDeviceVerification::EXISTS_ACTIVE_IP));
+
+  auto const& topo_default  = disc_default.get_topology();
+  auto const& topo_explicit = disc_explicit.get_topology();
+
+  REQUIRE(topo_default.num_network_devices == topo_explicit.num_network_devices);
+  REQUIRE(topo_default.network_devices.size() == topo_explicit.network_devices.size());
 }
 
 TEST_CASE("Topology Discovery rejects out-of-range CUDA_VISIBLE_DEVICES", "[hw_topology]")

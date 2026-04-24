@@ -6,7 +6,9 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <dlfcn.h>
+#include <ifaddrs.h>
 #include <nvml.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -460,15 +462,130 @@ PciePathType get_pcie_path_type(std::string const& gpu_pci_id, std::string const
 }
 
 /**
+ * @brief Check whether an InfiniBand/RoCE device has at least one active port.
+ *
+ * Iterates over /sys/class/infiniband/<device>/ports/<N>/state for every port.
+ * A port is considered active when its state string contains "ACTIVE".
+ *
+ * @param device_path Sysfs path to the InfiniBand device directory.
+ * @return true if at least one port is in the ACTIVE state.
+ */
+bool has_active_port(std::string const& device_path)
+{
+  fs::path ports_dir = fs::path(device_path) / "ports";
+  if (!fs::exists(ports_dir)) { return false; }
+
+  try {
+    for (auto const& port_entry : fs::directory_iterator(ports_dir)) {
+      if (!port_entry.is_directory()) { continue; }
+
+      std::string state = read_file_content((port_entry.path() / "state").string());
+      // The state file format is "<number>: <STATE_NAME>" (e.g. "4: ACTIVE").
+      if (state.find("ACTIVE") != std::string::npos) { return true; }
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+/**
+ * @brief Check whether an InfiniBand device has an accessible userspace verbs device node.
+ *
+ * Looks up the uverbs device name from
+ * /sys/class/infiniband/<device>/device/infiniband_verbs/ and then checks whether
+ * the corresponding /dev/infiniband/<uverbs> character device exists.  In containerized
+ * environments the sysfs entries may be mounted from the host while the /dev nodes
+ * are not passed through, leaving libibverbs unable to open the device.
+ *
+ * @param device_path Sysfs path to the InfiniBand device directory.
+ * @return true if the uverbs device node exists under /dev/infiniband/.
+ */
+bool has_uverbs_device(std::string const& device_path)
+{
+  fs::path verbs_dir = fs::path(device_path) / "device" / "infiniband_verbs";
+  if (!fs::exists(verbs_dir)) { return false; }
+
+  try {
+    for (auto const& entry : fs::directory_iterator(verbs_dir)) {
+      if (!entry.is_directory()) { continue; }
+      fs::path dev_node = fs::path("/dev/infiniband") / entry.path().filename();
+      if (fs::exists(dev_node)) { return true; }
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+/**
+ * @brief Check whether a network interface has at least one IP address (v4 or v6).
+ *
+ * Uses getifaddrs() to query all interface addresses and returns true as soon as
+ * an AF_INET or AF_INET6 entry matching @p iface_name is found.
+ *
+ * @param iface_name Name of the network interface (e.g. "ib0", "ibp26s0").
+ * @return true if the interface has at least one IP address assigned.
+ */
+bool interface_has_ip(std::string const& iface_name)
+{
+  struct ifaddrs* ifa_list = nullptr;
+  if (getifaddrs(&ifa_list) != 0) { return false; }
+
+  bool found = false;
+  for (struct ifaddrs* ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr) { continue; }
+    int family = ifa->ifa_addr->sa_family;
+    if ((family == AF_INET || family == AF_INET6) && iface_name == ifa->ifa_name) {
+      found = true;
+      break;
+    }
+  }
+
+  freeifaddrs(ifa_list);
+  return found;
+}
+
+/**
+ * @brief Check whether an InfiniBand device's associated net interface has an IP address.
+ *
+ * Looks up the net interface name from /sys/class/infiniband/<dev>/device/net/ and
+ * then checks for a configured IP address via getifaddrs().  Devices without IPoIB
+ * or RoCE networking configured (no IP) are unusable for IP-based transports.
+ *
+ * @param device_path Sysfs path to the InfiniBand device directory.
+ * @return true if the device has a net interface with at least one IP address.
+ */
+bool has_net_interface_with_ip(std::string const& device_path)
+{
+  fs::path net_dir = fs::path(device_path) / "device" / "net";
+  if (!fs::exists(net_dir)) { return false; }
+
+  try {
+    for (auto const& entry : fs::directory_iterator(net_dir)) {
+      if (!entry.is_directory()) { continue; }
+      if (interface_has_ip(entry.path().filename().string())) { return true; }
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+/**
  * @brief Discover network devices (InfiniBand/RoCE).
  *
  * Scans /sys/class/infiniband and collects device name, NUMA node, and PCI bus ID.
+ * Depending on @p verification, additional checks filter out unusable devices:
+ *   - EXISTS: device must be present in /sys/class/infiniband.
+ *   - EXISTS_ACTIVE: additionally, at least one port must be in the ACTIVE state
+ *     and the uverbs device node must exist under /dev/infiniband/.
+ *   - EXISTS_ACTIVE_IP: additionally, the net interface must have an IP address.
  * If the directory does not exist or an error occurs during iteration, returns an
  * empty vector (a warning is logged for iteration errors).
  *
+ * @param verification Verification level for network devices.
  * @return Vector of discovered network devices; empty if none or on failure.
  */
-std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology()
+std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
+  NetworkDeviceVerification verification)
 {
   std::vector<NetworkDeviceWithTopology> devices;
   std::string ib_path = "/sys/class/infiniband";
@@ -478,6 +595,14 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology()
   try {
     for (auto const& entry : fs::directory_iterator(ib_path)) {
       if (!entry.is_directory()) { continue; }
+
+      if (verification <= NetworkDeviceVerification::EXISTS_ACTIVE) {
+        if (!has_active_port(entry.path().string())) { continue; }
+        if (!has_uverbs_device(entry.path().string())) { continue; }
+      }
+      if (verification <= NetworkDeviceVerification::EXISTS_ACTIVE_IP) {
+        if (!has_net_interface_with_ip(entry.path().string())) { continue; }
+      }
 
       NetworkDeviceWithTopology dev;
       dev.name = entry.path().filename().string();
@@ -643,7 +768,7 @@ int count_numa_nodes()
 
 }  // namespace
 
-bool topology_discovery::discover()
+bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 {
   system_topology_info topology;
   NvmlLoader& nvml    = get_nvml_loader();
@@ -675,7 +800,7 @@ bool topology_discovery::discover()
 
   // Discover network devices
   std::vector<NetworkDeviceWithTopology> network_devices_with_topology =
-    discover_network_devices_with_topology();
+    discover_network_devices_with_topology(net_verification);
 
   // Get system information
   topology.hostname            = get_hostname();

@@ -277,6 +277,8 @@ The `topology_discovery` class detects the hardware layout at runtime using NVML
 - Storage devices (NVMe, SATA SSD/HDD) with NUMA affinity
 - PCIe path types between devices (PIX, PXB, PHB, NODE, SYS)
 
+Network device discovery is controlled by `NetworkDeviceVerification`, which determines how strictly devices are validated. By default (`EXISTS_ACTIVE_IP`), a device must exist, have an active port, and have an IP address on its net interface. Less strict levels (`EXISTS_ACTIVE`, `EXISTS`) relax these checks. See [topology-and-configuration.md](topology-and-configuration.md#network-device-verification) for details.
+
 This information feeds into `reservation_manager_configurator` to automatically bind host memory spaces to the correct NUMA nodes for each GPU.
 
 ---

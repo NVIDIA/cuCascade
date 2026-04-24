@@ -235,7 +235,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Used by: Application bootstrap code
 - Purpose: Query NVML and Linux sysfs for GPU-NUMA-NIC-storage topology
 - Location: `include/cucascade/memory/topology_discovery.hpp`, `src/memory/topology_discovery.cpp`
-- Contains: `topology_discovery`, `system_topology_info`, `gpu_topology_info`, `network_device_info`, `storage_device_info`
+- Contains: `topology_discovery`, `system_topology_info`, `gpu_topology_info`, `network_device_info`, `storage_device_info`, `NetworkDeviceVerification`
 - Depends on: NVML, Linux sysfs
 - Used by: `reservation_manager_configurator`
 - Purpose: Coordinate reservation requests across all memory spaces via strategy pattern
