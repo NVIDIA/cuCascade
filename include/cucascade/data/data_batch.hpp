@@ -275,7 +275,9 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
  * private interface. Clone operations are available to create independent copies
  * while the read lock is held.
  *
- * Move-only. The shared lock is released when this object is destroyed or moved-from.
+ * Copyable. Copying acquires a new shared lock on the same parent data_batch,
+ * incrementing the reader count. The shared lock is released when this object
+ * is destroyed, moved-from, or overwritten by assignment.
  */
 class read_only_data_batch {
  public:
@@ -329,12 +331,14 @@ class read_only_data_batch {
     const memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream) const;
 
-  // -- Move-only (D-12/ACC-05/ACC-06) --
+  // -- Move support --
   read_only_data_batch(read_only_data_batch&& other) noexcept;
   read_only_data_batch& operator=(read_only_data_batch&& other) noexcept;
   ~read_only_data_batch();
-  read_only_data_batch(const read_only_data_batch&)            = delete;
-  read_only_data_batch& operator=(const read_only_data_batch&) = delete;
+
+  // -- Copy support: acquires a new shared lock, increments reader count --
+  read_only_data_batch(const read_only_data_batch& other);
+  read_only_data_batch& operator=(const read_only_data_batch& other);
 
  private:
   friend class data_batch;

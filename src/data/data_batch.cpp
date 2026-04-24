@@ -149,6 +149,14 @@ read_only_data_batch::read_only_data_batch(read_only_data_batch&& other) noexcep
   // The read_only_count does NOT change: ownership was transferred, not a new reader created.
 }
 
+read_only_data_batch::read_only_data_batch(const read_only_data_batch& other)
+  : _batch(other._batch)
+  , _lock(other._batch ? std::shared_lock<std::shared_mutex>(other._batch->_rw_mutex)
+                       : std::shared_lock<std::shared_mutex>())
+{
+  if (_batch) { _batch->_read_only_count.fetch_add(1); }
+}
+
 read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& other) noexcept
 {
   if (this != &other) {
@@ -162,7 +170,27 @@ read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& oth
       _lock.unlock();
     }
     _batch = std::move(other._batch);
-    _lock  = std::move(other._lock);
+    _lock  = std::move(other._lock);   
+  }
+  return *this;
+}
+
+read_only_data_batch& read_only_data_batch::operator=(const read_only_data_batch& other)
+{
+  if (this != &other) {
+    if (_batch) {
+      auto prev = _batch->_read_only_count.fetch_sub(1);
+      if (prev == 1) { _batch->_state.store(batch_state::idle); }
+      _lock.unlock();
+    }
+    _batch = other._batch;
+    if (_batch) {
+      _lock = std::shared_lock<std::shared_mutex>(_batch->_rw_mutex);
+      _batch->_read_only_count.fetch_add(1);
+      _batch->_state.store(batch_state::read_only);
+    } else {
+      _lock = std::shared_lock<std::shared_mutex>();
+    }
   }
   return *this;
 }
