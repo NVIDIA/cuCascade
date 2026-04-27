@@ -51,7 +51,21 @@ class reservation_aware_resource_adaptor_impl {
     {
     }
 
-    ~device_reserved_arena() noexcept { _impl->do_release_reservation(this); }
+    ~device_reserved_arena() noexcept { release(); }
+
+    // Idempotent: only the first call subtracts the arena's unused portion from the global counter.
+    void release() noexcept
+    {
+      bool expected = false;
+      if (_logically_released.compare_exchange_strong(expected, true)) {
+        _impl->do_release_reservation(this);
+      }
+    }
+
+    [[nodiscard]] bool is_logically_released() const noexcept
+    {
+      return _logically_released.load(std::memory_order_acquire);
+    }
 
     bool grow_by(std::size_t additional_bytes) final
     {
@@ -72,13 +86,15 @@ class reservation_aware_resource_adaptor_impl {
 
    private:
     reservation_aware_resource_adaptor_impl* _impl;
+    std::atomic<bool> _logically_released{false};
   };
 
   /**
    * @brief Reservation state
    */
   struct stream_ordered_tracker_state {
-    std::unique_ptr<device_reserved_arena>
+    // shared_ptr so the alloc-origin map can hold a weak_ptr that outlives reset_tracker_state.
+    std::shared_ptr<device_reserved_arena>
       memory_reservation;  /// Stream memory reservation (may be null)
     std::unique_ptr<reservation_limit_policy>
       reservation_policy;                             /// Reservation policy for this stream
@@ -87,7 +103,7 @@ class reservation_aware_resource_adaptor_impl {
     friend class reservation_aware_resource_adaptor_impl;
 
     explicit stream_ordered_tracker_state(
-      std::unique_ptr<device_reserved_arena> arena,
+      std::shared_ptr<device_reserved_arena> arena,
       std::unique_ptr<reservation_limit_policy> reservation_policy,
       std::unique_ptr<oom_handling_policy> oom_policy);
 
@@ -108,7 +124,7 @@ class reservation_aware_resource_adaptor_impl {
     virtual void reset_tracker_state(rmm::cuda_stream_view stream) = 0;
 
     virtual void assign_reservation_to_tracker(rmm::cuda_stream_view stream,
-                                               std::unique_ptr<device_reserved_arena> reservation,
+                                               std::shared_ptr<device_reserved_arena> reservation,
                                                std::unique_ptr<reservation_limit_policy> policy,
                                                std::unique_ptr<oom_handling_policy> oom_policy) = 0;
 

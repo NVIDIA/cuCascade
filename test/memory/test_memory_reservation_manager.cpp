@@ -46,6 +46,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using namespace cucascade::memory;
@@ -64,6 +65,23 @@ std::unique_ptr<memory_reservation_manager> createSingleDeviceMemoryManager()
   builder.set_per_host_capacity(expected_host_capacity);  //  4 GB
   builder.use_host_per_gpu();
   builder.set_reservation_fraction_per_host(limit_ratio);
+
+  auto space_configs = builder.build();
+  return std::make_unique<memory_reservation_manager>(std::move(space_configs));
+}
+
+// PER_THREAD-mode manager: lookup uses calling thread's thread_local, ignoring stream.
+// This is the mode sirius runs in (per_stream_reservation=false).
+std::unique_ptr<memory_reservation_manager> createSingleDeviceMemoryManagerPerThread()
+{
+  reservation_manager_configurator builder;
+  builder.set_gpu_usage_limit(expected_gpu_capacity);
+  builder.set_gpu_memory_resource_factory(cucascade::test::make_shared_current_device_resource);
+  builder.set_reservation_fraction_per_gpu(limit_ratio);
+  builder.set_per_host_capacity(expected_host_capacity);
+  builder.use_host_per_gpu();
+  builder.set_reservation_fraction_per_host(limit_ratio);
+  builder.track_reservation_per_stream(false);
 
   auto space_configs = builder.build();
   return std::make_unique<memory_reservation_manager>(std::move(space_configs));
@@ -210,15 +228,17 @@ TEST_CASE("Reservation Strategies with Single Device", "[memory_space]")
   REQUIRE(preference_reservation->tier() == Tier::HOST);
 }
 
-SCENARIO("multi-reservation memory_resource mismatch", "[memory_space]")
+SCENARIO("multi-reservation cross-stream dealloc preserves origin attribution", "[memory_space]")
 {
+  // Origin tracking debits the reservation that was active at *alloc time*, regardless
+  // of which stream runs the dealloc.
   auto manager = createSingleDeviceMemoryManager();
 
   const size_t res_size         = 1ull * 1024 * 1024;  // 1MB
-  const size_t small_alloc_size = res_size / 2;        // 512KB
-  const size_t large_alloc_size = res_size * 2;        // 2MB
+  const size_t small_alloc_size = res_size / 2;        // 512KB (fits in res arena)
+  const size_t large_alloc_size = res_size * 2;        // 2MB  (over-reserves by 1MB)
 
-  GIVEN("Two reservations of 1MB each on different on different streams")
+  GIVEN("Two reservations of 1MB each attached to two different streams")
   {
     auto res1 = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
     auto res2 = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
@@ -229,11 +249,11 @@ SCENARIO("multi-reservation memory_resource mismatch", "[memory_space]")
     mr->attach_reservation_to_tracker(stream1, std::move(res1));
     mr->attach_reservation_to_tracker(stream2, std::move(res2));
 
-    WHEN("releasing allocation from a different memory resource")
+    WHEN("buffers are allocated on each stream and then cross-deallocated")
     {
-      auto upstrem_leftover = mr->get_available_memory();
-      REQUIRE(mr->get_available_memory(stream1) == upstrem_leftover + res_size);
-      REQUIRE(mr->get_available_memory(stream2) == upstrem_leftover + res_size);
+      auto upstream_leftover = mr->get_available_memory();
+      REQUIRE(mr->get_available_memory(stream1) == upstream_leftover + res_size);
+      REQUIRE(mr->get_available_memory(stream2) == upstream_leftover + res_size);
       auto* buff1 = mr->allocate(stream1, small_alloc_size, alignof(std::max_align_t));
       REQUIRE(mr->get_allocated_bytes(stream1) == small_alloc_size);
       REQUIRE(mr->get_available_memory(stream1) ==
@@ -242,15 +262,114 @@ SCENARIO("multi-reservation memory_resource mismatch", "[memory_space]")
       auto* buff2 = mr->allocate(stream2, large_alloc_size, alignof(std::max_align_t));
       REQUIRE(mr->get_allocated_bytes(stream2) == large_alloc_size);
       REQUIRE(mr->get_available_memory(stream2) == mr->get_available_memory());
-      THEN(
-        "allocations from another memory resource is absorbed by other stream as extra reservation")
+
+      THEN("each allocation is debited from its origin reservation, not the dealloc stream's")
       {
+        // buff2 was allocated under res2; freeing it on stream1 still credits res2.
         mr->deallocate(stream1, buff2, large_alloc_size, alignof(std::max_align_t));
-        CHECK(mr->get_available_memory_print(stream1) ==
-              mr->get_available_memory() + large_alloc_size + res_size - small_alloc_size);
+        CHECK(mr->get_allocated_bytes(stream1) == small_alloc_size);
+        CHECK(mr->get_allocated_bytes(stream2) == 0);
 
         mr->deallocate(stream2, buff1, small_alloc_size, alignof(std::max_align_t));
-        CHECK(mr->get_available_memory_print(stream2) == mr->get_available_memory());
+        CHECK(mr->get_allocated_bytes(stream1) == 0);
+        CHECK(mr->get_allocated_bytes(stream2) == 0);
+
+        CHECK(mr->get_available_memory(stream1) == mr->get_available_memory() + res_size);
+        CHECK(mr->get_available_memory(stream2) == mr->get_available_memory() + res_size);
+      }
+    }
+  }
+}
+
+SCENARIO("PER_THREAD mode: cross-thread dealloc preserves origin attribution",
+         "[memory_space][per_thread]")
+{
+  // In PER_THREAD mode (sirius's config), reservation lookup uses thread_local on the
+  // calling CPU thread. Cross-thread buffer lifetimes must still debit the origin.
+  auto manager = createSingleDeviceMemoryManagerPerThread();
+
+  const size_t res_size   = 1ull * 1024 * 1024;  // 1MB
+  const size_t alloc_size = res_size / 2;        // 512KB (fits in arena)
+
+  GIVEN("Thread A allocates with no reservation; thread B holds reservation R_b")
+  {
+    auto res_b = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
+    auto* mr   = res_b->get_memory_resource_of<Tier::GPU>();
+    rmm::cuda_stream stream;
+
+    void* unowned_buff = nullptr;
+    std::thread thread_a([&] {
+      // No reservation attached on this thread; alloc charges global only.
+      unowned_buff = mr->allocate(stream, alloc_size, alignof(std::max_align_t));
+    });
+    thread_a.join();
+    REQUIRE(unowned_buff != nullptr);
+
+    WHEN("thread B attaches R_b to its thread_local and frees thread A's buffer")
+    {
+      // Probe via get_available_memory; get_allocated_bytes would clamp a negative to 0.
+      std::size_t r_b_avail_after_dealloc      = 0;
+      std::size_t upstream_avail_after_dealloc = 0;
+      std::thread thread_b([&] {
+        mr->attach_reservation_to_tracker(stream, std::move(res_b));
+        REQUIRE(mr->get_allocated_bytes(stream) == 0);
+
+        mr->deallocate(stream, unowned_buff, alloc_size, alignof(std::max_align_t));
+
+        upstream_avail_after_dealloc = mr->get_available_memory();
+        r_b_avail_after_dealloc      = mr->get_available_memory(stream);
+
+        mr->reset_stream_reservation(stream);
+      });
+      thread_b.join();
+
+      THEN("R_b's arena reports available_memory == arena_size (no spurious credit)")
+      {
+        // Pre-fix: R_b.allocated_bytes -> -alloc_size, available = arena_size + alloc_size.
+        CHECK(r_b_avail_after_dealloc == upstream_avail_after_dealloc + res_size);
+      }
+    }
+  }
+
+  GIVEN("Thread A holds R_a and allocates; thread B holds R_b and deallocates")
+  {
+    auto res_a = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
+    auto res_b = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
+    auto* mr   = res_a->get_memory_resource_of<Tier::GPU>();
+    rmm::cuda_stream stream;
+
+    void* a_buff = nullptr;
+
+    std::thread thread_a([&, &res_a_ref = res_a] {
+      mr->attach_reservation_to_tracker(stream, std::move(res_a_ref));
+      a_buff = mr->allocate(stream, alloc_size, alignof(std::max_align_t));
+      REQUIRE(mr->get_allocated_bytes(stream) == alloc_size);
+      mr->reset_stream_reservation(stream);
+    });
+    thread_a.join();
+    REQUIRE(a_buff != nullptr);
+
+    WHEN("thread B attaches R_b and frees the buffer that R_a allocated")
+    {
+      std::size_t r_b_avail_after_dealloc      = 0;
+      std::size_t upstream_avail_after_dealloc = 0;
+      std::thread thread_b([&, &res_b_ref = res_b] {
+        mr->attach_reservation_to_tracker(stream, std::move(res_b_ref));
+        REQUIRE(mr->get_allocated_bytes(stream) == 0);
+
+        mr->deallocate(stream, a_buff, alloc_size, alignof(std::max_align_t));
+
+        upstream_avail_after_dealloc = mr->get_available_memory();
+        r_b_avail_after_dealloc      = mr->get_available_memory(stream);
+
+        mr->reset_stream_reservation(stream);
+      });
+      thread_b.join();
+
+      THEN("R_b's arena is untouched; dealloc went to R_a (already released — global only)")
+      {
+        // Pre-fix: dealloc would debit R_b instead of R_a, leaking R_a's allocation into R_b.
+        CHECK(r_b_avail_after_dealloc == upstream_avail_after_dealloc + res_size);
       }
     }
   }

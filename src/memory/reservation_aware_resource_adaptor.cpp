@@ -26,12 +26,16 @@
 
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace cucascade {
 namespace memory {
@@ -39,6 +43,31 @@ namespace memory {
 using impl_type                    = detail::reservation_aware_resource_adaptor_impl;
 using stream_ordered_tracker_state = impl_type::stream_ordered_tracker_state;
 using device_reserved_arena        = impl_type::device_reserved_arena;
+
+namespace {
+
+// Origin reservation per allocation; weak_ptr survives reset_tracker_state.
+struct alloc_origin_info {
+  std::weak_ptr<device_reserved_arena> alloc_arena_weak;
+};
+
+// Sharded by ptr hash to avoid serializing every allocate/deallocate on a single mutex.
+// 16 shards keeps contention below ~10% at 16 concurrent ops while staying lightweight.
+constexpr std::size_t kAllocOriginShards = 16;
+
+struct alloc_origin_shard {
+  std::mutex mutex;
+  std::unordered_map<void*, alloc_origin_info> map;
+};
+
+inline alloc_origin_shard& alloc_origin_shard_for(void* ptr)
+{
+  static std::array<alloc_origin_shard, kAllocOriginShards> shards;
+  // Drop the low 6 bits (alignment noise) before mixing into shard index.
+  return shards[(reinterpret_cast<std::uintptr_t>(ptr) >> 6) % kAllocOriginShards];
+}
+
+}  // namespace
 
 namespace {
 
@@ -50,14 +79,21 @@ struct stream_ordered_allocation_tracker : public impl_type::allocation_tracker_
 
   void reset_tracker_state(rmm::cuda_stream_view stream) override
   {
-    std::lock_guard lock(mutex);
-    auto it = stream_stats_map.find(stream.value());
-    if (it == stream_stats_map.end()) { return; }
-    stream_stats_map.erase(stream.value());
+    // Capture the arena and call release() outside the tracker mutex to avoid lock-order
+    // tangles with the origin-map mutex held by concurrent deallocate paths.
+    std::shared_ptr<device_reserved_arena> released_arena;
+    {
+      std::lock_guard lock(mutex);
+      auto it = stream_stats_map.find(stream.value());
+      if (it == stream_stats_map.end()) { return; }
+      released_arena = it->second->memory_reservation;
+      stream_stats_map.erase(it);
+    }
+    if (released_arena) { released_arena->release(); }
   }
 
   void assign_reservation_to_tracker(rmm::cuda_stream_view stream,
-                                     std::unique_ptr<device_reserved_arena> arena,
+                                     std::shared_ptr<device_reserved_arena> arena,
                                      std::unique_ptr<reservation_limit_policy> policy,
                                      std::unique_ptr<oom_handling_policy> oom_policy) override
   {
@@ -67,8 +103,9 @@ struct stream_ordered_allocation_tracker : public impl_type::allocation_tracker_
       throw rmm::logic_error("Stream already has reservation state set");
     }
 
-    stream_stats_map[stream.value()] = std::make_unique<stream_ordered_tracker_state>(
+    auto state = std::make_unique<stream_ordered_tracker_state>(
       std::move(arena), std::move(policy), std::move(oom_policy));
+    stream_stats_map[stream.value()] = std::move(state);
   }
 
   stream_ordered_tracker_state* get_tracker_state(rmm::cuda_stream_view stream) override
@@ -95,11 +132,15 @@ struct ptds_allocation_tracker : public impl_type::allocation_tracker_iface {
 
   void reset_tracker_state([[maybe_unused]] rmm::cuda_stream_view stream) override
   {
-    if (thread_reservation_state) { thread_reservation_state.reset(); }
+    if (thread_reservation_state) {
+      auto released_arena = thread_reservation_state->memory_reservation;
+      thread_reservation_state.reset();
+      if (released_arena) { released_arena->release(); }
+    }
   }
 
   void assign_reservation_to_tracker([[maybe_unused]] rmm::cuda_stream_view stream,
-                                     std::unique_ptr<device_reserved_arena> arena,
+                                     std::shared_ptr<device_reserved_arena> arena,
                                      std::unique_ptr<reservation_limit_policy> policy,
                                      std::unique_ptr<oom_handling_policy> oom_policy) override
   {
@@ -127,7 +168,7 @@ struct ptds_allocation_tracker : public impl_type::allocation_tracker_iface {
 }  // namespace
 
 stream_ordered_tracker_state::stream_ordered_tracker_state(
-  std::unique_ptr<device_reserved_arena> arena,
+  std::shared_ptr<device_reserved_arena> arena,
   std::unique_ptr<reservation_limit_policy> res_policy,
   std::unique_ptr<oom_handling_policy> oom_policy)
   : memory_reservation(std::move(arena)),
@@ -305,7 +346,7 @@ bool impl_type::attach_reservation_to_tracker(
 
   _allocation_tracker->assign_reservation_to_tracker(
     stream,
-    std::unique_ptr<device_reserved_arena>(
+    std::shared_ptr<device_reserved_arena>(
       dynamic_cast<device_reserved_arena*>(reserved_bytes->_arena.release())),
     std::move(stream_reservation_policy),
     std::move(stream_oom_policy));
@@ -363,11 +404,14 @@ void* impl_type::allocate(cuda::stream_ref stream,
                           [[maybe_unused]] std::size_t alignment)
 {
   auto* reservation_state = _allocation_tracker->get_tracker_state(stream);
+  void* ptr = (reservation_state != nullptr) ? do_allocate_managed(bytes, reservation_state, stream)
+                                             : do_allocate_managed(bytes, stream);
   if (reservation_state != nullptr) {
-    return do_allocate_managed(bytes, reservation_state, stream);
-  } else {
-    return do_allocate_managed(bytes, stream);
+    auto& shard = alloc_origin_shard_for(ptr);
+    std::lock_guard<std::mutex> lock{shard.mutex};
+    shard.map[ptr] = {reservation_state->memory_reservation};
   }
+  return ptr;
 }
 
 void* impl_type::do_allocate_managed(std::size_t bytes, rmm::cuda_stream_view stream)
@@ -443,21 +487,60 @@ void impl_type::deallocate(cuda::stream_ref stream,
                            std::size_t bytes,
                            [[maybe_unused]] std::size_t alignment) noexcept
 {
+  alloc_origin_info origin{};
+  bool have_origin = false;
+  {
+    auto& shard = alloc_origin_shard_for(ptr);
+    std::lock_guard<std::mutex> lock{shard.mutex};
+    auto it = shard.map.find(ptr);
+    if (it != shard.map.end()) {
+      origin      = std::move(it->second);
+      have_origin = true;
+      shard.map.erase(it);
+    }
+  }
   auto tracking_bytes           = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
   auto upstream_reclaimed_bytes = tracking_bytes;
-  auto* reservation_state       = _allocation_tracker->get_tracker_state(stream);
-  if (reservation_state != nullptr) {
-    auto* reservation     = reservation_state->memory_reservation.get();
-    auto reservation_size = static_cast<int64_t>(reservation->size());
+
+  // Debit the originating reservation if it's still alive; otherwise just decrement the
+  // global counter (the default upstream_reclaimed_bytes = tracking_bytes balances both
+  // the no-reservation alloc and the alloc-into-already-released-arena cases).
+  std::shared_ptr<device_reserved_arena> origin_arena_locked;
+  if (have_origin) { origin_arena_locked = origin.alloc_arena_weak.lock(); }
+  device_reserved_arena* origin_arena = nullptr;
+  if (origin_arena_locked && !origin_arena_locked->is_logically_released()) {
+    origin_arena = origin_arena_locked.get();
+  }
+
+  if (origin_arena != nullptr) {
+    auto reservation_size = static_cast<int64_t>(origin_arena->size());
     int64_t post_deallocation_size =
-      reservation->allocated_bytes.sub(static_cast<int64_t>(tracking_bytes));
+      origin_arena->allocated_bytes.sub(static_cast<int64_t>(tracking_bytes));
     int64_t pre_deallocation_size = post_deallocation_size + static_cast<int64_t>(tracking_bytes);
     if (pre_deallocation_size <= reservation_size) {
-      // if it was made using the reserved space
-      upstream_reclaimed_bytes = 0;
+      upstream_reclaimed_bytes = 0;  // entirely within reserved arena
     } else if (post_deallocation_size < reservation_size) {
-      // if it was partially made using the reserved space
       upstream_reclaimed_bytes = static_cast<std::size_t>(pre_deallocation_size - reservation_size);
+    }
+    // else: entirely over-reservation — upstream_reclaimed_bytes stays at tracking_bytes
+
+    // Should never trigger under origin tracking; if it does, it's likely a double-free.
+    if (post_deallocation_size < 0) {
+      static std::atomic<int> count{0};
+      int n = count.fetch_add(1, std::memory_order_relaxed);
+      if (n < 50) {
+        std::fprintf(stderr,
+                     "[ORIGIN-DEBIT-NEGATIVE #%d] origin_arena=%p tracking=%zu "
+                     "arena.allocated_bytes %ld -> %ld (reservation_size=%ld). "
+                     "Likely double-free or bypassed alloc path.\n",
+                     n,
+                     static_cast<void*>(origin_arena),
+                     tracking_bytes,
+                     pre_deallocation_size,
+                     post_deallocation_size,
+                     reservation_size);
+        std::fflush(stderr);
+      }
     }
   }
 // Suppress false-positive null-dereference warnings from CCCL library code
@@ -506,6 +589,25 @@ void impl_type::do_release_reservation(device_reserved_arena* arena) noexcept
   std::size_t released_bytes = 0;
   if (arena_size > allocation_size) {
     released_bytes = static_cast<std::size_t>(arena_size - allocation_size);
+  }
+
+  if (allocation_size < 0) {
+    static std::atomic<int> count{0};
+    int n = count.fetch_add(1, std::memory_order_relaxed);
+    if (n < 50) {
+      auto cur = static_cast<long long>(_total_allocated_bytes.load());
+      std::fprintf(stderr,
+                   "[INFLATED-RELEASE #%d] arena_size=%ld alloc_bytes=%ld -> "
+                   "released_bytes=%zu (over-drain by %ld bytes); "
+                   "_total_allocated_bytes before sub = %lld\n",
+                   n,
+                   arena_size,
+                   allocation_size,
+                   released_bytes,
+                   -allocation_size,
+                   cur);
+      std::fflush(stderr);
+    }
   }
 
   _number_of_allocations.fetch_sub(1);
