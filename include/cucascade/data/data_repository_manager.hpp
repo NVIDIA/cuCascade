@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -242,33 +243,25 @@ class data_repository_manager {
   }
 
  private:
-  // Implementation for shared_ptr - can copy to multiple repositories
-  template <typename T = PtrType>
-  typename std::enable_if<std::is_same<T, std::shared_ptr<data_batch>>::value>::type
-  add_data_batch_impl(T batch, std::vector<std::pair<size_t, std::string_view>>& ops)
+  void add_data_batch_impl(PtrType batch, std::vector<std::pair<size_t, std::string_view>>& ops)
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& op : ops) {
-      _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
-    }
-  }
-
-  // Implementation for unique_ptr - can only add to one repository (moves the batch)
-  template <typename T = PtrType>
-  typename std::enable_if<std::is_same<T, std::unique_ptr<data_batch>>::value>::type
-  add_data_batch_impl(T batch, std::vector<std::pair<size_t, std::string_view>>& ops)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (ops.size() > 1) {
-      throw std::runtime_error(
-        "unique_ptr data_batch can only be added to one repository. "
-        "Use shared_ptr for multiple destinations.");
-    }
-    if (!ops.empty()) {
-      auto& op = ops[0];
-      _repositories[{op.first, std::string(op.second)}]->add_data_batch(std::move(batch));
+    if constexpr (std::is_copy_constructible_v<PtrType>) {
+      for (auto& op : ops) {
+        _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
+      }
     } else {
-      throw std::runtime_error("No operator ports provided");
+      if (ops.size() > 1) {
+        throw std::runtime_error(
+          "unique_ptr data_batch can only be added to one repository. "
+          "Use shared_ptr for multiple destinations.");
+      }
+      if (!ops.empty()) {
+        auto& op = ops[0];
+        _repositories[{op.first, std::string(op.second)}]->add_data_batch(std::move(batch));
+      } else {
+        throw std::runtime_error("No operator ports provided");
+      }
     }
   }
 
