@@ -39,7 +39,7 @@ TEST_CASE("shared_data_repository Construction", "[data_repository]")
 {
   shared_data_repository repository;
 
-  auto batch = repository.pop_idle_data_batch();
+  auto batch = repository.pop_next_data_batch();
   REQUIRE(batch == nullptr);
 }
 
@@ -52,11 +52,11 @@ TEST_CASE("shared_data_repository Add and Pull Single Batch", "[data_repository]
 
   repository.add_data_batch(batch);
 
-  auto pulled_batch = repository.pop_idle_data_batch();
+  auto pulled_batch = repository.pop_next_data_batch();
   REQUIRE(pulled_batch != nullptr);
   REQUIRE(pulled_batch->get_batch_id() == 1);
 
-  auto empty = repository.pop_idle_data_batch();
+  auto empty = repository.pop_next_data_batch();
   REQUIRE(empty == nullptr);
 }
 
@@ -71,12 +71,12 @@ TEST_CASE("shared_data_repository FIFO Order", "[data_repository]")
   }
 
   for (uint64_t i = 1; i <= 5; ++i) {
-    auto pulled_batch = repository.pop_idle_data_batch();
+    auto pulled_batch = repository.pop_next_data_batch();
     REQUIRE(pulled_batch != nullptr);
     REQUIRE(pulled_batch->get_batch_id() == i);
   }
 
-  auto empty = repository.pop_idle_data_batch();
+  auto empty = repository.pop_next_data_batch();
   REQUIRE(empty == nullptr);
 }
 
@@ -93,9 +93,9 @@ TEST_CASE("shared_data_repository Same Batch Multiple Repositories", "[data_repo
   repo2.add_data_batch(batch);
   repo3.add_data_batch(batch);
 
-  auto pulled1 = repo1.pop_idle_data_batch();
-  auto pulled2 = repo2.pop_idle_data_batch();
-  auto pulled3 = repo3.pop_idle_data_batch();
+  auto pulled1 = repo1.pop_next_data_batch();
+  auto pulled2 = repo2.pop_next_data_batch();
+  auto pulled3 = repo3.pop_next_data_batch();
 
   REQUIRE(pulled1 != nullptr);
   REQUIRE(pulled2 != nullptr);
@@ -114,7 +114,7 @@ TEST_CASE("shared_data_repository Pull From Empty", "[data_repository]")
   shared_data_repository repository;
 
   for (int i = 0; i < 10; ++i) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     REQUIRE(batch == nullptr);
   }
 }
@@ -145,7 +145,7 @@ TEST_CASE("shared_data_repository Thread-Safe Adding", "[data_repository]")
 
   int count = 0;
   while (true) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -172,7 +172,7 @@ TEST_CASE("shared_data_repository Thread-Safe Pulling", "[data_repository]")
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
       while (true) {
-        auto batch = repository.pop_idle_data_batch();
+        auto batch = repository.pop_next_data_batch();
         if (!batch) break;
         ++thread_counts[i];
       }
@@ -190,7 +190,7 @@ TEST_CASE("shared_data_repository Thread-Safe Pulling", "[data_repository]")
 
   REQUIRE(total_count == num_batches);
 
-  auto empty = repository.pop_idle_data_batch();
+  auto empty = repository.pop_next_data_batch();
   REQUIRE(empty == nullptr);
 }
 
@@ -239,7 +239,7 @@ TEST_CASE("shared_data_repository Thread-Safe Pulling with Multiple Partitions",
 
   REQUIRE(total_count == num_batches);
 
-  auto empty = repository.pop_idle_data_batch();
+  auto empty = repository.pop_next_data_batch();
   REQUIRE(empty == nullptr);
 }
 
@@ -251,7 +251,7 @@ TEST_CASE("unique_data_repository Construction", "[data_repository]")
 {
   unique_data_repository repository;
 
-  auto batch = repository.pop_idle_data_batch();
+  auto batch = repository.pop_next_data_batch();
   REQUIRE(batch == nullptr);
 }
 
@@ -264,11 +264,11 @@ TEST_CASE("unique_data_repository Add and Pull Single Batch", "[data_repository]
 
   repository.add_data_batch(std::move(batch));
 
-  auto pulled_batch = repository.pop_idle_data_batch();
+  auto pulled_batch = repository.pop_next_data_batch();
   REQUIRE(pulled_batch != nullptr);
   REQUIRE(pulled_batch->get_batch_id() == 1);
 
-  auto empty = repository.pop_idle_data_batch();
+  auto empty = repository.pop_next_data_batch();
   REQUIRE(empty == nullptr);
 }
 
@@ -283,12 +283,12 @@ TEST_CASE("unique_data_repository FIFO Order", "[data_repository]")
   }
 
   for (uint64_t i = 1; i <= 5; ++i) {
-    auto pulled_batch = repository.pop_idle_data_batch();
+    auto pulled_batch = repository.pop_next_data_batch();
     REQUIRE(pulled_batch != nullptr);
     REQUIRE(pulled_batch->get_batch_id() == i);
   }
 
-  auto empty = repository.pop_idle_data_batch();
+  auto empty = repository.pop_next_data_batch();
   REQUIRE(empty == nullptr);
 }
 
@@ -306,7 +306,7 @@ TEST_CASE("unique_data_repository Large Number of Batches", "[data_repository]")
 
   int count = 0;
   while (true) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -325,13 +325,13 @@ TEST_CASE("unique_data_repository Interleaved Add and Pull", "[data_repository]"
       repository.add_data_batch(std::move(batch));
     }
 
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     REQUIRE(batch != nullptr);
   }
 
   int remaining = 0;
   while (true) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     if (!batch) break;
     ++remaining;
   }
@@ -366,7 +366,7 @@ TEST_CASE("unique_data_repository Thread-Safe Adding", "[data_repository]")
 
   int count = 0;
   while (true) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -393,7 +393,7 @@ TEST_CASE("unique_data_repository Thread-Safe Pulling", "[data_repository]")
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
       while (true) {
-        auto batch = repository.pop_idle_data_batch();
+        auto batch = repository.pop_next_data_batch();
         if (!batch) break;
         ++thread_counts[i];
       }
@@ -411,7 +411,7 @@ TEST_CASE("unique_data_repository Thread-Safe Pulling", "[data_repository]")
 
   REQUIRE(total_count == num_batches);
 
-  auto empty = repository.pop_idle_data_batch();
+  auto empty = repository.pop_next_data_batch();
   REQUIRE(empty == nullptr);
 }
 
@@ -443,7 +443,7 @@ TEST_CASE("unique_data_repository Concurrent Add and Pull", "[data_repository]")
     threads.emplace_back([&]() {
       int local_count = 0;
       while (local_count < batches_per_thread) {
-        auto batch = repository.pop_idle_data_batch();
+        auto batch = repository.pop_next_data_batch();
         if (batch) {
           ++local_count;
           ++pulled_count;
@@ -481,7 +481,7 @@ TEST_CASE("unique_data_repository High Contention", "[data_repository]")
         repository.add_data_batch(std::move(batch));
         ++total_added;
 
-        auto pulled = repository.pop_idle_data_batch();
+        auto pulled = repository.pop_next_data_batch();
         if (pulled) { ++total_pulled; }
       }
     });
@@ -494,7 +494,7 @@ TEST_CASE("unique_data_repository High Contention", "[data_repository]")
   REQUIRE(total_added == num_threads * operations_per_thread);
 
   while (true) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     if (!batch) break;
     ++total_pulled;
   }
@@ -546,12 +546,12 @@ TEST_CASE("shared_data_repository size After Pulling", "[data_repository]")
   REQUIRE(repository.size() == 5);
 
   for (int i = 1; i <= 4; ++i) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     REQUIRE(batch != nullptr);
     REQUIRE(repository.size() == (5 - i));
   }
 
-  auto last_batch = repository.pop_idle_data_batch();
+  auto last_batch = repository.pop_next_data_batch();
   REQUIRE(last_batch != nullptr);
   REQUIRE(repository.size() == 0);
 }
@@ -571,14 +571,14 @@ TEST_CASE("shared_data_repository size Interleaved Operations", "[data_repositor
 
     REQUIRE(repository.size() == (cycle * 2 + 3));
 
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     REQUIRE(batch != nullptr);
 
     REQUIRE(repository.size() == (cycle * 2 + 2));
   }
 
   while (repository.size() > 0) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     REQUIRE(batch != nullptr);
   }
 
@@ -625,12 +625,12 @@ TEST_CASE("unique_data_repository size After Pulling", "[data_repository]")
   REQUIRE(repository.size() == 5);
 
   for (int i = 1; i <= 4; ++i) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     REQUIRE(batch != nullptr);
     REQUIRE(repository.size() == (5 - i));
   }
 
-  auto last_batch = repository.pop_idle_data_batch();
+  auto last_batch = repository.pop_next_data_batch();
   REQUIRE(last_batch != nullptr);
   REQUIRE(repository.size() == 0);
 }
@@ -650,14 +650,14 @@ TEST_CASE("unique_data_repository size Interleaved Operations", "[data_repositor
 
     REQUIRE(repository.size() == (cycle * 2 + 3));
 
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     REQUIRE(batch != nullptr);
 
     REQUIRE(repository.size() == (cycle * 2 + 2));
   }
 
   while (repository.size() > 0) {
-    auto batch = repository.pop_idle_data_batch();
+    auto batch = repository.pop_next_data_batch();
     REQUIRE(batch != nullptr);
   }
 
@@ -753,7 +753,7 @@ TEST_CASE("shared_data_repository size Concurrent Operations", "[data_repository
       int pulled = 0;
       while (pulled < operations) {
         if (repository.size() > 0) {
-          auto batch = repository.pop_idle_data_batch();
+          auto batch = repository.pop_next_data_batch();
           if (batch) { ++pulled; }
         } else {
           std::this_thread::yield();
@@ -926,35 +926,58 @@ TEST_CASE("unique_data_repository throws an error when trying to get a batch by 
 }
 
 // =============================================================================
-// Tests for state-specific pop methods
+// Tests for pop_next_data_batch
 // =============================================================================
 
-TEST_CASE("shared_data_repository pop_idle_data_batch skips non-idle batches", "[data_repository]")
+TEST_CASE("shared_data_repository pop_next_data_batch empty returns nullptr", "[data_repository]")
+{
+  shared_data_repository repository;
+  REQUIRE(repository.pop_next_data_batch() == nullptr);
+}
+
+TEST_CASE("shared_data_repository pop_next_data_batch returns idle batch", "[data_repository]")
 {
   shared_data_repository repository;
 
-  auto data1  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch1 = std::make_shared<data_batch>(1, std::move(data1));
-  auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch2 = std::make_shared<data_batch>(2, std::move(data2));
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+  repository.add_data_batch(batch);
 
-  // Transition batch1 to read_only (via non-static, caller's ptr survives)
-  auto accessor = batch1->to_read_only();
-
-  repository.add_data_batch(batch1);
-  repository.add_data_batch(batch2);
-
-  // pop_idle should skip batch1 (read_only) and return batch2 (idle)
-  auto popped = repository.pop_idle_data_batch();
+  auto popped = repository.pop_next_data_batch();
   REQUIRE(popped != nullptr);
-  REQUIRE(popped->get_batch_id() == 2);
-
-  // pop_idle again — batch1 is still read_only, no idle batches left
-  auto popped2 = repository.pop_idle_data_batch();
-  REQUIRE(popped2 == nullptr);
+  REQUIRE(popped->get_batch_id() == 1);
+  REQUIRE(repository.pop_next_data_batch() == nullptr);
 }
 
-TEST_CASE("shared_data_repository pop_read_only_data_batch finds read-locked batch",
+TEST_CASE("shared_data_repository pop_next_data_batch returns read_only batch", "[data_repository]")
+{
+  shared_data_repository repository;
+
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(2, std::move(data));
+  auto accessor = batch->to_read_only();
+  repository.add_data_batch(batch);
+
+  auto popped = repository.pop_next_data_batch();
+  REQUIRE(popped != nullptr);
+  REQUIRE(popped->get_batch_id() == 2);
+}
+
+TEST_CASE("shared_data_repository pop_next_data_batch returns mutable batch", "[data_repository]")
+{
+  shared_data_repository repository;
+
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = std::make_shared<data_batch>(3, std::move(data));
+  auto accessor = batch->to_mutable();
+  repository.add_data_batch(batch);
+
+  auto popped = repository.pop_next_data_batch();
+  REQUIRE(popped != nullptr);
+  REQUIRE(popped->get_batch_id() == 3);
+}
+
+TEST_CASE("shared_data_repository pop_next_data_batch FIFO regardless of state",
           "[data_repository]")
 {
   shared_data_repository repository;
@@ -963,25 +986,33 @@ TEST_CASE("shared_data_repository pop_read_only_data_batch finds read-locked bat
   auto batch1 = std::make_shared<data_batch>(1, std::move(data1));
   auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   auto batch2 = std::make_shared<data_batch>(2, std::move(data2));
+  auto data3  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch3 = std::make_shared<data_batch>(3, std::move(data3));
 
-  // batch1 is idle, batch2 is read_only
-  auto accessor = batch2->to_read_only();
+  // batch1 read_only, batch2 mutable, batch3 idle — all three should come out in order
+  auto ro_accessor  = batch1->to_read_only();
+  auto mut_accessor = batch2->to_mutable();
 
   repository.add_data_batch(batch1);
   repository.add_data_batch(batch2);
+  repository.add_data_batch(batch3);
 
-  // pop_read_only should skip batch1 (idle) and return batch2 (read_only)
-  auto popped = repository.pop_read_only_data_batch();
-  REQUIRE(popped != nullptr);
-  REQUIRE(popped->get_batch_id() == 2);
+  auto p1 = repository.pop_next_data_batch();
+  REQUIRE(p1 != nullptr);
+  REQUIRE(p1->get_batch_id() == 1);
 
-  // No more read_only batches
-  auto popped2 = repository.pop_read_only_data_batch();
-  REQUIRE(popped2 == nullptr);
+  auto p2 = repository.pop_next_data_batch();
+  REQUIRE(p2 != nullptr);
+  REQUIRE(p2->get_batch_id() == 2);
+
+  auto p3 = repository.pop_next_data_batch();
+  REQUIRE(p3 != nullptr);
+  REQUIRE(p3->get_batch_id() == 3);
+
+  REQUIRE(repository.pop_next_data_batch() == nullptr);
 }
 
-TEST_CASE("shared_data_repository pop_mutable_data_batch finds mutable-locked batch",
-          "[data_repository]")
+TEST_CASE("shared_data_repository pop_next_data_batch with partitions", "[data_repository]")
 {
   shared_data_repository repository;
 
@@ -989,50 +1020,49 @@ TEST_CASE("shared_data_repository pop_mutable_data_batch finds mutable-locked ba
   auto batch1 = std::make_shared<data_batch>(1, std::move(data1));
   auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   auto batch2 = std::make_shared<data_batch>(2, std::move(data2));
-
-  // batch2 is mutable_locked
-  auto accessor = batch2->to_mutable();
-
-  repository.add_data_batch(batch1);
-  repository.add_data_batch(batch2);
-
-  // pop_mutable should skip batch1 (idle) and return batch2 (mutable_locked)
-  auto popped = repository.pop_mutable_data_batch();
-  REQUIRE(popped != nullptr);
-  REQUIRE(popped->get_batch_id() == 2);
-
-  // pop_idle should find batch1
-  auto popped2 = repository.pop_idle_data_batch();
-  REQUIRE(popped2 != nullptr);
-  REQUIRE(popped2->get_batch_id() == 1);
-}
-
-TEST_CASE("shared_data_repository state-specific pop from empty returns nullptr",
-          "[data_repository]")
-{
-  shared_data_repository repository;
-
-  REQUIRE(repository.pop_idle_data_batch() == nullptr);
-  REQUIRE(repository.pop_read_only_data_batch() == nullptr);
-  REQUIRE(repository.pop_mutable_data_batch() == nullptr);
-}
-
-TEST_CASE("shared_data_repository state-specific pop with partitions", "[data_repository]")
-{
-  shared_data_repository repository;
-
-  auto data1  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch1 = std::make_shared<data_batch>(1, std::move(data1));
-  auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch2 = std::make_shared<data_batch>(2, std::move(data2));
-
   auto accessor = batch1->to_read_only();
 
   repository.add_data_batch(batch1, 0);
   repository.add_data_batch(batch2, 1);
 
-  // Partition 0 has read_only batch, partition 1 has idle batch
-  REQUIRE(repository.pop_idle_data_batch(0) == nullptr);
-  REQUIRE(repository.pop_read_only_data_batch(0) != nullptr);
-  REQUIRE(repository.pop_idle_data_batch(1) != nullptr);
+  auto p0 = repository.pop_next_data_batch(0);
+  REQUIRE(p0 != nullptr);
+  REQUIRE(p0->get_batch_id() == 1);
+
+  auto p1 = repository.pop_next_data_batch(1);
+  REQUIRE(p1 != nullptr);
+  REQUIRE(p1->get_batch_id() == 2);
+
+  REQUIRE(repository.pop_next_data_batch(0) == nullptr);
+  REQUIRE(repository.pop_next_data_batch(1) == nullptr);
+}
+
+TEST_CASE("unique_data_repository pop_next_data_batch empty returns nullptr", "[data_repository]")
+{
+  unique_data_repository repository;
+  REQUIRE(repository.pop_next_data_batch() == nullptr);
+}
+
+TEST_CASE("unique_data_repository pop_next_data_batch returns batch regardless of state",
+          "[data_repository]")
+{
+  unique_data_repository repository;
+
+  auto data1  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch1 = std::make_unique<data_batch>(1, std::move(data1));
+  auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch2 = std::make_unique<data_batch>(2, std::move(data2));
+
+  repository.add_data_batch(std::move(batch1));
+  repository.add_data_batch(std::move(batch2));
+
+  auto p1 = repository.pop_next_data_batch();
+  REQUIRE(p1 != nullptr);
+  REQUIRE(p1->get_batch_id() == 1);
+
+  auto p2 = repository.pop_next_data_batch();
+  REQUIRE(p2 != nullptr);
+  REQUIRE(p2->get_batch_id() == 2);
+
+  REQUIRE(repository.pop_next_data_batch() == nullptr);
 }

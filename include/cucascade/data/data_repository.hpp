@@ -94,54 +94,30 @@ class idata_repository {
   void notify_state_change() { _cv.notify_all(); }
 
   /**
-   * @brief Remove and return the first idle data batch from the repository.
+   * @brief Remove and return the next data batch from the repository.
    *
-   * Scans the partition for the first batch with state == batch_state::idle.
-   * If no idle batch is found, returns a null pointer.
+   * Returns the first batch in the partition regardless of its state.
+   * If the partition is empty, returns a null pointer.
    *
    * @param partition_idx Index of the partition to pop from (default: 0)
-   * @return PtrType The data batch, or nullptr if no idle batch is found.
+   * @return PtrType The next data batch, or nullptr if the partition is empty.
    *
    * @note Thread-safe operation protected by internal mutex
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType pop_idle_data_batch(size_t partition_idx = 0)
+  virtual PtrType pop_next_data_batch(size_t partition_idx = 0)
   {
-    return pop_data_batch_by_state(batch_state::idle, partition_idx);
-  }
+    std::unique_lock<std::mutex> lock(_mutex);
 
-  /**
-   * @brief Remove and return the first read-only data batch from the repository.
-   *
-   * Scans the partition for the first batch with state == batch_state::read_only.
-   * If no read-only batch is found, returns a null pointer.
-   *
-   * @param partition_idx Index of the partition to pop from (default: 0)
-   * @return PtrType The data batch, or nullptr if no read-only batch is found.
-   *
-   * @note Thread-safe operation protected by internal mutex
-   * @throws std::out_of_range if partition_idx is out of range
-   */
-  virtual PtrType pop_read_only_data_batch(size_t partition_idx = 0)
-  {
-    return pop_data_batch_by_state(batch_state::read_only, partition_idx);
-  }
+    if (partition_idx >= _data_batches.size()) {
+      throw std::out_of_range("partition_idx out of range");
+    }
 
-  /**
-   * @brief Remove and return the first mutable-locked data batch from the repository.
-   *
-   * Scans the partition for the first batch with state == batch_state::mutable_locked.
-   * If no mutable batch is found, returns a null pointer.
-   *
-   * @param partition_idx Index of the partition to pop from (default: 0)
-   * @return PtrType The data batch, or nullptr if no mutable batch is found.
-   *
-   * @note Thread-safe operation protected by internal mutex
-   * @throws std::out_of_range if partition_idx is out of range
-   */
-  virtual PtrType pop_mutable_data_batch(size_t partition_idx = 0)
-  {
-    return pop_data_batch_by_state(batch_state::mutable_locked, partition_idx);
+    if (_data_batches[partition_idx].empty()) { return PtrType{}; }
+
+    auto batch = std::move(_data_batches[partition_idx].front());
+    _data_batches[partition_idx].erase(_data_batches[partition_idx].begin());
+    return batch;
   }
 
   /**
@@ -297,33 +273,6 @@ class idata_repository {
   }
 
  protected:
-  /**
-   * @brief Pop the first batch matching the given state from a partition.
-   *
-   * @param target_state The batch_state to filter on.
-   * @param partition_idx Index of the partition to scan.
-   * @return PtrType The first matching batch, or nullptr if none found.
-   */
-  PtrType pop_data_batch_by_state(batch_state target_state, size_t partition_idx)
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-
-    if (partition_idx >= _data_batches.size()) {
-      throw std::out_of_range("partition_idx out of range");
-    }
-
-    for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
-         ++it) {
-      if (it->get()->get_state() == target_state) {
-        auto batch = std::move(*it);
-        _data_batches[partition_idx].erase(it);
-        return batch;
-      }
-    }
-
-    return PtrType{};
-  }
-
   mutable std::mutex _mutex;    ///< Mutex for thread-safe access to repository operations
   std::condition_variable _cv;  ///< Condition variable for blocking pop operations
   std::vector<std::vector<PtrType>>
