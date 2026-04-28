@@ -21,8 +21,12 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
+#include <any>
+#include <cstddef>
 #include <memory>
+#include <variant>
 #include <vector>
 
 namespace cucascade {
@@ -47,6 +51,19 @@ class gpu_table_representation : public idata_representation {
    * @param memory_space The memory space where the GPU table resides
    */
   gpu_table_representation(std::unique_ptr<cudf::table> table,
+                           cucascade::memory::memory_space& memory_space);
+
+  /**
+   * @brief Construct a new gpu_table_representation object
+   *
+   * @param table Unique pointer to the cuDF table with the data (ownership is transferred)
+   * @tparam Owner The type of the owner of the cuDF table (e.g., a specific operator or component)
+   * @param memory_space The memory space where the GPU table resides
+   */
+  template <typename Owner>
+  gpu_table_representation(cudf::table_view table_view,
+                           Owner&& owner,
+                           std::size_t alloc_size,
                            cucascade::memory::memory_space& memory_space);
 
   /**
@@ -77,7 +94,14 @@ class gpu_table_representation : public idata_representation {
    *
    * @return const cudf::table& Reference to the cuDF table
    */
-  const cudf::table& get_table() const;
+  const cudf::table& get_table(rmm::cuda_stream_view stream) const;
+
+  /**
+   * @brief Get the underlying cuDF table view
+   *
+   * @return cudf::table_view A view of the cuDF table
+   */
+  cudf::table_view get_table_view() const;
 
   /**
    * @brief Release ownership of the underlying cuDF table
@@ -86,11 +110,28 @@ class gpu_table_representation : public idata_representation {
    *
    * @return std::unique_ptr<cudf::table> The cuDF table
    */
-  std::unique_ptr<cudf::table> release_table();
+  std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);
 
  private:
-  std::unique_ptr<cudf::table>
+  struct owning_table_view {
+    std::any owner;  ///< The owner of the cuDF table
+    std::size_t alloc_size{0};
+    cudf::table_view view;  ///< A view of the owned table for easy access
+  };
+
+  mutable std::variant<std::unique_ptr<cudf::table>, owning_table_view>
     _table;  ///< cudf::table is the underlying representation of the data
 };
+
+template <typename Owner>
+gpu_table_representation::gpu_table_representation(cudf::table_view table_view,
+                                                   Owner&& owner,
+                                                   std::size_t alloc_size,
+                                                   cucascade::memory::memory_space& memory_space)
+  : idata_representation(memory_space),
+    _table(
+      owning_table_view{std::make_any<Owner>(std::forward<Owner>(owner)), alloc_size, table_view})
+{
+}
 
 }  // namespace cucascade

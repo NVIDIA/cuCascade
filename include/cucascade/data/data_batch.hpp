@@ -454,7 +454,8 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * When transitioning from task_created, the task_created_count is preserved
    * so the pending task remains valid after the data is moved.
    *
-   * @return true if the batch was successfully locked (processing_count == 0 and state is idle or task_created with task_created_count > 0)
+   * @return true if the batch was successfully locked (processing_count == 0 and state is idle or
+   * task_created with task_created_count > 0)
    * @return false if the batch could not be locked
    */
   bool try_to_lock_for_in_transit();

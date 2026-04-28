@@ -85,7 +85,7 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
 
   // Compare original (from gpu_rep) with round-tripped
   test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table(), gpu_rep2->get_table(), shared_stream());
+    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
 }
 
 /// Create a simple column of the given type with uninitialized data.
@@ -630,7 +630,7 @@ TEST_CASE("gpu disk round-trip with explicit pipeline backend",
     registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
 
   test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table(), gpu_rep2->get_table(), shared_stream());
+    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
 }
 
 TEST_CASE("gpu disk round-trip pipeline with multiple types",
@@ -657,7 +657,7 @@ TEST_CASE("gpu disk round-trip pipeline with multiple types",
     registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
 
   test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table(), gpu_rep2->get_table(), shared_stream());
+    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
 }
 
 TEST_CASE("disk_data_representation get_uncompressed_data_size_in_bytes", "[disk][representation]")

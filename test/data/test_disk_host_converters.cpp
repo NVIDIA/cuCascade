@@ -101,7 +101,7 @@ void round_trip_test(std::unique_ptr<cudf::table> original_table)
 
   // Compare original (from gpu_rep) with round-tripped
   test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table(), gpu_rep2->get_table(), shared_stream());
+    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
 }
 
 /// Create a simple column of the given type with uninitialized data.

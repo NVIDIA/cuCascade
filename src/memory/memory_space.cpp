@@ -121,9 +121,10 @@ memory_space::memory_space(const gpu_memory_space_config& config)
     pool_handle = concrete_mr.pool_handle();
     _allocator  = cuda::mr::any_resource<cuda::mr::device_accessible>(std::move(concrete_mr));
 #else
-    auto concrete_mr = std::make_shared<rmm::mr::cuda_async_memory_resource>(config.memory_capacity);
-    pool_handle      = concrete_mr->pool_handle();
-    _allocator       = wrap_legacy_rmm_resource(std::move(concrete_mr));
+    auto concrete_mr =
+      std::make_shared<rmm::mr::cuda_async_memory_resource>(config.memory_capacity);
+    pool_handle = concrete_mr->pool_handle();
+    _allocator  = wrap_legacy_rmm_resource(std::move(concrete_mr));
 #endif
   }
 
@@ -352,8 +353,7 @@ rmm::device_async_resource_ref memory_space::get_default_allocator() const noexc
   return std::visit(
     utils::overloaded{
       [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
-        return rmm::device_async_resource_ref{
-          const_cast<reservation_aware_resource_adaptor&>(*mr)};
+        return rmm::device_async_resource_ref{const_cast<reservation_aware_resource_adaptor&>(*mr)};
       },
       [&](const std::unique_ptr<fixed_size_host_memory_resource>&) {
         return rmm::device_async_resource_ref{

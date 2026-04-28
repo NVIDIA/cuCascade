@@ -906,13 +906,13 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
   REQUIRE(cloned_repr != nullptr);
 
   // Verify table shape matches
-  REQUIRE(cloned_repr->get_table().num_rows() == original_rows);
-  REQUIRE(cloned_repr->get_table().num_columns() == original_columns);
+  REQUIRE(cloned_repr->get_table_view().num_rows() == original_rows);
+  REQUIRE(cloned_repr->get_table_view().num_columns() == original_columns);
 
   // Verify actual data content matches
   stream.synchronize();
   expect_cudf_tables_equal_on_stream(
-    original_repr->get_table(), cloned_repr->get_table(), stream.view());
+    original_repr->get_table_view(), cloned_repr->get_table_view(), stream.view());
 }
 
 TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gpu]")
@@ -933,13 +933,10 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
   // Verify the data representations are different objects
   REQUIRE(batch->get_data() != cloned->get_data());
 
-  // Verify the underlying cudf tables are different objects
-  REQUIRE(&original_repr->get_table() != &cloned_repr->get_table());
-
   // Verify each column points to different memory
-  for (cudf::size_type i = 0; i < original_repr->get_table().num_columns(); ++i) {
-    REQUIRE(original_repr->get_table().view().column(i).head() !=
-            cloned_repr->get_table().view().column(i).head());
+  for (cudf::size_type i = 0; i < original_repr->get_table_view().num_columns(); ++i) {
+    REQUIRE(original_repr->get_table_view().column(i).head() !=
+            cloned_repr->get_table_view().column(i).head());
   }
 }
 
@@ -971,7 +968,7 @@ TEST_CASE("data_batch clone with real GPU data while processing", "[data_batch][
 
   stream.synchronize();
   expect_cudf_tables_equal_on_stream(
-    original_repr->get_table(), cloned_repr->get_table(), stream.view());
+    original_repr->get_table_view(), cloned_repr->get_table_view(), stream.view());
 
   // Original should still be processing
   REQUIRE(batch->get_processing_count() == 1);
@@ -1018,11 +1015,11 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
 
   stream.synchronize();
   expect_cudf_tables_equal_on_stream(
-    original_repr->get_table(), clone1_repr->get_table(), stream.view());
+    original_repr->get_table_view(), clone1_repr->get_table_view(), stream.view());
   expect_cudf_tables_equal_on_stream(
-    original_repr->get_table(), clone2_repr->get_table(), stream.view());
+    original_repr->get_table_view(), clone2_repr->get_table_view(), stream.view());
   expect_cudf_tables_equal_on_stream(
-    original_repr->get_table(), clone3_repr->get_table(), stream.view());
+    original_repr->get_table_view(), clone3_repr->get_table_view(), stream.view());
 }
 
 TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
@@ -1041,8 +1038,8 @@ TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
 
   auto* cloned_repr = dynamic_cast<gpu_table_representation*>(cloned->get_data());
   REQUIRE(cloned_repr != nullptr);
-  REQUIRE(cloned_repr->get_table().num_rows() == 0);
-  REQUIRE(cloned_repr->get_table().num_columns() == 2);
+  REQUIRE(cloned_repr->get_table_view().num_rows() == 0);
+  REQUIRE(cloned_repr->get_table_view().num_columns() == 2);
 }
 
 TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
@@ -1064,18 +1061,18 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
   auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
 
   // Verify structure
-  REQUIRE(cloned_repr->get_table().num_rows() == 10000);
-  REQUIRE(cloned_repr->get_table().num_columns() == 2);
+  REQUIRE(cloned_repr->get_table_view().num_rows() == 10000);
+  REQUIRE(cloned_repr->get_table_view().num_columns() == 2);
 
   // Verify data integrity
   stream.synchronize();
   expect_cudf_tables_equal_on_stream(
-    original_repr->get_table(), cloned_repr->get_table(), stream.view());
+    original_repr->get_table_view(), cloned_repr->get_table_view(), stream.view());
 
   // Verify independence
-  for (cudf::size_type i = 0; i < original_repr->get_table().num_columns(); ++i) {
-    REQUIRE(original_repr->get_table().view().column(i).head() !=
-            cloned_repr->get_table().view().column(i).head());
+  for (cudf::size_type i = 0; i < original_repr->get_table_view().num_columns(); ++i) {
+    REQUIRE(original_repr->get_table_view().column(i).head() !=
+            cloned_repr->get_table_view().column(i).head());
   }
 }
 
