@@ -40,6 +40,7 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
@@ -140,8 +141,10 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
 {
-  // Synchronize the stream to ensure any prior operations (like table creation)
-  // are complete before we read from the source table
+  // Synchronize the caller's stream so any prior operation (e.g. the cudf::table
+  // construction that produced the source payload) is complete before we read
+  // from the source table. The caller's stream may be bound to any device;
+  // synchronize is a no-op at the driver level when there is no outstanding work.
   stream.synchronize();
 
   auto& gpu_source = source.cast<gpu_table_representation>();
@@ -151,43 +154,52 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
     return source.clone(stream);
   }
 
-  auto packed_data = cudf::pack(gpu_source.get_table(), stream);
-
-  assert(source.get_device_id() != target_memory_space->get_device_id());
   auto const target_device_id = target_memory_space->get_device_id();
   auto const source_device_id = source.get_device_id();
-  auto const bytes_to_copy    = packed_data.gpu_data->size();
   auto mr                     = target_memory_space->get_default_allocator();
 
-  // Acquire a stream that belongs to the target GPU device
+  // --- Pack on the source device context using a source-bound stream. ---
+  // cudf::pack allocates a contiguous device buffer on the CURRENT device.
+  // Issue cudf's internal allocations + async copies on a stream bound to the
+  // source device so they target the right CUDA context regardless of which
+  // device the caller's stream belongs to.
+  rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{source_device_id}};
+  rmm::cuda_stream source_stream;  // bound to source_device (current)
+  auto packed_data         = cudf::pack(gpu_source.get_table(), source_stream.view());
+  auto const bytes_to_copy = packed_data.gpu_data->size();
+  source_stream.synchronize();
+
+  // --- Allocate destination on the target device context. ---
+  // target_stream belongs to target_device; acquire_stream() returns a
+  // cuda_stream_view from the target_memory_space's stream pool.
   auto target_stream = target_memory_space->acquire_stream();
-
-  CUCASCADE_CUDA_TRY(cudaSetDevice(target_device_id));
+  rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{target_device_id}};
   rmm::device_uvector<uint8_t> dst_uvector(bytes_to_copy, target_stream, mr);
-  target_stream.synchronize();
-  // Restore previous device before peer copy
-  CUCASCADE_CUDA_TRY(cudaSetDevice(source_device_id));
 
-  // Asynchronously copy device->device across GPUs
+  // --- Peer copy on target_stream. ---
+  // Issuing the peer copy on target_stream means the subsequent unpack +
+  // table construction on the same stream observes in-order completion
+  // without a manual cross-stream event. cudaMemcpyPeerAsync accepts src/dst
+  // pointers from different device contexts; the current device does not need
+  // to match src or dst.
   CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(dst_uvector.data(),
                                          target_device_id,
                                          static_cast<const uint8_t*>(packed_data.gpu_data->data()),
                                          source_device_id,
                                          bytes_to_copy,
-                                         stream.value()));
-  stream.synchronize();
-  // Unpack on target device to build a cudf::table that lives on the target GPU
-  CUCASCADE_CUDA_TRY(cudaSetDevice(target_device_id));
+                                         target_stream.value()));
+  // Sync target_stream so the peer-copied bytes are stable on target_device
+  // before unpack reads them.
+  target_stream.synchronize();
+
+  // --- Unpack on the target device context. ---
   rmm::device_buffer dst_buffer = std::move(dst_uvector).release();
-  // Unpack using pointer-based API and construct an owning cudf::table
-  auto new_metadata = std::move(packed_data.metadata);
-  auto new_gpu_data = std::make_unique<rmm::device_buffer>(std::move(dst_buffer));
+  auto new_metadata             = std::move(packed_data.metadata);
+  auto new_gpu_data             = std::make_unique<rmm::device_buffer>(std::move(dst_buffer));
   auto new_table_view =
     cudf::unpack(new_metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
   auto new_table = std::make_unique<cudf::table>(new_table_view, target_stream, mr);
-  // Restore previous device
   target_stream.synchronize();
-  CUCASCADE_CUDA_TRY(cudaSetDevice(source_device_id));
 
   return std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
@@ -833,22 +845,34 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
     throw std::runtime_error("convert_host_fast_to_gpu: host table allocation is null");
   }
 
+  // Sync the caller's stream so any upstream work that produced this
+  // host_data_representation is flushed before we read the pinned host blocks.
+  // The caller's stream may be bound to a non-target device under multi-GPU;
+  // synchronize is safe across devices.
+  stream.synchronize();
+
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
 
-  auto mr = target_memory_space->get_default_allocator();
+  // Acquire a target-bound stream from the target memory_space's stream pool.
+  // Using the caller's stream for the H2D batch under a target-device RAII
+  // guard raises cudaErrorInvalidValue when stream and current device belong
+  // to different CUDA contexts (multi-GPU case).
+  auto target_stream = target_memory_space->acquire_stream();
+  auto mr            = target_memory_space->get_default_allocator();
 
   // Collect all H→D copy ops across all columns, then fire one batched call.
   BatchCopyAccumulator batch;
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(fast_table->columns.size());
   for (const auto& col_meta : fast_table->columns) {
-    gpu_columns.push_back(reconstruct_column(col_meta, fast_table->allocation, stream, mr, batch));
+    gpu_columns.push_back(
+      reconstruct_column(col_meta, fast_table->allocation, target_stream, mr, batch));
   }
   // Source is CPU-written pinned host memory: fully prepared before this call.
-  batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
+  batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
-  stream.synchronize();
+  target_stream.synchronize();
 
   return std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
