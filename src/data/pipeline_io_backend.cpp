@@ -105,13 +105,18 @@ class io_worker {
     }
   }
 
-  std::thread _thread;
+  // Members are constructed in declaration order. _thread spawns a worker
+  // pthread that immediately calls run() and acquires _mutex / waits on _cv,
+  // so _mutex and _cv MUST be declared before _thread — otherwise the worker
+  // can race the ctor and call pthread_mutex_lock on an uninitialized mutex,
+  // which returns EINVAL and causes std::terminate.
   std::mutex _mutex;
   std::condition_variable _cv;
   std::function<void()> _pending_work;
   std::promise<void> _pending_promise;
   bool _has_task{false};
   bool _shutdown{false};
+  std::thread _thread;
 };
 
 /// Each pinned buffer is 64 MB — matches NVMe optimal I/O size
