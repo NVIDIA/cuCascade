@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -25,11 +26,11 @@ namespace cucascade {
 namespace test {
 
 // Stream-aware variants to enforce stream ordering with async allocations
-bool cudf_tables_have_equal_contents_on_stream(const cudf::table& left,
-                                               const cudf::table& right,
+bool cudf_tables_have_equal_contents_on_stream(const cudf::table_view& left,
+                                               const cudf::table_view& right,
                                                rmm::cuda_stream_view stream_view);
-void expect_cudf_tables_equal_on_stream(const cudf::table& left,
-                                        const cudf::table& right,
+void expect_cudf_tables_equal_on_stream(const cudf::table_view& left,
+                                        const cudf::table_view& right,
                                         rmm::cuda_stream_view stream_view);
 
 }  // namespace test

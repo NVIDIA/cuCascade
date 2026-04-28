@@ -27,7 +27,6 @@
 #include <cstddef>
 #include <memory>
 #include <variant>
-#include <vector>
 
 namespace cucascade {
 
@@ -88,13 +87,6 @@ class gpu_table_representation : public idata_representation {
    * @return std::unique_ptr<idata_representation> A new gpu_table_representation with copied data
    */
   std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
-
-  /**
-   * @brief Get the underlying cuDF table
-   *
-   * @return const cudf::table& Reference to the cuDF table
-   */
-  const cudf::table& get_table(rmm::cuda_stream_view stream) const;
 
   /**
    * @brief Get the underlying cuDF table view
