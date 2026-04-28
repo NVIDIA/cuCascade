@@ -111,7 +111,7 @@ class gpu_table_representation : public idata_representation {
     cudf::table_view view;  ///< A view of the owned table for easy access
   };
 
-  mutable std::variant<std::unique_ptr<cudf::table>, owning_table_view>
+  std::variant<std::unique_ptr<cudf::table>, owning_table_view>
     _table;  ///< cudf::table is the underlying representation of the data
 };
 
