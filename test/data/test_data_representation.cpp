@@ -325,6 +325,76 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
   cucascade::test::expect_cudf_tables_equal_on_stream(
     src_repr.get_table_view(), dst_repr.get_table_view(), xfer_stream);
 }
+
+// =============================================================================
+// gpu_table_representation built from cudf::table_view + shared_ptr<cudf::table>
+// =============================================================================
+
+TEST_CASE("gpu->host_packed->gpu roundtrip preserves contents (table_view+shared_ptr ctor)",
+          "[gpu_data_representation][table_view_ctor]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  auto chain_stream = gpu_space->acquire_stream();
+  auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), chain_stream);
+
+  auto shared_table = std::make_shared<cudf::table>(std::move(table));
+  auto view         = shared_table->view();
+  auto alloc_size   = shared_table->alloc_size();
+  gpu_table_representation repr(
+    view, std::move(shared_table), alloc_size, *const_cast<memory::memory_space*>(gpu_space));
+
+  auto cpu_any = registry.convert<host_data_packed_representation>(repr, host_space, chain_stream);
+  auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
+
+  chain_stream.synchronize();
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table_view(), gpu_any->get_table_view(), chain_stream);
+}
+
+TEST_CASE("gpu->host_fast->gpu roundtrip preserves contents (table_view+shared_ptr ctor)",
+          "[gpu_data_representation][table_view_ctor]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  rmm::cuda_stream stream;
+  constexpr int N = 64;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream.view(),
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream.value()));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto shared_table = std::make_shared<cudf::table>(std::move(cols));
+  auto view         = shared_table->view();
+  auto alloc_size   = shared_table->alloc_size();
+  gpu_table_representation repr(
+    view, std::move(shared_table), alloc_size, *const_cast<memory::memory_space*>(gpu_space));
+
+  auto host = registry.convert<host_data_representation>(repr, host_space, stream.view());
+  auto back = registry.convert<gpu_table_representation>(*host, gpu_space, stream.view());
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == N);
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table_view(), back->get_table_view(), stream.view());
+}
+
 // =============================================================================
 // idata_representation Interface Tests
 // =============================================================================
