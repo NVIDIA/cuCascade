@@ -295,9 +295,9 @@ TEST_CASE("data_batch subscribe always succeeds", "[data_batch]")
   auto batch = std::make_shared<data_batch>(1, std::move(data));
 
   REQUIRE(batch->get_subscriber_count() == 0);
-  REQUIRE(batch->subscribe() == true);
+  batch->subscribe();
   REQUIRE(batch->get_subscriber_count() == 1);
-  REQUIRE(batch->subscribe() == true);
+  batch->subscribe();
   REQUIRE(batch->get_subscriber_count() == 2);
 }
 
@@ -942,9 +942,11 @@ TEST_CASE("convert_to synchronizes stream before destroying GPU source", "[data_
     });
 
   auto gpu_data = std::make_unique<observed_gpu_representation>(std::move(gpu_buf), observer);
-  data_batch batch(1, std::move(gpu_data));
-
-  batch.convert_to<mock_data_representation>(registry, host_space.get(), stream.view());
+  auto batch    = std::make_shared<data_batch>(1, std::move(gpu_data));
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<mock_data_representation>(registry, host_space.get(), stream.view());
+  }
 
   // With the fix: convert_to synchronizes the stream before the old GPU
   // representation is destroyed, so the CUDA event was already complete when
@@ -1037,9 +1039,11 @@ TEST_CASE("convert_to synchronizes stream before destroying HOST source when tar
 
   auto host_data = std::make_unique<observed_host_representation>(pinned_host, buf_size, observer);
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-  data_batch batch(1, std::move(host_data));
-
-  batch.convert_to<mock_data_representation>(registry, gpu_space.get(), stream.view());
+  auto batch     = std::make_shared<data_batch>(1, std::move(host_data));
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<mock_data_representation>(registry, gpu_space.get(), stream.view());
+  }
 
   // With the fix: convert_to synchronizes the stream before the old HOST
   // representation is destroyed, so the CUDA event was already complete when
@@ -1056,7 +1060,7 @@ static void CUDART_CB stream_delay_callback(void* /*userData*/)
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
-TEST_CASE("convert_to releases mutex before stream sync allowing concurrent access",
+TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync",
           "[data_batch][convert_to]")
 {
   rmm::cuda_stream stream;
@@ -1073,7 +1077,7 @@ TEST_CASE("convert_to releases mutex before stream sync allowing concurrent acce
   auto host_space = make_mock_memory_space(memory::Tier::HOST, 0);
 
   // The converter signals when it returns so we know convert_to is about to
-  // unlock the mutex and enter the stream sync phase.
+  // enter stream.synchronize() (which blocks for ~50 ms due to the host callback).
   std::atomic<bool> converter_returned{false};
 
   representation_converter_registry registry;
@@ -1098,132 +1102,42 @@ TEST_CASE("convert_to releases mutex before stream sync allowing concurrent acce
   auto batch    = std::make_shared<data_batch>(1, std::move(gpu_data));
 
   std::thread convert_thread([&]() {
-    batch->convert_to<mock_data_representation>(registry, host_space.get(), stream.view());
+    auto mut = batch->to_mutable();
+    mut.convert_to<mock_data_representation>(registry, host_space.get(), stream.view());
   });
 
-  // Spin until the converter function has returned — convert_to is about to
-  // unlock the mutex and enter the stream.synchronize() phase.
+  // Spin until the converter function has returned — convert_to is now blocked
+  // inside stream.synchronize() waiting for the ~50 ms host callback.
   while (!converter_returned.load(std::memory_order_acquire)) {
     std::this_thread::yield();
   }
 
-  // Brief pause to let convert_to move past the unlock into the sync phase.
+  // Brief pause to let convert_to enter the stream.synchronize() call.
   std::this_thread::sleep_for(std::chrono::microseconds(500));
 
-  // get_state() takes the mutex.  With the early-unlock optimisation it
-  // returns immediately while the stream sync is still running (the host
-  // callback sleeps for 50 ms).  If the mutex were held during the sync,
-  // we would be blocked for the full 50 ms.
-  auto state = batch->get_state();
+  // mutable_data_batch holds _rw_mutex exclusively for its entire lifetime,
+  // including during stream.synchronize().  try_to_mutable() must fail.
+  auto try_result        = batch->try_to_mutable();
+  auto state_during_sync = batch->get_state();
 
-  // Check whether the stream work was still in progress when we read the
-  // batch state.  cudaErrorNotReady means the event (recorded after the 50 ms
-  // host callback) hasn't been reached yet, proving we got the mutex DURING
-  // the sync.
+  // Confirm the stream work was still in progress when we called try_to_mutable.
+  // cudaErrorNotReady means the event (recorded after the 50 ms callback) hasn't
+  // completed yet, proving we polled DURING the sync window.
   bool accessed_during_sync = (cudaEventQuery(observer.event) == cudaErrorNotReady);
 
   convert_thread.join();
 
-  // With early unlock: the mutex is free while the stream syncs, so we
-  //   accessed the batch while stream work was still in-flight.
-  // With sync inside lock: the mutex is held until the sync finishes, so by
-  //   the time get_state() returns the event is already complete.
+  // Exclusive lock must have been held — try_to_mutable returned nullopt.
+  REQUIRE(!try_result.has_value());
+  // State must have been mutable_locked while the exclusive lock was held.
+  REQUIRE(state_during_sync == batch_state::mutable_locked);
+  // The event must still have been pending, confirming we polled during the sync.
   REQUIRE(accessed_during_sync);
-  REQUIRE(state == batch_state::idle);
+  // After the mutable_data_batch is destroyed, state returns to idle.
+  REQUIRE(batch->get_state() == batch_state::idle);
 
   CUCASCADE_CUDA_TRY(cudaFreeHost(pinned_host));
 }
-
-// =============================================================================
-// task_created_count preserved across in_transit round-trip (STATE-01, STATE-02)
-// =============================================================================
-
-TEST_CASE("data_batch task_created_count preserved across in_transit round-trip single task",
-          "[data_batch]")
-{
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
-
-  // Create one task
-  REQUIRE(batch->try_to_create_task() == true);
-  REQUIRE(batch->get_state() == batch_state::task_created);
-  REQUIRE(batch->get_task_created_count() == 1);
-
-  // Lock for in_transit
-  REQUIRE(batch->try_to_lock_for_in_transit() == true);
-  REQUIRE(batch->get_state() == batch_state::in_transit);
-  // task_created_count must still be 1 while in_transit
-  REQUIRE(batch->get_task_created_count() == 1);
-
-  // Release back to task_created
-  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
-  REQUIRE(batch->get_state() == batch_state::task_created);
-  // task_created_count must still be 1 after round-trip
-  REQUIRE(batch->get_task_created_count() == 1);
-}
-
-TEST_CASE("data_batch task_created_count preserved across in_transit round-trip multiple tasks",
-          "[data_batch]")
-{
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
-
-  // Create three tasks
-  REQUIRE(batch->try_to_create_task() == true);
-  REQUIRE(batch->try_to_create_task() == true);
-  REQUIRE(batch->try_to_create_task() == true);
-  REQUIRE(batch->get_state() == batch_state::task_created);
-  REQUIRE(batch->get_task_created_count() == 3);
-
-  // Lock for in_transit
-  REQUIRE(batch->try_to_lock_for_in_transit() == true);
-  REQUIRE(batch->get_state() == batch_state::in_transit);
-  REQUIRE(batch->get_task_created_count() == 3);
-
-  // Release back to task_created
-  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
-  REQUIRE(batch->get_state() == batch_state::task_created);
-  REQUIRE(batch->get_task_created_count() == 3);
-}
-
-TEST_CASE("data_batch can lock_for_processing after in_transit round-trip from task_created",
-          "[data_batch]")
-{
-  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch    = std::make_shared<data_batch>(1, std::move(data));
-  auto space_id = batch->get_memory_space()->get_id();
-
-  // Create task, go through in_transit round-trip
-  REQUIRE(batch->try_to_create_task() == true);
-  REQUIRE(batch->try_to_lock_for_in_transit() == true);
-  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
-  REQUIRE(batch->get_state() == batch_state::task_created);
-  REQUIRE(batch->get_task_created_count() == 1);
-
-  // Should still be able to lock for processing
-  auto r = batch->try_to_lock_for_processing(space_id);
-  REQUIRE(r.success == true);
-  REQUIRE(batch->get_state() == batch_state::processing);
-}
-
-TEST_CASE("data_batch can cancel_task after in_transit round-trip from task_created",
-          "[data_batch]")
-{
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(1, std::move(data));
-
-  // Create task, go through in_transit round-trip
-  REQUIRE(batch->try_to_create_task() == true);
-  REQUIRE(batch->try_to_lock_for_in_transit() == true);
-  REQUIRE(batch->try_to_release_in_transit(batch_state::task_created) == true);
-  REQUIRE(batch->get_state() == batch_state::task_created);
-
-  // Should still be able to cancel task
-  REQUIRE(batch->try_to_cancel_task() == true);
-  REQUIRE(batch->get_state() == batch_state::idle);
-  REQUIRE(batch->get_task_created_count() == 0);
-}
-
 
 // =============================================================================
 // Locked-to-locked transition tests

@@ -98,13 +98,9 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   uint64_t get_batch_id() const;
 
   /**
-   * @brief Increment the subscriber interest count.
-   *
-   * Atomic, lock-free. Returns true on the first subscription (0 -> 1).
-   *
-   * @return true if this was the first subscriber, false otherwise.
+   * @brief Increment the subscriber interest count.   
    */
-  bool subscribe();
+  void subscribe();
 
   /**
    * @brief Decrement the subscriber interest count.

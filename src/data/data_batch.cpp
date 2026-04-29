@@ -28,18 +28,22 @@ data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> 
 
 uint64_t data_batch::get_batch_id() const { return _batch_id; }
 
-bool data_batch::subscribe()
+void data_batch::subscribe()
 {
-  _subscriber_count.fetch_add(1, std::memory_order_relaxed);
-  return true;
+  _subscriber_count.fetch_add(1, std::memory_order_relaxed);  
 }
 
 void data_batch::unsubscribe()
 {
-  size_t prev = _subscriber_count.fetch_sub(1, std::memory_order_relaxed);
-  if (prev == 0) {
-    _subscriber_count.fetch_add(1, std::memory_order_relaxed);
-    throw std::runtime_error("Cannot unsubscribe: subscriber count is already zero");
+  size_t current = _subscriber_count.load(std::memory_order_relaxed);
+  while (true) {
+    if (current == 0) {
+      throw std::runtime_error("Cannot unsubscribe: subscriber count is already zero");
+    }
+    if (_subscriber_count.compare_exchange_weak(
+          current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return;
+    }
   }
 }
 
