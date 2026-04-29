@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
@@ -133,87 +134,15 @@ void representation_converter_registry::clear()
 
 namespace {
 
-/**
- * @brief Convert gpu_table_representation to gpu_table_representation (cross-GPU copy)
- */
+// Forward declaration. convert_gpu_to_gpu is defined below convert_gpu_to_host_fast
+// so it can reuse BatchCopyAccumulator and the column-tree reconstruction helpers,
+// peer-copying each column buffer directly and avoiding cudf::pack (whose internal
+// scratch allocator races with the cucascade resource ref under multi-GPU and
+// produces uninitialized dst_buf_info reads inside compute_splits).
 std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
-{
-  // Synchronize the caller's stream so any prior operation (e.g. the cudf::table
-  // construction that produced the source payload) is complete before we read
-  // from the source table. The caller's stream may be bound to any device;
-  // synchronize is a no-op at the driver level when there is no outstanding work.
-  stream.synchronize();
-
-  auto& gpu_source = source.cast<gpu_table_representation>();
-
-  // Same-device case: clone via source's own clone() method.
-  if (source.get_device_id() == target_memory_space->get_device_id()) {
-    return source.clone(stream);
-  }
-
-  auto const target_device_id = target_memory_space->get_device_id();
-  auto const source_device_id = source.get_device_id();
-  auto mr                     = target_memory_space->get_default_allocator();
-
-  // --- Pack on the source device context using a source-bound stream. ---
-  // cudf::pack allocates a contiguous device buffer on the CURRENT device.
-  // Issue cudf's internal allocations + async copies on a stream bound to the
-  // source device so they target the right CUDA context regardless of which
-  // device the caller's stream belongs to.
-  //
-  // CRITICAL: explicitly pass the SOURCE memory_space's allocator. Without
-  // this, cudf::pack falls back to rmm::mr::get_current_device_resource_ref()
-  // which is the global default — a pool we do NOT call cudaMemPoolSetAccess
-  // on. cudaMallocAsync pools require per-pool peer-access setup; if pack's
-  // gpu_data lives in the global default pool while cudaMemcpyPeerAsync
-  // copies between cucascade pools, the peer copy silently no-ops on the
-  // mismatched pool and dst stays uninitialized. Using the cucascade-managed
-  // pool here keeps both src and dst inside pools we've already authorized.
-  rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{source_device_id}};
-  rmm::cuda_stream source_stream;  // bound to source_device (current)
-  auto source_mr           = gpu_source.get_memory_space().get_default_allocator();
-  auto packed_data         = cudf::pack(gpu_source.get_table(), source_stream.view(), source_mr);
-  auto const bytes_to_copy = packed_data.gpu_data->size();
-  source_stream.synchronize();
-
-  // --- Allocate destination on the target device context. ---
-  // target_stream belongs to target_device; acquire_stream() returns a
-  // cuda_stream_view from the target_memory_space's stream pool.
-  auto target_stream = target_memory_space->acquire_stream();
-  rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{target_device_id}};
-  rmm::device_uvector<uint8_t> dst_uvector(bytes_to_copy, target_stream, mr);
-
-  // --- Peer copy on target_stream. ---
-  // Issuing the peer copy on target_stream means the subsequent unpack +
-  // table construction on the same stream observes in-order completion
-  // without a manual cross-stream event. cudaMemcpyPeerAsync accepts src/dst
-  // pointers from different device contexts; the current device does not need
-  // to match src or dst.
-  CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(dst_uvector.data(),
-                                         target_device_id,
-                                         static_cast<const uint8_t*>(packed_data.gpu_data->data()),
-                                         source_device_id,
-                                         bytes_to_copy,
-                                         target_stream.value()));
-  // Sync target_stream so the peer-copied bytes are stable on target_device
-  // before unpack reads them.
-  target_stream.synchronize();
-
-  // --- Unpack on the target device context. ---
-  rmm::device_buffer dst_buffer = std::move(dst_uvector).release();
-  auto new_metadata             = std::move(packed_data.metadata);
-  auto new_gpu_data             = std::make_unique<rmm::device_buffer>(std::move(dst_buffer));
-  auto new_table_view =
-    cudf::unpack(new_metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
-  auto new_table = std::make_unique<cudf::table>(new_table_view, target_stream, mr);
-  target_stream.synchronize();
-
-  return std::make_unique<gpu_table_representation>(
-    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
-}
+  rmm::cuda_stream_view stream);
 
 /**
  * @brief Convert gpu_table_representation to host_data_packed_representation
@@ -638,6 +567,290 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
 
   return std::make_unique<host_data_representation>(
     std::move(host_alloc), const_cast<memory::memory_space*>(target_memory_space));
+}
+
+// =============================================================================
+// Fast GPU -> GPU converter (direct per-buffer peer copy, no cudf::pack)
+// =============================================================================
+
+/**
+ * @brief Allocate a target-side device buffer and copy @p size bytes from @p src_ptr
+ * (on @p src_device) into it.
+ *
+ * Routing is decided per-pair by the empirical probe in cucascade::memory
+ * (see ensure_p2p_probed):
+ *   - probe says peer DMA works → cudaMemcpyPeerAsync (direct device-to-device
+ *     DMA over NVLink / supported PCIe)
+ *   - probe says peer DMA broken → explicit host-staged copy through pinned
+ *     host memory (consumer Intel chipsets etc. where cudaMemcpyPeer* silently
+ *     no-ops). We do the staging ourselves rather than relying on the driver's
+ *     auto-fallback, so the correctness path is identical and observable
+ *     regardless of driver/CUDA version quirks.
+ */
+static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
+                                                    int src_device,
+                                                    std::size_t size,
+                                                    int dst_device,
+                                                    rmm::cuda_stream_view target_stream,
+                                                    rmm::device_async_resource_ref target_mr)
+{
+  rmm::device_buffer buf(size, target_stream, target_mr);
+  if (size == 0 || src_ptr == nullptr) { return buf; }
+
+  if (memory::probe_peer_dma_works(src_device, dst_device)) {
+    // Real peer DMA works on this hardware — direct path.
+    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
+      buf.data(), dst_device, src_ptr, src_device, size, target_stream.value()));
+    return buf;
+  }
+
+  // Peer DMA broken — explicitly stage through pinned host memory.
+  void* host_buf = nullptr;
+  CUCASCADE_CUDA_TRY(cudaMallocHost(&host_buf, size));
+  {
+    rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
+    rmm::cuda_stream src_stream;
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+      host_buf, src_ptr, size, cudaMemcpyDeviceToHost, src_stream.view().value()));
+    src_stream.synchronize();
+  }
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+    buf.data(), host_buf, size, cudaMemcpyHostToDevice, target_stream.value()));
+  CUCASCADE_CUDA_TRY(cudaStreamSynchronize(target_stream.value()));
+  cudaFreeHost(host_buf);
+  return buf;
+}
+
+/**
+ * @brief Synchronous version of alloc_and_peer_copy_async. Used for null masks
+ * because cudf column factories may inspect them during column construction.
+ */
+static rmm::device_buffer alloc_and_peer_copy_sync(const void* src_ptr,
+                                                   int src_device,
+                                                   std::size_t size,
+                                                   int dst_device,
+                                                   rmm::cuda_stream_view target_stream,
+                                                   rmm::device_async_resource_ref target_mr)
+{
+  auto buf = alloc_and_peer_copy_async(
+    src_ptr, src_device, size, dst_device, target_stream, target_mr);
+  if (size == 0 || src_ptr == nullptr) { return buf; }
+  target_stream.synchronize();
+  return buf;
+}
+
+/**
+ * @brief Recursively rebuild a cudf::column on the target device, peer-copying each
+ * leaf buffer (null mask, data, offsets, children) directly. Mirrors the structure
+ * of reconstruct_column() (host→gpu) but reads from a source cudf::column_view on a
+ * peer device using cudaMemcpyPeerAsync.
+ *
+ * Null masks are copied synchronously because cudf factories may read them during
+ * column construction. Data and offset buffers are issued asynchronously on
+ * @p target_stream; the caller must sync that stream before the resulting cudf::table
+ * is observed by another stream.
+ *
+ * @note Assumes the source column_view has offset == 0 (no slicing), matching the
+ *       same constraint imposed by plan_column_copy() on the GPU↔Host fast path.
+ */
+static std::unique_ptr<cudf::column> reconstruct_column_p2p(
+  const cudf::column_view& src,
+  int src_device,
+  int dst_device,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  assert(src.offset() == 0 && "column_view with non-zero offset is not supported");
+
+  rmm::device_buffer null_mask{};
+  if (src.nullable()) {
+    auto const null_mask_size = cudf::bitmask_allocation_size_bytes(src.size());
+    null_mask = alloc_and_peer_copy_sync(
+      src.null_mask(), src_device, null_mask_size, dst_device, stream, mr);
+  }
+  cudf::size_type const null_count = src.nullable() ? src.null_count() : 0;
+
+  if (src.type().id() == cudf::type_id::STRING) {
+    if (src.num_children() < 1) {
+      // Empty / degenerate STRING column with no offsets child (cudf produces
+      // these for empty intermediate results). Use cudf::make_empty_column
+      // which builds the correct internal layout (offsets child of size 1
+      // holding [0], chars in parent's data buffer of size 0).
+      return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+    }
+    // Copy offsets as-is (preserve source's INT32 vs INT64 type). make_strings_column
+    // accepts either offset type.
+    auto offsets_col = reconstruct_column_p2p(src.child(0), src_device, dst_device, stream, mr);
+
+    rmm::device_buffer chars_buf{};
+    if (src.size() > 0 && src.data<char>() != nullptr) {
+      // Read total chars size from offsets[size-1]. Reading from the *source* column
+      // here is unsafe: cudf::strings_column_view::chars_size() ultimately calls
+      // cudaMemcpyAsync(... cudaMemcpyDefault ...), which on cudaMallocAsync pool
+      // memory across devices silently returns success without copying bytes — the
+      // host buffer keeps its uninitialized stack value (often -1). Read instead
+      // from the target-side offsets buffer we just peer-copied; that's a same-device
+      // D→H read on the target stream and works reliably regardless of pool peer
+      // access semantics.
+      auto const offsets_view = offsets_col->view();
+      auto const last_idx     = offsets_view.size() - 1;
+      int64_t chars_bytes     = 0;
+      stream.synchronize();
+      if (offsets_view.type().id() == cudf::type_id::INT32) {
+        int32_t value = 0;
+        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(&value,
+                                           offsets_view.head<int32_t>() + last_idx,
+                                           sizeof(int32_t),
+                                           cudaMemcpyDeviceToHost,
+                                           stream.value()));
+        stream.synchronize();
+        chars_bytes = value;
+      } else {
+        int64_t value = 0;
+        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(&value,
+                                           offsets_view.head<int64_t>() + last_idx,
+                                           sizeof(int64_t),
+                                           cudaMemcpyDeviceToHost,
+                                           stream.value()));
+        stream.synchronize();
+        chars_bytes = value;
+      }
+      if (chars_bytes > 0) {
+        chars_buf = alloc_and_peer_copy_async(src.data<char>(),
+                                              src_device,
+                                              static_cast<std::size_t>(chars_bytes),
+                                              dst_device,
+                                              stream,
+                                              mr);
+      }
+    }
+    return cudf::make_strings_column(src.size(),
+                                     std::move(offsets_col),
+                                     std::move(chars_buf),
+                                     null_count,
+                                     std::move(null_mask));
+  }
+
+  if (src.type().id() == cudf::type_id::LIST) {
+    if (src.num_children() < 2) {
+      throw std::invalid_argument(
+        "reconstruct_column_p2p: LIST column must have two children (offsets, values)");
+    }
+    // Preserve source's offsets type — make_lists_column accepts INT32 or INT64.
+    auto offsets_col = reconstruct_column_p2p(src.child(0), src_device, dst_device, stream, mr);
+    auto values_col  = reconstruct_column_p2p(src.child(1), src_device, dst_device, stream, mr);
+    return cudf::make_lists_column(src.size(),
+                                   std::move(offsets_col),
+                                   std::move(values_col),
+                                   null_count,
+                                   std::move(null_mask));
+  }
+
+  if (src.type().id() == cudf::type_id::STRUCT) {
+    std::vector<std::unique_ptr<cudf::column>> fields;
+    fields.reserve(static_cast<std::size_t>(src.num_children()));
+    for (cudf::size_type i = 0; i < src.num_children(); ++i) {
+      fields.push_back(reconstruct_column_p2p(src.child(i), src_device, dst_device, stream, mr));
+    }
+    // Construct directly to skip make_structs_column's superimpose_nulls kernel —
+    // our peer-copied null masks are already consistent (mirrors reconstruct_column()).
+    return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRUCT},
+                                          src.size(),
+                                          rmm::device_buffer{},
+                                          std::move(null_mask),
+                                          null_count,
+                                          std::move(fields));
+  }
+
+  if (src.type().id() == cudf::type_id::DICTIONARY32) {
+    if (src.num_children() < 2) {
+      throw std::invalid_argument(
+        "reconstruct_column_p2p: DICTIONARY32 column must have two children "
+        "(indices, keys)");
+    }
+    // cudf DICTIONARY32 child order: [0]=indices, [1]=keys.
+    // make_dictionary_column parameter order: (keys, indices, ...).
+    auto indices_col = reconstruct_column_p2p(src.child(0), src_device, dst_device, stream, mr);
+    auto keys_col    = reconstruct_column_p2p(src.child(1), src_device, dst_device, stream, mr);
+    return cudf::make_dictionary_column(
+      std::move(keys_col), std::move(indices_col), std::move(null_mask), null_count);
+  }
+
+  // Fixed-width / fixed-point — single flat data buffer.
+  rmm::device_buffer data_buf{};
+  if (src.size() > 0 && src.head() != nullptr) {
+    auto const data_size = static_cast<std::size_t>(src.size()) * cudf::size_of(src.type());
+    data_buf            = alloc_and_peer_copy_async(
+      src.head(), src_device, data_size, dst_device, stream, mr);
+  }
+  return std::make_unique<cudf::column>(
+    src.type(), src.size(), std::move(data_buf), std::move(null_mask), null_count);
+}
+
+/**
+ * @brief Convert gpu_table_representation to gpu_table_representation (cross-GPU copy).
+ *
+ * Replaces the previous cudf::pack-based path. cudf::pack's compute_splits internally
+ * launches kernels that read scratch buffers allocated through the current_device
+ * resource ref; under sirius's multi-GPU setup the cucascade resource adapter created
+ * a stream-ordered race that materialized as uninitialized dst_buf_info reads (caught
+ * by compute-sanitizer) and silently produced garbage packed bytes. This path mirrors
+ * convert_gpu_to_host_fast / convert_host_fast_to_gpu: walk the source column tree,
+ * allocate target-side buffers, and peer-copy each leaf buffer directly.
+ */
+std::unique_ptr<idata_representation> convert_gpu_to_gpu(
+  idata_representation& source,
+  const memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream)
+{
+  // Sync the caller's stream so the source table's buffers are stable on the source
+  // device before we issue peer copies. The caller's stream is the one that produced
+  // (or last touched) the source representation.
+  stream.synchronize();
+
+  auto& gpu_source = source.cast<gpu_table_representation>();
+
+  // Same-device case: clone via source's own clone() method.
+  if (source.get_device_id() == target_memory_space->get_device_id()) {
+    return source.clone(stream);
+  }
+
+  auto const src_device_id = gpu_source.get_device_id();
+  auto const dst_device_id = target_memory_space->get_device_id();
+
+  // Full device sync on the SOURCE device before reading: in a multi-stream pipeline
+  // the source buffers may have been written by streams other than the caller's
+  // (e.g. an upstream operator's stream pool). Syncing the source device makes all
+  // prior source-side writes visible before we issue the host-staged copies.
+  {
+    rmm::cuda_set_device_raii src_sync_guard{rmm::cuda_device_id{src_device_id}};
+    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
+  }
+
+  rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
+
+  // Target-bound stream from the target memory_space's stream pool. All peer copies
+  // and target-side allocations are issued on this stream so they observe in-order
+  // completion without explicit cross-stream events.
+  auto target_stream = target_memory_space->acquire_stream();
+  auto mr            = target_memory_space->get_default_allocator();
+
+  cudf::table_view const src_view = gpu_source.get_table().view();
+
+  std::vector<std::unique_ptr<cudf::column>> target_columns;
+  target_columns.reserve(static_cast<std::size_t>(src_view.num_columns()));
+  for (cudf::size_type i = 0; i < src_view.num_columns(); ++i) {
+    target_columns.push_back(reconstruct_column_p2p(
+      src_view.column(i), src_device_id, dst_device_id, target_stream, mr));
+  }
+
+  auto new_table = std::make_unique<cudf::table>(std::move(target_columns));
+  // Sync so all peer copies and any cudf::cast launches complete before the new
+  // table is observed by another stream.
+  target_stream.synchronize();
+
+  return std::make_unique<gpu_table_representation>(
+    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
 }
 
 /**
@@ -1493,7 +1706,13 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 
 void register_builtin_converters(representation_converter_registry& registry)
 {
-  // GPU -> GPU (cross-device copy)
+  // GPU -> GPU (cross-device copy). The convert_gpu_to_gpu implementation uses
+  // cudaMemcpyPeerAsync for each column buffer. Whether that takes the direct
+  // peer-DMA fast path or falls back to the driver's host-stage path is
+  // decided by cucascade::memory::ensure_p2p_probed() at the first
+  // memory_space construction — the probe runs once per process, detects the
+  // "lying enable" failure mode on consumer Intel chipsets, and disables peer
+  // access for any GPU pair where direct DMA does not actually move bytes.
   registry.register_converter<gpu_table_representation, gpu_table_representation>(
     convert_gpu_to_gpu);
 
