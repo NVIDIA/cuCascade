@@ -163,9 +163,19 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   // Issue cudf's internal allocations + async copies on a stream bound to the
   // source device so they target the right CUDA context regardless of which
   // device the caller's stream belongs to.
+  //
+  // CRITICAL: explicitly pass the SOURCE memory_space's allocator. Without
+  // this, cudf::pack falls back to rmm::mr::get_current_device_resource_ref()
+  // which is the global default — a pool we do NOT call cudaMemPoolSetAccess
+  // on. cudaMallocAsync pools require per-pool peer-access setup; if pack's
+  // gpu_data lives in the global default pool while cudaMemcpyPeerAsync
+  // copies between cucascade pools, the peer copy silently no-ops on the
+  // mismatched pool and dst stays uninitialized. Using the cucascade-managed
+  // pool here keeps both src and dst inside pools we've already authorized.
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{source_device_id}};
   rmm::cuda_stream source_stream;  // bound to source_device (current)
-  auto packed_data         = cudf::pack(gpu_source.get_table(), source_stream.view());
+  auto source_mr           = gpu_source.get_memory_space().get_default_allocator();
+  auto packed_data         = cudf::pack(gpu_source.get_table(), source_stream.view(), source_mr);
   auto const bytes_to_copy = packed_data.gpu_data->size();
   source_stream.synchronize();
 

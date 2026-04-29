@@ -26,13 +26,9 @@ namespace cucascade {
 
 namespace memory {
 
-void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int owner_device_id)
+namespace {
+void set_access_on_pool(cudaMemPool_t pool, int owner_device_id, int device_count)
 {
-  int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
-    (void)cudaGetLastError();
-    return;
-  }
   for (int peer = 0; peer < device_count; ++peer) {
     if (peer == owner_device_id) { continue; }
     int can_access = 0;
@@ -46,8 +42,33 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
     desc.location.id   = peer;
     desc.flags         = cudaMemAccessFlagsProtReadWrite;
     if (cudaMemPoolSetAccess(pool, &desc, 1) != cudaSuccess) {
-      (void)cudaGetLastError();  // best effort; non-fatal on systems without P2P
+      (void)cudaGetLastError();  // best effort
     }
+  }
+}
+}  // namespace
+
+void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int owner_device_id)
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return;
+  }
+  // Set access on the cuda_async_memory_resource pool we just created.
+  set_access_on_pool(pool, owner_device_id, device_count);
+
+  // Also set access on the device's DEFAULT pool. cudf and other libraries may
+  // route allocations through the default pool (e.g. cudf::concatenate when
+  // its resource_ref points back to the device default), and without
+  // peer-access set on the default pool, cudaMemcpyPeer* between two default
+  // pools silently no-ops the same way it does for cudaMallocAsync pools.
+  rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{owner_device_id});
+  cudaMemPool_t default_pool{};
+  if (cudaDeviceGetMemPool(&default_pool, owner_device_id) == cudaSuccess) {
+    set_access_on_pool(default_pool, owner_device_id, device_count);
+  } else {
+    (void)cudaGetLastError();
   }
 }
 
