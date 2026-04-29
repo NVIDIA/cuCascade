@@ -22,6 +22,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -295,8 +296,8 @@ static bool columns_equal_recursive(const cudf::column_view& left,
 // Stream-aware comparison that recursively compares column content.
 // Handles all column types including compound types (STRING, LIST, STRUCT, DICTIONARY)
 // and tolerates INT32 vs INT64 offset differences in STRING/LIST columns.
-bool cudf_tables_have_equal_contents_on_stream(const cudf::table& left,
-                                               const cudf::table& right,
+bool cudf_tables_have_equal_contents_on_stream(const cudf::table_view& left,
+                                               const cudf::table_view& right,
                                                rmm::cuda_stream_view stream_view)
 {
   if (left.num_rows() != right.num_rows()) {
@@ -315,9 +316,8 @@ bool cudf_tables_have_equal_contents_on_stream(const cudf::table& left,
   stream_view.synchronize();
 
   for (int col_idx = 0; col_idx < left.num_columns(); ++col_idx) {
-    if (!columns_equal_recursive(left.view().column(col_idx),
-                                 right.view().column(col_idx),
-                                 "col[" + std::to_string(col_idx) + "]")) {
+    if (!columns_equal_recursive(
+          left.column(col_idx), right.column(col_idx), "col[" + std::to_string(col_idx) + "]")) {
       return false;
     }
   }
@@ -325,8 +325,8 @@ bool cudf_tables_have_equal_contents_on_stream(const cudf::table& left,
   return true;
 }
 
-void expect_cudf_tables_equal_on_stream(const cudf::table& left,
-                                        const cudf::table& right,
+void expect_cudf_tables_equal_on_stream(const cudf::table_view& left,
+                                        const cudf::table_view& right,
                                         rmm::cuda_stream_view stream_view)
 {
   REQUIRE(cudf_tables_have_equal_contents_on_stream(left, right, stream_view));

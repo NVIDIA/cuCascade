@@ -28,22 +28,45 @@ gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> 
 {
 }
 
-std::size_t gpu_table_representation::get_size_in_bytes() const { return _table->alloc_size(); }
+std::size_t gpu_table_representation::get_size_in_bytes() const
+{
+  if (std::holds_alternative<std::unique_ptr<cudf::table>>(_table)) {
+    return std::get<std::unique_ptr<cudf::table>>(_table)->alloc_size();
+  } else if (std::holds_alternative<owning_table_view>(_table)) {
+    return std::get<owning_table_view>(_table).alloc_size;
+  }
+  return 0;
+}
 
 std::size_t gpu_table_representation::get_uncompressed_data_size_in_bytes() const
 {
   return get_size_in_bytes();
 }
 
-const cudf::table& gpu_table_representation::get_table() const { return *_table; }
+cudf::table_view gpu_table_representation::get_table_view() const
+{
+  if (std::holds_alternative<std::unique_ptr<cudf::table>>(_table)) {
+    return std::get<std::unique_ptr<cudf::table>>(_table)->view();
+  } else {
+    return std::get<owning_table_view>(_table).view;
+  }
+}
 
-std::unique_ptr<cudf::table> gpu_table_representation::release_table() { return std::move(_table); }
+std::unique_ptr<cudf::table> gpu_table_representation::release_table(
+  [[maybe_unused]] rmm::cuda_stream_view stream)
+{
+  if (std::holds_alternative<owning_table_view>(_table)) {
+    _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
+  }
+  return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
+}
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)
 {
   // Create a deep copy of the cuDF table using the provided stream
-  auto table_copy = std::make_unique<cudf::table>(_table->view(), stream);
-  return std::make_unique<gpu_table_representation>(std::move(table_copy), get_memory_space());
+  cudf::table_view view = get_table_view();
+  return std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(view, stream),
+                                                    get_memory_space());
 }
 
 }  // namespace cucascade

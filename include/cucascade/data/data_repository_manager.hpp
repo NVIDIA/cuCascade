@@ -203,7 +203,6 @@ class data_repository_manager {
     return leaked;
   }
 
-  
   /**
    * @brief Iterate over all repositories, calling the visitor for each one.
    *

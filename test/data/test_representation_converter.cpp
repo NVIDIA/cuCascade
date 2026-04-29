@@ -418,7 +418,7 @@ TEST_CASE("Built-in HOST to GPU conversion works", "[representation_converter][b
 
   REQUIRE(gpu_result != nullptr);
   REQUIRE(gpu_result->get_current_tier() == memory::Tier::GPU);
-  REQUIRE(gpu_result->get_table().num_rows() == 50);
+  REQUIRE(gpu_result->get_table_view().num_rows() == 50);
 }
 
 TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
@@ -451,7 +451,7 @@ TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
   // Verify data integrity
   REQUIRE(result_repr != nullptr);
   cucascade::test::expect_cudf_tables_equal_on_stream(
-    original_repr.get_table(), result_repr->get_table(), stream);
+    original_repr.get_table_view(), result_repr->get_table_view(), stream);
 }
 
 // =============================================================================

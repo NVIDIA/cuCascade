@@ -101,8 +101,7 @@ class legacy_rmm_resource_adapter {
     resource_->deallocate(rmm::cuda_stream_view{stream}, ptr, bytes);
   }
 
-  void* allocate_sync(std::size_t bytes,
-                      std::size_t alignment = alignof(std::max_align_t))
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
     auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
     rmm::cuda_stream_default.synchronize();
@@ -122,8 +121,7 @@ class legacy_rmm_resource_adapter {
     return resource_.get() == other.resource_.get();
   }
 
-  friend void get_property(legacy_rmm_resource_adapter const&,
-                           cuda::mr::device_accessible) noexcept
+  friend void get_property(legacy_rmm_resource_adapter const&, cuda::mr::device_accessible) noexcept
   {
   }
 

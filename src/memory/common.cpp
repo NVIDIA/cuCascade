@@ -33,8 +33,7 @@ cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_reso
 #if CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
   return {rmm::mr::cuda_async_memory_resource(capacity)};
 #else
-  return wrap_legacy_rmm_resource(
-    std::make_shared<rmm::mr::cuda_async_memory_resource>(capacity));
+  return wrap_legacy_rmm_resource(std::make_shared<rmm::mr::cuda_async_memory_resource>(capacity));
 #endif
 }
 

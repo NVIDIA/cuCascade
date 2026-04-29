@@ -151,7 +151,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
     return source.clone(stream);
   }
 
-  auto packed_data = cudf::pack(gpu_source.get_table(), stream);
+  auto packed_data = cudf::pack(gpu_source.get_table_view(), stream);
 
   assert(source.get_device_id() != target_memory_space->get_device_id());
   auto const target_device_id = target_memory_space->get_device_id();
@@ -206,7 +206,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
   stream.synchronize();
 
   auto& gpu_source = source.cast<gpu_table_representation>();
-  auto packed_data = cudf::pack(gpu_source.get_table(), stream);
+  auto packed_data = cudf::pack(gpu_source.get_table_view(), stream);
 
   auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
   auto allocation = mr->allocate_multiple_blocks(packed_data.gpu_data->size());
@@ -588,7 +588,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   rmm::cuda_stream_view stream)
 {
   auto& gpu_source            = source.cast<gpu_table_representation>();
-  const cudf::table_view view = gpu_source.get_table().view();
+  const cudf::table_view view = gpu_source.get_table_view();
 
   // --- Pass 1: plan the allocation layout ---
   std::size_t current_offset = 0;
@@ -1253,8 +1253,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
 {
   auto& backend       = target_memory_space->get_io_backend();
   auto& gpu_source    = source.cast<gpu_table_representation>();
-  const auto& table   = gpu_source.get_table();
-  cudf::table_view tv = table.view();
+  cudf::table_view tv = gpu_source.get_table_view();
 
   // Generate unique file path under the disk memory space's mount directory
   auto mount_path = target_memory_space->get_disk_mount_path();

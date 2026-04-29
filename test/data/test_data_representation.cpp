@@ -143,7 +143,7 @@ TEST_CASE("host_data_packed_representation converts to GPU and preserves content
   auto& gpu_repr = *gpu_any;
   // Compare using the same stream used for conversion to avoid cross-stream hazards
   cucascade::test::expect_cudf_tables_equal_on_stream(
-    original, gpu_repr.get_table(), pack_stream.view());
+    original, gpu_repr.get_table_view(), pack_stream.view());
 }
 
 // =============================================================================
@@ -205,7 +205,7 @@ TEST_CASE("gpu_table_representation get_table", "[gpu_data_representation]")
 
   gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)), *gpu_space);
 
-  const cudf::table& retrieved_table = repr.get_table();
+  const cudf::table_view& retrieved_table = repr.get_table_view();
   REQUIRE(retrieved_table.num_columns() == num_columns);
   REQUIRE(retrieved_table.num_rows() == 100);
 }
@@ -271,7 +271,7 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
   auto& back = *gpu_any;
   chain_stream.synchronize();
   cucascade::test::expect_cudf_tables_equal_on_stream(
-    repr.get_table(), back.get_table(), chain_stream);
+    repr.get_table_view(), back.get_table_view(), chain_stream);
   // Stream is automatically managed - no explicit release needed
 }
 
@@ -323,8 +323,78 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
 
   // Compare content equality using the same stream used for transfer
   cucascade::test::expect_cudf_tables_equal_on_stream(
-    src_repr.get_table(), dst_repr.get_table(), xfer_stream);
+    src_repr.get_table_view(), dst_repr.get_table_view(), xfer_stream);
 }
+
+// =============================================================================
+// gpu_table_representation built from cudf::table_view + shared_ptr<cudf::table>
+// =============================================================================
+
+TEST_CASE("gpu->host_packed->gpu roundtrip preserves contents (table_view+shared_ptr ctor)",
+          "[gpu_data_representation][table_view_ctor]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  auto chain_stream = gpu_space->acquire_stream();
+  auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), chain_stream);
+
+  auto shared_table = std::make_shared<cudf::table>(std::move(table));
+  auto view         = shared_table->view();
+  auto alloc_size   = shared_table->alloc_size();
+  gpu_table_representation repr(
+    view, std::move(shared_table), alloc_size, *const_cast<memory::memory_space*>(gpu_space));
+
+  auto cpu_any = registry.convert<host_data_packed_representation>(repr, host_space, chain_stream);
+  auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
+
+  chain_stream.synchronize();
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table_view(), gpu_any->get_table_view(), chain_stream);
+}
+
+TEST_CASE("gpu->host_fast->gpu roundtrip preserves contents (table_view+shared_ptr ctor)",
+          "[gpu_data_representation][table_view_ctor]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  rmm::cuda_stream stream;
+  constexpr int N = 64;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream.view(),
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream.value()));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto shared_table = std::make_shared<cudf::table>(std::move(cols));
+  auto view         = shared_table->view();
+  auto alloc_size   = shared_table->alloc_size();
+  gpu_table_representation repr(
+    view, std::move(shared_table), alloc_size, *const_cast<memory::memory_space*>(gpu_space));
+
+  auto host = registry.convert<host_data_representation>(repr, host_space, stream.view());
+  auto back = registry.convert<gpu_table_representation>(*host, gpu_space, stream.view());
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == N);
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table_view(), back->get_table_view(), stream.view());
+}
+
 // =============================================================================
 // idata_representation Interface Tests
 // =============================================================================
@@ -345,7 +415,7 @@ TEST_CASE("idata_representation cast functionality",
     // Cast to derived type
     gpu_table_representation& casted = base_ptr->cast<gpu_table_representation>();
     REQUIRE(&casted == &repr);
-    REQUIRE(casted.get_table().num_rows() == 100);
+    REQUIRE(casted.get_table_view().num_rows() == 100);
   }
 }
 
@@ -365,7 +435,7 @@ TEST_CASE("idata_representation const cast functionality",
     // Const cast to derived type
     const gpu_table_representation& casted = base_ptr->cast<gpu_table_representation>();
     REQUIRE(&casted == &repr);
-    REQUIRE(casted.get_table().num_rows() == 100);
+    REQUIRE(casted.get_table_view().num_rows() == 100);
   }
 }
 
@@ -421,8 +491,8 @@ TEST_CASE("gpu_table_representation with single column", "[gpu_data_representati
   auto table = std::make_unique<cudf::table>(std::move(columns));
   gpu_table_representation repr(std::move(table), *gpu_space);
 
-  REQUIRE(repr.get_table().num_columns() == 1);
-  REQUIRE(repr.get_table().num_rows() == 100);
+  REQUIRE(repr.get_table_view().num_columns() == 1);
+  REQUIRE(repr.get_table_view().num_rows() == 100);
   REQUIRE(repr.get_size_in_bytes() >= 100 * 4);  // At least 100 rows * 4 bytes
 }
 
@@ -456,8 +526,8 @@ TEST_CASE("gpu_table_representation with multiple column types", "[gpu_data_repr
   auto table = std::make_unique<cudf::table>(std::move(columns));
   gpu_table_representation repr(std::move(table), *gpu_space);
 
-  REQUIRE(repr.get_table().num_columns() == 4);
-  REQUIRE(repr.get_table().num_rows() == 100);
+  REQUIRE(repr.get_table_view().num_columns() == 4);
+  REQUIRE(repr.get_table_view().num_rows() == 100);
   // Size should be at least 100 * (1 + 2 + 4 + 8) = 1500 bytes
   REQUIRE(repr.get_size_in_bytes() >= 1500);
 }
@@ -494,18 +564,16 @@ TEST_CASE("gpu_table_representation clone creates independent copy", "[gpu_data_
   REQUIRE(cloned->get_size_in_bytes() == repr.get_size_in_bytes());
 
   // Verify the tables have the same shape
-  REQUIRE(cloned->get_table().num_columns() == repr.get_table().num_columns());
-  REQUIRE(cloned->get_table().num_rows() == repr.get_table().num_rows());
+  REQUIRE(cloned->get_table_view().num_columns() == repr.get_table_view().num_columns());
+  REQUIRE(cloned->get_table_view().num_rows() == repr.get_table_view().num_rows());
 
   // Verify the data is equal
   cucascade::test::expect_cudf_tables_equal_on_stream(
-    repr.get_table(), cloned->get_table(), rmm::cuda_stream_default);
+    repr.get_table_view(), cloned->get_table_view(), rmm::cuda_stream_default);
 
   // Verify the tables are independent (different memory addresses)
-  REQUIRE(&cloned->get_table() != &repr.get_table());
-  for (cudf::size_type i = 0; i < repr.get_table().num_columns(); ++i) {
-    REQUIRE(repr.get_table().view().column(i).head() !=
-            cloned->get_table().view().column(i).head());
+  for (cudf::size_type i = 0; i < repr.get_table_view().num_columns(); ++i) {
+    REQUIRE(repr.get_table_view().column(i).head() != cloned->get_table_view().column(i).head());
   }
 }
 
@@ -521,7 +589,7 @@ TEST_CASE("gpu_table_representation clone empty table", "[gpu_data_representatio
 
   auto* cloned = dynamic_cast<gpu_table_representation*>(cloned_base.get());
   REQUIRE(cloned != nullptr);
-  REQUIRE(cloned->get_table().num_rows() == 0);
+  REQUIRE(cloned->get_table_view().num_rows() == 0);
   REQUIRE(cloned->get_size_in_bytes() == 0);
 }
 
@@ -570,7 +638,7 @@ TEST_CASE("host_data_packed_representation clone creates independent copy",
   stream.synchronize();
 
   cucascade::test::expect_cudf_tables_equal_on_stream(
-    orig_gpu->get_table(), cloned_gpu->get_table(), stream.view());
+    orig_gpu->get_table_view(), cloned_gpu->get_table_view(), stream.view());
 }
 
 //  */
@@ -1794,10 +1862,10 @@ TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
   stream.synchronize();
 
   REQUIRE(back != nullptr);
-  REQUIRE(back->get_table().num_columns() == 1);
-  REQUIRE(back->get_table().num_rows() == N);
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == N);
 
-  cudf::table_view back_tv = back->get_table().view();
+  cudf::table_view back_tv = back->get_table_view();
   auto bytes               = gpu_bytes(back_tv.column(0).data<uint8_t>(), N * sizeof(int32_t));
   REQUIRE(bytes[0] == 0xAB);
   REQUIRE(bytes[N * sizeof(int32_t) - 1] == 0xAB);
@@ -1830,8 +1898,8 @@ TEST_CASE("Round-trip fast: nullable INT64 null mask preserved", "[fast][roundtr
   auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
   stream.synchronize();
 
-  REQUIRE(back->get_table().num_columns() == 1);
-  cudf::table_view back_tv = back->get_table().view();
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  cudf::table_view back_tv = back->get_table_view();
   REQUIRE(back_tv.column(0).nullable());
   REQUIRE(back_tv.column(0).null_count() == 0);
 
@@ -1865,7 +1933,7 @@ TEST_CASE("Round-trip fast: FLOAT64 byte integrity", "[fast][roundtrip]")
   auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
   stream.synchronize();
 
-  cudf::table_view back_tv = back->get_table().view();
+  cudf::table_view back_tv = back->get_table_view();
   auto data_bytes          = gpu_bytes(back_tv.column(0).data<uint8_t>(), N * sizeof(double));
   REQUIRE(data_bytes[0] == 0xCD);
   REQUIRE(data_bytes[N * sizeof(double) - 1] == 0xCD);
@@ -1912,9 +1980,9 @@ TEST_CASE("Round-trip fast: STRING column content preserved", "[fast][roundtrip]
   auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
   stream.synchronize();
 
-  REQUIRE(back->get_table().num_columns() == 1);
-  REQUIRE(back->get_table().num_rows() == num_strings);
-  cudf::table_view back_tv = back->get_table().view();
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == num_strings);
+  cudf::table_view back_tv = back->get_table_view();
   REQUIRE(back_tv.column(0).type().id() == cudf::type_id::STRING);
   // Chars should be preserved
   auto char_bytes =
@@ -1966,8 +2034,8 @@ TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]
   auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
   stream.synchronize();
 
-  REQUIRE(back->get_table().num_rows() == num_lists);
-  cudf::table_view back_tv = back->get_table().view();
+  REQUIRE(back->get_table_view().num_rows() == num_lists);
+  cudf::table_view back_tv = back->get_table_view();
   REQUIRE(back_tv.column(0).type().id() == cudf::type_id::LIST);
   REQUIRE(back_tv.column(0).num_children() == 2);
   // Values child bytes preserved
@@ -2016,8 +2084,8 @@ TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][rou
   auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
   stream.synchronize();
 
-  REQUIRE(back->get_table().num_rows() == N);
-  cudf::table_view back_tv = back->get_table().view();
+  REQUIRE(back->get_table_view().num_rows() == N);
+  cudf::table_view back_tv = back->get_table_view();
   REQUIRE(back_tv.column(0).type().id() == cudf::type_id::STRUCT);
   REQUIRE(back_tv.column(0).num_children() == 2);
 
@@ -2052,7 +2120,7 @@ TEST_CASE("Round-trip fast: empty table (0 rows)", "[fast][roundtrip]")
   stream.synchronize();
 
   REQUIRE(back != nullptr);
-  REQUIRE(back->get_table().num_columns() == 1);
-  REQUIRE(back->get_table().num_rows() == 0);
-  REQUIRE(back->get_table().view().column(0).type().id() == cudf::type_id::INT32);
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == 0);
+  REQUIRE(back->get_table_view().column(0).type().id() == cudf::type_id::INT32);
 }

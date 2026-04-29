@@ -171,7 +171,10 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
         if (tracker) tracker->allocated_bytes.fetch_sub(static_cast<int64_t>(total_bytes));
         throw rmm::out_of_memory(
           "Not enough free blocks available in fixed_size_host_memory_resource and pool expansion "
-          "failed. total_bytes: " + std::to_string(total_bytes) + ", upstream_tracked_bytes: " + std::to_string(upstream_tracked_bytes) + ", only " + std::to_string(_free_blocks.size()) + " free blocks available from " + std::to_string(num_blocks) + " requested blocks" + ".");
+          "failed. total_bytes: " +
+          std::to_string(total_bytes) + ", upstream_tracked_bytes: " +
+          std::to_string(upstream_tracked_bytes) + ", only " + std::to_string(_free_blocks.size()) +
+          " free blocks available from " + std::to_string(num_blocks) + " requested blocks" + ".");
       }
 
       std::byte* ptr = static_cast<std::byte*>(_free_blocks.back());
@@ -183,8 +186,11 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
   } else {
     if (tracker) tracker->allocated_bytes.fetch_sub(static_cast<int64_t>(total_bytes));
     throw rmm::out_of_memory(
-      "Not enough free blocks available in fixed_size_host_memory_resource. " 
-      "total_bytes: " + std::to_string(total_bytes) + ", upstream_tracked_bytes: " + std::to_string(upstream_tracked_bytes) + ", only " + std::to_string(_free_blocks.size()) + " free blocks available from " + std::to_string(num_blocks) + " requested blocks" + ".");
+      "Not enough free blocks available in fixed_size_host_memory_resource. "
+      "total_bytes: " +
+      std::to_string(total_bytes) + ", upstream_tracked_bytes: " +
+      std::to_string(upstream_tracked_bytes) + ", only " + std::to_string(_free_blocks.size()) +
+      " free blocks available from " + std::to_string(num_blocks) + " requested blocks" + ".");
   }
   return {};
 }

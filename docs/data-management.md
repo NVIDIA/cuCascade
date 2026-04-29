@@ -81,8 +81,7 @@ class gpu_table_representation : public idata_representation {
     std::unique_ptr<cudf::table> _table;
 
 public:
-    const cudf::table& get_table() const;
-    std::unique_ptr<cudf::table> release_table();  // Transfer ownership
+    std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);  // Transfer ownership
 
     std::size_t get_size_in_bytes() const override;
     std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
@@ -218,7 +217,7 @@ auto result = batch.try_to_lock_for_processing(memory_space_id);
 if (result.success) {
     // result.handle is a data_batch_processing_handle
     auto& data = batch.get_data()->cast<gpu_table_representation>();
-    process(data.get_table());
+    process(data.get_table_view());
     // handle destructs here -> processing_count--
     // if count reaches 0: processing -> idle (or task_created if tasks pending)
 }
