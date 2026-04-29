@@ -144,6 +144,17 @@ inline cuda::mr::any_resource<cuda::mr::device_accessible> wrap_legacy_rmm_resou
 cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_resource(
   int device_id, std::size_t capacity);
 
+/**
+ * @brief Grant cross-device peer ReadWrite access on a cudaMallocAsync pool.
+ *
+ * cudaMallocAsync pools require explicit `cudaMemPoolSetAccess` for cross-device peer copy
+ * (cudaMemcpyPeer*) to actually transfer bytes; `cudaDeviceEnablePeerAccess` alone only
+ * governs legacy cudaMalloc memory. This helper iterates all visible CUDA devices and
+ * declares that each peer (other than `owner_device_id`) may read/write the pool.
+ * Best effort — non-P2P-capable peers are skipped silently.
+ */
+void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int owner_device_id);
+
 cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
 make_default_host_memory_resource(int device_id, std::size_t capacity);
 

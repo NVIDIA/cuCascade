@@ -116,14 +116,27 @@ memory_space::memory_space(const gpu_memory_space_config& config)
     _allocator = config.mr_factory_fn(config.device_id, config.memory_capacity);
   } else {
     rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
+    // Do NOT pass config.memory_capacity as initial_pool_size — under RAPIDS
+    // 26.04 (post-CCCL-MR migration #98) that primes the pool by allocating
+    // the full capacity upfront and retaining it (release_threshold=total).
+    // Multiple memory_space instances per device would then exhaust physical
+    // GPU memory before any work runs. The reservation_aware_resource_adaptor
+    // enforces the cucascade-level budget independently.
+    //
+    // Also: explicitly grant cross-device peer ReadWrite access on the pool —
+    // cudaMallocAsync pools require cudaMemPoolSetAccess for cudaMemcpyPeer*
+    // to actually copy; cudaDeviceEnablePeerAccess only governs legacy
+    // cudaMalloc memory.
 #if CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
-    rmm::mr::cuda_async_memory_resource concrete_mr(config.memory_capacity);
+    rmm::mr::cuda_async_memory_resource concrete_mr;
     pool_handle = concrete_mr.pool_handle();
-    _allocator  = cuda::mr::any_resource<cuda::mr::device_accessible>(std::move(concrete_mr));
+    enable_pool_peer_access_for_all_visible_devices(pool_handle, config.device_id);
+    _allocator = cuda::mr::any_resource<cuda::mr::device_accessible>(std::move(concrete_mr));
 #else
-    auto concrete_mr = std::make_shared<rmm::mr::cuda_async_memory_resource>(config.memory_capacity);
+    auto concrete_mr = std::make_shared<rmm::mr::cuda_async_memory_resource>();
     pool_handle      = concrete_mr->pool_handle();
-    _allocator       = wrap_legacy_rmm_resource(std::move(concrete_mr));
+    enable_pool_peer_access_for_all_visible_devices(pool_handle, config.device_id);
+    _allocator = wrap_legacy_rmm_resource(std::move(concrete_mr));
 #endif
   }
 

@@ -26,15 +26,53 @@ namespace cucascade {
 
 namespace memory {
 
+void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int owner_device_id)
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return;
+  }
+  for (int peer = 0; peer < device_count; ++peer) {
+    if (peer == owner_device_id) { continue; }
+    int can_access = 0;
+    if (cudaDeviceCanAccessPeer(&can_access, peer, owner_device_id) != cudaSuccess ||
+        !can_access) {
+      (void)cudaGetLastError();
+      continue;
+    }
+    cudaMemAccessDesc desc{};
+    desc.location.type = cudaMemLocationTypeDevice;
+    desc.location.id   = peer;
+    desc.flags         = cudaMemAccessFlagsProtReadWrite;
+    if (cudaMemPoolSetAccess(pool, &desc, 1) != cudaSuccess) {
+      (void)cudaGetLastError();  // best effort; non-fatal on systems without P2P
+    }
+  }
+}
+
 cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_resource(
-  int device_id, size_t capacity)
+  int device_id, [[maybe_unused]] size_t capacity)
 {
   rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{device_id});
+  // Construct the cudaMallocAsync pool WITHOUT priming — passing the cucascade
+  // capacity as initial_pool_size makes RMM allocate+immediately-deallocate
+  // that many bytes upfront (RAPIDS 26.04 behavior, post-CCCL-MR migration #98),
+  // which under cudaMemPoolAttrReleaseThreshold=total leaves all those bytes
+  // RETAINED in the pool. With multiple memory_space instances per device
+  // (e.g. shared_test_env constructs 3 envs upfront in unittest.cpp main),
+  // the cumulative priming exhausts physical GPU memory before any test runs.
+  // The reservation_aware_resource_adaptor enforces the cucascade-level budget
+  // independently, so the underlying RMM pool can grow lazily without losing
+  // budget enforcement.
 #if CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
-  return {rmm::mr::cuda_async_memory_resource(capacity)};
+  rmm::mr::cuda_async_memory_resource concrete_mr;
+  enable_pool_peer_access_for_all_visible_devices(concrete_mr.pool_handle(), device_id);
+  return {std::move(concrete_mr)};
 #else
-  return wrap_legacy_rmm_resource(
-    std::make_shared<rmm::mr::cuda_async_memory_resource>(capacity));
+  auto concrete_mr = std::make_shared<rmm::mr::cuda_async_memory_resource>();
+  enable_pool_peer_access_for_all_visible_devices(concrete_mr->pool_handle(), device_id);
+  return wrap_legacy_rmm_resource(std::move(concrete_mr));
 #endif
 }
 
