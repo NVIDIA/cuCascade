@@ -71,12 +71,14 @@ void data_batch::set_data(std::unique_ptr<idata_representation> data) { _data = 
 std::shared_ptr<data_batch> data_batch::to_idle(read_only_data_batch&& accessor)
 {
   auto ptr = accessor._batch;
+  { auto _ = std::move(accessor); }  // destroy accessor, releasing shared lock
   return ptr;
 }
 
 std::shared_ptr<data_batch> data_batch::to_idle(mutable_data_batch&& accessor)
 {
   auto ptr = accessor._batch;
+  { auto _ = std::move(accessor); }  // destroy accessor, releasing exclusive lock
   return ptr;
 }
 
