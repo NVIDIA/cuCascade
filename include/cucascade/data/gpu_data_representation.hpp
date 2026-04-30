@@ -22,6 +22,8 @@
 
 #include <cudf/table/table.hpp>
 
+#include <cuda_runtime.h>
+
 #include <memory>
 #include <vector>
 
@@ -48,6 +50,22 @@ class gpu_table_representation : public idata_representation {
    */
   gpu_table_representation(std::unique_ptr<cudf::table> table,
                            cucascade::memory::memory_space& memory_space);
+
+  /**
+   * @brief Destructor — destroys the writer-event if one was recorded.
+   *
+   * STREAM-LINEAGE: events recorded on a writer stream via record_writer_event() are
+   * owned by the representation and released on destruction.
+   */
+  ~gpu_table_representation() override;
+
+  // Non-copyable / non-movable: the representation owns a cudaEvent_t handle whose
+  // lifetime must be unique. Move semantics could be added but are not needed by
+  // any in-tree caller.
+  gpu_table_representation(const gpu_table_representation&)            = delete;
+  gpu_table_representation(gpu_table_representation&&)                 = delete;
+  gpu_table_representation& operator=(const gpu_table_representation&) = delete;
+  gpu_table_representation& operator=(gpu_table_representation&&)      = delete;
 
   /**
    * @brief Get the size of the data representation in bytes
@@ -88,9 +106,46 @@ class gpu_table_representation : public idata_representation {
    */
   std::unique_ptr<cudf::table> release_table();
 
+  /**
+   * @brief Record a CUDA event on @p writer_stream and store it as the writer event.
+   *
+   * STREAM-LINEAGE: any cross-stream / cross-device reader of this representation's
+   * memory must wait on this event before issuing reads. Concretely,
+   * representation_converter.cpp's convert_gpu_to_gpu() will call
+   * cudaStreamWaitEvent(reader_stream, get_writer_event(), 0) before peer-copying
+   * source buffers.
+   *
+   * Calling this multiple times overwrites the previously recorded event (the
+   * representation owns a single writer event handle that is reused). Passing a
+   * default-constructed cuda_stream_view records no event and clears any prior one.
+   *
+   * @param writer_stream The stream on which the most recent writes to this
+   *                      representation's memory were enqueued.
+   */
+  void record_writer_event(rmm::cuda_stream_view writer_stream);
+
+  /**
+   * @brief Get the writer event recorded by record_writer_event(), or nullptr if none.
+   *
+   * Readers that cross stream / device boundaries must call cudaStreamWaitEvent on
+   * this event (when non-null) before reading the underlying memory. When this
+   * returns nullptr, callers should fall back to a coarser sync (e.g.
+   * cudaDeviceSynchronize on the source device) — this is the legacy behavior
+   * preserved for representations constructed by code paths that have not yet
+   * been migrated to record writer events.
+   *
+   * @return cudaEvent_t The writer event, or nullptr if none has been recorded.
+   */
+  [[nodiscard]] cudaEvent_t get_writer_event() const;
+
  private:
   std::unique_ptr<cudf::table>
     _table;  ///< cudf::table is the underlying representation of the data
+
+  /// Lazily-created CUDA event recording the completion of the most recent
+  /// writer-stream work that produced this representation. Null until the first
+  /// call to record_writer_event().
+  cudaEvent_t _writer_event{nullptr};
 };
 
 }  // namespace cucascade

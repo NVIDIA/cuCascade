@@ -818,14 +818,24 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto const src_device_id = gpu_source.get_device_id();
   auto const dst_device_id = target_memory_space->get_device_id();
 
-  // Full device sync on the SOURCE device before reading: in a multi-stream pipeline
-  // the source buffers may have been written by streams other than the caller's
-  // (e.g. an upstream operator's stream pool). Syncing the source device makes all
-  // prior source-side writes visible before we issue the host-staged copies.
-  {
-    rmm::cuda_set_device_raii src_sync_guard{rmm::cuda_device_id{src_device_id}};
-    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
-  }
+  // STREAM-LINEAGE INVARIANT: cross-device peer copies of cudaMallocAsync allocations
+  // require explicit event-ordered synchronization with the writer stream. A
+  // source-device-wide cudaDeviceSynchronize() does NOT establish the cross-mempool
+  // visibility the driver needs — see project_phase08_fu17.md and Phase 13 race
+  // localization (sanitizer flagged 433 stream-ordered-race errors at this site
+  // even with the brute-force device sync below). Producer-consumer pairing:
+  //   producer = the stream that wrote gpu_source (recorded via
+  //              gpu_table_representation::record_writer_event)
+  //   consumer = target_stream (acquired from target memory space below)
+  // We resolve this in two passes:
+  //   1) Wait on the writer event (if recorded) on the *target* stream so the
+  //      reader sees the writer's allocation/copy ordering. This is the precise
+  //      primitive the sanitizer recognizes as closing the race.
+  //   2) Keep the source-device cudaDeviceSynchronize() as defense-in-depth for
+  //      callers that have not yet been migrated to record writer events
+  //      (get_writer_event() == nullptr). When the writer event is set the
+  //      cudaDeviceSynchronize is technically redundant but harmless.
+  cudaEvent_t const writer_event = gpu_source.get_writer_event();
 
   rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
 
@@ -834,6 +844,21 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   // completion without explicit cross-stream events.
   auto target_stream = target_memory_space->acquire_stream();
   auto mr            = target_memory_space->get_default_allocator();
+
+  if (writer_event != nullptr) {
+    // STREAM-LINEAGE pass 1: tie the reader stream's timeline to the writer's
+    // recorded event. After this point the target_stream observes all
+    // writer-side cudaMallocAsync allocations and writes in proper order.
+    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(target_stream.value(), writer_event, 0));
+  } else {
+    // STREAM-LINEAGE pass 2 (fallback): no writer event recorded — fall back to
+    // a coarser source-device sync. This path is documented as insufficient for
+    // cross-mempool cudaMallocAsync allocations but is preserved for
+    // representations produced by code paths that have not yet been migrated to
+    // record_writer_event().
+    rmm::cuda_set_device_raii src_sync_guard{rmm::cuda_device_id{src_device_id}};
+    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
+  }
 
   cudf::table_view const src_view = gpu_source.get_table().view();
 
@@ -849,8 +874,16 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   // table is observed by another stream.
   target_stream.synchronize();
 
-  return std::make_unique<gpu_table_representation>(
+  // STREAM-LINEAGE: the resulting representation was written by target_stream;
+  // record an event on it so any subsequent cross-device reader of this new
+  // representation observes the producer-consumer ordering. Although we just
+  // synchronized target_stream above (so a same-stream reader needs no further
+  // wait), the event is still required for readers that arrive on a different
+  // stream.
+  auto result = std::make_unique<gpu_table_representation>(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
+  result->record_writer_event(target_stream);
+  return result;
 }
 
 /**
