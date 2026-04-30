@@ -367,6 +367,20 @@ rmm::device_async_resource_ref memory_space::get_default_allocator() const noexc
     _reservation_allocator);
 }
 
+const chunked_resource_info* memory_space::get_chunked_resource_info() const noexcept
+{
+  const chunked_resource_info* result = nullptr;
+  std::visit(
+    [&result](const auto& ptr) {
+      using held_type = std::remove_reference_t<decltype(*ptr)>;
+      if constexpr (std::is_base_of_v<chunked_resource_info, held_type>) {
+        if (ptr != nullptr) { result = static_cast<const chunked_resource_info*>(ptr.get()); }
+      }
+    },
+    _reservation_allocator);
+  return result;
+}
+
 std::string_view memory_space::get_disk_mount_path() const
 {
   if (_id.tier != Tier::DISK) {

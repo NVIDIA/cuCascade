@@ -37,6 +37,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace cucascade {
@@ -146,16 +147,29 @@ class pipeline_io_backend : public idisk_io_backend {
  public:
   explicit pipeline_io_backend(bool direct_io) : _direct_io(direct_io)
   {
+    // Pinned host buffers are context-independent under UVA — safe to share across GPUs.
     CUCASCADE_CUDA_TRY(cudaMallocHost(&_buf[0], PIPELINE_BUF_SIZE));
     CUCASCADE_CUDA_TRY(cudaMallocHost(&_buf[1], PIPELINE_BUF_SIZE));
-    CUCASCADE_CUDA_TRY(cudaStreamCreate(&_copy_stream));
-    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&_order_event, cudaEventDisableTiming));
+    // The copy stream and order event are CUDA-context-specific. They are created lazily
+    // per device in get_device_resources() so this backend works across multiple GPU
+    // contexts within the same process.
   }
 
   ~pipeline_io_backend() noexcept override
   {
-    cudaEventDestroy(_order_event);
-    cudaStreamDestroy(_copy_stream);
+    // Save and restore the caller thread's current CUDA device. Without this, the final
+    // cudaSetDevice in the loop below would silently leak out of the destructor, changing
+    // the current device for any code that runs after this backend is destroyed.
+    int saved_dev = 0;
+    cudaGetDevice(&saved_dev);
+    for (auto& [dev, res] : _per_device) {
+      // Destroy each resource under the device where it was created. CUDA event/stream
+      // handles from one context are invalid in another, so the set-device call matters.
+      cudaSetDevice(dev);
+      cudaEventDestroy(res.order_event);
+      cudaStreamDestroy(res.copy_stream);
+    }
+    cudaSetDevice(saved_dev);
     if (_buf[0]) { cudaFreeHost(_buf[0]); }
     if (_buf[1]) { cudaFreeHost(_buf[1]); }
   }
@@ -173,9 +187,15 @@ class pipeline_io_backend : public idisk_io_backend {
   {
     if (size == 0) return;
 
+    // Serialize: shared pinned buffers and per-device (copy_stream, order_event) must not be
+    // used concurrently by multiple threads.
+    std::lock_guard<std::mutex> io_lock(_device_io_mutex);
+
+    auto& res = get_device_resources();
+
     // Ensure all GPU work on the caller's stream completes before D2H copies begin
-    CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
-    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
+    CUCASCADE_CUDA_TRY(cudaEventRecord(res.order_event, stream.value()));
+    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream, res.order_event));
 
     int flags = O_CREAT | O_WRONLY;
     if (_direct_io) { flags |= O_DIRECT; }
@@ -198,8 +218,8 @@ class pipeline_io_backend : public idisk_io_backend {
                                          static_cast<const char*>(dev_ptr) + src_offset,
                                          chunk,
                                          cudaMemcpyDeviceToHost,
-                                         _copy_stream));
-      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(_copy_stream));
+                                         res.copy_stream));
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream));
 
       // Wait for previous disk write to finish before reusing that buffer
       if (write_future.valid()) { write_future.get(); }
@@ -242,9 +262,15 @@ class pipeline_io_backend : public idisk_io_backend {
   {
     if (size == 0) return;
 
+    // Serialize: shared pinned buffers and per-device (copy_stream, order_event) must not be
+    // used concurrently by multiple threads.
+    std::lock_guard<std::mutex> io_lock(_device_io_mutex);
+
+    auto& res = get_device_resources();
+
     // Ensure caller's stream work completes before we use the destination buffer
-    CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
-    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
+    CUCASCADE_CUDA_TRY(cudaEventRecord(res.order_event, stream.value()));
+    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream, res.order_event));
 
     int flags = O_RDONLY;
     if (_direct_io) { flags |= O_DIRECT; }
@@ -283,7 +309,7 @@ class pipeline_io_backend : public idisk_io_backend {
                                            _buf[cur],
                                            chunks_to_copy,
                                            cudaMemcpyHostToDevice,
-                                           _copy_stream));
+                                           res.copy_stream));
         dst_offset += chunks_to_copy;
       }
 
@@ -308,7 +334,7 @@ class pipeline_io_backend : public idisk_io_backend {
       }
 
       // Wait for H2D copy to complete
-      if (chunks_to_copy > 0) { CUCASCADE_CUDA_TRY(cudaStreamSynchronize(_copy_stream)); }
+      if (chunks_to_copy > 0) { CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream)); }
 
       // Wait for disk read to complete
       if (read_future.valid()) { read_future.get(); }
@@ -373,9 +399,15 @@ class pipeline_io_backend : public idisk_io_backend {
   {
     if (entries.empty()) return;
 
+    // Serialize: shared pinned buffers and per-device (copy_stream, order_event) must not be
+    // used concurrently by multiple threads.
+    std::lock_guard<std::mutex> io_lock(_device_io_mutex);
+
+    auto& res = get_device_resources();
+
     // Ensure all GPU work on the caller's stream completes before D2H copies begin
-    CUCASCADE_CUDA_TRY(cudaEventRecord(_order_event, stream.value()));
-    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(_copy_stream, _order_event));
+    CUCASCADE_CUDA_TRY(cudaEventRecord(res.order_event, stream.value()));
+    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream, res.order_event));
 
     int flags = O_CREAT | O_WRONLY;
     if (_direct_io) { flags |= O_DIRECT; }
@@ -408,8 +440,8 @@ class pipeline_io_backend : public idisk_io_backend {
     for (const auto& c : chunks) {
       // D2H copy into current buffer
       CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(_buf[cur], c.src, c.size, cudaMemcpyDeviceToHost, _copy_stream));
-      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(_copy_stream));
+        cudaMemcpyAsync(_buf[cur], c.src, c.size, cudaMemcpyDeviceToHost, res.copy_stream));
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream));
 
       // Wait for previous write to finish (so we can reuse its buffer next iteration)
       if (write_future.valid()) { write_future.get(); }
@@ -439,11 +471,38 @@ class pipeline_io_backend : public idisk_io_backend {
   }
 
  private:
+  struct device_resources {
+    cudaStream_t copy_stream{};
+    cudaEvent_t order_event{};
+  };
+
+  /// Return stream+event for the current CUDA device, lazy-creating on first access.
+  /// Subsequent lookups return the cached pair. References remain stable across inserts
+  /// because `std::unordered_map` does not invalidate value references on rehash.
+  device_resources& get_device_resources()
+  {
+    int dev = 0;
+    CUCASCADE_CUDA_TRY(cudaGetDevice(&dev));
+    std::lock_guard<std::mutex> lock(_resources_mutex);
+    auto it = _per_device.find(dev);
+    if (it != _per_device.end()) { return it->second; }
+    device_resources res{};
+    CUCASCADE_CUDA_TRY(cudaStreamCreate(&res.copy_stream));
+    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&res.order_event, cudaEventDisableTiming));
+    return _per_device.emplace(dev, res).first->second;
+  }
+
   void* _buf[2]{nullptr, nullptr};
-  cudaStream_t _copy_stream{};
-  cudaEvent_t _order_event{};
   bool _direct_io;
   io_worker _io_worker;
+  std::mutex _resources_mutex;
+  std::unordered_map<int, device_resources> _per_device;
+  // Serializes the device read/write paths so concurrent callers don't race on the shared
+  // pinned buffers (_buf[0], _buf[1]) or on a device's shared (copy_stream, order_event).
+  // This matches the project's "disk I/O must be safe for concurrent use" constraint —
+  // correctness, not parallelism. A per-call pool of (buffer, stream, event) contexts would
+  // unlock true concurrency; deferred until needed.
+  std::mutex _device_io_mutex;
 };
 
 }  // namespace

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/memory/chunked_resource_info.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
@@ -116,6 +117,14 @@ class memory_space {
 
   // Allocator management
   [[nodiscard]] rmm::device_async_resource_ref get_default_allocator() const noexcept;
+
+  /**
+   * @brief Probe the underlying allocator for the `chunked_resource_info` mixin.
+   *
+   * @return Non-null pointer to the mixin interface if the underlying allocator inherits from
+   * `chunked_resource_info`; `nullptr` otherwise (contiguous allocator).
+   */
+  [[nodiscard]] const chunked_resource_info* get_chunked_resource_info() const noexcept;
 
   template <typename T>
     requires(cuda::mr::resource_with<T, cuda::mr::device_accessible> ||

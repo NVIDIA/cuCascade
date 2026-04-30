@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cucascade/error.hpp>
+#include <cucascade/memory/chunked_resource_info.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -64,7 +65,7 @@ namespace memory {
  * Modified to derive from device_memory_resource instead of host_memory_resource for RMM
  * compatibility.
  */
-class fixed_size_host_memory_resource {
+class fixed_size_host_memory_resource : public chunked_resource_info {
  public:
   static constexpr std::size_t default_block_size = 1 << 20;  ///< Default block size (1MB)
   static constexpr std::size_t default_pool_size  = 128;      ///< Default number of blocks in pool
@@ -251,6 +252,13 @@ class fixed_size_host_memory_resource {
    * @return std::size_t The size of each block in bytes
    */
   [[nodiscard]] std::size_t get_block_size() const noexcept;
+
+  /**
+   * @brief Advertise the per-allocation chunk size for chunked-allocator probes.
+   *
+   * Implements `chunked_resource_info::max_chunk_bytes()` by forwarding to `get_block_size()`.
+   */
+  [[nodiscard]] std::size_t max_chunk_bytes() const override { return get_block_size(); }
 
   /**
    * @brief Get the number of free blocks.
