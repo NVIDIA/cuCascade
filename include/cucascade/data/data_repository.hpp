@@ -84,14 +84,9 @@ class idata_repository {
         _data_batches.resize(partition_idx + 1);
       }
       _data_batches[partition_idx].push_back(std::move(batch));
-    }
-    _cv.notify_all();
+    }    
   }
 
-  /**
-   * @brief Notify waiting threads that a batch may be available.
-   */
-  void notify_state_change() { _cv.notify_all(); }
 
   /**
    * @brief Remove and return the next data batch from the repository.
@@ -274,7 +269,6 @@ class idata_repository {
 
  protected:
   mutable std::mutex _mutex;    ///< Mutex for thread-safe access to repository operations
-  std::condition_variable _cv;  ///< Condition variable for blocking pop operations
   std::vector<std::vector<PtrType>>
     _data_batches;  ///< Container for data batch pointers (partitioned)
 };
