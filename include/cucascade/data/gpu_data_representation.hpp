@@ -22,6 +22,8 @@
 
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cuda_runtime.h>
 
 #include <memory>
@@ -43,13 +45,25 @@ namespace cucascade {
 class gpu_table_representation : public idata_representation {
  public:
   /**
-   * @brief Construct a new gpu_table_representation object
+   * @brief Construct a new gpu_table_representation object.
+   *
+   * STREAM-LINEAGE: every gpu_table_representation must be born with a recorded
+   * writer event so cross-stream / cross-device readers (notably
+   * representation_converter.cpp's convert_gpu_to_gpu()) can establish ordering
+   * via cudaStreamWaitEvent. The constructor calls record_writer_event(@p
+   * writer_stream) automatically — passing a default-constructed
+   * cuda_stream_view records no event (legacy, only acceptable for paths whose
+   * data was never produced on any stream).
    *
    * @param table Unique pointer to the cuDF table with the data (ownership is transferred)
    * @param memory_space The memory space where the GPU table resides
+   * @param writer_stream The stream on which @p table's data was last written.
+   *                      MUST be the actual writer stream — passing the wrong
+   *                      stream re-introduces the race this contract closes.
    */
   gpu_table_representation(std::unique_ptr<cudf::table> table,
-                           cucascade::memory::memory_space& memory_space);
+                           cucascade::memory::memory_space& memory_space,
+                           rmm::cuda_stream_view writer_stream);
 
   /**
    * @brief Destructor — destroys the writer-event if one was recorded.

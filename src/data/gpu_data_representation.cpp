@@ -24,9 +24,18 @@
 namespace cucascade {
 
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
-                                                   cucascade::memory::memory_space& memory_space)
+                                                   cucascade::memory::memory_space& memory_space,
+                                                   rmm::cuda_stream_view writer_stream)
   : idata_representation(memory_space), _table(std::move(table))
 {
+  // STREAM-LINEAGE: record the writer event in the constructor body so every
+  // representation is born with a recorded event. Skipping when the caller
+  // passes a default-constructed (per-thread default) stream view preserves
+  // legacy behavior for callers that genuinely have no writer stream — they
+  // will fall back to cudaDeviceSynchronize on the source device in
+  // convert_gpu_to_gpu(). All non-legacy callers MUST pass a real writer
+  // stream.
+  if (writer_stream.value() != nullptr) { record_writer_event(writer_stream); }
 }
 
 gpu_table_representation::~gpu_table_representation()
@@ -59,9 +68,8 @@ std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_
   // it so any cross-stream/cross-device reader of the clone honors the
   // producer-consumer ordering established by record_writer_event().
   auto table_copy = std::make_unique<cudf::table>(_table->view(), stream);
-  auto cloned     = std::make_unique<gpu_table_representation>(std::move(table_copy),
-                                                           get_memory_space());
-  cloned->record_writer_event(stream);
+  auto cloned     = std::make_unique<gpu_table_representation>(
+    std::move(table_copy), get_memory_space(), stream);
   return cloned;
 }
 

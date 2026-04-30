@@ -237,8 +237,11 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
   auto new_table = std::make_unique<cudf::table>(new_table_view, stream, mr);
   stream.synchronize();
 
+  // STREAM-LINEAGE: the resulting representation was written by `stream`;
+  // record an event on it so cross-stream/cross-device readers honor producer
+  // ordering.
   return std::make_unique<gpu_table_representation>(
-    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
+    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
 }
 
 /**
@@ -875,15 +878,13 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   target_stream.synchronize();
 
   // STREAM-LINEAGE: the resulting representation was written by target_stream;
-  // record an event on it so any subsequent cross-device reader of this new
-  // representation observes the producer-consumer ordering. Although we just
-  // synchronized target_stream above (so a same-stream reader needs no further
-  // wait), the event is still required for readers that arrive on a different
-  // stream.
-  auto result = std::make_unique<gpu_table_representation>(
-    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
-  result->record_writer_event(target_stream);
-  return result;
+  // the constructor records an event on it so any subsequent cross-device
+  // reader of this new representation observes the producer-consumer ordering.
+  // Although we just synchronized target_stream above (so a same-stream reader
+  // needs no further wait), the event is still required for readers that
+  // arrive on a different stream.
+  return std::make_unique<gpu_table_representation>(
+    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), target_stream);
 }
 
 /**
@@ -1130,8 +1131,10 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   target_stream.synchronize();
 
+  // STREAM-LINEAGE: writes happened on target_stream; record event so
+  // cross-stream readers observe ordering.
   return std::make_unique<gpu_table_representation>(
-    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
+    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), target_stream);
 }
 
 /**
@@ -1731,8 +1734,10 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   stream.synchronize();
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
+  // STREAM-LINEAGE: writes happened on `stream`; record event so cross-stream
+  // readers observe ordering.
   return std::make_unique<gpu_table_representation>(
-    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space));
+    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
 }
 
 }  // namespace
