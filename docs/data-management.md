@@ -1,6 +1,6 @@
 # Data Management
 
-A deep dive into cuCascade's data lifecycle, batch state machine, repositories, and representation conversion.
+A deep dive into cuCascade's data lifecycle, batch read-only and mutable locking accessor classes, repositories, and representation conversion.
 
 ## Table of Contents
 
@@ -38,7 +38,7 @@ A deep dive into cuCascade's data lifecycle, batch state machine, repositories, 
 The data module manages the lifecycle of data as it flows through processing pipelines and moves between memory tiers. It provides:
 
 - **Tier-agnostic data representations** -- abstract interface with GPU and host implementations
-- **State machine for batch lifecycle** -- prevents concurrent access conflicts during processing and tier movement
+- **Locking read-only and mutable accessor classes for batch lifecycle** -- prevents concurrent access conflicts during processing and tier movement
 - **Type-indexed conversion** -- extensible registry for converting data between representations
 - **Partitioned repositories** -- thread-safe storage with blocking retrieval
 - **Multi-pipeline coordination** -- manages data across operators with atomic ID generation
@@ -160,14 +160,15 @@ A `host_table_packed_allocation` (`include/cucascade/memory/host_table_packed.hp
 
 **File**: `include/cucascade/data/data_batch.hpp`
 
-A `data_batch` wraps a data representation and controls access through four states:
+A `data_batch` wraps a data representation and controls access through three states using a
+reader-writer lock model. Data is only accessible through RAII accessor objects that hold the
+appropriate lock — the idle `data_batch` pointer grants no data access.
 
 | State | Meaning |
 |-------|---------|
-| `idle` | No pending tasks, no active processing. Available for scheduling or tier movement. |
-| `task_created` | A task has been registered (`_task_created_count > 0`) but processing hasn't started. |
-| `processing` | One or more `data_batch_processing_handle`s are active (`_processing_count > 0`). |
-| `in_transit` | Locked for movement between memory tiers. No concurrent access allowed. |
+| `idle` | No active locks. Available for reading, mutation, or tier movement. |
+| `read_only` | One or more `read_only_data_batch` shared locks are active (`_read_only_count > 0`). Concurrent readers allowed; exclusive access blocked. |
+| `mutable_locked` | One `mutable_data_batch` exclusive lock is active. No concurrent readers; full read/write access. |
 
 ### State Transitions
 
@@ -175,70 +176,107 @@ A `data_batch` wraps a data representation and controls access through four stat
 stateDiagram-v2
     direction LR
 
-    idle --> task_created : try_to_create_task()
-    idle --> in_transit : try_to_lock_for_in_transit()
+    idle --> read_only : to_read_only() / try_to_read_only()
+    idle --> mutable_locked : to_mutable() / try_to_mutable()
 
-    task_created --> processing : try_to_lock_for_processing()
-    task_created --> in_transit : try_to_lock_for_in_transit()
-    task_created --> idle : try_to_cancel_task()
+    read_only --> idle : to_idle(read_only_data_batch&&) [last reader]
+    read_only --> mutable_locked : readonly_to_mutable(read_only_data_batch&&)
 
-    processing --> idle : handle release (count -> 0)
-    processing --> task_created : try_to_create_task()
-
-    in_transit --> idle : try_to_release_in_transit()
-    in_transit --> task_created : try_to_release_in_transit(task_created)
+    mutable_locked --> idle : to_idle(mutable_data_batch&&)
+    mutable_locked --> read_only : mutable_to_readonly(mutable_data_batch&&)
 ```
 
 **Key rules**:
-- `try_to_create_task()` can stack -- `_task_created_count` can be > 1
-- `try_to_lock_for_processing()` validates memory space matches and decrements `_task_created_count`
-- Multiple processing handles can coexist (concurrent reads)
-- `in_transit` blocks all other operations (exclusive lock for tier movement)
-- `try_to_lock_for_in_transit()` fails if `_processing_count > 0` (must wait for processing to finish)
-
-**Disallowed transitions**:
-
-| Attempt | From State | Failure Reason |
-|---------|-----------|----------------|
-| `try_to_create_task()` | `in_transit` | Returns `false` |
-| `try_to_lock_for_in_transit()` | `processing` | Returns `false` |
-| `try_to_lock_for_processing()` | `idle` | Status: `task_not_created` |
-| `try_to_lock_for_processing()` | wrong memory space | Status: `memory_space_mismatch` |
-| `try_to_lock_for_processing()` | no data | Status: `missing_data` |
+- Non-static transitions (`to_read_only`, `to_mutable`, `try_to_*`) use `shared_from_this()` and do not consume the caller's `shared_ptr`.
+- Static transitions (`to_idle`, `readonly_to_mutable`, `mutable_to_readonly`) consume the accessor via `&&`, making the source null at the call site — the compiler enforces that you cannot use an accessor after releasing it.
+- `to_read_only()` / `to_mutable()` **block** until the lock is available.
+- `try_to_read_only()` / `try_to_mutable()` are **non-blocking** and return `std::nullopt` on failure.
+- Multiple `read_only_data_batch` handles may coexist on the same batch (concurrent reads).
+- `mutable_data_batch` is exclusive: it cannot coexist with any other reader or writer.
+- Copying a `read_only_data_batch` acquires a new shared lock on the parent, incrementing `_read_only_count`.
 
 See [data_batch_state_transitions.md](data_batch_state_transitions.md) for the complete reference.
 
-### Processing Handles
+### RAII Accessor Classes
 
-The `data_batch_processing_handle` is an RAII guard that decrements the processing count when destroyed:
+Access to batch data is only possible through one of two RAII accessor classes:
+
+**`read_only_data_batch`** — shared (read) lock:
 
 ```cpp
-auto result = batch.try_to_lock_for_processing(memory_space_id);
-if (result.success) {
-    // result.handle is a data_batch_processing_handle
-    auto& data = batch.get_data()->cast<gpu_table_representation>();
-    process(data.get_table_view());
-    // handle destructs here -> processing_count--
-    // if count reaches 0: processing -> idle (or task_created if tasks pending)
-}
+// Acquire shared lock (blocks if exclusive lock held)
+read_only_data_batch ro = batch->to_read_only();
+
+// Access data
+auto* data = ro.get_data()->cast<gpu_table_representation>();
+process(data->get_table_view());
+
+// Release: either let ro go out of scope, or explicitly return to idle
+auto idle_batch = cucascade::data_batch::to_idle(std::move(ro));
 ```
 
 Properties:
-- **Move-only** -- prevents accidental copies that would corrupt the count
-- **Multiple handles** -- concurrent processing is supported (shared read access)
-- **Scope-safe** -- count is decremented even if an exception is thrown
+- **Copyable** — each copy acquires a new shared lock; `_read_only_count` increments per copy.
+- **Movable** — moves transfer lock ownership without changing the count.
+- Destruction or `to_idle()` decrements `_read_only_count`; the batch returns to `idle` when the count reaches zero.
+
+**`mutable_data_batch`** — exclusive (write) lock:
+
+```cpp
+// Acquire exclusive lock (blocks until all readers and writers release)
+mutable_data_batch mut = batch->to_mutable();
+
+// Read and write data
+mut.set_data(std::move(new_representation));
+
+// Release back to idle
+auto idle_batch = cucascade::data_batch::to_idle(std::move(mut));
+```
+
+Properties:
+- **Move-only** — no copies allowed; only one exclusive lock can exist at a time.
+- Destruction or `to_idle()` releases the exclusive lock.
+
+**Upgrade / Downgrade**:
+
+```cpp
+// Upgrade: shared → exclusive (releases shared, acquires exclusive — may block)
+mutable_data_batch mut = cucascade::data_batch::readonly_to_mutable(std::move(ro));
+
+// Downgrade: exclusive → shared (releases exclusive, acquires shared — may block)
+read_only_data_batch ro2 = cucascade::data_batch::mutable_to_readonly(std::move(mut));
+```
 
 ### Thread Safety
 
-Each `data_batch` is protected by a `std::mutex`. State transitions are guarded by the mutex, and an optional `std::condition_variable` is notified after each state change (used by repositories to unblock waiting pops).
+Each `data_batch` uses a `std::shared_mutex`: shared locks for readers (`read_only_data_batch`) and unique locks for writers (`mutable_data_batch`). The observable state (`batch_state` enum) is tracked atomically so it can be queried without acquiring the mutex. `_read_only_count` is also atomic for lock-free reader-count queries.
+
+### Subscriber Counting
+
+Independent of the locking model, batches support a subscriber reference count:
+
+```cpp
+batch->subscribe();          // Increment interest count (lock-free)
+batch->unsubscribe();        // Decrement interest count (lock-free)
+batch->get_subscriber_count(); // Query count (lock-free)
+```
+
+This is used by the pipeline and downgrade executor to track which batches are still of interest, independently of whether they are currently locked.
 
 ### Cloning
 
 ```cpp
-auto cloned = batch.clone(new_batch_id, stream);
+// Via read-only accessor (caller already holds lock)
+read_only_data_batch ro = batch->to_read_only();
+auto cloned = ro.clone(new_batch_id, stream);
+
+// With representation conversion
+auto cloned = ro.clone_to<host_data_representation>(registry, new_batch_id, host_space, stream);
 ```
 
-Cloning creates a task, locks for processing, clones the underlying data representation, then releases the lock. The cloned batch starts in `idle` state with the new ID.
+Cloning produces a new `shared_ptr<data_batch>` in `idle` state with the given ID. The clone
+contains a deep copy of the data representation, residing in the same memory space as the original
+(or a different space when using `clone_to`).
 
 ---
 
@@ -331,27 +369,30 @@ sequenceDiagram
 
 ### Add and Pop Semantics
 
-A repository is a thread-safe, partitioned queue of data batches:
+A repository is a thread-safe, partitioned queue of idle `data_batch` pointers. It does not
+perform any locking or state transitions — callers are responsible for acquiring the appropriate
+`read_only_data_batch` or `mutable_data_batch` accessor after popping.
 
 ```cpp
-// Add a batch (sets its CV for state change notifications)
-repository.add_data_batch(std::move(batch), partition_idx);
+// Add a batch (idle state)
+repository.add_data_batch(batch_ptr, partition_idx);
 
-// Pop first batch that can transition to target state (BLOCKS if none ready)
-auto batch = repository.pop_data_batch(batch_state::task_created, partition_idx);
+// Pop the next batch from a partition (non-blocking; returns nullptr if empty)
+auto batch = repository.pop_next_data_batch(partition_idx);
+if (batch) {
+    auto ro = batch->to_read_only();   // acquire shared lock
+    process(ro.get_data());
+}
 
-// Pop specific batch by ID (returns nullptr if not found)
-auto batch = repository.pop_data_batch_by_id(42, batch_state::in_transit, partition_idx);
+// Pop a specific batch by ID (returns nullptr if not found)
+auto batch = repository.pop_data_batch_by_id(batch_id, partition_idx);
 
-// Non-removing access (shared_ptr repositories only)
-auto batch = repository.get_data_batch_by_id(42, batch_state::task_created, partition_idx);
+// Non-removing access — read pointer without dequeuing (shared_ptr repos only)
+auto batch = repository.get_data_batch_by_id(batch_id, partition_idx);
 ```
 
-Pop behavior by target state:
-- `task_created` -- calls `try_to_create_task()` on each batch until one succeeds
-- `in_transit` -- calls `try_to_lock_for_in_transit()` on each batch
-- `processing` -- **throws** (must create task first, then lock for processing separately)
-- `idle` -- always returns `false` (terminal state, not a valid pop target)
+`pop_next_data_batch` is **non-blocking** — it returns `nullptr` immediately if the partition is
+empty. Callers poll or check `empty()` / `total_size()` to determine whether to wait.
 
 ### Partitioning
 
@@ -442,22 +483,22 @@ Application
     |       |-- memory_space.make_reservation(size)
     |
     |-- data_repository_manager.add_data_batch(batch, ops)
-    |       |-- data_repository.add_data_batch(batch)
+    |       |-- data_repository.add_data_batch(batch)   [batch is idle]
     |
-    |-- data_repository.pop_data_batch(task_created)
-    |       |-- data_batch.try_to_create_task()
+    |-- data_repository.pop_next_data_batch(partition_idx)
+    |       |-- returns shared_ptr<data_batch> (idle, non-blocking)
     |
-    |-- data_batch.try_to_lock_for_processing(memory_space_id)
-    |       |-- validates memory_space match
-    |       |-- returns processing_handle (RAII)
+    |-- batch->to_read_only()                           [shared lock]
+    |       |-- returns read_only_data_batch (blocks until available)
+    |       |-- ro.get_data() grants read access to idata_representation
     |
     |-- [on memory pressure]
-    |   data_batch.try_to_lock_for_in_transit()
-    |   converter_registry.convert(data, target_space, stream)
+    |   mutable_data_batch mut = data_batch::readonly_to_mutable(std::move(ro))
+    |   mut.convert_to<TargetRepresentation>(registry, target_space, stream)
+    |       |-- converter_registry.convert(data, target_space, stream)
     |       |-- allocates in target memory_space
     |       |-- cudaMemcpy between tiers
-    |   data_batch.set_data(new_representation)
-    |   data_batch.try_to_release_in_transit()
+    |   data_batch::to_idle(std::move(mut))             [release exclusive lock]
 ```
 
 ---
@@ -467,7 +508,7 @@ Application
 | File | Purpose |
 |------|---------|
 | `include/cucascade/data/common.hpp` | `idata_representation` abstract interface |
-| `include/cucascade/data/data_batch.hpp` | `data_batch`, `batch_state`, `data_batch_processing_handle` |
+| `include/cucascade/data/data_batch.hpp` | `data_batch`, `read_only_data_batch`, `mutable_data_batch`, `batch_state` |
 | `include/cucascade/data/data_repository.hpp` | `idata_repository<PtrType>`, `shared_data_repository`, `unique_data_repository` |
 | `include/cucascade/data/data_repository_manager.hpp` | `data_repository_manager`, `operator_port_key` |
 | `include/cucascade/data/representation_converter.hpp` | `representation_converter_registry`, `converter_key` |

@@ -24,6 +24,7 @@ namespace cucascade {
 data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
   : _batch_id(batch_id), _data(std::move(data))
 {
+  if (_data == nullptr) { throw std::runtime_error("data is null in data_batch constructor"); }
 }
 
 uint64_t data_batch::get_batch_id() const { return _batch_id; }

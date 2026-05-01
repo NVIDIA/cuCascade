@@ -205,6 +205,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * Releases the shared lock, then acquires an exclusive lock (may block).
    * The source accessor is consumed via move.
+   * NOTE: The transition is not atomic. 
    *
    * @param accessor Rvalue reference to the read-only accessor (consumed).
    * @return A mutable_data_batch holding the exclusive lock.
@@ -216,6 +217,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * Releases the exclusive lock, then acquires a shared lock (may block).
    * The source accessor is consumed via move.
+   * NOTE: The transition is not atomic. 
    *
    * @param accessor Rvalue reference to the mutable accessor (consumed).
    * @return A read_only_data_batch holding the shared lock.
