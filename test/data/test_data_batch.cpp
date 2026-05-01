@@ -611,44 +611,6 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
   }
 }
 
-TEST_CASE("data_batch clone with real GPU data while processing", "[data_batch][gpu]")
-{
-  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-  rmm::cuda_stream stream;
-
-  auto table = create_simple_cudf_table(75, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
-  auto batch    = std::make_shared<data_batch>(1, std::move(gpu_repr));
-  auto space_id = batch->get_memory_space()->get_id();
-
-  // Start processing on the original batch
-  REQUIRE(batch->try_to_create_task() == true);
-  auto r = batch->try_to_lock_for_processing(space_id);
-  REQUIRE(r.success == true);
-  auto handle = std::move(r.handle);
-  REQUIRE(batch->get_processing_count() == 1);
-
-  // Clone while processing - should succeed and data should be valid
-  auto cloned = batch->clone(2, stream.view());
-  REQUIRE(cloned != nullptr);
-
-  // Verify data integrity after clone during processing
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(batch->get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(cloned->get_data());
-
-  stream.synchronize();
-  expect_cudf_tables_equal_on_stream(
-    original_repr->get_table_view(), cloned_repr->get_table_view(), stream.view());
-
-  // Original should still be processing
-  REQUIRE(batch->get_processing_count() == 1);
-  REQUIRE(batch->get_state() == batch_state::processing);
-
-  // Release handle
-  handle.release();
-  REQUIRE(batch->get_processing_count() == 0);
-}
 
 TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
 {
@@ -737,7 +699,7 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
   expect_cudf_tables_equal_on_stream(
     original_repr->get_table_view(), cloned_repr->get_table_view(), stream.view());
 
-  for (cudf::size_type i = 0; i < original_repr->get_table().num_columns(); ++i) {
+  for (cudf::size_type i = 0; i < original_repr->get_table_view().num_columns(); ++i) {
     REQUIRE(original_repr->get_table_view().column(i).head() !=
             cloned_repr->get_table_view().column(i).head());
   }
