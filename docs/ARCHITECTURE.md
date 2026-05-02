@@ -32,7 +32,7 @@ Rather than failing when GPU memory runs out, cuCascade provides:
 - **Reservation-based allocation** -- prevent GPU oversubscription by reserving memory upfront
 - **Automatic data movement** -- move data between tiers based on configurable pressure thresholds
 - **Hardware-aware placement** -- discover NUMA topology and place memory optimally
-- **Safe concurrent access** -- state machine and RAII handles protect data during multi-threaded processing
+- **Safe concurrent access** -- RAII read-only and mutable accessor classes protect data during multi-threaded processing
 
 ## System Architecture
 
@@ -203,7 +203,7 @@ sequenceDiagram
 
 **File**: `include/cucascade/data/data_batch.hpp`
 
-A `data_batch` is the fundamental unit of data in cuCascade. It wraps a tier-specific data representation (GPU table or host table) and manages concurrent access through a state machine.
+A `data_batch` is the fundamental unit of data in cuCascade. It wraps a tier-specific data representation (GPU table or host table) and manages concurrent access through a RAII read-only and mutable accessor classes.
 
 ```mermaid
 stateDiagram-v2
@@ -326,7 +326,7 @@ cuCascade uses a strict lock hierarchy to prevent deadlocks:
 ```
 Level 1: atomic<uint64_t> (batch ID generation -- lock-free)
     |
-Level 2: data_batch._mutex (protects state machine)
+Level 2: data_batch, read_only_data_batch, mutable_data_batch (3-class sytem provides read-only and mutable access classes)
     |
 Level 3: idata_repository._mutex (protects batch storage)
     |
@@ -355,7 +355,7 @@ Key synchronization primitives:
 | **RAII** | `data_batch_processing_handle`, `borrowed_stream`, `multiple_blocks_allocation`, `notify_on_exit` |
 | **Factory** | `DeviceMemoryResourceFactoryFn` for tier-specific allocator creation |
 | **Adapter** | `reservation_aware_resource_adaptor` wraps RMM resources with tracking |
-| **State Machine** | `data_batch` with explicit states and guarded transitions |
+| **3-Class System** | `data_batch` with read-only and mutable class variants which provide locking and accessors |
 | **Observer** | `notification_channel` / `event_notifier` for memory release signaling |
 | **Type-Indexed Registry** | `representation_converter_registry` keyed by `(source_type, target_type)` |
 | **Variant** | `memory_space_config` for tier-specific configuration, `reserving_adaptor_type` for allocators |
@@ -392,7 +392,7 @@ Key synchronization primitives:
 | File | Purpose |
 |------|---------|
 | `include/cucascade/data/common.hpp` | `idata_representation` interface |
-| `include/cucascade/data/data_batch.hpp` | Batch lifecycle, state machine, processing handles |
+| `include/cucascade/data/data_batch.hpp` | Batch lifecycle, read-only and mutable locking accessor classes|
 | `include/cucascade/data/data_repository.hpp` | Partitioned batch storage with blocking pops |
 | `include/cucascade/data/data_repository_manager.hpp` | Multi-pipeline repository coordination |
 | `include/cucascade/data/representation_converter.hpp` | Type-indexed converter registry |

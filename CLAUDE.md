@@ -218,7 +218,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Three memory tiers represented by `Tier::GPU`, `Tier::HOST`, `Tier::DISK` enum values (`include/cucascade/memory/common.hpp`)
 - Strategy pattern for reservation requests; converter registry pattern for data tier transitions
 - RAII-first ownership: reservations, processing handles, streams, and disk files all release automatically on destruction
-- Thread-safe state machine on every `data_batch` using mutex + condition variable
+- `data_batch` uses 3-class system with `data_batch`, `read_only_data_batch` and `mutable_data_batch`
 - C++20 concepts constrain template parameters at compile time; `std::variant` dispatches tier-specific allocator types at runtime
 ## Two Major Subsystems
 ### 1. Memory Subsystem (`cucascade::memory`)
@@ -274,7 +274,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `GDS` uses raw cuFile batch API; `KVIKIO` uses kvikIO with automatic GDS/POSIX fallback; `PIPELINE` uses double-buffered pinned host transfer for D2H overlap with disk writes
 - Depends on: kvikIO, cuFile (GDS)
 - Used by: built-in disk converters registered via `register_builtin_converters()`
-- Purpose: Lifecycle management; state machine; processing-count reference counting
+- Purpose: Lifecycle management; substription-count reference counting, read-only and mutable locking
 - Location: `include/cucascade/data/data_batch.hpp`, `src/data/data_batch.cpp`
 - Contains: `data_batch` (owns `unique_ptr<idata_representation>`), `batch_state` enum, `data_batch_processing_handle` (RAII, holds `weak_ptr<data_batch>`), `idata_batch_probe` interface, `lock_for_processing_result`
 - Allowed state transitions: `idle → in_transit | task_created`, `task_created → processing | idle`, `processing → idle`, `in_transit → idle`
@@ -310,7 +310,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Purpose: Type-pair dispatch for tier conversions
 - Location: `include/cucascade/data/representation_converter.hpp`
 - Pattern: `unordered_map<converter_key, representation_converter_fn>` keyed by `{typeid(Source), typeid(Target)}`; thread-safe with internal mutex
-- Purpose: Unit of data movement; state machine + reference counting
+- Purpose: Unit of data movement; read-only and mutable locking
 - Location: `include/cucascade/data/data_batch.hpp`
 - Pattern: Owns `unique_ptr<idata_representation>`; `data_batch_processing_handle` holds `weak_ptr` so handle doesn't keep batch alive; `idata_batch_probe` for external state observation callbacks
 - Purpose: On-disk file descriptor and binary format for a serialized cuDF table
