@@ -44,6 +44,7 @@
 
 #include <catch2/catch.hpp>
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <thread>
@@ -724,5 +725,68 @@ SCENARIO("Host Reservation", "[memory_space][host_reservation]")
         REQUIRE(mr->get_total_allocated_bytes() == 0);
       }
     }
+  }
+}
+
+TEST_CASE("Concurrent reset and deallocate on the same stream are safe",
+          "[memory_space][threading]")
+{
+  // Reset and in-flight deallocates from the same stream race; per iteration the global
+  // counter must return to baseline. Catches lifetime / accounting drift between
+  // reset_stream_reservation and concurrent deallocate paths.
+  auto manager = createSingleDeviceMemoryManager();
+
+  const size_t res_size  = 4ull * 1024 * 1024;
+  const size_t buf_size  = 4 * 1024;
+  const size_t k_buffers = 32;
+  const size_t n_iters   = 500;
+
+  // Capture the resource adaptor pointer via a throwaway reservation; it is owned by the
+  // manager and stays valid past seed_res's drop. baseline reads after the drop.
+  reservation_aware_resource_adaptor* mr = nullptr;
+  {
+    auto seed_res = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
+    REQUIRE(seed_res != nullptr);
+    mr = seed_res->get_memory_resource_of<Tier::GPU>();
+  }
+  const std::size_t baseline_global = mr->get_total_allocated_bytes();
+
+  for (size_t i = 0; i < n_iters; ++i) {
+    auto res = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
+    REQUIRE(res != nullptr);
+
+    rmm::cuda_stream stream;
+    REQUIRE(mr->attach_reservation_to_tracker(stream, std::move(res)));
+
+    std::vector<void*> buffers(k_buffers, nullptr);
+    for (size_t j = 0; j < k_buffers; ++j) {
+      buffers[j] = mr->allocate(stream, buf_size, alignof(std::max_align_t));
+      REQUIRE(buffers[j] != nullptr);
+    }
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    threads.reserve(k_buffers + 1);
+
+    for (size_t j = 0; j < k_buffers; ++j) {
+      threads.emplace_back([&, j]() {
+        ready.fetch_add(1, std::memory_order_acq_rel);
+        while (!go.load(std::memory_order_acquire)) {}
+        mr->deallocate(stream, buffers[j], buf_size, alignof(std::max_align_t));
+      });
+    }
+    threads.emplace_back([&]() {
+      ready.fetch_add(1, std::memory_order_acq_rel);
+      while (!go.load(std::memory_order_acquire)) {}
+      mr->reset_stream_reservation(stream);
+    });
+
+    while (ready.load(std::memory_order_acquire) < static_cast<int>(k_buffers + 1)) {}
+    go.store(true, std::memory_order_release);
+
+    for (auto& t : threads) { t.join(); }
+
+    REQUIRE(mr->get_total_allocated_bytes() == baseline_global);
   }
 }

@@ -51,21 +51,7 @@ class reservation_aware_resource_adaptor_impl {
     {
     }
 
-    ~device_reserved_arena() noexcept { release(); }
-
-    // Idempotent: only the first call subtracts the arena's unused portion from the global counter.
-    void release() noexcept
-    {
-      bool expected = false;
-      if (_logically_released.compare_exchange_strong(expected, true)) {
-        _impl->do_release_reservation(this);
-      }
-    }
-
-    [[nodiscard]] bool is_logically_released() const noexcept
-    {
-      return _logically_released.load(std::memory_order_acquire);
-    }
+    ~device_reserved_arena() noexcept { _impl->do_release_reservation(this); }
 
     bool grow_by(std::size_t additional_bytes) final
     {
@@ -86,7 +72,6 @@ class reservation_aware_resource_adaptor_impl {
 
    private:
     reservation_aware_resource_adaptor_impl* _impl;
-    std::atomic<bool> _logically_released{false};
   };
 
   /**

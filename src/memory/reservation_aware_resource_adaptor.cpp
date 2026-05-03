@@ -29,7 +29,6 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cstdio>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -79,17 +78,14 @@ struct stream_ordered_allocation_tracker : public impl_type::allocation_tracker_
 
   void reset_tracker_state(rmm::cuda_stream_view stream) override
   {
-    // Capture the arena and call release() outside the tracker mutex to avoid lock-order
-    // tangles with the origin-map mutex held by concurrent deallocate paths.
-    std::shared_ptr<device_reserved_arena> released_arena;
+    std::unique_ptr<stream_ordered_tracker_state> released_state;
     {
       std::lock_guard lock(mutex);
       auto it = stream_stats_map.find(stream.value());
       if (it == stream_stats_map.end()) { return; }
-      released_arena = it->second->memory_reservation;
+      released_state = std::move(it->second);
       stream_stats_map.erase(it);
     }
-    if (released_arena) { released_arena->release(); }
   }
 
   void assign_reservation_to_tracker(rmm::cuda_stream_view stream,
@@ -132,11 +128,7 @@ struct ptds_allocation_tracker : public impl_type::allocation_tracker_iface {
 
   void reset_tracker_state([[maybe_unused]] rmm::cuda_stream_view stream) override
   {
-    if (thread_reservation_state) {
-      auto released_arena = thread_reservation_state->memory_reservation;
-      thread_reservation_state.reset();
-      if (released_arena) { released_arena->release(); }
-    }
+    thread_reservation_state.reset();
   }
 
   void assign_reservation_to_tracker([[maybe_unused]] rmm::cuda_stream_view stream,
@@ -502,46 +494,23 @@ void impl_type::deallocate(cuda::stream_ref stream,
   auto tracking_bytes           = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
   auto upstream_reclaimed_bytes = tracking_bytes;
 
-  // Debit the originating reservation if it's still alive; otherwise just decrement the
-  // global counter (the default upstream_reclaimed_bytes = tracking_bytes balances both
-  // the no-reservation alloc and the alloc-into-already-released-arena cases).
   std::shared_ptr<device_reserved_arena> origin_arena_locked;
   if (have_origin) { origin_arena_locked = origin.alloc_arena_weak.lock(); }
-  device_reserved_arena* origin_arena = nullptr;
-  if (origin_arena_locked && !origin_arena_locked->is_logically_released()) {
-    origin_arena = origin_arena_locked.get();
-  }
 
-  if (origin_arena != nullptr) {
+  if (origin_arena_locked) {
+    auto* origin_arena    = origin_arena_locked.get();
     auto reservation_size = static_cast<int64_t>(origin_arena->size());
     int64_t post_deallocation_size =
       origin_arena->allocated_bytes.sub(static_cast<int64_t>(tracking_bytes));
     int64_t pre_deallocation_size = post_deallocation_size + static_cast<int64_t>(tracking_bytes);
     if (pre_deallocation_size <= reservation_size) {
-      upstream_reclaimed_bytes = 0;  // entirely within reserved arena
+      // entirely within reserved arena
+      upstream_reclaimed_bytes = 0;
     } else if (post_deallocation_size < reservation_size) {
+      // partially over-reservation
       upstream_reclaimed_bytes = static_cast<std::size_t>(pre_deallocation_size - reservation_size);
     }
     // else: entirely over-reservation — upstream_reclaimed_bytes stays at tracking_bytes
-
-    // Should never trigger under origin tracking; if it does, it's likely a double-free.
-    if (post_deallocation_size < 0) {
-      static std::atomic<int> count{0};
-      int n = count.fetch_add(1, std::memory_order_relaxed);
-      if (n < 50) {
-        std::fprintf(stderr,
-                     "[ORIGIN-DEBIT-NEGATIVE #%d] origin_arena=%p tracking=%zu "
-                     "arena.allocated_bytes %ld -> %ld (reservation_size=%ld). "
-                     "Likely double-free or bypassed alloc path.\n",
-                     n,
-                     static_cast<void*>(origin_arena),
-                     tracking_bytes,
-                     pre_deallocation_size,
-                     post_deallocation_size,
-                     reservation_size);
-        std::fflush(stderr);
-      }
-    }
   }
 // Suppress false-positive null-dereference warnings from CCCL library code
 #pragma GCC diagnostic push
@@ -589,25 +558,6 @@ void impl_type::do_release_reservation(device_reserved_arena* arena) noexcept
   std::size_t released_bytes = 0;
   if (arena_size > allocation_size) {
     released_bytes = static_cast<std::size_t>(arena_size - allocation_size);
-  }
-
-  if (allocation_size < 0) {
-    static std::atomic<int> count{0};
-    int n = count.fetch_add(1, std::memory_order_relaxed);
-    if (n < 50) {
-      auto cur = static_cast<long long>(_total_allocated_bytes.load());
-      std::fprintf(stderr,
-                   "[INFLATED-RELEASE #%d] arena_size=%ld alloc_bytes=%ld -> "
-                   "released_bytes=%zu (over-drain by %ld bytes); "
-                   "_total_allocated_bytes before sub = %lld\n",
-                   n,
-                   arena_size,
-                   allocation_size,
-                   released_bytes,
-                   -allocation_size,
-                   cur);
-      std::fflush(stderr);
-    }
   }
 
   _number_of_allocations.fetch_sub(1);
