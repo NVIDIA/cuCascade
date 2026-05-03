@@ -78,7 +78,8 @@ class reservation_aware_resource_adaptor_impl {
    * @brief Reservation state
    */
   struct stream_ordered_tracker_state {
-    std::unique_ptr<device_reserved_arena>
+    // shared_ptr so the alloc-origin map can hold a weak_ptr that outlives reset_tracker_state.
+    std::shared_ptr<device_reserved_arena>
       memory_reservation;  /// Stream memory reservation (may be null)
     std::unique_ptr<reservation_limit_policy>
       reservation_policy;                             /// Reservation policy for this stream
@@ -87,7 +88,7 @@ class reservation_aware_resource_adaptor_impl {
     friend class reservation_aware_resource_adaptor_impl;
 
     explicit stream_ordered_tracker_state(
-      std::unique_ptr<device_reserved_arena> arena,
+      std::shared_ptr<device_reserved_arena> arena,
       std::unique_ptr<reservation_limit_policy> reservation_policy,
       std::unique_ptr<oom_handling_policy> oom_policy);
 
@@ -108,7 +109,7 @@ class reservation_aware_resource_adaptor_impl {
     virtual void reset_tracker_state(rmm::cuda_stream_view stream) = 0;
 
     virtual void assign_reservation_to_tracker(rmm::cuda_stream_view stream,
-                                               std::unique_ptr<device_reserved_arena> reservation,
+                                               std::shared_ptr<device_reserved_arena> reservation,
                                                std::unique_ptr<reservation_limit_policy> policy,
                                                std::unique_ptr<oom_handling_policy> oom_policy) = 0;
 
