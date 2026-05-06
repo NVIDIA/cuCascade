@@ -182,6 +182,37 @@ TEST_CASE("Topology Discovery default uses strictest verification", "[hw_topolog
   REQUIRE(topo_default.network_devices.size() == topo_explicit.network_devices.size());
 }
 
+// Regression test for the bug where GPU NUMA node was reported as -1 on hosts whose ACPI
+// SRAT/SLIT tables do not publish PCIe-to-NUMA affinity data. In that case
+// /sys/bus/pci/devices/<pci>/numa_node returns -1, and topology_discovery now falls back
+// to nvmlDeviceGetMemoryAffinity, which walks the GPU driver's PCI bridge topology.
+//
+// Invariant: when the host advertises NUMA topology and GPUs are present, every discovered
+// GPU must resolve to a valid NUMA node (either via sysfs on well-configured systems, or
+// via the NVML fallback otherwise). This test passes either way and would catch a
+// regression that re-introduced the -1 leak.
+TEST_CASE("Topology Discovery resolves GPU NUMA node on NUMA-aware hosts", "[hw_topology]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto const& topology = discovery.get_topology();
+
+  if (topology.num_gpus == 0 || topology.num_numa_nodes <= 0) {
+    SUCCEED("Skipped: requires at least one GPU and a NUMA-aware host");
+    return;
+  }
+
+  for (auto const& gpu : topology.gpus) {
+    INFO("GPU " << gpu.id << " (" << gpu.name << " @ " << gpu.pci_bus_id << ")");
+    REQUIRE(gpu.numa_node >= 0);
+    REQUIRE(gpu.numa_node < topology.num_numa_nodes);
+    // memory_binding is populated from numa_node whenever the latter is known.
+    REQUIRE(!gpu.memory_binding.empty());
+    REQUIRE(gpu.memory_binding.front() == gpu.numa_node);
+  }
+}
+
 TEST_CASE("Topology Discovery rejects out-of-range CUDA_VISIBLE_DEVICES", "[hw_topology]")
 {
   ScopedEnvVar env("CUDA_VISIBLE_DEVICES", "99999999");

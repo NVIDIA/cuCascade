@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -46,7 +47,14 @@ struct NvmlLoader {
   nvmlReturn_t (*p_nvmlDeviceIsMigDeviceHandle)(nvmlDevice_t, unsigned int*)    = nullptr;
   nvmlReturn_t (*p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle)(nvmlDevice_t,
                                                                  nvmlDevice_t*) = nullptr;
-  const char* (*p_nvmlErrorString)(nvmlReturn_t)                                = nullptr;
+  // Optional: present on most drivers but we tolerate its absence so a missing symbol
+  // does not disable NVML entirely. Used as a fallback when ACPI SRAT lacks PCIe
+  // affinity data and sysfs reports numa_node = -1.
+  nvmlReturn_t (*p_nvmlDeviceGetMemoryAffinity)(nvmlDevice_t,
+                                                unsigned int,
+                                                unsigned long*,
+                                                nvmlAffinityScope_t) = nullptr;
+  const char* (*p_nvmlErrorString)(nvmlReturn_t)                     = nullptr;
 
   NvmlLoader() { load(); }
 
@@ -82,6 +90,9 @@ struct NvmlLoader {
     p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle =
       reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, nvmlDevice_t*)>(
         dlsym(handle, "nvmlDeviceGetDeviceHandleFromMigDeviceHandle"));
+    p_nvmlDeviceGetMemoryAffinity = reinterpret_cast<nvmlReturn_t (*)(
+      nvmlDevice_t, unsigned int, unsigned long*, nvmlAffinityScope_t)>(
+      dlsym(handle, "nvmlDeviceGetMemoryAffinity"));
     p_nvmlErrorString =
       reinterpret_cast<const char* (*)(nvmlReturn_t)>(dlsym(handle, "nvmlErrorString"));
     // If any required symbol is missing, treat NVML as unavailable
@@ -857,7 +868,19 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       gpu.uuid = (result == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
 
       // Get NUMA node and CPU affinity from /sys
-      gpu.numa_node         = get_numa_node_from_sys(gpu.pci_bus_id);
+      gpu.numa_node = get_numa_node_from_sys(gpu.pci_bus_id);
+      // Fallback: if the kernel reports -1 (typical when ACPI SRAT lacks PCIe
+      // affinity data), ask NVML directly. NVML walks the GPU driver's PCI bridge
+      // topology rather than relying on firmware tables, so it usually has the
+      // correct answer (same source as `nvidia-smi topo -m`).
+      if (gpu.numa_node == -1 && nvml.p_nvmlDeviceGetMemoryAffinity) {
+        unsigned long nodeset = 0;
+        if (nvml.p_nvmlDeviceGetMemoryAffinity(device, 1, &nodeset, NVML_AFFINITY_SCOPE_NODE) ==
+              NVML_SUCCESS &&
+            nodeset != 0) {
+          gpu.numa_node = std::countr_zero(nodeset);
+        }
+      }
       gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
       gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
 
