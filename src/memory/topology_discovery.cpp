@@ -47,14 +47,11 @@ struct NvmlLoader {
   nvmlReturn_t (*p_nvmlDeviceIsMigDeviceHandle)(nvmlDevice_t, unsigned int*)    = nullptr;
   nvmlReturn_t (*p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle)(nvmlDevice_t,
                                                                  nvmlDevice_t*) = nullptr;
-  // Used as a fallback when ACPI SRAT lacks PCIe affinity data and sysfs reports
-  // numa_node = -1. Required: NVML has shipped this since the CUDA 8.0 driver
-  // branch (~2016) and it is documented as available on all Kepler+ devices.
   nvmlReturn_t (*p_nvmlDeviceGetMemoryAffinity)(nvmlDevice_t,
                                                 unsigned int,
                                                 unsigned long*,
-                                                nvmlAffinityScope_t) = nullptr;
-  const char* (*p_nvmlErrorString)(nvmlReturn_t)                     = nullptr;
+                                                nvmlAffinityScope_t)            = nullptr;
+  const char* (*p_nvmlErrorString)(nvmlReturn_t)                                = nullptr;
 
   NvmlLoader() { load(); }
 
@@ -335,25 +332,31 @@ std::vector<size_t> resolve_visible_gpu_indices(
 }
 
 /**
- * @brief Get NUMA node from /sys for a PCI device.
+ * @brief Get the host NUMA node id with the best memory affinity to a GPU.
  *
- * Reads /sys/bus/pci/devices/<pci>/numa_node. If the file is missing, empty, or
- * cannot be parsed as an integer, returns -1.
+ * Queries NVML's `nvmlDeviceGetMemoryAffinity` with `NVML_AFFINITY_SCOPE_NODE` and
+ * returns the lowest-numbered NUMA node in the resulting bitmask. NVML walks the
+ * GPU driver's PCI bridge topology directly, so this is unaffected by ACPI
+ * SRAT/SLIT firmware quirks that cause `/sys/bus/pci/devices/<pci>/numa_node` to
+ * report -1 on otherwise NUMA-aware hosts. Same source as `nvidia-smi topo -m`.
  *
- * @param pci_bus_id PCI bus ID of the device.
- * @return NUMA node number on success; -1 if unavailable.
+ * @param nvml Loaded NVML loader; `nvml.available()` must already be true.
+ * @param device NVML device handle.
+ * @return NUMA node id on success; -1 if NVML reports no affinity (empty bitmask
+ * or query failure).
+ *
+ * @note `nodeSetSize = 1` (one `unsigned long` = 64 NUMA bits) is sufficient for
+ * any realistic system.
  */
-int get_numa_node_from_sys(std::string const& pci_bus_id)
+int get_numa_node_from_nvml(NvmlLoader const& nvml, nvmlDevice_t device)
 {
-  std::string normalized_id = normalize_pci_bus_id(pci_bus_id);
-  std::string path          = "/sys/bus/pci/devices/" + normalized_id + "/numa_node";
-  std::string content       = read_file_content(path);
-  if (content.empty()) { return -1; }
-  try {
-    return std::stoi(content);
-  } catch (...) {
-    return -1;
+  unsigned long nodeset = 0;
+  if (nvml.p_nvmlDeviceGetMemoryAffinity(device, 1, &nodeset, NVML_AFFINITY_SCOPE_NODE) ==
+        NVML_SUCCESS &&
+      nodeset != 0) {
+    return std::countr_zero(nodeset);
   }
+  return -1;
 }
 
 /**
@@ -868,20 +871,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       result   = nvml.p_nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
       gpu.uuid = (result == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
 
-      // Get NUMA node and CPU affinity from /sys
-      gpu.numa_node = get_numa_node_from_sys(gpu.pci_bus_id);
-      // Fallback: if the kernel reports -1 (typical when ACPI SRAT lacks PCIe
-      // affinity data), ask NVML directly. NVML walks the GPU driver's PCI bridge
-      // topology rather than relying on firmware tables, so it usually has the
-      // correct answer (same source as `nvidia-smi topo -m`).
-      if (gpu.numa_node == -1) {
-        unsigned long nodeset = 0;
-        if (nvml.p_nvmlDeviceGetMemoryAffinity(device, 1, &nodeset, NVML_AFFINITY_SCOPE_NODE) ==
-              NVML_SUCCESS &&
-            nodeset != 0) {
-          gpu.numa_node = std::countr_zero(nodeset);
-        }
-      }
+      gpu.numa_node         = get_numa_node_from_nvml(nvml, device);
       gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
       gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
 

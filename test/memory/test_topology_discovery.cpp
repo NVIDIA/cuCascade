@@ -183,14 +183,14 @@ TEST_CASE("Topology Discovery default uses strictest verification", "[hw_topolog
 }
 
 // Regression test for the bug where GPU NUMA node was reported as -1 on hosts whose ACPI
-// SRAT/SLIT tables do not publish PCIe-to-NUMA affinity data. In that case
-// /sys/bus/pci/devices/<pci>/numa_node returns -1, and topology_discovery now falls back
-// to nvmlDeviceGetMemoryAffinity, which walks the GPU driver's PCI bridge topology.
+// SRAT/SLIT tables do not publish PCIe-to-NUMA affinity data. The previous implementation
+// read /sys/bus/pci/devices/<pci>/numa_node, which returns -1 in that case;
+// topology_discovery now resolves the NUMA node via nvmlDeviceGetMemoryAffinity, which
+// walks the GPU driver's PCI bridge topology and is unaffected by firmware quirks.
 //
 // Invariant: when the host advertises NUMA topology and GPUs are present, every discovered
-// GPU must resolve to a valid NUMA node (either via sysfs on well-configured systems, or
-// via the NVML fallback otherwise). This test passes either way and would catch a
-// regression that re-introduced the -1 leak.
+// GPU must resolve to a valid NUMA node. This test would catch a regression that
+// re-introduced the -1 leak.
 TEST_CASE("Topology Discovery resolves GPU NUMA node on NUMA-aware hosts", "[hw_topology]")
 {
   topology_discovery discovery;
@@ -198,8 +198,8 @@ TEST_CASE("Topology Discovery resolves GPU NUMA node on NUMA-aware hosts", "[hw_
 
   auto const& topology = discovery.get_topology();
 
-  if (topology.num_gpus == 0 || topology.num_numa_nodes <= 0) {
-    SUCCEED("Skipped: requires at least one GPU and a NUMA-aware host");
+  if (topology.num_gpus == 0) {
+    SUCCEED("Skipped: requires at least one GPU");
     return;
   }
 
