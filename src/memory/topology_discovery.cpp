@@ -47,9 +47,9 @@ struct NvmlLoader {
   nvmlReturn_t (*p_nvmlDeviceIsMigDeviceHandle)(nvmlDevice_t, unsigned int*)    = nullptr;
   nvmlReturn_t (*p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle)(nvmlDevice_t,
                                                                  nvmlDevice_t*) = nullptr;
-  // Optional: present on most drivers but we tolerate its absence so a missing symbol
-  // does not disable NVML entirely. Used as a fallback when ACPI SRAT lacks PCIe
-  // affinity data and sysfs reports numa_node = -1.
+  // Used as a fallback when ACPI SRAT lacks PCIe affinity data and sysfs reports
+  // numa_node = -1. Required: NVML has shipped this since the CUDA 8.0 driver
+  // branch (~2016) and it is documented as available on all Kepler+ devices.
   nvmlReturn_t (*p_nvmlDeviceGetMemoryAffinity)(nvmlDevice_t,
                                                 unsigned int,
                                                 unsigned long*,
@@ -98,7 +98,7 @@ struct NvmlLoader {
     // If any required symbol is missing, treat NVML as unavailable
     if (!p_nvmlInit_v2 || !p_nvmlShutdown || !p_nvmlDeviceGetCount_v2 ||
         !p_nvmlDeviceGetHandleByIndex_v2 || !p_nvmlDeviceGetName || !p_nvmlDeviceGetPciInfo_v3 ||
-        !p_nvmlDeviceGetUUID || !p_nvmlErrorString) {
+        !p_nvmlDeviceGetUUID || !p_nvmlDeviceGetMemoryAffinity || !p_nvmlErrorString) {
       dlclose(handle);
       handle                                         = nullptr;
       p_nvmlInit_v2                                  = nullptr;
@@ -111,6 +111,7 @@ struct NvmlLoader {
       p_nvmlDeviceGetHandleByUUID                    = nullptr;
       p_nvmlDeviceIsMigDeviceHandle                  = nullptr;
       p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle = nullptr;
+      p_nvmlDeviceGetMemoryAffinity                  = nullptr;
       p_nvmlErrorString                              = nullptr;
     }
   }
@@ -119,7 +120,7 @@ struct NvmlLoader {
   {
     return handle && p_nvmlInit_v2 && p_nvmlShutdown && p_nvmlDeviceGetCount_v2 &&
            p_nvmlDeviceGetHandleByIndex_v2 && p_nvmlDeviceGetName && p_nvmlDeviceGetPciInfo_v3 &&
-           p_nvmlDeviceGetUUID && p_nvmlErrorString;
+           p_nvmlDeviceGetUUID && p_nvmlDeviceGetMemoryAffinity && p_nvmlErrorString;
   }
 };
 
@@ -873,7 +874,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       // affinity data), ask NVML directly. NVML walks the GPU driver's PCI bridge
       // topology rather than relying on firmware tables, so it usually has the
       // correct answer (same source as `nvidia-smi topo -m`).
-      if (gpu.numa_node == -1 && nvml.p_nvmlDeviceGetMemoryAffinity) {
+      if (gpu.numa_node == -1) {
         unsigned long nodeset = 0;
         if (nvml.p_nvmlDeviceGetMemoryAffinity(device, 1, &nodeset, NVML_AFFINITY_SCOPE_NODE) ==
               NVML_SUCCESS &&
