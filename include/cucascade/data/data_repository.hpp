@@ -84,9 +84,8 @@ class idata_repository {
         _data_batches.resize(partition_idx + 1);
       }
       _data_batches[partition_idx].push_back(std::move(batch));
-    }    
+    }
   }
-
 
   /**
    * @brief Remove and return the next data batch from the repository.
@@ -268,12 +267,12 @@ class idata_repository {
   }
 
  protected:
-  mutable std::mutex _mutex;    ///< Mutex for thread-safe access to repository operations
+  mutable std::mutex _mutex;  ///< Mutex for thread-safe access to repository operations
   std::vector<std::vector<PtrType>>
     _data_batches;  ///< Container for data batch pointers (partitioned)
 };
 
-using shared_data_repository = idata_repository<std::shared_ptr<data_batch>>;
+using shared_data_repository = idata_repository<std::shared_ptr<synchronized_data_batch>>;
 using unique_data_repository = idata_repository<std::unique_ptr<data_batch>>;
 
 }  // namespace cucascade
