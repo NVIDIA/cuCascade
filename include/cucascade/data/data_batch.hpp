@@ -109,6 +109,24 @@ class data_batch {
    */
   memory::memory_space* get_memory_space() const;
 
+  /**
+   * @brief Replace the data representation.
+   * @param data New data representation (takes ownership).
+   */
+  void set_data(std::unique_ptr<idata_representation> data) { _data = std::move(data); }
+
+  /**
+   * @brief Convert the data representation in-place.
+   *
+   * Replaces the held data with a new representation produced by the converter
+   * registry. If the conversion involves the GPU tier, synchronizes the stream
+   * before the old representation is destroyed to prevent use-after-free.
+   *
+   * @tparam TargetRepresentation Target representation type.
+   * @param registry           Converter registry for type-keyed dispatch.
+   * @param target_memory_space Target memory space for the new representation.
+   * @param stream              CUDA stream for memory operations.
+   */
   template <typename TargetRepresentation>
   void convert_to(representation_converter_registry& registry,
                   const memory::memory_space* target_memory_space,
@@ -151,7 +169,17 @@ class synchronized_data_batch : std::enable_shared_from_this<synchronized_data_b
                                                        std::unique_ptr<idata_representation> data);
 
   /**
-   * @brief Transition from idle to read-only (shared lock) without consuming the caller's pointer.
+   * @brief Get the unique batch identifier.
+   *
+   * Lock-free -- safe to call without acquiring an accessor.
+   *
+   * @return The batch ID (immutable after construction).
+   */
+  [[nodiscard]] uint64_t get_batch_id() const { return _batch.get_batch_id(); }
+
+  /**
+   * @brief Transition from idle to read-only (shared lock) without consuming the caller's
+   * pointer.
    *
    *  Blocks until the shared lock is acquired.
    *
@@ -160,7 +188,8 @@ class synchronized_data_batch : std::enable_shared_from_this<synchronized_data_b
   [[nodiscard]] read_only_data_batch get_read_only();
 
   /**
-   * @brief Transition from idle to mutable (exclusive lock) without consuming the caller's pointer.
+   * @brief Transition from idle to mutable (exclusive lock) without consuming the caller's
+   * pointer.
    *
    * Uses shared_from_this() to obtain a new shared_ptr. Blocks until the
    * exclusive lock is acquired.
@@ -199,8 +228,48 @@ class synchronized_data_batch : std::enable_shared_from_this<synchronized_data_b
    */
   void unsubscribe();
 
-  size_t get_subscriber_count() const;
+  /**
+   * @brief Get the current subscriber count.
+   *
+   * Atomic, lock-free.
+   *
+   * @return The number of active subscribers.
+   */
+  size_t get_subscriber_count() const { return _subscriber_count.load(std::memory_order_relaxed); }
 
+  /**
+   * @brief Get the observable lock state of this batch.
+   *
+   * Atomic, lock-free. Returns the current state: idle, read_only, or
+   * mutable_locked. Updated during every state transition.
+   *
+   * @return The current batch_state.
+   */
+  batch_state get_state() const { return _state.load(std::memory_order_relaxed); }
+
+  /**
+   * @brief Get the number of active read_only_data_batch instances holding this batch.
+   *
+   * Atomic, lock-free. Counts concurrent shared-lock holders. Transitions to zero
+   * when the last read_only_data_batch is destroyed (or moved-from).
+   *
+   * @return The current reader count.
+   */
+  size_t get_read_only_count() const { return _read_only_count.load(std::memory_order_acquire); }
+
+  /**
+   * @brief Create an independent deep copy with representation conversion.
+   *
+   * The clone has a new batch ID and its data is converted to TargetRepresentation
+   * using the provided converter registry.
+   *
+   * @tparam TargetRepresentation Target representation type.
+   * @param registry           Converter registry for type-keyed dispatch.
+   * @param new_batch_id       Batch ID for the cloned batch.
+   * @param target_memory_space Target memory space for the converted data.
+   * @param stream              CUDA stream for memory operations.
+   * @return A new data_batch wrapped in shared_ptr.
+   */
   template <typename TargetRepresentation>
   std::shared_ptr<synchronized_data_batch> clone_to(representation_converter_registry& registry,
                                                     uint64_t new_batch_id,
@@ -210,6 +279,24 @@ class synchronized_data_batch : std::enable_shared_from_this<synchronized_data_b
     auto new_representation =
       registry.convert<TargetRepresentation>(_batch._data, target_memory_space, stream);
     return make(new_batch_id, std::move(new_representation));
+  }
+
+  /**
+   * @brief Create an independent deep copy of the batch data.
+   *
+   * The clone has a new batch ID and its own copy of the data representation,
+   * residing in the same memory space as the original.
+   *
+   * @param new_batch_id Batch ID for the cloned batch.
+   * @param stream       CUDA stream for memory operations.
+   * @return A new data_batch wrapped in shared_ptr.
+   * @throws std::runtime_error if the data is null.
+   */
+  [[nodiscard]] std::shared_ptr<synchronized_data_batch> clone(uint64_t new_batch_id,
+                                                               rmm::cuda_stream_view stream) const
+  {
+    auto cloned_data = _batch._data->clone(stream);
+    return make(new_batch_id, std::move(cloned_data));
   }
 
  private:
