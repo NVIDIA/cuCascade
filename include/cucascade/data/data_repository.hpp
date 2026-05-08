@@ -273,6 +273,5 @@ class idata_repository {
 };
 
 using shared_data_repository = idata_repository<std::shared_ptr<data_batch>>;
-using unique_data_repository = idata_repository<std::unique_ptr<data_batch_core>>;
 
 }  // namespace cucascade

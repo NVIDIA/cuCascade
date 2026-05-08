@@ -15,19 +15,19 @@
  * limitations under the License.
  */
 
+#include "cucascade/data/data_batch.hpp"
+
 #include <cucascade/data/data_repository.hpp>
 
 namespace cucascade {
 
 // Explicit template instantiations for smart pointer types
 template class idata_repository<std::shared_ptr<data_batch>>;
-template class idata_repository<std::unique_ptr<data_batch>>;
 
 // Explicit specialization of get_data_batch_by_id for shared_ptr (copies the pointer)
 template <>
-std::shared_ptr<data_batch_core>
-idata_repository<std::shared_ptr<data_batch_core>>::get_data_batch_by_id(uint64_t batch_id,
-                                                                         size_t partition_idx)
+std::shared_ptr<data_batch> idata_repository<std::shared_ptr<data_batch>>::get_data_batch_by_id(
+  uint64_t batch_id, size_t partition_idx)
 {
   std::unique_lock<std::mutex> lock(_mutex);
 
@@ -43,17 +43,6 @@ idata_repository<std::shared_ptr<data_batch_core>>::get_data_batch_by_id(uint64_
   }
 
   return nullptr;
-}
-
-// Explicit specialization of get_data_batch_by_id for unique_ptr (not supported)
-template <>
-std::unique_ptr<data_batch_core>
-idata_repository<std::unique_ptr<data_batch_core>>::get_data_batch_by_id(uint64_t /*batch_id*/,
-                                                                         size_t /*partition_idx*/)
-{
-  throw std::runtime_error(
-    "get_data_batch_by_id is not supported for unique_ptr repositories. "
-    "Use pop_data_batch to move ownership instead.");
 }
 
 }  // namespace cucascade
