@@ -67,6 +67,7 @@ struct host_memory_space_config {
   std::size_t block_size           = default_block_size;
   std::size_t pool_size            = default_pool_size;
   std::size_t initial_number_pools = default_initial_number_pools;
+  bool make_portable               = false;
 
   DeviceMemoryResourceFactoryFn mr_factory_fn{nullptr};
 

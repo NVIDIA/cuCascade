@@ -40,7 +40,16 @@ cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_reso
 cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
 make_default_host_memory_resource(int numa_node_id, [[maybe_unused]] size_t capacity)
 {
-  return {cucascade::memory::numa_region_pinned_host_memory_resource(numa_node_id)};
+  return make_default_host_memory_resource(numa_node_id, capacity, false);
+}
+
+cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
+make_default_host_memory_resource(int numa_node_id,
+                                  [[maybe_unused]] size_t capacity,
+                                  bool make_portable)
+{
+  return {cucascade::memory::numa_region_pinned_host_memory_resource(numa_node_id,
+                                                                     make_portable)};
 }
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)
@@ -48,7 +57,9 @@ DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)
   if (tier == Tier::GPU) {
     return make_default_gpu_memory_resource;
   } else if (tier == Tier::HOST) {
-    return make_default_host_memory_resource;
+    return [](int numa_node_id, size_t capacity) {
+      return make_default_host_memory_resource(numa_node_id, capacity);
+    };
   } else {
     return [](int, size_t) {
       return cuda::mr::any_resource<cuda::mr::device_accessible>{null_device_memory_resource{}};
