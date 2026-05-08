@@ -43,9 +43,7 @@ struct operator_port_key {
   std::string port_id;
 
   bool operator==(const operator_port_key& other) const
-  {
-    return operator_id == other.operator_id && port_id == other.port_id;
-  }
+  { return operator_id == other.operator_id && port_id == other.port_id; }
 
   bool operator<(const operator_port_key& other) const
   {
@@ -136,9 +134,7 @@ class data_repository_manager {
    * @note Thread-safe operation
    */
   void add_data_batch(PtrType batch, std::vector<std::pair<size_t, std::string_view>> ops)
-  {
-    add_data_batch_impl(std::move(batch), ops);
-  }
+  { add_data_batch_impl(std::move(batch), ops); }
 
   /**
    * @brief Get direct access to a repository for advanced operations.
@@ -155,9 +151,7 @@ class data_repository_manager {
    * safety
    */
   std::unique_ptr<repository_type>& get_repository(size_t operator_id, std::string_view port_id)
-  {
-    return _repositories.at({operator_id, std::string(port_id)});
-  }
+  { return _repositories.at({operator_id, std::string(port_id)}); }
 
   /**
    * @brief Generate a globally unique data batch identifier.
@@ -273,7 +267,7 @@ class data_repository_manager {
 };
 
 // Type aliases for common use cases
-using shared_data_repository_manager = data_repository_manager<std::shared_ptr<data_batch>>;
-using unique_data_repository_manager = data_repository_manager<std::unique_ptr<data_batch>>;
+using shared_data_repository_manager = data_repository_manager<std::shared_ptr<data_batch_core>>;
+using unique_data_repository_manager = data_repository_manager<std::unique_ptr<data_batch_core>>;
 
 }  // namespace cucascade

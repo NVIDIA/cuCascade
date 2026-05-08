@@ -50,7 +50,7 @@ enum class batch_state { idle, read_only, mutable_locked };
 // Forward declarations -- required before data_batch because it be-friends them.
 class read_only_data_batch;
 class mutable_data_batch;
-class synchronized_data_batch;
+class data_batch;
 
 /**
  * @brief Core data batch type representing the "idle" (unlocked) state.
@@ -66,19 +66,19 @@ class synchronized_data_batch;
  * @note Non-copyable and non-movable. The object itself never moves; only the
  *       smart pointer to it is transferred between states.
  */
-class data_batch {
-  friend synchronized_data_batch;
+class data_batch_core {
+  friend data_batch;
   friend read_only_data_batch;
   friend mutable_data_batch;
 
  public:
-  ~data_batch() = default;
+  ~data_batch_core() = default;
 
   // -- Deleted move/copy  --
-  data_batch(data_batch&&)                 = delete;
-  data_batch& operator=(data_batch&&)      = delete;
-  data_batch(const data_batch&)            = delete;
-  data_batch& operator=(const data_batch&) = delete;
+  data_batch_core(data_batch_core&&)                 = delete;
+  data_batch_core& operator=(data_batch_core&&)      = delete;
+  data_batch_core(const data_batch_core&)            = delete;
+  data_batch_core& operator=(const data_batch_core&) = delete;
 
   /**
    * @brief Get the unique batch identifier.
@@ -150,7 +150,7 @@ class data_batch {
   }
 
  private:
-  data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data);
+  data_batch_core(uint64_t batch_id, std::unique_ptr<idata_representation> data);
 
   const uint64_t _batch_id;                     ///< Immutable batch identifier
   std::unique_ptr<idata_representation> _data;  ///< Owned data representation
@@ -160,13 +160,13 @@ class data_batch {
  * @brief Synchronized data batch type allowing thread safe access to the code data batch
  * via RAII accessers.
  */
-class synchronized_data_batch : std::enable_shared_from_this<synchronized_data_batch> {
+class data_batch : std::enable_shared_from_this<data_batch> {
   friend read_only_data_batch;
   friend mutable_data_batch;
 
  public:
-  static std::shared_ptr<synchronized_data_batch> make(uint64_t batch_id,
-                                                       std::unique_ptr<idata_representation> data);
+  static std::shared_ptr<data_batch> make(uint64_t batch_id,
+                                          std::unique_ptr<idata_representation> data);
 
   /**
    * @brief Get the unique batch identifier.
@@ -271,13 +271,13 @@ class synchronized_data_batch : std::enable_shared_from_this<synchronized_data_b
    * @return A new data_batch wrapped in shared_ptr.
    */
   template <typename TargetRepresentation>
-  std::shared_ptr<synchronized_data_batch> clone_to(representation_converter_registry& registry,
-                                                    uint64_t new_batch_id,
-                                                    const memory::memory_space* target_memory_space,
-                                                    rmm::cuda_stream_view stream) const
+  std::shared_ptr<data_batch> clone_to(representation_converter_registry& registry,
+                                       uint64_t new_batch_id,
+                                       const memory::memory_space* target_memory_space,
+                                       rmm::cuda_stream_view stream) const
   {
     auto new_representation =
-      registry.convert<TargetRepresentation>(_batch._data, target_memory_space, stream);
+      registry.convert<TargetRepresentation>(*(_batch._data), target_memory_space, stream);
     return make(new_batch_id, std::move(new_representation));
   }
 
@@ -292,20 +292,20 @@ class synchronized_data_batch : std::enable_shared_from_this<synchronized_data_b
    * @return A new data_batch wrapped in shared_ptr.
    * @throws std::runtime_error if the data is null.
    */
-  [[nodiscard]] std::shared_ptr<synchronized_data_batch> clone(uint64_t new_batch_id,
-                                                               rmm::cuda_stream_view stream) const
+  [[nodiscard]] std::shared_ptr<data_batch> clone(uint64_t new_batch_id,
+                                                  rmm::cuda_stream_view stream) const
   {
     auto cloned_data = _batch._data->clone(stream);
     return make(new_batch_id, std::move(cloned_data));
   }
 
  private:
-  synchronized_data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
-    : _batch(data_batch(batch_id, std::move(data)))
+  data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
+    : _batch(data_batch_core(batch_id, std::move(data)))
   {
   }
 
-  data_batch _batch;
+  data_batch_core _batch;
   mutable std::shared_mutex _rw_mutex;
 
   std::atomic<size_t> _subscriber_count{0};            ///< Atomic subscriber interest count
@@ -326,7 +326,7 @@ class synchronized_data_batch : std::enable_shared_from_this<synchronized_data_b
  * is destroyed, moved-from, or overwritten by assignment.
  */
 class read_only_data_batch {
-  friend class synchronized_data_batch;
+  friend class data_batch;
 
  public:
   ~read_only_data_batch();
@@ -338,12 +338,12 @@ class read_only_data_batch {
   read_only_data_batch& operator=(const read_only_data_batch& other) = delete;
 
   // will allow only read access
-  const data_batch* operator->() const { return &(_owner->_batch); }
-  const data_batch& operator*() const { return _owner->_batch; }
+  const data_batch_core* operator->() const { return &(_owner->_batch); }
+  const data_batch_core& operator*() const { return _owner->_batch; }
 
-  static std::shared_ptr<synchronized_data_batch> to_idle(read_only_data_batch&& accessor)
+  static std::shared_ptr<data_batch> to_idle(read_only_data_batch&& accessor)
   {
-    std::shared_ptr<synchronized_data_batch> ptr = accessor._owner;
+    std::shared_ptr<data_batch> ptr = accessor._owner;
     {
       auto _ = std::move(accessor);
     }  // destroy accessor, releasing shared lock
@@ -367,14 +367,14 @@ class read_only_data_batch {
    * @param parent Shared pointer to the parent data_batch (moved in).
    * @param lock   Shared lock already acquired on the parent's mutex.
    */
-  read_only_data_batch(std::shared_ptr<synchronized_data_batch> parent,
+  read_only_data_batch(std::shared_ptr<data_batch> parent,
                        std::shared_lock<std::shared_mutex> lock);
 
   // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the shared lock first, then _batch drops the parent
   // reference. This prevents accessing a destroyed mutex.
-  std::shared_ptr<synchronized_data_batch> _owner;  ///< Parent lifetime (destroyed second)
-  std::shared_lock<std::shared_mutex> _lock;        ///< Shared lock (destroyed first)
+  std::shared_ptr<data_batch> _owner;         ///< Parent lifetime (destroyed second)
+  std::shared_lock<std::shared_mutex> _lock;  ///< Shared lock (destroyed first)
 };
 
 /**
@@ -387,7 +387,7 @@ class read_only_data_batch {
  * Move-only. The exclusive lock is released when this object is destroyed or moved-from.
  */
 class mutable_data_batch {
-  friend class synchronized_data_batch;
+  friend class data_batch;
 
  public:
   ~mutable_data_batch();
@@ -398,12 +398,12 @@ class mutable_data_batch {
   mutable_data_batch(const mutable_data_batch&)            = delete;
   mutable_data_batch& operator=(const mutable_data_batch&) = delete;
 
-  data_batch* operator->() { return &(_owner->_batch); }
-  data_batch& operator*() { return _owner->_batch; }
+  data_batch_core* operator->() { return &(_owner->_batch); }
+  data_batch_core& operator*() { return _owner->_batch; }
 
-  static std::shared_ptr<synchronized_data_batch> to_idle(mutable_data_batch&& accessor)
+  static std::shared_ptr<data_batch> to_idle(mutable_data_batch&& accessor)
   {
-    std::shared_ptr<synchronized_data_batch> ptr = accessor._owner;
+    std::shared_ptr<data_batch> ptr = accessor._owner;
     {
       auto _ = std::move(accessor);
     }  // destroy accessor, releasing shared lock
@@ -417,14 +417,13 @@ class mutable_data_batch {
    * @param parent Shared pointer to the parent data_batch (moved in).
    * @param lock   Exclusive lock already acquired on the parent's mutex.
    */
-  mutable_data_batch(std::shared_ptr<synchronized_data_batch> parent,
-                     std::unique_lock<std::shared_mutex> lock);
+  mutable_data_batch(std::shared_ptr<data_batch> parent, std::unique_lock<std::shared_mutex> lock);
 
   // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the exclusive lock first, then _batch drops the parent
   // reference. This prevents accessing a destroyed mutex.
-  std::shared_ptr<synchronized_data_batch> _owner;  ///< Parent lifetime (destroyed second)
-  std::unique_lock<std::shared_mutex> _lock;        ///< Exclusive lock (destroyed first)
+  std::shared_ptr<data_batch> _owner;         ///< Parent lifetime (destroyed second)
+  std::unique_lock<std::shared_mutex> _lock;  ///< Exclusive lock (destroyed first)
 };
 
 }  // namespace cucascade

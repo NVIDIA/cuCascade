@@ -21,46 +21,46 @@ namespace cucascade {
 
 // ========== data_batch ==========
 
-uint64_t data_batch::get_batch_id() const { return _batch_id; }
+uint64_t data_batch_core::get_batch_id() const { return _batch_id; }
 
-memory::Tier data_batch::get_current_tier() const { return _data->get_current_tier(); }
+memory::Tier data_batch_core::get_current_tier() const { return _data->get_current_tier(); }
 
-idata_representation* data_batch::get_data() const { return _data.get(); }
+idata_representation* data_batch_core::get_data() const { return _data.get(); }
 
-memory::memory_space* data_batch::get_memory_space() const { return &(_data->get_memory_space()); }
+memory::memory_space* data_batch_core::get_memory_space() const
+{ return &(_data->get_memory_space()); }
 
-data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
+data_batch_core::data_batch_core(uint64_t batch_id, std::unique_ptr<idata_representation> data)
   : _batch_id(batch_id), _data(std::move(data))
 {
 }
 
 // ========== synchronized_data_batch ==========
 
-std::shared_ptr<synchronized_data_batch> synchronized_data_batch::make(
-  uint64_t batch_id, std::unique_ptr<idata_representation> data)
+std::shared_ptr<data_batch> data_batch::make(uint64_t batch_id,
+                                             std::unique_ptr<idata_representation> data)
 {
   if (data == nullptr) {
     throw std::runtime_error("data is null in synchronized_data_batch constructor");
   }
-  return std::shared_ptr<synchronized_data_batch>(
-    new synchronized_data_batch(batch_id, std::move(data)));
+  return std::shared_ptr<data_batch>(new data_batch(batch_id, std::move(data)));
 }
 
-read_only_data_batch synchronized_data_batch::get_read_only()
+read_only_data_batch data_batch::get_read_only()
 {
   auto self = shared_from_this();
   std::shared_lock<std::shared_mutex> lock(_rw_mutex);
   return read_only_data_batch(std::move(self), std::move(lock));
 }
 
-mutable_data_batch synchronized_data_batch::get_mutable()
+mutable_data_batch data_batch::get_mutable()
 {
   auto self = shared_from_this();
   std::unique_lock<std::shared_mutex> lock(_rw_mutex);
   return mutable_data_batch(std::move(self), std::move(lock));
 }
 
-std::optional<read_only_data_batch> synchronized_data_batch::try_get_read_only()
+std::optional<read_only_data_batch> data_batch::try_get_read_only()
 {
   std::shared_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
@@ -68,7 +68,7 @@ std::optional<read_only_data_batch> synchronized_data_batch::try_get_read_only()
   return read_only_data_batch(std::move(self), std::move(lock));
 }
 
-std::optional<mutable_data_batch> synchronized_data_batch::try_get_mutable()
+std::optional<mutable_data_batch> data_batch::try_get_mutable()
 {
   std::unique_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
@@ -76,10 +76,9 @@ std::optional<mutable_data_batch> synchronized_data_batch::try_get_mutable()
   return mutable_data_batch(std::move(self), std::move(lock));
 }
 
-void synchronized_data_batch::subscribe()
-{ _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
+void data_batch::subscribe() { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
 
-void synchronized_data_batch::unsubscribe()
+void data_batch::unsubscribe()
 {
   size_t current = _subscriber_count.load(std::memory_order_relaxed);
   while (true) {
@@ -92,9 +91,6 @@ void synchronized_data_batch::unsubscribe()
     }
   }
 }
-
-size_t synchronized_data_batch::get_subscriber_count() const
-{ return _subscriber_count.load(std::memory_order_relaxed); }
 
 // ========== read_only_data_batch ==========
 
@@ -156,7 +152,7 @@ read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& oth
 //   return *this;
 // }
 
-read_only_data_batch::read_only_data_batch(std::shared_ptr<synchronized_data_batch> owner,
+read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> owner,
                                            std::shared_lock<std::shared_mutex> lock)
   : _owner(std::move(owner)), _lock(std::move(lock))
 {
@@ -196,7 +192,7 @@ mutable_data_batch& mutable_data_batch::operator=(mutable_data_batch&& other) no
   return *this;
 }
 
-mutable_data_batch::mutable_data_batch(std::shared_ptr<synchronized_data_batch> owner,
+mutable_data_batch::mutable_data_batch(std::shared_ptr<data_batch> owner,
                                        std::unique_lock<std::shared_mutex> lock)
   : _owner(std::move(owner)), _lock(std::move(lock))
 { _owner->_state.store(batch_state::mutable_locked); }
