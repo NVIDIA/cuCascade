@@ -113,6 +113,7 @@ if(CUCASCADE_NVTX)
 endif()
 
 # Add source directories (they will add sources to cucascade_objects)
+add_subdirectory(src/cuda)
 add_subdirectory(src/memory)
 add_subdirectory(src/data)
 
