@@ -53,15 +53,14 @@ class mutable_data_batch;
 class data_batch;
 
 /**
- * @brief Core data batch type representing the "idle" (unlocked) state.
+ * @brief Internal data batch payload owned by data_batch.
  *
- * Owns the data representation, a reader-writer mutex, and subscriber bookkeeping.
- * Almost nothing is publicly accessible -- data, tier, and memory space are private
- * and can only be reached through RAII accessor types that hold the appropriate lock.
+ * Owns the data representation. Data, tier, and memory-space access are exposed here,
+ * but this core object is only reachable through RAII accessor types that hold the
+ * appropriate lock.
  *
- * State transitions are static methods that move ownership of the accessor,
- * making the source null at the call site. This provides compile-time enforcement:1
- * once a batch is locked, the caller cannot access the idle handle.
+ * State transitions and synchronization live on data_batch. This core object only
+ * exposes data/tier/memory methods to friend accessor classes.
  *
  * @note Non-copyable and non-movable. The object itself never moves; only the
  *       smart pointer to it is transferred between states.
@@ -157,10 +156,10 @@ class data_batch_core {
 };
 
 /**
- * @brief Synchronized data batch type allowing thread safe access to the code data batch
- * via RAII accessers.
+ * @brief Synchronized data batch type allowing thread-safe access to the core data batch
+ * via RAII accessors.
  */
-class data_batch : std::enable_shared_from_this<data_batch> {
+class data_batch : public std::enable_shared_from_this<data_batch> {
   friend read_only_data_batch;
   friend mutable_data_batch;
 
@@ -317,13 +316,11 @@ class data_batch : std::enable_shared_from_this<data_batch> {
  * @brief RAII read-only accessor for data_batch.
  *
  * Holds a shared lock on the parent data_batch's mutex, permitting concurrent
- * readers. Data is accessible through named methods that delegate to data_batch's
- * private interface. Clone operations are available to create independent copies
- * while the read lock is held.
+ * readers. Data is accessible through operator forwarding to data_batch_core.
  *
- * Copyable. Copying acquires a new shared lock on the same parent data_batch,
- * incrementing the reader count. The shared lock is released when this object
- * is destroyed, moved-from, or overwritten by assignment.
+ * Move-only. Use clone_read_only_access() to acquire an additional shared lock
+ * on the same parent batch. The shared lock is released when this object is
+ * destroyed, moved-from, or overwritten by assignment.
  */
 class read_only_data_batch {
   friend class data_batch;
@@ -370,7 +367,7 @@ class read_only_data_batch {
   read_only_data_batch(std::shared_ptr<data_batch> parent,
                        std::shared_lock<std::shared_mutex> lock);
 
-  // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
+  // INVARIANT: _owner must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the shared lock first, then _batch drops the parent
   // reference. This prevents accessing a destroyed mutex.
   std::shared_ptr<data_batch> _owner;         ///< Parent lifetime (destroyed second)
@@ -406,7 +403,7 @@ class mutable_data_batch {
     std::shared_ptr<data_batch> ptr = accessor._owner;
     {
       auto _ = std::move(accessor);
-    }  // destroy accessor, releasing shared lock
+    }  // destroy accessor, releasing exclusive lock
     return ptr;
   }
 
@@ -419,7 +416,7 @@ class mutable_data_batch {
    */
   mutable_data_batch(std::shared_ptr<data_batch> parent, std::unique_lock<std::shared_mutex> lock);
 
-  // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
+  // INVARIANT: _owner must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the exclusive lock first, then _batch drops the parent
   // reference. This prevents accessing a destroyed mutex.
   std::shared_ptr<data_batch> _owner;         ///< Parent lifetime (destroyed second)

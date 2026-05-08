@@ -211,14 +211,14 @@ cuCascade uses [Catch2](https://github.com/catchorg/Catch2) v2.13.10 (fetched fr
 
 Tests use BDD-style assertions:
 ```cpp
-TEST_CASE("data batch transitions to task_created", "[data_batch]") {
-    auto batch = data_batch(1, make_gpu_representation());
+TEST_CASE("data batch acquires read access", "[data_batch]") {
+    auto batch = data_batch::make(1, make_gpu_representation());
 
-    REQUIRE(batch.get_state() == batch_state::idle);
+    REQUIRE(batch->get_state() == batch_state::idle);
 
-    bool success = batch.try_to_create_task();
-    REQUIRE(success);
-    REQUIRE(batch.get_state() == batch_state::task_created);
+    auto ro = batch->get_read_only();
+    REQUIRE(batch->get_state() == batch_state::read_only);
+    REQUIRE(ro->get_batch_id() == 1);
 }
 ```
 
@@ -228,8 +228,8 @@ All tests compile into a single executable `cucascade_tests`:
 
 | Directory | Tests | Coverage |
 |-----------|-------|----------|
-| `test/data/test_data_batch.cpp` | 47+ cases | State transitions, processing handles, cloning |
-| `test/data/test_data_repository.cpp` | 140+ cases | Add/pop, partitioning, blocking, threading |
+| `test/data/test_data_batch.cpp` | 47+ cases | Accessor transitions, locking, cloning |
+| `test/data/test_data_repository.cpp` | 140+ cases | Add/pop, partitioning, threading |
 | `test/data/test_data_repository_manager.cpp` | 100+ cases | Multi-operator, batch IDs, concurrent access |
 | `test/data/test_data_representation.cpp` | Representation interface | Size, tier, clone operations |
 | `test/data/test_representation_converter.cpp` | Converter registry | Registration, lookup, conversion |

@@ -19,7 +19,7 @@
 
 namespace cucascade {
 
-// ========== data_batch ==========
+// ========== data_batch_core ==========
 
 uint64_t data_batch_core::get_batch_id() const { return _batch_id; }
 
@@ -28,21 +28,21 @@ memory::Tier data_batch_core::get_current_tier() const { return _data->get_curre
 idata_representation* data_batch_core::get_data() const { return _data.get(); }
 
 memory::memory_space* data_batch_core::get_memory_space() const
-{ return &(_data->get_memory_space()); }
+{
+  return &(_data->get_memory_space());
+}
 
 data_batch_core::data_batch_core(uint64_t batch_id, std::unique_ptr<idata_representation> data)
   : _batch_id(batch_id), _data(std::move(data))
 {
 }
 
-// ========== synchronized_data_batch ==========
+// ========== data_batch ==========
 
 std::shared_ptr<data_batch> data_batch::make(uint64_t batch_id,
                                              std::unique_ptr<idata_representation> data)
 {
-  if (data == nullptr) {
-    throw std::runtime_error("data is null in synchronized_data_batch constructor");
-  }
+  if (data == nullptr) { throw std::runtime_error("data is null in data_batch constructor"); }
   return std::shared_ptr<data_batch>(new data_batch(batch_id, std::move(data)));
 }
 
@@ -132,26 +132,6 @@ read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& oth
   return *this;
 }
 
-// read_only_data_batch& read_only_data_batch::operator=(const read_only_data_batch& other)
-// {
-//   if (this != &other) {
-//     if (_batch) {
-//       auto prev = _batch->_read_only_count.fetch_sub(1);
-//       if (prev == 1) { _batch->_state.store(batch_state::idle); }
-//       _lock.unlock();
-//     }
-//     _batch = other._batch;
-//     if (_batch) {
-//       _lock = std::shared_lock<std::shared_mutex>(_batch->_rw_mutex);
-//       _batch->_read_only_count.fetch_add(1);
-//       _batch->_state.store(batch_state::read_only);
-//     } else {
-//       _lock = std::shared_lock<std::shared_mutex>();
-//     }
-//   }
-//   return *this;
-// }
-
 read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> owner,
                                            std::shared_lock<std::shared_mutex> lock)
   : _owner(std::move(owner)), _lock(std::move(lock))
@@ -195,6 +175,8 @@ mutable_data_batch& mutable_data_batch::operator=(mutable_data_batch&& other) no
 mutable_data_batch::mutable_data_batch(std::shared_ptr<data_batch> owner,
                                        std::unique_lock<std::shared_mutex> lock)
   : _owner(std::move(owner)), _lock(std::move(lock))
-{ _owner->_state.store(batch_state::mutable_locked); }
+{
+  _owner->_state.store(batch_state::mutable_locked);
+}
 
 }  // namespace cucascade

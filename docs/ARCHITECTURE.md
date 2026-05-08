@@ -203,43 +203,37 @@ sequenceDiagram
 
 **File**: `include/cucascade/data/data_batch.hpp`
 
-A `data_batch` is the fundamental unit of data in cuCascade. It wraps a tier-specific data representation (GPU table or host table) and manages concurrent access through a RAII read-only and mutable accessor classes.
+A `data_batch` is the fundamental unit of data in cuCascade. It wraps a tier-specific data representation (GPU table or host table) and manages concurrent access through RAII read-only and mutable accessor classes.
 
 ```mermaid
 stateDiagram-v2
     direction LR
 
-    idle --> task_created : try_to_create_task()
-    idle --> in_transit : try_to_lock_for_in_transit()
-    task_created --> processing : try_to_lock_for_processing()
-    task_created --> in_transit : try_to_lock_for_in_transit()
-    task_created --> idle : try_to_cancel_task()
-    processing --> idle : handle destruction
-    processing --> task_created : try_to_create_task()
-    in_transit --> idle : try_to_release_in_transit()
-    in_transit --> task_created : try_to_release_in_transit(task_created)
+    idle --> read_only : get_read_only() / try_get_read_only()
+    idle --> mutable_locked : get_mutable() / try_get_mutable()
+    read_only --> idle : read_only_data_batch::to_idle()
+    mutable_locked --> idle : mutable_data_batch::to_idle()
 ```
 
 **States**:
-- **idle** -- no pending work, available for scheduling or tier movement
-- **task_created** -- a task has been registered but processing hasn't started
-- **processing** -- one or more RAII `data_batch_processing_handle`s are active
-- **in_transit** -- locked for movement between memory tiers (no concurrent access)
+- **idle** -- no active readers or writers; the synchronized handle grants no direct data access
+- **read_only** -- one or more `read_only_data_batch` shared locks are active
+- **mutable_locked** -- one `mutable_data_batch` exclusive lock is active
 
-The `data_batch_processing_handle` uses RAII to ensure the processing count is always correctly decremented, even on exceptions.
+The accessor objects use RAII to release locks automatically, even on exceptions.
 
 ### Data Repositories
 
 **File**: `include/cucascade/data/data_repository.hpp`
 
-A `data_repository` is a partitioned storage for data batches. It provides blocking `pop` operations that wait until a batch reaches the requested state.
+A `data_repository` is partitioned storage for synchronized data batch handles. It provides non-blocking `pop` operations that return `nullptr` when a partition is empty.
 
 ```cpp
-// Pop a batch that can transition to task_created (blocks if none ready)
-auto batch = repository.pop_data_batch(batch_state::task_created);
+// Pop the next batch from the default partition
+auto batch = repository.pop_next_data_batch();
 
 // Pop a specific batch by ID
-auto batch = repository.pop_data_batch_by_id(42, batch_state::in_transit);
+auto batch = repository.pop_data_batch_by_id(42);
 ```
 
 The `data_repository_manager` coordinates multiple repositories across operators/pipelines and provides atomic batch ID generation.
@@ -290,25 +284,23 @@ A typical lifecycle of data through cuCascade:
 ```
 1. INGESTION
    Create data representation (e.g., gpu_table_representation wrapping a cuDF table)
-   -> Wrap in data_batch with unique ID from data_repository_manager
+   -> Wrap in data_batch::make(unique_id, representation)
    -> Add to data_repository
 
-2. TASK SCHEDULING
-   batch.try_to_create_task()              [idle -> task_created]
-   repository.pop_data_batch(task_created) [retrieve batch for processing]
+2. REPOSITORY DISTRIBUTION
+   manager.add_data_batch(batch, destinations)
+   repository.pop_next_data_batch()        [retrieve synchronized batch handle]
 
 3. PROCESSING
-   batch.try_to_lock_for_processing()      [task_created -> processing]
-   -> Returns data_batch_processing_handle (RAII)
-   -> Access data via batch.get_data()
-   -> Handle destructs on scope exit       [processing -> idle]
+   auto ro = batch->get_read_only()        [shared lock]
+   -> Access data via ro->get_data()
+   -> Accessor destructs on scope exit     [read_only -> idle when last reader exits]
 
 4. MEMORY PRESSURE (downgrade)
    memory_space.should_downgrade_memory()  [threshold exceeded]
-   batch.try_to_lock_for_in_transit()      [idle -> in_transit]
-   converter_registry.convert<host_data_representation>(...)
-   batch.set_data(new_representation)      [data now on HOST]
-   batch.try_to_release_in_transit()       [in_transit -> idle]
+   auto mut = batch->get_mutable()         [exclusive lock]
+   mut->convert_to<host_data_representation>(...)
+   mutable_data_batch::to_idle(std::move(mut))
 
 5. DATA NEEDED (upgrade)
    Same flow as downgrade but in reverse tier direction
@@ -326,7 +318,7 @@ cuCascade uses a strict lock hierarchy to prevent deadlocks:
 ```
 Level 1: atomic<uint64_t> (batch ID generation -- lock-free)
     |
-Level 2: data_batch, read_only_data_batch, mutable_data_batch (3-class sytem provides read-only and mutable access classes)
+Level 2: data_batch, read_only_data_batch, mutable_data_batch (3-class system provides read-only and mutable access classes)
     |
 Level 3: idata_repository._mutex (protects batch storage)
     |
@@ -339,7 +331,7 @@ Level 6: memory_reservation_manager._wait_mutex (protects reservation waiting)
 
 Key synchronization primitives:
 - **`std::mutex`** -- guards state transitions, storage, and configuration
-- **`std::condition_variable`** -- blocks repository pops and reservation requests until satisfied
+- **`std::condition_variable`** -- blocks reservation requests until satisfied
 - **`std::atomic`** -- lock-free counters for batch IDs, allocated bytes, and peak tracking
 - **`atomic_bounded_counter`** -- CAS-based bounded arithmetic for reservation enforcement
 - **`notification_channel`** -- signals waiting threads when reservations are released
@@ -352,7 +344,7 @@ Key synchronization primitives:
 |---------|-----------|
 | **Strategy** | `reservation_request_strategy` subclasses for memory selection |
 | **Builder** | `reservation_manager_configurator` for fluent system configuration |
-| **RAII** | `data_batch_processing_handle`, `borrowed_stream`, `multiple_blocks_allocation`, `notify_on_exit` |
+| **RAII** | `read_only_data_batch`, `mutable_data_batch`, `borrowed_stream`, `multiple_blocks_allocation`, `notify_on_exit` |
 | **Factory** | `DeviceMemoryResourceFactoryFn` for tier-specific allocator creation |
 | **Adapter** | `reservation_aware_resource_adaptor` wraps RMM resources with tracking |
 | **3-Class System** | `data_batch` with read-only and mutable class variants which provide locking and accessors |
@@ -393,7 +385,7 @@ Key synchronization primitives:
 |------|---------|
 | `include/cucascade/data/common.hpp` | `idata_representation` interface |
 | `include/cucascade/data/data_batch.hpp` | Batch lifecycle, read-only and mutable locking accessor classes|
-| `include/cucascade/data/data_repository.hpp` | Partitioned batch storage with blocking pops |
+| `include/cucascade/data/data_repository.hpp` | Partitioned batch storage with non-blocking pops |
 | `include/cucascade/data/data_repository_manager.hpp` | Multi-pipeline repository coordination |
 | `include/cucascade/data/representation_converter.hpp` | Type-indexed converter registry |
 | `include/cucascade/data/gpu_data_representation.hpp` | GPU-resident cuDF table wrapper |

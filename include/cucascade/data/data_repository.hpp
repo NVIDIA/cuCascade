@@ -45,7 +45,7 @@ namespace cucascade {
  * - Thread-safe access to shared data structures
  *
  * @tparam PtrType The smart pointer type used to manage data_batch lifecycle.
- *                 Typically std::shared_ptr<data_batch> or std::unique_ptr<data_batch>.
+ *                 The public repository alias uses std::shared_ptr<data_batch>.
  *
  * @note Implementations must be thread-safe as multiple threads may access
  *       the repository concurrently during query execution.
@@ -66,11 +66,10 @@ class idata_repository {
   /**
    * @brief Add a new data batch to this repository.
    *
-   * The repository takes ownership of the data_batch (for unique_ptr) or shares
-   * ownership (for shared_ptr) and will manage its lifecycle according to the
+   * The repository stores the data_batch pointer and manages it according to the
    * implementation's storage policy.
    *
-   * @param batch Smart pointer to the data_batch to add (ownership transferred/shared)
+   * @param batch Smart pointer to the data_batch to add
    * @param partition_idx Index of the partition to add the batch to (default: 0)
    *
    * @note Thread-safe operation protected by internal mutex
@@ -158,8 +157,7 @@ class idata_repository {
    * @return PtrType A copy of the data batch pointer with the matching batch_id, or nullptr
    *
    * @note Thread-safe operation protected by internal mutex
-   * @note Only supported for shared_ptr repositories. Will throw for unique_ptr repositories.
-   * @throws std::runtime_error if called on unique_ptr repository
+   * @note Supported for shared_ptr repositories by returning a copy of the pointer.
    * @throws std::out_of_range if partition_idx is out of range
    */
   virtual PtrType get_data_batch_by_id(uint64_t batch_id, size_t partition_idx = 0);

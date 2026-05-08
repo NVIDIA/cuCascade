@@ -43,7 +43,9 @@ struct operator_port_key {
   std::string port_id;
 
   bool operator==(const operator_port_key& other) const
-  { return operator_id == other.operator_id && port_id == other.port_id; }
+  {
+    return operator_id == other.operator_id && port_id == other.port_id;
+  }
 
   bool operator<(const operator_port_key& other) const
   {
@@ -76,7 +78,7 @@ struct operator_port_key {
  * a unified interface for higher-level components like the GPU executor and memory manager.
  *
  * @tparam PtrType The smart pointer type used to manage data_batch lifecycle.
- *                 Typically std::shared_ptr<data_batch> or std::unique_ptr<data_batch>.
+ *                 The public manager alias uses std::shared_ptr<data_batch>.
  *
  * @note All operations are thread-safe and can be called concurrently from multiple
  *       pipeline execution threads.
@@ -125,8 +127,7 @@ class data_repository_manager {
   /**
    * @brief Add a data_batch to specified operator repositories.
    *
-   * For shared_ptr: The batch is copied to each repository.
-   * For unique_ptr: This method requires only one operator (single owner semantics).
+   * The shared batch pointer is copied to each destination repository.
    *
    * @param batch The data_batch smart pointer to add
    * @param ops The operator IDs and ports whose repositories will receive this batch
@@ -134,7 +135,9 @@ class data_repository_manager {
    * @note Thread-safe operation
    */
   void add_data_batch(PtrType batch, std::vector<std::pair<size_t, std::string_view>> ops)
-  { add_data_batch_impl(std::move(batch), ops); }
+  {
+    add_data_batch_impl(std::move(batch), ops);
+  }
 
   /**
    * @brief Get direct access to a repository for advanced operations.
@@ -151,7 +154,9 @@ class data_repository_manager {
    * safety
    */
   std::unique_ptr<repository_type>& get_repository(size_t operator_id, std::string_view port_id)
-  { return _repositories.at({operator_id, std::string(port_id)}); }
+  {
+    return _repositories.at({operator_id, std::string(port_id)});
+  }
 
   /**
    * @brief Generate a globally unique data batch identifier.

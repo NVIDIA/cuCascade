@@ -24,29 +24,27 @@ no access to the underlying data.
 
 ### Allowed Transitions
 
-#### Non-static (via `shared_from_this` — caller's `shared_ptr` is NOT consumed)
+#### Access Acquisition (caller's `shared_ptr` is not consumed)
 
 | From | To | Method | Blocking |
 |------|----|--------|----------|
-| `idle` | `read_only` | `to_read_only()` | Yes — blocks until shared lock available |
-| `idle` | `read_only` | `try_to_read_only()` | No — returns `std::nullopt` if exclusive lock held |
-| `idle` | `mutable_locked` | `to_mutable()` | Yes — blocks until exclusive lock available |
-| `idle` | `mutable_locked` | `try_to_mutable()` | No — returns `std::nullopt` if any lock held |
+| `idle` | `read_only` | `get_read_only()` | Yes — blocks until shared lock available |
+| `idle` | `read_only` | `try_get_read_only()` | No — returns `std::nullopt` if exclusive lock held |
+| `idle` | `mutable_locked` | `get_mutable()` | Yes — blocks until exclusive lock available |
+| `idle` | `mutable_locked` | `try_get_mutable()` | No — returns `std::nullopt` if any lock held |
 
-#### Static (consume accessor via `&&` — source is left null)
+#### Access Release (consume accessor via `&&`; source is left null)
 
 | From | To | Method | Blocking | Notes |
 |------|----|--------|----------|-------|
-| `read_only` | `idle` | `to_idle(read_only_data_batch&&)` | No | Returns `shared_ptr<data_batch>`; state becomes `idle` when last reader releases |
-| `mutable_locked` | `idle` | `to_idle(mutable_data_batch&&)` | No | Releases exclusive lock; returns `shared_ptr<data_batch>` |
-| `read_only` | `mutable_locked` | `readonly_to_mutable(read_only_data_batch&&)` | Yes — blocks until exclusive lock available | Releases shared lock first, then acquires exclusive |
-| `mutable_locked` | `read_only` | `mutable_to_readonly(mutable_data_batch&&)` | Yes — blocks until shared lock available | Releases exclusive lock first, then acquires shared |
+| `read_only` | `idle` | `read_only_data_batch::to_idle(read_only_data_batch&&)` | No | Returns `shared_ptr<data_batch>`; state becomes `idle` when last reader releases |
+| `mutable_locked` | `idle` | `mutable_data_batch::to_idle(mutable_data_batch&&)` | No | Releases exclusive lock; returns `shared_ptr<data_batch>` |
 
 ### Disallowed / Non-Transitions
 
-- `try_to_read_only()` returns `std::nullopt` when a `mutable_data_batch` is active (exclusive lock held).
-- `try_to_mutable()` returns `std::nullopt` when any lock is held (shared or exclusive).
-- `to_read_only()` and `to_mutable()` on a batch not managed by `shared_ptr` throw `std::bad_weak_ptr` (they require `shared_from_this()`).
+- `try_get_read_only()` returns `std::nullopt` when a `mutable_data_batch` is active (exclusive lock held).
+- `try_get_mutable()` returns `std::nullopt` when any lock is held (shared or exclusive).
+- There is no direct read-to-write upgrade or write-to-read downgrade API. Release the current accessor, then acquire the next access mode from the returned `shared_ptr<data_batch>`.
 
 ### Subscriber Counting
 
@@ -66,24 +64,22 @@ Independent of the locking model, a batch maintains an atomic subscriber interes
 stateDiagram-v2
     direction LR
 
-    idle --> read_only : to_read_only() [blocking]\ntry_to_read_only() [non-blocking]
-    idle --> mutable_locked : to_mutable() [blocking]\ntry_to_mutable() [non-blocking]
+    idle --> read_only : get_read_only() [blocking]\ntry_get_read_only() [non-blocking]
+    idle --> mutable_locked : get_mutable() [blocking]\ntry_get_mutable() [non-blocking]
 
-    read_only --> idle : to_idle(read_only_data_batch&&)\n[last reader → idle]
-    read_only --> mutable_locked : readonly_to_mutable(read_only_data_batch&&)\n[releases shared, acquires exclusive]
+    read_only --> idle : read_only_data_batch::to_idle(read_only_data_batch&&)\n[last reader -> idle]
 
-    mutable_locked --> idle : to_idle(mutable_data_batch&&)
-    mutable_locked --> read_only : mutable_to_readonly(mutable_data_batch&&)\n[releases exclusive, acquires shared]
+    mutable_locked --> idle : mutable_data_batch::to_idle(mutable_data_batch&&)
 
     note right of read_only
       Multiple read_only_data_batch handles
       may coexist (concurrent reads).
-      try_to_mutable() returns nullopt.
+      try_get_mutable() returns nullopt.
     end note
 
     note right of mutable_locked
       Exclusive access.
-      try_to_read_only() returns nullopt.
-      try_to_mutable() returns nullopt.
+      try_get_read_only() returns nullopt.
+      try_get_mutable() returns nullopt.
     end note
 ```
