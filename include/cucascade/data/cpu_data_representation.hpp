@@ -24,6 +24,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace cucascade {
@@ -75,6 +76,27 @@ class host_data_representation : public idata_representation {
    * @return const reference to the unique_ptr owning the allocation
    */
   const std::unique_ptr<memory::host_table_allocation>& get_host_table() const;
+
+  /// @brief Number of top-level columns held by the underlying allocation.
+  [[nodiscard]] std::size_t num_columns() const noexcept;
+
+  /**
+   * @brief Total bytes (null mask + data, recursive over children) for column @p i.
+   *
+   * @throws std::out_of_range if @p i >= num_columns().
+   */
+  [[nodiscard]] std::size_t column_size(std::size_t i) const;
+
+  /**
+   * @brief Create a host_data_representation that shares buffers but exposes only the
+   * requested columns.
+   *
+   * Forwards to host_table_allocation::slice(). The returned representation references the
+   * same underlying pinned buffers as the source; converting it to another tier yields a
+   * table containing only the selected columns.
+   */
+  [[nodiscard]] std::unique_ptr<host_data_representation> slice(
+    std::span<const std::size_t> col_indices) const;
 
  private:
   std::unique_ptr<memory::host_table_allocation> _host_table;

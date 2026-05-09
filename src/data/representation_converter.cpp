@@ -528,15 +528,16 @@ static memory::column_metadata plan_column_copy(const cudf::column_view& col,
  * Does NOT issue any CUDA calls; the caller fires one cudaMemcpyBatchAsync after collecting all
  * ops.
  */
-static void collect_d2h_ops(const void* src,
-                            std::size_t size,
-                            std::size_t alloc_offset,
-                            memory::fixed_multiple_blocks_allocation& alloc,
-                            BatchCopyAccumulator& batch)
+static void collect_d2h_ops(
+  const void* src,
+  std::size_t size,
+  std::size_t alloc_offset,
+  memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  BatchCopyAccumulator& batch)
 {
   if (size == 0 || src == nullptr) { return; }
 
-  const std::size_t block_size = alloc->block_size();
+  const std::size_t block_size = alloc.block_size();
   std::size_t block_idx        = alloc_offset / block_size;
   std::size_t block_off        = alloc_offset % block_size;
   std::size_t src_off          = 0;
@@ -546,7 +547,7 @@ static void collect_d2h_ops(const void* src,
     std::size_t space_in_block = block_size - block_off;
     std::size_t bytes_to_copy  = std::min(remaining, space_in_block);
 
-    auto block = alloc->at(block_idx);
+    auto block = alloc.at(block_idx);
     batch.add(block.data() + block_off, static_cast<const uint8_t*>(src) + src_off, bytes_to_copy);
     src_off += bytes_to_copy;
     block_off += bytes_to_copy;
@@ -560,10 +561,11 @@ static void collect_d2h_ops(const void* src,
 /**
  * @brief Recursively collect D→H copy ops for a column's null mask, data buffer, and children.
  */
-static void collect_column_d2h_ops(const cudf::column_view& col,
-                                   const memory::column_metadata& meta,
-                                   memory::fixed_multiple_blocks_allocation& alloc,
-                                   BatchCopyAccumulator& batch)
+static void collect_column_d2h_ops(
+  const cudf::column_view& col,
+  const memory::column_metadata& meta,
+  memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  BatchCopyAccumulator& batch)
 {
   if (meta.has_null_mask) {
     collect_d2h_ops(col.null_mask(), meta.null_mask_size, meta.null_mask_offset, alloc, batch);
@@ -606,12 +608,13 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   // --- Pass 3: collect all D→H copy ops, then fire one batched call ---
   BatchCopyAccumulator batch;
   for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-    collect_column_d2h_ops(view.column(i), columns[static_cast<std::size_t>(i)], allocation, batch);
+    collect_column_d2h_ops(
+      view.column(i), columns[static_cast<std::size_t>(i)], *allocation, batch);
   }
   batch.flush(stream, cudaMemcpySrcAccessOrderStream);
   stream.synchronize();
 
-  auto host_alloc = std::make_unique<memory::host_table_allocation>(
+  auto host_alloc = memory::host_table_allocation::create(
     std::move(allocation), std::move(columns), total_size);
 
   return std::make_unique<host_data_representation>(
@@ -625,21 +628,22 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
  * batch.flush(). The buffer must remain alive until flush() completes (it will, since it is
  * owned by the column tree being assembled in the caller).
  */
-static rmm::device_buffer alloc_and_schedule_h2d(memory::fixed_multiple_blocks_allocation& alloc,
-                                                 std::size_t alloc_offset,
-                                                 std::size_t size,
-                                                 rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr,
-                                                 BatchCopyAccumulator& batch)
+static rmm::device_buffer alloc_and_schedule_h2d(
+  memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  std::size_t alloc_offset,
+  std::size_t size,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  BatchCopyAccumulator& batch)
 {
   rmm::device_buffer buf(size, stream, mr);
   if (size == 0) { return buf; }
-  if (!alloc || alloc->size() == 0) {
+  if (alloc.size() == 0) {
     throw std::invalid_argument(
-      "alloc_and_schedule_h2d: allocation is null or empty but copy size is non-zero");
+      "alloc_and_schedule_h2d: allocation is empty but copy size is non-zero");
   }
 
-  const std::size_t block_size = alloc->block_size();
+  const std::size_t block_size = alloc.block_size();
   std::size_t block_idx        = alloc_offset / block_size;
   std::size_t block_off        = alloc_offset % block_size;
   std::size_t dst_off          = 0;
@@ -649,7 +653,7 @@ static rmm::device_buffer alloc_and_schedule_h2d(memory::fixed_multiple_blocks_a
     std::size_t space_in_block = block_size - block_off;
     std::size_t bytes_to_copy  = std::min(remaining, space_in_block);
 
-    auto block = alloc->at(block_idx);
+    auto block = alloc.at(block_idx);
     batch.add(static_cast<uint8_t*>(buf.data()) + dst_off, block.data() + block_off, bytes_to_copy);
     dst_off += bytes_to_copy;
     block_off += bytes_to_copy;
@@ -668,16 +672,17 @@ static rmm::device_buffer alloc_and_schedule_h2d(memory::fixed_multiple_blocks_a
  * the stream. Used for null masks which cudf column factories access on construction
  * (before batch.flush() runs).
  */
-static rmm::device_buffer alloc_and_copy_h2d_sync(memory::fixed_multiple_blocks_allocation& alloc,
-                                                  std::size_t alloc_offset,
-                                                  std::size_t size,
-                                                  rmm::cuda_stream_view stream,
-                                                  rmm::device_async_resource_ref mr)
+static rmm::device_buffer alloc_and_copy_h2d_sync(
+  memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  std::size_t alloc_offset,
+  std::size_t size,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
   rmm::device_buffer buf(size, stream, mr);
   if (size == 0) { return buf; }
 
-  const std::size_t block_size = alloc->block_size();
+  const std::size_t block_size = alloc.block_size();
   std::size_t block_idx        = alloc_offset / block_size;
   std::size_t block_off        = alloc_offset % block_size;
   std::size_t dst_off          = 0;
@@ -687,7 +692,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(memory::fixed_multiple_blocks_
     std::size_t space_in_block = block_size - block_off;
     std::size_t bytes_to_copy  = std::min(remaining, space_in_block);
 
-    auto block = alloc->at(block_idx);
+    auto block = alloc.at(block_idx);
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(static_cast<uint8_t*>(buf.data()) + dst_off,
                                        block.data() + block_off,
                                        bytes_to_copy,
@@ -715,7 +720,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(memory::fixed_multiple_blocks_
  */
 static std::unique_ptr<cudf::column> reconstruct_column(
   const memory::column_metadata& meta,
-  memory::fixed_multiple_blocks_allocation& alloc,
+  memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
@@ -842,7 +847,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(fast_table->columns.size());
   for (const auto& col_meta : fast_table->columns) {
-    gpu_columns.push_back(reconstruct_column(col_meta, fast_table->allocation, stream, mr, batch));
+    gpu_columns.push_back(reconstruct_column(col_meta, *fast_table->allocation, stream, mr, batch));
   }
   // Source is CPU-written pinned host memory: fully prepared before this call.
   batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
@@ -901,7 +906,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
     }
   }
   std::vector<memory::column_metadata> columns_copy = host_table->columns;
-  auto new_host_table = std::make_unique<memory::host_table_allocation>(
+  auto new_host_table                               = memory::host_table_allocation::create(
     std::move(dst_allocation), std::move(columns_copy), data_size);
   return std::make_unique<host_data_representation>(
     std::move(new_host_table), const_cast<memory::memory_space*>(target_memory_space));
@@ -932,14 +937,15 @@ struct disk_file_guard {
 /**
  * @brief Write data from a host block allocation to a disk file, handling block-boundary spanning.
  */
-static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_allocation& alloc,
-                                      std::size_t alloc_offset,
-                                      std::size_t size,
-                                      const std::filesystem::path& file_path,
-                                      std::size_t file_offset,
-                                      idisk_io_backend& backend)
+static void write_host_buffer_to_disk(
+  const memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  std::size_t alloc_offset,
+  std::size_t size,
+  const std::filesystem::path& file_path,
+  std::size_t file_offset,
+  idisk_io_backend& backend)
 {
-  const std::size_t block_size = alloc->block_size();
+  const std::size_t block_size = alloc.block_size();
   std::size_t block_idx        = alloc_offset / block_size;
   std::size_t block_off        = alloc_offset % block_size;
   std::size_t written          = 0;
@@ -947,7 +953,7 @@ static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_alloca
     std::size_t remaining = size - written;
     std::size_t avail     = block_size - block_off;
     std::size_t chunk     = std::min(remaining, avail);
-    auto block            = alloc->at(block_idx);
+    auto block            = alloc.at(block_idx);
     backend.write(file_path, block.data() + block_off, chunk, file_offset + written);
     written += chunk;
     block_off += chunk;
@@ -961,14 +967,15 @@ static void write_host_buffer_to_disk(const memory::fixed_multiple_blocks_alloca
 /**
  * @brief Read data from a disk file into a host block allocation, handling block-boundary spanning.
  */
-static void read_disk_buffer_to_host(const std::filesystem::path& file_path,
-                                     std::size_t file_offset,
-                                     std::size_t size,
-                                     memory::fixed_multiple_blocks_allocation& alloc,
-                                     std::size_t alloc_offset,
-                                     idisk_io_backend& backend)
+static void read_disk_buffer_to_host(
+  const std::filesystem::path& file_path,
+  std::size_t file_offset,
+  std::size_t size,
+  memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  std::size_t alloc_offset,
+  idisk_io_backend& backend)
 {
-  const std::size_t block_size = alloc->block_size();
+  const std::size_t block_size = alloc.block_size();
   std::size_t block_idx        = alloc_offset / block_size;
   std::size_t block_off        = alloc_offset % block_size;
   std::size_t read_total       = 0;
@@ -976,7 +983,7 @@ static void read_disk_buffer_to_host(const std::filesystem::path& file_path,
     std::size_t remaining = size - read_total;
     std::size_t avail     = block_size - block_off;
     std::size_t chunk     = std::min(remaining, avail);
-    auto block            = alloc->at(block_idx);
+    auto block            = alloc.at(block_idx);
     backend.read(file_path, block.data() + block_off, chunk, file_offset + read_total);
     read_total += chunk;
     block_off += chunk;
@@ -1032,11 +1039,12 @@ static memory::column_metadata recompute_file_offsets(const memory::column_metad
 /**
  * @brief Recursively write column buffers from host blocks to disk at computed file offsets.
  */
-static void write_column_buffers(const memory::column_metadata& src_meta,
-                                 const memory::column_metadata& disk_meta,
-                                 const memory::fixed_multiple_blocks_allocation& alloc,
-                                 const std::filesystem::path& file_path,
-                                 idisk_io_backend& backend)
+static void write_column_buffers(
+  const memory::column_metadata& src_meta,
+  const memory::column_metadata& disk_meta,
+  const memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  const std::filesystem::path& file_path,
+  idisk_io_backend& backend)
 {
   if (src_meta.has_null_mask && src_meta.null_mask_size > 0) {
     write_host_buffer_to_disk(alloc,
@@ -1099,11 +1107,12 @@ static memory::column_metadata recompute_host_offsets(const memory::column_metad
 /**
  * @brief Recursively read column buffers from disk into host blocks.
  */
-static void read_column_buffers(const memory::column_metadata& disk_meta,
-                                const memory::column_metadata& host_meta,
-                                const std::filesystem::path& file_path,
-                                memory::fixed_multiple_blocks_allocation& alloc,
-                                idisk_io_backend& backend)
+static void read_column_buffers(
+  const memory::column_metadata& disk_meta,
+  const memory::column_metadata& host_meta,
+  const std::filesystem::path& file_path,
+  memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  idisk_io_backend& backend)
 {
   if (disk_meta.has_null_mask && disk_meta.null_mask_size > 0) {
     read_disk_buffer_to_host(file_path,
@@ -1156,7 +1165,7 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   // Write column data buffers
   for (std::size_t i = 0; i < host_table->columns.size(); ++i) {
     write_column_buffers(
-      host_table->columns[i], disk_columns[i], host_table->allocation, file_path, backend);
+      host_table->columns[i], disk_columns[i], *host_table->allocation, file_path, backend);
   }
 
   guard.release();
@@ -1205,10 +1214,10 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
 
   // Read column data from file into host blocks
   for (std::size_t i = 0; i < disk_columns.size(); ++i) {
-    read_column_buffers(disk_columns[i], host_columns[i], file_path, allocation, backend);
+    read_column_buffers(disk_columns[i], host_columns[i], file_path, *allocation, backend);
   }
 
-  auto host_alloc = std::make_unique<memory::host_table_allocation>(
+  auto host_alloc = memory::host_table_allocation::create(
     std::move(allocation), std::move(host_columns), total_host_size);
   return std::make_unique<host_data_representation>(
     std::move(host_alloc), const_cast<memory::memory_space*>(target_memory_space));
