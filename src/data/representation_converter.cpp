@@ -734,6 +734,12 @@ static std::unique_ptr<cudf::column> reconstruct_column(
   const cudf::size_type null_count = meta.has_null_mask ? meta.null_count : 0;
 
   if (meta.type_id == cudf::type_id::STRING) {
+    // cudf::make_empty_column(STRING) produces a 0-row strings column with no children, and
+    // plan_column_copy faithfully records that. Reconstruct the canonical empty strings column
+    // here instead of failing the offsets-child check below.
+    if (meta.children.empty() && meta.num_rows == 0) {
+      return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+    }
     if (meta.children.size() < 1) {
       throw std::invalid_argument(
         "reconstruct_column: STRING column metadata must have at least one child (offsets)");
@@ -1341,6 +1347,11 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   const cudf::size_type null_count = meta.has_null_mask ? meta.null_count : 0;
 
   if (meta.type_id == cudf::type_id::STRING) {
+    // See reconstruct_column for the empty-strings-column rationale. cudf::make_empty_column(
+    // STRING) produces a column with no children; recreate it instead of erroring.
+    if (meta.children.empty() && meta.num_rows == 0) {
+      return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+    }
     if (meta.children.size() < 1) {
       throw std::invalid_argument(
         "reconstruct_column_from_disk: STRING column metadata must have at least one child "

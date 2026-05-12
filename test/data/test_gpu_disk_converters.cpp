@@ -299,6 +299,25 @@ TEST_CASE("gpu disk round-trip string column", "[disk][gpu-converter][string]")
   gpu_disk_round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
 }
 
+// Regression: see test_disk_host_converters.cpp — same root cause, but here we exercise the
+// direct disk→GPU path through reconstruct_column_from_disk.
+TEST_CASE("gpu disk round-trip empty strings column", "[disk][gpu-converter][string][empty]")
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}));
+  gpu_disk_round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("gpu disk round-trip empty strings column mixed with non-empty column",
+          "[disk][gpu-converter][string][empty]")
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}));
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}));
+  gpu_disk_round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
 TEST_CASE("gpu disk round-trip string column with nulls", "[disk][gpu-converter][string][null]")
 {
   std::vector<std::string> host_strings = {"alpha", "beta", "gamma", "delta"};
