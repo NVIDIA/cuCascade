@@ -59,7 +59,6 @@ target_include_directories(
 target_compile_options(
   cucascade_benchmarks
   PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:${CUCASCADE_CXX_WARNING_FLAGS}>
     $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
     ${CUCASCADE_CUDA_WARNING_FLAGS})
 
