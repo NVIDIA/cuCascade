@@ -21,7 +21,7 @@ cmake_minimum_required(VERSION 3.26.4 FATAL_ERROR)
 project(
   cuCascade
   VERSION 0.1.0
-  LANGUAGES C CXX CUDA
+  LANGUAGES CXX CUDA
   DESCRIPTION "GPU memory management and data representation library")
 
 # Options
@@ -63,7 +63,7 @@ endif()
 # =============================================================================
 option(CUCASCADE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 
-# Warning flags for C/C++
+# Warning flags for C++
 set(CUCASCADE_CXX_WARNING_FLAGS
     -Wall
     -Wextra
@@ -77,7 +77,7 @@ set(CUCASCADE_CXX_WARNING_FLAGS
     -Wformat=2
     -Wimplicit-fallthrough)
 
-if(WARNINGS_AS_ERRORS)
+if(CUCASCADE_WARNINGS_AS_ERRORS)
   list(APPEND CUCASCADE_CXX_WARNING_FLAGS -Werror)
 endif()
 
@@ -103,8 +103,7 @@ add_library(cucascade_objects OBJECT)
 # Apply warning flags to object library
 target_compile_options(
   cucascade_objects
-  PRIVATE $<$<COMPILE_LANGUAGE:C>:${CUCASCADE_CXX_WARNING_FLAGS}>
-          $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
+  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
           ${CUCASCADE_CUDA_WARNING_FLAGS})
 
 # NVTX compile definition
@@ -122,7 +121,7 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
-set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart CUDA::nvml
+set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart_static
                                Threads::Threads ${NUMA_LIB})
 
 # Set include directories for the object library

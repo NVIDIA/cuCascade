@@ -58,7 +58,7 @@ target_include_directories(
 
 # Link dependencies
 target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
-                                              CUDA::cudart)
+                                              CUDA::cudart_static)
 
 # Register tests with CTest
 add_test(NAME cucascade_tests COMMAND cucascade_tests)
