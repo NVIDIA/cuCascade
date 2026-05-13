@@ -58,7 +58,7 @@ target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
                                               CUDA::cudart_static)
 
 # Register tests with CTest
-add_test(NAME cucascade_tests COMMAND cucascade_tests --verbosity high)
+add_test(NAME cucascade_tests COMMAND cucascade_tests)
 
 # Create topology discovery test executable
 add_executable(
@@ -79,4 +79,4 @@ target_link_libraries(cucascade_topology_discovery_tests
 
 # Register tests with CTest
 add_test(NAME cucascade_topology_discovery_tests
-         COMMAND cucascade_topology_discovery_tests --verbosity high)
+         COMMAND cucascade_topology_discovery_tests)
