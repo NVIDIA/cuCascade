@@ -74,7 +74,7 @@ set_target_properties(cucascade_topology_discovery_tests
 
 # Set include directories
 target_include_directories(
-  cucascade_tests
+  cucascade_topology_discovery_tests
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
           ${Catch2_SOURCE_DIR}/single_include)
 
