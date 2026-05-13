@@ -36,9 +36,6 @@ set(BENCHMARK_ENABLE_INSTALL
 
 FetchContent_MakeAvailable(benchmark)
 
-# Set include directories for benchmarks
-include_directories(${CMAKE_CURRENT_SOURCE_DIR})
-
 # Collect all benchmark sources
 set(BENCHMARK_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_representation_converter.cpp

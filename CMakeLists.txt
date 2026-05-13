@@ -15,7 +15,7 @@
 # the License.
 # =============================================================================
 
-cmake_minimum_required(VERSION 3.26.4 FATAL_ERROR)
+cmake_minimum_required(VERSION 4.0 FATAL_ERROR)
 
 # Set project name and languages
 project(
@@ -137,6 +137,8 @@ target_include_directories(cucascade_topology_discovery_objects
 
 # Link dependencies to object library
 target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+target_link_libraries(cucascade_topology_discovery_objects
+                      PUBLIC CUDA::nvml_static)
 
 # cxx_std_20 is PUBLIC so consumers know they need C++20 to use our headers.
 # cuda_std_20 is kept separate and applied PRIVATE to cucascade_objects to avoid
@@ -162,6 +164,8 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
   add_library(cuCascade::cucascade_topology_discovery_static ALIAS
               cucascade_topology_discovery_static)
 
+  target_link_libraries(cucascade_topology_discovery_static
+                        PRIVATE CUDA::nvml_static)
   target_include_directories(cucascade_topology_discovery_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
@@ -195,15 +199,14 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
   add_library(cuCascade::cucascade_topology_discovery_shared ALIAS
               cucascade_topology_discovery_shared)
 
+  target_link_libraries(cucascade_topology_discovery_shared
+                        PRIVATE CUDA::nvml_static)
   target_include_directories(cucascade_topology_discovery_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)
 
-  set_target_properties(
-    cucascade_topology_discovery_shared
-    PROPERTIES OUTPUT_NAME cucascade_topology_discovery
-               VERSION ${PROJECT_VERSION}
-               SOVERSION ${PROJECT_VERSION_MAJOR})
+  set_target_properties(cucascade_topology_discovery_shared
+                        PROPERTIES OUTPUT_NAME cucascade_topology_discovery)
 
   add_library(cucascade_shared SHARED $<TARGET_OBJECTS:cucascade_objects>)
   add_library(cuCascade::cucascade_shared ALIAS cucascade_shared)
@@ -215,11 +218,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
                             cucascade_topology_discovery_shared)
   target_compile_features(cucascade_shared PUBLIC cxx_std_20)
 
-  set_target_properties(
-    cucascade_shared
-    PROPERTIES OUTPUT_NAME cucascade
-               VERSION ${PROJECT_VERSION}
-               SOVERSION ${PROJECT_VERSION_MAJOR})
+  set_target_properties(cucascade_shared PROPERTIES OUTPUT_NAME cucascade)
 endif()
 
 # =============================================================================

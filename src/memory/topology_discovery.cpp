@@ -29,95 +29,6 @@ namespace fs = std::filesystem;
 namespace cucascade::memory {
 
 namespace {
-
-// Runtime NVML loader to avoid link-time dependency on CUDA::nvml
-struct NvmlLoader {
-  void* handle = nullptr;
-
-  // Function pointers
-  nvmlReturn_t (*p_nvmlInit_v2)()                                               = nullptr;
-  nvmlReturn_t (*p_nvmlShutdown)()                                              = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetCount_v2)(unsigned int*)                        = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetHandleByIndex_v2)(unsigned int, nvmlDevice_t*)  = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int)        = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetPciInfo_v3)(nvmlDevice_t, nvmlPciInfo_t*)       = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetUUID)(nvmlDevice_t, char*, unsigned int)        = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetHandleByUUID)(const char*, nvmlDevice_t*)       = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceIsMigDeviceHandle)(nvmlDevice_t, unsigned int*)    = nullptr;
-  nvmlReturn_t (*p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle)(nvmlDevice_t,
-                                                                 nvmlDevice_t*) = nullptr;
-  const char* (*p_nvmlErrorString)(nvmlReturn_t)                                = nullptr;
-
-  NvmlLoader() { load(); }
-
-  ~NvmlLoader()
-  {
-    if (handle) { dlclose(handle); }
-  }
-
-  void load()
-  {
-    // Try the SONAME first, then the unversioned name as a fallback
-    handle = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (!handle) { handle = dlopen("libnvidia-ml.so", RTLD_LAZY | RTLD_LOCAL); }
-    if (!handle) { return; }
-
-    p_nvmlInit_v2  = reinterpret_cast<nvmlReturn_t (*)()>(dlsym(handle, "nvmlInit_v2"));
-    p_nvmlShutdown = reinterpret_cast<nvmlReturn_t (*)()>(dlsym(handle, "nvmlShutdown"));
-    p_nvmlDeviceGetCount_v2 =
-      reinterpret_cast<nvmlReturn_t (*)(unsigned int*)>(dlsym(handle, "nvmlDeviceGetCount_v2"));
-    p_nvmlDeviceGetHandleByIndex_v2 =
-      reinterpret_cast<nvmlReturn_t (*)(unsigned int, nvmlDevice_t*)>(
-        dlsym(handle, "nvmlDeviceGetHandleByIndex_v2"));
-    p_nvmlDeviceGetName = reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, char*, unsigned int)>(
-      dlsym(handle, "nvmlDeviceGetName"));
-    p_nvmlDeviceGetPciInfo_v3 = reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, nvmlPciInfo_t*)>(
-      dlsym(handle, "nvmlDeviceGetPciInfo_v3"));
-    p_nvmlDeviceGetUUID = reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, char*, unsigned int)>(
-      dlsym(handle, "nvmlDeviceGetUUID"));
-    p_nvmlDeviceGetHandleByUUID = reinterpret_cast<nvmlReturn_t (*)(const char*, nvmlDevice_t*)>(
-      dlsym(handle, "nvmlDeviceGetHandleByUUID"));
-    p_nvmlDeviceIsMigDeviceHandle = reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, unsigned int*)>(
-      dlsym(handle, "nvmlDeviceIsMigDeviceHandle"));
-    p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle =
-      reinterpret_cast<nvmlReturn_t (*)(nvmlDevice_t, nvmlDevice_t*)>(
-        dlsym(handle, "nvmlDeviceGetDeviceHandleFromMigDeviceHandle"));
-    p_nvmlErrorString =
-      reinterpret_cast<const char* (*)(nvmlReturn_t)>(dlsym(handle, "nvmlErrorString"));
-    // If any required symbol is missing, treat NVML as unavailable
-    if (!p_nvmlInit_v2 || !p_nvmlShutdown || !p_nvmlDeviceGetCount_v2 ||
-        !p_nvmlDeviceGetHandleByIndex_v2 || !p_nvmlDeviceGetName || !p_nvmlDeviceGetPciInfo_v3 ||
-        !p_nvmlDeviceGetUUID || !p_nvmlErrorString) {
-      dlclose(handle);
-      handle                                         = nullptr;
-      p_nvmlInit_v2                                  = nullptr;
-      p_nvmlShutdown                                 = nullptr;
-      p_nvmlDeviceGetCount_v2                        = nullptr;
-      p_nvmlDeviceGetHandleByIndex_v2                = nullptr;
-      p_nvmlDeviceGetName                            = nullptr;
-      p_nvmlDeviceGetPciInfo_v3                      = nullptr;
-      p_nvmlDeviceGetUUID                            = nullptr;
-      p_nvmlDeviceGetHandleByUUID                    = nullptr;
-      p_nvmlDeviceIsMigDeviceHandle                  = nullptr;
-      p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle = nullptr;
-      p_nvmlErrorString                              = nullptr;
-    }
-  }
-
-  [[nodiscard]] bool available() const
-  {
-    return handle && p_nvmlInit_v2 && p_nvmlShutdown && p_nvmlDeviceGetCount_v2 &&
-           p_nvmlDeviceGetHandleByIndex_v2 && p_nvmlDeviceGetName && p_nvmlDeviceGetPciInfo_v3 &&
-           p_nvmlDeviceGetUUID && p_nvmlErrorString;
-  }
-};
-
-NvmlLoader& get_nvml_loader()
-{
-  static NvmlLoader loader;
-  return loader;
-}
-
 /**
  * @brief Network device with topology information.
  */
@@ -771,27 +682,19 @@ int count_numa_nodes()
 bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 {
   system_topology_info topology;
-  NvmlLoader& nvml    = get_nvml_loader();
-  nvmlReturn_t result = NVML_SUCCESS;
-  if (!nvml.available()) {
-    std::cerr << "NVML not available: failed to load libnvidia-ml.so.1" << std::endl;
+  result = nvmlInit_v2();
+  if (result != NVML_SUCCESS) {
+    std::cerr << "Failed to initialize NVML: " << nvmlErrorString(result) << std::endl;
     // Continue anyway to report system info even without GPUs
-  } else {
-    result = nvml.p_nvmlInit_v2();
-    if (result != NVML_SUCCESS) {
-      std::cerr << "Failed to initialize NVML: " << nvml.p_nvmlErrorString(result) << std::endl;
-      // Continue anyway to report system info even without GPUs
-    }
   }
 
   // Get GPU count
   unsigned int device_count = 0;
   bool nvml_available       = false;
-  if (nvml.available() && result == NVML_SUCCESS) {
-    result = nvml.p_nvmlDeviceGetCount_v2(&device_count);
+  if (result == NVML_SUCCESS) {
+    result = nvmlDeviceGetCount_v2(&device_count);
     if (result != NVML_SUCCESS) {
-      std::cerr << "Warning: Failed to get device count: " << nvml.p_nvmlErrorString(result)
-                << std::endl;
+      std::cerr << "Warning: Failed to get device count: " << nvmlErrorString(result) << std::endl;
       device_count = 0;
     } else {
       nvml_available = true;
@@ -829,10 +732,10 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
   if (nvml_available) {
     for (unsigned int i = 0; i < device_count; ++i) {
       nvmlDevice_t device;
-      result = nvml.p_nvmlDeviceGetHandleByIndex_v2(i, &device);
+      result = nvmlDeviceGetHandleByIndex_v2(i, &device);
       if (result != NVML_SUCCESS) {
         std::cerr << "Warning: Failed to get handle for GPU " << i << ": "
-                  << nvml.p_nvmlErrorString(result) << std::endl;
+                  << nvmlErrorString(result) << std::endl;
         continue;
       }
 
@@ -841,11 +744,11 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 
       // Get device name, PCI bus ID and UUID
       std::array<char, NVML_DEVICE_NAME_BUFFER_SIZE> name{};
-      result   = nvml.p_nvmlDeviceGetName(device, name.data(), NVML_DEVICE_NAME_BUFFER_SIZE);
+      result   = nvmlDeviceGetName(device, name.data(), NVML_DEVICE_NAME_BUFFER_SIZE);
       gpu.name = (result == NVML_SUCCESS) ? std::string(name.data()) : "Unknown";
 
       nvmlPciInfo_t pci_info;
-      result = nvml.p_nvmlDeviceGetPciInfo_v3(device, &pci_info);
+      result = nvmlDeviceGetPciInfo_v3(device, &pci_info);
       if (result != NVML_SUCCESS) {
         std::cerr << "Warning: Failed to get PCI info for GPU " << i << std::endl;
         continue;
@@ -853,7 +756,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       gpu.pci_bus_id = std::string(pci_info.busId);
 
       std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
-      result   = nvml.p_nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
+      result   = nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
       gpu.uuid = (result == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
 
       // Get NUMA node and CPU affinity from /sys
@@ -888,7 +791,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     topology.gpus.push_back(std::move(gpu));
   }
 
-  if (nvml_available) { nvml.p_nvmlShutdown(); }
+  if (nvml_available) { nvmlShutdown(); }
 
   _topology = std::move(topology);
   return true;
