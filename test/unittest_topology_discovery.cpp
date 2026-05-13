@@ -19,8 +19,6 @@
 
 #include <catch2/catch.hpp>
 
-CATCH_REGISTER_LISTENER(device_sync_listener)
-
 int main(int argc, char* argv[])
 {
   // Run tests
