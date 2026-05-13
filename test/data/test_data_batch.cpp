@@ -575,8 +575,8 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
 
   auto ro_clone = cloned->get_read_only();
 
-  const auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro->get_data());
-  const auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone->get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro->get_data());
+  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone->get_data());
   REQUIRE(original_repr != nullptr);
   REQUIRE(cloned_repr != nullptr);
 
@@ -604,8 +604,8 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
 
   auto ro_clone = cloned->get_read_only();
 
-  const auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro->get_data());
-  const auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone->get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro->get_data());
+  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone->get_data());
 
   // Verify each column points to different memory
   for (cudf::size_type i = 0; i < original_repr->get_table_view().num_columns(); ++i) {
@@ -638,10 +638,10 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
   auto ro_c2 = clone2->get_read_only();
   auto ro_c3 = clone3->get_read_only();
 
-  const auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro->get_data());
-  const auto* clone1_repr   = dynamic_cast<const gpu_table_representation*>(ro_c1->get_data());
-  const auto* clone2_repr   = dynamic_cast<const gpu_table_representation*>(ro_c2->get_data());
-  const auto* clone3_repr   = dynamic_cast<const gpu_table_representation*>(ro_c3->get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro->get_data());
+  auto* clone1_repr   = dynamic_cast<gpu_table_representation*>(ro_c1->get_data());
+  auto* clone2_repr   = dynamic_cast<gpu_table_representation*>(ro_c2->get_data());
+  auto* clone3_repr   = dynamic_cast<gpu_table_representation*>(ro_c3->get_data());
 
   stream.synchronize();
   expect_cudf_tables_equal_on_stream(
@@ -666,8 +666,8 @@ TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
   auto cloned = ro->clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
-  auto ro_clone           = cloned->get_read_only();
-  const auto* cloned_repr = dynamic_cast<const gpu_table_representation*>(ro_clone->get_data());
+  auto ro_clone     = cloned->get_read_only();
+  auto* cloned_repr = dynamic_cast<gpu_table_representation*>(ro_clone->get_data());
   REQUIRE(cloned_repr != nullptr);
   REQUIRE(cloned_repr->get_table_view().num_rows() == 0);
   REQUIRE(cloned_repr->get_table_view().num_columns() == 2);
@@ -690,8 +690,8 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
 
   auto ro_clone = cloned->get_read_only();
 
-  const auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro->get_data());
-  const auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone->get_data());
+  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro->get_data());
+  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone->get_data());
 
   // Verify structure
   REQUIRE(cloned_repr->get_table_view().num_rows() == 10000);

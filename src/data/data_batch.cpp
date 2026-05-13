@@ -27,9 +27,9 @@ uint64_t data_batch_core::get_batch_id() const { return _batch_id; }
 
 memory::Tier data_batch_core::get_current_tier() const { return _data->get_current_tier(); }
 
-const idata_representation* data_batch_core::get_data() const { return _data.get(); }
+idata_representation* data_batch_core::get_data() const { return _data.get(); }
 
-const memory::memory_space* data_batch_core::get_memory_space() const
+memory::memory_space* data_batch_core::get_memory_space() const
 {
   return &(_data->get_memory_space());
 }

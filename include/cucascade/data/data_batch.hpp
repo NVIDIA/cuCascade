@@ -99,13 +99,13 @@ class data_batch_core {
    * @brief Get a raw pointer to the data representation.
    * @return Non-owning pointer to the data, or nullptr if empty.
    */
-  [[nodiscard]] const idata_representation* get_data() const;
+  [[nodiscard]] idata_representation* get_data() const;
 
   /**
    * @brief Get a raw pointer to the memory space.
    * @return Non-owning pointer to the memory space, or nullptr if data is null.
    */
-  [[nodiscard]] const memory::memory_space* get_memory_space() const;
+  [[nodiscard]] memory::memory_space* get_memory_space() const;
 
   /**
    * @brief Replace the data representation.
@@ -141,7 +141,7 @@ class data_batch_core {
 
     if (needs_sync) {
       // Conversions involving GPU may enqueue async operations on the provided
-      // stream that read from the source memory.  Synchronize before the old
+      // stream that read from the source memory. Synchronize before the old
       // representation is destroyed to avoid use-after-free.
       stream.synchronize();
     }
