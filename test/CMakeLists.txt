@@ -34,7 +34,6 @@ set(TEST_SOURCES
     # Memory tests
     ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_memory_reservation_manager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_small_pinned_host_memory_resource.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_topology_discovery.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_gpu_kernels.cu
     # Data tests
     ${CMAKE_CURRENT_SOURCE_DIR}/data/test_bandwidth_profiler.cpp
@@ -66,3 +65,23 @@ target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
 
 # Register tests with CTest
 add_test(NAME cucascade_tests COMMAND cucascade_tests)
+
+# Create topology discovery test executable
+add_executable(cucascade_topology_discovery_tests
+               memory/test_topology_discovery.cpp unittest.cpp)
+set_target_properties(cucascade_topology_discovery_tests
+                      PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+
+# Set include directories
+target_include_directories(
+  cucascade_tests
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+          ${Catch2_SOURCE_DIR}/single_include)
+
+# Link dependencies
+target_link_libraries(cucascade_topology_discovery_tests
+                      PRIVATE cucascade Catch2::Catch2 CUDA::cudart_static)
+
+# Register tests with CTest
+add_test(NAME cucascade_topology_discovery_tests
+         COMMAND cucascade_topology_discovery_tests)
