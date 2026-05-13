@@ -152,7 +152,6 @@ bool is_numeric_token(std::string const& token)
 }
 
 std::vector<size_t> resolve_visible_gpu_indices(
-  NvmlLoader& nvml,
   std::vector<gpu_topology_info> const& nvml_gpus,
   std::unordered_map<std::string, size_t> const& index_by_pci,
   std::unordered_map<std::string, size_t> const& index_by_uuid)
@@ -190,22 +189,18 @@ std::vector<size_t> resolve_visible_gpu_indices(
       }
     } else if (token.starts_with("GPU-") || token.starts_with("MIG-")) {
       nvmlDevice_t handle;
-      if (nvml.p_nvmlDeviceGetHandleByUUID &&
-          nvml.p_nvmlDeviceGetHandleByUUID(token.c_str(), &handle) == NVML_SUCCESS) {
+      if (nvmlDeviceGetHandleByUUID(token.c_str(), &handle) == NVML_SUCCESS) {
         unsigned int is_mig = 0;
-        if (nvml.p_nvmlDeviceIsMigDeviceHandle &&
-            nvml.p_nvmlDeviceIsMigDeviceHandle(handle, &is_mig) == NVML_SUCCESS && is_mig &&
-            nvml.p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle) {
+        if (nvmlDeviceIsMigDeviceHandle(handle, &is_mig) == NVML_SUCCESS && is_mig) {
           nvmlDevice_t parent_handle;
-          if (nvml.p_nvmlDeviceGetDeviceHandleFromMigDeviceHandle(handle, &parent_handle) ==
+          if (nvmlDeviceGetDeviceHandleFromMigDeviceHandle(handle, &parent_handle) ==
               NVML_SUCCESS) {
             handle = parent_handle;
           }
         }
 
         nvmlPciInfo_t pci_info;
-        if (nvml.p_nvmlDeviceGetPciInfo_v3 &&
-            nvml.p_nvmlDeviceGetPciInfo_v3(handle, &pci_info) == NVML_SUCCESS) {
+        if (nvmlDeviceGetPciInfo_v3(handle, &pci_info) == NVML_SUCCESS) {
           std::string normalized = normalize_pci_bus_id(pci_info.busId);
           auto it                = index_by_pci.find(normalized);
           if (it != index_by_pci.end()) {
@@ -682,7 +677,7 @@ int count_numa_nodes()
 bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 {
   system_topology_info topology;
-  result = nvmlInit_v2();
+  nvmlReturn_t result = nvmlInit_v2();
   if (result != NVML_SUCCESS) {
     std::cerr << "Failed to initialize NVML: " << nvmlErrorString(result) << std::endl;
     // Continue anyway to report system info even without GPUs
@@ -781,7 +776,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
   }
 
   auto visible_indices =
-    resolve_visible_gpu_indices(nvml, nvml_gpus, nvml_index_by_pci, nvml_index_by_uuid);
+    resolve_visible_gpu_indices(nvml_gpus, nvml_index_by_pci, nvml_index_by_uuid);
   topology.num_gpus = static_cast<unsigned int>(visible_indices.size());
   for (size_t visible_idx = 0; visible_idx < visible_indices.size(); ++visible_idx) {
     size_t nvml_idx = visible_indices[visible_idx];
