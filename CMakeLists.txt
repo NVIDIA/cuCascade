@@ -204,6 +204,8 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
   target_include_directories(cucascade_topology_discovery_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)
+  # Work around a bug in libnvidia-ml.so - it attempts to call back into the
+  # stub library
   target_link_options(cucascade_topology_discovery_shared PRIVATE
                       "LINKER:--exclude-libs,libnvidia-ml")
 
