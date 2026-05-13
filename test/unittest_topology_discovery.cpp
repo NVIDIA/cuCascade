@@ -17,17 +17,7 @@
 
 #define CATCH_CONFIG_RUNNER
 
-#include <cuda_runtime_api.h>
-
 #include <catch2/catch.hpp>
-
-namespace {
-struct device_sync_listener : Catch::TestEventListenerBase {
-  using Catch::TestEventListenerBase::TestEventListenerBase;
-
-  void testCaseEnded(Catch::TestCaseStats const&) override { cudaDeviceSynchronize(); }
-};
-}  // namespace
 
 CATCH_REGISTER_LISTENER(device_sync_listener)
 
