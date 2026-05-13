@@ -62,8 +62,7 @@ class data_batch;
  * State transitions and synchronization live on data_batch. This core object only
  * exposes data/tier/memory methods to friend accessor classes.
  *
- * @note Non-copyable and non-movable. The object itself never moves; only the
- *       smart pointer to it is transferred between states.
+ * @note Non-copyable and non-movable. The object itself never moves.
  */
 class data_batch_core {
   friend data_batch;
@@ -86,7 +85,7 @@ class data_batch_core {
    *
    * @return The batch ID (immutable after construction).
    */
-  uint64_t get_batch_id() const;
+  [[nodiscard]] uint64_t get_batch_id() const;
 
   // Only friend accessor classes can call these methods.
 
@@ -94,19 +93,19 @@ class data_batch_core {
    * @brief Get the memory tier of the held data.
    * @return The current memory tier.
    */
-  memory::Tier get_current_tier() const;
+  [[nodiscard]] memory::Tier get_current_tier() const;
 
   /**
    * @brief Get a raw pointer to the data representation.
    * @return Non-owning pointer to the data, or nullptr if empty.
    */
-  idata_representation* get_data() const;
+  [[nodiscard]] const idata_representation* get_data() const;
 
   /**
    * @brief Get a raw pointer to the memory space.
    * @return Non-owning pointer to the memory space, or nullptr if data is null.
    */
-  memory::memory_space* get_memory_space() const;
+  [[nodiscard]] const memory::memory_space* get_memory_space() const;
 
   /**
    * @brief Replace the data representation.
@@ -148,6 +147,40 @@ class data_batch_core {
     }
   }
 
+  /**
+   * @brief Create an independent deep copy with representation conversion.
+   *
+   * The clone has a new batch ID and its data is converted to TargetRepresentation
+   * using the provided converter registry.
+   *
+   * @tparam TargetRepresentation Target representation type.
+   * @param registry           Converter registry for type-keyed dispatch.
+   * @param new_batch_id       Batch ID for the cloned batch.
+   * @param target_memory_space Target memory space for the converted data.
+   * @param stream              CUDA stream for memory operations.
+   * @return A new data_batch wrapped in shared_ptr.
+   */
+  template <typename TargetRepresentation>
+  [[nodiscard]] std::shared_ptr<data_batch> clone_to(
+    representation_converter_registry& registry,
+    uint64_t new_batch_id,
+    const memory::memory_space* target_memory_space,
+    rmm::cuda_stream_view stream) const;
+
+  /**
+   * @brief Create an independent deep copy of the batch data.
+   *
+   * The clone has a new batch ID and its own copy of the data representation,
+   * residing in the same memory space as the original.
+   *
+   * @param new_batch_id Batch ID for the cloned batch.
+   * @param stream       CUDA stream for memory operations.
+   * @return A new data_batch wrapped in shared_ptr.
+   * @throws std::runtime_error if the data is null.
+   */
+  [[nodiscard]] std::shared_ptr<data_batch> clone(uint64_t new_batch_id,
+                                                  rmm::cuda_stream_view stream) const;
+
  private:
   data_batch_core(uint64_t batch_id, std::unique_ptr<idata_representation> data);
 
@@ -164,13 +197,17 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   friend mutable_data_batch;
 
  public:
+  /**
+   * @brief Factory function to create new data_batches.
+   */
   static std::shared_ptr<data_batch> make(uint64_t batch_id,
                                           std::unique_ptr<idata_representation> data);
 
   /**
    * @brief Get the unique batch identifier.
    *
-   * Lock-free -- safe to call without acquiring an accessor.
+   * Lock-free -- safe to call without acquiring an accessor
+   * since batch_id is immutable after construction.
    *
    * @return The batch ID (immutable after construction).
    */
@@ -256,53 +293,8 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   size_t get_read_only_count() const { return _read_only_count.load(std::memory_order_acquire); }
 
-  /**
-   * @brief Create an independent deep copy with representation conversion.
-   *
-   * The clone has a new batch ID and its data is converted to TargetRepresentation
-   * using the provided converter registry.
-   *
-   * @tparam TargetRepresentation Target representation type.
-   * @param registry           Converter registry for type-keyed dispatch.
-   * @param new_batch_id       Batch ID for the cloned batch.
-   * @param target_memory_space Target memory space for the converted data.
-   * @param stream              CUDA stream for memory operations.
-   * @return A new data_batch wrapped in shared_ptr.
-   */
-  template <typename TargetRepresentation>
-  std::shared_ptr<data_batch> clone_to(representation_converter_registry& registry,
-                                       uint64_t new_batch_id,
-                                       const memory::memory_space* target_memory_space,
-                                       rmm::cuda_stream_view stream) const
-  {
-    auto new_representation =
-      registry.convert<TargetRepresentation>(*(_batch._data), target_memory_space, stream);
-    return make(new_batch_id, std::move(new_representation));
-  }
-
-  /**
-   * @brief Create an independent deep copy of the batch data.
-   *
-   * The clone has a new batch ID and its own copy of the data representation,
-   * residing in the same memory space as the original.
-   *
-   * @param new_batch_id Batch ID for the cloned batch.
-   * @param stream       CUDA stream for memory operations.
-   * @return A new data_batch wrapped in shared_ptr.
-   * @throws std::runtime_error if the data is null.
-   */
-  [[nodiscard]] std::shared_ptr<data_batch> clone(uint64_t new_batch_id,
-                                                  rmm::cuda_stream_view stream) const
-  {
-    auto cloned_data = _batch._data->clone(stream);
-    return make(new_batch_id, std::move(cloned_data));
-  }
-
  private:
-  data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
-    : _batch(data_batch_core(batch_id, std::move(data)))
-  {
-  }
+  data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data);
 
   data_batch_core _batch;
   mutable std::shared_mutex _rw_mutex;
@@ -311,6 +303,19 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   std::atomic<batch_state> _state{batch_state::idle};  ///< Observable lock state
   std::atomic<size_t> _read_only_count{0};  ///< Count of active read_only_data_batch instances
 };
+
+// Defined after data_batch's concrete definition to use data_batch::make
+template <typename TargetRepresentation>
+[[nodiscard]] std::shared_ptr<data_batch> data_batch_core::clone_to(
+  representation_converter_registry& registry,
+  uint64_t new_batch_id,
+  const memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream) const
+{
+  auto new_representation =
+    registry.convert<TargetRepresentation>(*_data, target_memory_space, stream);
+  return data_batch::make(new_batch_id, std::move(new_representation));
+}
 
 /**
  * @brief RAII read-only accessor for data_batch.

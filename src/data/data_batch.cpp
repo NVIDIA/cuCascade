@@ -17,6 +17,8 @@
 
 #include <cucascade/data/data_batch.hpp>
 
+#include <memory>
+
 namespace cucascade {
 
 // ========== data_batch_core ==========
@@ -25,11 +27,18 @@ uint64_t data_batch_core::get_batch_id() const { return _batch_id; }
 
 memory::Tier data_batch_core::get_current_tier() const { return _data->get_current_tier(); }
 
-idata_representation* data_batch_core::get_data() const { return _data.get(); }
+const idata_representation* data_batch_core::get_data() const { return _data.get(); }
 
-memory::memory_space* data_batch_core::get_memory_space() const
+const memory::memory_space* data_batch_core::get_memory_space() const
 {
   return &(_data->get_memory_space());
+}
+
+[[nodiscard]] std::shared_ptr<data_batch> data_batch_core::clone(uint64_t new_batch_id,
+                                                                 rmm::cuda_stream_view stream) const
+{
+  auto cloned_data = _data->clone(stream);
+  return data_batch::make(new_batch_id, std::move(cloned_data));
 }
 
 data_batch_core::data_batch_core(uint64_t batch_id, std::unique_ptr<idata_representation> data)
@@ -90,6 +99,11 @@ void data_batch::unsubscribe()
       return;
     }
   }
+}
+
+data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
+  : _batch(batch_id, std::move(data))
+{
 }
 
 // ========== read_only_data_batch ==========

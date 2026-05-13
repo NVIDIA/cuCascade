@@ -31,7 +31,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -112,6 +111,7 @@ TEST_CASE("data_batch get_read_only acquires shared access", "[data_batch]")
   auto batch = data_batch::make(1, std::move(data));
 
   auto ro = batch->get_read_only();
+
   REQUIRE(ro->get_batch_id() == 1);
   REQUIRE(ro->get_current_tier() == memory::Tier::GPU);
 }
@@ -491,7 +491,7 @@ TEST_CASE("data_batch clone creates independent copy", "[data_batch]")
   auto batch = data_batch::make(42, std::move(data));
 
   auto ro     = batch->get_read_only();
-  auto cloned = batch->clone(100, rmm::cuda_stream_view{});
+  auto cloned = ro->clone(100, rmm::cuda_stream_view{});
 
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 100);
@@ -510,13 +510,13 @@ TEST_CASE("data_batch clone with different batch IDs", "[data_batch]")
 
   auto ro = batch->get_read_only();
 
-  auto clone1 = batch->clone(1, rmm::cuda_stream_view{});
+  auto clone1 = ro->clone(1, rmm::cuda_stream_view{});
   REQUIRE(clone1->get_batch_id() == 1);
 
-  auto clone2 = batch->clone(0, rmm::cuda_stream_view{});
+  auto clone2 = ro->clone(0, rmm::cuda_stream_view{});
   REQUIRE(clone2->get_batch_id() == 0);
 
-  auto clone3 = batch->clone(UINT64_MAX, rmm::cuda_stream_view{});
+  auto clone3 = ro->clone(UINT64_MAX, rmm::cuda_stream_view{});
   REQUIRE(clone3->get_batch_id() == UINT64_MAX);
 }
 
@@ -527,7 +527,7 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
     auto data   = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto batch  = data_batch::make(1, std::move(data));
     auto ro     = batch->get_read_only();
-    auto cloned = batch->clone(2, rmm::cuda_stream_view{});
+    auto cloned = ro->clone(2, rmm::cuda_stream_view{});
     auto ro_cl  = cloned->get_read_only();
     REQUIRE(ro_cl->get_current_tier() == memory::Tier::GPU);
   }
@@ -536,7 +536,7 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
     auto data   = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
     auto batch  = data_batch::make(1, std::move(data));
     auto ro     = batch->get_read_only();
-    auto cloned = batch->clone(2, rmm::cuda_stream_view{});
+    auto cloned = ro->clone(2, rmm::cuda_stream_view{});
     auto ro_cl  = cloned->get_read_only();
     REQUIRE(ro_cl->get_current_tier() == memory::Tier::HOST);
   }
@@ -545,7 +545,7 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
     auto data   = std::make_unique<mock_data_representation>(memory::Tier::DISK, 1024);
     auto batch  = data_batch::make(1, std::move(data));
     auto ro     = batch->get_read_only();
-    auto cloned = batch->clone(2, rmm::cuda_stream_view{});
+    auto cloned = ro->clone(2, rmm::cuda_stream_view{});
     auto ro_cl  = cloned->get_read_only();
     REQUIRE(ro_cl->get_current_tier() == memory::Tier::DISK);
   }
@@ -569,14 +569,14 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->get_read_only();
-  auto cloned = batch->clone(2, stream.view());
+  auto cloned = ro->clone(2, stream.view());
   REQUIRE(cloned != nullptr);
   REQUIRE(cloned->get_batch_id() == 2);
 
   auto ro_clone = cloned->get_read_only();
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro->get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone->get_data());
+  const auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro->get_data());
+  const auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone->get_data());
   REQUIRE(original_repr != nullptr);
   REQUIRE(cloned_repr != nullptr);
 
@@ -600,12 +600,12 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->get_read_only();
-  auto cloned = batch->clone(2, stream.view());
+  auto cloned = ro->clone(2, stream.view());
 
   auto ro_clone = cloned->get_read_only();
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro->get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone->get_data());
+  const auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro->get_data());
+  const auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone->get_data());
 
   // Verify each column points to different memory
   for (cudf::size_type i = 0; i < original_repr->get_table_view().num_columns(); ++i) {
@@ -626,9 +626,9 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
 
   // Clone 3 times from the same read_only accessor (clone does not consume the accessor)
   auto ro     = batch->get_read_only();
-  auto clone1 = batch->clone(10, stream.view());
-  auto clone2 = batch->clone(20, stream.view());
-  auto clone3 = batch->clone(30, stream.view());
+  auto clone1 = ro->clone(10, stream.view());
+  auto clone2 = ro->clone(20, stream.view());
+  auto clone3 = ro->clone(30, stream.view());
 
   REQUIRE(clone1->get_batch_id() == 10);
   REQUIRE(clone2->get_batch_id() == 20);
@@ -638,10 +638,10 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
   auto ro_c2 = clone2->get_read_only();
   auto ro_c3 = clone3->get_read_only();
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro->get_data());
-  auto* clone1_repr   = dynamic_cast<gpu_table_representation*>(ro_c1->get_data());
-  auto* clone2_repr   = dynamic_cast<gpu_table_representation*>(ro_c2->get_data());
-  auto* clone3_repr   = dynamic_cast<gpu_table_representation*>(ro_c3->get_data());
+  const auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro->get_data());
+  const auto* clone1_repr   = dynamic_cast<const gpu_table_representation*>(ro_c1->get_data());
+  const auto* clone2_repr   = dynamic_cast<const gpu_table_representation*>(ro_c2->get_data());
+  const auto* clone3_repr   = dynamic_cast<const gpu_table_representation*>(ro_c3->get_data());
 
   stream.synchronize();
   expect_cudf_tables_equal_on_stream(
@@ -663,11 +663,11 @@ TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->get_read_only();
-  auto cloned = batch->clone(2, stream.view());
+  auto cloned = ro->clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
-  auto ro_clone     = cloned->get_read_only();
-  auto* cloned_repr = dynamic_cast<gpu_table_representation*>(ro_clone->get_data());
+  auto ro_clone           = cloned->get_read_only();
+  const auto* cloned_repr = dynamic_cast<const gpu_table_representation*>(ro_clone->get_data());
   REQUIRE(cloned_repr != nullptr);
   REQUIRE(cloned_repr->get_table_view().num_rows() == 0);
   REQUIRE(cloned_repr->get_table_view().num_columns() == 2);
@@ -685,13 +685,13 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->get_read_only();
-  auto cloned = batch->clone(2, stream.view());
+  auto cloned = ro->clone(2, stream.view());
   REQUIRE(cloned != nullptr);
 
   auto ro_clone = cloned->get_read_only();
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro->get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone->get_data());
+  const auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro->get_data());
+  const auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone->get_data());
 
   // Verify structure
   REQUIRE(cloned_repr->get_table_view().num_rows() == 10000);
