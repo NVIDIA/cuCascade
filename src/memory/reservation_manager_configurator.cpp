@@ -176,6 +176,12 @@ builder_reference& reservation_manager_configurator::set_host_memory_resource_fa
   return *this;
 }
 
+builder_reference& reservation_manager_configurator::set_host_portability(bool make_portable)
+{
+  _host_memory_portability = make_portable;
+  return *this;
+}
+
 builder_reference& reservation_manager_configurator::set_disk_mounting_point(
   int uuid, std::size_t capacity, std::string mounting_point)
 {
@@ -198,6 +204,7 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
 {
   auto gpus_info  = extract_gpu_ids(topology);
   auto host_infos = extract_host_ids(gpus_info, topology);
+  bool const make_host_portable = _host_memory_portability.value_or(gpus_info.size() > 1);
 
   std::vector<memory_space_config> configs;
   for (auto& info : gpus_info) {
@@ -227,13 +234,14 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
     host_memory_space_config config;
     config.numa_id         = info.space_id;
     config.memory_capacity = per_host_capacity;
-    config.mr_factory_fn =
-      (info.space_id == info.numa_id)
-        ? _cpu_mr_fn
-        : [current_mr_fn = _cpu_mr_fn, numa_id = info.numa_id](
-            int, size_t capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
-      return current_mr_fn(numa_id, capacity);
+    config.make_portable   = make_host_portable;
+    DeviceMemoryResourceFactoryFn host_mr_fn =
+      [current_mr_fn = _cpu_mr_fn, numa_id = info.numa_id, make_host_portable](
+        int, size_t capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
+      if (current_mr_fn) { return current_mr_fn(numa_id, capacity); }
+      return make_default_host_memory_resource(numa_id, capacity, make_host_portable);
     };
+    config.mr_factory_fn = std::move(host_mr_fn);
     config.reservation_limit_fraction = _cpu_reservation.get_fraction(per_host_capacity);
     config.downgrade_trigger_fraction = downgrade_fractions_per_host_.first;
     config.downgrade_stop_fraction    = downgrade_fractions_per_host_.second;

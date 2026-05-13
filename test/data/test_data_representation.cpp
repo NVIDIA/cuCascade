@@ -44,8 +44,10 @@
 
 #include <catch2/catch.hpp>
 
+#include <array>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <vector>
 
 using namespace cucascade;
@@ -648,16 +650,17 @@ TEST_CASE("host_data_packed_representation clone creates independent copy",
 // =============================================================================
 
 /// Read `size` bytes from a multi-block allocation starting at byte offset `offset`.
-static std::vector<uint8_t> read_from_alloc(const memory::fixed_multiple_blocks_allocation& alloc,
-                                            std::size_t offset,
-                                            std::size_t size)
+static std::vector<uint8_t> read_from_alloc(
+  const memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  std::size_t offset,
+  std::size_t size)
 {
   std::vector<uint8_t> result(size);
-  const std::size_t blk_sz = alloc->block_size();
+  const std::size_t blk_sz = alloc.block_size();
   std::size_t bi = offset / blk_sz, bo = offset % blk_sz, di = 0;
   while (di < size) {
     std::size_t n = std::min(size - di, blk_sz - bo);
-    std::memcpy(result.data() + di, alloc->at(bi).data() + bo, n);
+    std::memcpy(result.data() + di, alloc.at(bi).data() + bo, n);
     di += n;
     bo += n;
     if (bo == blk_sz) {
@@ -798,7 +801,7 @@ TEST_CASE("Fast converter copies INT32 data bytes correctly", "[fast][data_integ
 
   const auto& meta = host->get_host_table()->columns[0];
   auto actual_bytes =
-    read_from_alloc(host->get_host_table()->allocation, meta.data_offset, meta.data_size);
+    read_from_alloc(*host->get_host_table()->allocation, meta.data_offset, meta.data_size);
   auto expected_bytes = gpu_bytes(gpu_ptr, meta.data_size);
   REQUIRE(actual_bytes == expected_bytes);
 }
@@ -829,7 +832,7 @@ TEST_CASE("Fast converter copies FLOAT64 data bytes correctly", "[fast][data_int
 
   const auto& meta = host->get_host_table()->columns[0];
   auto actual_bytes =
-    read_from_alloc(host->get_host_table()->allocation, meta.data_offset, meta.data_size);
+    read_from_alloc(*host->get_host_table()->allocation, meta.data_offset, meta.data_size);
   auto expected_bytes = gpu_bytes(gpu_ptr, meta.data_size);
   REQUIRE(actual_bytes == expected_bytes);
 }
@@ -865,7 +868,7 @@ TEST_CASE("Fast converter: nullable INT32 — null mask metadata and bytes", "[f
   REQUIRE(meta.null_mask_size == cudf::bitmask_allocation_size_bytes(N));
 
   auto actual_mask =
-    read_from_alloc(host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
+    read_from_alloc(*host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
   auto expected_mask = gpu_bytes(mask_ptr, meta.null_mask_size);
   REQUIRE(actual_mask == expected_mask);
 }
@@ -899,12 +902,12 @@ TEST_CASE("Fast converter: nullable INT64 — both null mask and data bytes are 
   const auto& meta = host->get_host_table()->columns[0];
 
   auto actual_data =
-    read_from_alloc(host->get_host_table()->allocation, meta.data_offset, meta.data_size);
+    read_from_alloc(*host->get_host_table()->allocation, meta.data_offset, meta.data_size);
   auto expected_data = gpu_bytes(data_ptr, meta.data_size);
   REQUIRE(actual_data == expected_data);
 
   auto actual_mask =
-    read_from_alloc(host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
+    read_from_alloc(*host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
   auto expected_mask = gpu_bytes(mask_ptr, meta.null_mask_size);
   REQUIRE(actual_mask == expected_mask);
 }
@@ -1777,9 +1780,9 @@ TEST_CASE("host_data_representation clone: same bytes, independent allocation", 
   const auto& orig_meta  = host->get_host_table()->columns[0];
   const auto& clone_meta = cloned->get_host_table()->columns[0];
   auto orig_bytes =
-    read_from_alloc(host->get_host_table()->allocation, orig_meta.data_offset, orig_meta.data_size);
+    read_from_alloc(*host->get_host_table()->allocation, orig_meta.data_offset, orig_meta.data_size);
   auto clone_bytes = read_from_alloc(
-    cloned->get_host_table()->allocation, clone_meta.data_offset, clone_meta.data_size);
+    *cloned->get_host_table()->allocation, clone_meta.data_offset, clone_meta.data_size);
   REQUIRE(orig_bytes == clone_bytes);
   REQUIRE(orig_bytes[0] == 0x55);  // Known fill pattern
 }
@@ -2123,4 +2126,107 @@ TEST_CASE("Round-trip fast: empty table (0 rows)", "[fast][roundtrip]")
   REQUIRE(back->get_table_view().num_columns() == 1);
   REQUIRE(back->get_table_view().num_rows() == 0);
   REQUIRE(back->get_table_view().column(0).type().id() == cudf::type_id::INT32);
+}
+
+// =============================================================================
+// host_data_representation::slice round-trip
+// =============================================================================
+
+namespace {
+
+/// Build a GPU table with four primitive columns, each filled with a distinct byte pattern so a
+/// mis-routed slice (wrong column or wrong bytes) is detectable byte-for-byte.
+std::unique_ptr<cudf::table> build_four_column_gpu_table(rmm::cuda_stream_view stream,
+                                                         rmm::device_async_resource_ref mr,
+                                                         int num_rows)
+{
+  auto fill = [&](cudf::data_type dt, std::size_t bytes_per_row, uint8_t pattern) {
+    auto col = cudf::make_numeric_column(dt, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+    if (num_rows > 0) {
+      auto bytes = static_cast<std::size_t>(num_rows) * bytes_per_row;
+      CUCASCADE_CUDA_TRY(
+        cudaMemsetAsync(col->mutable_view().head(), pattern, bytes, stream.value()));
+    }
+    return col;
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(fill(cudf::data_type{cudf::type_id::INT32}, sizeof(int32_t), 0xA1));
+  cols.push_back(fill(cudf::data_type{cudf::type_id::INT64}, sizeof(int64_t), 0xB2));
+  cols.push_back(fill(cudf::data_type{cudf::type_id::FLOAT32}, sizeof(float), 0xC3));
+  cols.push_back(fill(cudf::data_type{cudf::type_id::FLOAT64}, sizeof(double), 0xD4));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+}  // namespace
+
+TEST_CASE("host_data_representation::slice round-trip preserves selected columns",
+          "[fast][slice][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 128;
+  auto orig_table =
+    build_four_column_gpu_table(stream.view(), gpu_space->get_default_allocator(), N);
+  stream.synchronize();
+  const cudf::table_view orig_view = orig_table->view();
+
+  // GPU -> HOST
+  gpu_table_representation gpu_repr(std::move(orig_table),
+                                    *const_cast<memory::memory_space*>(gpu_space));
+  auto host = fast_convert(gpu_repr, host_space, registry, stream.view());
+  stream.synchronize();
+  REQUIRE(host->num_columns() == 4);
+
+  SECTION("Slice keeps non-contiguous subset and matches original columns")
+  {
+    const std::array<std::size_t, 2> kept{0, 2};
+    auto sliced = host->slice(std::span<const std::size_t>(kept.data(), kept.size()));
+    REQUIRE(sliced != nullptr);
+    REQUIRE(sliced->num_columns() == 2);
+    REQUIRE(sliced->column_size(0) == host->column_size(0));
+    REQUIRE(sliced->column_size(1) == host->column_size(2));
+    // Slice shares buffers with the source allocation.
+    REQUIRE(sliced->get_host_table()->allocation.get() ==
+            host->get_host_table()->allocation.get());
+
+    auto back = fast_back_convert(*sliced, gpu_space, registry, stream.view());
+    stream.synchronize();
+    REQUIRE(back != nullptr);
+    REQUIRE(back->get_table_view().num_columns() == 2);
+
+    const cudf::table_view expected_view{
+      {orig_view.column(kept[0]), orig_view.column(kept[1])}};
+    cucascade::test::expect_cudf_tables_equal_on_stream(
+      expected_view, back->get_table_view(), stream.view());
+  }
+
+  SECTION("Reordered slice maps to the requested column order")
+  {
+    const std::array<std::size_t, 3> kept{3, 1, 0};
+    auto sliced = host->slice(std::span<const std::size_t>(kept.data(), kept.size()));
+    REQUIRE(sliced->num_columns() == 3);
+
+    auto back = fast_back_convert(*sliced, gpu_space, registry, stream.view());
+    stream.synchronize();
+    REQUIRE(back->get_table_view().num_columns() == 3);
+
+    const cudf::table_view expected_view{
+      {orig_view.column(kept[0]), orig_view.column(kept[1]), orig_view.column(kept[2])}};
+    cucascade::test::expect_cudf_tables_equal_on_stream(
+      expected_view, back->get_table_view(), stream.view());
+  }
+
+  SECTION("Out-of-range index throws")
+  {
+    const std::array<std::size_t, 1> kept{4};  // valid range is [0, 4)
+    REQUIRE_THROWS_AS(host->slice(std::span<const std::size_t>(kept.data(), kept.size())),
+                      std::out_of_range);
+  }
 }

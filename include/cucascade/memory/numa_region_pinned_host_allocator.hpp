@@ -27,7 +27,7 @@ namespace memory {
 
 class numa_region_pinned_host_memory_resource final {
  public:
-  explicit numa_region_pinned_host_memory_resource(int numa_node) : _numa_node(numa_node) {}
+  explicit numa_region_pinned_host_memory_resource(int numa_node, bool make_portable = false);
   ~numa_region_pinned_host_memory_resource()                                              = default;
   numa_region_pinned_host_memory_resource(numa_region_pinned_host_memory_resource const&) = default;
   numa_region_pinned_host_memory_resource(numa_region_pinned_host_memory_resource&&)      = default;
@@ -77,7 +77,10 @@ class numa_region_pinned_host_memory_resource final {
   }
 
  private:
+  static int cuda_host_flags(int numa_node, bool make_portable) noexcept;
+
   int _numa_node{-1};
+  int _cuda_host_flags{0};
 };
 
 }  // namespace memory
