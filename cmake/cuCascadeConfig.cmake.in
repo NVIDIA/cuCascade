@@ -3,7 +3,7 @@
 include(CMakeFindDependencyMacro)
 
 # Find required dependencies
-find_dependency(CUDAToolkit REQUIRED VERSION 12.4)
+find_dependency(CUDAToolkit REQUIRED VERSION 12.9)
 find_dependency(Threads REQUIRED)
 find_dependency(rmm REQUIRED CONFIG)
 find_dependency(cudf REQUIRED CONFIG)
