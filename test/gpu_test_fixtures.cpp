@@ -32,6 +32,8 @@
 #include <optional>
 #include <utility>
 
+#define CATCH_CONFIG_RUNNER
+
 namespace {
 
 #if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6)
