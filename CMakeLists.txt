@@ -137,6 +137,8 @@ target_include_directories(cucascade_topology_discovery_objects
 
 # Link dependencies to object library
 target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+target_link_libraries(cucascade_topology_discovery_objects
+                      PUBLIC $<COMPILE_ONLY:CUDA::nvml>)
 
 # cxx_std_20 is PUBLIC so consumers know they need C++20 to use our headers.
 # cuda_std_20 is kept separate and applied PRIVATE to cucascade_objects to avoid
@@ -162,6 +164,8 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
   add_library(cuCascade::cucascade_topology_discovery_static ALIAS
               cucascade_topology_discovery_static)
 
+  target_link_libraries(cucascade_topology_discovery_static
+                        PRIVATE ${CMAKE_DL_LIBS})
   target_include_directories(cucascade_topology_discovery_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
@@ -195,6 +199,8 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
   add_library(cuCascade::cucascade_topology_discovery_shared ALIAS
               cucascade_topology_discovery_shared)
 
+  target_link_libraries(cucascade_topology_discovery_shared
+                        PRIVATE ${CMAKE_DL_LIBS})
   target_include_directories(cucascade_topology_discovery_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)
