@@ -80,7 +80,7 @@ target_include_directories(
 
 # Link dependencies
 target_link_libraries(cucascade_topology_discovery_tests
-                      PRIVATE cucascade Catch2::Catch2 CUDA::cudart_static)
+                      PRIVATE cucascade_topology_discovery Catch2::Catch2)
 
 # Register tests with CTest
 add_test(NAME cucascade_topology_discovery_tests
