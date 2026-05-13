@@ -98,10 +98,15 @@ endif()
 # Object library (compiles sources once, used by both static and shared libs)
 # =============================================================================
 add_library(cucascade_objects OBJECT)
+add_library(cucascade_topology_discovery_objects OBJECT)
 
 # Apply warning flags to object library
 target_compile_options(
   cucascade_objects
+  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
+          ${CUCASCADE_CUDA_WARNING_FLAGS})
+target_compile_options(
+  cucascade_topology_discovery_objects
   PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
           ${CUCASCADE_CUDA_WARNING_FLAGS})
 
@@ -127,6 +132,8 @@ set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart
 # Set include directories for the object library
 target_include_directories(cucascade_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+target_include_directories(cucascade_topology_discovery_objects
+                           PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
 
 # Link dependencies to object library
 target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
@@ -136,20 +143,42 @@ target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
 # propagating it to consumers that have no CUDA compiler requirement.
 target_compile_features(cucascade_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_objects PRIVATE cuda_std_20)
+target_compile_features(cucascade_topology_discovery_objects PUBLIC cxx_std_20)
+target_compile_features(cucascade_topology_discovery_objects
+                        PRIVATE cuda_std_20)
 
 set_target_properties(cucascade_objects PROPERTIES CXX_EXTENSIONS OFF
                                                    POSITION_INDEPENDENT_CODE ON)
+set_target_properties(
+  cucascade_topology_discovery_objects PROPERTIES CXX_EXTENSIONS OFF
+                                                  POSITION_INDEPENDENT_CODE ON)
 
 # =============================================================================
 # Static library
 # =============================================================================
 if(CUCASCADE_BUILD_STATIC_LIBS)
+  add_library(cucascade_topology_discovery_static STATIC
+              $<TARGET_OBJECTS:cucascade_topology_discovery_objects>)
+  add_library(cuCascade::cucascade_topology_discovery_static ALIAS
+              cucascade_topology_discovery_static)
+
+  target_include_directories(cucascade_topology_discovery_static
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
+
+  set_target_properties(
+    cucascade_topology_discovery_static
+    PROPERTIES OUTPUT_NAME cucascade_topology_discovery
+               EXPORT_NAME cucascade_topology_discovery_static)
+
   add_library(cucascade_static STATIC $<TARGET_OBJECTS:cucascade_objects>)
   add_library(cuCascade::cucascade_static ALIAS cucascade_static)
 
   target_include_directories(cucascade_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
-  target_link_libraries(cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+  target_link_libraries(
+    cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
+                            cucascade_topology_discovery_static)
   target_compile_features(cucascade_static PUBLIC cxx_std_20)
 
   set_target_properties(
@@ -161,12 +190,29 @@ endif()
 # Shared library
 # =============================================================================
 if(CUCASCADE_BUILD_SHARED_LIBS)
+  add_library(cucascade_topology_discovery_shared SHARED
+              $<TARGET_OBJECTS:cucascade_topology_discovery_objects>)
+  add_library(cuCascade::cucascade_topology_discovery_shared ALIAS
+              cucascade_topology_discovery_shared)
+
+  target_include_directories(cucascade_topology_discovery_shared
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)
+
+  set_target_properties(
+    cucascade_topology_discovery_shared
+    PROPERTIES OUTPUT_NAME cucascade_topology_discovery
+               VERSION ${PROJECT_VERSION}
+               SOVERSION ${PROJECT_VERSION_MAJOR})
+
   add_library(cucascade_shared SHARED $<TARGET_OBJECTS:cucascade_objects>)
   add_library(cuCascade::cucascade_shared ALIAS cucascade_shared)
 
   target_include_directories(cucascade_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
-  target_link_libraries(cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+  target_link_libraries(
+    cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
+                            cucascade_topology_discovery_shared)
   target_compile_features(cucascade_shared PUBLIC cxx_std_20)
 
   set_target_properties(
@@ -181,11 +227,18 @@ endif()
 # =============================================================================
 if(CUCASCADE_BUILD_SHARED_LIBS)
   add_library(cuCascade::cucascade ALIAS cucascade_shared)
+  add_library(cuCascade::cucascade ALIAS cucascade_topology_discovery_shared)
   # For backwards compatibility, also create 'cucascade' as an alias
   add_library(cucascade ALIAS cucascade_shared)
+  add_library(cucascade_topology_discovery ALIAS
+              cucascade_topology_discovery_shared)
 elseif(CUCASCADE_BUILD_STATIC_LIBS)
   add_library(cuCascade::cucascade ALIAS cucascade_static)
+  add_library(cuCascade::cucascade_topology_discovery ALIAS
+              cucascade_topology_discovery_static)
   add_library(cucascade ALIAS cucascade_static)
+  add_library(cucascade_topology_discovery ALIAS
+              cucascade_topology_discovery_static)
 endif()
 
 # =============================================================================
@@ -205,10 +258,12 @@ install(
 # Collect targets to install
 set(CUCASCADE_INSTALL_TARGETS)
 if(CUCASCADE_BUILD_STATIC_LIBS)
-  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_static)
+  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_static
+       cucascade_topology_discovery_static)
 endif()
 if(CUCASCADE_BUILD_SHARED_LIBS)
-  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared)
+  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared
+       cucascade_topology_discovery_shared)
 endif()
 
 # Install library targets

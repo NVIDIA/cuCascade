@@ -31,5 +31,6 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/reservation_manager_configurator.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/small_pinned_host_memory_resource.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/stream_pool.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/error.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/topology_discovery.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/error.cpp)
+target_sources(cucascade_topology_discovery_objects
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/topology_discovery.cpp)
