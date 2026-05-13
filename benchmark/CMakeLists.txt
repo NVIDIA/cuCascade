@@ -65,7 +65,7 @@ target_compile_options(
 # Link dependencies
 target_link_libraries(
   cucascade_benchmarks PRIVATE cucascade benchmark::benchmark
-                               benchmark::benchmark_main CUDA::cudart)
+                               benchmark::benchmark_main CUDA::cudart_static)
 
 # Add custom target to run benchmarks
 add_custom_target(
