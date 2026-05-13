@@ -27,23 +27,23 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(
   cucascade_tests
   # Utils
-  ${CMAKE_CURRENT_SOURCE_DIR}/utils/cudf_test_utils.cpp
+  utils/cudf_test_utils.cpp
   # Memory tests
-  ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_memory_reservation_manager.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_small_pinned_host_memory_resource.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_gpu_kernels.cu
+  memory/test_memory_reservation_manager.cpp
+  memory/test_small_pinned_host_memory_resource.cpp
+  memory/test_gpu_kernels.cu
   # Data tests
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_bandwidth_profiler.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_batch.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_repository.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_repository_manager.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_representation.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_disk_io_backend.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_disk_host_converters.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_gpu_disk_converters.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/data/test_representation_converter.cpp
+  data/test_bandwidth_profiler.cpp
+  data/test_data_batch.cpp
+  data/test_data_repository.cpp
+  data/test_data_repository_manager.cpp
+  data/test_data_representation.cpp
+  data/test_disk_io_backend.cpp
+  data/test_disk_host_converters.cpp
+  data/test_gpu_disk_converters.cpp
+  data/test_representation_converter.cpp
   # Main test runner
-  ${CMAKE_CURRENT_SOURCE_DIR}/unittest.cpp)
+  unittest.cpp)
 set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
                                                  CUDA_STANDARD_REQUIRED ON)
 
