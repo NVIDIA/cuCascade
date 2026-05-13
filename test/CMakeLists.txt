@@ -43,7 +43,8 @@ add_executable(
   data/test_gpu_disk_converters.cpp
   data/test_representation_converter.cpp
   # Main test runner
-  unittest.cpp)
+  unittest.cpp
+  gpu_test_fixtures.cpp)
 set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
                                                  CUDA_STANDARD_REQUIRED ON)
 
@@ -61,9 +62,8 @@ target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
 add_test(NAME cucascade_tests COMMAND cucascade_tests)
 
 # Create topology discovery test executable
-add_executable(
-  cucascade_topology_discovery_tests memory/test_topology_discovery.cpp
-                                     unittest_topology_discovery.cpp)
+add_executable(cucascade_topology_discovery_tests
+               memory/test_topology_discovery.cpp unittest.cpp)
 set_target_properties(cucascade_topology_discovery_tests
                       PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
