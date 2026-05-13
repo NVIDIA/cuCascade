@@ -227,7 +227,8 @@ endif()
 # =============================================================================
 if(CUCASCADE_BUILD_SHARED_LIBS)
   add_library(cuCascade::cucascade ALIAS cucascade_shared)
-  add_library(cuCascade::cucascade ALIAS cucascade_topology_discovery_shared)
+  add_library(cuCascade::cucascade_topology_discovery ALIAS
+              cucascade_topology_discovery_shared)
   # For backwards compatibility, also create 'cucascade' as an alias
   add_library(cucascade ALIAS cucascade_shared)
   add_library(cucascade_topology_discovery ALIAS
