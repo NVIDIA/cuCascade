@@ -106,13 +106,15 @@ class io_worker {
     }
   }
 
-  std::thread _thread;
   std::mutex _mutex;
   std::condition_variable _cv;
   std::function<void()> _pending_work;
   std::promise<void> _pending_promise;
   bool _has_task{false};
   bool _shutdown{false};
+
+  // This has to be constructed last to prevent constructor race conditions
+  std::thread _thread;
 };
 
 /// Each pinned buffer is 64 MB — matches NVMe optimal I/O size
