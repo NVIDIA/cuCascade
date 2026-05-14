@@ -39,6 +39,10 @@ if(NOT CUCASCADE_BUILD_SHARED_LIBS AND NOT CUCASCADE_BUILD_STATIC_LIBS)
   )
 endif()
 
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
+
+# TODO: Remove vendored FindCUDAToolkit once we require CMake 4.4
+
 # Find required packages
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)

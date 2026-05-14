@@ -59,6 +59,10 @@ repos:
     rev: v0.6.13
     hooks:
       - id: cmake-format
+        # TODO: Remove vendored FindCUDAToolkit once we require CMake 4.4
+        exclude: |
+          (?x)
+            ^cmake/Modules/FindCUDAToolkit[.]cmake$
       - id: cmake-lint
         args:
           [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
