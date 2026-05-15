@@ -173,6 +173,10 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
   target_include_directories(cucascade_topology_discovery_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
+  # Work around a bug in libnvidia-ml.so - it attempts to call back into the
+  # stub library (https://nvbugspro.nvidia.com/bug/6174166)
+  target_link_options(cucascade_topology_discovery_static INTERFACE
+                      "LINKER:--exclude-libs,libnvidia-ml")
 
   set_target_properties(
     cucascade_topology_discovery_static
