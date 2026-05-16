@@ -786,7 +786,14 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     topology.gpus.push_back(std::move(gpu));
   }
 
-  if (nvml_available) { nvmlShutdown(); }
+  // Intentionally do NOT call nvmlShutdown() here. With the statically-linked
+  // libnvidia-ml (see PR #127) and the CUDA driver's own internal NVML state,
+  // tearing NVML down between discover() invocations leaves stale function
+  // pointers in driver-side data structures, causing the next discover() call
+  // (or any subsequent NVML user in the same process) to crash dereferencing
+  // a `??` address. NVML's init is refcounted and process-wide; leaving it
+  // initialized for the lifetime of the process is the documented usage
+  // pattern for long-lived applications.
 
   _topology = std::move(topology);
   return true;
