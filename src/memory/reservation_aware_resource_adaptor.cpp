@@ -431,7 +431,7 @@ void* impl_type::do_allocate_unmanaged(std::size_t allocation_bytes,
     }
   } else {
     throw cucascade_out_of_memory("not enough capacity to allocate memory",
-                                  MemoryError::POOL_EXHAUSTED,
+                                  MemoryError::LIMIT_EXCEEDED,
                                   allocation_bytes,
                                   post_allocation_size,
                                   _pool_handle);

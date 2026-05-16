@@ -39,6 +39,7 @@ add_executable(
   data/test_data_repository_manager.cpp
   data/test_data_representation.cpp
   data/test_disk_io_backend.cpp
+  data/test_io_worker.cpp
   data/test_disk_host_converters.cpp
   data/test_gpu_disk_converters.cpp
   data/test_representation_converter.cpp
