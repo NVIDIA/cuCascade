@@ -118,15 +118,11 @@ void clone_column_buffers(
   memory::fixed_size_host_memory_resource::multiple_blocks_allocation& dst)
 {
   if (src_meta.has_null_mask && src_meta.null_mask_size > 0) {
-    copy_between_blocks(src,
-                        src_meta.null_mask_offset,
-                        dst,
-                        dst_meta.null_mask_offset,
-                        src_meta.null_mask_size);
+    copy_between_blocks(
+      src, src_meta.null_mask_offset, dst, dst_meta.null_mask_offset, src_meta.null_mask_size);
   }
   if (src_meta.has_data && src_meta.data_size > 0) {
-    copy_between_blocks(
-      src, src_meta.data_offset, dst, dst_meta.data_offset, src_meta.data_size);
+    copy_between_blocks(src, src_meta.data_offset, dst, dst_meta.data_offset, src_meta.data_size);
   }
   for (std::size_t i = 0; i < src_meta.children.size(); ++i) {
     clone_column_buffers(src_meta.children[i], dst_meta.children[i], src, dst);
@@ -251,9 +247,8 @@ std::unique_ptr<host_data_representation> host_data_representation::slice(
   std::span<const std::size_t> col_indices) const
 {
   auto sliced = _host_table->slice(col_indices);
-  return std::make_unique<host_data_representation>(std::move(sliced),
-                                                    &const_cast<memory::memory_space&>(
-                                                      get_memory_space()));
+  return std::make_unique<host_data_representation>(
+    std::move(sliced), &const_cast<memory::memory_space&>(get_memory_space()));
 }
 
 std::unique_ptr<idata_representation> host_data_representation::clone(

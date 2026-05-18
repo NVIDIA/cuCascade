@@ -202,8 +202,8 @@ std::vector<memory_space_config> reservation_manager_configurator::build() const
 std::vector<memory_space_config> reservation_manager_configurator::build(
   const system_topology_info& topology) const
 {
-  auto gpus_info  = extract_gpu_ids(topology);
-  auto host_infos = extract_host_ids(gpus_info, topology);
+  auto gpus_info                = extract_gpu_ids(topology);
+  auto host_infos               = extract_host_ids(gpus_info, topology);
   bool const make_host_portable = _host_memory_portability.value_or(gpus_info.size() > 1);
 
   std::vector<memory_space_config> configs;
@@ -241,7 +241,7 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
       if (current_mr_fn) { return current_mr_fn(numa_id, capacity); }
       return make_default_host_memory_resource(numa_id, capacity, make_host_portable);
     };
-    config.mr_factory_fn = std::move(host_mr_fn);
+    config.mr_factory_fn              = std::move(host_mr_fn);
     config.reservation_limit_fraction = _cpu_reservation.get_fraction(per_host_capacity);
     config.downgrade_trigger_fraction = downgrade_fractions_per_host_.first;
     config.downgrade_stop_fraction    = downgrade_fractions_per_host_.second;

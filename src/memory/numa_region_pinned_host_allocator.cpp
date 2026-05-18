@@ -25,8 +25,8 @@
 namespace cucascade {
 namespace memory {
 
-numa_region_pinned_host_memory_resource::numa_region_pinned_host_memory_resource(
-  int numa_node, bool make_portable)
+numa_region_pinned_host_memory_resource::numa_region_pinned_host_memory_resource(int numa_node,
+                                                                                 bool make_portable)
   : _numa_node(numa_node), _cuda_host_flags(cuda_host_flags(numa_node, make_portable))
 {
 }
@@ -39,9 +39,8 @@ int numa_region_pinned_host_memory_resource::cuda_host_flags(int numa_node,
                            : static_cast<int>(cudaHostRegisterMapped);
   }
 
-  return numa_node == -1
-           ? static_cast<int>(cudaHostAllocPortable | cudaHostAllocMapped)
-           : static_cast<int>(cudaHostRegisterPortable | cudaHostRegisterMapped);
+  return numa_node == -1 ? static_cast<int>(cudaHostAllocPortable | cudaHostAllocMapped)
+                         : static_cast<int>(cudaHostRegisterPortable | cudaHostRegisterMapped);
 }
 
 void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,

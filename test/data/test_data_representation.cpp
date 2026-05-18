@@ -897,8 +897,8 @@ TEST_CASE("Fast converter: nullable INT32 — null mask metadata and bytes", "[f
   REQUIRE(meta.has_null_mask == true);
   REQUIRE(meta.null_mask_size == cudf::bitmask_allocation_size_bytes(N));
 
-  auto actual_mask =
-    read_from_alloc(*host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
+  auto actual_mask = read_from_alloc(
+    *host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
   auto expected_mask = gpu_bytes(mask_ptr, meta.null_mask_size);
   REQUIRE(actual_mask == expected_mask);
 }
@@ -937,8 +937,8 @@ TEST_CASE("Fast converter: nullable INT64 — both null mask and data bytes are 
   auto expected_data = gpu_bytes(data_ptr, meta.data_size);
   REQUIRE(actual_data == expected_data);
 
-  auto actual_mask =
-    read_from_alloc(*host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
+  auto actual_mask = read_from_alloc(
+    *host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
   auto expected_mask = gpu_bytes(mask_ptr, meta.null_mask_size);
   REQUIRE(actual_mask == expected_mask);
 }
@@ -1829,8 +1829,8 @@ TEST_CASE("host_data_representation clone: same bytes, independent allocation", 
   // Byte content is identical
   const auto& orig_meta  = host->get_host_table()->columns[0];
   const auto& clone_meta = cloned->get_host_table()->columns[0];
-  auto orig_bytes =
-    read_from_alloc(*host->get_host_table()->allocation, orig_meta.data_offset, orig_meta.data_size);
+  auto orig_bytes        = read_from_alloc(
+    *host->get_host_table()->allocation, orig_meta.data_offset, orig_meta.data_size);
   auto clone_bytes = read_from_alloc(
     *cloned->get_host_table()->allocation, clone_meta.data_offset, clone_meta.data_size);
   REQUIRE(orig_bytes == clone_bytes);
@@ -2250,16 +2250,14 @@ TEST_CASE("host_data_representation::slice round-trip preserves selected columns
     REQUIRE(sliced->column_size(0) == host->column_size(0));
     REQUIRE(sliced->column_size(1) == host->column_size(2));
     // Slice shares buffers with the source allocation.
-    REQUIRE(sliced->get_host_table()->allocation.get() ==
-            host->get_host_table()->allocation.get());
+    REQUIRE(sliced->get_host_table()->allocation.get() == host->get_host_table()->allocation.get());
 
     auto back = fast_back_convert(*sliced, gpu_space, registry, stream.view());
     stream.synchronize();
     REQUIRE(back != nullptr);
     REQUIRE(back->get_table_view().num_columns() == 2);
 
-    const cudf::table_view expected_view{
-      {orig_view.column(kept[0]), orig_view.column(kept[1])}};
+    const cudf::table_view expected_view{{orig_view.column(kept[0]), orig_view.column(kept[1])}};
     cucascade::test::expect_cudf_tables_equal_on_stream(
       expected_view, back->get_table_view(), stream.view());
   }

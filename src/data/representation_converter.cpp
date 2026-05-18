@@ -571,8 +571,8 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   batch.flush(stream, cudaMemcpySrcAccessOrderStream);
   stream.synchronize();
 
-  auto host_alloc = memory::host_table_allocation::create(
-    std::move(allocation), std::move(columns), total_size);
+  auto host_alloc =
+    memory::host_table_allocation::create(std::move(allocation), std::move(columns), total_size);
 
   return std::make_unique<host_data_representation>(
     std::move(host_alloc), const_cast<memory::memory_space*>(target_memory_space));

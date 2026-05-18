@@ -267,8 +267,7 @@ make_default_host_memory_resource(int numa_node_id,
                                   [[maybe_unused]] size_t capacity,
                                   bool make_portable)
 {
-  return {cucascade::memory::numa_region_pinned_host_memory_resource(numa_node_id,
-                                                                     make_portable)};
+  return {cucascade::memory::numa_region_pinned_host_memory_resource(numa_node_id, make_portable)};
 }
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)

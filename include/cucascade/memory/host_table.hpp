@@ -70,8 +70,7 @@ struct column_metadata {
  */
 class host_table_allocation {
  public:
-  using buffers_ptr =
-    std::shared_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation>;
+  using buffers_ptr = std::shared_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation>;
 
   /**
    * @brief Construct a host_table_allocation taking ownership of @p buffers.
@@ -94,8 +93,7 @@ class host_table_allocation {
    * @return A new host_table_allocation referencing the shared buffers.
    * @throws std::out_of_range if any index is invalid.
    */
-  std::unique_ptr<host_table_allocation> slice(
-    std::span<const std::size_t> col_indices) const;
+  std::unique_ptr<host_table_allocation> slice(std::span<const std::size_t> col_indices) const;
 
   /**
    * @brief Deep-copy currently-present column buffers into @p target memory_space.
