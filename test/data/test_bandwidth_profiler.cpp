@@ -106,15 +106,12 @@ TEST_CASE("chunked_resource_info is exposed by fixed_size_host_memory_resource",
 
 TEST_CASE("measure_bandwidth rejects input without a GPU space", "[bandwidth_profiler]")
 {
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   auto& host              = shared_host_space();
   auto& disk              = shared_disk_space();
   std::array spaces_array = {host.get(), disk.get()};
   std::span<memory::memory_space* const> spaces{spaces_array};
 
-  REQUIRE_THROWS_AS(measure_bandwidth(spaces, registry, tiny_config()), std::invalid_argument);
+  REQUIRE_THROWS_AS(measure_bandwidth(spaces, tiny_config()), std::invalid_argument);
 }
 
 // =============================================================================
@@ -124,9 +121,6 @@ TEST_CASE("measure_bandwidth rejects input without a GPU space", "[bandwidth_pro
 TEST_CASE("measure_bandwidth enumerates pairs with bidirectional entries and no disk-to-disk",
           "[bandwidth_profiler]")
 {
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   auto& gpu   = shared_gpu_space();
   auto& host  = shared_host_space();
   auto& disk  = shared_disk_space();
@@ -138,7 +132,7 @@ TEST_CASE("measure_bandwidth enumerates pairs with bidirectional entries and no 
   std::array spaces_array = {gpu.get(), host.get(), disk.get(), disk2.get()};
   std::span<memory::memory_space* const> spaces{spaces_array};
 
-  auto profile = measure_bandwidth(spaces, registry, tiny_config());
+  auto profile = measure_bandwidth(spaces, tiny_config());
 
   // No self-pair and no disk-to-disk.
   for (auto const& pair : profile.pairs) {
@@ -172,9 +166,6 @@ TEST_CASE("measure_bandwidth enumerates pairs with bidirectional entries and no 
 
 TEST_CASE("measure_bandwidth records only the configured sizes per pair", "[bandwidth_profiler]")
 {
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   auto& gpu             = shared_gpu_space();
   auto& host            = shared_host_space();
   std::array spaces_arr = {gpu.get(), host.get()};
@@ -186,7 +177,7 @@ TEST_CASE("measure_bandwidth records only the configured sizes per pair", "[band
   cfg.timed_iterations   = 2;
   cfg.measure_disk_pairs = false;
 
-  auto profile = measure_bandwidth(spaces, registry, cfg);
+  auto profile = measure_bandwidth(spaces, cfg);
 
   auto const* gh = profile.find(gpu->get_id(), host->get_id());
   REQUIRE(gh != nullptr);
@@ -205,15 +196,12 @@ TEST_CASE("measure_bandwidth records only the configured sizes per pair", "[band
 TEST_CASE("per-pair result records chunk size for chunked source/destination spaces",
           "[bandwidth_profiler][chunked_resource_info]")
 {
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   auto& gpu             = shared_gpu_space();
   auto& host            = shared_host_space();
   std::array spaces_arr = {gpu.get(), host.get()};
   std::span<memory::memory_space* const> spaces{spaces_arr};
 
-  auto profile = measure_bandwidth(spaces, registry, tiny_config());
+  auto profile = measure_bandwidth(spaces, tiny_config());
 
   // GPU allocator is contiguous; HOST allocator is fixed_size_host_memory_resource (chunked).
   // So for every pair the chunked byte count should be > 0 on the HOST side and 0 on the GPU side.
@@ -232,15 +220,26 @@ TEST_CASE("per-pair result records chunk size for chunked source/destination spa
 TEST_CASE("pairs without a registered converter are reported as unavailable",
           "[bandwidth_profiler]")
 {
-  // Empty registry — no converters registered.
-  representation_converter_registry registry;
+  // The singleton normally has built-ins via lazy init; wipe it for the duration of this
+  // test (then restore) so we can exercise the "no converter" path of measure_bandwidth.
+  struct singleton_scrub {
+    representation_converter_registry& r;
+    singleton_scrub() : r(representation_converter_registry::instance()) { r.clear(); }
+    ~singleton_scrub()
+    {
+      try {
+        register_builtin_converters(r);
+      } catch (...) {
+      }
+    }
+  } guard;
 
   auto& gpu             = shared_gpu_space();
   auto& host            = shared_host_space();
   std::array spaces_arr = {gpu.get(), host.get()};
   std::span<memory::memory_space* const> spaces{spaces_arr};
 
-  auto profile = measure_bandwidth(spaces, registry, tiny_config());
+  auto profile = measure_bandwidth(spaces, tiny_config());
 
   // All enumerated pairs should be marked unavailable with a non-empty reason.
   REQUIRE_FALSE(profile.pairs.empty());
@@ -302,9 +301,6 @@ std::string format_bytes(std::size_t bytes)
 
 TEST_CASE("print bandwidth matrix", "[.bandwidth_matrix]")
 {
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
 
@@ -334,7 +330,7 @@ TEST_CASE("print bandwidth matrix", "[.bandwidth_matrix]")
   cfg.measure_disk_pairs            = true;
   cfg.drop_page_cache_between_iters = true;
 
-  auto profile = measure_bandwidth(spaces, registry, cfg);
+  auto profile = measure_bandwidth(spaces, cfg);
 
   std::ostringstream out;
   out << "\n\n=== Bandwidth Profile ===\n";
@@ -416,15 +412,12 @@ TEST_CASE("print bandwidth matrix", "[.bandwidth_matrix]")
 TEST_CASE("measure_bandwidth produces positive gbps for GPU<->HOST with builtin converters",
           "[bandwidth_profiler][integration]")
 {
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   auto& gpu             = shared_gpu_space();
   auto& host            = shared_host_space();
   std::array spaces_arr = {gpu.get(), host.get()};
   std::span<memory::memory_space* const> spaces{spaces_arr};
 
-  auto profile = measure_bandwidth(spaces, registry, tiny_config());
+  auto profile = measure_bandwidth(spaces, tiny_config());
 
   auto const* gh = profile.find(gpu->get_id(), host->get_id());
   auto const* hg = profile.find(host->get_id(), gpu->get_id());

@@ -110,6 +110,16 @@ class representation_converter_registry {
   ~representation_converter_registry() = default;
 
   /**
+   * @brief Access the process-wide registry instance.
+   *
+   * On first call, the registry is populated with the built-in converters via
+   * `register_builtin_converters`. Subsequent calls return the same instance.
+   *
+   * @return Reference to the singleton registry.
+   */
+  static representation_converter_registry& instance();
+
+  /**
    * @brief Register a converter between two representation types.
    *
    * @code

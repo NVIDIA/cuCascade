@@ -338,10 +338,9 @@ class read_only_data_batch {
    * @brief Create an independent deep copy with representation conversion.
    *
    * The clone has a new batch ID and its data is converted to TargetRepresentation
-   * using the provided converter registry.
+   * using the process-wide converter registry (`representation_converter_registry::instance()`).
    *
    * @tparam TargetRepresentation Target representation type.
-   * @param registry           Converter registry for type-keyed dispatch.
    * @param new_batch_id       Batch ID for the cloned batch.
    * @param target_memory_space Target memory space for the converted data.
    * @param stream              CUDA stream for memory operations.
@@ -349,7 +348,6 @@ class read_only_data_batch {
    */
   template <typename TargetRepresentation>
   [[nodiscard]] std::shared_ptr<data_batch> clone_to(
-    representation_converter_registry& registry,
     uint64_t new_batch_id,
     const memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream) const;
@@ -418,19 +416,17 @@ class mutable_data_batch {
   /**
    * @brief Convert the data representation in-place.
    *
-   * Replaces the held data with a new representation produced by the converter
-   * registry. If the conversion involves the GPU tier, synchronizes the stream
-   * before the old representation is destroyed to prevent use-after-free.
+   * Replaces the held data with a new representation produced by the process-wide
+   * converter registry (`representation_converter_registry::instance()`). If the
+   * conversion involves the GPU tier, synchronizes the stream before the old
+   * representation is destroyed to prevent use-after-free.
    *
    * @tparam TargetRepresentation Target representation type.
-   * @param registry           Converter registry for type-keyed dispatch.
    * @param target_memory_space Target memory space for the new representation.
    * @param stream              CUDA stream for memory operations.
    */
   template <typename TargetRepresentation>
-  void convert_to(representation_converter_registry& registry,
-                  const memory::memory_space* target_memory_space,
-                  rmm::cuda_stream_view stream);
+  void convert_to(const memory::memory_space* target_memory_space, rmm::cuda_stream_view stream);
 
   // -- Clone operations (CLONE-01/CLONE-02) --
 
@@ -452,10 +448,9 @@ class mutable_data_batch {
    * @brief Create an independent deep copy with representation conversion.
    *
    * The clone has a new batch ID and its data is converted to TargetRepresentation
-   * using the provided converter registry.
+   * using the process-wide converter registry (`representation_converter_registry::instance()`).
    *
    * @tparam TargetRepresentation Target representation type.
-   * @param registry           Converter registry for type-keyed dispatch.
    * @param new_batch_id       Batch ID for the cloned batch.
    * @param target_memory_space Target memory space for the converted data.
    * @param stream              CUDA stream for memory operations.
@@ -463,7 +458,6 @@ class mutable_data_batch {
    */
   template <typename TargetRepresentation>
   [[nodiscard]] std::shared_ptr<data_batch> clone_to(
-    representation_converter_registry& registry,
     uint64_t new_batch_id,
     const memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream) const;
@@ -501,25 +495,25 @@ class mutable_data_batch {
 
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> read_only_data_batch::clone_to(
-  representation_converter_registry& registry,
   uint64_t new_batch_id,
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream) const
 {
   auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+    representation_converter_registry::instance().convert<TargetRepresentation>(
+      *_batch->_data, target_memory_space, stream);
   return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
 }
 
 // -- mutable_data_batch::convert_to (in-place conversion) --
 
 template <typename TargetRepresentation>
-void mutable_data_batch::convert_to(representation_converter_registry& registry,
-                                    const memory::memory_space* target_memory_space,
+void mutable_data_batch::convert_to(const memory::memory_space* target_memory_space,
                                     rmm::cuda_stream_view stream)
 {
   auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+    representation_converter_registry::instance().convert<TargetRepresentation>(
+      *_batch->_data, target_memory_space, stream);
   auto old_representation = std::move(_batch->_data);
   _batch->_data           = std::move(new_representation);
 
@@ -539,13 +533,13 @@ void mutable_data_batch::convert_to(representation_converter_registry& registry,
 
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> mutable_data_batch::clone_to(
-  representation_converter_registry& registry,
   uint64_t new_batch_id,
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream) const
 {
   auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+    representation_converter_registry::instance().convert<TargetRepresentation>(
+      *_batch->_data, target_memory_space, stream);
   return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
 }
 

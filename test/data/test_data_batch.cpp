@@ -887,7 +887,10 @@ TEST_CASE("convert_to synchronizes stream before destroying GPU source", "[data_
   // Register a converter that enqueues async work reading from the source GPU
   // buffer WITHOUT synchronizing.  convert_to must sync before destroying the
   // source.
-  representation_converter_registry registry;
+  // Singleton registry persists across tests, so drop any prior registration of
+  // this type-pair (captures from a previous test are dangling) before re-registering.
+  auto& registry = representation_converter_registry::instance();
+  registry.unregister_converter<observed_gpu_representation, mock_data_representation>();
   registry.register_converter<observed_gpu_representation, mock_data_representation>(
     [&](idata_representation& source,
         const memory::memory_space* /*target_space*/,
@@ -905,7 +908,7 @@ TEST_CASE("convert_to synchronizes stream before destroying GPU source", "[data_
   auto batch    = std::make_shared<data_batch>(1, std::move(gpu_data));
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<mock_data_representation>(registry, host_space.get(), stream.view());
+    mut.convert_to<mock_data_representation>(host_space.get(), stream.view());
   }
 
   // With the fix: convert_to synchronizes the stream before the old GPU
@@ -982,7 +985,10 @@ TEST_CASE("convert_to synchronizes stream before destroying HOST source when tar
   // Register a converter that enqueues an async H2D copy reading from the
   // source HOST buffer WITHOUT synchronizing.  convert_to must sync before
   // destroying the source.
-  representation_converter_registry registry;
+  // Singleton registry persists across tests, so drop any prior registration of
+  // this type-pair (captures from a previous test are dangling) before re-registering.
+  auto& registry = representation_converter_registry::instance();
+  registry.unregister_converter<observed_host_representation, mock_data_representation>();
   registry.register_converter<observed_host_representation, mock_data_representation>(
     [&](idata_representation& source,
         const memory::memory_space* /*target_space*/,
@@ -1002,7 +1008,7 @@ TEST_CASE("convert_to synchronizes stream before destroying HOST source when tar
   auto batch     = std::make_shared<data_batch>(1, std::move(host_data));
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<mock_data_representation>(registry, gpu_space.get(), stream.view());
+    mut.convert_to<mock_data_representation>(gpu_space.get(), stream.view());
   }
 
   // With the fix: convert_to synchronizes the stream before the old HOST
@@ -1040,7 +1046,10 @@ TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync
   // enter stream.synchronize() (which blocks for ~50 ms due to the host callback).
   std::atomic<bool> converter_returned{false};
 
-  representation_converter_registry registry;
+  // Singleton registry persists across tests, so drop any prior registration of
+  // this type-pair (captures from a previous test are dangling) before re-registering.
+  auto& registry = representation_converter_registry::instance();
+  registry.unregister_converter<observed_gpu_representation, mock_data_representation>();
   registry.register_converter<observed_gpu_representation, mock_data_representation>(
     [&](idata_representation& source,
         const memory::memory_space* /*target_space*/,
@@ -1063,7 +1072,7 @@ TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync
 
   std::thread convert_thread([&]() {
     auto mut = batch->to_mutable();
-    mut.convert_to<mock_data_representation>(registry, host_space.get(), stream.view());
+    mut.convert_to<mock_data_representation>(host_space.get(), stream.view());
   });
 
   // Spin until the converter function has returned — convert_to is now blocked

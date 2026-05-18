@@ -93,10 +93,7 @@ std::unique_ptr<cudf::table> make_gpu_table_of_size(std::size_t size_bytes,
 /// is a GPU other than the bootstrap, the GPU->GPU converter moves data across devices itself
 /// (it acquires a stream on the target GPU internally).
 std::unique_ptr<idata_representation> build_source_representation(
-  memory::memory_space* src_space,
-  memory::memory_space* bootstrap_gpu,
-  std::size_t size_bytes,
-  const representation_converter_registry& registry)
+  memory::memory_space* src_space, memory::memory_space* bootstrap_gpu, std::size_t size_bytes)
 {
   // The initial cudf table MUST be allocated with the bootstrap GPU as the current CUDA device,
   // otherwise cudf's scratch allocations land on the wrong GPU and we hit illegal-memory-access
@@ -110,12 +107,13 @@ std::unique_ptr<idata_representation> build_source_representation(
     std::make_unique<gpu_table_representation>(std::move(table), *bootstrap_gpu, bootstrap_stream);
   bootstrap_stream.synchronize();
 
-  // Step 2: land the data in the requested src space via the registry. The converter is
-  // responsible for switching device when moving data across GPUs.
+  // Step 2: land the data in the requested src space via the singleton registry. The converter
+  // is responsible for switching device when moving data across GPUs.
   if (src_space == bootstrap_gpu) { return gpu_rep; }
 
   auto src_type = canonical_type_for(src_space->get_tier());
-  auto result   = registry.convert(*gpu_rep, src_type, src_space, bootstrap_stream);
+  auto result   = representation_converter_registry::instance().convert(
+    *gpu_rep, src_type, src_space, bootstrap_stream);
   // The converter may have enqueued async GPU reads from `gpu_rep`'s table on
   // `bootstrap_stream`. Sync before `gpu_rep` goes out of scope — otherwise its cuDF table's
   // RMM deallocation races with the in-flight copy and corrupts the converted output.
@@ -151,17 +149,18 @@ void evict_page_cache(const std::string& path)
   ::close(fd);
 }
 
-/// Core per-pair probe — warmup + timed loop around `registry.convert(...)`.
+/// Core per-pair probe — warmup + timed loop around the singleton registry's `convert(...)`.
 bandwidth_sample measure_single_size(idata_representation& source,
                                      std::type_index target_type,
                                      memory::memory_space* dst_space,
-                                     const representation_converter_registry& registry,
                                      rmm::cuda_stream_view stream,
                                      std::size_t nominal_size_bytes,
                                      std::size_t warmup_iters,
                                      std::size_t timed_iters,
                                      bool drop_page_cache_between_iters)
 {
+  auto& registry = representation_converter_registry::instance();
+
   // Grab the disk source's file path once so we can evict its page cache between iterations.
   // For non-disk sources this stays empty and the evict call is skipped.
   std::string disk_source_path;
@@ -258,7 +257,6 @@ std::optional<bandwidth_sample> bandwidth_profile::sample(memory::memory_space_i
 // ---------------------------------------------------------------------------------------------
 
 bandwidth_profile measure_bandwidth(std::span<memory::memory_space* const> spaces,
-                                    const representation_converter_registry& registry,
                                     const bandwidth_profile_config& config)
 {
   bandwidth_profile profile;
@@ -310,7 +308,7 @@ bandwidth_profile measure_bandwidth(std::span<memory::memory_space* const> space
 
       for (auto size_bytes : config.test_sizes_bytes) {
         try {
-          auto source = build_source_representation(src, bootstrap_gpu, size_bytes, registry);
+          auto source = build_source_representation(src, bootstrap_gpu, size_bytes);
 
           // Pin the current CUDA context to the stream's device for the duration of the
           // measurement loop. Some converter and disk-backend code paths allocate scratch on
@@ -330,7 +328,6 @@ bandwidth_profile measure_bandwidth(std::span<memory::memory_space* const> space
           auto sample = measure_single_size(*source,
                                             target_type,
                                             dst,
-                                            registry,
                                             stream,
                                             size_bytes,
                                             config.warmup_iterations,

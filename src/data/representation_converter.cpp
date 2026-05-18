@@ -131,6 +131,14 @@ void representation_converter_registry::clear()
   _converters.clear();
 }
 
+representation_converter_registry& representation_converter_registry::instance()
+{
+  static representation_converter_registry registry;
+  static std::once_flag init_flag;
+  std::call_once(init_flag, [&] { register_builtin_converters(registry); });
+  return registry;
+}
+
 // =============================================================================
 // Built-in converter implementations
 // =============================================================================

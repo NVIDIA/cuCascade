@@ -147,9 +147,10 @@ struct bandwidth_profile {
  * At least one GPU space must be present: it is used to materialize the canonical source
  * cudf table that seeds every pairwise transfer.
  *
+ * Conversions dispatch through the process-wide `representation_converter_registry::instance()`,
+ * which is lazily populated with the built-in converters on first use.
+ *
  * @param spaces   The memory spaces to profile.
- * @param registry Converter registry to dispatch through. Pass a registry populated by
- *                 `register_builtin_converters` plus any user-supplied converters.
  * @param config   Measurement knobs; defaults probe a size sweep.
  *
  * @return `bandwidth_profile` containing one `bandwidth_pair_result` per ordered pair considered.
@@ -157,7 +158,6 @@ struct bandwidth_profile {
  * @throws std::invalid_argument if no GPU space is present in `spaces`.
  */
 [[nodiscard]] bandwidth_profile measure_bandwidth(std::span<memory::memory_space* const> spaces,
-                                                  const representation_converter_registry& registry,
                                                   const bandwidth_profile_config& config = {});
 
 }  // namespace data
