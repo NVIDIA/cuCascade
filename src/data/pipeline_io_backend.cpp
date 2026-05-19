@@ -22,6 +22,9 @@
 #include <cucascade/error.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <fcntl.h>
@@ -162,19 +165,17 @@ class pipeline_io_backend : public idisk_io_backend {
     // on freed pinned memory or wedge the kernel I/O path.
     _io_worker.shutdown_and_join();
 
-    // Save and restore the caller thread's current CUDA device. Without this, the final
-    // cudaSetDevice in the loop below would silently leak out of the destructor, changing
-    // the current device for any code that runs after this backend is destroyed.
-    int saved_dev = 0;
-    cudaGetDevice(&saved_dev);
-    for (auto& [dev, res] : _per_device) {
-      // Destroy each resource under the device where it was created. CUDA event/stream
-      // handles from one context are invalid in another, so the set-device call matters.
-      cudaSetDevice(dev);
-      cudaEventDestroy(res.order_event);
-      cudaStreamDestroy(res.copy_stream);
+    // Destroy each resource under the device where it was created. CUDA event/stream
+    // handles from one context are invalid in another, so the set-device call matters.
+    // The per-iteration RAII guard saves the caller's current device and restores it on
+    // scope exit, so the loop cannot silently leak a device change out of the destructor.
+    for (auto it = _per_device.begin(); it != _per_device.end();) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{it->first}};
+      cudaEventDestroy(it->second.order_event);
+      // erase() runs ~device_resources (and therefore ~rmm::cuda_stream) while the guard
+      // still has this entry's device active.
+      it = _per_device.erase(it);
     }
-    cudaSetDevice(saved_dev);
     // Free via the same allocator that produced the buffers — for NUMA-bound buffers
     // this dispatches cudaHostUnregister + numa_free; for the -1 fallback path it
     // dispatches cudaFreeHost.
@@ -203,7 +204,7 @@ class pipeline_io_backend : public idisk_io_backend {
 
     // Ensure all GPU work on the caller's stream completes before D2H copies begin
     CUCASCADE_CUDA_TRY(cudaEventRecord(res.order_event, stream.value()));
-    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream, res.order_event));
+    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream.value(), res.order_event));
 
     int flags = O_CREAT | O_WRONLY;
     if (_direct_io) { flags |= O_DIRECT; }
@@ -230,8 +231,8 @@ class pipeline_io_backend : public idisk_io_backend {
                                          static_cast<const char*>(dev_ptr) + src_offset,
                                          chunk,
                                          cudaMemcpyDeviceToHost,
-                                         res.copy_stream));
-      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream));
+                                         res.copy_stream.value()));
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream.value()));
 
       // Wait for previous disk write to finish before reusing that buffer
       if (write_future.valid()) { write_future.get(); }
@@ -282,7 +283,7 @@ class pipeline_io_backend : public idisk_io_backend {
 
     // Ensure caller's stream work completes before we use the destination buffer
     CUCASCADE_CUDA_TRY(cudaEventRecord(res.order_event, stream.value()));
-    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream, res.order_event));
+    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream.value(), res.order_event));
 
     int flags = O_RDONLY;
     if (_direct_io) { flags |= O_DIRECT; }
@@ -322,7 +323,7 @@ class pipeline_io_backend : public idisk_io_backend {
                                            _buf[cur],
                                            chunks_to_copy,
                                            cudaMemcpyHostToDevice,
-                                           res.copy_stream));
+                                           res.copy_stream.value()));
         dst_offset += chunks_to_copy;
       }
 
@@ -347,7 +348,7 @@ class pipeline_io_backend : public idisk_io_backend {
       }
 
       // Wait for H2D copy to complete
-      if (chunks_to_copy > 0) { CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream)); }
+      if (chunks_to_copy > 0) { CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream.value())); }
 
       // Wait for disk read to complete
       if (read_future.valid()) { read_future.get(); }
@@ -418,7 +419,7 @@ class pipeline_io_backend : public idisk_io_backend {
 
     // Ensure all GPU work on the caller's stream completes before D2H copies begin
     CUCASCADE_CUDA_TRY(cudaEventRecord(res.order_event, stream.value()));
-    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream, res.order_event));
+    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(res.copy_stream.value(), res.order_event));
 
     int flags = O_CREAT | O_WRONLY;
     if (_direct_io) { flags |= O_DIRECT; }
@@ -454,8 +455,8 @@ class pipeline_io_backend : public idisk_io_backend {
     for (const auto& c : chunks) {
       // D2H copy into current buffer
       CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(_buf[cur], c.src, c.size, cudaMemcpyDeviceToHost, res.copy_stream));
-      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream));
+        cudaMemcpyAsync(_buf[cur], c.src, c.size, cudaMemcpyDeviceToHost, res.copy_stream.value()));
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream.value()));
 
       // Wait for previous write to finish (so we can reuse its buffer next iteration)
       if (write_future.valid()) { write_future.get(); }
@@ -485,7 +486,7 @@ class pipeline_io_backend : public idisk_io_backend {
 
  private:
   struct device_resources {
-    cudaStream_t copy_stream{};
+    rmm::cuda_stream copy_stream;
     cudaEvent_t order_event{};
   };
 
@@ -499,10 +500,9 @@ class pipeline_io_backend : public idisk_io_backend {
     std::lock_guard<std::mutex> lock(_resources_mutex);
     auto it = _per_device.find(dev);
     if (it != _per_device.end()) { return it->second; }
-    device_resources res{};
-    CUCASCADE_CUDA_TRY(cudaStreamCreate(&res.copy_stream));
+    device_resources res{rmm::cuda_stream{}};
     CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&res.order_event, cudaEventDisableTiming));
-    return _per_device.emplace(dev, res).first->second;
+    return _per_device.emplace(dev, std::move(res)).first->second;
   }
 
   void* _buf[2]{nullptr, nullptr};
