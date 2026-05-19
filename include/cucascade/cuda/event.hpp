@@ -22,14 +22,67 @@
 #include <cuda_runtime_api.h>
 
 #include <chrono>
+#include <cstddef>
 
 namespace cucascade {
 namespace cuda {
 
+namespace event {
+enum class query_result { success, in_progress, error };
+}
+
+/**
+ * @brief Non-owning view of a CUDA event.
+ *
+ * Mirrors the rmm::cuda_stream / rmm::cuda_stream_view relationship: cuda_event owns
+ * the underlying cudaEvent_t handle, while cuda_event_view is a copyable, non-owning
+ * reference. Pass cuda_event_view by value through APIs that only need to query or
+ * record an event but should not affect its lifetime.
+ */
+class cuda_event_view {
+ public:
+  cuda_event_view()                                           = default;
+  ~cuda_event_view()                                          = default;
+  cuda_event_view(cuda_event_view const&) noexcept            = default;
+  cuda_event_view(cuda_event_view&&) noexcept                 = default;
+  cuda_event_view& operator=(cuda_event_view const&) noexcept = default;
+  cuda_event_view& operator=(cuda_event_view&&) noexcept      = default;
+
+  // Disable construction from literal 0 / nullptr so callers can't silently pass an
+  // invalid handle the way one might to a default-constructed view.
+  cuda_event_view(int)            = delete;
+  cuda_event_view(std::nullptr_t) = delete;
+
+  /**
+   * @brief Construct a view referring to an existing cudaEvent_t handle.
+   */
+  cuda_event_view(cudaEvent_t event) noexcept : event_{event} {}
+
+  [[nodiscard]] cudaEvent_t value() const noexcept { return event_; }
+  operator cudaEvent_t() const noexcept { return event_; }
+
+  void record(rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+  void wait(rmm::cuda_stream_view stream = rmm::cuda_stream_default) const;
+  void synchronize() const;
+
+  /**
+   * @brief Return elapsed time between `start` and this event.
+   *
+   * Both events must have been recorded, completed, and created with timing enabled.
+   */
+  [[nodiscard]] std::chrono::duration<float, std::milli> elapsed_time(cuda_event_view start) const;
+
+  /**
+   * @brief Query whether the event has completed without blocking.
+   */
+  [[nodiscard]] event::query_result query() const noexcept;
+
+ private:
+  cudaEvent_t event_{};
+};
+
 class cuda_event {
  public:
-  enum class query_status { success, in_progress, error };
-
   explicit cuda_event(unsigned int flags = cudaEventDisableTiming);
   ~cuda_event() noexcept;
 
@@ -41,6 +94,16 @@ class cuda_event {
 
   [[nodiscard]] cudaEvent_t get() const noexcept;
   [[nodiscard]] explicit operator cudaEvent_t() const noexcept;
+
+  /**
+   * @brief Return a non-owning view of this event.
+   */
+  [[nodiscard]] cuda_event_view view() const noexcept;
+
+  /**
+   * @brief Implicit conversion to cuda_event_view.
+   */
+  operator cuda_event_view() const noexcept;
 
   void record(rmm::cuda_stream_view stream = rmm::cuda_stream_default);
   void wait(rmm::cuda_stream_view stream = rmm::cuda_stream_default) const;
@@ -57,7 +120,7 @@ class cuda_event {
   /**
    * @brief Query whether the event has completed without blocking.
    */
-  [[nodiscard]] query_status query() const noexcept;
+  [[nodiscard]] event::query_result query() const noexcept;
 
  private:
   cudaEvent_t event_{nullptr};

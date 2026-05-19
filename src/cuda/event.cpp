@@ -50,31 +50,52 @@ cudaEvent_t cuda_event::get() const noexcept { return event_; }
 
 cuda_event::operator cudaEvent_t() const noexcept { return event_; }
 
-void cuda_event::record(rmm::cuda_stream_view stream)
+cuda_event_view cuda_event::view() const noexcept { return cuda_event_view{event_}; }
+
+cuda_event::operator cuda_event_view() const noexcept { return cuda_event_view{event_}; }
+
+void cuda_event::record(rmm::cuda_stream_view stream) { view().record(stream); }
+
+void cuda_event::wait(rmm::cuda_stream_view stream) const { view().wait(stream); }
+
+void cuda_event::synchronize() const { view().synchronize(); }
+
+std::chrono::duration<float, std::milli> cuda_event::elapsed_time(cuda_event const& start) const
+{
+  return view().elapsed_time(start.view());
+}
+
+event::query_result cuda_event::query() const noexcept { return view().query(); }
+
+void cuda_event_view::record(rmm::cuda_stream_view stream)
 {
   CUCASCADE_CUDA_TRY(::cudaEventRecord(event_, stream.value()));
 }
 
-void cuda_event::wait(rmm::cuda_stream_view stream) const
+void cuda_event_view::wait(rmm::cuda_stream_view stream) const
 {
   CUCASCADE_CUDA_TRY(::cudaStreamWaitEvent(stream.value(), event_, 0));
 }
 
-void cuda_event::synchronize() const { CUCASCADE_CUDA_TRY(::cudaEventSynchronize(event_)); }
+void cuda_event_view::synchronize() const
+{
+  CUCASCADE_CUDA_TRY(::cudaEventSynchronize(event_));
+}
 
-std::chrono::duration<float, std::milli> cuda_event::elapsed_time(cuda_event const& start) const
+std::chrono::duration<float, std::milli> cuda_event_view::elapsed_time(
+  cuda_event_view start) const
 {
   float ms{0.F};
-  CUCASCADE_CUDA_TRY(::cudaEventElapsedTime(&ms, start.get(), event_));
+  CUCASCADE_CUDA_TRY(::cudaEventElapsedTime(&ms, start.value(), event_));
   return std::chrono::duration<float, std::milli>{ms};
 }
 
-cuda_event::query_status cuda_event::query() const noexcept
+event::query_result cuda_event_view::query() const noexcept
 {
   cudaError_t const status = ::cudaEventQuery(event_);
-  if (status == cudaSuccess) { return query_status::success; }
-  if (status == cudaErrorNotReady) { return query_status::in_progress; }
-  return query_status::error;
+  if (status == cudaSuccess) { return event::query_result::success; }
+  if (status == cudaErrorNotReady) { return event::query_result::in_progress; }
+  return event::query_result::error;
 }
 
 }  // namespace cuda

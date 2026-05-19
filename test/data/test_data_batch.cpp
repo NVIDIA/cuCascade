@@ -18,6 +18,7 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 
@@ -822,15 +823,10 @@ TEST_CASE("data_batch non-static try_to_mutable fails when read-locked", "[data_
 // Tracks whether a CUDA event recorded after async work was complete at the
 // time the source representation was destroyed.
 struct conversion_sync_observer {
-  cudaEvent_t event{};
+  cucascade::cuda::cuda_event event;
   bool synced_before_destroy = false;
 
-  conversion_sync_observer()
-  {
-    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-  }
-  ~conversion_sync_observer() { cudaEventDestroy(event); }
-
+  conversion_sync_observer()                                           = default;
   conversion_sync_observer(const conversion_sync_observer&)            = delete;
   conversion_sync_observer& operator=(const conversion_sync_observer&) = delete;
 };
@@ -851,7 +847,8 @@ class observed_gpu_representation : private cucascade::test::mock_memory_space_h
 
   ~observed_gpu_representation() override
   {
-    _observer.synced_before_destroy = (cudaEventQuery(_observer.event) == cudaSuccess);
+    _observer.synced_before_destroy =
+      (_observer.event.query() == cucascade::cuda::event::query_result::success);
   }
 
   void const* data() const { return _buf.data(); }
@@ -898,7 +895,7 @@ TEST_CASE("convert_to synchronizes stream before destroying GPU source", "[data_
       CUCASCADE_CUDA_TRY(
         cudaMemcpyAsync(pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));
       // Record event after the async copy so we can check completion order
-      CUCASCADE_CUDA_TRY(cudaEventRecord(observer.event, s.value()));
+      observer.event.record(s);
       // Deliberately NO stream.synchronize() — convert_to must handle this
       return std::make_unique<mock_data_representation>(memory::Tier::HOST, buf_size);
     });
@@ -949,7 +946,8 @@ class observed_host_representation : private cucascade::test::mock_memory_space_
 
   ~observed_host_representation() override
   {
-    _observer.synced_before_destroy = (cudaEventQuery(_observer.event) == cudaSuccess);
+    _observer.synced_before_destroy =
+      (_observer.event.query() == cucascade::cuda::event::query_result::success);
   }
 
   void const* data() const { return _pinned_ptr; }
@@ -994,7 +992,7 @@ TEST_CASE("convert_to synchronizes stream before destroying HOST source when tar
       CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
         gpu_buf.data(), host_src.data(), buf_size, cudaMemcpyHostToDevice, s.value()));
       // Record event after the async copy so we can check completion order
-      CUCASCADE_CUDA_TRY(cudaEventRecord(observer.event, s.value()));
+      observer.event.record(s);
       // Deliberately NO stream.synchronize() — convert_to must handle this
       return std::make_unique<mock_data_representation>(memory::Tier::GPU, buf_size);
     });
@@ -1055,7 +1053,7 @@ TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync
       CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(s.value(), stream_delay_callback, nullptr));
       // Record event AFTER the delay — it won't be complete until the
       // callback finishes, regardless of GPU speed.
-      CUCASCADE_CUDA_TRY(cudaEventRecord(observer.event, s.value()));
+      observer.event.record(s);
       converter_returned.store(true, std::memory_order_release);
       return std::make_unique<mock_data_representation>(memory::Tier::HOST, buf_size);
     });
@@ -1085,7 +1083,8 @@ TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync
   // Confirm the stream work was still in progress when we called try_to_mutable.
   // cudaErrorNotReady means the event (recorded after the 50 ms callback) hasn't
   // completed yet, proving we polled DURING the sync window.
-  bool accessed_during_sync = (cudaEventQuery(observer.event) == cudaErrorNotReady);
+  bool accessed_during_sync =
+    (observer.event.query() == cucascade::cuda::event::query_result::in_progress);
 
   convert_thread.join();
 
