@@ -232,7 +232,7 @@ class pipeline_io_backend : public idisk_io_backend {
                                          chunk,
                                          cudaMemcpyDeviceToHost,
                                          res.copy_stream.value()));
-      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream.value()));
+      res.copy_stream.synchronize();
 
       // Wait for previous disk write to finish before reusing that buffer
       if (write_future.valid()) { write_future.get(); }
@@ -348,7 +348,7 @@ class pipeline_io_backend : public idisk_io_backend {
       }
 
       // Wait for H2D copy to complete
-      if (chunks_to_copy > 0) { CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream.value())); }
+      if (chunks_to_copy > 0) { res.copy_stream.synchronize(); }
 
       // Wait for disk read to complete
       if (read_future.valid()) { read_future.get(); }
@@ -456,7 +456,7 @@ class pipeline_io_backend : public idisk_io_backend {
       // D2H copy into current buffer
       CUCASCADE_CUDA_TRY(
         cudaMemcpyAsync(_buf[cur], c.src, c.size, cudaMemcpyDeviceToHost, res.copy_stream.value()));
-      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(res.copy_stream.value()));
+      res.copy_stream.synchronize();
 
       // Wait for previous write to finish (so we can reuse its buffer next iteration)
       if (write_future.valid()) { write_future.get(); }

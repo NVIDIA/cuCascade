@@ -101,8 +101,8 @@ class small_pinned_host_memory_resource {
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    auto* ptr = allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(cudaStream_t{nullptr}));
+    auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    rmm::cuda_stream_default.synchronize();
     return ptr;
   }
 
@@ -110,8 +110,8 @@ class small_pinned_host_memory_resource {
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
-    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(cudaStream_t{nullptr}));
+    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    rmm::cuda_stream_default.synchronize_no_throw();
   }
 
   bool operator==(small_pinned_host_memory_resource const& other) const noexcept;
