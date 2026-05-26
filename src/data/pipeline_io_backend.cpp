@@ -65,7 +65,9 @@ int resolve_gpu_numa_node(int device_id) noexcept
   if (cudaDeviceGetPCIBusId(pci_buf, sizeof(pci_buf), device_id) != cudaSuccess) { return -1; }
   // CUDA returns IDs like "0000:65:00.0"; sysfs uses lower-case form.
   std::string pci(pci_buf);
-  for (auto& c : pci) { c = static_cast<char>(std::tolower(c)); }
+  for (auto& c : pci) {
+    c = static_cast<char>(std::tolower(c));
+  }
   std::ifstream f("/sys/bus/pci/devices/" + pci + "/numa_node");
   if (!f.is_open()) { return -1; }
   std::string content;

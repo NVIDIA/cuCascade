@@ -2234,9 +2234,8 @@ TEST_CASE("host_data_representation::slice round-trip preserves selected columns
   const cudf::table_view orig_view = orig_table->view();
 
   // GPU -> HOST
-  gpu_table_representation gpu_repr(std::move(orig_table),
-                                    *const_cast<memory::memory_space*>(gpu_space),
-                                    stream.view());
+  gpu_table_representation gpu_repr(
+    std::move(orig_table), *const_cast<memory::memory_space*>(gpu_space), stream.view());
   auto host = fast_convert(gpu_repr, host_space, registry, stream.view());
   stream.synchronize();
   REQUIRE(host->num_columns() == 4);

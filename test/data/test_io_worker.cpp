@@ -83,8 +83,7 @@ TEST_CASE("io_worker shutdown_and_join is idempotent", "[io_worker]")
 // latch. If shutdown_and_join() returned while the task was still running,
 // the assertion `task_completed_before_shutdown_returned` would be false.
 // =============================================================================
-TEST_CASE("io_worker shutdown waits for in-flight task to complete",
-          "[io_worker][regression]")
+TEST_CASE("io_worker shutdown waits for in-flight task to complete", "[io_worker][regression]")
 {
   std::mutex latch_mutex;
   std::condition_variable latch_cv;
@@ -105,7 +104,9 @@ TEST_CASE("io_worker shutdown waits for in-flight task to complete",
     });
 
     // Wait until the task is actually running on the worker thread.
-    while (!task_running.load()) { std::this_thread::sleep_for(1ms); }
+    while (!task_running.load()) {
+      std::this_thread::sleep_for(1ms);
+    }
 
     // Start a thread that triggers worker shutdown while the task is blocked.
     // This is the scenario where, in the buggy ordering, the owner would free
@@ -152,7 +153,7 @@ TEST_CASE("io_worker lets owner safely free task-referenced state after shutdown
   // A heap-allocated buffer that the task writes to. With the correct
   // ordering, the owner's destruction frees this only after the worker has
   // joined, so the task's write has already completed.
-  auto buffer = std::make_unique<std::atomic<int>>(0);
+  auto buffer      = std::make_unique<std::atomic<int>>(0);
   auto* buffer_ptr = buffer.get();
 
   std::atomic<bool> task_ran_to_completion{false};
