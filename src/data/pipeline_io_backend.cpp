@@ -18,10 +18,11 @@
 #include "io_backend_internal.hpp"
 #include "io_worker.hpp"
 
-#include <cucascade/cuda/event.hpp>
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+
+#include <cucascade/cuda/event.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>

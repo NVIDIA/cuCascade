@@ -18,6 +18,8 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/error.hpp>
 
+#include <cucascade/cuda/event.hpp>
+
 #include <cudf/column/column_stream.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -41,10 +43,7 @@ gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> 
 
 gpu_table_representation::~gpu_table_representation()
 {
-  // STREAM-LINEAGE: release the writer event if one was recorded. Use
-  // CUCASCADE_ASSERT_CUDA_SUCCESS so destructor stays noexcept-safe (release
-  // builds discard the error; debug builds assert). Null-event branch is the
-  // common case for representations whose writer never recorded an event.
+  // STREAM-LINEAGE: release the writer event if one was recorded.
   if (_writer_event != nullptr) {
     CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(_writer_event));
     _writer_event = nullptr;
@@ -116,13 +115,12 @@ std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_
 
 void gpu_table_representation::record_writer_event(rmm::cuda_stream_view writer_stream)
 {
-  // STREAM-LINEAGE: lazily allocate the event handle on first call. The event
-  // uses cudaEventDisableTiming for cheaper record/wait (we never query the
-  // elapsed time on it — it's used solely for cross-stream ordering).
+  // STREAM-LINEAGE: lazily create the event on first call (cudaEventDisableTiming —
+  // used solely for cross-stream ordering, never for elapsed-time queries).
   if (_writer_event == nullptr) {
     CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&_writer_event, cudaEventDisableTiming));
   }
-  CUCASCADE_CUDA_TRY(cudaEventRecord(_writer_event, writer_stream.value()));
+  cucascade::cuda::cuda_event_view{_writer_event}.record(writer_stream);
 }
 
 cudaEvent_t gpu_table_representation::get_writer_event() const { return _writer_event; }

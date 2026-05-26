@@ -97,7 +97,7 @@ class gpu_table_representation : public idata_representation {
    */
   ~gpu_table_representation() override;
 
-  // Non-copyable / non-movable: the representation owns a cudaEvent_t handle whose
+  // Non-copyable / non-movable: the representation owns a CUDA event handle whose
   // lifetime must be unique. Move semantics could be added but are not needed by
   // any in-tree caller.
   gpu_table_representation(const gpu_table_representation&)            = delete;
