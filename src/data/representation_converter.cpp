@@ -55,6 +55,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -67,7 +68,7 @@ namespace cucascade {
 void representation_converter_registry::register_converter_impl(
   const converter_key& key, representation_converter_fn converter)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::shared_mutex> lock(_mutex);
 
   if (_converters.find(key) != _converters.end()) {
     std::ostringstream oss;
@@ -81,7 +82,7 @@ void representation_converter_registry::register_converter_impl(
 
 bool representation_converter_registry::has_converter_impl(const converter_key& key) const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::shared_lock<std::shared_mutex> lock(_mutex);
   return _converters.find(key) != _converters.end();
 }
 
@@ -93,7 +94,7 @@ std::unique_ptr<idata_representation> representation_converter_registry::convert
 {
   representation_converter_fn converter;
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::shared_lock<std::shared_mutex> lock(_mutex);
 
     auto it = _converters.find(key);
     if (it == _converters.end()) {
@@ -121,13 +122,13 @@ std::unique_ptr<idata_representation> representation_converter_registry::convert
 
 bool representation_converter_registry::unregister_converter_impl(const converter_key& key)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::shared_mutex> lock(_mutex);
   return _converters.erase(key) > 0;
 }
 
 void representation_converter_registry::clear()
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::unique_lock<std::shared_mutex> lock(_mutex);
   _converters.clear();
 }
 
