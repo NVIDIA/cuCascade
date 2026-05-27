@@ -236,7 +236,6 @@ std::vector<size_t> resolve_visible_gpu_indices(
  * returns the lowest-numbered NUMA node in the resulting bitmask. Same source as 
  * `nvidia-smi topo -m`.
  *
- * @param nvml Loaded NVML loader; `nvml.available()` must already be true.
  * @param device NVML device handle.
  * @return NUMA node id on success; -1 if NVML reports no affinity (empty bitmask
  * or query failure).
@@ -244,10 +243,10 @@ std::vector<size_t> resolve_visible_gpu_indices(
  * @note `nodeSetSize = 1` (one `unsigned long` = 64 NUMA bits) is sufficient for
  * any realistic system.
  */
-int get_numa_node_from_nvml(NvmlLoader const& nvml, nvmlDevice_t device)
+int get_numa_node_from_nvml(nvmlDevice_t device)
 {
   unsigned long nodeset = 0;
-  if (nvml.p_nvmlDeviceGetMemoryAffinity(device, 1, &nodeset, NVML_AFFINITY_SCOPE_NODE) ==
+  if (nvmlDeviceGetMemoryAffinity(device, 1, &nodeset, NVML_AFFINITY_SCOPE_NODE) ==
         NVML_SUCCESS &&
       nodeset != 0) {
     return std::countr_zero(nodeset);
@@ -766,7 +765,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       result   = nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
       gpu.uuid = (result == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
 
-      gpu.numa_node         = get_numa_node_from_nvml(nvml, device);
+      gpu.numa_node         = get_numa_node_from_nvml(device);
       gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
       gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
 
