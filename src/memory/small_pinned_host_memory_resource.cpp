@@ -44,13 +44,17 @@ void* small_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_
   if (bytes == 0) { return nullptr; }
   // cuDF calls get_pinned_memory_resource() directly from some code paths (e.g. join/sort
   // staging buffers) that bypass the allocate_host_as_pinned threshold check.  Serve those
-  // with cudaMallocHost so the
-  // memory remains pinned and device-accessible.  cuDF 26.04+ may access
-  // hostdevice_vector memory directly from GPU kernels (e.g. detect_malformed_pages),
-  // so returning pageable memory here would cause cudaErrorIllegalAddress.
+  // with cudaHostAlloc(Portable) so the memory remains pinned AND DMA-accessible from
+  // every CUDA context (multi-GPU consumers need the Portable flag; cudaMallocHost /
+  // cudaHostAllocDefault produce memory that is only DMA-accessible from the allocating
+  // device's context, which under CUDA 13+ makes cudaMemcpyBatchAsync reject cross-device
+  // sources with cudaErrorInvalidValue). cuDF 26.04+ may access hostdevice_vector memory
+  // directly from GPU kernels (e.g. detect_malformed_pages), so returning pageable memory
+  // here would cause cudaErrorIllegalAddress.
   if (bytes > MAX_SLAB_SIZE) {
     void* ptr = nullptr;
-    auto err  = ::cudaMallocHost(&ptr, bytes);
+    // Portable + Mapped — see numa_region_pinned_host_allocator.cpp comment.
+    auto err = ::cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
     if (err != cudaSuccess) { throw std::bad_alloc{}; }
     return ptr;
   }

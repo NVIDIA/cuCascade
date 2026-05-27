@@ -36,9 +36,6 @@ set(BENCHMARK_ENABLE_INSTALL
 
 FetchContent_MakeAvailable(benchmark)
 
-# Set include directories for benchmarks
-include_directories(${CMAKE_CURRENT_SOURCE_DIR})
-
 # Collect all benchmark sources
 set(BENCHMARK_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_representation_converter.cpp
@@ -59,14 +56,13 @@ target_include_directories(
 target_compile_options(
   cucascade_benchmarks
   PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:${CUCASCADE_CXX_WARNING_FLAGS}>
     $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
     ${CUCASCADE_CUDA_WARNING_FLAGS})
 
 # Link dependencies
 target_link_libraries(
   cucascade_benchmarks PRIVATE cucascade benchmark::benchmark
-                               benchmark::benchmark_main CUDA::cudart)
+                               benchmark::benchmark_main CUDA::cudart_static)
 
 # Add custom target to run benchmarks
 add_custom_target(

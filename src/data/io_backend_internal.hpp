@@ -25,6 +25,12 @@ namespace cucascade {
 
 /// @brief Create a double-buffered pipeline I/O backend instance.
 /// @param direct_io When true, open data files with O_DIRECT (bypass page cache).
-std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io = false);
+/// @param target_device CUDA device id that the backend will primarily serve. When
+///        provided (>= 0) and the GPU's PCI device has a known NUMA node, the
+///        internal pinned host buffers are page-bound to that NUMA node to avoid
+///        cross-socket D2H/H2D traffic. -1 (default) falls back to non-bound
+///        portable+mapped pinned memory.
+std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io    = false,
+                                                           int target_device = -1);
 
 }  // namespace cucascade

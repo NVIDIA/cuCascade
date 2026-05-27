@@ -953,8 +953,8 @@ TEST_CASE("shared_data_repository pop_next_data_batch returns read_only batch", 
 {
   shared_data_repository repository;
 
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(2, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(2, std::move(data));
   auto accessor = batch->to_read_only();
   repository.add_data_batch(batch);
 
@@ -967,8 +967,8 @@ TEST_CASE("shared_data_repository pop_next_data_batch returns mutable batch", "[
 {
   shared_data_repository repository;
 
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = std::make_shared<data_batch>(3, std::move(data));
+  auto data     = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch    = std::make_shared<data_batch>(3, std::move(data));
   auto accessor = batch->to_mutable();
   repository.add_data_batch(batch);
 
@@ -1016,10 +1016,10 @@ TEST_CASE("shared_data_repository pop_next_data_batch with partitions", "[data_r
 {
   shared_data_repository repository;
 
-  auto data1  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch1 = std::make_shared<data_batch>(1, std::move(data1));
-  auto data2  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch2 = std::make_shared<data_batch>(2, std::move(data2));
+  auto data1    = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch1   = std::make_shared<data_batch>(1, std::move(data1));
+  auto data2    = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch2   = std::make_shared<data_batch>(2, std::move(data2));
   auto accessor = batch1->to_read_only();
 
   repository.add_data_batch(batch1, 0);

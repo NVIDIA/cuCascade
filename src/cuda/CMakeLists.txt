@@ -15,6 +15,4 @@
 # the License.
 # =============================================================================
 
-set(TEST_SOURCES
-    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/cudf_test_utils.cpp
-    PARENT_SCOPE)
+target_sources(cucascade_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp)

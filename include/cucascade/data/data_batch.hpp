@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cucascade/data/common.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
 
@@ -80,7 +81,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   /** @brief Default destructor. */
   ~data_batch() = default;
 
-  // -- Deleted move/copy (D-04/CORE-07) --
+  // -- Deleted move/copy --
   data_batch(data_batch&&)                 = delete;
   data_batch& operator=(data_batch&&)      = delete;
   data_batch(const data_batch&)            = delete;
@@ -98,7 +99,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   uint64_t get_batch_id() const;
 
   /**
-   * @brief Increment the subscriber interest count.   
+   * @brief Increment the subscriber interest count.
    */
   void subscribe();
 
@@ -205,7 +206,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * Releases the shared lock, then acquires an exclusive lock (may block).
    * The source accessor is consumed via move.
-   * NOTE: The transition is not atomic. 
+   * NOTE: The transition is not atomic.
    *
    * @param accessor Rvalue reference to the read-only accessor (consumed).
    * @return A mutable_data_batch holding the exclusive lock.
@@ -217,7 +218,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * Releases the exclusive lock, then acquires a shared lock (may block).
    * The source accessor is consumed via move.
-   * NOTE: The transition is not atomic. 
+   * NOTE: The transition is not atomic.
    *
    * @param accessor Rvalue reference to the mutable accessor (consumed).
    * @return A read_only_data_batch holding the shared lock.
@@ -229,7 +230,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   friend class read_only_data_batch;
   friend class mutable_data_batch;
 
-  // -- Private data accessors (D-23/CORE-02) --
+  // -- Private data accessors --
   // Only friend accessor classes can call these methods.
 
   /**
@@ -279,7 +280,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
  */
 class read_only_data_batch {
  public:
-  // -- Named accessor methods (D-09/ACC-01) --
+  // -- Named accessor methods --
 
   /** @brief Get the batch identifier. */
   uint64_t get_batch_id() const { return _batch->get_batch_id(); }
@@ -292,6 +293,30 @@ class read_only_data_batch {
 
   /** @brief Get a raw pointer to the memory space. */
   memory::memory_space* get_memory_space() const { return _batch->get_memory_space(); }
+
+  /**
+   * @brief Get the writer event from the underlying GPU representation, or nullptr.
+   *
+   * D-B3 proxy: delegates to gpu_table_representation::get_writer_event() via
+   * dynamic_cast. Returns nullptr when the underlying representation is not a
+   * gpu_table_representation (e.g., host or disk tier) or when no writer event has
+   * been recorded yet.
+   *
+   * STREAM-LINEAGE: callers that cross stream / device boundaries should call
+   * cudaStreamWaitEvent on the returned event (when non-null) before reading the
+   * underlying memory of this batch.
+   *
+   * @return cudaEvent_t The writer event, or nullptr if not a GPU representation or
+   *         no event recorded.
+   */
+  [[nodiscard]] cudaEvent_t get_writer_event() const
+  {
+    auto* repr = get_data();
+    if (!repr) { return nullptr; }
+    auto* gpu_repr = dynamic_cast<gpu_table_representation*>(repr);
+    if (!gpu_repr) { return nullptr; }
+    return gpu_repr->get_writer_event();
+  }
 
   // -- Clone operations (D-18/D-19/D-20/CLONE-01/CLONE-02) --
 
@@ -353,8 +378,8 @@ class read_only_data_batch {
   // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the shared lock first, then _batch drops the parent
   // reference. This prevents accessing a destroyed mutex.
-  std::shared_ptr<data_batch> _batch;           ///< Parent lifetime (destroyed second)
-  std::shared_lock<std::shared_mutex> _lock;    ///< Shared lock (destroyed first)
+  std::shared_ptr<data_batch> _batch;         ///< Parent lifetime (destroyed second)
+  std::shared_lock<std::shared_mutex> _lock;  ///< Shared lock (destroyed first)
 };
 
 /**
@@ -368,7 +393,7 @@ class read_only_data_batch {
  */
 class mutable_data_batch {
  public:
-  // -- Read methods (same as read_only, ACC-02) --
+  // -- Read methods (same as read_only) --
 
   /** @brief Get the batch identifier. */
   uint64_t get_batch_id() const { return _batch->get_batch_id(); }
@@ -382,7 +407,7 @@ class mutable_data_batch {
   /** @brief Get a raw pointer to the memory space. */
   memory::memory_space* get_memory_space() const { return _batch->get_memory_space(); }
 
-  // -- Write methods (D-10/ACC-02) --
+  // -- Write methods --
 
   /**
    * @brief Replace the data representation.
@@ -459,14 +484,13 @@ class mutable_data_batch {
    * @param parent Shared pointer to the parent data_batch (moved in).
    * @param lock   Exclusive lock already acquired on the parent's mutex.
    */
-  mutable_data_batch(std::shared_ptr<data_batch> parent,
-                     std::unique_lock<std::shared_mutex> lock);
+  mutable_data_batch(std::shared_ptr<data_batch> parent, std::unique_lock<std::shared_mutex> lock);
 
   // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the exclusive lock first, then _batch drops the parent
   // reference. This prevents accessing a destroyed mutex.
-  std::shared_ptr<data_batch> _batch;           ///< Parent lifetime (destroyed second)
-  std::unique_lock<std::shared_mutex> _lock;    ///< Exclusive lock (destroyed first)
+  std::shared_ptr<data_batch> _batch;         ///< Parent lifetime (destroyed second)
+  std::unique_lock<std::shared_mutex> _lock;  ///< Exclusive lock (destroyed first)
 };
 
 // =============================================================================
@@ -487,7 +511,7 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
   return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
 }
 
-// -- mutable_data_batch::convert_to (in-place conversion, ACC-02) --
+// -- mutable_data_batch::convert_to (in-place conversion) --
 
 template <typename TargetRepresentation>
 void mutable_data_batch::convert_to(representation_converter_registry& registry,

@@ -23,6 +23,7 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <list>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <variant>
@@ -135,6 +136,9 @@ class reservation_manager_configurator {
   /// @param mr_fn Function to create CPU memory resource.
   builder_reference& set_host_memory_resource_factory(DeviceMemoryResourceFactoryFn mr_fn);
 
+  /// \brief override whether default host pinned memory allocations are portable across GPUs.
+  builder_reference& set_host_portability(bool make_portable);
+
   builder_reference& set_host_pool_features(std::size_t chunk_size,
                                             std::size_t block_size,
                                             std::size_t initial_block_count);
@@ -220,7 +224,8 @@ class reservation_manager_configurator {
   std::optional<std::size_t> initial_block_count;
   std::pair<double, double> downgrade_fractions_per_host_{0.85, 0.65};
   fraction_or_size _cpu_reservation{0.85};  // 75% limit per NUMA node by default
-  mutable DeviceMemoryResourceFactoryFn _cpu_mr_fn = make_default_host_memory_resource;
+  mutable DeviceMemoryResourceFactoryFn _cpu_mr_fn{};
+  std::optional<bool> _host_memory_portability;
 
   std::vector<std::tuple<int, std::size_t, std::string>> _disk_mounting_points{};
 };

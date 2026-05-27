@@ -29,10 +29,7 @@ data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> 
 
 uint64_t data_batch::get_batch_id() const { return _batch_id; }
 
-void data_batch::subscribe()
-{
-  _subscriber_count.fetch_add(1, std::memory_order_relaxed);  
-}
+void data_batch::subscribe() { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
 
 void data_batch::unsubscribe()
 {
@@ -72,14 +69,18 @@ void data_batch::set_data(std::unique_ptr<idata_representation> data) { _data = 
 std::shared_ptr<data_batch> data_batch::to_idle(read_only_data_batch&& accessor)
 {
   auto ptr = accessor._batch;
-  { auto _ = std::move(accessor); }  // destroy accessor, releasing shared lock
+  {
+    auto _ = std::move(accessor);
+  }  // destroy accessor, releasing shared lock
   return ptr;
 }
 
 std::shared_ptr<data_batch> data_batch::to_idle(mutable_data_batch&& accessor)
 {
   auto ptr = accessor._batch;
-  { auto _ = std::move(accessor); }  // destroy accessor, releasing exclusive lock
+  {
+    auto _ = std::move(accessor);
+  }  // destroy accessor, releasing exclusive lock
   return ptr;
 }
 
@@ -121,9 +122,9 @@ mutable_data_batch data_batch::readonly_to_mutable(read_only_data_batch&& access
 {
   auto ptr = accessor._batch;
   {
-    // destructor decrements _read_only_count, releases the shared lock and sets state to idle                                                             
+    // destructor decrements _read_only_count, releases the shared lock and sets state to idle
     auto _ = std::move(accessor);  // move into temporary, destroyed at }
-  }   
+  }
   std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
   return mutable_data_batch(std::move(ptr), std::move(lock));
 }
@@ -132,9 +133,9 @@ read_only_data_batch data_batch::mutable_to_readonly(mutable_data_batch&& access
 {
   auto ptr = accessor._batch;
   {
-    // destructor frees the exclusive lock and sets state to idle                                                             
+    // destructor frees the exclusive lock and sets state to idle
     auto _ = std::move(accessor);  // move into temporary, destroyed at }
-  }   
+  }
   std::shared_lock<std::shared_mutex> lock(ptr->_rw_mutex);
   return read_only_data_batch(std::move(ptr), std::move(lock));
 }
@@ -157,8 +158,8 @@ read_only_data_batch::read_only_data_batch(read_only_data_batch&& other) noexcep
 }
 
 read_only_data_batch::read_only_data_batch(const read_only_data_batch& other)
-  : _batch(other._batch)
-  , _lock(other._batch ? std::shared_lock<std::shared_mutex>(other._batch->_rw_mutex)
+  : _batch(other._batch),
+    _lock(other._batch ? std::shared_lock<std::shared_mutex>(other._batch->_rw_mutex)
                        : std::shared_lock<std::shared_mutex>())
 {
   if (_batch) { _batch->_read_only_count.fetch_add(1); }
@@ -177,7 +178,7 @@ read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& oth
       _lock.unlock();
     }
     _batch = std::move(other._batch);
-    _lock  = std::move(other._lock);   
+    _lock  = std::move(other._lock);
   }
   return *this;
 }

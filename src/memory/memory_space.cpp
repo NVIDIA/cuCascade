@@ -40,7 +40,8 @@
 namespace cucascade {
 
 // Forward declaration — defined in src/data/pipeline_io_backend.cpp
-std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io = false);
+std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io    = false,
+                                                           int target_device = -1);
 
 namespace memory {
 namespace {
@@ -149,7 +150,8 @@ memory_space::memory_space(const host_memory_space_config& config)
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
     _allocator(config.mr_factory_fn
                  ? config.mr_factory_fn(config.numa_id, config.memory_capacity)
-                 : make_default_host_memory_resource(config.numa_id, config.memory_capacity))
+                 : make_default_host_memory_resource(
+                     config.numa_id, config.memory_capacity, config.make_portable))
 {
   _reservation_allocator =
     std::make_unique<fixed_size_host_memory_resource>(_id.device_id,

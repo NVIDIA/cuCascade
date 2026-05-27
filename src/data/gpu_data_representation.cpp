@@ -16,6 +16,7 @@
  */
 
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/error.hpp>
 
 #include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -23,9 +24,30 @@
 namespace cucascade {
 
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
-                                                   cucascade::memory::memory_space& memory_space)
+                                                   cucascade::memory::memory_space& memory_space,
+                                                   rmm::cuda_stream_view writer_stream)
   : idata_representation(memory_space), _table(std::move(table))
 {
+  // STREAM-LINEAGE: record the writer event in the constructor body so every
+  // representation is born with a recorded event. Skipping when the caller
+  // passes a default-constructed (per-thread default) stream view preserves
+  // legacy behavior for callers that genuinely have no writer stream — they
+  // will fall back to cudaDeviceSynchronize on the source device in
+  // convert_gpu_to_gpu(). All non-legacy callers MUST pass a real writer
+  // stream.
+  if (writer_stream.value() != nullptr) { record_writer_event(writer_stream); }
+}
+
+gpu_table_representation::~gpu_table_representation()
+{
+  // STREAM-LINEAGE: release the writer event if one was recorded. Use
+  // CUCASCADE_ASSERT_CUDA_SUCCESS so destructor stays noexcept-safe (release
+  // builds discard the error; debug builds assert). Null-event branch is the
+  // common case for representations whose writer never recorded an event.
+  if (_writer_event != nullptr) {
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(_writer_event));
+    _writer_event = nullptr;
+  }
 }
 
 std::size_t gpu_table_representation::get_size_in_bytes() const
@@ -63,10 +85,27 @@ std::unique_ptr<cudf::table> gpu_table_representation::release_table(
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)
 {
-  // Create a deep copy of the cuDF table using the provided stream
+  // Create a deep copy of the cuDF table using the provided stream.
+  // STREAM-LINEAGE: the clone has been written by `stream`; record an event on
+  // it so any cross-stream/cross-device reader of the clone honors the
+  // producer-consumer ordering established by record_writer_event().
   cudf::table_view view = get_table_view();
-  return std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(view, stream),
-                                                    get_memory_space());
+  auto cloned           = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(view, stream), get_memory_space(), stream);
+  return cloned;
 }
+
+void gpu_table_representation::record_writer_event(rmm::cuda_stream_view writer_stream)
+{
+  // STREAM-LINEAGE: lazily allocate the event handle on first call. The event
+  // uses cudaEventDisableTiming for cheaper record/wait (we never query the
+  // elapsed time on it — it's used solely for cross-stream ordering).
+  if (_writer_event == nullptr) {
+    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&_writer_event, cudaEventDisableTiming));
+  }
+  CUCASCADE_CUDA_TRY(cudaEventRecord(_writer_event, writer_stream.value()));
+}
+
+cudaEvent_t gpu_table_representation::get_writer_event() const { return _writer_event; }
 
 }  // namespace cucascade

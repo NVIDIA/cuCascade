@@ -16,9 +16,11 @@
  */
 
 #include "io_backend_internal.hpp"
+#include "io_worker.hpp"
 
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/error.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -26,94 +28,19 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <condition_variable>
+#include <cctype>
 #include <cstddef>
-#include <cstdint>
 #include <cstring>
-#include <exception>
 #include <filesystem>
-#include <functional>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace cucascade {
 namespace {
-
-// =============================================================================
-// io_worker — persistent single-thread task runner for disk I/O
-//
-// Avoids per-chunk std::async thread creation overhead. Accepts one task at a
-// time; callers wait for completion via the returned std::future<void>.
-// =============================================================================
-
-class io_worker {
- public:
-  io_worker() : _thread([this] { run(); }) {}
-
-  ~io_worker()
-  {
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _shutdown = true;
-    }
-    _cv.notify_one();
-    _thread.join();
-  }
-
-  io_worker(const io_worker&)            = delete;
-  io_worker& operator=(const io_worker&) = delete;
-  io_worker(io_worker&&)                 = delete;
-  io_worker& operator=(io_worker&&)      = delete;
-
-  /// Submit a task and return a future that resolves when it completes.
-  [[nodiscard]] std::future<void> submit(std::function<void()> work)
-  {
-    std::promise<void> promise;
-    auto future = promise.get_future();
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _pending_work    = std::move(work);
-      _pending_promise = std::move(promise);
-      _has_task        = true;
-    }
-    _cv.notify_one();
-    return future;
-  }
-
- private:
-  void run()
-  {
-    while (true) {
-      std::unique_lock<std::mutex> lock(_mutex);
-      _cv.wait(lock, [this] { return _has_task || _shutdown; });
-      if (_shutdown && !_has_task) return;
-
-      auto work    = std::move(_pending_work);
-      auto promise = std::move(_pending_promise);
-      _has_task    = false;
-      lock.unlock();
-
-      try {
-        work();
-        promise.set_value();
-      } catch (...) {
-        promise.set_exception(std::current_exception());
-      }
-    }
-  }
-
-  std::thread _thread;
-  std::mutex _mutex;
-  std::condition_variable _cv;
-  std::function<void()> _pending_work;
-  std::promise<void> _pending_promise;
-  bool _has_task{false};
-  bool _shutdown{false};
-};
 
 /// Each pinned buffer is 64 MB — matches NVMe optimal I/O size
 constexpr std::size_t PIPELINE_BUF_SIZE = 64ULL * 1024 * 1024;
@@ -126,6 +53,69 @@ std::size_t align_up_dio(std::size_t n)
 {
   return (n + DIRECT_IO_ALIGNMENT - 1) & ~(DIRECT_IO_ALIGNMENT - 1);
 }
+
+/// Best-effort lookup of the NUMA node that the GPU's PCI device is attached to.
+/// Returns -1 if the device id is invalid, the PCI bus id can't be queried, or
+/// /sys/bus/pci/devices/<bus>/numa_node is unreadable / -1. Pure topology query —
+/// no allocation, no side effects.
+int resolve_gpu_numa_node(int device_id) noexcept
+{
+  if (device_id < 0) { return -1; }
+  char pci_buf[32] = {0};
+  if (cudaDeviceGetPCIBusId(pci_buf, sizeof(pci_buf), device_id) != cudaSuccess) { return -1; }
+  // CUDA returns IDs like "0000:65:00.0"; sysfs uses lower-case form.
+  std::string pci(pci_buf);
+  for (auto& c : pci) {
+    c = static_cast<char>(std::tolower(c));
+  }
+  std::ifstream f("/sys/bus/pci/devices/" + pci + "/numa_node");
+  if (!f.is_open()) { return -1; }
+  std::string content;
+  std::getline(f, content);
+  if (content.empty()) { return -1; }
+  try {
+    return std::stoi(content);
+  } catch (...) {
+    return -1;
+  }
+}
+
+/**
+ * @brief RAII guard that drains an in-flight io_worker future and closes a fd.
+ *
+ * Used in the device read/write loops so that if a CUDA call (or anything
+ * else) throws between submit() and the matching .get(), unwinding still
+ * waits for the worker's task to finish before the pinned buffers it touches
+ * can be reused or freed by a subsequent caller / destructor. Also closes
+ * the file descriptor on the same scope exit.
+ */
+class drain_and_close {
+ public:
+  drain_and_close(std::future<void>& fut, int& fd) noexcept : _fut(fut), _fd(fd) {}
+  ~drain_and_close() noexcept
+  {
+    if (_fut.valid()) {
+      try {
+        _fut.get();
+      } catch (...) {
+        // Already unwinding (or normal exit after a get-that-failed); a
+        // task-side I/O error here would just mask the original cause.
+      }
+    }
+    if (_fd >= 0) {
+      ::close(_fd);
+      _fd = -1;
+    }
+  }
+  drain_and_close(const drain_and_close&)            = delete;
+  drain_and_close& operator=(const drain_and_close&) = delete;
+  drain_and_close(drain_and_close&&)                 = delete;
+  drain_and_close& operator=(drain_and_close&&)      = delete;
+
+ private:
+  std::future<void>& _fut;
+  int& _fd;
+};
 
 // =============================================================================
 // pipeline_io_backend — double-buffered pinned host memory pipeline
@@ -145,11 +135,18 @@ std::size_t align_up_dio(std::size_t n)
 
 class pipeline_io_backend : public idisk_io_backend {
  public:
-  explicit pipeline_io_backend(bool direct_io) : _direct_io(direct_io)
+  explicit pipeline_io_backend(bool direct_io, int target_device = -1)
+    : _direct_io(direct_io),
+      _pinned_mr(resolve_gpu_numa_node(target_device), /*make_portable=*/true)
   {
-    // Pinned host buffers are context-independent under UVA — safe to share across GPUs.
-    CUCASCADE_CUDA_TRY(cudaMallocHost(&_buf[0], PIPELINE_BUF_SIZE));
-    CUCASCADE_CUDA_TRY(cudaMallocHost(&_buf[1], PIPELINE_BUF_SIZE));
+    // Allocate as portable+mapped so the buffers are usable from any CUDA context
+    // (required for multi-GPU correctness — without Portable, only the context active
+    // at allocation time gets the fast-path pinned mapping). When target_device is
+    // valid and its NUMA node is known, page-bind to that node via libnuma so D2H/H2D
+    // doesn't cross the inter-socket interconnect. numa_node==-1 falls back to plain
+    // cudaHostAlloc(Portable|Mapped) inside numa_region_pinned_host_memory_resource.
+    _buf[0] = _pinned_mr.allocate_sync(PIPELINE_BUF_SIZE);
+    _buf[1] = _pinned_mr.allocate_sync(PIPELINE_BUF_SIZE);
     // The copy stream and order event are CUDA-context-specific. They are created lazily
     // per device in get_device_resources() so this backend works across multiple GPU
     // contexts within the same process.
@@ -157,6 +154,14 @@ class pipeline_io_backend : public idisk_io_backend {
 
   ~pipeline_io_backend() noexcept override
   {
+    // Quiesce the worker before freeing anything it might still be touching.
+    // Submitted tasks (pwrite/pread on _buf[*]) run on the worker thread, so
+    // cudaFreeHost(_buf[*]) below is unsafe until the worker has stopped.
+    // Without this explicit call, _io_worker would be torn down by member
+    // destruction *after* this body — and a stuck pwrite would either hang
+    // on freed pinned memory or wedge the kernel I/O path.
+    _io_worker.shutdown_and_join();
+
     // Save and restore the caller thread's current CUDA device. Without this, the final
     // cudaSetDevice in the loop below would silently leak out of the destructor, changing
     // the current device for any code that runs after this backend is destroyed.
@@ -170,8 +175,11 @@ class pipeline_io_backend : public idisk_io_backend {
       cudaStreamDestroy(res.copy_stream);
     }
     cudaSetDevice(saved_dev);
-    if (_buf[0]) { cudaFreeHost(_buf[0]); }
-    if (_buf[1]) { cudaFreeHost(_buf[1]); }
+    // Free via the same allocator that produced the buffers — for NUMA-bound buffers
+    // this dispatches cudaHostUnregister + numa_free; for the -1 fallback path it
+    // dispatches cudaFreeHost.
+    if (_buf[0]) { _pinned_mr.deallocate_sync(_buf[0], PIPELINE_BUF_SIZE); }
+    if (_buf[1]) { _pinned_mr.deallocate_sync(_buf[1], PIPELINE_BUF_SIZE); }
   }
 
   pipeline_io_backend(const pipeline_io_backend&)            = delete;
@@ -209,6 +217,10 @@ class pipeline_io_backend : public idisk_io_backend {
     std::size_t dest_offset = file_offset;
     int cur                 = 0;
     std::future<void> write_future;
+    // Guarantees the in-flight pwrite finishes (and fd closes) even if a CUDA
+    // call below throws — otherwise the worker thread keeps touching
+    // _buf[cur] after this function unwinds.
+    drain_and_close guard(write_future, fd);
 
     while (remaining > 0) {
       std::size_t chunk = std::min(remaining, PIPELINE_BUF_SIZE);
@@ -249,9 +261,9 @@ class pipeline_io_backend : public idisk_io_backend {
       dest_offset += chunk;
     }
 
-    // Wait for final write
+    // Wait for the final write so its failure propagates as an exception on
+    // the happy path. On unwind, the guard drains silently.
     if (write_future.valid()) { write_future.get(); }
-    ::close(fd);
   }
 
   void read(const std::filesystem::path& path,
@@ -284,7 +296,9 @@ class pipeline_io_backend : public idisk_io_backend {
     std::size_t src_offset = file_offset;
     int cur                = 0;
     std::future<void> read_future;
-    std::future<void> copy_future;
+    // Drains an in-flight pread (and closes fd) on any exit path so the
+    // worker isn't left touching _buf[*] after we unwind.
+    drain_and_close guard(read_future, fd);
 
     // Pre-read first chunk into buffer 0
     // O_DIRECT requires aligned size; read more, H2D copy only what's needed
@@ -293,7 +307,6 @@ class pipeline_io_backend : public idisk_io_backend {
     {
       auto bytes_read = ::pread(fd, _buf[0], first_read_sz, static_cast<off_t>(src_offset));
       if (bytes_read < 0 || static_cast<std::size_t>(bytes_read) < first_chunk) {
-        ::close(fd);
         CUCASCADE_FAIL("pipeline pread failed");
       }
     }
@@ -343,8 +356,6 @@ class pipeline_io_backend : public idisk_io_backend {
       cur            = 1 - cur;
       chunks_to_copy = next_chunk;
     }
-
-    ::close(fd);
   }
 
   void write(const std::filesystem::path& path,
@@ -436,6 +447,9 @@ class pipeline_io_backend : public idisk_io_backend {
     // Double-buffered pipeline: D2H into buf[cur], pwrite buf[prev] in parallel
     int cur = 0;
     std::future<void> write_future;
+    // Drains the trailing pwrite (and closes fd) even if a CUDA call in the
+    // loop throws — keeps the worker from outliving this scope mid-task.
+    drain_and_close guard(write_future, fd);
 
     for (const auto& c : chunks) {
       // D2H copy into current buffer
@@ -467,7 +481,6 @@ class pipeline_io_backend : public idisk_io_backend {
     }
 
     if (write_future.valid()) { write_future.get(); }
-    ::close(fd);
   }
 
  private:
@@ -494,7 +507,11 @@ class pipeline_io_backend : public idisk_io_backend {
 
   void* _buf[2]{nullptr, nullptr};
   bool _direct_io;
-  io_worker _io_worker;
+  // Owns the pinned host buffers below. Declared before _buf usages-by-pointer is fine
+  // (we only call its allocate/deallocate inline in ctor/dtor), but declared before the
+  // mutex/map members so the worker (declared last) is destroyed before this MR is —
+  // ensuring no submitted task is still touching _buf when its pages get unregistered.
+  memory::numa_region_pinned_host_memory_resource _pinned_mr;
   std::mutex _resources_mutex;
   std::unordered_map<int, device_resources> _per_device;
   // Serializes the device read/write paths so concurrent callers don't race on the shared
@@ -503,13 +520,18 @@ class pipeline_io_backend : public idisk_io_backend {
   // correctness, not parallelism. A per-call pool of (buffer, stream, event) contexts would
   // unlock true concurrency; deferred until needed.
   std::mutex _device_io_mutex;
+  // Declared last so that, even if a future caller skips the explicit
+  // shutdown_and_join() at the top of the destructor, the reverse member
+  // destruction order still tears down the worker before the buffers and
+  // streams it might be touching.
+  detail::io_worker _io_worker;
 };
 
 }  // namespace
 
-std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io)
+std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io, int target_device)
 {
-  return std::make_unique<pipeline_io_backend>(direct_io);
+  return std::make_unique<pipeline_io_backend>(direct_io, target_device);
 }
 
 }  // namespace cucascade

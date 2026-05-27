@@ -81,7 +81,8 @@ void round_trip_test(std::unique_ptr<cudf::table> original_table)
   register_builtin_converters(registry);
 
   // Create GPU representation from the original table
-  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(original_table), *gpu_space);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::move(original_table), *gpu_space, rmm::cuda_stream_view{});
 
   // GPU -> host_data
   auto host_rep =
@@ -312,6 +313,29 @@ TEST_CASE("host_data disk round-trip string column", "[disk][converter][string]"
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(str_col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+// Regression: cudf::make_empty_column(STRING) returns a 0-row strings column with no children.
+// plan_column_copy faithfully records 0 children, and reconstruct_column previously rejected
+// that metadata. Empty-string batches show up in real pipelines (e.g. probe-side partition
+// outputs after a filter), get downgraded to host under memory pressure, and crash on
+// upgrade back to GPU.
+TEST_CASE("host_data disk round-trip empty strings column", "[disk][converter][string][empty]")
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("host_data disk round-trip empty strings column mixed with non-empty column",
+          "[disk][converter][string][empty]")
+{
+  // Mimic the in-pipeline shape: a 0-row table where one of the columns is an empty STRING.
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}));
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}));
   round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
 }
 
