@@ -841,7 +841,7 @@ class observed_gpu_representation : private cucascade::test::mock_memory_space_h
  public:
   observed_gpu_representation(rmm::device_buffer buf, conversion_sync_observer& observer)
     : mock_memory_space_holder(memory::Tier::GPU, 0),
-      idata_representation(*space),
+      idata_representation(*space, typeid(observed_gpu_representation)),
       _buf(std::move(buf)),
       _observer(observer)
   {
@@ -941,7 +941,7 @@ class observed_host_representation : private cucascade::test::mock_memory_space_
                                std::size_t size,
                                conversion_sync_observer& observer)
     : mock_memory_space_holder(memory::Tier::HOST, 0),
-      idata_representation(*space),
+      idata_representation(*space, typeid(observed_host_representation)),
       _pinned_ptr(pinned_ptr),
       _size(size),
       _observer(observer)

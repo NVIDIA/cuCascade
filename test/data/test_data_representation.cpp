@@ -93,9 +93,6 @@ TEST_CASE("host_data_packed_representation converts to GPU and preserves content
           "[cpu_data_representation][gpu_data_representation]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
 
@@ -140,7 +137,7 @@ TEST_CASE("host_data_packed_representation converts to GPU and preserves content
 
   // Convert to GPU and compare cudf tables
   auto gpu_stream = gpu_space->acquire_stream();
-  auto gpu_any    = registry.convert<gpu_table_representation>(host_repr, gpu_space, pack_stream);
+  auto gpu_any    = host_repr.convert_to<gpu_table_representation>(gpu_space, pack_stream);
   pack_stream.synchronize();
   auto& gpu_repr = *gpu_any;
   // Compare using the same stream used for conversion to avoid cross-stream hazards
@@ -262,9 +259,6 @@ TEST_CASE("gpu_table_representation device_id", "[gpu_data_representation]")
 TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_representation]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
@@ -276,8 +270,8 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
                                 *const_cast<memory::memory_space*>(gpu_space),
                                 rmm::cuda_stream_view{});
 
-  auto cpu_any = registry.convert<host_data_packed_representation>(repr, host_space, chain_stream);
-  auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
+  auto cpu_any = repr.convert_to<host_data_packed_representation>(host_space, chain_stream);
+  auto gpu_any = cpu_any->convert_to<gpu_table_representation>(gpu_space, chain_stream);
 
   auto& back = *gpu_any;
   chain_stream.synchronize();
@@ -312,10 +306,7 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
   int dev_src = 0;
   int dev_dst = 1;
 
-  auto mgr = create_multi_gpu_manager(dev_src, dev_dst);
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
+  auto mgr                              = create_multi_gpu_manager(dev_src, dev_dst);
   const memory::memory_space* src_space = mgr->get_memory_space(memory::Tier::GPU, dev_src);
   const memory::memory_space* dst_space = mgr->get_memory_space(memory::Tier::GPU, dev_dst);
   REQUIRE(src_space != nullptr);
@@ -330,7 +321,7 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
                                     *const_cast<memory::memory_space*>(src_space),
                                     rmm::cuda_stream_view{});
 
-  auto dst_any   = registry.convert<gpu_table_representation>(src_repr, dst_space, xfer_stream);
+  auto dst_any   = src_repr.convert_to<gpu_table_representation>(dst_space, xfer_stream);
   auto& dst_repr = *dst_any;
 
   // Compare content equality using the same stream used for transfer
@@ -346,9 +337,6 @@ TEST_CASE("gpu->host_packed->gpu roundtrip preserves contents (table_view+shared
           "[gpu_data_representation][table_view_ctor]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
@@ -364,8 +352,8 @@ TEST_CASE("gpu->host_packed->gpu roundtrip preserves contents (table_view+shared
                                 *const_cast<memory::memory_space*>(gpu_space),
                                 rmm::cuda_stream_view{});
 
-  auto cpu_any = registry.convert<host_data_packed_representation>(repr, host_space, chain_stream);
-  auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
+  auto cpu_any = repr.convert_to<host_data_packed_representation>(host_space, chain_stream);
+  auto gpu_any = cpu_any->convert_to<gpu_table_representation>(gpu_space, chain_stream);
 
   chain_stream.synchronize();
   cucascade::test::expect_cudf_tables_equal_on_stream(
@@ -376,9 +364,6 @@ TEST_CASE("gpu->host_fast->gpu roundtrip preserves contents (table_view+shared_p
           "[gpu_data_representation][table_view_ctor]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
@@ -403,8 +388,8 @@ TEST_CASE("gpu->host_fast->gpu roundtrip preserves contents (table_view+shared_p
                                 *const_cast<memory::memory_space*>(gpu_space),
                                 rmm::cuda_stream_view{});
 
-  auto host = registry.convert<host_data_representation>(repr, host_space, stream.view());
-  auto back = registry.convert<gpu_table_representation>(*host, gpu_space, stream.view());
+  auto host = repr.convert_to<host_data_representation>(host_space, stream.view());
+  auto back = host->convert_to<gpu_table_representation>(gpu_space, stream.view());
   stream.synchronize();
 
   REQUIRE(back->get_table_view().num_columns() == 1);
@@ -621,9 +606,6 @@ TEST_CASE("host_data_packed_representation clone creates independent copy",
           "[cpu_data_representation]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
 
@@ -636,8 +618,7 @@ TEST_CASE("host_data_packed_representation clone creates independent copy",
                                     *const_cast<memory::memory_space*>(gpu_space),
                                     rmm::cuda_stream_view{});
 
-  auto host_repr_ptr =
-    registry.convert<host_data_packed_representation>(gpu_repr, host_space, stream);
+  auto host_repr_ptr = gpu_repr.convert_to<host_data_packed_representation>(host_space, stream);
   stream.synchronize();
 
   // Clone the host representation
@@ -658,8 +639,8 @@ TEST_CASE("host_data_packed_representation clone creates independent copy",
           host_repr_ptr->get_host_table()->allocation.get());
 
   // Convert both back to GPU and verify data equality
-  auto cloned_gpu = registry.convert<gpu_table_representation>(*cloned, gpu_space, stream);
-  auto orig_gpu   = registry.convert<gpu_table_representation>(*host_repr_ptr, gpu_space, stream);
+  auto cloned_gpu = cloned->convert_to<gpu_table_representation>(gpu_space, stream);
+  auto orig_gpu   = host_repr_ptr->convert_to<gpu_table_representation>(gpu_space, stream);
   stream.synchronize();
 
   cucascade::test::expect_cudf_tables_equal_on_stream(
@@ -716,14 +697,13 @@ static gpu_table_representation wrap_column(
     std::make_unique<cudf::table>(std::move(cols)), gpu_space, writer_stream);
 }
 
-/// Convert a gpu_table_representation to host_data_representation via the registry.
+/// Convert a gpu_table_representation to host_data_representation via the singleton registry.
 static std::unique_ptr<host_data_representation> fast_convert(
   gpu_table_representation& src,
   const memory::memory_space* host_space,
-  representation_converter_registry& registry,
   rmm::cuda_stream_view stream)
 {
-  return registry.convert<host_data_representation>(src, host_space, stream);
+  return src.convert_to<host_data_representation>(host_space, stream);
 }
 
 // =============================================================================
@@ -733,9 +713,8 @@ static std::unique_ptr<host_data_representation> fast_convert(
 TEST_CASE("register_builtin_converters registers GPU->host_data_representation",
           "[fast][registration]")
 {
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-  REQUIRE(registry.has_converter<gpu_table_representation, host_data_representation>());
+  REQUIRE(representation_converter_registry::instance()
+            .has_converter<gpu_table_representation, host_data_representation>());
 }
 
 // =============================================================================
@@ -743,8 +722,7 @@ TEST_CASE("register_builtin_converters registers GPU->host_data_representation",
 // =============================================================================
 
 template <cudf::type_id TypeID, typename CppType>
-static void check_fixed_width_metadata(memory::memory_reservation_manager& mgr,
-                                       representation_converter_registry& registry)
+static void check_fixed_width_metadata(memory::memory_reservation_manager& mgr)
 {
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
@@ -760,7 +738,7 @@ static void check_fixed_width_metadata(memory::memory_reservation_manager& mgr,
 
   auto repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   REQUIRE(host != nullptr);
@@ -780,21 +758,18 @@ static void check_fixed_width_metadata(memory::memory_reservation_manager& mgr,
 TEST_CASE("Fast converter metadata: fixed-width primitive types", "[fast][metadata]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   // clang-format off
-  SECTION("INT8")   { check_fixed_width_metadata<cudf::type_id::INT8,   int8_t  >(mgr, registry); }
-  SECTION("INT16")  { check_fixed_width_metadata<cudf::type_id::INT16,  int16_t >(mgr, registry); }
-  SECTION("INT32")  { check_fixed_width_metadata<cudf::type_id::INT32,  int32_t >(mgr, registry); }
-  SECTION("INT64")  { check_fixed_width_metadata<cudf::type_id::INT64,  int64_t >(mgr, registry); }
-  SECTION("UINT8")  { check_fixed_width_metadata<cudf::type_id::UINT8,  uint8_t >(mgr, registry); }
-  SECTION("UINT16") { check_fixed_width_metadata<cudf::type_id::UINT16, uint16_t>(mgr, registry); }
-  SECTION("UINT32") { check_fixed_width_metadata<cudf::type_id::UINT32, uint32_t>(mgr, registry); }
-  SECTION("UINT64") { check_fixed_width_metadata<cudf::type_id::UINT64, uint64_t>(mgr, registry); }
-  SECTION("FLOAT32"){ check_fixed_width_metadata<cudf::type_id::FLOAT32, float  >(mgr, registry); }
-  SECTION("FLOAT64"){ check_fixed_width_metadata<cudf::type_id::FLOAT64, double >(mgr, registry); }
-  SECTION("BOOL8")  { check_fixed_width_metadata<cudf::type_id::BOOL8,   bool   >(mgr, registry); }
+  SECTION("INT8")   { check_fixed_width_metadata<cudf::type_id::INT8,   int8_t  >(mgr); }
+  SECTION("INT16")  { check_fixed_width_metadata<cudf::type_id::INT16,  int16_t >(mgr); }
+  SECTION("INT32")  { check_fixed_width_metadata<cudf::type_id::INT32,  int32_t >(mgr); }
+  SECTION("INT64")  { check_fixed_width_metadata<cudf::type_id::INT64,  int64_t >(mgr); }
+  SECTION("UINT8")  { check_fixed_width_metadata<cudf::type_id::UINT8,  uint8_t >(mgr); }
+  SECTION("UINT16") { check_fixed_width_metadata<cudf::type_id::UINT16, uint16_t>(mgr); }
+  SECTION("UINT32") { check_fixed_width_metadata<cudf::type_id::UINT32, uint32_t>(mgr); }
+  SECTION("UINT64") { check_fixed_width_metadata<cudf::type_id::UINT64, uint64_t>(mgr); }
+  SECTION("FLOAT32"){ check_fixed_width_metadata<cudf::type_id::FLOAT32, float  >(mgr); }
+  SECTION("FLOAT64"){ check_fixed_width_metadata<cudf::type_id::FLOAT64, double >(mgr); }
+  SECTION("BOOL8")  { check_fixed_width_metadata<cudf::type_id::BOOL8,   bool   >(mgr); }
   // clang-format on
 }
 
@@ -805,9 +780,6 @@ TEST_CASE("Fast converter metadata: fixed-width primitive types", "[fast][metada
 TEST_CASE("Fast converter copies INT32 data bytes correctly", "[fast][data_integrity]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -824,7 +796,7 @@ TEST_CASE("Fast converter copies INT32 data bytes correctly", "[fast][data_integ
 
   auto repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
@@ -837,9 +809,6 @@ TEST_CASE("Fast converter copies INT32 data bytes correctly", "[fast][data_integ
 TEST_CASE("Fast converter copies FLOAT64 data bytes correctly", "[fast][data_integrity]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -856,7 +825,7 @@ TEST_CASE("Fast converter copies FLOAT64 data bytes correctly", "[fast][data_int
 
   auto repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
@@ -873,9 +842,6 @@ TEST_CASE("Fast converter copies FLOAT64 data bytes correctly", "[fast][data_int
 TEST_CASE("Fast converter: nullable INT32 — null mask metadata and bytes", "[fast][nullable]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -890,7 +856,7 @@ TEST_CASE("Fast converter: nullable INT32 — null mask metadata and bytes", "[f
 
   auto repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
@@ -907,9 +873,6 @@ TEST_CASE("Fast converter: nullable INT64 — both null mask and data bytes are 
           "[fast][nullable]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -927,7 +890,7 @@ TEST_CASE("Fast converter: nullable INT64 — both null mask and data bytes are 
 
   auto repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
@@ -950,9 +913,6 @@ TEST_CASE("Fast converter: nullable INT64 — both null mask and data bytes are 
 TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -968,7 +928,7 @@ TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::TIMESTAMP_DAYS);
@@ -987,7 +947,7 @@ TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::TIMESTAMP_SECONDS);
@@ -1005,7 +965,7 @@ TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::TIMESTAMP_MICROSECONDS);
@@ -1016,9 +976,6 @@ TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
 TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1034,7 +991,7 @@ TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::DURATION_DAYS);
@@ -1051,7 +1008,7 @@ TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::DURATION_MILLISECONDS);
@@ -1068,7 +1025,7 @@ TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::DURATION_NANOSECONDS);
@@ -1083,9 +1040,6 @@ TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
 TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][decimal]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1101,7 +1055,7 @@ TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][dec
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::DECIMAL32);
@@ -1121,7 +1075,7 @@ TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][dec
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::DECIMAL64);
@@ -1139,7 +1093,7 @@ TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][dec
     stream.synchronize();
     auto repr = wrap_column(
       std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-    auto host = fast_convert(repr, host_space, registry, stream.view());
+    auto host = fast_convert(repr, host_space, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
     REQUIRE(meta.type_id == cudf::type_id::DECIMAL128);
@@ -1155,9 +1109,6 @@ TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][dec
 TEST_CASE("Fast converter: STRING column metadata structure", "[fast][string]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1191,7 +1142,7 @@ TEST_CASE("Fast converter: STRING column metadata structure", "[fast][string]")
 
   auto repr = wrap_column(
     std::move(strings_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
@@ -1218,9 +1169,6 @@ TEST_CASE("Fast converter: STRING column metadata structure", "[fast][string]")
 TEST_CASE("Fast converter: LIST<INT32> column metadata structure", "[fast][list]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1253,7 +1201,7 @@ TEST_CASE("Fast converter: LIST<INT32> column metadata structure", "[fast][list]
 
   auto repr = wrap_column(
     std::move(list_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
@@ -1279,9 +1227,6 @@ TEST_CASE("Fast converter: LIST<INT32> column metadata structure", "[fast][list]
 TEST_CASE("Fast converter: nullable LIST<INT32> preserves parent null mask", "[fast][list]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1316,7 +1261,7 @@ TEST_CASE("Fast converter: nullable LIST<INT32> preserves parent null mask", "[f
 
   auto repr = wrap_column(
     std::move(list_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
@@ -1332,9 +1277,6 @@ TEST_CASE("Fast converter: nullable LIST<INT32> preserves parent null mask", "[f
 TEST_CASE("Fast converter: STRUCT<INT32, FLOAT64> column metadata structure", "[fast][struct]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1359,7 +1301,7 @@ TEST_CASE("Fast converter: STRUCT<INT32, FLOAT64> column metadata structure", "[
 
   auto repr = wrap_column(
     std::move(struct_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
@@ -1387,9 +1329,6 @@ TEST_CASE("Fast converter: STRUCT<INT32, FLOAT64> column metadata structure", "[
 TEST_CASE("Fast converter: LIST<LIST<INT32>> nested metadata", "[fast][nested]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1443,7 +1382,7 @@ TEST_CASE("Fast converter: LIST<LIST<INT32>> nested metadata", "[fast][nested]")
 
   auto repr = wrap_column(
     std::move(outer_list), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   // Outer LIST
@@ -1484,9 +1423,6 @@ TEST_CASE("Fast converter: LIST<LIST<INT32>> nested metadata", "[fast][nested]")
 TEST_CASE("Fast converter: LIST<STRUCT<INT32,FLOAT64>> nested metadata", "[fast][nested]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1532,7 +1468,7 @@ TEST_CASE("Fast converter: LIST<STRUCT<INT32,FLOAT64>> nested metadata", "[fast]
 
   auto repr = wrap_column(
     std::move(list_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   // Outer: LIST
@@ -1576,9 +1512,6 @@ TEST_CASE("Fast converter: LIST<STRUCT<INT32,FLOAT64>> nested metadata", "[fast]
 TEST_CASE("Fast converter: STRUCT<LIST<INT32>,FLOAT64> nested metadata", "[fast][nested]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1628,7 +1561,7 @@ TEST_CASE("Fast converter: STRUCT<LIST<INT32>,FLOAT64> nested metadata", "[fast]
 
   auto repr = wrap_column(
     std::move(struct_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   // Top-level: STRUCT
@@ -1674,9 +1607,6 @@ TEST_CASE("Fast converter: STRUCT<LIST<INT32>,FLOAT64> nested metadata", "[fast]
 TEST_CASE("Fast converter: empty table (0 rows)", "[fast][empty]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1700,7 +1630,7 @@ TEST_CASE("Fast converter: empty table (0 rows)", "[fast][empty]")
                                 *const_cast<memory::memory_space*>(gpu_space),
                                 rmm::cuda_stream_view{});
 
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   REQUIRE(host != nullptr);
@@ -1721,9 +1651,6 @@ TEST_CASE("Fast converter: empty table (0 rows)", "[fast][empty]")
 TEST_CASE("Fast converter: multi-column table with all primitive types", "[fast][multi_column]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1759,7 +1686,7 @@ TEST_CASE("Fast converter: multi-column table with all primitive types", "[fast]
                                 *const_cast<memory::memory_space*>(gpu_space),
                                 rmm::cuda_stream_view{});
 
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   REQUIRE(host != nullptr);
@@ -1784,9 +1711,6 @@ TEST_CASE("Fast converter: multi-column table with all primitive types", "[fast]
 TEST_CASE("host_data_representation clone: same bytes, independent allocation", "[fast][clone]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1802,7 +1726,7 @@ TEST_CASE("host_data_representation clone: same bytes, independent allocation", 
 
   auto repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   auto cloned_base = host->clone(stream.view());
@@ -1840,9 +1764,6 @@ TEST_CASE("host_data_representation clone: same bytes, independent allocation", 
 TEST_CASE("host_data_representation clone: empty table", "[fast][clone]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1856,7 +1777,7 @@ TEST_CASE("host_data_representation clone: empty table", "[fast][clone]")
 
   auto repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(repr, host_space, registry, stream.view());
+  auto host = fast_convert(repr, host_space, stream.view());
   stream.synchronize();
 
   auto cloned_base = host->clone(stream.view());
@@ -1871,30 +1792,25 @@ TEST_CASE("host_data_representation clone: empty table", "[fast][clone]")
 // Round-trip: HOST FAST → GPU
 // =============================================================================
 
-/// Convert a host_data_representation back to gpu_table_representation via registry.
+/// Convert a host_data_representation back to gpu_table_representation via the singleton registry.
 static std::unique_ptr<gpu_table_representation> fast_back_convert(
   host_data_representation& src,
   const memory::memory_space* gpu_space,
-  representation_converter_registry& registry,
   rmm::cuda_stream_view stream)
 {
-  return registry.convert<gpu_table_representation>(src, gpu_space, stream);
+  return src.convert_to<gpu_table_representation>(gpu_space, stream);
 }
 
 TEST_CASE("register_builtin_converters registers host_data_representation->GPU",
           "[fast][registration]")
 {
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-  REQUIRE(registry.has_converter<host_data_representation, gpu_table_representation>());
+  REQUIRE(representation_converter_registry::instance()
+            .has_converter<host_data_representation, gpu_table_representation>());
 }
 
 TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1910,10 +1826,10 @@ TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
 
   auto orig_repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
+  auto host = fast_convert(orig_repr, host_space, stream.view());
   stream.synchronize();
 
-  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
+  auto back = fast_back_convert(*host, gpu_space, stream.view());
   stream.synchronize();
 
   REQUIRE(back != nullptr);
@@ -1929,9 +1845,6 @@ TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
 TEST_CASE("Round-trip fast: nullable INT64 null mask preserved", "[fast][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1948,10 +1861,10 @@ TEST_CASE("Round-trip fast: nullable INT64 null mask preserved", "[fast][roundtr
 
   auto orig_repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
+  auto host = fast_convert(orig_repr, host_space, stream.view());
   stream.synchronize();
 
-  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
+  auto back = fast_back_convert(*host, gpu_space, stream.view());
   stream.synchronize();
 
   REQUIRE(back->get_table_view().num_columns() == 1);
@@ -1966,9 +1879,6 @@ TEST_CASE("Round-trip fast: nullable INT64 null mask preserved", "[fast][roundtr
 TEST_CASE("Round-trip fast: FLOAT64 byte integrity", "[fast][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -1984,10 +1894,10 @@ TEST_CASE("Round-trip fast: FLOAT64 byte integrity", "[fast][roundtrip]")
 
   auto orig_repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
+  auto host = fast_convert(orig_repr, host_space, stream.view());
   stream.synchronize();
 
-  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
+  auto back = fast_back_convert(*host, gpu_space, stream.view());
   stream.synchronize();
 
   cudf::table_view back_tv = back->get_table_view();
@@ -1999,9 +1909,6 @@ TEST_CASE("Round-trip fast: FLOAT64 byte integrity", "[fast][roundtrip]")
 TEST_CASE("Round-trip fast: STRING column content preserved", "[fast][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -2031,10 +1938,10 @@ TEST_CASE("Round-trip fast: STRING column content preserved", "[fast][roundtrip]
 
   auto orig_repr = wrap_column(
     std::move(strings_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
+  auto host = fast_convert(orig_repr, host_space, stream.view());
   stream.synchronize();
 
-  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
+  auto back = fast_back_convert(*host, gpu_space, stream.view());
   stream.synchronize();
 
   REQUIRE(back->get_table_view().num_columns() == 1);
@@ -2051,9 +1958,6 @@ TEST_CASE("Round-trip fast: STRING column content preserved", "[fast][roundtrip]
 TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -2086,10 +1990,10 @@ TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]
 
   auto orig_repr = wrap_column(
     std::move(list_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
+  auto host = fast_convert(orig_repr, host_space, stream.view());
   stream.synchronize();
 
-  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
+  auto back = fast_back_convert(*host, gpu_space, stream.view());
   stream.synchronize();
 
   REQUIRE(back->get_table_view().num_rows() == num_lists);
@@ -2105,9 +2009,6 @@ TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]
 TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -2136,10 +2037,10 @@ TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][rou
 
   auto orig_repr = wrap_column(
     std::move(struct_col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
+  auto host = fast_convert(orig_repr, host_space, stream.view());
   stream.synchronize();
 
-  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
+  auto back = fast_back_convert(*host, gpu_space, stream.view());
   stream.synchronize();
 
   REQUIRE(back->get_table_view().num_rows() == N);
@@ -2156,9 +2057,6 @@ TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][rou
 TEST_CASE("Round-trip fast: empty table (0 rows)", "[fast][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -2172,10 +2070,10 @@ TEST_CASE("Round-trip fast: empty table (0 rows)", "[fast][roundtrip]")
 
   auto orig_repr = wrap_column(
     std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
-  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
+  auto host = fast_convert(orig_repr, host_space, stream.view());
   stream.synchronize();
 
-  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
+  auto back = fast_back_convert(*host, gpu_space, stream.view());
   stream.synchronize();
 
   REQUIRE(back != nullptr);
@@ -2220,9 +2118,6 @@ TEST_CASE("host_data_representation::slice round-trip preserves selected columns
           "[fast][slice][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
   const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
   rmm::cuda_stream stream;
@@ -2236,7 +2131,7 @@ TEST_CASE("host_data_representation::slice round-trip preserves selected columns
   // GPU -> HOST
   gpu_table_representation gpu_repr(
     std::move(orig_table), *const_cast<memory::memory_space*>(gpu_space), stream.view());
-  auto host = fast_convert(gpu_repr, host_space, registry, stream.view());
+  auto host = fast_convert(gpu_repr, host_space, stream.view());
   stream.synchronize();
   REQUIRE(host->num_columns() == 4);
 
@@ -2251,7 +2146,7 @@ TEST_CASE("host_data_representation::slice round-trip preserves selected columns
     // Slice shares buffers with the source allocation.
     REQUIRE(sliced->get_host_table()->allocation.get() == host->get_host_table()->allocation.get());
 
-    auto back = fast_back_convert(*sliced, gpu_space, registry, stream.view());
+    auto back = fast_back_convert(*sliced, gpu_space, stream.view());
     stream.synchronize();
     REQUIRE(back != nullptr);
     REQUIRE(back->get_table_view().num_columns() == 2);
@@ -2267,7 +2162,7 @@ TEST_CASE("host_data_representation::slice round-trip preserves selected columns
     auto sliced = host->slice(std::span<const std::size_t>(kept.data(), kept.size()));
     REQUIRE(sliced->num_columns() == 3);
 
-    auto back = fast_back_convert(*sliced, gpu_space, registry, stream.view());
+    auto back = fast_back_convert(*sliced, gpu_space, stream.view());
     stream.synchronize();
     REQUIRE(back->get_table_view().num_columns() == 3);
 

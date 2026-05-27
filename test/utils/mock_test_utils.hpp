@@ -114,7 +114,8 @@ class mock_data_representation : private mock_memory_space_holder, public idata_
   explicit mock_data_representation(memory::Tier tier, size_t size = 1024, size_t device_id = 0)
     : mock_memory_space_holder(tier, device_id)  // Construct holder first
       ,
-      idata_representation(*space)  // Pass reference to base class
+      idata_representation(*space,
+                           typeid(mock_data_representation))  // Pass reference to base class
       ,
       _size(size)
   {

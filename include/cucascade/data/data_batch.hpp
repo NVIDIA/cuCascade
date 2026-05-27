@@ -500,8 +500,7 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
   rmm::cuda_stream_view stream) const
 {
   auto new_representation =
-    representation_converter_registry::instance().convert<TargetRepresentation>(
-      *_batch->_data, target_memory_space, stream);
+    _batch->_data->clone_to<TargetRepresentation>(target_memory_space, stream);
   return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
 }
 
@@ -512,8 +511,7 @@ void mutable_data_batch::convert_to(const memory::memory_space* target_memory_sp
                                     rmm::cuda_stream_view stream)
 {
   auto new_representation =
-    representation_converter_registry::instance().convert<TargetRepresentation>(
-      *_batch->_data, target_memory_space, stream);
+    _batch->_data->convert_to<TargetRepresentation>(target_memory_space, stream);
   auto old_representation = std::move(_batch->_data);
   _batch->_data           = std::move(new_representation);
 
@@ -538,8 +536,7 @@ std::shared_ptr<data_batch> mutable_data_batch::clone_to(
   rmm::cuda_stream_view stream) const
 {
   auto new_representation =
-    representation_converter_registry::instance().convert<TargetRepresentation>(
-      *_batch->_data, target_memory_space, stream);
+    _batch->_data->clone_to<TargetRepresentation>(target_memory_space, stream);
   return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
 }
 

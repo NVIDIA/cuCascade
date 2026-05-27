@@ -216,7 +216,8 @@ std::unique_ptr<host_table_allocation> host_table_allocation::clone(memory_space
 
 host_data_representation::host_data_representation(
   std::unique_ptr<memory::host_table_allocation> host_table, memory::memory_space* memory_space)
-  : idata_representation(*memory_space), _host_table(std::move(host_table))
+  : idata_representation(*memory_space, typeid(host_data_representation)),
+    _host_table(std::move(host_table))
 {
 }
 
@@ -265,7 +266,8 @@ std::unique_ptr<idata_representation> host_data_representation::clone(
 host_data_packed_representation::host_data_packed_representation(
   std::unique_ptr<cucascade::memory::host_table_packed_allocation> host_table,
   cucascade::memory::memory_space* memory_space)
-  : idata_representation(*memory_space), _host_table(std::move(host_table))
+  : idata_representation(*memory_space, typeid(host_data_packed_representation)),
+    _host_table(std::move(host_table))
 {
 }
 

@@ -105,16 +105,6 @@ void drop_os_cache(const std::string& path)
   }
 }
 
-/**
- * @brief Create a converter registry with all built-in converters.
- */
-std::unique_ptr<representation_converter_registry> make_benchmark_registry()
-{
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-  return registry;
-}
-
 // For non-NUMA systems, this should be -1, causing the allocator to use cudaHostAlloc instead of
 // cudaHostRegister
 constexpr int hostDevId = -1;
@@ -415,8 +405,6 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = make_benchmark_registry();
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
 
@@ -435,16 +423,14 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
     std::make_unique<cudf::table>(std::move(warmup_table)),
     *const_cast<memory_space*>(gpu_space),
     stream.view());
-  auto warmup_result =
-    registry->convert<disk_data_representation>(*warmup_repr, disk_space, stream.view());
+  auto warmup_result = warmup_repr->convert_to<disk_data_representation>(disk_space, stream.view());
   stream.synchronize();
 
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream.view());
+    auto disk_result = gpu_rep->convert_to<disk_data_representation>(disk_space, stream.view());
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -470,8 +456,6 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = make_benchmark_registry();
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
 
@@ -484,15 +468,14 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
                                                *const_cast<memory_space*>(gpu_space),
                                                stream.view());
 
-  auto disk_rep = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream.view());
+  auto disk_rep = gpu_rep->convert_to<disk_data_representation>(disk_space, stream.view());
   stream.synchronize();
 
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto gpu_result =
-      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream.view());
+    auto gpu_result = disk_rep->convert_to<gpu_table_representation>(gpu_space, stream.view());
     stream.synchronize();
   }
 
@@ -517,9 +500,6 @@ void BM_ConvertHostToDisk(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -533,15 +513,14 @@ void BM_ConvertHostToDisk(benchmark::State& state)
                                                *const_cast<memory_space*>(gpu_space),
                                                stream.view());
 
-  auto host_rep = registry->convert<host_data_representation>(*gpu_rep, host_space, stream.view());
+  auto host_rep = gpu_rep->convert_to<host_data_representation>(host_space, stream.view());
   stream.synchronize();
 
   size_t bytes_transferred = host_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*host_rep, disk_space, stream.view());
+    auto disk_result = host_rep->convert_to<disk_data_representation>(disk_space, stream.view());
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -567,9 +546,6 @@ void BM_ConvertDiskToHost(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
@@ -583,18 +559,17 @@ void BM_ConvertDiskToHost(benchmark::State& state)
                                                *const_cast<memory_space*>(gpu_space),
                                                stream.view());
 
-  auto host_rep = registry->convert<host_data_representation>(*gpu_rep, host_space, stream.view());
+  auto host_rep = gpu_rep->convert_to<host_data_representation>(host_space, stream.view());
   stream.synchronize();
 
-  auto disk_rep = registry->convert<disk_data_representation>(*host_rep, disk_space, stream.view());
+  auto disk_rep = host_rep->convert_to<disk_data_representation>(disk_space, stream.view());
   stream.synchronize();
 
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto host_result =
-      registry->convert<host_data_representation>(*disk_rep, host_space, stream.view());
+    auto host_result = disk_rep->convert_to<host_data_representation>(host_space, stream.view());
     stream.synchronize();
   }
 
@@ -623,8 +598,6 @@ void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = make_benchmark_registry();
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
 
@@ -640,8 +613,7 @@ void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream.view());
+    auto disk_result = gpu_rep->convert_to<disk_data_representation>(disk_space, stream.view());
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -667,8 +639,6 @@ void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = make_benchmark_registry();
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
 
@@ -684,8 +654,7 @@ void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream.view());
+    auto disk_result = gpu_rep->convert_to<disk_data_representation>(disk_space, stream.view());
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -711,8 +680,6 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = make_benchmark_registry();
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
 
@@ -728,8 +695,7 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream.view());
+    auto disk_result = gpu_rep->convert_to<disk_data_representation>(disk_space, stream.view());
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -825,9 +791,6 @@ void BM_ConvertGpuToDiskPipeline(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
 
@@ -843,8 +806,7 @@ void BM_ConvertGpuToDiskPipeline(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream.view());
+    auto disk_result = gpu_rep->convert_to<disk_data_representation>(disk_space, stream.view());
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -881,11 +843,9 @@ std::unique_ptr<disk_data_representation> write_table_to_disk(cudf::table&& tabl
                                                               const memory_space* disk_space,
                                                               rmm::cuda_stream_view stream)
 {
-  auto registry = make_benchmark_registry();
-
   auto gpu_rep = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
-  auto disk_rep = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
+  auto disk_rep = gpu_rep->convert_to<disk_data_representation>(disk_space, stream);
   stream.synchronize();
   return disk_rep;
 }
@@ -908,15 +868,12 @@ void BM_ConvertDiskToGpuPipeline(benchmark::State& state)
                                       disk_space,
                                       stream.view());
 
-  auto registry = make_benchmark_registry();
-
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
   const auto& disk_file    = disk_rep->get_disk_table().file_path;
 
   for ([[maybe_unused]] auto _ : state) {
     drop_os_cache(disk_file);
-    auto gpu_result =
-      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream.view());
+    auto gpu_result = disk_rep->convert_to<gpu_table_representation>(gpu_space, stream.view());
     stream.synchronize();
   }
 
@@ -954,8 +911,6 @@ void pipeline_write_benchmark(benchmark::State& state, TableFactory table_factor
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = make_benchmark_registry();
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
 
@@ -971,7 +926,7 @@ void pipeline_write_benchmark(benchmark::State& state, TableFactory table_factor
 
   for ([[maybe_unused]] auto _ : state) {
     auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream.view());
+      gpu_rep->template convert_to<disk_data_representation>(disk_space, stream.view());
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -1004,15 +959,13 @@ void pipeline_read_benchmark(benchmark::State& state, TableFactory table_factory
   auto disk_rep = write_table_to_disk(
     table_factory(total_bytes, num_columns), gpu_space, disk_space, stream.view());
 
-  auto registry = make_benchmark_registry();
-
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
   const auto& disk_file    = disk_rep->get_disk_table().file_path;
 
   for ([[maybe_unused]] auto _ : state) {
     drop_os_cache(disk_file);
     auto gpu_result =
-      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream.view());
+      disk_rep->template convert_to<gpu_table_representation>(gpu_space, stream.view());
     stream.synchronize();
   }
 

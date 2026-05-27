@@ -34,7 +34,8 @@ namespace cucascade {
 
 disk_data_representation::disk_data_representation(
   std::unique_ptr<memory::disk_table_allocation> disk_table, memory::memory_space& memory_space)
-  : idata_representation(memory_space), _disk_table(std::move(disk_table))
+  : idata_representation(memory_space, typeid(disk_data_representation)),
+    _disk_table(std::move(disk_table))
 {
 }
 

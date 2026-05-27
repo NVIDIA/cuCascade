@@ -43,7 +43,7 @@ using cucascade::test::make_mock_memory_space;
 class custom_test_representation : public idata_representation {
  public:
   custom_test_representation(int value, memory::memory_space& space)
-    : idata_representation(space), _value(value)
+    : idata_representation(space, typeid(custom_test_representation)), _value(value)
   {
   }
 
@@ -66,7 +66,7 @@ class custom_test_representation : public idata_representation {
 class another_test_representation : public idata_representation {
  public:
   another_test_representation(double value, memory::memory_space& space)
-    : idata_representation(space), _value(value)
+    : idata_representation(space, typeid(another_test_representation)), _value(value)
   {
   }
 

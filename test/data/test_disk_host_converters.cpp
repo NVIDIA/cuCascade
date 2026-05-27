@@ -77,28 +77,22 @@ void round_trip_test(std::unique_ptr<cudf::table> original_table)
   auto& host_space = shared_host_space();
   auto& disk_space = shared_disk_space();
 
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   // Create GPU representation from the original table
   auto gpu_rep = std::make_unique<gpu_table_representation>(
     std::move(original_table), *gpu_space, rmm::cuda_stream_view{});
 
   // GPU -> host_data
-  auto host_rep =
-    registry.convert<host_data_representation>(*gpu_rep, host_space.get(), shared_stream());
+  auto host_rep = gpu_rep->convert_to<host_data_representation>(host_space.get(), shared_stream());
 
   // host_data -> disk
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*host_rep, disk_space.get(), shared_stream());
+  auto disk_rep = host_rep->convert_to<disk_data_representation>(disk_space.get(), shared_stream());
 
   // disk -> host_data
   auto host_rep2 =
-    registry.convert<host_data_representation>(*disk_rep, host_space.get(), shared_stream());
+    disk_rep->convert_to<host_data_representation>(host_space.get(), shared_stream());
 
   // host_data -> GPU
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*host_rep2, gpu_space.get(), shared_stream());
+  auto gpu_rep2 = host_rep2->convert_to<gpu_table_representation>(gpu_space.get(), shared_stream());
 
   // Compare original (from gpu_rep) with round-tripped
   test::expect_cudf_tables_equal_on_stream(

@@ -69,20 +69,15 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
   auto& gpu_space  = shared_gpu_space();
   auto& disk_space = shared_disk_space();
 
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   // Create GPU representation from the original table
   auto gpu_rep = std::make_unique<gpu_table_representation>(
     std::move(original_table), *gpu_space, rmm::cuda_stream_view{});
 
   // GPU -> disk (direct via write/write_batch)
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
+  auto disk_rep = gpu_rep->convert_to<disk_data_representation>(disk_space.get(), shared_stream());
 
   // disk -> GPU (direct via read)
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
+  auto gpu_rep2 = disk_rep->convert_to<gpu_table_representation>(gpu_space.get(), shared_stream());
 
   // Compare original (from gpu_rep) with round-tripped
   test::expect_cudf_tables_equal_on_stream(
@@ -637,18 +632,13 @@ TEST_CASE("gpu disk round-trip with explicit pipeline backend",
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
   auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
 
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   // Simple INT32 column, 100 rows
   auto table   = make_typed_table(cudf::type_id::INT32, 100);
   auto gpu_rep = std::make_unique<gpu_table_representation>(
     std::move(table), *gpu_space, rmm::cuda_stream_view{});
 
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
+  auto disk_rep = gpu_rep->convert_to<disk_data_representation>(disk_space.get(), shared_stream());
+  auto gpu_rep2 = disk_rep->convert_to<gpu_table_representation>(gpu_space.get(), shared_stream());
 
   test::expect_cudf_tables_equal_on_stream(
     gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
@@ -660,23 +650,18 @@ TEST_CASE("gpu disk round-trip pipeline with multiple types",
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
   auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
 
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   // Test with multiple numeric types
   auto type_id = GENERATE(cudf::type_id::INT32, cudf::type_id::INT64, cudf::type_id::FLOAT64);
   auto table   = make_typed_table(type_id, 1000);
   auto gpu_rep = std::make_unique<gpu_table_representation>(
     std::move(table), *gpu_space, rmm::cuda_stream_view{});
 
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
+  auto disk_rep = gpu_rep->convert_to<disk_data_representation>(disk_space.get(), shared_stream());
 
   REQUIRE(disk_rep->get_size_in_bytes() > 0);
   REQUIRE(disk_rep->get_uncompressed_data_size_in_bytes() == disk_rep->get_size_in_bytes());
 
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
+  auto gpu_rep2 = disk_rep->convert_to<gpu_table_representation>(gpu_space.get(), shared_stream());
 
   test::expect_cudf_tables_equal_on_stream(
     gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
@@ -687,15 +672,11 @@ TEST_CASE("disk_data_representation get_uncompressed_data_size_in_bytes", "[disk
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
   auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
 
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
   auto table   = make_typed_table(cudf::type_id::INT64, 1000);
   auto gpu_rep = std::make_unique<gpu_table_representation>(
     std::move(table), *gpu_space, rmm::cuda_stream_view{});
 
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
+  auto disk_rep = gpu_rep->convert_to<disk_data_representation>(disk_space.get(), shared_stream());
 
   REQUIRE(disk_rep->get_size_in_bytes() > 0);
   REQUIRE(disk_rep->get_uncompressed_data_size_in_bytes() == disk_rep->get_size_in_bytes());

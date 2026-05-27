@@ -26,7 +26,7 @@ namespace cucascade {
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
                                                    cucascade::memory::memory_space& memory_space,
                                                    rmm::cuda_stream_view writer_stream)
-  : idata_representation(memory_space), _table(std::move(table))
+  : idata_representation(memory_space, typeid(gpu_table_representation)), _table(std::move(table))
 {
   // STREAM-LINEAGE: record the writer event in the constructor body so every
   // representation is born with a recorded event. Skipping when the caller

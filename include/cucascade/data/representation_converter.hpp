@@ -174,7 +174,16 @@ class representation_converter_registry {
   template <typename TargetType>
   bool has_converter_for(const idata_representation& source) const
   {
-    converter_key key{std::type_index(typeid(source)), std::type_index(typeid(TargetType))};
+    converter_key key{source.get_type_index(), std::type_index(typeid(TargetType))};
+    return has_converter_impl(key);
+  }
+
+  /**
+   * @brief Check if a converter exists for the given pre-built key. Public so that
+   *        `idata_representation::has_converter<Dst>()` can look up by stored source type.
+   */
+  [[nodiscard]] bool has_converter(const converter_key& key) const
+  {
     return has_converter_impl(key);
   }
 
@@ -196,7 +205,7 @@ class representation_converter_registry {
                                       const memory::memory_space* target_memory_space,
                                       rmm::cuda_stream_view stream = rmm::cuda_stream_default) const
   {
-    converter_key key{std::type_index(typeid(source)), std::type_index(typeid(TargetType))};
+    converter_key key{source.get_type_index(), std::type_index(typeid(TargetType))};
     auto result = convert_impl(key, source, target_memory_space, stream);
     return std::unique_ptr<TargetType>(static_cast<TargetType*>(result.release()));
   }
@@ -264,5 +273,37 @@ class representation_converter_registry {
  * @param registry The converter registry to register converters with.
  */
 void register_builtin_converters(representation_converter_registry& registry);
+
+// =============================================================================
+// idata_representation template method definitions
+//
+// Declared in <cucascade/data/common.hpp>; defined here because they call into the
+// singleton registry, which is fully visible only after this header.
+// =============================================================================
+
+template <typename Dst>
+  requires std::derived_from<Dst, idata_representation>
+std::unique_ptr<Dst> idata_representation::convert_to(
+  const cucascade::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream)
+{
+  return representation_converter_registry::instance().convert<Dst>(
+    *this, target_memory_space, stream);
+}
+
+template <typename Dst>
+  requires std::derived_from<Dst, idata_representation>
+std::unique_ptr<Dst> idata_representation::clone_to(
+  const cucascade::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream)
+{
+  return convert_to<Dst>(target_memory_space, stream);
+}
+
+template <typename Dst>
+  requires std::derived_from<Dst, idata_representation>
+bool idata_representation::has_converter() const
+{
+  converter_key key{_type_index, std::type_index(typeid(Dst))};
+  return representation_converter_registry::instance().has_converter(key);
+}
 
 }  // namespace cucascade

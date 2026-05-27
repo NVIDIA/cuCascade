@@ -199,7 +199,7 @@ gpu_table_representation::gpu_table_representation(cudf::table_view table_view,
                                                    std::size_t alloc_size,
                                                    cucascade::memory::memory_space& memory_space,
                                                    rmm::cuda_stream_view writer_stream)
-  : idata_representation(memory_space),
+  : idata_representation(memory_space, typeid(gpu_table_representation)),
     _table(
       owning_table_view{std::make_any<Owner>(std::forward<Owner>(owner)), alloc_size, table_view})
 {

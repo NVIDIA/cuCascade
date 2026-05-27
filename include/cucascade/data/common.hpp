@@ -24,8 +24,12 @@
 #include <concepts>
 #include <cstddef>
 #include <memory>
+#include <typeindex>
+#include <typeinfo>
 
 namespace cucascade {
+
+class representation_converter_registry;  // forward declaration for template methods below
 
 /**
  * @brief Interface representing a data representation residing in a specific memory tier.
@@ -43,8 +47,11 @@ class idata_representation {
    * @brief Construct a new idata_representation object
    *
    * @param memory_space The memory space where the data resides
+   * @param type_idx     The std::type_index of the most-derived class — subclasses must pass
+   *                     `typeid(SubclassName)`. Used as the source key for converter lookup.
    */
-  idata_representation(cucascade::memory::memory_space& memory_space) : _memory_space(memory_space)
+  idata_representation(cucascade::memory::memory_space& memory_space, std::type_index type_idx)
+    : _memory_space(memory_space), _type_index(type_idx)
   {
   }
 
@@ -52,6 +59,47 @@ class idata_representation {
    * @brief Virtual destructor to ensure proper cleanup of derived classes
    */
   virtual ~idata_representation() = default;
+
+  /**
+   * @brief Get the stored type identifier of the most-derived class.
+   *
+   * This is the source key used for converter lookup against the
+   * `representation_converter_registry`. Subclasses set it at construction.
+   */
+  [[nodiscard]] std::type_index get_type_index() const noexcept { return _type_index; }
+
+  /**
+   * @brief Convert this representation to a new `Dst` representation via the singleton registry.
+   *
+   * @tparam Dst The target representation type (must derive from `idata_representation`).
+   * @param target_memory_space The memory space the new representation lives in.
+   * @param stream              CUDA stream for memory operations.
+   * @return Owning pointer to the newly produced representation.
+   * @throws std::runtime_error if no converter is registered for `(this->get_type_index(), Dst)`.
+   *
+   * Definition lives in `representation_converter.hpp` (after the registry class is defined).
+   */
+  template <typename Dst>
+    requires std::derived_from<Dst, idata_representation>
+  std::unique_ptr<Dst> convert_to(const cucascade::memory::memory_space* target_memory_space,
+                                  rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+
+  /**
+   * @brief Equivalent to `convert_to<Dst>` at the representation level; provided for API symmetry
+   *        with `data_batch::clone_to`. Both return an independent new representation.
+   */
+  template <typename Dst>
+    requires std::derived_from<Dst, idata_representation>
+  std::unique_ptr<Dst> clone_to(const cucascade::memory::memory_space* target_memory_space,
+                                rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+
+  /**
+   * @brief Check whether the singleton registry has a converter from this representation's
+   *        runtime type to `Dst`.
+   */
+  template <typename Dst>
+    requires std::derived_from<Dst, idata_representation>
+  [[nodiscard]] bool has_converter() const;
 
   /**
    * @brief Get the tier of memory that this representation resides in
@@ -142,6 +190,7 @@ class idata_representation {
 
  private:
   cucascade::memory::memory_space& _memory_space;  ///< The memory space where the data resides
+  std::type_index _type_index;  ///< Runtime type tag set by the most-derived ctor
 };
 
 }  // namespace cucascade

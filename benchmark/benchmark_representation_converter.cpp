@@ -175,9 +175,6 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   // Use shared memory manager across all threads
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
 
@@ -202,7 +199,7 @@ void BM_ConvertGpuToHost(benchmark::State& state)
     *const_cast<memory_space*>(gpu_space),
     warmup_stream.view());
   auto warmup_result =
-    registry->convert<host_data_packed_representation>(*warmup_repr, host_space, warmup_stream);
+    warmup_repr->convert_to<host_data_packed_representation>(host_space, warmup_stream);
   warmup_stream.synchronize();
 
   size_t bytes_transferred = thread_gpu_reprs[0]->get_size_in_bytes() * thread_count;
@@ -215,8 +212,8 @@ void BM_ConvertGpuToHost(benchmark::State& state)
     // Create threads
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
-        auto host_result = registry->convert<host_data_packed_representation>(
-          *thread_gpu_reprs[t], host_space, streams[t]);
+        auto host_result =
+          thread_gpu_reprs[t]->convert_to<host_data_packed_representation>(host_space, streams[t]);
         streams[t].synchronize();
       });
     }
@@ -250,9 +247,6 @@ void BM_ConvertHostToGpu(benchmark::State& state)
   // Use shared memory manager across all threads
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
 
@@ -269,7 +263,7 @@ void BM_ConvertHostToGpu(benchmark::State& state)
                                                  *const_cast<memory_space*>(gpu_space),
                                                  setup_stream.view());
     auto host_repr =
-      registry->convert<host_data_packed_representation>(*gpu_repr_temp, host_space, setup_stream);
+      gpu_repr_temp->convert_to<host_data_packed_representation>(host_space, setup_stream);
     setup_stream.synchronize();
     thread_host_reprs.push_back(std::move(host_repr));
   }
@@ -277,7 +271,7 @@ void BM_ConvertHostToGpu(benchmark::State& state)
   // Warm-up
   rmm::cuda_stream warmup_stream;
   auto warmup_result =
-    registry->convert<gpu_table_representation>(*thread_host_reprs[0], gpu_space, warmup_stream);
+    thread_host_reprs[0]->convert_to<gpu_table_representation>(gpu_space, warmup_stream);
   warmup_stream.synchronize();
 
   size_t bytes_transferred = thread_host_reprs[0]->get_size_in_bytes() * thread_count;
@@ -291,7 +285,7 @@ void BM_ConvertHostToGpu(benchmark::State& state)
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
         auto gpu_result =
-          registry->convert<gpu_table_representation>(*thread_host_reprs[t], gpu_space, streams[t]);
+          thread_host_reprs[t]->convert_to<gpu_table_representation>(gpu_space, streams[t]);
         streams[t].synchronize();
       });
     }
@@ -328,9 +322,6 @@ void BM_ConvertGpuToHostFast(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
 
@@ -353,8 +344,7 @@ void BM_ConvertGpuToHostFast(benchmark::State& state)
     std::make_unique<cudf::table>(std::move(warmup_table)),
     *const_cast<memory_space*>(gpu_space),
     warmup_stream.view());
-  auto warmup_result =
-    registry->convert<host_data_representation>(*warmup_repr, host_space, warmup_stream);
+  auto warmup_result = warmup_repr->convert_to<host_data_representation>(host_space, warmup_stream);
   warmup_stream.synchronize();
 
   size_t bytes_transferred = thread_gpu_reprs[0]->get_size_in_bytes() * thread_count;
@@ -366,7 +356,7 @@ void BM_ConvertGpuToHostFast(benchmark::State& state)
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
         auto host_result =
-          registry->convert<host_data_representation>(*thread_gpu_reprs[t], host_space, streams[t]);
+          thread_gpu_reprs[t]->convert_to<host_data_representation>(host_space, streams[t]);
         streams[t].synchronize();
       });
     }
@@ -397,9 +387,6 @@ void BM_ConvertHostFastToGpu(benchmark::State& state)
 
   auto mgr = get_shared_memory_manager();
 
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
 
@@ -414,8 +401,7 @@ void BM_ConvertHostFastToGpu(benchmark::State& state)
       std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
                                                  *const_cast<memory_space*>(gpu_space),
                                                  setup_stream.view());
-    auto host_repr =
-      registry->convert<host_data_representation>(*gpu_repr_temp, host_space, setup_stream);
+    auto host_repr = gpu_repr_temp->convert_to<host_data_representation>(host_space, setup_stream);
     setup_stream.synchronize();
     thread_host_reprs.push_back(std::move(host_repr));
   }
@@ -423,7 +409,7 @@ void BM_ConvertHostFastToGpu(benchmark::State& state)
   // Warm-up
   rmm::cuda_stream warmup_stream;
   auto warmup_result =
-    registry->convert<gpu_table_representation>(*thread_host_reprs[0], gpu_space, warmup_stream);
+    thread_host_reprs[0]->convert_to<gpu_table_representation>(gpu_space, warmup_stream);
   warmup_stream.synchronize();
 
   size_t bytes_transferred = thread_host_reprs[0]->get_size_in_bytes() * thread_count;
@@ -435,7 +421,7 @@ void BM_ConvertHostFastToGpu(benchmark::State& state)
     for (uint64_t t = 0; t < thread_count; ++t) {
       threads.emplace_back([&, t]() {
         auto gpu_result =
-          registry->convert<gpu_table_representation>(*thread_host_reprs[t], gpu_space, streams[t]);
+          thread_host_reprs[t]->convert_to<gpu_table_representation>(gpu_space, streams[t]);
         streams[t].synchronize();
       });
     }

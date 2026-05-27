@@ -115,7 +115,7 @@ std::unique_ptr<idata_representation> representation_converter_registry::convert
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream) const
 {
-  converter_key key{std::type_index(typeid(source)), target_type};
+  converter_key key{source.get_type_index(), target_type};
   return convert_impl(key, source, target_memory_space, stream);
 }
 
