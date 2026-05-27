@@ -335,10 +335,8 @@ std::vector<size_t> resolve_visible_gpu_indices(
  * @brief Get the host NUMA node id with the best memory affinity to a GPU.
  *
  * Queries NVML's `nvmlDeviceGetMemoryAffinity` with `NVML_AFFINITY_SCOPE_NODE` and
- * returns the lowest-numbered NUMA node in the resulting bitmask. NVML walks the
- * GPU driver's PCI bridge topology directly, so this is unaffected by ACPI
- * SRAT/SLIT firmware quirks that cause `/sys/bus/pci/devices/<pci>/numa_node` to
- * report -1 on otherwise NUMA-aware hosts. Same source as `nvidia-smi topo -m`.
+ * returns the lowest-numbered NUMA node in the resulting bitmask. Same source as 
+ * `nvidia-smi topo -m`.
  *
  * @param nvml Loaded NVML loader; `nvml.available()` must already be true.
  * @param device NVML device handle.
