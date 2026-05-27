@@ -48,6 +48,8 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cucascade/cuda/event.hpp>
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -610,13 +612,13 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
       rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
       CUCASCADE_CUDA_TRY(
         cudaMemcpyAsync(host_buf, src_ptr, size, cudaMemcpyDeviceToHost, target_stream.value()));
-      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(target_stream.value()));
+      target_stream.synchronize();
     }
     {
       rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
       CUCASCADE_CUDA_TRY(
         cudaMemcpyAsync(buf.data(), host_buf, size, cudaMemcpyHostToDevice, target_stream.value()));
-      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(target_stream.value()));
+      target_stream.synchronize();
     }
     mr.deallocate_sync(host_buf, size);
     return buf;
@@ -650,7 +652,7 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
         block_offset = 0;
       }
     }
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(target_stream.value()));
+    target_stream.synchronize();
   }
 
   // Pass 2: host-to-device, chunked across the same blocks. Switch the CUDA
@@ -679,7 +681,7 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
         block_offset = 0;
       }
     }
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(target_stream.value()));
+    target_stream.synchronize();
   }
   // allocation's destructor returns blocks to the host pool — no cudaFreeHost.
   return buf;
@@ -905,7 +907,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
     // STREAM-LINEAGE pass 1: tie the reader stream's timeline to the writer's
     // recorded event. After this point the target_stream observes all
     // writer-side cudaMallocAsync allocations and writes in proper order.
-    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(target_stream.value(), writer_event, 0));
+    cucascade::cuda::cuda_event_view{writer_event}.wait(target_stream);
   } else {
     // STREAM-LINEAGE pass 2 (fallback): no writer event recorded — fall back to
     // a coarser source-device sync. This path is documented as insufficient for

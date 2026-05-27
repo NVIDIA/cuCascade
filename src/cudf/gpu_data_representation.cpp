@@ -15,10 +15,9 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/error.hpp>
-
-#include <cucascade/cuda/event.hpp>
 
 #include <cudf/column/column_stream.hpp>
 #include <cudf/copying.hpp>
