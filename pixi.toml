@@ -24,7 +24,7 @@ unzip = "*"
 # CUDA 13
 [feature.cuda-13]
 system-requirements = { cuda = "13" }
-dependencies = { "cuda-version" = "13.*" }
+dependencies = { "cuda-version" = "13.2.*" }
 activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120" } }
 
 # CUDA 12
