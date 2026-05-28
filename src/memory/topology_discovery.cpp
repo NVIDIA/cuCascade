@@ -233,7 +233,7 @@ std::vector<size_t> resolve_visible_gpu_indices(
  * @brief Get the host NUMA node id with the best memory affinity to a GPU.
  *
  * Queries NVML's `nvmlDeviceGetMemoryAffinity` with `NVML_AFFINITY_SCOPE_NODE` and
- * returns the lowest-numbered NUMA node in the resulting bitmask. Same source as 
+ * returns the lowest-numbered NUMA node in the resulting bitmask. Same source as
  * `nvidia-smi topo -m`.
  *
  * @param device NVML device handle.
@@ -246,8 +246,7 @@ std::vector<size_t> resolve_visible_gpu_indices(
 int get_numa_node_from_nvml(nvmlDevice_t device)
 {
   unsigned long nodeset = 0;
-  if (nvmlDeviceGetMemoryAffinity(device, 1, &nodeset, NVML_AFFINITY_SCOPE_NODE) ==
-        NVML_SUCCESS &&
+  if (nvmlDeviceGetMemoryAffinity(device, 1, &nodeset, NVML_AFFINITY_SCOPE_NODE) == NVML_SUCCESS &&
       nodeset != 0) {
     return std::countr_zero(nodeset);
   }
