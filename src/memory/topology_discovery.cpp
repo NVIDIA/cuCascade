@@ -721,7 +721,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       report_nvml_error(result, "Failed to get device count");
       device_count = 0;
     } else {
-      nvml_available = true;      
+      nvml_available = true;
     }
   }
 
@@ -824,9 +824,9 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       unsigned int max_mig = 0;
       nvmlReturn_t mc_rc   = nvmlDeviceGetMaxMigDeviceCount(device, &max_mig);
       if (mc_rc != NVML_SUCCESS) {
-        report_nvml_error(mc_rc,
-                          "MIG enabled on GPU " + std::to_string(i) +
-                            " but failed to query MIG device count");
+        report_nvml_error(
+          mc_rc,
+          "MIG enabled on GPU " + std::to_string(i) + " but failed to query MIG device count");
         max_mig = 0;
       }
 
@@ -846,8 +846,8 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       }
 
       if (emitted == 0) {
-        std::cerr << "Warning: MIG enabled on GPU " << i
-                  << " but no MIG instances were enumerated" << std::endl;
+        std::cerr << "Warning: MIG enabled on GPU " << i << " but no MIG instances were enumerated"
+                  << std::endl;
       }
     }
   }
@@ -862,6 +862,8 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     gpu.id   = static_cast<unsigned int>(visible_idx);
     topology.gpus.push_back(std::move(gpu));
   }
+  std::cerr << "num_gpus: " << topology.num_gpus << " vs gpu count: " << topology.gpus.size()
+            << " device count: " << device_count << std::endl;
 
   // Do not call nvmlShutdown here — NVML is initialized once per process via
   // the static-local in this function. See the comment at the top of discover().
