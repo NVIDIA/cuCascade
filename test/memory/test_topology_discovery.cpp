@@ -183,8 +183,7 @@ TEST_CASE("Topology Discovery default uses strictest verification", "[hw_topolog
 }
 
 // Invariant: when the host advertises NUMA topology and GPUs are present, every discovered
-// GPU must resolve to a valid NUMA node. This test would catch a regression that
-// re-introduced the -1 leak.
+// GPU must resolve to a valid NUMA node.
 TEST_CASE("Topology Discovery resolves GPU NUMA node on NUMA-aware hosts", "[hw_topology]")
 {
   topology_discovery discovery;
