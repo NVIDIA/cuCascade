@@ -188,33 +188,38 @@ std::vector<size_t> resolve_visible_gpu_indices(
         throw std::invalid_argument("CUDA_VISIBLE_DEVICES entry " + token + " is out of range");
       }
     } else if (token.starts_with("GPU-") || token.starts_with("MIG-")) {
-      nvmlDevice_t handle;
-      if (nvmlDeviceGetHandleByUUID(token.c_str(), &handle) == NVML_SUCCESS) {
-        unsigned int is_mig = 0;
-        if (nvmlDeviceIsMigDeviceHandle(handle, &is_mig) == NVML_SUCCESS && is_mig) {
-          nvmlDevice_t parent_handle;
-          if (nvmlDeviceGetDeviceHandleFromMigDeviceHandle(handle, &parent_handle) ==
-              NVML_SUCCESS) {
-            handle = parent_handle;
-          }
-        }
-
-        nvmlPciInfo_t pci_info;
-        if (nvmlDeviceGetPciInfo_v3(handle, &pci_info) == NVML_SUCCESS) {
-          std::string normalized = normalize_pci_bus_id(pci_info.busId);
-          auto it                = index_by_pci.find(normalized);
-          if (it != index_by_pci.end()) {
-            if (seen.insert(it->second).second) { indices.push_back(it->second); }
-            matched = true;
-          }
-        }
+      // Direct UUID lookup first. With MIG enumeration each MIG instance is
+      // registered under its own MIG-* UUID, so this matches both forms.
+      auto uuid_it = index_by_uuid.find(token);
+      if (uuid_it != index_by_uuid.end()) {
+        if (seen.insert(uuid_it->second).second) { indices.push_back(uuid_it->second); }
+        matched = true;
       }
 
-      if (!matched && token.starts_with("GPU-")) {
-        auto it = index_by_uuid.find(token);
-        if (it != index_by_uuid.end()) {
-          if (seen.insert(it->second).second) { indices.push_back(it->second); }
-          matched = true;
+      // Fallback: resolve the UUID via NVML to a parent PCI bus and match by PCI.
+      // Reachable only when MIG instances were not enumerated (e.g. NVML denied
+      // access to MIG mode); a MIG UUID then maps to its parent physical GPU.
+      if (!matched) {
+        nvmlDevice_t handle;
+        if (nvmlDeviceGetHandleByUUID(token.c_str(), &handle) == NVML_SUCCESS) {
+          unsigned int is_mig = 0;
+          if (nvmlDeviceIsMigDeviceHandle(handle, &is_mig) == NVML_SUCCESS && is_mig) {
+            nvmlDevice_t parent_handle;
+            if (nvmlDeviceGetDeviceHandleFromMigDeviceHandle(handle, &parent_handle) ==
+                NVML_SUCCESS) {
+              handle = parent_handle;
+            }
+          }
+
+          nvmlPciInfo_t pci_info;
+          if (nvmlDeviceGetPciInfo_v3(handle, &pci_info) == NVML_SUCCESS) {
+            std::string normalized = normalize_pci_bus_id(pci_info.busId);
+            auto it                = index_by_pci.find(normalized);
+            if (it != index_by_pci.end()) {
+              if (seen.insert(it->second).second) { indices.push_back(it->second); }
+              matched = true;
+            }
+          }
         }
       }
     }
@@ -699,7 +704,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       std::cerr << "Warning: Failed to get device count: " << nvmlErrorString(result) << std::endl;
       device_count = 0;
     } else {
-      nvml_available = true;
+      nvml_available = true;      
     }
   }
 
@@ -732,6 +737,38 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
   std::unordered_map<std::string, size_t> nvml_index_by_pci;
   std::unordered_map<std::string, size_t> nvml_index_by_uuid;
   if (nvml_available) {
+    // Emit one gpu_topology_info from an NVML device handle (either a physical GPU
+    // or a MIG instance). Topology fields (PCI, NUMA, CPU affinity, NICs) come from
+    // the physical parent — MIG instances share their parent's physical hardware.
+    auto emit_gpu = [&](nvmlDevice_t handle,
+                        std::string const& parent_pci,
+                        int parent_numa,
+                        std::string const& parent_cpu_affinity,
+                        std::vector<int> const& parent_cpu_cores,
+                        std::vector<std::string> const& parent_nics) {
+      gpu_topology_info gpu;
+
+      std::array<char, NVML_DEVICE_NAME_BUFFER_SIZE> name{};
+      nvmlReturn_t r = nvmlDeviceGetName(handle, name.data(), NVML_DEVICE_NAME_BUFFER_SIZE);
+      gpu.name       = (r == NVML_SUCCESS) ? std::string(name.data()) : "Unknown";
+
+      std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
+      r        = nvmlDeviceGetUUID(handle, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
+      gpu.uuid = (r == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
+
+      gpu.pci_bus_id        = parent_pci;
+      gpu.numa_node         = parent_numa;
+      gpu.cpu_affinity_list = parent_cpu_affinity;
+      gpu.cpu_cores         = parent_cpu_cores;
+      if (parent_numa >= 0) { gpu.memory_binding.push_back(parent_numa); }
+      gpu.network_devices = parent_nics;
+
+      nvml_gpus.push_back(std::move(gpu));
+      if (!nvml_gpus.back().uuid.empty()) {
+        nvml_index_by_uuid.emplace(nvml_gpus.back().uuid, nvml_gpus.size() - 1);
+      }
+    };
+
     for (unsigned int i = 0; i < device_count; ++i) {
       nvmlDevice_t device;
       result = nvmlDeviceGetHandleByIndex_v2(i, &device);
@@ -741,43 +778,59 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
         continue;
       }
 
-      gpu_topology_info gpu;
-      gpu.id = i;
-
-      // Get device name, PCI bus ID and UUID
-      std::array<char, NVML_DEVICE_NAME_BUFFER_SIZE> name{};
-      result   = nvmlDeviceGetName(device, name.data(), NVML_DEVICE_NAME_BUFFER_SIZE);
-      gpu.name = (result == NVML_SUCCESS) ? std::string(name.data()) : "Unknown";
-
+      // Resolve the physical device's topology once; reused for every MIG instance.
       nvmlPciInfo_t pci_info;
       result = nvmlDeviceGetPciInfo_v3(device, &pci_info);
       if (result != NVML_SUCCESS) {
         std::cerr << "Warning: Failed to get PCI info for GPU " << i << std::endl;
         continue;
       }
-      gpu.pci_bus_id = std::string(pci_info.busId);
+      std::string parent_pci      = std::string(pci_info.busId);
+      int parent_numa             = get_numa_node_from_sys(parent_pci);
+      std::string parent_cpu_aff  = get_cpu_affinity_from_sys(parent_pci);
+      std::vector<int> parent_cpu = parse_cpu_list(parent_cpu_aff);
+      std::vector<std::string> parent_nics =
+        map_network_devices_to_gpu(parent_pci, parent_numa, topology.network_devices);
 
-      std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
-      result   = nvmlDeviceGetUUID(device, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
-      gpu.uuid = (result == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
+      unsigned int mig_current = NVML_DEVICE_MIG_DISABLE;
+      unsigned int mig_pending = NVML_DEVICE_MIG_DISABLE;
+      nvmlReturn_t mig_rc      = nvmlDeviceGetMigMode(device, &mig_current, &mig_pending);
+      // NVML_ERROR_NOT_SUPPORTED on non-Ampere/non-MIG-capable GPUs — treat as disabled.
+      bool mig_enabled = (mig_rc == NVML_SUCCESS && mig_current == NVML_DEVICE_MIG_ENABLE);
 
-      // Get NUMA node and CPU affinity from /sys
-      gpu.numa_node         = get_numa_node_from_sys(gpu.pci_bus_id);
-      gpu.cpu_affinity_list = get_cpu_affinity_from_sys(gpu.pci_bus_id);
-      gpu.cpu_cores         = parse_cpu_list(gpu.cpu_affinity_list);
+      if (!mig_enabled) {
+        emit_gpu(device, parent_pci, parent_numa, parent_cpu_aff, parent_cpu, parent_nics);
+        // PCI-based index entries are unambiguous only for physical GPUs.
+        nvml_index_by_pci.emplace(normalize_pci_bus_id(parent_pci), nvml_gpus.size() - 1);
+        continue;
+      }
 
-      // Memory binding is typically the same as NUMA node
-      if (gpu.numa_node >= 0) { gpu.memory_binding.push_back(gpu.numa_node); }
+      unsigned int max_mig = 0;
+      nvmlReturn_t mc_rc   = nvmlDeviceGetMaxMigDeviceCount(device, &max_mig);
+      if (mc_rc != NVML_SUCCESS) {
+        std::cerr << "Warning: MIG enabled on GPU " << i
+                  << " but failed to query MIG device count: " << nvmlErrorString(mc_rc)
+                  << std::endl;
+        max_mig = 0;
+      }
 
-      // Map network devices to this GPU using PCIe topology
-      gpu.network_devices =
-        map_network_devices_to_gpu(gpu.pci_bus_id, gpu.numa_node, topology.network_devices);
+      unsigned int emitted = 0;
+      for (unsigned int mig_idx = 0; mig_idx < max_mig; ++mig_idx) {
+        nvmlDevice_t mig_device;
+        nvmlReturn_t r = nvmlDeviceGetMigDeviceHandleByIndex(device, mig_idx, &mig_device);
+        if (r == NVML_ERROR_NOT_FOUND) { continue; }
+        if (r != NVML_SUCCESS) {
+          std::cerr << "Warning: Failed to get MIG handle for GPU " << i << " slot " << mig_idx
+                    << ": " << nvmlErrorString(r) << std::endl;
+          continue;
+        }
+        emit_gpu(mig_device, parent_pci, parent_numa, parent_cpu_aff, parent_cpu, parent_nics);
+        ++emitted;
+      }
 
-      nvml_gpus.push_back(std::move(gpu));
-      nvml_index_by_pci.emplace(normalize_pci_bus_id(nvml_gpus.back().pci_bus_id),
-                                nvml_gpus.size() - 1);
-      if (!nvml_gpus.back().uuid.empty()) {
-        nvml_index_by_uuid.emplace(nvml_gpus.back().uuid, nvml_gpus.size() - 1);
+      if (emitted == 0) {
+        std::cerr << "Warning: MIG enabled on GPU " << i
+                  << " but no MIG instances were enumerated" << std::endl;
       }
     }
   }
