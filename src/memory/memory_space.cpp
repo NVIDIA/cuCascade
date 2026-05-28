@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -37,7 +38,63 @@
 #include <variant>
 
 namespace cucascade {
+
+// Forward declaration — defined in src/data/pipeline_io_backend.cpp
+std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io    = false,
+                                                           int target_device = -1);
+
 namespace memory {
+namespace {
+
+class fixed_size_host_resource_ref {
+ public:
+  explicit fixed_size_host_resource_ref(fixed_size_host_memory_resource& resource)
+    : resource_(&resource)
+  {
+  }
+
+  void* allocate(cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t))
+  {
+    return resource_->allocate(stream, bytes, alignment);
+  }
+
+  void deallocate(cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    resource_->deallocate(stream, ptr, bytes, alignment);
+  }
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    return resource_->allocate_sync(bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    resource_->deallocate_sync(ptr, bytes, alignment);
+  }
+
+  bool operator==(fixed_size_host_resource_ref const& other) const noexcept
+  {
+    return resource_ == other.resource_;
+  }
+
+  friend void get_property(fixed_size_host_resource_ref const&,
+                           cuda::mr::device_accessible) noexcept
+  {
+  }
+
+ private:
+  fixed_size_host_memory_resource* resource_;
+};
+
+}  // namespace
 
 //===----------------------------------------------------------------------===//
 // memory_space Implementation
@@ -49,26 +106,32 @@ memory_space::memory_space(const gpu_memory_space_config& config)
     _memory_limit(config.reservation_limit()),
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
-    _allocator(config.mr_factory_fn
-                 ? config.mr_factory_fn(config.device_id, config.memory_capacity)
-                 : make_default_gpu_memory_resource(config.device_id, config.memory_capacity)),
     _stream_pool{[&]() -> std::unique_ptr<rmm::cuda_stream_pool> {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id(config.device_id)};
       return std::make_unique<rmm::cuda_stream_pool>(16, rmm::cuda_stream::flags::non_blocking);
     }()}
 {
-  if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
-
   cudaMemPool_t pool_handle{nullptr};
-  if (auto* r = dynamic_cast<rmm::mr::cuda_async_memory_resource*>(_allocator.get())) {
-    pool_handle = r->pool_handle();
-  } else if (auto* r = dynamic_cast<rmm::mr::cuda_async_view_memory_resource*>(_allocator.get())) {
-    pool_handle = r->pool_handle();
+
+  if (config.mr_factory_fn) {
+    _allocator = config.mr_factory_fn(config.device_id, config.memory_capacity);
+  } else {
+    rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
+#if CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
+    rmm::mr::cuda_async_memory_resource concrete_mr(config.memory_capacity);
+    pool_handle = concrete_mr.pool_handle();
+    _allocator  = cuda::mr::any_resource<cuda::mr::device_accessible>(std::move(concrete_mr));
+#else
+    auto concrete_mr =
+      std::make_shared<rmm::mr::cuda_async_memory_resource>(config.memory_capacity);
+    pool_handle = concrete_mr->pool_handle();
+    _allocator  = wrap_legacy_rmm_resource(std::move(concrete_mr));
+#endif
   }
 
   _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
     _id,
-    *_allocator,
+    rmm::device_async_resource_ref(_allocator),
     _memory_limit,
     _capacity,
     nullptr,
@@ -87,17 +150,20 @@ memory_space::memory_space(const host_memory_space_config& config)
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
     _allocator(config.mr_factory_fn
                  ? config.mr_factory_fn(config.numa_id, config.memory_capacity)
-                 : make_default_host_memory_resource(config.numa_id, config.memory_capacity))
+                 : make_default_host_memory_resource(
+                     config.numa_id, config.memory_capacity, config.make_portable))
 {
-  if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
   _reservation_allocator =
     std::make_unique<fixed_size_host_memory_resource>(_id.device_id,
-                                                      *_allocator,
+                                                      rmm::device_async_resource_ref(_allocator),
                                                       _memory_limit,
                                                       _capacity,
                                                       config.block_size,
                                                       config.pool_size,
                                                       config.initial_number_pools);
+  auto& host_allocator =
+    std::get<std::unique_ptr<fixed_size_host_memory_resource>>(_reservation_allocator);
+  _reservation_allocator_resource.emplace(fixed_size_host_resource_ref{*host_allocator});
 }
 
 memory_space::memory_space(const disk_memory_space_config& config)
@@ -106,10 +172,31 @@ memory_space::memory_space(const disk_memory_space_config& config)
     _memory_limit(config.reservation_limit()),
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
-    _allocator(std::make_unique<null_device_memory_resource>())
+    _allocator(null_device_memory_resource{}),
+    _io_backend(cucascade::make_pipeline_io_backend())
 {
   if (config.mount_paths.empty()) {
     throw std::invalid_argument("Mount path must be provided for disk memory space");
+  }
+  _reservation_allocator =
+    std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
+}
+
+memory_space::memory_space(const disk_memory_space_config& config,
+                           std::shared_ptr<idisk_io_backend> io_backend)
+  : _id(config.tier(), config.disk_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(null_device_memory_resource{}),
+    _io_backend(std::move(io_backend))
+{
+  if (config.mount_paths.empty()) {
+    throw std::invalid_argument("Mount path must be provided for disk memory space");
+  }
+  if (!_io_backend) {
+    throw std::invalid_argument("I/O backend must not be null for disk memory space");
   }
   _reservation_allocator =
     std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
@@ -197,17 +284,23 @@ std::size_t memory_space::get_active_reservation_count() const
 
 bool memory_space::should_downgrade_memory() const
 {
-  return _memory_limit - get_available_memory() >= _start_downgrading_memory_threshold;
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return false; }
+  return _memory_limit - available_memory >= _start_downgrading_memory_threshold;
 }
 
 bool memory_space::should_stop_downgrading_memory() const
 {
-  return _memory_limit - get_available_memory() <= _stop_downgrading_memory_threshold;
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return true; }
+  return _memory_limit - available_memory <= _stop_downgrading_memory_threshold;
 }
 
 size_t memory_space::get_amount_to_downgrade() const
 {
-  size_t consumed = _memory_limit - get_available_memory();
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return 0; }
+  size_t consumed = _memory_limit - available_memory;
   if (consumed <= _stop_downgrading_memory_threshold) { return 0; }
   return consumed - _stop_downgrading_memory_threshold;
 }
@@ -257,16 +350,54 @@ size_t memory_space::get_total_reserved_memory() const
 
 size_t memory_space::get_max_memory() const noexcept { return _memory_limit; }
 
-rmm::mr::device_memory_resource* memory_space::get_default_allocator() const noexcept
+rmm::device_async_resource_ref memory_space::get_default_allocator() const noexcept
 {
   return std::visit(
-    utils::overloaded{[this]([[maybe_unused]] const std::unique_ptr<disk_access_limiter>& other)
-                        -> rmm::mr::device_memory_resource* { return _allocator.get(); },
-                      [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr)
-                        -> rmm::mr::device_memory_resource* { return mr.get(); },
-                      [](const std::unique_ptr<fixed_size_host_memory_resource>& mr)
-                        -> rmm::mr::device_memory_resource* { return mr.get(); }},
+    utils::overloaded{
+      [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+        return rmm::device_async_resource_ref{const_cast<reservation_aware_resource_adaptor&>(*mr)};
+      },
+      [&](const std::unique_ptr<fixed_size_host_memory_resource>&) {
+        return rmm::device_async_resource_ref{
+          const_cast<cuda::mr::any_resource<cuda::mr::device_accessible>&>(
+            *_reservation_allocator_resource)};
+      },
+      [&](const std::unique_ptr<disk_access_limiter>&) {
+        return rmm::device_async_resource_ref{
+          const_cast<cuda::mr::any_resource<cuda::mr::device_accessible>&>(_allocator)};
+      }},
     _reservation_allocator);
+}
+
+const chunked_resource_info* memory_space::get_chunked_resource_info() const noexcept
+{
+  const chunked_resource_info* result = nullptr;
+  std::visit(
+    [&result](const auto& ptr) {
+      using held_type = std::remove_reference_t<decltype(*ptr)>;
+      if constexpr (std::is_base_of_v<chunked_resource_info, held_type>) {
+        if (ptr != nullptr) { result = static_cast<const chunked_resource_info*>(ptr.get()); }
+      }
+    },
+    _reservation_allocator);
+  return result;
+}
+
+std::string_view memory_space::get_disk_mount_path() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("get_disk_mount_path called on non-DISK memory space");
+  }
+  auto& limiter = std::get<std::unique_ptr<disk_access_limiter>>(_reservation_allocator);
+  return limiter->get_mount_path();
+}
+
+idisk_io_backend& memory_space::get_io_backend() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("get_io_backend called on non-DISK memory space");
+  }
+  return *_io_backend;
 }
 
 std::string memory_space::to_string() const

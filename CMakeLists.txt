@@ -15,13 +15,13 @@
 # the License.
 # =============================================================================
 
-cmake_minimum_required(VERSION 3.26.4 FATAL_ERROR)
+cmake_minimum_required(VERSION 4.0 FATAL_ERROR)
 
 # Set project name and languages
 project(
   cuCascade
   VERSION 0.1.0
-  LANGUAGES C CXX CUDA
+  LANGUAGES CXX CUDA
   DESCRIPTION "GPU memory management and data representation library")
 
 # Options
@@ -38,6 +38,10 @@ if(NOT CUCASCADE_BUILD_SHARED_LIBS AND NOT CUCASCADE_BUILD_STATIC_LIBS)
       "At least one of CUCASCADE_BUILD_SHARED_LIBS or CUCASCADE_BUILD_STATIC_LIBS must be ON"
   )
 endif()
+
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
+
+# TODO: Remove vendored FindCUDAToolkit once we require CMake 4.4
 
 # Find required packages
 find_package(CUDAToolkit REQUIRED)
@@ -63,7 +67,7 @@ endif()
 # =============================================================================
 option(CUCASCADE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 
-# Warning flags for C/C++
+# Warning flags for C++
 set(CUCASCADE_CXX_WARNING_FLAGS
     -Wall
     -Wextra
@@ -72,12 +76,11 @@ set(CUCASCADE_CXX_WARNING_FLAGS
     -Wunused
     -Wconversion
     -Wsign-conversion
-    -Wnull-dereference
     -Wdouble-promotion
     -Wformat=2
     -Wimplicit-fallthrough)
 
-if(WARNINGS_AS_ERRORS)
+if(CUCASCADE_WARNINGS_AS_ERRORS)
   list(APPEND CUCASCADE_CXX_WARNING_FLAGS -Werror)
 endif()
 
@@ -99,12 +102,16 @@ endif()
 # Object library (compiles sources once, used by both static and shared libs)
 # =============================================================================
 add_library(cucascade_objects OBJECT)
+add_library(cucascade_topology_discovery_objects OBJECT)
 
 # Apply warning flags to object library
 target_compile_options(
   cucascade_objects
-  PRIVATE $<$<COMPILE_LANGUAGE:C>:${CUCASCADE_CXX_WARNING_FLAGS}>
-          $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
+  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
+          ${CUCASCADE_CUDA_WARNING_FLAGS})
+target_compile_options(
+  cucascade_topology_discovery_objects
+  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
           ${CUCASCADE_CUDA_WARNING_FLAGS})
 
 # NVTX compile definition
@@ -114,6 +121,7 @@ if(CUCASCADE_NVTX)
 endif()
 
 # Add source directories (they will add sources to cucascade_objects)
+add_subdirectory(src/cuda)
 add_subdirectory(src/memory)
 add_subdirectory(src/data)
 
@@ -122,35 +130,67 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
-set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart CUDA::nvml
+set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart_static
                                Threads::Threads ${NUMA_LIB})
 
 # Set include directories for the object library
 target_include_directories(cucascade_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+target_include_directories(cucascade_topology_discovery_objects
+                           PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
 
 # Link dependencies to object library
 target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+target_link_libraries(cucascade_topology_discovery_objects
+                      PUBLIC CUDA::nvml_static)
 
 # cxx_std_20 is PUBLIC so consumers know they need C++20 to use our headers.
 # cuda_std_20 is kept separate and applied PRIVATE to cucascade_objects to avoid
 # propagating it to consumers that have no CUDA compiler requirement.
 target_compile_features(cucascade_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_objects PRIVATE cuda_std_20)
+target_compile_features(cucascade_topology_discovery_objects PUBLIC cxx_std_20)
+target_compile_features(cucascade_topology_discovery_objects
+                        PRIVATE cuda_std_20)
 
 set_target_properties(cucascade_objects PROPERTIES CXX_EXTENSIONS OFF
                                                    POSITION_INDEPENDENT_CODE ON)
+set_target_properties(
+  cucascade_topology_discovery_objects PROPERTIES CXX_EXTENSIONS OFF
+                                                  POSITION_INDEPENDENT_CODE ON)
 
 # =============================================================================
 # Static library
 # =============================================================================
 if(CUCASCADE_BUILD_STATIC_LIBS)
+  add_library(cucascade_topology_discovery_static STATIC
+              $<TARGET_OBJECTS:cucascade_topology_discovery_objects>)
+  add_library(cuCascade::cucascade_topology_discovery_static ALIAS
+              cucascade_topology_discovery_static)
+
+  target_link_libraries(cucascade_topology_discovery_static
+                        PRIVATE CUDA::nvml_static)
+  target_include_directories(cucascade_topology_discovery_static
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
+  # Work around a bug in libnvidia-ml.so - it attempts to call back into the
+  # stub library (https://nvbugspro.nvidia.com/bug/6174166)
+  target_link_options(cucascade_topology_discovery_static INTERFACE
+                      "LINKER:--exclude-libs,libnvidia-ml")
+
+  set_target_properties(
+    cucascade_topology_discovery_static
+    PROPERTIES OUTPUT_NAME cucascade_topology_discovery
+               EXPORT_NAME cucascade_topology_discovery_static)
+
   add_library(cucascade_static STATIC $<TARGET_OBJECTS:cucascade_objects>)
   add_library(cuCascade::cucascade_static ALIAS cucascade_static)
 
   target_include_directories(cucascade_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
-  target_link_libraries(cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+  target_link_libraries(
+    cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
+                            cucascade_topology_discovery_static)
   target_compile_features(cucascade_static PUBLIC cxx_std_20)
 
   set_target_properties(
@@ -162,19 +202,35 @@ endif()
 # Shared library
 # =============================================================================
 if(CUCASCADE_BUILD_SHARED_LIBS)
+  add_library(cucascade_topology_discovery_shared SHARED
+              $<TARGET_OBJECTS:cucascade_topology_discovery_objects>)
+  add_library(cuCascade::cucascade_topology_discovery_shared ALIAS
+              cucascade_topology_discovery_shared)
+
+  target_link_libraries(cucascade_topology_discovery_shared
+                        PRIVATE CUDA::nvml_static)
+  target_include_directories(cucascade_topology_discovery_shared
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)
+  # Work around a bug in libnvidia-ml.so - it attempts to call back into the
+  # stub library (https://nvbugspro.nvidia.com/bug/6174166)
+  target_link_options(cucascade_topology_discovery_shared PRIVATE
+                      "LINKER:--exclude-libs,libnvidia-ml")
+
+  set_target_properties(cucascade_topology_discovery_shared
+                        PROPERTIES OUTPUT_NAME cucascade_topology_discovery)
+
   add_library(cucascade_shared SHARED $<TARGET_OBJECTS:cucascade_objects>)
   add_library(cuCascade::cucascade_shared ALIAS cucascade_shared)
 
   target_include_directories(cucascade_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
-  target_link_libraries(cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+  target_link_libraries(
+    cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
+                            cucascade_topology_discovery_shared)
   target_compile_features(cucascade_shared PUBLIC cxx_std_20)
 
-  set_target_properties(
-    cucascade_shared
-    PROPERTIES OUTPUT_NAME cucascade
-               VERSION ${PROJECT_VERSION}
-               SOVERSION ${PROJECT_VERSION_MAJOR})
+  set_target_properties(cucascade_shared PROPERTIES OUTPUT_NAME cucascade)
 endif()
 
 # =============================================================================
@@ -182,11 +238,19 @@ endif()
 # =============================================================================
 if(CUCASCADE_BUILD_SHARED_LIBS)
   add_library(cuCascade::cucascade ALIAS cucascade_shared)
+  add_library(cuCascade::cucascade_topology_discovery ALIAS
+              cucascade_topology_discovery_shared)
   # For backwards compatibility, also create 'cucascade' as an alias
   add_library(cucascade ALIAS cucascade_shared)
+  add_library(cucascade_topology_discovery ALIAS
+              cucascade_topology_discovery_shared)
 elseif(CUCASCADE_BUILD_STATIC_LIBS)
   add_library(cuCascade::cucascade ALIAS cucascade_static)
+  add_library(cuCascade::cucascade_topology_discovery ALIAS
+              cucascade_topology_discovery_static)
   add_library(cucascade ALIAS cucascade_static)
+  add_library(cucascade_topology_discovery ALIAS
+              cucascade_topology_discovery_static)
 endif()
 
 # =============================================================================
@@ -206,10 +270,12 @@ install(
 # Collect targets to install
 set(CUCASCADE_INSTALL_TARGETS)
 if(CUCASCADE_BUILD_STATIC_LIBS)
-  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_static)
+  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_static
+       cucascade_topology_discovery_static)
 endif()
 if(CUCASCADE_BUILD_SHARED_LIBS)
-  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared)
+  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared
+       cucascade_topology_discovery_shared)
 endif()
 
 # Install library targets

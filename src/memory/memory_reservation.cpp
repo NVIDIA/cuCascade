@@ -49,7 +49,7 @@ reservation::reservation(const memory_space* space, std::unique_ptr<reserved_are
 
 reservation::~reservation() = default;
 
-rmm::mr::device_memory_resource* reservation::get_memory_resource() const noexcept
+rmm::device_async_resource_ref reservation::get_memory_resource() const noexcept
 {
   return _space->get_default_allocator();
 }

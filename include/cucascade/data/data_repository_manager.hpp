@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -204,23 +205,6 @@ class data_repository_manager {
   }
 
   /**
-   * @brief Get N batches from the specified repositories for downgrade.
-   *
-   * @param memory_space_id The memory space id to get the data batches from
-   * @param amount_to_downgrade The amount of data in bytes to downgrade
-   * @return std::vector<PtrType> A vector of data batches that are candidates for downgrade
-   */
-  std::vector<PtrType> get_data_batches_for_downgrade(
-    [[maybe_unused]] cucascade::memory::memory_space_id memory_space_id,
-    [[maybe_unused]] size_t amount_to_downgrade)
-  {
-    std::vector<PtrType> data_batches;
-    // Note: Implementation would iterate through repositories and collect batches
-    // This is a placeholder - actual implementation depends on how batches are tracked
-    return data_batches;
-  }
-
-  /**
    * @brief Iterate over all repositories, calling the visitor for each one.
    *
    * The visitor receives a raw pointer to each repository. The visitor must not
@@ -237,34 +221,47 @@ class data_repository_manager {
     }
   }
 
- private:
-  // Implementation for shared_ptr - can copy to multiple repositories
-  template <typename T = PtrType>
-  typename std::enable_if<std::is_same<T, std::shared_ptr<data_batch>>::value>::type
-  add_data_batch_impl(T batch, std::vector<std::pair<size_t, std::string_view>>& ops)
+  /**
+   * @brief Get a snapshot of all current repository pointers.
+   *
+   * Returns a vector of raw pointers to each non-null repository. The vector
+   * is built under the manager mutex, so callers can iterate it externally
+   * without holding the lock (the repositories themselves remain thread-safe).
+   *
+   * @return std::vector<repository_type*> Snapshot of non-null repository pointers
+   * @note Thread-safe — holds the manager mutex for the duration of collection.
+   */
+  std::vector<repository_type*> get_repositories()
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& op : ops) {
-      _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
+    std::vector<repository_type*> result;
+    result.reserve(_repositories.size());
+    for (auto& [key, repo] : _repositories) {
+      if (repo) { result.push_back(repo.get()); }
     }
+    return result;
   }
 
-  // Implementation for unique_ptr - can only add to one repository (moves the batch)
-  template <typename T = PtrType>
-  typename std::enable_if<std::is_same<T, std::unique_ptr<data_batch>>::value>::type
-  add_data_batch_impl(T batch, std::vector<std::pair<size_t, std::string_view>>& ops)
+ private:
+  void add_data_batch_impl(PtrType batch, std::vector<std::pair<size_t, std::string_view>>& ops)
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    if (ops.size() > 1) {
-      throw std::runtime_error(
-        "unique_ptr data_batch can only be added to one repository. "
-        "Use shared_ptr for multiple destinations.");
-    }
-    if (!ops.empty()) {
-      auto& op = ops[0];
-      _repositories[{op.first, std::string(op.second)}]->add_data_batch(std::move(batch));
+    if constexpr (std::is_copy_constructible_v<PtrType>) {
+      for (auto& op : ops) {
+        _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
+      }
     } else {
-      throw std::runtime_error("No operator ports provided");
+      if (ops.size() > 1) {
+        throw std::runtime_error(
+          "unique_ptr data_batch can only be added to one repository. "
+          "Use shared_ptr for multiple destinations.");
+      }
+      if (!ops.empty()) {
+        auto& op = ops[0];
+        _repositories[{op.first, std::string(op.second)}]->add_data_batch(std::move(batch));
+      } else {
+        throw std::runtime_error("No operator ports provided");
+      }
     }
   }
 

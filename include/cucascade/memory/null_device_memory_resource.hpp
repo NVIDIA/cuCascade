@@ -17,37 +17,57 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
+#include <cuda/memory_resource>
+#include <cuda/stream_ref>
+
+#include <cstddef>
 
 namespace cucascade {
 namespace memory {
 
 /**
- * A no-op device_memory_resource used for DISK tier to satisfy API requirements.
+ * A no-op memory resource used for DISK tier to satisfy API requirements.
  * - allocate always returns nullptr
  * - deallocate is a no-op
  */
-class null_device_memory_resource : public rmm::mr::device_memory_resource {
+class null_device_memory_resource {
  public:
-  null_device_memory_resource()           = default;
-  ~null_device_memory_resource() override = default;
+  null_device_memory_resource()  = default;
+  ~null_device_memory_resource() = default;
 
- protected:
-  void* do_allocate([[maybe_unused]] std::size_t bytes,
-                    [[maybe_unused]] rmm::cuda_stream_view stream) override
+  void* allocate([[maybe_unused]] cuda::stream_ref stream,
+                 [[maybe_unused]] std::size_t bytes,
+                 [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t))
   {
     return nullptr;
   }
-  void do_deallocate([[maybe_unused]] void* p,
-                     [[maybe_unused]] std::size_t bytes,
-                     [[maybe_unused]] rmm::cuda_stream_view stream) noexcept override
+
+  void deallocate([[maybe_unused]] cuda::stream_ref stream,
+                  [[maybe_unused]] void* p,
+                  [[maybe_unused]] std::size_t bytes,
+                  [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
   }
-  [[nodiscard]] bool do_is_equal(
-    const rmm::mr::device_memory_resource& other) const noexcept override
+
+  void* allocate_sync([[maybe_unused]] std::size_t bytes,
+                      [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t))
+  {
+    return nullptr;
+  }
+
+  void deallocate_sync([[maybe_unused]] void* p,
+                       [[maybe_unused]] std::size_t bytes,
+                       [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+  }
+
+  bool operator==(null_device_memory_resource const& other) const noexcept
   {
     return this == &other;
+  }
+
+  friend void get_property(null_device_memory_resource const&, cuda::mr::device_accessible) noexcept
+  {
   }
 };
 

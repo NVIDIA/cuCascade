@@ -15,9 +15,8 @@
  * limitations under the License.
  */
 
+#include <cucascade/error.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
-
-#include <cucascade/cuda_utils.hpp>
 
 #include <numa.h>
 
@@ -26,8 +25,27 @@
 namespace cucascade {
 namespace memory {
 
-void* numa_region_pinned_host_memory_resource::do_allocate(
-  std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream)
+numa_region_pinned_host_memory_resource::numa_region_pinned_host_memory_resource(int numa_node,
+                                                                                 bool make_portable)
+  : _numa_node(numa_node), _cuda_host_flags(cuda_host_flags(numa_node, make_portable))
+{
+}
+
+int numa_region_pinned_host_memory_resource::cuda_host_flags(int numa_node,
+                                                             bool make_portable) noexcept
+{
+  if (!make_portable) {
+    return numa_node == -1 ? static_cast<int>(cudaHostAllocDefault)
+                           : static_cast<int>(cudaHostRegisterMapped);
+  }
+
+  return numa_node == -1 ? static_cast<int>(cudaHostAllocPortable | cudaHostAllocMapped)
+                         : static_cast<int>(cudaHostRegisterPortable | cudaHostRegisterMapped);
+}
+
+void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+                                                        std::size_t bytes,
+                                                        [[maybe_unused]] std::size_t alignment)
 {
   CUCASCADE_FUNC_RANGE();
   // don't allocate anything if the user requested zero bytes
@@ -35,18 +53,23 @@ void* numa_region_pinned_host_memory_resource::do_allocate(
 
   if (_numa_node == -1) {
     void* ptr{nullptr};
-    CUCASCADE_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault), bytes);
+    CUCASCADE_CUDA_TRY_ALLOC(
+      cudaHostAlloc(&ptr, bytes, static_cast<unsigned int>(_cuda_host_flags)), bytes);
     return ptr;
   } else {
     void* ptr = numa_alloc_onnode(bytes, _numa_node);
     if (ptr == nullptr) { throw rmm::bad_alloc(std::strerror(errno)); }
-    CUCASCADE_CUDA_TRY_ALLOC(cudaHostRegister(ptr, bytes, cudaHostRegisterMapped), bytes);
+    CUCASCADE_CUDA_TRY_ALLOC(
+      cudaHostRegister(ptr, bytes, static_cast<unsigned int>(_cuda_host_flags)), bytes);
     return ptr;
   }
 }
 
-void numa_region_pinned_host_memory_resource::do_deallocate(
-  void* ptr, std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream) noexcept
+void numa_region_pinned_host_memory_resource::deallocate(
+  [[maybe_unused]] cuda::stream_ref stream,
+  void* ptr,
+  std::size_t bytes,
+  [[maybe_unused]] std::size_t alignment) noexcept
 {
   CUCASCADE_FUNC_RANGE();
   if (_numa_node == -1) {
@@ -57,11 +80,23 @@ void numa_region_pinned_host_memory_resource::do_deallocate(
   }
 }
 
-bool numa_region_pinned_host_memory_resource::do_is_equal(
-  const rmm::mr::device_memory_resource& other) const noexcept
+void* numa_region_pinned_host_memory_resource::allocate_sync(std::size_t bytes,
+                                                             [[maybe_unused]] std::size_t alignment)
 {
-  auto* mr_ptr = dynamic_cast<numa_region_pinned_host_memory_resource const*>(&other);
-  return mr_ptr == this && mr_ptr->_numa_node == this->_numa_node;
+  return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+}
+
+void numa_region_pinned_host_memory_resource::deallocate_sync(
+  void* ptr, std::size_t bytes, [[maybe_unused]] std::size_t alignment) noexcept
+{
+  deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+}
+
+bool numa_region_pinned_host_memory_resource::operator==(
+  numa_region_pinned_host_memory_resource const& other) const noexcept
+{
+  return this == &other && _numa_node == other._numa_node &&
+         _cuda_host_flags == other._cuda_host_flags;
 }
 
 }  // namespace memory

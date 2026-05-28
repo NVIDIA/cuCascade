@@ -7,7 +7,19 @@ on:
       - "pull-request/[0-9]+"
 
 jobs:
+  lint:
+    runs-on: linux-amd64-cpu4
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+
   build:
+    needs: lint
     runs-on: linux-amd64-cpu4
     strategy:
       fail-fast: false
@@ -26,7 +38,7 @@ jobs:
           cache: false
           environments: ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }}
 
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} build
 
@@ -108,7 +120,7 @@ jobs:
           path: .cache/benchmark_result.json
 
       - name: Compare benchmark results
-        uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1.20.7
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
         with:
           tool: googlecpp
           output-file-path: ${{ github.workspace }}/benchmark_result.json

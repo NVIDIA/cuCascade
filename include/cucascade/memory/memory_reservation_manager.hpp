@@ -22,6 +22,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <condition_variable>
 #include <filesystem>
@@ -33,9 +34,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 
 namespace cucascade {
 namespace memory {

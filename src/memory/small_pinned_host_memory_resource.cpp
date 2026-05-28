@@ -37,22 +37,25 @@ small_pinned_host_memory_resource::~small_pinned_host_memory_resource()
   // free_lists_ entries are raw pointers into those blocks; no individual cleanup needed.
 }
 
-void* small_pinned_host_memory_resource::do_allocate(std::size_t bytes,
-                                                     [[maybe_unused]] rmm::cuda_stream_view stream)
+void* small_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+                                                  std::size_t bytes,
+                                                  [[maybe_unused]] std::size_t alignment)
 {
   if (bytes == 0) { return nullptr; }
   // cuDF calls get_pinned_memory_resource() directly from some code paths (e.g. join/sort
   // staging buffers) that bypass the allocate_host_as_pinned threshold check.  Serve those
-  // with cudaMallocHost so the
-  // memory remains pinned and device-accessible.  cuDF 26.04+ may access
-  // hostdevice_vector memory directly from GPU kernels (e.g. detect_malformed_pages),
-  // so returning pageable memory here would cause cudaErrorIllegalAddress.
+  // with cudaHostAlloc(Portable) so the memory remains pinned AND DMA-accessible from
+  // every CUDA context (multi-GPU consumers need the Portable flag; cudaMallocHost /
+  // cudaHostAllocDefault produce memory that is only DMA-accessible from the allocating
+  // device's context, which under CUDA 13+ makes cudaMemcpyBatchAsync reject cross-device
+  // sources with cudaErrorInvalidValue). cuDF 26.04+ may access hostdevice_vector memory
+  // directly from GPU kernels (e.g. detect_malformed_pages), so returning pageable memory
+  // here would cause cudaErrorIllegalAddress.
   if (bytes > MAX_SLAB_SIZE) {
     void* ptr = nullptr;
-    auto err  = ::cudaMallocHost(&ptr, bytes);
-    if (err != cudaSuccess) {
-      throw std::bad_alloc{};
-    }
+    // Portable + Mapped — see numa_region_pinned_host_allocator.cpp comment.
+    auto err = ::cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+    if (err != cudaSuccess) { throw std::bad_alloc{}; }
     return ptr;
   }
 
@@ -64,8 +67,10 @@ void* small_pinned_host_memory_resource::do_allocate(std::size_t bytes,
   return ptr;
 }
 
-void small_pinned_host_memory_resource::do_deallocate(
-  void* ptr, std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream) noexcept
+void small_pinned_host_memory_resource::deallocate([[maybe_unused]] cuda::stream_ref stream,
+                                                   void* ptr,
+                                                   std::size_t bytes,
+                                                   [[maybe_unused]] std::size_t alignment) noexcept
 {
   if (ptr == nullptr || bytes == 0) { return; }
   if (bytes > MAX_SLAB_SIZE) {
@@ -78,8 +83,8 @@ void small_pinned_host_memory_resource::do_deallocate(
   free_lists_[idx].push_back(ptr);
 }
 
-bool small_pinned_host_memory_resource::do_is_equal(
-  const rmm::mr::device_memory_resource& other) const noexcept
+bool small_pinned_host_memory_resource::operator==(
+  small_pinned_host_memory_resource const& other) const noexcept
 {
   return this == &other;
 }

@@ -132,7 +132,7 @@ TEST_CASE("shared_data_repository_manager Add Data Batch Single Operator",
 
   // Repository should have the batch
   auto& repo        = manager.get_repository(operator_id, "default");
-  auto pulled_batch = repo->pop_data_batch(batch_state::task_created);
+  auto pulled_batch = repo->pop_next_data_batch();
   REQUIRE(pulled_batch != nullptr);
   REQUIRE(pulled_batch->get_batch_id() == batch_id);
 }
@@ -163,7 +163,7 @@ TEST_CASE("shared_data_repository_manager Add Data Batch Multiple Operators",
   // All repositories should have the batch (same shared_ptr)
   for (size_t id : operator_ids) {
     auto& repo  = manager.get_repository(id, "default");
-    auto pulled = repo->pop_data_batch(batch_state::task_created);
+    auto pulled = repo->pop_next_data_batch();
     REQUIRE(pulled != nullptr);
     REQUIRE(pulled->get_batch_id() == batch_id);
   }
@@ -244,7 +244,7 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Add Batch", "[data_reposit
   auto& repo = manager.get_repository(operator_id, "default");
   int count  = 0;
   while (true) {
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -299,7 +299,7 @@ TEST_CASE("unique_data_repository_manager Add Data Batch Single Operator",
 
   // Repository should have the batch
   auto& repo        = manager.get_repository(operator_id, "default");
-  auto pulled_batch = repo->pop_data_batch(batch_state::task_created);
+  auto pulled_batch = repo->pop_next_data_batch();
   REQUIRE(pulled_batch != nullptr);
   REQUIRE(pulled_batch->get_batch_id() == batch_id);
 }
@@ -349,7 +349,7 @@ TEST_CASE("unique_data_repository_manager Add Multiple Batches", "[data_reposito
   auto& repo = manager.get_repository(operator_id, "default");
   int count  = 0;
   while (true) {
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -408,7 +408,7 @@ TEST_CASE("shared_data_repository_manager Full Workflow", "[data_repository_mana
     auto& repo = manager.get_repository(0, "default");
     int count  = 0;
     while (true) {
-      auto batch = repo->pop_data_batch(batch_state::task_created);
+      auto batch = repo->pop_next_data_batch();
       if (!batch) break;
       ++count;
     }
@@ -420,7 +420,7 @@ TEST_CASE("shared_data_repository_manager Full Workflow", "[data_repository_mana
     auto& repo = manager.get_repository(1, "default");
     int count  = 0;
     while (true) {
-      auto batch = repo->pop_data_batch(batch_state::task_created);
+      auto batch = repo->pop_next_data_batch();
       if (!batch) break;
       ++count;
     }
@@ -432,7 +432,7 @@ TEST_CASE("shared_data_repository_manager Full Workflow", "[data_repository_mana
     auto& repo = manager.get_repository(2, "default");
     int count  = 0;
     while (true) {
-      auto batch = repo->pop_data_batch(batch_state::task_created);
+      auto batch = repo->pop_next_data_batch();
       if (!batch) break;
       ++count;
     }
@@ -483,7 +483,7 @@ TEST_CASE("shared_data_repository_manager Large Number of Batches", "[data_repos
   auto& repo = manager.get_repository(operator_id, "default");
   int count  = 0;
   while (true) {
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -561,7 +561,7 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Mixed Operations",
         // Occasionally pull and store a batch (to test concurrent pull operations)
         if (j % 10 == 0) {
           auto& repo  = manager.get_repository(operator_id, "default");
-          auto pulled = repo->pop_data_batch(batch_state::task_created);
+          auto pulled = repo->pop_next_data_batch();
           if (pulled) {
             std::lock_guard<std::mutex> lock(pull_mutex);
             all_batches.push_back(std::move(pulled));
@@ -634,7 +634,7 @@ TEST_CASE("shared_data_repository_manager Concurrent Add and Pull", "[data_repos
 
       // Keep pulling while adders are working
       while (keep_adding.load()) {
-        auto batch = repo->pop_data_batch(batch_state::task_created);
+        auto batch = repo->pop_next_data_batch();
         if (batch) {
           ++batches_pulled;
         } else {
@@ -645,7 +645,7 @@ TEST_CASE("shared_data_repository_manager Concurrent Add and Pull", "[data_repos
 
       // Final cleanup - pull remaining batches
       while (true) {
-        auto batch = repo->pop_data_batch(batch_state::task_created);
+        auto batch = repo->pop_next_data_batch();
         if (!batch) break;
         ++batches_pulled;
       }
@@ -674,7 +674,7 @@ TEST_CASE("shared_data_repository_manager Concurrent Add and Pull", "[data_repos
   // All repositories should be empty
   for (int i = 0; i < num_operators; ++i) {
     auto& repo = manager.get_repository(i, "default");
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     REQUIRE(batch == nullptr);
   }
 }
@@ -710,7 +710,7 @@ TEST_CASE("shared_data_repository_manager High Contention Add Pull", "[data_repo
         ++total_added;
 
         // Immediately try to pull a batch (might be ours or someone else's)
-        auto pulled = repo->pop_data_batch(batch_state::task_created);
+        auto pulled = repo->pop_next_data_batch();
         if (pulled) { ++total_pulled; }
       }
     });
@@ -727,7 +727,7 @@ TEST_CASE("shared_data_repository_manager High Contention Add Pull", "[data_repo
   // Clean up remaining batches
   auto& repo = manager.get_repository(operator_id, "default");
   while (true) {
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     if (!batch) break;
     ++total_pulled;
   }
@@ -773,7 +773,7 @@ TEST_CASE("shared_data_repository_manager Concurrent Add Multiple Operators Per 
 
       // Pull all batches from this operator
       while (true) {
-        auto batch = repo->pop_data_batch(batch_state::task_created);
+        auto batch = repo->pop_next_data_batch();
         if (!batch) break;
         ++batches_pulled;
       }
@@ -792,7 +792,7 @@ TEST_CASE("shared_data_repository_manager Concurrent Add Multiple Operators Per 
   // All repositories should be empty
   for (int i = 0; i < num_operators; ++i) {
     auto& repo = manager.get_repository(i, "default");
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     REQUIRE(batch == nullptr);
   }
 }
@@ -876,7 +876,7 @@ TEST_CASE("unique_data_repository_manager Thread-Safe Add Batch", "[data_reposit
   auto& repo = manager.get_repository(operator_id, "default");
   int count  = 0;
   while (true) {
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -926,7 +926,7 @@ TEST_CASE("unique_data_repository_manager Concurrent Add and Pull", "[data_repos
       auto& repo = manager.get_repository(operator_id, "default");
 
       while (keep_adding.load()) {
-        auto batch = repo->pop_data_batch(batch_state::task_created);
+        auto batch = repo->pop_next_data_batch();
         if (batch) {
           ++batches_pulled;
         } else {
@@ -936,7 +936,7 @@ TEST_CASE("unique_data_repository_manager Concurrent Add and Pull", "[data_repos
 
       // Final cleanup
       while (true) {
-        auto batch = repo->pop_data_batch(batch_state::task_created);
+        auto batch = repo->pop_next_data_batch();
         if (!batch) break;
         ++batches_pulled;
       }
@@ -994,7 +994,7 @@ TEST_CASE("unique_data_repository_manager High Contention", "[data_repository_ma
         ++total_added;
 
         // Immediately try to pull a batch
-        auto pulled = repo->pop_data_batch(batch_state::task_created);
+        auto pulled = repo->pop_next_data_batch();
         if (pulled) { ++total_pulled; }
       }
     });
@@ -1011,7 +1011,7 @@ TEST_CASE("unique_data_repository_manager High Contention", "[data_repository_ma
   // Clean up remaining batches
   auto& repo = manager.get_repository(operator_id, "default");
   while (true) {
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     if (!batch) break;
     ++total_pulled;
   }
@@ -1080,7 +1080,7 @@ TEST_CASE("shared_data_repository_manager Batches With Different Sizes",
   auto& repo = manager.get_repository(operator_id, "default");
   int count  = 0;
   while (true) {
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -1112,7 +1112,7 @@ TEST_CASE("shared_data_repository_manager Batches With Different Tiers",
   auto& repo = manager.get_repository(operator_id, "default");
   int count  = 0;
   while (true) {
-    auto batch = repo->pop_data_batch(batch_state::task_created);
+    auto batch = repo->pop_next_data_batch();
     if (!batch) break;
     ++count;
   }
@@ -1139,11 +1139,11 @@ TEST_CASE("shared_data_repository_manager Rapid Add Pull Cycles", "[data_reposit
     manager.add_data_batch(batch, operator_ports);
 
     // Pull the batch
-    auto pulled = repo->pop_data_batch(batch_state::task_created);
+    auto pulled = repo->pop_next_data_batch();
     REQUIRE(pulled != nullptr);
   }
 
   // Repository should be empty
-  auto empty = repo->pop_data_batch(batch_state::task_created);
+  auto empty = repo->pop_next_data_batch();
   REQUIRE(empty == nullptr);
 }

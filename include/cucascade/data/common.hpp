@@ -20,7 +20,6 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 
 #include <concepts>
 #include <cstddef>
@@ -88,6 +87,17 @@ class idata_representation {
    * @return std::size_t The number of bytes used to store this representation
    */
   virtual std::size_t get_size_in_bytes() const = 0;
+
+  /**
+   * @brief Get the logical (uncompressed) data size in bytes
+   *
+   * For representations that store data in a compressed format (e.g. Parquet), this returns
+   * the uncompressed data size. For uncompressed representations, this returns the same value
+   * as get_size_in_bytes().
+   *
+   * @return std::size_t The logical data size in bytes
+   */
+  virtual std::size_t get_uncompressed_data_size_in_bytes() const = 0;
 
   /**
    * @brief Create a deep copy of this data representation.

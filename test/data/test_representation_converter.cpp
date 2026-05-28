@@ -48,6 +48,7 @@ class custom_test_representation : public idata_representation {
   }
 
   std::size_t get_size_in_bytes() const override { return sizeof(_value); }
+  std::size_t get_uncompressed_data_size_in_bytes() const override { return sizeof(_value); }
 
   std::unique_ptr<idata_representation> clone(
     [[maybe_unused]] rmm::cuda_stream_view stream) override
@@ -70,6 +71,7 @@ class another_test_representation : public idata_representation {
   }
 
   std::size_t get_size_in_bytes() const override { return sizeof(_value); }
+  std::size_t get_uncompressed_data_size_in_bytes() const override { return sizeof(_value); }
 
   std::unique_ptr<idata_representation> clone(
     [[maybe_unused]] rmm::cuda_stream_view stream) override
@@ -379,7 +381,8 @@ TEST_CASE("Built-in GPU to HOST conversion works", "[representation_converter][b
   rmm::cuda_stream stream;
   auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
   gpu_table_representation gpu_repr(std::make_unique<cudf::table>(std::move(table)),
-                                    *const_cast<memory::memory_space*>(gpu_space));
+                                    *const_cast<memory::memory_space*>(gpu_space),
+                                    rmm::cuda_stream_view{});
 
   auto host_result =
     registry.convert<host_data_packed_representation>(gpu_repr, host_space, stream);
@@ -405,7 +408,8 @@ TEST_CASE("Built-in HOST to GPU conversion works", "[representation_converter][b
   // First create a GPU repr then convert to host to get a valid host_data_packed_representation
   auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
   gpu_table_representation gpu_repr(std::make_unique<cudf::table>(std::move(table)),
-                                    *const_cast<memory::memory_space*>(gpu_space));
+                                    *const_cast<memory::memory_space*>(gpu_space),
+                                    rmm::cuda_stream_view{});
 
   auto host_repr = registry.convert<host_data_packed_representation>(gpu_repr, host_space, stream);
   stream.synchronize();
@@ -416,7 +420,7 @@ TEST_CASE("Built-in HOST to GPU conversion works", "[representation_converter][b
 
   REQUIRE(gpu_result != nullptr);
   REQUIRE(gpu_result->get_current_tier() == memory::Tier::GPU);
-  REQUIRE(gpu_result->get_table().num_rows() == 50);
+  REQUIRE(gpu_result->get_table_view().num_rows() == 50);
 }
 
 TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
@@ -435,7 +439,8 @@ TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
   auto original_table =
     create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream.view());
   gpu_table_representation original_repr(std::make_unique<cudf::table>(std::move(original_table)),
-                                         *const_cast<memory::memory_space*>(gpu_space));
+                                         *const_cast<memory::memory_space*>(gpu_space),
+                                         rmm::cuda_stream_view{});
 
   // GPU -> HOST
   auto host_repr =
@@ -449,7 +454,7 @@ TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
   // Verify data integrity
   REQUIRE(result_repr != nullptr);
   cucascade::test::expect_cudf_tables_equal_on_stream(
-    original_repr.get_table(), result_repr->get_table(), stream);
+    original_repr.get_table_view(), result_repr->get_table_view(), stream);
 }
 
 // =============================================================================

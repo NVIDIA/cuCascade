@@ -79,8 +79,33 @@ if (discovery.discover()) {
 2. **GPU enumeration** -- NVML queries device count, names, UUIDs, PCIe bus IDs
 3. **NUMA mapping** -- reads `/sys/bus/pci/devices/<bus_id>/numa_node` for each GPU
 4. **CPU affinity** -- reads `/sys/bus/pci/devices/<bus_id>/local_cpulist`
-5. **Network devices** -- scans `/sys/class/infiniband/` and `/sys/class/net/` for NICs with NUMA info
+5. **Network devices** -- scans `/sys/class/infiniband/` for NICs with NUMA info, with configurable verification (see [Network Device Verification](#network-device-verification))
 6. **Storage devices** -- scans `/sys/block/` for NVMe and SATA devices with NUMA info
+
+### Network Device Verification
+
+The `discover()` method accepts a `NetworkDeviceVerification` parameter that controls how strictly network devices are validated before inclusion. This prevents assigning non-functional devices to `UCX_NET_DEVICES` (which would cause connection failures).
+
+| Level | Enum Value | Checks Performed |
+|-------|------------|------------------|
+| **Strictest (default)** | `EXISTS_ACTIVE_IP` | Device exists, uverbs device node accessible, at least one port is ACTIVE, and the associated net interface has an IP address |
+| **Medium** | `EXISTS_ACTIVE` | Device exists, uverbs device node accessible, and at least one port is ACTIVE |
+| **Most permissive** | `EXISTS` | Device exists in `/sys/class/infiniband/` |
+
+```cpp
+topology_discovery discovery;
+
+// Default: strictest (requires active port + IP address)
+discovery.discover();
+
+// Only require active port (skip IP check)
+discovery.discover(NetworkDeviceVerification::EXISTS_ACTIVE);
+
+// Include all devices regardless of state
+discovery.discover(NetworkDeviceVerification::EXISTS);
+```
+
+Port state is read from `/sys/class/infiniband/<device>/ports/<N>/state`. The uverbs device node check verifies that `/dev/infiniband/uverbsN` exists for the device (in containerized environments sysfs may be mounted from the host while the device nodes are not passed through). IP address presence is checked via `getifaddrs()` on the net interface found under `/sys/class/infiniband/<device>/device/net/`.
 
 ### GPU-to-NUMA Affinity
 
