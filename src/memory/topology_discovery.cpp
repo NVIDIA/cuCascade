@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -672,19 +673,39 @@ int count_numa_nodes()
   return count;
 }
 
+nvmlReturn_t initialize_nvml_for_current_process()
+{
+  static std::mutex mutex;
+  static pid_t initialized_pid    = -1;
+  static nvmlReturn_t init_result = NVML_ERROR_UNINITIALIZED;
+
+  std::lock_guard<std::mutex> lock(mutex);
+  pid_t const pid = getpid();
+  if (initialized_pid != pid) {
+    init_result     = nvmlInit_v2();
+    initialized_pid = pid;
+  }
+  return init_result;
+}
+
 }  // namespace
 
 bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 {
   system_topology_info topology;
-  // NVML is initialized exactly once per process via this static-local. Calling
-  // nvmlInit_v2 + nvmlShutdown in sequence (which discover() used to do on every
-  // call) SEGVs on NVIDIA driver 595.58.03 — the second nvmlInit_v2 after a
-  // shutdown lands on a stale internal function pointer in libnvidia-ml.
+  // NVML is initialized exactly once per process. Calling nvmlInit_v2 +
+  // nvmlShutdown in sequence (which discover() used to do on every call)
+  // SEGVs on NVIDIA driver 595.58.03 - the second nvmlInit_v2 after a shutdown
+  // lands on a stale internal function pointer in libnvidia-ml.
+  //
+  // The cached init state is keyed by PID so a child process created with fork()
+  // re-initializes NVML before issuing queries. Without this, forked children
+  // can inherit the parent's initialized state and fail later NVML calls such as
+  // nvmlDeviceGetCount_v2().
+  //
   // The driver releases NVML resources at process exit via its own atexit hook,
   // so we never need to call nvmlShutdown explicitly.
-  static const nvmlReturn_t init_result = nvmlInit_v2();
-  nvmlReturn_t result                   = init_result;
+  nvmlReturn_t result = initialize_nvml_for_current_process();
   if (result != NVML_SUCCESS) {
     std::cerr << "Failed to initialize NVML: " << nvmlErrorString(result) << std::endl;
     // Continue anyway to report system info even without GPUs
