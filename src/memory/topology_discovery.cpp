@@ -39,6 +39,23 @@ struct NetworkDeviceWithTopology {
 };
 
 /**
+ * @brief Emit a standardized warning for a failed NVML call.
+ *
+ * Formats the message as "Warning: <context>: <nvmlErrorString(result)>" and writes
+ * it to stderr. Callers retain control of flow (skip, continue, use defaults) — this
+ * helper only standardizes message formatting so every NVML failure surfaces the same
+ * way and always includes the decoded NVML error string.
+ *
+ * @param result NVML return code that did not equal NVML_SUCCESS.
+ * @param context Description of the operation that failed (e.g. "Failed to get
+ * device count" or "Failed to get handle for GPU 0").
+ */
+void report_nvml_error(nvmlReturn_t result, std::string const& context)
+{
+  std::cerr << "Warning: " << context << ": " << nvmlErrorString(result) << std::endl;
+}
+
+/**
  * @brief Read a file and return its content.
  *
  * Attempts to open and read the file at @p path. If the file cannot be opened or
@@ -691,7 +708,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
   static const nvmlReturn_t init_result = nvmlInit_v2();
   nvmlReturn_t result                   = init_result;
   if (result != NVML_SUCCESS) {
-    std::cerr << "Failed to initialize NVML: " << nvmlErrorString(result) << std::endl;
+    report_nvml_error(result, "Failed to initialize NVML");
     // Continue anyway to report system info even without GPUs
   }
 
@@ -701,7 +718,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
   if (result == NVML_SUCCESS) {
     result = nvmlDeviceGetCount_v2(&device_count);
     if (result != NVML_SUCCESS) {
-      std::cerr << "Warning: Failed to get device count: " << nvmlErrorString(result) << std::endl;
+      report_nvml_error(result, "Failed to get device count");
       device_count = 0;
     } else {
       nvml_available = true;      
@@ -773,8 +790,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       nvmlDevice_t device;
       result = nvmlDeviceGetHandleByIndex_v2(i, &device);
       if (result != NVML_SUCCESS) {
-        std::cerr << "Warning: Failed to get handle for GPU " << i << ": "
-                  << nvmlErrorString(result) << std::endl;
+        report_nvml_error(result, "Failed to get handle for GPU " + std::to_string(i));
         continue;
       }
 
@@ -782,7 +798,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       nvmlPciInfo_t pci_info;
       result = nvmlDeviceGetPciInfo_v3(device, &pci_info);
       if (result != NVML_SUCCESS) {
-        std::cerr << "Warning: Failed to get PCI info for GPU " << i << std::endl;
+        report_nvml_error(result, "Failed to get PCI info for GPU " + std::to_string(i));
         continue;
       }
       std::string parent_pci      = std::string(pci_info.busId);
@@ -808,9 +824,9 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
       unsigned int max_mig = 0;
       nvmlReturn_t mc_rc   = nvmlDeviceGetMaxMigDeviceCount(device, &max_mig);
       if (mc_rc != NVML_SUCCESS) {
-        std::cerr << "Warning: MIG enabled on GPU " << i
-                  << " but failed to query MIG device count: " << nvmlErrorString(mc_rc)
-                  << std::endl;
+        report_nvml_error(mc_rc,
+                          "MIG enabled on GPU " + std::to_string(i) +
+                            " but failed to query MIG device count");
         max_mig = 0;
       }
 
@@ -820,8 +836,9 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
         nvmlReturn_t r = nvmlDeviceGetMigDeviceHandleByIndex(device, mig_idx, &mig_device);
         if (r == NVML_ERROR_NOT_FOUND) { continue; }
         if (r != NVML_SUCCESS) {
-          std::cerr << "Warning: Failed to get MIG handle for GPU " << i << " slot " << mig_idx
-                    << ": " << nvmlErrorString(r) << std::endl;
+          report_nvml_error(r,
+                            "Failed to get MIG handle for GPU " + std::to_string(i) + " slot " +
+                              std::to_string(mig_idx));
           continue;
         }
         emit_gpu(mig_device, parent_pci, parent_numa, parent_cpu_aff, parent_cpu, parent_nics);
