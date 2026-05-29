@@ -865,7 +865,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     gpu.id   = static_cast<unsigned int>(visible_idx);
     topology.gpus.push_back(std::move(gpu));
   }
-  
+
   // Do not call nvmlShutdown here — NVML is initialized once per process via
   // the static-local in this function. See the comment at the top of discover().
 
