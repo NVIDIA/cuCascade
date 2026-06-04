@@ -36,11 +36,11 @@ activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" 
 # cuDF (nightly channel, default)
 [feature.cudf-nightly]
 channels = [{ channel = "rapidsai-nightly", priority = 1 }]
-dependencies = { "libcudf" = "26.06.*" }
+dependencies = { "libcudf" = "26.08.*" }
 
 [feature.cudf-stable]
 channels = [{ channel = "rapidsai", priority = 1 }]
-dependencies = { "libcudf" = "26.04.*" }
+dependencies = { "libcudf" = "26.06.*" }
 
 [environments]
 default = ["cuda-13", "cudf-nightly"]

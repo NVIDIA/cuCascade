@@ -31,14 +31,6 @@
 #include <utility>
 #include <vector>
 
-#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6)
-#define CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE 1
-#else
-#define CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE 0
-#include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
-#endif
-
 namespace cucascade {
 namespace memory {
 /**
@@ -76,69 +68,6 @@ class memory_space_id {
 using DeviceMemoryResourceFactoryFn =
   std::function<cuda::mr::any_resource<cuda::mr::device_accessible>(int device_id,
                                                                     std::size_t capacity)>;
-
-#if !CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
-namespace detail {
-
-class legacy_rmm_resource_adapter {
- public:
-  explicit legacy_rmm_resource_adapter(std::shared_ptr<rmm::mr::device_memory_resource> resource)
-    : resource_(std::move(resource))
-  {
-  }
-
-  void* allocate(cuda::stream_ref stream,
-                 std::size_t bytes,
-                 [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t))
-  {
-    return resource_->allocate(rmm::cuda_stream_view{stream}, bytes);
-  }
-
-  void deallocate(cuda::stream_ref stream,
-                  void* ptr,
-                  std::size_t bytes,
-                  [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t)) noexcept
-  {
-    resource_->deallocate(rmm::cuda_stream_view{stream}, ptr, bytes);
-  }
-
-  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
-  {
-    auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
-    rmm::cuda_stream_default.synchronize();
-    return ptr;
-  }
-
-  void deallocate_sync(void* ptr,
-                       std::size_t bytes,
-                       std::size_t alignment = alignof(std::max_align_t)) noexcept
-  {
-    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
-    rmm::cuda_stream_default.synchronize_no_throw();
-  }
-
-  bool operator==(legacy_rmm_resource_adapter const& other) const noexcept
-  {
-    return resource_.get() == other.resource_.get();
-  }
-
-  friend void get_property(legacy_rmm_resource_adapter const&, cuda::mr::device_accessible) noexcept
-  {
-  }
-
- private:
-  std::shared_ptr<rmm::mr::device_memory_resource> resource_;
-};
-
-}  // namespace detail
-
-inline cuda::mr::any_resource<cuda::mr::device_accessible> wrap_legacy_rmm_resource(
-  std::shared_ptr<rmm::mr::device_memory_resource> resource)
-{
-  return cuda::mr::any_resource<cuda::mr::device_accessible>{
-    detail::legacy_rmm_resource_adapter{std::move(resource)}};
-}
-#endif
 
 cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_resource(
   int device_id, std::size_t capacity);

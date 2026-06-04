@@ -36,7 +36,6 @@
 
 namespace {
 
-#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6)
 using current_device_resource_handle = cuda::mr::any_resource<cuda::mr::device_accessible>;
 
 current_device_resource_handle replace_current_device_resource(std::size_t initial_bytes,
@@ -51,20 +50,6 @@ void restore_current_device_resource(current_device_resource_handle previous)
 {
   rmm::mr::set_current_device_resource(std::move(previous));
 }
-#else
-using current_device_resource_handle = rmm::device_async_resource_ref;
-
-template <typename Resource>
-current_device_resource_handle replace_current_device_resource(Resource& resource)
-{
-  return rmm::mr::set_current_device_resource_ref(resource);
-}
-
-void restore_current_device_resource(current_device_resource_handle previous)
-{
-  rmm::mr::set_current_device_resource_ref(previous);
-}
-#endif
 
 class test_gpu_pool {
  public:
@@ -82,12 +67,7 @@ class test_gpu_pool {
     auto initial_bytes = default_initial_bytes;
     if (initial_bytes > max_bytes) { initial_bytes = max_bytes; }
 
-#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6)
     previous_.emplace(replace_current_device_resource(initial_bytes, max_bytes));
-#else
-    pool_ = std::make_unique<rmm::mr::cuda_async_memory_resource>(initial_bytes, max_bytes);
-    previous_.emplace(replace_current_device_resource(*pool_));
-#endif
   }
 
   ~test_gpu_pool()
@@ -110,9 +90,6 @@ class test_gpu_pool {
   static constexpr std::size_t default_initial_bytes = 2ULL * 1024 * 1024 * 1024;
   static constexpr std::size_t default_max_bytes     = 10ULL * 1024 * 1024 * 1024;
 
-#if !(RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 6))
-  std::unique_ptr<rmm::mr::cuda_async_memory_resource> pool_;
-#endif
   std::optional<current_device_resource_handle> previous_;
 };
 
