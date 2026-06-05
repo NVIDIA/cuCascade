@@ -42,8 +42,7 @@ Building, testing, benchmarking, and contributing to cuCascade.
 | Ninja | Any |
 | CUDA Toolkit | 13+ |
 | NVIDIA Driver | Compatible with CUDA 13 |
-| libcudf | 25.10+ |
-| RMM | Via cuDF dependency |
+| RMM | librmm (direct dependency) |
 | numactl | Development headers |
 
 The easiest way to get all dependencies is via [Pixi](https://pixi.sh/), which manages the full environment.
@@ -95,9 +94,10 @@ cuCascade/
 │   │   ├── data_repository.hpp  # Partitioned batch storage
 │   │   ├── data_repository_manager.hpp
 │   │   ├── representation_converter.hpp
-│   │   ├── cpu_data_representation.hpp
-│   │   └── gpu_data_representation.hpp
-│   ├── memory/                  # Memory module headers (17 files)
+│   │   ├── disk_data_representation.hpp  # Disk-tier representation (in-library)
+│   │   ├── disk_file_format.hpp
+│   │   └── disk_io_backend.hpp  # GDS / kvikIO / pipeline backends
+│   ├── memory/                  # Memory module headers (20 files)
 │   │   ├── common.hpp           # Tier enum, memory_space_id
 │   │   ├── config.hpp           # Tier-specific config structs
 │   │   ├── memory_reservation_manager.hpp
@@ -113,20 +113,20 @@ cuCascade/
 │   │   ├── oom_handling_policy.hpp
 │   │   ├── error.hpp
 │   │   ├── numa_region_pinned_host_allocator.hpp
-│   │   ├── host_table.hpp
-│   │   ├── host_table_packed.hpp
+│   │   ├── column_metadata.hpp   # Domain-agnostic column buffer-layout descriptor
+│   │   ├── disk_table.hpp        # On-disk table allocation + binary format
 │   │   └── null_device_memory_resource.hpp
 │   └── utils/                   # Utility headers
 │       ├── atomics.hpp          # atomic_peak_tracker, atomic_bounded_counter
 │       └── overloaded.hpp       # Variant visitor helper
 ├── src/
-│   ├── data/                    # Data module implementation (6 .cpp files)
-│   └── memory/                  # Memory module implementation (15 .cpp files)
+│   ├── data/                    # Data module implementation (7 .cpp files)
+│   └── memory/                  # Memory module implementation (16 .cpp files)
 ├── test/
 │   ├── unittest.cpp             # Test runner with GPU pool setup
-│   ├── data/                    # Data module tests (5 files)
+│   ├── data/                    # Data module tests (6 files)
 │   ├── memory/                  # Memory module tests (3 files + GPU kernels)
-│   └── utils/                   # Test utilities (mocks, cuDF helpers)
+│   └── utils/                   # Test utilities (mocks, memory resources)
 ├── benchmark/                   # Google Benchmark suite
 ├── docs/                        # Documentation (you are here)
 ├── cmake/                       # CMake package config template
@@ -152,7 +152,7 @@ cucascade_objects (OBJECT library)
     └── src/memory/*.cpp
          │
          ├── cucascade_static (STATIC library)
-         │     Links: RMM, cuDF, CUDA runtime, CUDA NVML, pthreads, numa
+         │     Links: RMM, CUDA runtime, CUDA NVML, pthreads, numa
          │
          └── cucascade_shared (SHARED library)
                Same links, SOVERSION 0
@@ -212,7 +212,7 @@ cuCascade uses [Catch2](https://github.com/catchorg/Catch2) v2.13.10 (fetched fr
 Tests use BDD-style assertions:
 ```cpp
 TEST_CASE("data batch transitions to task_created", "[data_batch]") {
-    auto batch = data_batch(1, make_gpu_representation());
+    auto batch = data_batch(1, std::make_unique<mock_data_representation>(memory::Tier::GPU));
 
     REQUIRE(batch.get_state() == batch_state::idle);
 
@@ -231,8 +231,9 @@ All tests compile into a single executable `cucascade_tests`:
 | `test/data/test_data_batch.cpp` | 47+ cases | State transitions, processing handles, cloning |
 | `test/data/test_data_repository.cpp` | 140+ cases | Add/pop, partitioning, blocking, threading |
 | `test/data/test_data_repository_manager.cpp` | 100+ cases | Multi-operator, batch IDs, concurrent access |
-| `test/data/test_data_representation.cpp` | Representation interface | Size, tier, clone operations |
 | `test/data/test_representation_converter.cpp` | Converter registry | Registration, lookup, conversion |
+| `test/data/test_disk_io_backend.cpp` | Disk I/O backends | GDS / kvikIO / pipeline read/write |
+| `test/data/test_io_worker.cpp` | I/O worker | Background disk transfer scheduling |
 | `test/memory/test_memory_reservation_manager.cpp` | Reservation system | Strategies, limits, multi-space |
 | `test/memory/test_topology_discovery.cpp` | Hardware detection | NVML integration |
 | `test/memory/test_gpu_kernels.cu` | GPU kernel tests | Device-side operations |
@@ -243,13 +244,6 @@ All tests compile into a single executable `cucascade_tests`:
 - `make_mock_memory_space()` -- lightweight memory spaces without real allocators
 - `mock_data_representation` -- implements `idata_representation` for testing
 - `create_conversion_test_configs()` -- memory manager configs (1 GPU + 1 HOST)
-- `create_simple_cudf_table()` -- factory for test cuDF tables (INT32/INT64 columns)
-
-**`test/utils/cudf_test_utils.hpp`**:
-- `cudf_tables_have_equal_contents_on_stream()` -- stream-aware table comparison
-- `expect_cudf_tables_equal_on_stream()` -- assertion wrapper with detailed error reporting
-- `logging_device_resource` -- RMM allocation tracing
-- `shared_device_resource` -- shared allocator wrapper
 
 **`test/utils/test_memory_resources.hpp`**:
 - `make_shared_current_device_resource()` -- wraps the current RMM device resource for sharing
@@ -281,14 +275,13 @@ cd build/release && ./test/cucascade_tests -c "specific test name"
 
 ### Available Benchmarks
 
-Built with [Google Benchmark](https://github.com/google/benchmark) v1.8.3:
+Built with [Google Benchmark](https://github.com/google/benchmark) v1.8.3.
 
-| Benchmark | Description | Parameters |
-|-----------|-------------|------------|
-| `BM_ConvertGpuToHost` | GPU -> HOST data conversion | Size: 64KiB-512MiB, Cols: 2-8, Threads: 1-4 |
-| `BM_ConvertHostToGpu` | HOST -> GPU data conversion | Same as above |
-| `BM_GpuToHostThroughput` | Raw GPU -> HOST bandwidth | Size: 64KiB-512MiB, Threads: 1-4 |
-| `BM_HostToGpuThroughput` | Raw HOST -> GPU bandwidth | Same as above |
+The previous converter/throughput benchmarks were cuDF-dependent and were removed
+along with the cuDF-backed representations (issue #142). The benchmark suite
+currently ships no sources, so the `cucascade_benchmarks` target is skipped until
+new cuDF-free benchmarks (e.g. raw-buffer disk I/O) are added to
+`benchmark/CMakeLists.txt`.
 
 ### Running Benchmarks
 
@@ -300,8 +293,7 @@ pixi run benchmarks
 cd build/release && ./benchmark/cucascade_benchmarks
 
 # Filter to specific benchmarks
-./benchmark/cucascade_benchmarks --benchmark_filter=Convert
-./benchmark/cucascade_benchmarks --benchmark_filter=Throughput
+./benchmark/cucascade_benchmarks --benchmark_filter=<pattern>
 
 # JSON output for comparison
 ./benchmark/cucascade_benchmarks \
@@ -421,7 +413,7 @@ Available targets:
 - `cuCascade::cucascade_shared` -- shared library explicitly
 - `cuCascade::cucascade_static` -- static library explicitly
 
-Transitive dependencies (cuDF, RMM, CUDA Toolkit, Threads) are automatically found.
+Transitive dependencies (RMM, CUDA Toolkit, Threads) are automatically found.
 
 ---
 

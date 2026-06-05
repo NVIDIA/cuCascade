@@ -404,7 +404,6 @@ Default pool size: **16 streams** per memory space.
 | `include/cucascade/memory/oom_handling_policy.hpp` | OOM handling strategies |
 | `include/cucascade/memory/error.hpp` | `MemoryError` enum, `cucascade_out_of_memory` exception |
 | `include/cucascade/memory/numa_region_pinned_host_allocator.hpp` | NUMA-aware pinned host allocation |
-| `include/cucascade/memory/host_table.hpp` | `host_table_allocation` + `column_metadata` for direct-copy host representations |
-| `include/cucascade/memory/host_table_packed.hpp` | `host_table_packed_allocation` for packed (cudf::pack) host representations |
+| `include/cucascade/memory/column_metadata.hpp` | Generic per-column buffer-layout descriptor (`memory::column_metadata`) used by the disk tier and tier transfers |
 | `include/cucascade/memory/null_device_memory_resource.hpp` | No-op resource for disk tier |
 | `include/cucascade/utils/atomics.hpp` | `atomic_peak_tracker`, `atomic_bounded_counter` |

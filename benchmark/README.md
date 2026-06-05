@@ -4,10 +4,11 @@ This directory contains performance benchmarks for the cuCascade library using G
 
 ## Building the Benchmarks
 
-The benchmarks are built by default when you configure the project. To disable them:
+The benchmarks are built by default when you configure the project (when the suite
+contains sources — see [Available Benchmarks](#available-benchmarks)). To disable them:
 
 ```bash
-cmake -DBUILD_BENCHMARKS=OFF ..
+cmake -DCUCASCADE_BUILD_BENCHMARKS=OFF ..
 ```
 
 To build the project with benchmarks enabled:
@@ -30,42 +31,20 @@ After building, you can run all benchmarks:
 
 ### Running Specific Benchmarks
 
-To run only specific benchmarks, use filters:
+To run a subset of benchmarks, use a filter pattern:
 
 ```bash
-# Run only conversion benchmarks
-./benchmark/cucascade_benchmarks --benchmark_filter=Convert
-
-# Run only throughput benchmarks
-./benchmark/cucascade_benchmarks --benchmark_filter=Throughput
+./benchmark/cucascade_benchmarks --benchmark_filter=<pattern>
 ```
 
 ## Available Benchmarks
 
-### Representation Converter Benchmarks
-
-Located in `benchmark_representation_converter.cpp`:
-
-1. **BM_ConvertGpuToHost**: Benchmarks GPU to HOST memory conversion with varying data sizes
-   - Tests with different data sizes
-   - Tests with different column counts
-   - Reports throughput in bytes/second
-
-2. **BM_ConvertHostToGpu**: Benchmarks HOST to GPU memory conversion
-   - Similar parameterization as GPU to HOST
-   - Measures upload performance
-
-5. **BM_GpuToHostThroughput**: Focuses on memory bandwidth for GPU→HOST transfers
-   - Tests with data sizes
-   - Reports throughput in GiB/s
-
-6. **BM_HostToGpuThroughput**: Focuses on memory bandwidth for HOST→GPU transfers
-   - Similar parameterization as GPU to HOST throughput
-   - Reports throughput in GiB/s
-
-All benchmarks measure different thread counts.
-The multi-threading is explicitly implemented instead of relying on googlebenchmark's built-in threading functionality,
-because that resulted in improper results.
+> **None currently.** The previous representation-converter and throughput benchmarks
+> (`BM_ConvertGpuToHost`, `BM_ConvertHostToGpu`, `BM_GpuToHostThroughput`,
+> `BM_HostToGpuThroughput`) were cuDF-dependent and were removed together with the
+> cuDF-backed data representations (issue #142). `benchmark/CMakeLists.txt` currently
+> sets an empty `BENCHMARK_SOURCES` and returns early, so the `cucascade_benchmarks`
+> target is skipped until new cuDF-free benchmarks (e.g. raw-buffer disk I/O) are added.
 
 ## Adding New Benchmarks
 

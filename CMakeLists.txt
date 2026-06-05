@@ -47,11 +47,8 @@ list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
-# Find RMM from libcudf installation
+# Find RMM (RAPIDS Memory Manager) -- core to cuCascade's memory abstractions
 find_package(rmm REQUIRED CONFIG)
-
-# Find cudf for data representation support
-find_package(cudf REQUIRED CONFIG)
 
 # Find numa (provided by numactl-devel or libnuma-dev depending on the package
 # manager)
@@ -130,8 +127,8 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
-set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart_static
-                               Threads::Threads ${NUMA_LIB})
+set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static Threads::Threads
+                               ${NUMA_LIB})
 
 # Set include directories for the object library
 target_include_directories(cucascade_objects

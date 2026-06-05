@@ -11,7 +11,7 @@ A high-performance GPU memory management library for data-intensive applications
 - **Memory Reservation System**: Avoid oversubscribing your GPU by making reservations and using allocators that respect reservations
 - **Hardware Topology Discovery**: Automatic detection of NUMA regions and GPU-CPU affinity for optimal memory placement
 - **Stream-Aware Tracking**: Per-stream memory usage tracking and reservation enforcement
-- **cuDF Integration**: Native support for GPU DataFrames with batch processing capabilities and spilling to Host or Disk
+- **Pluggable Data Representations**: A tiered memory and data-movement substrate; concrete dataframe representations and tier-to-tier converters (e.g. a cuDF-based domain layer) are supplied by external user code and registered at runtime, with batch processing and spilling to Host or Disk
 - **Pluggable Policies**: Control what happens when you OOM, try to allocate more than a reservation, how you pick what data to spill, by creating policies that plug into the system.
 
 # Getting Started
@@ -46,7 +46,7 @@ pixi run benchmarks
 - **Compiler**: C++20 compatible compiler
 - **Build Tools**: CMake 4.1+, Ninja
 - **GPU/Drivers**: CUDA 13+, compatible NVIDIA driver
-- **Dependencies**: libcudf 25.10+
+- **Dependencies**: RMM (librmm)
 
 # Usage
 
@@ -152,8 +152,10 @@ cuCascade/
 │   │   ├── data_batch.hpp         # Batch processing for data
 │   │   ├── data_repository.hpp    # Data storage abstraction
 │   │   ├── data_repository_manager.hpp
-│   │   ├── cpu_data_representation.hpp
-│   │   └── gpu_data_representation.hpp
+│   │   ├── representation_converter.hpp  # Converter registry (ships empty)
+│   │   ├── disk_data_representation.hpp  # On-disk representation
+│   │   ├── disk_file_format.hpp   # On-disk binary format
+│   │   └── disk_io_backend.hpp    # GDS / kvikIO / pipeline backends
 │   └── memory/                    # Memory management headers
 │       ├── common.hpp             # Tier enum, memory_space_id, utilities
 │       ├── memory_reservation_manager.hpp  # Central reservation coordinator
@@ -174,9 +176,8 @@ cuCascade/
 ├── test/
 │   ├── data/                      # Data module tests
 │   ├── memory/                    # Memory module tests
-│   └── utils/                     # Test utilities (cuDF helpers)
+│   └── utils/                     # Test utilities (mock helpers)
 ├── benchmark/                     # Performance benchmarks
-│   ├── benchmark_representation_converter.cpp  # Converter benchmarks
 │   └── README.md                  # Benchmark documentation
 ├── cmake/                         # CMake configuration modules
 ├── CMakeLists.txt                 # Main CMake configuration
@@ -186,7 +187,8 @@ cuCascade/
 
 # References
 
-- [RAPIDS cuDF](https://github.com/rapidsai/cudf) - GPU DataFrame library
+- [RAPIDS RMM](https://github.com/rapidsai/rmm) - RAPIDS Memory Manager (core dependency)
+- [RAPIDS cuDF](https://github.com/rapidsai/cudf) - GPU DataFrame library (used by the optional domain layer)
 - [Pixi](https://pixi.sh/) - Package management tool
 
 # License

@@ -12,7 +12,6 @@ cxx-compiler = "*"
 doxygen = "*"
 fmt = "*"
 jinja2 = "*"
-libcurand-dev = "*"
 make = "*"
 ninja = "*"
 numactl = "*"
@@ -33,25 +32,32 @@ system-requirements = { cuda = "12.9" }
 dependencies = { "cuda-version" = "12.9.*" }
 activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" } }
 
-# cuDF (nightly channel, default)
-[feature.cudf-nightly]
+# RMM (RAPIDS Memory Manager) -- cuCascade's only RAPIDS dependency. Provides the
+# rmm CMake config consumed by find_package(rmm CONFIG). Previously pulled in
+# transitively via libcudf; now depended on directly so the library (and tests)
+# build without libcudf. Pin matches the RAPIDS release train; verify the exact
+# available version with `pixi search -c rapidsai-nightly librmm` if the solve fails.
+[feature.rmm-nightly]
 channels = [{ channel = "rapidsai-nightly", priority = 1 }]
-dependencies = { "libcudf" = "26.06.*" }
+dependencies = { "librmm" = "26.06.*" }
 
-[feature.cudf-stable]
+[feature.rmm-stable]
 channels = [{ channel = "rapidsai", priority = 1 }]
-dependencies = { "libcudf" = "26.04.*" }
+dependencies = { "librmm" = "26.04.*" }
 
 [environments]
-default = ["cuda-13", "cudf-nightly"]
-cuda-13-nightly = ["cuda-13", "cudf-nightly"]
-cuda-12-nightly = ["cuda-12", "cudf-nightly"]
-cuda-13-stable = ["cuda-13", "cudf-stable"]
-cuda-12-stable = ["cuda-12", "cudf-stable"]
+default = ["cuda-13", "rmm-nightly"]
+cuda-13-nightly = ["cuda-13", "rmm-nightly"]
+cuda-12-nightly = ["cuda-12", "rmm-nightly"]
+cuda-13-stable = ["cuda-13", "rmm-stable"]
+cuda-12-stable = ["cuda-12", "rmm-stable"]
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"
 build-debug = "cmake --preset debug && cmake --build build/debug"
+# Thin aliases matching the names referenced by issue #142's acceptance criteria.
+cmake-release = "cmake --preset release"
+build-release = "cmake --build build/release"
 clean = "rm -rf build"
 test = "cd build/release && ctest --output-on-failure"
 benchmarks = "cd build/release && ./benchmark/cucascade_benchmarks"

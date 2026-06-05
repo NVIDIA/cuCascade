@@ -7,9 +7,7 @@ A deep dive into cuCascade's data lifecycle, batch read-only and mutable locking
 - [Overview](#overview)
 - [Data Representations](#data-representations)
   - [Interface: idata_representation](#interface-idata_representation)
-  - [GPU Table Representation](#gpu-table-representation)
-  - [Host Table Representation (Direct Copy)](#host-table-representation-direct-copy)
-  - [Host Table Representation (Packed)](#host-table-representation-packed)
+  - [Concrete Representations](#concrete-representations)
 - [Data Batch Lifecycle](#data-batch-lifecycle)
   - [States](#states)
   - [State Transitions](#state-transitions)
@@ -18,8 +16,6 @@ A deep dive into cuCascade's data lifecycle, batch read-only and mutable locking
   - [Cloning](#cloning)
 - [Representation Conversion](#representation-conversion)
   - [Converter Registry](#converter-registry)
-  - [Built-in Converters](#built-in-converters)
-  - [Conversion Flow](#conversion-flow)
 - [Data Repositories](#data-repositories)
   - [Add and Pop Semantics](#add-and-pop-semantics)
   - [Partitioning](#partitioning)
@@ -37,7 +33,7 @@ A deep dive into cuCascade's data lifecycle, batch read-only and mutable locking
 
 The data module manages the lifecycle of data as it flows through processing pipelines and moves between memory tiers. It provides:
 
-- **Tier-agnostic data representations** -- abstract interface with GPU and host implementations
+- **Tier-agnostic data representations** -- abstract interface; cuCascade ships the disk representation in-library, while GPU/host representations are provided by the domain layer
 - **Locking read-only and mutable accessor classes for batch lifecycle** -- prevents concurrent access conflicts during processing and tier movement
 - **Type-indexed conversion** -- extensible registry for converting data between representations
 - **Partitioned repositories** -- thread-safe storage with blocking retrieval
@@ -70,87 +66,26 @@ public:
 
 Data representations are thin wrappers -- they hold the data but delegate storage details (tier, device, allocator) to their associated `memory_space`.
 
-### GPU Table Representation
+The interface also declares `record_writer_event(stream)` and `get_writer_event()` as base virtuals with no-op / `nullptr` defaults, used for cross-stream / cross-device synchronization. Representations whose memory is produced asynchronously on a CUDA stream (e.g. GPU representations in the domain layer) override them.
 
-**File**: `include/cucascade/data/gpu_data_representation.hpp`
+### Concrete Representations
 
-Wraps a `cudf::table` residing in GPU device memory:
+cuCascade is independent of libcudf and ships exactly **one** concrete representation in-library:
+`disk_data_representation` (`include/cucascade/data/disk_data_representation.hpp`), which persists a
+serialized table to disk and reads it back via the disk I/O backends (kvikIO / GDS / pipeline).
 
-```cpp
-class gpu_table_representation : public idata_representation {
-    std::unique_ptr<cudf::table> _table;
+GPU and host representations -- which wrap concrete column types such as `cudf::table` -- are **not**
+part of the core library. They are provided by an external **domain layer** that links cuCascade and
+libcudf, derive from `idata_representation`, and are wired into the conversion pipeline at runtime via
+`representation_converter_registry::register_converter<Source, Target>()`.
 
-public:
-    std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);  // Transfer ownership
-
-    std::size_t get_size_in_bytes() const override;
-    std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
-};
-```
-
-- `clone()` performs a deep copy using `cudf::table(table.view(), stream)`
-- Owns the `cudf::table` object but not the underlying GPU memory (managed by the allocator)
-
-### Host Table Representation (Direct Copy)
-
-**File**: `include/cucascade/data/cpu_data_representation.hpp`
-
-The preferred host representation. Directly copies each column's GPU device buffers into pinned
-host memory without an intermediate GPU-side contiguous allocation. Column layout is described by
-custom per-column `column_metadata` structs, enabling reconstruction without cudf's pack format.
-
-```cpp
-class host_data_representation : public idata_representation {
-    std::unique_ptr<memory::host_table_allocation> _host_table;
-
-public:
-    const std::unique_ptr<memory::host_table_allocation>& get_host_table() const;
-
-    std::size_t get_size_in_bytes() const override;
-    std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
-};
-```
-
-A `host_table_allocation` (`include/cucascade/memory/host_table.hpp`) contains:
-- `allocation` -- `multiple_blocks_allocation` (vector of fixed-size pinned memory blocks)
-- `columns` -- per-column `column_metadata` trees describing buffer offsets, sizes, and nesting
-- `data_size` -- total bytes stored across all blocks
-
-Each `column_metadata` node captures `type_id`, `num_rows`, `null_count`, `scale` (for decimals),
-plus buffer offsets/sizes for the null mask and data buffer, and recursive `children` for nested
-types (LIST, STRUCT, STRING, DICTIONARY32).
-
-This representation avoids the extra GPU allocation and GPU-to-GPU copy that `cudf::pack` performs.
-`cudaMemcpyBatchAsync` is used to transfer all column buffers in a single driver call per direction,
-achieving ~99% of raw PCIe bandwidth even with multiple concurrent threads.
-
-`clone()` copies data block-by-block with `std::memcpy` and duplicates the column metadata tree.
-
-### Host Table Representation (Packed)
-
-**File**: `include/cucascade/data/cpu_data_representation.hpp`
-
-A legacy representation that uses `cudf::pack()` to serialize the table to a contiguous GPU buffer
-before copying it to host memory. Useful when cudf's serialization format is required.
-
-```cpp
-class host_data_packed_representation : public idata_representation {
-    std::unique_ptr<memory::host_table_packed_allocation> _host_table;
-
-public:
-    const std::unique_ptr<memory::host_table_packed_allocation>& get_host_table() const;
-
-    std::size_t get_size_in_bytes() const override;
-    std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
-};
-```
-
-A `host_table_packed_allocation` (`include/cucascade/memory/host_table_packed.hpp`) contains:
-- `allocation` -- `multiple_blocks_allocation` (vector of fixed-size pinned memory blocks)
-- `metadata` -- serialized cuDF table metadata from `cudf::pack()` (for reconstruction via `cudf::unpack()`)
-- `data_size` -- actual data size in bytes
-
-`clone()` copies data block-by-block with `std::memcpy` and duplicates the metadata vector.
+Column buffer layout for tier transfers and disk storage is described by the generic, domain-agnostic
+`memory::column_metadata` (`include/cucascade/memory/column_metadata.hpp`). Each node captures an
+opaque `type_id` tag (the numeric value of a consumer's column-type enum, e.g. `cudf::type_id`, which
+cuCascade never interprets), `num_rows`, `null_count`, `scale` (for decimals), buffer offsets/sizes for
+the null mask and data buffer, and recursive `children` for nested types. The disk tier's
+`disk_table_allocation` (`include/cucascade/memory/disk_table.hpp`) holds a
+`std::vector<memory::column_metadata>`.
 
 ---
 
@@ -207,9 +142,9 @@ Access to batch data is only possible through one of two RAII accessor classes:
 // Acquire shared lock (blocks if exclusive lock held)
 read_only_data_batch ro = batch->to_read_only();
 
-// Access data
-auto* data = ro.get_data()->cast<gpu_table_representation>();
-process(data->get_table_view());
+// Access data (cast to the concrete representation registered by your domain layer)
+auto& data = ro.get_data()->cast<DomainGpuRepresentation>();
+process(data);
 
 // Release: either let ro go out of scope, or explicitly return to idle
 auto idle_batch = cucascade::data_batch::to_idle(std::move(ro));
@@ -270,8 +205,8 @@ This is used by the pipeline and downgrade executor to track which batches are s
 read_only_data_batch ro = batch->to_read_only();
 auto cloned = ro.clone(new_batch_id, stream);
 
-// With representation conversion
-auto cloned = ro.clone_to<host_data_representation>(registry, new_batch_id, host_space, stream);
+// With representation conversion (target type registered by your domain layer)
+auto cloned = ro.clone_to<DomainHostRepresentation>(registry, new_batch_id, host_space, stream);
 ```
 
 Cloning produces a new `shared_ptr<data_batch>` in `idle` state with the given ID. The clone
@@ -289,77 +224,27 @@ contains a deep copy of the data representation, residing in the same memory spa
 The `representation_converter_registry` stores conversion functions indexed by `(source_type, target_type)`:
 
 ```cpp
-// Register a custom converter
-registry.register_converter<gpu_table_representation, host_data_representation>(
+// Register a custom converter (SourceRep / TargetRep are concrete representations
+// derived from idata_representation, typically provided by the domain layer)
+registry.register_converter<SourceRep, TargetRep>(
     [](idata_representation& source, const memory_space* target, rmm::cuda_stream_view stream)
         -> std::unique_ptr<idata_representation> {
-        // Convert GPU table to host (direct copy)
+        // Build the target representation from the source
         return ...;
     }
 );
 
 // Convert data
-auto host_data = registry.convert<host_data_representation>(
-    *gpu_data, target_host_space, stream);
+auto converted = registry.convert<TargetRep>(*source_data, target_space, stream);
 ```
 
 The registry is thread-safe (all operations guarded by `std::mutex`).
 
-### Built-in Converters
-
-Registered via `register_builtin_converters()`:
-
-| Source | Target | Method |
-|--------|--------|--------|
-| `gpu_table_representation` | `host_data_representation` | `cudaMemcpyBatchAsync` (D2H) — copies each column's buffers directly to pinned host blocks; ~99% PCIe bandwidth |
-| `host_data_representation` | `gpu_table_representation` | Allocates `rmm::device_buffer` per column buffer, `cudaMemcpyBatchAsync` (H2D), reconstructs `cudf::column` tree |
-| `gpu_table_representation` | `host_data_packed_representation` | `cudf::pack()` on GPU -> `cudaMemcpyAsync` (D2H) to multi-block host allocation |
-| `host_data_packed_representation` | `gpu_table_representation` | `cudaMemcpyAsync` (H2D) from host blocks -> `cudf::unpack()` on device |
-| `gpu_table_representation` | `gpu_table_representation` | `cudf::pack()` -> `cudaMemcpyPeerAsync` -> `cudf::unpack()` (cross-device copy) |
-| `host_data_packed_representation` | `host_data_packed_representation` | Block-by-block `std::memcpy` + metadata copy (cross-NUMA copy) |
-
-### Conversion Flow
-
-GPU to HOST (direct copy — preferred):
-
-```mermaid
-sequenceDiagram
-    participant Caller
-    participant Registry as converter_registry
-    participant GPU as gpu_table_representation
-    participant Host as host_data_representation
-    participant HostMR as fixed_size_host_memory_resource
-
-    Caller->>Registry: convert<host_data_representation>(gpu_data, host_space, stream)
-    Registry->>HostMR: allocate_multiple_blocks(total_column_bytes)
-    Note over HostMR: Returns vector of 1MB pinned host blocks
-    Registry->>Registry: Traverse column tree, compute buffer offsets into host blocks
-    Registry->>Registry: cudaMemcpyBatchAsync(all_bufs_in_one_call, D2H, stream)
-    Note over Registry: Single driver call for all column buffers
-    Registry->>Host: Create host_data_representation(blocks, column_metadata_tree)
-    Registry-->>Caller: unique_ptr<host_data_representation>
-```
-
-GPU to HOST (packed — uses cudf serialization):
-
-```mermaid
-sequenceDiagram
-    participant Caller
-    participant Registry as converter_registry
-    participant GPU as gpu_table_representation
-    participant Host as host_data_packed_representation
-    participant HostMR as fixed_size_host_memory_resource
-
-    Caller->>Registry: convert<host_data_packed_representation>(gpu_data, host_space, stream)
-    Registry->>GPU: cudf::pack(table)
-    Note over GPU: Serializes table to contiguous buffer + metadata
-    Registry->>HostMR: allocate_multiple_blocks(data_size)
-    Note over HostMR: Returns vector of 1MB pinned host blocks
-    Registry->>Registry: cudaMemcpyAsync(host_blocks, gpu_buffer, D2H, stream)
-    Note over Registry: Copies data block by block
-    Registry->>Host: Create host_data_packed_representation(blocks, metadata)
-    Registry-->>Caller: unique_ptr<host_data_packed_representation>
-```
+cuCascade ships **no** built-in converters -- the registry starts empty. Consumers (the domain
+layer that links libcudf) register the converters they need at runtime via `register_converter()`.
+At convert time the registry looks up the function keyed by `{typeid(source), typeid(target)}` and
+invokes it; the registry itself is representation-agnostic and never names or interprets concrete
+types.
 
 ---
 
@@ -512,10 +397,8 @@ Application
 | `include/cucascade/data/data_repository.hpp` | `idata_repository<PtrType>`, `shared_data_repository`, `unique_data_repository` |
 | `include/cucascade/data/data_repository_manager.hpp` | `data_repository_manager`, `operator_port_key` |
 | `include/cucascade/data/representation_converter.hpp` | `representation_converter_registry`, `converter_key` |
-| `include/cucascade/data/gpu_data_representation.hpp` | `gpu_table_representation` wrapping `cudf::table` |
-| `include/cucascade/data/cpu_data_representation.hpp` | `host_data_representation` (direct buffer copy) and `host_data_packed_representation` (cudf::pack) |
-| `include/cucascade/memory/host_table.hpp` | `host_table_allocation` and `column_metadata` for direct-copy host representations |
-| `include/cucascade/memory/host_table_packed.hpp` | `host_table_packed_allocation` for packed (cudf::pack) host representations |
+| `include/cucascade/data/disk_data_representation.hpp` | `disk_data_representation` (the only in-library concrete representation) |
+| `include/cucascade/memory/column_metadata.hpp` | `memory::column_metadata` generic columnar buffer-layout descriptor |
 | `include/cucascade/utils/atomics.hpp` | `atomic_peak_tracker`, `atomic_bounded_counter` |
 | `include/cucascade/utils/overloaded.hpp` | Variant visitor helper |
 | `docs/data_batch_state_transitions.md` | Complete state machine reference |

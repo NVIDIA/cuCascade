@@ -32,10 +32,9 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Pixi >= 0.59
 - Config: `pixi.toml`
 - Lockfile: `pixi.lock` (committed)
-- Channels: `rapidsai-nightly`, `conda-forge` (default); `rapidsai`, `conda-forge` (cudf-stable feature)
+- Channels: `rapidsai-nightly`, `conda-forge` (default / `rmm-nightly` feature); `rapidsai`, `conda-forge` (`rmm-stable` feature)
 ## Frameworks
-- RMM (RAPIDS Memory Manager) - GPU/host memory resource abstraction; provides `rmm::mr::device_memory_resource`, `rmm::cuda_stream_view`, `rmm::out_of_memory`, `rmm::bad_alloc`; pulled in via `find_package(rmm REQUIRED CONFIG)` from libcudf installation
-- libcudf 26.06 (nightly) / 26.02 (stable) - Columnar data representation; provides `cudf::table`, `cudf::column`, `cudf::type_id`, `cudf::pack`/`unpack`; pulled in via `find_package(cudf REQUIRED CONFIG)`
+- RMM (RAPIDS Memory Manager) - GPU/host memory resource abstraction; provides `rmm::mr::device_memory_resource`, `rmm::cuda_stream_view`, `rmm::out_of_memory`, `rmm::bad_alloc`; the library's only direct RAPIDS dependency, pulled in via `find_package(rmm REQUIRED CONFIG)` (conda package `librmm`)
 - Catch2 v2.13.10 - Unit test framework; fetched via `FetchContent` in `test/CMakeLists.txt`; test executable: `cucascade_tests`
 - Google Benchmark v1.8.3 - Microbenchmark framework; fetched via `FetchContent` in `benchmark/CMakeLists.txt`; benchmark executable: `cucascade_benchmarks`
 - Ninja - Build generator (configured in `CMakePresets.json`)
@@ -46,8 +45,8 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - codespell v2.4.1 - Spell checking via pre-commit (ignore list: `.codespell_words`)
 - Doxygen - API documentation generation; config: `Doxyfile`; output parsed by `scripts/generate_api_docs.py`
 ## Key Dependencies
-- `libcudf` 26.06 / 26.02 - Core data representation; `cudf::table` is the GPU-tier data container; all column type handling (LIST, STRUCT, STRING, DICTIONARY32, etc.) delegates to cudf
-- `RMM` (via cudf) - `rmm::mr::device_memory_resource` is the base class for all custom allocators; `rmm::cuda_stream_view` is used throughout for CUDA stream propagation
+- `RMM` (conda package `librmm`) - direct dependency (no longer pulled in transitively via cudf); `rmm::mr::device_memory_resource` is the base class for all custom allocators; `rmm::cuda_stream_view` is used throughout for CUDA stream propagation
+- `libcudf` - NOT a dependency of the core library; only the optional external domain layer (which links cuCascade + libcudf) uses `cudf::table` and registers concrete GPU/HOST representations and converters at runtime
 - `CUDA::cudart` - Direct CUDA runtime API calls (`cudaMalloc`, `cudaMemcpyAsync`, `cudaStreamSynchronize`, `cudaFree`, `cudaMallocHost`, `cudaFreeHost`)
 - `CUDA::nvml` - GPU topology discovery via NVML in `src/memory/topology_discovery.cpp`
 - `kvikio` 26.06 / 26.02 - Async disk I/O with automatic GDS/POSIX fallback; used in `src/data/kvikio_io_backend.cpp` via `kvikio::FileHandle`; linked PRIVATE via `kvikio::kvikio`
@@ -93,7 +92,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - CUDA headers: `snake_case.cuh` (e.g., `test/memory/test_gpu_kernels.cuh`)
 - Source: `snake_case.cpp` for C++, `snake_case.cu` for CUDA kernels
 - Test files: `test_<module_name>.cpp` (e.g., `test/data/test_disk_io_backend.cpp`)
-- Benchmark files: `benchmark_<module_name>.cpp` (e.g., `benchmark/benchmark_disk_converter.cpp`)
+- Benchmark files: `benchmark_<module_name>.cpp` (under `benchmark/`)
 - `snake_case` for all: `memory_space`, `data_batch`, `disk_data_representation`
 - Interface classes prefixed with `i`: `idata_representation`, `idisk_io_backend`
 - Config structs suffixed with `_config`: `gpu_memory_space_config`, `disk_memory_space_config`
@@ -105,7 +104,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `snake_case`: `get_available_memory()`, `make_reservation_or_null()`
 - Getters prefixed with `get_`: `get_tier()`, `get_device_id()`, `get_batch_id()`
 - Boolean queries prefixed with `should_`, `has_`, or `is_`: `should_downgrade_memory()`
-- Factory functions prefixed with `make_` or `create_`: `make_mock_memory_space()`, `create_simple_cudf_table()`
+- Factory functions prefixed with `make_` or `create_`: `make_mock_memory_space()`, `create_conversion_test_configs()`
 - Try-pattern methods prefixed with `try_to_`: `try_to_create_task()`, `try_to_lock_for_processing()`
 - Blocking wait methods prefixed with `wait_to_`: `wait_to_create_task()`
 - Member variables prefixed with underscore: `_id`, `_capacity`, `_mutex`, `_disk_table`
@@ -139,11 +138,9 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `-Wnull-dereference -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough`
 ## License Header
 ## Include Organization
-#include "utils/cudf_test_utils.hpp"     // quoted local
-#include "utils/mock_test_utils.hpp"
+#include "utils/mock_test_utils.hpp"     // quoted local
 #include <cucascade/data/disk_data_representation.hpp>  // cucascade
 #include <cucascade/data/representation_converter.hpp>
-#include <cudf/column/column_factories.hpp>  // cuDF
 #include <rmm/cuda_stream.hpp>  // RMM
 #include <catch2/catch.hpp>  // system with dot
 #include <memory>   // STL
@@ -157,7 +154,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Nested namespaces use traditional form: `namespace cucascade { namespace test {` (not C++17 `::`)
 - Use anonymous `namespace { }` for file-local helpers in `.cpp` and test files
 - `using namespace cucascade;` at file scope in test files is acceptable
-- Specific test utilities imported explicitly: `using cucascade::test::create_simple_cudf_table;`
+- Specific test utilities imported explicitly: `using cucascade::test::make_mock_memory_space;`
 - C++17 nested namespace shorthand used in `test_memory_resources.hpp`: `namespace cucascade::test {`
 ## Error Handling
 - `CUCASCADE_CUDA_TRY(call)` — wraps CUDA runtime calls; throws `cucascade::cuda_error` on failure
@@ -255,17 +252,17 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Depends on: Config layer, memory resource layer
 - Used by: `memory_reservation_manager`, `idata_representation`
 - Purpose: Tier-specific data storage format; all derive from `idata_representation`
-- Location: `include/cucascade/data/common.hpp`, `include/cucascade/data/gpu_data_representation.hpp`, `include/cucascade/data/cpu_data_representation.hpp`, `include/cucascade/data/disk_data_representation.hpp`
-- Contains: `idata_representation` (abstract: `get_size_in_bytes()`, `get_uncompressed_data_size_in_bytes()`, `clone()`, templated `cast<T>()`), four concrete types
-- `disk_data_representation` owns a `disk_table_allocation` (file path + `column_metadata` vector); destructor deletes the file (RAII)
-- Depends on: `memory_space`, cuDF (`cudf::table`)
+- Location: `include/cucascade/data/common.hpp`, `include/cucascade/data/disk_data_representation.hpp`
+- Contains: `idata_representation` (abstract: `get_size_in_bytes()`, `get_uncompressed_data_size_in_bytes()`, `clone()`, templated `cast<T>()`, virtual `record_writer_event()` / `get_writer_event()` with no-op / nullptr defaults); `disk_data_representation` is the only in-library concrete type. GPU/HOST representations are provided by the domain layer (user code that links cuCascade + libcudf).
+- `disk_data_representation` owns a `disk_table_allocation` (file path + `std::vector<memory::column_metadata>`); destructor deletes the file (RAII)
+- Depends on: `memory_space`
 - Used by: `data_batch`, converter registry
 - Purpose: Type-pair dispatch table for converting between representation types
 - Location: `include/cucascade/data/representation_converter.hpp`, `src/data/representation_converter.cpp`
 - Contains: `representation_converter_registry`, `converter_key` (`{source_type_index, target_type_index}`), `representation_converter_fn`
 - Registration: `register_converter<SourceType, TargetType>(fn)` with static_assert constraints
 - Lookup: `convert<TargetType>(source, memory_space, stream)` uses `typeid(source)` at runtime
-- `register_builtin_converters()` registers GPU↔HOST and GPU↔DISK and HOST↔DISK converters; overload accepts `shared_ptr<idisk_io_backend>` to select I/O backend
+- The registry ships empty — cuCascade ships no built-in converters. The domain layer registers tier-to-tier converters (GPU↔HOST, GPU↔DISK, HOST↔DISK) at runtime via `register_converter()`
 - Depends on: `idata_representation`, `idisk_io_backend`
 - Used by: `data_batch::convert_to()`, `data_batch::clone_to()`
 - Purpose: Abstract disk I/O; concrete backends selectable at runtime
@@ -273,7 +270,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Contains: `idisk_io_backend` (abstract with `write_device`, `read_device`, `write_host`, `read_host`, `write_device_batch`, `read_device_batch`), `io_backend_type` enum (`KVIKIO`, `GDS`, `PIPELINE`), `make_io_backend(type)` factory
 - `GDS` uses raw cuFile batch API; `KVIKIO` uses kvikIO with automatic GDS/POSIX fallback; `PIPELINE` uses double-buffered pinned host transfer for D2H overlap with disk writes
 - Depends on: kvikIO, cuFile (GDS)
-- Used by: built-in disk converters registered via `register_builtin_converters()`
+- Used by: domain-layer disk converters registered via `register_converter()`
 - Purpose: Lifecycle management; substription-count reference counting, read-only and mutable locking
 - Location: `include/cucascade/data/data_batch.hpp`, `src/data/data_batch.cpp`
 - Contains: `data_batch` (owns `unique_ptr<idata_representation>`), `batch_state` enum, `data_batch_processing_handle` (RAII, holds `weak_ptr<data_batch>`), `idata_batch_probe` interface, `lock_for_processing_result`
@@ -302,7 +299,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Purpose: Uniform interface for tier-specific storage formats
 - Location: `include/cucascade/data/common.hpp`
 - Pattern: Abstract base with `get_size_in_bytes()`, `get_uncompressed_data_size_in_bytes()`, `clone()`, and templated `cast<T>()` (requires `std::derived_from<T, idata_representation>`)
-- Concrete types: `gpu_table_representation` (`include/cucascade/data/gpu_data_representation.hpp`), `host_data_representation`, `host_data_packed_representation` (`include/cucascade/data/cpu_data_representation.hpp`), `disk_data_representation` (`include/cucascade/data/disk_data_representation.hpp`)
+- In-library concrete type: `disk_data_representation` (`include/cucascade/data/disk_data_representation.hpp`). GPU/HOST concrete representations are provided by the domain layer (user code linking cuCascade + libcudf) and registered via `register_converter()`.
 - Purpose: Owns a single tier+device memory budget and its allocator
 - Location: `include/cucascade/memory/memory_space.hpp`
 - Pattern: Non-copyable/non-movable; variant-based allocator dispatch; exposes `make_reservation_or_null()`, `should_downgrade_memory()`, `get_disk_mount_path()`
@@ -313,9 +310,9 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Purpose: Unit of data movement; read-only and mutable locking
 - Location: `include/cucascade/data/data_batch.hpp`
 - Pattern: Owns `unique_ptr<idata_representation>`; `data_batch_processing_handle` holds `weak_ptr` so handle doesn't keep batch alive; `idata_batch_probe` for external state observation callbacks
-- Purpose: On-disk file descriptor and binary format for a serialized cuDF table
-- Location: `include/cucascade/memory/disk_table.hpp`, `include/cucascade/data/disk_file_format.hpp`
-- Pattern: File starts with 32-byte `disk_file_header` (magic `0x43554353`, version, num_columns, metadata_size, data_offset); column metadata serialized depth-first; column data aligned to 4096-byte boundaries for GDS DMA
+- Purpose: On-disk file descriptor and binary format for a serialized columnar table (described by domain-agnostic `memory::column_metadata`, whose `type_id` is an opaque `int32_t` tag cuCascade never interprets)
+- Location: `include/cucascade/memory/disk_table.hpp`, `include/cucascade/data/disk_file_format.hpp`, `include/cucascade/memory/column_metadata.hpp`
+- Pattern: The file holds only raw column buffers (per column, depth-first: null mask then data), each aligned to `DISK_FILE_ALIGNMENT` (4096 bytes) for direct DMA. No header or metadata is serialized to disk — the per-column `memory::column_metadata` is kept in-memory in `disk_table_allocation`, so a disk file is only meaningful together with its allocation. I/O is dispatched via the disk `memory_space`'s `get_io_backend()`
 - Purpose: Abstraction over GDS, kvikIO, and pipeline I/O strategies
 - Location: `include/cucascade/data/disk_io_backend.hpp`
 - Pattern: Interface with `write_device`/`read_device`/`write_host`/`read_host` and batch variants; `make_io_backend(io_backend_type)` factory

@@ -81,6 +81,11 @@ jobs:
 
   benchmark:
     needs: build
+    # Disabled: the cuDF-dependent converter/throughput benchmarks were removed with the
+    # cuDF-backed representations (issue #142), so benchmark/CMakeLists.txt ships no sources
+    # and the cucascade_benchmarks target is skipped. Re-enable once cuDF-free benchmarks
+    # (e.g. raw-buffer disk I/O) are added back to benchmark/CMakeLists.txt.
+    if: false
     runs-on: linux-amd64-gpu-t4-latest-1
     strategy:
       matrix:

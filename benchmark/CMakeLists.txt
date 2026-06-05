@@ -15,6 +15,16 @@
 # the License.
 # =============================================================================
 
+# Collect all benchmark sources. The previous converter/profiler benchmarks were
+# cudf-dependent and moved out with the cudf representations (issue #142). Add
+# new cudf-free benchmarks (e.g. raw-buffer disk I/O) here.
+set(BENCHMARK_SOURCES)
+
+if(NOT BENCHMARK_SOURCES)
+  message(STATUS "cuCascade: no benchmark sources; skipping benchmark target")
+  return()
+endif()
+
 # Fetch Google Benchmark
 include(FetchContent)
 FetchContent_Declare(
@@ -35,11 +45,6 @@ set(BENCHMARK_ENABLE_INSTALL
     CACHE BOOL "Disable install" FORCE)
 
 FetchContent_MakeAvailable(benchmark)
-
-# Collect all benchmark sources
-set(BENCHMARK_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_representation_converter.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_disk_converter.cpp)
 
 # Create benchmark executable
 add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})

@@ -41,6 +41,6 @@ cuCascade is organized into two core modules:
 ## Related Resources
 
 - [Main README](../README.md) -- project overview, quick start, and usage examples
-- [RAPIDS cuDF](https://github.com/rapidsai/cudf) -- GPU DataFrame library (core dependency)
-- [RMM](https://github.com/rapidsai/rmm) -- RAPIDS Memory Manager (memory allocation backend)
+- [RMM](https://github.com/rapidsai/rmm) -- RAPIDS Memory Manager (the only direct RAPIDS dependency)
+- [RAPIDS cuDF](https://github.com/rapidsai/cudf) -- GPU DataFrame library (used by the optional domain layer, not the core library)
 - [Pixi](https://pixi.sh/) -- Package management tool used for builds

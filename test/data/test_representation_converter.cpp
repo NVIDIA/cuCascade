@@ -15,11 +15,8 @@
  * limitations under the License.
  */
 
-#include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -31,8 +28,6 @@
 #include <vector>
 
 using namespace cucascade;
-using cucascade::test::create_conversion_test_configs;
-using cucascade::test::create_simple_cudf_table;
 using cucascade::test::make_mock_memory_space;
 
 // =============================================================================
@@ -251,12 +246,6 @@ TEST_CASE("representation_converter_registry unregister_converter", "[representa
   }
 }
 
-// Note: We don't test clear() directly on the global registry because:
-// 1. It removes builtin converters (GPU<->HOST)
-// 2. The static flag in register_builtin_converters() prevents re-registration
-// 3. This would break other tests that depend on builtin converters
-// The unregister_converter tests above verify the removal functionality safely.
-
 // =============================================================================
 // representation_converter_registry Conversion Tests
 // =============================================================================
@@ -330,131 +319,6 @@ TEST_CASE("representation_converter_registry convert with type_index", "[represe
       registry.convert(source, wrong_target, mock_space.get(), rmm::cuda_stream_default),
       std::runtime_error);
   }
-}
-
-// =============================================================================
-// Built-in Converter Registration Tests
-// =============================================================================
-
-TEST_CASE("register_builtin_converters registers all expected converters",
-          "[representation_converter][builtin]")
-{
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
-  SECTION("GPU to HOST converter is registered")
-  {
-    REQUIRE(registry.has_converter<gpu_table_representation, host_data_packed_representation>());
-  }
-
-  SECTION("HOST to GPU converter is registered")
-  {
-    REQUIRE(registry.has_converter<host_data_packed_representation, gpu_table_representation>());
-  }
-
-  SECTION("GPU to GPU converter is registered")
-  {
-    REQUIRE(registry.has_converter<gpu_table_representation, gpu_table_representation>());
-  }
-
-  SECTION("HOST to HOST converter is registered")
-  {
-    REQUIRE(
-      registry.has_converter<host_data_packed_representation, host_data_packed_representation>());
-  }
-}
-
-// =============================================================================
-// Built-in Converter Functional Tests
-// =============================================================================
-
-TEST_CASE("Built-in GPU to HOST conversion works", "[representation_converter][builtin][gpu_host]")
-{
-  memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
-  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
-  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
-
-  // Use the same stream for table creation and conversion to avoid stream-ordered races
-  rmm::cuda_stream stream;
-  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
-  gpu_table_representation gpu_repr(std::make_unique<cudf::table>(std::move(table)),
-                                    *const_cast<memory::memory_space*>(gpu_space),
-                                    rmm::cuda_stream_view{});
-
-  auto host_result =
-    registry.convert<host_data_packed_representation>(gpu_repr, host_space, stream);
-  stream.synchronize();
-
-  REQUIRE(host_result != nullptr);
-  REQUIRE(host_result->get_current_tier() == memory::Tier::HOST);
-  REQUIRE(host_result->get_size_in_bytes() > 0);
-}
-
-TEST_CASE("Built-in HOST to GPU conversion works", "[representation_converter][builtin][gpu_host]")
-{
-  memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
-  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
-  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
-
-  // Use the same stream for table creation and conversions to avoid stream-ordered races
-  rmm::cuda_stream stream;
-
-  // First create a GPU repr then convert to host to get a valid host_data_packed_representation
-  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
-  gpu_table_representation gpu_repr(std::make_unique<cudf::table>(std::move(table)),
-                                    *const_cast<memory::memory_space*>(gpu_space),
-                                    rmm::cuda_stream_view{});
-
-  auto host_repr = registry.convert<host_data_packed_representation>(gpu_repr, host_space, stream);
-  stream.synchronize();
-
-  // Now convert back to GPU
-  auto gpu_result = registry.convert<gpu_table_representation>(*host_repr, gpu_space, stream);
-  stream.synchronize();
-
-  REQUIRE(gpu_result != nullptr);
-  REQUIRE(gpu_result->get_current_tier() == memory::Tier::GPU);
-  REQUIRE(gpu_result->get_table_view().num_rows() == 50);
-}
-
-TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
-          "[representation_converter][builtin][roundtrip]")
-{
-  memory::memory_reservation_manager mgr(create_conversion_test_configs());
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
-  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
-  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
-
-  // Use the same stream for table creation and conversions to avoid stream-ordered races
-  rmm::cuda_stream stream;
-
-  auto original_table =
-    create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream.view());
-  gpu_table_representation original_repr(std::make_unique<cudf::table>(std::move(original_table)),
-                                         *const_cast<memory::memory_space*>(gpu_space),
-                                         rmm::cuda_stream_view{});
-
-  // GPU -> HOST
-  auto host_repr =
-    registry.convert<host_data_packed_representation>(original_repr, host_space, stream);
-  stream.synchronize();
-
-  // HOST -> GPU
-  auto result_repr = registry.convert<gpu_table_representation>(*host_repr, gpu_space, stream);
-  stream.synchronize();
-
-  // Verify data integrity
-  REQUIRE(result_repr != nullptr);
-  cucascade::test::expect_cudf_tables_equal_on_stream(
-    original_repr.get_table_view(), result_repr->get_table_view(), stream);
 }
 
 // =============================================================================

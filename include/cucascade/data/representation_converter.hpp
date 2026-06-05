@@ -92,8 +92,9 @@ struct converter_key_hash {
  *
  * The registry is thread-safe for concurrent registration and lookup.
  *
- * @note Built-in converters between gpu_table_representation and
- * host_data_packed_representation are registered via register_builtin_converters().
+ * @note cuCascade ships no built-in converters. Concrete converters (e.g. between GPU, HOST,
+ * and DISK representations) are provided by the domain layer, which registers them via
+ * register_converter().
  */
 class representation_converter_registry {
  public:
@@ -180,7 +181,7 @@ class representation_converter_registry {
    * @throws std::runtime_error if no converter is registered for the type pair
    *
    * @example
-   * auto result = registry.convert<gpu_table_representation>(source, space);
+   * auto result = registry.convert<my_target_representation>(source, space);
    */
   template <typename TargetType>
   std::unique_ptr<TargetType> convert(idata_representation& source,
@@ -244,16 +245,5 @@ class representation_converter_registry {
   mutable std::shared_mutex _mutex;
   std::unordered_map<converter_key, representation_converter_fn, converter_key_hash> _converters;
 };
-
-/**
- * @brief Initialize the built-in representation converters.
- *
- * Registers converters between all supported representation types (GPU, HOST, DISK).
- * Disk converters resolve the I/O backend from the disk memory_space at conversion time,
- * so each disk memory_space can use a different backend.
- *
- * @param registry The converter registry to register converters with.
- */
-void register_builtin_converters(representation_converter_registry& registry);
 
 }  // namespace cucascade

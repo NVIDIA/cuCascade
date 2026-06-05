@@ -15,11 +15,9 @@
  * limitations under the License.
  */
 
-#include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -41,8 +39,6 @@
 #include <vector>
 
 using namespace cucascade;
-using cucascade::test::create_simple_cudf_table;
-using cucascade::test::expect_cudf_tables_equal_on_stream;
 using cucascade::test::make_mock_memory_space;
 using cucascade::test::mock_data_representation;
 
@@ -545,162 +541,6 @@ TEST_CASE("data_batch clone preserves tier information", "[data_batch]")
     auto cloned = ro.clone(2, rmm::cuda_stream_view{});
     auto ro_cl  = cloned->to_read_only();
     REQUIRE(ro_cl.get_current_tier() == memory::Tier::DISK);
-  }
-}
-
-// =============================================================================
-// Real GPU data clone tests (TEST-05)
-// =============================================================================
-
-TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_batch][gpu]")
-{
-  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-  rmm::cuda_stream stream;
-
-  auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream.view());
-  auto original_rows    = table.num_rows();
-  auto original_columns = table.num_columns();
-
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
-  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
-
-  auto ro     = batch->to_read_only();
-  auto cloned = ro.clone(2, stream.view());
-  REQUIRE(cloned != nullptr);
-  REQUIRE(cloned->get_batch_id() == 2);
-
-  auto ro_clone = cloned->to_read_only();
-
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone.get_data());
-  REQUIRE(original_repr != nullptr);
-  REQUIRE(cloned_repr != nullptr);
-
-  // Verify table shape matches
-  REQUIRE(cloned_repr->get_table_view().num_rows() == original_rows);
-  REQUIRE(cloned_repr->get_table_view().num_columns() == original_columns);
-
-  stream.synchronize();
-  expect_cudf_tables_equal_on_stream(
-    original_repr->get_table_view(), cloned_repr->get_table_view(), stream.view());
-}
-
-TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gpu]")
-{
-  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-  rmm::cuda_stream stream;
-
-  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
-  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
-
-  auto ro     = batch->to_read_only();
-  auto cloned = ro.clone(2, stream.view());
-
-  auto ro_clone = cloned->to_read_only();
-
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone.get_data());
-
-  // Verify each column points to different memory
-  for (cudf::size_type i = 0; i < original_repr->get_table_view().num_columns(); ++i) {
-    REQUIRE(original_repr->get_table_view().column(i).head() !=
-            cloned_repr->get_table_view().column(i).head());
-  }
-}
-
-TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
-{
-  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-  rmm::cuda_stream stream;
-
-  auto table = create_simple_cudf_table(30, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
-  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
-
-  // Clone 3 times from the same read_only accessor (clone does not consume the accessor)
-  auto ro     = batch->to_read_only();
-  auto clone1 = ro.clone(10, stream.view());
-  auto clone2 = ro.clone(20, stream.view());
-  auto clone3 = ro.clone(30, stream.view());
-
-  REQUIRE(clone1->get_batch_id() == 10);
-  REQUIRE(clone2->get_batch_id() == 20);
-  REQUIRE(clone3->get_batch_id() == 30);
-
-  auto ro_c1 = clone1->to_read_only();
-  auto ro_c2 = clone2->to_read_only();
-  auto ro_c3 = clone3->to_read_only();
-
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
-  auto* clone1_repr   = dynamic_cast<gpu_table_representation*>(ro_c1.get_data());
-  auto* clone2_repr   = dynamic_cast<gpu_table_representation*>(ro_c2.get_data());
-  auto* clone3_repr   = dynamic_cast<gpu_table_representation*>(ro_c3.get_data());
-
-  stream.synchronize();
-  expect_cudf_tables_equal_on_stream(
-    original_repr->get_table_view(), clone1_repr->get_table_view(), stream.view());
-  expect_cudf_tables_equal_on_stream(
-    original_repr->get_table_view(), clone2_repr->get_table_view(), stream.view());
-  expect_cudf_tables_equal_on_stream(
-    original_repr->get_table_view(), clone3_repr->get_table_view(), stream.view());
-}
-
-TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
-{
-  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-  rmm::cuda_stream stream;
-
-  auto table    = create_simple_cudf_table(0, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
-  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
-
-  auto ro     = batch->to_read_only();
-  auto cloned = ro.clone(2, stream.view());
-  REQUIRE(cloned != nullptr);
-
-  auto ro_clone     = cloned->to_read_only();
-  auto* cloned_repr = dynamic_cast<gpu_table_representation*>(ro_clone.get_data());
-  REQUIRE(cloned_repr != nullptr);
-  REQUIRE(cloned_repr->get_table_view().num_rows() == 0);
-  REQUIRE(cloned_repr->get_table_view().num_columns() == 2);
-}
-
-TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
-{
-  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-  rmm::cuda_stream stream;
-
-  auto table =
-    create_simple_cudf_table(10000, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
-  auto batch = std::make_shared<data_batch>(1, std::move(gpu_repr));
-
-  auto ro     = batch->to_read_only();
-  auto cloned = ro.clone(2, stream.view());
-  REQUIRE(cloned != nullptr);
-
-  auto ro_clone = cloned->to_read_only();
-
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone.get_data());
-
-  // Verify structure
-  REQUIRE(cloned_repr->get_table_view().num_rows() == 10000);
-  REQUIRE(cloned_repr->get_table_view().num_columns() == 2);
-
-  stream.synchronize();
-  expect_cudf_tables_equal_on_stream(
-    original_repr->get_table_view(), cloned_repr->get_table_view(), stream.view());
-
-  for (cudf::size_type i = 0; i < original_repr->get_table_view().num_columns(); ++i) {
-    REQUIRE(original_repr->get_table_view().column(i).head() !=
-            cloned_repr->get_table_view().column(i).head());
   }
 }
 

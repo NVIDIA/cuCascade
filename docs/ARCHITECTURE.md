@@ -47,8 +47,12 @@ graph TB
         DR[data_repository]
         DB[data_batch]
         RC[representation_converter_registry]
-        GPU_REP[gpu_table_representation]
-        HOST_REP[host_data_representation / host_data_packed_representation]
+        IREP[idata_representation interface]
+        DISK_REP[disk_data_representation]
+    end
+
+    subgraph "Domain Layer (external)"
+        DOMAIN_REP[GPU / HOST representations + converters<br/>registered via register_converter]
     end
 
     subgraph "Memory Module"
@@ -73,8 +77,8 @@ graph TB
     APP --> MRM
     DRM --> DR
     DR --> DB
-    DB --> GPU_REP
-    DB --> HOST_REP
+    DB --> IREP
+    DISK_REP --> IREP
     DB --> RC
 
     MRM --> MS_GPU
@@ -91,8 +95,8 @@ graph TB
     FSHMR --> HOST_MEM
     DAL --> DISK_MEM
 
-    RC --> MS_GPU
-    RC --> MS_HOST
+    DISK_REP --> MS_DISK
+    DOMAIN_REP --> RC
 ```
 
 ## Memory Tier System
@@ -203,7 +207,7 @@ sequenceDiagram
 
 **File**: `include/cucascade/data/data_batch.hpp`
 
-A `data_batch` is the fundamental unit of data in cuCascade. It wraps a tier-specific data representation (GPU table or host table) and manages concurrent access through a RAII read-only and mutable accessor classes.
+A `data_batch` is the fundamental unit of data in cuCascade. It wraps a tier-specific data representation (an `idata_representation`, such as the in-library `disk_data_representation` or a GPU/HOST representation provided by the domain layer) and manages concurrent access through a RAII read-only and mutable accessor classes.
 
 ```mermaid
 stateDiagram-v2
@@ -250,19 +254,7 @@ The `data_repository_manager` coordinates multiple repositories across operators
 
 The `representation_converter_registry` provides type-indexed conversion between data representations. Converters are registered as functions keyed by `(source_type, target_type)`.
 
-**Built-in converters**:
-
-| Source | Target | Method |
-|--------|--------|--------|
-| GPU table | Host (direct) | `cudaMemcpyBatchAsync` (D2H) — copies column buffers directly; ~99% PCIe bandwidth |
-| Host (direct) | GPU table | `cudaMemcpyBatchAsync` (H2D) — reconstructs `cudf::column` tree from metadata |
-| GPU table | Host (packed) | `cudf::pack()` -> `cudaMemcpyAsync` (D2H) -> multi-block host allocation |
-| Host (packed) | GPU table | `cudaMemcpyAsync` (H2D) -> `cudf::unpack()` on device |
-| GPU table | GPU table | `cudf::pack()` -> `cudaMemcpyPeerAsync` -> `cudf::unpack()` (cross-device) |
-| Host (packed) | Host (packed) | Block-by-block `std::memcpy` (cross-NUMA) |
-
-"Host (direct)" = `host_data_representation` — preferred, no intermediate GPU allocation.
-"Host (packed)" = `host_data_packed_representation` — uses cudf's pack/unpack serialization.
+cuCascade ships no built-in converters; the registry starts empty. The domain layer (user code that links cuCascade together with libcudf) registers the tier-to-tier converters it needs (e.g. GPU <-> HOST <-> DISK) at runtime via `register_converter<Source, Target>(fn)`.
 
 ### Topology Discovery
 
@@ -289,7 +281,7 @@ A typical lifecycle of data through cuCascade:
 
 ```
 1. INGESTION
-   Create data representation (e.g., gpu_table_representation wrapping a cuDF table)
+   Create a data representation (provided by the domain layer, or disk_data_representation for the DISK tier)
    -> Wrap in data_batch with unique ID from data_repository_manager
    -> Add to data_repository
 
@@ -306,7 +298,7 @@ A typical lifecycle of data through cuCascade:
 4. MEMORY PRESSURE (downgrade)
    memory_space.should_downgrade_memory()  [threshold exceeded]
    batch.try_to_lock_for_in_transit()      [idle -> in_transit]
-   converter_registry.convert<host_data_representation>(...)
+   converter_registry.convert<HostRepresentation>(...) [domain-registered converter]
    batch.set_data(new_representation)      [data now on HOST]
    batch.try_to_release_in_transit()       [in_transit -> idle]
 
@@ -383,8 +375,7 @@ Key synchronization primitives:
 | `include/cucascade/memory/oom_handling_policy.hpp` | OOM handling strategies |
 | `include/cucascade/memory/error.hpp` | Custom error types and exceptions |
 | `include/cucascade/memory/numa_region_pinned_host_allocator.hpp` | NUMA-aware pinned host allocation |
-| `include/cucascade/memory/host_table.hpp` | `host_table_allocation` + `column_metadata` for direct-copy host representations |
-| `include/cucascade/memory/host_table_packed.hpp` | `host_table_packed_allocation` for packed (cudf::pack) host representations |
+| `include/cucascade/memory/column_metadata.hpp` | `column_metadata` -- generic, domain-agnostic column buffer-layout descriptor used by the disk tier |
 | `include/cucascade/memory/null_device_memory_resource.hpp` | No-op resource for disk tier |
 
 ### Data Module
@@ -395,8 +386,7 @@ Key synchronization primitives:
 | `include/cucascade/data/data_batch.hpp` | Batch lifecycle, read-only and mutable locking accessor classes|
 | `include/cucascade/data/data_repository.hpp` | Partitioned batch storage with blocking pops |
 | `include/cucascade/data/data_repository_manager.hpp` | Multi-pipeline repository coordination |
-| `include/cucascade/data/representation_converter.hpp` | Type-indexed converter registry |
-| `include/cucascade/data/gpu_data_representation.hpp` | GPU-resident cuDF table wrapper |
-| `include/cucascade/data/cpu_data_representation.hpp` | `host_data_representation` (direct buffer copy) and `host_data_packed_representation` (cudf::pack) |
+| `include/cucascade/data/representation_converter.hpp` | Type-indexed converter registry (ships empty; domain layer registers converters) |
+| `include/cucascade/data/disk_data_representation.hpp` | Sole in-library concrete representation (DISK tier) |
 | `include/cucascade/utils/atomics.hpp` | `atomic_peak_tracker`, `atomic_bounded_counter` |
 | `include/cucascade/utils/overloaded.hpp` | Variant visitor helper |
