@@ -30,6 +30,8 @@ option(CUCASCADE_BUILD_BENCHMARKS "Build the benchmark suite" ON)
 option(CUCASCADE_BUILD_SHARED_LIBS "Build shared library" ON)
 option(CUCASCADE_BUILD_STATIC_LIBS "Build static library" ON)
 option(CUCASCADE_NVTX "Enable NVTX range annotations" OFF)
+option(CUCASCADE_TOPOLOGY_ONLY
+       "Build only the topology discovery library (no cudf/rmm dependency)" OFF)
 
 # At least one library type must be built
 if(NOT CUCASCADE_BUILD_SHARED_LIBS AND NOT CUCASCADE_BUILD_STATIC_LIBS)
@@ -39,20 +41,29 @@ if(NOT CUCASCADE_BUILD_SHARED_LIBS AND NOT CUCASCADE_BUILD_STATIC_LIBS)
   )
 endif()
 
+# When topology-only, force off benchmarks (they require the full library)
+if(CUCASCADE_TOPOLOGY_ONLY)
+  set(CUCASCADE_BUILD_BENCHMARKS
+      OFF
+      CACHE BOOL "Build the benchmark suite" FORCE)
+endif()
+
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 
 # TODO: Remove vendored FindCUDAToolkit once we require CMake 4.4
 
 # Find required packages
 find_package(CUDAToolkit REQUIRED)
-find_package(Threads REQUIRED)
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  find_package(Threads REQUIRED)
 
-# Find RMM (RAPIDS Memory Manager) -- core to cuCascade's memory abstractions
-find_package(rmm REQUIRED CONFIG)
+  # Find RMM (RAPIDS Memory Manager) -- core to cuCascade's memory abstractions
+  find_package(rmm REQUIRED CONFIG)
 
-# Find numa (provided by numactl-devel or libnuma-dev depending on the package
-# manager)
-find_library(NUMA_LIB numa REQUIRED)
+  # Find numa (provided by numactl-devel or libnuma-dev depending on the package
+  # manager)
+  find_library(NUMA_LIB numa REQUIRED)
+endif()
 
 # Set CUDA architectures
 if(NOT CMAKE_CUDA_ARCHITECTURES)
@@ -91,67 +102,79 @@ endforeach()
 # =============================================================================
 # NVTX support
 # =============================================================================
-if(CUCASCADE_NVTX)
+if(CUCASCADE_NVTX AND NOT CUCASCADE_TOPOLOGY_ONLY)
   find_package(nvtx3 REQUIRED)
 endif()
 
 # =============================================================================
 # Object library (compiles sources once, used by both static and shared libs)
 # =============================================================================
-add_library(cucascade_objects OBJECT)
 add_library(cucascade_topology_discovery_objects OBJECT)
 
-# Apply warning flags to object library
-target_compile_options(
-  cucascade_objects
-  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
-          ${CUCASCADE_CUDA_WARNING_FLAGS})
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  add_library(cucascade_objects OBJECT)
+
+  # Apply warning flags to object library
+  target_compile_options(
+    cucascade_objects
+    PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
+            ${CUCASCADE_CUDA_WARNING_FLAGS})
+endif()
+
 target_compile_options(
   cucascade_topology_discovery_objects
   PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
           ${CUCASCADE_CUDA_WARNING_FLAGS})
 
 # NVTX compile definition
-if(CUCASCADE_NVTX)
+if(CUCASCADE_NVTX AND NOT CUCASCADE_TOPOLOGY_ONLY)
   target_compile_definitions(cucascade_objects PUBLIC CUCASCADE_NVTX)
   target_link_libraries(cucascade_objects PUBLIC nvtx3::nvtx3-cpp)
 endif()
 
 # Add source directories (they will add sources to cucascade_objects)
-add_subdirectory(src/cuda)
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  add_subdirectory(src/cuda)
+endif()
 add_subdirectory(src/memory)
-add_subdirectory(src/data)
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  add_subdirectory(src/data)
+endif()
 
 # Common usage requirements shared by the object library and installable targets
 set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
-set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static Threads::Threads
-                               ${NUMA_LIB})
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static Threads::Threads
+                                 ${NUMA_LIB})
 
-# Set include directories for the object library
-target_include_directories(cucascade_objects
-                           PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  # Set include directories for the object library
+  target_include_directories(cucascade_objects
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+
+  # Link dependencies to object library
+  target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+
+  # cxx_std_20 is PUBLIC so consumers know they need C++20 to use our headers.
+  # cuda_std_20 is kept separate and applied PRIVATE to cucascade_objects to
+  # avoid propagating it to consumers that have no CUDA compiler requirement.
+  target_compile_features(cucascade_objects PUBLIC cxx_std_20)
+  target_compile_features(cucascade_objects PRIVATE cuda_std_20)
+
+  set_target_properties(
+    cucascade_objects PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
+                                                    ON)
+endif()
+
 target_include_directories(cucascade_topology_discovery_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
-
-# Link dependencies to object library
-target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
 target_link_libraries(cucascade_topology_discovery_objects
                       PUBLIC CUDA::nvml_static)
-
-# cxx_std_20 is PUBLIC so consumers know they need C++20 to use our headers.
-# cuda_std_20 is kept separate and applied PRIVATE to cucascade_objects to avoid
-# propagating it to consumers that have no CUDA compiler requirement.
-target_compile_features(cucascade_objects PUBLIC cxx_std_20)
-target_compile_features(cucascade_objects PRIVATE cuda_std_20)
 target_compile_features(cucascade_topology_discovery_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_topology_discovery_objects
                         PRIVATE cuda_std_20)
-
-set_target_properties(cucascade_objects PROPERTIES CXX_EXTENSIONS OFF
-                                                   POSITION_INDEPENDENT_CODE ON)
 set_target_properties(
   cucascade_topology_discovery_objects PROPERTIES CXX_EXTENSIONS OFF
                                                   POSITION_INDEPENDENT_CODE ON)
@@ -180,19 +203,21 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
     PROPERTIES OUTPUT_NAME cucascade_topology_discovery
                EXPORT_NAME cucascade_topology_discovery_static)
 
-  add_library(cucascade_static STATIC $<TARGET_OBJECTS:cucascade_objects>)
-  add_library(cuCascade::cucascade_static ALIAS cucascade_static)
+  if(NOT CUCASCADE_TOPOLOGY_ONLY)
+    add_library(cucascade_static STATIC $<TARGET_OBJECTS:cucascade_objects>)
+    add_library(cuCascade::cucascade_static ALIAS cucascade_static)
 
-  target_include_directories(cucascade_static
-                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
-  target_link_libraries(
-    cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
-                            cucascade_topology_discovery_static)
-  target_compile_features(cucascade_static PUBLIC cxx_std_20)
+    target_include_directories(cucascade_static
+                               PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+    target_link_libraries(
+      cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
+                              cucascade_topology_discovery_static)
+    target_compile_features(cucascade_static PUBLIC cxx_std_20)
 
-  set_target_properties(
-    cucascade_static PROPERTIES OUTPUT_NAME cucascade EXPORT_NAME
-                                                      cucascade_static)
+    set_target_properties(
+      cucascade_static PROPERTIES OUTPUT_NAME cucascade EXPORT_NAME
+                                                        cucascade_static)
+  endif()
 endif()
 
 # =============================================================================
@@ -217,35 +242,41 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
   set_target_properties(cucascade_topology_discovery_shared
                         PROPERTIES OUTPUT_NAME cucascade_topology_discovery)
 
-  add_library(cucascade_shared SHARED $<TARGET_OBJECTS:cucascade_objects>)
-  add_library(cuCascade::cucascade_shared ALIAS cucascade_shared)
+  if(NOT CUCASCADE_TOPOLOGY_ONLY)
+    add_library(cucascade_shared SHARED $<TARGET_OBJECTS:cucascade_objects>)
+    add_library(cuCascade::cucascade_shared ALIAS cucascade_shared)
 
-  target_include_directories(cucascade_shared
-                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
-  target_link_libraries(
-    cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
-                            cucascade_topology_discovery_shared)
-  target_compile_features(cucascade_shared PUBLIC cxx_std_20)
+    target_include_directories(cucascade_shared
+                               PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+    target_link_libraries(
+      cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
+                              cucascade_topology_discovery_shared)
+    target_compile_features(cucascade_shared PUBLIC cxx_std_20)
 
-  set_target_properties(cucascade_shared PROPERTIES OUTPUT_NAME cucascade)
+    set_target_properties(cucascade_shared PROPERTIES OUTPUT_NAME cucascade)
+  endif()
 endif()
 
 # =============================================================================
 # Default target alias (prefer shared if available, else static)
 # =============================================================================
 if(CUCASCADE_BUILD_SHARED_LIBS)
-  add_library(cuCascade::cucascade ALIAS cucascade_shared)
+  if(NOT CUCASCADE_TOPOLOGY_ONLY)
+    add_library(cuCascade::cucascade ALIAS cucascade_shared)
+    # For backwards compatibility, also create 'cucascade' as an alias
+    add_library(cucascade ALIAS cucascade_shared)
+  endif()
   add_library(cuCascade::cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_shared)
-  # For backwards compatibility, also create 'cucascade' as an alias
-  add_library(cucascade ALIAS cucascade_shared)
   add_library(cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_shared)
 elseif(CUCASCADE_BUILD_STATIC_LIBS)
-  add_library(cuCascade::cucascade ALIAS cucascade_static)
+  if(NOT CUCASCADE_TOPOLOGY_ONLY)
+    add_library(cuCascade::cucascade ALIAS cucascade_static)
+    add_library(cucascade ALIAS cucascade_static)
+  endif()
   add_library(cuCascade::cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_static)
-  add_library(cucascade ALIAS cucascade_static)
   add_library(cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_static)
 endif()
@@ -257,22 +288,31 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 # Install headers
-install(
-  DIRECTORY include/
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  FILES_MATCHING
-  PATTERN "*.hpp"
-  PATTERN "*.h")
+if(CUCASCADE_TOPOLOGY_ONLY)
+  install(FILES include/cucascade/memory/topology_discovery.hpp
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
+else()
+  install(
+    DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING
+    PATTERN "*.hpp"
+    PATTERN "*.h")
+endif()
 
 # Collect targets to install
 set(CUCASCADE_INSTALL_TARGETS)
 if(CUCASCADE_BUILD_STATIC_LIBS)
-  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_static
-       cucascade_topology_discovery_static)
+  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_topology_discovery_static)
+  if(NOT CUCASCADE_TOPOLOGY_ONLY)
+    list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_static)
+  endif()
 endif()
 if(CUCASCADE_BUILD_SHARED_LIBS)
-  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared
-       cucascade_topology_discovery_shared)
+  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_topology_discovery_shared)
+  if(NOT CUCASCADE_TOPOLOGY_ONLY)
+    list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared)
+  endif()
 endif()
 
 # Install library targets
@@ -293,9 +333,16 @@ install(
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade)
 
 # Generate package config file
+if(CUCASCADE_TOPOLOGY_ONLY)
+  set(CUCASCADE_CONFIG_TEMPLATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cuCascadeTopologyOnlyConfig.cmake.in)
+else()
+  set(CUCASCADE_CONFIG_TEMPLATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cuCascadeConfig.cmake.in)
+endif()
+
 configure_package_config_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cuCascadeConfig.cmake.in
-  ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfig.cmake
+  ${CUCASCADE_CONFIG_TEMPLATE} ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfig.cmake
   INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade)
 
 # Generate version file

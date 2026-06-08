@@ -39,11 +39,11 @@ activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" 
 # available version with `pixi search -c rapidsai-nightly librmm` if the solve fails.
 [feature.rmm-nightly]
 channels = [{ channel = "rapidsai-nightly", priority = 1 }]
-dependencies = { "librmm" = "26.06.*" }
+dependencies = { "librmm" = "26.08.*" }
 
 [feature.rmm-stable]
 channels = [{ channel = "rapidsai", priority = 1 }]
-dependencies = { "librmm" = "26.04.*" }
+dependencies = { "librmm" = "26.06.*" }
 
 [environments]
 default = ["cuda-13", "rmm-nightly"]

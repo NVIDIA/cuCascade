@@ -49,7 +49,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `libcudf` - NOT a dependency of the core library; only the optional external domain layer (which links cuCascade + libcudf) uses `cudf::table` and registers concrete GPU/HOST representations and converters at runtime
 - `CUDA::cudart` - Direct CUDA runtime API calls (`cudaMalloc`, `cudaMemcpyAsync`, `cudaStreamSynchronize`, `cudaFree`, `cudaMallocHost`, `cudaFreeHost`)
 - `CUDA::nvml` - GPU topology discovery via NVML in `src/memory/topology_discovery.cpp`
-- `kvikio` 26.06 / 26.02 - Async disk I/O with automatic GDS/POSIX fallback; used in `src/data/kvikio_io_backend.cpp` via `kvikio::FileHandle`; linked PRIVATE via `kvikio::kvikio`
+- `kvikio` 26.08 / 26.06 - Async disk I/O with automatic GDS/POSIX fallback; used in `src/data/kvikio_io_backend.cpp` via `kvikio::FileHandle`; linked PRIVATE via `kvikio::kvikio`
 - `libcufile` (cuFile / GDS) - NVIDIA GPUDirect Storage for direct GPU↔NVMe transfers; `<cufile.h>` used in `src/data/gds_io_backend.cpp`; found via `find_library(CUFILE_LIB cufile ...)` — optional at configure time, required at runtime for GDS backend
 - `libnuma` - NUMA-aware pinned host memory allocation in `src/memory/numa_region_pinned_host_allocator.cpp`; found via `find_library(NUMA_LIB numa REQUIRED)`
 - `Threads::Threads` (pthreads) - Thread support; `std::mutex`, `std::condition_variable`, `std::async` throughout

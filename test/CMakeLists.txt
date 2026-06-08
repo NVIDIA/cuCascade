@@ -23,37 +23,39 @@ FetchContent_Declare(
   GIT_TAG v2.13.10)
 FetchContent_MakeAvailable(Catch2)
 
-# Create test executable
-add_executable(
-  cucascade_tests
-  # Memory tests
-  memory/test_memory_reservation_manager.cpp
-  memory/test_small_pinned_host_memory_resource.cpp
-  memory/test_gpu_kernels.cu
-  # Data tests
-  data/test_data_batch.cpp
-  data/test_data_repository.cpp
-  data/test_data_repository_manager.cpp
-  data/test_disk_io_backend.cpp
-  data/test_io_worker.cpp
-  data/test_representation_converter.cpp
-  # Main test runner
-  unittest.cpp)
-set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
-                                                 CUDA_STANDARD_REQUIRED ON)
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  # Create test executable
+  add_executable(
+    cucascade_tests
+    # Memory tests
+    memory/test_memory_reservation_manager.cpp
+    memory/test_small_pinned_host_memory_resource.cpp
+    memory/test_gpu_kernels.cu
+    # Data tests
+    data/test_data_batch.cpp
+    data/test_data_repository.cpp
+    data/test_data_repository_manager.cpp
+    data/test_disk_io_backend.cpp
+    data/test_io_worker.cpp
+    data/test_representation_converter.cpp
+    # Main test runner
+    unittest.cpp)
+  set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
+                                                   CUDA_STANDARD_REQUIRED ON)
 
-# Set include directories
-target_include_directories(
-  cucascade_tests
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
-          ${Catch2_SOURCE_DIR}/single_include)
+  # Set include directories
+  target_include_directories(
+    cucascade_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${Catch2_SOURCE_DIR}/single_include)
 
-# Link dependencies
-target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
-                                              CUDA::cudart_static)
+  # Link dependencies
+  target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
+                                                CUDA::cudart_static)
 
-# Register tests with CTest
-add_test(NAME cucascade_tests COMMAND cucascade_tests)
+  # Register tests with CTest
+  add_test(NAME cucascade_tests COMMAND cucascade_tests)
+endif()
 
 # Create topology discovery test executable
 add_executable(
