@@ -64,8 +64,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   find_package(cudf REQUIRED CONFIG)
 
   # Find numa (provided by numactl-devel or libnuma-dev depending on the package
-  # manager)
-  find_library(NUMA_LIB numa REQUIRED)
+  # manager). Uses the bundled FindNuma module, which produces the Numa::Numa
+  # imported target. The same module is installed with the package so consumers
+  # resolve libnuma on their own system rather than inheriting a hardcoded path.
+  find_package(Numa REQUIRED)
 endif()
 
 # Set CUDA architectures
@@ -151,7 +153,7 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart_static
-                                 Threads::Threads ${NUMA_LIB})
+                                 Threads::Threads Numa::Numa)
 
   # Set include directories for the object library
   target_include_directories(cucascade_objects
@@ -358,6 +360,14 @@ write_basic_package_version_file(
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfig.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfigVersion.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade)
+
+# Bundle the FindNuma module so consumers can rerun the same find logic (the
+# full library links the Numa::Numa target it produces). Not needed for
+# topology-only builds, which do not depend on libnuma.
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules/FindNuma.cmake
+          DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade/Modules)
+endif()
 
 # =============================================================================
 # Tests
