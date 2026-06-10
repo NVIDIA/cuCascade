@@ -432,6 +432,25 @@ class mutable_data_batch {
                   const memory::memory_space* target_memory_space,
                   rmm::cuda_stream_view stream);
 
+  /**
+   * @brief Rebind the held data's device buffers to use @p stream for future deallocation.
+   *
+   * Forwards to gpu_table_representation::rebind_stream when the held representation is a
+   * GPU table that owns its data; a no-op for every other representation (host, disk, or a
+   * GPU representation backed by an externally-owned table_view).
+   *
+   * Rebinding before an operation that may free the data (a GPU->host downgrade, or a pipeline
+   * task that consumes it) makes the buffers free on the active stream rather than the stream
+   * they were produced on, keeping RMM's per-stream free lists correct and avoiding the
+   * cross-stream premature-reuse hazard. Requires the exclusive (mutable) lock held by this
+   * accessor.
+   *
+   * @note Does NOT insert cross-stream ordering -- see gpu_table_representation::rebind_stream.
+   *
+   * @param stream Stream used for future asynchronous deallocation of the data's buffers.
+   */
+  void rebind_stream(rmm::cuda_stream_view stream);
+
   // -- Clone operations (CLONE-01/CLONE-02) --
 
   /**

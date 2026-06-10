@@ -16,6 +16,7 @@
  */
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
 namespace cucascade {
 
@@ -259,6 +260,13 @@ mutable_data_batch::~mutable_data_batch()
   if (_batch) {
     // Transition state to idle. The _lock member destructor handles releasing the exclusive lock.
     _batch->_state.store(batch_state::idle);
+  }
+}
+
+void mutable_data_batch::rebind_stream(rmm::cuda_stream_view stream)
+{
+  if (auto* gpu = dynamic_cast<gpu_table_representation*>(_batch->get_data())) {
+    gpu->rebind_stream(stream);
   }
 }
 
