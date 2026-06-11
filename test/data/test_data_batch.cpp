@@ -1595,7 +1595,7 @@ TEST_CASE("release_or_copy_table steals when sole owner", "[data_batch][gpu]")
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
   rmm::cuda_stream stream;
 
-  auto batch = make_gpu_table_batch(*gpu_space, stream.view(), 100, 3);
+  auto batch = make_gpu_table_batch(*gpu_space, stream.view(), 100, 2);
 
   // Record the device pointers of the original columns before stealing.
   std::vector<void const*> original_heads;
@@ -1610,7 +1610,7 @@ TEST_CASE("release_or_copy_table steals when sole owner", "[data_batch][gpu]")
   stream.synchronize();
 
   REQUIRE(stolen != nullptr);
-  REQUIRE(stolen->num_columns() == 3);
+  REQUIRE(stolen->num_columns() == 2);
   REQUIRE(stolen->num_rows() == 100);
 
   // Zero-copy: the returned columns must reuse the original device memory.
@@ -1623,7 +1623,7 @@ TEST_CASE("release_or_copy_table copies when shared", "[data_batch][gpu]")
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
   rmm::cuda_stream stream;
 
-  auto batch = make_gpu_table_batch(*gpu_space, stream.view(), 100, 3);
+  auto batch = make_gpu_table_batch(*gpu_space, stream.view(), 100, 2);
 
   // A second owner keeps the batch alive — this models another query branch /
   // repository still referencing the same data.
@@ -1641,7 +1641,7 @@ TEST_CASE("release_or_copy_table copies when shared", "[data_batch][gpu]")
   stream.synchronize();
 
   REQUIRE(copied != nullptr);
-  REQUIRE(copied->num_columns() == 3);
+  REQUIRE(copied->num_columns() == 2);
   REQUIRE(copied->num_rows() == 100);
 
   // Deep copy: the returned columns must NOT alias the original device memory.
@@ -1654,7 +1654,7 @@ TEST_CASE("release_or_copy_table copies when shared", "[data_batch][gpu]")
   auto ro              = other_owner->to_read_only();
   auto* surviving_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
   REQUIRE(surviving_repr != nullptr);
-  REQUIRE(surviving_repr->get_table_view().num_columns() == 3);
+  REQUIRE(surviving_repr->get_table_view().num_columns() == 2);
   REQUIRE(surviving_repr->get_table_view().num_rows() == 100);
   expect_cudf_tables_equal_on_stream(
     surviving_repr->get_table_view(), copied->view(), stream.view());
