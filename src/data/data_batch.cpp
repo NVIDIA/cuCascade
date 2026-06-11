@@ -16,6 +16,8 @@
  */
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/error.hpp>
 
 namespace cucascade {
 
@@ -82,6 +84,45 @@ std::shared_ptr<data_batch> data_batch::to_idle(mutable_data_batch&& accessor)
     auto _ = std::move(accessor);
   }  // destroy accessor, releasing exclusive lock
   return ptr;
+}
+
+std::unique_ptr<cudf::table> data_batch::release_or_copy_table(std::shared_ptr<data_batch> batch,
+                                                               rmm::cuda_stream_view stream)
+{
+  // Try to grab exclusive access WITHOUT blocking. A non-blocking try is essential: if another
+  // owner (e.g. a sibling query branch) is concurrently reading the batch, a blocking to_mutable()
+  // would stall — or deadlock — until they finish. A failed try is itself proof the batch is
+  // shared, so we copy in that case.
+  if (auto maybe_mut = batch->try_to_mutable()) {
+    auto mut = std::move(*maybe_mut);
+
+    // Drop the caller-provided reference; mut._batch is now the canonical handle. Its use_count()
+    // is 1 iff no other shared_ptr<data_batch> exists anywhere.
+    batch.reset();
+
+    auto* gpu = dynamic_cast<gpu_table_representation*>(mut._batch->get_data());
+    if (gpu == nullptr) {
+      CUCASCADE_FAIL("release_or_copy_table requires a gpu_table_representation");
+    }
+
+    if (mut._batch.use_count() == 1) {
+      // Sole owner: steal the columns zero-copy. The emptied representation is never observed
+      // because the batch is destroyed when `mut` drops the last reference at end of scope.
+      return gpu->release_table(stream);
+    }
+    // Shared with idle owners (none currently locked): copy while holding the exclusive lock so the
+    // source data is stable, then leave the live batch untouched for the other owners.
+    return std::make_unique<cudf::table>(gpu->get_table_view(), stream);
+  }
+
+  // Could not acquire exclusive access → the batch is actively locked by another owner, so it is
+  // definitely shared. Copy under a read lock (compatible with concurrent readers).
+  auto ro   = batch->to_read_only();
+  auto* gpu = dynamic_cast<gpu_table_representation*>(ro.get_data());
+  if (gpu == nullptr) {
+    CUCASCADE_FAIL("release_or_copy_table requires a gpu_table_representation");
+  }
+  return std::make_unique<cudf::table>(gpu->get_table_view(), stream);
 }
 
 // ========== Non-static transition methods ==========

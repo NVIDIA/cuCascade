@@ -159,6 +159,35 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   [[nodiscard]] static std::shared_ptr<data_batch> to_idle(mutable_data_batch&& accessor);
 
+  /**
+   * @brief Steal the underlying cuDF table if @p batch is uniquely owned, otherwise deep-copy it.
+   *
+   * Consumes @p batch: the caller MUST std::move in its only handle. The function attempts to
+   * acquire the exclusive lock NON-BLOCKING:
+   *  - If the try succeeds, it drops the consumed reference and checks ownership. When the lock
+   *    accessor's internal pointer is the sole owner (use_count() == 1, i.e. no other
+   *    `shared_ptr<data_batch>` exists anywhere — other query branches, repositories, subscriber
+   *    bookkeeping, etc.), the table is moved out zero-copy via release_table(). Otherwise an
+   *    independent deep copy is returned (taken while holding the exclusive lock) and the batch is
+   *    left intact for the other owners.
+   *  - If the try FAILS, another owner is actively locking the batch, so it is definitely shared;
+   *    the table is deep-copied under a read lock (compatible with concurrent readers).
+   *
+   * The non-blocking try is deliberate: a blocking exclusive lock would stall — or deadlock — when
+   * a sibling branch is concurrently reading the same shared batch.
+   *
+   * Soundness: a thread can only lock a batch via a `shared_ptr` it already holds, and every such
+   * pointer is reflected in use_count(). Because the steal happens only while we hold the exclusive
+   * lock and use_count() == 1, no other reader exists or can appear, making it race-free.
+   *
+   * @param batch The batch to consume; pass with std::move. Must hold a gpu_table_representation.
+   * @param stream CUDA stream for the copy path (and the release_table view-materialization path).
+   * @return The owned cuDF table, either moved out (unique) or deep-copied (shared).
+   * @throws cucascade::logic_error if the batch's representation is not a gpu_table_representation.
+   */
+  [[nodiscard]] static std::unique_ptr<cudf::table> release_or_copy_table(
+    std::shared_ptr<data_batch> batch, rmm::cuda_stream_view stream);
+
   // -- Non-static transitions (via shared_from_this) --
   // The caller's shared_ptr is NOT consumed. These only work when the
   // data_batch is managed by a shared_ptr (throws bad_weak_ptr otherwise).

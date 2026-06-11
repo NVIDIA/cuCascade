@@ -28,6 +28,7 @@
 
 #include <catch2/catch.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -1554,4 +1555,146 @@ TEST_CASE("read_only_data_batch copy then mutable after all copies released", "[
   auto mut = batch->to_mutable();
   REQUIRE(batch->get_state() == batch_state::mutable_locked);
   REQUIRE(mut.get_batch_id() == 1);
+}
+
+// =============================================================================
+// release_or_copy_table tests
+// =============================================================================
+
+namespace {
+
+// Build a single-batch shared_ptr<data_batch> wrapping a real GPU cuDF table.
+std::shared_ptr<data_batch> make_gpu_table_batch(cucascade::memory::memory_space& gpu_space,
+                                                 rmm::cuda_stream_view stream,
+                                                 cudf::size_type num_rows    = 100,
+                                                 cudf::size_type num_columns = 3)
+{
+  auto table =
+    create_simple_cudf_table(num_rows, num_columns, gpu_space.get_default_allocator(), stream);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), gpu_space, stream);
+  return std::make_shared<data_batch>(1, std::move(gpu_repr));
+}
+
+// Collect the device data pointers of each column so we can prove zero-copy
+// (identical pointers) vs. deep-copy (different pointers).
+std::vector<void const*> column_heads(cudf::table_view view)
+{
+  std::vector<void const*> heads;
+  heads.reserve(static_cast<size_t>(view.num_columns()));
+  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+    heads.push_back(view.column(i).head());
+  }
+  return heads;
+}
+
+}  // namespace
+
+TEST_CASE("release_or_copy_table steals when sole owner", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto batch = make_gpu_table_batch(*gpu_space, stream.view(), 100, 3);
+
+  // Record the device pointers of the original columns before stealing.
+  std::vector<void const*> original_heads;
+  {
+    auto ro = batch->to_read_only();
+    original_heads =
+      column_heads(dynamic_cast<gpu_table_representation*>(ro.get_data())->get_table_view());
+  }
+
+  // batch is the only handle: std::move it in so the helper becomes the sole owner.
+  auto stolen = data_batch::release_or_copy_table(std::move(batch), stream.view());
+  stream.synchronize();
+
+  REQUIRE(stolen != nullptr);
+  REQUIRE(stolen->num_columns() == 3);
+  REQUIRE(stolen->num_rows() == 100);
+
+  // Zero-copy: the returned columns must reuse the original device memory.
+  auto stolen_heads = column_heads(stolen->view());
+  REQUIRE(stolen_heads == original_heads);
+}
+
+TEST_CASE("release_or_copy_table copies when shared", "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto batch = make_gpu_table_batch(*gpu_space, stream.view(), 100, 3);
+
+  // A second owner keeps the batch alive — this models another query branch /
+  // repository still referencing the same data.
+  auto other_owner = batch;
+  REQUIRE(batch.use_count() == 2);
+
+  std::vector<void const*> original_heads;
+  {
+    auto ro = other_owner->to_read_only();
+    original_heads =
+      column_heads(dynamic_cast<gpu_table_representation*>(ro.get_data())->get_table_view());
+  }
+
+  auto copied = data_batch::release_or_copy_table(std::move(batch), stream.view());
+  stream.synchronize();
+
+  REQUIRE(copied != nullptr);
+  REQUIRE(copied->num_columns() == 3);
+  REQUIRE(copied->num_rows() == 100);
+
+  // Deep copy: the returned columns must NOT alias the original device memory.
+  auto copied_heads = column_heads(copied->view());
+  for (auto* head : copied_heads) {
+    REQUIRE(std::find(original_heads.begin(), original_heads.end(), head) == original_heads.end());
+  }
+
+  // The surviving owner still serves valid, unmodified data.
+  auto ro              = other_owner->to_read_only();
+  auto* surviving_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
+  REQUIRE(surviving_repr != nullptr);
+  REQUIRE(surviving_repr->get_table_view().num_columns() == 3);
+  REQUIRE(surviving_repr->get_table_view().num_rows() == 100);
+  expect_cudf_tables_equal_on_stream(
+    surviving_repr->get_table_view(), copied->view(), stream.view());
+}
+
+TEST_CASE("release_or_copy_table throws on non-GPU representation", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::HOST, 1024);
+  auto batch = std::make_shared<data_batch>(1, std::move(data));
+
+  REQUIRE_THROWS_AS(data_batch::release_or_copy_table(std::move(batch), rmm::cuda_stream_view{}),
+                    cucascade::logic_error);
+}
+
+TEST_CASE("release_or_copy_table copies while a concurrent reader holds the batch",
+          "[data_batch][gpu]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto batch = make_gpu_table_batch(*gpu_space, stream.view(), 50, 2);
+
+  // A concurrent reader holds a read-only lock (and thus a shared_ptr) for the
+  // duration of the call. release_or_copy_table must observe use_count > 1 and
+  // deep-copy rather than steal out from under the reader.
+  auto reader_ro = std::make_unique<read_only_data_batch>(batch->to_read_only());
+
+  std::vector<void const*> original_heads =
+    column_heads(dynamic_cast<gpu_table_representation*>(reader_ro->get_data())->get_table_view());
+
+  auto result = data_batch::release_or_copy_table(std::move(batch), stream.view());
+  stream.synchronize();
+
+  auto result_heads = column_heads(result->view());
+  for (auto* head : result_heads) {
+    REQUIRE(std::find(original_heads.begin(), original_heads.end(), head) == original_heads.end());
+  }
+
+  // Reader's data is still intact.
+  auto* reader_repr = dynamic_cast<gpu_table_representation*>(reader_ro->get_data());
+  REQUIRE(reader_repr->get_table_view().num_columns() == 2);
+  REQUIRE(reader_repr->get_table_view().num_rows() == 50);
 }
