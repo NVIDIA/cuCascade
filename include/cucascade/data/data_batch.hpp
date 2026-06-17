@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cucascade/data/common.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
 
@@ -180,6 +181,54 @@ class data_batch_core {
    */
   [[nodiscard]] std::shared_ptr<data_batch> clone(uint64_t new_batch_id,
                                                   rmm::cuda_stream_view stream) const;
+
+  /**
+   * @brief Rebind the held data's device buffers to use @p stream for future deallocation.
+   *
+   * Forwards to gpu_table_representation::rebind_stream when the held representation is a
+   * GPU table that owns its data; a no-op for every other representation (host, disk, or a
+   * GPU representation backed by an externally-owned table_view).
+   *
+   * Rebinding before an operation that may free the data (a GPU->host downgrade, or a pipeline
+   * task that consumes it) makes the buffers free on the active stream rather than the stream
+   * they were produced on, keeping RMM's per-stream free lists correct and avoiding the
+   * cross-stream premature-reuse hazard. Requires the exclusive (mutable) lock held by this
+   * accessor.
+   *
+   * @note Does NOT insert cross-stream ordering -- see gpu_table_representation::rebind_stream.
+   *
+   * @param stream Stream used for future asynchronous deallocation of the data's buffers.
+   */
+  void rebind_stream(rmm::cuda_stream_view stream)
+  {
+    if (auto* gpu = dynamic_cast<gpu_table_representation*>(_data.get())) {
+      gpu->rebind_stream(stream);
+    }
+  }
+
+  /**
+   * @brief Get the writer event from the underlying GPU representation, or nullptr.
+   *
+   * Delegates to gpu_table_representation::get_writer_event() via
+   * dynamic_cast. Returns nullptr when the underlying representation is not a
+   * gpu_table_representation (e.g., host or disk tier) or when no writer event has
+   * been recorded yet.
+   *
+   * STREAM-LINEAGE: callers that cross stream / device boundaries should call
+   * cudaStreamWaitEvent on the returned event (when non-null) before reading the
+   * underlying memory of this batch.
+   *
+   * @return cudaEvent_t The writer event, or nullptr if not a GPU representation or
+   *         no event recorded.
+   */
+  [[nodiscard]] cudaEvent_t get_writer_event() const
+  {
+    auto* repr = get_data();
+    if (!repr) { return nullptr; }
+    auto* gpu_repr = dynamic_cast<gpu_table_representation*>(repr);
+    if (!gpu_repr) { return nullptr; }
+    return gpu_repr->get_writer_event();
+  }
 
  private:
   data_batch_core(uint64_t batch_id, std::unique_ptr<idata_representation> data);

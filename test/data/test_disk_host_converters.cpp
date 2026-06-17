@@ -81,7 +81,8 @@ void round_trip_test(std::unique_ptr<cudf::table> original_table)
   register_builtin_converters(registry);
 
   // Create GPU representation from the original table
-  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(original_table), *gpu_space);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::move(original_table), *gpu_space, rmm::cuda_stream_view{});
 
   // GPU -> host_data
   auto host_rep =

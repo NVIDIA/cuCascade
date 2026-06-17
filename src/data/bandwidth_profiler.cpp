@@ -106,7 +106,8 @@ std::unique_ptr<idata_representation> build_source_representation(
   auto bootstrap_stream = bootstrap_gpu->acquire_stream();
   auto gpu_mr           = bootstrap_gpu->get_default_allocator();
   auto table            = make_gpu_table_of_size(size_bytes, gpu_mr, bootstrap_stream);
-  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *bootstrap_gpu);
+  auto gpu_rep =
+    std::make_unique<gpu_table_representation>(std::move(table), *bootstrap_gpu, bootstrap_stream);
   bootstrap_stream.synchronize();
 
   // Step 2: land the data in the requested src space via the registry. The converter is

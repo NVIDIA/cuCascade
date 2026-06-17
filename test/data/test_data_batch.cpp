@@ -565,7 +565,7 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
   auto original_columns = table.num_columns();
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->get_read_only();
@@ -596,7 +596,7 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
 
   auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->get_read_only();
@@ -621,7 +621,7 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
 
   auto table = create_simple_cudf_table(30, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   // Clone 3 times from the same read_only accessor (clone does not consume the accessor)
@@ -659,7 +659,7 @@ TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
 
   auto table    = create_simple_cudf_table(0, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->get_read_only();
@@ -681,7 +681,7 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
   auto table =
     create_simple_cudf_table(10000, 2, gpu_space->get_default_allocator(), stream.view());
   auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space);
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space, rmm::cuda_stream_view{});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->get_read_only();

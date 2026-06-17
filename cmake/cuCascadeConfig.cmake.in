@@ -3,10 +3,16 @@
 include(CMakeFindDependencyMacro)
 
 # Find required dependencies
-find_dependency(CUDAToolkit REQUIRED)
+find_dependency(CUDAToolkit REQUIRED VERSION 12.9)
 find_dependency(Threads REQUIRED)
 find_dependency(rmm REQUIRED CONFIG)
 find_dependency(cudf REQUIRED CONFIG)
+
+# The exported targets link the Numa::Numa imported target. Rerun the bundled
+# FindNuma module so it is reconstructed against the consumer's libnuma instead
+# of a path baked in at build time.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/Modules")
+find_dependency(Numa REQUIRED)
 
 # Include the targets file
 include("${CMAKE_CURRENT_LIST_DIR}/cuCascadeTargets.cmake")
@@ -20,6 +26,16 @@ if(TARGET cuCascade::cucascade_shared)
 elseif(TARGET cuCascade::cucascade_static)
   if(NOT TARGET cuCascade::cucascade)
     add_library(cuCascade::cucascade ALIAS cuCascade::cucascade_static)
+  endif()
+endif()
+# Users can link to cuCascade::cucascade_topology_discovery, cuCascade::cucascade_topology_discovery_static, or cuCascade::cucascade_topology_discovery_shared
+if(TARGET cuCascade::cucascade_topology_discovery_shared)
+  if(NOT TARGET cuCascade::cucascade_topology_discovery)
+    add_library(cuCascade::cucascade_topology_discovery ALIAS cuCascade::cucascade_topology_discovery_shared)
+  endif()
+elseif(TARGET cuCascade::cucascade_topology_discovery_static)
+  if(NOT TARGET cuCascade::cucascade_topology_discovery)
+    add_library(cuCascade::cucascade_topology_discovery ALIAS cuCascade::cucascade_topology_discovery_static)
   endif()
 endif()
 

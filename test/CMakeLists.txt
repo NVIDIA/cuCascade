@@ -23,46 +23,63 @@ FetchContent_Declare(
   GIT_TAG v2.13.10)
 FetchContent_MakeAvailable(Catch2)
 
-# Set include directories for tests
-include_directories(${CMAKE_CURRENT_SOURCE_DIR})
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/utils)
-
-# Collect all test sources directly (CMake PARENT_SCOPE has scoping issues)
-set(TEST_SOURCES
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  # Create test executable
+  add_executable(
+    cucascade_tests
     # Utils
-    ${CMAKE_CURRENT_SOURCE_DIR}/utils/cudf_test_utils.cpp
+    utils/cudf_test_utils.cpp
     # Memory tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_memory_reservation_manager.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_small_pinned_host_memory_resource.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_topology_discovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/memory/test_gpu_kernels.cu
+    memory/test_memory_reservation_manager.cpp
+    memory/test_small_pinned_host_memory_resource.cpp
+    memory/test_gpu_kernels.cu
     # Data tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_bandwidth_profiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_batch.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_repository.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_repository_manager.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_data_representation.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_disk_io_backend.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_disk_host_converters.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_gpu_disk_converters.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data/test_representation_converter.cpp
+    data/test_bandwidth_profiler.cpp
+    data/test_data_batch.cpp
+    data/test_data_repository.cpp
+    data/test_data_repository_manager.cpp
+    data/test_data_representation.cpp
+    data/test_disk_io_backend.cpp
+    data/test_io_worker.cpp
+    data/test_disk_host_converters.cpp
+    data/test_gpu_disk_converters.cpp
+    data/test_representation_converter.cpp
     # Main test runner
-    ${CMAKE_CURRENT_SOURCE_DIR}/unittest.cpp)
+    unittest.cpp)
+  set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
+                                                   CUDA_STANDARD_REQUIRED ON)
 
-# Create test executable
-add_executable(cucascade_tests ${TEST_SOURCES})
-set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
-                                                 CUDA_STANDARD_REQUIRED ON)
+  # Set include directories
+  target_include_directories(
+    cucascade_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${Catch2_SOURCE_DIR}/single_include)
+
+  # Link dependencies
+  target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
+                                                CUDA::cudart_static)
+
+  # Register tests with CTest
+  add_test(NAME cucascade_tests COMMAND cucascade_tests)
+endif()
+
+# Create topology discovery test executable
+add_executable(
+  cucascade_topology_discovery_tests memory/test_topology_discovery.cpp
+                                     unittest_topology_discovery.cpp)
+set_target_properties(cucascade_topology_discovery_tests
+                      PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
 # Set include directories
 target_include_directories(
-  cucascade_tests
+  cucascade_topology_discovery_tests
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
           ${Catch2_SOURCE_DIR}/single_include)
 
 # Link dependencies
-target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
-                                              CUDA::cudart)
+target_link_libraries(cucascade_topology_discovery_tests
+                      PRIVATE cucascade_topology_discovery Catch2::Catch2)
 
 # Register tests with CTest
-add_test(NAME cucascade_tests COMMAND cucascade_tests)
+add_test(NAME cucascade_topology_discovery_tests
+         COMMAND cucascade_topology_discovery_tests)

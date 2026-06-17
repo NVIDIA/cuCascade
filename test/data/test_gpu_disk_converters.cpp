@@ -73,7 +73,8 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
   register_builtin_converters(registry);
 
   // Create GPU representation from the original table
-  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(original_table), *gpu_space);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::move(original_table), *gpu_space, rmm::cuda_stream_view{});
 
   // GPU -> disk (direct via write/write_batch)
   auto disk_rep =
@@ -641,7 +642,8 @@ TEST_CASE("gpu disk round-trip with explicit pipeline backend",
 
   // Simple INT32 column, 100 rows
   auto table   = make_typed_table(cudf::type_id::INT32, 100);
-  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::move(table), *gpu_space, rmm::cuda_stream_view{});
 
   auto disk_rep =
     registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
@@ -664,7 +666,8 @@ TEST_CASE("gpu disk round-trip pipeline with multiple types",
   // Test with multiple numeric types
   auto type_id = GENERATE(cudf::type_id::INT32, cudf::type_id::INT64, cudf::type_id::FLOAT64);
   auto table   = make_typed_table(type_id, 1000);
-  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::move(table), *gpu_space, rmm::cuda_stream_view{});
 
   auto disk_rep =
     registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
@@ -688,7 +691,8 @@ TEST_CASE("disk_data_representation get_uncompressed_data_size_in_bytes", "[disk
   register_builtin_converters(registry);
 
   auto table   = make_typed_table(cudf::type_id::INT64, 1000);
-  auto gpu_rep = std::make_unique<gpu_table_representation>(std::move(table), *gpu_space);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::move(table), *gpu_space, rmm::cuda_stream_view{});
 
   auto disk_rep =
     registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());

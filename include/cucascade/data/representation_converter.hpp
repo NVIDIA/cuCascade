@@ -25,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <typeindex>
 #include <unordered_map>
@@ -240,7 +241,7 @@ class representation_converter_registry {
     rmm::cuda_stream_view stream) const;
   bool unregister_converter_impl(const converter_key& key);
 
-  mutable std::mutex _mutex;
+  mutable std::shared_mutex _mutex;
   std::unordered_map<converter_key, representation_converter_fn, converter_key_hash> _converters;
 };
 

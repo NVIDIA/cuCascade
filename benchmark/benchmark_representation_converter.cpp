@@ -188,15 +188,19 @@ void BM_ConvertGpuToHost(benchmark::State& state)
 
   for (uint64_t t = 0; t < thread_count; ++t) {
     auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-    thread_gpu_reprs.push_back(std::make_unique<gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space)));
+    thread_gpu_reprs.push_back(
+      std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                                 *const_cast<memory_space*>(gpu_space),
+                                                 rmm::cuda_stream_view{}));
   }
 
   // Warm-up
   rmm::cuda_stream warmup_stream;
   auto warmup_table = create_benchmark_table_from_bytes(1 * KiB, 2);
   auto warmup_repr  = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(warmup_table)), *const_cast<memory_space*>(gpu_space));
+    std::make_unique<cudf::table>(std::move(warmup_table)),
+    *const_cast<memory_space*>(gpu_space),
+    warmup_stream.view());
   auto warmup_result =
     registry->convert<host_data_packed_representation>(*warmup_repr, host_space, warmup_stream);
   warmup_stream.synchronize();
@@ -259,9 +263,11 @@ void BM_ConvertHostToGpu(benchmark::State& state)
 
   rmm::cuda_stream setup_stream;
   for (uint64_t t = 0; t < thread_count; ++t) {
-    auto table         = create_benchmark_table_from_bytes(total_bytes, num_columns);
-    auto gpu_repr_temp = std::make_unique<gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space));
+    auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
+    auto gpu_repr_temp =
+      std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                                 *const_cast<memory_space*>(gpu_space),
+                                                 setup_stream.view());
     auto host_repr =
       registry->convert<host_data_packed_representation>(*gpu_repr_temp, host_space, setup_stream);
     setup_stream.synchronize();
@@ -334,15 +340,19 @@ void BM_ConvertGpuToHostFast(benchmark::State& state)
 
   for (uint64_t t = 0; t < thread_count; ++t) {
     auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-    thread_gpu_reprs.push_back(std::make_unique<gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space)));
+    thread_gpu_reprs.push_back(
+      std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                                 *const_cast<memory_space*>(gpu_space),
+                                                 rmm::cuda_stream_view{}));
   }
 
   // Warm-up: small transfer to prime CUDA driver
   rmm::cuda_stream warmup_stream;
   auto warmup_table = create_benchmark_table_from_bytes(1 * KiB, 2);
   auto warmup_repr  = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(warmup_table)), *const_cast<memory_space*>(gpu_space));
+    std::make_unique<cudf::table>(std::move(warmup_table)),
+    *const_cast<memory_space*>(gpu_space),
+    warmup_stream.view());
   auto warmup_result =
     registry->convert<host_data_representation>(*warmup_repr, host_space, warmup_stream);
   warmup_stream.synchronize();
@@ -399,9 +409,11 @@ void BM_ConvertHostFastToGpu(benchmark::State& state)
 
   rmm::cuda_stream setup_stream;
   for (uint64_t t = 0; t < thread_count; ++t) {
-    auto table         = create_benchmark_table_from_bytes(total_bytes, num_columns);
-    auto gpu_repr_temp = std::make_unique<gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space));
+    auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
+    auto gpu_repr_temp =
+      std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                                 *const_cast<memory_space*>(gpu_space),
+                                                 setup_stream.view());
     auto host_repr =
       registry->convert<host_data_representation>(*gpu_repr_temp, host_space, setup_stream);
     setup_stream.synchronize();

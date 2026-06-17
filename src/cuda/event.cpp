@@ -16,7 +16,6 @@
  */
 
 #include <cucascade/cuda/event.hpp>
-
 #include <cucascade/error.hpp>
 
 #include <utility>
@@ -34,8 +33,7 @@ cuda_event::~cuda_event() noexcept
   if (event_ != nullptr) { CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(event_)); }
 }
 
-cuda_event::cuda_event(cuda_event&& other) noexcept
-  : event_(std::exchange(other.event_, nullptr))
+cuda_event::cuda_event(cuda_event&& other) noexcept : event_(std::exchange(other.event_, nullptr))
 {
 }
 
@@ -64,8 +62,7 @@ void cuda_event::wait(rmm::cuda_stream_view stream) const
 
 void cuda_event::synchronize() const { CUCASCADE_CUDA_TRY(::cudaEventSynchronize(event_)); }
 
-std::chrono::duration<float, std::milli> cuda_event::elapsed_time(
-  cuda_event const& start) const
+std::chrono::duration<float, std::milli> cuda_event::elapsed_time(cuda_event const& start) const
 {
   float ms{0.F};
   CUCASCADE_CUDA_TRY(::cudaEventElapsedTime(&ms, start.get(), event_));

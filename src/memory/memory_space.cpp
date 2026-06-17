@@ -40,7 +40,8 @@
 namespace cucascade {
 
 // Forward declaration — defined in src/data/pipeline_io_backend.cpp
-std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io = false);
+std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io    = false,
+                                                           int target_device = -1);
 
 namespace memory {
 namespace {
@@ -116,16 +117,9 @@ memory_space::memory_space(const gpu_memory_space_config& config)
     _allocator = config.mr_factory_fn(config.device_id, config.memory_capacity);
   } else {
     rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
-#if CUCASCADE_RMM_HAS_MOVABLE_ANY_RESOURCE
     rmm::mr::cuda_async_memory_resource concrete_mr(config.memory_capacity);
     pool_handle = concrete_mr.pool_handle();
     _allocator  = cuda::mr::any_resource<cuda::mr::device_accessible>(std::move(concrete_mr));
-#else
-    auto concrete_mr =
-      std::make_shared<rmm::mr::cuda_async_memory_resource>(config.memory_capacity);
-    pool_handle = concrete_mr->pool_handle();
-    _allocator  = wrap_legacy_rmm_resource(std::move(concrete_mr));
-#endif
   }
 
   _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
@@ -149,9 +143,8 @@ memory_space::memory_space(const host_memory_space_config& config)
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
     _allocator(config.mr_factory_fn
                  ? config.mr_factory_fn(config.numa_id, config.memory_capacity)
-                 : make_default_host_memory_resource(config.numa_id,
-                                                     config.memory_capacity,
-                                                     config.make_portable))
+                 : make_default_host_memory_resource(
+                     config.numa_id, config.memory_capacity, config.make_portable))
 {
   _reservation_allocator =
     std::make_unique<fixed_size_host_memory_resource>(_id.device_id,
@@ -164,6 +157,10 @@ memory_space::memory_space(const host_memory_space_config& config)
   auto& host_allocator =
     std::get<std::unique_ptr<fixed_size_host_memory_resource>>(_reservation_allocator);
   _reservation_allocator_resource.emplace(fixed_size_host_resource_ref{*host_allocator});
+  // Register so cross-tier code paths (e.g. representation_converter's
+  // peer-DMA-broken host-staging branch) can borrow blocks from this pool
+  // instead of calling cudaHostAlloc per transfer.
+  register_host_pool(config.numa_id, host_allocator.get());
 }
 
 memory_space::memory_space(const disk_memory_space_config& config)
@@ -202,7 +199,18 @@ memory_space::memory_space(const disk_memory_space_config& config,
     std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
 }
 
-memory_space::~memory_space() = default;
+memory_space::~memory_space()
+{
+  // Unregister this memory_space's HOST pool from the cross-tier registry.
+  // No-op for non-HOST tiers and for any partially-constructed instance whose
+  // _reservation_allocator never received a fixed_size_host_memory_resource.
+  if (_id.tier == Tier::HOST) {
+    if (auto* host_alloc =
+          std::get_if<std::unique_ptr<fixed_size_host_memory_resource>>(&_reservation_allocator)) {
+      unregister_host_pool(_id.device_id, host_alloc->get());
+    }
+  }
+}
 
 bool memory_space::operator==(const memory_space& other) const { return _id == other.get_id(); }
 
