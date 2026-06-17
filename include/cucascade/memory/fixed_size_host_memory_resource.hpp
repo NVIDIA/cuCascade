@@ -139,6 +139,8 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
 
     std::size_t size() const noexcept { return _blocks.size(); }
 
+    [[nodiscard]] std::vector<std::byte*> release_blocks() noexcept { return std::move(_blocks); }
+
     std::span<std::byte*> get_blocks() noexcept { return _blocks; }
 
     std::span<std::byte> operator[](std::size_t i) const
