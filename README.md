@@ -46,7 +46,23 @@ pixi run benchmarks
 - **Compiler**: C++20 compatible compiler
 - **Build Tools**: CMake 4.1+, Ninja
 - **GPU/Drivers**: CUDA 13+, compatible NVIDIA driver
-- **Dependencies**: libcudf 25.10+
+- **Dependencies**: RMM (core); libcudf 25.10+ (only for the optional `cucascade-cudf` library)
+
+> **Library layout:** the core `cuCascade::cucascade` target is cudf-free and depends only on
+> RMM + CUDA (plus libnuma and kvikIO/cuFile for the disk tier). The cudf-backed representations,
+> converters, and bandwidth profiler live in a separate `cuCascade::cucascade_cudf` target (headers
+> under `include/cucascade/cudf/`). The cudf library can be turned off at configure time with
+> `-DCUCASCADE_BUILD_CUDF=OFF`.
+>
+> cudf is exposed as a package *component*, so core consumers never need cudf installed:
+>
+> ```cmake
+> find_package(cuCascade REQUIRED)                  # cudf-free core
+> target_link_libraries(my_app PRIVATE cuCascade::cucascade)
+>
+> find_package(cuCascade REQUIRED COMPONENTS cudf)  # also resolves cudf
+> target_link_libraries(my_app PRIVATE cuCascade::cucascade_cudf)
+> ```
 
 # Usage
 

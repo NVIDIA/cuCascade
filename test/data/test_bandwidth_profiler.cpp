@@ -17,7 +17,8 @@
 
 #include "utils/mock_test_utils.hpp"
 
-#include <cucascade/data/bandwidth_profiler.hpp>
+#include <cucascade/cudf/bandwidth_profiler.hpp>
+#include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/chunked_resource_info.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>

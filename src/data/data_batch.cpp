@@ -16,7 +16,6 @@
  */
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 
 namespace cucascade {
 
@@ -265,9 +264,7 @@ mutable_data_batch::~mutable_data_batch()
 
 void mutable_data_batch::rebind_stream(rmm::cuda_stream_view stream)
 {
-  if (auto* gpu = dynamic_cast<gpu_table_representation*>(_batch->get_data())) {
-    gpu->rebind_stream(stream);
-  }
+  if (auto* repr = _batch->get_data()) { repr->rebind_stream(stream); }
 }
 
 std::shared_ptr<data_batch> mutable_data_batch::clone(uint64_t new_batch_id,

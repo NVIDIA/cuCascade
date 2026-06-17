@@ -163,7 +163,7 @@ class gpu_table_representation : public idata_representation {
    *
    * @param stream Stream used for future asynchronous deallocation of the table's buffers.
    */
-  void rebind_stream(rmm::cuda_stream_view stream);
+  void rebind_stream(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Record a CUDA event on @p writer_stream and store it as the writer event.
@@ -181,7 +181,7 @@ class gpu_table_representation : public idata_representation {
    * @param writer_stream The stream on which the most recent writes to this
    *                      representation's memory were enqueued.
    */
-  void record_writer_event(rmm::cuda_stream_view writer_stream);
+  void record_writer_event(rmm::cuda_stream_view writer_stream) override;
 
   /**
    * @brief Get the writer event recorded by record_writer_event(), or nullptr if none.
@@ -195,7 +195,7 @@ class gpu_table_representation : public idata_representation {
    *
    * @return cudaEvent_t The writer event, or nullptr if none has been recorded.
    */
-  [[nodiscard]] cudaEvent_t get_writer_event() const;
+  [[nodiscard]] cudaEvent_t get_writer_event() const override;
 
  private:
   struct owning_table_view {

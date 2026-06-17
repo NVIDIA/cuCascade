@@ -17,12 +17,10 @@
 
 #pragma once
 
+#include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
-#include <cudf/types.hpp>
-
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <span>
 #include <vector>
@@ -31,30 +29,6 @@ namespace cucascade {
 namespace memory {
 
 class memory_space;
-
-/**
- * @brief Metadata describing a single column's buffer layout within a host_table_allocation.
- *
- * Captures everything needed to reconstruct a cudf column from raw host memory bytes, without
- * relying on the cudf::pack serialization format. Children are stored recursively for nested types
- * (LIST, STRUCT, STRING, DICTIONARY32).
- */
-struct column_metadata {
-  cudf::type_id type_id;       ///< Column data type identifier
-  cudf::size_type num_rows;    ///< Number of logical rows (elements) in this column
-  cudf::size_type null_count;  ///< Number of null elements (may be UNKNOWN_NULL_COUNT)
-  int32_t scale;               ///< Scale factor for DECIMAL32/64/128 types; 0 for all others
-
-  bool has_null_mask;            ///< Whether a null mask buffer was copied
-  std::size_t null_mask_offset;  ///< Byte offset of the null mask within the allocation
-  std::size_t null_mask_size;    ///< Size of the null mask buffer in bytes
-
-  bool has_data;            ///< Whether a flat data buffer was copied (false for nested types)
-  std::size_t data_offset;  ///< Byte offset of the data buffer within the allocation
-  std::size_t data_size;    ///< Size of the data buffer in bytes
-
-  std::vector<column_metadata> children;  ///< Metadata for child columns (nested types)
-};
 
 /**
  * @brief Host memory allocation containing directly-copied column buffers and custom metadata.
