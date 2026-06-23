@@ -21,6 +21,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda_runtime.h>
+
 #include <concepts>
 #include <cstddef>
 #include <memory>
@@ -109,6 +111,42 @@ class idata_representation {
    * @return std::unique_ptr<idata_representation> A new data representation with copied data
    */
   virtual std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) = 0;
+
+  /**
+   * @brief Record a CUDA event marking completion of the most recent writes to this
+   *        representation's memory, for cross-stream / cross-device synchronization.
+   *
+   * The default implementation is a no-op. Tier-specific representations whose memory is
+   * produced asynchronously on a CUDA stream (e.g. GPU representations) override this to
+   * record an event on @p writer_stream.
+   *
+   * @param writer_stream The stream on which the most recent writes were enqueued.
+   */
+  virtual void record_writer_event([[maybe_unused]] rmm::cuda_stream_view writer_stream) {}
+
+  /**
+   * @brief Get the writer event recorded by record_writer_event(), or nullptr if none.
+   *
+   * Readers that cross stream / device boundaries should call cudaStreamWaitEvent on the
+   * returned event (when non-null) before reading this representation's memory. The default
+   * implementation returns nullptr; representations that record writer events override this.
+   *
+   * @return cudaEvent_t The writer event, or nullptr if none has been recorded.
+   */
+  [[nodiscard]] virtual cudaEvent_t get_writer_event() const { return nullptr; }
+
+  /**
+   * @brief Rebind the representation's device buffers to use @p stream for future deallocation.
+   *
+   * The default implementation is a no-op. Representations that own stream-ordered device memory
+   * (e.g. GPU representations) override this so their buffers free on the active stream rather
+   * than the stream they were produced on, keeping RMM's per-stream free lists correct.
+   *
+   * @note Does NOT insert cross-stream ordering -- callers must enforce ordering separately.
+   *
+   * @param stream Stream used for future asynchronous deallocation of the data's buffers.
+   */
+  virtual void rebind_stream([[maybe_unused]] rmm::cuda_stream_view stream) {}
 
   /**
    * @brief Casts this interface to a specific derived type.

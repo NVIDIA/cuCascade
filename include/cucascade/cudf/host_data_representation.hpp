@@ -17,10 +17,10 @@
 
 #pragma once
 
+#include <cucascade/cudf/host_table.hpp>
+#include <cucascade/cudf/host_table_packed.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/host_table.hpp>
-#include <cucascade/memory/host_table_packed.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <memory>

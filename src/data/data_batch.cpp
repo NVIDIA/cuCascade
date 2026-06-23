@@ -262,6 +262,11 @@ mutable_data_batch::~mutable_data_batch()
   }
 }
 
+void mutable_data_batch::rebind_stream(rmm::cuda_stream_view stream)
+{
+  if (auto* repr = _batch->get_data()) { repr->rebind_stream(stream); }
+}
+
 std::shared_ptr<data_batch> mutable_data_batch::clone(uint64_t new_batch_id,
                                                       rmm::cuda_stream_view stream) const
 {

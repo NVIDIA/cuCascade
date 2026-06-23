@@ -32,6 +32,10 @@ option(CUCASCADE_BUILD_STATIC_LIBS "Build static library" ON)
 option(CUCASCADE_NVTX "Enable NVTX range annotations" OFF)
 option(CUCASCADE_TOPOLOGY_ONLY
        "Build only the topology discovery library (no cudf/rmm dependency)" OFF)
+option(
+  CUCASCADE_BUILD_CUDF
+  "Build the cudf-coupled cucascade-cudf library (representations, converters, profiler)"
+  ON)
 
 # At least one library type must be built
 if(NOT CUCASCADE_BUILD_SHARED_LIBS AND NOT CUCASCADE_BUILD_STATIC_LIBS)
@@ -57,15 +61,19 @@ find_package(CUDAToolkit REQUIRED)
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   find_package(Threads REQUIRED)
 
-  # Find RMM from libcudf installation
+  # Find RMM (the cudf-free core depends only on RMM, not cudf)
   find_package(rmm REQUIRED CONFIG)
 
-  # Find cudf for data representation support
-  find_package(cudf REQUIRED CONFIG)
+  # Find cudf only when building the cudf-coupled cucascade-cudf library
+  if(CUCASCADE_BUILD_CUDF)
+    find_package(cudf REQUIRED CONFIG)
+  endif()
 
   # Find numa (provided by numactl-devel or libnuma-dev depending on the package
-  # manager)
-  find_library(NUMA_LIB numa REQUIRED)
+  # manager). Uses the bundled FindNuma module, which produces the Numa::Numa
+  # imported target. The same module is installed with the package so consumers
+  # resolve libnuma on their own system rather than inheriting a hardcoded path.
+  find_package(Numa REQUIRED)
 endif()
 
 # Set CUDA architectures
@@ -124,6 +132,16 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
             ${CUCASCADE_CUDA_WARNING_FLAGS})
 endif()
 
+if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
+  add_library(cucascade_cudf_objects OBJECT)
+
+  # Apply warning flags to the cudf object library
+  target_compile_options(
+    cucascade_cudf_objects
+    PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
+            ${CUCASCADE_CUDA_WARNING_FLAGS})
+endif()
+
 target_compile_options(
   cucascade_topology_discovery_objects
   PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
@@ -143,6 +161,9 @@ add_subdirectory(src/memory)
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_subdirectory(src/data)
 endif()
+if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
+  add_subdirectory(src/cudf)
+endif()
 
 # Common usage requirements shared by the object library and installable targets
 set(CUCASCADE_PUBLIC_INCLUDE_DIRS
@@ -150,8 +171,8 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<INSTALL_INTERFACE:include>)
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
-  set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm cudf::cudf CUDA::cudart_static
-                                 Threads::Threads ${NUMA_LIB})
+  set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static Threads::Threads
+                                 Numa::Numa)
 
   # Set include directories for the object library
   target_include_directories(cucascade_objects
@@ -169,6 +190,22 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   set_target_properties(
     cucascade_objects PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
                                                     ON)
+endif()
+
+if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
+  # The cudf object library inherits the core usage requirements (include dirs,
+  # rmm/cuda/numa, C++20, NVTX) by linking the core object library, and adds
+  # cudf.
+  target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_objects
+                                                      cudf::cudf)
+  target_include_directories(cucascade_cudf_objects
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_features(cucascade_cudf_objects PUBLIC cxx_std_20)
+  target_compile_features(cucascade_cudf_objects PRIVATE cuda_std_20)
+
+  set_target_properties(
+    cucascade_cudf_objects PROPERTIES CXX_EXTENSIONS OFF
+                                      POSITION_INDEPENDENT_CODE ON)
 endif()
 
 target_include_directories(cucascade_topology_discovery_objects
@@ -220,6 +257,22 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
     set_target_properties(
       cucascade_static PROPERTIES OUTPUT_NAME cucascade EXPORT_NAME
                                                         cucascade_static)
+
+    if(CUCASCADE_BUILD_CUDF)
+      add_library(cucascade_cudf_static STATIC
+                  $<TARGET_OBJECTS:cucascade_cudf_objects>)
+      add_library(cuCascade::cucascade_cudf_static ALIAS cucascade_cudf_static)
+
+      target_include_directories(cucascade_cudf_static
+                                 PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_link_libraries(cucascade_cudf_static PUBLIC cudf::cudf
+                                                         cucascade_static)
+      target_compile_features(cucascade_cudf_static PUBLIC cxx_std_20)
+
+      set_target_properties(
+        cucascade_cudf_static PROPERTIES OUTPUT_NAME cucascade_cudf
+                                         EXPORT_NAME cucascade_cudf_static)
+    endif()
   endif()
 endif()
 
@@ -257,6 +310,21 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
     target_compile_features(cucascade_shared PUBLIC cxx_std_20)
 
     set_target_properties(cucascade_shared PROPERTIES OUTPUT_NAME cucascade)
+
+    if(CUCASCADE_BUILD_CUDF)
+      add_library(cucascade_cudf_shared SHARED
+                  $<TARGET_OBJECTS:cucascade_cudf_objects>)
+      add_library(cuCascade::cucascade_cudf_shared ALIAS cucascade_cudf_shared)
+
+      target_include_directories(cucascade_cudf_shared
+                                 PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_link_libraries(cucascade_cudf_shared PUBLIC cudf::cudf
+                                                         cucascade_shared)
+      target_compile_features(cucascade_cudf_shared PUBLIC cxx_std_20)
+
+      set_target_properties(cucascade_cudf_shared PROPERTIES OUTPUT_NAME
+                                                             cucascade_cudf)
+    endif()
   endif()
 endif()
 
@@ -268,6 +336,10 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
     add_library(cuCascade::cucascade ALIAS cucascade_shared)
     # For backwards compatibility, also create 'cucascade' as an alias
     add_library(cucascade ALIAS cucascade_shared)
+    if(CUCASCADE_BUILD_CUDF)
+      add_library(cuCascade::cucascade_cudf ALIAS cucascade_cudf_shared)
+      add_library(cucascade_cudf ALIAS cucascade_cudf_shared)
+    endif()
   endif()
   add_library(cuCascade::cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_shared)
@@ -277,6 +349,10 @@ elseif(CUCASCADE_BUILD_STATIC_LIBS)
   if(NOT CUCASCADE_TOPOLOGY_ONLY)
     add_library(cuCascade::cucascade ALIAS cucascade_static)
     add_library(cucascade ALIAS cucascade_static)
+    if(CUCASCADE_BUILD_CUDF)
+      add_library(cuCascade::cucascade_cudf ALIAS cucascade_cudf_static)
+      add_library(cucascade_cudf ALIAS cucascade_cudf_static)
+    endif()
   endif()
   add_library(cuCascade::cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_static)
@@ -294,13 +370,23 @@ include(CMakePackageConfigHelpers)
 if(CUCASCADE_TOPOLOGY_ONLY)
   install(FILES include/cucascade/memory/topology_discovery.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
-else()
+elseif(CUCASCADE_BUILD_CUDF)
   install(
     DIRECTORY include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING
     PATTERN "*.hpp"
     PATTERN "*.h")
+else()
+  # cudf disabled: install all headers except the cudf-coupled subtree, which is
+  # unusable without the cucascade-cudf library and its libcudf dependency.
+  install(
+    DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING
+    PATTERN "*.hpp"
+    PATTERN "*.h"
+    PATTERN "cucascade/cudf" EXCLUDE)
 endif()
 
 # Collect targets to install
@@ -309,12 +395,18 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
   list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_topology_discovery_static)
   if(NOT CUCASCADE_TOPOLOGY_ONLY)
     list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_static)
+    if(CUCASCADE_BUILD_CUDF)
+      list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_cudf_static)
+    endif()
   endif()
 endif()
 if(CUCASCADE_BUILD_SHARED_LIBS)
   list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_topology_discovery_shared)
   if(NOT CUCASCADE_TOPOLOGY_ONLY)
     list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared)
+    if(CUCASCADE_BUILD_CUDF)
+      list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_cudf_shared)
+    endif()
   endif()
 endif()
 
@@ -358,6 +450,14 @@ write_basic_package_version_file(
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfig.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfigVersion.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade)
+
+# Bundle the FindNuma module so consumers can rerun the same find logic (the
+# full library links the Numa::Numa target it produces). Not needed for
+# topology-only builds, which do not depend on libnuma.
+if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules/FindNuma.cmake
+          DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade/Modules)
+endif()
 
 # =============================================================================
 # Tests

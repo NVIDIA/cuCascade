@@ -146,6 +146,26 @@ class gpu_table_representation : public idata_representation {
   std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);
 
   /**
+   * @brief Rebind the owned table's device buffers to use @p stream for future deallocation.
+   *
+   * Applies cudf::rebind_stream to every column (recursively rebinding data buffers, null
+   * masks, and nested children) so that the buffers are freed on @p stream rather than on the
+   * stream they were originally allocated on. No device memory is copied and no kernels are
+   * launched.
+   *
+   * No-op when this representation holds an owning_table_view: that alternative references
+   * memory owned by an external (type-erased) owner, which is responsible for its own
+   * deallocation stream.
+   *
+   * @note This does NOT insert cross-stream ordering. The caller must ensure a happens-before
+   * relationship from any stream with in-flight work touching this table's memory to @p stream
+   * before the rebound memory is reused or freed. See cudf::rebind_stream.
+   *
+   * @param stream Stream used for future asynchronous deallocation of the table's buffers.
+   */
+  void rebind_stream(rmm::cuda_stream_view stream) override;
+
+  /**
    * @brief Record a CUDA event on @p writer_stream and store it as the writer event.
    *
    * STREAM-LINEAGE: any cross-stream / cross-device reader of this representation's
@@ -161,7 +181,7 @@ class gpu_table_representation : public idata_representation {
    * @param writer_stream The stream on which the most recent writes to this
    *                      representation's memory were enqueued.
    */
-  void record_writer_event(rmm::cuda_stream_view writer_stream);
+  void record_writer_event(rmm::cuda_stream_view writer_stream) override;
 
   /**
    * @brief Get the writer event recorded by record_writer_event(), or nullptr if none.
@@ -175,7 +195,7 @@ class gpu_table_representation : public idata_representation {
    *
    * @return cudaEvent_t The writer event, or nullptr if none has been recorded.
    */
-  [[nodiscard]] cudaEvent_t get_writer_event() const;
+  [[nodiscard]] cudaEvent_t get_writer_event() const override;
 
  private:
   struct owning_table_view {

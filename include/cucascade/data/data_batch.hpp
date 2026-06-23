@@ -18,9 +18,10 @@
 #pragma once
 
 #include <cucascade/data/common.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
+
+#include <cuda_runtime.h>
 
 #include <atomic>
 #include <cstddef>
@@ -295,27 +296,23 @@ class read_only_data_batch {
   memory::memory_space* get_memory_space() const { return _batch->get_memory_space(); }
 
   /**
-   * @brief Get the writer event from the underlying GPU representation, or nullptr.
+   * @brief Get the writer event from the underlying representation, or nullptr.
    *
-   * D-B3 proxy: delegates to gpu_table_representation::get_writer_event() via
-   * dynamic_cast. Returns nullptr when the underlying representation is not a
-   * gpu_table_representation (e.g., host or disk tier) or when no writer event has
-   * been recorded yet.
+   * D-B3 proxy: delegates polymorphically to idata_representation::get_writer_event().
+   * Returns nullptr when there is no underlying representation, when the representation's
+   * tier records no writer event (the base-class default, e.g. host or disk tier), or when
+   * no writer event has been recorded yet.
    *
    * STREAM-LINEAGE: callers that cross stream / device boundaries should call
    * cudaStreamWaitEvent on the returned event (when non-null) before reading the
    * underlying memory of this batch.
    *
-   * @return cudaEvent_t The writer event, or nullptr if not a GPU representation or
-   *         no event recorded.
+   * @return cudaEvent_t The writer event, or nullptr if none is available.
    */
   [[nodiscard]] cudaEvent_t get_writer_event() const
   {
     auto* repr = get_data();
-    if (!repr) { return nullptr; }
-    auto* gpu_repr = dynamic_cast<gpu_table_representation*>(repr);
-    if (!gpu_repr) { return nullptr; }
-    return gpu_repr->get_writer_event();
+    return repr ? repr->get_writer_event() : nullptr;
   }
 
   // -- Clone operations (D-18/D-19/D-20/CLONE-01/CLONE-02) --
@@ -431,6 +428,26 @@ class mutable_data_batch {
   void convert_to(representation_converter_registry& registry,
                   const memory::memory_space* target_memory_space,
                   rmm::cuda_stream_view stream);
+
+  /**
+   * @brief Rebind the held data's device buffers to use @p stream for future deallocation.
+   *
+   * Delegates polymorphically to idata_representation::rebind_stream. Representations that own
+   * stream-ordered device memory (e.g. a GPU table that owns its data) rebind their buffers; it
+   * is a no-op for every other representation (host, disk, or a GPU representation backed by an
+   * externally-owned table_view).
+   *
+   * Rebinding before an operation that may free the data (a GPU->host downgrade, or a pipeline
+   * task that consumes it) makes the buffers free on the active stream rather than the stream
+   * they were produced on, keeping RMM's per-stream free lists correct and avoiding the
+   * cross-stream premature-reuse hazard. Requires the exclusive (mutable) lock held by this
+   * accessor.
+   *
+   * @note Does NOT insert cross-stream ordering -- see idata_representation::rebind_stream.
+   *
+   * @param stream Stream used for future asynchronous deallocation of the data's buffers.
+   */
+  void rebind_stream(rmm::cuda_stream_view stream);
 
   // -- Clone operations (CLONE-01/CLONE-02) --
 

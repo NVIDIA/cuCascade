@@ -15,9 +15,10 @@
  * limitations under the License.
  */
 
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/error.hpp>
 
+#include <cudf/column/column_stream.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -81,6 +82,24 @@ std::unique_ptr<cudf::table> gpu_table_representation::release_table(
     _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
   }
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
+}
+
+void gpu_table_representation::rebind_stream(rmm::cuda_stream_view stream)
+{
+  // Only the owned-table alternative can be rebound: the owning_table_view alternative
+  // references memory owned by an external (type-erased) owner, which manages its own
+  // deallocation stream.
+  if (!std::holds_alternative<std::unique_ptr<cudf::table>>(_table)) { return; }
+  auto& table = std::get<std::unique_ptr<cudf::table>>(_table);
+  if (!table || table->num_columns() == 0) { return; }
+
+  // cudf::table move-assignment is deleted, so release the columns, rebind each, and rebuild
+  // the table in place. No device memory is copied and no kernels are launched.
+  auto columns = table->release();
+  for (auto& col : columns) {
+    col = cudf::rebind_stream(std::move(*col), stream);
+  }
+  table = std::make_unique<cudf::table>(std::move(columns));
 }
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)

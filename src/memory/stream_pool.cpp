@@ -68,7 +68,6 @@ exclusive_stream_pool::exclusive_stream_pool(rmm::cuda_device_id device_id,
   rmm::cuda_set_device_raii set_device{_device_id};
   if (pool_size == 0) { throw std::logic_error("Stream pool size must be greater than zero"); }
 
-  _streams.reserve(pool_size);
   for (std::size_t i = 0; i < pool_size; ++i) {
     _streams.emplace_back(rmm::cuda_stream(_flags));
   }
@@ -86,8 +85,11 @@ borrowed_stream exclusive_stream_pool::acquire_stream(stream_acquire_policy poli
       _cv.wait(lock, [this]() { return !_streams.empty(); });
     }
   }
-  auto stream = std::move(_streams.back());
-  _streams.pop_back();
+  // Acquire from the front; release_stream() returns to the back. This cycles through all
+  // streams round-robin so every stream's prior async work has maximal time to drain before
+  // it is handed out again, instead of hammering the most-recently-returned stream.
+  auto stream = std::move(_streams.front());
+  _streams.pop_front();
   return borrowed_stream(std::move(stream),
                          std::bind_front(&exclusive_stream_pool::release_stream, this));
 }

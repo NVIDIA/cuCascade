@@ -22,6 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 
 namespace cucascade {
@@ -99,7 +100,9 @@ class exclusive_stream_pool {
   std::condition_variable _cv;
   rmm::cuda_device_id _device_id;
   rmm::cuda_stream::flags _flags;
-  std::vector<rmm::cuda_stream> _streams;
+  // Streams are acquired from the front and returned to the back so the pool cycles through
+  // all streams round-robin, rather than repeatedly reusing the most-recently-returned one.
+  std::deque<rmm::cuda_stream> _streams;
 };
 
 }  // namespace memory

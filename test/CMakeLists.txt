@@ -24,26 +24,18 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
-  # Create test executable
+  # Core (cudf-free) test executable - links only the cudf-free cucascade core.
   add_executable(
     cucascade_tests
-    # Utils
-    utils/cudf_test_utils.cpp
     # Memory tests
     memory/test_memory_reservation_manager.cpp
     memory/test_small_pinned_host_memory_resource.cpp
     memory/test_gpu_kernels.cu
     # Data tests
-    data/test_bandwidth_profiler.cpp
-    data/test_data_batch.cpp
     data/test_data_repository.cpp
     data/test_data_repository_manager.cpp
-    data/test_data_representation.cpp
     data/test_disk_io_backend.cpp
     data/test_io_worker.cpp
-    data/test_disk_host_converters.cpp
-    data/test_gpu_disk_converters.cpp
-    data/test_representation_converter.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
@@ -61,6 +53,39 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   # Register tests with CTest
   add_test(NAME cucascade_tests COMMAND cucascade_tests)
+endif()
+
+if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
+  # cudf-coupled test executable - links the cucascade-cudf library.
+  add_executable(
+    cucascade_cudf_tests
+    # Utils
+    utils/cudf_test_utils.cpp
+    # Data tests (cudf-backed representations / converters / profiler)
+    data/test_bandwidth_profiler.cpp
+    data/test_data_batch.cpp
+    data/test_data_representation.cpp
+    data/test_disk_host_converters.cpp
+    data/test_gpu_disk_converters.cpp
+    data/test_representation_converter.cpp
+    # Main test runner
+    unittest.cpp)
+  set_target_properties(cucascade_cudf_tests
+                        PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+
+  # Set include directories
+  target_include_directories(
+    cucascade_cudf_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${Catch2_SOURCE_DIR}/single_include)
+
+  # Link dependencies
+  target_link_libraries(
+    cucascade_cudf_tests PRIVATE cucascade_cudf Catch2::Catch2
+                                 CUDA::cudart_static)
+
+  # Register tests with CTest
+  add_test(NAME cucascade_cudf_tests COMMAND cucascade_cudf_tests)
 endif()
 
 # Create topology discovery test executable

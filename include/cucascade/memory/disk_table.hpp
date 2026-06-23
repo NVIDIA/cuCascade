@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <cucascade/memory/host_table.hpp>
+#include <cucascade/memory/column_metadata.hpp>
 
 #include <cstddef>
 #include <string>
@@ -30,10 +30,10 @@ namespace memory {
 /**
  * @brief Disk-resident allocation containing per-column metadata and a file path.
  *
- * Mirrors the role of host_table_allocation for the disk tier. Instead of pinned
- * host memory blocks, data is stored in a single file on disk identified by
- * file_path. The column_metadata descriptors are identical to those used by
- * host_table_allocation, enabling straightforward conversion between tiers.
+ * Describes a table serialized to a single file on disk: the file path, the per-column
+ * buffer-layout metadata, and the total data size. The column_metadata descriptors are the
+ * same generic layout descriptors used for in-memory column buffers, enabling straightforward
+ * conversion between tiers.
  */
 struct disk_table_allocation {
   std::string file_path;                 ///< Absolute path to the batch file on disk
