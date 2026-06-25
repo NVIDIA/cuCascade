@@ -37,6 +37,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -412,6 +413,78 @@ TEST_CASE("gpu->host_fast->gpu roundtrip preserves contents (table_view+shared_p
   REQUIRE(back->get_table_view().num_rows() == N);
   cucascade::test::expect_cudf_tables_equal_on_stream(
     repr.get_table_view(), back->get_table_view(), stream.view());
+}
+
+TEST_CASE("HOST converter draws from caller reservation (no double-count)",
+          "[cpu_data_representation][gpu_data_representation][reservation]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  auto* host_mr = host_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
+  REQUIRE(host_mr != nullptr);
+
+  // Build a GPU table large enough that a double-count would be unmistakable.
+  rmm::cuda_stream stream;
+  constexpr cudf::size_type num_rows = 1 << 20;  // ~4 MiB of INT32 payload
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       num_rows,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream.view(),
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xAB, num_rows * sizeof(int32_t), stream.value()));
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto shared_table = std::make_shared<cudf::table>(std::move(cols));
+  auto view         = shared_table->view();
+  auto alloc_size   = shared_table->alloc_size();
+  gpu_table_representation repr(view,
+                                std::move(shared_table),
+                                alloc_size,
+                                *const_cast<memory::memory_space*>(gpu_space),
+                                rmm::cuda_stream_view{});
+  stream.synchronize();
+
+  // The converter rounds the host allocation up to the block size, so reserve that
+  // much plus one block of headroom to guarantee the conversion fits entirely inside
+  // the reservation (the upstream_tracked_bytes == 0 branch) even if its planned
+  // layout size differs from cudf's alloc_size by alignment padding.
+  const std::size_t block_size    = host_mr->get_block_size();
+  const std::size_t reserve_bytes = rmm::align_up(alloc_size, block_size) + block_size;
+
+  const std::size_t committed_before = host_mr->get_total_allocated_bytes();
+
+  // Reserve N up front -- this commits ~N against the pool capacity counter.
+  std::unique_ptr<memory::reservation> res =
+    const_cast<memory::memory_space*>(host_space)->make_reservation_or_null(reserve_bytes);
+  REQUIRE(res != nullptr);
+
+  const std::size_t committed_after_reserve = host_mr->get_total_allocated_bytes();
+  REQUIRE(committed_after_reserve - committed_before >= alloc_size);
+
+  // Convert GPU -> HOST, threading the caller's reservation through the converter
+  // API. This must NOT throw rmm::out_of_memory and must NOT commit a second N.
+  std::unique_ptr<host_data_representation> host_rep;
+  REQUIRE_NOTHROW(host_rep = registry.convert<host_data_representation>(
+                    repr, host_space, stream.view(), res.get()));
+  stream.synchronize();
+  REQUIRE(host_rep != nullptr);
+
+  // Total committed bytes after the conversion must stay ~= the reservation (N),
+  // NOT ~2N. Allow only block-size rounding slack on top of the reservation.
+  const std::size_t committed_after_convert = host_mr->get_total_allocated_bytes();
+  const std::size_t reservation_commit      = committed_after_reserve - committed_before;
+  const std::size_t conversion_extra        = committed_after_convert - committed_after_reserve;
+
+  // The conversion fits inside the reservation, so it must add (essentially) nothing.
+  CHECK(conversion_extra <= block_size);
+  // Guard against the double-count: total committed must be far below 2N.
+  CHECK(committed_after_convert < committed_before + 2 * reservation_commit);
 }
 
 // =============================================================================

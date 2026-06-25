@@ -347,6 +347,9 @@ class read_only_data_batch {
    * @param new_batch_id       Batch ID for the cloned batch.
    * @param target_memory_space Target memory space for the converted data.
    * @param stream              CUDA stream for memory operations.
+   * @param reservation         Optional caller-owned reservation on the target space; threaded into
+   *                            the converter so the target allocation draws from it.
+   * @param probe               Optional probe for the cloned batch.
    * @return A new data_batch wrapped in shared_ptr.
    */
   template <typename TargetRepresentation>
@@ -355,6 +358,7 @@ class read_only_data_batch {
     uint64_t new_batch_id,
     const memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream,
+    memory::reservation* reservation         = nullptr,
     std::unique_ptr<idata_batch_probe> probe = std::make_unique<idata_batch_probe>()) const;
 
   // -- Move support --
@@ -429,11 +433,15 @@ class mutable_data_batch {
    * @param registry           Converter registry for type-keyed dispatch.
    * @param target_memory_space Target memory space for the new representation.
    * @param stream              CUDA stream for memory operations.
+   * @param reservation         Optional caller-owned reservation on the target space; threaded into
+   *                            the converter so the target allocation draws from it instead of
+   *                            committing fresh capacity (avoids double-counting on the HOST tier).
    */
   template <typename TargetRepresentation>
   void convert_to(representation_converter_registry& registry,
                   const memory::memory_space* target_memory_space,
-                  rmm::cuda_stream_view stream);
+                  rmm::cuda_stream_view stream,
+                  memory::reservation* reservation = nullptr);
 
   /**
    * @brief Rebind the held data's device buffers to use @p stream for future deallocation.
@@ -482,6 +490,9 @@ class mutable_data_batch {
    * @param new_batch_id       Batch ID for the cloned batch.
    * @param target_memory_space Target memory space for the converted data.
    * @param stream              CUDA stream for memory operations.
+   * @param reservation         Optional caller-owned reservation on the target space; threaded into
+   *                            the converter so the target allocation draws from it.
+   * @param probe               Optional probe for the cloned batch.
    * @return A new data_batch wrapped in shared_ptr.
    */
   template <typename TargetRepresentation>
@@ -490,6 +501,7 @@ class mutable_data_batch {
     uint64_t new_batch_id,
     const memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream,
+    memory::reservation* reservation         = nullptr,
     std::unique_ptr<idata_batch_probe> probe = std::make_unique<idata_batch_probe>()) const;
 
   // -- Move-only --
@@ -561,10 +573,11 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
   uint64_t new_batch_id,
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream,
+  memory::reservation* reservation,
   std::unique_ptr<idata_batch_probe> probe) const
 {
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+  auto new_representation = registry.convert<TargetRepresentation>(
+    *_batch->_data, target_memory_space, stream, reservation);
   return data_batch::make(new_batch_id, std::move(new_representation), std::move(probe));
 }
 
@@ -573,7 +586,8 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
 template <typename TargetRepresentation>
 void mutable_data_batch::convert_to(representation_converter_registry& registry,
                                     const memory::memory_space* target_memory_space,
-                                    rmm::cuda_stream_view stream)
+                                    rmm::cuda_stream_view stream,
+                                    memory::reservation* reservation)
 {
   _batch->_probe->conversion_started(*(_batch->_data), target_memory_space);
   bool conversion_succeeded = false;
@@ -592,8 +606,8 @@ void mutable_data_batch::convert_to(representation_converter_registry& registry,
     .success = conversion_succeeded,
   };
 
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+  auto new_representation = registry.convert<TargetRepresentation>(
+    *_batch->_data, target_memory_space, stream, reservation);
   auto old_representation = std::move(_batch->_data);
   _batch->_data           = std::move(new_representation);
 
@@ -617,10 +631,11 @@ std::shared_ptr<data_batch> mutable_data_batch::clone_to(
   uint64_t new_batch_id,
   const memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream,
+  memory::reservation* reservation,
   std::unique_ptr<idata_batch_probe> probe) const
 {
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+  auto new_representation = registry.convert<TargetRepresentation>(
+    *_batch->_data, target_memory_space, stream, reservation);
   return data_batch::make(new_batch_id, std::move(new_representation), std::move(probe));
 }
 

@@ -890,7 +890,8 @@ TEST_CASE("convert_to synchronizes stream before destroying GPU source", "[data_
   registry.register_converter<observed_gpu_representation, mock_data_representation>(
     [&](idata_representation& source,
         const memory::memory_space* /*target_space*/,
-        rmm::cuda_stream_view s) -> std::unique_ptr<idata_representation> {
+        rmm::cuda_stream_view s,
+        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
       auto& gpu_src = source.cast<observed_gpu_representation>();
       CUCASCADE_CUDA_TRY(
         cudaMemcpyAsync(pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));
@@ -986,7 +987,8 @@ TEST_CASE("convert_to synchronizes stream before destroying HOST source when tar
   registry.register_converter<observed_host_representation, mock_data_representation>(
     [&](idata_representation& source,
         const memory::memory_space* /*target_space*/,
-        rmm::cuda_stream_view s) -> std::unique_ptr<idata_representation> {
+        rmm::cuda_stream_view s,
+        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
       auto& host_src = source.cast<observed_host_representation>();
       rmm::device_buffer gpu_buf(buf_size, s);
       CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
@@ -1044,7 +1046,8 @@ TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync
   registry.register_converter<observed_gpu_representation, mock_data_representation>(
     [&](idata_representation& source,
         const memory::memory_space* /*target_space*/,
-        rmm::cuda_stream_view s) -> std::unique_ptr<idata_representation> {
+        rmm::cuda_stream_view s,
+        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
       auto& gpu_src = source.cast<observed_gpu_representation>();
       CUCASCADE_CUDA_TRY(
         cudaMemcpyAsync(pinned_host, gpu_src.data(), buf_size, cudaMemcpyDeviceToHost, s.value()));

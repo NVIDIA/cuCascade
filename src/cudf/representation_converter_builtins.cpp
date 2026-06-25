@@ -89,7 +89,8 @@ inline cudf::type_id as_cudf_type_id(int32_t type_id)
 std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream);
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] memory::reservation* reservation);
 
 /**
  * @brief Convert gpu_table_representation to host_data_packed_representation
@@ -97,7 +98,8 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 std::unique_ptr<idata_representation> convert_gpu_to_host(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  memory::reservation* reservation)
 {
   // Synchronize the stream to ensure any prior operations (like table creation)
   // are complete before we read from the source table
@@ -107,7 +109,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
   auto packed_data = cudf::pack(gpu_source.get_table_view(), stream);
 
   auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
-  auto allocation = mr->allocate_multiple_blocks(packed_data.gpu_data->size());
+  auto allocation = mr->allocate_multiple_blocks(packed_data.gpu_data->size(), reservation);
 
   size_t block_index      = 0;
   size_t block_offset     = 0;
@@ -144,7 +146,8 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
 std::unique_ptr<idata_representation> convert_host_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] memory::reservation* reservation)
 {
   auto& host_source    = source.cast<host_data_packed_representation>();
   auto& host_table     = host_source.get_host_table();
@@ -199,7 +202,8 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
 std::unique_ptr<idata_representation> convert_host_to_host(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view /*stream*/)
+  rmm::cuda_stream_view /*stream*/,
+  memory::reservation* reservation)
 {
   auto& host_source    = source.cast<host_data_packed_representation>();
   auto& host_table     = host_source.get_host_table();
@@ -211,7 +215,7 @@ std::unique_ptr<idata_representation> convert_host_to_host(
     throw std::runtime_error(
       "Target HOST memory_space does not have a fixed_size_host_memory_resource");
   }
-  auto dst_allocation         = mr->allocate_multiple_blocks(data_size);
+  auto dst_allocation         = mr->allocate_multiple_blocks(data_size, reservation);
   size_t src_block_index      = 0;
   size_t src_block_offset     = 0;
   size_t dst_block_index      = 0;
@@ -490,7 +494,8 @@ static void collect_column_d2h_ops(
 std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  memory::reservation* reservation)
 {
   auto& gpu_source            = source.cast<gpu_table_representation>();
   const cudf::table_view view = gpu_source.get_table_view();
@@ -506,7 +511,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
 
   // --- Pass 2: allocate pinned host blocks ---
   auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
-  auto allocation = mr->allocate_multiple_blocks(total_size);
+  auto allocation = mr->allocate_multiple_blocks(total_size, reservation);
 
   // --- Pass 3: collect all D→H copy ops, then fire one batched call ---
   BatchCopyAccumulator batch;
@@ -858,7 +863,8 @@ static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_v
 std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] memory::reservation* reservation)
 {
   // Sync the caller's stream so the source table's buffers are stable on the source
   // device before we issue peer copies. The caller's stream is the one that produced
@@ -1158,7 +1164,8 @@ static std::unique_ptr<cudf::column> reconstruct_column(
 std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] memory::reservation* reservation)
 {
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
@@ -1208,7 +1215,8 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
 std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view /*stream*/)
+  rmm::cuda_stream_view /*stream*/,
+  memory::reservation* reservation)
 {
   auto& host_source    = source.cast<host_data_representation>();
   auto& host_table     = host_source.get_host_table();
@@ -1220,7 +1228,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
     throw std::runtime_error(
       "Target HOST memory_space does not have a fixed_size_host_memory_resource");
   }
-  auto dst_allocation         = mr->allocate_multiple_blocks(data_size);
+  auto dst_allocation         = mr->allocate_multiple_blocks(data_size, reservation);
   size_t src_block_index      = 0;
   size_t src_block_offset     = 0;
   size_t dst_block_index      = 0;
@@ -1483,7 +1491,8 @@ static void read_column_buffers(
 static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  [[maybe_unused]] rmm::cuda_stream_view stream)
+  [[maybe_unused]] rmm::cuda_stream_view stream,
+  [[maybe_unused]] memory::reservation* reservation)
 {
   auto& backend          = target_memory_space->get_io_backend();
   auto& host_source      = source.cast<host_data_representation>();
@@ -1528,7 +1537,8 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
 static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  [[maybe_unused]] rmm::cuda_stream_view stream)
+  [[maybe_unused]] rmm::cuda_stream_view stream,
+  memory::reservation* reservation)
 {
   auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
@@ -1553,7 +1563,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
     throw std::runtime_error(
       "Target HOST memory_space does not have a fixed_size_host_memory_resource");
   }
-  auto allocation = mr->allocate_multiple_blocks(total_host_size);
+  auto allocation = mr->allocate_multiple_blocks(total_host_size, reservation);
 
   // Read column data from file into host blocks
   for (std::size_t i = 0; i < disk_columns.size(); ++i) {
@@ -1601,7 +1611,8 @@ static void collect_gpu_column_io_entries(const cudf::column_view& col,
 static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] memory::reservation* reservation)
 {
   auto& backend       = target_memory_space->get_io_backend();
   auto& gpu_source    = source.cast<gpu_table_representation>();
@@ -1786,7 +1797,8 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] memory::reservation* reservation)
 {
   auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
