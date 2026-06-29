@@ -17,7 +17,9 @@
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/error.hpp>
 
+#include <cassert>
 #include <memory>
 
 namespace cucascade {
@@ -109,18 +111,7 @@ data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> 
 
 // ========== read_only_data_batch ==========
 
-read_only_data_batch::~read_only_data_batch()
-{
-  // Decrement the reader count. If we were the last reader, transition to idle.
-  // NOTE: Do NOT call _lock.unlock() here — the _lock member destructor handles that.
-  // The destructor body runs before member destructors, so _owner is still valid here.
-  // After this function returns, _lock destructor fires first (declared after _owner,
-  // destroyed in reverse order), releasing the shared lock. Then _owner destructor fires.
-  if (_owner) {  // the read_only_data_batch may have been moved.
-    size_t prev = _owner->_read_only_count.fetch_sub(1);
-    if (prev == 1) { _owner->_state.store(batch_state::idle); }
-  }
-}
+read_only_data_batch::~read_only_data_batch() { reset(); }
 
 read_only_data_batch::read_only_data_batch(read_only_data_batch&& other) noexcept
   : _owner(std::move(other._owner)), _lock(std::move(other._lock))
@@ -132,14 +123,7 @@ read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& oth
 {
   if (this != &other) {
     // Release the current state (same logic as destructor)
-    if (_owner) {
-      size_t prev = _owner->_read_only_count.fetch_sub(1);
-      if (prev == 1) { _owner->_state.store(batch_state::idle); }
-      // _lock will be replaced below; its destructor fires when the old _lock is overwritten,
-      // releasing the shared lock. We release _lock explicitly here so the sequence is:
-      // decrement count -> set state (if last) -> release lock.
-      _lock.unlock();
-    }
+    this->reset();
     _owner = std::move(other._owner);
     _lock  = std::move(other._lock);
     // other._owner is now nullptr — other's destructor will be a no-op.
@@ -155,15 +139,28 @@ read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> owner,
   _owner->_state.store(batch_state::read_only);
 }
 
-// ========== mutable_data_batch ==========
-
-mutable_data_batch::~mutable_data_batch()
+void read_only_data_batch::reset()
 {
-  if (_owner) {  // mutable_data_batch may have been moved
-    // Transition state to idle. The _lock member destructor handles releasing the exclusive lock.
-    _owner->_state.store(batch_state::idle);
+  // Reset the owner (used for destruction, move assignments and resets)
+  if (_owner) {
+    // Only reset if the owner is still valid and has not been moved-from
+    // or reset already.
+
+    // INVARIANT: if the owner exists, a valid lock is held.
+    assert(_lock.owns_lock());
+
+    // Decrement the reader count. If we were the last reader, transition to idle.
+    const size_t prev = _owner->_read_only_count.fetch_sub(1);
+    if (prev == 1) { _owner->_state.store(batch_state::idle); }
+
+    _lock.unlock();
+    _owner.reset();
   }
 }
+
+// ========== mutable_data_batch ==========
+
+mutable_data_batch::~mutable_data_batch() { reset(); }
 
 mutable_data_batch::mutable_data_batch(mutable_data_batch&& other) noexcept
   : _owner(std::move(other._owner)), _lock(std::move(other._lock))
@@ -174,12 +171,7 @@ mutable_data_batch::mutable_data_batch(mutable_data_batch&& other) noexcept
 mutable_data_batch& mutable_data_batch::operator=(mutable_data_batch&& other) noexcept
 {
   if (this != &other) {
-    // Release the current state (same logic as destructor)
-    if (_owner) {
-      _owner->_state.store(batch_state::idle);
-      // Release the exclusive lock explicitly before taking ownership of the new one.
-      _lock.unlock();
-    }
+    this->reset();
     _owner = std::move(other._owner);
     _lock  = std::move(other._lock);
     // other._owner is now nullptr — other's destructor will be a no-op.
@@ -192,6 +184,21 @@ mutable_data_batch::mutable_data_batch(std::shared_ptr<data_batch> owner,
   : _owner(std::move(owner)), _lock(std::move(lock))
 {
   _owner->_state.store(batch_state::mutable_locked);
+}
+
+void mutable_data_batch::reset()
+{
+  // Reset the owner
+  if (_owner) {
+    // Only reset if the owner is still valid and has not been moved-from or reset.
+
+    // INVARIANT: if the owner exists, a valid lock is held.
+    assert(_lock.owns_lock());
+
+    _owner->_state.store(batch_state::idle);
+    _lock.unlock();
+    _owner.reset();
+  }
 }
 
 }  // namespace cucascade

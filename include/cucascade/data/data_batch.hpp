@@ -24,11 +24,14 @@
 
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <utility>
 
 namespace cucascade {
@@ -238,8 +241,8 @@ class data_batch_core {
 };
 
 /**
- * @brief Synchronized data batch type allowing thread-safe access to the core data batch
- * via RAII accessors.
+ * @brief Synchronized data batch type allowing thread-safe access to the core data_batch_core
+ * via std::shared_mutex based RAII accessors.
  */
 class data_batch : public std::enable_shared_from_this<data_batch> {
   friend read_only_data_batch;
@@ -268,6 +271,19 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    *  Blocks until the shared lock is acquired.
    *
+   * @note NON-RECURSIVE: do not acquire a second accessor (read-only or mutable) for the same
+   * batch on a thread that already holds one;
+   * from: https://en.cppreference.com/cpp/thread/shared_mutex/lock_shared:
+   * "If lock_shared is called by a thread that already owns the mutex in any mode (exclusive or
+   * shared), the behavior is undefined."
+   *
+   * Re-acquiring AFTER the prior accessor has been released is fine.
+   *
+   * A held accessor must not be moved to another thread and released there;
+   * from: https://en.cppreference.com/cpp/thread/shared_mutex/unlock_shared:
+   * "The mutex must be locked by the current thread of execution in shared mode, otherwise, the
+   * behavior is undefined."
+   *
    * @return A read_only_data_batch holding the shared lock.
    */
   [[nodiscard]] read_only_data_batch get_read_only();
@@ -279,12 +295,31 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * Uses shared_from_this() to obtain a new shared_ptr. Blocks until the
    * exclusive lock is acquired.
    *
+   * @note NON-RECURSIVE: do not acquire a second accessor (read-only or mutable) for the same
+   * batch on a thread that already holds one;
+   * from: https://en.cppreference.com/cpp/thread/shared_mutex/lock:
+   * "f lock is called by a thread that already owns the shared_mutex in any mode (exclusive or
+   * shared), the behavior is undefined."
+   *
+   * Re-acquiring AFTER the prior accessor has been released is fine.
+   *
+   * A held accessor must not be moved to another thread and released there;
+   * from: https://en.cppreference.com/cpp/thread/shared_mutex/unlock:
+   * "The mutex must be locked by the current thread of execution, otherwise, the behavior is
+   * undefined. "
+   *
    * @return A mutable_data_batch holding the exclusive lock.
    */
   [[nodiscard]] mutable_data_batch get_mutable();
 
   /**
-   * @brief Try to transition from idle to read-only (non-blocking).
+   * @brief Try to get a read read-only access handle (non-blocking).
+   *
+   * @note NON-RECURSIVE: do not call this on a thread that already holds any accessor for the
+   * same batch -- recursive locking of std::shared_mutex is undefined behavior. Re-acquiring
+   * AFTER the prior accessor has been released is fine. A held accessor must not be moved to
+   * another thread and released there. (Debug builds detect same-thread recursion via an
+   * ownership guard.)
    *
    * @return An optional containing the read-only accessor on success, or
    *         std::nullopt if the lock could not be acquired immediately.
@@ -293,6 +328,12 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
 
   /**
    * @brief Try to transition from idle to mutable (non-blocking).
+   *
+   * @note NON-RECURSIVE: do not call this on a thread that already holds any accessor for the
+   * same batch -- recursive locking of std::shared_mutex is undefined behavior. Re-acquiring
+   * AFTER the prior accessor has been released is fine. A held accessor must not be moved to
+   * another thread and released there. (Debug builds detect same-thread recursion via an
+   * ownership guard.)
    *
    * @return An optional containing the mutable accessor on success, or
    *         std::nullopt if the lock could not be acquired immediately.
@@ -369,12 +410,11 @@ template <typename TargetRepresentation>
 /**
  * @brief RAII read-only accessor for data_batch.
  *
- * Holds a shared lock on the parent data_batch's mutex, permitting concurrent
- * readers. Data is accessible through operator forwarding to data_batch_core.
+ * Holds a std::shared_lock on the owner data_batch's std::shared_mutex, permitting parallel
+ * readers from multiple threads. Data is accessible through operator forwarding to data_batch_core.
  *
- * Move-only. Use clone_read_only_access() to acquire an additional shared lock
- * on the same parent batch. The shared lock is released when this object is
- * destroyed, moved-from, or overwritten by assignment.
+ * Move-only. Destruction, reset, or overwrite release the shared lock; move construction/assignment
+ * transfers ownership and leaves the source invalid.
  */
 class read_only_data_batch {
   friend class data_batch;
@@ -389,53 +429,96 @@ class read_only_data_batch {
   read_only_data_batch& operator=(const read_only_data_batch& other) = delete;
 
   // will allow only read access
-  const data_batch_core* operator->() const { return &(_owner->_batch); }
-  const data_batch_core& operator*() const { return _owner->_batch; }
-
-  static std::shared_ptr<data_batch> to_idle(read_only_data_batch&& accessor)
+  const data_batch_core* operator->() const
   {
-    std::shared_ptr<data_batch> ptr = accessor._owner;
-    {
-      auto _ = std::move(accessor);
-    }  // destroy accessor, releasing shared lock
-    return ptr;
+    assert_validity();
+    return &(_owner->_batch);
+  }
+  const data_batch_core& operator*() const
+  {
+    assert_validity();
+    return _owner->_batch;
   }
 
-  read_only_data_batch clone_read_only_access() const
-  {
-    std::optional<read_only_data_batch> maybe_clone = _owner->try_get_read_only();
+  /**
+   * @brief Whether the handle is valid or not. A handle can become invalid if the handle
+   * was moved-from or reset.
+   */
+  [[nodiscard]] bool is_valid() const noexcept { return _owner != nullptr; }
 
-    // the shared_mutex is already locked under shared access because
-    // the current read_only_data_batch exists.
-    assert(maybe_clone.has_value());
-    return std::move(*maybe_clone);
-  };
+  /**
+   * @brief Get a copy of the owner of the underlying data, while retaining this read-only accessor
+   * handle.
+   *
+   * @note The returned owner pointer must NOT be used to acquire another accessor on the thread
+   * that already holds this one: accessors are NON-RECURSIVE and recursive locking of
+   * std::shared_mutex is undefined behavior. Re-acquiring AFTER this accessor is released is fine.
+   * A held accessor must also not be moved to another thread and released there (cross-thread
+   * unlock_shared is undefined behavior).
+   * Throws std::logic_error if the accessor handle was moved-from or reset.
+   */
+  [[nodiscard]] std::shared_ptr<data_batch> get_owner_copy() const
+  {
+    assert_validity();
+    std::shared_ptr<data_batch> copy = this->_owner;
+    return copy;
+  }
+
+  // /**
+  //  * @brief Reset the passed accessor handle, releasing its read-only lock (other
+  //  * read-only accessor handles continue to exist independently). Returns the underlying data
+  //  owner.
+  //  *
+  //  * @note Calling this function invalidates this accessor handle.
+  //  */
+  // static std::shared_ptr<data_batch> reset_and_release_owner(read_only_data_batch&& read_only)
+  // {
+  //   std::shared_ptr<data_batch> copy = read_only.get_owner_copy();
+  //   read_only.reset();
+  //   return copy;
+  // }
 
  private:
   /**
+   * @brief Asserts whether the handle is valid or not. A handle can become invalid if the handle
+   * was moved-from or reset. Throws a std::logic_error if the handle is no longer valid.
+   */
+  void assert_validity() const
+  {
+    if (not _owner) { throw std::logic_error("read_only_data_batch: invalid moved-from accessor"); }
+    // INVARIANT: a valid lock is held if _owner exists.
+    assert(_lock.owns_lock());
+  }
+
+  /**
+   * @brief Reset the read-only accessor handle, releasing *this* read-only lock (other read-only
+   * access handles continue to exist independently), and dropping the handle to the underlying
+   * data owner. This handle becomes invalid after this reset.
+   */
+  void reset();
+
+  /**
    * @brief Private constructor -- only data_batch methods can create instances.
    *
-   * @param parent Shared pointer to the parent data_batch (moved in).
-   * @param lock   Shared lock already acquired on the parent's mutex.
+   * @param owner Shared pointer to the owner data_batch (moved in).
+   * @param lock  Shared lock already acquired on the owner's mutex.
    */
-  read_only_data_batch(std::shared_ptr<data_batch> parent,
-                       std::shared_lock<std::shared_mutex> lock);
+  read_only_data_batch(std::shared_ptr<data_batch> owner, std::shared_lock<std::shared_mutex> lock);
 
-  // INVARIANT: _owner must be declared before _lock -- destruction order is load-bearing.
-  // When destroyed, _lock releases the shared lock first, then _batch drops the parent
-  // reference. This prevents accessing a destroyed mutex.
-  std::shared_ptr<data_batch> _owner;         ///< Parent lifetime (destroyed second)
-  std::shared_lock<std::shared_mutex> _lock;  ///< Shared lock (destroyed first)
+  // Destruction order is load-bearing; but we explicitly handle destruction via reset().
+  std::shared_ptr<data_batch> _owner;
+  std::shared_lock<std::shared_mutex> _lock;
 };
 
 /**
  * @brief RAII mutable accessor for data_batch.
  *
- * Holds an exclusive lock on the parent data_batch's mutex, permitting a single
+ * Holds an exclusive lock on the owner data_batch's mutex, permitting a single
  * writer with no concurrent readers. Provides all read methods plus write methods
  * (set_data, convert_to) and clone operations (clone, clone_to).
  *
- * Move-only. The exclusive lock is released when this object is destroyed or moved-from.
+ * Move-only. Destruction, reset, or overwrite release the exclusive lock; move
+ * construction/assignment transfers ownership and leaves the source invalid.
  */
 class mutable_data_batch {
   friend class data_batch;
@@ -449,32 +532,94 @@ class mutable_data_batch {
   mutable_data_batch(const mutable_data_batch&)            = delete;
   mutable_data_batch& operator=(const mutable_data_batch&) = delete;
 
-  data_batch_core* operator->() { return &(_owner->_batch); }
-  data_batch_core& operator*() { return _owner->_batch; }
-
-  static std::shared_ptr<data_batch> to_idle(mutable_data_batch&& accessor)
+  data_batch_core* operator->() const
   {
-    std::shared_ptr<data_batch> ptr = accessor._owner;
-    {
-      auto _ = std::move(accessor);
-    }  // destroy accessor, releasing exclusive lock
-    return ptr;
+    assert_validity();
+    return &(_owner->_batch);
   }
+  data_batch_core& operator*() const
+  {
+    assert_validity();
+    return _owner->_batch;
+  }
+
+  /**
+   * @brief Whether the handle is valid or not. A handle can become invalid if the handle
+   * was moved-from.
+   */
+  [[nodiscard]] bool is_valid() const noexcept { return _owner != nullptr; }
+
+  /**
+   * @brief Get a copy of the owner of the underlying data, while retaining this exclusive mutable
+   * accessor handle.
+   *
+   * @note Throws std::logic_error if the accessor handle was moved-from or reset.
+   */
+  [[nodiscard]] std::shared_ptr<data_batch> get_owner_copy() const
+  {
+    assert_validity();
+    std::shared_ptr<data_batch> copy = this->_owner;
+    return copy;
+  }
+
+  // /**
+  //  * @brief Reset the mutable accessor handle, releasing the exclusive lock. Returns the
+  //  underlying
+  //  * data owner.
+  //  *
+  //  * @note Calling this fn invalidates this accessor handle.
+  //  */
+  // static std::shared_ptr<data_batch> reset_and_release_owner(mutable_data_batch&& read_write)
+  // {
+  //   std::shared_ptr<data_batch> copy = read_write.get_owner_copy();
+  //   read_write.reset();
+  //   return copy;
+  // }
 
  private:
   /**
+   * @brief Reset the mutable accessor handle, releasing the exclusive lock and dropping the
+   * handle to the underlying data owner. This handle becomes invalid after this reset.
+   */
+  void reset();
+
+  /**
+   * @brief Asserts whether the handle is valid or not. A handle can become invalid if the handle
+   * was moved-from or reset. Throws a std::logic_error if the handle is no longer valid.
+   */
+  void assert_validity() const
+  {
+    if (not _owner) { throw std::logic_error("mutable_data_batch: invalid moved-from accessor"); }
+  }
+
+  /**
    * @brief Private constructor -- only data_batch methods can create instances.
    *
-   * @param parent Shared pointer to the parent data_batch (moved in).
-   * @param lock   Exclusive lock already acquired on the parent's mutex.
+   * @param owner Shared pointer to the owner data_batch (moved in).
+   * @param lock   Exclusive lock already acquired on the owner's mutex.
    */
-  mutable_data_batch(std::shared_ptr<data_batch> parent, std::unique_lock<std::shared_mutex> lock);
+  mutable_data_batch(std::shared_ptr<data_batch> owner, std::unique_lock<std::shared_mutex> lock);
 
-  // INVARIANT: _owner must be declared before _lock -- destruction order is load-bearing.
-  // When destroyed, _lock releases the exclusive lock first, then _batch drops the parent
-  // reference. This prevents accessing a destroyed mutex.
-  std::shared_ptr<data_batch> _owner;         ///< Parent lifetime (destroyed second)
-  std::unique_lock<std::shared_mutex> _lock;  ///< Exclusive lock (destroyed first)
+  // Destruction order is load-bearing; but we explicitly handle destruction via reset().
+  std::shared_ptr<data_batch> _owner;
+  std::unique_lock<std::shared_mutex> _lock;
 };
+
+template <class T>
+concept data_batch_accessor =
+  std::same_as<T, read_only_data_batch> || std::same_as<T, mutable_data_batch>;
+
+/** @brief Reset the accessor handle, releasing its (shared or unique) held lock. Returns the
+ * underlying data owner.
+ *
+ * @note Calling this function invalidates this accessor handle.
+ */
+template <data_batch_accessor Handle>
+std::shared_ptr<data_batch> reset_and_release_owner(
+  Handle handle)  // only allows std::move since the handles are move-only
+{
+  return handle.get_owner_copy();
+  // The handle is reset via destruction at scope exit.
+}
 
 }  // namespace cucascade
