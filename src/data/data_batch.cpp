@@ -16,7 +16,6 @@
  */
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/error.hpp>
 
 #include <cassert>

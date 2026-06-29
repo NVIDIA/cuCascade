@@ -15,6 +15,16 @@
 # the License.
 # =============================================================================
 
+# The benchmarks exercise the cudf-backed representation converters, so they
+# require the cucascade-cudf library. Skip them when it is not being built.
+if(NOT CUCASCADE_BUILD_CUDF)
+  message(
+    STATUS
+      "cuCascade benchmarks require CUCASCADE_BUILD_CUDF=ON (cudf-backed converters); skipping"
+  )
+  return()
+endif()
+
 # Fetch Google Benchmark
 include(FetchContent)
 FetchContent_Declare(
@@ -61,7 +71,7 @@ target_compile_options(
 
 # Link dependencies
 target_link_libraries(
-  cucascade_benchmarks PRIVATE cucascade benchmark::benchmark
+  cucascade_benchmarks PRIVATE cucascade_cudf benchmark::benchmark
                                benchmark::benchmark_main CUDA::cudart_static)
 
 # Add custom target to run benchmarks

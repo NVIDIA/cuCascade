@@ -18,8 +18,8 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>

@@ -221,6 +221,16 @@ static bool columns_equal_recursive(const cudf::column_view& left,
   // LIST: compare offsets (normalized) + recurse into values child
   if (type_id == cudf::type_id::LIST) {
     if (left.num_children() >= 2 && left.size() > 0) {
+      // LIST offsets must stay INT32 (cudf::size_type) across a round trip — list algorithms
+      // read the offsets child as size_type, so an INT64 offsets child is malformed. (STRING
+      // offsets are intentionally tolerant of INT32/INT64 above.)
+      if (left.child(0).type().id() != right.child(0).type().id()) {
+        std::cout << "[cudf-equal] " << path << " LIST offsets type mismatch: left="
+                  << static_cast<int>(left.child(0).type().id())
+                  << " right=" << static_cast<int>(right.child(0).type().id()) << std::endl
+                  << std::flush;
+        return false;
+      }
       auto left_offsets  = read_offsets_to_host(left.child(0));
       auto right_offsets = read_offsets_to_host(right.child(0));
       if (left_offsets != right_offsets) {

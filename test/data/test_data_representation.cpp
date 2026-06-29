@@ -18,14 +18,15 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/cudf/host_table.hpp>
+#include <cucascade/cudf/host_table_packed.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/host_table.hpp>
-#include <cucascade/memory/host_table_packed.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <cudf/column/column.hpp>
@@ -769,7 +770,7 @@ static void check_fixed_width_metadata(memory::memory_reservation_manager& mgr,
 
   const auto& cols = host->get_host_table()->columns;
   REQUIRE(cols.size() == 1);
-  REQUIRE(cols[0].type_id == TypeID);
+  REQUIRE(cols[0].type_id == static_cast<int32_t>(TypeID));
   REQUIRE(cols[0].num_rows == N);
   REQUIRE(cols[0].has_data == true);
   REQUIRE(cols[0].data_size == static_cast<std::size_t>(N) * sizeof(CppType));
@@ -971,7 +972,7 @@ TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::TIMESTAMP_DAYS);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::TIMESTAMP_DAYS));
     REQUIRE(meta.has_data == true);
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int32_t));
     REQUIRE(meta.children.empty());
@@ -990,7 +991,7 @@ TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::TIMESTAMP_SECONDS);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::TIMESTAMP_SECONDS));
     REQUIRE(meta.has_data == true);
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
   }
@@ -1008,7 +1009,7 @@ TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::TIMESTAMP_MICROSECONDS);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::TIMESTAMP_MICROSECONDS));
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
   }
 }
@@ -1037,7 +1038,7 @@ TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::DURATION_DAYS);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DURATION_DAYS));
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int32_t));
   }
 
@@ -1054,7 +1055,7 @@ TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::DURATION_MILLISECONDS);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DURATION_MILLISECONDS));
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
   }
 
@@ -1071,7 +1072,7 @@ TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::DURATION_NANOSECONDS);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DURATION_NANOSECONDS));
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
   }
 }
@@ -1104,7 +1105,7 @@ TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][dec
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::DECIMAL32);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DECIMAL32));
     REQUIRE(meta.scale == -3);
     REQUIRE(meta.has_data == true);
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int32_t));
@@ -1124,7 +1125,7 @@ TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][dec
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::DECIMAL64);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DECIMAL64));
     REQUIRE(meta.scale == -6);
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
   }
@@ -1142,7 +1143,7 @@ TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][dec
     auto host = fast_convert(repr, host_space, registry, stream.view());
     stream.synchronize();
     const auto& meta = host->get_host_table()->columns[0];
-    REQUIRE(meta.type_id == cudf::type_id::DECIMAL128);
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DECIMAL128));
     REQUIRE(meta.scale == -9);
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * 16);  // 128-bit = 16 bytes
   }
@@ -1195,7 +1196,7 @@ TEST_CASE("Fast converter: STRING column metadata structure", "[fast][string]")
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
-  REQUIRE(meta.type_id == cudf::type_id::STRING);
+  REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::STRING));
   REQUIRE(meta.num_rows == num_strings);
   // In this cudf version, STRING stores chars in the column's data buffer.
   REQUIRE(meta.has_data == true);
@@ -1205,7 +1206,7 @@ TEST_CASE("Fast converter: STRING column metadata structure", "[fast][string]")
   REQUIRE(meta.children.size() == 1);
 
   const auto& offsets_meta = meta.children[0];
-  REQUIRE(offsets_meta.type_id == cudf::type_id::INT32);
+  REQUIRE(offsets_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(offsets_meta.num_rows == num_strings + 1);
   REQUIRE(offsets_meta.has_data == true);
   REQUIRE(offsets_meta.data_size == static_cast<std::size_t>(num_strings + 1) * sizeof(int32_t));
@@ -1257,20 +1258,20 @@ TEST_CASE("Fast converter: LIST<INT32> column metadata structure", "[fast][list]
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
-  REQUIRE(meta.type_id == cudf::type_id::LIST);
+  REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
   REQUIRE(meta.num_rows == num_lists);
   REQUIRE(meta.has_data == false);
   REQUIRE(meta.has_null_mask == false);
   REQUIRE(meta.children.size() == 2);
 
   const auto& offsets_meta = meta.children[0];
-  REQUIRE(offsets_meta.type_id == cudf::type_id::INT32);
+  REQUIRE(offsets_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(offsets_meta.num_rows == num_lists + 1);
   REQUIRE(offsets_meta.has_data == true);
   REQUIRE(offsets_meta.data_size == static_cast<std::size_t>(num_lists + 1) * sizeof(int32_t));
 
   const auto& values_meta = meta.children[1];
-  REQUIRE(values_meta.type_id == cudf::type_id::INT32);
+  REQUIRE(values_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(values_meta.num_rows == num_values);
   REQUIRE(values_meta.has_data == true);
   REQUIRE(values_meta.data_size == static_cast<std::size_t>(num_values) * sizeof(int32_t));
@@ -1320,7 +1321,7 @@ TEST_CASE("Fast converter: nullable LIST<INT32> preserves parent null mask", "[f
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
-  REQUIRE(meta.type_id == cudf::type_id::LIST);
+  REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
   REQUIRE(meta.has_null_mask == true);
   REQUIRE(meta.null_mask_size == cudf::bitmask_allocation_size_bytes(num_lists));
 }
@@ -1363,18 +1364,18 @@ TEST_CASE("Fast converter: STRUCT<INT32, FLOAT64> column metadata structure", "[
   stream.synchronize();
 
   const auto& meta = host->get_host_table()->columns[0];
-  REQUIRE(meta.type_id == cudf::type_id::STRUCT);
+  REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::STRUCT));
   REQUIRE(meta.num_rows == N);
   REQUIRE(meta.has_data == false);
   REQUIRE(meta.has_null_mask == false);
   REQUIRE(meta.children.size() == 2);
 
-  REQUIRE(meta.children[0].type_id == cudf::type_id::INT32);
+  REQUIRE(meta.children[0].type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(meta.children[0].num_rows == N);
   REQUIRE(meta.children[0].has_data == true);
   REQUIRE(meta.children[0].data_size == static_cast<std::size_t>(N) * sizeof(int32_t));
 
-  REQUIRE(meta.children[1].type_id == cudf::type_id::FLOAT64);
+  REQUIRE(meta.children[1].type_id == static_cast<int32_t>(cudf::type_id::FLOAT64));
   REQUIRE(meta.children[1].num_rows == N);
   REQUIRE(meta.children[1].has_data == true);
   REQUIRE(meta.children[1].data_size == static_cast<std::size_t>(N) * sizeof(double));
@@ -1448,29 +1449,29 @@ TEST_CASE("Fast converter: LIST<LIST<INT32>> nested metadata", "[fast][nested]")
 
   // Outer LIST
   const auto& outer_meta = host->get_host_table()->columns[0];
-  REQUIRE(outer_meta.type_id == cudf::type_id::LIST);
+  REQUIRE(outer_meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
   REQUIRE(outer_meta.num_rows == num_outer);
   REQUIRE(outer_meta.has_data == false);
   REQUIRE(outer_meta.children.size() == 2);
 
   // outer.children[0] = outer offsets (INT32)
-  REQUIRE(outer_meta.children[0].type_id == cudf::type_id::INT32);
+  REQUIRE(outer_meta.children[0].type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(outer_meta.children[0].num_rows == num_outer + 1);
   REQUIRE(outer_meta.children[0].has_data == true);
 
   // outer.children[1] = inner LIST
   const auto& inner_meta = outer_meta.children[1];
-  REQUIRE(inner_meta.type_id == cudf::type_id::LIST);
+  REQUIRE(inner_meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
   REQUIRE(inner_meta.num_rows == num_inner);
   REQUIRE(inner_meta.has_data == false);
   REQUIRE(inner_meta.children.size() == 2);
 
   // inner.children[0] = inner offsets (INT32)
-  REQUIRE(inner_meta.children[0].type_id == cudf::type_id::INT32);
+  REQUIRE(inner_meta.children[0].type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(inner_meta.children[0].num_rows == num_inner + 1);
 
   // inner.children[1] = values (INT32)
-  REQUIRE(inner_meta.children[1].type_id == cudf::type_id::INT32);
+  REQUIRE(inner_meta.children[1].type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(inner_meta.children[1].num_rows == num_values);
   REQUIRE(inner_meta.children[1].has_data == true);
   REQUIRE(inner_meta.children[1].data_size ==
@@ -1537,32 +1538,32 @@ TEST_CASE("Fast converter: LIST<STRUCT<INT32,FLOAT64>> nested metadata", "[fast]
 
   // Outer: LIST
   const auto& list_meta = host->get_host_table()->columns[0];
-  REQUIRE(list_meta.type_id == cudf::type_id::LIST);
+  REQUIRE(list_meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
   REQUIRE(list_meta.num_rows == num_lists);
   REQUIRE(list_meta.has_data == false);
   REQUIRE(list_meta.children.size() == 2);
 
   // list.children[0] = offsets (INT32)
   const auto& offs_meta = list_meta.children[0];
-  REQUIRE(offs_meta.type_id == cudf::type_id::INT32);
+  REQUIRE(offs_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(offs_meta.num_rows == num_lists + 1);
   REQUIRE(offs_meta.has_data == true);
   REQUIRE(offs_meta.data_size == static_cast<std::size_t>(num_lists + 1) * sizeof(int32_t));
 
   // list.children[1] = STRUCT<INT32, FLOAT64>
   const auto& struct_meta = list_meta.children[1];
-  REQUIRE(struct_meta.type_id == cudf::type_id::STRUCT);
+  REQUIRE(struct_meta.type_id == static_cast<int32_t>(cudf::type_id::STRUCT));
   REQUIRE(struct_meta.num_rows == num_structs);
   REQUIRE(struct_meta.has_data == false);
   REQUIRE(struct_meta.children.size() == 2);
 
-  REQUIRE(struct_meta.children[0].type_id == cudf::type_id::INT32);
+  REQUIRE(struct_meta.children[0].type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(struct_meta.children[0].num_rows == num_structs);
   REQUIRE(struct_meta.children[0].has_data == true);
   REQUIRE(struct_meta.children[0].data_size ==
           static_cast<std::size_t>(num_structs) * sizeof(int32_t));
 
-  REQUIRE(struct_meta.children[1].type_id == cudf::type_id::FLOAT64);
+  REQUIRE(struct_meta.children[1].type_id == static_cast<int32_t>(cudf::type_id::FLOAT64));
   REQUIRE(struct_meta.children[1].num_rows == num_structs);
   REQUIRE(struct_meta.children[1].has_data == true);
   REQUIRE(struct_meta.children[1].data_size ==
@@ -1633,35 +1634,35 @@ TEST_CASE("Fast converter: STRUCT<LIST<INT32>,FLOAT64> nested metadata", "[fast]
 
   // Top-level: STRUCT
   const auto& struct_meta = host->get_host_table()->columns[0];
-  REQUIRE(struct_meta.type_id == cudf::type_id::STRUCT);
+  REQUIRE(struct_meta.type_id == static_cast<int32_t>(cudf::type_id::STRUCT));
   REQUIRE(struct_meta.num_rows == num_rows);
   REQUIRE(struct_meta.has_data == false);
   REQUIRE(struct_meta.children.size() == 2);
 
   // struct.children[0] = LIST<INT32>
   const auto& list_meta = struct_meta.children[0];
-  REQUIRE(list_meta.type_id == cudf::type_id::LIST);
+  REQUIRE(list_meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
   REQUIRE(list_meta.num_rows == num_rows);
   REQUIRE(list_meta.has_data == false);
   REQUIRE(list_meta.children.size() == 2);
 
   // list offsets
   const auto& list_offs_meta = list_meta.children[0];
-  REQUIRE(list_offs_meta.type_id == cudf::type_id::INT32);
+  REQUIRE(list_offs_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(list_offs_meta.num_rows == num_rows + 1);
   REQUIRE(list_offs_meta.has_data == true);
   REQUIRE(list_offs_meta.data_size == static_cast<std::size_t>(num_rows + 1) * sizeof(int32_t));
 
   // list values
   const auto& list_vals_meta = list_meta.children[1];
-  REQUIRE(list_vals_meta.type_id == cudf::type_id::INT32);
+  REQUIRE(list_vals_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
   REQUIRE(list_vals_meta.num_rows == num_values);
   REQUIRE(list_vals_meta.has_data == true);
   REQUIRE(list_vals_meta.data_size == static_cast<std::size_t>(num_values) * sizeof(int32_t));
 
   // struct.children[1] = FLOAT64
   const auto& float_meta = struct_meta.children[1];
-  REQUIRE(float_meta.type_id == cudf::type_id::FLOAT64);
+  REQUIRE(float_meta.type_id == static_cast<int32_t>(cudf::type_id::FLOAT64));
   REQUIRE(float_meta.num_rows == num_rows);
   REQUIRE(float_meta.has_data == true);
   REQUIRE(float_meta.data_size == static_cast<std::size_t>(num_rows) * sizeof(double));
@@ -1768,7 +1769,7 @@ TEST_CASE("Fast converter: multi-column table with all primitive types", "[fast]
   for (std::size_t i = 0; i < type_sizes.size(); ++i) {
     const auto& [tid, sz] = type_sizes[i];
     const auto& meta      = host->get_host_table()->columns[i];
-    REQUIRE(meta.type_id == tid);
+    REQUIRE(meta.type_id == static_cast<int32_t>(tid));
     REQUIRE(meta.num_rows == N);
     REQUIRE(meta.has_data == true);
     REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sz);

@@ -113,9 +113,9 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
  * pool access to ProtNone) tells the driver to fall back to its internal pinned
  * host-staging path for `cudaMemcpyPeer*` — slower than real peer DMA but correct.
  *
- * Intended call site: cucascade::register_builtin_converters() — runs once after
- * memory_spaces are constructed and the application has called
- * `cudaDeviceEnablePeerAccess` for each pair. Idempotent.
+ * Intended call site: once after memory_spaces are constructed and the application has
+ * called `cudaDeviceEnablePeerAccess` for each pair (e.g. by the cucascade-cudf layer that
+ * registers tier converters). Idempotent.
  *
  * @param pools_by_device A vector indexed by device id (0..N-1) of the cucascade
  *        pool to also reset access on. Pass an empty vector if cucascade pools

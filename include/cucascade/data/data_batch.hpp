@@ -18,9 +18,10 @@
 #pragma once
 
 #include <cucascade/data/common.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
+
+#include <cuda_runtime.h>
 
 #include <atomic>
 #include <cassert>
@@ -188,9 +189,10 @@ class data_batch_core {
   /**
    * @brief Rebind the held data's device buffers to use @p stream for future deallocation.
    *
-   * Forwards to gpu_table_representation::rebind_stream when the held representation is a
-   * GPU table that owns its data; a no-op for every other representation (host, disk, or a
-   * GPU representation backed by an externally-owned table_view).
+   * Delegates polymorphically to idata_representation::rebind_stream. Representations that own
+   * stream-ordered device memory (e.g. a GPU table that owns its data) rebind their buffers; it
+   * is a no-op for every other representation (host, disk, or a GPU representation backed by an
+   * externally-owned table_view).
    *
    * Rebinding before an operation that may free the data (a GPU->host downgrade, or a pipeline
    * task that consumes it) makes the buffers free on the active stream rather than the stream
@@ -198,15 +200,13 @@ class data_batch_core {
    * cross-stream premature-reuse hazard. Requires the exclusive (mutable) lock held by this
    * accessor.
    *
-   * @note Does NOT insert cross-stream ordering -- see gpu_table_representation::rebind_stream.
+   * @note Does NOT insert cross-stream ordering -- see idata_representation::rebind_stream.
    *
    * @param stream Stream used for future asynchronous deallocation of the data's buffers.
    */
   void rebind_stream(rmm::cuda_stream_view stream)
   {
-    if (auto* gpu = dynamic_cast<gpu_table_representation*>(_data.get())) {
-      gpu->rebind_stream(stream);
-    }
+    if (auto* repr = get_data()) { repr->rebind_stream(stream); }
   }
 
   /**
@@ -227,10 +227,7 @@ class data_batch_core {
   [[nodiscard]] cudaEvent_t get_writer_event() const
   {
     auto* repr = get_data();
-    if (!repr) { return nullptr; }
-    auto* gpu_repr = dynamic_cast<gpu_table_representation*>(repr);
-    if (!gpu_repr) { return nullptr; }
-    return gpu_repr->get_writer_event();
+    return repr ? repr->get_writer_event() : nullptr;
   }
 
  private:
