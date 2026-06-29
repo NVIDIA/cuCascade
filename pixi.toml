@@ -1,8 +1,13 @@
 [workspace]
 channels = ["conda-forge"]
 name = "cuCascade"
-platforms = ["linux-64", "linux-aarch64"]
-requires-pixi = ">=0.59"
+platforms = [
+    { platform = "linux-64", cuda = "12.9" },
+    { platform = "linux-aarch64", cuda = "12.9" },
+    { platform = "linux-64", cuda = "13" },
+    { platform = "linux-aarch64", cuda = "13" },
+]
+requires-pixi = ">=0.71"
 
 [dependencies]
 cmake = "4.*"
@@ -23,13 +28,13 @@ unzip = "*"
 
 # CUDA 13
 [feature.cuda-13]
-system-requirements = { cuda = "13" }
+platforms = ["linux-64-cuda-13", "linux-aarch64-cuda-13"]
 dependencies = { "cuda-version" = "13.2.*" }
 activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120" } }
 
 # CUDA 12
 [feature.cuda-12]
-system-requirements = { cuda = "12.9" }
+platforms = ["linux-64-cuda-12-9", "linux-aarch64-cuda-12-9"]
 dependencies = { "cuda-version" = "12.9.*" }
 activation = { env = { CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real" } }
 
