@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -47,8 +48,6 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
-
-#include <cucascade/cuda/event.hpp>
 
 #include <cuda_runtime.h>
 

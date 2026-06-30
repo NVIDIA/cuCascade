@@ -66,6 +66,16 @@ class cuda_event_view {
   void synchronize() const;
 
   /**
+   * @brief Synchronize the calling thread on this event, without throwing.
+   *
+   * Like synchronize(), blocks the calling thread until the event has completed, but
+   * does not throw on failure. Intended for noexcept / destructor contexts.
+   *
+   * @return cudaSuccess on success, otherwise the failing CUDA error code.
+   */
+  [[nodiscard]] cudaError_t synchronize_no_throw() const noexcept;
+
+  /**
    * @brief Return elapsed time between `start` and this event.
    *
    * Both events must have been recorded, completed, and created with timing enabled.
@@ -108,6 +118,16 @@ class cuda_event {
   void record(rmm::cuda_stream_view stream = rmm::cuda_stream_default);
   void wait(rmm::cuda_stream_view stream = rmm::cuda_stream_default) const;
   void synchronize() const;
+
+  /**
+   * @brief Synchronize the calling thread on this event, without throwing.
+   *
+   * Like synchronize(), blocks the calling thread until the event has completed, but
+   * does not throw on failure. Intended for noexcept / destructor contexts.
+   *
+   * @return cudaSuccess on success, otherwise the failing CUDA error code.
+   */
+  [[nodiscard]] cudaError_t synchronize_no_throw() const noexcept;
 
   /**
    * @brief Return elapsed time between `start` and this event.

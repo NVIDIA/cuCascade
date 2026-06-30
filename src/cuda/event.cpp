@@ -60,6 +60,11 @@ void cuda_event::wait(rmm::cuda_stream_view stream) const { view().wait(stream);
 
 void cuda_event::synchronize() const { view().synchronize(); }
 
+cudaError_t cuda_event::synchronize_no_throw() const noexcept
+{
+  return view().synchronize_no_throw();
+}
+
 std::chrono::duration<float, std::milli> cuda_event::elapsed_time(cuda_event const& start) const
 {
   return view().elapsed_time(start.view());
@@ -78,6 +83,11 @@ void cuda_event_view::wait(rmm::cuda_stream_view stream) const
 }
 
 void cuda_event_view::synchronize() const { CUCASCADE_CUDA_TRY(::cudaEventSynchronize(event_)); }
+
+cudaError_t cuda_event_view::synchronize_no_throw() const noexcept
+{
+  return ::cudaEventSynchronize(event_);
+}
 
 std::chrono::duration<float, std::milli> cuda_event_view::elapsed_time(cuda_event_view start) const
 {
