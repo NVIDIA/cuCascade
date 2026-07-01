@@ -28,19 +28,22 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace cucascade;
 using cucascade::test::mock_data_representation;
+
+static_assert(std::is_same_v<shared_data_repository_manager, data_repository_manager>);
 
 // =============================================================================
 // Tests for shared_ptr based repository manager
 // =============================================================================
 
 // Test basic construction
-TEST_CASE("shared_data_repository_manager Construction", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Construction", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Manager should be empty initially
   // Accessing non-existent repository should throw
@@ -48,12 +51,12 @@ TEST_CASE("shared_data_repository_manager Construction", "[data_repository_manag
 }
 
 // Test adding a single repository
-TEST_CASE("shared_data_repository_manager Add Single Repository", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Add Single Repository", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   size_t operator_id = 1;
-  auto repository    = std::make_unique<shared_data_repository>();
+  auto repository    = std::make_unique<idata_repository>();
   manager.add_new_repository(operator_id, "default", std::move(repository));
 
   // Repository should be accessible
@@ -62,15 +65,15 @@ TEST_CASE("shared_data_repository_manager Add Single Repository", "[data_reposit
 }
 
 // Test adding multiple repositories
-TEST_CASE("shared_data_repository_manager Add Multiple Repositories", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Add Multiple Repositories", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   constexpr int num_operators = 10;
 
   // Add repositories for multiple operators
   for (size_t i = 0; i < num_operators; ++i) {
-    auto repository = std::make_unique<shared_data_repository>();
+    auto repository = std::make_unique<idata_repository>();
     manager.add_new_repository(i, "default", std::move(repository));
   }
 
@@ -82,9 +85,9 @@ TEST_CASE("shared_data_repository_manager Add Multiple Repositories", "[data_rep
 }
 
 // Test unique batch ID generation
-TEST_CASE("shared_data_repository_manager Unique Batch IDs", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Unique Batch IDs", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Generate multiple IDs
   std::vector<uint64_t> ids;
@@ -99,9 +102,9 @@ TEST_CASE("shared_data_repository_manager Unique Batch IDs", "[data_repository_m
 }
 
 // Test batch ID monotonic increment
-TEST_CASE("shared_data_repository_manager Monotonic Batch IDs", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Monotonic Batch IDs", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Generate IDs and verify they increment
   uint64_t prev_id = manager.get_next_data_batch_id();
@@ -113,19 +116,18 @@ TEST_CASE("shared_data_repository_manager Monotonic Batch IDs", "[data_repositor
 }
 
 // Test adding data batch to single operator
-TEST_CASE("shared_data_repository_manager Add Data Batch Single Operator",
-          "[data_repository_manager]")
+TEST_CASE("data_repository_manager Add Data Batch Single Operator", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<shared_data_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
   // Create and add batch
   auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+  auto batch        = data_batch::make(batch_id, std::move(data));
 
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
   manager.add_data_batch(batch, operator_ports);
@@ -138,21 +140,20 @@ TEST_CASE("shared_data_repository_manager Add Data Batch Single Operator",
 }
 
 // Test adding data batch to multiple operators (shared_ptr copies to each)
-TEST_CASE("shared_data_repository_manager Add Data Batch Multiple Operators",
-          "[data_repository_manager]")
+TEST_CASE("data_repository_manager Add Data Batch Multiple Operators", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add multiple repositories
   std::vector<size_t> operator_ids = {1, 2, 3};
   for (size_t id : operator_ids) {
-    manager.add_new_repository(id, "default", std::make_unique<shared_data_repository>());
+    manager.add_new_repository(id, "default", std::make_unique<idata_repository>());
   }
 
   // Create and add batch to all operators
   auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+  auto batch        = data_batch::make(batch_id, std::move(data));
 
   std::vector<std::pair<size_t, std::string_view>> operator_ports;
   for (size_t id : operator_ids) {
@@ -170,10 +171,9 @@ TEST_CASE("shared_data_repository_manager Add Data Batch Multiple Operators",
 }
 
 // Test concurrent batch ID generation
-TEST_CASE("shared_data_repository_manager Thread-Safe Batch ID Generation",
-          "[data_repository_manager]")
+TEST_CASE("data_repository_manager Thread-Safe Batch ID Generation", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   constexpr int num_threads    = 10;
   constexpr int ids_per_thread = 100;
@@ -209,13 +209,13 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Batch ID Generation",
 }
 
 // Test concurrent batch addition with shared_ptr
-TEST_CASE("shared_data_repository_manager Thread-Safe Add Batch", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Thread-Safe Add Batch", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<shared_data_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
   constexpr int num_threads        = 10;
   constexpr int batches_per_thread = 50;
@@ -229,7 +229,7 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Add Batch", "[data_reposit
       for (int j = 0; j < batches_per_thread; ++j) {
         auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
         uint64_t batch_id = manager.get_next_data_batch_id();
-        auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+        auto batch        = data_batch::make(batch_id, std::move(data));
         manager.add_data_batch(batch, operator_ports);
       }
     });
@@ -252,123 +252,18 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Add Batch", "[data_reposit
 }
 
 // =============================================================================
-// Tests for unique_ptr based repository manager
-// =============================================================================
-
-// Test basic construction
-TEST_CASE("unique_data_repository_manager Construction", "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  // Manager should be empty initially
-  // Accessing non-existent repository should throw
-  REQUIRE_THROWS_AS(manager.get_repository(0, "default"), std::out_of_range);
-}
-
-// Test adding a single repository with unique_ptr
-TEST_CASE("unique_data_repository_manager Add Single Repository", "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  size_t operator_id = 1;
-  auto repository    = std::make_unique<unique_data_repository>();
-  manager.add_new_repository(operator_id, "default", std::move(repository));
-
-  // Repository should be accessible
-  auto& repo = manager.get_repository(operator_id, "default");
-  REQUIRE(repo != nullptr);
-}
-
-// Test adding data batch with unique_ptr (single operator only)
-TEST_CASE("unique_data_repository_manager Add Data Batch Single Operator",
-          "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  // Add repository
-  size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<unique_data_repository>());
-
-  // Create and add batch
-  auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = std::make_unique<data_batch>(batch_id, std::move(data));
-
-  std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
-  manager.add_data_batch(std::move(batch), operator_ports);
-
-  // Repository should have the batch
-  auto& repo        = manager.get_repository(operator_id, "default");
-  auto pulled_batch = repo->pop_next_data_batch();
-  REQUIRE(pulled_batch != nullptr);
-  REQUIRE(pulled_batch->get_batch_id() == batch_id);
-}
-
-// Test that unique_ptr throws when adding to multiple operators
-TEST_CASE("unique_data_repository_manager Add Batch Multiple Operators Throws",
-          "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  // Add multiple repositories
-  manager.add_new_repository(1, "default", std::make_unique<unique_data_repository>());
-  manager.add_new_repository(2, "default", std::make_unique<unique_data_repository>());
-
-  // Create batch
-  auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = std::make_unique<data_batch>(batch_id, std::move(data));
-
-  // Trying to add to multiple operators should throw
-  std::vector<std::pair<size_t, std::string_view>> operator_ports = {{1, "default"},
-                                                                     {2, "default"}};
-  REQUIRE_THROWS_AS(manager.add_data_batch(std::move(batch), operator_ports), std::runtime_error);
-}
-
-// Test adding multiple batches with unique_ptr
-TEST_CASE("unique_data_repository_manager Add Multiple Batches", "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  // Add repository
-  size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<unique_data_repository>());
-
-  constexpr int num_batches                                       = 10;
-  std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
-
-  // Add multiple batches
-  for (int i = 0; i < num_batches; ++i) {
-    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-    uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_unique<data_batch>(batch_id, std::move(data));
-    manager.add_data_batch(std::move(batch), operator_ports);
-  }
-
-  // Repository should have all batches
-  auto& repo = manager.get_repository(operator_id, "default");
-  int count  = 0;
-  while (true) {
-    auto batch = repo->pop_next_data_batch();
-    if (!batch) break;
-    ++count;
-  }
-  REQUIRE(count == num_batches);
-}
-
-// =============================================================================
 // Integration Tests
 // =============================================================================
 
 // Test full workflow with shared_ptr
-TEST_CASE("shared_data_repository_manager Full Workflow", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Setup: Create 3 operators
   std::vector<size_t> operator_ids = {0, 1, 2};
   for (size_t id : operator_ids) {
-    manager.add_new_repository(id, "default", std::make_unique<shared_data_repository>());
+    manager.add_new_repository(id, "default", std::make_unique<idata_repository>());
   }
 
   // Add batches to different operator combinations
@@ -377,7 +272,7 @@ TEST_CASE("shared_data_repository_manager Full Workflow", "[data_repository_mana
   {
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+    auto batch        = data_batch::make(batch_id, std::move(data));
     std::vector<std::pair<size_t, std::string_view>> all_ports;
     for (size_t id : operator_ids) {
       all_ports.push_back({id, "default"});
@@ -389,7 +284,7 @@ TEST_CASE("shared_data_repository_manager Full Workflow", "[data_repository_mana
   {
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+    auto batch        = data_batch::make(batch_id, std::move(data));
     std::vector<std::pair<size_t, std::string_view>> p0 = {{0, "default"}};
     manager.add_data_batch(batch, p0);
   }
@@ -398,7 +293,7 @@ TEST_CASE("shared_data_repository_manager Full Workflow", "[data_repository_mana
   {
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 4096);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+    auto batch        = data_batch::make(batch_id, std::move(data));
     std::vector<std::pair<size_t, std::string_view>> p12 = {{1, "default"}, {2, "default"}};
     manager.add_data_batch(batch, p12);
   }
@@ -441,15 +336,15 @@ TEST_CASE("shared_data_repository_manager Full Workflow", "[data_repository_mana
 }
 
 // Test large number of operators
-TEST_CASE("shared_data_repository_manager Large Number of Operators", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Large Number of Operators", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   constexpr int num_operators = 1000;
 
   // Add many operators
   for (int i = 0; i < num_operators; ++i) {
-    manager.add_new_repository(i, "default", std::make_unique<shared_data_repository>());
+    manager.add_new_repository(i, "default", std::make_unique<idata_repository>());
   }
 
   // All operators should be accessible
@@ -460,13 +355,13 @@ TEST_CASE("shared_data_repository_manager Large Number of Operators", "[data_rep
 }
 
 // Test large number of batches
-TEST_CASE("shared_data_repository_manager Large Number of Batches", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Large Number of Batches", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<shared_data_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
   constexpr int num_batches                                       = 1000;
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
@@ -475,7 +370,7 @@ TEST_CASE("shared_data_repository_manager Large Number of Batches", "[data_repos
   for (int i = 0; i < num_batches; ++i) {
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+    auto batch        = data_batch::make(batch_id, std::move(data));
     manager.add_data_batch(batch, operator_ports);
   }
 
@@ -495,9 +390,9 @@ TEST_CASE("shared_data_repository_manager Large Number of Batches", "[data_repos
 // =============================================================================
 
 // Test concurrent repository addition
-TEST_CASE("shared_data_repository_manager Thread-Safe Add Repository", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Thread-Safe Add Repository", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   constexpr int num_threads = 10;
   std::vector<std::thread> threads;
@@ -505,7 +400,7 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Add Repository", "[data_re
   // Launch threads to add repositories
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
-      auto repository = std::make_unique<shared_data_repository>();
+      auto repository = std::make_unique<idata_repository>();
       manager.add_new_repository(i, "default", std::move(repository));
     });
   }
@@ -523,14 +418,13 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Add Repository", "[data_re
 }
 
 // Test concurrent mixed operations with shared_ptr
-TEST_CASE("shared_data_repository_manager Thread-Safe Mixed Operations",
-          "[data_repository_manager]")
+TEST_CASE("data_repository_manager Thread-Safe Mixed Operations", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add initial repositories
   for (int i = 0; i < 5; ++i) {
-    manager.add_new_repository(i, "default", std::make_unique<shared_data_repository>());
+    manager.add_new_repository(i, "default", std::make_unique<idata_repository>());
   }
 
   constexpr int num_threads           = 10;
@@ -551,7 +445,7 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Mixed Operations",
         // Add batch to random operator
         size_t operator_id = (i + j) % 5;
         auto data          = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-        auto batch         = std::make_shared<data_batch>(batch_id, std::move(data));
+        auto batch         = data_batch::make(batch_id, std::move(data));
         std::vector<std::pair<size_t, std::string_view>> operator_ports = {
           {operator_id, "default"}};
         manager.add_data_batch(batch, operator_ports);
@@ -584,14 +478,14 @@ TEST_CASE("shared_data_repository_manager Thread-Safe Mixed Operations",
 }
 
 // Test concurrent add and pull with shared_ptr
-TEST_CASE("shared_data_repository_manager Concurrent Add and Pull", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Concurrent Add and Pull", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add repositories for multiple operators
   constexpr int num_operators = 3;
   for (int i = 0; i < num_operators; ++i) {
-    manager.add_new_repository(i, "default", std::make_unique<shared_data_repository>());
+    manager.add_new_repository(i, "default", std::make_unique<idata_repository>());
   }
 
   constexpr int num_adder_threads  = 5;
@@ -613,7 +507,7 @@ TEST_CASE("shared_data_repository_manager Concurrent Add and Pull", "[data_repos
         // Add batch to one or more operators
         size_t operator_id = (i + j) % num_operators;
         auto data          = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-        auto batch         = std::make_shared<data_batch>(batch_id, std::move(data));
+        auto batch         = data_batch::make(batch_id, std::move(data));
         std::vector<std::pair<size_t, std::string_view>> operator_ports = {
           {operator_id, "default"}};
         manager.add_data_batch(batch, operator_ports);
@@ -680,13 +574,13 @@ TEST_CASE("shared_data_repository_manager Concurrent Add and Pull", "[data_repos
 }
 
 // Test high-contention concurrent add and pull
-TEST_CASE("shared_data_repository_manager High Contention Add Pull", "[data_repository_manager]")
+TEST_CASE("data_repository_manager High Contention Add Pull", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Single operator for maximum contention
   size_t operator_id = 0;
-  manager.add_new_repository(operator_id, "default", std::make_unique<shared_data_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
   constexpr int num_threads           = 20;
   constexpr int operations_per_thread = 50;
@@ -705,7 +599,7 @@ TEST_CASE("shared_data_repository_manager High Contention Add Pull", "[data_repo
         // Add a batch
         uint64_t batch_id = manager.get_next_data_batch_id();
         auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 512);
-        auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+        auto batch        = data_batch::make(batch_id, std::move(data));
         manager.add_data_batch(batch, operator_ports);
         ++total_added;
 
@@ -737,15 +631,15 @@ TEST_CASE("shared_data_repository_manager High Contention Add Pull", "[data_repo
 }
 
 // Test concurrent add with multiple views per batch (shared_ptr)
-TEST_CASE("shared_data_repository_manager Concurrent Add Multiple Operators Per Batch",
+TEST_CASE("data_repository_manager Concurrent Add Multiple Operators Per Batch",
           "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add repositories
   constexpr int num_operators = 5;
   for (int i = 0; i < num_operators; ++i) {
-    manager.add_new_repository(i, "default", std::make_unique<shared_data_repository>());
+    manager.add_new_repository(i, "default", std::make_unique<idata_repository>());
   }
 
   constexpr int num_batches = 50;
@@ -760,7 +654,7 @@ TEST_CASE("shared_data_repository_manager Concurrent Add Multiple Operators Per 
   for (int i = 0; i < num_batches; ++i) {
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+    auto batch        = data_batch::make(batch_id, std::move(data));
     manager.add_data_batch(batch, all_operator_ports);
   }
 
@@ -798,254 +692,31 @@ TEST_CASE("shared_data_repository_manager Concurrent Add Multiple Operators Per 
 }
 
 // =============================================================================
-// unique_ptr Manager Thread-Safety Tests
-// =============================================================================
-
-// Test concurrent batch ID generation with unique_ptr manager
-TEST_CASE("unique_data_repository_manager Thread-Safe Batch ID Generation",
-          "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  constexpr int num_threads    = 10;
-  constexpr int ids_per_thread = 100;
-
-  std::vector<std::thread> threads;
-  std::vector<std::vector<uint64_t>> thread_ids(num_threads);
-
-  // Launch threads to generate IDs
-  for (int i = 0; i < num_threads; ++i) {
-    threads.emplace_back([&, i]() {
-      for (int j = 0; j < ids_per_thread; ++j) {
-        thread_ids[i].push_back(manager.get_next_data_batch_id());
-      }
-    });
-  }
-
-  // Wait for all threads
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  // Collect all IDs
-  std::vector<uint64_t> all_ids;
-  for (const auto& ids : thread_ids) {
-    all_ids.insert(all_ids.end(), ids.begin(), ids.end());
-  }
-
-  // All IDs should be unique
-  std::sort(all_ids.begin(), all_ids.end());
-  auto last = std::unique(all_ids.begin(), all_ids.end());
-  REQUIRE(last == all_ids.end());
-  REQUIRE(all_ids.size() == num_threads * ids_per_thread);
-}
-
-// Test concurrent batch addition with unique_ptr
-TEST_CASE("unique_data_repository_manager Thread-Safe Add Batch", "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  // Add repository
-  size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<unique_data_repository>());
-
-  constexpr int num_threads        = 10;
-  constexpr int batches_per_thread = 50;
-
-  std::vector<std::thread> threads;
-  std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
-
-  // Launch threads to add batches
-  for (int i = 0; i < num_threads; ++i) {
-    threads.emplace_back([&]() {
-      for (int j = 0; j < batches_per_thread; ++j) {
-        auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-        uint64_t batch_id = manager.get_next_data_batch_id();
-        auto batch        = std::make_unique<data_batch>(batch_id, std::move(data));
-        manager.add_data_batch(std::move(batch), operator_ports);
-      }
-    });
-  }
-
-  // Wait for all threads
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  // Repository should have all batches
-  auto& repo = manager.get_repository(operator_id, "default");
-  int count  = 0;
-  while (true) {
-    auto batch = repo->pop_next_data_batch();
-    if (!batch) break;
-    ++count;
-  }
-  REQUIRE(count == num_threads * batches_per_thread);
-}
-
-// Test concurrent add and pull with unique_ptr
-TEST_CASE("unique_data_repository_manager Concurrent Add and Pull", "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  // Add repository
-  size_t operator_id = 0;
-  manager.add_new_repository(operator_id, "default", std::make_unique<unique_data_repository>());
-
-  constexpr int num_adder_threads  = 5;
-  constexpr int num_puller_threads = 5;
-  constexpr int batches_per_adder  = 100;
-
-  std::vector<std::thread> threads;
-  std::atomic<int> batches_added{0};
-  std::atomic<int> batches_pulled{0};
-  std::atomic<bool> keep_adding{true};
-
-  std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
-
-  // Launch adder threads
-  for (int i = 0; i < num_adder_threads; ++i) {
-    threads.emplace_back([&]() {
-      for (int j = 0; j < batches_per_adder; ++j) {
-        auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-        uint64_t batch_id = manager.get_next_data_batch_id();
-        auto batch        = std::make_unique<data_batch>(batch_id, std::move(data));
-        manager.add_data_batch(std::move(batch), operator_ports);
-
-        ++batches_added;
-
-        // Small delay to allow pullers to work
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-      }
-    });
-  }
-
-  // Launch puller threads
-  for (int i = 0; i < num_puller_threads; ++i) {
-    threads.emplace_back([&]() {
-      auto& repo = manager.get_repository(operator_id, "default");
-
-      while (keep_adding.load()) {
-        auto batch = repo->pop_next_data_batch();
-        if (batch) {
-          ++batches_pulled;
-        } else {
-          std::this_thread::yield();
-        }
-      }
-
-      // Final cleanup
-      while (true) {
-        auto batch = repo->pop_next_data_batch();
-        if (!batch) break;
-        ++batches_pulled;
-      }
-    });
-  }
-
-  // Wait for adder threads to complete
-  for (int i = 0; i < num_adder_threads; ++i) {
-    threads[i].join();
-  }
-
-  // Signal pullers that adding is done
-  keep_adding.store(false);
-
-  // Wait for puller threads to complete
-  for (size_t i = num_adder_threads; i < threads.size(); ++i) {
-    threads[i].join();
-  }
-
-  // Verify all batches were added
-  REQUIRE(batches_added == num_adder_threads * batches_per_adder);
-
-  // Verify all batches were pulled
-  REQUIRE(batches_pulled == num_adder_threads * batches_per_adder);
-}
-
-// Test high contention with unique_ptr
-TEST_CASE("unique_data_repository_manager High Contention", "[data_repository_manager]")
-{
-  unique_data_repository_manager manager;
-
-  size_t operator_id = 0;
-  manager.add_new_repository(operator_id, "default", std::make_unique<unique_data_repository>());
-
-  constexpr int num_threads           = 20;
-  constexpr int operations_per_thread = 50;
-
-  std::vector<std::thread> threads;
-  std::atomic<int> total_added{0};
-  std::atomic<int> total_pulled{0};
-
-  std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
-
-  // Launch threads doing both add and pull operations
-  for (int i = 0; i < num_threads; ++i) {
-    threads.emplace_back([&]() {
-      auto& repo = manager.get_repository(operator_id, "default");
-
-      for (int j = 0; j < operations_per_thread; ++j) {
-        // Add a batch
-        auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 512);
-        uint64_t batch_id = manager.get_next_data_batch_id();
-        auto batch        = std::make_unique<data_batch>(batch_id, std::move(data));
-        manager.add_data_batch(std::move(batch), operator_ports);
-        ++total_added;
-
-        // Immediately try to pull a batch
-        auto pulled = repo->pop_next_data_batch();
-        if (pulled) { ++total_pulled; }
-      }
-    });
-  }
-
-  // Wait for all threads
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  // Verify counts
-  REQUIRE(total_added == num_threads * operations_per_thread);
-
-  // Clean up remaining batches
-  auto& repo = manager.get_repository(operator_id, "default");
-  while (true) {
-    auto batch = repo->pop_next_data_batch();
-    if (!batch) break;
-    ++total_pulled;
-  }
-
-  // All batches should have been processed
-  REQUIRE(total_pulled == total_added);
-}
-
-// =============================================================================
 // Edge Case Tests
 // =============================================================================
 
 // Test with operator ID zero
-TEST_CASE("shared_data_repository_manager Operator ID Zero", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Operator ID Zero", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Operator ID 0 should work like any other ID
-  manager.add_new_repository(0, "default", std::make_unique<shared_data_repository>());
+  manager.add_new_repository(0, "default", std::make_unique<idata_repository>());
 
   auto& repo = manager.get_repository(0, "default");
   REQUIRE(repo != nullptr);
 }
 
 // Test with large operator IDs
-TEST_CASE("shared_data_repository_manager Large Operator IDs", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Large Operator IDs", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   std::vector<size_t> large_ids = {1000, 10000, 100000, SIZE_MAX - 1, SIZE_MAX};
 
   // Add repositories with large IDs
   for (size_t id : large_ids) {
-    manager.add_new_repository(id, "default", std::make_unique<shared_data_repository>());
+    manager.add_new_repository(id, "default", std::make_unique<idata_repository>());
   }
 
   // All should be accessible
@@ -1056,14 +727,13 @@ TEST_CASE("shared_data_repository_manager Large Operator IDs", "[data_repository
 }
 
 // Test batch with different data sizes
-TEST_CASE("shared_data_repository_manager Batches With Different Sizes",
-          "[data_repository_manager]")
+TEST_CASE("data_repository_manager Batches With Different Sizes", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<shared_data_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
   std::vector<size_t> sizes = {1, 1024, 1024 * 1024, 1024 * 1024 * 10};
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
@@ -1072,7 +742,7 @@ TEST_CASE("shared_data_repository_manager Batches With Different Sizes",
   for (size_t size : sizes) {
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, size);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+    auto batch        = data_batch::make(batch_id, std::move(data));
     manager.add_data_batch(batch, operator_ports);
   }
 
@@ -1088,14 +758,13 @@ TEST_CASE("shared_data_repository_manager Batches With Different Sizes",
 }
 
 // Test batch with different memory tiers
-TEST_CASE("shared_data_repository_manager Batches With Different Tiers",
-          "[data_repository_manager]")
+TEST_CASE("data_repository_manager Batches With Different Tiers", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<shared_data_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
   std::vector<memory::Tier> tiers = {memory::Tier::GPU, memory::Tier::HOST, memory::Tier::DISK};
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
@@ -1104,7 +773,7 @@ TEST_CASE("shared_data_repository_manager Batches With Different Tiers",
   for (memory::Tier tier : tiers) {
     auto data         = std::make_unique<mock_data_representation>(tier, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+    auto batch        = data_batch::make(batch_id, std::move(data));
     manager.add_data_batch(batch, operator_ports);
   }
 
@@ -1120,13 +789,13 @@ TEST_CASE("shared_data_repository_manager Batches With Different Tiers",
 }
 
 // Test rapid add and pull cycles
-TEST_CASE("shared_data_repository_manager Rapid Add Pull Cycles", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Rapid Add Pull Cycles", "[data_repository_manager]")
 {
-  shared_data_repository_manager manager;
+  data_repository_manager manager;
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<shared_data_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
   auto& repo = manager.get_repository(operator_id, "default");
@@ -1135,7 +804,7 @@ TEST_CASE("shared_data_repository_manager Rapid Add Pull Cycles", "[data_reposit
   for (int cycle = 0; cycle < 100; ++cycle) {
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = std::make_shared<data_batch>(batch_id, std::move(data));
+    auto batch        = data_batch::make(batch_id, std::move(data));
     manager.add_data_batch(batch, operator_ports);
 
     // Pull the batch

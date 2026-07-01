@@ -211,14 +211,13 @@ cuCascade uses [Catch2](https://github.com/catchorg/Catch2) v2.13.10 (fetched fr
 
 Tests use BDD-style assertions:
 ```cpp
-TEST_CASE("data batch transitions to task_created", "[data_batch]") {
-    auto batch = data_batch(1, make_gpu_representation());
+TEST_CASE("data batch acquires read-only access", "[data_batch]") {
+    auto batch = data_batch::make(1, make_gpu_representation());
 
-    REQUIRE(batch.get_state() == batch_state::idle);
+    REQUIRE(batch->get_state() == batch_state::idle);
 
-    bool success = batch.try_to_create_task();
-    REQUIRE(success);
-    REQUIRE(batch.get_state() == batch_state::task_created);
+    auto read_only = batch->to_read_only();
+    REQUIRE(batch->get_state() == batch_state::read_only);
 }
 ```
 

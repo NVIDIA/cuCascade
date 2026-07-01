@@ -21,10 +21,16 @@ namespace cucascade {
 
 // ========== data_batch implementation ==========
 
+std::shared_ptr<data_batch> data_batch::make(uint64_t batch_id,
+                                             std::unique_ptr<idata_representation> data)
+{
+  if (data == nullptr) { throw std::runtime_error("data is null in data_batch factory"); }
+  return std::shared_ptr<data_batch>(new data_batch(batch_id, std::move(data)));
+}
+
 data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
   : _batch_id(batch_id), _data(std::move(data))
 {
-  if (_data == nullptr) { throw std::runtime_error("data is null in data_batch constructor"); }
 }
 
 uint64_t data_batch::get_batch_id() const { return _batch_id; }
@@ -221,7 +227,7 @@ std::shared_ptr<data_batch> read_only_data_batch::clone(uint64_t new_batch_id,
 {
   if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
   auto cloned_data = _batch->_data->clone(stream);
-  return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
+  return data_batch::make(new_batch_id, std::move(cloned_data));
 }
 
 // ========== mutable_data_batch ==========
@@ -272,7 +278,7 @@ std::shared_ptr<data_batch> mutable_data_batch::clone(uint64_t new_batch_id,
 {
   if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
   auto cloned_data = _batch->_data->clone(stream);
-  return std::make_shared<data_batch>(new_batch_id, std::move(cloned_data));
+  return data_batch::make(new_batch_id, std::move(cloned_data));
 }
 
 }  // namespace cucascade

@@ -68,18 +68,21 @@ class mutable_data_batch;
  *       smart pointer to it is transferred between states.
  */
 class data_batch : public std::enable_shared_from_this<data_batch> {
- public:
-  // -- Construction --
+  friend class read_only_data_batch;
+  friend class mutable_data_batch;
 
+ public:
   /**
-   * @brief Construct a new data_batch.
+   * @brief Factory function to create new data_batches.
    *
    * @param batch_id Unique identifier for this batch (immutable after construction).
    * @param data     Owned data representation; must not be null.
+   * @return A shared pointer owning the new batch.
+   * @throws std::runtime_error if data is null.
    */
-  data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data);
+  static std::shared_ptr<data_batch> make(uint64_t batch_id,
+                                          std::unique_ptr<idata_representation> data);
 
-  /** @brief Default destructor. */
   ~data_batch() = default;
 
   // -- Deleted move/copy --
@@ -141,8 +144,6 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @return The current reader count.
    */
   size_t get_read_only_count() const { return _read_only_count.load(std::memory_order_acquire); }
-
-  // -- Static transition methods (D-13/D-14/D-15/D-17) --
 
   /**
    * @brief Transition from read-only back to idle (release shared lock).
@@ -227,12 +228,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   [[nodiscard]] static read_only_data_batch mutable_to_readonly(mutable_data_batch&& accessor);
 
  private:
-  // -- Friend declarations (D-24/REPO-04) --
-  friend class read_only_data_batch;
-  friend class mutable_data_batch;
-
-  // -- Private data accessors --
-  // Only friend accessor classes can call these methods.
+  data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data);
 
   /**
    * @brief Get the memory tier of the held data.
@@ -258,7 +254,6 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   void set_data(std::unique_ptr<idata_representation> data);
 
-  // -- Members --
   const uint64_t _batch_id;                            ///< Immutable batch identifier
   std::unique_ptr<idata_representation> _data;         ///< Owned data representation
   mutable std::shared_mutex _rw_mutex;                 ///< Reader-writer mutex
@@ -298,7 +293,7 @@ class read_only_data_batch {
   /**
    * @brief Get the writer event from the underlying representation, or nullptr.
    *
-   * D-B3 proxy: delegates polymorphically to idata_representation::get_writer_event().
+   * Delegates polymorphically to idata_representation::get_writer_event().
    * Returns nullptr when there is no underlying representation, when the representation's
    * tier records no writer event (the base-class default, e.g. host or disk tier), or when
    * no writer event has been recorded yet.
@@ -314,8 +309,6 @@ class read_only_data_batch {
     auto* repr = get_data();
     return repr ? repr->get_writer_event() : nullptr;
   }
-
-  // -- Clone operations (D-18/D-19/D-20/CLONE-01/CLONE-02) --
 
   /**
    * @brief Create an independent deep copy of the batch data.
@@ -449,8 +442,6 @@ class mutable_data_batch {
    */
   void rebind_stream(rmm::cuda_stream_view stream);
 
-  // -- Clone operations (CLONE-01/CLONE-02) --
-
   /**
    * @brief Create an independent deep copy of the batch data.
    *
@@ -514,8 +505,6 @@ class mutable_data_batch {
 // Template implementations (TargetRepresentation-templated methods only)
 // =============================================================================
 
-// -- read_only_data_batch::clone_to (deep copy + conversion, CLONE-02) --
-
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> read_only_data_batch::clone_to(
   representation_converter_registry& registry,
@@ -525,7 +514,7 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
 {
   auto new_representation =
     registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
-  return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
+  return data_batch::make(new_batch_id, std::move(new_representation));
 }
 
 // -- mutable_data_batch::convert_to (in-place conversion) --
@@ -552,8 +541,6 @@ void mutable_data_batch::convert_to(representation_converter_registry& registry,
   }
 }
 
-// -- mutable_data_batch::clone_to (deep copy + conversion, CLONE-02) --
-
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> mutable_data_batch::clone_to(
   representation_converter_registry& registry,
@@ -563,7 +550,7 @@ std::shared_ptr<data_batch> mutable_data_batch::clone_to(
 {
   auto new_representation =
     registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
-  return std::make_shared<data_batch>(new_batch_id, std::move(new_representation));
+  return data_batch::make(new_batch_id, std::move(new_representation));
 }
 
 }  // namespace cucascade

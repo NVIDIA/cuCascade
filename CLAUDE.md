@@ -285,16 +285,16 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Used by: `idata_repository`, application code
 - Purpose: Partitioned, thread-safe collections of batches; blocking pop with state transition
 - Location: `include/cucascade/data/data_repository.hpp`, `src/data/data_repository.cpp`
-- Contains: `idata_repository<PtrType>` (template: `shared_ptr<data_batch>` or `unique_ptr<data_batch>`), `shared_data_repository`, `unique_data_repository`
+- Contains: `idata_repository` (stores `shared_ptr<data_batch>`) and the compatibility alias `shared_data_repository`
 - `pop_data_batch(target_state)` blocks on condition variable until a batch can transition
 - `pop_data_batch_by_id()` / `get_data_batch_by_id()` for directed retrieval
 - Depends on: `data_batch`
 - Used by: `data_repository_manager`
 - Purpose: Top-level coordinator; operator-port keyed repository map; unique batch ID generation
-- Location: `include/cucascade/data/data_repository_manager.hpp`, `src/data/data_repository_manager.cpp`
-- Contains: `data_repository_manager<PtrType>`, `operator_port_key`, `shared_data_repository_manager`, `unique_data_repository_manager`
+- Location: `include/cucascade/data/data_repository_manager.hpp`
+- Contains: `data_repository_manager`, `operator_port_key`, and the compatibility alias `shared_data_repository_manager`
 - Batch IDs generated atomically via `_next_data_batch_id` (`std::atomic<uint64_t>`)
-- SFINAE selects copy vs. move in `add_data_batch_impl` based on `PtrType`
+- `add_data_batch_impl` copies shared batch pointers to each destination repository
 - Depends on: `idata_repository`
 - Used by: Application pipeline code
 ## Data Flow

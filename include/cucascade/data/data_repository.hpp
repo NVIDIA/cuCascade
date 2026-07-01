@@ -44,13 +44,9 @@ namespace cucascade {
  * - Providing downgrade candidates for memory tier management
  * - Thread-safe access to shared data structures
  *
- * @tparam PtrType The smart pointer type used to manage data_batch lifecycle.
- *                 Typically std::shared_ptr<data_batch> or std::unique_ptr<data_batch>.
- *
  * @note Implementations must be thread-safe as multiple threads may access
  *       the repository concurrently during query execution.
  */
-template <typename PtrType>
 class idata_repository {
  public:
   /**
@@ -66,16 +62,15 @@ class idata_repository {
   /**
    * @brief Add a new data batch to this repository.
    *
-   * The repository takes ownership of the data_batch (for unique_ptr) or shares
-   * ownership (for shared_ptr) and will manage its lifecycle according to the
-   * implementation's storage policy.
+   * The repository shares ownership of the data_batch and manages its lifecycle
+   * according to the implementation's storage policy.
    *
-   * @param batch Smart pointer to the data_batch to add (ownership transferred/shared)
+   * @param batch Shared pointer to the data_batch to add
    * @param partition_idx Index of the partition to add the batch to (default: 0)
    *
    * @note Thread-safe operation protected by internal mutex
    */
-  virtual void add_data_batch(PtrType batch, size_t partition_idx = 0)
+  virtual void add_data_batch(std::shared_ptr<data_batch> batch, size_t partition_idx = 0)
   {
     {
       std::lock_guard<std::mutex> lock(_mutex);
@@ -94,12 +89,12 @@ class idata_repository {
    * If the partition is empty, returns a null pointer.
    *
    * @param partition_idx Index of the partition to pop from (default: 0)
-   * @return PtrType The next data batch, or nullptr if the partition is empty.
+   * @return The next data batch, or nullptr if the partition is empty.
    *
    * @note Thread-safe operation protected by internal mutex
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType pop_next_data_batch(size_t partition_idx = 0)
+  virtual std::shared_ptr<data_batch> pop_next_data_batch(size_t partition_idx = 0)
   {
     std::unique_lock<std::mutex> lock(_mutex);
 
@@ -107,7 +102,7 @@ class idata_repository {
       throw std::out_of_range("partition_idx out of range");
     }
 
-    if (_data_batches[partition_idx].empty()) { return PtrType{}; }
+    if (_data_batches[partition_idx].empty()) { return {}; }
 
     auto batch = std::move(_data_batches[partition_idx].front());
     _data_batches[partition_idx].erase(_data_batches[partition_idx].begin());
@@ -122,12 +117,13 @@ class idata_repository {
    *
    * @param batch_id The unique identifier of the batch to retrieve
    * @param partition_idx Index of the partition to search (default: 0)
-   * @return PtrType The data batch with the matching batch_id, or nullptr if not found
+   * @return The data batch with the matching batch_id, or nullptr if not found
    *
    * @note Thread-safe operation protected by internal mutex
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType pop_data_batch_by_id(uint64_t batch_id, size_t partition_idx = 0)
+  virtual std::shared_ptr<data_batch> pop_data_batch_by_id(uint64_t batch_id,
+                                                           size_t partition_idx = 0)
   {
     std::unique_lock<std::mutex> lock(_mutex);
 
@@ -144,7 +140,7 @@ class idata_repository {
       }
     }
 
-    return PtrType{};
+    return {};
   }
 
   /**
@@ -155,14 +151,13 @@ class idata_repository {
    *
    * @param batch_id The unique identifier of the batch to retrieve
    * @param partition_idx Index of the partition to search (default: 0)
-   * @return PtrType A copy of the data batch pointer with the matching batch_id, or nullptr
+   * @return A copy of the data batch pointer with the matching batch_id, or nullptr
    *
    * @note Thread-safe operation protected by internal mutex
-   * @note Only supported for shared_ptr repositories. Will throw for unique_ptr repositories.
-   * @throws std::runtime_error if called on unique_ptr repository
    * @throws std::out_of_range if partition_idx is out of range
    */
-  virtual PtrType get_data_batch_by_id(uint64_t batch_id, size_t partition_idx = 0);
+  virtual std::shared_ptr<data_batch> get_data_batch_by_id(uint64_t batch_id,
+                                                           size_t partition_idx = 0);
 
   /**
    * @brief Get all batch IDs from a partition.
@@ -268,11 +263,10 @@ class idata_repository {
 
  protected:
   mutable std::mutex _mutex;  ///< Mutex for thread-safe access to repository operations
-  std::vector<std::vector<PtrType>>
+  std::vector<std::vector<std::shared_ptr<data_batch>>>
     _data_batches;  ///< Container for data batch pointers (partitioned)
 };
 
-using shared_data_repository = idata_repository<std::shared_ptr<data_batch>>;
-using unique_data_repository = idata_repository<std::unique_ptr<data_batch>>;
+using shared_data_repository = idata_repository;
 
 }  // namespace cucascade

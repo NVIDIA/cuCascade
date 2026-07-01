@@ -26,7 +26,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -77,16 +76,12 @@ struct operator_port_key {
  * The manager abstracts the complexity of multi-pipeline data management and provides
  * a unified interface for higher-level components like the GPU executor and memory manager.
  *
- * @tparam PtrType The smart pointer type used to manage data_batch lifecycle.
- *                 Typically std::shared_ptr<data_batch> or std::unique_ptr<data_batch>.
- *
  * @note All operations are thread-safe and can be called concurrently from multiple
  *       pipeline execution threads.
  */
-template <typename PtrType>
 class data_repository_manager {
  public:
-  using repository_type = idata_repository<PtrType>;
+  using repository_type = idata_repository;
 
   /**
    * @brief Default constructor - initializes empty repository manager.
@@ -127,15 +122,15 @@ class data_repository_manager {
   /**
    * @brief Add a data_batch to specified operator repositories.
    *
-   * For shared_ptr: The batch is copied to each repository.
-   * For unique_ptr: This method requires only one operator (single owner semantics).
+   * The shared batch pointer is copied to each repository.
    *
    * @param batch The data_batch smart pointer to add
    * @param ops The operator IDs and ports whose repositories will receive this batch
    *
    * @note Thread-safe operation
    */
-  void add_data_batch(PtrType batch, std::vector<std::pair<size_t, std::string_view>> ops)
+  void add_data_batch(std::shared_ptr<data_batch> batch,
+                      std::vector<std::pair<size_t, std::string_view>> ops)
   {
     add_data_batch_impl(std::move(batch), ops);
   }
@@ -243,25 +238,12 @@ class data_repository_manager {
   }
 
  private:
-  void add_data_batch_impl(PtrType batch, std::vector<std::pair<size_t, std::string_view>>& ops)
+  void add_data_batch_impl(std::shared_ptr<data_batch> batch,
+                           std::vector<std::pair<size_t, std::string_view>>& ops)
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    if constexpr (std::is_copy_constructible_v<PtrType>) {
-      for (auto& op : ops) {
-        _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
-      }
-    } else {
-      if (ops.size() > 1) {
-        throw std::runtime_error(
-          "unique_ptr data_batch can only be added to one repository. "
-          "Use shared_ptr for multiple destinations.");
-      }
-      if (!ops.empty()) {
-        auto& op = ops[0];
-        _repositories[{op.first, std::string(op.second)}]->add_data_batch(std::move(batch));
-      } else {
-        throw std::runtime_error("No operator ports provided");
-      }
+    for (auto& op : ops) {
+      _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
     }
   }
 
@@ -272,8 +254,6 @@ class data_repository_manager {
     _repositories;  ///< Map of operator ID to idata_repository
 };
 
-// Type aliases for common use cases
-using shared_data_repository_manager = data_repository_manager<std::shared_ptr<data_batch>>;
-using unique_data_repository_manager = data_repository_manager<std::unique_ptr<data_batch>>;
+using shared_data_repository_manager = data_repository_manager;
 
 }  // namespace cucascade
