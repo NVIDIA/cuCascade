@@ -38,6 +38,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace cucascade;
@@ -77,6 +78,8 @@ TEST_CASE("data_batch is non-copyable and non-movable", "[data_batch]")
   static_assert(!std::is_move_assignable_v<data_batch>);
   static_assert(
     !std::is_constructible_v<data_batch, uint64_t, std::unique_ptr<idata_representation>>);
+  static_assert(std::is_same_v<decltype(std::declval<const read_only_data_batch&>().get_data()),
+                               const idata_representation*>);
 }
 
 // =============================================================================
@@ -571,8 +574,8 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
 
   auto ro_clone = cloned->to_read_only();
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone.get_data());
+  auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro.get_data());
+  auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone.get_data());
   REQUIRE(original_repr != nullptr);
   REQUIRE(cloned_repr != nullptr);
 
@@ -600,8 +603,8 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
 
   auto ro_clone = cloned->to_read_only();
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone.get_data());
+  auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro.get_data());
+  auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone.get_data());
 
   // Verify each column points to different memory
   for (cudf::size_type i = 0; i < original_repr->get_table_view().num_columns(); ++i) {
@@ -634,10 +637,10 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
   auto ro_c2 = clone2->to_read_only();
   auto ro_c3 = clone3->to_read_only();
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
-  auto* clone1_repr   = dynamic_cast<gpu_table_representation*>(ro_c1.get_data());
-  auto* clone2_repr   = dynamic_cast<gpu_table_representation*>(ro_c2.get_data());
-  auto* clone3_repr   = dynamic_cast<gpu_table_representation*>(ro_c3.get_data());
+  auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro.get_data());
+  auto* clone1_repr   = dynamic_cast<const gpu_table_representation*>(ro_c1.get_data());
+  auto* clone2_repr   = dynamic_cast<const gpu_table_representation*>(ro_c2.get_data());
+  auto* clone3_repr   = dynamic_cast<const gpu_table_representation*>(ro_c3.get_data());
 
   stream.synchronize();
   expect_cudf_tables_equal_on_stream(
@@ -663,7 +666,7 @@ TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
   REQUIRE(cloned != nullptr);
 
   auto ro_clone     = cloned->to_read_only();
-  auto* cloned_repr = dynamic_cast<gpu_table_representation*>(ro_clone.get_data());
+  auto* cloned_repr = dynamic_cast<const gpu_table_representation*>(ro_clone.get_data());
   REQUIRE(cloned_repr != nullptr);
   REQUIRE(cloned_repr->get_table_view().num_rows() == 0);
   REQUIRE(cloned_repr->get_table_view().num_columns() == 2);
@@ -686,8 +689,8 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
 
   auto ro_clone = cloned->to_read_only();
 
-  auto* original_repr = dynamic_cast<gpu_table_representation*>(ro.get_data());
-  auto* cloned_repr   = dynamic_cast<gpu_table_representation*>(ro_clone.get_data());
+  auto* original_repr = dynamic_cast<const gpu_table_representation*>(ro.get_data());
+  auto* cloned_repr   = dynamic_cast<const gpu_table_representation*>(ro_clone.get_data());
 
   // Verify structure
   REQUIRE(cloned_repr->get_table_view().num_rows() == 10000);

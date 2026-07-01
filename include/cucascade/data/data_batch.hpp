@@ -285,7 +285,7 @@ class read_only_data_batch {
   memory::Tier get_current_tier() const { return _batch->get_current_tier(); }
 
   /** @brief Get a raw pointer to the data representation. */
-  idata_representation* get_data() const { return _batch->get_data(); }
+  [[nodiscard]] const idata_representation* get_data() const { return _batch->get_data(); }
 
   /** @brief Get a raw pointer to the memory space. */
   memory::memory_space* get_memory_space() const { return _batch->get_memory_space(); }

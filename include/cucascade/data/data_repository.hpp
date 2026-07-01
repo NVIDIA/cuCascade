@@ -157,7 +157,23 @@ class data_repository {
    * @throws std::out_of_range if partition_idx is out of range
    */
   virtual std::shared_ptr<data_batch> get_data_batch_by_id(uint64_t batch_id,
-                                                           size_t partition_idx = 0);
+                                                           size_t partition_idx = 0) const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (partition_idx >= _data_batches.size()) {
+      throw std::out_of_range("partition_idx out of range");
+    }
+
+    for (const std::shared_ptr<data_batch>& batch : _data_batches[partition_idx]) {
+      if (batch->get_batch_id() == batch_id) {
+        std::shared_ptr<data_batch> copy = batch;
+        return copy;
+      }
+    }
+
+    return nullptr;
+  }
 
   /**
    * @brief Get all batch IDs from a partition.

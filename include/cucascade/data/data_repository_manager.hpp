@@ -129,10 +129,13 @@ class data_repository_manager {
    *
    * @note Thread-safe operation
    */
-  void add_data_batch(std::shared_ptr<data_batch> batch,
-                      std::vector<std::pair<size_t, std::string_view>> ops)
+  void add_data_batch(const std::shared_ptr<data_batch>& batch,
+                      const std::vector<std::pair<size_t, std::string_view>>& ops)
   {
-    add_data_batch_impl(std::move(batch), ops);
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (auto& op : ops) {
+      _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
+    }
   }
 
   /**
@@ -238,15 +241,6 @@ class data_repository_manager {
   }
 
  private:
-  void add_data_batch_impl(std::shared_ptr<data_batch> batch,
-                           std::vector<std::pair<size_t, std::string_view>>& ops)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& op : ops) {
-      _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
-    }
-  }
-
   std::mutex _mutex;  ///< Mutex for thread-safe access
   std::atomic<uint64_t> _next_data_batch_id =
     0;  ///< Atomic counter for generating unique data batch identifiers
