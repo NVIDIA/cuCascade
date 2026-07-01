@@ -460,9 +460,6 @@ The `add_data_batch()` method distributes a batch to one or more repositories:
 ```cpp
 // shared_ptr: same batch goes to multiple repositories
 manager.add_data_batch(shared_batch, {{0, "output"}, {1, "input"}});
-
-// unique_ptr: batch goes to exactly one repository (throws if multiple specified)
-manager.add_data_batch(std::move(unique_batch), {{1, "input"}});
 ```
 
 The manager also provides `get_data_batches_for_downgrade()` to find batches eligible for tier demotion based on their memory space.
