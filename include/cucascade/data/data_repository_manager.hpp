@@ -129,8 +129,8 @@ class data_repository_manager {
    *
    * @note Thread-safe operation
    */
-  void add_data_batch(const std::shared_ptr<data_batch>& batch,
-                      const std::vector<std::pair<size_t, std::string_view>>& ops)
+  void add_data_batch(std::shared_ptr<data_batch> batch,
+                      std::vector<std::pair<size_t, std::string_view>> ops)
   {
     std::lock_guard<std::mutex> lock(_mutex);
     for (auto& op : ops) {
