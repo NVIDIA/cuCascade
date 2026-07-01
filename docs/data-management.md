@@ -420,7 +420,7 @@ auto batch = repository.pop_data_batch(batch_state::task_created, 0);
 
 | Type | Compatibility Alias | Use Case |
 |------|---------------------|----------|
-| `idata_repository` | `shared_data_repository` | Same batch shared across multiple repositories (fan-out) |
+| `data_repository` | `shared_data_repository` | Same batch shared across multiple repositories (fan-out) |
 
 Repositories use `shared_ptr<data_batch>` because batches are created by `data_batch::make()` and
 the accessor transition API uses `shared_from_this()`.
@@ -437,9 +437,9 @@ Repositories are indexed by `(operator_id, port_id)` pairs:
 
 ```cpp
 // Add repositories for different operators
-manager.add_new_repository(0, "output", std::make_unique<idata_repository>());
-manager.add_new_repository(1, "input", std::make_unique<idata_repository>());
-manager.add_new_repository(1, "output", std::make_unique<idata_repository>());
+manager.add_new_repository(0, "output", std::make_unique<data_repository>());
+manager.add_new_repository(1, "input", std::make_unique<data_repository>());
+manager.add_new_repository(1, "output", std::make_unique<data_repository>());
 
 // Access a specific repository
 auto& repo = manager.get_repository(1, "input");
@@ -516,7 +516,7 @@ Application
 |------|---------|
 | `include/cucascade/data/common.hpp` | `idata_representation` abstract interface |
 | `include/cucascade/data/data_batch.hpp` | `data_batch`, `read_only_data_batch`, `mutable_data_batch`, `batch_state` |
-| `include/cucascade/data/data_repository.hpp` | `idata_repository` |
+| `include/cucascade/data/data_repository.hpp` | `data_repository` |
 | `include/cucascade/data/data_repository_manager.hpp` | `data_repository_manager`, `operator_port_key` |
 | `include/cucascade/data/representation_converter.hpp` | `representation_converter_registry`, `converter_key` |
 | `include/cucascade/data/gpu_data_representation.hpp` | `gpu_table_representation` wrapping `cudf::table` |

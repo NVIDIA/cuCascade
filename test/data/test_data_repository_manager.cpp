@@ -56,7 +56,7 @@ TEST_CASE("data_repository_manager Add Single Repository", "[data_repository_man
   data_repository_manager manager;
 
   size_t operator_id = 1;
-  auto repository    = std::make_unique<idata_repository>();
+  auto repository    = std::make_unique<data_repository>();
   manager.add_new_repository(operator_id, "default", std::move(repository));
 
   // Repository should be accessible
@@ -73,7 +73,7 @@ TEST_CASE("data_repository_manager Add Multiple Repositories", "[data_repository
 
   // Add repositories for multiple operators
   for (size_t i = 0; i < num_operators; ++i) {
-    auto repository = std::make_unique<idata_repository>();
+    auto repository = std::make_unique<data_repository>();
     manager.add_new_repository(i, "default", std::move(repository));
   }
 
@@ -122,7 +122,7 @@ TEST_CASE("data_repository_manager Add Data Batch Single Operator", "[data_repos
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
 
   // Create and add batch
   auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
@@ -147,7 +147,7 @@ TEST_CASE("data_repository_manager Add Data Batch Multiple Operators", "[data_re
   // Add multiple repositories
   std::vector<size_t> operator_ids = {1, 2, 3};
   for (size_t id : operator_ids) {
-    manager.add_new_repository(id, "default", std::make_unique<idata_repository>());
+    manager.add_new_repository(id, "default", std::make_unique<data_repository>());
   }
 
   // Create and add batch to all operators
@@ -215,7 +215,7 @@ TEST_CASE("data_repository_manager Thread-Safe Add Batch", "[data_repository_man
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
 
   constexpr int num_threads        = 10;
   constexpr int batches_per_thread = 50;
@@ -263,7 +263,7 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
   // Setup: Create 3 operators
   std::vector<size_t> operator_ids = {0, 1, 2};
   for (size_t id : operator_ids) {
-    manager.add_new_repository(id, "default", std::make_unique<idata_repository>());
+    manager.add_new_repository(id, "default", std::make_unique<data_repository>());
   }
 
   // Add batches to different operator combinations
@@ -344,7 +344,7 @@ TEST_CASE("data_repository_manager Large Number of Operators", "[data_repository
 
   // Add many operators
   for (int i = 0; i < num_operators; ++i) {
-    manager.add_new_repository(i, "default", std::make_unique<idata_repository>());
+    manager.add_new_repository(i, "default", std::make_unique<data_repository>());
   }
 
   // All operators should be accessible
@@ -361,7 +361,7 @@ TEST_CASE("data_repository_manager Large Number of Batches", "[data_repository_m
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
 
   constexpr int num_batches                                       = 1000;
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
@@ -400,7 +400,7 @@ TEST_CASE("data_repository_manager Thread-Safe Add Repository", "[data_repositor
   // Launch threads to add repositories
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
-      auto repository = std::make_unique<idata_repository>();
+      auto repository = std::make_unique<data_repository>();
       manager.add_new_repository(i, "default", std::move(repository));
     });
   }
@@ -424,7 +424,7 @@ TEST_CASE("data_repository_manager Thread-Safe Mixed Operations", "[data_reposit
 
   // Add initial repositories
   for (int i = 0; i < 5; ++i) {
-    manager.add_new_repository(i, "default", std::make_unique<idata_repository>());
+    manager.add_new_repository(i, "default", std::make_unique<data_repository>());
   }
 
   constexpr int num_threads           = 10;
@@ -485,7 +485,7 @@ TEST_CASE("data_repository_manager Concurrent Add and Pull", "[data_repository_m
   // Add repositories for multiple operators
   constexpr int num_operators = 3;
   for (int i = 0; i < num_operators; ++i) {
-    manager.add_new_repository(i, "default", std::make_unique<idata_repository>());
+    manager.add_new_repository(i, "default", std::make_unique<data_repository>());
   }
 
   constexpr int num_adder_threads  = 5;
@@ -580,7 +580,7 @@ TEST_CASE("data_repository_manager High Contention Add Pull", "[data_repository_
 
   // Single operator for maximum contention
   size_t operator_id = 0;
-  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
 
   constexpr int num_threads           = 20;
   constexpr int operations_per_thread = 50;
@@ -639,7 +639,7 @@ TEST_CASE("data_repository_manager Concurrent Add Multiple Operators Per Batch",
   // Add repositories
   constexpr int num_operators = 5;
   for (int i = 0; i < num_operators; ++i) {
-    manager.add_new_repository(i, "default", std::make_unique<idata_repository>());
+    manager.add_new_repository(i, "default", std::make_unique<data_repository>());
   }
 
   constexpr int num_batches = 50;
@@ -701,7 +701,7 @@ TEST_CASE("data_repository_manager Operator ID Zero", "[data_repository_manager]
   data_repository_manager manager;
 
   // Operator ID 0 should work like any other ID
-  manager.add_new_repository(0, "default", std::make_unique<idata_repository>());
+  manager.add_new_repository(0, "default", std::make_unique<data_repository>());
 
   auto& repo = manager.get_repository(0, "default");
   REQUIRE(repo != nullptr);
@@ -716,7 +716,7 @@ TEST_CASE("data_repository_manager Large Operator IDs", "[data_repository_manage
 
   // Add repositories with large IDs
   for (size_t id : large_ids) {
-    manager.add_new_repository(id, "default", std::make_unique<idata_repository>());
+    manager.add_new_repository(id, "default", std::make_unique<data_repository>());
   }
 
   // All should be accessible
@@ -733,7 +733,7 @@ TEST_CASE("data_repository_manager Batches With Different Sizes", "[data_reposit
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
 
   std::vector<size_t> sizes = {1, 1024, 1024 * 1024, 1024 * 1024 * 10};
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
@@ -764,7 +764,7 @@ TEST_CASE("data_repository_manager Batches With Different Tiers", "[data_reposit
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
 
   std::vector<memory::Tier> tiers = {memory::Tier::GPU, memory::Tier::HOST, memory::Tier::DISK};
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
@@ -795,7 +795,7 @@ TEST_CASE("data_repository_manager Rapid Add Pull Cycles", "[data_repository_man
 
   // Add repository
   size_t operator_id = 1;
-  manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
+  manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
 
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
   auto& repo = manager.get_repository(operator_id, "default");

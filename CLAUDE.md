@@ -282,10 +282,10 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Contains: `data_batch` (owns `unique_ptr<idata_representation>`), `batch_state` enum, `data_batch_processing_handle` (RAII, holds `weak_ptr<data_batch>`), `idata_batch_probe` interface, `lock_for_processing_result`
 - Allowed state transitions: `idle → in_transit | task_created`, `task_created → processing | idle`, `processing → idle`, `in_transit → idle`
 - Depends on: `idata_representation`, `representation_converter_registry`
-- Used by: `idata_repository`, application code
+- Used by: `data_repository`, application code
 - Purpose: Partitioned, thread-safe collections of batches; blocking pop with state transition
 - Location: `include/cucascade/data/data_repository.hpp`, `src/data/data_repository.cpp`
-- Contains: `idata_repository` (stores `shared_ptr<data_batch>`) and the compatibility alias `shared_data_repository`
+- Contains: `data_repository` (stores `shared_ptr<data_batch>`) and the compatibility alias `shared_data_repository`
 - `pop_data_batch(target_state)` blocks on condition variable until a batch can transition
 - `pop_data_batch_by_id()` / `get_data_batch_by_id()` for directed retrieval
 - Depends on: `data_batch`
@@ -295,12 +295,12 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Contains: `data_repository_manager`, `operator_port_key`, and the compatibility alias `shared_data_repository_manager`
 - Batch IDs generated atomically via `_next_data_batch_id` (`std::atomic<uint64_t>`)
 - `add_data_batch_impl` copies shared batch pointers to each destination repository
-- Depends on: `idata_repository`
+- Depends on: `data_repository`
 - Used by: Application pipeline code
 ## Data Flow
 - `data_batch` mutex protects all state transitions and `_processing_count`
 - Blocking `wait_to_*` methods use `_internal_cv` on the batch mutex
-- `idata_repository` propagates state change notifications via `_state_change_cv` pointer set on each batch
+- `data_repository` propagates state change notifications via `_state_change_cv` pointer set on each batch
 ## Key Abstractions
 - Purpose: Uniform interface for tier-specific storage formats
 - Location: `include/cucascade/data/common.hpp`
@@ -353,7 +353,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `oom_handling_policy` interface (`include/cucascade/memory/oom_handling_policy.hpp`) allows pluggable OOM recovery; default `throw_on_oom_policy`
 - `reservation_limit_policy` handles over-reservation: `ignore`, `fail`, or `increase` strategies
 ## Cross-Cutting Concerns
-- All public methods on `memory_space`, `data_batch`, `idata_repository`, `data_repository_manager` are mutex-protected
+- All public methods on `memory_space`, `data_batch`, `data_repository`, `data_repository_manager` are mutex-protected
 - `representation_converter_registry` uses internal mutex for concurrent register/lookup
 - Atomic counters (`atomic_bounded_counter`, `atomic_peak_tracker` in `include/cucascade/utils/atomics.hpp`) for lock-free allocation tracking in hot paths
 - `notification_channel` provides cross-component async signaling with `shutdown()` support

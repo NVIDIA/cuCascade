@@ -31,7 +31,7 @@ namespace cucascade {
 /**
  * @brief Abstract interface for managing collections of data_batch objects within a pipeline.
  *
- * idata_repository defines the contract for storing, retrieving, and managing data batches
+ * data_repository defines the contract for storing, retrieving, and managing data batches
  * within a specific pipeline. Different implementations can provide various storage strategies,
  * such as:
  * - FIFO (First In, First Out) repositories for streaming data
@@ -47,17 +47,17 @@ namespace cucascade {
  * @note Implementations must be thread-safe as multiple threads may access
  *       the repository concurrently during query execution.
  */
-class idata_repository {
+class data_repository {
  public:
   /**
    * @brief Default constructor - initializes with one empty partition.
    */
-  idata_repository() : _data_batches(1) {}
+  data_repository() : _data_batches(1) {}
 
   /**
    * @brief Virtual destructor for proper cleanup of derived classes.
    */
-  virtual ~idata_repository() = default;
+  virtual ~data_repository() = default;
 
   /**
    * @brief Add a new data batch to this repository.
@@ -267,6 +267,6 @@ class idata_repository {
     _data_batches;  ///< Container for data batch pointers (partitioned)
 };
 
-using shared_data_repository = idata_repository;
+using shared_data_repository = data_repository;
 
 }  // namespace cucascade

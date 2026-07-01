@@ -57,7 +57,7 @@ struct operator_port_key {
  * @brief Central manager for coordinating data repositories across multiple pipelines.
  *
  * data_repository_manager serves as the top-level coordinator for data management in
- * cuCascade. It maintains a collection of idata_repository instances, each associated
+ * cuCascade. It maintains a collection of data_repository instances, each associated
  * with a specific pipeline, and provides centralized services for:
  *
  * - Repository lifecycle management (creation, access, cleanup)
@@ -68,9 +68,9 @@ struct operator_port_key {
  * Architecture:
  * ```
  * data_repository_manager
- * ├── Pipeline 1 → idata_repository (FIFO/LRU/Priority)
- * ├── Pipeline 2 → idata_repository (FIFO/LRU/Priority)
- * └── Pipeline N → idata_repository (FIFO/LRU/Priority)
+ * ├── Pipeline 1 → data_repository (FIFO/LRU/Priority)
+ * ├── Pipeline 2 → data_repository (FIFO/LRU/Priority)
+ * └── Pipeline N → data_repository (FIFO/LRU/Priority)
  * ```
  *
  * The manager abstracts the complexity of multi-pipeline data management and provides
@@ -81,7 +81,7 @@ struct operator_port_key {
  */
 class data_repository_manager {
  public:
-  using repository_type = idata_repository;
+  using repository_type = data_repository;
 
   /**
    * @brief Default constructor - initializes empty repository manager.
@@ -251,7 +251,7 @@ class data_repository_manager {
   std::atomic<uint64_t> _next_data_batch_id =
     0;  ///< Atomic counter for generating unique data batch identifiers
   std::map<operator_port_key, std::unique_ptr<repository_type>>
-    _repositories;  ///< Map of operator ID to idata_repository
+    _repositories;  ///< Map of operator ID to data_repository
 };
 
 using shared_data_repository_manager = data_repository_manager;

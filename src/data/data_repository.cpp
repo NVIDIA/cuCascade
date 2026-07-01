@@ -19,8 +19,8 @@
 
 namespace cucascade {
 
-std::shared_ptr<data_batch> idata_repository::get_data_batch_by_id(uint64_t batch_id,
-                                                                   size_t partition_idx)
+std::shared_ptr<data_batch> data_repository::get_data_batch_by_id(uint64_t batch_id,
+                                                                  size_t partition_idx)
 {
   std::unique_lock<std::mutex> lock(_mutex);
 

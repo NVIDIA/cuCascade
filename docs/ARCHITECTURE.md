@@ -328,7 +328,7 @@ Level 1: atomic<uint64_t> (batch ID generation -- lock-free)
     |
 Level 2: data_batch, read_only_data_batch, mutable_data_batch (3-class system provides read-only and mutable access classes)
     |
-Level 3: idata_repository._mutex (protects batch storage)
+Level 3: data_repository._mutex (protects batch storage)
     |
 Level 4: data_repository_manager._mutex (protects repository map)
     |
