@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cucascade/data/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -186,8 +187,6 @@ class representation_converter_registry {
    * @param source The source data representation
    * @param target_memory_space The target memory space for the new representation
    * @param stream CUDA stream for memory operations
-   * @param reservation Optional caller-owned reservation on the target space; threaded into the
-   *        converter so the target allocation draws from it instead of committing fresh capacity.
    * @return std::unique_ptr<TargetType> The converted representation
    * @throws std::runtime_error if no converter is registered for the type pair
    *
@@ -197,11 +196,35 @@ class representation_converter_registry {
   template <typename TargetType>
   std::unique_ptr<TargetType> convert(idata_representation& source,
                                       const memory::memory_space* target_memory_space,
-                                      rmm::cuda_stream_view stream     = rmm::cuda_stream_default,
-                                      memory::reservation* reservation = nullptr) const
+                                      rmm::cuda_stream_view stream = rmm::cuda_stream_default) const
   {
     converter_key key{std::type_index(typeid(source)), std::type_index(typeid(TargetType))};
-    auto result = convert_impl(key, source, target_memory_space, stream, reservation);
+    auto result = convert_impl(key, source, target_memory_space, stream, nullptr);
+    return std::unique_ptr<TargetType>(static_cast<TargetType*>(result.release()));
+  }
+
+  /**
+   * @brief Convert a data representation, drawing the target allocation from a reservation.
+   *
+   * The target memory space is derived from the reservation (reservation::get_memory_space()) and
+   * the reservation is threaded into the converter so the target allocation draws down the
+   * reservation instead of committing fresh capacity. Use this overload whenever the caller has
+   * already reserved capacity on the target space (avoids double-counting on the HOST tier).
+   *
+   * @tparam TargetType The target representation type
+   * @param source The source data representation
+   * @param reservation Caller-owned reservation on the target memory space
+   * @param stream CUDA stream for memory operations
+   * @return std::unique_ptr<TargetType> The converted representation
+   * @throws std::runtime_error if no converter is registered for the type pair
+   */
+  template <typename TargetType>
+  std::unique_ptr<TargetType> convert(idata_representation& source,
+                                      memory::reservation& reservation,
+                                      rmm::cuda_stream_view stream = rmm::cuda_stream_default) const
+  {
+    converter_key key{std::type_index(typeid(source)), std::type_index(typeid(TargetType))};
+    auto result = convert_impl(key, source, &reservation.get_memory_space(), stream, &reservation);
     return std::unique_ptr<TargetType>(static_cast<TargetType*>(result.release()));
   }
 
@@ -214,17 +237,17 @@ class representation_converter_registry {
    * @param target_type The target representation type index
    * @param target_memory_space The target memory space for the new representation
    * @param stream CUDA stream for memory operations
-   * @param reservation Optional caller-owned reservation on the target space; threaded into the
-   *        converter so the target allocation draws from it instead of committing fresh capacity.
    * @return std::unique_ptr<idata_representation> The converted representation
    * @throws std::runtime_error if no converter is registered for the type pair
+   *
+   * @note This runtime-typed overload always allocates without a reservation. Callers that hold a
+   *       reservation should use the templated convert<TargetType>(source, reservation, stream).
    */
   std::unique_ptr<idata_representation> convert(
     idata_representation& source,
     std::type_index target_type,
     const memory::memory_space* target_memory_space,
-    rmm::cuda_stream_view stream     = rmm::cuda_stream_default,
-    memory::reservation* reservation = nullptr) const;
+    rmm::cuda_stream_view stream = rmm::cuda_stream_default) const;
 
   /**
    * @brief Unregister a converter for the given type pair.

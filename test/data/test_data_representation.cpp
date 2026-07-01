@@ -467,11 +467,11 @@ TEST_CASE("HOST converter draws from caller reservation (no double-count)",
   const std::size_t committed_after_reserve = host_mr->get_total_allocated_bytes();
   REQUIRE(committed_after_reserve - committed_before >= alloc_size);
 
-  // Convert GPU -> HOST, threading the caller's reservation through the converter
-  // API. This must NOT throw rmm::out_of_memory and must NOT commit a second N.
+  // Convert GPU -> HOST via the reservation overload, so the target space is derived from the
+  // reservation and the allocation draws it down. This must NOT throw rmm::out_of_memory and
+  // must NOT commit a second N.
   std::unique_ptr<host_data_representation> host_rep;
-  REQUIRE_NOTHROW(host_rep = registry.convert<host_data_representation>(
-                    repr, host_space, stream.view(), res.get()));
+  REQUIRE_NOTHROW(host_rep = registry.convert<host_data_representation>(repr, *res, stream.view()));
   stream.synchronize();
   REQUIRE(host_rep != nullptr);
 
