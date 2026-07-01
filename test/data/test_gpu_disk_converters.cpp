@@ -439,6 +439,89 @@ TEST_CASE("gpu disk round-trip nested list column", "[disk][gpu-converter][list]
   gpu_disk_round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
 }
 
+TEST_CASE("gpu disk round-trip nullable list column", "[disk][gpu-converter][list][nullable]")
+{
+  // LIST<INT32> with a null list. Offsets [0, 2, 5, 5, 8] -> 4 lists, lengths [2, 3, 0, 3].
+  // Mark list index 2 (the empty [5,5) range) as null so the null row stays empty and the
+  // original column is well-formed. Exercises the null_count > 0 reconstruction path.
+  std::vector<int32_t> host_offsets = {0, 2, 5, 5, 8};
+  auto const num_lists              = static_cast<cudf::size_type>(host_offsets.size() - 1);
+
+  auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               num_lists + 1,
+                                               cudf::mask_state::UNALLOCATED,
+                                               shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(offsets_col->mutable_view().data<int32_t>(),
+                                     host_offsets.data(),
+                                     host_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().value()));
+
+  auto values_col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 8, cudf::mask_state::UNALLOCATED, shared_stream());
+
+  // Null mask: all lists valid except index 2.
+  auto null_mask = cudf::create_null_mask(num_lists, cudf::mask_state::ALL_VALID, shared_stream());
+  cudf::set_null_mask(
+    static_cast<cudf::bitmask_type*>(null_mask.data()), 2, 3, false, shared_stream());
+
+  shared_stream().synchronize();
+
+  auto list_col = cudf::make_lists_column(
+    num_lists, std::move(offsets_col), std::move(values_col), 1, std::move(null_mask));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(list_col));
+  gpu_disk_round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("gpu disk round-trip nullable nested list column",
+          "[disk][gpu-converter][list][nested][nullable]")
+{
+  // LIST<LIST<INT32>> with a null outer list. Inner: offsets [0, 2, 3] -> 2 inner lists
+  // (lengths 2, 1) over 3 values. Outer: offsets [0, 2, 2] -> outer list 0 holds both inner
+  // lists, outer list 1 is the empty [2,2) range and is marked null. Exercises reconstruction
+  // recursion through a null mask.
+  std::vector<int32_t> inner_offsets = {0, 2, 3};
+  auto inner_offsets_col             = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(inner_offsets_col->mutable_view().data<int32_t>(),
+                                     inner_offsets.data(),
+                                     inner_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().value()));
+
+  auto inner_values = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+
+  auto inner_list = cudf::make_lists_column(
+    2, std::move(inner_offsets_col), std::move(inner_values), 0, rmm::device_buffer{});
+
+  // Outer lists: offsets [0, 2, 2] -> list 0 holds both inner lists, list 1 is empty (and null).
+  std::vector<int32_t> outer_offsets = {0, 2, 2};
+  auto outer_offsets_col             = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(outer_offsets_col->mutable_view().data<int32_t>(),
+                                     outer_offsets.data(),
+                                     outer_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().value()));
+
+  // Outer null mask: outer list index 1 is null.
+  auto outer_null_mask = cudf::create_null_mask(2, cudf::mask_state::ALL_VALID, shared_stream());
+  cudf::set_null_mask(
+    static_cast<cudf::bitmask_type*>(outer_null_mask.data()), 1, 2, false, shared_stream());
+
+  shared_stream().synchronize();
+
+  auto outer_list = cudf::make_lists_column(
+    2, std::move(outer_offsets_col), std::move(inner_list), 1, std::move(outer_null_mask));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(outer_list));
+  gpu_disk_round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
 // =============================================================================
 // STRUCT column round-trip tests
 // =============================================================================

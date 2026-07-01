@@ -1087,19 +1087,22 @@ static std::unique_ptr<cudf::column> reconstruct_column(
       throw std::invalid_argument(
         "reconstruct_column: LIST column metadata must have two children (offsets, values)");
     }
-    auto offsets_col = reconstruct_column(meta.children[0], alloc, stream, mr, batch);
-    if (offsets_col->type().id() == cudf::type_id::INT32) {
-      // Flush pending H2D copies so the INT32 offsets buffer has valid data on device
-      // before the cast reads from it. See STRING branch comment above.
-      batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
-      offsets_col =
-        cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
-    }
-    return cudf::make_lists_column(meta.num_rows,
-                                   std::move(offsets_col),
-                                   reconstruct_column(meta.children[1], alloc, stream, mr, batch),
-                                   null_count,
-                                   std::move(null_mask));
+    // LIST offsets must remain INT32 (cudf::size_type). The INT64 promotion is correct only for
+    // STRING offsets (large-strings convention), not LIST. Construct the column directly (like
+    // the STRUCT branch below) instead of make_lists_column: this preserves the INT32 offsets
+    // and avoids a purge_nonempty_nulls kernel launch. Our serialized data already has consistent
+    // null masks, and that kernel would otherwise read buffers still pending in the batched H2D
+    // copies.
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.reserve(2);
+    children.push_back(reconstruct_column(meta.children[0], alloc, stream, mr, batch));
+    children.push_back(reconstruct_column(meta.children[1], alloc, stream, mr, batch));
+    return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::LIST},
+                                          meta.num_rows,
+                                          rmm::device_buffer{},
+                                          std::move(null_mask),
+                                          null_count,
+                                          std::move(children));
   }
 
   if (as_cudf_type_id(meta.type_id) == cudf::type_id::STRUCT) {
@@ -1713,18 +1716,22 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
         "reconstruct_column_from_disk: LIST column metadata must have two children (offsets, "
         "values)");
     }
-    auto offsets_col =
-      reconstruct_column_from_disk(meta.children[0], file_path, stream, mr, backend);
-    if (offsets_col->type().id() == cudf::type_id::INT32) {
-      offsets_col =
-        cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
-    }
-    return cudf::make_lists_column(
-      meta.num_rows,
-      std::move(offsets_col),
-      reconstruct_column_from_disk(meta.children[1], file_path, stream, mr, backend),
-      null_count,
-      std::move(null_mask));
+    // LIST offsets must remain INT32 (cudf::size_type); see reconstruct_column for the rationale.
+    // Construct directly (like the STRUCT branch below) to preserve the INT32 offsets and skip
+    // make_lists_column's purge_nonempty_nulls. Our serialized data already has consistent null
+    // masks.
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.reserve(2);
+    children.push_back(
+      reconstruct_column_from_disk(meta.children[0], file_path, stream, mr, backend));
+    children.push_back(
+      reconstruct_column_from_disk(meta.children[1], file_path, stream, mr, backend));
+    return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::LIST},
+                                          meta.num_rows,
+                                          rmm::device_buffer{},
+                                          std::move(null_mask),
+                                          null_count,
+                                          std::move(children));
   }
 
   if (as_cudf_type_id(meta.type_id) == cudf::type_id::STRUCT) {
