@@ -297,7 +297,10 @@ The `representation_converter_registry` stores conversion functions indexed by `
 ```cpp
 // Register a custom converter
 registry.register_converter<gpu_table_representation, host_data_representation>(
-    [](idata_representation& source, const memory_space* target, rmm::cuda_stream_view stream)
+    [](idata_representation& source,
+       const memory_space* target,
+       rmm::cuda_stream_view stream,
+       memory::reservation* reservation)
         -> std::unique_ptr<idata_representation> {
         // Convert GPU table to host (direct copy)
         return ...;
@@ -307,6 +310,10 @@ registry.register_converter<gpu_table_representation, host_data_representation>(
 // Convert data
 auto host_data = registry.convert<host_data_representation>(
     *gpu_data, target_host_space, stream);
+
+// Convert using a caller-owned target reservation
+auto reserved_host_data = registry.convert<host_data_representation>(
+    *gpu_data, target_reservation, stream);
 ```
 
 The registry is thread-safe (all operations guarded by `std::mutex`).
