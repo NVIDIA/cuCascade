@@ -134,7 +134,7 @@ class data_repository_manager {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     for (auto& op : ops) {
-      _repositories[{op.first, std::string(op.second)}]->add_data_batch(batch);
+      _repositories.at({op.first, std::string(op.second)})->add_data_batch(batch);
     }
   }
 
