@@ -17,25 +17,37 @@
 
 #include <cucascade/data/data_batch.hpp>
 
+#include <memory>
+#include <stdexcept>
+
 namespace cucascade {
 
 // ========== data_batch implementation ==========
 
 std::shared_ptr<data_batch> data_batch::make(uint64_t batch_id,
-                                             std::unique_ptr<idata_representation> data)
+                                             std::unique_ptr<idata_representation> data,
+                                             std::unique_ptr<idata_batch_probe> probe)
 {
   if (data == nullptr) { throw std::runtime_error("data is null in data_batch factory"); }
-  return std::shared_ptr<data_batch>(new data_batch(batch_id, std::move(data)));
+  if (probe == nullptr) { throw std::runtime_error("probe is null in data_batch factory"); }
+  return std::shared_ptr<data_batch>(new data_batch(batch_id, std::move(data), std::move(probe)));
 }
 
-data_batch::data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data)
-  : _batch_id(batch_id), _data(std::move(data))
+data_batch::data_batch(uint64_t batch_id,
+                       std::unique_ptr<idata_representation> data,
+                       std::unique_ptr<idata_batch_probe> probe)
+  : _batch_id(batch_id), _data(std::move(data)), _probe(std::move(probe))
 {
+  _probe->created(get_batch_id(), *get_data());
 }
 
 uint64_t data_batch::get_batch_id() const { return _batch_id; }
 
-void data_batch::subscribe() { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
+void data_batch::subscribe()
+{
+  const size_t prev = _subscriber_count.fetch_add(1, std::memory_order_relaxed);
+  _probe->subscriber_count_changed(prev + 1);
+}
 
 void data_batch::unsubscribe()
 {
@@ -46,6 +58,7 @@ void data_batch::unsubscribe()
     }
     if (_subscriber_count.compare_exchange_weak(
           current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      _probe->subscriber_count_changed(current - 1);
       return;
     }
   }
@@ -68,7 +81,12 @@ memory::memory_space* data_batch::get_memory_space() const
   return &_data->get_memory_space();
 }
 
-void data_batch::set_data(std::unique_ptr<idata_representation> data) { _data = std::move(data); }
+void data_batch::set_data(std::unique_ptr<idata_representation> data)
+{
+  if (_data == nullptr) { throw std::runtime_error("data is null in data_batch::set_data"); }
+  _data = std::move(data);
+  _probe->data_replaced(*_data);
+}
 
 // ========== Static transition methods ==========
 
@@ -152,8 +170,12 @@ read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> parent,
                                            std::shared_lock<std::shared_mutex> lock)
   : _batch(std::move(parent)), _lock(std::move(lock))
 {
-  _batch->_read_only_count.fetch_add(1);
-  _batch->_state.store(batch_state::read_only);
+  const size_t prev = _batch->_read_only_count.fetch_add(1);
+  if (prev == 0) {
+    _batch->_state.store(batch_state::read_only);
+    _batch->_probe->state_changed(batch_state::read_only);
+  }
+  _batch->_probe->reader_count_changed(prev + 1);
 }
 
 read_only_data_batch::read_only_data_batch(read_only_data_batch&& other) noexcept
@@ -168,7 +190,11 @@ read_only_data_batch::read_only_data_batch(const read_only_data_batch& other)
     _lock(other._batch ? std::shared_lock<std::shared_mutex>(other._batch->_rw_mutex)
                        : std::shared_lock<std::shared_mutex>())
 {
-  if (_batch) { _batch->_read_only_count.fetch_add(1); }
+  if (_batch) {
+    const size_t prev = _batch->_read_only_count.fetch_add(1);
+    assert(_batch->_state == batch_state::read_only);
+    _batch->_probe->reader_count_changed(prev + 1);
+  }
 }
 
 read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& other) noexcept
@@ -176,8 +202,13 @@ read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& oth
   if (this != &other) {
     // Release the current state (same logic as destructor)
     if (_batch) {
-      auto prev = _batch->_read_only_count.fetch_sub(1);
-      if (prev == 1) { _batch->_state.store(batch_state::idle); }
+      const size_t prev = _batch->_read_only_count.fetch_sub(1);
+      if (prev == 1) {
+        _batch->_state.store(batch_state::idle);
+        _batch->_probe->state_changed(batch_state::idle);
+      }
+      _batch->_probe->reader_count_changed(prev - 1);
+
       // _lock will be replaced below; its destructor fires when the old _lock is overwritten,
       // releasing the shared lock. We release _lock explicitly here so the sequence is:
       // decrement count -> set state (if last) -> release lock.
@@ -193,15 +224,25 @@ read_only_data_batch& read_only_data_batch::operator=(const read_only_data_batch
 {
   if (this != &other) {
     if (_batch) {
-      auto prev = _batch->_read_only_count.fetch_sub(1);
-      if (prev == 1) { _batch->_state.store(batch_state::idle); }
+      const size_t prev = _batch->_read_only_count.fetch_sub(1);
+      if (prev == 1) {
+        _batch->_state.store(batch_state::idle);
+        _batch->_probe->state_changed(batch_state::idle);
+      }
+      _batch->_probe->reader_count_changed(prev - 1);
+
       _lock.unlock();
     }
     _batch = other._batch;
     if (_batch) {
       _lock = std::shared_lock<std::shared_mutex>(_batch->_rw_mutex);
-      _batch->_read_only_count.fetch_add(1);
-      _batch->_state.store(batch_state::read_only);
+
+      const size_t prev = _batch->_read_only_count.fetch_add(1);
+      if (prev == 0) {
+        _batch->_state.store(batch_state::read_only);
+        _batch->_probe->state_changed(batch_state::read_only);
+      }
+      _batch->_probe->reader_count_changed(prev + 1);
     } else {
       _lock = std::shared_lock<std::shared_mutex>();
     }
@@ -217,17 +258,23 @@ read_only_data_batch::~read_only_data_batch()
     // The destructor body runs before member destructors, so _batch is still valid here.
     // After this function returns, _lock destructor fires first (declared after _batch,
     // destroyed in reverse order), releasing the shared lock. Then _batch destructor fires.
-    auto prev = _batch->_read_only_count.fetch_sub(1);
-    if (prev == 1) { _batch->_state.store(batch_state::idle); }
+    const size_t prev = _batch->_read_only_count.fetch_sub(1);
+    if (prev == 1) {
+      _batch->_state.store(batch_state::idle);
+      _batch->_probe->state_changed(batch_state::idle);
+    }
+    _batch->_probe->reader_count_changed(prev - 1);
   }
 }
 
-std::shared_ptr<data_batch> read_only_data_batch::clone(uint64_t new_batch_id,
-                                                        rmm::cuda_stream_view stream) const
+std::shared_ptr<data_batch> read_only_data_batch::clone(
+  uint64_t new_batch_id,
+  rmm::cuda_stream_view stream,
+  std::unique_ptr<idata_batch_probe> probe) const
 {
   if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
   auto cloned_data = _batch->_data->clone(stream);
-  return data_batch::make(new_batch_id, std::move(cloned_data));
+  return data_batch::make(new_batch_id, std::move(cloned_data), std::move(probe));
 }
 
 // ========== mutable_data_batch ==========
@@ -237,6 +284,7 @@ mutable_data_batch::mutable_data_batch(std::shared_ptr<data_batch> parent,
   : _batch(std::move(parent)), _lock(std::move(lock))
 {
   _batch->_state.store(batch_state::mutable_locked);
+  _batch->_probe->state_changed(batch_state::mutable_locked);
 }
 
 mutable_data_batch::mutable_data_batch(mutable_data_batch&& other) noexcept
@@ -251,6 +299,7 @@ mutable_data_batch& mutable_data_batch::operator=(mutable_data_batch&& other) no
     // Release the current state (same logic as destructor)
     if (_batch) {
       _batch->_state.store(batch_state::idle);
+      _batch->_probe->state_changed(batch_state::idle);
       // Release the exclusive lock explicitly before taking ownership of the new one.
       _lock.unlock();
     }
@@ -265,6 +314,7 @@ mutable_data_batch::~mutable_data_batch()
   if (_batch) {
     // Transition state to idle. The _lock member destructor handles releasing the exclusive lock.
     _batch->_state.store(batch_state::idle);
+    _batch->_probe->state_changed(batch_state::idle);
   }
 }
 
@@ -273,12 +323,14 @@ void mutable_data_batch::rebind_stream(rmm::cuda_stream_view stream)
   if (auto* repr = _batch->get_data()) { repr->rebind_stream(stream); }
 }
 
-std::shared_ptr<data_batch> mutable_data_batch::clone(uint64_t new_batch_id,
-                                                      rmm::cuda_stream_view stream) const
+std::shared_ptr<data_batch> mutable_data_batch::clone(
+  uint64_t new_batch_id,
+  rmm::cuda_stream_view stream,
+  std::unique_ptr<idata_batch_probe> probe) const
 {
   if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
   auto cloned_data = _batch->_data->clone(stream);
-  return data_batch::make(new_batch_id, std::move(cloned_data));
+  return data_batch::make(new_batch_id, std::move(cloned_data), std::move(probe));
 }
 
 }  // namespace cucascade
