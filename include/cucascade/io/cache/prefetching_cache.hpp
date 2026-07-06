@@ -136,7 +136,7 @@ class prefetching_cache {
   friend class prefetching_handle;
 
  public:
-  using byte_range         = cudf::io::text::byte_range_info;
+  using byte_range         = cucascade::io::byte_range;
   using prefetch_request   = std::shared_ptr<prefetch_request_context>;
   using request_queue_type = moodycamel::BlockingConcurrentQueue<prefetch_request>;
 

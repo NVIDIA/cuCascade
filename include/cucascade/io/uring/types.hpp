@@ -18,11 +18,9 @@
 
 #pragma once
 
+#include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
-
-#include <cudf/io/datasource.hpp>
-#include <cudf/io/text/byte_range_info.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>

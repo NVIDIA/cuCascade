@@ -758,14 +758,14 @@ std::unique_ptr<rest_reactor::io_object_type> rest_reactor::create_io_object(std
     "rest_reactor::create_io_object: use rest_ioctx::create_io_object (needs HEAD + authorizer)");
 }
 
-std::vector<cudf::io::text::byte_range_info> rest_reactor::align_and_coalesce(
-  std::span<const cudf::io::text::byte_range_info> ranges, std::optional<size_t> alignment)
+std::vector<byte_range> rest_reactor::align_and_coalesce(std::span<const byte_range> ranges,
+                                                         std::optional<size_t> alignment)
 {
   // No physical block alignment for REST: honor a caller alignment >= 1 as a
   // lower bound, otherwise treat alignment as 1 (byte) — i.e. pure coalescing.
   size_t const align = std::max<size_t>(alignment.value_or(1), 1);
 
-  std::vector<cudf::io::text::byte_range_info> aligned;
+  std::vector<byte_range> aligned;
   aligned.reserve(ranges.size());
   for (auto const& r : ranges) {
     if (r.size() <= 0) { continue; }
@@ -781,7 +781,7 @@ std::vector<cudf::io::text::byte_range_info> rest_reactor::align_and_coalesce(
     return a.offset() < b.offset();
   });
 
-  std::vector<cudf::io::text::byte_range_info> coalesced;
+  std::vector<byte_range> coalesced;
   coalesced.reserve(aligned.size());
   coalesced.push_back(aligned.front());
   for (size_t i = 1; i < aligned.size(); ++i) {

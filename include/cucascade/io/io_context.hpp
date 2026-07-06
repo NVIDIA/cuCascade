@@ -40,7 +40,8 @@ enum class io_context_type { uring, restful };
 
 namespace cache {
 class prefetching_cache;
-}
+class prefetching_handle;
+}  // namespace cache
 
 class datasource;
 
@@ -90,13 +91,16 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
 
   virtual void shutdown() noexcept = 0;
 
-  /// Open a datasource for @p path.  The backend creates the underlying
-  /// io_object internally (however is appropriate for the scheme — opening
-  /// local fds, issuing a HEAD for object stores, ...) and wraps it in a
-  /// @c datasource bound to this ioctx.  Throws on unsupported /
-  /// unreachable paths (callers that want a check-without-open should use
-  /// @c supports()).
-  [[nodiscard]] std::unique_ptr<datasource> open_datasource(std::string path);
+  /// Open the backend-appropriate io_object for @p path (local fds / an
+  /// object-store HEAD / ...).  Throws on unsupported / unreachable paths
+  /// (callers that want a check-without-open should use @c supports()).
+  /// The cudf-coupled datasource layer wraps the result in a
+  /// @c cucascade::io::datasource; cudf-free callers drive the read APIs
+  /// below directly.
+  [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path)
+  {
+    return create_io_object(std::move(path));
+  }
 
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
@@ -187,9 +191,41 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// non-overlapping ranges (sorted by offset).  @p alignment is a lower bound:
   /// when unset, or smaller than the backend's optimal alignment, the backend
   /// uses its own alignment instead.
-  [[nodiscard]] virtual std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<const cudf::io::text::byte_range_info> ranges,
+  [[nodiscard]] virtual std::vector<byte_range> align_and_coalesce(
+    std::span<const byte_range> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept = 0;
+
+  // -- Cache-aware reads --------------------------------------------------------
+  //
+  // The read entry points callers should use: when the prefetching cache is
+  // armed they serve (and account) the read through it, otherwise they fall
+  // through to the backend primitives (*_io below).  @p handle is the scan's
+  // prefetching_handle (from a prior fadvise/insert), passed as a raw pointer
+  // so the cache can consume/observe it; it may be null when the caller made
+  // no prefetch reservation.  All async variants return @c exec::semi_future.
+
+  size_t host_read(const io_object& obj,
+                   size_t offset,
+                   size_t size,
+                   uint8_t* dst,
+                   cache::prefetching_handle* handle = nullptr);
+
+  [[nodiscard]] exec::semi_future<size_t> host_read_async(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    cache::prefetching_handle* handle = nullptr);
+
+  [[nodiscard]] exec::semi_future<size_t> device_read_async(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    rmm::cuda_stream_view stream,
+    cache::prefetching_handle* handle = nullptr);
+
+  // -- Backend primitives (cache-unaware) ----------------------------------------
 
   virtual size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
 

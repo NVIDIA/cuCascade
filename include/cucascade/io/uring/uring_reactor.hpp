@@ -279,8 +279,7 @@ class uring_reactor {
 
  public:
   /// O_DIRECT requires 4 KiB alignment of both file offset and length.
-  static cudf::io::text::byte_range_info align_to_physical(cudf::io::text::byte_range_info logical,
-                                                           size_t file_size);
+  static byte_range align_to_physical(byte_range logical, size_t file_size);
 
   /// Align every input range's ends outward to the effective alignment, then
   /// coalesce overlapping or adjacent results into a minimal set of aligned,
@@ -290,9 +289,8 @@ class uring_reactor {
   /// viable alignment and is used when @p alignment is unset.  A caller-supplied
   /// alignment is honored only when it is at least @c IO_BLOCK_SIZE; a smaller
   /// value is ignored in favor of the reactor's own alignment.
-  static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<const cudf::io::text::byte_range_info> ranges,
-    std::optional<size_t> alignment = std::nullopt);
+  static std::vector<byte_range> align_and_coalesce(std::span<const byte_range> ranges,
+                                                    std::optional<size_t> alignment = std::nullopt);
 
  private:
   void worker_loop(const std::stop_token& stop_token);

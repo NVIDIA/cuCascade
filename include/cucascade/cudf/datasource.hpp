@@ -33,10 +33,13 @@ namespace cucascade::io {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Concrete @c io_datasource backed by io_uring.
+ * @brief Concrete @c cudf::io::datasource backed by a cucascade::io backend.
  *
- * Thin delegate: every read method forwards to @c ioctx, passing the
- * owned @c io_object by reference.
+ * The cudf bridge over the cudf-free io core: every read forwards to the
+ * ioctx's cache-aware read APIs (which return @c exec::semi_future) and this
+ * layer converts to the @c std::future / @c datasource::buffer shapes cudf
+ * expects.  Lives in the cucascade-cudf bundle — the io core has no cudf
+ * dependency.
  *
  * Ownership model: one scan owns one @c datasource.  The underlying
  * @c io_object can be shared across multiple datasources (e.g. when
@@ -58,8 +61,8 @@ class datasource : public cudf::io::datasource {
   [[nodiscard]] std::shared_ptr<ioctx> io_ctx() const { return _io_ctx; }
 
   /// The underlying io_object this datasource reads through.  Exposed so
-  /// callers that received the datasource from @c ioctx::open_datasource
-  /// can still reach the io_object (e.g. as the metadata-store cache key).
+  /// callers that received the datasource from @c open_datasource can still
+  /// reach the io_object (e.g. as the metadata-store cache key).
   [[nodiscard]] const io_object& get_io_object() const noexcept { return *_io_object; }
 
   /// Backend-parsed metadata for this datasource's io_object, looked up in the
@@ -147,5 +150,13 @@ class datasource : public cudf::io::datasource {
   /// uses this to cancel still-pending work.
   cache::prefetching_handle _prefetch_handle;
 };
+
+/// Open a datasource for @p path on @p io_ctx: creates the backend-appropriate
+/// io_object (local fds / object-store HEAD / ...) and wraps it in a
+/// @c datasource bound to that ioctx.  Throws on unsupported / unreachable
+/// paths (callers that want a check-without-open should use
+/// @c ioctx::supports()).
+[[nodiscard]] std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx,
+                                                          std::string path);
 
 }  // namespace cucascade::io

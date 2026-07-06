@@ -18,8 +18,7 @@
 
 #pragma once
 
-#include <cudf/io/datasource.hpp>
-#include <cudf/io/text/byte_range_info.hpp>
+#include <cucascade/io/byte_range.hpp>
 
 #include <cuda_runtime.h>
 

@@ -27,8 +27,6 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-#include <cudf/io/datasource.hpp>
-
 #include <cuda_runtime.h>
 
 #include <algorithm>

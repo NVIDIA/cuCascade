@@ -458,7 +458,7 @@ struct unique_ring {
     return io_uring_peek_batch_cqe(ring.get(), cqes.data(), static_cast<unsigned>(cqes.size()));
   }
 
-  [[nodiscard]] void mark_cqe_seen(io_uring_cqe* cqe) const { io_uring_cqe_seen(ring.get(), cqe); }
+  void mark_cqe_seen(io_uring_cqe* cqe) const { io_uring_cqe_seen(ring.get(), cqe); }
 
   void submit([[maybe_unused]] std::size_t n_added)
   {
@@ -741,8 +741,7 @@ void uring_reactor::shutdown()
   }
 }
 
-cudf::io::text::byte_range_info uring_reactor::align_to_physical(
-  cudf::io::text::byte_range_info logical, size_t file_size)
+byte_range uring_reactor::align_to_physical(byte_range logical, size_t file_size)
 {
   auto offset    = static_cast<size_t>(logical.offset());
   auto size      = static_cast<size_t>(logical.size());
@@ -752,8 +751,8 @@ cudf::io::text::byte_range_info uring_reactor::align_to_physical(
   return {static_cast<int64_t>(a_start), static_cast<int64_t>(a_end - a_start)};
 }
 
-std::vector<cudf::io::text::byte_range_info> uring_reactor::align_and_coalesce(
-  std::span<const cudf::io::text::byte_range_info> ranges, std::optional<size_t> alignment)
+std::vector<byte_range> uring_reactor::align_and_coalesce(std::span<const byte_range> ranges,
+                                                          std::optional<size_t> alignment)
 {
   // O_DIRECT mandates IO_BLOCK_SIZE alignment, so it is the floor: honor a
   // larger caller request, ignore anything smaller (including an unset value).
@@ -761,7 +760,7 @@ std::vector<cudf::io::text::byte_range_info> uring_reactor::align_and_coalesce(
 
   // Round each range's ends outward to `align`; drop empty ranges.  Integer
   // (not bitmask) rounding so a non-power-of-two caller alignment still works.
-  std::vector<cudf::io::text::byte_range_info> aligned;
+  std::vector<byte_range> aligned;
   aligned.reserve(ranges.size());
   for (auto const& r : ranges) {
     if (r.size() <= 0) { continue; }
@@ -778,7 +777,7 @@ std::vector<cudf::io::text::byte_range_info> uring_reactor::align_and_coalesce(
     return a.offset() < b.offset();
   });
 
-  std::vector<cudf::io::text::byte_range_info> coalesced;
+  std::vector<byte_range> coalesced;
   coalesced.reserve(aligned.size());
   coalesced.push_back(aligned.front());
   for (size_t i = 1; i < aligned.size(); ++i) {

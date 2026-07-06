@@ -18,6 +18,7 @@
 
 #include <cucascade/io/cache/metadata_store.hpp>
 
+#include <mutex>
 #include <utility>
 
 namespace cucascade::io::cache {

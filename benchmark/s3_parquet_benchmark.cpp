@@ -28,7 +28,7 @@
 // (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
 // AWS_DEFAULT_REGION, AWS_ENDPOINT_URL) and are honored by both backends.
 
-#include <cucascade/io/datasource.hpp>
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/s3/s3_request_authorizer.hpp>
 #include <cucascade/io/types.hpp>
@@ -372,7 +372,7 @@ int main(int argc, char** argv)
     io_ctx->start();
 
     for (auto const& key : keys) {
-      sources.push_back(io_ctx->open_datasource("s3://" + bucket + "/" + key));
+      sources.push_back(cucascade::io::open_datasource(io_ctx, "s3://" + bucket + "/" + key));
     }
   } else {
     for (auto const& key : keys) {

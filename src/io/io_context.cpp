@@ -18,7 +18,6 @@
 
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
-#include <cucascade/io/datasource.hpp>
 #include <cucascade/io/io_context.hpp>
 
 #include <cassert>
@@ -54,13 +53,31 @@ void ioctx::initialize_cache(
 
 void ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
-std::unique_ptr<datasource> ioctx::open_datasource(std::string path)
+size_t ioctx::host_read(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache::prefetching_handle* handle)
 {
-  // Create the backend-appropriate io_object (local fds / object-store HEAD /
-  // ...) and wrap it in a datasource bound to this ioctx.  Datasource
-  // construction is uniform across backends, so it lives here rather than in a
-  // per-backend hook.
-  return std::make_unique<datasource>(shared_from_this(), create_io_object(std::move(path)));
+  if (uses_prefetching_cache()) { return _cache->host_read(obj, offset, size, dst, handle); }
+  return host_read_io(obj, offset, size, dst);
+}
+
+exec::semi_future<size_t> ioctx::host_read_async(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache::prefetching_handle* handle)
+{
+  if (uses_prefetching_cache()) { return _cache->host_read_async(obj, offset, size, dst, handle); }
+  return host_read_async_io(obj, offset, size, dst);
+}
+
+exec::semi_future<size_t> ioctx::device_read_async(const io_object& obj,
+                                                   size_t offset,
+                                                   size_t size,
+                                                   uint8_t* dst,
+                                                   rmm::cuda_stream_view stream,
+                                                   cache::prefetching_handle* handle)
+{
+  if (uses_prefetching_cache()) {
+    return _cache->device_read_async(obj, offset, size, dst, stream, handle);
+  }
+  return device_read_async_io(obj, offset, size, dst, stream);
 }
 
 }  // namespace cucascade::io

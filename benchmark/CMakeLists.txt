@@ -96,8 +96,8 @@ if(CUCASCADE_BUILD_IO)
       $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
       ${CUCASCADE_CUDA_WARNING_FLAGS})
 
-  target_link_libraries(cucascade_parquet_benchmark PRIVATE cucascade_io
-                                                            CUDA::cudart_static)
+  target_link_libraries(cucascade_parquet_benchmark
+                        PRIVATE cucascade_cudf cucascade_io CUDA::cudart_static)
 endif()
 
 # =============================================================================
@@ -121,6 +121,6 @@ if(CUCASCADE_BUILD_S3_BENCHMARK)
 
   target_link_libraries(
     cucascade_s3_parquet_benchmark
-    PRIVATE cucascade_io kvikio::kvikio ${AWSSDK_LINK_LIBRARIES}
+    PRIVATE cucascade_cudf cucascade_io kvikio::kvikio ${AWSSDK_LINK_LIBRARIES}
             CUDA::cudart_static)
 endif()

@@ -46,13 +46,11 @@ option(
   "Build the S3 parquet benchmark (requires aws-sdk-cpp; NOT a cuCascade dependency)"
   OFF)
 
-# The io library implements cudf::io::datasource, so it requires the cudf
-# dependency to be available.
-if(CUCASCADE_BUILD_IO AND (CUCASCADE_TOPOLOGY_ONLY OR NOT CUCASCADE_BUILD_CUDF))
+# The io core is cudf-free (the cudf::io::datasource bridge lives in the
+# cucascade-cudf bundle); it only requires a full (non-topology-only) build.
+if(CUCASCADE_BUILD_IO AND CUCASCADE_TOPOLOGY_ONLY)
   message(
-    STATUS
-      "CUCASCADE_BUILD_IO disabled: requires CUCASCADE_BUILD_CUDF=ON and a non-topology-only build"
-  )
+    STATUS "CUCASCADE_BUILD_IO disabled: requires a non-topology-only build")
   set(CUCASCADE_BUILD_IO
       OFF
       CACHE BOOL "Build the cucascade-io library" FORCE)
@@ -271,6 +269,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   set_target_properties(
     cucascade_cudf_objects PROPERTIES CXX_EXTENSIONS OFF
                                       POSITION_INDEPENDENT_CODE ON)
+
+  # The datasource bridge (src/cudf/datasource.cpp) compiles against the io
+  # core's headers, which need the io usage requirements (concurrentqueue
+  # include dir, curl/uring types, ...).
+  if(CUCASCADE_BUILD_IO)
+    target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_io_objects)
+  endif()
 endif()
 
 if(CUCASCADE_BUILD_IO)
@@ -278,7 +283,7 @@ if(CUCASCADE_BUILD_IO)
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
   # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
   # approach.
-  set(CUCASCADE_IO_LINK_LIBS cudf::cudf PkgConfig::LIBURING PkgConfig::CURL
+  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
                              OpenSSL::Crypto)
 
   target_link_libraries(cucascade_io_objects PUBLIC cucascade_objects
@@ -354,6 +359,10 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
                                  PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
       target_link_libraries(cucascade_cudf_static PUBLIC cudf::cudf
                                                          cucascade_static)
+      if(CUCASCADE_BUILD_IO)
+        # The datasource bridge references io-core symbols.
+        target_link_libraries(cucascade_cudf_static PUBLIC cucascade_io_static)
+      endif()
       target_compile_features(cucascade_cudf_static PUBLIC cxx_std_20)
 
       set_target_properties(
@@ -425,6 +434,10 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
                                  PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
       target_link_libraries(cucascade_cudf_shared PUBLIC cudf::cudf
                                                          cucascade_shared)
+      if(CUCASCADE_BUILD_IO)
+        # The datasource bridge references io-core symbols.
+        target_link_libraries(cucascade_cudf_shared PUBLIC cucascade_io_shared)
+      endif()
       target_compile_features(cucascade_cudf_shared PUBLIC cxx_std_20)
 
       set_target_properties(cucascade_cudf_shared PROPERTIES OUTPUT_NAME

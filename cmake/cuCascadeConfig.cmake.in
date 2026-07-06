@@ -24,14 +24,16 @@ if(cuCascade_cudf_FOUND AND "cudf" IN_LIST cuCascade_FIND_COMPONENTS)
   find_dependency(cudf REQUIRED CONFIG)
 endif()
 
-# The optional cucascade-io library (datasource, uring/rest reactors) is
-# resolved lazily via the `io` package component, mirroring the cudf component
-# above. The exported io targets reference the PkgConfig::LIBURING /
-# PkgConfig::CURL imported targets by name, so they are reconstructed here with
-# the same pkg_check_modules calls used at build time.
+# The optional cucascade-io library (uring/rest reactors, prefetching cache)
+# is resolved lazily via the `io` package component, mirroring the cudf
+# component above. The io core is cudf-free. The exported io targets reference
+# the PkgConfig::LIBURING / PkgConfig::CURL imported targets by name, so they
+# are reconstructed here with the same pkg_check_modules calls used at build
+# time. The cudf component also needs these when io was built: cucascade_cudf
+# links cucascade_io for the cudf::io::datasource bridge.
 set(cuCascade_io_FOUND @CUCASCADE_BUILD_IO@)
-if(cuCascade_io_FOUND AND "io" IN_LIST cuCascade_FIND_COMPONENTS)
-  find_dependency(cudf REQUIRED CONFIG)
+if(cuCascade_io_FOUND AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
+                           OR "cudf" IN_LIST cuCascade_FIND_COMPONENTS))
   find_dependency(PkgConfig REQUIRED)
   pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
   pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)

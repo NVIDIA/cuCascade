@@ -16,23 +16,19 @@
  * limitations under the License.
  */
 
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/exec/try.hpp>
+#include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
-#include <cucascade/io/datasource.hpp>
-#include <cucascade/log/logging.hpp>
 
 #include <rmm/device_buffer.hpp>
-
-#include <fcntl.h>
-#include <sys/stat.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -93,11 +89,7 @@ bool datasource::is_device_read_preferred(size_t) const { return _io_ctx->suppor
 
 size_t datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
-  }
-  return _io_ctx->host_read_io(*_io_object, offset, size, dst);
+  return _io_ctx->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offset, size_t size)
@@ -110,14 +102,8 @@ std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offse
 
 std::future<size_t> datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  exec::semi_future<size_t> semi;
-  if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    semi        = cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
-  } else {
-    semi = _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
-  }
-  return bridge_semi_to_std(std::move(semi));
+  return bridge_semi_to_std(
+    _io_ctx->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle));
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read_async(
@@ -161,14 +147,8 @@ std::future<size_t> datasource::device_read_async(size_t offset,
                                                   uint8_t* dst,
                                                   rmm::cuda_stream_view stream)
 {
-  exec::semi_future<size_t> semi;
-  if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    semi = cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
-  } else {
-    semi = _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
-  }
-  return bridge_semi_to_std(std::move(semi));
+  return bridge_semi_to_std(
+    _io_ctx->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle));
 }
 
 std::unique_ptr<datasource> datasource::duplicate() const
@@ -195,10 +175,18 @@ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges
     _prefetch_handle.cancel();
   }
 
+  // Convert the cudf ranges to the io core's cudf-free byte_range at this
+  // boundary — the cache (io core) never sees a cudf type.
+  std::vector<byte_range> converted;
+  converted.reserve(ranges.size());
+  for (auto const& r : ranges) {
+    converted.emplace_back(r.offset(), r.size());
+  }
+
   // Hand the ranges to the cache.  insert() returns an empty handle when
   // it didn't enqueue any new work (dormant cache, every range coalesced
   // with an existing entry); we only stash a real handle.
-  auto handle = cache->insert(*_io_object, ranges, dev_id);
+  auto handle = cache->insert(*_io_object, converted, dev_id);
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 
@@ -219,6 +207,13 @@ bool datasource::uses_prefetching_cache()
 {
   auto* cache = _io_ctx->cache();
   return cache != nullptr && _io_ctx->can_use_prefetching_cache();
+}
+
+std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx, std::string path)
+{
+  if (!io_ctx) { throw std::invalid_argument("open_datasource: io_ctx must be non-null"); }
+  auto obj = io_ctx->open_io_object(std::move(path));
+  return std::make_unique<datasource>(std::move(io_ctx), std::move(obj));
 }
 
 }  // namespace cucascade::io

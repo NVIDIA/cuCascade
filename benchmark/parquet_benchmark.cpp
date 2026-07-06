@@ -18,8 +18,8 @@
 // Standalone parquet read benchmark: cudf's default datasource (mmap/pread)
 // vs the cucascade::io uring datasource (O_DIRECT io_uring + DMA to GPU).
 
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
-#include <cucascade/io/datasource.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -328,7 +328,7 @@ int main(int argc, char** argv)
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     sources.reserve(paths.size());
     for (auto const& path : paths) {
-      sources.push_back(io_ctx->open_datasource(path));
+      sources.push_back(cucascade::io::open_datasource(io_ctx, path));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 

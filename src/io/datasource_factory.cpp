@@ -29,8 +29,6 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <cudf/io/datasource.hpp>
-
 #include <cctype>
 #include <exception>
 #include <memory>

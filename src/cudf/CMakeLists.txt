@@ -21,3 +21,10 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/host_data_representation.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/bandwidth_profiler.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter_builtins.cpp)
+
+# The cudf::io::datasource bridge over the cudf-free io core — only built when
+# the io library is enabled (the io core itself carries no cudf dependency).
+if(CUCASCADE_BUILD_IO)
+  target_sources(cucascade_cudf_objects
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/datasource.cpp)
+endif()

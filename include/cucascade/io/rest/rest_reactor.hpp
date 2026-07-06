@@ -211,9 +211,8 @@ class rest_reactor {
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
   /// bound) into a minimal sorted set — fewer ranges means fewer GETs.
-  static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<const cudf::io::text::byte_range_info> ranges,
-    std::optional<size_t> alignment = std::nullopt);
+  static std::vector<byte_range> align_and_coalesce(std::span<const byte_range> ranges,
+                                                    std::optional<size_t> alignment = std::nullopt);
 
  private:
   void worker_loop(const std::stop_token& stop_token);

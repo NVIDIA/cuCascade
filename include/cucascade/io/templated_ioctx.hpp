@@ -154,18 +154,15 @@ concept reactor_has_host_to_device_rx = requires(R r,
 };
 
 template <class R>
-concept reactor_has_vector_host_rx =
-  requires(R r,
-           typename R::io_object_type file,
-           typename R::reactor_config_type cfg,
-           std::span<io_object_segment> dsts,
-           std::span<const cudf::io::text::byte_range_info> ranges,
-           std::optional<size_t> alignment) {
-    { r.prep_host_rxv_request(cfg, file, dsts) } -> std::same_as<typename R::request_type_ptr>;
-    {
-      r.align_and_coalesce(ranges, alignment)
-    } -> std::same_as<std::vector<cudf::io::text::byte_range_info>>;
-  };
+concept reactor_has_vector_host_rx = requires(R r,
+                                              typename R::io_object_type file,
+                                              typename R::reactor_config_type cfg,
+                                              std::span<io_object_segment> dsts,
+                                              std::span<const byte_range> ranges,
+                                              std::optional<size_t> alignment) {
+  { r.prep_host_rxv_request(cfg, file, dsts) } -> std::same_as<typename R::request_type_ptr>;
+  { r.align_and_coalesce(ranges, alignment) } -> std::same_as<std::vector<byte_range>>;
+};
 
 template <class R>
 struct reactor_traits {
@@ -286,8 +283,8 @@ class templated_ioctx : public ioctx {
     return Reactor::preferred_prefetching_stage();
   }
 
-  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<const cudf::io::text::byte_range_info> ranges,
+  [[nodiscard]] std::vector<byte_range> align_and_coalesce(
+    std::span<const byte_range> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept override
   {
     if constexpr (reactor_traits_t::supports_vector_host_read) {
