@@ -102,18 +102,20 @@ static std::vector<std::string> expand_paths(std::string const& spec)
 
 static void usage(char const* prog)
 {
-  std::cerr << "usage: " << prog << " <path|glob> <cudf|uring> <num_rows> [n_reactors]\n"
+  std::cerr << "usage: " << prog << " <path|glob> <cudf|uring> <num_rows> [n_reactors] [odirect]\n"
             << "  path|glob  – parquet file path, or shell glob (e.g. "
                "'dir/*.parquet')\n"
             << "  cudf       – cudf default (mmap/pread)\n"
-            << "  uring      – O_DIRECT io_uring + DMA to GPU\n"
+            << "  uring      – io_uring + DMA to GPU\n"
             << "  num_rows   – rows to read (0 = all)\n"
-            << "  n_reactors – uring reactor threads (default 2; uring only)\n";
+            << "  n_reactors – uring reactor threads (default 2; uring only)\n"
+            << "  odirect    – 1 = O_DIRECT (default), 0 = buffered/page-cache "
+               "(uring only)\n";
 }
 
 int main(int argc, char** argv)
 {
-  if (argc != 4 && argc != 5) {
+  if (argc < 4 || argc > 6) {
     usage(argv[0]);
     return 1;
   }
@@ -137,7 +139,7 @@ int main(int argc, char** argv)
   size_t num_rows = static_cast<size_t>(num_rows_arg);  // 0 means all
 
   size_t n_reactors = 2;
-  if (argc == 5) {
+  if (argc >= 5) {
     long long n_reactors_arg = std::stoll(argv[4]);
     if (n_reactors_arg <= 0) {
       std::cerr << "n_reactors must be > 0\n";
@@ -145,6 +147,9 @@ int main(int argc, char** argv)
     }
     n_reactors = static_cast<size_t>(n_reactors_arg);
   }
+
+  bool use_odirect = true;
+  if (argc == 6) { use_odirect = std::stoll(argv[5]) != 0; }
 
   auto paths = expand_paths(path_spec);
   if (paths.empty()) {
@@ -318,8 +323,8 @@ int main(int argc, char** argv)
                                                                1);               // initial_pools
 
     auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-      cucascade::io::uring::uring_reactor::reactor_config_type{.bounce_size =
-                                                                 host_mr.get_block_size()},
+      cucascade::io::uring::uring_reactor::reactor_config_type{
+        .bounce_size = host_mr.get_block_size(), .use_odirect = use_odirect},
       &host_mr);
     auto io_ctx =
       std::make_shared<cucascade::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
