@@ -90,6 +90,13 @@ struct rest_chunked_rx_request {
   std::unique_ptr<device_cpy_request> cpy_req;
   std::shared_ptr<request_manager> manager;
 
+  // Set by submit() when it backs a null-destination chunk with a pinned
+  // bounce slot.  set_data makes chunk.is_buffer_allocated() true, so finish()
+  // can no longer infer bounce-staging from the chunk itself; it must consult
+  // this flag to take the event-synchronized recycle path (see
+  // needs_event_for_synchronization).
+  bool staged_through_bounce{false};
+
   /// True iff this read's bytes must be host->device copied after landing.
   [[nodiscard]] bool is_device() const noexcept { return cpy_req != nullptr; }
 
@@ -102,11 +109,15 @@ struct rest_chunked_rx_request {
   }
 
   /// True iff the H2D copy must be synchronized through a CUDA event: it stages
-  /// through a reactor-owned bounce slot (null destination) that can only be
-  /// recycled once the copy off it has completed.
+  /// through a reactor-owned bounce slot that can only be recycled once the copy
+  /// off it has completed.  Keys off @c staged_through_bounce rather than
+  /// chunk.is_buffer_allocated(), because submit() sets the chunk's data to the
+  /// bounce (set_data) *before* finish() evaluates this — reading the chunk
+  /// would report "already buffered" and wrongly skip the event/park path,
+  /// letting the slot (and its bounce) be recycled while the copy still drains.
   [[nodiscard]] bool needs_event_for_synchronization() const noexcept
   {
-    return !chunk.is_buffer_allocated() && cpy_req != nullptr;
+    return staged_through_bounce && cpy_req != nullptr;
   }
 };
 

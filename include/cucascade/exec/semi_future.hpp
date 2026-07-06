@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -197,6 +198,58 @@ inline bool futex_wait_until(std::atomic<std::uint32_t>& atom,
 #endif
 }
 
+// Untimed counterpart of futex_wait_until: block until atom != expected (or a
+// spurious wake / EINTR — the caller's loop re-checks either way).
+
+inline void futex_wait(std::atomic<std::uint32_t>& atom, std::uint32_t expected)
+{
+#ifdef __linux__
+  constexpr unsigned futex_wait_op      = 0U;
+  constexpr unsigned futex_private_flag = 128U;
+  syscall(SYS_futex,
+          reinterpret_cast<std::uint32_t*>(&atom),
+          static_cast<int>(futex_wait_op | futex_private_flag),
+          expected,
+          nullptr,
+          nullptr,
+          0);
+#else
+  atom.wait(expected, std::memory_order_acquire);
+#endif
+}
+
+// Wake every waiter parked on @p atom — the producer-side counterpart of
+// futex_wait / futex_wait_until, mirroring folly's futexWake.
+//
+// On Linux, core waiters (timed AND untimed) park exclusively through the raw
+// futex helpers above, and this raw FUTEX_WAKE is the only wake they can
+// observe. Do NOT substitute std::atomic::notify_all: libstdc++'s wait/notify
+// are not interoperable with raw futex use of the same word — notify_all can
+// elide the wake syscall based on an internal waiter count that raw waiters
+// never increment, and some builds (e.g. conda-forge gcc, configured without
+// _GLIBCXX_HAVE_LINUX_FUTEX_PRIVATE) issue SHARED futex ops while we use
+// PRIVATE ones; private and shared futexes hash to different kernel buckets
+// and never wake each other. One mechanism, both sides, like folly's Futex.
+// On non-Linux platforms both wait paths degrade to std::atomic::wait /
+// spin-yield, so notify_all is the matching wake there.
+
+inline void futex_wake_all(std::atomic<std::uint32_t>& atom)
+{
+#ifdef __linux__
+  constexpr unsigned futex_wake         = 1U;
+  constexpr unsigned futex_private_flag = 128U;
+  syscall(SYS_futex,
+          reinterpret_cast<std::uint32_t*>(&atom),
+          static_cast<int>(futex_wake | futex_private_flag),
+          std::numeric_limits<int>::max(),
+          nullptr,
+          nullptr,
+          0);
+#else
+  atom.notify_all();
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // core: the shared slot between promise and semi_future/future.
 //
@@ -239,7 +292,7 @@ class core {
           expected, has_result, std::memory_order_acq_rel, std::memory_order_acquire)) {
       // Pull-mode consumer (if any) is woken; push-mode set_callback (if it
       // arrives later) will fire inline.
-      _state.notify_all();
+      detail::futex_wake_all(_state);
       return;
     }
     // The only other valid prior state is has_callback: a callback was
@@ -263,13 +316,16 @@ class core {
     run_and_complete();
   }
 
-  // Pull-mode block until ready. Idempotent.
+  // Pull-mode block until ready. Idempotent. Parks via the same raw-futex
+  // mechanism as wait_until so a single futex_wake_all reaches every waiter
+  // (see the futex_wake_all comment for why std::atomic::wait must not be
+  // mixed in here).
   void wait()
   {
     while (true) {
       auto s = _state.load(std::memory_order_acquire);
       if (s == has_result || s == done) { return; }
-      _state.wait(s, std::memory_order_acquire);
+      detail::futex_wait(_state, s);
     }
   }
 
@@ -310,7 +366,7 @@ class core {
     auto cb = std::move(_callback);
     std::move(cb)(std::move(_try));
     _state.store(done, std::memory_order_release);
-    _state.notify_all();
+    detail::futex_wake_all(_state);
   }
 
   std::atomic<std::uint32_t> _state{empty};

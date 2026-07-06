@@ -67,14 +67,11 @@ class unique_function<R(Args...)> {
 
   friend bool operator==(const unique_function& f, std::nullptr_t) noexcept { return !f; }
 
-  R operator()(Args... args)
-  {
-    return _impl->invoke(std::forward<Args>(args)...);
-  }
+  R operator()(Args... args) { return _impl->invoke(std::forward<Args>(args)...); }
 
  private:
   struct concept_t {
-    virtual ~concept_t()            = default;
+    virtual ~concept_t()             = default;
     virtual R invoke(Args&&... args) = 0;
   };
 

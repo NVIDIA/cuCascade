@@ -52,12 +52,22 @@ dependencies = { "libcudf" = "26.08.*" }
 channels = [{ channel = "rapidsai", priority = 1 }]
 dependencies = { "libcudf" = "26.06.*" }
 
+# AWS SDK is only needed by the optional S3 parquet benchmark
+# (CUCASCADE_BUILD_S3_BENCHMARK=ON). It is deliberately NOT a dependency of
+# cuCascade itself — use the s3-bench environment to build that benchmark.
+[feature.s3-bench]
+dependencies = { "aws-sdk-cpp" = "*" }
+
+[feature.s3-bench.tasks]
+build-s3-bench = "cmake --preset s3-bench && cmake --build build/s3-bench --target cucascade_s3_parquet_benchmark"
+
 [environments]
 default = ["cuda-13", "cudf-nightly"]
 cuda-13-nightly = ["cuda-13", "cudf-nightly"]
 cuda-12-nightly = ["cuda-12", "cudf-nightly"]
 cuda-13-stable = ["cuda-13", "cudf-stable"]
 cuda-12-stable = ["cuda-12", "cudf-stable"]
+s3-bench = ["cuda-13", "cudf-nightly", "s3-bench"]
 
 [tasks]
 build = "cmake --preset release && cmake --build build/release"

@@ -81,3 +81,46 @@ add_custom_target(
   DEPENDS cucascade_benchmarks
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
   COMMENT "Running cuCascade benchmarks")
+
+# =============================================================================
+# Standalone parquet read benchmark (CLI, not Google Benchmark): cudf's default
+# datasource vs the cucascade-io uring datasource. Requires the io library.
+# =============================================================================
+if(CUCASCADE_BUILD_IO)
+  add_executable(cucascade_parquet_benchmark
+                 ${CMAKE_CURRENT_SOURCE_DIR}/parquet_benchmark.cpp)
+
+  target_compile_options(
+    cucascade_parquet_benchmark
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
+      ${CUCASCADE_CUDA_WARNING_FLAGS})
+
+  target_link_libraries(cucascade_parquet_benchmark PRIVATE cucascade_io
+                                                            CUDA::cudart_static)
+endif()
+
+# =============================================================================
+# S3 parquet benchmark (CLI): cucascade-io REST datasource (AWS-SDK presigned
+# URLs) vs kvikIO's remote S3 handle. Opt-in via CUCASCADE_BUILD_S3_BENCHMARK so
+# aws-sdk-cpp never becomes a dependency of cuCascade itself (use the `s3-bench`
+# pixi environment, which provides it).
+# =============================================================================
+if(CUCASCADE_BUILD_S3_BENCHMARK)
+  find_package(AWSSDK REQUIRED COMPONENTS s3)
+  find_package(kvikio REQUIRED CONFIG)
+
+  add_executable(cucascade_s3_parquet_benchmark
+                 ${CMAKE_CURRENT_SOURCE_DIR}/s3_parquet_benchmark.cpp)
+
+  target_compile_options(
+    cucascade_s3_parquet_benchmark
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
+      ${CUCASCADE_CUDA_WARNING_FLAGS})
+
+  target_link_libraries(
+    cucascade_s3_parquet_benchmark
+    PRIVATE cucascade_io kvikio::kvikio ${AWSSDK_LINK_LIBRARIES}
+            CUDA::cudart_static)
+endif()

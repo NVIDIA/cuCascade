@@ -113,16 +113,6 @@ class scoped_dispatcher {
  private:
   using task_t = unique_function<void()>;
 
-  static void log_exception_ptr(const std::exception_ptr& eptr,
-                                std::source_location loc = std::source_location::current())
-  {
-    try {
-      if (eptr) std::rethrow_exception(eptr);
-    } catch (const std::exception& e) {
-    } catch (...) {
-    }
-  }
-
   template <typename F>
   task_t wrap(F&& f)
   {
@@ -131,7 +121,6 @@ class scoped_dispatcher {
         try {
           invoke_with_optional_stop_token(f, stop_.get_token());
         } catch (...) { /* swallow */
-          log_exception_ptr(std::current_exception());
         }
       }
       on_task_done();

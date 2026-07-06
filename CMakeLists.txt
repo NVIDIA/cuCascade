@@ -41,6 +41,11 @@ option(
   "Build the cucascade-io library (datasource, uring/rest reactors, prefetching cache)"
   ON)
 
+option(
+  CUCASCADE_BUILD_S3_BENCHMARK
+  "Build the S3 parquet benchmark (requires aws-sdk-cpp; NOT a cuCascade dependency)"
+  OFF)
+
 # The io library implements cudf::io::datasource, so it requires the cudf
 # dependency to be available.
 if(CUCASCADE_BUILD_IO AND (CUCASCADE_TOPOLOGY_ONLY OR NOT CUCASCADE_BUILD_CUDF))
@@ -51,6 +56,19 @@ if(CUCASCADE_BUILD_IO AND (CUCASCADE_TOPOLOGY_ONLY OR NOT CUCASCADE_BUILD_CUDF))
   set(CUCASCADE_BUILD_IO
       OFF
       CACHE BOOL "Build the cucascade-io library" FORCE)
+endif()
+
+# The S3 benchmark needs the io library (rest backend) and the benchmark tree.
+# Checked after the io gating above so a force-disabled io also disables it.
+if(CUCASCADE_BUILD_S3_BENCHMARK AND (NOT CUCASCADE_BUILD_IO
+                                     OR NOT CUCASCADE_BUILD_BENCHMARKS))
+  message(
+    STATUS
+      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON and CUCASCADE_BUILD_BENCHMARKS=ON"
+  )
+  set(CUCASCADE_BUILD_S3_BENCHMARK
+      OFF
+      CACHE BOOL "Build the S3 parquet benchmark" FORCE)
 endif()
 
 # At least one library type must be built

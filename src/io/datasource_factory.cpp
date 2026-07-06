@@ -16,9 +16,8 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/datasource_factory.hpp>
-
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
@@ -26,12 +25,11 @@
 #include <cucascade/io/s3/static_credentials.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/log/logging.hpp>
-
-#include <cudf/io/datasource.hpp>
-
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+
+#include <cudf/io/datasource.hpp>
 
 #include <cctype>
 #include <exception>
@@ -84,8 +82,7 @@ using factory_type        = io_context_registry::factory_type;
 factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
-  return [&reservation_manager](
-           const io_config& config) -> std::shared_ptr<ioctx> {
+  return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto* host_mr = first_host_resource(reservation_manager);
       if (host_mr == nullptr) {
@@ -110,8 +107,7 @@ factory_type make_uring_ioctx_factory(
 factory_type make_rest_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
-  return [&reservation_manager](
-           const io_config& config) -> std::shared_ptr<ioctx> {
+  return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto authorizer = make_s3_authorizer(config.object_store);
       if (!authorizer) {

@@ -639,7 +639,6 @@ std::string prefetching_cache::summary() const
 
 void prefetching_cache::prepare_for_query() noexcept
 {
-
   _ticker.fetch_add(1, std::memory_order_relaxed);
 
   // Snapshot the counters so the next summary() can report this cycle's deltas.

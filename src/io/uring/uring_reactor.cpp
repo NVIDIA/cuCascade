@@ -399,9 +399,7 @@ unique_ring_ptr make_ring(unsigned depth)
   p.flags |= IORING_SETUP_SINGLE_ISSUER;
   p.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
   int rc = io_uring_queue_init_params(depth, r.get(), &p);
-  if (rc == 0) {
-    return unique_ring_ptr{r.release()};
-  }
+  if (rc == 0) { return unique_ring_ptr{r.release()}; }
 #endif
   auto r2 = std::make_unique<io_uring>();
   int rc2 = io_uring_queue_init(depth, r2.get(), 0);
@@ -540,6 +538,12 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
                                                      const io_object_segment& segment)
 {
   if (segment.size == 0) { return rx_request::create({}); }
+  // A host read must carry the caller's destination buffer.  A null buffer
+  // means "reactor-staged" (internal bounce slot), which only makes sense for
+  // device reads: a host read staged through the bounce would report success
+  // while the bytes sit unreachable in a reactor-private buffer.
+  assert(segment.is_buffer_allocated() &&
+         "uring_reactor::prep_host_rx_request: host read requires a non-null destination buffer");
 
   int const fd = (cfg.use_odirect && segment.is_odirect_compatible()) ? file.odirect_handle()
                                                                       : file.buffered_handle();
@@ -699,6 +703,12 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
   // future returns, never the over-read amount.  Merging does not change it.
   size_t bytes_requested = 0;
   for (auto const& s : segments) {
+    // See prep_host_rx_request: host reads must carry caller buffers; a
+    // null-buffer segment here would be silently staged through an internal
+    // bounce slot and its bytes lost to the caller.
+    assert(s.is_buffer_allocated() &&
+           "uring_reactor::prep_host_rxv_request: host read requires non-null "
+           "destination buffers");
     bytes_requested += s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
   }
 
@@ -1028,9 +1038,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     // wait for all in-flight requests to complete so we don't report spurious errors on shutdown
     while (inflight > 0) {
       auto s = ring.wait_for(SHUTDOWN_POLL_MS);
-      if (s) {
-        break;
-      }
+      if (s) { break; }
       reap_cqes();
     }
 
@@ -1073,9 +1081,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
 
         if (inflight > 0) {
           auto s = ring.wait_for(SHUTDOWN_POLL_MS);
-          if (s) {
-            break;
-          }
+          if (s) { break; }
           reap_cqes();
         }
 

@@ -46,6 +46,16 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
+    },
+    {
+      "name": "s3-bench",
+      "displayName": "S3 benchmark (Release + aws-sdk-cpp)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/s3-bench",
+      "cacheVariables": {
+        "CUCASCADE_BUILD_S3_BENCHMARK": "ON",
+        "CUCASCADE_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [

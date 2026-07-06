@@ -40,12 +40,8 @@ void ioctx::initialize_cache(
 {
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
-  if (_cache) {
-    return;
-  }
-  if (!can_use_prefetching_cache()) {
-    return;
-  }
+  if (_cache) { return; }
+  if (!can_use_prefetching_cache()) { return; }
   try {
     _cache = std::make_unique<cache::prefetching_cache>(
       reservation_manager, this, cache_config, std::move(topology_index));

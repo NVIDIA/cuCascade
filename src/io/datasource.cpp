@@ -191,9 +191,7 @@ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges
   // handle is a caller bug.  Warn loudly; cancel the stale handle so the
   // worker drops the old request and we don't leak both into the cache.
   if (_prefetch_handle) {
-    if (_prefetch_handle.is_active()) {
-      return;
-    }
+    if (_prefetch_handle.is_active()) { return; }
     _prefetch_handle.cancel();
   }
 

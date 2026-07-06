@@ -21,8 +21,6 @@
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/io_context.hpp>
 
-#include <absl/functional/any_invocable.h>
-
 #include <functional>
 #include <memory>
 #include <shared_mutex>
