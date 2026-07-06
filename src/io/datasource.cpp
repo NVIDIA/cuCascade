@@ -16,16 +16,15 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/datasource.hpp>
-
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/datasource.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/device_buffer.hpp>
 
 #include <fcntl.h>
-#include <cucascade/log/logging.hpp>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -62,8 +61,7 @@ std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf)
 
 }  // namespace
 
-datasource::datasource(std::shared_ptr<ioctx> io_ctx,
-                                     std::shared_ptr<io_object> io_object)
+datasource::datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_object)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_object))
 {
 }
@@ -77,8 +75,7 @@ std::shared_ptr<io_object_metadata> datasource::metadata() const
   return cache.get_metadata(*_io_object);
 }
 
-[[nodiscard]] bool datasource::store_metadata(
-  std::shared_ptr<io_object_metadata> metadata)
+[[nodiscard]] bool datasource::store_metadata(std::shared_ptr<io_object_metadata> metadata)
 {
   if (!_io_ctx || !_io_object) { return false; }
   auto& cache = _io_ctx->metadata_store();
@@ -90,15 +87,9 @@ size_t datasource::size() const { return _io_object->size(); }
 
 bool datasource::supports_device_read() const { return _io_ctx->supports_device_read(); }
 
-bool datasource::supports_vector_host_read() const
-{
-  return _io_ctx->supports_vector_host_read();
-}
+bool datasource::supports_vector_host_read() const { return _io_ctx->supports_vector_host_read(); }
 
-bool datasource::is_device_read_preferred(size_t) const
-{
-  return _io_ctx->supports_device_read();
-}
+bool datasource::is_device_read_preferred(size_t) const { return _io_ctx->supports_device_read(); }
 
 size_t datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
@@ -109,8 +100,7 @@ size_t datasource::host_read(size_t offset, size_t size, uint8_t* dst)
   return _io_ctx->host_read_io(*_io_object, offset, size, dst);
 }
 
-std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offset,
-                                                                           size_t size)
+std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offset, size_t size)
 {
   std::vector<uint8_t> buf(size);
   auto n = host_read(offset, size, buf.data());
@@ -144,8 +134,9 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read
   });
 }
 
-std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(
-  size_t offset, size_t size, rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(size_t offset,
+                                                                      size_t size,
+                                                                      rmm::cuda_stream_view stream)
 {
   rmm::device_buffer buf(size, stream);
   auto n = device_read(offset, size, reinterpret_cast<uint8_t*>(buf.data()), stream);
@@ -155,9 +146,9 @@ std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(
 }
 
 size_t datasource::device_read(size_t offset,
-                                      size_t size,
-                                      uint8_t* dst,
-                                      rmm::cuda_stream_view stream)
+                               size_t size,
+                               uint8_t* dst,
+                               rmm::cuda_stream_view stream)
 {
   auto f = device_read_async(offset, size, dst, stream);
   auto n = f.get();
@@ -166,9 +157,9 @@ size_t datasource::device_read(size_t offset,
 }
 
 std::future<size_t> datasource::device_read_async(size_t offset,
-                                                         size_t size,
-                                                         uint8_t* dst,
-                                                         rmm::cuda_stream_view stream)
+                                                  size_t size,
+                                                  uint8_t* dst,
+                                                  rmm::cuda_stream_view stream)
 {
   exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
@@ -190,7 +181,7 @@ std::unique_ptr<datasource> datasource::duplicate() const
 }
 
 void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
-                                std::optional<int> dev_id)
+                         std::optional<int> dev_id)
 {
   auto* cache = _io_ctx->cache();
   if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
@@ -201,11 +192,6 @@ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges
   // worker drops the old request and we don't leak both into the cache.
   if (_prefetch_handle) {
     if (_prefetch_handle.is_active()) {
-      spdlog::warn(
-        "datasource::fadvise: a prefetching_handle was already stored on "
-        "this datasource (path={}); cancelling the stale request.  Each scan "
-        "should own a unique datasource.",
-        _io_object->object_path());
       return;
     }
     _prefetch_handle.cancel();

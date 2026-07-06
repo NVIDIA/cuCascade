@@ -24,11 +24,11 @@
 #include <cucascade/io/s3/s3_object_ref.hpp>
 #include <cucascade/io/s3/s3_request_authorizer.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <blockingconcurrentqueue.h>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <chrono>
 #include <cstddef>

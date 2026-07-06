@@ -111,7 +111,7 @@ std::string uri_encode(std::string_view s, bool encode_slash)
   std::string out;
   out.reserve(s.size());
   for (char raw : s) {
-    auto c = static_cast<unsigned char>(raw);
+    auto c          = static_cast<unsigned char>(raw);
     bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
                       c == '-' || c == '_' || c == '.' || c == '~';
     if (unreserved || (c == '/' && !encode_slash)) {

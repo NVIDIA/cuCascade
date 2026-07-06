@@ -35,14 +35,14 @@ class null_device_memory_resource {
   null_device_memory_resource()  = default;
   ~null_device_memory_resource() = default;
 
-  void* allocate([[maybe_unused]] cuda::stream_ref stream,
+  void* allocate([[maybe_unused]] ::cuda::stream_ref stream,
                  [[maybe_unused]] std::size_t bytes,
                  [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t))
   {
     return nullptr;
   }
 
-  void deallocate([[maybe_unused]] cuda::stream_ref stream,
+  void deallocate([[maybe_unused]] ::cuda::stream_ref stream,
                   [[maybe_unused]] void* p,
                   [[maybe_unused]] std::size_t bytes,
                   [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t)) noexcept
@@ -66,7 +66,8 @@ class null_device_memory_resource {
     return this == &other;
   }
 
-  friend void get_property(null_device_memory_resource const&, cuda::mr::device_accessible) noexcept
+  friend void get_property(null_device_memory_resource const&,
+                           ::cuda::mr::device_accessible) noexcept
   {
   }
 };

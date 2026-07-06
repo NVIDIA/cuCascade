@@ -24,12 +24,12 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/io/uring/types.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <cuda_runtime.h>
 
 #include <blockingconcurrentqueue.h>
 #include <concurrentqueue.h>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <liburing.h>
 
 #include <array>

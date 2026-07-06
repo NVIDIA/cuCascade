@@ -46,12 +46,12 @@ namespace memory {
  *
  * Based on RMM's tracking_resource_adaptor but extended for per-stream tracking.
  *
- * This class inherits from cuda::mr::shared_resource, making it copyable and
+ * This class inherits from ::cuda::mr::shared_resource, making it copyable and
  * movable via reference counting. Copies share the same underlying state.
  */
 class reservation_aware_resource_adaptor
-  : public cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl> {
-  using shared_base = cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl>;
+  : public ::cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl> {
+  using shared_base = ::cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl>;
   using impl_type   = detail::reservation_aware_resource_adaptor_impl;
 
  public:
@@ -62,7 +62,7 @@ class reservation_aware_resource_adaptor
   using AllocationTrackingScope      = impl_type::AllocationTrackingScope;
 
   friend void get_property(reservation_aware_resource_adaptor const&,
-                           cuda::mr::device_accessible) noexcept
+                           ::cuda::mr::device_accessible) noexcept
   {
   }
 
@@ -239,12 +239,12 @@ class reservation_aware_resource_adaptor
   // Convenience allocate/deallocate with default alignment
   //===----------------------------------------------------------------------===//
 
-  void* allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
+  void* allocate(::cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
   {
     return get().allocate(stream, bytes, alignment);
   }
 
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment) noexcept

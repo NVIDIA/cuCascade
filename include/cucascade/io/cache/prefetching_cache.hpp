@@ -18,7 +18,6 @@
 
 #pragma once
 
-#include <blockingconcurrentqueue.h>
 #include <cucascade/exec/admission_control.hpp>
 #include <cucascade/exec/scoped_dispatcher.hpp>
 #include <cucascade/exec/semi_future.hpp>
@@ -26,6 +25,7 @@
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/types.hpp>
 
+#include <blockingconcurrentqueue.h>
 #include <concurrentqueue.h>
 
 #include <atomic>
@@ -181,11 +181,8 @@ class prefetching_cache {
                                           std::span<const byte_range> ranges,
                                           std::optional<int> gpu_id = {});
 
-  [[nodiscard]] bool host_read_from_cache_only(const io_object& obj,
-                                               size_t offset,
-                                               size_t size,
-                                               uint8_t* dst,
-                                               prefetching_handle* out_handle);
+  [[nodiscard]] bool host_read_from_cache_only(
+    const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle);
 
   struct file_entry {
     std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);

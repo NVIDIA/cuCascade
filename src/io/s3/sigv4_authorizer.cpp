@@ -16,10 +16,9 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/s3/sigv4_authorizer.hpp>
-
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/s3/sigv4.hpp>
+#include <cucascade/io/s3/sigv4_authorizer.hpp>
 
 #include <cctype>
 #include <ctime>
@@ -45,9 +44,7 @@ std::string to_lower(std::string_view s)
 /// a specific bucket or object.
 std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
 {
-  if (endpoint.empty()) {
-    throw credential_error("sigv4_presigned_authorizer: empty endpoint");
-  }
+  if (endpoint.empty()) { throw credential_error("sigv4_presigned_authorizer: empty endpoint"); }
   auto sep = endpoint.find("://");
   if (sep == std::string_view::npos) {
     throw credential_error(
@@ -56,8 +53,7 @@ std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
   std::string scheme = to_lower(endpoint.substr(0, sep));
   if (scheme != "http" && scheme != "https") {
     throw credential_error(
-      "sigv4_presigned_authorizer: endpoint scheme must be http or https (got '" + scheme +
-      "')");
+      "sigv4_presigned_authorizer: endpoint scheme must be http or https (got '" + scheme + "')");
   }
   std::string remainder{endpoint.substr(sep + 3)};
   // Anything past host[:port] (path, query, fragment) is rejected — endpoint
@@ -113,28 +109,25 @@ std::string_view method_to_str(s3_request_method method)
 }  // namespace
 
 sigv4_authorizer_base::sigv4_authorizer_base(static_credentials creds,
-                                                           std::string region,
-                                                           std::string endpoint)
+                                             std::string region,
+                                             std::string endpoint)
   : _creds(std::move(creds)), _region(std::move(region))
 {
   if (_creds.access_key_id.empty() || _creds.secret_access_key.empty()) {
     throw credential_error(
       "sigv4_authorizer: access_key_id and secret_access_key must be non-empty");
   }
-  if (_region.empty()) {
-    throw credential_error("sigv4_authorizer: region must be non-empty");
-  }
+  if (_region.empty()) { throw credential_error("sigv4_authorizer: region must be non-empty"); }
 
   auto [scheme, host] = parse_endpoint(endpoint);
   _scheme             = std::move(scheme);
   _host               = std::move(host);
 }
 
-sigv4_presigned_authorizer::sigv4_presigned_authorizer(
-  static_credentials creds,
-  std::string region,
-  std::string endpoint,
-  std::chrono::seconds default_ttl)
+sigv4_presigned_authorizer::sigv4_presigned_authorizer(static_credentials creds,
+                                                       std::string region,
+                                                       std::string endpoint,
+                                                       std::chrono::seconds default_ttl)
   : sigv4_authorizer_base(std::move(creds), std::move(region), std::move(endpoint)),
     _ttl(default_ttl)
 {
@@ -144,8 +137,8 @@ sigv4_presigned_authorizer::sigv4_presigned_authorizer(
 }
 
 s3_authorized_request sigv4_presigned_authorizer::authorize(s3_object_ref const& obj,
-                                                                   s3_request_method method,
-                                                                   std::chrono::seconds timeout)
+                                                            s3_request_method method,
+                                                            std::chrono::seconds timeout)
 {
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);
@@ -173,15 +166,15 @@ s3_authorized_request sigv4_presigned_authorizer::authorize(s3_object_ref const&
 }
 
 sigv4_header_authorizer::sigv4_header_authorizer(static_credentials creds,
-                                                               std::string region,
-                                                               std::string endpoint)
+                                                 std::string region,
+                                                 std::string endpoint)
   : sigv4_authorizer_base(std::move(creds), std::move(region), std::move(endpoint))
 {
 }
 
 s3_authorized_request sigv4_header_authorizer::authorize(s3_object_ref const& obj,
-                                                                s3_request_method method,
-                                                                std::chrono::seconds /*timeout*/)
+                                                         s3_request_method method,
+                                                         std::chrono::seconds /*timeout*/)
 {
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);

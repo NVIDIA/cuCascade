@@ -191,10 +191,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     std::span<const cudf::io::text::byte_range_info> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept = 0;
 
-  virtual size_t host_read_io(const io_object& obj,
-                              size_t offset,
-                              size_t size,
-                              uint8_t* dst) = 0;
+  virtual size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
 
   virtual exec::semi_future<size_t> host_read_async_io(const io_object& obj,
                                                        size_t offset,

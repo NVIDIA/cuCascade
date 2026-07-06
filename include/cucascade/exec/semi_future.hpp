@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <cucascade/exec/unique_function.hpp>
+
 #include <atomic>
 #include <cassert>
 #include <cerrno>
@@ -39,12 +41,10 @@
 
 #include <cucascade/exec/try.hpp>
 
-#include <absl/functional/any_invocable.h>
-
 namespace cucascade::exec {
 
 // Task type submitted to an executor.
-using executor_func = absl::AnyInvocable<void() &&>;
+using executor_func = unique_function<void()>;
 
 // Concept: any type with a void enqueue(executor_func) member.
 template <class exec_t>
@@ -218,7 +218,7 @@ inline bool futex_wait_until(std::atomic<std::uint32_t>& atom,
 template <class value_t>
 class core {
  public:
-  using callback = absl::AnyInvocable<void(try_t<value_t>&&) &&>;
+  using callback = unique_function<void(try_t<value_t>&&)>;
 
   core()                       = default;
   core(core const&)            = delete;
@@ -333,7 +333,7 @@ class core {
 
 template <class value_t>
 struct state {
-  using callback = absl::AnyInvocable<void(try_t<value_t>&&) &&>;
+  using callback = unique_function<void(try_t<value_t>&&)>;
 
   virtual ~state()                                                         = default;
   virtual void await()                                                     = 0;

@@ -22,15 +22,14 @@
 // virtual interface (device_read_async_io_using).  Extracted here to break the
 // circular include between io_context.hpp and prefetching_cache.hpp.
 
+#include <cucascade/io/types.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
-#include <cucascade/io/types.hpp>
 
 #include <cudf/io/datasource.hpp>
 
 #include <cuda_runtime.h>
-
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -375,7 +374,7 @@ struct alignas(64) chunk_lifecycle {
         // saturate at uint16 max to avoid wrap.
         uint16_t new_inserts =
           cur_inserts == 0xFFFFu ? uint16_t{0xFFFFu} : static_cast<uint16_t>(cur_inserts + 1);
-        next                 = pack(cur_tick, cur_reads, new_inserts);
+        next = pack(cur_tick, cur_reads, new_inserts);
       }
 
       if (packed.compare_exchange_weak(
@@ -510,7 +509,8 @@ find_entry(const Chunks& chunks,
     const std::size_t last_idx = first_idx + expected_count - 1;
 
     if (last_idx >= count) return {};
-    if (std::to_address(first[static_cast<std::ptrdiff_t>(last_idx)])->offset != last_chunk_off) return {};
+    if (std::to_address(first[static_cast<std::ptrdiff_t>(last_idx)])->offset != last_chunk_off)
+      return {};
 
     // Coverage confirmed by the invariant: sorted + non-overlapping + fixed-size
     // means consecutive chunks differ by exactly chunk_size, so the intermediates

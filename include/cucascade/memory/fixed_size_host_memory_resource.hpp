@@ -331,18 +331,18 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
    */
   std::size_t get_peak_total_allocated_bytes() const;
 
-  void* allocate(cuda::stream_ref stream,
+  void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t));
 
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    auto* ptr = allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
     CUCASCADE_CUDA_TRY(cudaStreamSynchronize(cudaStream_t{nullptr}));
     return ptr;
   }
@@ -351,14 +351,14 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
     CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(cudaStream_t{nullptr}));
   }
 
   [[nodiscard]] bool operator==(fixed_size_host_memory_resource const& other) const noexcept;
 
   friend void get_property(fixed_size_host_memory_resource const&,
-                           cuda::mr::device_accessible) noexcept
+                           ::cuda::mr::device_accessible) noexcept
   {
   }
 

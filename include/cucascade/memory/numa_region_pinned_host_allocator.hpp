@@ -39,14 +39,14 @@ class numa_region_pinned_host_memory_resource final {
   /**
    * @brief Allocates pinned host memory of size at least \p bytes bytes.
    */
-  void* allocate(cuda::stream_ref stream,
+  void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t));
 
   /**
    * @brief Deallocate memory pointed to by \p ptr.
    */
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept;
@@ -61,18 +61,18 @@ class numa_region_pinned_host_memory_resource final {
     numa_region_pinned_host_memory_resource const& other) const noexcept;
 
   /**
-   * @brief Enables the `cuda::mr::device_accessible` property
+   * @brief Enables the `::cuda::mr::device_accessible` property
    */
   friend void get_property(numa_region_pinned_host_memory_resource const&,
-                           cuda::mr::device_accessible) noexcept
+                           ::cuda::mr::device_accessible) noexcept
   {
   }
 
   /**
-   * @brief Enables the `cuda::mr::host_accessible` property
+   * @brief Enables the `::cuda::mr::host_accessible` property
    */
   friend void get_property(numa_region_pinned_host_memory_resource const&,
-                           cuda::mr::host_accessible) noexcept
+                           ::cuda::mr::host_accessible) noexcept
   {
   }
 

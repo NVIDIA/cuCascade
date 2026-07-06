@@ -31,8 +31,7 @@ void metadata_store::register_metadata(io_object const& obj,
   _by_key[key] = std::move(metadata);
 }
 
-std::shared_ptr<io_object_metadata> metadata_store::get_metadata(
-  io_object const& obj) const
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
 {
   auto const& key = obj.raw_file_cache_id();
   std::shared_lock lk(_mtx);

@@ -16,11 +16,10 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/io_context.hpp>
-
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
 #include <cucascade/io/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
 
 #include <cassert>
 #include <cmath>
@@ -42,23 +41,17 @@ void ioctx::initialize_cache(
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
   if (_cache) {
-    CUCASCADE_LOG_WARN(
-      "ioctx::initialize_cache() called but prefetching_cache already present");
     return;
   }
   if (!can_use_prefetching_cache()) {
-    CUCASCADE_LOG_WARN(
-      "ioctx::initialize_cache() called but backend does not support vector host read");
     return;
   }
   try {
     _cache = std::make_unique<cache::prefetching_cache>(
       reservation_manager, this, cache_config, std::move(topology_index));
   } catch (const std::exception& e) {
-    CUCASCADE_LOG_ERROR("prefetching_cache construction failed: {}", e.what());
     _cache.reset();
   } catch (...) {
-    CUCASCADE_LOG_ERROR("prefetching_cache construction failed: unknown error");
     _cache.reset();
   }
 }

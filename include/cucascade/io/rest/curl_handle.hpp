@@ -39,7 +39,7 @@ namespace cucascade::io::rest {
 // ---------------------------------------------------------------------------
 
 /// Evaluate a libcurl easy-interface call and throw on a non-OK code.
-#define CUCASCADE_CURL_CHECK(call)                                                         \
+#define CUCASCADE_CURL_CHECK(call)                                                      \
   do {                                                                                  \
     CURLcode _ec = (call);                                                              \
     if (_ec != CURLE_OK) {                                                              \
@@ -49,7 +49,7 @@ namespace cucascade::io::rest {
   } while (false)
 
 /// Evaluate a libcurl multi-interface call and throw on a non-OK code.
-#define CUCASCADE_CURLM_CHECK(call)                                                        \
+#define CUCASCADE_CURLM_CHECK(call)                                                     \
   do {                                                                                  \
     CURLMcode _mc = (call);                                                             \
     if (_mc != CURLM_OK) {                                                              \

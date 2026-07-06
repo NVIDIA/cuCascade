@@ -16,16 +16,15 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/rest/rest_reactor.hpp>
-
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
 #include <cucascade/io/rest/curl_handle.hpp>
+#include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/uri_parser.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/cuda_device.hpp>
 
-#include <spdlog/spdlog.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
@@ -200,7 +199,7 @@ curl_slist_ptr build_header_list(std::vector<std::pair<std::string, std::string>
 /// "Range: bytes=<lo>-<hi>" (inclusive end) for [offset, offset+size).
 std::string range_header(size_t offset, size_t size)
 {
-  return fmt::format("Range: bytes={}-{}", offset, offset + size - 1);
+  return "Range: bytes=" + std::to_string(offset) + "-" + std::to_string(offset + size - 1);
 }
 
 /// Parse the first-byte position out of a Content-Range value of the form
@@ -1284,9 +1283,15 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           if (inflight == 0 && !slots.empty()) { curl_easy_upkeep(slots.front().easy.get()); }
         } else {
           int ev_bitmask = 0;
-          if (events[static_cast<std::size_t>(i)].events & EPOLLIN) { ev_bitmask |= CURL_CSELECT_IN; }
-          if (events[static_cast<std::size_t>(i)].events & EPOLLOUT) { ev_bitmask |= CURL_CSELECT_OUT; }
-          if (events[static_cast<std::size_t>(i)].events & (EPOLLERR | EPOLLHUP)) { ev_bitmask |= CURL_CSELECT_ERR; }
+          if (events[static_cast<std::size_t>(i)].events & EPOLLIN) {
+            ev_bitmask |= CURL_CSELECT_IN;
+          }
+          if (events[static_cast<std::size_t>(i)].events & EPOLLOUT) {
+            ev_bitmask |= CURL_CSELECT_OUT;
+          }
+          if (events[static_cast<std::size_t>(i)].events & (EPOLLERR | EPOLLHUP)) {
+            ev_bitmask |= CURL_CSELECT_ERR;
+          }
           curl_multi_socket_action(multi.get(), fd, ev_bitmask, &running);
         }
       }
@@ -1305,7 +1310,6 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         pc.event->synchronize();
         pc.manager->chunk_complete(pc.bytes);
       } catch (const std::exception& e) {
-        spdlog::error("rest_reactor: copy-event synchronize on shutdown failed: {}", e.what());
         pc.manager->report_error(std::make_exception_ptr(std::runtime_error(
           std::string("rest_reactor: device H2D copy failed on shutdown: ") + e.what())));
       }
@@ -1332,7 +1336,6 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     }
     ready.clear();
   } catch (const std::exception& e) {
-    spdlog::error("rest_reactor worker_loop: {}", e.what());
   }
 
   std::unique_ptr<rest_chunked_rx_request> dr;

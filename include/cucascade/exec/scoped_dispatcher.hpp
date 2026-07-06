@@ -18,11 +18,13 @@
 
 #pragma once
 
-#include <absl/functional/any_invocable.h>
 #include <cucascade/exec/thread_pool.hpp>
+#include <cucascade/exec/unique_function.hpp>
 
+#include <cassert>
 #include <concepts>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <source_location>
 #include <type_traits>
@@ -109,7 +111,7 @@ class scoped_dispatcher {
   }
 
  private:
-  using task_t = absl::AnyInvocable<void()>;
+  using task_t = unique_function<void()>;
 
   static void log_exception_ptr(const std::exception_ptr& eptr,
                                 std::source_location loc = std::source_location::current())
@@ -117,11 +119,7 @@ class scoped_dispatcher {
     try {
       if (eptr) std::rethrow_exception(eptr);
     } catch (const std::exception& e) {
-      CUCASCADE_LOG_ERROR(
-        "Exception in scoped_dispatcher task at {}:{}: {}", loc.file_name(), loc.line(), e.what());
     } catch (...) {
-      CUCASCADE_LOG_ERROR(
-        "Unknown exception in scoped_dispatcher task at {}:{}", loc.file_name(), loc.line());
     }
   }
 

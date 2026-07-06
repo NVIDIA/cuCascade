@@ -16,45 +16,16 @@
  * limitations under the License.
  */
 
-#include <spdlog/spdlog.h>
+#pragma once
 
-#include <exception>
-#include <source_location>
-#include <string>
-#include <string_view>
+#include <cucascade/log/logging.hpp>
 
-inline void log_exception_helper(const std::source_location& loc)
-{
-  spdlog::source_loc spd_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
-  try {
-    throw;
-  } catch (const std::exception& e) {
-    spdlog::log(spd_loc, spdlog::level::err, "Exception caught: {}", e.what());
-  } catch (...) {
-    spdlog::log(spd_loc, spdlog::level::err, "UNKNOWN exception caught");
-  }
-}
-
-template <typename... Args>
-void log_exception_helper(const std::source_location& loc, std::string_view fmt_str, Args&&... args)
-{
-  spdlog::source_loc spd_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
-
-  // Formats your string cleanly using v1.8.5 syntax
-  std::string user_msg = fmt::vformat(fmt_str, fmt::make_format_args(args...));
-
-  try {
-    throw;
-  } catch (const std::exception& e) {
-    spdlog::log(spd_loc, spdlog::level::err, "{}: {}", user_msg, e.what());
-  } catch (...) {
-    spdlog::log(spd_loc, spdlog::level::err, "{}: UNKNOWN exception", user_msg);
-  }
-}
-
-#define CUCASCADE_TRY_AND_LOG_EXCEPTION(expression, ...)                                 \
-  try {                                                                               \
-    expression;                                                                       \
-  } catch (...) {                                                                     \
-    log_exception_helper(std::source_location::current() __VA_OPT__(, ) __VA_ARGS__); \
+/// Run @p expression, swallowing any exception it throws. The optional
+/// message arguments are type-checked but never evaluated (logging is
+/// compiled out — see logging.hpp).
+#define CUCASCADE_TRY_AND_LOG_EXCEPTION(expression, ...) \
+  try {                                                  \
+    expression;                                          \
+  } catch (...) {                                        \
+    __VA_OPT__(CUCASCADE_LOG_NOOP(__VA_ARGS__);)         \
   }

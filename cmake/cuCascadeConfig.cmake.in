@@ -36,9 +36,6 @@ if(cuCascade_io_FOUND AND "io" IN_LIST cuCascade_FIND_COMPONENTS)
   pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
   pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
   find_dependency(OpenSSL REQUIRED)
-  find_dependency(absl REQUIRED CONFIG)
-  find_dependency(spdlog REQUIRED CONFIG)
-  find_dependency(fmt REQUIRED CONFIG)
 endif()
 
 # Include the targets file

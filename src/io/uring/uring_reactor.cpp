@@ -16,20 +16,19 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/uring/uring_reactor.hpp>
+#include "driver_types.h"
 
 #include <cucascade/cuda/event.hpp>
-#include "driver_types.h"
 #include <cucascade/io/details/slot_pool.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
+#include <cucascade/io/uring/uring_reactor.hpp>
+#include <cucascade/log/logging.hpp>
 #include <cucascade/utils/error_utils.hpp>
 
 #include <rmm/cuda_device.hpp>
 
-#include <absl/cleanup/cleanup.h>
 #include <fcntl.h>
-#include <cucascade/log/logging.hpp>
 #include <numa.h>
 #include <sys/stat.h>
 
@@ -401,19 +400,12 @@ unique_ring_ptr make_ring(unsigned depth)
   p.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
   int rc = io_uring_queue_init_params(depth, r.get(), &p);
   if (rc == 0) {
-    spdlog::trace("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN, entries={}",
-                  depth);
     return unique_ring_ptr{r.release()};
   }
-  spdlog::trace(
-    "uring_device_reactor: SINGLE_ISSUER|DEFER_TASKRUN unsupported "
-    "({}), falling back to plain flags",
-    strerror(-rc));
 #endif
   auto r2 = std::make_unique<io_uring>();
   int rc2 = io_uring_queue_init(depth, r2.get(), 0);
   if (rc2 < 0) throw std::runtime_error("uring_reactor: ring init: " + std::string(strerror(-rc2)));
-  spdlog::trace("uring_reactor: ring using plain flags, entries={}", depth);
   return unique_ring_ptr{r2.release()};
 }
 
@@ -428,9 +420,9 @@ struct unique_ring {
   /// back to plain, unregistered reads instead of aborting startup.
   [[nodiscard]] bool register_buffers(std::span<iovec> iovecs)
   {
-    if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), static_cast<unsigned>(iovecs.size())); rc < 0) {
-      spdlog::warn("uring_reactor: io_uring_register_buffers failed ({}); fixed buffers disabled",
-                   strerror(-rc));
+    if (int rc = io_uring_register_buffers(
+          ring.get(), iovecs.data(), static_cast<unsigned>(iovecs.size()));
+        rc < 0) {
       return false;
     }
     return true;
@@ -591,9 +583,9 @@ request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type
   // (clamped to the file), giving an O_DIRECT-compliant span.
   auto const phys =
     align_to_physical({static_cast<int64_t>(offset), static_cast<int64_t>(size)}, file.size());
-  auto const a_start  = static_cast<size_t>(phys.offset());
-  auto const a_end    = a_start + static_cast<size_t>(phys.size());
-  auto alinged_size = static_cast<size_t>(phys.size());
+  auto const a_start = static_cast<size_t>(phys.offset());
+  auto const a_end   = a_start + static_cast<size_t>(phys.size());
+  auto alinged_size  = static_cast<size_t>(phys.size());
   auto manager =
     std::make_shared<request_manager>(size, (alinged_size + cfg.bounce_size - 1) / cfg.bounce_size);
 
@@ -853,7 +845,6 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   static constexpr std::chrono::milliseconds SHUTDOWN_POLL_MS{100};
 
   std::stop_callback cb(stop_token, [this] {
-    spdlog::trace("uring_reactor worker_loop: stop requested");
     _requests.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queue
   });
 
@@ -905,8 +896,8 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     copying_slots.erase(std::remove_if(copying_slots.begin(),
                                        copying_slots.end(),
                                        [&](slot_token const& token) {
-                                         auto si        = static_cast<std::size_t>(token.slot_index());
-                                         auto& s        = slots[si];
+                                         auto si = static_cast<std::size_t>(token.slot_index());
+                                         auto& s = slots[si];
                                          auto ev_status = s.event->query();
                                          return !(ev_status == query_status::in_progress);
                                        }),
@@ -930,7 +921,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         break;
       }
 
-      auto& s = slots[static_cast<std::size_t>(slot.slot_index())];
+      auto& s                      = slots[static_cast<std::size_t>(slot.slot_index())];
       chunk_io_request_type_ptr dr = nullptr;
       while (dr == nullptr) {
         if (!_requests.try_dequeue(dr) && inflight == 0) { _requests.wait_dequeue(dr); }
@@ -946,7 +937,8 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
       }
       cucascade::cuda::cuda_event* cu_event = nullptr;
       if (dr->needs_event_for_synchronization()) {
-        cu_event = std::addressof(per_device_copy_events[dr->cpy_req->device_id][static_cast<std::size_t>(s.slot_index)]);
+        cu_event = std::addressof(
+          per_device_copy_events[dr->cpy_req->device_id][static_cast<std::size_t>(s.slot_index)]);
       }
 
       s.on_request(std::move(dr), std::move(slot), cu_event);
@@ -981,11 +973,6 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         // resubmit — register_bound_buffer re-preps it as a plain read.  No
         // bytes landed, so the resubmit reads the whole range from scratch.
         if (s.used_fixed_buffer && is_fixed_buffer_error(errc)) {
-          spdlog::warn(
-            "uring_reactor: fixed-buffer read failed on slot {} ({}); "
-            "falling back to plain read",
-            si,
-            strerror(errc));
           s.support_fixed_buffers = false;
           incomplete_requests.push_back(si);
           continue;
@@ -1042,7 +1029,6 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     while (inflight > 0) {
       auto s = ring.wait_for(SHUTDOWN_POLL_MS);
       if (s) {
-        spdlog::error("uring_reactor: io_uring_wait_cqe failed during shutdown: {}", strerror(s));
         break;
       }
       reap_cqes();
@@ -1054,9 +1040,10 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
       int si     = s.slot_index();
       auto& slot = slots[static_cast<std::size_t>(si)];
       if (slot.event) {
-        CUCASCADE_TRY_AND_LOG_EXCEPTION(slot.event->synchronize(),
-                                     "uring_reactor: failed to synchronize copy event for slot {}",
-                                     si);
+        CUCASCADE_TRY_AND_LOG_EXCEPTION(
+          slot.event->synchronize(),
+          "uring_reactor: failed to synchronize copy event for slot {}",
+          si);
       }
     });
 
@@ -1075,7 +1062,10 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
 
   // The main loop: drain the request queue and submit new SQEs, wait for completions and reap
   {
-    auto cleanup = absl::MakeCleanup([&]() { clean_up_and_shutdown(); });
+    struct scope_cleanup {
+      std::function<void()> fn;
+      ~scope_cleanup() { fn(); }
+    } cleanup{[&]() { clean_up_and_shutdown(); }};
 
     try {
       while (!stop_token.stop_requested()) {
@@ -1084,7 +1074,6 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         if (inflight > 0) {
           auto s = ring.wait_for(SHUTDOWN_POLL_MS);
           if (s) {
-            spdlog::error("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(s));
             break;
           }
           reap_cqes();
@@ -1095,7 +1084,6 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         poll_copy_completions();
       }
     } catch (const std::exception& e) {
-      spdlog::error("uring_reactor: exception: {}", e.what());
     }
   }
 }

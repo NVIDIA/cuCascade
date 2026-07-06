@@ -18,13 +18,14 @@
 
 #pragma once
 
+#include <cucascade/exec/unique_function.hpp>
 #include <cucascade/log/logging.hpp>
 
-#include <absl/functional/any_invocable.h>
-
+#include <algorithm>
 #include <concepts>
 #include <condition_variable>
 #include <exception>
+#include <functional>
 #include <latch>
 #include <mutex>
 #include <queue>
@@ -38,9 +39,9 @@ namespace cucascade::exec {
 class static_thread_pool {
  public:
   explicit static_thread_pool(int num_threads,
-                              const std::string& name                             = "thread_pool",
-                              std::vector<int> cpu_ids                            = {},
-                              absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
+                              const std::string& name               = "thread_pool",
+                              std::vector<int> cpu_ids              = {},
+                              std::function<void()> per_thread_init = nullptr)
   {
     threads_.reserve(static_cast<std::size_t>(num_threads));
 
@@ -93,9 +94,7 @@ class static_thread_pool {
       try {
         callable();
       } catch (const std::exception& e) {
-        CUCASCADE_LOG_ERROR("Exception thrown from thread_pool on_error handler {}", e.what());
       } catch (...) {
-        CUCASCADE_LOG_ERROR("Unknown exception thrown from thread_pool");
       }
     });
     cv_.notify_one();
@@ -121,7 +120,7 @@ class static_thread_pool {
   void work_loop()
   {
     while (!stop_requested_) {
-      absl::AnyInvocable<void() noexcept> func;
+      unique_function<void()> func;
       {
         std::unique_lock<std::mutex> l(mu_);
         cv_.wait(l, [this] { return has_work_or_stopped(); });
@@ -136,7 +135,7 @@ class static_thread_pool {
 
   std::mutex mu_;
   std::condition_variable cv_;
-  std::queue<absl::AnyInvocable<void() noexcept>> queue_;
+  std::queue<unique_function<void()>> queue_;
   std::atomic<bool> stop_requested_{false};
   std::vector<std::thread> threads_;
 };

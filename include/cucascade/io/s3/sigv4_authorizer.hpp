@@ -67,9 +67,9 @@ class sigv4_presigned_authorizer final : public sigv4_authorizer_base {
   /// @throw cucascade::io::credential_error on empty creds/region, malformed
   ///        endpoint, or non-positive @p default_ttl.
   sigv4_presigned_authorizer(static_credentials creds,
-                                    std::string region,
-                                    std::string endpoint,
-                                    std::chrono::seconds default_ttl = std::chrono::minutes{5});
+                             std::string region,
+                             std::string endpoint,
+                             std::chrono::seconds default_ttl = std::chrono::minutes{5});
 
   /// Thread-safe: @c sigv4::presign_url is pure and members are immutable after
   /// construction.
@@ -97,9 +97,7 @@ class sigv4_header_authorizer final : public sigv4_authorizer_base {
  public:
   /// @throw cucascade::io::credential_error on empty creds/region or malformed
   ///        endpoint.
-  sigv4_header_authorizer(static_credentials creds,
-                                 std::string region,
-                                 std::string endpoint);
+  sigv4_header_authorizer(static_credentials creds, std::string region, std::string endpoint);
 
   /// Thread-safe: @c sigv4::sign_request is pure and members are immutable after
   /// construction.

@@ -91,9 +91,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
     pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
     find_package(OpenSSL REQUIRED)
-    find_package(absl REQUIRED CONFIG)
-    find_package(spdlog REQUIRED CONFIG)
-    find_package(fmt REQUIRED CONFIG)
 
     # moodycamel::ConcurrentQueue — header-only lock-free MPMC queues used by
     # the reactors and the prefetching cache.
@@ -263,15 +260,8 @@ if(CUCASCADE_BUILD_IO)
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
   # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
   # approach.
-  set(CUCASCADE_IO_LINK_LIBS
-      cudf::cudf
-      PkgConfig::LIBURING
-      PkgConfig::CURL
-      OpenSSL::Crypto
-      absl::any_invocable
-      absl::cleanup
-      spdlog::spdlog
-      fmt::fmt)
+  set(CUCASCADE_IO_LINK_LIBS cudf::cudf PkgConfig::LIBURING PkgConfig::CURL
+                             OpenSSL::Crypto)
 
   target_link_libraries(cucascade_io_objects PUBLIC cucascade_objects
                                                     ${CUCASCADE_IO_LINK_LIBS})

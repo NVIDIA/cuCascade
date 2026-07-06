@@ -19,7 +19,6 @@
 #pragma once
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
-
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <span>

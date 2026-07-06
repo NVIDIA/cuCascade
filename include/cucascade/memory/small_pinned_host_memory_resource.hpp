@@ -38,7 +38,7 @@ namespace memory {
  * provided fixed_size_host_memory_resource and carving it into slabs of the
  * appropriate size.
  *
- * Satisfies the cuda::mr::device_accessible and cuda::mr::host_accessible
+ * Satisfies the ::cuda::mr::device_accessible and ::cuda::mr::host_accessible
  * properties, making it compatible with rmm::host_device_async_resource_ref
  * and suitable for use as cuDF's default pinned memory resource.
  *
@@ -83,7 +83,7 @@ class small_pinned_host_memory_resource {
    *
    * For @p bytes > MAX_SLAB_SIZE: falls back to cudaMallocHost (pinned).
    */
-  void* allocate(cuda::stream_ref stream,
+  void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t));
 
@@ -94,14 +94,14 @@ class small_pinned_host_memory_resource {
    * Pinned allocations (@p bytes > MAX_SLAB_SIZE) are freed via cudaFreeHost.
    * @p bytes must equal the value passed to the corresponding allocate.
    */
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    auto* ptr = allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
     CUCASCADE_CUDA_TRY(cudaStreamSynchronize(cudaStream_t{nullptr}));
     return ptr;
   }
@@ -110,7 +110,7 @@ class small_pinned_host_memory_resource {
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
     CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(cudaStream_t{nullptr}));
   }
 
@@ -121,7 +121,7 @@ class small_pinned_host_memory_resource {
    * Required to satisfy rmm::host_device_async_resource_ref.
    */
   friend void get_property(small_pinned_host_memory_resource const&,
-                           cuda::mr::device_accessible) noexcept
+                           ::cuda::mr::device_accessible) noexcept
   {
   }
 
@@ -130,7 +130,7 @@ class small_pinned_host_memory_resource {
    * Required to satisfy rmm::host_device_async_resource_ref.
    */
   friend void get_property(small_pinned_host_memory_resource const&,
-                           cuda::mr::host_accessible) noexcept
+                           ::cuda::mr::host_accessible) noexcept
   {
   }
 
@@ -150,9 +150,9 @@ class small_pinned_host_memory_resource {
   std::vector<fixed_multiple_blocks_allocation> owned_allocations_;
 };
 
-static_assert(cuda::mr::resource_with<small_pinned_host_memory_resource,
-                                      cuda::mr::device_accessible,
-                                      cuda::mr::host_accessible>);
+static_assert(::cuda::mr::resource_with<small_pinned_host_memory_resource,
+                                        ::cuda::mr::device_accessible,
+                                        ::cuda::mr::host_accessible>);
 
 }  // namespace memory
 }  // namespace cucascade

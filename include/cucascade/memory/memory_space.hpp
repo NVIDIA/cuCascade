@@ -127,7 +127,7 @@ class memory_space {
   [[nodiscard]] const chunked_resource_info* get_chunked_resource_info() const noexcept;
 
   template <typename T>
-    requires(cuda::mr::resource_with<T, cuda::mr::device_accessible> ||
+    requires(::cuda::mr::resource_with<T, ::cuda::mr::device_accessible> ||
              std::same_as<T, disk_access_limiter>)
   T* get_memory_resource_as() const noexcept
   {
@@ -174,9 +174,9 @@ class memory_space {
     std::make_shared<notification_channel>();
 
   // Memory resources owned by this memory_space
-  cuda::mr::any_resource<cuda::mr::device_accessible> _allocator;
+  ::cuda::mr::any_resource<::cuda::mr::device_accessible> _allocator;
   reserving_adaptor_type _reservation_allocator;
-  std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
+  std::optional<::cuda::mr::any_resource<::cuda::mr::device_accessible>>
     _reservation_allocator_resource;
   std::unique_ptr<rmm::cuda_stream_pool> _stream_pool;
   std::shared_ptr<idisk_io_backend> _io_backend;  ///< I/O backend for DISK tier (null for others)

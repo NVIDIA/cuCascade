@@ -254,9 +254,7 @@ class templated_ioctx : public ioctx {
       try {
         r->shutdown();
       } catch (const std::exception& e) {
-        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", e.what());
       } catch (...) {
-        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
       }
     }
   }
@@ -314,10 +312,7 @@ class templated_ioctx : public ioctx {
 
   // -- Host reads (generic: delegate to io_object_type + std::async) --------
 
-  size_t host_read_io(const io_object& obj,
-                      size_t offset,
-                      size_t size,
-                      uint8_t* dst) override
+  size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) override
   {
     auto& tobj = as_typed(obj);
     size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
@@ -347,7 +342,9 @@ class templated_ioctx : public ioctx {
       assert(reqs.size() <= reactors.size());
       std::for_each(std::make_move_iterator(reqs.begin()),
                     std::make_move_iterator(reqs.end()),
-                    [&reactors, i = std::size_t{0}](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+                    [&reactors, i = std::size_t{0}](auto&& r) mutable {
+                      reactors[i++]->enqueue(std::move(r));
+                    });
       return semi;
     } catch (...) {
       return exec::make_semi_future<size_t>(std::current_exception());
@@ -376,10 +373,11 @@ class templated_ioctx : public ioctx {
         auto semi = req->get_future();
         auto reqs = request_type::splits(std::move(req), reactors.size());
         assert(reqs.size() <= reactors.size());
-        std::for_each(
-          std::make_move_iterator(reqs.begin()),
-          std::make_move_iterator(reqs.end()),
-          [&reactors, i = std::size_t{0}](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+        std::for_each(std::make_move_iterator(reqs.begin()),
+                      std::make_move_iterator(reqs.end()),
+                      [&reactors, i = std::size_t{0}](auto&& r) mutable {
+                        reactors[i++]->enqueue(std::move(r));
+                      });
         return semi;
       } catch (...) {
         return exec::make_semi_future<size_t>(std::current_exception());
@@ -412,10 +410,11 @@ class templated_ioctx : public ioctx {
         auto semi = req->get_future();
         auto reqs = request_type::splits(std::move(req), reactors.size());
         assert(reqs.size() <= reactors.size());
-        std::for_each(
-          std::make_move_iterator(reqs.begin()),
-          std::make_move_iterator(reqs.end()),
-          [&reactors, i = std::size_t{0}](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+        std::for_each(std::make_move_iterator(reqs.begin()),
+                      std::make_move_iterator(reqs.end()),
+                      [&reactors, i = std::size_t{0}](auto&& r) mutable {
+                        reactors[i++]->enqueue(std::move(r));
+                      });
         return semi;
       } catch (...) {
         return exec::make_semi_future<size_t>(std::current_exception());
@@ -444,10 +443,11 @@ class templated_ioctx : public ioctx {
         auto semi = req->get_future();
         auto reqs = request_type::splits(std::move(req), reactors.size());
         assert(reqs.size() <= reactors.size());
-        std::for_each(
-          std::make_move_iterator(reqs.begin()),
-          std::make_move_iterator(reqs.end()),
-          [&reactors, i = std::size_t{0}](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+        std::for_each(std::make_move_iterator(reqs.begin()),
+                      std::make_move_iterator(reqs.end()),
+                      [&reactors, i = std::size_t{0}](auto&& r) mutable {
+                        reactors[i++]->enqueue(std::move(r));
+                      });
         return semi;
       } catch (...) {
         return exec::make_semi_future<size_t>(std::current_exception());

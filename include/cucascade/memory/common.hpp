@@ -66,10 +66,10 @@ class memory_space_id {
 };
 
 using DeviceMemoryResourceFactoryFn =
-  std::function<cuda::mr::any_resource<cuda::mr::device_accessible>(int device_id,
-                                                                    std::size_t capacity)>;
+  std::function<::cuda::mr::any_resource<::cuda::mr::device_accessible>(int device_id,
+                                                                        std::size_t capacity)>;
 
-cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_resource(
+::cuda::mr::any_resource<::cuda::mr::device_accessible> make_default_gpu_memory_resource(
   int device_id, std::size_t capacity);
 
 /**
@@ -125,10 +125,10 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
  */
 int disable_peer_access_where_broken(std::vector<cudaMemPool_t> const& pools_by_device = {});
 
-cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
+::cuda::mr::any_resource<::cuda::mr::device_accessible, ::cuda::mr::host_accessible>
 make_default_host_memory_resource(int device_id, std::size_t capacity);
 
-cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
+::cuda::mr::any_resource<::cuda::mr::device_accessible, ::cuda::mr::host_accessible>
 make_default_host_memory_resource(int device_id, std::size_t capacity, bool make_portable);
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier);

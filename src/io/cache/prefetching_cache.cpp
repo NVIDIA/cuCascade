@@ -16,14 +16,14 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/cache/prefetching_cache.hpp>
-
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/exec/try.hpp>
+#include <cucascade/io/cache/prefetching_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/topology_index.hpp>
 #include <cucascade/utils/error_utils.hpp>
 
@@ -31,9 +31,6 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
-
-#include <spdlog/fmt/fmt.h>
-#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
@@ -305,8 +302,7 @@ prefetching_cache::~prefetching_cache()
 // insert
 // ===========================================================================
 
-prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
-  const io_object& obj)
+prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(const io_object& obj)
 {
   const auto& key = obj.raw_file_cache_id();
   std::shared_lock lk(_map_mtx);
@@ -331,7 +327,7 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
 {
   if (!_armed) { return prefetching_handle(nullptr); }
 
-  auto& file      = get_or_create_file_entry(obj);
+  auto& file = get_or_create_file_entry(obj);
 
   const size_t chunk_bytes = _chunk_size;
   auto coalesced_ranges    = _io_ctx->align_and_coalesce(ranges, chunk_bytes);
@@ -370,11 +366,8 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
   return handle;
 }
 
-bool prefetching_cache::host_read_from_cache_only(const io_object& obj,
-                                                  size_t offset,
-                                                  size_t size,
-                                                  uint8_t* dst,
-                                                  prefetching_handle* out_handle)
+bool prefetching_cache::host_read_from_cache_only(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
 {
   if (size == 0) return true;
 
@@ -421,11 +414,8 @@ bool prefetching_cache::host_read_from_cache_only(const io_object& obj,
   return false;
 }
 
-exec::semi_future<std::size_t> prefetching_cache::host_read_async(const io_object& obj,
-                                                                  size_t offset,
-                                                                  size_t size,
-                                                                  uint8_t* dst,
-                                                                  prefetching_handle* out_handle)
+exec::semi_future<std::size_t> prefetching_cache::host_read_async(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
 {
   bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
   if (status) { return exec::make_semi_future<std::size_t>(size); }
@@ -434,11 +424,8 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_async(const io_objec
   return _io_ctx->host_read_async_io(obj, offset, size, dst);
 }
 
-std::size_t prefetching_cache::host_read(const io_object& obj,
-                                         size_t offset,
-                                         size_t size,
-                                         uint8_t* dst,
-                                         prefetching_handle* out_handle)
+std::size_t prefetching_cache::host_read(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
 {
   bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
   if (status) { return size; }
@@ -639,25 +626,19 @@ std::string prefetching_cache::summary() const
   uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
   uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
 
-  return fmt::format(
-    "prefetching_cache: "
-    "global[reads={} hits={} h2d={} miss={} evictions={}] "
-    "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
-    reads,
-    hits,
-    h2d,
-    miss,
-    evict,
-    reads - _last_reported.n_reads,
-    hits - _last_reported.hits,
-    h2d - _last_reported.h2d,
-    miss - _last_reported.misses,
-    evict - _last_reported.evictions);
+  std::string out = "prefetching_cache: global[reads=" + std::to_string(reads) +
+                    " hits=" + std::to_string(hits) + " h2d=" + std::to_string(h2d) +
+                    " miss=" + std::to_string(miss) + " evictions=" + std::to_string(evict) +
+                    "] last_cycle[reads=" + std::to_string(reads - _last_reported.n_reads) +
+                    " hits=" + std::to_string(hits - _last_reported.hits) +
+                    " h2d=" + std::to_string(h2d - _last_reported.h2d) +
+                    " miss=" + std::to_string(miss - _last_reported.misses) +
+                    " evictions=" + std::to_string(evict - _last_reported.evictions) + "]";
+  return out;
 }
 
 void prefetching_cache::prepare_for_query() noexcept
 {
-  CUCASCADE_LOG_TRACE("prefetching_cache: summary of cache performance {}", summary());
 
   _ticker.fetch_add(1, std::memory_order_relaxed);
 
@@ -676,7 +657,6 @@ void prefetching_cache::prepare_for_query() noexcept
 void prefetching_cache::prepare_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
-    spdlog::trace("prefetching_cache: prepare_loop received stop request, unblocking queue");
     _preparation_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
 
@@ -718,10 +698,6 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
         c->numa_node = numa_allocated;
         if (!c->state.mark_allocated()) {
           buffers.push_back(buffer);  // return the buffer to the pool
-          spdlog::error(
-            "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
-            "allocated",
-            c->offset);
         }
       }
     }
@@ -746,7 +722,6 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
 void prefetching_cache::prefetch_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
-    spdlog::trace("prefetching_cache: prefetch_loop received stop request, unblocking queue");
     _prefetch_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
   while (!_shutting_down && !st.stop_requested()) {
@@ -797,7 +772,6 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
 void prefetching_cache::evict_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
-    spdlog::trace("prefetching_cache: evict_loop received stop request, unblocking queue");
     _eviction_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
 
@@ -841,8 +815,10 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
       _cfg.dispose_after_use || eviction_requested || _pool->should_start_evicting();
     if (!should_evict) { continue; }
 
-    size_t const need = _cfg.dispose_after_use ? std::numeric_limits<size_t>::max()
-                                               : static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
+    size_t const need =
+      _cfg.dispose_after_use
+        ? std::numeric_limits<size_t>::max()
+        : static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
 
     auto const query_tick = static_cast<uint32_t>(_ticker.load(std::memory_order_relaxed));
 

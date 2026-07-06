@@ -46,8 +46,7 @@ namespace cucascade::io {
  */
 class datasource : public cudf::io::datasource {
  public:
-  explicit datasource(std::shared_ptr<ioctx> io_ctx,
-                             std::shared_ptr<io_object> io_object);
+  explicit datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_object);
 
   ~datasource() override;
 

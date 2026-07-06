@@ -52,13 +52,11 @@ class metadata_store {
   /// @p metadata is silently ignored — symmetric with the older
   /// @c prefetching_cache::register_metadata contract so callers that
   /// pass through pre-parsed metadata don't have to null-check.
-  void register_metadata(io_object const& obj,
-                         std::shared_ptr<io_object_metadata> metadata);
+  void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
 
   /// Look up the metadata for @p obj's cache key.  Returns nullptr on
   /// miss.
-  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(
-    io_object const& obj) const;
+  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(io_object const& obj) const;
 
  private:
   mutable std::shared_mutex _mtx;
