@@ -36,6 +36,22 @@ option(
   CUCASCADE_BUILD_CUDF
   "Build the cudf-coupled cucascade-cudf library (representations, converters, profiler)"
   ON)
+option(
+  CUCASCADE_BUILD_IO
+  "Build the cucascade-io library (datasource, uring/rest reactors, prefetching cache)"
+  ON)
+
+# The io library implements cudf::io::datasource, so it requires the cudf
+# dependency to be available.
+if(CUCASCADE_BUILD_IO AND (CUCASCADE_TOPOLOGY_ONLY OR NOT CUCASCADE_BUILD_CUDF))
+  message(
+    STATUS
+      "CUCASCADE_BUILD_IO disabled: requires CUCASCADE_BUILD_CUDF=ON and a non-topology-only build"
+  )
+  set(CUCASCADE_BUILD_IO
+      OFF
+      CACHE BOOL "Build the cucascade-io library" FORCE)
+endif()
 
 # At least one library type must be built
 if(NOT CUCASCADE_BUILD_SHARED_LIBS AND NOT CUCASCADE_BUILD_STATIC_LIBS)
@@ -67,6 +83,26 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   # Find cudf only when building the cudf-coupled cucascade-cudf library
   if(CUCASCADE_BUILD_CUDF)
     find_package(cudf REQUIRED CONFIG)
+  endif()
+
+  # Third-party dependencies of the cucascade-io library (datasource layer)
+  if(CUCASCADE_BUILD_IO)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+    find_package(OpenSSL REQUIRED)
+    find_package(absl REQUIRED CONFIG)
+    find_package(spdlog REQUIRED CONFIG)
+    find_package(fmt REQUIRED CONFIG)
+
+    # moodycamel::ConcurrentQueue — header-only lock-free MPMC queues used by
+    # the reactors and the prefetching cache.
+    include(FetchContent)
+    FetchContent_Declare(
+      concurrentqueue
+      GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+      GIT_TAG v1.0.4)
+    FetchContent_MakeAvailable(concurrentqueue)
   endif()
 
   # Find numa (provided by numactl-devel or libnuma-dev depending on the package
@@ -142,6 +178,16 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
             ${CUCASCADE_CUDA_WARNING_FLAGS})
 endif()
 
+if(CUCASCADE_BUILD_IO)
+  add_library(cucascade_io_objects OBJECT)
+
+  # Apply warning flags to the io object library
+  target_compile_options(
+    cucascade_io_objects
+    PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
+            ${CUCASCADE_CUDA_WARNING_FLAGS})
+endif()
+
 target_compile_options(
   cucascade_topology_discovery_objects
   PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
@@ -163,6 +209,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 endif()
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   add_subdirectory(src/cudf)
+endif()
+if(CUCASCADE_BUILD_IO)
+  add_subdirectory(src/exec)
+  add_subdirectory(src/io)
 endif()
 
 # Common usage requirements shared by the object library and installable targets
@@ -206,6 +256,35 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   set_target_properties(
     cucascade_cudf_objects PROPERTIES CXX_EXTENSIONS OFF
                                       POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(CUCASCADE_BUILD_IO)
+  # Link libraries shared by the io object library and the installable io
+  # targets. PkgConfig::* imported targets are reconstructed on the consumer
+  # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
+  # approach.
+  set(CUCASCADE_IO_LINK_LIBS
+      cudf::cudf
+      PkgConfig::LIBURING
+      PkgConfig::CURL
+      OpenSSL::Crypto
+      absl::any_invocable
+      absl::cleanup
+      spdlog::spdlog
+      fmt::fmt)
+
+  target_link_libraries(cucascade_io_objects PUBLIC cucascade_objects
+                                                    ${CUCASCADE_IO_LINK_LIBS})
+  target_include_directories(
+    cucascade_io_objects
+    PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS}
+           $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>)
+  target_compile_features(cucascade_io_objects PUBLIC cxx_std_20)
+  target_compile_features(cucascade_io_objects PRIVATE cuda_std_20)
+
+  set_target_properties(
+    cucascade_io_objects PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
+                                                       ON)
 endif()
 
 target_include_directories(cucascade_topology_discovery_objects
@@ -273,6 +352,24 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
         cucascade_cudf_static PROPERTIES OUTPUT_NAME cucascade_cudf
                                          EXPORT_NAME cucascade_cudf_static)
     endif()
+
+    if(CUCASCADE_BUILD_IO)
+      add_library(cucascade_io_static STATIC
+                  $<TARGET_OBJECTS:cucascade_io_objects>)
+      add_library(cuCascade::cucascade_io_static ALIAS cucascade_io_static)
+
+      target_include_directories(
+        cucascade_io_static
+        PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS}
+               $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>)
+      target_link_libraries(cucascade_io_static PUBLIC ${CUCASCADE_IO_LINK_LIBS}
+                                                       cucascade_static)
+      target_compile_features(cucascade_io_static PUBLIC cxx_std_20)
+
+      set_target_properties(
+        cucascade_io_static PROPERTIES OUTPUT_NAME cucascade_io
+                                       EXPORT_NAME cucascade_io_static)
+    endif()
   endif()
 endif()
 
@@ -325,6 +422,23 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
       set_target_properties(cucascade_cudf_shared PROPERTIES OUTPUT_NAME
                                                              cucascade_cudf)
     endif()
+
+    if(CUCASCADE_BUILD_IO)
+      add_library(cucascade_io_shared SHARED
+                  $<TARGET_OBJECTS:cucascade_io_objects>)
+      add_library(cuCascade::cucascade_io_shared ALIAS cucascade_io_shared)
+
+      target_include_directories(
+        cucascade_io_shared
+        PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS}
+               $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>)
+      target_link_libraries(cucascade_io_shared PUBLIC ${CUCASCADE_IO_LINK_LIBS}
+                                                       cucascade_shared)
+      target_compile_features(cucascade_io_shared PUBLIC cxx_std_20)
+
+      set_target_properties(cucascade_io_shared PROPERTIES OUTPUT_NAME
+                                                           cucascade_io)
+    endif()
   endif()
 endif()
 
@@ -340,6 +454,10 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
       add_library(cuCascade::cucascade_cudf ALIAS cucascade_cudf_shared)
       add_library(cucascade_cudf ALIAS cucascade_cudf_shared)
     endif()
+    if(CUCASCADE_BUILD_IO)
+      add_library(cuCascade::cucascade_io ALIAS cucascade_io_shared)
+      add_library(cucascade_io ALIAS cucascade_io_shared)
+    endif()
   endif()
   add_library(cuCascade::cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_shared)
@@ -352,6 +470,10 @@ elseif(CUCASCADE_BUILD_STATIC_LIBS)
     if(CUCASCADE_BUILD_CUDF)
       add_library(cuCascade::cucascade_cudf ALIAS cucascade_cudf_static)
       add_library(cucascade_cudf ALIAS cucascade_cudf_static)
+    endif()
+    if(CUCASCADE_BUILD_IO)
+      add_library(cuCascade::cucascade_io ALIAS cucascade_io_static)
+      add_library(cucascade_io ALIAS cucascade_io_static)
     endif()
   endif()
   add_library(cuCascade::cucascade_topology_discovery ALIAS
@@ -398,6 +520,9 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
     if(CUCASCADE_BUILD_CUDF)
       list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_cudf_static)
     endif()
+    if(CUCASCADE_BUILD_IO)
+      list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_io_static)
+    endif()
   endif()
 endif()
 if(CUCASCADE_BUILD_SHARED_LIBS)
@@ -406,6 +531,9 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
     list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_shared)
     if(CUCASCADE_BUILD_CUDF)
       list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_cudf_shared)
+    endif()
+    if(CUCASCADE_BUILD_IO)
+      list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_io_shared)
     endif()
   endif()
 endif()
