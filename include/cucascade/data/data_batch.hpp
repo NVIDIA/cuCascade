@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
@@ -94,7 +95,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   data_batch(const data_batch&)            = delete;
   data_batch& operator=(const data_batch&) = delete;
 
-  // -- Lock-free public API --
+  // -- Public API usable without holding an accessor --
 
   /**
    * @brief Get the unique batch identifier.
@@ -112,8 +113,6 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
 
   /**
    * @brief Decrement the subscriber interest count.
-   *
-   * Atomic, lock-free.
    *
    * @throws std::runtime_error if subscriber count is already zero.
    */
@@ -265,7 +264,11 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   std::atomic<size_t> _subscriber_count{0};            ///< Atomic subscriber interest count
   std::atomic<batch_state> _state{batch_state::idle};  ///< Observable lock state
   std::atomic<size_t> _read_only_count{0};  ///< Count of active read_only_data_batch instances
+
   std::unique_ptr<idata_batch_probe> _probe;
+  /// Serializes counter/state updates with their probe callbacks so notifications
+  /// are delivered in the order the changes occurred.
+  mutable std::mutex _probe_mutex;
 };
 
 /**
@@ -531,21 +534,25 @@ class idata_batch_probe {
   virtual ~idata_batch_probe() = default;
 
   virtual void created([[maybe_unused]] const uint64_t batch_id,
-                       [[maybe_unused]] const idata_representation& data)
+                       [[maybe_unused]] const idata_representation& data) noexcept
   {
   }
-  virtual void conversion_started([[maybe_unused]] const idata_representation& current_data,
-                                  [[maybe_unused]] const memory::memory_space* target_memory_space)
+  virtual void conversion_started(
+    [[maybe_unused]] const idata_representation& current_data,
+    [[maybe_unused]] const memory::memory_space* target_memory_space) noexcept
   {
   }
   virtual void conversion_completed([[maybe_unused]] const idata_representation& data,
-                                    [[maybe_unused]] const bool success)
+                                    [[maybe_unused]] const bool success) noexcept
   {
   }
-  virtual void data_replaced([[maybe_unused]] const idata_representation& new_data) {}
-  virtual void state_changed([[maybe_unused]] const batch_state new_state) {}
-  virtual void subscriber_count_changed([[maybe_unused]] const size_t& new_subscriber_count) {}
-  virtual void reader_count_changed([[maybe_unused]] const size_t& new_read_only_count) {}
+  virtual void data_replaced([[maybe_unused]] const idata_representation& new_data) noexcept {}
+  virtual void state_changed([[maybe_unused]] const batch_state new_state) noexcept {}
+  virtual void subscriber_count_changed(
+    [[maybe_unused]] const size_t& new_subscriber_count) noexcept
+  {
+  }
+  virtual void reader_count_changed([[maybe_unused]] const size_t& new_read_only_count) noexcept {}
 };
 
 // =============================================================================

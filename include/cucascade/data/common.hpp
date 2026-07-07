@@ -60,28 +60,28 @@ class idata_representation {
    *
    * @return Tier The memory tier
    */
-  memory::Tier get_current_tier() const { return _memory_space.get_tier(); }
+  memory::Tier get_current_tier() const noexcept { return _memory_space.get_tier(); }
 
   /**
    * @brief Get the device ID where the data resides
    *
    * @return device_id The device ID
    */
-  int get_device_id() const { return _memory_space.get_device_id(); }
+  int get_device_id() const noexcept { return _memory_space.get_device_id(); }
 
   /**
    * @brief Get the memory space where the data resides
    *
    * @return memory_space& Reference to the memory space
    */
-  cucascade::memory::memory_space& get_memory_space() { return _memory_space; }
+  cucascade::memory::memory_space& get_memory_space() noexcept { return _memory_space; }
 
   /**
    * @brief Get the memory space where the data resides (const version)
    *
    * @return const memory_space& Const reference to the memory space
    */
-  const cucascade::memory::memory_space& get_memory_space() const { return _memory_space; }
+  const cucascade::memory::memory_space& get_memory_space() const noexcept { return _memory_space; }
 
   /**
    * @brief Get the size of the data representation in bytes

@@ -18,6 +18,7 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 
 namespace cucascade {
@@ -45,23 +46,19 @@ uint64_t data_batch::get_batch_id() const { return _batch_id; }
 
 void data_batch::subscribe()
 {
-  const size_t prev = _subscriber_count.fetch_add(1, std::memory_order_relaxed);
-  _probe->subscriber_count_changed(prev + 1);
+  std::lock_guard<std::mutex> guard(_probe_mutex);
+  const size_t count = _subscriber_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  _probe->subscriber_count_changed(count);
 }
 
 void data_batch::unsubscribe()
 {
-  size_t current = _subscriber_count.load(std::memory_order_relaxed);
-  while (true) {
-    if (current == 0) {
-      throw std::runtime_error("Cannot unsubscribe: subscriber count is already zero");
-    }
-    if (_subscriber_count.compare_exchange_weak(
-          current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
-      _probe->subscriber_count_changed(current - 1);
-      return;
-    }
+  std::lock_guard<std::mutex> guard(_probe_mutex);
+  if (_subscriber_count.load(std::memory_order_relaxed) == 0) {
+    throw std::runtime_error("Cannot unsubscribe: subscriber count is already zero");
   }
+  const size_t count = _subscriber_count.fetch_sub(1, std::memory_order_relaxed) - 1;
+  _probe->subscriber_count_changed(count);
 }
 
 size_t data_batch::get_subscriber_count() const
@@ -83,7 +80,7 @@ memory::memory_space* data_batch::get_memory_space() const
 
 void data_batch::set_data(std::unique_ptr<idata_representation> data)
 {
-  if (_data == nullptr) { throw std::runtime_error("data is null in data_batch::set_data"); }
+  if (data == nullptr) { throw std::runtime_error("data is null in data_batch::set_data"); }
   _data = std::move(data);
   _probe->data_replaced(*_data);
 }
@@ -170,6 +167,7 @@ read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> parent,
                                            std::shared_lock<std::shared_mutex> lock)
   : _batch(std::move(parent)), _lock(std::move(lock))
 {
+  std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
   const size_t prev = _batch->_read_only_count.fetch_add(1);
   if (prev == 0) {
     _batch->_state.store(batch_state::read_only);
@@ -191,6 +189,7 @@ read_only_data_batch::read_only_data_batch(const read_only_data_batch& other)
                        : std::shared_lock<std::shared_mutex>())
 {
   if (_batch) {
+    std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
     const size_t prev = _batch->_read_only_count.fetch_add(1);
     assert(_batch->_state == batch_state::read_only);
     _batch->_probe->reader_count_changed(prev + 1);
@@ -202,12 +201,15 @@ read_only_data_batch& read_only_data_batch::operator=(read_only_data_batch&& oth
   if (this != &other) {
     // Release the current state (same logic as destructor)
     if (_batch) {
-      const size_t prev = _batch->_read_only_count.fetch_sub(1);
-      if (prev == 1) {
-        _batch->_state.store(batch_state::idle);
-        _batch->_probe->state_changed(batch_state::idle);
+      {
+        std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
+        const size_t prev = _batch->_read_only_count.fetch_sub(1);
+        if (prev == 1) {
+          _batch->_state.store(batch_state::idle);
+          _batch->_probe->state_changed(batch_state::idle);
+        }
+        _batch->_probe->reader_count_changed(prev - 1);
       }
-      _batch->_probe->reader_count_changed(prev - 1);
 
       // _lock will be replaced below; its destructor fires when the old _lock is overwritten,
       // releasing the shared lock. We release _lock explicitly here so the sequence is:
@@ -224,12 +226,15 @@ read_only_data_batch& read_only_data_batch::operator=(const read_only_data_batch
 {
   if (this != &other) {
     if (_batch) {
-      const size_t prev = _batch->_read_only_count.fetch_sub(1);
-      if (prev == 1) {
-        _batch->_state.store(batch_state::idle);
-        _batch->_probe->state_changed(batch_state::idle);
+      {
+        std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
+        const size_t prev = _batch->_read_only_count.fetch_sub(1);
+        if (prev == 1) {
+          _batch->_state.store(batch_state::idle);
+          _batch->_probe->state_changed(batch_state::idle);
+        }
+        _batch->_probe->reader_count_changed(prev - 1);
       }
-      _batch->_probe->reader_count_changed(prev - 1);
 
       _lock.unlock();
     }
@@ -237,6 +242,7 @@ read_only_data_batch& read_only_data_batch::operator=(const read_only_data_batch
     if (_batch) {
       _lock = std::shared_lock<std::shared_mutex>(_batch->_rw_mutex);
 
+      std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
       const size_t prev = _batch->_read_only_count.fetch_add(1);
       if (prev == 0) {
         _batch->_state.store(batch_state::read_only);
@@ -258,6 +264,7 @@ read_only_data_batch::~read_only_data_batch()
     // The destructor body runs before member destructors, so _batch is still valid here.
     // After this function returns, _lock destructor fires first (declared after _batch,
     // destroyed in reverse order), releasing the shared lock. Then _batch destructor fires.
+    std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
     const size_t prev = _batch->_read_only_count.fetch_sub(1);
     if (prev == 1) {
       _batch->_state.store(batch_state::idle);
@@ -283,6 +290,7 @@ mutable_data_batch::mutable_data_batch(std::shared_ptr<data_batch> parent,
                                        std::unique_lock<std::shared_mutex> lock)
   : _batch(std::move(parent)), _lock(std::move(lock))
 {
+  std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
   _batch->_state.store(batch_state::mutable_locked);
   _batch->_probe->state_changed(batch_state::mutable_locked);
 }
@@ -298,8 +306,11 @@ mutable_data_batch& mutable_data_batch::operator=(mutable_data_batch&& other) no
   if (this != &other) {
     // Release the current state (same logic as destructor)
     if (_batch) {
-      _batch->_state.store(batch_state::idle);
-      _batch->_probe->state_changed(batch_state::idle);
+      {
+        std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
+        _batch->_state.store(batch_state::idle);
+        _batch->_probe->state_changed(batch_state::idle);
+      }
       // Release the exclusive lock explicitly before taking ownership of the new one.
       _lock.unlock();
     }
@@ -313,6 +324,7 @@ mutable_data_batch::~mutable_data_batch()
 {
   if (_batch) {
     // Transition state to idle. The _lock member destructor handles releasing the exclusive lock.
+    std::lock_guard<std::mutex> guard(_batch->_probe_mutex);
     _batch->_state.store(batch_state::idle);
     _batch->_probe->state_changed(batch_state::idle);
   }
