@@ -95,7 +95,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   data_batch(const data_batch&)            = delete;
   data_batch& operator=(const data_batch&) = delete;
 
-  // -- Public API usable without holding an accessor --
+  // -- Lock-free public API --
 
   /**
    * @brief Get the unique batch identifier.
@@ -108,11 +108,15 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
 
   /**
    * @brief Increment the subscriber interest count.
+   *
+   * Atomic, lock-free.
    */
   void subscribe();
 
   /**
    * @brief Decrement the subscriber interest count.
+   *
+   * Atomic, lock-free.
    *
    * @throws std::runtime_error if subscriber count is already zero.
    */
@@ -266,9 +270,6 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   std::atomic<size_t> _read_only_count{0};  ///< Count of active read_only_data_batch instances
 
   std::unique_ptr<idata_batch_probe> _probe;
-  /// Serializes counter/state updates with their probe callbacks so notifications
-  /// are delivered in the order the changes occurred.
-  mutable std::mutex _probe_mutex;
 };
 
 /**
@@ -523,10 +524,11 @@ class mutable_data_batch {
  * data_batch metadata while probing the data_batch by overriding the provided methods
  * that expose the data_batch state when certain events occur, like state transitions.
  *
- * @note It is the implementer's responsibility that the calls to this class' functions
- * return quickly, as they are called in a thread-safe manner, and will block other
- * mutating changes while they execute. This interface is primarily intended for
- * bookkeeping purposes. Default impl is no-op
+ * @note All callbacks are invoked either during batch construction (created) or while
+ * the batch's exclusive lock is held via mutable_data_batch, so per batch they are
+ * totally ordered and never run concurrently. It is the implementer's responsibility
+ * that they return quickly, as they block other mutating changes while they execute.
+ * This interface is primarily intended for bookkeeping purposes. Default impl is no-op
  */
 class idata_batch_probe {
  public:
@@ -547,12 +549,6 @@ class idata_batch_probe {
   {
   }
   virtual void data_replaced([[maybe_unused]] const idata_representation& new_data) noexcept {}
-  virtual void state_changed([[maybe_unused]] const batch_state new_state) noexcept {}
-  virtual void subscriber_count_changed(
-    [[maybe_unused]] const size_t& new_subscriber_count) noexcept
-  {
-  }
-  virtual void reader_count_changed([[maybe_unused]] const size_t& new_read_only_count) noexcept {}
 };
 
 // =============================================================================
