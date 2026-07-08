@@ -21,6 +21,7 @@
 
 #include <cuda/memory_resource>
 #include <cuda/stream_ref>
+#include <cuda_runtime_api.h>
 
 #include <array>
 #include <cstddef>
@@ -144,9 +145,27 @@ class small_pinned_host_memory_resource {
   /// Must be called with mutex_ held.
   void expand_pool_locked(std::size_t slab_idx);
 
+  /// A free slab plus, when it was just deallocated, a CUDA event recorded on
+  /// the freeing stream. Reusing the slab must wait on this event so an
+  /// in-flight async H2D copy that still reads the slab (e.g. cuDF's parquet
+  /// stats min/max buffers) completes before another stream overwrites it.
+  /// @c ready_event is null for freshly-carved slabs that were never used.
+  struct free_slab {
+    void* ptr;
+    cudaEvent_t ready_event;
+  };
+
+  /// Borrow a timing-disabled CUDA event (recycled from @c event_pool_ or newly
+  /// created). Returns null if event creation fails. Must hold @c mutex_.
+  cudaEvent_t acquire_event_locked();
+
+  /// Return an event to @c event_pool_ for reuse. Must hold @c mutex_.
+  void release_event_locked(cudaEvent_t event) noexcept;
+
   fixed_size_host_memory_resource& upstream_;
   mutable std::mutex mutex_;
-  std::array<std::vector<void*>, 5> free_lists_{};
+  std::array<std::vector<free_slab>, 5> free_lists_{};
+  std::vector<cudaEvent_t> event_pool_;
   std::vector<fixed_multiple_blocks_allocation> owned_allocations_;
 };
 
