@@ -88,7 +88,8 @@ static DataSource parse_source(std::string_view s)
 static void usage(char const* prog)
 {
   std::cerr
-    << "usage: " << prog << " <bucket> <prefix> <rest|kvikio> <num_rows> [n_reactors] [key=value ...]\n"
+    << "usage: " << prog
+    << " <bucket> <prefix> <rest|kvikio> <num_rows> [n_reactors] [key=value ...]\n"
     << "  bucket     – S3 bucket name (no scheme)\n"
     << "  prefix     – key prefix to list ('-' for the whole bucket); only\n"
     << "               keys ending in .parquet are read\n"
