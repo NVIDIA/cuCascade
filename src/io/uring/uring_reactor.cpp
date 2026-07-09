@@ -68,7 +68,8 @@ namespace {
 /// by a silent fallback.
 [[nodiscard]] constexpr bool is_fixed_buffer_error(int errc) noexcept
 {
-  return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS;
+  return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS ||
+         errc == ENOMEM;
 }
 
 struct io_slot {
