@@ -64,6 +64,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // 4 columns used by the classic TPC-H lineitem aggregations (Q1, Q6, …).
@@ -86,17 +87,63 @@ static DataSource parse_source(std::string_view s)
 
 static void usage(char const* prog)
 {
-  std::cerr << "usage: " << prog << " <bucket> <prefix> <rest|kvikio> <num_rows> [n_reactors]\n"
-            << "  bucket     – S3 bucket name (no scheme)\n"
-            << "  prefix     – key prefix to list ('-' for the whole bucket); only\n"
-            << "               keys ending in .parquet are read\n"
-            << "  rest       – cucascade::io REST reactor (AWS-SDK presigned URLs)\n"
-            << "  kvikio     – kvikIO RemoteHandle S3 endpoint\n"
-            << "  num_rows   – rows to read (0 = all)\n"
-            << "  n_reactors – REST reactor threads (default 2; rest only)\n"
-            << "\n"
-            << "credentials/region/endpoint via the AWS environment: AWS_ACCESS_KEY_ID,\n"
-            << "AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION, AWS_ENDPOINT_URL\n";
+  std::cerr
+    << "usage: " << prog << " <bucket> <prefix> <rest|kvikio> <num_rows> [n_reactors] [key=value ...]\n"
+    << "  bucket     – S3 bucket name (no scheme)\n"
+    << "  prefix     – key prefix to list ('-' for the whole bucket); only\n"
+    << "               keys ending in .parquet are read\n"
+    << "  rest       – cucascade::io REST reactor (AWS-SDK presigned URLs)\n"
+    << "  kvikio     – kvikIO RemoteHandle S3 endpoint\n"
+    << "  num_rows   – rows to read (0 = all)\n"
+    << "  n_reactors – REST reactor threads (default 2; rest only)\n"
+    << "\n"
+    << "REST config overrides (rest only; key=value, any order after num_rows):\n"
+    << "  n_reactors=<N>          REST reactor threads (same as positional)\n"
+    << "  max_connections=<N>     max concurrent in-flight easy handles per reactor (def 16)\n"
+    << "  chunk_size=<bytes>      target max bytes per ranged GET (def 8388608)\n"
+    << "  max_n_chunks=<N>        max buffers fused into one scatter GET (def 16)\n"
+    << "  max_read_split=<N>      parallel GETs a contiguous host read splits into (def 16)\n"
+    << "  request_timeout_s=<S>   whole-request timeout, 0 = no limit (def 30)\n"
+    << "  max_retry_attempts=<N>  retry attempts (def 10)\n"
+    << "\n"
+    << "Read parallelism (both backends):\n"
+    << "  read_threads=<N>        split num_rows across N host threads, each reading its\n"
+    << "                          own row-range on its own CUDA stream (def 1)\n"
+    << "\n"
+    << "credentials/region/endpoint via the AWS environment: AWS_ACCESS_KEY_ID,\n"
+    << "AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION, AWS_ENDPOINT_URL\n";
+}
+
+// Apply a "key=value" REST config override. n_reactors lives outside the
+// rest::config, so it is threaded through separately. Returns false for an
+// unknown key so the caller can report it and exit.
+static bool apply_rest_override(std::string const& key,
+                                std::string const& val,
+                                cucascade::io::rest::config& cfg,
+                                size_t& n_reactors,
+                                size_t& read_threads)
+{
+  auto ull = [&val] { return static_cast<std::size_t>(std::stoull(val)); };
+  if (key == "read_threads") {
+    read_threads = ull();
+  } else if (key == "n_reactors") {
+    n_reactors = ull();
+  } else if (key == "max_connections") {
+    cfg.max_connections = ull();
+  } else if (key == "chunk_size") {
+    cfg.chunk_size = ull();
+  } else if (key == "max_n_chunks") {
+    cfg.max_n_chunks = ull();
+  } else if (key == "max_read_split") {
+    cfg.max_read_split = ull();
+  } else if (key == "request_timeout_s") {
+    cfg.request_timeout_s = std::stol(val);
+  } else if (key == "max_retry_attempts") {
+    cfg.max_retry_attempts = ull();
+  } else {
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +252,7 @@ class awssdk_presigned_authorizer final : public cucascade::io::s3::s3_request_a
 class kvikio_s3_datasource final : public cudf::io::datasource {
  public:
   explicit kvikio_s3_datasource(std::string const& s3_url)
-    : _handle(kvikio::RemoteHandle::open(s3_url))
+    : _handle(kvikio::RemoteHandle::open(to_https_url(s3_url), kvikio::RemoteEndpointType::S3))
   {
   }
 
@@ -257,6 +304,17 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
   }
 
  private:
+  // kvikIO's RemoteHandle::open rejects the "s3://" scheme; convert it to the
+  // virtual-hosted "https://<bucket>.s3.<region>.amazonaws.com/<object>" form
+  // (region/endpoint from AWS_DEFAULT_REGION / AWS_ENDPOINT_URL) that the S3
+  // endpoint expects.
+  [[nodiscard]] static std::string to_https_url(std::string const& s3_url)
+  {
+    auto [bucket, object] = kvikio::S3Endpoint::parse_s3_url(s3_url);
+    return kvikio::S3Endpoint::url_from_bucket_and_object(
+      std::move(bucket), std::move(object), std::nullopt, std::nullopt);
+  }
+
   [[nodiscard]] size_t clamp(size_t offset, size_t size) const
   {
     size_t const fsize = _handle.nbytes();
@@ -270,7 +328,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
 int main(int argc, char** argv)
 {
-  if (argc != 5 && argc != 6) {
+  if (argc < 5) {
     usage(argv[0]);
     return 1;
   }
@@ -295,14 +353,39 @@ int main(int argc, char** argv)
   }
   size_t num_rows = static_cast<size_t>(num_rows_arg);  // 0 means all
 
-  size_t n_reactors = 2;
-  if (argc == 6) {
-    long long n_reactors_arg = std::stoll(argv[5]);
-    if (n_reactors_arg <= 0) {
-      std::cerr << "n_reactors must be > 0\n";
-      return 1;
+  // Everything after num_rows is either a bare positional n_reactors (kept for
+  // backward compatibility) or a "key=value" REST config override, in any
+  // order.  Overrides are collected into rest_cfg (used by the rest path only).
+  size_t n_reactors   = 2;
+  size_t read_threads = 1;
+  cucascade::io::rest::config rest_cfg;
+  try {
+    for (int i = 5; i < argc; ++i) {
+      std::string const tok = argv[i];
+      auto const eq         = tok.find('=');
+      if (eq == std::string::npos) {
+        // Bare positional: n_reactors.
+        long long const v = std::stoll(tok);
+        if (v <= 0) {
+          std::cerr << "n_reactors must be > 0\n";
+          return 1;
+        }
+        n_reactors = static_cast<size_t>(v);
+      } else if (!apply_rest_override(
+                   tok.substr(0, eq), tok.substr(eq + 1), rest_cfg, n_reactors, read_threads)) {
+        std::cerr << "unknown config key: " << tok.substr(0, eq) << "\n";
+        usage(argv[0]);
+        return 1;
+      }
     }
-    n_reactors = static_cast<size_t>(n_reactors_arg);
+  } catch (std::exception const& e) {
+    std::cerr << "bad argument value: " << e.what() << "\n";
+    return 1;
+  }
+
+  if (read_threads == 0) {
+    std::cerr << "read_threads must be > 0\n";
+    return 1;
   }
 
   aws_api api;
@@ -362,23 +445,38 @@ int main(int argc, char** argv)
 
   std::shared_ptr<cucascade::io::rest::rest_ioctx> io_ctx;  // rest path only
   if (source == DataSource::rest) {
-    cucascade::io::rest::config rest_cfg;
     rest_cfg.bounce_block_size = host_mr.get_block_size();
+
+    std::cout << "REST   : n_reactors=" << n_reactors
+              << "  max_connections=" << rest_cfg.max_connections
+              << "  chunk_size=" << rest_cfg.chunk_size
+              << "  max_n_chunks=" << rest_cfg.max_n_chunks
+              << "  max_read_split=" << rest_cfg.max_read_split << "\n\n";
 
     auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
     auto rest_ctx   = std::make_shared<cucascade::io::rest::rest_reactor::reactor_context>(
       std::move(rest_cfg), std::move(authorizer), &host_mr);
     io_ctx = std::make_shared<cucascade::io::rest::rest_ioctx>(n_reactors, std::move(rest_ctx));
     io_ctx->start();
-
-    for (auto const& key : keys) {
-      sources.push_back(cucascade::io::open_datasource(io_ctx, "s3://" + bucket + "/" + key));
-    }
-  } else {
-    for (auto const& key : keys) {
-      sources.push_back(std::make_unique<kvikio_s3_datasource>("s3://" + bucket + "/" + key));
-    }
   }
+
+  // Build one full set of datasources (one per file) for a given consumer.
+  // read_parquet consumes (moves) its sources, so each read_threads worker gets
+  // its own independent set; opening a source does one untimed HEAD per object.
+  auto build_sources = [&]() {
+    std::vector<std::unique_ptr<cudf::io::datasource>> v;
+    v.reserve(keys.size());
+    for (auto const& key : keys) {
+      if (source == DataSource::rest) {
+        v.push_back(cucascade::io::open_datasource(io_ctx, "s3://" + bucket + "/" + key));
+      } else {
+        v.push_back(std::make_unique<kvikio_s3_datasource>("s3://" + bucket + "/" + key));
+      }
+    }
+    return v;
+  };
+
+  sources = build_sources();  // used by the untimed metadata scan below
 
   auto scan_opts = cudf::io::parquet_reader_options::builder().column_names(COLUMNS).build();
 
@@ -454,19 +552,55 @@ int main(int argc, char** argv)
             << " byte range(s), " << std::fixed << std::setprecision(2)
             << static_cast<double>(total_range_bytes) / (1024.0 * 1024.0) << " MiB total\n\n";
 
-  auto read_opts_builder = cudf::io::parquet_reader_options::builder().column_names(COLUMNS);
-  if (num_rows > 0) read_opts_builder.num_rows(static_cast<int64_t>(num_rows));
-  auto read_opts = read_opts_builder.build();
+  // Total rows to read across all files; num_rows==0 means "all".
+  int64_t total_available = 0;
+  for (auto const& md : metadatas)
+    total_available += md.num_rows;
+  int64_t const rows_to_read =
+    (num_rows == 0) ? total_available
+                    : std::min<int64_t>(static_cast<int64_t>(num_rows), total_available);
 
-  // cudaMemcpyBatchAsync rejects the legacy / per-thread default streams with
-  // cudaMemLocation hints — pass an explicit stream so all H2D copies inside
-  // the datasource and cudf share the same one.
-  rmm::cuda_stream stream;
+  int const n_threads = static_cast<int>(read_threads);
 
-  // Timed run.
+  // Pre-build, OUTSIDE the timed region, each worker's own datasource set,
+  // metadata copy, and CUDA stream.  Each worker reads a disjoint contiguous
+  // row-range [skip, skip+nrows) of the concatenated files on its own stream.
+  std::vector<std::vector<std::unique_ptr<cudf::io::datasource>>> thread_sources;
+  std::vector<std::vector<cudf::io::parquet::FileMetaData>> thread_metadata;
+  std::vector<rmm::cuda_stream> streams(static_cast<size_t>(n_threads));
+  thread_sources.reserve(static_cast<size_t>(n_threads));
+  thread_metadata.reserve(static_cast<size_t>(n_threads));
+  for (int t = 0; t < n_threads; ++t) {
+    thread_sources.push_back(t == 0 ? std::move(sources) : build_sources());
+    thread_metadata.push_back(metadatas);  // copy: read_parquet moves its metadata
+  }
+
+  int64_t const base = rows_to_read / n_threads;
+  std::cout << "Read   : " << n_threads << " thread(s) / stream(s), " << rows_to_read
+            << " rows total (~" << base << " rows/thread)\n\n";
+
+  // Timed run: launch one host thread per stream, each running an independent
+  // read_parquet over its row-range, then join.
   double ms = time_ms([&] {
-    auto tbl =
-      cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(n_threads));
+    for (int t = 0; t < n_threads; ++t) {
+      int64_t const skip  = base * t;
+      int64_t const nrows = (t == n_threads - 1) ? (rows_to_read - skip) : base;
+      workers.emplace_back([&, t, skip, nrows] {
+        auto opts = cudf::io::parquet_reader_options::builder()
+                      .column_names(COLUMNS)
+                      .skip_rows(skip)
+                      .num_rows(nrows)
+                      .build();
+        auto tbl = cudf::io::read_parquet(std::move(thread_sources[static_cast<size_t>(t)]),
+                                          std::move(thread_metadata[static_cast<size_t>(t)]),
+                                          opts,
+                                          streams[static_cast<size_t>(t)].view());
+      });
+    }
+    for (auto& w : workers)
+      w.join();
   });
 
   std::cout << std::fixed << std::setprecision(1) << ms << " ms\n";
