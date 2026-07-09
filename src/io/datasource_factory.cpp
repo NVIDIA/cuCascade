@@ -21,8 +21,8 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
-#include <cucascade/io/s3/sigv4_authorizer.hpp>
-#include <cucascade/io/s3/static_credentials.hpp>
+#include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
+#include <cucascade/io/rest/s3/static_credentials.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -55,18 +55,18 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
 /// Build a SigV4 authorizer from the object-store credentials, or nullptr when
 /// the store is not configured (empty endpoint / credentials / region — which
 /// disables the REST backend).  The signing form follows @c s3_signing_mode.
-std::shared_ptr<s3::s3_request_authorizer> make_s3_authorizer(const object_store_config& os)
+std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_config& os)
 {
   if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
     return nullptr;
   }
-  auto creds = s3::static_credentials_from(os);
+  auto creds = rest::s3::static_credentials_from(os);
   switch (os.s3_signing_mode) {
     case object_store_config::signing_mode::header:
-      return std::make_shared<s3::sigv4_header_authorizer>(
+      return std::make_shared<rest::s3::sigv4_header_authorizer>(
         std::move(creds), os.region, os.endpoint);
     case object_store_config::signing_mode::presigned:
-      return std::make_shared<s3::sigv4_presigned_authorizer>(
+      return std::make_shared<rest::s3::sigv4_presigned_authorizer>(
         std::move(creds), os.region, os.endpoint);
   }
   return nullptr;

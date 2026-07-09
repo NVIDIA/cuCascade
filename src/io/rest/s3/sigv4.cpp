@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/s3/sigv4.hpp>
+#include <cucascade/io/rest/s3/sigv4.hpp>
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -32,7 +32,7 @@
 #include <ctime>
 #include <stdexcept>
 
-namespace cucascade::io::s3 {
+namespace cucascade::io::rest::s3 {
 
 namespace {
 
@@ -395,4 +395,4 @@ std::string presign_url(std::string_view method,
   return out;
 }
 
-}  // namespace cucascade::io::s3
+}  // namespace cucascade::io::rest::s3

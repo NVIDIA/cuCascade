@@ -18,13 +18,13 @@
 
 #pragma once
 
-#include <cucascade/io/s3/s3_request_authorizer.hpp>
-#include <cucascade/io/s3/static_credentials.hpp>
+#include <cucascade/io/rest/authorizer.hpp>
+#include <cucascade/io/rest/s3/static_credentials.hpp>
 
 #include <chrono>
 #include <string>
 
-namespace cucascade::io::s3 {
+namespace cucascade::io::rest::s3 {
 
 /**
  * @brief Common base for the built-in SigV4 authorizers: hand-rolled SigV4 over
@@ -36,10 +36,10 @@ namespace cucascade::io::s3 {
  * externally-rotated temporary credentials (reconstruct the authorizer on
  * rotation; these impls do not refresh). Downstream projects that want
  * refresh-aware credentials (IMDS / STS chain / SSO) ship their own
- * @c s3_request_authorizer; the public surface is a single @c authorize() call
+ * @c request_authorizer; the public surface is a single @c authorize() call
  * so they can do so without exposing raw keys to cuCascade.
  */
-class sigv4_authorizer_base : public s3_request_authorizer {
+class sigv4_authorizer_base : public request_authorizer {
  protected:
   /// @param region    Signing region (e.g. @c "us-east-1").
   /// @param endpoint  scheme://host[:port], no path / query / fragment.
@@ -74,9 +74,9 @@ class sigv4_presigned_authorizer final : public sigv4_authorizer_base {
   /// Thread-safe: @c sigv4::presign_url is pure and members are immutable after
   /// construction.
   /// @throw cucascade::io::credential_error on empty bucket / key or SigV4 failure.
-  s3_authorized_request authorize(s3_object_ref const& obj,
-                                  s3_request_method method,
-                                  std::chrono::seconds timeout) override;
+  authorized_request authorize(object_ref const& obj,
+                               request_method method,
+                               std::chrono::seconds timeout) override;
 
  private:
   std::chrono::seconds _ttl;
@@ -102,9 +102,9 @@ class sigv4_header_authorizer final : public sigv4_authorizer_base {
   /// Thread-safe: @c sigv4::sign_request is pure and members are immutable after
   /// construction.
   /// @throw cucascade::io::credential_error on empty bucket / key or SigV4 failure.
-  s3_authorized_request authorize(s3_object_ref const& obj,
-                                  s3_request_method method,
-                                  std::chrono::seconds timeout) override;
+  authorized_request authorize(object_ref const& obj,
+                               request_method method,
+                               std::chrono::seconds timeout) override;
 };
 
-}  // namespace cucascade::io::s3
+}  // namespace cucascade::io::rest::s3

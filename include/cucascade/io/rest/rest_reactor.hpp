@@ -19,10 +19,9 @@
 #pragma once
 
 #include <cucascade/io/cache/types.hpp>
+#include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/types.hpp>
-#include <cucascade/io/s3/s3_object_ref.hpp>
-#include <cucascade/io/s3/s3_request_authorizer.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
@@ -68,7 +67,7 @@ class rest_io_object : public io_object {
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
-  [[nodiscard]] s3::s3_object_ref object_ref() const { return s3::s3_object_ref{_bucket, _key}; }
+  [[nodiscard]] object_ref get_object_ref() const { return object_ref{_bucket, _key}; }
 
  private:
   std::string _path;
@@ -103,14 +102,14 @@ class rest_reactor {
   class reactor_context {
    public:
     reactor_context(config cfg,
-                    std::shared_ptr<s3::s3_request_authorizer> authorizer,
+                    std::shared_ptr<request_authorizer> authorizer,
                     cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
       : _config(std::move(cfg)), _authorizer(std::move(authorizer)), _host_mr(host_mr)
     {
     }
 
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
-    [[nodiscard]] const std::shared_ptr<s3::s3_request_authorizer>& authorizer() const noexcept
+    [[nodiscard]] const std::shared_ptr<request_authorizer>& authorizer() const noexcept
     {
       return _authorizer;
     }
@@ -122,7 +121,7 @@ class rest_reactor {
 
    private:
     config _config;
-    std::shared_ptr<s3::s3_request_authorizer> _authorizer;
+    std::shared_ptr<request_authorizer> _authorizer;
     cucascade::memory::fixed_size_host_memory_resource* _host_mr{nullptr};
   };
 

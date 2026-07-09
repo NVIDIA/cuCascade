@@ -17,15 +17,15 @@
  */
 
 #include <cucascade/io/io_errors.hpp>
-#include <cucascade/io/s3/sigv4.hpp>
-#include <cucascade/io/s3/sigv4_authorizer.hpp>
+#include <cucascade/io/rest/s3/sigv4.hpp>
+#include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
 
 #include <cctype>
 #include <ctime>
 #include <stdexcept>
 #include <utility>
 
-namespace cucascade::io::s3 {
+namespace cucascade::io::rest::s3 {
 
 namespace {
 
@@ -73,7 +73,7 @@ std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
 
 /// Path-style canonical URI "/<bucket>/<key>", RFC3986-encoded. Bucket encodes
 /// '/' (none valid in bucket names); key leaves '/' so nested keys pass through.
-std::string make_canonical_uri(s3_object_ref const& obj)
+std::string make_canonical_uri(object_ref const& obj)
 {
   if (obj.bucket.empty()) { throw credential_error("sigv4_authorizer: empty bucket"); }
   if (obj.key.empty()) { throw credential_error("sigv4_authorizer: empty key"); }
@@ -97,11 +97,11 @@ sigv4_signer_config make_signer(static_credentials const& creds, std::string con
   return signer;
 }
 
-std::string_view method_to_str(s3_request_method method)
+std::string_view method_to_str(request_method method)
 {
   switch (method) {
-    case s3_request_method::GET: return "GET";
-    case s3_request_method::HEAD: return "HEAD";
+    case request_method::GET: return "GET";
+    case request_method::HEAD: return "HEAD";
   }
   return "GET";  // unreachable; all enumerators handled
 }
@@ -136,9 +136,9 @@ sigv4_presigned_authorizer::sigv4_presigned_authorizer(static_credentials creds,
   }
 }
 
-s3_authorized_request sigv4_presigned_authorizer::authorize(s3_object_ref const& obj,
-                                                            s3_request_method method,
-                                                            std::chrono::seconds timeout)
+authorized_request sigv4_presigned_authorizer::authorize(object_ref const& obj,
+                                                         request_method method,
+                                                         std::chrono::seconds timeout)
 {
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);
@@ -150,14 +150,14 @@ s3_authorized_request sigv4_presigned_authorizer::authorize(s3_object_ref const&
   try {
     // Auth lives entirely in the URL query, so the URL is returned with EMPTY
     // headers.
-    return s3_authorized_request{presign_url(method_to_str(method),
-                                             _scheme,
-                                             _host,
-                                             canonical_uri,
-                                             signer,
-                                             std::time(nullptr),
-                                             effective_ttl),
-                                 {}};
+    return authorized_request{presign_url(method_to_str(method),
+                                          _scheme,
+                                          _host,
+                                          canonical_uri,
+                                          signer,
+                                          std::time(nullptr),
+                                          effective_ttl),
+                              {}};
   } catch (credential_error const&) {
     throw;
   } catch (std::exception const& e) {
@@ -172,9 +172,9 @@ sigv4_header_authorizer::sigv4_header_authorizer(static_credentials creds,
 {
 }
 
-s3_authorized_request sigv4_header_authorizer::authorize(s3_object_ref const& obj,
-                                                         s3_request_method method,
-                                                         std::chrono::seconds /*timeout*/)
+authorized_request sigv4_header_authorizer::authorize(object_ref const& obj,
+                                                      request_method method,
+                                                      std::chrono::seconds /*timeout*/)
 {
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);
@@ -192,7 +192,7 @@ s3_authorized_request sigv4_header_authorizer::authorize(s3_object_ref const& ob
                                    signer,
                                    std::time(nullptr));
     std::string url = _scheme + "://" + _host + canonical_uri;
-    return s3_authorized_request{std::move(url), std::move(signed_req.headers)};
+    return authorized_request{std::move(url), std::move(signed_req.headers)};
   } catch (credential_error const&) {
     throw;
   } catch (std::exception const& e) {
@@ -200,4 +200,4 @@ s3_authorized_request sigv4_header_authorizer::authorize(s3_object_ref const& ob
   }
 }
 
-}  // namespace cucascade::io::s3
+}  // namespace cucascade::io::rest::s3

@@ -443,7 +443,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   n_chunks = std::max<size_t>(n_chunks, (segment.size + max_piece_bytes - 1) / max_piece_bytes);
 
   auto manager       = std::make_shared<request_manager>(segment.size, n_chunks);
-  auto const obj     = file.object_ref();
+  auto const obj     = file.get_object_ref();
   size_t const fsize = file.size();
   uint8_t* const dst = segment.data();
 
@@ -500,7 +500,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
                         cfg.max_n_chunks);
 
   auto manager   = std::make_shared<request_manager>(bytes_requested, groups.size());
-  auto const obj = file.object_ref();
+  auto const obj = file.get_object_ref();
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(groups.size());
@@ -542,7 +542,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
   size_t const n_win  = (wanted + bounce - 1) / bounce;
 
   auto manager   = std::make_shared<request_manager>(wanted, n_win);
-  auto const obj = file.object_ref();
+  auto const obj = file.get_object_ref();
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(n_win);
@@ -585,7 +585,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
 
   size_t const fsize   = file.size();
   size_t const req_end = offset + size;
-  auto const obj       = file.object_ref();
+  auto const obj       = file.get_object_ref();
 
   // Validate overlap, total the device-buffer bytes each segment fills (the
   // value reported to the caller — not the host read size, which over-reads to
@@ -686,12 +686,12 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
 
 size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
 {
-  s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
+  object_ref const obj{std::string(bucket), std::string(key)};
   std::string last_error;
   for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
     header_capture hc;
     auto const authd =
-      _ctx->authorizer()->authorize(obj, s3::s3_request_method::HEAD, presign_ttl(_config));
+      _ctx->authorizer()->authorize(obj, request_method::HEAD, presign_ttl(_config));
 
     curl_easy_ptr h{curl_easy_init()};
     if (!h) { throw std::runtime_error("rest_reactor::head_object_size: curl_easy_init failed"); }
@@ -1103,8 +1103,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
     auto setup_easy = [&](io_slot& s) {
       CURL* const h = s.easy.get();
-      auto authd    = _ctx->authorizer()->authorize(
-        s.req->object, s3::s3_request_method::GET, presign_ttl(_config));
+      auto authd =
+        _ctx->authorizer()->authorize(s.req->object, request_method::GET, presign_ttl(_config));
       s.url           = std::move(authd.url);
       s.sink.buffers  = std::span<iovec>(s.req->chunk.buffers);
       s.sink.capacity = s.req->chunk.size;

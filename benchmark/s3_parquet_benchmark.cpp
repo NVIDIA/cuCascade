@@ -29,8 +29,8 @@
 // AWS_DEFAULT_REGION, AWS_ENDPOINT_URL) and are honored by both backends.
 
 #include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
-#include <cucascade/io/s3/s3_request_authorizer.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
@@ -217,23 +217,23 @@ static std::vector<std::string> list_parquet_objects(Aws::S3::S3Client& client,
   return keys;
 }
 
-/// cucascade::io::s3::s3_request_authorizer backed by the AWS SDK presigner.
+/// cucascade::io::rest::request_authorizer backed by the AWS SDK presigner.
 /// Presigned URLs carry the auth in the query string, so no headers are
 /// returned; the REST reactor appends its Range header without invalidating
 /// the signature.
-class awssdk_presigned_authorizer final : public cucascade::io::s3::s3_request_authorizer {
+class awssdk_presigned_authorizer final : public cucascade::io::rest::request_authorizer {
  public:
   explicit awssdk_presigned_authorizer(std::shared_ptr<Aws::S3::S3Client> client)
     : _client(std::move(client))
   {
   }
 
-  [[nodiscard]] cucascade::io::s3::s3_authorized_request authorize(
-    cucascade::io::s3::s3_object_ref const& obj,
-    cucascade::io::s3::s3_request_method method,
+  [[nodiscard]] cucascade::io::rest::authorized_request authorize(
+    cucascade::io::rest::object_ref const& obj,
+    cucascade::io::rest::request_method method,
     std::chrono::seconds timeout) override
   {
-    auto const http_method = method == cucascade::io::s3::s3_request_method::GET
+    auto const http_method = method == cucascade::io::rest::request_method::GET
                                ? Aws::Http::HttpMethod::HTTP_GET
                                : Aws::Http::HttpMethod::HTTP_HEAD;
     long long const ttl    = timeout.count() > 0 ? timeout.count() : 60;
