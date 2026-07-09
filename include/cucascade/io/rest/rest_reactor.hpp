@@ -205,7 +205,7 @@ class rest_reactor {
   {
     // Network round-trips are high-latency; read ahead on demand rather than
     // eagerly prefilling the whole working set.
-    return cache::prefetching_stage::just_in_time;
+    return cache::prefetching_stage::opportunistic;
   }
 
   /// REST has no physical block alignment, so this only coalesces overlapping /
