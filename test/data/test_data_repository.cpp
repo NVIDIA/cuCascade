@@ -25,6 +25,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -475,6 +476,47 @@ TEST_CASE("data_repository pop Multiple Partitions", "[data_repository]")
   REQUIRE(retrieved_batch_ids1.empty());
   retrieved_batch_ids2 = repository.get_batch_ids(2);
   REQUIRE(retrieved_batch_ids2.empty());
+}
+
+TEST_CASE("data_repository set_num_partitions grows and validates size(p)", "[data_repository]")
+{
+  data_repository repository;
+
+  // A fresh repository starts with a single partition; size(p>0) is out of range.
+  REQUIRE(repository.num_partitions() == 1);
+  REQUIRE_THROWS_AS(repository.size(1), std::out_of_range);
+
+  // Growing to 4 partitions makes every index in [0, 4) queryable and empty.
+  repository.set_num_partitions(4);
+  REQUIRE(repository.num_partitions() == 4);
+  for (std::size_t p = 0; p < 4; ++p) {
+    REQUIRE(repository.size(p) == 0);
+  }
+
+  // Existing data in partition 0 is preserved across the grow.
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = data_batch::make(7, std::move(data));
+  repository.add_data_batch(batch, 3);
+  repository.set_num_partitions(8);
+  REQUIRE(repository.num_partitions() == 8);
+  REQUIRE(repository.size(3) == 1);
+  REQUIRE(repository.size(7) == 0);
+}
+
+TEST_CASE("data_repository set_num_partitions rejects non-growing counts", "[data_repository]")
+{
+  data_repository repository;
+  repository.set_num_partitions(3);
+
+  // Zero is never valid.
+  REQUIRE_THROWS_AS(repository.set_num_partitions(0), std::invalid_argument);
+
+  // Equal to or smaller than the current count is rejected (grow-only).
+  REQUIRE_THROWS_AS(repository.set_num_partitions(3), std::invalid_argument);
+  REQUIRE_THROWS_AS(repository.set_num_partitions(2), std::invalid_argument);
+
+  // The failed calls leave the partition count untouched.
+  REQUIRE(repository.num_partitions() == 3);
 }
 
 TEST_CASE("data_repository pop by id", "[data_repository]")

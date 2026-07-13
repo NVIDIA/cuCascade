@@ -23,6 +23,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -275,6 +277,37 @@ class data_repository {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     return _data_batches.size();
+  }
+
+  /**
+   * @brief Grow the number of partitions in the repository.
+   *
+   * Growing only: the new count must be strictly greater than the current count.
+   * Shrinking is not supported because it could discard batches that are already in
+   * flight.
+   *
+   * @param new_num_partitions The desired number of partitions. Must be strictly
+   *        greater than 0 and strictly greater than the current number of partitions.
+   *
+   * @note Thread-safe operation protected by internal mutex
+   * @throws std::invalid_argument if @p new_num_partitions is 0
+   * @throws std::invalid_argument if @p new_num_partitions is not strictly greater
+   *         than the current number of partitions
+   */
+  void set_num_partitions(std::size_t new_num_partitions)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (new_num_partitions == 0) {
+      throw std::invalid_argument(
+        "data_repository::set_num_partitions: new number of partitions must be greater than 0");
+    }
+    if (new_num_partitions <= _data_batches.size()) {
+      throw std::invalid_argument(
+        "data_repository::set_num_partitions: new number of partitions (" +
+        std::to_string(new_num_partitions) + ") must be greater than the current number (" +
+        std::to_string(_data_batches.size()) + ")");
+    }
+    _data_batches.resize(new_num_partitions);
   }
 
  protected:
