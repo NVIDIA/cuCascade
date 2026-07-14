@@ -32,6 +32,7 @@
 #include "utils/test_memory_resources.hpp"
 
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/error.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -603,6 +604,162 @@ SCENARIO("Host Reservation", "[memory_space][host_reservation]")
       {
         REQUIRE(mr->get_total_reserved_bytes() == 0);
         REQUIRE(mr->get_total_allocated_bytes() == 0);
+      }
+    }
+  }
+}
+
+// Two buffers, two reservations, each in its own scope.
+//   get_total_reserved_bytes()  = sum of live reservation sizes (logical budget)
+//   get_total_allocated_bytes() = bytes physically backed by upstream cudaMalloc
+// Each reservation lives only long enough to admit one allocation.
+TEST_CASE("Two reservations admit two buffers in separate scopes",
+          "[memory_space][gpu][reservation]")
+{
+  auto manager    = createSingleDeviceMemoryManager();
+  auto* gpu_space = manager->get_memory_space(Tier::GPU, 0);
+  auto* mr        = gpu_space->get_memory_resource_of<Tier::GPU>();
+  REQUIRE(mr != nullptr);
+
+  const size_t buf_size = 16ull * 1024 * 1024;  // 16 MB
+  auto stream1          = gpu_space->acquire_stream();
+  auto stream2          = gpu_space->acquire_stream();
+  rmm::device_async_resource_ref mr_ref{*mr};
+
+  {
+    rmm::device_buffer buf1, buf2;
+
+    CHECK(mr->get_total_reserved_bytes() == 0);
+    CHECK(mr->get_total_allocated_bytes() == 0);
+
+    {
+      auto res1 = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, buf_size);
+      REQUIRE(res1 != nullptr);
+      buf1 = rmm::device_buffer(buf_size, stream1, mr_ref);
+
+      CHECK(mr->get_total_reserved_bytes() == buf_size);
+      CHECK(mr->get_total_allocated_bytes() == buf_size);
+    }
+    // res1 destroyed; buf1 still alive
+    CHECK(mr->get_total_reserved_bytes() == 0);
+    CHECK(mr->get_total_allocated_bytes() == buf_size);
+
+    {
+      auto res2 = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, buf_size);
+      REQUIRE(res2 != nullptr);
+      buf2 = rmm::device_buffer(buf_size, stream2, mr_ref);
+
+      CHECK(mr->get_total_reserved_bytes() == buf_size);
+      CHECK(mr->get_total_allocated_bytes() == 2 * buf_size);
+    }
+    // res2 destroyed; both buffers still alive
+    CHECK(mr->get_total_reserved_bytes() == 0);
+    CHECK(mr->get_total_allocated_bytes() == 2 * buf_size);
+  }
+  stream1.synchronize();
+  stream2.synchronize();
+
+  CHECK(mr->get_total_reserved_bytes() == 0);
+  CHECK(mr->get_total_allocated_bytes() == 0);
+}
+
+// A held-but-unattached reservation and a direct (unmanaged) allocation are
+// tracked on the same capacity counter -- they are additive, not a backing
+// store. Reserving the full reservation limit and then allocating the same
+// amount directly must exceed capacity and throw. To let an allocation draw
+// from a reservation instead of stacking on top, it must be attached to the
+// stream tracker via attach_reservation_to_tracker.
+SCENARIO("Unattached reserve_upto plus direct allocation exceeds capacity",
+         "[memory_space][gpu][reservation]")
+{
+  auto manager    = createSingleDeviceMemoryManager();
+  auto* gpu_space = manager->get_memory_space(Tier::GPU, 0);
+  auto* mr        = gpu_space->get_memory_resource_of<Tier::GPU>();
+  REQUIRE(mr != nullptr);
+
+  // capacity = 2GB, reservation limit = 0.75 * 2GB = 1.5GB
+  const size_t reserve_size = static_cast<size_t>(expected_gpu_capacity * limit_ratio);
+
+  GIVEN("a held-but-unattached reserve_upto reservation of the full limit")
+  {
+    auto res_arena = mr->reserve_upto(reserve_size);
+    REQUIRE(res_arena != nullptr);
+    REQUIRE(mr->get_total_reserved_bytes() == reserve_size);
+    REQUIRE(mr->get_total_allocated_bytes() == reserve_size);
+
+    rmm::cuda_stream stream;
+
+    THEN("it throws because reservation + allocation exceed capacity")
+    {
+      rmm::device_buffer buf(reserve_size, stream, *mr);
+    }
+  }
+}
+
+// DESIRED CONTRACT (currently failing): with the increase overflow policy, a
+// reservation that grows to cover an allocation must release the grown capacity
+// once that allocation is freed, rather than staying "sticky" until
+// reset_stream_reservation or adaptor teardown. A sticky reservation partitions
+// capacity to an idle stream: physically the memory is free, yet it stays
+// reserved and unavailable to other streams. This test also pins that a reset
+// leaves no double-counted residue behind (see growth double-count bug).
+SCENARIO("Grown reservation is released back to capacity once freed",
+         "[memory_space][gpu][reservation]")
+{
+  auto manager    = createSingleDeviceMemoryManager();
+  auto* gpu_space = manager->get_memory_space(Tier::GPU, 0);
+  auto* mr        = gpu_space->get_memory_resource_of<Tier::GPU>();
+  REQUIRE(mr != nullptr);
+
+  const size_t reservation_size = 1024;
+  const size_t chunk            = 1024;
+
+  GIVEN("a 1KB reservation on a stream with an increase overflow policy")
+  {
+    rmm::cuda_stream stream;
+    rmm::device_async_resource_ref mr_ref{*mr};
+
+    const size_t available_before_attach = mr->get_available_memory();
+
+    auto res = manager->request_reservation(specific_memory_space{Tier::GPU, 0}, reservation_size);
+    mr->attach_reservation_to_tracker(
+      stream, std::move(res), std::make_unique<increase_reservation_limit_policy>());
+
+    REQUIRE(mr->get_total_reserved_bytes() == reservation_size);
+    const size_t available_after_attach = mr->get_available_memory();
+
+    WHEN("an allocation beyond the reservation forces it to grow, then is freed")
+    {
+      {
+        std::vector<rmm::device_buffer> bufs;
+        bufs.reserve(3);
+        bufs.emplace_back(chunk, stream, mr_ref);
+        bufs.emplace_back(chunk, stream, mr_ref);
+        bufs.emplace_back(chunk, stream, mr_ref);  // exceeds reservation -> grows
+        stream.synchronize();
+        bufs.clear();  // free every allocation on the stream
+      }
+      stream.synchronize();
+
+      THEN("the grown reservation shrinks back and returns capacity automatically")
+      {
+        // Nothing is physically live on the stream after every free.
+        REQUIRE(mr->get_allocated_bytes(stream) == 0);
+
+        // DESIRED (D3): an idle reservation must not stay grown -- once all of
+        // its allocations are freed it should shrink back to its original size
+        // so the capacity is available to other streams again. Fails today: the
+        // reservation stays sticky at its grown size.
+        REQUIRE(mr->get_total_reserved_bytes() == reservation_size);
+        REQUIRE(mr->get_available_memory() == available_after_attach);
+
+        // DESIRED (B1): an explicit reset fully releases the reservation with no
+        // leftover committed bytes. Fails today: the growth path double-counts,
+        // leaving a residue so availability does not return to the pre-attach
+        // baseline.
+        mr->reset_stream_reservation(stream);
+        REQUIRE(mr->get_total_reserved_bytes() == 0);
+        REQUIRE(mr->get_available_memory() == available_before_attach);
       }
     }
   }
