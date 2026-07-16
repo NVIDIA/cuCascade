@@ -67,6 +67,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_data_representation.cpp
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
+    data/test_owning_table_view.cpp
     data/test_representation_converter.cpp
     # Main test runner
     unittest.cpp)
