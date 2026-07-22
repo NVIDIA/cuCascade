@@ -24,6 +24,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <filesystem>
 #include <memory>
@@ -43,6 +44,7 @@ class memory_reservation_manager;
 class reservation_aware_resource_adaptor;
 class fixed_size_host_memory_resource;
 class reservation;
+class topology_index;
 
 //===----------------------------------------------------------------------===//
 // Reservation Request Strategies
@@ -52,6 +54,21 @@ struct reservation_request_strategy {
   explicit reservation_request_strategy(bool strong_ordering) : _strong_ordering(strong_ordering) {}
 
   virtual std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const = 0;
+
+  /**
+   * @brief Stable hash identifying this request's candidate selection.
+   *
+   * Used by @c topology_index to memoize candidate lists: two strategies that would
+   * produce the same candidate set must hash equal, and strategies producing different
+   * sets should hash differently (collisions only cost cache accuracy, not safety).
+   *
+   * The default mixes only the dynamic type, which is correct for strategies whose
+   * candidate set is fully determined by their type.
+   *
+   * @note Subclasses whose candidate set varies with instance fields MUST override this
+   *       and mix those fields in; otherwise distinct instances share a cache entry.
+   */
+  [[nodiscard]] virtual std::size_t hash() const noexcept;
 
   [[nodiscard]] bool has_strong_ordering() const noexcept { return _strong_ordering; }
 
@@ -85,6 +102,7 @@ struct any_memory_space_in_tier_with_preference : public reservation_request_str
   }
 
   std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+  [[nodiscard]] std::size_t hash() const noexcept override;
 };
 
 /**
@@ -95,6 +113,7 @@ struct any_memory_space_in_tier : public reservation_request_strategy {
   explicit any_memory_space_in_tier(Tier t) : reservation_request_strategy(false), tier(t) {}
 
   std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+  [[nodiscard]] std::size_t hash() const noexcept override;
 };
 
 /**
@@ -110,6 +129,7 @@ struct any_memory_space_in_tiers : public reservation_request_strategy {
   }
 
   std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+  [[nodiscard]] std::size_t hash() const noexcept override;
 };
 
 /**
@@ -125,6 +145,7 @@ struct specific_memory_space : public reservation_request_strategy {
   }
 
   std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+  [[nodiscard]] std::size_t hash() const noexcept override;
 };
 
 /**
@@ -145,6 +166,7 @@ struct any_memory_space_to_downgrade : public reservation_request_strategy {
   }
 
   std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+  [[nodiscard]] std::size_t hash() const noexcept override;
 };
 
 /**
@@ -160,6 +182,7 @@ struct any_memory_space_to_upgrade : public reservation_request_strategy {
   }
 
   std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+  [[nodiscard]] std::size_t hash() const noexcept override;
 };
 
 //===----------------------------------------------------------------------===//
@@ -234,6 +257,26 @@ class memory_reservation_manager {
   std::span<const memory_space*> get_all_memory_spaces() const noexcept;
 
   //===----------------------------------------------------------------------===//
+  // Topology Index
+  //===----------------------------------------------------------------------===//
+
+  /**
+   * Attach a topology_index that this manager uses to resolve (and memoize) candidate
+   * memory spaces for reservation requests. Typically built via
+   * cucascade::memory::build(topology, manager) after construction, then set here.
+   *
+   * @note The index holds a non-owning back-pointer to this manager, so it must not
+   *       outlive it. Passing nullptr detaches the index (candidate selection falls back
+   *       to computing directly from each request's strategy).
+   */
+  void set_topology_index(std::shared_ptr<const topology_index> index);
+
+  /**
+   * The currently attached topology_index, or nullptr if none is set.
+   */
+  [[nodiscard]] std::shared_ptr<const topology_index> get_topology_index() const noexcept;
+
+  //===----------------------------------------------------------------------===//
   // Aggregated Queries
   //===----------------------------------------------------------------------===//
 
@@ -264,6 +307,12 @@ class memory_reservation_manager {
   std::unordered_map<memory_space_id, memory_space*> _memory_space_lookup;
   std::unordered_map<Tier, std::vector<memory_space*>> _tier_to_memory_spaces;
   std::unordered_map<Tier, std::vector<const memory_space*>> _const_tier_to_memory_spaces;
+
+  // Optional topology index used to resolve/memoize reservation candidates (non-owning
+  // back-pointer to this manager lives inside the index; see set_topology_index).
+  // Atomic so the reservation hot path can load-and-pin it without tearing against a
+  // concurrent set_topology_index().
+  std::atomic<std::shared_ptr<const topology_index>> _topology_index;
 
   // Helper method: attempts to select a space and immediately make a reservation
   // Returns a reservation when successful, or std::nullopt if none can satisfy the request

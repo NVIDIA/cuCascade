@@ -18,9 +18,15 @@
 
 #pragma once
 
+#include <cucascade/error.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -77,9 +83,14 @@ class topology_index {
   ///
   /// @param topology  the system topology to resolve NUMA nodes from.
   /// @param manager   reservation manager whose GPU/HOST spaces define the scope.
+  ///
+  /// @note The index keeps a non-owning back-pointer to @p manager so it can resolve
+  ///       memory spaces and candidates on demand.  The manager MUST outlive this index
+  ///       (the manager-dependent accessors @c get_spaces_of and @c get_candidates are
+  ///       undefined otherwise); the NUMA accessors do not touch the manager.
   topology_index(cucascade::memory::system_topology_info topology,
-                 const cucascade::memory::memory_reservation_manager& manager)
-    : _topology(std::move(topology))
+                 cucascade::memory::memory_reservation_manager& manager)
+    : _topology(std::move(topology)), _manager(&manager)
   {
     auto extract_ids = [](cucascade::memory::Tier tier) {
       return [tier](const cucascade::memory::memory_reservation_manager& manager) {
@@ -113,6 +124,17 @@ class topology_index {
       _gpu_to_numa[gpu_id] = numa_node;
       _numa_to_gpus[numa_node].push_back(gpu_id);
     }
+
+    // Snapshot the manager's memory spaces per tier so get_spaces_of() can hand out both
+    // mutable and const views without re-querying the manager on every call.  Mutable
+    // pointers are recovered via the manager's non-const lookup to avoid const_cast.
+    for (const auto* space : manager.get_all_memory_spaces()) {
+      cucascade::memory::Tier const tier = space->get_tier();
+      cucascade::memory::memory_space* mutable_space =
+        manager.get_memory_space(tier, space->get_device_id());
+      _tier_spaces[tier].push_back(mutable_space);
+      _const_tier_spaces[tier].push_back(mutable_space);
+    }
   }
 
   /// @brief The topology this index was built from.
@@ -145,11 +167,103 @@ class topology_index {
 
   [[nodiscard]] std::span<const int> gpu_ids() const noexcept { return _gpu_ids; }
 
+  /// @brief Mutable memory spaces in @p tier (snapshot taken at build time).
+  /// @return a view of the manager's spaces for that tier, or an empty span if none.
+  ///         The span is valid for the lifetime of this index.
+  [[nodiscard]] std::span<cucascade::memory::memory_space*> get_spaces_of(
+    cucascade::memory::Tier tier)
+  {
+    auto it = _tier_spaces.find(tier);
+    if (it == _tier_spaces.end()) { return {}; }
+    return it->second;
+  }
+
+  /// @brief Const memory spaces in @p tier (snapshot taken at build time).
+  /// @return a read-only view of the manager's spaces for that tier, or an empty span.
+  [[nodiscard]] std::span<const cucascade::memory::memory_space*> get_spaces_of(
+    cucascade::memory::Tier tier) const
+  {
+    auto it = _const_tier_spaces.find(tier);
+    if (it == _const_tier_spaces.end()) { return {}; }
+    // span<const memory_space*> binds to a non-const vector of const pointers; the
+    // const_cast drops only the container's constness, not the pointees' (same pattern as
+    // memory_reservation_manager::get_memory_spaces_for_tier).
+    return const_cast<std::vector<const cucascade::memory::memory_space*>&>(it->second);
+  }
+
+  /// @brief Candidate memory spaces for a reservation @p strategy, memoized by its hash.
+  ///
+  /// The first call for a given @c strategy.hash() computes the candidate list via the
+  /// strategy and caches it; later calls with an equal hash return the cached span
+  /// directly.  Candidate *sets* depend only on the topology (live free-memory is checked
+  /// later, when a reservation is actually made), so caching by strategy identity is
+  /// sound.
+  ///
+  /// @return a view of the candidate spaces, valid for the lifetime of this index.
+  /// @throws cucascade::logic_error if this index was not built from a reservation
+  ///         manager (the device-ids constructor cannot resolve candidates).
+  [[nodiscard]] std::span<cucascade::memory::memory_space*> get_candidates(
+    const cucascade::memory::reservation_request_strategy& strategy) const
+  {
+    if (_manager == nullptr) {
+      CUCASCADE_FAIL("topology_index::get_candidates requires an index built from a manager");
+    }
+    std::size_t const key = strategy.hash();
+
+    // Fast path: concurrent readers share the lock on a cache hit.
+    {
+      std::shared_lock<std::shared_mutex> read_lock(_candidate_mutex);
+      auto it = _candidate_cache.find(key);
+      if (it != _candidate_cache.end()) { return it->second; }
+    }
+
+    // Cache miss: compute outside the lock (the manager's space set is immutable), then
+    // insert under an exclusive lock.  A concurrent miss on the same key is harmless:
+    // emplace keeps the first inserted value and both callers return the same node.
+    std::vector<cucascade::memory::memory_space*> computed = strategy.get_candidates(*_manager);
+    std::unique_lock<std::shared_mutex> write_lock(_candidate_mutex);
+    // References into an unordered_map node stay valid across later inserts, and cached
+    // entries are never mutated after insertion, so the returned span outlives the lock.
+    return _candidate_cache.emplace(key, std::move(computed)).first->second;
+  }
+
  private:
   cucascade::memory::system_topology_info _topology;
   std::unordered_map<int, int> _gpu_to_numa;                ///< GPU device id -> NUMA node.
   std::unordered_map<int, std::vector<int>> _numa_to_gpus;  ///< NUMA node -> GPU device ids.
   std::vector<int> _gpu_ids;  ///< Scoped GPU device ids, in caller order (for span stability).
+
+  /// Non-owning back-pointer to the manager the index was built from (nullptr when built
+  /// from explicit device ids).  The manager must outlive this index.
+  cucascade::memory::memory_reservation_manager* _manager{nullptr};
+
+  /// Per-tier memory-space snapshots (mutable + const views over the same pointers).
+  std::unordered_map<cucascade::memory::Tier, std::vector<cucascade::memory::memory_space*>>
+    _tier_spaces;
+  std::unordered_map<cucascade::memory::Tier, std::vector<const cucascade::memory::memory_space*>>
+    _const_tier_spaces;
+
+  /// Candidate lists memoized by reservation-strategy hash.  Mutable so get_candidates can
+  /// populate the cache while remaining a const query.  A shared_mutex lets concurrent
+  /// cache hits proceed in parallel; only the (rare) insert takes the lock exclusively.
+  mutable std::shared_mutex _candidate_mutex;
+  mutable std::unordered_map<std::size_t, std::vector<cucascade::memory::memory_space*>>
+    _candidate_cache;
 };
+
+/// @brief Build a topology index scoped to a reservation manager's memory spaces.
+///
+/// Convenience factory returning a shared, immutable index.  The index keeps a non-owning
+/// back-pointer to @p manager, so @p manager must outlive the returned index.
+///
+/// @param topology  the system topology to resolve NUMA nodes from.
+/// @param manager   reservation manager whose GPU/HOST spaces define the scope.
+/// @return a shared const topology index.
+[[nodiscard]] inline std::shared_ptr<const topology_index> build(
+  cucascade::memory::system_topology_info topology,
+  cucascade::memory::memory_reservation_manager& manager)
+{
+  return std::make_shared<const topology_index>(std::move(topology), manager);
+}
 
 }  // namespace cucascade::memory

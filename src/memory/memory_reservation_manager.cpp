@@ -20,6 +20,7 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <cucascade/memory/topology_index.hpp>
 #include <cucascade/utils/overloaded.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -29,14 +30,76 @@
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
+#include <typeinfo>
 #include <variant>
 
 namespace cucascade {
 namespace memory {
 
+namespace {
+
+// Fold an additional value into a running hash seed (boost::hash_combine formula, 64-bit).
+std::size_t hash_combine(std::size_t seed, std::size_t value) noexcept
+{
+  return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
+}
+
+}  // namespace
+
 //===----------------------------------------------------------------------===//
 // Reservation Strategy Implementations
 //===----------------------------------------------------------------------===//
+
+std::size_t reservation_request_strategy::hash() const noexcept
+{
+  return typeid(*this).hash_code();
+}
+
+std::size_t any_memory_space_in_tier_with_preference::hash() const noexcept
+{
+  std::size_t seed = typeid(*this).hash_code();
+  seed             = hash_combine(seed, static_cast<std::size_t>(tier));
+  seed             = hash_combine(seed, preferred_device_id.has_value() ? *preferred_device_id : 0);
+  seed             = hash_combine(seed, preferred_device_id.has_value() ? 1u : 0u);
+  return seed;
+}
+
+std::size_t any_memory_space_in_tier::hash() const noexcept
+{
+  return hash_combine(typeid(*this).hash_code(), static_cast<std::size_t>(tier));
+}
+
+std::size_t any_memory_space_in_tiers::hash() const noexcept
+{
+  std::size_t seed = typeid(*this).hash_code();
+  for (Tier t : tiers) {
+    seed = hash_combine(seed, static_cast<std::size_t>(t));
+  }
+  return seed;
+}
+
+std::size_t specific_memory_space::hash() const noexcept
+{
+  return hash_combine(typeid(*this).hash_code(), target_id.uuid());
+}
+
+std::size_t any_memory_space_to_downgrade::hash() const noexcept
+{
+  std::size_t seed = typeid(*this).hash_code();
+  seed             = hash_combine(seed, src_id.uuid());
+  for (Tier t : target_tiers) {
+    seed = hash_combine(seed, static_cast<std::size_t>(t));
+  }
+  return seed;
+}
+
+std::size_t any_memory_space_to_upgrade::hash() const noexcept
+{
+  std::size_t seed = typeid(*this).hash_code();
+  seed             = hash_combine(seed, src_id.uuid());
+  seed             = hash_combine(seed, static_cast<std::size_t>(target_tier));
+  return seed;
+}
 
 std::span<memory_space*> reservation_request_strategy::get_all_memory_resource(
   memory_reservation_manager& manager)
@@ -191,6 +254,17 @@ std::span<const memory_space*> memory_reservation_manager::get_all_memory_spaces
   return const_cast<std::vector<const memory_space*>&>(_const_memory_space_views);
 }
 
+void memory_reservation_manager::set_topology_index(std::shared_ptr<const topology_index> index)
+{
+  _topology_index.store(std::move(index));
+}
+
+std::shared_ptr<const topology_index> memory_reservation_manager::get_topology_index()
+  const noexcept
+{
+  return _topology_index.load();
+}
+
 memory_space* memory_reservation_manager::get_mutable_memory_space(Tier tier, int32_t device_id)
 {
   memory_space_id id(tier, device_id);
@@ -302,7 +376,21 @@ memory_reservation_manager::select_memory_space_and_make_reservation(
   };
 
   bool has_strong_ordering = request.has_strong_ordering();
-  auto candidates          = request.get_candidates(*this);
+
+  // Resolve candidates through the topology index (memoized by strategy hash) when one is
+  // attached; otherwise compute them directly from the request.  Pin the index in a local
+  // shared_ptr so a concurrent set_topology_index() cannot free the cache backing the
+  // returned span while it is still in use below.
+  std::shared_ptr<const topology_index> index = _topology_index.load();
+  std::vector<memory_space*> fallback;
+  std::span<memory_space*> candidates;
+  if (index) {
+    candidates = index->get_candidates(request);
+  } else {
+    fallback   = request.get_candidates(*this);
+    candidates = fallback;
+  }
+
   if (has_strong_ordering) {
     return try_candidates(candidates, &memory_space::make_reservation, size);
   } else {
