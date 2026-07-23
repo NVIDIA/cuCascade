@@ -220,7 +220,7 @@ int main(int argc, char** argv)
   // scan in parquet_benchmark.cpp.
   std::vector<coalesced_range> ranges;
   size_t total_range_bytes = 0;
-  int64_t accumulated_rows  = 0;
+  int64_t accumulated_rows = 0;
 
   for (size_t file_idx = 0; file_idx < paths.size(); ++file_idx) {
     auto const& path = paths[file_idx];
@@ -310,8 +310,8 @@ int main(int argc, char** argv)
                                                              1);               // initial_pools
 
   auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-    cucascade::io::uring::uring_reactor::reactor_config_type{.bounce_size = host_mr.get_block_size(),
-                                                             .use_odirect = true},
+    cucascade::io::uring::uring_reactor::reactor_config_type{
+      .bounce_size = host_mr.get_block_size(), .use_odirect = true},
     &host_mr);
   std::shared_ptr<cucascade::io::ioctx> io_ctx =
     std::make_shared<cucascade::io::uring::uring_ioctx>(n_threads, std::move(uring_ctx));
@@ -336,7 +336,7 @@ int main(int argc, char** argv)
   // Per-range destination buffers (untimed).  host → pinned; device → rmm.
   rmm::cuda_stream alloc_stream;
   std::vector<uint8_t*> dsts(ranges.size(), nullptr);
-  std::vector<void*> host_bufs;             // owned pinned allocations (host dest)
+  std::vector<void*> host_bufs;              // owned pinned allocations (host dest)
   std::vector<rmm::device_buffer> dev_bufs;  // owned device allocations (device dest)
   if (dest == Dest::host) {
     host_bufs.reserve(ranges.size());
@@ -392,8 +392,7 @@ int main(int argc, char** argv)
               seg_sets.emplace_back();
               cur_file = r.file_idx;
             }
-            seg_sets.back().push_back(
-              cucascade::io::io_object_segment{r.offset, r.size, dsts[i]});
+            seg_sets.back().push_back(cucascade::io::io_object_segment{r.offset, r.size, dsts[i]});
           }
           // Re-walk to bind each segment set to its io_object and dispatch.
           size_t set = 0;

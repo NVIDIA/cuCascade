@@ -24,8 +24,8 @@
 //   rest   – the native cucascade::io REST reactor (libcurl scatter GETs
 //            authorized via AWS-SDK presigned URLs).  host reads go through the
 //            vector-I/O primitive (host_read_ranges_async_io); device reads
-//            through the host->device staging primitive (the REST reactor has
-//            no direct-to-device path).
+//            through device_read_async (reactor-staged: the reactor streams
+//            each range network->pinned-bounce->device on its own slots).
 //   kvikio – kvikIO's RemoteHandle S3 endpoint wrapped as a cudf datasource;
 //            host_read_async / device_read_async issued per range.
 // All async operations are collected first and synchronized at the end.
@@ -106,19 +106,52 @@ static Dest parse_dest(std::string_view s)
 
 static void usage(char const* prog)
 {
-  std::cerr << "usage: " << prog
-            << " <bucket> <prefix> <rest|kvikio> <host|device> <num_rows> [n_threads]\n"
-            << "  bucket     – S3 bucket name (no scheme)\n"
-            << "  prefix     – key prefix to list ('-' for the whole bucket); only\n"
-            << "               keys ending in .parquet are read\n"
-            << "  rest       – native REST reactor (host=vector-io, device=host->device)\n"
-            << "  kvikio     – kvikIO RemoteHandle per-range host_read/device_read_async\n"
-            << "  host|device– destination tier the ranges are read into\n"
-            << "  num_rows   – rows to read (0 = all)\n"
-            << "  n_threads  – reader threads / REST reactors (default 2)\n"
-            << "\n"
-            << "credentials/region/endpoint via the AWS environment: AWS_ACCESS_KEY_ID,\n"
-            << "AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION, AWS_ENDPOINT_URL\n";
+  std::cerr
+    << "usage: " << prog
+    << " <bucket> <prefix> <rest|kvikio> <host|device> <num_rows> [n_threads] [key=value ...]\n"
+    << "  bucket     – S3 bucket name (no scheme)\n"
+    << "  prefix     – key prefix to list ('-' for the whole bucket); only\n"
+    << "               keys ending in .parquet are read\n"
+    << "  rest       – native REST reactor (host=vector-io, device=host->device)\n"
+    << "  kvikio     – kvikIO RemoteHandle per-range host_read/device_read_async\n"
+    << "  host|device– destination tier the ranges are read into\n"
+    << "  num_rows   – rows to read (0 = all)\n"
+    << "  n_threads  – reader threads / REST reactors (default 2)\n"
+    << "\n"
+    << "REST config overrides (rest only; key=value, any order after num_rows):\n"
+    << "  n_threads=<N>           reader threads / REST reactors\n"
+    << "  max_connections=<N>     max concurrent in-flight easy handles per reactor (def 16)\n"
+    << "  chunk_size=<bytes>      target max bytes per ranged GET (def 8388608)\n"
+    << "  max_n_chunks=<N>        max buffers fused into one scatter GET (def 16)\n"
+    << "  max_read_split=<N>      parallel GETs a contiguous host read splits into (def 16)\n"
+    << "\n"
+    << "credentials/region/endpoint via the AWS environment: AWS_ACCESS_KEY_ID,\n"
+    << "AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION, AWS_ENDPOINT_URL\n";
+}
+
+// Apply a "key=value" REST config override.  n_threads lives outside the
+// rest::config, so it is threaded through separately.  Returns false for an
+// unknown key so the caller can report it and exit.
+static bool apply_override(std::string const& key,
+                           std::string const& val,
+                           cucascade::io::rest::config& cfg,
+                           size_t& n_threads)
+{
+  auto ull = [&val] { return static_cast<std::size_t>(std::stoull(val)); };
+  if (key == "n_threads") {
+    n_threads = ull();
+  } else if (key == "max_connections") {
+    cfg.max_connections = ull();
+  } else if (key == "chunk_size") {
+    cfg.chunk_size = ull();
+  } else if (key == "max_n_chunks") {
+    cfg.max_n_chunks = ull();
+  } else if (key == "max_read_split") {
+    cfg.max_read_split = ull();
+  } else {
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +341,7 @@ struct coalesced_range {
 
 int main(int argc, char** argv)
 {
-  if (argc < 6 || argc > 7) {
+  if (argc < 6) {
     usage(argv[0]);
     return 1;
   }
@@ -335,14 +368,30 @@ int main(int argc, char** argv)
   }
   size_t num_rows = static_cast<size_t>(num_rows_arg);  // 0 means all
 
+  // Everything after num_rows is either a bare positional n_threads (kept for
+  // backward compatibility) or a "key=value" REST config override, any order.
   size_t n_threads = 2;
-  if (argc == 7) {
-    long long n_threads_arg = std::stoll(argv[6]);
-    if (n_threads_arg <= 0) {
-      std::cerr << "n_threads must be > 0\n";
-      return 1;
+  cucascade::io::rest::config rest_cfg;
+  try {
+    for (int i = 6; i < argc; ++i) {
+      std::string const tok = argv[i];
+      auto const eq         = tok.find('=');
+      if (eq == std::string::npos) {
+        long long const v = std::stoll(tok);
+        if (v <= 0) {
+          std::cerr << "n_threads must be > 0\n";
+          return 1;
+        }
+        n_threads = static_cast<size_t>(v);
+      } else if (!apply_override(tok.substr(0, eq), tok.substr(eq + 1), rest_cfg, n_threads)) {
+        std::cerr << "unknown config key: " << tok.substr(0, eq) << "\n";
+        usage(argv[0]);
+        return 1;
+      }
     }
-    n_threads = static_cast<size_t>(n_threads_arg);
+  } catch (std::exception const& e) {
+    std::cerr << "bad argument value: " << e.what() << "\n";
+    return 1;
   }
 
   aws_api api;
@@ -383,12 +432,16 @@ int main(int argc, char** argv)
   // -- Backend / staging setup (untimed) --------------------------------------
 
   // Host staging pool for the REST reactor's bounce slots (rest path only, but
-  // cheap to keep unconditional).
-  constexpr uint32_t POOL_MAX_SLABS = 20;
+  // cheap to keep unconditional).  device_read_async draws one 1 MiB bounce
+  // block per in-flight connection, so the pool must cover the worst case of
+  // n_threads (reactors) * max_connections concurrent GETs, else it OOMs.
   constexpr size_t CHUNKS_PER_SLAB =
     cucascade::memory::fixed_size_host_memory_resource::default_pool_size;
-  constexpr size_t POOL_CAPACITY =
-    static_cast<size_t>(POOL_MAX_SLABS) * CHUNKS_PER_SLAB * (1 << 20);
+  size_t const default_blocks = 20 * CHUNKS_PER_SLAB;
+  size_t const needed_blocks  = n_threads * rest_cfg.max_connections + CHUNKS_PER_SLAB;
+  size_t const pool_blocks    = std::max(default_blocks, needed_blocks);
+  size_t const n_slabs        = (pool_blocks + CHUNKS_PER_SLAB - 1) / CHUNKS_PER_SLAB;
+  size_t const POOL_CAPACITY  = n_slabs * CHUNKS_PER_SLAB * (1 << 20);
 
   cucascade::memory::numa_region_pinned_host_memory_resource upstream(0, /*make_portable=*/true);
   cucascade::memory::fixed_size_host_memory_resource host_mr(0,                // device_id
@@ -406,10 +459,14 @@ int main(int argc, char** argv)
   std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
 
   if (backend == Backend::rest) {
-    cucascade::io::rest::config rest_cfg;
     rest_cfg.bounce_block_size = host_mr.get_block_size();
-    auto authorizer            = std::make_shared<awssdk_presigned_authorizer>(s3_client);
-    auto rest_ctx              = std::make_shared<cucascade::io::rest::rest_reactor::reactor_context>(
+    std::cout << "REST   : n_reactors=" << n_threads
+              << "  max_connections=" << rest_cfg.max_connections
+              << "  chunk_size=" << rest_cfg.chunk_size
+              << "  max_n_chunks=" << rest_cfg.max_n_chunks
+              << "  max_read_split=" << rest_cfg.max_read_split << "\n";
+    auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
+    auto rest_ctx   = std::make_shared<cucascade::io::rest::rest_reactor::reactor_context>(
       std::move(rest_cfg), std::move(authorizer), &host_mr);
     io_ctx = std::make_shared<cucascade::io::rest::rest_ioctx>(n_threads, std::move(rest_ctx));
     io_ctx->start();
@@ -440,7 +497,7 @@ int main(int argc, char** argv)
   // num_rows budget is consumed in object order.
   std::vector<coalesced_range> ranges;
   size_t total_range_bytes = 0;
-  int64_t accumulated_rows  = 0;
+  int64_t accumulated_rows = 0;
 
   for (size_t obj_idx = 0; obj_idx < keys.size(); ++obj_idx) {
     std::vector<uint8_t> footer_buf;
@@ -493,8 +550,8 @@ int main(int argc, char** argv)
     }
 
     for (auto const& br : coalesced) {
-      ranges.push_back(coalesced_range{
-        obj_idx, static_cast<size_t>(br.offset()), static_cast<size_t>(br.size())});
+      ranges.push_back(
+        coalesced_range{obj_idx, static_cast<size_t>(br.offset()), static_cast<size_t>(br.size())});
       total_range_bytes += static_cast<size_t>(br.size());
     }
   }
@@ -509,13 +566,14 @@ int main(int argc, char** argv)
             << " MiB total\n\n";
 
   // Per-range destination buffers (untimed).  host → pinned; device → rmm.
-  // The rest device path also needs a per-range pinned staging buffer, since
-  // the REST reactor has no direct-to-device read (it stages host->device).
+  // Both device paths (REST reactor-staged device_read_async and kvikIO
+  // device_read_async) manage their own host bounce slots internally, so no
+  // caller-supplied staging buffer is needed.
   rmm::cuda_stream alloc_stream;
   std::vector<uint8_t*> dsts(ranges.size(), nullptr);
-  std::vector<void*> host_bufs;              // owned pinned allocations
+  std::vector<void*> host_bufs;              // owned pinned allocations (host dest only)
   std::vector<rmm::device_buffer> dev_bufs;  // owned device allocations
-  bool const need_stage = (dest == Dest::device && backend == Backend::rest);
+  bool const need_stage = false;
 
   if (dest == Dest::host) {
     host_bufs.reserve(ranges.size());
@@ -575,8 +633,7 @@ int main(int argc, char** argv)
               seg_sets.emplace_back();
               cur_obj = r.obj_idx;
             }
-            seg_sets.back().push_back(
-              cucascade::io::io_object_segment{r.offset, r.size, dsts[i]});
+            seg_sets.back().push_back(cucascade::io::io_object_segment{r.offset, r.size, dsts[i]});
           }
           size_t set = 0;
           cur_obj    = SIZE_MAX;
@@ -591,24 +648,15 @@ int main(int argc, char** argv)
           for (auto& f : futs)
             std::move(f).get();
         } else if (backend == Backend::rest && dest == Dest::device) {
-          // REST has no direct device read: stage each range host->device via
-          // host_to_device_read_async_io, one segment per range.
-          std::vector<cucascade::io::io_object_segment> segs;
-          segs.reserve(hi - lo);
-          for (size_t i = lo; i < hi; ++i)
-            segs.push_back(cucascade::io::io_object_segment{
-              ranges[i].offset, ranges[i].size, static_cast<uint8_t*>(host_bufs[i])});
+          // Reactor-staged device read: one device_read_async per range (the
+          // reactor manages its own pinned bounce slots).  Mirrors kvikIO's
+          // per-range device_read_async for an apples-to-apples comparison.
           std::vector<cucascade::exec::semi_future<size_t>> futs;
           futs.reserve(hi - lo);
           for (size_t i = lo; i < hi; ++i) {
             auto const& r = ranges[i];
-            futs.push_back(io_ctx->host_to_device_read_async_io(
-              *io_objects[r.obj_idx],
-              std::span<cucascade::io::io_object_segment>(&segs[i - lo], 1),
-              r.offset,
-              r.size,
-              dsts[i],
-              stream.view()));
+            futs.push_back(io_ctx->device_read_async(
+              *io_objects[r.obj_idx], r.offset, r.size, dsts[i], stream.view()));
           }
           for (auto& f : futs)
             std::move(f).get();
