@@ -252,7 +252,13 @@ cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_reso
   int device_id, size_t capacity)
 {
   rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{device_id});
-  return {rmm::mr::cuda_async_memory_resource(capacity)};
+  rmm::mr::cuda_async_memory_resource mr(capacity);
+  // Expose the pool as the device's current mem pool so the handle survives the
+  // type-erasure below; RMM still allocates from its own explicit pool regardless.
+  if (cudaDeviceSetMemPool(device_id, mr.pool_handle()) != cudaSuccess) {
+    (void)cudaGetLastError();  // best effort
+  }
+  return {std::move(mr)};
 }
 
 cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>

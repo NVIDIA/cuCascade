@@ -115,6 +115,13 @@ memory_space::memory_space(const gpu_memory_space_config& config)
 
   if (config.mr_factory_fn) {
     _allocator = config.mr_factory_fn(config.device_id, config.memory_capacity);
+    // The factory type-erases its resource, losing the pool handle; recover it from
+    // the device's current mem pool so pool-aware OOM policies can inspect/trim it.
+    rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
+    if (cudaDeviceGetMemPool(&pool_handle, config.device_id) != cudaSuccess) {
+      pool_handle = nullptr;
+      (void)cudaGetLastError();
+    }
   } else {
     rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
     rmm::mr::cuda_async_memory_resource concrete_mr(config.memory_capacity);
