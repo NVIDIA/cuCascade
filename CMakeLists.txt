@@ -69,13 +69,25 @@ set(CUCASCADE_ABSEIL_INVOCABLE_TARGET
       "abseil any_invocable CMake target to link (default: absl::any_invocable)"
 )
 
-# Existing moodycamel concurrentqueue target to link (e.g. sirius's
-# duckdb_moodycamel). If empty, cameron314/concurrentqueue is fetched.
+# How to obtain moodycamel's concurrentqueue headers. Resolution order: 1.
+# CUCASCADE_MOODYCAMEL_TARGET  - link an existing CMake target that carries the
+# include dirs (e.g. a host-provided interface target). 2.
+# CUCASCADE_MOODYCAMEL_INCLUDE_DIR - a directory already holding
+# blockingconcurrentqueue.h / concurrentqueue.h (e.g. sirius's
+# duckdb/third_party/concurrentqueue). Nothing is fetched. 3. neither set -
+# fetch cameron314/concurrentqueue.
 set(CUCASCADE_MOODYCAMEL_TARGET
     ""
     CACHE
       STRING
       "moodycamel concurrentqueue CMake target to link (default: fetch cameron314/concurrentqueue)"
+)
+
+set(CUCASCADE_MOODYCAMEL_INCLUDE_DIR
+    ""
+    CACHE
+      PATH
+      "Directory containing moodycamel concurrentqueue headers (skips fetching; ignored if CUCASCADE_MOODYCAMEL_TARGET is set)"
 )
 
 # C++ namespace of the moodycamel headers. duckdb's fork (used by sirius)
@@ -159,8 +171,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
                 cucascade_io_thirdparty)
 
     # moodycamel::ConcurrentQueue — header-only lock-free MPMC queues used by
-    # the reactors and the prefetching cache. Reuse a host-provided target if
-    # given, otherwise fetch cameron314's upstream.
+    # the reactors and the prefetching cache. Reuse a host-provided target or
+    # include dir if given, otherwise fetch cameron314's upstream.
     if(CUCASCADE_MOODYCAMEL_TARGET)
       message(
         STATUS
@@ -169,6 +181,14 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
       target_link_libraries(
         cucascade_io_thirdparty
         INTERFACE $<BUILD_INTERFACE:${CUCASCADE_MOODYCAMEL_TARGET}>)
+    elseif(CUCASCADE_MOODYCAMEL_INCLUDE_DIR)
+      message(
+        STATUS
+          "cucascade-io: using provided moodycamel include dir '${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}' (namespace ${CUCASCADE_MOODYCAMEL_NAMESPACE})"
+      )
+      target_include_directories(
+        cucascade_io_thirdparty
+        INTERFACE $<BUILD_INTERFACE:${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}>)
     else()
       include(FetchContent)
       FetchContent_Declare(
