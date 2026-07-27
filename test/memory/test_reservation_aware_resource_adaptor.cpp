@@ -113,6 +113,9 @@ TEST_CASE("OOM reports the viewed pool of a cuda_async_view_memory_resource upst
   CHECK(reported == view_mr.pool_handle());
 }
 
+// cuda_async_managed_memory_resource requires CUDA 13.0 or higher (stream-ordered
+// managed memory pools). Guarded at compile time so the CUDA 12 track skips it.
+#if CUDART_VERSION >= 13000
 TEST_CASE("OOM reports the default managed pool of a cuda_async_managed_memory_resource upstream",
           "[reservation_aware][oom][gpu]")
 {
@@ -124,6 +127,7 @@ TEST_CASE("OOM reports the default managed pool of a cuda_async_managed_memory_r
   CHECK(reported != nullptr);
   CHECK(reported == managed_mr.pool_handle());
 }
+#endif
 
 TEST_CASE("OOM reports a null pool for a non-pool upstream (cuda_memory_resource)",
           "[reservation_aware][oom][gpu]")
