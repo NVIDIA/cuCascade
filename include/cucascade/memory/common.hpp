@@ -73,43 +73,6 @@ using DeviceMemoryResourceFactoryFn =
   int device_id, std::size_t capacity);
 
 /**
- * @brief Backing-memory location for a pool produced by make_device_memory_resource_factory.
- */
-enum class hw_pin {
-  device,  ///< Pool is backed by device memory.
-  host     ///< Pool is backed by pinned, device-accessible host memory.
-};
-
-/**
- * @brief Optional CUDA memory-pool usage flags for make_device_memory_resource_factory.
- */
-enum class mr_usage {
-  none,          ///< No special usage.
-  hw_decompress  ///< Pool participates in hardware-accelerated decompression.
-};
-
-/**
- * @brief Build a fixed-configuration device-memory-resource factory.
- *
- * Produces a `DeviceMemoryResourceFactoryFn` that, when invoked with a device id
- * (and a per-call capacity), creates a `cudaMemPool_t` with the requested pinning
- * location and usage flags, applies the release threshold, and serves allocations
- * from it via `rmm::mr::cuda_async_view_memory_resource`. The pool is owned for the
- * lifetime of the returned resource (destroyed on last copy's destruction).
- *
- * @param capacity Default pool capacity in bytes; used when the factory is invoked
- * with a per-call capacity of 0, and (when @p release_threshold is 0) as the pool's
- * release threshold.
- * @param release_threshold Bytes the pool keeps reserved after frees
- * (`cudaMemPoolAttrReleaseThreshold`). 0 defaults to the effective capacity.
- * @param pin Backing-memory location (host-pinned vs device).
- * @param usage Optional pool usage flags (e.g. hardware decompression).
- * @return A factory callable of type `DeviceMemoryResourceFactoryFn`.
- */
-[[nodiscard]] DeviceMemoryResourceFactoryFn make_device_memory_resource_factory(
-  std::size_t capacity, std::size_t release_threshold, hw_pin pin, mr_usage usage);
-
-/**
  * @brief Grant cross-device peer ReadWrite access on a cudaMallocAsync pool.
  *
  * cudaMallocAsync pools require explicit `cudaMemPoolSetAccess` for cross-device peer copy

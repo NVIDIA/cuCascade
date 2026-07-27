@@ -5,7 +5,6 @@
 
 #pragma once
 
-#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,8 +25,6 @@ struct gpu_topology_info {
   std::vector<int> memory_binding;           ///< NUMA nodes for memory binding.
   std::vector<std::string> network_devices;  ///< Network devices (NICs) optimal for this GPU.
   bool hw_decompression_available{false};    ///< Hardware-accelerated decompression engine present.
-  std::size_t hw_decompression_max_chunk{0};  ///< Max bytes accepted by a single hardware
-                                              ///< decompress op (0 if unavailable/unknown).
 };
 
 /**

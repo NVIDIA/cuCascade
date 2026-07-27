@@ -5,7 +5,8 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
-#include <cuda.h>
+#include <rmm/cuda_device.hpp>
+#include <rmm/detail/runtime_capabilities.hpp>
 
 #include <dlfcn.h>
 #include <ifaddrs.h>
@@ -60,46 +61,24 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
 }
 
 /**
- * @brief Query hardware-accelerated decompression support for a CUDA device.
+ * @brief Query whether a CUDA device supports hardware-accelerated decompression.
  *
- * Uses the CUDA driver API device attributes (no runtime-API enum exists in
- * CUDA 13.x). A nonzero algorithm mask means the device exposes the hardware
- * decompression engine; the maximum-length attribute reports the largest single
- * decompress operation the engine accepts. Both queries are best-effort: on
- * older drivers/hardware the attributes are simply reported as unsupported and
- * the outputs are left at their "unavailable" defaults.
+ * Delegates to `rmm::detail::hwdecompress::is_supported()`, which checks the CUDA
+ * driver version. RMM's capability queries are scoped to the current device, so the
+ * call is wrapped in an `rmm::cuda_set_device_raii`. Best-effort: any failure while
+ * setting the device or probing yields false.
  *
  * @param cuda_ordinal CUDA device ordinal (matches the runtime device index used
  * elsewhere in discovery under the same CUDA_VISIBLE_DEVICES ordering).
- * @param available Set to true iff the decompression engine is available.
- * @param max_chunk Set to the max bytes per single decompress op (0 if N/A).
+ * @return true iff the hardware decompression engine is available.
  */
-void query_hw_decompression(unsigned int cuda_ordinal, bool& available, std::size_t& max_chunk)
+bool query_hw_decompression(unsigned int cuda_ordinal)
 {
-  available = false;
-  max_chunk = 0;
-
-  // cuInit is idempotent; the driver may already be initialized by the runtime.
-  // Guarded by a thread-safe function-local static so we only probe once.
-  static bool const driver_ok = (cuInit(0) == CUDA_SUCCESS);
-  if (!driver_ok) { return; }
-
-  CUdevice dev{};
-  if (cuDeviceGet(&dev, static_cast<int>(cuda_ordinal)) != CUDA_SUCCESS) { return; }
-
-  int algorithm_mask = 0;
-  if (cuDeviceGetAttribute(
-        &algorithm_mask, CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK, dev) != CUDA_SUCCESS) {
-    return;
-  }
-  if (algorithm_mask == CU_MEM_DECOMPRESS_UNSUPPORTED) { return; }
-
-  available   = true;
-  int max_len = 0;
-  if (cuDeviceGetAttribute(&max_len, CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_MAXIMUM_LENGTH, dev) ==
-        CUDA_SUCCESS &&
-      max_len > 0) {
-    max_chunk = static_cast<std::size_t>(max_len);
+  try {
+    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{static_cast<int>(cuda_ordinal)}};
+    return rmm::detail::hwdecompress::is_supported();
+  } catch (...) {
+    return false;
   }
 }
 
@@ -928,9 +907,9 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
   for (size_t visible_idx = 0; visible_idx < visible_indices.size(); ++visible_idx) {
     size_t nvml_idx = visible_indices[visible_idx];
     if (nvml_idx >= nvml_gpus.size()) { continue; }
-    auto gpu = nvml_gpus[nvml_idx];
-    gpu.id   = static_cast<unsigned int>(visible_idx);
-    query_hw_decompression(gpu.id, gpu.hw_decompression_available, gpu.hw_decompression_max_chunk);
+    auto gpu                       = nvml_gpus[nvml_idx];
+    gpu.id                         = static_cast<unsigned int>(visible_idx);
+    gpu.hw_decompression_available = query_hw_decompression(gpu.id);
     topology.gpus.push_back(std::move(gpu));
   }
 

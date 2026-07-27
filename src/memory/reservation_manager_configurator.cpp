@@ -164,8 +164,7 @@ builder_reference& reservation_manager_configurator::set_gpu_memory_resource_fac
   DeviceMemoryResourceFactoryFn mr_fn)
 {
   assert(mr_fn && "GPU memory resource factory cannot be nullptr");
-  _gpu_mr_fn          = std::move(mr_fn);
-  _gpu_mr_fn_user_set = true;
+  _gpu_mr_fn = std::move(mr_fn);
   return *this;
 }
 
@@ -207,29 +206,6 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
   auto host_infos               = extract_host_ids(gpus_info, topology);
   bool const make_host_portable = _host_memory_portability.value_or(gpus_info.size() > 1);
 
-  // If the caller did not install an explicit GPU factory and every selected GPU
-  // exposes the hardware decompression engine, override the GPU memory resource
-  // with a cuda_async_view_memory_resource over a pinned pool flagged for
-  // hardware-accelerated decompression.
-  auto all_gpus_support_hw_decompress = [&]() -> bool {
-    if (_gpu_mr_fn_user_set || gpus_info.empty()) { return false; }
-    for (const auto& info : gpus_info) {
-      auto it = std::find_if(topology.gpus.begin(), topology.gpus.end(), [&](const auto& gpu) {
-        return static_cast<int>(gpu.id) == info.hw_id;
-      });
-      if (it == topology.gpus.end() || !it->hw_decompression_available) { return false; }
-    }
-    return true;
-  };
-
-  DeviceMemoryResourceFactoryFn gpu_mr_fn = _gpu_mr_fn;
-  if (all_gpus_support_hw_decompress()) {
-    // capacity/release_threshold left at 0 so the per-space memory_capacity flows
-    // through at call time and doubles as the pool release threshold.
-    gpu_mr_fn = make_device_memory_resource_factory(
-      /*capacity=*/0, /*release_threshold=*/0, hw_pin::host, mr_usage::hw_decompress);
-  }
-
   std::vector<memory_space_config> configs;
   for (auto& info : gpus_info) {
     gpu_memory_space_config config;
@@ -237,8 +213,8 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
     config.memory_capacity = _gpu_capacity.get_capacity(info.gpu_capacity);
     config.mr_factory_fn =
       (info.space_id == info.hw_id)
-        ? gpu_mr_fn
-        : [current_mr_fn = gpu_mr_fn, hw_id = info.hw_id](
+        ? _gpu_mr_fn
+        : [current_mr_fn = _gpu_mr_fn, hw_id = info.hw_id](
             int, size_t capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
       return current_mr_fn(hw_id, capacity);
     };

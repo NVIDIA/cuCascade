@@ -23,7 +23,11 @@
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/cuda_async_managed_memory_resource.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
 
 #include <atomic>
@@ -145,6 +149,26 @@ struct ptds_allocation_tracker : public impl_type::allocation_tracker_iface {
   }
 };
 
+// Recovers the CUDA memory pool backing an upstream resource, for accurate OOM
+// diagnostics. cuda::mr::resource_cast does an exact-type downcast of the wrapped
+// concrete resource (returning nullptr on mismatch), so we probe the RMM resources
+// that own a pool and expose pool_handle(); any other upstream (e.g. a plain
+// cudaMalloc-backed resource) yields a null handle.
+[[nodiscard]] cudaMemPool_t extract_pool_handle(rmm::device_async_resource_ref upstream) noexcept
+{
+  if (auto* mr = ::cuda::mr::resource_cast<rmm::mr::cuda_async_memory_resource>(&upstream)) {
+    return mr->pool_handle();
+  }
+  if (auto* mr = ::cuda::mr::resource_cast<rmm::mr::cuda_async_view_memory_resource>(&upstream)) {
+    return mr->pool_handle();
+  }
+  if (auto* mr =
+        ::cuda::mr::resource_cast<rmm::mr::cuda_async_managed_memory_resource>(&upstream)) {
+    return mr->pool_handle();
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 stream_ordered_tracker_state::stream_ordered_tracker_state(
@@ -197,7 +221,7 @@ impl_type::reservation_aware_resource_adaptor_impl(
   cudaMemPool_t pool_handle)
   : _space_id(space_id),
     _upstream(std::move(upstream)),
-    _pool_handle(pool_handle),
+    _pool_handle(pool_handle != nullptr ? pool_handle : extract_pool_handle(_upstream)),
     _memory_limit(capacity),
     _capacity(capacity),
     _allocation_tracker([&]() -> std::unique_ptr<allocation_tracker_iface> {
@@ -226,7 +250,7 @@ impl_type::reservation_aware_resource_adaptor_impl(
   cudaMemPool_t pool_handle)
   : _space_id(space_id),
     _upstream(std::move(upstream)),
-    _pool_handle(pool_handle),
+    _pool_handle(pool_handle != nullptr ? pool_handle : extract_pool_handle(_upstream)),
     _memory_limit(memory_limit),
     _capacity(capacity),
     _allocation_tracker([&]() -> std::unique_ptr<allocation_tracker_iface> {

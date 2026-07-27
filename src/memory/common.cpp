@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/null_device_memory_resource.hpp>
@@ -23,12 +22,8 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
-#include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
-#include <cstdint>
-#include <memory>
 #include <mutex>
-#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -258,124 +253,6 @@ cuda::mr::any_resource<cuda::mr::device_accessible> make_default_gpu_memory_reso
 {
   rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{device_id});
   return {rmm::mr::cuda_async_memory_resource(capacity)};
-}
-
-namespace {
-
-// Owns a cudaMemPool_t and serves allocations from it through an
-// rmm::mr::cuda_async_view_memory_resource. The pool is held via a shared_ptr so
-// the wrapper stays copyable (a requirement for cuda::mr::any_resource) while
-// still destroying the pool exactly once, when the last copy goes away.
-class owning_async_pool_memory_resource {
- public:
-  explicit owning_async_pool_memory_resource(cudaMemPool_t pool)
-    : _pool(pool,
-            [](cudaMemPool_t handle) {
-              if (handle != nullptr) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaMemPoolDestroy(handle)); }
-            }),
-      _view(pool)
-  {
-  }
-
-  void* allocate(cuda::stream_ref stream,
-                 std::size_t bytes,
-                 std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
-  {
-    return _view.allocate(stream, bytes, alignment);
-  }
-
-  void deallocate(cuda::stream_ref stream,
-                  void* ptr,
-                  std::size_t bytes,
-                  std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept
-  {
-    _view.deallocate(stream, ptr, bytes, alignment);
-  }
-
-  void* allocate_sync(std::size_t bytes, std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
-  {
-    return _view.allocate_sync(bytes, alignment);
-  }
-
-  void deallocate_sync(void* ptr,
-                       std::size_t bytes,
-                       std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept
-  {
-    _view.deallocate_sync(ptr, bytes, alignment);
-  }
-
-  [[nodiscard]] bool operator==(owning_async_pool_memory_resource const& other) const noexcept
-  {
-    return _view == other._view;
-  }
-
-  [[nodiscard]] bool operator!=(owning_async_pool_memory_resource const& other) const noexcept
-  {
-    return _view != other._view;
-  }
-
-  friend void get_property(owning_async_pool_memory_resource const&,
-                           cuda::mr::device_accessible) noexcept
-  {
-  }
-
-  [[nodiscard]] cudaMemPool_t pool_handle() const noexcept { return _view.pool_handle(); }
-
- private:
-  std::shared_ptr<std::remove_pointer_t<cudaMemPool_t>> _pool;
-  rmm::mr::cuda_async_view_memory_resource _view;
-};
-
-static_assert(
-  cuda::mr::resource_with<owning_async_pool_memory_resource, cuda::mr::device_accessible>);
-
-// Create a cudaMemPool with the requested pinning location and usage flags.
-cudaMemPool_t create_configured_mem_pool(int device_id, hw_pin pin, mr_usage usage)
-{
-  cudaMemPoolProps props{};
-  props.allocType   = cudaMemAllocationTypePinned;
-  props.handleTypes = cudaMemHandleTypeNone;
-  if (pin == hw_pin::host) {
-    // Pinned host memory is device-accessible via UVA — suitable as staging for
-    // the hardware decompression engine.
-    props.location.type = cudaMemLocationTypeHost;
-    props.location.id   = device_id;
-  } else {
-    props.location.type = cudaMemLocationTypeDevice;
-    props.location.id   = device_id;
-  }
-  if (usage == mr_usage::hw_decompress) { props.usage = cudaMemPoolCreateUsageHwDecompress; }
-
-  cudaMemPool_t pool{nullptr};
-  CUCASCADE_CUDA_TRY(cudaMemPoolCreate(&pool, &props));
-  return pool;
-}
-
-}  // namespace
-
-DeviceMemoryResourceFactoryFn make_device_memory_resource_factory(std::size_t capacity,
-                                                                  std::size_t release_threshold,
-                                                                  hw_pin pin,
-                                                                  mr_usage usage)
-{
-  return [capacity, release_threshold, pin, usage](
-           int device_id,
-           std::size_t call_capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
-    rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{device_id});
-
-    std::size_t const effective_capacity = call_capacity != 0 ? call_capacity : capacity;
-
-    // Transfer ownership of the pool into the wrapper immediately so that a
-    // failure while setting attributes still destroys the pool.
-    owning_async_pool_memory_resource resource{create_configured_mem_pool(device_id, pin, usage)};
-
-    std::uint64_t threshold =
-      release_threshold != 0 ? release_threshold : static_cast<std::uint64_t>(effective_capacity);
-    CUCASCADE_CUDA_TRY(
-      cudaMemPoolSetAttribute(resource.pool_handle(), cudaMemPoolAttrReleaseThreshold, &threshold));
-
-    return cuda::mr::any_resource<cuda::mr::device_accessible>{std::move(resource)};
-  };
 }
 
 cuda::mr::any_resource<cuda::mr::device_accessible, cuda::mr::host_accessible>
