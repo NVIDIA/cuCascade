@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/io/cache/types.hpp>
+#include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/types.hpp>
@@ -26,8 +27,6 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-
-#include <blockingconcurrentqueue.h>
 
 #include <chrono>
 #include <cstddef>
@@ -237,7 +236,7 @@ class rest_reactor {
   file_descriptor _wakeup_fd;
 
   std::stop_source _stop_source;
-  moodycamel::BlockingConcurrentQueue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+  blocking_concurrent_queue<std::unique_ptr<rest_chunked_rx_request>> _requests;
   std::jthread _worker;
 };
 

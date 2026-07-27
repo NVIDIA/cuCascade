@@ -18,7 +18,7 @@
 
 #pragma once
 
-#include <cucascade/exec/unique_function.hpp>
+#include <cucascade/exec/invocable.hpp>
 #include <cucascade/log/logging.hpp>
 
 #include <algorithm>
@@ -120,7 +120,7 @@ class static_thread_pool {
   void work_loop()
   {
     while (!stop_requested_) {
-      unique_function<void()> func;
+      invocable<void()> func;
       {
         std::unique_lock<std::mutex> l(mu_);
         cv_.wait(l, [this] { return has_work_or_stopped(); });
@@ -135,7 +135,7 @@ class static_thread_pool {
 
   std::mutex mu_;
   std::condition_variable cv_;
-  std::queue<unique_function<void()>> queue_;
+  std::queue<invocable<void()>> queue_;
   std::atomic<bool> stop_requested_{false};
   std::vector<std::thread> threads_;
 };

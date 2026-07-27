@@ -40,6 +40,22 @@ if(cuCascade_io_FOUND AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
   find_dependency(OpenSSL REQUIRED)
 endif()
 
+# moodycamel (concurrentqueue) headers are not shipped with the install: the io
+# public headers include them via <cucascade/io/concurrent_queue.hpp>, so a
+# consumer must provide the same moodycamel this install was built against
+# (namespace @CUCASCADE_MOODYCAMEL_NAMESPACE@). Likewise, when the io library was
+# built with CUCASCADE_USE_ABSEIL_INVOCABLE, cucascade::exec::invocable resolves
+# to absl::AnyInvocable in the installed headers, so abseil must be available.
+# The exported targets do not force-link either (the build-tree links are
+# stripped); they only carry the matching compile definitions.
+set(cuCascade_USE_ABSEIL_INVOCABLE @CUCASCADE_USE_ABSEIL_INVOCABLE@)
+if(cuCascade_io_FOUND
+   AND cuCascade_USE_ABSEIL_INVOCABLE
+   AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
+        OR "cudf" IN_LIST cuCascade_FIND_COMPONENTS))
+  find_dependency(absl CONFIG)
+endif()
+
 # Include the targets file
 include("${CMAKE_CURRENT_LIST_DIR}/cuCascadeTargets.cmake")
 

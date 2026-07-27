@@ -46,6 +46,44 @@ option(
   "Build the S3 parquet benchmark (requires aws-sdk-cpp; NOT a cuCascade dependency)"
   OFF)
 
+# Swappable third-party backends for the io layer. The io code was ported from a
+# codebase with its own vendored dependencies. These knobs let an embedding host
+# (e.g. sirius) reuse the copies it already links instead of the
+# standalone-build defaults.
+
+# cucascade::exec::invocable backing: OFF -> in-tree move-only callable; ON ->
+# absl::AnyInvocable (reuses a host project's abseil).
+option(
+  CUCASCADE_USE_ABSEIL_INVOCABLE
+  "Back cucascade::exec::invocable with absl::AnyInvocable instead of the built-in implementation"
+  OFF)
+
+# Existing abseil any_invocable target to link when
+# CUCASCADE_USE_ABSEIL_INVOCABLE is ON. If empty, an already-defined
+# absl::any_invocable target is used when present, otherwise find_package(absl)
+# is invoked.
+set(CUCASCADE_ABSEIL_INVOCABLE_TARGET
+    ""
+    CACHE
+      STRING
+      "abseil any_invocable CMake target to link (default: absl::any_invocable)"
+)
+
+# Existing moodycamel concurrentqueue target to link (e.g. sirius's
+# duckdb_moodycamel). If empty, cameron314/concurrentqueue is fetched.
+set(CUCASCADE_MOODYCAMEL_TARGET
+    ""
+    CACHE
+      STRING
+      "moodycamel concurrentqueue CMake target to link (default: fetch cameron314/concurrentqueue)"
+)
+
+# C++ namespace of the moodycamel headers. duckdb's fork (used by sirius)
+# renames it to duckdb_moodycamel; upstream cameron314 uses moodycamel.
+set(CUCASCADE_MOODYCAMEL_NAMESPACE
+    "moodycamel"
+    CACHE STRING "C++ namespace of the moodycamel concurrentqueue headers")
+
 # The io core is cudf-free (the cudf::io::datasource bridge lives in the
 # cucascade-cudf bundle); it only requires a full (non-topology-only) build.
 if(CUCASCADE_BUILD_IO AND CUCASCADE_TOPOLOGY_ONLY)
@@ -108,14 +146,68 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
     find_package(OpenSSL REQUIRED)
 
+    # cucascade_io_thirdparty carries the swappable moodycamel + invocable
+    # (abseil) usage requirements from a single place; the io object library,
+    # its installable static/shared variants, and their in-tree consumers
+    # (cucascade-cudf, benchmarks) all inherit them by linking this target.
+    # External targets/include dirs are wrapped in $<BUILD_INTERFACE:...> so the
+    # exported package stays clean: an installed consumer supplies its own
+    # moodycamel/abseil (as before), while the propagated compile definitions
+    # keep the namespace/backend choice consistent across the boundary.
+    add_library(cucascade_io_thirdparty INTERFACE)
+    add_library(cuCascade::cucascade_io_thirdparty ALIAS
+                cucascade_io_thirdparty)
+
     # moodycamel::ConcurrentQueue — header-only lock-free MPMC queues used by
-    # the reactors and the prefetching cache.
-    include(FetchContent)
-    FetchContent_Declare(
-      concurrentqueue
-      GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
-      GIT_TAG v1.0.4)
-    FetchContent_MakeAvailable(concurrentqueue)
+    # the reactors and the prefetching cache. Reuse a host-provided target if
+    # given, otherwise fetch cameron314's upstream.
+    if(CUCASCADE_MOODYCAMEL_TARGET)
+      message(
+        STATUS
+          "cucascade-io: using provided moodycamel target '${CUCASCADE_MOODYCAMEL_TARGET}' (namespace ${CUCASCADE_MOODYCAMEL_NAMESPACE})"
+      )
+      target_link_libraries(
+        cucascade_io_thirdparty
+        INTERFACE $<BUILD_INTERFACE:${CUCASCADE_MOODYCAMEL_TARGET}>)
+    else()
+      include(FetchContent)
+      FetchContent_Declare(
+        concurrentqueue
+        GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+        GIT_TAG v1.0.4)
+      FetchContent_MakeAvailable(concurrentqueue)
+      target_include_directories(
+        cucascade_io_thirdparty
+        INTERFACE $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>)
+    endif()
+    target_compile_definitions(
+      cucascade_io_thirdparty
+      INTERFACE CUCASCADE_MOODYCAMEL_NAMESPACE=${CUCASCADE_MOODYCAMEL_NAMESPACE}
+    )
+
+    # cucascade::exec::invocable backend. When abseil is requested, reuse a
+    # provided target, else an already-defined absl::any_invocable, else
+    # find_package(absl). The compile definition is propagated to consumers so
+    # the header resolves to the same backend on both sides of the boundary.
+    if(CUCASCADE_USE_ABSEIL_INVOCABLE)
+      if(CUCASCADE_ABSEIL_INVOCABLE_TARGET)
+        set(_cucascade_absl_target ${CUCASCADE_ABSEIL_INVOCABLE_TARGET})
+      elseif(TARGET absl::any_invocable)
+        set(_cucascade_absl_target absl::any_invocable)
+      else()
+        find_package(absl CONFIG REQUIRED)
+        set(_cucascade_absl_target absl::any_invocable)
+      endif()
+      message(
+        STATUS
+          "cucascade::exec::invocable backed by absl::AnyInvocable (target '${_cucascade_absl_target}')"
+      )
+      target_link_libraries(
+        cucascade_io_thirdparty
+        INTERFACE $<BUILD_INTERFACE:${_cucascade_absl_target}>)
+      target_compile_definitions(cucascade_io_thirdparty
+                                 INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
+    endif()
   endif()
 
   # Find numa (provided by numactl-devel or libnuma-dev depending on the package
@@ -286,12 +378,11 @@ if(CUCASCADE_BUILD_IO)
   set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
                              OpenSSL::Crypto)
 
-  target_link_libraries(cucascade_io_objects PUBLIC cucascade_objects
-                                                    ${CUCASCADE_IO_LINK_LIBS})
-  target_include_directories(
-    cucascade_io_objects
-    PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS}
-           $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>)
+  target_link_libraries(
+    cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
+                                cucascade_io_thirdparty)
+  target_include_directories(cucascade_io_objects
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_io_objects PUBLIC cxx_std_20)
   target_compile_features(cucascade_io_objects PRIVATE cuda_std_20)
 
@@ -375,12 +466,11 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
                   $<TARGET_OBJECTS:cucascade_io_objects>)
       add_library(cuCascade::cucascade_io_static ALIAS cucascade_io_static)
 
-      target_include_directories(
-        cucascade_io_static
-        PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS}
-               $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>)
-      target_link_libraries(cucascade_io_static PUBLIC ${CUCASCADE_IO_LINK_LIBS}
-                                                       cucascade_static)
+      target_include_directories(cucascade_io_static
+                                 PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_link_libraries(
+        cucascade_io_static PUBLIC ${CUCASCADE_IO_LINK_LIBS} cucascade_static
+                                   cucascade_io_thirdparty)
       target_compile_features(cucascade_io_static PUBLIC cxx_std_20)
 
       set_target_properties(
@@ -449,12 +539,11 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
                   $<TARGET_OBJECTS:cucascade_io_objects>)
       add_library(cuCascade::cucascade_io_shared ALIAS cucascade_io_shared)
 
-      target_include_directories(
-        cucascade_io_shared
-        PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS}
-               $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>)
-      target_link_libraries(cucascade_io_shared PUBLIC ${CUCASCADE_IO_LINK_LIBS}
-                                                       cucascade_shared)
+      target_include_directories(cucascade_io_shared
+                                 PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_link_libraries(
+        cucascade_io_shared PUBLIC ${CUCASCADE_IO_LINK_LIBS} cucascade_shared
+                                   cucascade_io_thirdparty)
       target_compile_features(cucascade_io_shared PUBLIC cxx_std_20)
 
       set_target_properties(cucascade_io_shared PROPERTIES OUTPUT_NAME
@@ -557,6 +646,14 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
       list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_io_shared)
     endif()
   endif()
+endif()
+
+# The io libraries link the cucascade_io_thirdparty INTERFACE target PUBLIC, so
+# it must join the export set. Its build-tree-only include dirs / link libs are
+# stripped on export (they are wrapped in $<BUILD_INTERFACE:...>); only the
+# moodycamel-namespace / invocable-backend compile definitions carry over.
+if(CUCASCADE_BUILD_IO AND NOT CUCASCADE_TOPOLOGY_ONLY)
+  list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_io_thirdparty)
 endif()
 
 # Install library targets
