@@ -213,6 +213,10 @@ class reservation_manager_configurator {
   fraction_or_size _gpu_reservation{0.85};                              // uses 85% of capacity
   std::pair<double, double> downgrade_fractions_per_gpu_{0.85, 0.65};
   mutable DeviceMemoryResourceFactoryFn _gpu_mr_fn = make_default_gpu_memory_resource;
+  // Tracks whether the caller explicitly installed a GPU memory-resource factory.
+  // When false, build() may auto-select a hardware-decompression pool factory if
+  // every selected GPU supports the hardware decompression engine.
+  bool _gpu_mr_fn_user_set{false};
 
   std::size_t _host_capacity{static_cast<std::size_t>(4UL << 30)};  // 4GB
   bool _is_capacity_per_space{true};
