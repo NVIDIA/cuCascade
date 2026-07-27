@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from pylibcudf.io.datasource import Datasource
+
+
+class CuCascadeDatasource(Datasource):
+    def fadvise(self, ranges: list[tuple[int, int]], dev_id: int = -1) -> None: ...
+    def duplicate(self) -> CuCascadeDatasource: ...
+
+
+class UringEngine:
+    def __init__(
+        self,
+        n_reactors: int = 2,
+        pool_capacity: int = 2684354560,
+        block_size: int = 1048576,
+        use_odirect: bool = True,
+        numa_node: int = 0,
+    ) -> None: ...
+    def open(self, path: str) -> CuCascadeDatasource: ...
+
+
+class RestEngine:
+    def __init__(
+        self,
+        access_key_id: str = "",
+        secret_access_key: str = "",
+        session_token: str = "",
+        region: str = "us-east-1",
+        endpoint: str = "",
+        n_reactors: int = 4,
+        tls_verify: bool = True,
+        pool_capacity: int = 2684354560,
+        block_size: int = 1048576,
+    ) -> None: ...
+    def open(self, path: str) -> CuCascadeDatasource: ...
