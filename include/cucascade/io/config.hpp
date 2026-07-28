@@ -28,6 +28,33 @@
 namespace cucascade::io {
 
 /**
+ * @brief Storage caching behavior selected at the io_context level.
+ *
+ * A single knob for two coupled decisions — whether local reads bypass the OS
+ * page cache with O_DIRECT, and whether cucascade's prefetching cache is on:
+ *   - @c none     : O_DIRECT on,  prefetching cache off  (direct, uncached)
+ *   - @c os       : O_DIRECT off, prefetching cache off  (rely on the OS page cache)
+ *   - @c prefetch : O_DIRECT on,  prefetching cache on   (cucascade prefetching cache)
+ */
+enum class cache_level {
+  none,
+  os,
+  prefetch,
+};
+
+/// True when @p level reads through O_DIRECT (i.e. everything but @c os).
+[[nodiscard]] constexpr bool odirect_enabled(cache_level level) noexcept
+{
+  return level != cache_level::os;
+}
+
+/// True when @p level enables the prefetching cache (only @c prefetch).
+[[nodiscard]] constexpr bool prefetch_enabled(cache_level level) noexcept
+{
+  return level == cache_level::prefetch;
+}
+
+/**
  * @brief Top-level configuration for the cucascade::io datasource layer.
  *
  * Consumed by @c io_context_registry and the per-backend ioctx factories.
@@ -47,12 +74,15 @@ struct io_config {
   /// (each its own libcurl event loop + connection pool).
   std::size_t rest_n_reactors{2};
 
-  /// Enable the prefetching cache on the ioctx.  When false the cache is
-  /// constructed but unarmed (no background IO threads).
-  bool enable_prefetch_cache{false};
+  /// Storage caching behavior (O_DIRECT + prefetching cache).  Sources
+  /// @c local.use_odirect and whether the prefetching cache is enabled via
+  /// @c odirect_enabled() / @c prefetch_enabled().  Defaults to @c none
+  /// (O_DIRECT on, prefetching cache off).
+  cache_level caching{};
 
   /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
-  /// ring depth, etc.
+  /// ring depth, etc.  @c local.use_odirect is derived from @c cache_level
+  /// when the ioctx is built through the datasource factory.
   uring::config local{};
 
   /// REST (S3/object-store) reactor configuration — timeouts, TLS, chunking,

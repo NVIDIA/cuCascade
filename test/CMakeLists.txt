@@ -40,7 +40,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_io_worker.cpp
     # Exec tests
     exec/test_spin_lock.cpp
-    # IO cache tests
+    # IO tests
+    io/test_io_config.cpp
     io/test_prefetching_cache_chunking.cpp
     # Main test runner
     unittest.cpp)

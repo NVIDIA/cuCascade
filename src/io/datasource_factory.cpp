@@ -108,6 +108,9 @@ factory_type make_uring_ioctx_factory(
       // and the pinned bounce-staging resource itself.
       auto uring_cfg        = config.local;
       uring_cfg.bounce_size = host_mr->get_block_size();
+      // O_DIRECT is driven by the io_context-level cache_level, not set on the
+      // local reactor config directly.
+      uring_cfg.use_odirect = odirect_enabled(config.caching);
       auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(uring_cfg, host_mr);
       return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
