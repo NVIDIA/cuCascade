@@ -860,7 +860,9 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
 
     std::ignore = req->state->mark_loading();
 
-    auto token = _rate_limiter.acquire(segments.size());
+    // One unit per in-flight prefetch task (not per chunk): reserve on dispatch,
+    // release on completion when the token below is dropped in the continuation.
+    auto token = _rate_limiter.acquire(1);
 
     if (req->is_cancelled() || st.stop_requested()) {
       std::ranges::for_each(allocated_chunks,
