@@ -157,7 +157,7 @@ TEST_CASE("spin_lock basic acquire/release and try_lock", "[spin_lock][exec]")
   REQUIRE(lock.try_lock());        // acquired
   REQUIRE_FALSE(lock.try_lock());  // already held -> fails
   lock.unlock();
-  REQUIRE(lock.try_lock());        // free again
+  REQUIRE(lock.try_lock());  // free again
   lock.unlock();
 
   SECTION("spin_lock_guard (std::lock_guard alias) is RAII")

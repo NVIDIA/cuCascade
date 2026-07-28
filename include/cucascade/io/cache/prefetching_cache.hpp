@@ -183,7 +183,14 @@ class prefetching_cache {
     const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle);
 
   struct file_entry {
-    std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);
+    // @p desired_cache_from carries, in parallel with @p incoming, the signed
+    // page-aligned cache_from each incoming chunk offset should be populated
+    // with (see cached_chunk::cache_from / needed_cache_from).  On first
+    // creation of a chunk the value is stored directly; on an existing chunk it
+    // is merged in (merge_cache_from) when the chunk's state permits.
+    std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
+                                                     std::span<const int32_t> desired_cache_from,
+                                                     uint32_t ticker);
 
     std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                             std::size_t size,
