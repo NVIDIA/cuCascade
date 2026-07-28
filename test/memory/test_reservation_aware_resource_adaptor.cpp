@@ -42,7 +42,7 @@
 #include <cuda/stream_ref>
 #include <cuda_runtime_api.h>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <cstddef>
 

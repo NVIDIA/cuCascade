@@ -20,7 +20,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <algorithm>
 #include <cstddef>
