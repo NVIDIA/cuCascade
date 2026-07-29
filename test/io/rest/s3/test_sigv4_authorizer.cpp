@@ -283,7 +283,8 @@ TEST_CASE("ListObjectsV2 parser requires a token for a truncated page", "[s3][li
   CHECK_THROWS_WITH(
     cucascade::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult>)"),
-    Catch::Matchers::ContainsSubstring("without") && Catch::Matchers::ContainsSubstring("ContinuationToken"));
+    Catch::Matchers::ContainsSubstring("without") &&
+      Catch::Matchers::ContainsSubstring("ContinuationToken"));
 }
 
 TEST_CASE("ListObjectsV2 parser trims a valid IsTruncated value", "[s3][list_parser]")
@@ -316,7 +317,8 @@ TEST_CASE("ListObjectsV2 parser does not read a continuation token outside the r
   CHECK_THROWS_WITH(
     cucascade::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult><NextContinuationToken>outside</NextContinuationToken>)"),
-    Catch::Matchers::ContainsSubstring("without") && Catch::Matchers::ContainsSubstring("ContinuationToken"));
+    Catch::Matchers::ContainsSubstring("without") &&
+      Catch::Matchers::ContainsSubstring("ContinuationToken"));
 }
 
 TEST_CASE("ListObjectsV2 parser rejects a root close before the root open", "[s3][list_parser]")
