@@ -182,6 +182,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
         cucascade_io_thirdparty
         INTERFACE $<BUILD_INTERFACE:${CUCASCADE_MOODYCAMEL_TARGET}>)
     elseif(CUCASCADE_MOODYCAMEL_INCLUDE_DIR)
+      if(NOT EXISTS "${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}/concurrentqueue.h")
+        message(
+          FATAL_ERROR
+            "CUCASCADE_MOODYCAMEL_INCLUDE_DIR does not contain concurrentqueue.h: ${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}"
+        )
+      endif()
       message(
         STATUS
           "cucascade-io: using provided moodycamel include dir '${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}' (namespace ${CUCASCADE_MOODYCAMEL_NAMESPACE})"

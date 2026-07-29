@@ -38,6 +38,26 @@ if(cuCascade_io_FOUND AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
   pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
   pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
   find_dependency(OpenSSL REQUIRED)
+
+  # Best-effort check that the moodycamel headers the installed io headers
+  # include are reachable. They are not shipped (the consumer provides the same
+  # copy this install was built against, namespace @CUCASCADE_MOODYCAMEL_NAMESPACE@),
+  # so warn at configure time rather than letting it surface as an opaque
+  # "concurrentqueue.h: No such file" during compilation. This is a plain
+  # find_path over the default search paths, so a consumer supplying moodycamel
+  # only via a target's include dirs may still see this warning — hence a
+  # warning, not an error.
+  find_path(CUCASCADE_MOODYCAMEL_HEADER_DIR
+            NAMES concurrentqueue.h blockingconcurrentqueue.h)
+  if(NOT CUCASCADE_MOODYCAMEL_HEADER_DIR)
+    message(
+      WARNING
+        "cuCascade[io]: moodycamel concurrentqueue headers (concurrentqueue.h / "
+        "blockingconcurrentqueue.h, namespace @CUCASCADE_MOODYCAMEL_NAMESPACE@) were "
+        "not found on the default include search paths. The installed io headers "
+        "include them; add the directory containing them to the consuming target's "
+        "include path (they are not shipped with cuCascade).")
+  endif()
 endif()
 
 # moodycamel (concurrentqueue) headers are not shipped with the install: the io
@@ -53,7 +73,7 @@ if(cuCascade_io_FOUND
    AND cuCascade_USE_ABSEIL_INVOCABLE
    AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
         OR "cudf" IN_LIST cuCascade_FIND_COMPONENTS))
-  find_dependency(absl CONFIG)
+  find_dependency(absl REQUIRED CONFIG)
 endif()
 
 # Include the targets file
