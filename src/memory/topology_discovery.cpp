@@ -695,32 +695,93 @@ std::string get_hostname()
 }
 
 /**
- * @brief Count NUMA nodes on the system.
+ * @brief Read the total and free memory of a NUMA node.
  *
- * Counts subdirectories named "node*" under /sys/devices/system/node. Returns 0 if
- * the directory does not exist or cannot be iterated.
+ * Parses /sys/devices/system/node/node<id>/meminfo, whose lines have the form
+ * "Node 0 MemTotal:       263950224 kB". Values are reported in kB and converted
+ * to bytes. Missing entries are reported as 0.
  *
- * @return Number of NUMA nodes; 0 if unavailable.
+ * @param numa_path Path to the NUMA node directory.
+ * @param info NUMA node info to populate.
  */
-int count_numa_nodes()
+void read_numa_node_memory(fs::path const& numa_path, numa_topology_info& info)
 {
-  std::string numa_path = "/sys/devices/system/node";
-  int count             = 0;
+  std::ifstream meminfo(numa_path / "meminfo");
+  if (!meminfo.is_open()) { return; }
 
-  if (!fs::exists(numa_path)) { return 0; }
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    // Each line is "Node <id> <key>: <value> kB".
+    auto const colon = line.find(':');
+    if (colon == std::string::npos) { continue; }
+
+    std::size_t const key_end   = colon;
+    std::size_t const key_start = line.find_last_of(' ', key_end) + 1;
+    std::string const key       = line.substr(key_start, key_end - key_start);
+    if (key != "MemTotal" && key != "MemFree") { continue; }
+
+    std::size_t value_kb = 0;
+    try {
+      value_kb = std::stoull(line.substr(colon + 1));
+    } catch (...) {
+      continue;
+    }
+
+    if (key == "MemTotal") {
+      info.memory_capacity = value_kb * 1024;
+    } else {
+      info.free_memory = value_kb * 1024;
+    }
+  }
+}
+
+/**
+ * @brief Discover NUMA nodes and their memory capacities.
+ *
+ * Scans subdirectories named "node<id>" under /sys/devices/system/node and reads each
+ * node's memory capacity. Returns an empty vector if the directory does not exist or
+ * cannot be iterated.
+ *
+ * @return NUMA node information sorted by node id; empty if unavailable.
+ */
+std::vector<numa_topology_info> discover_numa_nodes()
+{
+  std::string const numa_path = "/sys/devices/system/node";
+  std::vector<numa_topology_info> nodes;
+
+  if (!fs::exists(numa_path)) { return nodes; }
 
   try {
     for (auto const& entry : fs::directory_iterator(numa_path)) {
-      std::string name = entry.path().filename().string();
-      if (name.starts_with("node")) {  // starts with "node"
-        count++;
+      std::string const name = entry.path().filename().string();
+      if (!name.starts_with("node")) { continue; }
+
+      std::string const id_str = name.substr(4);
+      if (id_str.empty() || !std::all_of(id_str.begin(), id_str.end(), [](unsigned char c) {
+            return std::isdigit(c);
+          })) {
+        continue;
       }
+
+      numa_topology_info info;
+      try {
+        info.id = std::stoi(id_str);
+      } catch (...) {
+        continue;
+      }
+      read_numa_node_memory(entry.path(), info);
+      nodes.push_back(info);
     }
   } catch (...) {
-    return 0;
+    return {};
   }
 
-  return count;
+  std::sort(
+    nodes.begin(), nodes.end(), [](numa_topology_info const& lhs, numa_topology_info const& rhs) {
+      return lhs.id < rhs.id;
+    });
+
+  return nodes;
 }
 
 nvmlReturn_t initialize_nvml_for_current_process()
@@ -780,7 +841,8 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 
   // Get system information
   topology.hostname            = get_hostname();
-  topology.num_numa_nodes      = count_numa_nodes();
+  topology.numa_nodes          = discover_numa_nodes();
+  topology.num_numa_nodes      = static_cast<int>(topology.numa_nodes.size());
   topology.num_gpus            = device_count;
   topology.num_network_devices = static_cast<int>(network_devices_with_topology.size());
 

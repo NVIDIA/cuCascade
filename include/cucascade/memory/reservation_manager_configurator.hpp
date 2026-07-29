@@ -120,6 +120,14 @@ class reservation_manager_configurator {
   /// @param bytes Memory capacity per NUMA node in bytes.
   builder_reference& set_per_host_capacity(std::size_t bytes);
 
+  /// @brief set the capacity of each host tier as a fraction of its NUMA node capacity
+  /// @param fraction Fraction of the NUMA node memory capacity to use, in (0.0, 1.0].
+  /// @note Requires NUMA capacities in the topology passed to `build()`; `build()` throws
+  ///       if the capacity of a NUMA node backing a host space is unknown.
+  /// @note The fraction applies per host space. With `use_host_per_gpu()` and several GPUs
+  ///       on the same NUMA node, each space gets that fraction of the shared node.
+  builder_reference& set_usage_limit_ratio_per_host(double fraction);
+
   /// \brief set reservation limit ratio per GPU
   /// @param fraction Fraction of GPU memory capacity to reserve.
   builder_reference& set_downgrade_fractions_per_host(double start, double end);
@@ -171,6 +179,7 @@ class reservation_manager_configurator {
   struct host_info {
     int space_id{-1};
     int numa_id{-1};
+    std::size_t numa_capacity{0};
   };
 
   std::vector<gpu_info> extract_gpu_ids(const system_topology_info& topology) const;
@@ -191,6 +200,16 @@ class reservation_manager_configurator {
         auto size = std::get<std::size_t>(_fraction_or_size_value);
         return static_cast<double>(size) / static_cast<double>(total_size);
       }
+    }
+
+    [[nodiscard]] bool holds_fraction() const
+    {
+      return std::holds_alternative<double>(_fraction_or_size_value);
+    }
+
+    [[nodiscard]] std::size_t get_size() const
+    {
+      return std::get<std::size_t>(_fraction_or_size_value);
     }
 
     [[nodiscard]] std::size_t get_capacity(std::size_t total_size) const
@@ -214,7 +233,7 @@ class reservation_manager_configurator {
   std::pair<double, double> downgrade_fractions_per_gpu_{0.85, 0.65};
   mutable DeviceMemoryResourceFactoryFn _gpu_mr_fn = make_default_gpu_memory_resource;
 
-  std::size_t _host_capacity{static_cast<std::size_t>(4UL << 30)};  // 4GB
+  fraction_or_size _host_capacity{static_cast<std::size_t>(4UL << 30)};  // 4GB
   bool _is_capacity_per_space{true};
   struct bind_host_to_gpu_id {};
   struct bind_cpu_to_gpu_numa {};

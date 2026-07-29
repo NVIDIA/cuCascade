@@ -206,6 +206,67 @@ TEST_CASE("Topology Discovery resolves GPU NUMA node on NUMA-aware hosts", "[hw_
   }
 }
 
+TEST_CASE("Topology Discovery reports NUMA node capacities", "[hw_topology]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto const& topology = discovery.get_topology();
+
+  // num_numa_nodes is derived from the discovered node list.
+  REQUIRE(topology.numa_nodes.size() == static_cast<size_t>(topology.num_numa_nodes));
+
+  if (topology.numa_nodes.empty()) {
+    SUCCEED("Skipped: host does not expose NUMA topology");
+    return;
+  }
+
+  size_t summed_capacity = 0;
+  int previous_id        = -1;
+  for (auto const& node : topology.numa_nodes) {
+    INFO("NUMA node " << node.id);
+    REQUIRE(node.id >= 0);
+    // Nodes are reported sorted by id and each id appears once.
+    REQUIRE(node.id > previous_id);
+    previous_id = node.id;
+
+    // /sys/devices/system/node/node<id>/meminfo always reports MemTotal and MemFree.
+    REQUIRE(node.memory_capacity > 0);
+    REQUIRE(node.free_memory <= node.memory_capacity);
+
+    REQUIRE(topology.get_numa_memory_capacity(node.id) == node.memory_capacity);
+    REQUIRE(topology.get_numa_free_memory(node.id) == node.free_memory);
+    summed_capacity += node.memory_capacity;
+  }
+
+  REQUIRE(topology.get_total_numa_memory_capacity() == summed_capacity);
+
+  // Unknown node ids resolve to 0 rather than throwing.
+  REQUIRE(topology.get_numa_memory_capacity(-1) == 0);
+  REQUIRE(topology.get_numa_memory_capacity(topology.numa_nodes.back().id + 1) == 0);
+  REQUIRE(topology.get_numa_free_memory(-1) == 0);
+}
+
+// Every GPU's NUMA node must be one of the discovered NUMA nodes with a known capacity,
+// so host memory spaces can be sized from it.
+TEST_CASE("Topology Discovery maps GPUs to NUMA nodes with known capacity", "[hw_topology]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto const& topology = discovery.get_topology();
+
+  if (topology.num_gpus == 0 || topology.numa_nodes.empty()) {
+    SUCCEED("Skipped: requires at least one GPU and NUMA node");
+    return;
+  }
+
+  for (auto const& gpu : topology.gpus) {
+    INFO("GPU " << gpu.id << " on NUMA node " << gpu.numa_node);
+    REQUIRE(topology.get_numa_memory_capacity(gpu.numa_node) > 0);
+  }
+}
+
 TEST_CASE("Topology Discovery rejects out-of-range CUDA_VISIBLE_DEVICES", "[hw_topology]")
 {
   ScopedEnvVar env("CUDA_VISIBLE_DEVICES", "99999999");

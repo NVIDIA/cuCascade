@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -51,6 +52,19 @@ struct storage_device_info {
 };
 
 /**
+ * @brief NUMA node memory information.
+ *
+ * Capacities are reported in bytes and are read from
+ * `/sys/devices/system/node/node<id>/meminfo`. They are 0 when the kernel does not
+ * expose the corresponding entry.
+ */
+struct numa_topology_info {
+  int id{-1};                      ///< NUMA node ID.
+  std::size_t memory_capacity{0};  ///< Total memory of the node in bytes (0 if unknown).
+  std::size_t free_memory{0};      ///< Currently free memory of the node in bytes (0 if unknown).
+};
+
+/**
  * @brief System topology information.
  */
 struct system_topology_info {
@@ -61,6 +75,51 @@ struct system_topology_info {
   std::vector<gpu_topology_info> gpus;               ///< GPU topology information.
   std::vector<network_device_info> network_devices;  ///< Network device information.
   std::vector<storage_device_info> storage_devices;  ///< Storage device information.
+  std::vector<numa_topology_info> numa_nodes;        ///< NUMA node information, sorted by id.
+
+  /**
+   * @brief Get the memory capacity of a NUMA node.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Capacity of the node in bytes; 0 if the node is unknown or its capacity
+   *         could not be determined.
+   */
+  [[nodiscard]] std::size_t get_numa_memory_capacity(int numa_id) const
+  {
+    for (auto const& node : numa_nodes) {
+      if (node.id == numa_id) { return node.memory_capacity; }
+    }
+    return 0;
+  }
+
+  /**
+   * @brief Get the free memory of a NUMA node.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Free memory of the node in bytes; 0 if the node is unknown or its free
+   *         memory could not be determined.
+   */
+  [[nodiscard]] std::size_t get_numa_free_memory(int numa_id) const
+  {
+    for (auto const& node : numa_nodes) {
+      if (node.id == numa_id) { return node.free_memory; }
+    }
+    return 0;
+  }
+
+  /**
+   * @brief Get the summed memory capacity of all discovered NUMA nodes.
+   *
+   * @return Total host memory capacity in bytes.
+   */
+  [[nodiscard]] std::size_t get_total_numa_memory_capacity() const
+  {
+    std::size_t total = 0;
+    for (auto const& node : numa_nodes) {
+      total += node.memory_capacity;
+    }
+    return total;
+  }
 };
 
 /**
