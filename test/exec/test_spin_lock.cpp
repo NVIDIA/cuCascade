@@ -29,7 +29,7 @@
 
 #include <cucascade/exec/spin_lock.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <atomic>
 #include <cstddef>
