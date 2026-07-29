@@ -161,6 +161,84 @@ TEST_CASE("Configurator reservation limit follows the fraction-derived host capa
   REQUIRE(hosts.front().reservation_limit() == reservation_bytes);
 }
 
+// Hosts whose GPU reports no NUMA affinity (numa_node == -1) have no discoverable capacity.
+// Absolute capacities must still be honored verbatim on such hosts.
+TEST_CASE("Configurator uses absolute host capacity when the NUMA node is unknown",
+          "[configurator]")
+{
+  system_topology_info topology;
+  if (!make_single_gpu_topology(topology, synthetic_numa_capacity)) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  // Emulate a GPU without NUMA affinity: no node backs the host space.
+  topology.gpus.front().numa_node = -1;
+  topology.numa_nodes.clear();
+  topology.num_numa_nodes = 0;
+
+  constexpr std::size_t requested = 2ull << 30;  // 2 GiB
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
+  builder.use_host_per_numa();
+  builder.set_per_host_capacity(requested);
+
+  auto const hosts = host_configs(builder.build(topology));
+
+  REQUIRE(hosts.size() == 1);
+  REQUIRE(hosts.front().numa_id == -1);
+  REQUIRE(hosts.front().memory_capacity == requested);
+}
+
+// The total-capacity split must also survive an unknown NUMA node.
+TEST_CASE("Configurator uses total host capacity when the NUMA node is unknown", "[configurator]")
+{
+  system_topology_info topology;
+  if (!make_single_gpu_topology(topology, synthetic_numa_capacity)) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  topology.gpus.front().numa_node = -1;
+  topology.numa_nodes.clear();
+  topology.num_numa_nodes = 0;
+
+  constexpr std::size_t requested = 8ull << 30;  // 8 GiB
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
+  builder.use_host_per_numa();
+  builder.set_total_host_capacity(requested);
+
+  auto const hosts = host_configs(builder.build(topology));
+
+  REQUIRE(hosts.size() == 1);
+  REQUIRE(hosts.front().memory_capacity == requested);
+}
+
+TEST_CASE(
+  "Configurator throws when a NUMA node has no discoverable capacity and a fraction is "
+  "requested",
+  "[configurator]")
+{
+  system_topology_info topology;
+  if (!make_single_gpu_topology(topology, synthetic_numa_capacity)) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  // GPU without NUMA affinity: the fraction has nothing to resolve against.
+  topology.gpus.front().numa_node = -1;
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
+  builder.use_host_per_numa();
+  builder.set_usage_limit_ratio_per_host(0.5);
+
+  REQUIRE_THROWS_AS(builder.build(topology), std::runtime_error);
+}
+
 TEST_CASE("Configurator throws when NUMA capacity is unknown and a fraction is requested",
           "[configurator]")
 {
@@ -209,6 +287,6 @@ TEST_CASE("Configurator resolves host capacity from discovered NUMA capacity", "
 
   REQUIRE(hosts.size() == 1);
   REQUIRE(hosts.front().memory_capacity > 0);
-  REQUIRE(hosts.front().memory_capacity == static_cast<std::size_t>(
-                                             static_cast<double>(numa_capacity) * 0.1));
+  REQUIRE(hosts.front().memory_capacity ==
+          static_cast<std::size_t>(static_cast<double>(numa_capacity) * 0.1));
 }
