@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#define CATCH_CONFIG_RUNNER
 
 #include <catch2/catch_all.hpp>
 

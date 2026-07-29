@@ -15,8 +15,6 @@
  * limitations under the License.
  */
 
-#define CATCH_CONFIG_RUNNER
-
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
