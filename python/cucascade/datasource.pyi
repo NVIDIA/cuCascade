@@ -6,9 +6,16 @@ from __future__ import annotations
 from pylibcudf.io.datasource import Datasource
 
 
+class ReadFuture:
+    def get(self) -> int: ...
+
+
 class CuCascadeDatasource(Datasource):
     def fadvise(self, ranges: list[tuple[int, int]], dev_id: int = -1) -> None: ...
     def duplicate(self) -> CuCascadeDatasource: ...
+    def read_ranges_async(
+        self, ranges: list[tuple[int, int]], buffer: memoryview
+    ) -> list[ReadFuture]: ...
 
 
 class UringEngine:

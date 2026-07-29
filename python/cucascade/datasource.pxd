@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from libc.stdint cimport int64_t
+from libc.stdint cimport int64_t, uint8_t
 from libcpp cimport bool as cpp_bool
+from libcpp.future cimport future
 from libcpp.memory cimport unique_ptr
 from libcpp.string cimport string
 from libcpp.vector cimport vector
@@ -21,6 +22,7 @@ cdef extern from "cucascade/cudf/datasource.hpp" namespace "cucascade::io" nogil
     cdef cppclass cc_datasource "cucascade::io::datasource"(cudf_datasource):
         unique_ptr[cc_datasource] duplicate() except +
         void fadvise(const vector[byte_range_info]& ranges, int dev_id) except +
+        future[size_t] host_read_async(size_t offset, size_t size, uint8_t* dst) except +
 
 
 cdef extern from "cucascade/cudf/uring_datasource_engine.hpp" namespace "cucascade::io" nogil:
