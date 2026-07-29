@@ -273,7 +273,7 @@ std::string suffix_range_header(size_t n) { return "Range: bytes=-" + std::to_st
 /// "bytes <first>-<last>/<total>" (the trimmed value captured by the header
 /// callback).  Returns nullopt for any value that does not start with a
 /// well-formed "bytes <first>-" so the caller can reject an unverifiable 206.
-std::optional<size_t> content_range_start(std::string const& cr)
+std::optional<size_t> content_range_start(std::string_view cr)
 {
   constexpr std::string_view kUnit = "bytes";
   std::string_view sv{cr};
@@ -387,7 +387,15 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
 
 }  // namespace
 
-std::optional<size_t> content_range_total(std::string const& cr)
+shared_byte_span make_shared_byte_span(std::vector<std::uint8_t> bytes)
+{
+  auto owner = std::make_shared<detail::byte_storage>(std::move(bytes));
+  // Aliasing constructor: shares `owner`'s control block (keeping the buffer
+  // alive) while the pointer itself refers to the span member inside it.
+  return shared_byte_span{owner, &owner->view};
+}
+
+std::optional<size_t> content_range_total(std::string_view cr)
 {
   constexpr std::string_view kUnit = "bytes";
   std::string_view sv{cr};
@@ -956,7 +964,7 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
       if (total && start && *start <= *total && sink.data.size() == *total - *start) {
         probe.object_size = *total;
         probe.window_lo   = *start;
-        probe.bytes       = std::make_shared<const std::vector<std::uint8_t>>(std::move(sink.data));
+        probe.bytes       = make_shared_byte_span(std::move(sink.data));
       }
       return probe;
     } else if (status == 200 || status == 416) {

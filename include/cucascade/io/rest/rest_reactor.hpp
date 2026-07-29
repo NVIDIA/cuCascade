@@ -46,7 +46,50 @@ namespace cucascade::io::rest {
 /// "bytes <first>-<last>/<total>".  Returns nullopt when the unit is not
 /// "bytes", the range is unsatisfied ("bytes */..."), or the total is unknown
 /// ("*") — i.e. any response the footer probe cannot trust.
-[[nodiscard]] std::optional<std::size_t> content_range_total(std::string const& content_range);
+[[nodiscard]] std::optional<std::size_t> content_range_total(std::string_view content_range);
+
+// ---------------------------------------------------------------------------
+// shared_byte_span
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// Owns a byte buffer plus a span over it.  Exists so @ref make_shared_byte_span
+/// can hand out a shared_ptr to the *span* (via the aliasing constructor) while
+/// the shared_ptr's control block keeps the *buffer* alive.  Never held
+/// directly by callers.
+struct byte_storage {
+  std::vector<std::uint8_t> bytes;
+  std::span<const std::uint8_t> view;
+
+  // `bytes` is declared first, so it is already initialised when `view` binds
+  // to it — the span never sees a moved-from buffer.
+  explicit byte_storage(std::vector<std::uint8_t> b) : bytes(std::move(b)), view(bytes) {}
+
+  // Non-copyable, non-movable: `view` points into `bytes`, so copying would
+  // deep-copy the buffer and leave the copy's span aimed at the original's
+  // allocation.  Only ever built in place by make_shared, so neither is needed.
+  byte_storage(byte_storage const&)            = delete;
+  byte_storage& operator=(byte_storage const&) = delete;
+  byte_storage(byte_storage&&)                 = delete;
+  byte_storage& operator=(byte_storage&&)      = delete;
+};
+
+}  // namespace detail
+
+/// A shared, immutable view over a byte buffer.
+///
+/// Deliberately a span rather than a @c vector: consumers only ever read
+/// through it (@c data / @c size / @c subspan), so exposing the container type —
+/// and with it its allocator, growth policy and mutation API — would leak an
+/// implementation detail into the interface.  Ownership still rides along: the
+/// shared_ptr is built with the aliasing constructor, so the control block
+/// retains the underlying buffer while the pointer itself refers to the span.
+using shared_byte_span = std::shared_ptr<const std::span<const std::uint8_t>>;
+
+/// Take ownership of @p bytes and return a @ref shared_byte_span over it.
+/// A single allocation: the buffer and its span live in one control block.
+[[nodiscard]] shared_byte_span make_shared_byte_span(std::vector<std::uint8_t> bytes);
 
 // ---------------------------------------------------------------------------
 // footer_probe
@@ -55,12 +98,11 @@ namespace cucascade::io::rest {
 /// Result of a suffix-range footer probe: the object's total size plus the
 /// trailing window [window_lo, object_size) captured in @c bytes.  @c bytes is
 /// null when the probe could not be satisfied (the caller then falls back to a
-/// HEAD).  Held by shared_ptr so the trailing bytes are shared, not copied, with
-/// the io_object that carries them for this open.
+/// HEAD).  Shared, not copied, with the io_object that carries it for this open.
 struct footer_probe {
   std::size_t object_size{0};
   std::size_t window_lo{0};
-  std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+  shared_byte_span bytes;
 };
 
 // ---------------------------------------------------------------------------
@@ -89,7 +131,7 @@ class rest_io_object : public io_object {
                  std::string key,
                  size_t object_size,
                  size_t window_lo,
-                 std::shared_ptr<const std::vector<std::uint8_t>> stash)
+                 shared_byte_span stash)
     : _path(std::move(path)),
       _bucket(std::move(bucket)),
       _key(std::move(key)),
@@ -110,10 +152,7 @@ class rest_io_object : public io_object {
   /// Trailing bytes prefetched at open (a suffix-range footer probe), or null
   /// when the object was opened without one.  A read fully inside
   /// [stash_window_lo, size) is served from here by @c host_read.
-  [[nodiscard]] const std::shared_ptr<const std::vector<std::uint8_t>>& stash() const noexcept
-  {
-    return _stash;
-  }
+  [[nodiscard]] shared_byte_span const& stash() const noexcept { return _stash; }
   [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
 
  private:
@@ -122,7 +161,7 @@ class rest_io_object : public io_object {
   std::string _key;
   size_t _file_size{0};
   size_t _window_lo{0};
-  std::shared_ptr<const std::vector<std::uint8_t>> _stash;
+  shared_byte_span _stash;
 };
 
 // ---------------------------------------------------------------------------

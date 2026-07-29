@@ -61,7 +61,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   add_executable(
     cucascade_io_tests
     io/test_uri_parser.cpp
+    io/cache/test_metadata_store.cpp
     io/kvikio/test_kvikio_config.cpp
+    io/rest/test_shared_byte_span.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
