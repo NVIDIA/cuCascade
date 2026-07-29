@@ -16,7 +16,7 @@
 
 #include <cucascade/io/rest/s3/sigv4.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <algorithm>
 #include <cctype>

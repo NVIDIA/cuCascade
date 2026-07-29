@@ -18,7 +18,7 @@
 
 #include <cucascade/io/uri_parser.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <stdexcept>
 #include <string>
