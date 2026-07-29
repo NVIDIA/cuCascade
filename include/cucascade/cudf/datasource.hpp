@@ -159,4 +159,19 @@ class datasource : public cudf::io::datasource {
 [[nodiscard]] std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx,
                                                           std::string path);
 
+/// As above, forwarding @p hint to the backend's io_object resolution so it can,
+/// e.g., prefetch a parquet footer in the same round-trip as the size
+/// (@c open_hint::parquet_footer_probe).  Backends that cannot act on the hint
+/// fall back to the plain open.
+[[nodiscard]] std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx,
+                                                          std::string path,
+                                                          open_hint hint);
+
+/// As above, with the object's size already known (e.g. from an S3
+/// ListObjectsV2 response), so a backend that can act on it skips its size
+/// discovery entirely (no HEAD for object stores).
+[[nodiscard]] std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx,
+                                                          std::string path,
+                                                          std::uint64_t known_size);
+
 }  // namespace cucascade::io

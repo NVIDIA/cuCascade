@@ -56,6 +56,31 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_test(NAME cucascade_tests COMMAND cucascade_tests)
 endif()
 
+if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
+  # IO test executable - links the cudf-free cucascade-io datasource layer.
+  add_executable(
+    cucascade_io_tests
+    io/test_uri_parser.cpp
+    io/kvikio/test_kvikio_config.cpp
+    io/rest/s3/test_sigv4.cpp
+    io/rest/s3/test_sigv4_authorizer.cpp
+    io/rest/s3/test_static_credentials.cpp
+    # Main test runner
+    unittest.cpp)
+  set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
+                                                      CUDA_STANDARD_REQUIRED ON)
+
+  target_include_directories(
+    cucascade_io_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${Catch2_SOURCE_DIR}/single_include)
+
+  target_link_libraries(cucascade_io_tests PRIVATE cucascade_io Catch2::Catch2
+                                                   CUDA::cudart_static)
+
+  add_test(NAME cucascade_io_tests COMMAND cucascade_io_tests)
+endif()
+
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   # cudf-coupled test executable - links the cucascade-cudf library.
   add_executable(

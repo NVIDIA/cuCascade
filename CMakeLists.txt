@@ -158,6 +158,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
     find_package(OpenSSL REQUIRED)
 
+    # kvikIO — backs the local-file fallback ioctx (kvikio_context). Used
+    # directly (not via cudf) so the io library stays cudf-free. Not swappable:
+    # unlike moodycamel/invocable below there is no in-tree stand-in to replace.
+    find_package(kvikio REQUIRED CONFIG)
+
     # cucascade_io_thirdparty carries the swappable moodycamel + invocable
     # (abseil) usage requirements from a single place; the io object library,
     # its installable static/shared variants, and their in-tree consumers
@@ -402,7 +407,7 @@ if(CUCASCADE_BUILD_IO)
   # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
   # approach.
   set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
-                             OpenSSL::Crypto)
+                             OpenSSL::Crypto kvikio::kvikio)
 
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}

@@ -27,6 +27,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
@@ -36,7 +37,15 @@
 
 namespace cucascade::io {
 
-enum class io_context_type { uring, restful };
+enum class io_context_type { uring, restful, kvikio };
+
+/// Hint passed to @c open_io_object so a backend can tailor how it resolves an
+/// object's metadata.  @c generic resolves the size however is cheapest for the
+/// scheme (a HEAD for object stores).  @c parquet_footer_probe asks the backend
+/// to resolve the size *and* stash the object's trailing bytes in one
+/// round-trip (a suffix-range GET), so the parquet footer reads that follow are
+/// served locally instead of costing extra round-trips.
+enum class open_hint { generic, parquet_footer_probe };
 
 namespace cache {
 class prefetching_cache;
@@ -100,6 +109,22 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path)
   {
     return create_io_object(std::move(path));
+  }
+
+  /// As above, forwarding @p hint to the backend's io_object resolution so it
+  /// can, e.g., prefetch a parquet footer in the same round-trip as the size.
+  [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path, open_hint hint)
+  {
+    return create_io_object(std::move(path), hint);
+  }
+
+  /// As above, with the object's size already known (e.g. from an S3
+  /// ListObjectsV2 response), so a backend that can act on it skips its size
+  /// discovery entirely (no HEAD for object stores).
+  [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path,
+                                                          std::uint64_t known_size)
+  {
+    return create_io_object(std::move(path), known_size);
   }
 
   /// Whether this backend can serve reads for @p path.  Backends should
@@ -262,6 +287,20 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// the public surface (callers receive a ready @c datasource).  Throws
   /// on unsupported / unreachable paths.
   virtual std::shared_ptr<io_object> create_io_object(std::string path) = 0;
+
+  /// Hinted variant.  The base implementation ignores @p hint and delegates to
+  /// the required @c create_io_object(path); a backend that can act on the hint
+  /// (e.g. rest_ioctx's suffix-range footer probe) overrides this.  Kept a
+  /// distinct virtual — not a defaulted argument on the pure virtual above — so
+  /// the hint dispatches on the dynamic type instead of binding statically.
+  virtual std::shared_ptr<io_object> create_io_object(std::string path, open_hint hint);
+
+  /// Known-size variant.  The base implementation ignores @p known_size and
+  /// delegates to the required @c create_io_object(path); a backend whose size
+  /// discovery would otherwise cost a round-trip overrides this to build the
+  /// io_object without one.  Same distinct-virtual rationale as the hint
+  /// variant above.
+  virtual std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size);
 
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,

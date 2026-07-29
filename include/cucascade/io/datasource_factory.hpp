@@ -38,17 +38,13 @@ namespace cucascade::io {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Thread-safe registry mapping URI schemes to @c ioctx instances.
+ * @brief Thread-safe registry of @c ioctx backends, resolved by full path.
  *
- * The engine constructs a registry at startup and populates it with one
- * @c ioctx per backend (uring / gds / s3 / rdma_s3). The factory looks
- * up the correct backend by URI scheme at datasource-creation time.
- *
- * Scheme matching is case-insensitive: @c register_ioctx and @c lookup both
- * lowercase the scheme before storing / searching, matching the
- * normalization done by @c cucascade::io::parse (RFC 3986 §3.1). Callers may
- * register / look up with any casing — @c register_ioctx("S3", ...) and
- * @c lookup("s3") refer to the same entry.
+ * The engine constructs a registry at startup and registers one entry per
+ * backend (kvikio / uring / restful), each carrying a path-capability checker.
+ * At datasource-creation time @c lookup_path runs the checkers against a full
+ * path (the checkers parse the URI / stat the filesystem themselves) and picks
+ * the backend, preferring an explicit backend over the kvikio catch-all.
  *
  * All operations are safe under concurrent reads; mutations take an exclusive
  * lock but are expected only at engine bootstrap / shutdown.
@@ -75,17 +71,21 @@ class io_context_registry {
   using factory_type        = std::function<std::shared_ptr<io::ioctx>(const config_type&)>;
 
   /**
-   * @brief Register an ioctx for a scheme. Replaces any prior registration
-   *        for the same scheme.
+   * @brief Register an ioctx backend. Replaces any prior registration for the
+   *        same type.
    *
-   * The scheme is lowercased before storage; subsequent @c lookup calls
-   * with any casing of the same scheme resolve to this entry.
-   * @param type    Opaque identifier for the ioctx type. Used by the engine to
-   *                identify the backend.
+   * @param type    Backend identifier (uring / restful / kvikio).
+   * @param checker Decides whether this backend claims a given path.
+   * @param factory Constructs the backend's ioctx; invoked by @c make_ioctx.
    */
   void register_ioctx(io_context_type type, scheme_checker_type checker, factory_type factory);
 
-  std::optional<io_context_type> lookup(std::string_view scheme) const noexcept;
+  /// Resolve the backend for a full @p path (not a bare scheme — the checkers
+  /// parse the URI / stat the filesystem themselves).  Explicit backends
+  /// (uring / restful) take precedence over the kvikio catch-all, so `s3://`
+  /// never resolves to kvikio and a local file routes to uring before the
+  /// universal fallback.  std::nullopt when nothing matches.
+  std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
 

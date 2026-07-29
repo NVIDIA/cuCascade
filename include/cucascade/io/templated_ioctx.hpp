@@ -23,6 +23,7 @@
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
@@ -251,7 +252,9 @@ class templated_ioctx : public ioctx {
       try {
         r->shutdown();
       } catch (const std::exception& e) {
+        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", e.what());
       } catch (...) {
+        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
       }
     }
   }
