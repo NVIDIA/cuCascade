@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-
 #include <catch2/catch_all.hpp>
 
 int main(int argc, char* argv[])
