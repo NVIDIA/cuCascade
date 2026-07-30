@@ -31,6 +31,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # Memory tests
     memory/test_memory_reservation_manager.cpp
     memory/test_reservation_aware_resource_adaptor.cpp
+    memory/test_experimental_reservation_aware_resource_adaptor.cpp
     memory/test_small_pinned_host_memory_resource.cpp
     memory/test_gpu_kernels.cu
     # Data tests
