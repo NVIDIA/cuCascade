@@ -736,11 +736,35 @@ void read_numa_node_memory(fs::path const& numa_path, numa_topology_info& info)
 }
 
 /**
+ * @brief Read whether a NUMA node has any CPU assigned to it.
+ *
+ * Reads /sys/devices/system/node/node<id>/cpulist, which is empty for CPU-less nodes.
+ *
+ * @param numa_path Path to the NUMA node directory.
+ * @return True if at least one CPU is assigned to the node; false if none or unreadable.
+ */
+bool numa_node_has_cpus(fs::path const& numa_path)
+{
+  std::ifstream cpulist(numa_path / "cpulist");
+  if (!cpulist.is_open()) { return false; }
+
+  std::string line;
+  while (std::getline(cpulist, line)) {
+    if (line.find_first_not_of(" \t\r\n") != std::string::npos) { return true; }
+  }
+  return false;
+}
+
+/**
  * @brief Discover NUMA nodes and their memory capacities.
  *
  * Scans subdirectories named "node<id>" under /sys/devices/system/node and reads each
  * node's memory capacity. Returns an empty vector if the directory does not exist or
  * cannot be iterated.
+ *
+ * A node that has memory but no CPU is not host memory: on DGX Station and Grace-Hopper
+ * the GPU's own HBM is exposed as such a node, as is CXL-attached memory. Those nodes are
+ * flagged with `is_device_memory` so that host memory spaces are never sized from them.
  *
  * @return NUMA node information sorted by node id; empty if unavailable.
  */
@@ -770,6 +794,8 @@ std::vector<numa_topology_info> discover_numa_nodes()
         continue;
       }
       read_numa_node_memory(entry.path(), info);
+      info.has_cpus         = numa_node_has_cpus(entry.path());
+      info.is_device_memory = !info.has_cpus && info.memory_capacity > 0;
       nodes.push_back(info);
     }
   } catch (...) {

@@ -66,9 +66,12 @@ bool make_single_gpu_topology(system_topology_info& topology, std::size_t numa_c
   if (topology.gpus.empty()) { return false; }
 
   topology.gpus.resize(1);
-  topology.num_gpus   = 1;
-  topology.numa_nodes = {
-    numa_topology_info{topology.gpus.front().numa_node, numa_capacity, numa_capacity / 2}};
+  topology.num_gpus       = 1;
+  topology.numa_nodes     = {numa_topology_info{.id               = topology.gpus.front().numa_node,
+                                                .memory_capacity  = numa_capacity,
+                                                .free_memory      = numa_capacity / 2,
+                                                .has_cpus         = true,
+                                                .is_device_memory = false}};
   topology.num_numa_nodes = 1;
   return true;
 }
@@ -85,8 +88,8 @@ TEST_CASE("Configurator sets host capacity as a fraction of NUMA capacity", "[co
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
-  builder.set_usage_limit_ratio_per_host(0.25);
+  builder.use_numa_id_as_host_id();
+  builder.set_usage_limit_ratio_per_numa_region(0.25);
 
   auto const hosts = host_configs(builder.build(topology));
 
@@ -106,8 +109,8 @@ TEST_CASE("Configurator sets host capacity in absolute bytes", "[configurator]")
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
-  builder.set_per_host_capacity(requested);
+  builder.use_numa_id_as_host_id();
+  builder.set_per_numa_region_capacity(requested);
 
   auto const hosts = host_configs(builder.build(topology));
 
@@ -127,9 +130,9 @@ TEST_CASE("Configurator host capacity fraction overrides a previous absolute set
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
+  builder.use_numa_id_as_host_id();
   builder.set_total_host_capacity(1ull << 30);
-  builder.set_usage_limit_ratio_per_host(0.5);
+  builder.set_usage_limit_ratio_per_numa_region(0.5);
 
   auto const hosts = host_configs(builder.build(topology));
 
@@ -150,9 +153,9 @@ TEST_CASE("Configurator reservation limit follows the fraction-derived host capa
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
-  builder.set_usage_limit_ratio_per_host(0.5);
-  builder.set_reservation_limit_per_host(reservation_bytes);
+  builder.use_numa_id_as_host_id();
+  builder.set_usage_limit_ratio_per_numa_region(0.5);
+  builder.set_reservation_limit_per_numa_region(reservation_bytes);
 
   auto const hosts = host_configs(builder.build(topology));
 
@@ -181,8 +184,8 @@ TEST_CASE("Configurator uses absolute host capacity when the NUMA node is unknow
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
-  builder.set_per_host_capacity(requested);
+  builder.use_numa_id_as_host_id();
+  builder.set_per_numa_region_capacity(requested);
 
   auto const hosts = host_configs(builder.build(topology));
 
@@ -208,7 +211,7 @@ TEST_CASE("Configurator uses total host capacity when the NUMA node is unknown",
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
+  builder.use_numa_id_as_host_id();
   builder.set_total_host_capacity(requested);
 
   auto const hosts = host_configs(builder.build(topology));
@@ -233,8 +236,8 @@ TEST_CASE(
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
-  builder.set_usage_limit_ratio_per_host(0.5);
+  builder.use_numa_id_as_host_id();
+  builder.set_usage_limit_ratio_per_numa_region(0.5);
 
   REQUIRE_THROWS_AS(builder.build(topology), std::runtime_error);
 }
@@ -254,8 +257,8 @@ TEST_CASE("Configurator throws when NUMA capacity is unknown and a fraction is r
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
-  builder.set_usage_limit_ratio_per_host(0.5);
+  builder.use_numa_id_as_host_id();
+  builder.set_usage_limit_ratio_per_numa_region(0.5);
 
   REQUIRE_THROWS_AS(builder.build(topology), std::runtime_error);
 }
@@ -273,20 +276,89 @@ TEST_CASE("Configurator resolves host capacity from discovered NUMA capacity", "
 
   auto const numa_id       = topology.gpus.front().numa_node;
   auto const numa_capacity = topology.get_numa_memory_capacity(numa_id);
-  if (numa_capacity == 0) {
-    SUCCEED("Skipped: NUMA capacity is not exposed on this host");
+  auto const* numa_node    = topology.find_numa_node(numa_id);
+  if (!numa_capacity.has_value() || (numa_node != nullptr && numa_node->is_device_memory)) {
+    SUCCEED("Skipped: no host NUMA capacity exposed for the GPU's node");
     return;
   }
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
-  builder.use_host_per_numa();
-  builder.set_usage_limit_ratio_per_host(0.1);
+  builder.use_numa_id_as_host_id();
+  builder.set_usage_limit_ratio_per_numa_region(0.1);
 
   auto const hosts = host_configs(builder.build(topology));
 
   REQUIRE(hosts.size() == 1);
   REQUIRE(hosts.front().memory_capacity > 0);
   REQUIRE(hosts.front().memory_capacity ==
-          static_cast<std::size_t>(static_cast<double>(numa_capacity) * 0.1));
+          static_cast<std::size_t>(static_cast<double>(*numa_capacity) * 0.1));
+}
+
+// GPU HBM surfaces as a CPU-less NUMA node on DGX Station and Grace-Hopper. Sizing a host
+// space from it would hand out device memory as if it were host memory.
+TEST_CASE("Configurator throws when the backing NUMA region is device memory", "[configurator]")
+{
+  system_topology_info topology;
+  if (!make_single_gpu_topology(topology, synthetic_numa_capacity)) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  topology.numa_nodes.front().has_cpus         = false;
+  topology.numa_nodes.front().is_device_memory = true;
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
+  builder.use_numa_id_as_host_id();
+  builder.set_usage_limit_ratio_per_numa_region(0.5);
+
+  REQUIRE_THROWS_AS(builder.build(topology), std::runtime_error);
+}
+
+// An absolute capacity is caller-supplied, so a device-memory node is not consulted at all.
+TEST_CASE("Configurator honors an absolute capacity on a device-memory NUMA region",
+          "[configurator]")
+{
+  system_topology_info topology;
+  if (!make_single_gpu_topology(topology, synthetic_numa_capacity)) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  topology.numa_nodes.front().has_cpus         = false;
+  topology.numa_nodes.front().is_device_memory = true;
+
+  constexpr std::size_t requested = 2ull << 30;  // 2 GiB
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
+  builder.use_numa_id_as_host_id();
+  builder.set_per_numa_region_capacity(requested);
+
+  auto const hosts = host_configs(builder.build(topology));
+
+  REQUIRE(hosts.size() == 1);
+  REQUIRE(hosts.front().memory_capacity == requested);
+}
+
+// Device-memory nodes are not host memory and must not inflate the host total.
+TEST_CASE("Total NUMA capacity excludes device-memory nodes", "[configurator]")
+{
+  system_topology_info topology;
+  topology.numa_nodes = {numa_topology_info{.id               = 0,
+                                            .memory_capacity  = 1024,
+                                            .free_memory      = 512,
+                                            .has_cpus         = true,
+                                            .is_device_memory = false},
+                         numa_topology_info{.id               = 1,
+                                            .memory_capacity  = 4096,
+                                            .free_memory      = 4096,
+                                            .has_cpus         = false,
+                                            .is_device_memory = true}};
+
+  REQUIRE(topology.get_total_numa_memory_capacity() == 1024);
+  REQUIRE(topology.get_numa_memory_capacity(1).value() == 4096);
+  REQUIRE_FALSE(topology.get_numa_memory_capacity(7).has_value());
+  REQUIRE(topology.find_numa_node(7) == nullptr);
 }

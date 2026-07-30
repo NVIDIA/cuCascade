@@ -51,8 +51,8 @@ namespace memory {
  * builder.set_number_of_gpus(2)
  *        .set_gpu_usage_limit(2UL << 30)
  *        .set_reservation_limit_ratio_per_gpu(0.8)
- *        .set_numa_ids({0, 1})
- *        .set_capacity_per_numa_node(8UL << 30)
+ *        .use_numa_id_as_host_id()
+ *        .set_per_numa_region_capacity(8UL << 30)
  *        .set_gpu_memory_resource_factory(custom_gpu_factory)
  *        .set_cpu_memory_resource_factory(custom_cpu_factory);
  * auto configs = builder.build(system_topology);
@@ -102,43 +102,50 @@ class reservation_manager_configurator {
   /// @param mr_fn Function to create GPU memory resource.
   builder_reference& set_gpu_memory_resource_factory(DeviceMemoryResourceFactoryFn mr_fn);
 
-  // --- cpu / host settings ---
+  // --- cpu / numa region settings ---
+  //
+  // A host memory space covers a single NUMA region, not the whole host, so the per-space
+  // settings are named after the region they size. Only `set_total_host_capacity()` is
+  // host-wide: it is divided across the spaces.
 
-  /// @brief set host ids
-  /// @param host_ids Vector of host ids.
-  /// @note this is meant to be used for testing purpose only, host ids will be mapped to numa ids
-  builder_reference& use_host_per_gpu();
+  /// @brief identify each host space by the id of the GPU it backs
+  /// @note One host space is created per GPU. The space is still bound to that GPU's NUMA
+  ///       node for allocation; only the space id differs. Meant for testing.
+  builder_reference& use_gpu_id_as_host_id();
 
-  /// @brief automatically bind cpu tiers to gpus based on topology
-  builder_reference& use_host_per_numa();
+  /// @brief identify each host space by its NUMA node id (default)
+  /// @note One host space is created per NUMA node, shared by every GPU on that node.
+  builder_reference& use_numa_id_as_host_id();
 
-  /// set capacity per host tier
-  /// @param bytes Memory capacity per NUMA node in bytes.
+  /// @brief set the memory capacity shared by all host spaces
+  /// @param bytes Total host memory capacity in bytes, split evenly across the host spaces.
   builder_reference& set_total_host_capacity(std::size_t bytes);
 
-  /// set capacity per host tier
-  /// @param bytes Memory capacity per NUMA node in bytes.
-  builder_reference& set_per_host_capacity(std::size_t bytes);
+  /// @brief set the capacity of each NUMA region space
+  /// @param bytes Memory capacity per NUMA region in bytes.
+  builder_reference& set_per_numa_region_capacity(std::size_t bytes);
 
-  /// @brief set the capacity of each host tier as a fraction of its NUMA node capacity
-  /// @param fraction Fraction of the NUMA node memory capacity to use, in (0.0, 1.0].
+  /// @brief set the capacity of each NUMA region space as a fraction of that region's capacity
+  /// @param fraction Fraction of the NUMA region memory capacity to use, in (0.0, 1.0].
   /// @note Requires NUMA capacities in the topology passed to `build()`; `build()` throws
-  ///       if the capacity of a NUMA node backing a host space is unknown.
-  /// @note The fraction applies per host space. With `use_host_per_gpu()` and several GPUs
-  ///       on the same NUMA node, each space gets that fraction of the shared node.
-  builder_reference& set_usage_limit_ratio_per_host(double fraction);
+  ///       if the capacity of a NUMA region backing a space is unknown, or if that region is
+  ///       device memory rather than host memory.
+  /// @note The fraction applies per space. With `use_gpu_id_as_host_id()` and several GPUs
+  ///       on the same NUMA node, each space gets that fraction of the shared region.
+  builder_reference& set_usage_limit_ratio_per_numa_region(double fraction);
 
-  /// \brief set reservation limit ratio per GPU
-  /// @param fraction Fraction of GPU memory capacity to reserve.
-  builder_reference& set_downgrade_fractions_per_host(double start, double end);
+  /// \brief set the downgrade trigger and stop fractions per NUMA region
+  /// @param start Fraction of region capacity at which downgrading starts.
+  /// @param end Fraction of region capacity at which downgrading stops.
+  builder_reference& set_downgrade_fractions_per_numa_region(double start, double end);
 
-  /// \brief set ratio of space capacity used for reservation in cpus
-  /// @param fraction Fraction of NUMA node memory capacity to reserve.
-  builder_reference& set_reservation_limit_per_host(size_t bytes);
+  /// \brief set absolute reservation limit per NUMA region
+  /// @param bytes Reservable bytes per NUMA region.
+  builder_reference& set_reservation_limit_per_numa_region(size_t bytes);
 
-  /// \brief set ratio of space capacity used for reservation in cpus
-  /// @param fraction Fraction of NUMA node memory capacity to reserve.
-  builder_reference& set_reservation_fraction_per_host(double fraction);
+  /// \brief set ratio of space capacity used for reservation per NUMA region
+  /// @param fraction Fraction of NUMA region memory capacity to reserve.
+  builder_reference& set_reservation_fraction_per_numa_region(double fraction);
 
   /// \brief set the function that takes in the numa node id and create cpu memory resource
   /// @param mr_fn Function to create CPU memory resource.
@@ -176,16 +183,17 @@ class reservation_manager_configurator {
     int numa_id{-1};
   };
 
-  struct host_info {
+  struct numa_region_info {
     int space_id{-1};
     int numa_id{-1};
-    std::size_t numa_capacity{0};
+    std::optional<std::size_t> numa_capacity{};  ///< Nullopt when the region capacity is unknown.
+    bool is_device_memory{false};                ///< True when the region is GPU/device memory.
   };
 
   std::vector<gpu_info> extract_gpu_ids(const system_topology_info& topology) const;
 
-  std::vector<host_info> extract_host_ids(const std::vector<gpu_info>& gpus,
-                                          const system_topology_info& topology) const;
+  std::vector<numa_region_info> extract_numa_region_ids(const std::vector<gpu_info>& gpus,
+                                                        const system_topology_info& topology) const;
 
   struct fraction_or_size {
     fraction_or_size(double fraction) : _fraction_or_size_value(fraction) {}
@@ -233,15 +241,15 @@ class reservation_manager_configurator {
   std::pair<double, double> downgrade_fractions_per_gpu_{0.85, 0.65};
   mutable DeviceMemoryResourceFactoryFn _gpu_mr_fn = make_default_gpu_memory_resource;
 
-  fraction_or_size _host_capacity{static_cast<std::size_t>(4UL << 30)};  // 4GB
+  fraction_or_size _numa_region_capacity{static_cast<std::size_t>(4UL << 30)};  // 4GB
   bool _is_capacity_per_space{true};
-  struct bind_host_to_gpu_id {};
-  struct bind_cpu_to_gpu_numa {};
-  std::variant<bind_cpu_to_gpu_numa, bind_host_to_gpu_id> _host_creation_policy{};
+  struct bind_host_id_to_gpu_id {};
+  struct bind_host_id_to_numa_id {};
+  std::variant<bind_host_id_to_numa_id, bind_host_id_to_gpu_id> _host_id_policy{};
   std::optional<std::size_t> chunk_size;
   std::optional<std::size_t> block_size;
   std::optional<std::size_t> initial_block_count;
-  std::pair<double, double> downgrade_fractions_per_host_{0.85, 0.65};
+  std::pair<double, double> downgrade_fractions_per_numa_region_{0.85, 0.65};
   fraction_or_size _cpu_reservation{0.85};  // 75% limit per NUMA node by default
   mutable DeviceMemoryResourceFactoryFn _cpu_mr_fn{};
   std::optional<bool> _host_memory_portability;
