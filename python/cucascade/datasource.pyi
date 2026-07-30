@@ -42,5 +42,8 @@ class RestEngine:
         tls_verify: bool = True,
         pool_capacity: int = 2684354560,
         block_size: int = 1048576,
+        max_connections: int = 16,
+        chunk_size: int = 8388608,
+        max_n_chunks: int = 16,
     ) -> None: ...
     def open(self, path: str) -> CuCascadeDatasource: ...

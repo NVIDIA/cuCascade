@@ -248,6 +248,15 @@ cdef class RestEngine:
         Default is approximately 2.5 GiB.
     block_size : int, optional
         Fixed block size in bytes for the staging pool. Default is 1 MiB.
+    max_connections : int, optional
+        Maximum concurrent in-flight HTTP connections per reactor.
+        Default is 16.
+    chunk_size : int, optional
+        Maximum bytes per ranged GET request. Adjacent segments are fused
+        up to this size; oversized segments are split. Default is 8 MiB.
+    max_n_chunks : int, optional
+        Maximum number of destination buffers fused into a single scatter
+        GET. Default is 16.
     """
 
     cdef unique_ptr[rest_datasource_engine] _engine
@@ -263,6 +272,9 @@ cdef class RestEngine:
         bint tls_verify=True,
         size_t pool_capacity=2684354560,
         size_t block_size=1048576,
+        size_t max_connections=16,
+        size_t chunk_size=8388608,
+        size_t max_n_chunks=16,
     ):
         cdef string c_access_key_id     = access_key_id.encode()
         cdef string c_secret_access_key = secret_access_key.encode()
@@ -281,6 +293,9 @@ cdef class RestEngine:
                     tls_verify,
                     pool_capacity,
                     block_size,
+                    max_connections,
+                    chunk_size,
+                    max_n_chunks,
                 )
             )
 

@@ -61,10 +61,13 @@ class rest_datasource_engine {
                                   std::string session_token,
                                   std::string region,
                                   std::string endpoint,
-                                  std::size_t n_reactors    = 4,
-                                  bool        tls_verify    = true,
-                                  std::size_t pool_capacity = default_pool_capacity,
-                                  std::size_t block_size    = default_block_size);
+                                  std::size_t n_reactors      = 4,
+                                  bool        tls_verify      = true,
+                                  std::size_t pool_capacity   = default_pool_capacity,
+                                  std::size_t block_size      = default_block_size,
+                                  std::size_t max_connections = 16,
+                                  std::size_t chunk_size      = 8UL << 20,
+                                  std::size_t max_n_chunks    = 16);
 
   ~rest_datasource_engine();
 

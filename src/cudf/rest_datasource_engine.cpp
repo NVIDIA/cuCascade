@@ -19,7 +19,10 @@ rest_datasource_engine::rest_datasource_engine(std::string access_key_id,
                                                std::size_t n_reactors,
                                                bool tls_verify,
                                                std::size_t pool_capacity,
-                                               std::size_t block_size)
+                                               std::size_t block_size,
+                                               std::size_t max_connections,
+                                               std::size_t chunk_size,
+                                               std::size_t max_n_chunks)
   : _upstream(0, true),
     _host_mr(0, _upstream, pool_capacity, pool_capacity, block_size, 128, 1)
 {
@@ -34,6 +37,9 @@ rest_datasource_engine::rest_datasource_engine(std::string access_key_id,
   rest::config rest_cfg{};
   rest_cfg.bounce_block_size = _host_mr.get_block_size();
   rest_cfg.tls_verify        = tls_verify;
+  rest_cfg.max_connections   = max_connections;
+  rest_cfg.chunk_size        = chunk_size;
+  rest_cfg.max_n_chunks      = max_n_chunks;
 
   auto rest_ctx = std::make_shared<rest::rest_reactor::reactor_context>(
     std::move(rest_cfg), std::move(authorizer), &_host_mr);
