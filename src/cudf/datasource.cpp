@@ -106,6 +106,16 @@ std::future<size_t> datasource::host_read_async(size_t offset, size_t size, uint
     _io_ctx->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle));
 }
 
+std::future<size_t> datasource::host_read_ranges_async(std::span<io_object_segment> segments)
+{
+  return bridge_semi_to_std(_io_ctx->host_read_ranges_async_io(*_io_object, segments));
+}
+
+std::future<size_t> datasource::host_read_ranges_async(std::vector<io_object_segment>& segments)
+{
+  return host_read_ranges_async(std::span<io_object_segment>{segments});
+}
+
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read_async(
   size_t offset, size_t size)
 {

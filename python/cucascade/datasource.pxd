@@ -8,6 +8,7 @@ from libcpp.memory cimport unique_ptr
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 
+
 from pylibcudf.libcudf.io.datasource cimport datasource as cudf_datasource
 
 
@@ -18,11 +19,17 @@ cdef extern from "cudf/io/text/byte_range_info.hpp" namespace "cudf::io::text" n
         int64_t size() const
 
 
+cdef extern from "cucascade/io/types.hpp" namespace "cucascade::io" nogil:
+    cdef cppclass io_object_segment:
+        io_object_segment(size_t offset, size_t size, uint8_t* buffer) except +
+
+
 cdef extern from "cucascade/cudf/datasource.hpp" namespace "cucascade::io" nogil:
     cdef cppclass cc_datasource "cucascade::io::datasource"(cudf_datasource):
         unique_ptr[cc_datasource] duplicate() except +
         void fadvise(const vector[byte_range_info]& ranges, int dev_id) except +
         future[size_t] host_read_async(size_t offset, size_t size, uint8_t* dst) except +
+        future[size_t] host_read_ranges_async(vector[io_object_segment]& segments) except +
 
 
 cdef extern from "cucascade/cudf/uring_datasource_engine.hpp" namespace "cucascade::io" nogil:

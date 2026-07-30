@@ -23,6 +23,7 @@ from pylibcudf.libcudf.io.datasource cimport datasource as cudf_datasource
 from cucascade.datasource cimport (
     byte_range_info,
     cc_datasource,
+    io_object_segment,
     rest_datasource_engine,
     uring_datasource_engine,
 )
@@ -147,6 +148,39 @@ cdef class CuCascadeDatasource(Datasource):
             futures.append(rf)
             dst_offset += sz
         return futures
+
+    def read_all_ranges_async(self, list ranges, object buffer):
+        """Submit all byte ranges as a single vectorized host read.
+
+        Uses the engine's scatter-read backend to fetch all ranges in as few
+        HTTP requests as possible, writing each range into ``buffer`` at the
+        corresponding offset. Returns a single future that resolves when every
+        range has been written.
+
+        Parameters
+        ----------
+        ranges : list[tuple[int, int]]
+            Byte ranges as ``(offset, size)`` pairs in file order.
+        buffer : memoryview
+            Contiguous writable host buffer sized to hold the sum of all range
+            sizes.
+
+        Returns
+        -------
+        ReadFuture
+            A single future that resolves when all ranges have been written.
+        """
+        cdef uint8_t[::1] c_buf = buffer
+        cdef uint8_t* base = &c_buf[0]
+        cdef vector[io_object_segment] segments
+        cdef int64_t off, sz
+        cdef size_t dst_offset = 0
+        for off, sz in ranges:
+            segments.emplace_back(off, sz, base + dst_offset)
+            dst_offset += sz
+        cdef ReadFuture rf = ReadFuture.__new__(ReadFuture)
+        rf._fut = deref(self._ds).host_read_ranges_async(segments)
+        return rf
 
 
 cdef class UringEngine:

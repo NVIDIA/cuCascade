@@ -16,6 +16,9 @@ class CuCascadeDatasource(Datasource):
     def read_ranges_async(
         self, ranges: list[tuple[int, int]], buffer: memoryview
     ) -> list[ReadFuture]: ...
+    def read_all_ranges_async(
+        self, ranges: list[tuple[int, int]], buffer: memoryview
+    ) -> ReadFuture: ...
 
 
 class UringEngine:
