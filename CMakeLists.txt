@@ -425,7 +425,7 @@ endif()
 target_include_directories(cucascade_topology_discovery_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
 target_link_libraries(cucascade_topology_discovery_objects
-                      PUBLIC CUDA::nvml_static rmm::rmm)
+                      PUBLIC CUDA::nvml_static ${CMAKE_DL_LIBS})
 target_compile_features(cucascade_topology_discovery_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_topology_discovery_objects
                         PRIVATE cuda_std_20)
@@ -443,7 +443,7 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
               cucascade_topology_discovery_static)
 
   target_link_libraries(cucascade_topology_discovery_static
-                        PRIVATE CUDA::nvml_static rmm::rmm)
+                        PRIVATE CUDA::nvml_static ${CMAKE_DL_LIBS})
   target_include_directories(cucascade_topology_discovery_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
@@ -521,7 +521,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
               cucascade_topology_discovery_shared)
 
   target_link_libraries(cucascade_topology_discovery_shared
-                        PRIVATE CUDA::nvml_static rmm::rmm)
+                        PRIVATE CUDA::nvml_static ${CMAKE_DL_LIBS})
   target_include_directories(cucascade_topology_discovery_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)

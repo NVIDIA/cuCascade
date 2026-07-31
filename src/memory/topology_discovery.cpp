@@ -5,9 +5,6 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
-#include <rmm/cuda_device.hpp>
-#include <rmm/detail/runtime_capabilities.hpp>
-
 #include <dlfcn.h>
 #include <ifaddrs.h>
 #include <nvml.h>
@@ -61,25 +58,129 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
 }
 
 /**
- * @brief Query whether a CUDA device supports hardware-accelerated decompression.
+ * @brief Minimal subset of the CUDA driver API used for device capability queries.
  *
- * Delegates to `rmm::detail::hwdecompress::is_supported()`, which checks the CUDA
- * driver version. RMM's capability queries are scoped to the current device, so the
- * call is wrapped in an `rmm::cuda_set_device_raii`. Best-effort: any failure while
- * setting the device or probing yields false.
+ * Resolved with dlopen/dlsym rather than linked, so this library keeps loading on
+ * hosts without an NVIDIA driver (matching how NVML is treated here) and so the
+ * topology-only build needs no CUDA runtime or RMM dependency.
  *
- * @param cuda_ordinal CUDA device ordinal (matches the runtime device index used
- * elsewhere in discovery under the same CUDA_VISIBLE_DEVICES ordering).
- * @return true iff the hardware decompression engine is available.
+ * `CUdevice` and `CUresult` are spelled as `int` to avoid pulling in `<cuda.h>`:
+ * `CUdevice` is a typedef for `int` and `CUresult` is an int-sized enum, so both
+ * match the driver ABI.
  */
-bool query_hw_decompression(unsigned int cuda_ordinal)
+struct cuda_driver_api {
+  int (*init)(unsigned int){nullptr};
+  int (*device_get_by_pci_bus_id)(int*, char const*){nullptr};
+  int (*device_get_attribute)(int*, int, int){nullptr};
+  bool available{false};
+};
+
+/// CUDA driver success code (`CUDA_SUCCESS`).
+constexpr int cuda_driver_success{0};
+
+/// `CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK`, added in CUDA 12.8. Spelled
+/// literally so this file builds against older toolkit headers; the driver's
+/// attribute numbering is ABI-stable. A non-zero mask means the device exposes at
+/// least one hardware decompression algorithm.
+constexpr int cu_device_attribute_mem_decompress_algorithm_mask{136};
+
+/**
+ * @brief Resolve a symbol from an already-opened shared object.
+ *
+ * `dlsym` returns `void*`; converting an object pointer to a function pointer is
+ * conditionally-supported in ISO C++ (and rejected under `-Wpedantic`) but is
+ * well-defined on POSIX. The copy through `memcpy` performs the conversion without
+ * tripping the diagnostic.
+ *
+ * @tparam Fn Function pointer type of the symbol.
+ * @param handle Handle returned by `dlopen`.
+ * @param name Symbol name.
+ * @return The resolved function pointer, or nullptr if the symbol is absent.
+ */
+template <typename Fn>
+Fn load_symbol(void* handle, char const* name)
 {
-  try {
-    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{static_cast<int>(cuda_ordinal)}};
-    return rmm::detail::hwdecompress::is_supported();
-  } catch (...) {
+  void* symbol = dlsym(handle, name);
+  Fn fn{};
+  if (symbol != nullptr) { std::memcpy(&fn, &symbol, sizeof(fn)); }
+  return fn;
+}
+
+/**
+ * @brief Load and initialize the CUDA driver API once per process.
+ *
+ * The library handle is intentionally never `dlclose`d — it is held for the process
+ * lifetime, mirroring the init-once treatment of NVML in `discover()`.
+ *
+ * @return The resolved entry points; `available` is false if the driver is missing,
+ * a symbol could not be resolved, or `cuInit` failed.
+ */
+cuda_driver_api const& load_cuda_driver_api()
+{
+  static cuda_driver_api const api = [] {
+    cuda_driver_api resolved;
+
+    void* handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (handle == nullptr) { return resolved; }
+
+    resolved.init = load_symbol<decltype(cuda_driver_api::init)>(handle, "cuInit");
+    resolved.device_get_by_pci_bus_id =
+      load_symbol<decltype(cuda_driver_api::device_get_by_pci_bus_id)>(handle,
+                                                                       "cuDeviceGetByPCIBusId");
+    resolved.device_get_attribute =
+      load_symbol<decltype(cuda_driver_api::device_get_attribute)>(handle, "cuDeviceGetAttribute");
+
+    if (resolved.init == nullptr || resolved.device_get_by_pci_bus_id == nullptr ||
+        resolved.device_get_attribute == nullptr) {
+      return cuda_driver_api{};
+    }
+    if (resolved.init(0) != cuda_driver_success) { return cuda_driver_api{}; }
+
+    resolved.available = true;
+    return resolved;
+  }();
+  return api;
+}
+
+/**
+ * @brief Query whether a GPU has a hardware-accelerated decompression engine.
+ *
+ * The device is identified by PCI bus id rather than by ordinal. Device ordinals are
+ * not a stable identity across APIs: NVML enumerates in PCI-bus order while the CUDA
+ * runtime defaults to `CUDA_DEVICE_ORDER=FASTEST_FIRST`, so the index of a GPU in
+ * this discovery's list need not name the same device to CUDA on a heterogeneous
+ * host. `cuDeviceGetByPCIBusId` sidesteps both that reordering and any
+ * `CUDA_VISIBLE_DEVICES` remapping.
+ *
+ * `cuDeviceGetAttribute` takes its device explicitly, so no context is created and
+ * the calling thread's current device is left untouched.
+ *
+ * Best-effort: a missing driver, a bus id CUDA does not expose (e.g. masked out by
+ * `CUDA_VISIBLE_DEVICES`), or an attribute unsupported by the running driver all
+ * yield false.
+ *
+ * @param pci_bus_id PCI bus id of the GPU, in NVML's `domain:bus:device.function`
+ * form. For a MIG instance this is the parent physical GPU's bus id, which is the
+ * correct scope: the decompression engine is a property of the physical device.
+ * @return true iff the device reports at least one hardware decompression algorithm.
+ */
+bool query_hw_decompression(std::string const& pci_bus_id)
+{
+  auto const& api = load_cuda_driver_api();
+  if (!api.available || pci_bus_id.empty()) { return false; }
+
+  int device = 0;
+  if (api.device_get_by_pci_bus_id(&device, pci_bus_id.c_str()) != cuda_driver_success) {
     return false;
   }
+
+  int algorithm_mask = 0;
+  if (api.device_get_attribute(&algorithm_mask,
+                               cu_device_attribute_mem_decompress_algorithm_mask,
+                               device) != cuda_driver_success) {
+    return false;
+  }
+  return algorithm_mask != 0;
 }
 
 /**
@@ -909,7 +1010,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     if (nvml_idx >= nvml_gpus.size()) { continue; }
     auto gpu                       = nvml_gpus[nvml_idx];
     gpu.id                         = static_cast<unsigned int>(visible_idx);
-    gpu.hw_decompression_available = query_hw_decompression(gpu.id);
+    gpu.hw_decompression_available = query_hw_decompression(gpu.pci_bus_id);
     topology.gpus.push_back(std::move(gpu));
   }
 
