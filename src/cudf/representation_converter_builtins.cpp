@@ -1065,9 +1065,12 @@ static std::unique_ptr<cudf::column> reconstruct_column(
   rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
-  // Null mask — copied synchronously because cudf factories access it on construction
+  // Null mask — copied synchronously because cudf factories access it on construction.
+  // An all-valid mask (null_count == 0) is semantically identical to no mask: skip its
+  // upload entirely and construct the column non-nullable, avoiding a per-column
+  // blocking memcpy + stream sync.
   rmm::device_buffer null_mask{};
-  if (meta.has_null_mask) {
+  if (meta.has_null_mask && meta.null_count > 0) {
     null_mask =
       alloc_and_copy_h2d_sync(alloc, meta.null_mask_offset, meta.null_mask_size, stream, mr);
   }
