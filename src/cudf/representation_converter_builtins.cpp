@@ -50,6 +50,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
 #include <cassert>
@@ -73,6 +74,14 @@ namespace cucascade {
 // =============================================================================
 
 namespace {
+
+// RAII NVTX range for profiling converter phases (thread-local push/pop stack).
+struct nvtx_scope {
+  explicit nvtx_scope(const char* name) { nvtxRangePushA(name); }
+  ~nvtx_scope() { nvtxRangePop(); }
+  nvtx_scope(const nvtx_scope&)            = delete;
+  nvtx_scope& operator=(const nvtx_scope&) = delete;
+};
 
 // memory::column_metadata::type_id is a generic int32_t type tag; the cudf layer interprets it
 // as the numeric value of a cudf::type_id. These helpers convert across that boundary.
@@ -962,7 +971,9 @@ static rmm::device_buffer alloc_and_schedule_h2d(
   rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
+  nvtxRangePushA("hg:dev_alloc");
   rmm::device_buffer buf(size, stream, mr);
+  nvtxRangePop();
   if (size == 0) { return buf; }
   if (alloc.size() == 0) {
     throw std::invalid_argument(
@@ -1005,7 +1016,10 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
+  nvtx_scope range{"hg:nullmask_sync"};
+  nvtxRangePushA("hg:dev_alloc");
   rmm::device_buffer buf(size, stream, mr);
+  nvtxRangePop();
   if (size == 0) { return buf; }
 
   const std::size_t block_size = alloc.block_size();
@@ -1075,6 +1089,7 @@ static std::unique_ptr<cudf::column> reconstruct_column(
       // Flush pending H2D copies so the INT32 offsets buffer has valid data on device
       // before the cast reads from it. The cast replaces offsets_col, freeing the old
       // INT32 buffer, so batch must not hold dangling pointers to it.
+      nvtx_scope cast_range{"hg:offsets_cast"};
       batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
       offsets_col =
         cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
@@ -1167,6 +1182,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   rmm::cuda_stream_view stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"hg:convert"};
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
   if (!fast_table) { throw std::runtime_error("convert_host_fast_to_gpu: host table is null"); }
@@ -1178,7 +1194,9 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // host_data_representation is flushed before we read the pinned host blocks.
   // The caller's stream may be bound to a non-target device under multi-GPU;
   // synchronize is safe across devices.
+  nvtxRangePushA("hg:presync");
   stream.synchronize();
+  nvtxRangePop();
 
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
 
@@ -1186,22 +1204,30 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // Using the caller's stream for the H2D batch under a target-device RAII
   // guard raises cudaErrorInvalidValue when stream and current device belong
   // to different CUDA contexts (multi-GPU case).
+  nvtxRangePushA("hg:acquire_stream");
   auto target_stream = target_memory_space->acquire_stream();
   auto mr            = target_memory_space->get_default_allocator();
+  nvtxRangePop();
 
   // Collect all H→D copy ops across all columns, then fire one batched call.
   BatchCopyAccumulator batch;
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(fast_table->columns.size());
+  nvtxRangePushA("hg:reconstruct");
   for (const auto& col_meta : fast_table->columns) {
     gpu_columns.push_back(
       reconstruct_column(col_meta, *fast_table->allocation, target_stream, mr, batch));
   }
+  nvtxRangePop();
   // Source is CPU-written pinned host memory: fully prepared before this call.
+  nvtxRangePushA("hg:flush_submit");
   batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
+  nvtxRangePop();
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
+  nvtxRangePushA("hg:final_sync");
   target_stream.synchronize();
+  nvtxRangePop();
 
   // STREAM-LINEAGE: writes happened on target_stream; record event so
   // cross-stream readers observe ordering.
