@@ -5,6 +5,8 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <cuda.h>
+
 #include <dlfcn.h>
 #include <ifaddrs.h>
 #include <nvml.h>
@@ -61,49 +63,36 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
  * @brief Minimal subset of the CUDA driver API used for device capability queries.
  *
  * Resolved with dlopen/dlsym rather than linked, so this library keeps loading on
- * hosts without an NVIDIA driver (matching how NVML is treated here) and so the
- * topology-only build needs no CUDA runtime or RMM dependency.
- *
- * `CUdevice` and `CUresult` are spelled as `int` to avoid pulling in `<cuda.h>`:
- * `CUdevice` is a typedef for `int` and `CUresult` is an int-sized enum, so both
- * match the driver ABI.
+ * hosts without an NVIDIA driver, matching how NVML is treated here.
  */
 struct cuda_driver_api {
-  int (*init)(unsigned int){nullptr};
-  int (*device_get_by_pci_bus_id)(int*, char const*){nullptr};
-  int (*device_get_attribute)(int*, int, int){nullptr};
+  CUresult (*init)(unsigned int){nullptr};
+  CUresult (*device_get_by_pci_bus_id)(CUdevice*, char const*){nullptr};
+  CUresult (*device_get_attribute)(int*, CUdevice_attribute, CUdevice){nullptr};
   bool available{false};
 };
-
-/// CUDA driver success code (`CUDA_SUCCESS`).
-constexpr int cuda_driver_success{0};
-
-/// `CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK`, added in CUDA 12.8. Spelled
-/// literally so this file builds against older toolkit headers; the driver's
-/// attribute numbering is ABI-stable. A non-zero mask means the device exposes at
-/// least one hardware decompression algorithm.
-constexpr int cu_device_attribute_mem_decompress_algorithm_mask{136};
 
 /**
  * @brief Resolve a symbol from an already-opened shared object.
  *
- * `dlsym` returns `void*`; converting an object pointer to a function pointer is
- * conditionally-supported in ISO C++ (and rejected under `-Wpedantic`) but is
- * well-defined on POSIX. The copy through `memcpy` performs the conversion without
- * tripping the diagnostic.
+ * A null return from `dlsym` is not by itself an error — a symbol may legitimately
+ * have a null value — so failure is detected by clearing `dlerror()` beforehand and
+ * inspecting it afterwards.
  *
  * @tparam Fn Function pointer type of the symbol.
+ * @param fn Set to the resolved symbol on success; left untouched on failure.
  * @param handle Handle returned by `dlopen`.
  * @param name Symbol name.
- * @return The resolved function pointer, or nullptr if the symbol is absent.
+ * @return true if the symbol was resolved.
  */
 template <typename Fn>
-Fn load_symbol(void* handle, char const* name)
+bool load_symbol(Fn& fn, void* handle, char const* name)
 {
-  void* symbol = dlsym(handle, name);
-  Fn fn{};
-  if (symbol != nullptr) { std::memcpy(&fn, &symbol, sizeof(fn)); }
-  return fn;
+  ::dlerror();
+  auto* symbol = reinterpret_cast<Fn>(dlsym(handle, name));
+  if (::dlerror() != nullptr) { return false; }
+  fn = symbol;
+  return true;
 }
 
 /**
@@ -123,18 +112,12 @@ cuda_driver_api const& load_cuda_driver_api()
     void* handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
     if (handle == nullptr) { return resolved; }
 
-    resolved.init = load_symbol<decltype(cuda_driver_api::init)>(handle, "cuInit");
-    resolved.device_get_by_pci_bus_id =
-      load_symbol<decltype(cuda_driver_api::device_get_by_pci_bus_id)>(handle,
-                                                                       "cuDeviceGetByPCIBusId");
-    resolved.device_get_attribute =
-      load_symbol<decltype(cuda_driver_api::device_get_attribute)>(handle, "cuDeviceGetAttribute");
-
-    if (resolved.init == nullptr || resolved.device_get_by_pci_bus_id == nullptr ||
-        resolved.device_get_attribute == nullptr) {
+    if (!load_symbol(resolved.init, handle, "cuInit") ||
+        !load_symbol(resolved.device_get_by_pci_bus_id, handle, "cuDeviceGetByPCIBusId") ||
+        !load_symbol(resolved.device_get_attribute, handle, "cuDeviceGetAttribute")) {
       return cuda_driver_api{};
     }
-    if (resolved.init(0) != cuda_driver_success) { return cuda_driver_api{}; }
+    if (resolved.init(0) != CUDA_SUCCESS) { return cuda_driver_api{}; }
 
     resolved.available = true;
     return resolved;
@@ -169,15 +152,13 @@ bool query_hw_decompression(std::string const& pci_bus_id)
   auto const& api = load_cuda_driver_api();
   if (!api.available || pci_bus_id.empty()) { return false; }
 
-  int device = 0;
-  if (api.device_get_by_pci_bus_id(&device, pci_bus_id.c_str()) != cuda_driver_success) {
-    return false;
-  }
+  CUdevice device = 0;
+  if (api.device_get_by_pci_bus_id(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) { return false; }
 
   int algorithm_mask = 0;
   if (api.device_get_attribute(&algorithm_mask,
-                               cu_device_attribute_mem_decompress_algorithm_mask,
-                               device) != cuda_driver_success) {
+                               CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
+                               device) != CUDA_SUCCESS) {
     return false;
   }
   return algorithm_mask != 0;
