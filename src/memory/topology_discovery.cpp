@@ -181,7 +181,6 @@ std::string read_file_content(std::string const& path)
   std::stringstream buffer;
   buffer << file.rdbuf();
   std::string content = buffer.str();
-  // Trim trailing newline
   if (!content.empty() && content.back() == '\n') { content.pop_back(); }
   return content;
 }
@@ -207,14 +206,12 @@ std::vector<int> parse_cpu_list(std::string const& cpulist)
   while (std::getline(iss, token, ',')) {
     size_t dash_pos = token.find('-');
     if (dash_pos != std::string::npos) {
-      // Range, e.g., "0-31"
       int start = std::stoi(token.substr(0, dash_pos));
       int end   = std::stoi(token.substr(dash_pos + 1));
       for (int i = start; i <= end; ++i) {
         cores.push_back(i);
       }
     } else {
-      // Single core, e.g., "5"
       cores.push_back(std::stoi(token));
     }
   }
@@ -240,7 +237,6 @@ std::string normalize_pci_bus_id(std::string const& pci_bus_id)
   std::string domain = pci_bus_id.substr(0, colon_pos);
   if (domain.length() > 4) { domain = domain.substr(domain.length() - 4); }
 
-  // Convert to lowercase
   std::string normalized_id = domain + pci_bus_id.substr(colon_pos);
   std::ranges::transform(normalized_id, normalized_id.begin(), ::tolower);
 
@@ -463,7 +459,6 @@ PciePathType get_pcie_path_type(std::string const& gpu_pci_id, std::string const
   std::string gpu_norm = normalize_pci_bus_id(gpu_pci_id);
   std::string nic_norm = normalize_pci_bus_id(nic_pci_id);
 
-  // Read NUMA nodes
   int gpu_numa = -1, nic_numa = -1;
   std::string gpu_numa_str = read_file_content("/sys/bus/pci/devices/" + gpu_norm + "/numa_node");
   std::string nic_numa_str = read_file_content("/sys/bus/pci/devices/" + nic_norm + "/numa_node");
@@ -471,7 +466,6 @@ PciePathType get_pcie_path_type(std::string const& gpu_pci_id, std::string const
   if (!gpu_numa_str.empty()) { gpu_numa = std::stoi(gpu_numa_str); }
   if (!nic_numa_str.empty()) { nic_numa = std::stoi(nic_numa_str); }
 
-  // If different NUMA nodes, it's a SYS connection
   if (gpu_numa != nic_numa && gpu_numa >= 0 && nic_numa >= 0) { return PciePathType::SYS; }
 
   // Use PCI bus number proximity as a heuristic for connection quality
@@ -646,7 +640,6 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
       NetworkDeviceWithTopology dev;
       dev.name = entry.path().filename().string();
 
-      // Get device's NUMA node and PCI bus ID
       std::string numa_path = entry.path().string() + "/device/numa_node";
       std::string numa_str  = read_file_content(numa_path);
       dev.numa_node         = numa_str.empty() ? -1 : std::stoi(numa_str);
@@ -676,7 +669,6 @@ std::vector<storage_device_info> discover_storage_devices_with_topology()
       dev.name = entry.path().filename().string();
       dev.type = StorageDriveType::NVME;
 
-      // Get device's NUMA node and PCI bus ID
       std::string numa_path = entry.path().string() + "/device/numa_node";
       std::string numa_str  = read_file_content(numa_path);
       dev.numa_node         = numa_str.empty() ? -1 : std::stoi(numa_str);
@@ -710,7 +702,6 @@ std::vector<std::string> map_network_devices_to_gpu(
 {
   std::vector<std::string> mapped_devices;
 
-  // Structure to hold NIC with its topology path type
   struct NicWithPath {
     std::string name;
     PciePathType path_type;
@@ -718,7 +709,6 @@ std::vector<std::string> map_network_devices_to_gpu(
 
   std::vector<NicWithPath> nics_with_paths;
 
-  // Query topology distance for each NIC
   for (auto const& dev : network_devices) {
     if (dev.pci_bus_id.empty()) {
       continue;  // Skip devices without PCI info
@@ -731,7 +721,6 @@ std::vector<std::string> map_network_devices_to_gpu(
     nics_with_paths.push_back(nic);
   }
 
-  // Find the best (lowest) path type
   if (nics_with_paths.empty()) { return mapped_devices; }
 
   PciePathType best_path_type = PciePathType::SYS;
@@ -739,19 +728,16 @@ std::vector<std::string> map_network_devices_to_gpu(
     if (nic.path_type < best_path_type) { best_path_type = nic.path_type; }
   }
 
-  // Return all NICs with the best path type
   for (auto const& nic : nics_with_paths) {
     if (nic.path_type == best_path_type) { mapped_devices.push_back(nic.name); }
   }
 
-  // If no devices found, fall back to NUMA-based mapping
   if (mapped_devices.empty()) {
     for (auto const& dev : network_devices) {
       if (dev.numa_node == gpu_numa_node) { mapped_devices.push_back(dev.name); }
     }
   }
 
-  // Last resort: return all devices
   if (mapped_devices.empty() && !network_devices.empty()) {
     for (auto const& dev : network_devices) {
       mapped_devices.push_back(dev.name);
@@ -843,7 +829,6 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     // Continue anyway to report system info even without GPUs
   }
 
-  // Get GPU count
   unsigned int device_count = 0;
   bool nvml_available       = false;
   if (result == NVML_SUCCESS) {
@@ -856,17 +841,14 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     }
   }
 
-  // Discover network devices
   std::vector<NetworkDeviceWithTopology> network_devices_with_topology =
     discover_network_devices_with_topology(net_verification);
 
-  // Get system information
   topology.hostname            = get_hostname();
   topology.num_numa_nodes      = count_numa_nodes();
   topology.num_gpus            = device_count;
   topology.num_network_devices = static_cast<int>(network_devices_with_topology.size());
 
-  // Convert network devices to public format
   topology.network_devices.clear();
   for (auto const& dev : network_devices_with_topology) {
     network_device_info info;
@@ -878,7 +860,6 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 
   topology.storage_devices = discover_storage_devices_with_topology();
 
-  // Collect GPU information
   topology.gpus.clear();
 
   std::vector<gpu_topology_info> nvml_gpus;
