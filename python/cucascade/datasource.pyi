@@ -48,5 +48,6 @@ class RestEngine:
         max_connections: int = 16,
         chunk_size: int = 8388608,
         max_n_chunks: int = 16,
+        enable_cache: bool = False,
     ) -> None: ...
     def open(self, path: str) -> CuCascadeDatasource: ...

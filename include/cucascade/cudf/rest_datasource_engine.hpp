@@ -7,6 +7,7 @@
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <cstddef>
@@ -67,7 +68,8 @@ class rest_datasource_engine {
                                   std::size_t block_size      = default_block_size,
                                   std::size_t max_connections = 16,
                                   std::size_t chunk_size      = 8UL << 20,
-                                  std::size_t max_n_chunks    = 16);
+                                  std::size_t max_n_chunks    = 16,
+                                  bool        enable_cache    = false);
 
   ~rest_datasource_engine();
 
@@ -87,9 +89,10 @@ class rest_datasource_engine {
   [[nodiscard]] std::unique_ptr<datasource> open(std::string path) const;
 
  private:
-  cucascade::memory::numa_region_pinned_host_memory_resource _upstream;
-  cucascade::memory::fixed_size_host_memory_resource         _host_mr;
-  std::shared_ptr<ioctx>                                     _io_ctx;
+  cucascade::memory::numa_region_pinned_host_memory_resource          _upstream;
+  cucascade::memory::fixed_size_host_memory_resource                  _host_mr;
+  std::shared_ptr<ioctx>                                              _io_ctx;
+  std::unique_ptr<cucascade::memory::memory_reservation_manager>      _reservation_manager;
 };
 
 }  // namespace cucascade::io

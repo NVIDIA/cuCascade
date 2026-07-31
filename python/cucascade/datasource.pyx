@@ -291,6 +291,11 @@ cdef class RestEngine:
     max_n_chunks : int, optional
         Maximum number of destination buffers fused into a single scatter
         GET. Default is 16.
+    enable_cache : bool, optional
+        Whether to enable cuCascade's internal prefetch cache. When ``True``,
+        :meth:`CuCascadeDatasource.fadvise` queues S3 downloads into cuCascade's
+        bounce buffer pool so that subsequent reads may be served from cache
+        rather than S3. Default is ``False``.
     """
 
     cdef unique_ptr[rest_datasource_engine] _engine
@@ -309,6 +314,7 @@ cdef class RestEngine:
         size_t max_connections=16,
         size_t chunk_size=8388608,
         size_t max_n_chunks=16,
+        bint enable_cache=False,
     ):
         cdef string c_access_key_id     = access_key_id.encode()
         cdef string c_secret_access_key = secret_access_key.encode()
@@ -330,6 +336,7 @@ cdef class RestEngine:
                     max_connections,
                     chunk_size,
                     max_n_chunks,
+                    enable_cache,
                 )
             )
 

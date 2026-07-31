@@ -55,5 +55,6 @@ cdef extern from "cucascade/cudf/rest_datasource_engine.hpp" namespace "cucascad
                                size_t block_size,
                                size_t max_connections,
                                size_t chunk_size,
-                               size_t max_n_chunks) except +
+                               size_t max_n_chunks,
+                               cpp_bool enable_cache) except +
         unique_ptr[cc_datasource] open(string path) except +

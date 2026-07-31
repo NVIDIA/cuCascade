@@ -4,10 +4,14 @@
  */
 
 #include <cucascade/cudf/rest_datasource_engine.hpp>
+#include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
 #include <cucascade/io/rest/s3/static_credentials.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
+#include <cucascade/memory/topology_index.hpp>
 
 namespace cucascade::io {
 
@@ -22,7 +26,8 @@ rest_datasource_engine::rest_datasource_engine(std::string access_key_id,
                                                std::size_t block_size,
                                                std::size_t max_connections,
                                                std::size_t chunk_size,
-                                               std::size_t max_n_chunks)
+                                               std::size_t max_n_chunks,
+                                               bool enable_cache)
   : _upstream(0, true),
     _host_mr(0, _upstream, pool_capacity, pool_capacity, block_size, 128, 1)
 {
@@ -46,10 +51,37 @@ rest_datasource_engine::rest_datasource_engine(std::string access_key_id,
 
   auto io_ctx = std::make_shared<rest::rest_ioctx>(n_reactors, std::move(rest_ctx));
   io_ctx->start();
-  _io_ctx = std::move(io_ctx);
+  _io_ctx = io_ctx;
+
+  if (enable_cache) {
+    memory::topology_discovery discovery;
+    static_cast<void>(discovery.discover());
+    auto const& topology = discovery.get_topology();
+
+    auto configs = memory::reservation_manager_configurator{}
+                     .set_number_of_gpus(1)
+                     .use_host_per_numa()
+                     .set_total_host_capacity(pool_capacity)
+                     .build(topology);
+
+    _reservation_manager =
+      std::make_unique<memory::memory_reservation_manager>(std::move(configs));
+
+    io::cache::config cache_cfg{};
+    cache_cfg.dispose_after_use = true;
+
+    auto topo_index =
+      std::make_shared<memory::topology_index>(topology, std::vector<int>{0});
+
+    _io_ctx->initialize_cache(*_reservation_manager, cache_cfg, std::move(topo_index));
+  }
 }
 
-rest_datasource_engine::~rest_datasource_engine() { _io_ctx->shutdown(); }
+rest_datasource_engine::~rest_datasource_engine()
+{
+  _io_ctx->pre_destroy();
+  _io_ctx->shutdown();
+}
 
 std::unique_ptr<datasource> rest_datasource_engine::open(std::string path) const
 {
