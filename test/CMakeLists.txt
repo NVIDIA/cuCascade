@@ -65,7 +65,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_dispatch_failure_hook.cpp
     io/test_uri_parser.cpp
     io/cache/test_metadata_store.cpp
-    io/kvikio/test_kvikio_config.cpp
     io/rest/test_object_store_lister.cpp
     io/rest/test_rest_footer_resolve.cpp
     io/rest/test_rest_perf_snapshot.cpp
@@ -76,6 +75,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_static_credentials.cpp
     # Main test runner
     unittest.cpp)
+
+  # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
+  if(CUCASCADE_BUILD_CUDF)
+    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp)
+  endif()
+
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
                                                       CUDA_STANDARD_REQUIRED ON)
 

@@ -108,11 +108,13 @@ endif()
 
 # The S3 benchmark needs the io library (rest backend) and the benchmark tree.
 # Checked after the io gating above so a force-disabled io also disables it.
-if(CUCASCADE_BUILD_S3_BENCHMARK AND (NOT CUCASCADE_BUILD_IO
-                                     OR NOT CUCASCADE_BUILD_BENCHMARKS))
+if(CUCASCADE_BUILD_S3_BENCHMARK
+   AND (NOT CUCASCADE_BUILD_IO
+        OR NOT CUCASCADE_BUILD_BENCHMARKS
+        OR NOT CUCASCADE_BUILD_CUDF))
   message(
     STATUS
-      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON and CUCASCADE_BUILD_BENCHMARKS=ON"
+      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf and kvikIO)"
   )
   set(CUCASCADE_BUILD_S3_BENCHMARK
       OFF
@@ -158,10 +160,15 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
     find_package(OpenSSL REQUIRED)
 
-    # kvikIO — backs the local-file fallback ioctx (kvikio_context). Used
-    # directly (not via cudf) so the io library stays cudf-free. Not swappable:
-    # unlike moodycamel/invocable below there is no in-tree stand-in to replace.
-    find_package(kvikio REQUIRED CONFIG)
+    # kvikIO — backs the local-file fallback ioctx (kvikio_context). It reaches
+    # the environment only through libcudf's dependency closure (libkvikio is
+    # not a direct dependency), so it is tied to CUCASCADE_BUILD_CUDF: a
+    # cudf-free build drops kvikio_context and its catch-all registry entry,
+    # leaving uring/restful to claim paths. Consumers see the difference via the
+    # CUCASCADE_HAS_KVIKIO definition propagated by cucascade_io_thirdparty.
+    if(CUCASCADE_BUILD_CUDF)
+      find_package(kvikio REQUIRED CONFIG)
+    endif()
 
     # cucascade_io_thirdparty carries the swappable moodycamel + invocable
     # (abseil) usage requirements from a single place; the io object library,
@@ -238,6 +245,15 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
         INTERFACE $<BUILD_INTERFACE:${_cucascade_absl_target}>)
       target_compile_definitions(cucascade_io_thirdparty
                                  INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
+    endif()
+
+    # Gates the kvikIO fallback ioctx in io_config and the datasource registry.
+    # Carried on the same INTERFACE target as the definitions above so the io
+    # object library, its installable variants, and installed consumers all
+    # agree on the layout of io_config.
+    if(CUCASCADE_BUILD_CUDF)
+      target_compile_definitions(cucascade_io_thirdparty
+                                 INTERFACE CUCASCADE_HAS_KVIKIO)
     endif()
   endif()
 
@@ -407,7 +423,10 @@ if(CUCASCADE_BUILD_IO)
   # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
   # approach.
   set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
-                             OpenSSL::Crypto kvikio::kvikio)
+                             OpenSSL::Crypto)
+  if(CUCASCADE_BUILD_CUDF)
+    list(APPEND CUCASCADE_IO_LINK_LIBS kvikio::kvikio)
+  endif()
 
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
