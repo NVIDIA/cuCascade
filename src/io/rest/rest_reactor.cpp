@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -48,6 +49,14 @@
 namespace cucascade::io::rest {
 
 namespace {
+
+/// Raise @p a to @p v when @p v is larger.  Relaxed throughout: the *_ns_max
+/// counters are perf metrics and tolerate reordered updates.
+void atomic_max_relaxed(std::atomic<std::uint64_t>& a, std::uint64_t v) noexcept
+{
+  std::uint64_t cur = a.load(std::memory_order_relaxed);
+  while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
 
 // ---- libcurl callbacks -----------------------------------------------------
 
@@ -502,6 +511,12 @@ void rest_reactor::enqueue(request_type_ptr req)
 void rest_reactor::enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_request>> batch)
 {
   if (batch.empty()) { return; }
+  if (_config.perf_instrumentation) {
+    auto const now = std::chrono::steady_clock::now();
+    for (auto& c : batch) {
+      if (c) { c->t_enqueue = now; }
+    }
+  }
   bool const ok = _requests.enqueue_bulk(std::make_move_iterator(batch.data()), batch.size());
   if (!ok) { throw std::runtime_error("rest_reactor::enqueue_chunks: enqueue_bulk failed"); }
   interrupt();
@@ -807,6 +822,30 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
   return std::move(fut).get();
 }
 
+rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
+{
+  rest_perf_snapshot s;
+  s.chunk_get_ns_total       = _perf.chunk_get_ns_total.load(std::memory_order_relaxed);
+  s.chunk_get_count          = _perf.chunk_get_count.load(std::memory_order_relaxed);
+  s.chunk_get_ns_max         = _perf.chunk_get_ns_max.load(std::memory_order_relaxed);
+  s.queue_wait_ns_total      = _perf.queue_wait_ns_total.load(std::memory_order_relaxed);
+  s.queue_wait_count         = _perf.queue_wait_count.load(std::memory_order_relaxed);
+  s.ttfb_ns                  = _perf.ttfb_ns.load(std::memory_order_relaxed);
+  s.h2d_observed_ns_total    = _perf.h2d_observed_ns_total.load(std::memory_order_relaxed);
+  s.h2d_observed_count       = _perf.h2d_observed_count.load(std::memory_order_relaxed);
+  s.h2d_observed_ns_max      = _perf.h2d_observed_ns_max.load(std::memory_order_relaxed);
+  s.retries_total            = _perf.retries_total.load(std::memory_order_relaxed);
+  s.terminal_failures_total  = _perf.terminal_failures_total.load(std::memory_order_relaxed);
+  s.device_stream_sync_total = _perf.device_stream_sync_total.load(std::memory_order_relaxed);
+  s.payload_bytes_read_total = _perf.payload_bytes_read_total.load(std::memory_order_relaxed);
+  s.blocking_host_get_count  = _perf.blocking_host_get_count.load(std::memory_order_relaxed);
+  s.blocking_host_get_wall_ns_total =
+    _perf.blocking_host_get_wall_ns_total.load(std::memory_order_relaxed);
+  s.blocking_host_get_wall_ns_max =
+    _perf.blocking_host_get_wall_ns_max.load(std::memory_order_relaxed);
+  return s;
+}
+
 size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
 {
   object_ref const obj{std::string(bucket), std::string(key)};
@@ -837,6 +876,7 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
       curl_off_t cl = -1;
       curl_easy_getinfo(h.get(), CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
       if (cl < 0) {
+        _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
         throw std::runtime_error("rest_reactor::head_object_size: missing Content-Length for " +
                                  obj.bucket + "/" + obj.key);
       }
@@ -848,10 +888,12 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
     bool const retriable =
       (rc != CURLE_OK && is_retriable_curl(rc)) || (rc == CURLE_OK && is_retriable_status(status));
     if (!retriable) {
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
       throw std::runtime_error("rest_reactor::head_object_size: " + last_error + " for " +
                                obj.bucket + "/" + obj.key);
     }
     if (attempt + 1 < _config.max_retry_attempts) {
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
       CUCASCADE_LOG_WARN("rest_reactor::head_object_size: retrying {}/{} after {} (attempt {}/{})",
                          obj.bucket,
                          obj.key,
@@ -861,6 +903,7 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
       std::this_thread::sleep_for(compute_backoff(attempt, hc.retry_after, _config));
     }
   }
+  _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
   throw std::runtime_error("rest_reactor::head_object_size: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
 }
@@ -896,6 +939,9 @@ std::string rest_reactor::list_page(std::string_view bucket,
     long status       = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
 
+    // Control-plane response: the XML body is deliberately NOT credited to
+    // chunk_get_count / payload_bytes_read_total — those track object-read
+    // payload, and LIST is metadata.
     if (rc == CURLE_OK && status == 200) { return body; }
 
     last_error =
@@ -903,10 +949,12 @@ std::string rest_reactor::list_page(std::string_view bucket,
     bool const retriable =
       (rc != CURLE_OK && is_retriable_curl(rc)) || (rc == CURLE_OK && is_retriable_status(status));
     if (!retriable) {
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
       throw std::runtime_error("rest_reactor::list_page: " + last_error + " for " + bucket_s + "/" +
                                prefix_s);
     }
     if (attempt + 1 < _config.max_retry_attempts) {
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
       CUCASCADE_LOG_WARN("rest_reactor::list_page: retrying {}/{} after {} (attempt {}/{})",
                          bucket_s,
                          prefix_s,
@@ -916,6 +964,7 @@ std::string rest_reactor::list_page(std::string_view bucket,
       std::this_thread::sleep_for(compute_backoff(attempt, hc.retry_after, _config));
     }
   }
+  _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
   throw std::runtime_error("rest_reactor::list_page: exhausted retries (" + last_error + ") for " +
                            bucket_s + "/" + prefix_s);
 }
@@ -952,9 +1001,15 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     CUCASCADE_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &suffix_header_cb));
     CUCASCADE_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &sink));
 
+    auto const t0     = std::chrono::steady_clock::now();
     CURLcode const rc = curl_easy_perform(h.get());
     long status       = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+
+    // Mirror the async worker's finish(): payload bytes are always-on and
+    // per-attempt, so credit this attempt's body bytes outside the
+    // perf_instrumentation gate.
+    _perf.payload_bytes_read_total.fetch_add(sink.total_received, std::memory_order_relaxed);
 
     // suffix_write_cb aborts any non-206 body, so a CURLE_WRITE_ERROR here is our
     // own doing and the HTTP status is still valid; only a different curl error
@@ -962,6 +1017,7 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     if (rc != CURLE_OK && rc != CURLE_WRITE_ERROR) {
       last_error = std::string(curl_easy_strerror(rc));
       if (!is_retriable_curl(rc)) {
+        _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
         throw std::runtime_error("rest_reactor::fetch_footer_suffix: " + last_error + " for " +
                                  obj.bucket + "/" + obj.key);
       }
@@ -972,6 +1028,19 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
       auto const total = content_range_total(sink.content_range);
       auto const start = content_range_start(sink.content_range);
       if (total && start && *start <= *total && sink.data.size() == *total - *start) {
+        // Account the footer-suffix GET like an async chunk GET so bind-time
+        // footer reads stay visible in the perf snapshot.
+        if (_config.perf_instrumentation) {
+          auto const get_ns =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - t0)
+                                         .count());
+          _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
+          _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
+          atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
+          std::uint64_t expected = 0;
+          _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
+        }
         probe.object_size = *total;
         probe.window_lo   = *start;
         probe.bytes       = make_shared_byte_span(std::move(sink.data));
@@ -985,11 +1054,13 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
       last_error = "HTTP " + std::to_string(status);
     } else {
       // 404 / 403 / 401 / ... — an error a HEAD would not recover from either.
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
       throw std::runtime_error("rest_reactor::fetch_footer_suffix: HTTP " + std::to_string(status) +
                                " for " + obj.bucket + "/" + obj.key);
     }
 
     if (attempt + 1 < _config.max_retry_attempts) {
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
       CUCASCADE_LOG_WARN(
         "rest_reactor::fetch_footer_suffix: retrying {}/{} after {} (attempt {}/{})",
         obj.bucket,
@@ -1000,6 +1071,7 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
       std::this_thread::sleep_for(compute_backoff(attempt, sink.retry_after, _config));
     }
   }
+  _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
   throw std::runtime_error("rest_reactor::fetch_footer_suffix: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
 }
@@ -1323,6 +1395,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         if (st == query_status::success) {
           it->manager->chunk_complete(it->bytes);
         } else {
+          _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
           it->manager->report_error(
             std::make_exception_ptr(std::runtime_error("rest_reactor: device H2D copy failed")));
         }
@@ -1357,6 +1430,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       std::size_t const max_attempts =
         is_auth ? _config.max_auth_retry_attempts : _config.max_retry_attempts;
       if (counter + 1 >= max_attempts) {
+        _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
         req->manager->report_error(std::make_exception_ptr(std::runtime_error(
           "rest_reactor: exhausted retries for " + req->object.bucket + "/" + req->object.key)));
         return;
@@ -1364,6 +1438,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       // Backoff tracks the transient-attempt count; an auth retry re-presigns
       // and reuses the current step without inflating it.
       auto const delay = compute_backoff(req->attempt, retry_after, _config);
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
       CUCASCADE_LOG_WARN("rest_reactor: retrying {}/{} after {} (attempt {}/{})",
                          req->object.bucket,
                          req->object.key,
@@ -1430,6 +1505,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           dr->is_device() && (!dr->chunk.is_buffer_allocated() || dr->staged_through_bounce);
         if (needs_bounce && s.bounce == nullptr) {
           // Device staging requested but no host memory resource was configured.
+          _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
           dr->manager->report_error(std::make_exception_ptr(std::runtime_error(
             "rest_reactor: device staging unavailable (no host memory resource)")));
           dr.reset();
@@ -1437,6 +1513,16 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         }
 
         s.req = std::move(dr);
+        if (_config.perf_instrumentation) {
+          auto const now  = std::chrono::steady_clock::now();
+          s.req->t_submit = now;
+          if (s.req->attempt == 0) {
+            auto const wait_ns = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(now - s.req->t_enqueue).count());
+            _perf.queue_wait_ns_total.fetch_add(wait_ns, std::memory_order_relaxed);
+            _perf.queue_wait_count.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
         if (needs_bounce) {
           s.req->chunk.set_data(s.bounce);
           // Record bounce-staging before finish() reads it: set_data has just
@@ -1456,7 +1542,11 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     // `copying` (held until its H2D copy finishes); otherwise the caller
     // recycles the slot immediately.
     auto finish = [&](int i, CURLcode rc, long status) -> bool {
-      io_slot& s          = slots[static_cast<size_t>(i)];
+      io_slot& s = slots[static_cast<size_t>(i)];
+      // Always-on: credit this attempt's body bytes BEFORE any success / retry /
+      // terminal branching, so retried / partial / failed attempts stay in the
+      // byte budget.
+      _perf.payload_bytes_read_total.fetch_add(s.sink.total_received, std::memory_order_relaxed);
       auto& req           = *s.req;
       bool const ok_range = (status == 206) || (status == 200 && req.chunk.offset == 0);
       // A 206 must report, via Content-Range, that it delivered the exact range
@@ -1470,6 +1560,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       if (rc == CURLE_OK && status == 206) {
         auto const start = content_range_start(s.hc.content_range);
         if (!start || *start != req.chunk.offset) {
+          _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
           req.manager->report_error(std::make_exception_ptr(std::runtime_error(
             "rest_reactor: 206 Content-Range mismatch (got '" + s.hc.content_range +
             "', requested offset " + std::to_string(req.chunk.offset) + ") for " +
@@ -1478,6 +1569,22 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         }
       }
       if (rc == CURLE_OK && ok_range && s.sink.written >= req.chunk.size) {
+        if (_config.perf_instrumentation) {
+          auto const get_ns =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - req.t_submit)
+                                         .count());
+          _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
+          _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
+          atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
+          std::uint64_t expected = 0;
+          _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
+          if (req.perf_blocking_host_get) {
+            _perf.blocking_host_get_count.fetch_add(1, std::memory_order_relaxed);
+            _perf.blocking_host_get_wall_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
+            atomic_max_relaxed(_perf.blocking_host_get_wall_ns_max, get_ns);
+          }
+        }
         if (req.is_device()) {
           // Issue the async H2D copy.  Bounce-staged reads need a CUDA event so
           // the slot (its bounce buffer) is only reused once the copy off it
@@ -1490,10 +1597,22 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             ev  = &copy_events[req.cpy_req->device_id][static_cast<size_t>(i)];
             cev = ev->get();
           }
+          std::chrono::steady_clock::time_point h2d_start;
+          if (_config.perf_instrumentation) { h2d_start = std::chrono::steady_clock::now(); }
           cudaError_t const err = req.copy_h2d_async(cev);
           if (err != cudaSuccess) {
+            _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
             req.manager->report_error(err);
             return false;
+          }
+          if (_config.perf_instrumentation) {
+            auto const h2d_ns =
+              static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - h2d_start)
+                                           .count());
+            _perf.h2d_observed_ns_total.fetch_add(h2d_ns, std::memory_order_relaxed);
+            _perf.h2d_observed_count.fetch_add(1, std::memory_order_relaxed);
+            atomic_max_relaxed(_perf.h2d_observed_ns_max, h2d_ns);
           }
           if (needs_event) {
             // Bounce buffer is still feeding the copy: hand the slot's token to
@@ -1517,6 +1636,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       if (rc == CURLE_OK && status == 200 && req.chunk.offset != 0) {
         // Server ignored Range and returned the whole object: the bytes start
         // at offset 0, not req.offset — non-retriable, would loop forever.
+        _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
         req.manager->report_error(std::make_exception_ptr(
           std::runtime_error("rest_reactor: server ignored Range (HTTP 200) for " +
                              req.object.bucket + "/" + req.object.key)));
@@ -1545,6 +1665,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       std::string const msg = rc != CURLE_OK
                                 ? std::string(curl_easy_strerror(rc))
                                 : (ok_range ? "short read" : "HTTP " + std::to_string(status));
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
       req.manager->report_error(std::make_exception_ptr(std::runtime_error(
         "rest_reactor: " + msg + " for " + req.object.bucket + "/" + req.object.key)));
       return false;
@@ -1633,6 +1754,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     // the request_manager would never reach total_chunks.
     for (auto& pc : copying) {
       try {
+        _perf.device_stream_sync_total.fetch_add(1, std::memory_order_relaxed);
         pc.event->synchronize();
         pc.manager->chunk_complete(pc.bytes);
       } catch (const std::exception& e) {

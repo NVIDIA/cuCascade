@@ -28,6 +28,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -162,6 +163,45 @@ class rest_io_object : public io_object {
   size_t _file_size{0};
   size_t _window_lo{0};
   shared_byte_span _stash;
+};
+
+// ---------------------------------------------------------------------------
+// rest_perf_snapshot
+// ---------------------------------------------------------------------------
+
+/// Plain-value perf counters read out of a reactor, or summed across the pool
+/// by @c rest_ioctx.  The ns totals/maxes and ttfb stay 0 unless the reactor's
+/// @c perf_instrumentation is on; retry / terminal / device-stream-sync and
+/// payload-bytes counts are populated regardless.  The layout is not
+/// ABI-stable: consumers build from the same source pin, and fields are
+/// appended, never reordered or removed.
+struct rest_perf_snapshot {
+  std::uint64_t chunk_get_ns_total{0};
+  std::uint64_t chunk_get_count{0};
+  std::uint64_t chunk_get_ns_max{0};
+  std::uint64_t queue_wait_ns_total{0};
+  std::uint64_t queue_wait_count{0};
+  // ttfb = span from GET submission to completion of the reactor's first
+  // completed GET (async chunk or footer probe) — not first byte on the wire.
+  std::uint64_t ttfb_ns{0};
+  // h2d_observed_* time the copy_h2d_async call itself — the host-side async
+  // launch cost, not the copy, which completes later on the stream.
+  std::uint64_t h2d_observed_ns_total{0};
+  std::uint64_t h2d_observed_count{0};
+  std::uint64_t h2d_observed_ns_max{0};
+  std::uint64_t retries_total{0};
+  std::uint64_t terminal_failures_total{0};
+  std::uint64_t device_stream_sync_total{0};
+  // Always-on: HTTP response *body* bytes received (sink.total_received), summed
+  // over every completed curl attempt incl. retries / partial / failed bodies.
+  // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
+  std::uint64_t payload_bytes_read_total{0};
+  // perf_instrumentation-gated. Blocking host GETs remain part of chunk_get_*
+  // and are also attributed to blocking_host_get_*. Stash hits issue no GET and
+  // increment neither.
+  std::uint64_t blocking_host_get_count{0};
+  std::uint64_t blocking_host_get_wall_ns_total{0};
+  std::uint64_t blocking_host_get_wall_ns_max{0};
 };
 
 /// How @c prep_host_rx_request attributes the resulting GETs in the perf
@@ -300,11 +340,16 @@ class rest_reactor {
   /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
   /// request query (no auth params — authorization is added via
   /// @c authorize_list).  @p prefix is only for retry-log / error text.
-  /// Control-plane op: retries are WARN-logged like every retry loop here, but
-  /// the XML body is never treated as object-read payload.
+  /// Control-plane op: retries/terminals are counted (and retries WARN-logged)
+  /// like every retry loop here, but the XML body never touches the chunk-GET /
+  /// payload byte counters.
   std::string list_page(std::string_view bucket,
                         std::string_view prefix,
                         std::string_view canonical_query);
+
+  /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
+  /// loads); safe to call while the reactor is running.
+  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
   // -- capabilities / factory ----------------------------------------------
 
@@ -353,6 +398,29 @@ class rest_reactor {
 
   std::stop_source _stop_source;
   blocking_concurrent_queue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+
+  // Instrumentation counters, owned by the reactor (not worker_loop locals) so
+  // rest_ioctx can read them cross-thread.  Gating: see rest_perf_snapshot.
+  struct perf_counters {
+    std::atomic<std::uint64_t> chunk_get_ns_total{0};
+    std::atomic<std::uint64_t> chunk_get_count{0};
+    std::atomic<std::uint64_t> chunk_get_ns_max{0};
+    std::atomic<std::uint64_t> queue_wait_ns_total{0};
+    std::atomic<std::uint64_t> queue_wait_count{0};
+    std::atomic<std::uint64_t> ttfb_ns{0};
+    std::atomic<std::uint64_t> h2d_observed_ns_total{0};
+    std::atomic<std::uint64_t> h2d_observed_count{0};
+    std::atomic<std::uint64_t> h2d_observed_ns_max{0};
+    std::atomic<std::uint64_t> retries_total{0};
+    std::atomic<std::uint64_t> terminal_failures_total{0};
+    std::atomic<std::uint64_t> device_stream_sync_total{0};
+    std::atomic<std::uint64_t> payload_bytes_read_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_count{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
+  };
+  perf_counters _perf;
+
   std::jthread _worker;
 };
 
