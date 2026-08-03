@@ -25,10 +25,16 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_reactor.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4_authorizer.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/list_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/prefetching_cache.cpp)
+
+# kvikIO reaches the environment only via libcudf's dependency closure, so the
+# fallback ioctx is built only alongside the cudf layer.
+if(CUCASCADE_BUILD_CUDF)
+  target_sources(cucascade_io_objects
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp)
+endif()
