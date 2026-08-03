@@ -219,24 +219,20 @@ TEST_CASE("arguments are not evaluated for a filtered record", "[log]")
   CHECK(evaluations == 1);
 }
 
-TEST_CASE("placeholder and argument counts may disagree without throwing", "[log]")
+TEST_CASE("format strings behave like std::format", "[log]")
 {
   sink_guard const guard;
   capture captured;
   cucascade::log::set_sink(&capture_sink, &captured, level::trace);
 
-  SECTION("surplus arguments are dropped")
+  // Too few arguments or a bad format spec are compile errors, so they cannot be
+  // exercised here -- that is the point of using std::format_string.
+
+  SECTION("surplus arguments are ignored, as std::format allows")
   {
     CUCASCADE_LOG_INFO("only {}", 1, 2);
     REQUIRE(captured.messages.size() == 1);
     CHECK(captured.messages.front() == "only 1");
-  }
-
-  SECTION("unfilled placeholders stay literal")
-  {
-    CUCASCADE_LOG_INFO("{} and {}", 1);
-    REQUIRE(captured.messages.size() == 1);
-    CHECK(captured.messages.front() == "1 and {}");
   }
 
   SECTION("a message with no placeholders passes through")
@@ -244,6 +240,20 @@ TEST_CASE("placeholder and argument counts may disagree without throwing", "[log
     CUCASCADE_LOG_INFO("nothing to substitute");
     REQUIRE(captured.messages.size() == 1);
     CHECK(captured.messages.front() == "nothing to substitute");
+  }
+
+  SECTION("format specs are honoured")
+  {
+    CUCASCADE_LOG_INFO("{:.2f} {:#x} {:>4}", 3.14159, 255, "ab");
+    REQUIRE(captured.messages.size() == 1);
+    CHECK(captured.messages.front() == "3.14 0xff   ab");
+  }
+
+  SECTION("formatting is locale-independent")
+  {
+    CUCASCADE_LOG_INFO("{}", 1048576);
+    REQUIRE(captured.messages.size() == 1);
+    CHECK(captured.messages.front() == "1048576");
   }
 }
 

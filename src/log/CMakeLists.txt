@@ -15,12 +15,14 @@
 # the License.
 # =============================================================================
 
-# Only the built-in stderr sink lives here. The logging machinery itself (level
-# check, sink slot, formatting) stays header-only in
-# include/cucascade/log/logging.hpp so that logging never imposes a link
-# dependency -- including on the topology-only build, which does not produce
-# cucascade_objects and therefore has no stderr sink available.
+# Record delivery (vemit), sink publication and the built-in stderr sink. Only
+# the level check and the sink slot stay inline in
+# include/cucascade/log/logging.hpp, so the hot path remains header-only while
+# <format>, <chrono> and <ctime> stay out of every translation unit that logs.
+#
+# Logging therefore requires linking cuCascade, and is unavailable in a
+# topology-only build, which does not produce cucascade_objects.
 if(TARGET cucascade_objects)
   target_sources(cucascade_objects
-                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stderr_sink.cpp)
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/logging.cpp)
 endif()
