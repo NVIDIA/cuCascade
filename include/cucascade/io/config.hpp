@@ -18,7 +18,9 @@
 #pragma once
 
 #include <cucascade/io/cache/config.hpp>
+#ifdef CUCASCADE_HAS_KVIKIO
 #include <cucascade/io/kvikio/config.hpp>
+#endif
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/uring/config.hpp>
@@ -35,7 +37,9 @@ namespace cucascade::io {
  * Sub-configs:
  *  - @c local   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c kvikio  — kvikIO fallback tunables (local-disk catch-all path).
+ *  - @c kvikio  — kvikIO fallback tunables (local-disk catch-all path); present
+ *    only when the library is built with CUCASCADE_BUILD_CUDF, which is what
+ *    supplies kvikIO.
  *  - @c cache   — prefetching cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -59,11 +63,13 @@ struct io_config {
   /// retry policy, etc.
   rest::config rest{};
 
+#ifdef CUCASCADE_HAS_KVIKIO
   /// kvikIO fallback configuration — thread-pool size, task/bounce sizing,
   /// O_DIRECT, compat mode.  All fields default to "unset", leaving kvikIO's
   /// own env-var-seeded defaults in place.  Note these are process-global once
   /// applied; see @ref kvikio_config.
   kvikio_config kvikio{};
+#endif
 
   /// Prefetching cache configuration — in-flight budget, pool sizing,
   /// dispose-after-use policy.

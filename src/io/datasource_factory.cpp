@@ -19,7 +19,9 @@
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#ifdef CUCASCADE_HAS_KVIKIO
 #include <cucascade/io/kvikio/kvikio_context.hpp>
+#endif
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
@@ -78,6 +80,7 @@ std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
 
+#ifdef CUCASCADE_HAS_KVIKIO
 factory_type make_kvikio_ioctx_factory()
 {
   return [](const io_config& config) -> std::shared_ptr<ioctx> {
@@ -91,6 +94,7 @@ factory_type make_kvikio_ioctx_factory()
     }
   };
 }
+#endif
 
 factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
@@ -160,11 +164,14 @@ io_context_registry::io_context_registry(
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  kvikio is the universal fallback —
   // it can open any local path — so it matches everything and lookup_path
-  // defers it behind the explicit backends.
+  // defers it behind the explicit backends.  Without kvikIO (a cudf-free
+  // build) there is no catch-all and unmatched paths resolve to nothing.
+#ifdef CUCASCADE_HAS_KVIKIO
   _entries.emplace(
     io_context_type::kvikio,
     entry{
       io_context_type::kvikio, [](std::string_view) { return true; }, make_kvikio_ioctx_factory()});
+#endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
