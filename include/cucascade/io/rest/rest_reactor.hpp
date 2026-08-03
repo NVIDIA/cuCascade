@@ -164,6 +164,11 @@ class rest_io_object : public io_object {
   shared_byte_span _stash;
 };
 
+/// How @c prep_host_rx_request attributes the resulting GETs in the perf
+/// snapshot: a @c blocking read (synchronous host_read) is counted in
+/// blocking_host_get_* in addition to chunk_get_*.
+enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
+
 // ---------------------------------------------------------------------------
 // rest_reactor
 // ---------------------------------------------------------------------------
@@ -237,6 +242,10 @@ class rest_reactor {
   static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
                                                const io_object_type& file,
                                                const io_object_segment& segment);
+  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
+                                               const io_object_type& file,
+                                               const io_object_segment& segment,
+                                               host_read_attribution attribution);
 
   static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
                                                 const io_object_type& file,

@@ -515,6 +515,14 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
                                                                   const io_object_type& file,
                                                                   const io_object_segment& segment)
 {
+  return prep_host_rx_request(cfg, file, segment, host_read_attribution::async_chunk);
+}
+
+rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_config_type& cfg,
+                                                                  const io_object_type& file,
+                                                                  const io_object_segment& segment,
+                                                                  host_read_attribution attribution)
+{
   if (segment.size == 0) { return rest_rx_request::create({}); }
   // A host read has no bounce fallback (needs_bounce requires is_device()): a
   // null destination would reach the sink's null-iovec guard, drop the body,
@@ -556,12 +564,13 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   chunks.reserve(n_chunks);
   size_t pos = 0;  // byte offset within the segment
   for (size_t c = 0; c < n_chunks; ++c) {
-    size_t const piece = base + (c < rem ? 1 : 0);
-    auto req           = std::make_unique<rest_chunked_rx_request>();
-    req->object        = obj;
-    req->chunk         = io_object_segment{segment.offset + pos, piece, dst + pos};
-    req->file_size     = fsize;
-    req->manager       = manager;
+    size_t const piece          = base + (c < rem ? 1 : 0);
+    auto req                    = std::make_unique<rest_chunked_rx_request>();
+    req->object                 = obj;
+    req->chunk                  = io_object_segment{segment.offset + pos, piece, dst + pos};
+    req->file_size              = fsize;
+    req->manager                = manager;
+    req->perf_blocking_host_get = (attribution == host_read_attribution::blocking);
     chunks.push_back(std::move(req));
     pos += piece;
   }
@@ -791,7 +800,8 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
   // full TCP+TLS handshake per call and duplicates the retry logic.  Build the
   // request, grab its future BEFORE enqueue (which moves the chunks out), then
   // block: get() rethrows the first reported error or returns the byte count.
-  auto req = prep_host_rx_request(_config, file, io_object_segment{offset, size, dst});
+  auto req = prep_host_rx_request(
+    _config, file, io_object_segment{offset, size, dst}, host_read_attribution::blocking);
   auto fut = req->get_future();
   enqueue(std::move(req));
   return std::move(fut).get();

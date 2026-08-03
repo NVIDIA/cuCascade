@@ -87,6 +87,12 @@ struct config {
   std::chrono::milliseconds retry_jitter{50};
   bool honor_retry_after{true};
 
+  /// When set, the reactor records the per-chunk micro timings (chunk_get,
+  /// queue_wait, ttfb, h2d_observed) into its perf counters.  The retry,
+  /// terminal-failure, device-stream-sync and payload-byte counters are always
+  /// recorded, independent of this flag.
+  bool perf_instrumentation{false};
+
   /// Suffix-range window (bytes) for the parquet footer probe
   /// (@c open_hint::parquet_footer_probe): one `Range: bytes=-N` GET resolves the
   /// object size and stashes its last N bytes, so cuDF's trailer/footer reads are
