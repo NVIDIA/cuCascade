@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <string>
 #include <utility>
+#include <variant>
 
 namespace cucascade {
 namespace memory {
@@ -38,16 +39,16 @@ namespace detail {
  * Allocating moves bytes from the adaptor's reserved counter to its allocated counter;
  * the unspent balance is refunded only when the last reference dies.
  *
- * @tparam Adaptor Always `reservation_aware_resource_adaptor`.
- *
- * The adaptor is a template parameter only so that the reservation can hold one by
- * value: `reservation_aware_resource_adaptor` is defined in terms of its impl, so it is
- * still incomplete at the friend declaration site, and only a dependent member type
- * defers the completeness requirement to instantiation time.
+ * @tparam Adaptor One of `device_adaptor`, `host_adaptor`, or `host_device_adaptor`. Its
+ * properties are forwarded to the reservation via `cuda::forward_property`, so a
+ * reservation advertises whatever the granting adaptor advertises (e.g.
+ * `cuda::mr::device_accessible`). That forwarding is what lets `memory_reservation`
+ * project this impl into an erased resource of the matching accessibility.
  */
 template <typename Adaptor>
-  requires std::same_as<Adaptor, reservation_aware_resource_adaptor>
-class memory_reservation_impl {
+  requires reservation_adaptor<Adaptor>
+class memory_reservation_impl
+  : public ::cuda::forward_property<memory_reservation_impl<Adaptor>, Adaptor> {
  public:
   memory_reservation_impl(Adaptor adaptor, std::int64_t grant, std::size_t overbooking)
     : adaptor_{std::move(adaptor)}, grant_{grant}, overbooking_{overbooking}, balance_{grant}
@@ -121,9 +122,7 @@ class memory_reservation_impl {
     return this == std::addressof(other);
   }
 
-  friend void get_property(memory_reservation_impl const&, ::cuda::mr::device_accessible) noexcept
-  {
-  }
+  [[nodiscard]] Adaptor const& upstream_resource() const noexcept { return adaptor_; }
 
   [[nodiscard]] Adaptor const& adaptor() const noexcept { return adaptor_; }
 
@@ -148,42 +147,102 @@ class memory_reservation_impl {
   std::atomic<std::int64_t> balance_;
 };
 
+/**
+ * @brief The reference-counted handle on a reservation's shared state.
+ */
+template <typename Adaptor>
+using reservation_handle = ::cuda::mr::shared_resource<memory_reservation_impl<Adaptor>>;
+
 }  // namespace detail
 
 /**
- * @brief A memory reservation that is itself a memory resource.
+ * @brief A memory reservation, independent of the accessibility of its memory.
  *
  * Granted by `reservation_aware_resource_adaptor::reserve()`, a reservation holds a
- * budget of bytes carved out of the adaptor's limit. It is an RMM memory resource, so
- * it can be handed to cudf (or anything else taking a `rmm::device_async_resource_ref`),
- * and every allocation made through it is charged against that budget. An allocation
- * exceeding the remaining `balance()` throws `rmm::out_of_memory`; deallocating returns
- * the bytes to the balance.
+ * budget of bytes carved out of the adaptor's limit. Every allocation made through it is
+ * charged against that budget: an allocation exceeding the remaining `balance()` throws
+ * `rmm::out_of_memory`, and deallocating returns the bytes to the balance.
+ *
+ * This is a single type regardless of where the memory lives. Internally it holds one of
+ * three shared states, chosen by the granting adaptor's upstream, and its own type says
+ * nothing about accessibility. Query `accessibility()` to find out.
+ *
+ * @par Handing a reservation to cudf or RMM
+ *
+ * A reservation is not itself a memory resource. Project it into an erased resource of
+ * the accessibility you need, and pass that:
+ *
+ * @code{.cpp}
+ * auto res   = adaptor.reserve(1 << 30, allow_overbooking::NO);
+ * auto table = cudf::groupby(..., stream, res.as_device());
+ * @endcode
+ *
+ * `as_device()`, `as_host()`, and `as_host_device()` each throw
+ * `cucascade::logic_error` when the reservation's memory does not have the requested
+ * accessibility. Use `accessibility()`, `is_device_accessible()`, or
+ * `is_host_accessible()` to branch without exceptions.
  *
  * @par Ownership
  *
- * Like `reservation_aware_resource_adaptor`, this is a `cuda::mr::shared_resource`, so
- * copies share the same reservation and are interchangeable. RMM stores such a copy
- * inside every buffer allocated from the reservation, which is what keeps the
- * reservation alive for as long as those buffers need it to service deallocations.
+ * Copies of a reservation share the same shared state and are interchangeable. The
+ * handles returned by the `as_*()` methods own a reference to that same state, so a
+ * buffer allocated through one keeps the reservation alive for as long as it needs to
+ * service its deallocation, even after every `memory_reservation` copy is gone.
  *
- * The unspent balance is refunded to the adaptor when the last copy dies. Reserving
+ * The unspent balance is refunded to the adaptor when the last reference dies. Reserving
  * more than is allocated therefore keeps the surplus out of circulation for as long as
  * any derived buffer lives, so reserve what you actually use.
- *
- * @code{.cpp}
- * auto res = adaptor.reserve(1 << 30, allow_overbooking::NO);
- * auto table = cudf::groupby(..., stream, res);
- * @endcode
  */
-class memory_reservation : public ::cuda::mr::shared_resource<
-                             detail::memory_reservation_impl<reservation_aware_resource_adaptor>> {
-  using shared_base = ::cuda::mr::shared_resource<
-    detail::memory_reservation_impl<reservation_aware_resource_adaptor>>;
-
+class memory_reservation {
  public:
-  /// @brief The shared state of the reservation.
-  using impl_type = detail::memory_reservation_impl<reservation_aware_resource_adaptor>;
+  /**
+   * @brief The accessibility of the memory this reservation draws on.
+   *
+   * @return The accessibility, fixed at grant time by the adaptor's upstream.
+   */
+  [[nodiscard]] reservation_accessibility accessibility() const noexcept;
+
+  /**
+   * @brief Whether `as_device()` will succeed.
+   *
+   * @return True when the reservation's memory is device accessible.
+   */
+  [[nodiscard]] bool is_device_accessible() const noexcept;
+
+  /**
+   * @brief Whether `as_host()` will succeed.
+   *
+   * @return True when the reservation's memory is host accessible.
+   */
+  [[nodiscard]] bool is_host_accessible() const noexcept;
+
+  /**
+   * @brief Project the reservation into a device-accessible memory resource.
+   *
+   * The returned handle owns a reference to the reservation's shared state, so it may
+   * outlive this object.
+   *
+   * @return An erased resource advertising `cuda::mr::device_accessible`.
+   * @throws cucascade::logic_error if the reservation's memory is not device accessible.
+   */
+  [[nodiscard]] any_device_resource as_device() const;
+
+  /**
+   * @brief Project the reservation into a host-accessible memory resource.
+   *
+   * @return An erased resource advertising `cuda::mr::host_accessible`.
+   * @throws cucascade::logic_error if the reservation's memory is not host accessible.
+   */
+  [[nodiscard]] any_host_resource as_host() const;
+
+  /**
+   * @brief Project the reservation into a host- and device-accessible memory resource.
+   *
+   * @return An erased resource advertising both accessibility properties.
+   * @throws cucascade::logic_error unless the reservation's memory is both host and
+   * device accessible.
+   */
+  [[nodiscard]] any_host_device_resource as_host_device() const;
 
   /**
    * @brief Equality comparison.
@@ -191,30 +250,21 @@ class memory_reservation : public ::cuda::mr::shared_resource<
    * @param other The other reservation to compare.
    * @return True if both refer to the same reservation.
    */
-  [[nodiscard]] bool operator==(memory_reservation const& other) const noexcept
-  {
-    return get() == other.get();
-  }
+  [[nodiscard]] bool operator==(memory_reservation const& other) const noexcept;
 
   /**
    * @brief The number of bytes originally granted.
    *
    * @return The granted size in bytes.
    */
-  [[nodiscard]] std::size_t grant() const noexcept
-  {
-    return detail::safe_cast<std::size_t>(get().grant());
-  }
+  [[nodiscard]] std::size_t grant() const noexcept;
 
   /**
    * @brief The remaining unallocated size of the reservation.
    *
    * @return The remaining size in bytes.
    */
-  [[nodiscard]] std::size_t balance() const noexcept
-  {
-    return detail::safe_cast<std::size_t>(get().balance());
-  }
+  [[nodiscard]] std::size_t balance() const noexcept;
 
   /**
    * @brief The number of bytes by which the grant overbooks the adaptor's limit.
@@ -224,38 +274,28 @@ class memory_reservation : public ::cuda::mr::shared_resource<
    *
    * @return The overbooked size in bytes.
    */
-  [[nodiscard]] std::size_t overbooking() const noexcept { return get().overbooking(); }
-
-  /**
-   * @brief The adaptor that granted the reservation.
-   *
-   * @return The adaptor.
-   */
-  [[nodiscard]] reservation_aware_resource_adaptor const& adaptor() const noexcept
-  {
-    return get().adaptor();
-  }
+  [[nodiscard]] std::size_t overbooking() const noexcept;
 
  private:
+  template <typename Upstream>
   friend class reservation_aware_resource_adaptor;
 
+  /// @brief The shared state, one alternative per accessibility.
+  using handle_variant = std::variant<detail::reservation_handle<device_adaptor>,
+                                      detail::reservation_handle<host_adaptor>,
+                                      detail::reservation_handle<host_device_adaptor>>;
+
   /**
-   * @brief Construct from an already-granted reservation.
+   * @brief Construct from an already-granted shared state.
    *
    * Private so that only `reservation_aware_resource_adaptor` can grant reservations.
-   * The reservation holds a copy of the adaptor, so the adaptor stays alive for as
-   * long as any buffer allocated from the reservation needs it.
    *
-   * @param adaptor The adaptor that granted the reservation.
-   * @param granted The number of bytes granted.
-   * @param overbooking The number of bytes by which @p granted overbooks the limit.
+   * @param handle The shared state of the granted reservation.
    */
-  memory_reservation(reservation_aware_resource_adaptor const& adaptor,
-                     std::size_t granted,
-                     std::size_t overbooking);
-};
+  explicit memory_reservation(handle_variant handle) : handle_{std::move(handle)} {}
 
-static_assert(::cuda::mr::resource_with<memory_reservation, ::cuda::mr::device_accessible>);
+  handle_variant handle_;
+};
 
 }  // namespace experimental
 }  // namespace memory

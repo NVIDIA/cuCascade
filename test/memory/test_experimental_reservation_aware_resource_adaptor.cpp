@@ -30,6 +30,7 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
@@ -42,11 +43,12 @@
 #include <random>
 #include <vector>
 
-using cucascade::memory::experimental::allow_overbooking;
-using cucascade::memory::experimental::memory_reservation;
-using cucascade::memory::experimental::reservation_aware_resource_adaptor;
+using namespace cucascade::memory::experimental;
 
 namespace {
+
+/// The concrete state a reservation's erased handle wraps, for `resource_cast` round trips.
+using device_reservation_handle = detail::reservation_handle<device_adaptor>;
 
 bool has_cuda_device()
 {
@@ -69,15 +71,23 @@ TEST_CASE("Reserve moves bytes from available to reserved", "[experimental_reser
 {
   if (!has_cuda_device()) { return; }
 
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   auto check_any_resouce_conversion = [&](auto& mr_like) {
+    using mr_like_t = std::remove_cvref_t<decltype(mr_like)>;
     cuda::mr::any_resource<cuda::mr::device_accessible> any_device = mr_like;
-    cuda::mr::any_resource<> any_adaptor                           = mr_like;
+    cuda::mr::any_resource<> any_erased                            = mr_like;
     CHECK(any_device == mr_like);
-    CHECK(any_adaptor == mr_like);
+    CHECK(any_erased == mr_like);
+
+    auto res_cast = [](auto* _res_ptr) {
+      auto casted_ptr = cuda::mr::resource_cast<mr_like_t>(_res_ptr);
+      CHECK(casted_ptr != nullptr);
+      return casted_ptr;
+    };
+
+    CHECK(mr_like == *res_cast(&any_device));
+    CHECK(mr_like == *res_cast(&any_erased));
   };
   check_any_resouce_conversion(adaptor);
 
@@ -86,7 +96,23 @@ TEST_CASE("Reserve moves bytes from available to reserved", "[experimental_reser
   REQUIRE_NOTHROW(std::ignore = adaptor.reserve(0, allow_overbooking::NO));
 
   auto res = adaptor.reserve(1024, allow_overbooking::NO);
-  check_any_resouce_conversion(res);
+
+  CHECK(res.accessibility() == reservation_accessibility::DEVICE);
+  CHECK(res.is_device_accessible());
+  CHECK_FALSE(res.is_host_accessible());
+  CHECK_THROWS_AS(res.as_host(), cucascade::logic_error);
+  CHECK_THROWS_AS(res.as_host_device(), cucascade::logic_error);
+
+  // The projection owns a reference to the same shared state, recoverable by name.
+  auto projected                  = res.as_device();
+  cuda::mr::any_resource<> erased = projected;
+  CHECK(erased == projected);
+  auto* handle = cuda::mr::resource_cast<device_reservation_handle>(&projected);
+  REQUIRE(handle != nullptr);
+  CHECK((*handle)->balance() == 1024);
+
+  auto copy = res;
+  CHECK(copy == res);
 
   CHECK(res.overbooking() == 0);
   CHECK(res.balance() == 1024);
@@ -99,20 +125,18 @@ TEST_CASE("Allocating keeps available unchanged", "[experimental_reservation_awa
   if (!has_cuda_device()) { return; }
 
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   auto res = adaptor.reserve(1024, allow_overbooking::NO);
 
   {
-    rmm::device_buffer buf1{256, stream, res};
+    rmm::device_buffer buf1{256, stream, res.as_device()};
     CHECK(res.balance() == 768);
     CHECK(adaptor.total_reserved() == 768);
     CHECK(adaptor.current_allocated() == 256);
     CHECK(adaptor.available() == limit - 1024);
 
-    rmm::device_buffer buf2{512, stream, res};
+    rmm::device_buffer buf2{512, stream, res.as_device()};
     CHECK(res.balance() == 256);
     CHECK(adaptor.total_reserved() == 256);
     CHECK(adaptor.current_allocated() == 768);
@@ -130,12 +154,10 @@ TEST_CASE("Exceeding the grant throws", "[experimental_reservation_aware][gpu]")
   if (!has_cuda_device()) { return; }
 
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   auto res = adaptor.reserve(1024, allow_overbooking::NO);
-  REQUIRE_THROWS_AS((rmm::device_buffer{2048, stream, res}), rmm::out_of_memory);
+  REQUIRE_THROWS_AS((rmm::device_buffer{2048, stream, res.as_device()}), rmm::out_of_memory);
   CHECK(res.balance() == 1024);
   CHECK(adaptor.current_allocated() == 0);
   stream.synchronize();
@@ -146,14 +168,12 @@ TEST_CASE("Zero-sized reservation throws on first byte", "[experimental_reservat
   if (!has_cuda_device()) { return; }
 
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   auto res = adaptor.reserve(static_cast<std::size_t>(2 * limit), allow_overbooking::NO);
   CHECK(res.balance() == 0);
   CHECK(res.overbooking() == static_cast<std::size_t>(limit));
-  REQUIRE_THROWS_AS((rmm::device_buffer{1, stream, res}), rmm::out_of_memory);
+  REQUIRE_THROWS_AS((rmm::device_buffer{1, stream, res.as_device()}), rmm::out_of_memory);
   stream.synchronize();
 }
 
@@ -161,9 +181,7 @@ TEST_CASE("Overbooking is granted when allowed", "[experimental_reservation_awar
 {
   if (!has_cuda_device()) { return; }
 
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   auto res = adaptor.reserve(static_cast<std::size_t>(2 * limit), allow_overbooking::YES);
   CHECK(res.balance() == static_cast<std::size_t>(2 * limit));
@@ -171,13 +189,57 @@ TEST_CASE("Overbooking is granted when allowed", "[experimental_reservation_awar
   CHECK(adaptor.available() == -limit);
 }
 
+TEST_CASE("Host reservations project to host only", "[experimental_reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { return; }
+
+  host_adaptor adaptor{any_host_resource{rmm::mr::pinned_host_memory_resource{}}, limit};
+
+  auto res = adaptor.reserve(1024, allow_overbooking::NO);
+  CHECK(res.accessibility() == reservation_accessibility::HOST);
+  CHECK(res.is_host_accessible());
+  CHECK_FALSE(res.is_device_accessible());
+  CHECK_THROWS_AS(res.as_device(), cucascade::logic_error);
+  CHECK_THROWS_AS(res.as_host_device(), cucascade::logic_error);
+
+  auto mr    = res.as_host();
+  auto* data = mr.allocate_sync(256, 256);
+  CHECK(res.balance() == 768);
+  CHECK(adaptor.current_allocated() == 256);
+  mr.deallocate_sync(data, 256, 256);
+  CHECK(res.balance() == 1024);
+  CHECK(adaptor.current_allocated() == 0);
+}
+
+TEST_CASE("Host-device reservations project three ways", "[experimental_reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { return; }
+
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  host_device_adaptor adaptor{any_host_device_resource{rmm::mr::pinned_host_memory_resource{}},
+                              limit};
+
+  auto res = adaptor.reserve(1024, allow_overbooking::NO);
+  CHECK(res.accessibility() == reservation_accessibility::HOST_DEVICE);
+  CHECK(res.is_host_accessible());
+  CHECK(res.is_device_accessible());
+  CHECK_NOTHROW(std::ignore = res.as_host());
+  CHECK_NOTHROW(std::ignore = res.as_host_device());
+
+  {
+    rmm::device_buffer buf{256, stream, res.as_device()};
+    CHECK(res.balance() == 768);
+    CHECK(adaptor.current_allocated() == 256);
+  }
+  CHECK(res.balance() == 1024);
+  stream.synchronize();
+}
+
 TEST_CASE("Destruction refunds the unused balance", "[experimental_reservation_aware][gpu]")
 {
   if (!has_cuda_device()) { return; }
 
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   {
     auto res = adaptor.reserve(1024, allow_overbooking::NO);
@@ -192,20 +254,19 @@ TEST_CASE("Buffer outlives the reserving scope", "[experimental_reservation_awar
   if (!has_cuda_device()) { return; }
 
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   {
     auto buf = [&] {
       auto res = adaptor.reserve(1024, allow_overbooking::NO);
-      return rmm::device_buffer{512, stream, res};
+      return rmm::device_buffer{512, stream, res.as_device()};
     }();
 
-    auto mr           = buf.memory_resource();
-    auto* reservation = ::cuda::mr::resource_cast<memory_reservation>(&mr);
-    REQUIRE(reservation != nullptr);
-    CHECK(reservation->balance() == 512);
+    // The buffer's own handle is now the only reference keeping the reservation alive.
+    auto mr      = buf.memory_resource();
+    auto* handle = ::cuda::mr::resource_cast<device_reservation_handle>(&mr);
+    REQUIRE(handle != nullptr);
+    CHECK((*handle)->balance() == 512);
 
     CHECK(adaptor.current_allocated() == 512);
     CHECK(adaptor.total_reserved() == 512);
@@ -225,13 +286,11 @@ TEST_CASE("Main memory record tracks allocations", "[experimental_reservation_aw
   if (!has_cuda_device()) { return; }
 
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   auto res = adaptor.reserve(1024, allow_overbooking::NO);
   {
-    rmm::device_buffer buf{256, stream, res};
+    rmm::device_buffer buf{256, stream, res.as_device()};
     auto record = adaptor.get_main_record();
     CHECK(record.current == 256);
     CHECK(record.total == 256);
@@ -259,9 +318,7 @@ TEST_CASE("Concurrent allocations share one reservation", "[experimental_reserva
   constexpr std::size_t num_threads     = 2;
   constexpr std::size_t grant           = num_buffers * max_buffer_size;
 
-  reservation_aware_resource_adaptor adaptor{
-    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
-    limit};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   std::mt19937 rng{42};
   std::uniform_int_distribution<std::size_t> dist{0, max_buffer_size};
@@ -280,7 +337,7 @@ TEST_CASE("Concurrent allocations share one reservation", "[experimental_reserva
     workers.push_back(std::async(std::launch::async, [&, tid] {
       for (std::size_t i = tid; i < num_buffers; i += num_threads) {
         auto alloc_stream = pool.get_stream(i % pool.get_pool_size());
-        buffers[i]        = rmm::device_buffer{sizes[i], alloc_stream, res};
+        buffers[i]        = rmm::device_buffer{sizes[i], alloc_stream, res.as_device()};
       }
     }));
   }

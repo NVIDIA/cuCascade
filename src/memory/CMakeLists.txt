@@ -30,7 +30,8 @@ if(TARGET cucascade_objects)
       ${CMAKE_CURRENT_SOURCE_DIR}/numa_region_pinned_host_allocator.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/oom_handling_policy.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/reservation_aware_resource_adaptor.cpp
-      ${CMAKE_CURRENT_SOURCE_DIR}/experimental_reservation_aware_resource_adaptor.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/experimental/memory_reservation.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/experimental/reservation_aware_resource_adaptor.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/reservation_manager_configurator.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/small_pinned_host_memory_resource.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/stream_pool.cpp

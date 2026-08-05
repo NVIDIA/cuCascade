@@ -42,10 +42,31 @@ namespace cucascade {
 namespace memory {
 namespace experimental {
 
+template <typename Upstream>
 class reservation_aware_resource_adaptor;
 class memory_reservation;
 
 using any_device_resource = ::cuda::mr::any_resource<::cuda::mr::device_accessible>;
+using any_host_resource   = ::cuda::mr::any_resource<::cuda::mr::host_accessible>;
+using any_host_device_resource =
+  ::cuda::mr::any_resource<::cuda::mr::device_accessible, ::cuda::mr::host_accessible>;
+
+using device_adaptor      = reservation_aware_resource_adaptor<any_device_resource>;
+using host_adaptor        = reservation_aware_resource_adaptor<any_host_resource>;
+using host_device_adaptor = reservation_aware_resource_adaptor<any_host_device_resource>;
+
+/**
+ * @brief The accessibility of the memory a reservation draws on.
+ *
+ * Determined by the upstream of the granting adaptor and fixed for the lifetime of the
+ * reservation. Selects which of `memory_reservation::as_device()`, `as_host()`, and
+ * `as_host_device()` are valid.
+ */
+enum class reservation_accessibility : std::uint8_t {
+  DEVICE,       ///< Device accessible only.
+  HOST,         ///< Host accessible only.
+  HOST_DEVICE,  ///< Both host and device accessible.
+};
 
 /**
  * @brief Snapshot of the adaptor's main (non-scoped) allocation accounting.
@@ -82,19 +103,34 @@ template <typename To, typename From>
   }
 }
 
+/**
+ * @brief The adaptor instantiations that may grant a reservation.
+ */
+template <typename T>
+concept reservation_adaptor = std::same_as<T, device_adaptor> || std::same_as<T, host_adaptor> ||
+                              std::same_as<T, host_device_adaptor>;
+
 // Forward-declared so `reservation_aware_resource_adaptor_impl` can friend it.
 // Defined in memory_reservation.hpp.
 template <typename Adaptor>
-  requires std::same_as<Adaptor, reservation_aware_resource_adaptor>
+  requires reservation_adaptor<Adaptor>
 class memory_reservation_impl;
 
 /**
  * @brief Shared state of a reservation-aware resource adaptor.
  *
- * Owns an upstream device resource and tracks a single main memory record (no scoped
+ * Owns an upstream resource and tracks a single main memory record (no scoped
  * records). Reservations are granted against a runtime-adjustable limit.
+ *
+ * @tparam Upstream The upstream memory resource type. Its properties are forwarded to
+ * the impl via `cuda::forward_property`, so any tag advertised by `Upstream`
+ * (e.g. `cuda::mr::device_accessible`) is visible on the impl and, transitively, on
+ * the wrapping `shared_resource`.
  */
-class reservation_aware_resource_adaptor_impl {
+template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
+class reservation_aware_resource_adaptor_impl
+  : public ::cuda::forward_property<reservation_aware_resource_adaptor_impl<Upstream>, Upstream> {
  public:
   /**
    * @brief Construct with a primary memory resource and a memory limit.
@@ -102,7 +138,7 @@ class reservation_aware_resource_adaptor_impl {
    * @param upstream_mr The primary memory resource (moved in).
    * @param limit Maximum number of bytes that may be allocated and reserved.
    */
-  reservation_aware_resource_adaptor_impl(any_device_resource upstream_mr, std::int64_t limit)
+  reservation_aware_resource_adaptor_impl(Upstream upstream_mr, std::int64_t limit)
     : upstream_mr_{std::move(upstream_mr)}, limit_{limit}
   {
   }
@@ -121,10 +157,9 @@ class reservation_aware_resource_adaptor_impl {
     return this == std::addressof(other);
   }
 
-  [[nodiscard]] any_device_resource const& get_upstream_resource() const noexcept
-  {
-    return upstream_mr_;
-  }
+  [[nodiscard]] Upstream const& upstream_resource() const noexcept { return upstream_mr_; }
+
+  [[nodiscard]] Upstream const& get_upstream_resource() const noexcept { return upstream_mr_; }
 
   [[nodiscard]] std::int64_t limit() const noexcept
   {
@@ -225,13 +260,10 @@ class reservation_aware_resource_adaptor_impl {
     sync_stream_.synchronize_no_throw();
   }
 
-  friend void get_property(reservation_aware_resource_adaptor_impl const&,
-                           ::cuda::mr::device_accessible) noexcept
-  {
-  }
-
  private:
-  friend class memory_reservation_impl<reservation_aware_resource_adaptor>;
+  friend class memory_reservation_impl<device_adaptor>;
+  friend class memory_reservation_impl<host_adaptor>;
+  friend class memory_reservation_impl<host_device_adaptor>;
 
   void record_allocation(std::int64_t nbytes)
   {
@@ -249,7 +281,7 @@ class reservation_aware_resource_adaptor_impl {
     num_current_allocs_.sub(1, std::memory_order_acq_rel);
   }
 
-  any_device_resource upstream_mr_;
+  Upstream upstream_mr_;
 
   utils::atomic_bounded_counter<std::int64_t> num_current_allocs_{0};
   utils::atomic_bounded_counter<std::int64_t> num_total_allocs_{0};
@@ -270,12 +302,20 @@ class reservation_aware_resource_adaptor_impl {
 /**
  * @brief A memory resource adaptor that only allocates through reservations.
  *
- * This adaptor wraps a primary device memory resource and adds a memory limit with
- * allocation tracking. Memory is obtained by calling `reserve()` and allocating through
- * the returned `memory_reservation`.
+ * This adaptor wraps a primary memory resource and adds a memory limit with allocation
+ * tracking. Memory is obtained by calling `reserve()` and allocating through the returned
+ * `memory_reservation`.
  *
  * This class is copyable and shares ownership of its internal state via
  * `cuda::mr::shared_resource`.
+ *
+ * Only three instantiations exist, one per accessibility: `device_adaptor`,
+ * `host_adaptor`, and `host_device_adaptor`. The upstream's accessibility is forwarded to
+ * the adaptor and on to every reservation it grants, so a `device_adaptor` yields
+ * reservations usable as device resources and nothing else.
+ *
+ * @tparam Upstream The erased upstream resource type: `any_device_resource`,
+ * `any_host_resource`, or `any_host_device_resource`.
  *
  * @par Allocating without a reservation
  *
@@ -294,14 +334,18 @@ class reservation_aware_resource_adaptor_impl {
  * Allocating through a reservation moves bytes from the second bucket to the first,
  * leaving `available()` unchanged; that is what makes a reservation a promise.
  */
+template <typename Upstream>
 class reservation_aware_resource_adaptor
-  : public ::cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl> {
+  : public ::cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl<Upstream>> {
  public:
   /// @brief The adaptor's shared implementation.
-  using impl_type = detail::reservation_aware_resource_adaptor_impl;
+  using impl_type = detail::reservation_aware_resource_adaptor_impl<Upstream>;
 
   /// @brief The reference-counted handle on the shared implementation.
   using shared_base = ::cuda::mr::shared_resource<impl_type>;
+
+  /// @brief The erased upstream resource type.
+  using upstream_type = Upstream;
 
   /**
    * @brief Construct with the specified primary memory resource and limit.
@@ -309,7 +353,7 @@ class reservation_aware_resource_adaptor
    * @param upstream_mr The primary memory resource.
    * @param limit Maximum number of bytes that may be allocated and reserved.
    */
-  reservation_aware_resource_adaptor(any_device_resource upstream_mr, std::int64_t limit);
+  reservation_aware_resource_adaptor(Upstream upstream_mr, std::int64_t limit);
 
   /**
    * @brief Equality comparison.
@@ -319,7 +363,7 @@ class reservation_aware_resource_adaptor
    */
   [[nodiscard]] bool operator==(reservation_aware_resource_adaptor const& other) const noexcept
   {
-    return get() == other.get();
+    return this->get() == other.get();
   }
 
   /**
@@ -395,13 +439,10 @@ class reservation_aware_resource_adaptor
   /**
    * @brief Get a reference to the primary upstream resource.
    *
-   * @return Reference to the RMM memory resource.
+   * @return Reference to the erased upstream resource.
    */
-  [[nodiscard]] rmm::device_async_resource_ref get_upstream_resource() const noexcept;
+  [[nodiscard]] Upstream const& get_upstream_resource() const noexcept;
 };
-
-static_assert(
-  ::cuda::mr::resource_with<reservation_aware_resource_adaptor, ::cuda::mr::device_accessible>);
 
 }  // namespace experimental
 }  // namespace memory
