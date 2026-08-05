@@ -204,27 +204,27 @@ class reservation_aware_resource_adaptor_impl
    * @return A pair of the number of bytes granted (either @p size or zero) and the
    * number of bytes by which the request overbooks the limit.
    *
-   * @note Rejections are best-effort under contention: concurrent requests each claim
-   * before checking, so requests that would fit individually may be rejected.
+   * @note The decision is made against a snapshot: `limit_` and `current_` are read
+   * separately from the commit, so a concurrent allocation can still push the total
+   * past the limit after a request is granted.
    */
   [[nodiscard]] std::pair<std::size_t, std::size_t> reserve(std::size_t size,
                                                             bool allow_overbooking)
   {
-    auto const want             = safe_cast<std::int64_t>(size);
-    std::int64_t const capacity = limit() - current_allocated();
+    auto const want = safe_cast<std::int64_t>(size);
+    auto reserved   = total_reserved_.load(std::memory_order_acquire);
 
-    // Claim the bytes up front and roll back if they didn't fit. While a claim is
-    // being rolled back the reserved total reads high, which makes a concurrent
-    // `available()` pessimistic, never optimistic.
-    auto const reserved         = total_reserved_.add(want, std::memory_order_acq_rel) - want;
-    std::int64_t const headroom = capacity - (reserved + want);
-    if (headroom >= 0) { return {size, 0}; }
-    auto const overbooking = safe_cast<std::size_t>(-headroom);
-    if (!allow_overbooking) {
-      total_reserved_.sub(want, std::memory_order_acq_rel);
-      return {0, overbooking};
+    // Commit the claim only once it is known to fit, so a rejected request never
+    // writes to the counter and never inflates what a concurrent `available()` sees.
+    // A failed exchange re-reads the limit and the allocated total as well.
+    while (true) {
+      std::int64_t const headroom = limit() - current_allocated() - reserved - want;
+      if (headroom < 0 && !allow_overbooking) { return {0, safe_cast<std::size_t>(-headroom)}; }
+      if (total_reserved_->compare_exchange_weak(
+            reserved, reserved + want, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return {size, headroom < 0 ? safe_cast<std::size_t>(-headroom) : 0};
+      }
     }
-    return {size, overbooking};
   }
 
   void* allocate(::cuda::stream_ref stream,
