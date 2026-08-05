@@ -971,9 +971,11 @@ static rmm::device_buffer alloc_and_schedule_h2d(
   rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
-  nvtxRangePushA("hg:dev_alloc");
-  rmm::device_buffer buf(size, stream, mr);
-  nvtxRangePop();
+  rmm::device_buffer buf;
+  {
+    nvtx_scope alloc_range{"hg:dev_alloc"};
+    buf = rmm::device_buffer(size, stream, mr);
+  }
   if (size == 0) { return buf; }
   if (alloc.size() == 0) {
     throw std::invalid_argument(
@@ -1017,9 +1019,11 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
   rmm::device_async_resource_ref mr)
 {
   nvtx_scope range{"hg:nullmask_sync"};
-  nvtxRangePushA("hg:dev_alloc");
-  rmm::device_buffer buf(size, stream, mr);
-  nvtxRangePop();
+  rmm::device_buffer buf;
+  {
+    nvtx_scope alloc_range{"hg:dev_alloc"};
+    buf = rmm::device_buffer(size, stream, mr);
+  }
   if (size == 0) { return buf; }
 
   const std::size_t block_size = alloc.block_size();
@@ -1197,9 +1201,10 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // host_data_representation is flushed before we read the pinned host blocks.
   // The caller's stream may be bound to a non-target device under multi-GPU;
   // synchronize is safe across devices.
-  nvtxRangePushA("hg:presync");
-  stream.synchronize();
-  nvtxRangePop();
+  {
+    nvtx_scope presync_range{"hg:presync"};
+    stream.synchronize();
+  }
 
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
 
@@ -1207,30 +1212,34 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // Using the caller's stream for the H2D batch under a target-device RAII
   // guard raises cudaErrorInvalidValue when stream and current device belong
   // to different CUDA contexts (multi-GPU case).
-  nvtxRangePushA("hg:acquire_stream");
-  auto target_stream = target_memory_space->acquire_stream();
-  auto mr            = target_memory_space->get_default_allocator();
-  nvtxRangePop();
+  auto target_stream = [&] {
+    nvtx_scope acquire_range{"hg:acquire_stream"};
+    return target_memory_space->acquire_stream();
+  }();
+  auto mr = target_memory_space->get_default_allocator();
 
   // Collect all H→D copy ops across all columns, then fire one batched call.
   BatchCopyAccumulator batch;
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(fast_table->columns.size());
-  nvtxRangePushA("hg:reconstruct");
-  for (const auto& col_meta : fast_table->columns) {
-    gpu_columns.push_back(
-      reconstruct_column(col_meta, *fast_table->allocation, target_stream, mr, batch));
+  {
+    nvtx_scope reconstruct_range{"hg:reconstruct"};
+    for (const auto& col_meta : fast_table->columns) {
+      gpu_columns.push_back(
+        reconstruct_column(col_meta, *fast_table->allocation, target_stream, mr, batch));
+    }
   }
-  nvtxRangePop();
   // Source is CPU-written pinned host memory: fully prepared before this call.
-  nvtxRangePushA("hg:flush_submit");
-  batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
-  nvtxRangePop();
+  {
+    nvtx_scope flush_range{"hg:flush_submit"};
+    batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
+  }
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
-  nvtxRangePushA("hg:final_sync");
-  target_stream.synchronize();
-  nvtxRangePop();
+  {
+    nvtx_scope final_sync_range{"hg:final_sync"};
+    target_stream.synchronize();
+  }
 
   // STREAM-LINEAGE: writes happened on target_stream; record event so
   // cross-stream readers observe ordering.
