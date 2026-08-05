@@ -287,6 +287,106 @@ TEST_CASE("interim response tags do not leak into the final response", "[rest][v
   }
 }
 
+TEST_CASE("footer probes do not reuse Content-Range from an interim response",
+          "[rest][validation_tag]")
+{
+  range_fault_policy fault{};
+  fault.interim_get_content_range = "bytes " + std::to_string(object_size - probe_size) + "-" +
+                                    std::to_string(object_size - 1) + "/" +
+                                    std::to_string(object_size);
+  fault.omit_successful_content_range = true;
+  fault.successful_get_etag           = "\"discarded-probe\"";
+  fault.successful_head_etag          = "\"fallback-head\"";
+  loopback_range_server server(test_payload(), fault);
+  auto ioctx  = make_ioctx(server, test_config());
+  auto object = ioctx->open_io_object(std::string{object_uri}, open_hint::parquet_footer_probe);
+
+  CHECK(object->size() == object_size);
+  CHECK(object->validation_tag() == "\"fallback-head\"");
+  CHECK(server.get_count() == 1);
+  CHECK(server.head_count() == 1);
+}
+
+TEST_CASE("retry backoff uses only the final response block", "[rest][validation_tag]")
+{
+  auto retry_config = [](std::chrono::milliseconds fallback) {
+    auto cfg               = test_config();
+    cfg.honor_retry_after  = true;
+    cfg.retry_backoff_base = fallback;
+    return cfg;
+  };
+
+  SECTION("HEAD ignores interim Retry-After when the final block omits it")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_heads         = 1;
+    fault.interim_head_retry_after = "2";
+    loopback_range_server server(test_payload(), fault);
+    auto reactor = make_reactor(server, retry_config(1ms));
+
+    auto const start   = std::chrono::steady_clock::now();
+    auto const result  = reactor->head_object("bucket", "object.bin");
+    auto const elapsed = std::chrono::steady_clock::now() - start;
+
+    CHECK(result.object_size == object_size);
+    CHECK(elapsed < 1s);
+    CHECK(server.head_count() == 2);
+  }
+
+  SECTION("HEAD uses Retry-After from the final block")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_heads         = 1;
+    fault.interim_head_retry_after = "2";
+    fault.failed_head_retry_after  = "0";
+    loopback_range_server server(test_payload(), fault);
+    auto reactor = make_reactor(server, retry_config(1500ms));
+
+    auto const start   = std::chrono::steady_clock::now();
+    auto const result  = reactor->head_object("bucket", "object.bin");
+    auto const elapsed = std::chrono::steady_clock::now() - start;
+
+    CHECK(result.object_size == object_size);
+    CHECK(elapsed < 1s);
+    CHECK(server.head_count() == 2);
+  }
+
+  SECTION("footer probe ignores interim Retry-After when the final block omits it")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets         = 1;
+    fault.interim_get_retry_after = "2";
+    loopback_range_server server(test_payload(), fault);
+    auto reactor = make_reactor(server, retry_config(1ms));
+
+    auto const start   = std::chrono::steady_clock::now();
+    auto const probe   = reactor->fetch_footer_suffix("bucket", "object.bin", probe_size);
+    auto const elapsed = std::chrono::steady_clock::now() - start;
+
+    REQUIRE(probe.bytes != nullptr);
+    CHECK(elapsed < 1s);
+    CHECK(server.get_count() == 2);
+  }
+
+  SECTION("footer probe uses Retry-After from the final block")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets         = 1;
+    fault.interim_get_retry_after = "2";
+    fault.failed_get_retry_after  = "0";
+    loopback_range_server server(test_payload(), fault);
+    auto reactor = make_reactor(server, retry_config(1500ms));
+
+    auto const start   = std::chrono::steady_clock::now();
+    auto const probe   = reactor->fetch_footer_suffix("bucket", "object.bin", probe_size);
+    auto const elapsed = std::chrono::steady_clock::now() - start;
+
+    REQUIRE(probe.bytes != nullptr);
+    CHECK(elapsed < 1s);
+    CHECK(server.get_count() == 2);
+  }
+}
+
 TEST_CASE("rest ioctx threads validation tags through every network open path",
           "[rest][validation_tag]")
 {
