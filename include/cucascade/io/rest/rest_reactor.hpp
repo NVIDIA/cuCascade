@@ -122,9 +122,8 @@ struct head_object_result {
 /**
  * @brief Concrete @c io_object backed by a RESTful object-store key.
  *
- * Passive bag of identity: the original URL/path (also the cache id), the
- * bucket + key the reactor authorizes against, and the object size discovered
- * by a one-time HEAD at construction.  Does no I/O of its own.
+ * Stores the object identity and metadata captured when it was opened.
+ * Does no I/O of its own.
  */
 class rest_io_object : public io_object {
  public:

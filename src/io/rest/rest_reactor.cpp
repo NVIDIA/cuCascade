@@ -144,18 +144,16 @@ size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
   return bytes;
 }
 
-/// True iff @p line is an HTTP status line ("HTTP/..."), i.e. the start of a
-/// (possibly interim) response's header block within one transfer.
+/// Returns true for an HTTP status line.
 bool is_http_status_line(std::string_view line) noexcept
 {
   return line.size() >= 5 && ascii_lower(line[0]) == 'h' && ascii_lower(line[1]) == 't' &&
          ascii_lower(line[2]) == 't' && ascii_lower(line[3]) == 'p' && line[4] == '/';
 }
 
-/// Per-attempt capture for the blocking HEAD: Retry-After for backoff plus the
-/// object's ETag.  Separate from @c header_capture so the async data-GET path
-/// parses nothing it does not consume.  The ETag resets on every status line,
-/// so interim responses (proxy CONNECT) within one transfer leave no residue.
+/// Headers captured for one HEAD attempt.  Separate from @c header_capture so
+/// the async data-GET path parses nothing it does not consume.  A status line
+/// starts a new response block within the transfer, so all fields reset there.
 struct head_capture {
   std::string retry_after;
   std::string etag;
@@ -166,7 +164,10 @@ size_t head_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   auto* hc           = static_cast<head_capture*>(userdata);
   size_t const bytes = size * nitems;
   std::string_view const line(buffer, bytes);
-  if (is_http_status_line(line)) { hc->etag.clear(); }
+  if (is_http_status_line(line)) {
+    hc->etag.clear();
+    hc->retry_after.clear();
+  }
   if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
   if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
   return bytes;
@@ -187,10 +188,9 @@ struct suffix_sink {
   std::string etag;
 };
 
-/// Header callback for a suffix probe: parse the status code out of the status
-/// line so the body callback can abort a non-206 early, and capture the headers
-/// the caller needs (Content-Range to verify the 206, Retry-After for backoff,
-/// ETag for the probe result).
+/// Capture the status and headers used to validate or retry a suffix probe.
+/// A status line starts a new response block within the transfer, so the
+/// header fields reset there — only the final block's values survive.
 size_t suffix_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
 {
   auto* s            = static_cast<suffix_sink*>(userdata);
@@ -198,6 +198,8 @@ size_t suffix_header_cb(char* buffer, size_t size, size_t nitems, void* userdata
   std::string_view const line(buffer, bytes);
   if (is_http_status_line(line)) {
     s->etag.clear();
+    s->content_range.clear();
+    s->retry_after.clear();
     if (auto const sp = line.find(' '); sp != std::string_view::npos) {
       long code = 0;
       for (size_t i = sp + 1; i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
