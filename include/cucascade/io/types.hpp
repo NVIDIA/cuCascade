@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cucascade::io {
@@ -93,6 +94,16 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// Total size of the underlying object, populated by the reactor at
   /// construction time and stored on the io_object thereafter.
   [[nodiscard]] virtual size_t size() const noexcept = 0;
+
+  /// Opaque validation tag for the underlying object as observed at open (the
+  /// HTTP ETag for object-store backends, quotes and any weak `W/` prefix
+  /// preserved); empty when unavailable.  Consumers compare it only for
+  /// equality against a tag they captured earlier — it is a cache validator,
+  /// NOT a precondition token (weak ETags are invalid for If-Match / If-Range
+  /// strong comparison).  The view is valid only while this io_object is
+  /// alive; copy it to outlive the handle.  An empty tag disables
+  /// validation-based caching above — degraded performance, never wrong bytes.
+  [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
 };
 
 class io_object_metadata {
