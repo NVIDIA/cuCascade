@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/memory/experimental/reservation_aware_resource_adaptor.hpp>
+#include <cucascade/memory/experimental/memory_reservation.hpp>
 
 #include <utility>
 

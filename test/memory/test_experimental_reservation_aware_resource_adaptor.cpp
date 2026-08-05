@@ -73,12 +73,21 @@ TEST_CASE("Reserve moves bytes from available to reserved", "[experimental_reser
     ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
     limit};
 
+  auto check_any_resouce_conversion = [&](auto& mr_like) {
+    cuda::mr::any_resource<cuda::mr::device_accessible> any_device = mr_like;
+    cuda::mr::any_resource<> any_adaptor                           = mr_like;
+    CHECK(any_device == mr_like);
+    CHECK(any_adaptor == mr_like);
+  };
+  check_any_resouce_conversion(adaptor);
+
   REQUIRE(adaptor.available() == limit);
 
   REQUIRE_NOTHROW(std::ignore = adaptor.reserve(0, allow_overbooking::NO));
 
   auto res = adaptor.reserve(1024, allow_overbooking::NO);
-  CHECK(adaptor == res.adaptor());
+  check_any_resouce_conversion(res);
+
   CHECK(res.overbooking() == 0);
   CHECK(res.balance() == 1024);
   CHECK(adaptor.total_reserved() == 1024);
