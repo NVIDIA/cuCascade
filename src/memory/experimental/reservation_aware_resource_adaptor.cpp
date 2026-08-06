@@ -92,7 +92,21 @@ memory_reservation reservation_aware_resource_adaptor<Upstream>::reserve(
   using impl_t = detail::memory_reservation_impl<reservation_aware_resource_adaptor<Upstream>>;
   return memory_reservation{
     memory_reservation::handle_variant{::cuda::mr::make_shared_resource<impl_t>(
-      *this, detail::safe_cast<std::int64_t>(granted), overbooking)}};
+      *this, detail::safe_cast<std::int64_t>(granted), overbooking, grant_enforcement::STRICT)}};
+}
+
+template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
+memory_reservation reservation_aware_resource_adaptor<Upstream>::reserve_soft(
+  std::size_t size, allow_overbooking overbooking_policy)
+{
+  auto const [granted, overbooking] =
+    this->get().reserve(size, overbooking_policy == allow_overbooking::YES);
+
+  using impl_t = detail::memory_reservation_impl<reservation_aware_resource_adaptor<Upstream>>;
+  return memory_reservation{
+    memory_reservation::handle_variant{::cuda::mr::make_shared_resource<impl_t>(
+      *this, detail::safe_cast<std::int64_t>(granted), overbooking, grant_enforcement::SOFT)}};
 }
 
 template class reservation_aware_resource_adaptor<any_device_resource>;

@@ -39,6 +39,13 @@ namespace detail {
  * Allocating moves bytes from the adaptor's reserved counter to its allocated counter;
  * the unspent balance is refunded only when the last reference dies.
  *
+ * The reservation's claim on `reservation_aware_resource_adaptor::total_reserved()` is
+ * `reserved_part(balance())`, never the raw balance, so a soft reservation that has
+ * overdrawn claims nothing rather than crediting back memory it is still using. Every
+ * balance transition adjusts the counter by the change in that quantity, which keeps the
+ * claim exact across allocation, partial release, and full recovery, and unwinds it to
+ * zero on destruction.
+ *
  * @tparam Adaptor One of `device_adaptor`, `host_adaptor`, or `host_device_adaptor`. Its
  * properties are forwarded to the reservation via `cuda::forward_property`, so a
  * reservation advertises whatever the granting adaptor advertises (e.g.
@@ -50,14 +57,21 @@ template <typename Adaptor>
 class memory_reservation_impl
   : public ::cuda::forward_property<memory_reservation_impl<Adaptor>, Adaptor> {
  public:
-  memory_reservation_impl(Adaptor adaptor, std::int64_t grant, std::size_t overbooking)
-    : adaptor_{std::move(adaptor)}, grant_{grant}, overbooking_{overbooking}, balance_{grant}
+  memory_reservation_impl(Adaptor adaptor,
+                          std::int64_t grant,
+                          std::size_t overbooking,
+                          grant_enforcement enforcement)
+    : adaptor_{std::move(adaptor)},
+      grant_{grant},
+      overbooking_{overbooking},
+      enforcement_{enforcement},
+      balance_{grant}
   {
   }
 
   ~memory_reservation_impl()
   {
-    adaptor_->total_reserved_.sub(balance(), std::memory_order_acq_rel);
+    adaptor_->total_reserved_.sub(reserved_part(balance()), std::memory_order_acq_rel);
   }
 
   memory_reservation_impl(memory_reservation_impl const&)            = delete;
@@ -69,6 +83,8 @@ class memory_reservation_impl
 
   [[nodiscard]] std::size_t overbooking() const noexcept { return overbooking_; }
 
+  [[nodiscard]] bool is_soft() const noexcept { return enforcement_ == grant_enforcement::SOFT; }
+
   [[nodiscard]] std::int64_t balance() const noexcept
   {
     return balance_.load(std::memory_order_acquire);
@@ -79,15 +95,16 @@ class memory_reservation_impl
                  std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
   {
     auto const amount = safe_cast<std::int64_t>(bytes);
-    draw_down_res(amount);
-    void* ptr = nullptr;
+    auto const before = draw_down_res(amount);
+    void* ptr         = nullptr;
     try {
       ptr = adaptor_->allocate(stream, bytes, alignment);
     } catch (...) {
       balance_.fetch_add(amount, std::memory_order_acq_rel);
       throw;
     }
-    adaptor_->total_reserved_.sub(amount, std::memory_order_acq_rel);
+    adaptor_->total_reserved_.sub(reserved_part(before) - reserved_part(before - amount),
+                                  std::memory_order_acq_rel);
     return ptr;
   }
 
@@ -97,8 +114,9 @@ class memory_reservation_impl
                   std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept
   {
     auto const amount = safe_cast<std::int64_t>(bytes);
-    balance_.fetch_add(amount, std::memory_order_acq_rel);
-    adaptor_->total_reserved_.add(amount, std::memory_order_acq_rel);
+    auto const before = balance_.fetch_add(amount, std::memory_order_acq_rel);
+    adaptor_->total_reserved_.add(reserved_part(before + amount) - reserved_part(before),
+                                  std::memory_order_acq_rel);
     adaptor_->deallocate(stream, ptr, bytes, alignment);
   }
 
@@ -126,8 +144,20 @@ class memory_reservation_impl
   [[nodiscard]] Adaptor const& upstream_resource() const noexcept { return adaptor_; }
 
  private:
-  void draw_down_res(std::int64_t bytes)
+  /// @brief The part of a balance that is still reserved-but-unspent. An overdraft is
+  /// funded from outside the grant, so it contributes nothing to the adaptor's reserve.
+  static constexpr std::int64_t reserved_part(std::int64_t balance) noexcept
   {
+    return balance > 0 ? balance : 0;
+  }
+
+  /// @return The balance before the draw-down.
+  std::int64_t draw_down_res(std::int64_t bytes)
+  {
+    // Nothing to enforce, so skip the compare-exchange entirely and let the balance
+    // go negative; the overdraft still shows up in the adaptor's `current_allocated()`.
+    if (is_soft()) { return balance_.fetch_sub(bytes, std::memory_order_acq_rel); }
+
     auto balance = balance_.load(std::memory_order_relaxed);
     do {
       if (bytes > balance) {
@@ -138,11 +168,13 @@ class memory_reservation_impl
       }
     } while (!balance_.compare_exchange_weak(
       balance, balance - bytes, std::memory_order_acq_rel, std::memory_order_relaxed));
+    return balance;
   }
 
   Adaptor adaptor_;
   std::int64_t const grant_;
   std::size_t const overbooking_;
+  grant_enforcement const enforcement_;
   std::atomic<std::int64_t> balance_;
 };
 
@@ -161,6 +193,11 @@ using reservation_handle = ::cuda::mr::shared_resource<memory_reservation_impl<A
  * budget of bytes carved out of the adaptor's limit. Every allocation made through it is
  * charged against that budget: an allocation exceeding the remaining `balance()` throws
  * `rmm::out_of_memory`, and deallocating returns the bytes to the balance.
+ *
+ * A reservation from `reserve_soft()` is not capped. It accounts identically but permits
+ * allocations past the grant, reporting the overdraft as a negative `balance()`. Only the
+ * grant is backed by the adaptor's reserve; the overdraft is spent against the limit
+ * without a claim on it, so it shows up in `current_allocated()` alone.
  *
  * This is a single type regardless of where the memory lives. Internally it holds one of
  * three shared states, chosen by the granting adaptor's upstream, and its own type says
@@ -261,9 +298,19 @@ class memory_reservation {
   /**
    * @brief The remaining unallocated size of the reservation.
    *
+   * Negative on a soft reservation that has allocated past its grant, by the size of
+   * the overdraft. Never negative on a strict one, which refuses those allocations.
+   *
    * @return The remaining size in bytes.
    */
-  [[nodiscard]] std::size_t balance() const noexcept;
+  [[nodiscard]] std::int64_t balance() const noexcept;
+
+  /**
+   * @brief Whether allocations may exceed the grant.
+   *
+   * @return True when the reservation was granted by `reserve_soft()`.
+   */
+  [[nodiscard]] bool is_soft() const noexcept;
 
   /**
    * @brief The number of bytes by which the grant overbooks the adaptor's limit.

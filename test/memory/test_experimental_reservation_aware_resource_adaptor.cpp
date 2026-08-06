@@ -163,6 +163,73 @@ TEST_CASE("Exceeding the grant throws", "[experimental_reservation_aware][gpu]")
   stream.synchronize();
 }
 
+TEST_CASE("Soft reservations allow exceeding the grant", "[experimental_reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { return; }
+
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
+
+  auto res = adaptor.reserve_soft(1024, allow_overbooking::NO);
+  CHECK(res.is_soft());
+  CHECK(res.balance() == 1024);
+
+  {
+    // Overdrawing is permitted and shows up as a negative balance.
+    rmm::device_buffer buf{3072, stream, res.as_device()};
+    CHECK(res.balance() == -2048);
+
+    // The overdraft shows up as consumed memory, not as returned reserve.
+    CHECK(adaptor.current_allocated() == 3072);
+    CHECK(adaptor.total_reserved() == 0);
+    CHECK(adaptor.available() == limit - 3072);
+  }
+
+  CHECK(res.balance() == 1024);
+  CHECK(adaptor.current_allocated() == 0);
+  CHECK(adaptor.total_reserved() == 1024);
+  stream.synchronize();
+}
+
+TEST_CASE("Overdrawn soft reservation outlived by its buffer",
+          "[experimental_reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { return; }
+
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
+
+  {
+    rmm::device_buffer buf = [&] {
+      auto res = adaptor.reserve_soft(1024, allow_overbooking::NO);
+      return rmm::device_buffer{4096, stream, res.as_device()};
+    }();
+    // Only the reservation handle is gone; the buffer still holds the shared state, so
+    // the refund has not run yet. The grant is fully drawn, hence a zero reserve.
+    CHECK(adaptor.total_reserved() == 0);
+    CHECK(adaptor.current_allocated() == 4096);
+  }
+
+  CHECK(adaptor.total_reserved() == 0);
+  CHECK(adaptor.current_allocated() == 0);
+  CHECK(adaptor.available() == limit);
+  stream.synchronize();
+}
+
+TEST_CASE("Strict reservations remain capped", "[experimental_reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { return; }
+
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
+
+  auto res = adaptor.reserve(1024, allow_overbooking::NO);
+  CHECK_FALSE(res.is_soft());
+  REQUIRE_THROWS_AS((rmm::device_buffer{3072, stream, res.as_device()}), rmm::out_of_memory);
+  CHECK(res.balance() == 1024);
+  stream.synchronize();
+}
+
 TEST_CASE("Zero-sized reservation throws on first byte", "[experimental_reservation_aware][gpu]")
 {
   if (!has_cuda_device()) { return; }
@@ -184,7 +251,7 @@ TEST_CASE("Overbooking is granted when allowed", "[experimental_reservation_awar
   device_adaptor adaptor{any_device_resource{rmm::mr::cuda_memory_resource{}}, limit};
 
   auto res = adaptor.reserve(static_cast<std::size_t>(2 * limit), allow_overbooking::YES);
-  CHECK(res.balance() == static_cast<std::size_t>(2 * limit));
+  CHECK(res.balance() == 2 * limit);
   CHECK(res.overbooking() == static_cast<std::size_t>(limit));
   CHECK(adaptor.available() == -limit);
 }
@@ -327,7 +394,7 @@ TEST_CASE("Concurrent allocations share one reservation", "[experimental_reserva
   auto const total = std::accumulate(sizes.begin(), sizes.end(), std::size_t{0});
 
   auto res = adaptor.reserve(grant, allow_overbooking::NO);
-  REQUIRE(res.balance() == grant);
+  REQUIRE(res.balance() == static_cast<std::int64_t>(grant));
 
   rmm::cuda_stream_pool pool{4, rmm::cuda_stream::flags::non_blocking};
   std::vector<rmm::device_buffer> buffers(num_buffers);
@@ -345,13 +412,13 @@ TEST_CASE("Concurrent allocations share one reservation", "[experimental_reserva
     REQUIRE_NOTHROW(worker.get());
   }
 
-  CHECK(res.balance() == grant - total);
+  CHECK(res.balance() == static_cast<std::int64_t>(grant - total));
   CHECK(adaptor.total_reserved() == static_cast<std::int64_t>(grant - total));
   CHECK(adaptor.current_allocated() == static_cast<std::int64_t>(total));
   CHECK(adaptor.available() == limit - static_cast<std::int64_t>(grant));
 
   buffers.clear();
-  CHECK(res.balance() == grant);
+  CHECK(res.balance() == static_cast<std::int64_t>(grant));
   CHECK(adaptor.current_allocated() == 0);
 
   synchronize_pool(pool);

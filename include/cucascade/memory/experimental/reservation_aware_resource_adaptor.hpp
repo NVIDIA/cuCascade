@@ -89,6 +89,17 @@ enum class allow_overbooking : bool {
   YES,  ///< Grant the request even when the memory isn't available.
 };
 
+/**
+ * @brief Whether a reservation caps the allocations made through it.
+ *
+ * Orthogonal to `allow_overbooking`, which governs the size of the grant rather than
+ * what may be drawn against it.
+ */
+enum class grant_enforcement : bool {
+  STRICT,  ///< Allocating past the grant throws `rmm::out_of_memory`.
+  SOFT,    ///< Allocating past the grant is permitted and drives the balance negative.
+};
+
 namespace detail {
 
 template <typename To, typename From>
@@ -390,6 +401,28 @@ class reservation_aware_resource_adaptor
   [[nodiscard]] memory_reservation reserve(std::size_t size, allow_overbooking overbooking_policy);
 
   /**
+   * @brief Reserve an amount of memory without capping allocations at the grant.
+   *
+   * Identical to `reserve()` in how the grant is sized and accounted, but allocations
+   * through the returned reservation are never refused for exceeding it. Going past the
+   * grant drives `memory_reservation::balance()` negative by the overdraft. The overdrawn
+   * bytes count only in `current_allocated()` and contribute nothing to
+   * `total_reserved()`, so `available()` treats the overdraft as consumed rather than as
+   * free space for as long as it lasts.
+   *
+   * Nothing throttles an overdraft. It is charged against the adaptor's limit but not
+   * bounded by it, so `available()` can go negative and stay there until the memory is
+   * released. Use this when the total is not known up front and a hard failure
+   * mid-pipeline is worse than temporarily exceeding the budget.
+   *
+   * @param size The number of bytes to reserve.
+   * @param overbooking_policy Whether overbooking is allowed.
+   * @return The reservation, which reports `memory_reservation::is_soft() == true`.
+   */
+  [[nodiscard]] memory_reservation reserve_soft(std::size_t size,
+                                                allow_overbooking overbooking_policy);
+
+  /**
    * @brief Get the memory limit.
    *
    * @return The limit in bytes.
@@ -411,10 +444,19 @@ class reservation_aware_resource_adaptor
   [[nodiscard]] std::int64_t current_allocated() const noexcept;
 
   /**
-   * @brief Get the memory currently held by live reservations.
+   * @brief Get the memory promised to live reservations but not yet allocated.
    *
    * Excludes reserved bytes that have already been allocated; those are reported by
-   * `current_allocated()` instead.
+   * `current_allocated()` instead. A soft reservation that has overdrawn its grant
+   * contributes zero rather than a negative amount, so an overdraft never reads back as
+   * free capacity.
+   *
+   * @note Accurate once the accounting settles. Each allocation updates the reservation's
+   * balance and this counter as two separate atomic operations, and concurrent
+   * allocations apply their updates in an order unrelated to the order they observed
+   * those balances. A read taken while updates are in flight can therefore land low, even
+   * below zero, by up to the size of the concurrent allocations. It resolves as they
+   * complete.
    *
    * @return Total number of reserved bytes.
    */
@@ -423,8 +465,13 @@ class reservation_aware_resource_adaptor
   /**
    * @brief Get the memory available for new reservations.
    *
-   * Computed as `limit() - current_allocated() - total_reserved()`. May be negative
-   * when reservations have overbooked the limit.
+   * Computed as `limit() - current_allocated() - total_reserved()`. Negative when
+   * reservations have overbooked the limit or a soft reservation has overdrawn its grant.
+   *
+   * @note A best-effort snapshot, not an atomic one: the three counters are read
+   * independently and each carries the caveat on `total_reserved()`. Treat the result as
+   * a hint that a concurrent allocation may already have invalidated, which is why
+   * `reserve()` re-reads it rather than trusting a value handed in from outside.
    *
    * @return The available memory in bytes.
    */
