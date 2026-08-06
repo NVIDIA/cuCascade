@@ -26,7 +26,7 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <cstddef>
 #include <stdexcept>

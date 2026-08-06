@@ -2000,7 +2000,7 @@ TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
   REQUIRE(bytes[N * sizeof(int32_t) - 1] == 0xAB);
 }
 
-TEST_CASE("Round-trip fast: nullable INT64 null mask preserved", "[fast][roundtrip]")
+TEST_CASE("Round-trip fast: all-valid null mask is elided on reconstruction", "[fast][roundtrip]")
 {
   memory::memory_reservation_manager mgr(create_conversion_test_configs());
   representation_converter_registry registry;
@@ -2030,11 +2030,64 @@ TEST_CASE("Round-trip fast: nullable INT64 null mask preserved", "[fast][roundtr
 
   REQUIRE(back->get_table_view().num_columns() == 1);
   cudf::table_view back_tv = back->get_table_view();
-  REQUIRE(back_tv.column(0).nullable());
+  // An all-valid mask (null_count == 0) is semantically identical to no mask:
+  // reconstruction deliberately skips its upload and builds the column
+  // non-nullable, saving a per-column blocking memcpy + stream sync.
+  REQUIRE_FALSE(back_tv.column(0).nullable());
   REQUIRE(back_tv.column(0).null_count() == 0);
 
   auto data_bytes = gpu_bytes(back_tv.column(0).data<uint8_t>(), N * sizeof(int64_t));
   REQUIRE(data_bytes[0] == 0x77);
+}
+
+TEST_CASE("Round-trip fast: null mask with real nulls is uploaded and preserved",
+          "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 32;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                       N,
+                                       cudf::mask_state::ALL_VALID,
+                                       stream.view(),
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0x55, N * sizeof(int64_t), stream.view()));
+  // Null out rows [3, 7) — 4 nulls.
+  cudf::set_null_mask(col->mutable_view().null_mask(), 3, 7, false, stream.view());
+  stream.synchronize();
+  col->set_null_count(4);
+
+  auto orig_repr = wrap_column(
+    std::move(col), *const_cast<memory::memory_space*>(gpu_space), rmm::cuda_stream_view{});
+  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  cudf::table_view back_tv = back->get_table_view();
+  REQUIRE(back_tv.column(0).nullable());
+  REQUIRE(back_tv.column(0).null_count() == 4);
+
+  // Mask bits round-trip exactly: rows [3, 7) invalid, everything else valid.
+  auto mask_bytes = gpu_bytes(reinterpret_cast<const uint8_t*>(back_tv.column(0).null_mask()),
+                              sizeof(cudf::bitmask_type));
+  const uint32_t mask_word =
+    static_cast<uint32_t>(mask_bytes[0]) | (static_cast<uint32_t>(mask_bytes[1]) << 8) |
+    (static_cast<uint32_t>(mask_bytes[2]) << 16) | (static_cast<uint32_t>(mask_bytes[3]) << 24);
+  REQUIRE(mask_word == ~(uint32_t{0b1111} << 3));
+
+  auto data_bytes = gpu_bytes(back_tv.column(0).data<uint8_t>(), N * sizeof(int64_t));
+  REQUIRE(data_bytes[0] == 0x55);
+  REQUIRE(data_bytes[N * sizeof(int64_t) - 1] == 0x55);
 }
 
 TEST_CASE("Round-trip fast: FLOAT64 byte integrity", "[fast][roundtrip]")
