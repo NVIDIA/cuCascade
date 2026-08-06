@@ -43,6 +43,7 @@ namespace memory {
 namespace experimental {
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 class reservation_aware_resource_adaptor;
 class memory_reservation;
 
@@ -157,9 +158,8 @@ class reservation_aware_resource_adaptor_impl
     return this == std::addressof(other);
   }
 
+  /// @brief The hook `cuda::forward_property` uses to forward the upstream's properties.
   [[nodiscard]] Upstream const& upstream_resource() const noexcept { return upstream_mr_; }
-
-  [[nodiscard]] Upstream const& get_upstream_resource() const noexcept { return upstream_mr_; }
 
   [[nodiscard]] std::int64_t limit() const noexcept
   {
@@ -335,6 +335,7 @@ class reservation_aware_resource_adaptor_impl
  * leaving `available()` unchanged; that is what makes a reservation a promise.
  */
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 class reservation_aware_resource_adaptor
   : public ::cuda::mr::shared_resource<detail::reservation_aware_resource_adaptor_impl<Upstream>> {
  public:

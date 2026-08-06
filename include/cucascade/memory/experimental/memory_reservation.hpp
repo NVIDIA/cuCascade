@@ -122,9 +122,8 @@ class memory_reservation_impl
     return this == std::addressof(other);
   }
 
+  /// @brief The hook `cuda::forward_property` uses to forward the adaptor's properties.
   [[nodiscard]] Adaptor const& upstream_resource() const noexcept { return adaptor_; }
-
-  [[nodiscard]] Adaptor const& adaptor() const noexcept { return adaptor_; }
 
  private:
   void draw_down_res(std::int64_t bytes)
@@ -278,6 +277,7 @@ class memory_reservation {
 
  private:
   template <typename Upstream>
+    requires ::cuda::mr::resource<Upstream>
   friend class reservation_aware_resource_adaptor;
 
   /// @brief The shared state, one alternative per accessibility.

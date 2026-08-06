@@ -25,6 +25,7 @@ namespace memory {
 namespace experimental {
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 reservation_aware_resource_adaptor<Upstream>::reservation_aware_resource_adaptor(
   Upstream primary_mr, std::int64_t limit)
   : shared_base(::cuda::mr::make_shared_resource<impl_type>(std::move(primary_mr), limit))
@@ -32,48 +33,56 @@ reservation_aware_resource_adaptor<Upstream>::reservation_aware_resource_adaptor
 }
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 std::int64_t reservation_aware_resource_adaptor<Upstream>::limit() const noexcept
 {
   return this->get().limit();
 }
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 void reservation_aware_resource_adaptor<Upstream>::set_limit(std::int64_t limit) noexcept
 {
   this->get().set_limit(limit);
 }
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 std::int64_t reservation_aware_resource_adaptor<Upstream>::current_allocated() const noexcept
 {
   return this->get().current_allocated();
 }
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 std::int64_t reservation_aware_resource_adaptor<Upstream>::total_reserved() const noexcept
 {
   return this->get().total_reserved();
 }
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 std::int64_t reservation_aware_resource_adaptor<Upstream>::available() const noexcept
 {
   return this->get().available();
 }
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 memory_record reservation_aware_resource_adaptor<Upstream>::get_main_record() const
 {
   return this->get().get_main_record();
 }
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 Upstream const& reservation_aware_resource_adaptor<Upstream>::get_upstream_resource() const noexcept
 {
-  return this->get().get_upstream_resource();
+  return this->get().upstream_resource();
 }
 
 template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 memory_reservation reservation_aware_resource_adaptor<Upstream>::reserve(
   std::size_t size, allow_overbooking overbooking_policy)
 {
