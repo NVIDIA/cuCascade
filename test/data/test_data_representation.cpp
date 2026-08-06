@@ -2411,3 +2411,140 @@ TEST_CASE("host_data_representation::slice round-trip preserves selected columns
                       std::out_of_range);
   }
 }
+
+// =============================================================================
+// gpu_table_representation materialize_table / release_table
+// =============================================================================
+
+namespace {
+
+/// Move-only owner satisfying detail::no_alloc_materializable — exercises the
+/// zero-copy move path of the templated gpu_table_representation ctor.
+struct table_owner {
+  std::unique_ptr<cudf::table> t;
+  cudf::table& operator*() const { return *t; }
+};
+
+/// Device data pointer of each column of a view (buffer identity).
+std::vector<const void*> column_heads(cudf::table_view view)
+{
+  std::vector<const void*> out(static_cast<std::size_t>(view.num_columns()));
+  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+    out[static_cast<std::size_t>(i)] = view.column(i).head();
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("gpu_table_representation materialize_table copies generic-owner views in place",
+          "[gpu_data_representation][materialize_table]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto table  = create_simple_cudf_table(64, 2, gpu_space->get_default_allocator(), stream.view());
+  auto shared = std::make_shared<cudf::table>(std::move(table));
+  auto keep   = shared;  // keeps the source data alive for comparison
+  const std::size_t estimate = keep->alloc_size() + 4096;  // deliberately off
+
+  gpu_table_representation repr(
+    keep->view(), std::move(shared), estimate, *gpu_space, stream.view());
+  REQUIRE(repr.get_size_in_bytes() == estimate);
+  const auto source_heads = column_heads(keep->view());
+
+  repr.materialize_table(stream.view());
+  stream.synchronize();
+
+  // shared_ptr owners are copy-constructible, so materialization copies: fresh
+  // buffers, size updated from the estimate to the actual allocation, writer
+  // event recorded, contents preserved.
+  REQUIRE(repr.get_writer_event() != nullptr);
+  REQUIRE(repr.get_size_in_bytes() != estimate);
+  REQUIRE(repr.get_size_in_bytes() > 0);
+  const auto materialized_heads = column_heads(repr.get_table_view());
+  for (std::size_t i = 0; i < source_heads.size(); ++i) {
+    REQUIRE(materialized_heads[i] != source_heads[i]);
+  }
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    keep->view(), repr.get_table_view(), stream.view());
+
+  // A second call is a no-op on the now-owned table.
+  const std::size_t materialized_size = repr.get_size_in_bytes();
+  repr.materialize_table(stream.view());
+  REQUIRE(repr.get_size_in_bytes() == materialized_size);
+  REQUIRE(column_heads(repr.get_table_view()) == materialized_heads);
+
+  // Size accounting is consistent with the released table.
+  auto released = repr.release_table(stream.view());
+  REQUIRE(released != nullptr);
+  REQUIRE(released->alloc_size() == materialized_size);
+}
+
+TEST_CASE("gpu_table_representation materialize_table is a no-op for owned tables",
+          "[gpu_data_representation][materialize_table]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto table = create_simple_cudf_table(32, 2, gpu_space->get_default_allocator(), stream.view());
+  auto owned = std::make_unique<cudf::table>(std::move(table));
+  const auto heads_before = column_heads(owned->view());
+
+  gpu_table_representation repr(std::move(owned), *gpu_space, stream.view());
+  const std::size_t size_before = repr.get_size_in_bytes();
+
+  repr.materialize_table(stream.view());
+
+  REQUIRE(repr.get_size_in_bytes() == size_before);
+  REQUIRE(column_heads(repr.get_table_view()) == heads_before);
+}
+
+TEST_CASE("gpu_table_representation materialize_table moves buffers out of move-only owners",
+          "[gpu_data_representation][materialize_table]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto table = create_simple_cudf_table(48, 2, gpu_space->get_default_allocator(), stream.view());
+  auto owned = std::make_unique<cudf::table>(std::move(table));
+  const auto view         = owned->view();
+  const auto alloc_size   = owned->alloc_size();
+  const auto heads_before = column_heads(view);
+
+  gpu_table_representation repr(
+    view, table_owner{std::move(owned)}, alloc_size, *gpu_space, stream.view());
+
+  repr.materialize_table(stream.view());
+
+  // Exclusively-owned, full-view owner: zero-copy — buffer identity preserved.
+  REQUIRE(column_heads(repr.get_table_view()) == heads_before);
+  REQUIRE(repr.get_size_in_bytes() == alloc_size);
+
+  auto released = repr.release_table(stream.view());
+  REQUIRE(released != nullptr);
+  REQUIRE(column_heads(released->view()) == heads_before);
+}
+
+TEST_CASE("gpu_table_representation release_table leaves a defined empty state",
+          "[gpu_data_representation][materialize_table]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+
+  auto table = create_simple_cudf_table(16, 2, gpu_space->get_default_allocator(), stream.view());
+  gpu_table_representation repr(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space, stream.view());
+  REQUIRE(repr.get_size_in_bytes() > 0);
+
+  auto released = repr.release_table(stream.view());
+  REQUIRE(released != nullptr);
+
+  // After release: zero size, empty view, further releases return nullptr,
+  // and materialize_table is a harmless no-op.
+  REQUIRE(repr.get_size_in_bytes() == 0);
+  REQUIRE(repr.get_table_view().num_columns() == 0);
+  REQUIRE(repr.release_table(stream.view()) == nullptr);
+  repr.materialize_table(stream.view());
+  REQUIRE(repr.get_size_in_bytes() == 0);
+}

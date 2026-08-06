@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/cudf/owning_table_view.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -27,10 +28,11 @@
 
 #include <cuda_runtime.h>
 
-#include <any>
+#include <concepts>
 #include <cstddef>
 #include <memory>
-#include <variant>
+#include <type_traits>
+#include <utility>
 
 namespace cucascade {
 
@@ -77,12 +79,17 @@ class gpu_table_representation : public idata_representation {
    *
    * @param table_view View of the cuDF table (data ownership lives in @p owner)
    * @tparam Owner The type of the owner of the cuDF table (e.g., a specific operator or component)
-   * @param owner Owner of the underlying data (transferred via std::any storage)
+   * @param owner Owner of the underlying data (type-erased into an owning_table_view; move-only
+   *              owners are supported). Exclusively-owned owners satisfying
+   *              detail::no_alloc_materializable enable zero-copy materialize_table()/
+   *              release_table(); any other owner is materialized by copy.
    * @param alloc_size Allocation size in bytes for the data
    * @param memory_space The memory space where the GPU table resides
    * @param writer_stream The stream on which @p table_view's data was last written.
    */
   template <typename Owner>
+    requires(!std::same_as<std::decay_t<Owner>, owning_table_view> &&
+             !std::same_as<std::decay_t<Owner>, std::unique_ptr<cudf::table>>)
   gpu_table_representation(cudf::table_view table_view,
                            Owner&& owner,
                            std::size_t alloc_size,
@@ -138,12 +145,41 @@ class gpu_table_representation : public idata_representation {
   /**
    * @brief Release ownership of the underlying cuDF table
    *
-   * After calling this method, this representation no longer owns the table.
+   * After calling this method, this representation no longer owns the table:
+   * get_size_in_bytes() returns 0 and get_table_view() returns an empty view.
+   * A view-state representation is materialized first (zero-copy for
+   * no-alloc-materializable owners, otherwise copied via this memory space's
+   * default allocator). Returns nullptr if the table was already released.
+   *
+   * STREAM-LINEAGE: @p stream first waits on the recorded writer event (if any)
+   * so the materializing read is ordered after the producing writes.
    *
    * @param stream CUDA stream (used to materialize the table from a view path before release)
    * @return std::unique_ptr<cudf::table> The cuDF table
    */
   std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);
+
+  /**
+   * @brief Materialize a view-state representation into an owned cuDF table in place.
+   *
+   * No-op when the representation already owns its table or is empty. For a
+   * view state, realizes the exposed view into an owned table: zero-copy
+   * (buffers moved out of the owner) when the owner is exclusively owned and
+   * no-alloc-materializable, otherwise a copy allocated from this memory
+   * space's default allocator. get_size_in_bytes() is updated from the
+   * caller-provided estimate to the materialized table's actual allocation
+   * size.
+   *
+   * STREAM-LINEAGE: @p stream first waits on the recorded writer event (if
+   * any), then the writer event is re-recorded on @p stream after the
+   * materialization — wait-then-record keeps the event lineage correct for
+   * both the move and copy paths. When no writer event was recorded (legacy
+   * paths), the caller must pass a stream already ordered after the producing
+   * writes, as with clone().
+   *
+   * @param stream CUDA stream for the materializing copy (and event ordering)
+   */
+  void materialize_table(rmm::cuda_stream_view stream);
 
   /**
    * @brief Rebind the owned table's device buffers to use @p stream for future deallocation.
@@ -153,7 +189,7 @@ class gpu_table_representation : public idata_representation {
    * stream they were originally allocated on. No device memory is copied and no kernels are
    * launched.
    *
-   * No-op when this representation holds an owning_table_view: that alternative references
+   * No-op when this representation holds a view state (not materialized): a view references
    * memory owned by an external (type-erased) owner, which is responsible for its own
    * deallocation stream.
    *
@@ -198,14 +234,16 @@ class gpu_table_representation : public idata_representation {
   [[nodiscard]] cudaEvent_t get_writer_event() const override;
 
  private:
-  struct owning_table_view {
-    std::any owner;  ///< The owner of the cuDF table
-    std::size_t alloc_size{0};
-    cudf::table_view view;  ///< A view of the owned table for easy access
-  };
+  /// Bytes attributed to this representation. Captured from the owned table's
+  /// alloc_size() (owned ctor) or the caller-provided estimate (view ctor);
+  /// updated to the actual table size by materialize_table(); zeroed by
+  /// release_table(). Declared before _table so the owned ctor can read the
+  /// table's size before moving it into _table.
+  std::size_t _alloc_size{0};
 
-  std::variant<std::unique_ptr<cudf::table>, owning_table_view>
-    _table;  ///< cudf::table is the underlying representation of the data
+  /// The table handle: an owned cudf::table, a type-erased owner + column
+  /// selection (view state), or empty (after release_table()).
+  owning_table_view _table;
 
   /// Lazily-created CUDA event recording the completion of the most recent
   /// writer-stream work that produced this representation. Null until the first
@@ -214,14 +252,16 @@ class gpu_table_representation : public idata_representation {
 };
 
 template <typename Owner>
+  requires(!std::same_as<std::decay_t<Owner>, owning_table_view> &&
+           !std::same_as<std::decay_t<Owner>, std::unique_ptr<cudf::table>>)
 gpu_table_representation::gpu_table_representation(cudf::table_view table_view,
                                                    Owner&& owner,
                                                    std::size_t alloc_size,
                                                    cucascade::memory::memory_space& memory_space,
                                                    rmm::cuda_stream_view writer_stream)
   : idata_representation(memory_space),
-    _table(
-      owning_table_view{std::make_any<Owner>(std::forward<Owner>(owner)), alloc_size, table_view})
+    _alloc_size(alloc_size),
+    _table(std::forward<Owner>(owner), table_view)
 {
   // STREAM-LINEAGE: record writer event so cross-stream/cross-device readers
   // can establish ordering via cudaStreamWaitEvent.

@@ -28,7 +28,9 @@ namespace cucascade {
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
                                                    cucascade::memory::memory_space& memory_space,
                                                    rmm::cuda_stream_view writer_stream)
-  : idata_representation(memory_space), _table(std::move(table))
+  : idata_representation(memory_space),
+    _alloc_size(table ? table->alloc_size() : 0),
+    _table(std::move(table))
 {
   // STREAM-LINEAGE: record the writer event in the constructor body so every
   // representation is born with a recorded event. Skipping when the caller
@@ -49,55 +51,58 @@ gpu_table_representation::~gpu_table_representation()
   }
 }
 
-std::size_t gpu_table_representation::get_size_in_bytes() const
-{
-  if (std::holds_alternative<std::unique_ptr<cudf::table>>(_table)) {
-    return std::get<std::unique_ptr<cudf::table>>(_table)->alloc_size();
-  } else if (std::holds_alternative<owning_table_view>(_table)) {
-    return std::get<owning_table_view>(_table).alloc_size;
-  }
-  return 0;
-}
+std::size_t gpu_table_representation::get_size_in_bytes() const { return _alloc_size; }
 
 std::size_t gpu_table_representation::get_uncompressed_data_size_in_bytes() const
 {
   return get_size_in_bytes();
 }
 
-cudf::table_view gpu_table_representation::get_table_view() const
+cudf::table_view gpu_table_representation::get_table_view() const { return _table.view(); }
+
+std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_stream_view stream)
 {
-  if (std::holds_alternative<std::unique_ptr<cudf::table>>(_table)) {
-    return std::get<std::unique_ptr<cudf::table>>(_table)->view();
-  } else {
-    return std::get<owning_table_view>(_table).view;
-  }
+  // STREAM-LINEAGE: order the (potentially materializing) read after the
+  // recorded writer event before touching the underlying buffers on `stream`.
+  if (_writer_event != nullptr) { cucascade::cuda::cuda_event_view{_writer_event}.wait(stream); }
+  auto table  = _table.release(stream, get_memory_space().get_default_allocator());
+  _alloc_size = 0;
+  return table;
 }
 
-std::unique_ptr<cudf::table> gpu_table_representation::release_table(
-  [[maybe_unused]] rmm::cuda_stream_view stream)
+void gpu_table_representation::materialize_table(rmm::cuda_stream_view stream)
 {
-  if (std::holds_alternative<owning_table_view>(_table)) {
-    _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
-  }
-  return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
+  if (!_table || _table.is_materialized()) { return; }
+  // STREAM-LINEAGE: wait-then-record — `stream` must observe the producing
+  // writes before the materializing read (move or copy), and the writer event
+  // is re-recorded afterwards so future readers order against the
+  // materialization. When no writer event was recorded (legacy paths), the
+  // caller must pass a stream already ordered after the producing writes.
+  if (_writer_event != nullptr) { cucascade::cuda::cuda_event_view{_writer_event}.wait(stream); }
+  _table.materialize(stream, get_memory_space().get_default_allocator());
+  _alloc_size = _table.alloc_size();
+  record_writer_event(stream);
 }
 
 void gpu_table_representation::rebind_stream(rmm::cuda_stream_view stream)
 {
-  // Only the owned-table alternative can be rebound: the owning_table_view alternative
-  // references memory owned by an external (type-erased) owner, which manages its own
+  // Only the owned-table state can be rebound: a view state references memory
+  // owned by an external (type-erased) owner, which manages its own
   // deallocation stream.
-  if (!std::holds_alternative<std::unique_ptr<cudf::table>>(_table)) { return; }
-  auto& table = std::get<std::unique_ptr<cudf::table>>(_table);
-  if (!table || table->num_columns() == 0) { return; }
-
-  // cudf::table move-assignment is deleted, so release the columns, rebind each, and rebuild
-  // the table in place. No device memory is copied and no kernels are launched.
-  auto columns = table->release();
-  for (auto& col : columns) {
-    col = cudf::rebind_stream(std::move(*col), stream);
+  if (!_table.is_materialized()) { return; }
+  // Pure move — the materialized state surrenders its table without touching
+  // device memory (stream/mr are unused on this path).
+  auto table = _table.release(stream, get_memory_space().get_default_allocator());
+  if (table->num_columns() > 0) {
+    // cudf::table move-assignment is deleted, so release the columns, rebind each, and rebuild
+    // the table in place. No device memory is copied and no kernels are launched.
+    auto columns = table->release();
+    for (auto& col : columns) {
+      col = cudf::rebind_stream(std::move(*col), stream);
+    }
+    table = std::make_unique<cudf::table>(std::move(columns));
   }
-  table = std::make_unique<cudf::table>(std::move(columns));
+  _table = owning_table_view{std::move(table)};
 }
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)

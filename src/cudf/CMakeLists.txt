@@ -18,6 +18,7 @@
 target_sources(
   cucascade_cudf_objects
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_data_representation.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/owning_table_view.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/host_data_representation.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/bandwidth_profiler.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter_builtins.cpp)

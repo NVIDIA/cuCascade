@@ -72,16 +72,20 @@ Data representations are thin wrappers -- they hold the data but delegate storag
 
 ### GPU Table Representation
 
-**File**: `include/cucascade/data/gpu_data_representation.hpp`
+**File**: `include/cucascade/cudf/gpu_data_representation.hpp`
 
-Wraps a `cudf::table` residing in GPU device memory:
+Wraps a `cudf::table` residing in GPU device memory. The table is held through an
+`owning_table_view` (`include/cucascade/cudf/owning_table_view.hpp`) — a handle that is either an
+owned `cudf::table`, a `cudf::table_view` backed by a type-erased external owner, or empty:
 
 ```cpp
 class gpu_table_representation : public idata_representation {
-    std::unique_ptr<cudf::table> _table;
+    std::size_t _alloc_size;      // estimate for view states; actual once materialized
+    owning_table_view _table;
 
 public:
-    std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);  // Transfer ownership
+    void materialize_table(rmm::cuda_stream_view stream);                     // View -> owned table, in place
+    std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream); // Transfer ownership
 
     std::size_t get_size_in_bytes() const override;
     std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
@@ -89,6 +93,9 @@ public:
 ```
 
 - `clone()` performs a deep copy using `cudf::table(table.view(), stream)`
+- `materialize_table()` / `release_table()` realize a view state into an owned table: zero-copy
+  (column buffers moved out) for exclusively-owned `no_alloc_materializable` owners, otherwise a
+  copy allocated from the representation's memory space
 - Owns the `cudf::table` object but not the underlying GPU memory (managed by the allocator)
 
 ### Host Table Representation (Direct Copy)
