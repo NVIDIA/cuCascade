@@ -380,6 +380,7 @@ class templated_ioctx : public ioctx {
                       });
         return semi;
       } catch (...) {
+        on_device_dispatch_failure();
         return exec::make_semi_future<size_t>(std::current_exception());
       }
     } else {
@@ -388,6 +389,26 @@ class templated_ioctx : public ioctx {
     }
   }
 
+ protected:
+  /**
+   * @brief Applies backend policy after synchronous device dispatch fails.
+   *
+   * Called from the exception handlers in device_read_async_io() and
+   * host_to_device_read_async_io(), before the exception is returned through
+   * an errored future.
+   *
+   * An S3-over-RDMA backend overrides this hook to check for a sticky CUDA
+   * context error. Returning such an error as an ordinary request failure
+   * could allow registered GPU memory to be reused or released before RDMA
+   * writes and CUDA work are known to be quiescent. In that case the backend
+   * must invoke its fatal policy instead of returning.
+   *
+   * The default implementation does nothing. An override must not throw or
+   * re-enter this ioctx.
+   */
+  virtual void on_device_dispatch_failure() noexcept {}
+
+ public:
   exec::semi_future<size_t> host_to_device_read_async_io(
     const io_object& obj,
     std::span<io_object_segment> slices,
@@ -417,6 +438,7 @@ class templated_ioctx : public ioctx {
                       });
         return semi;
       } catch (...) {
+        on_device_dispatch_failure();
         return exec::make_semi_future<size_t>(std::current_exception());
       }
     } else {
