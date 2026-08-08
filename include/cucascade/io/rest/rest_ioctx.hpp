@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cucascade/io/object_store_listing.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
@@ -46,7 +47,7 @@ namespace cucascade::io::rest {
  * via a blocking HEAD before constructing the @c rest_io_object — the static
  * reactor factory cannot do this since it needs the authorizer + a round-trip.
  */
-class rest_ioctx : public templated_ioctx<rest_reactor> {
+class rest_ioctx : public templated_ioctx<rest_reactor>, public object_store_listing {
  public:
   /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context per
   /// pool: it carries the per-reactor @c config, the presigning authorizer, and
@@ -74,7 +75,7 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
                           std::string_view prefix,
                           std::size_t page_size,
                           std::function<bool(s3::list_objects_v2_page const&)> const& sink,
-                          std::optional<std::size_t> max_scanned = std::nullopt);
+                          std::optional<std::size_t> max_scanned = std::nullopt) override;
 
   /// Whole-listing convenience over @c list_objects_paged: every object under
   /// @p prefix, in document order, with sizes.  Throws (never truncates) when
@@ -90,7 +91,7 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// glob layer one level up can bound its match set without a reactor handle.
   /// Falls back to the built-in default when the pool is empty (never in
   /// practice).
-  [[nodiscard]] std::size_t list_max_matches() const;
+  [[nodiscard]] std::size_t list_max_matches() const override;
 
  protected:
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
