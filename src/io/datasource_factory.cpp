@@ -185,10 +185,37 @@ void io_context_registry::register_ioctx(io_context_type type,
   _entries[type] = {type, std::move(checker), std::move(factory)};
 }
 
+void io_context_registry::replace_ioctx(io_context_type old_type,
+                                        io_context_type new_type,
+                                        scheme_checker_type checker,
+                                        factory_type factory)
+{
+  if (!checker) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: null scheme checker");
+  }
+  if (!factory) { throw std::invalid_argument("datasource_registry: replace_ioctx: null factory"); }
+  std::lock_guard lk{_mtx};
+  if (_lookup_latched.load(std::memory_order_acquire)) {
+    throw std::logic_error(
+      "datasource_registry: replace_ioctx after the first lookup_path (bootstrap-only)");
+  }
+  if (!_entries.contains(old_type)) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: old type not registered");
+  }
+  if (_entries.contains(new_type)) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: new type already registered");
+  }
+  // Strong guarantee: the emplace is the only throwing step and precedes the
+  // erase; erase by KEY, not by a pre-emplace iterator (emplace may rehash).
+  _entries.emplace(new_type, entry{new_type, std::move(checker), std::move(factory)});
+  _entries.erase(old_type);
+}
+
 std::optional<io_context_type> io_context_registry::lookup_path(
   std::string_view path) const noexcept
 {
   std::shared_lock lk{_mtx};
+  _lookup_latched.store(true, std::memory_order_release);
   // kvikio's checker matches everything; _entries iterates in unspecified order,
   // so defer the catch-all and let an explicit backend (uring/restful) win.
   std::optional<io_context_type> fallback;
