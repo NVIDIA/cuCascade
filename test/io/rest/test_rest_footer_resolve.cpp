@@ -306,6 +306,11 @@ rest_perf_snapshot snapshot_after_single_opens(loopback_range_server const& serv
   return fixture.ioctx->perf_snapshot();
 }
 
+class per_key_authorizer_error : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 }  // namespace
 
 TEST_CASE("batched footer resolve matches single-probe bytes, size, and validation tag",
@@ -398,6 +403,99 @@ TEST_CASE("batched footer resolve isolates per-object authorization and not-foun
   CHECK(server.get_count("missing.parquet") == 1);
   CHECK(server.get_count("b.parquet") == 1);
   CHECK(server.get_count("denied.parquet") == 1);
+}
+
+TEST_CASE("batched footer resolve releases malformed probe buffers before HEAD fallback",
+          "[rest][footer_resolve]")
+{
+  constexpr std::size_t malformed_count = 6;
+  std::unordered_map<std::string, key_response_script> scripts;
+  std::vector<std::string> paths;
+  for (std::size_t i = 0; i < malformed_count; ++i) {
+    auto key          = "malformed-" + std::to_string(i) + ".parquet";
+    scripts[key].gets = {scripted_response{.malformed_content_range = true}};
+    paths.push_back(object_uri(key));
+  }
+  paths.push_back(object_uri("normal.parquet"));
+
+  loopback_range_server server(test_payload(), {}, {}, std::move(scripts));
+  auto fixture = make_ioctx(server, test_config(2, 2 * probe_size));
+  auto results = resolve(*fixture.ioctx, paths);
+
+  REQUIRE(results.size() == paths.size());
+  for (std::size_t i = 0; i < malformed_count; ++i) {
+    auto const& result = result_at(results, i);
+    require_success(result);
+    CHECK_FALSE(result.footer);
+    auto const key = "malformed-" + std::to_string(i) + ".parquet";
+    CHECK(server.get_count(key) == 1);
+    CHECK(server.head_count(key) == 1);
+  }
+  auto const& normal = result_at(results, malformed_count);
+  require_success(normal);
+  REQUIRE(normal.footer);
+  CHECK(normal.footer->size() == probe_size);
+  CHECK(server.get_count("normal.parquet") == 1);
+  CHECK(server.head_count("normal.parquet") == 0);
+
+  for (auto& result : results) {
+    result.footer.reset();
+  }
+  CHECK(fixture.ioctx->perf_snapshot().footer_stash_reserved_bytes == 0);
+}
+
+TEST_CASE("batched footer resolve isolates a per-key authorizer exception",
+          "[rest][footer_resolve]")
+{
+  loopback_range_server server(test_payload());
+  auto fixture = make_ioctx(server, test_config(3));
+  fixture.authorizer->set_object_exception(
+    "auth-error.parquet",
+    std::make_exception_ptr(per_key_authorizer_error{"original authorizer error"}));
+  std::vector<std::string> paths{
+    object_uri("a.parquet"), object_uri("auth-error.parquet"), object_uri("b.parquet")};
+
+  auto const results = resolve(*fixture.ioctx, paths);
+
+  REQUIRE(results.size() == paths.size());
+  require_success(result_at(results, 0));
+  auto const& failed = result_at(results, 1);
+  require_failure(failed);
+  try {
+    std::rethrow_exception(failed.error);
+    FAIL("expected the original authorizer exception");
+  } catch (per_key_authorizer_error const& error) {
+    CHECK(std::string_view{error.what()} == "original authorizer error");
+  } catch (...) {
+    FAIL("authorizer exception type changed");
+  }
+  require_success(result_at(results, 2));
+  CHECK(server.get_count("a.parquet") == 1);
+  CHECK(server.get_count("auth-error.parquet") == 0);
+  CHECK(server.get_count("b.parquet") == 1);
+  CHECK(fixture.authorizer->object_calls() == 3);
+}
+
+TEST_CASE("batched footer resolve isolates malformed paths and rejects an undersized budget",
+          "[rest][footer_resolve]")
+{
+  loopback_range_server server(test_payload());
+  auto fixture = make_ioctx(server, test_config(2));
+  std::vector<std::string> paths{"not-a-uri", object_uri("valid.parquet")};
+
+  auto const results = resolve(*fixture.ioctx, paths);
+
+  REQUIRE(results.size() == paths.size());
+  auto const& malformed = result_at(results, 0);
+  require_failure(malformed);
+  CHECK_THROWS_AS(std::rethrow_exception(malformed.error), std::invalid_argument);
+  require_success(result_at(results, 1));
+  CHECK(server.get_count("valid.parquet") == 1);
+
+  auto undersized = make_ioctx(server, test_config(1, probe_size - 1));
+  std::vector<std::string> one{object_uri("undersized.parquet")};
+  CHECK_THROWS(undersized.ioctx->resolve_footer_objects(one, [](footer_resolve_result) {}));
+  CHECK(server.get_count("undersized.parquet") == 0);
 }
 
 TEST_CASE("batched footer resolve streams fast siblings while another entry delays and retries",

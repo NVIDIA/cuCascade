@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -83,6 +84,7 @@ struct scripted_response {
   std::chrono::milliseconds delay{0};
   std::optional<std::string> etag;
   std::optional<std::string> retry_after;
+  bool malformed_content_range{false};
 };
 
 struct key_response_script {
@@ -337,7 +339,7 @@ class loopback_range_server {
       auto const size         = end - start + 1;
       std::string response =
         "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(size);
-      if (_fault.malformed_content_range) {
+      if (_fault.malformed_content_range || (scripted && scripted->malformed_content_range)) {
         response += "\r\nContent-Range: bytes malformed";
         append_etag_header(response, _fault.failed_get_etag);
       } else {
@@ -562,11 +564,25 @@ class list_capable_mock_authorizer final : public io::rest::request_authorizer {
  public:
   explicit list_capable_mock_authorizer(std::string endpoint) : _endpoint(std::move(endpoint)) {}
 
+  void set_object_exception(std::string key, std::exception_ptr error)
+  {
+    std::scoped_lock lock{_exceptions_mutex};
+    _object_exceptions.insert_or_assign(std::move(key), std::move(error));
+  }
+
   io::rest::authorized_request authorize(io::rest::object_ref const& obj,
                                          io::rest::request_method,
                                          std::chrono::seconds) override
   {
     _object_calls.fetch_add(1, std::memory_order_relaxed);
+    std::exception_ptr error;
+    {
+      std::scoped_lock lock{_exceptions_mutex};
+      if (auto const found = _object_exceptions.find(obj.key); found != _object_exceptions.end()) {
+        error = found->second;
+      }
+    }
+    if (error) { std::rethrow_exception(error); }
     return {_endpoint + "/" + obj.bucket + "/" + obj.key, {}};
   }
 
@@ -585,6 +601,8 @@ class list_capable_mock_authorizer final : public io::rest::request_authorizer {
   std::string _endpoint;
   std::atomic<int> _object_calls{0};
   std::atomic<int> _list_calls{0};
+  std::mutex _exceptions_mutex;
+  std::unordered_map<std::string, std::exception_ptr> _object_exceptions;
 };
 
 }  // namespace cucascade::test
