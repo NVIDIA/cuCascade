@@ -18,15 +18,21 @@
 
 #pragma once
 
+#include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -59,7 +65,8 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
 
   /// Pool-aggregated perf counters: per-reactor snapshots with totals and
   /// counts summed, maxes maxed, and ttfb the smallest non-zero reactor value.
-  /// Lock-free; safe to call while the pool is running.
+  /// Reactor counters are lock-free; the footer-budget gauge takes one short
+  /// mutex.  Safe to call while the pool is running.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
@@ -92,6 +99,30 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// practice).
   [[nodiscard]] std::size_t list_max_matches() const;
 
+  /// Resolve many objects' footers concurrently.  Per-entry semantics are
+  /// IDENTICAL to @c open_io_object(path, parquet_footer_probe): one verified
+  /// suffix GET; 200/416/unverifiable-206 fall back to a HEAD supplying
+  /// size+tag; the same retry policy per entry, never stalling siblings.  The
+  /// caller's thread drives one curl multi with connection reuse across
+  /// entries, and @p on_result is invoked ON THE CALLER'S THREAD, SERIALLY,
+  /// as each entry lands — completion order, no all-entries barrier.
+  ///
+  /// Every input occurrence is delivered exactly once (duplicates delivered
+  /// per occurrence, disambiguated by index); no callback runs after the
+  /// call returns.  On @p stop, in-flight transfers abort and every
+  /// undelivered entry receives one std::system_error(operation_canceled) —
+  /// including a batch cancelled while queued behind another batch (one
+  /// active batch per ioctx; concurrent calls FIFO-serialize).  If
+  /// @p on_result throws, the remaining entries are cancelled (delivered as
+  /// canceled, their callback throws suppressed) and the first exception is
+  /// rethrown after the sweep.  Throws directly only on submission errors:
+  /// an empty batch, or the API disabled via
+  /// @c config::footer_resolve_max_inflight == 0.  This ioctx must outlive
+  /// the call.
+  void resolve_footer_objects(std::span<std::string const> paths,
+                              std::function<void(footer_resolve_result)> const& on_result,
+                              std::stop_token stop = {});
+
  protected:
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
@@ -114,6 +145,23 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// footer reads are served locally.  Falls back to a plain HEAD (no stash)
   /// when the response is unusable.
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
+
+  /// The effective resolve_footer_objects concurrency cap: the configured
+  /// knob, or n_reactors * max_connections under footer_resolve_auto.  0 =
+  /// the API is disabled.
+  [[nodiscard]] std::size_t footer_resolve_inflight_cap() const;
+
+  // Batched-footer-resolve coordination: one active batch per ioctx, later
+  // calls FIFO-parked on the ticket queue (stop-aware — a queued batch whose
+  // token fires is removed without ever becoming active).  _footer_budget is
+  // created in the constructor and never reassigned, so perf_snapshot() may
+  // read it without the mutex.
+  mutable std::mutex _footer_resolve_mutex;
+  std::condition_variable_any _footer_resolve_cv;
+  std::deque<std::uint64_t> _footer_resolve_queue;
+  std::uint64_t _footer_resolve_next_ticket{0};
+  bool _footer_resolve_active{false};
+  std::shared_ptr<exec::admission_control> _footer_budget;
 };
 
 }  // namespace cucascade::io::rest

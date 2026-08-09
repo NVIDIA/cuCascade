@@ -113,6 +113,26 @@ struct config {
   /// two axes diverge when a prefix is huge but few keys match, so both exist.
   std::size_t list_max_matches{s3::default_max_list_objects};     // 100'000
   std::size_t list_max_scanned{s3::default_max_scanned_objects};  // 1'000'000
+
+  /// Sentinel for the footer_resolve_* knobs below: derive the value from the
+  /// ioctx shape instead of using an explicit setting.
+  static constexpr std::size_t footer_resolve_auto{static_cast<std::size_t>(-1)};
+
+  /// Concurrency cap for one @c rest_ioctx::resolve_footer_objects batch: at
+  /// most this many probe/HEAD transfers are on the wire at once, and the
+  /// batch's curl multi pools at most this many connections.
+  /// @c footer_resolve_auto derives n_reactors * max_connections at the ioctx;
+  /// 0 disables the API entirely (resolve_footer_objects throws) — the
+  /// rollback switch.
+  std::size_t footer_resolve_max_inflight{footer_resolve_auto};
+
+  /// Aggregate cap (bytes) on live footer payloads across all batches of one
+  /// ioctx.  Each entry reserves @c footer_probe_bytes just before its GET is
+  /// issued; the bytes return when the delivered payload buffer is freed, so
+  /// the cap paces resolve-ahead to how fast the caller drops payloads.
+  /// @c footer_resolve_auto derives 2 * effective-inflight *
+  /// footer_probe_bytes.
+  std::size_t footer_resolve_stash_budget{footer_resolve_auto};
 };
 
 }  // namespace cucascade::io::rest

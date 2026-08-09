@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
@@ -32,6 +33,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -113,6 +116,31 @@ struct footer_probe {
 struct head_object_result {
   std::size_t object_size{0};
   std::string etag;
+};
+
+// ---------------------------------------------------------------------------
+// footer_resolve_result
+// ---------------------------------------------------------------------------
+
+/// One resolved entry of a batched footer resolve
+/// (@c rest_ioctx::resolve_footer_objects).  Exactly one of {object, error}
+/// is set.
+///
+/// @c object is stashless — identity, size and validation tag only.  The
+/// suffix window bytes arrive in @c footer instead, whose buffer is the byte
+/// lease: it is allocated against the ioctx-wide footer budget
+/// (@c config::footer_resolve_stash_budget) and the bytes return to that
+/// budget when the buffer is freed, so the intended lifetime is parse-only.
+/// Reads on @c object inside the window re-GET over the network.  @c footer
+/// is null on the HEAD-fallback path (probe unusable), where @c window_lo
+/// stays 0.
+struct footer_resolve_result {
+  std::size_t index{0};               ///< position in the submitted span
+  std::string path;                   ///< the submitted path, verbatim
+  std::shared_ptr<io_object> object;  ///< stashless: size + validation tag
+  shared_byte_span footer;            ///< suffix window bytes (the lease)
+  std::size_t window_lo{0};           ///< file offset of footer->front()
+  std::exception_ptr error;           ///< per-entry failure, isolated
 };
 
 // ---------------------------------------------------------------------------
@@ -219,6 +247,11 @@ struct rest_perf_snapshot {
   std::uint64_t blocking_host_get_count{0};
   std::uint64_t blocking_host_get_wall_ns_total{0};
   std::uint64_t blocking_host_get_wall_ns_max{0};
+  // Ioctx-level (not summed across reactors): live / high-water bytes reserved
+  // from the footer-resolve stash budget.  0 when the batched footer API has
+  // never run on this ioctx.
+  std::uint64_t footer_stash_reserved_bytes{0};
+  std::uint64_t footer_stash_reserved_peak_bytes{0};
 };
 
 /// How @c prep_host_rx_request attributes the resulting GETs in the perf
@@ -355,6 +388,29 @@ class rest_reactor {
   /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so
   /// the caller falls back to a HEAD.  @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
+
+  /// Batched footer resolve engine: every entry gets the same per-attempt
+  /// semantics as @c fetch_footer_suffix plus the HEAD fallback, but all
+  /// entries share one curl multi driven on the caller's thread, so
+  /// connections are reused across entries (at most @p max_inflight pooled)
+  /// and at most @p max_inflight transfers are on the wire at once.
+  /// @p paths / @p objects / @p indices are parallel: @p indices carries each
+  /// entry's position in the caller's original batch.  Each probe reserves
+  /// @c footer_probe_bytes from @p budget before its GET is issued
+  /// (non-blocking while any transfer is active; a blocking, stop-aware wait
+  /// only when none is) and the delivered payload buffer carries the
+  /// reservation until it is freed.  @p on_result runs on the caller's
+  /// thread, serially, as entries land; see
+  /// @c rest_ioctx::resolve_footer_objects for the delivery contract.
+  /// Assumes non-empty input and max_inflight >= 1; concurrent-batch
+  /// serialization is the ioctx's job, not this method's.
+  void resolve_footer_batch(std::span<std::string const> paths,
+                            std::span<object_ref const> objects,
+                            std::span<std::size_t const> indices,
+                            std::size_t max_inflight,
+                            std::shared_ptr<exec::admission_control> budget,
+                            std::function<void(footer_resolve_result)> const& on_result,
+                            std::stop_token stop);
 
   /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML
   /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted

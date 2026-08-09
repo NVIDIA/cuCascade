@@ -1117,6 +1117,398 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
 }
 
 // ---------------------------------------------------------------------------
+// batched footer resolve
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Backing storage for a footer payload delivered by resolve_footer_batch:
+/// the byte buffer plus the entry's budget reservation.  Member order is the
+/// release contract — `lease` is declared after `budget`, so it is destroyed
+/// first and returns its bytes to a still-alive admission_control even when
+/// this storage outlives the ioctx that created it.
+struct leased_byte_storage {
+  std::shared_ptr<exec::admission_control> budget;
+  exec::admission_control::slot lease;
+  std::vector<std::uint8_t> bytes;
+  std::span<const std::uint8_t> view;
+
+  leased_byte_storage(std::shared_ptr<exec::admission_control> b,
+                      exec::admission_control::slot l,
+                      std::vector<std::uint8_t> data)
+    : budget(std::move(b)), lease(std::move(l)), bytes(std::move(data)), view(bytes)
+  {
+  }
+
+  leased_byte_storage(leased_byte_storage const&)            = delete;
+  leased_byte_storage& operator=(leased_byte_storage const&) = delete;
+  leased_byte_storage(leased_byte_storage&&)                 = delete;
+  leased_byte_storage& operator=(leased_byte_storage&&)      = delete;
+};
+
+shared_byte_span make_leased_byte_span(std::shared_ptr<exec::admission_control> budget,
+                                       exec::admission_control::slot lease,
+                                       std::vector<std::uint8_t> bytes)
+{
+  auto owner =
+    std::make_shared<leased_byte_storage>(std::move(budget), std::move(lease), std::move(bytes));
+  return shared_byte_span{owner, &owner->view};
+}
+
+enum class footer_entry_stage : std::uint8_t { pending, transfer, backoff, done };
+enum class footer_entry_kind : std::uint8_t { probe, head };
+
+/// Per-entry state of one batched footer resolve.  Lives in a fixed-size
+/// vector for the whole batch — the curl callbacks hold pointers into it.
+struct footer_entry {
+  std::size_t pos{0};  // position in the batch's parallel spans
+  footer_entry_stage stage{footer_entry_stage::pending};
+  footer_entry_kind kind{footer_entry_kind::probe};
+  std::size_t attempt{0};
+  suffix_sink sink;
+  head_capture head;
+  exec::admission_control::slot lease;
+  curl_easy_ptr easy;
+  curl_slist_ptr headers;
+  std::string range;
+  std::string last_error;
+  std::chrono::steady_clock::time_point retry_at{};
+  std::chrono::steady_clock::time_point t0{};
+};
+
+}  // namespace
+
+void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
+                                        std::span<object_ref const> objects,
+                                        std::span<std::size_t const> indices,
+                                        std::size_t max_inflight,
+                                        std::shared_ptr<exec::admission_control> budget,
+                                        std::function<void(footer_resolve_result)> const& on_result,
+                                        std::stop_token stop)
+{
+  std::size_t const window = _config.footer_probe_bytes;
+
+  curl_multi_ptr multi{curl_multi_init()};
+  if (!multi) {
+    throw std::runtime_error("rest_reactor::resolve_footer_batch: curl_multi_init failed");
+  }
+  CUCASCADE_CURLM_CHECK(curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, CURLPIPE_NOTHING));
+  CUCASCADE_CURLM_CHECK(
+    curl_multi_setopt(multi.get(), CURLMOPT_MAXCONNECTS, static_cast<long>(max_inflight)));
+  CUCASCADE_CURLM_CHECK(
+    curl_multi_setopt(multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(max_inflight)));
+
+  // curl_multi_wakeup is the one multi function that is safe to call from
+  // another thread; a wakeup with no poll in flight makes the next poll
+  // return early, so the stop signal cannot be lost between the check and
+  // the poll.
+  std::stop_callback wake{stop, [&multi] { curl_multi_wakeup(multi.get()); }};
+
+  std::vector<footer_entry> entries(paths.size());
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    entries[i].pos = i;
+  }
+
+  std::size_t undelivered   = entries.size();
+  std::size_t active        = 0;
+  std::size_t next_to_start = 0;
+  std::exception_ptr callback_error;
+
+  auto deliver = [&](footer_entry& e, footer_resolve_result&& r) {
+    e.stage = footer_entry_stage::done;
+    --undelivered;
+    try {
+      on_result(std::move(r));
+    } catch (...) {
+      // First exception wins; throws from the cancel sweep's own deliveries
+      // are suppressed.
+      if (!callback_error) { callback_error = std::current_exception(); }
+    }
+  };
+
+  auto error_result = [&](footer_entry const& e, std::exception_ptr err) {
+    footer_resolve_result r;
+    r.index = indices[e.pos];
+    r.path  = paths[e.pos];
+    r.error = std::move(err);
+    return r;
+  };
+
+  auto fail_entry = [&](footer_entry& e, std::string const& what) {
+    _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+    e.lease = {};
+    deliver(e,
+            error_result(e,
+                         std::make_exception_ptr(std::runtime_error(
+                           "rest_reactor::resolve_footer_batch: " + what + " for " +
+                           objects[e.pos].bucket + "/" + objects[e.pos].key))));
+  };
+
+  auto cancel_remaining = [&] {
+    for (auto& e : entries) {
+      if (e.stage == footer_entry_stage::done) { continue; }
+      if (e.easy) {
+        curl_multi_remove_handle(multi.get(), e.easy.get());
+        e.easy.reset();
+        e.headers.reset();
+        if (e.stage == footer_entry_stage::transfer) { --active; }
+      }
+      e.lease = {};
+      deliver(e,
+              error_result(e,
+                           std::make_exception_ptr(
+                             std::system_error(std::make_error_code(std::errc::operation_canceled),
+                                               "rest_reactor::resolve_footer_batch: canceled"))));
+    }
+  };
+
+  auto submit = [&](footer_entry& e) {
+    bool const is_probe = e.kind == footer_entry_kind::probe;
+    auto const authd    = _ctx->authorizer()->authorize(
+      objects[e.pos], is_probe ? request_method::GET : request_method::HEAD, presign_ttl(_config));
+
+    e.easy = curl_easy_ptr{curl_easy_init()};
+    if (!e.easy) {
+      e.lease = {};
+      deliver(e,
+              error_result(e,
+                           std::make_exception_ptr(std::runtime_error(
+                             "rest_reactor::resolve_footer_batch: curl_easy_init failed"))));
+      return;
+    }
+    configure_easy_handle(e.easy.get(), global_curl_context::instance().share_handle());
+    apply_request_opts(e.easy.get(), _config);
+    if (is_probe) {
+      e.sink     = suffix_sink{};
+      e.sink.cap = window;
+      e.range    = suffix_range_header(window);
+      e.headers  = build_header_list(authd.headers, &e.range);
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_WRITEFUNCTION, &suffix_write_cb));
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_WRITEDATA, &e.sink));
+      CUCASCADE_CURL_CHECK(
+        curl_easy_setopt(e.easy.get(), CURLOPT_HEADERFUNCTION, &suffix_header_cb));
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HEADERDATA, &e.sink));
+    } else {
+      e.head    = head_capture{};
+      e.headers = build_header_list(authd.headers, nullptr);
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_NOBODY, 1L));
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_WRITEFUNCTION, &write_discard));
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HEADERFUNCTION, &head_header_cb));
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HEADERDATA, &e.head));
+    }
+    CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_URL, authd.url.c_str()));
+    CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HTTPHEADER, e.headers.get()));
+    CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_PRIVATE, &e));
+    e.t0 = std::chrono::steady_clock::now();
+    CUCASCADE_CURLM_CHECK(curl_multi_add_handle(multi.get(), e.easy.get()));
+    e.stage = footer_entry_stage::transfer;
+    ++active;
+  };
+
+  auto schedule_retry = [&](footer_entry& e, std::string const& retry_after) {
+    if (e.attempt + 1 < _config.max_retry_attempts) {
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
+      CUCASCADE_LOG_WARN(
+        "rest_reactor::resolve_footer_batch: retrying {}/{} after {} (attempt {}/{})",
+        objects[e.pos].bucket,
+        objects[e.pos].key,
+        e.last_error,
+        e.attempt + 1,
+        _config.max_retry_attempts);
+      e.retry_at =
+        std::chrono::steady_clock::now() + compute_backoff(e.attempt, retry_after, _config);
+      e.attempt += 1;
+      e.stage = footer_entry_stage::backoff;
+    } else {
+      fail_entry(e, "exhausted retries (" + e.last_error + ")");
+    }
+  };
+
+  auto finish_probe = [&](footer_entry& e, CURLcode rc, long status) {
+    _perf.payload_bytes_read_total.fetch_add(e.sink.total_received, std::memory_order_relaxed);
+    if (rc != CURLE_OK && rc != CURLE_WRITE_ERROR) {
+      e.last_error = std::string(curl_easy_strerror(rc));
+      if (!is_retriable_curl(rc)) {
+        fail_entry(e, e.last_error);
+        return;
+      }
+      schedule_retry(e, e.sink.retry_after);
+      return;
+    }
+    if (status == 206) {
+      auto const total = content_range_total(e.sink.content_range);
+      auto const start = content_range_start(e.sink.content_range);
+      if (total && start && *start <= *total && e.sink.data.size() == *total - *start) {
+        if (_config.perf_instrumentation) {
+          auto const get_ns =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - e.t0)
+                                         .count());
+          _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
+          _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
+          atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
+          std::uint64_t expected = 0;
+          _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
+        }
+        footer_resolve_result r;
+        r.index     = indices[e.pos];
+        r.path      = paths[e.pos];
+        r.window_lo = *start;
+        r.object    = std::make_shared<rest_io_object>(
+          paths[e.pos], objects[e.pos].bucket, objects[e.pos].key, *total, std::move(e.sink.etag));
+        r.footer = make_leased_byte_span(budget, std::move(e.lease), std::move(e.sink.data));
+        deliver(e, std::move(r));
+        return;
+      }
+      // Unverifiable 206: like the blocking path, fall back to a HEAD.  The
+      // lease is returned — a HEAD delivers no payload.
+      e.lease   = {};
+      e.kind    = footer_entry_kind::head;
+      e.attempt = 0;
+      submit(e);
+      return;
+    }
+    if (status == 200 || status == 416) {
+      e.lease   = {};
+      e.kind    = footer_entry_kind::head;
+      e.attempt = 0;
+      submit(e);
+      return;
+    }
+    if (is_retriable_status(status)) {
+      e.last_error = "HTTP " + std::to_string(status);
+      schedule_retry(e, e.sink.retry_after);
+      return;
+    }
+    fail_entry(e, "HTTP " + std::to_string(status));
+  };
+
+  auto finish_head = [&](footer_entry& e, CURLcode rc, long status, curl_off_t content_length) {
+    if (rc == CURLE_OK && status == 200) {
+      if (content_length < 0) {
+        fail_entry(e, "missing Content-Length");
+        return;
+      }
+      footer_resolve_result r;
+      r.index  = indices[e.pos];
+      r.path   = paths[e.pos];
+      r.object = std::make_shared<rest_io_object>(paths[e.pos],
+                                                  objects[e.pos].bucket,
+                                                  objects[e.pos].key,
+                                                  static_cast<size_t>(content_length),
+                                                  std::move(e.head.etag));
+      deliver(e, std::move(r));
+      return;
+    }
+    e.last_error =
+      rc != CURLE_OK ? std::string(curl_easy_strerror(rc)) : ("HTTP " + std::to_string(status));
+    bool const retriable =
+      (rc != CURLE_OK && is_retriable_curl(rc)) || (rc == CURLE_OK && is_retriable_status(status));
+    if (!retriable) {
+      fail_entry(e, e.last_error);
+      return;
+    }
+    schedule_retry(e, e.head.retry_after);
+  };
+
+  auto process_completions = [&] {
+    int msgs_left = 0;
+    while (CURLMsg* msg = curl_multi_info_read(multi.get(), &msgs_left)) {
+      if (msg->msg != CURLMSG_DONE) { continue; }
+      CURL* h           = msg->easy_handle;
+      CURLcode const rc = msg->data.result;
+      void* priv        = nullptr;
+      curl_easy_getinfo(h, CURLINFO_PRIVATE, &priv);
+      auto& e     = *static_cast<footer_entry*>(priv);
+      long status = 0;
+      curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+      curl_off_t content_length = -1;
+      if (e.kind == footer_entry_kind::head) {
+        curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
+      }
+      CUCASCADE_CURLM_CHECK(curl_multi_remove_handle(multi.get(), h));
+      e.easy.reset();
+      e.headers.reset();
+      --active;
+      if (e.kind == footer_entry_kind::probe) {
+        finish_probe(e, rc, status);
+      } else {
+        finish_head(e, rc, status, content_length);
+      }
+    }
+  };
+
+  auto any_backoff = [&] {
+    return std::any_of(entries.begin(), entries.end(), [](footer_entry const& e) {
+      return e.stage == footer_entry_stage::backoff;
+    });
+  };
+
+  // Returns false when a blocking budget wait was cut short by @p stop.
+  auto start_pending = [&] {
+    while (active < max_inflight && next_to_start < entries.size()) {
+      auto& e = entries[next_to_start];
+      exec::admission_control::slot lease;
+      if (active > 0 || any_backoff()) {
+        // Never block on budget while a transfer or a due retry could still
+        // make progress and release bytes.
+        lease = budget->try_acquire(window);
+        if (!lease) { return true; }
+      } else {
+        lease = budget->acquire(window, stop);
+        if (!lease) { return false; }
+      }
+      e.lease = std::move(lease);
+      ++next_to_start;
+      submit(e);
+    }
+    return true;
+  };
+
+  auto resubmit_due = [&] {
+    auto const now = std::chrono::steady_clock::now();
+    for (auto& e : entries) {
+      if (active >= max_inflight) { break; }
+      if (e.stage == footer_entry_stage::backoff && e.retry_at <= now) { submit(e); }
+    }
+  };
+
+  auto poll_timeout_ms = [&] {
+    long timeout   = 100;
+    auto const now = std::chrono::steady_clock::now();
+    for (auto const& e : entries) {
+      if (e.stage != footer_entry_stage::backoff) { continue; }
+      auto const dt =
+        std::chrono::duration_cast<std::chrono::milliseconds>(e.retry_at - now).count();
+      timeout = std::min(timeout, std::max<long>(1, static_cast<long>(dt)));
+    }
+    return timeout;
+  };
+
+  while (undelivered > 0) {
+    if (stop.stop_requested() || callback_error) {
+      cancel_remaining();
+      break;
+    }
+    resubmit_due();
+    if (!start_pending()) {
+      cancel_remaining();
+      break;
+    }
+    if (undelivered == 0 || stop.stop_requested() || callback_error) { continue; }
+    int running = 0;
+    CUCASCADE_CURLM_CHECK(curl_multi_perform(multi.get(), &running));
+    process_completions();
+    if (undelivered == 0 || stop.stop_requested() || callback_error) { continue; }
+    int numfds = 0;
+    CUCASCADE_CURLM_CHECK(
+      curl_multi_poll(multi.get(), nullptr, 0, static_cast<int>(poll_timeout_ms()), &numfds));
+  }
+
+  if (callback_error) { std::rethrow_exception(callback_error); }
+}
+
+// ---------------------------------------------------------------------------
 // capabilities / factory
 // ---------------------------------------------------------------------------
 

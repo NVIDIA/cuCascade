@@ -23,9 +23,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io::rest {
 
@@ -34,6 +38,157 @@ rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::rea
       return std::make_unique<rest_reactor>(ctx, "rest-" + std::to_string(i++));
     })
 {
+  // Created once here and never reassigned: payload leases capture it by
+  // shared_ptr (so they may outlive this ioctx) and perf_snapshot() reads it
+  // without the coordination mutex.
+  if (std::size_t const inflight = footer_resolve_inflight_cap(); inflight > 0) {
+    auto const& cfg   = _reactors.front()->get_config();
+    std::size_t bytes = cfg.footer_resolve_stash_budget;
+    if (bytes == config::footer_resolve_auto || bytes == 0) {
+      bytes = 2 * inflight * cfg.footer_probe_bytes;
+    }
+    _footer_budget = std::make_shared<exec::admission_control>(std::max<std::size_t>(bytes, 1));
+  }
+}
+
+std::size_t rest_ioctx::footer_resolve_inflight_cap() const
+{
+  if (_reactors.empty()) { return 0; }
+  auto const& cfg = _reactors.front()->get_config();
+  if (cfg.footer_resolve_max_inflight == config::footer_resolve_auto) {
+    return std::max<std::size_t>(1, _reactors.size() * cfg.max_connections);
+  }
+  return cfg.footer_resolve_max_inflight;
+}
+
+void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
+                                        std::function<void(footer_resolve_result)> const& on_result,
+                                        std::stop_token stop)
+{
+  if (paths.empty()) {
+    throw std::invalid_argument("rest_ioctx::resolve_footer_objects: empty batch");
+  }
+  if (_reactors.empty()) {
+    throw std::runtime_error("rest_ioctx::resolve_footer_objects: no reactors");
+  }
+  std::size_t const max_inflight = footer_resolve_inflight_cap();
+  if (max_inflight == 0 || !_footer_budget) {
+    throw std::invalid_argument(
+      "rest_ioctx::resolve_footer_objects: disabled (footer_resolve_max_inflight == 0)");
+  }
+
+  // Parse up front; a bad scheme is a per-entry error (isolation), not a
+  // batch error.
+  std::vector<std::string> valid_paths;
+  std::vector<object_ref> valid_objects;
+  std::vector<std::size_t> valid_indices;
+  std::vector<std::pair<std::size_t, std::exception_ptr>> parse_errors;
+  valid_paths.reserve(paths.size());
+  valid_objects.reserve(paths.size());
+  valid_indices.reserve(paths.size());
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    auto parsed = cucascade::io::parse(paths[i]);
+    if (parsed.scheme != "s3") {
+      parse_errors.emplace_back(
+        i,
+        std::make_exception_ptr(std::invalid_argument(
+          "rest_ioctx::resolve_footer_objects: unsupported scheme '" + parsed.scheme + "'")));
+      continue;
+    }
+    valid_paths.push_back(paths[i]);
+    valid_objects.push_back(object_ref{std::move(parsed.host), std::move(parsed.path)});
+    valid_indices.push_back(i);
+  }
+
+  std::exception_ptr callback_error;
+  auto deliver_guarded = [&](footer_resolve_result&& r) {
+    try {
+      on_result(std::move(r));
+    } catch (...) {
+      // First exception wins; later throws during a cancel sweep are
+      // suppressed.
+      if (!callback_error) { callback_error = std::current_exception(); }
+    }
+  };
+  auto canceled = [] {
+    return std::make_exception_ptr(
+      std::system_error(std::make_error_code(std::errc::operation_canceled),
+                        "rest_ioctx::resolve_footer_objects: canceled"));
+  };
+
+  // FIFO admission: one active batch per ioctx; the wait is stop-aware, so a
+  // queued batch whose token fires is removed without ever becoming active.
+  {
+    std::unique_lock lk(_footer_resolve_mutex);
+    std::uint64_t const ticket = _footer_resolve_next_ticket++;
+    _footer_resolve_queue.push_back(ticket);
+    bool const admitted = _footer_resolve_cv.wait(lk, stop, [&] {
+      return !_footer_resolve_active && !_footer_resolve_queue.empty() &&
+             _footer_resolve_queue.front() == ticket;
+    });
+    if (!admitted) {
+      std::erase(_footer_resolve_queue, ticket);
+      lk.unlock();
+      _footer_resolve_cv.notify_all();
+      for (std::size_t i = 0; i < paths.size(); ++i) {
+        footer_resolve_result r;
+        r.index = i;
+        r.path  = paths[i];
+        r.error = canceled();
+        deliver_guarded(std::move(r));
+      }
+      if (callback_error) { std::rethrow_exception(callback_error); }
+      return;
+    }
+    _footer_resolve_active = true;
+    _footer_resolve_queue.pop_front();
+  }
+
+  struct gate_release {
+    rest_ioctx* self;
+    ~gate_release()
+    {
+      {
+        std::lock_guard lk(self->_footer_resolve_mutex);
+        self->_footer_resolve_active = false;
+      }
+      self->_footer_resolve_cv.notify_all();
+    }
+  } release{this};
+
+  // Deliver parse failures first (serial, on this thread); if a callback
+  // throws, every not-yet-delivered entry is swept as canceled and the first
+  // exception is rethrown — same rule as the engine.
+  std::size_t parse_pos = 0;
+  for (; parse_pos < parse_errors.size() && !callback_error; ++parse_pos) {
+    footer_resolve_result r;
+    r.index = parse_errors[parse_pos].first;
+    r.path  = paths[parse_errors[parse_pos].first];
+    r.error = std::move(parse_errors[parse_pos].second);
+    deliver_guarded(std::move(r));
+  }
+  if (callback_error) {
+    for (std::size_t p = parse_pos; p < parse_errors.size(); ++p) {
+      footer_resolve_result r;
+      r.index = parse_errors[p].first;
+      r.path  = paths[parse_errors[p].first];
+      r.error = canceled();
+      deliver_guarded(std::move(r));
+    }
+    for (std::size_t v = 0; v < valid_indices.size(); ++v) {
+      footer_resolve_result r;
+      r.index = valid_indices[v];
+      r.path  = valid_paths[v];
+      r.error = canceled();
+      deliver_guarded(std::move(r));
+    }
+    std::rethrow_exception(callback_error);
+  }
+
+  if (valid_indices.empty()) { return; }
+
+  _reactors.front()->resolve_footer_batch(
+    valid_paths, valid_objects, valid_indices, max_inflight, _footer_budget, on_result, stop);
 }
 
 rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
@@ -60,6 +215,10 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
     agg.blocking_host_get_wall_ns_total += s.blocking_host_get_wall_ns_total;
     agg.blocking_host_get_wall_ns_max =
       std::max(agg.blocking_host_get_wall_ns_max, s.blocking_host_get_wall_ns_max);
+  }
+  if (_footer_budget) {
+    agg.footer_stash_reserved_bytes      = _footer_budget->reserved();
+    agg.footer_stash_reserved_peak_bytes = _footer_budget->peak_reserved();
   }
   return agg;
 }
