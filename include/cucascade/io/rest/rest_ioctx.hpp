@@ -120,7 +120,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @c config::footer_resolve_max_inflight == 0, or an explicit
   /// @c footer_resolve_stash_budget smaller than @c footer_probe_bytes.  An
   /// unparsable or non-s3 path is a per-entry error, not a batch error.
-  /// This ioctx must outlive the call.
+  /// Should the transfer driver itself fail mid-batch (a curl multi error),
+  /// every undelivered entry is delivered as canceled before that failure
+  /// is rethrown — exactly-once holds on every exit path.  This ioctx must
+  /// outlive the call.
   void resolve_footer_objects(std::span<std::string const> paths,
                               std::function<void(footer_resolve_result)> const& on_result,
                               std::stop_token stop = {});

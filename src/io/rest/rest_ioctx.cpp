@@ -44,9 +44,7 @@ rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::rea
   if (std::size_t const inflight = footer_resolve_inflight_cap(); inflight > 0) {
     auto const& cfg   = _reactors.front()->get_config();
     std::size_t bytes = cfg.footer_resolve_stash_budget;
-    if (bytes == config::footer_resolve_auto || bytes == 0) {
-      bytes = 2 * inflight * cfg.footer_probe_bytes;
-    }
+    if (bytes == config::footer_resolve_auto) { bytes = 2 * inflight * cfg.footer_probe_bytes; }
     _footer_budget = std::make_shared<exec::admission_control>(std::max<std::size_t>(bytes, 1));
   }
 }

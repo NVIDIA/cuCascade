@@ -1208,6 +1208,10 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
   std::vector<footer_entry> entries(paths.size());
   for (std::size_t i = 0; i < entries.size(); ++i) {
     entries[i].pos = i;
+    // Single-probe parity: fetch_footer_suffix skips the suffix GET entirely
+    // when the window is zero, so a zero-window batch entry starts at the
+    // HEAD fallback directly (no GET, no lease).
+    if (window == 0) { entries[i].kind = footer_entry_kind::head; }
   }
 
   // Unwind safety: should anything below throw while transfers are in
@@ -1460,6 +1464,10 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
   auto process_completions = [&] {
     int msgs_left = 0;
     while (CURLMsg* msg = curl_multi_info_read(multi.get(), &msgs_left)) {
+      // After the first callback throw (or a stop), nothing more may be
+      // delivered as success — undrained completions stay attached and fall
+      // to the cancel sweep.
+      if (callback_error || stop.stop_requested()) { break; }
       if (msg->msg != CURLMSG_DONE) { continue; }
       CURL* h           = msg->easy_handle;
       CURLcode const rc = msg->data.result;
@@ -1486,19 +1494,22 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
 
   // Returns false when a blocking budget wait was cut short by @p stop.
   auto start_pending = [&] {
-    while (active < max_inflight && next_to_start < entries.size()) {
+    while (!callback_error && !stop.stop_requested() && active < max_inflight &&
+           next_to_start < entries.size()) {
       auto& e = entries[next_to_start];
-      exec::admission_control::slot lease;
-      if (active > 0 || backoff_count > 0) {
-        // Never block on budget while a transfer or a due retry could still
-        // make progress and release bytes.
-        lease = budget->try_acquire(window);
-        if (!lease) { return true; }
-      } else {
-        lease = budget->acquire(window, stop);
-        if (!lease) { return false; }
+      if (window != 0) {
+        exec::admission_control::slot lease;
+        if (active > 0 || backoff_count > 0) {
+          // Never block on budget while a transfer or a due retry could
+          // still make progress and release bytes.
+          lease = budget->try_acquire(window);
+          if (!lease) { return true; }
+        } else {
+          lease = budget->acquire(window, stop);
+          if (!lease) { return false; }
+        }
+        e.lease = std::move(lease);
       }
-      e.lease = std::move(lease);
       ++next_to_start;
       submit(e);
     }
@@ -1507,7 +1518,8 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
 
   auto resubmit_due = [&] {
     auto const now = std::chrono::steady_clock::now();
-    while (!retry_heap.empty() && active < max_inflight) {
+    while (!callback_error && !stop.stop_requested() && !retry_heap.empty() &&
+           active < max_inflight) {
       auto const [due, e] = retry_heap.top();
       if (e->stage != footer_entry_stage::backoff) {
         retry_heap.pop();
@@ -1534,24 +1546,32 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
     return timeout;
   };
 
-  while (undelivered > 0) {
-    if (stop.stop_requested() || callback_error) {
-      cancel_remaining();
-      break;
+  try {
+    while (undelivered > 0) {
+      if (stop.stop_requested() || callback_error) {
+        cancel_remaining();
+        break;
+      }
+      resubmit_due();
+      if (!start_pending()) {
+        cancel_remaining();
+        break;
+      }
+      if (undelivered == 0 || stop.stop_requested() || callback_error) { continue; }
+      int running = 0;
+      CUCASCADE_CURLM_CHECK(curl_multi_perform(multi.get(), &running));
+      process_completions();
+      if (undelivered == 0 || stop.stop_requested() || callback_error) { continue; }
+      int numfds = 0;
+      CUCASCADE_CURLM_CHECK(
+        curl_multi_poll(multi.get(), nullptr, 0, static_cast<int>(poll_timeout_ms()), &numfds));
     }
-    resubmit_due();
-    if (!start_pending()) {
-      cancel_remaining();
-      break;
-    }
-    if (undelivered == 0 || stop.stop_requested() || callback_error) { continue; }
-    int running = 0;
-    CUCASCADE_CURLM_CHECK(curl_multi_perform(multi.get(), &running));
-    process_completions();
-    if (undelivered == 0 || stop.stop_requested() || callback_error) { continue; }
-    int numfds = 0;
-    CUCASCADE_CURLM_CHECK(
-      curl_multi_poll(multi.get(), nullptr, 0, static_cast<int>(poll_timeout_ms()), &numfds));
+  } catch (...) {
+    // Driver failure (a curl multi error, an allocation failure): deliver
+    // the cancel sweep first so exactly-once holds even here, then surface
+    // the driver's own exception, not a callback's.
+    cancel_remaining();
+    throw;
   }
 
   if (callback_error) { std::rethrow_exception(callback_error); }
