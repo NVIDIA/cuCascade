@@ -41,6 +41,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -76,12 +77,29 @@ struct listed_object {
   std::uint64_t size{0};
 };
 
+struct scripted_response {
+  /// Zero selects the server's normal successful response for this method.
+  int status{0};
+  std::chrono::milliseconds delay{0};
+  std::optional<std::string> etag;
+  std::optional<std::string> retry_after;
+};
+
+struct key_response_script {
+  std::vector<scripted_response> gets;
+  std::vector<scripted_response> heads;
+};
+
 class loopback_range_server {
  public:
   explicit loopback_range_server(std::vector<std::uint8_t> object,
-                                 range_fault_policy fault          = {},
-                                 std::vector<listed_object> listed = {})
-    : _object(std::move(object)), _fault(fault), _listed(std::move(listed))
+                                 range_fault_policy fault                                     = {},
+                                 std::vector<listed_object> listed                            = {},
+                                 std::unordered_map<std::string, key_response_script> scripts = {})
+    : _object(std::move(object)),
+      _fault(std::move(fault)),
+      _listed(std::move(listed)),
+      _scripts(std::move(scripts))
   {
     if (_object.empty()) { throw std::runtime_error("loopback object must be non-empty"); }
 
@@ -131,10 +149,23 @@ class loopback_range_server {
   loopback_range_server& operator=(loopback_range_server const&) = delete;
 
   [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
+  [[nodiscard]] std::uint16_t port() const noexcept { return _port; }
 
   [[nodiscard]] std::size_t head_count() const noexcept { return _head_count.load(); }
   [[nodiscard]] std::size_t get_count() const noexcept { return _get_count.load(); }
   [[nodiscard]] std::size_t list_count() const noexcept { return _list_count.load(); }
+  [[nodiscard]] std::size_t accepted_connection_count() const noexcept
+  {
+    return _accepted_connection_count.load();
+  }
+  [[nodiscard]] std::size_t head_count(std::string_view key) const
+  {
+    return request_count(_head_counts_by_key, key);
+  }
+  [[nodiscard]] std::size_t get_count(std::string_view key) const
+  {
+    return request_count(_get_counts_by_key, key);
+  }
 
  private:
   static std::string errno_message() { return std::strerror(errno); }
@@ -166,6 +197,11 @@ class loopback_range_server {
     send_all(fd, response);
   }
 
+  static void append_connection_header(std::string& response, bool close_connection)
+  {
+    response += close_connection ? "\r\nConnection: close" : "\r\nConnection: keep-alive";
+  }
+
   void accept_loop()
   {
     while (!_stop.load(std::memory_order_relaxed)) {
@@ -176,6 +212,7 @@ class loopback_range_server {
         if (_stop.load(std::memory_order_relaxed)) { return; }
         continue;
       }
+      _accepted_connection_count.fetch_add(1, std::memory_order_relaxed);
       std::scoped_lock lock{_workers_mutex};
       _workers.emplace_back([this, fd] {
         handle_client(fd);
@@ -190,82 +227,111 @@ class loopback_range_server {
     timeout.tv_sec = 5;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    std::string request(8192, '\0');
-    ssize_t const n = ::recv(fd, request.data(), request.size(), 0);
-    if (n <= 0) { return; }
-    request.resize(static_cast<std::size_t>(n));
+    std::string pending;
+    std::string request;
+    while (!_stop.load(std::memory_order_relaxed) && read_request(fd, pending, request)) {
+      if (handle_request(fd, request)) { return; }
+    }
+  }
 
-    bool const is_head = request.rfind("HEAD ", 0) == 0;
-    bool const is_get  = request.rfind("GET ", 0) == 0;
+  bool handle_request(int fd, std::string const& request)
+  {
+    bool const close_connection = requests_connection_close(request);
+    bool const is_head          = request.rfind("HEAD ", 0) == 0;
+    bool const is_get           = request.rfind("GET ", 0) == 0;
     bool const is_list = is_get && request_target(request).find("list-type=2") != std::string::npos;
-
-    if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
+    auto const key     = request_key(request);
 
     if (is_head) {
       auto const head_idx = _head_count.fetch_add(1, std::memory_order_relaxed);
+      auto const key_idx  = increment_request_count(_head_counts_by_key, key);
+      auto const scripted = scripted_step(key, false, key_idx);
+      delay_response(scripted);
       send_interim_headers(fd, _fault.interim_head_etag, {}, _fault.interim_head_retry_after);
-      if (_fault.fail_all_heads || head_idx < _fault.fail_first_heads) {
-        std::string response =
-          "HTTP/1.1 " + std::to_string(_fault.head_fail_status) + " Error\r\nContent-Length: 0";
-        append_etag_header(response, _fault.failed_head_etag);
-        append_header(response, "Retry-After", _fault.failed_head_retry_after);
-        response += "\r\nConnection: close\r\n\r\n";
+      bool const scripted_failure = scripted && scripted->status >= 400;
+      bool const policy_failure =
+        !scripted && (_fault.fail_all_heads || head_idx < _fault.fail_first_heads);
+      if (scripted_failure || policy_failure) {
+        auto const status    = scripted_failure ? scripted->status : _fault.head_fail_status;
+        std::string response = "HTTP/1.1 " + std::to_string(status) + " Error\r\nContent-Length: 0";
+        append_etag_header(response, response_etag(scripted, _fault.failed_head_etag));
+        append_header(
+          response, "Retry-After", response_retry_after(scripted, _fault.failed_head_retry_after));
+        append_connection_header(response, close_connection);
+        response += "\r\n\r\n";
         send_all(fd, response);
-        return;
+        return close_connection;
       }
       std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
-      append_etag_header(response, _fault.successful_head_etag);
-      response += "\r\nConnection: close\r\n\r\n";
+      append_etag_header(response, response_etag(scripted, _fault.successful_head_etag));
+      append_connection_header(response, close_connection);
+      response += "\r\n\r\n";
       send_all(fd, response);
-      return;
+      return close_connection;
     }
 
     if (is_list) {
+      if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
       _list_count.fetch_add(1, std::memory_order_relaxed);
       auto const body = list_xml();
-      send_all(fd,
-               "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
-                 std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
-      return;
+      std::string response =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
+        std::to_string(body.size());
+      append_connection_header(response, close_connection);
+      response += "\r\n\r\n" + body;
+      send_all(fd, response);
+      return close_connection;
     }
 
     if (!is_get) {
-      send_all(fd,
-               "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-      return;
+      std::string response{"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0"};
+      append_connection_header(response, close_connection);
+      response += "\r\n\r\n";
+      send_all(fd, response);
+      return close_connection;
     }
 
-    auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
+    auto const get_idx  = _get_count.fetch_add(1, std::memory_order_relaxed);
+    auto const key_idx  = increment_request_count(_get_counts_by_key, key);
+    auto const scripted = scripted_step(key, true, key_idx);
+    delay_response(scripted);
     send_interim_headers(fd,
                          _fault.interim_get_etag,
                          _fault.interim_get_content_range,
                          _fault.interim_get_retry_after);
-    if (_fault.fail_all_gets || get_idx < _fault.fail_first_gets) {
-      std::string response =
-        "HTTP/1.1 " + std::to_string(_fault.fail_status) + " Error\r\nContent-Length: 0";
-      append_etag_header(response, _fault.failed_get_etag);
-      append_header(response, "Retry-After", _fault.failed_get_retry_after);
-      response += "\r\nConnection: close\r\n\r\n";
+    bool const scripted_failure = scripted && scripted->status >= 400;
+    bool const policy_failure =
+      !scripted && (_fault.fail_all_gets || get_idx < _fault.fail_first_gets);
+    if (scripted_failure || policy_failure) {
+      auto const status    = scripted_failure ? scripted->status : _fault.fail_status;
+      std::string response = "HTTP/1.1 " + std::to_string(status) + " Error\r\nContent-Length: 0";
+      append_etag_header(response, response_etag(scripted, _fault.failed_get_etag));
+      append_header(
+        response, "Retry-After", response_retry_after(scripted, _fault.failed_get_retry_after));
+      append_connection_header(response, close_connection);
+      response += "\r\n\r\n";
       send_all(fd, response);
-      return;
+      return close_connection;
     }
 
     if (auto range = parse_range(request)) {
       if (_fault.fail_range_with_416) {
         std::string response{"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0"};
         append_etag_header(response, _fault.failed_get_etag);
-        response += "\r\nConnection: close\r\n\r\n";
+        append_connection_header(response, close_connection);
+        response += "\r\n\r\n";
         send_all(fd, response);
-        return;
+        return close_connection;
       }
       if (_fault.ignore_range_with_200) {
         std::string response =
           "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
         append_etag_header(response, _fault.failed_get_etag);
-        response += "\r\nConnection: close\r\n\r\n";
+        append_connection_header(response, close_connection);
+        response += "\r\n\r\n";
         send_all(fd, response);
         send_all(fd, _object.data(), _object.size());
-        return;
+        return close_connection;
       }
       auto const [start, end] = *range;
       auto const size         = end - start + 1;
@@ -279,19 +345,50 @@ class loopback_range_server {
           response += "\r\nContent-Range: bytes " + std::to_string(start) + "-" +
                       std::to_string(end) + "/" + std::to_string(_object.size());
         }
-        append_etag_header(response, _fault.successful_get_etag);
+        append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
       }
-      response += "\r\nConnection: close\r\n\r\n";
+      append_connection_header(response, close_connection);
+      response += "\r\n\r\n";
       send_all(fd, response);
       send_all(fd, _object.data() + start, size);
-      return;
+      return close_connection;
     }
 
     std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
-    append_etag_header(response, _fault.successful_get_etag);
-    response += "\r\nConnection: close\r\n\r\n";
+    append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
+    append_connection_header(response, close_connection);
+    response += "\r\n\r\n";
     send_all(fd, response);
     send_all(fd, _object.data(), _object.size());
+    return close_connection;
+  }
+
+  static bool read_request(int fd, std::string& pending, std::string& request)
+  {
+    constexpr std::size_t max_header_bytes = 64 * 1024;
+    while (true) {
+      auto const end = pending.find("\r\n\r\n");
+      if (end != std::string::npos) {
+        request = pending.substr(0, end + 4);
+        pending.erase(0, end + 4);
+        return true;
+      }
+      if (pending.size() >= max_header_bytes) { return false; }
+
+      char bytes[8192];
+      ssize_t const n = ::recv(fd, bytes, sizeof(bytes), 0);
+      if (n <= 0) { return false; }
+      pending.append(bytes, static_cast<std::size_t>(n));
+    }
+  }
+
+  static bool requests_connection_close(std::string const& request)
+  {
+    std::string lower = request;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return lower.find("\r\nconnection: close") != std::string::npos;
   }
 
   static std::string request_target(std::string const& request)
@@ -301,6 +398,61 @@ class loopback_range_server {
     auto const second = request.find(' ', first + 1);
     if (second == std::string::npos) { return {}; }
     return request.substr(first + 1, second - first - 1);
+  }
+
+  static std::string request_key(std::string const& request)
+  {
+    auto target = request_target(request);
+    if (auto const query = target.find('?'); query != std::string::npos) { target.resize(query); }
+    if (!target.empty() && target.front() == '/') { target.erase(0, 1); }
+    auto const bucket_end = target.find('/');
+    return bucket_end == std::string::npos ? target : target.substr(bucket_end + 1);
+  }
+
+  [[nodiscard]] std::optional<scripted_response> scripted_step(std::string const& key,
+                                                               bool get,
+                                                               std::size_t index) const
+  {
+    auto const script = _scripts.find(key);
+    if (script == _scripts.end()) { return std::nullopt; }
+    auto const& steps = get ? script->second.gets : script->second.heads;
+    if (steps.empty()) { return std::nullopt; }
+    return steps[std::min(index, steps.size() - 1)];
+  }
+
+  void delay_response(std::optional<scripted_response> const& scripted) const
+  {
+    auto delay = _fault.response_delay;
+    if (scripted) { delay += scripted->delay; }
+    if (delay.count() > 0) { std::this_thread::sleep_for(delay); }
+  }
+
+  static std::string response_etag(std::optional<scripted_response> const& scripted,
+                                   std::string const& fallback)
+  {
+    return scripted && scripted->etag ? *scripted->etag : fallback;
+  }
+
+  static std::string response_retry_after(std::optional<scripted_response> const& scripted,
+                                          std::string const& fallback)
+  {
+    return scripted && scripted->retry_after ? *scripted->retry_after : fallback;
+  }
+
+  std::size_t increment_request_count(std::unordered_map<std::string, std::size_t>& counts,
+                                      std::string const& key)
+  {
+    std::scoped_lock lock{_request_counts_mutex};
+    auto& count = counts[key];
+    return count++;
+  }
+
+  [[nodiscard]] std::size_t request_count(
+    std::unordered_map<std::string, std::size_t> const& counts, std::string_view key) const
+  {
+    std::scoped_lock lock{_request_counts_mutex};
+    auto const found = counts.find(std::string{key});
+    return found == counts.end() ? 0 : found->second;
   }
 
   static std::string xml_escape(std::string_view value)
@@ -392,10 +544,15 @@ class loopback_range_server {
   std::vector<std::uint8_t> _object;
   range_fault_policy _fault;
   std::vector<listed_object> _listed;
+  std::unordered_map<std::string, key_response_script> _scripts;
   std::atomic<bool> _stop{false};
+  std::atomic<std::size_t> _accepted_connection_count{0};
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
   std::atomic<std::size_t> _list_count{0};
+  mutable std::mutex _request_counts_mutex;
+  std::unordered_map<std::string, std::size_t> _head_counts_by_key;
+  std::unordered_map<std::string, std::size_t> _get_counts_by_key;
   std::thread _thread;
   std::mutex _workers_mutex;
   std::vector<std::thread> _workers;

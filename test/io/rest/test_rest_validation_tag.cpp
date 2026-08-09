@@ -22,14 +22,21 @@
 #include <cucascade/io/rest/mock_authorizer.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 
+#include <arpa/inet.h>
 #include <catch2/catch_all.hpp>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -40,8 +47,10 @@ using cucascade::io::rest::config;
 using cucascade::io::rest::mock_authorizer;
 using cucascade::io::rest::rest_ioctx;
 using cucascade::io::rest::rest_reactor;
+using cucascade::test::key_response_script;
 using cucascade::test::loopback_range_server;
 using cucascade::test::range_fault_policy;
+using cucascade::test::scripted_response;
 using namespace std::chrono_literals;
 
 constexpr std::size_t object_size{4096};
@@ -89,7 +98,183 @@ std::shared_ptr<rest_ioctx> make_ioctx(loopback_range_server const& server, conf
   return std::make_shared<rest_ioctx>(1, std::move(context));
 }
 
+struct raw_http_response {
+  int status{0};
+  std::string headers;
+  std::vector<std::uint8_t> body;
+
+  [[nodiscard]] std::optional<std::string> header(std::string_view name) const
+  {
+    auto const prefix = "\r\n" + std::string{name} + ": ";
+    auto const begin  = headers.find(prefix);
+    if (begin == std::string::npos) { return std::nullopt; }
+    auto const value_begin = begin + prefix.size();
+    auto const end         = headers.find("\r\n", value_begin);
+    return headers.substr(value_begin, end - value_begin);
+  }
+};
+
+class raw_http_connection {
+ public:
+  explicit raw_http_connection(loopback_range_server const& server)
+  {
+    _fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (_fd < 0) { throw std::runtime_error("socket failed"); }
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port   = htons(server.port());
+    if (::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1 ||
+        ::connect(_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+      ::close(_fd);
+      _fd = -1;
+      throw std::runtime_error("connect failed");
+    }
+  }
+
+  ~raw_http_connection()
+  {
+    if (_fd >= 0) { ::close(_fd); }
+  }
+
+  raw_http_connection(raw_http_connection const&)            = delete;
+  raw_http_connection& operator=(raw_http_connection const&) = delete;
+
+  raw_http_response request(std::string_view method,
+                            std::string_view target,
+                            bool close_connection = false)
+  {
+    std::string request{method};
+    request += " ";
+    request += target;
+    request += " HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+    if (method == "GET") { request += "Range: bytes=-16\r\n"; }
+    request += close_connection ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
+    send_all(request);
+    return read_response(method != "HEAD");
+  }
+
+  [[nodiscard]] bool peer_closed()
+  {
+    timeval timeout{};
+    timeout.tv_sec = 1;
+    (void)::setsockopt(_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    char byte{};
+    return ::recv(_fd, &byte, 1, 0) == 0;
+  }
+
+ private:
+  void send_all(std::string_view bytes)
+  {
+    std::size_t sent = 0;
+    while (sent < bytes.size()) {
+      auto const n = ::send(_fd, bytes.data() + sent, bytes.size() - sent, MSG_NOSIGNAL);
+      if (n <= 0) { throw std::runtime_error("send failed"); }
+      sent += static_cast<std::size_t>(n);
+    }
+  }
+
+  void read_at_least(std::size_t bytes)
+  {
+    while (_pending.size() < bytes) {
+      std::array<char, 8192> buffer{};
+      auto const n = ::recv(_fd, buffer.data(), buffer.size(), 0);
+      if (n <= 0) { throw std::runtime_error("unexpected end of HTTP response"); }
+      _pending.append(buffer.data(), static_cast<std::size_t>(n));
+    }
+  }
+
+  raw_http_response read_response(bool has_body)
+  {
+    auto header_end = _pending.find("\r\n\r\n");
+    while (header_end == std::string::npos) {
+      read_at_least(_pending.size() + 1);
+      header_end = _pending.find("\r\n\r\n");
+    }
+
+    raw_http_response response;
+    response.headers = _pending.substr(0, header_end + 4);
+    _pending.erase(0, header_end + 4);
+    response.status = std::stoi(response.headers.substr(response.headers.find(' ') + 1, 3));
+
+    std::size_t body_size = 0;
+    if (has_body) {
+      auto const content_length = response.header("Content-Length");
+      REQUIRE(content_length.has_value());
+      body_size = static_cast<std::size_t>(std::stoull(*content_length));
+      read_at_least(body_size);
+      response.body.assign(_pending.begin(), _pending.begin() + body_size);
+      _pending.erase(0, body_size);
+    }
+    return response;
+  }
+
+  int _fd{-1};
+  std::string _pending;
+};
+
 }  // namespace
+
+TEST_CASE("loopback range server keeps connections alive and counts requests per key",
+          "[rest][loopback_server]")
+{
+  loopback_range_server server(test_payload());
+  raw_http_connection connection(server);
+
+  auto const first  = connection.request("GET", "/bucket/first.parquet");
+  auto const second = connection.request("HEAD", "/bucket/second.parquet", true);
+
+  CHECK(first.status == 206);
+  CHECK(first.body.size() == 16);
+  CHECK(second.status == 200);
+  CHECK(server.accepted_connection_count() == 1);
+  CHECK(server.get_count() == 1);
+  CHECK(server.head_count() == 1);
+  CHECK(server.get_count("first.parquet") == 1);
+  CHECK(server.get_count("second.parquet") == 0);
+  CHECK(server.head_count("first.parquet") == 0);
+  CHECK(server.head_count("second.parquet") == 1);
+  CHECK(connection.peer_closed());
+}
+
+TEST_CASE("loopback range server scripts responses independently per key",
+          "[rest][loopback_server]")
+{
+  std::unordered_map<std::string, key_response_script> scripts;
+  scripts["retry.parquet"].gets   = {scripted_response{.status = 503, .etag = "\"retry-v1\""},
+                                     scripted_response{.etag = "\"retry-v2\""}};
+  scripts["missing.parquet"].gets = {scripted_response{.status = 404}};
+  scripts["denied.parquet"].heads = {scripted_response{.status = 403}};
+  scripts["tagged.parquet"].gets  = {scripted_response{.etag = "\"tag-v1\""},
+                                     scripted_response{.etag = "\"tag-v2\""}};
+  scripts["slow.parquet"].gets    = {scripted_response{.delay = 20ms}};
+
+  loopback_range_server server(test_payload(), {}, {}, std::move(scripts));
+  raw_http_connection connection(server);
+
+  CHECK(connection.request("GET", "/bucket/retry.parquet").status == 503);
+  auto const retry = connection.request("GET", "/bucket/retry.parquet");
+  CHECK(retry.status == 206);
+  CHECK(retry.header("ETag") == "\"retry-v2\"");
+  CHECK(connection.request("GET", "/bucket/missing.parquet").status == 404);
+  CHECK(connection.request("HEAD", "/bucket/denied.parquet").status == 403);
+
+  auto const tag_v1 = connection.request("GET", "/bucket/tagged.parquet");
+  auto const tag_v2 = connection.request("GET", "/bucket/tagged.parquet");
+  CHECK(tag_v1.header("ETag") == "\"tag-v1\"");
+  CHECK(tag_v2.header("ETag") == "\"tag-v2\"");
+
+  auto const start = std::chrono::steady_clock::now();
+  CHECK(connection.request("GET", "/bucket/slow.parquet", true).status == 206);
+  CHECK(std::chrono::steady_clock::now() - start >= 15ms);
+
+  CHECK(server.get_count("retry.parquet") == 2);
+  CHECK(server.get_count("missing.parquet") == 1);
+  CHECK(server.head_count("denied.parquet") == 1);
+  CHECK(server.get_count("tagged.parquet") == 2);
+  CHECK(server.get_count("slow.parquet") == 1);
+  CHECK(server.accepted_connection_count() == 1);
+}
 
 TEST_CASE("footer probes capture only the verified response validation tag",
           "[rest][validation_tag]")
