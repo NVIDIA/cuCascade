@@ -31,6 +31,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -56,6 +57,8 @@ struct range_fault_policy {
   bool fail_all_heads{false};
   int head_fail_status{503};
   std::chrono::milliseconds response_delay{0};
+  /// Hold GET responses until this many GET requests have arrived; 0 disables the barrier.
+  std::size_t get_response_barrier{0};
   bool ignore_range_with_200{false};
   bool fail_range_with_416{false};
   bool malformed_content_range{false};
@@ -135,6 +138,7 @@ class loopback_range_server {
   ~loopback_range_server()
   {
     _stop.store(true, std::memory_order_relaxed);
+    _get_response_cv.notify_all();
     if (_listen_fd >= 0) {
       // shutdown() wakes the blocked accept(); close() alone does not reliably interrupt it.
       ::shutdown(_listen_fd, SHUT_RDWR);
@@ -293,8 +297,9 @@ class loopback_range_server {
       return close_connection;
     }
 
-    auto const get_idx  = _get_count.fetch_add(1, std::memory_order_relaxed);
-    auto const key_idx  = increment_request_count(_get_counts_by_key, key);
+    auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
+    auto const key_idx = increment_request_count(_get_counts_by_key, key);
+    wait_at_get_response_barrier();
     auto const scripted = scripted_step(key, true, key_idx);
     delay_response(scripted);
     send_interim_headers(fd,
@@ -429,6 +434,17 @@ class loopback_range_server {
     if (delay.count() > 0) { std::this_thread::sleep_for(delay); }
   }
 
+  void wait_at_get_response_barrier()
+  {
+    if (_fault.get_response_barrier == 0) { return; }
+    _get_response_cv.notify_all();
+    std::unique_lock lock{_get_response_mutex};
+    _get_response_cv.wait(lock, [&] {
+      return _stop.load(std::memory_order_relaxed) ||
+             _get_count.load(std::memory_order_relaxed) >= _fault.get_response_barrier;
+    });
+  }
+
   static std::string response_etag(std::optional<scripted_response> const& scripted,
                                    std::string const& fallback)
   {
@@ -552,6 +568,8 @@ class loopback_range_server {
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
   std::atomic<std::size_t> _list_count{0};
+  std::mutex _get_response_mutex;
+  std::condition_variable _get_response_cv;
   mutable std::mutex _request_counts_mutex;
   std::unordered_map<std::string, std::size_t> _head_counts_by_key;
   std::unordered_map<std::string, std::size_t> _get_counts_by_key;

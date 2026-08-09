@@ -374,6 +374,48 @@ TEST_CASE("batched footer resolve matches single-probe bytes, size, and validati
   }
 }
 
+TEST_CASE("batched footer resolve uses HEAD only when the probe window is zero",
+          "[rest][footer_resolve]")
+{
+  constexpr std::size_t path_count = 3;
+  range_fault_policy fault{};
+  fault.successful_head_etag = "\"head-only\"";
+  loopback_range_server server(test_payload(), fault);
+  auto cfg               = test_config(path_count);
+  cfg.footer_probe_bytes = 0;
+  auto fixture           = make_ioctx(server, cfg);
+  std::vector<std::string> paths;
+  paths.reserve(path_count);
+  for (std::size_t i = 0; i < path_count; ++i) {
+    paths.push_back(object_uri("head-only-" + std::to_string(i) + ".parquet"));
+  }
+
+  std::vector<footer_resolve_result> results;
+  results.reserve(paths.size());
+  std::uint64_t max_reserved = 0;
+  fixture.ioctx->resolve_footer_objects(paths, [&](footer_resolve_result result) {
+    max_reserved =
+      std::max(max_reserved, fixture.ioctx->perf_snapshot().footer_stash_reserved_bytes);
+    results.push_back(std::move(result));
+  });
+
+  REQUIRE(results.size() == paths.size());
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    auto const& result = result_at(results, i);
+    require_success(result);
+    CHECK(result.object->size() == object_size);
+    CHECK(result.object->validation_tag() == "\"head-only\"");
+    CHECK_FALSE(result.footer);
+    CHECK(result.window_lo == 0);
+    CHECK(server.get_count("head-only-" + std::to_string(i) + ".parquet") == 0);
+    CHECK(server.head_count("head-only-" + std::to_string(i) + ".parquet") == 1);
+  }
+  CHECK(server.get_count() == 0);
+  CHECK(server.head_count() == path_count);
+  CHECK(max_reserved == 0);
+  CHECK(fixture.ioctx->perf_snapshot().footer_stash_reserved_bytes == 0);
+}
+
 TEST_CASE("batched footer resolve isolates per-object authorization and not-found errors",
           "[rest][footer_resolve]")
 {
@@ -735,6 +777,74 @@ TEST_CASE(
   std::this_thread::sleep_for(25ms);
   std::scoped_lock lock{state->mutex};
   CHECK(state->successful + state->canceled == callbacks_at_return);
+}
+
+TEST_CASE("batched footer resolve cancels concurrent completions after the first callback error",
+          "[rest][footer_resolve]")
+{
+  constexpr std::size_t max_inflight = 3;
+  constexpr std::size_t path_count   = 6;
+  range_fault_policy fault;
+  fault.get_response_barrier = max_inflight;
+  loopback_range_server server(test_payload(), fault);
+  auto fixture = make_ioctx(server, test_config(max_inflight));
+  std::vector<std::string> paths;
+  paths.reserve(path_count);
+  for (std::size_t i = 0; i < path_count; ++i) {
+    paths.push_back(object_uri("callback-" + std::to_string(i) + ".parquet"));
+  }
+
+  std::array<std::size_t, path_count> deliveries{};
+  std::size_t successes = 0;
+  std::size_t canceled  = 0;
+  bool all_canceled_errors{true};
+  bool caught_first{false};
+  try {
+    fixture.ioctx->resolve_footer_objects(paths, [&](footer_resolve_result result) {
+      REQUIRE(result.index < deliveries.size());
+      ++deliveries[result.index];
+      if (result.error) {
+        all_canceled_errors &= is_operation_canceled(result.error);
+        ++canceled;
+        return;
+      }
+      ++successes;
+      throw first_callback_error{};
+    });
+  } catch (first_callback_error const&) {
+    caught_first = true;
+  }
+
+  CHECK(caught_first);
+  CHECK(successes == 1);
+  CHECK(canceled == path_count - 1);
+  CHECK(all_canceled_errors);
+  CHECK(std::all_of(deliveries.begin(), deliveries.end(), [](auto count) { return count == 1; }));
+  CHECK(server.get_count() == max_inflight);
+  for (std::size_t i = 0; i < path_count; ++i) {
+    auto const key = "callback-" + std::to_string(i) + ".parquet";
+    CHECK(server.get_count(key) == (i < max_inflight ? 1 : 0));
+  }
+  CHECK(server.head_count() == 0);
+  CHECK(fixture.authorizer->object_calls() == max_inflight);
+
+  auto const callbacks_at_return = successes + canceled;
+  std::this_thread::sleep_for(25ms);
+  CHECK(successes + canceled == callbacks_at_return);
+}
+
+TEST_CASE("batched footer resolve rejects an explicit zero payload budget",
+          "[rest][footer_resolve]")
+{
+  loopback_range_server server(test_payload());
+  auto fixture = make_ioctx(server, test_config(2, 0));
+  std::vector<std::string> paths{object_uri("zero-budget.parquet")};
+
+  CHECK_THROWS_AS(fixture.ioctx->resolve_footer_objects(paths, [](footer_resolve_result) {}),
+                  std::invalid_argument);
+  CHECK(server.get_count() == 0);
+  CHECK(server.head_count() == 0);
+  CHECK(fixture.authorizer->object_calls() == 0);
 }
 
 TEST_CASE("batched footer resolve bounds retained payloads across concurrent batches",
