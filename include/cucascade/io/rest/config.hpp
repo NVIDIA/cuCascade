@@ -131,7 +131,9 @@ struct config {
   /// issued; the bytes return when the delivered payload buffer is freed, so
   /// the cap paces resolve-ahead to how fast the caller drops payloads.
   /// @c footer_resolve_auto derives 2 * effective-inflight *
-  /// footer_probe_bytes.
+  /// footer_probe_bytes.  An explicit value smaller than
+  /// @c footer_probe_bytes is rejected at resolve time — a sub-window budget
+  /// cannot be honored as a hard cap.
   std::size_t footer_resolve_stash_budget{footer_resolve_auto};
 };
 

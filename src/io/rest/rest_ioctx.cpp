@@ -76,6 +76,13 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
     throw std::invalid_argument(
       "rest_ioctx::resolve_footer_objects: disabled (footer_resolve_max_inflight == 0)");
   }
+  if (_footer_budget->budget() < _reactors.front()->get_config().footer_probe_bytes) {
+    // A budget below one probe window cannot admit any entry without
+    // over-committing past the cap, so it cannot be honored as a hard cap.
+    throw std::invalid_argument(
+      "rest_ioctx::resolve_footer_objects: footer_resolve_stash_budget smaller than "
+      "footer_probe_bytes");
+  }
 
   // Parse up front; a bad scheme is a per-entry error (isolation), not a
   // batch error.
@@ -87,17 +94,20 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
   valid_objects.reserve(paths.size());
   valid_indices.reserve(paths.size());
   for (std::size_t i = 0; i < paths.size(); ++i) {
-    auto parsed = cucascade::io::parse(paths[i]);
-    if (parsed.scheme != "s3") {
-      parse_errors.emplace_back(
-        i,
-        std::make_exception_ptr(std::invalid_argument(
-          "rest_ioctx::resolve_footer_objects: unsupported scheme '" + parsed.scheme + "'")));
-      continue;
+    try {
+      auto parsed = cucascade::io::parse(paths[i]);
+      if (parsed.scheme != "s3") {
+        throw std::invalid_argument("rest_ioctx::resolve_footer_objects: unsupported scheme '" +
+                                    parsed.scheme + "'");
+      }
+      valid_paths.push_back(paths[i]);
+      valid_objects.push_back(object_ref{std::move(parsed.host), std::move(parsed.path)});
+      valid_indices.push_back(i);
+    } catch (...) {
+      // A malformed path joins bad-scheme paths as a per-entry error —
+      // parsing must never cost the batch its exactly-once delivery.
+      parse_errors.emplace_back(i, std::current_exception());
     }
-    valid_paths.push_back(paths[i]);
-    valid_objects.push_back(object_ref{std::move(parsed.host), std::move(parsed.path)});
-    valid_indices.push_back(i);
   }
 
   std::exception_ptr callback_error;

@@ -38,6 +38,7 @@
 #include <cstring>
 #include <deque>
 #include <optional>
+#include <queue>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1209,10 +1210,33 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
     entries[i].pos = i;
   }
 
+  // Unwind safety: should anything below throw while transfers are in
+  // flight, every easy handle still attached to the multi must be detached
+  // BEFORE `entries` (which owns the handles) is destroyed — cleaning up an
+  // easy handle still added to a multi is undefined.  Normal exits detach in
+  // process_completions / cancel_remaining, leaving this a no-op.
+  struct multi_detach {
+    CURLM* m;
+    std::vector<footer_entry>* entries;
+    ~multi_detach()
+    {
+      for (auto& e : *entries) {
+        if (e.easy) { curl_multi_remove_handle(m, e.easy.get()); }
+      }
+    }
+  } detach_guard{multi.get(), &entries};
+
   std::size_t undelivered   = entries.size();
   std::size_t active        = 0;
   std::size_t next_to_start = 0;
   std::exception_ptr callback_error;
+
+  // Backoff bookkeeping: a count plus a deadline min-heap, so the event loop
+  // never rescans the whole entry vector.  Heap records whose entry left the
+  // backoff stage are skipped lazily on pop.
+  std::size_t backoff_count = 0;
+  using retry_record        = std::pair<std::chrono::steady_clock::time_point, footer_entry*>;
+  std::priority_queue<retry_record, std::vector<retry_record>, std::greater<>> retry_heap;
 
   auto deliver = [&](footer_entry& e, footer_resolve_result&& r) {
     e.stage = footer_entry_stage::done;
@@ -1236,6 +1260,8 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
 
   auto fail_entry = [&](footer_entry& e, std::string const& what) {
     _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+    // Buffer before lease: the bytes must be gone before the ledger says so.
+    e.sink  = suffix_sink{};
     e.lease = {};
     deliver(e,
             error_result(e,
@@ -1253,6 +1279,7 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
         e.headers.reset();
         if (e.stage == footer_entry_stage::transfer) { --active; }
       }
+      e.sink  = suffix_sink{};
       e.lease = {};
       deliver(e,
               error_result(e,
@@ -1264,45 +1291,59 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
 
   auto submit = [&](footer_entry& e) {
     bool const is_probe = e.kind == footer_entry_kind::probe;
-    auto const authd    = _ctx->authorizer()->authorize(
-      objects[e.pos], is_probe ? request_method::GET : request_method::HEAD, presign_ttl(_config));
+    try {
+      auto const authd =
+        _ctx->authorizer()->authorize(objects[e.pos],
+                                      is_probe ? request_method::GET : request_method::HEAD,
+                                      presign_ttl(_config));
 
-    e.easy = curl_easy_ptr{curl_easy_init()};
-    if (!e.easy) {
+      e.easy = curl_easy_ptr{curl_easy_init()};
+      if (!e.easy) {
+        throw std::runtime_error("rest_reactor::resolve_footer_batch: curl_easy_init failed");
+      }
+      configure_easy_handle(e.easy.get(), global_curl_context::instance().share_handle());
+      apply_request_opts(e.easy.get(), _config);
+      if (is_probe) {
+        e.sink     = suffix_sink{};
+        e.sink.cap = window;
+        // Reserve up front so the buffer never grows past the budgeted window
+        // while bytes stream in.
+        e.sink.data.reserve(window);
+        e.range   = suffix_range_header(window);
+        e.headers = build_header_list(authd.headers, &e.range);
+        CUCASCADE_CURL_CHECK(
+          curl_easy_setopt(e.easy.get(), CURLOPT_WRITEFUNCTION, &suffix_write_cb));
+        CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_WRITEDATA, &e.sink));
+        CUCASCADE_CURL_CHECK(
+          curl_easy_setopt(e.easy.get(), CURLOPT_HEADERFUNCTION, &suffix_header_cb));
+        CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HEADERDATA, &e.sink));
+      } else {
+        e.head    = head_capture{};
+        e.headers = build_header_list(authd.headers, nullptr);
+        CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_NOBODY, 1L));
+        CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_WRITEFUNCTION, &write_discard));
+        CUCASCADE_CURL_CHECK(
+          curl_easy_setopt(e.easy.get(), CURLOPT_HEADERFUNCTION, &head_header_cb));
+        CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HEADERDATA, &e.head));
+      }
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_URL, authd.url.c_str()));
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HTTPHEADER, e.headers.get()));
+      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_PRIVATE, &e));
+      if (_config.perf_instrumentation) { e.t0 = std::chrono::steady_clock::now(); }
+      CUCASCADE_CURLM_CHECK(curl_multi_add_handle(multi.get(), e.easy.get()));
+      e.stage = footer_entry_stage::transfer;
+      ++active;
+    } catch (...) {
+      // Per-entry failure: the authorizer may throw on credential errors and
+      // any curl setup check may throw; the entry gets that exception and
+      // siblings continue.  The handle is not in the multi here — every check
+      // above precedes curl_multi_add_handle, and a failed add does not add.
+      e.easy.reset();
+      e.headers.reset();
+      e.sink  = suffix_sink{};
       e.lease = {};
-      deliver(e,
-              error_result(e,
-                           std::make_exception_ptr(std::runtime_error(
-                             "rest_reactor::resolve_footer_batch: curl_easy_init failed"))));
-      return;
+      deliver(e, error_result(e, std::current_exception()));
     }
-    configure_easy_handle(e.easy.get(), global_curl_context::instance().share_handle());
-    apply_request_opts(e.easy.get(), _config);
-    if (is_probe) {
-      e.sink     = suffix_sink{};
-      e.sink.cap = window;
-      e.range    = suffix_range_header(window);
-      e.headers  = build_header_list(authd.headers, &e.range);
-      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_WRITEFUNCTION, &suffix_write_cb));
-      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_WRITEDATA, &e.sink));
-      CUCASCADE_CURL_CHECK(
-        curl_easy_setopt(e.easy.get(), CURLOPT_HEADERFUNCTION, &suffix_header_cb));
-      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HEADERDATA, &e.sink));
-    } else {
-      e.head    = head_capture{};
-      e.headers = build_header_list(authd.headers, nullptr);
-      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_NOBODY, 1L));
-      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_WRITEFUNCTION, &write_discard));
-      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HEADERFUNCTION, &head_header_cb));
-      CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HEADERDATA, &e.head));
-    }
-    CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_URL, authd.url.c_str()));
-    CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_HTTPHEADER, e.headers.get()));
-    CUCASCADE_CURL_CHECK(curl_easy_setopt(e.easy.get(), CURLOPT_PRIVATE, &e));
-    e.t0 = std::chrono::steady_clock::now();
-    CUCASCADE_CURLM_CHECK(curl_multi_add_handle(multi.get(), e.easy.get()));
-    e.stage = footer_entry_stage::transfer;
-    ++active;
   };
 
   auto schedule_retry = [&](footer_entry& e, std::string const& retry_after) {
@@ -1319,6 +1360,8 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
         std::chrono::steady_clock::now() + compute_backoff(e.attempt, retry_after, _config);
       e.attempt += 1;
       e.stage = footer_entry_stage::backoff;
+      ++backoff_count;
+      retry_heap.emplace(e.retry_at, &e);
     } else {
       fail_entry(e, "exhausted retries (" + e.last_error + ")");
     }
@@ -1361,7 +1404,9 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
         return;
       }
       // Unverifiable 206: like the blocking path, fall back to a HEAD.  The
-      // lease is returned — a HEAD delivers no payload.
+      // body bytes and the lease are both returned — a HEAD delivers no
+      // payload, and a discarded buffer must not outlive its reservation.
+      e.sink    = suffix_sink{};
       e.lease   = {};
       e.kind    = footer_entry_kind::head;
       e.attempt = 0;
@@ -1369,6 +1414,7 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
       return;
     }
     if (status == 200 || status == 416) {
+      e.sink    = suffix_sink{};
       e.lease   = {};
       e.kind    = footer_entry_kind::head;
       e.attempt = 0;
@@ -1438,18 +1484,12 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
     }
   };
 
-  auto any_backoff = [&] {
-    return std::any_of(entries.begin(), entries.end(), [](footer_entry const& e) {
-      return e.stage == footer_entry_stage::backoff;
-    });
-  };
-
   // Returns false when a blocking budget wait was cut short by @p stop.
   auto start_pending = [&] {
     while (active < max_inflight && next_to_start < entries.size()) {
       auto& e = entries[next_to_start];
       exec::admission_control::slot lease;
-      if (active > 0 || any_backoff()) {
+      if (active > 0 || backoff_count > 0) {
         // Never block on budget while a transfer or a due retry could still
         // make progress and release bytes.
         lease = budget->try_acquire(window);
@@ -1467,19 +1507,28 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
 
   auto resubmit_due = [&] {
     auto const now = std::chrono::steady_clock::now();
-    for (auto& e : entries) {
-      if (active >= max_inflight) { break; }
-      if (e.stage == footer_entry_stage::backoff && e.retry_at <= now) { submit(e); }
+    while (!retry_heap.empty() && active < max_inflight) {
+      auto const [due, e] = retry_heap.top();
+      if (e->stage != footer_entry_stage::backoff) {
+        retry_heap.pop();
+        continue;
+      }
+      if (due > now) { break; }
+      retry_heap.pop();
+      --backoff_count;
+      submit(*e);
     }
   };
 
   auto poll_timeout_ms = [&] {
-    long timeout   = 100;
-    auto const now = std::chrono::steady_clock::now();
-    for (auto const& e : entries) {
-      if (e.stage != footer_entry_stage::backoff) { continue; }
-      auto const dt =
-        std::chrono::duration_cast<std::chrono::milliseconds>(e.retry_at - now).count();
+    long timeout = 100;
+    while (!retry_heap.empty() && retry_heap.top().second->stage != footer_entry_stage::backoff) {
+      retry_heap.pop();
+    }
+    if (!retry_heap.empty()) {
+      auto const dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        retry_heap.top().first - std::chrono::steady_clock::now())
+                        .count();
       timeout = std::min(timeout, std::max<long>(1, static_cast<long>(dt)));
     }
     return timeout;

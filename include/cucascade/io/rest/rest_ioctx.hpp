@@ -116,9 +116,11 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @p on_result throws, the remaining entries are cancelled (delivered as
   /// canceled, their callback throws suppressed) and the first exception is
   /// rethrown after the sweep.  Throws directly only on submission errors:
-  /// an empty batch, or the API disabled via
-  /// @c config::footer_resolve_max_inflight == 0.  This ioctx must outlive
-  /// the call.
+  /// an empty batch, the API disabled via
+  /// @c config::footer_resolve_max_inflight == 0, or an explicit
+  /// @c footer_resolve_stash_budget smaller than @c footer_probe_bytes.  An
+  /// unparsable or non-s3 path is a per-entry error, not a batch error.
+  /// This ioctx must outlive the call.
   void resolve_footer_objects(std::span<std::string const> paths,
                               std::function<void(footer_resolve_result)> const& on_result,
                               std::stop_token stop = {});
