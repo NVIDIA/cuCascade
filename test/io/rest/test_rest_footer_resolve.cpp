@@ -676,9 +676,12 @@ TEST_CASE("batched footer resolve bounds retained payloads across concurrent bat
     ioctx->resolve_footer_objects(second_paths, second_callback);
   });
 
+  bool stayed_within_budget = true;
   while (!first.ready_within(0ms)) {
-    REQUIRE(retained->wait_for_payload(1s));
-    CHECK(retained->resident() <= budget);
+    if (!retained->wait_for_payload(1s)) {
+      throw std::runtime_error("timed out waiting for first-batch footer payload");
+    }
+    stayed_within_budget &= retained->resident() <= budget;
     if (first_delivered->load() == first_paths.size()) { break; }
     retained->release_one();
   }
@@ -687,21 +690,30 @@ TEST_CASE("batched footer resolve bounds retained payloads across concurrent bat
   REQUIRE(retained->wait_for_payload(1s));
   CHECK(retained->resident() == budget);
   CHECK(server->get_count("second.parquet") == 0);
+  auto const held_snapshot = fixture.ioctx->perf_snapshot();
+  CHECK(held_snapshot.footer_stash_reserved_bytes == budget);
+  CHECK(held_snapshot.footer_stash_reserved_peak_bytes == budget);
   retained->release_one();
   REQUIRE(wait_until([&] { return server->get_count("second.parquet") == 1; }, 1s));
 
   while (!second.ready_within(0ms)) {
-    REQUIRE(retained->wait_for_payload(1s));
-    CHECK(retained->resident() <= budget);
+    if (!retained->wait_for_payload(1s)) {
+      throw std::runtime_error("timed out waiting for second-batch footer payload");
+    }
+    stayed_within_budget &= retained->resident() <= budget;
     if (second_delivered->load() == second_paths.size()) { break; }
     retained->release_one();
   }
   require_ready(second);
   retained->release_all();
 
+  auto const drained_snapshot = fixture.ioctx->perf_snapshot();
   CHECK(errors->load() == 0);
+  CHECK(stayed_within_budget);
   CHECK(retained->resident() == 0);
   CHECK(retained->peak() <= budget);
+  CHECK(drained_snapshot.footer_stash_reserved_bytes == 0);
+  CHECK(drained_snapshot.footer_stash_reserved_peak_bytes == budget);
   CHECK(server->get_count() == first_paths.size() + second_paths.size());
 
   auto disabled = make_ioctx(*server, test_config(0, budget));
@@ -900,11 +912,11 @@ TEST_CASE("batched footer resolve reuses at most the configured in-flight connec
 {
   constexpr std::size_t inflight = 2;
   loopback_range_server server(test_payload());
-  auto fixture = make_ioctx(server, test_config(inflight));
   std::vector<std::string> paths;
   for (std::size_t i = 0; i < 12; ++i) {
     paths.push_back(object_uri("reuse-" + std::to_string(i) + ".parquet"));
   }
+  auto fixture = make_ioctx(server, test_config(inflight, paths.size() * probe_size));
 
   auto const results = resolve(*fixture.ioctx, paths);
 
