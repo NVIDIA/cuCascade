@@ -48,8 +48,9 @@ namespace cucascade::io::s3rdma {
  * LIST and HEAD use the configured HTTP(S) control plane; glob resolution
  * uses LIST results.
  *
- * Integration uses @c io_context_type::s3rdma,
- * @c io_context_registry::replace_ioctx, @c object_store_listing, and
+ * Integration uses @c io_context_type::s3rdma and
+ * @c io_context_registry::replace_ioctx, composes @c rest::object_store_lister
+ * with its own page fetch for LIST, and overrides
  * @c templated_ioctx::on_device_dispatch_failure.
  *
  * This declaration has no implementation or factory registration. Its deleted

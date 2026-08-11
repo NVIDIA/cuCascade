@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/object_store_listing.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/object_store_lister.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 
 #include <arpa/inet.h>
@@ -31,7 +31,6 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -47,10 +46,10 @@
 
 namespace {
 
-using cucascade::io::object_store_listing;
 using cucascade::io::rest::authorized_request;
 using cucascade::io::rest::config;
 using cucascade::io::rest::object_ref;
+using cucascade::io::rest::object_store_lister;
 using cucascade::io::rest::request_authorizer;
 using cucascade::io::rest::request_method;
 using cucascade::io::rest::rest_ioctx;
@@ -360,6 +359,55 @@ config listing_config(std::size_t list_max_matches = 100'000)
   return cfg;
 }
 
+std::string direct_page_xml(std::vector<listed_object> objects,
+                            bool truncated,
+                            std::optional<std::string_view> next_token = std::nullopt)
+{
+  std::string body = "<ListBucketResult><IsTruncated>";
+  body += truncated ? "true" : "false";
+  body += "</IsTruncated>";
+  if (next_token.has_value()) {
+    body += "<NextContinuationToken>" + std::string{*next_token} + "</NextContinuationToken>";
+  }
+  for (auto const& object : objects) {
+    body += "<Contents><Key>" + object.key + "</Key><Size>" + std::to_string(object.size) +
+            "</Size></Contents>";
+  }
+  body += "</ListBucketResult>";
+  return body;
+}
+
+class stub_page_fetch {
+ public:
+  explicit stub_page_fetch(std::vector<std::string> responses) : _responses(std::move(responses)) {}
+
+  std::string fetch(std::string_view, std::string_view, std::string_view)
+  {
+    if (_next == _responses.size()) {
+      throw std::runtime_error("stub page fetch exhausted its responses");
+    }
+    return _responses[_next++];
+  }
+
+ private:
+  std::vector<std::string> _responses;
+  std::size_t _next{0};
+};
+
+object_store_lister make_direct_lister(std::shared_ptr<stub_page_fetch> fetch,
+                                       std::size_t max_scanned = 100,
+                                       std::size_t max_matches = 100)
+{
+  return object_store_lister{
+    [fetch = std::move(fetch)](
+      std::string_view bucket, std::string_view prefix, std::string_view canonical_query) {
+      return fetch->fetch(bucket, prefix, canonical_query);
+    },
+    max_scanned,
+    max_matches,
+    "test_lister::list_objects"};
+}
+
 struct listing_fixture {
   explicit listing_fixture(std::vector<scripted_page> pages, std::size_t list_max_matches = 100'000)
     : server(std::move(pages)),
@@ -371,8 +419,6 @@ struct listing_fixture {
     ioctx->start();
   }
 
-  [[nodiscard]] object_store_listing& listing() const { return *ioctx; }
-
   scripted_list_server server;
   std::shared_ptr<loopback_list_authorizer> authorizer;
   std::shared_ptr<rest_ioctx> ioctx;
@@ -380,10 +426,8 @@ struct listing_fixture {
 
 }  // namespace
 
-TEST_CASE("rest listing is reachable through the object store interface", "[rest][listing]")
+TEST_CASE("rest ioctx delegates paged listing to its composed lister", "[rest][listing]")
 {
-  static_assert(std::derived_from<rest_ioctx, object_store_listing>);
-
   listing_fixture fixture{
     {scripted_page{.request_token = "",
                    .objects       = {{"prefix/a.parquet", 11}, {"prefix/b.parquet", 22}},
@@ -395,11 +439,10 @@ TEST_CASE("rest listing is reachable through the object store interface", "[rest
                    .next_token    = ""}}};
   std::vector<list_objects_v2_page> delivered;
 
-  fixture.listing().list_objects_paged(
-    "bucket", "prefix/", 2, [&](list_objects_v2_page const& page) {
-      delivered.push_back(page);
-      return true;
-    });
+  fixture.ioctx->list_objects_paged("bucket", "prefix/", 2, [&](list_objects_v2_page const& page) {
+    delivered.push_back(page);
+    return true;
+  });
 
   REQUIRE(delivered.size() == 2);
   REQUIRE(delivered[0].entries.size() == 2);
@@ -417,6 +460,23 @@ TEST_CASE("rest listing is reachable through the object store interface", "[rest
   CHECK(observations[0].continuation_token.empty());
   CHECK(observations[1].continuation_token == "page/2");
   CHECK(observations[1].prefix == "prefix/");
+
+  SECTION("whole-list delegation preserves order and enforces max_keys")
+  {
+    auto const objects = fixture.ioctx->list_objects("bucket", "prefix/", 2);
+
+    REQUIRE(objects.size() == 3);
+    CHECK(objects[0].key == "prefix/a.parquet");
+    CHECK(objects[0].size == 11);
+    CHECK(objects[1].key == "prefix/b.parquet");
+    CHECK(objects[1].size == 22);
+    CHECK(objects[2].key == "prefix/c.parquet");
+    CHECK(objects[2].size == 33);
+
+    CHECK_THROWS_WITH(fixture.ioctx->list_objects("bucket", "prefix/", 2, 2),
+                      Catch::Matchers::ContainsSubstring("rest_ioctx::list_objects:") &&
+                        Catch::Matchers::ContainsSubstring("more than 2 objects"));
+  }
 }
 
 TEST_CASE("a listing sink can stop before the next page request", "[rest][listing]")
@@ -430,7 +490,7 @@ TEST_CASE("a listing sink can stop before the next page request", "[rest][listin
                    .next_token    = ""}}};
   std::size_t pages_seen = 0;
 
-  fixture.listing().list_objects_paged("bucket", "prefix/", 1, [&](list_objects_v2_page const&) {
+  fixture.ioctx->list_objects_paged("bucket", "prefix/", 1, [&](list_objects_v2_page const&) {
     ++pages_seen;
     return false;
   });
@@ -445,8 +505,8 @@ TEST_CASE("listing page size is clamped on the wire", "[rest][listing]")
     .request_token = "", .objects = {{"key", 1}}, .truncated = false, .next_token = ""}}};
   auto const consume = [](list_objects_v2_page const&) { return true; };
 
-  fixture.listing().list_objects_paged("bucket", "", 0, consume);
-  fixture.listing().list_objects_paged("bucket", "", 1001, consume);
+  fixture.ioctx->list_objects_paged("bucket", "", 0, consume);
+  fixture.ioctx->list_objects_paged("bucket", "", 1001, consume);
 
   auto const observations = fixture.server.observations();
   REQUIRE(observations.size() == 2);
@@ -462,7 +522,7 @@ TEST_CASE("listing throws when the scanned object cap is exceeded", "[rest][list
                                          .next_token    = ""}}};
   std::size_t pages_seen = 0;
 
-  CHECK_THROWS_WITH(fixture.listing().list_objects_paged(
+  CHECK_THROWS_WITH(fixture.ioctx->list_objects_paged(
                       "bucket",
                       "prefix/",
                       1000,
@@ -471,18 +531,81 @@ TEST_CASE("listing throws when the scanned object cap is exceeded", "[rest][list
                         return true;
                       },
                       1),
-                    Catch::Matchers::ContainsSubstring("scanned more than 1 objects"));
+                    Catch::Matchers::ContainsSubstring("rest_ioctx::list_objects:") &&
+                      Catch::Matchers::ContainsSubstring("scanned more than 1 objects"));
   CHECK(pages_seen == 0);
   CHECK(fixture.server.request_count() == 1);
 }
 
-TEST_CASE("listing exposes the configured match cap through the interface", "[rest][listing]")
+TEST_CASE("rest ioctx exposes the configured listing match cap", "[rest][listing]")
 {
   constexpr std::size_t configured_cap = 37;
   listing_fixture fixture{
     {scripted_page{.request_token = "", .objects = {}, .truncated = false, .next_token = ""}},
     configured_cap};
 
-  CHECK(fixture.listing().list_max_matches() == configured_cap);
+  CHECK(fixture.ioctx->list_max_matches() == configured_cap);
   CHECK(fixture.server.request_count() == 0);
+}
+
+TEST_CASE("object store lister rejects unsafe pagination and result growth", "[rest][listing]")
+{
+  auto const consume = [](list_objects_v2_page const&) { return true; };
+
+  SECTION("a truncated page requires a non-empty continuation token")
+  {
+    // A missing element is rejected by the parser; an empty element reaches the lister guard.
+    auto fetch  = std::make_shared<stub_page_fetch>(std::vector<std::string>{direct_page_xml(
+      {{"prefix/a", 1}}, true, std::optional<std::string_view>{std::string_view{}})});
+    auto lister = make_direct_lister(std::move(fetch));
+
+    CHECK_THROWS_WITH(lister.list_objects_paged("bucket", "prefix/", 1000, consume),
+                      Catch::Matchers::ContainsSubstring("test_lister::list_objects:") &&
+                        Catch::Matchers::ContainsSubstring("without a continuation token"));
+  }
+
+  SECTION("a truncated page cannot be empty")
+  {
+    auto fetch = std::make_shared<stub_page_fetch>(
+      std::vector<std::string>{direct_page_xml({}, true, std::string_view{"next"})});
+    auto lister = make_direct_lister(std::move(fetch));
+
+    CHECK_THROWS_WITH(lister.list_objects_paged("bucket", "prefix/", 1000, consume),
+                      Catch::Matchers::ContainsSubstring("test_lister::list_objects:") &&
+                        Catch::Matchers::ContainsSubstring("with no entries"));
+  }
+
+  SECTION("a continuation token must advance")
+  {
+    auto fetch = std::make_shared<stub_page_fetch>(
+      std::vector<std::string>{direct_page_xml({{"prefix/a", 1}}, true, std::string_view{"next"}),
+                               direct_page_xml({{"prefix/b", 2}}, true, std::string_view{"next"})});
+    auto lister = make_direct_lister(std::move(fetch));
+
+    CHECK_THROWS_WITH(lister.list_objects_paged("bucket", "prefix/", 1000, consume),
+                      Catch::Matchers::ContainsSubstring("test_lister::list_objects:") &&
+                        Catch::Matchers::ContainsSubstring("continuation token did not advance"));
+  }
+
+  SECTION("the scanned object cap is enforced")
+  {
+    auto fetch = std::make_shared<stub_page_fetch>(
+      std::vector<std::string>{direct_page_xml({{"prefix/a", 1}, {"prefix/b", 2}}, false)});
+    auto lister = make_direct_lister(std::move(fetch), 1);
+
+    CHECK_THROWS_WITH(lister.list_objects_paged("bucket", "prefix/", 1000, consume),
+                      Catch::Matchers::ContainsSubstring("test_lister::list_objects:") &&
+                        Catch::Matchers::ContainsSubstring("scanned more than 1 objects"));
+  }
+
+  SECTION("the whole-list match cap is enforced")
+  {
+    auto fetch = std::make_shared<stub_page_fetch>(
+      std::vector<std::string>{direct_page_xml({{"prefix/a", 1}, {"prefix/b", 2}}, false)});
+    auto lister = make_direct_lister(std::move(fetch), 100, 1);
+
+    CHECK_THROWS_WITH(lister.list_objects("bucket", "prefix/"),
+                      Catch::Matchers::ContainsSubstring("test_lister::list_objects:") &&
+                        Catch::Matchers::ContainsSubstring("more than 1 objects"));
+  }
 }

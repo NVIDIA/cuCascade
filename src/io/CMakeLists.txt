@@ -21,6 +21,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma/s3rdma_ioctx.cpp
