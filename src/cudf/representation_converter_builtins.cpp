@@ -44,6 +44,7 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
@@ -81,6 +82,22 @@ inline cudf::type_id as_cudf_type_id(int32_t type_id)
   return static_cast<cudf::type_id>(type_id);
 }
 
+// Orders `source_read_stream` after the source's latest recorded writer. An event-backed wait is
+// asynchronous and does not extend source lifetime; callers must retain the source until their
+// reads complete. If no event is recorded, this function synchronizes the source device before
+// returning. The device associated with `source_read_stream` must be current on entry.
+void wait_for_gpu_source(gpu_table_representation const& source,
+                         rmm::cuda_stream_view source_read_stream)
+{
+  if (auto const writer_event = source.get_writer_event(); writer_event != nullptr) {
+    cuda::cuda_event_view{writer_event}.wait(source_read_stream);
+    return;
+  }
+
+  rmm::cuda_set_device_raii source_device_guard{rmm::cuda_device_id{source.get_device_id()}};
+  CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
+}
+
 // Forward declaration. convert_gpu_to_gpu is defined below convert_gpu_to_host_fast
 // so it can reuse BatchCopyAccumulator and the column-tree reconstruction helpers,
 // peer-copying each column buffer directly and avoiding cudf::pack (whose internal
@@ -101,11 +118,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
   rmm::cuda_stream_view stream,
   memory::reservation* reservation)
 {
-  // Synchronize the stream to ensure any prior operations (like table creation)
-  // are complete before we read from the source table
-  stream.synchronize();
-
   auto& gpu_source = source.cast<gpu_table_representation>();
+  rmm::cuda_set_device_raii source_device_guard{rmm::cuda_device_id{source.get_device_id()}};
+  wait_for_gpu_source(gpu_source, stream);
   auto packed_data = cudf::pack(gpu_source.get_table_view(), stream);
 
   auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
@@ -497,7 +512,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   rmm::cuda_stream_view stream,
   memory::reservation* reservation)
 {
-  auto& gpu_source            = source.cast<gpu_table_representation>();
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  rmm::cuda_set_device_raii source_device_guard{rmm::cuda_device_id{source.get_device_id()}};
+  wait_for_gpu_source(gpu_source, stream);
   const cudf::table_view view = gpu_source.get_table_view();
 
   // --- Pass 1: plan the allocation layout ---
@@ -866,11 +883,6 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   rmm::cuda_stream_view stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
-  // Sync the caller's stream so the source table's buffers are stable on the source
-  // device before we issue peer copies. The caller's stream is the one that produced
-  // (or last touched) the source representation.
-  stream.synchronize();
-
   auto& gpu_source = source.cast<gpu_table_representation>();
 
   // Same-device case: clone via source's own clone() method.
@@ -881,25 +893,6 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto const src_device_id = gpu_source.get_device_id();
   auto const dst_device_id = target_memory_space->get_device_id();
 
-  // STREAM-LINEAGE INVARIANT: cross-device peer copies of cudaMallocAsync
-  // allocations require explicit event-ordered synchronization with the
-  // writer stream. A source-device-wide cudaDeviceSynchronize() does NOT
-  // establish the cross-mempool visibility the driver needs — under
-  // compute-sanitizer this site emits hundreds of stream-ordered-race errors
-  // even with a brute-force device sync. Producer-consumer pairing:
-  //   producer = the stream that wrote gpu_source (recorded via
-  //              gpu_table_representation::record_writer_event)
-  //   consumer = target_stream (acquired from target memory space below)
-  // We resolve this in two passes:
-  //   1) Wait on the writer event (if recorded) on the *target* stream so the
-  //      reader sees the writer's allocation/copy ordering. This is the precise
-  //      primitive the sanitizer recognizes as closing the race.
-  //   2) Keep the source-device cudaDeviceSynchronize() as defense-in-depth for
-  //      callers that have not yet been migrated to record writer events
-  //      (get_writer_event() == nullptr). When the writer event is set the
-  //      cudaDeviceSynchronize is technically redundant but harmless.
-  cudaEvent_t const writer_event = gpu_source.get_writer_event();
-
   rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
 
   // Target-bound stream from the target memory_space's stream pool. All peer copies
@@ -907,21 +900,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   // completion without explicit cross-stream events.
   auto target_stream = target_memory_space->acquire_stream();
   auto mr            = target_memory_space->get_default_allocator();
-
-  if (writer_event != nullptr) {
-    // STREAM-LINEAGE pass 1: tie the reader stream's timeline to the writer's
-    // recorded event. After this point the target_stream observes all
-    // writer-side cudaMallocAsync allocations and writes in proper order.
-    cucascade::cuda::cuda_event_view{writer_event}.wait(target_stream);
-  } else {
-    // STREAM-LINEAGE pass 2 (fallback): no writer event recorded — fall back to
-    // a coarser source-device sync. This path is documented as insufficient for
-    // cross-mempool cudaMallocAsync allocations but is preserved for
-    // representations produced by code paths that have not yet been migrated to
-    // record_writer_event().
-    rmm::cuda_set_device_raii src_sync_guard{rmm::cuda_device_id{src_device_id}};
-    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
-  }
+  wait_for_gpu_source(gpu_source, target_stream);
 
   cudf::table_view const src_view = gpu_source.get_table_view();
 
@@ -1614,8 +1593,10 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   rmm::cuda_stream_view stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
-  auto& backend       = target_memory_space->get_io_backend();
-  auto& gpu_source    = source.cast<gpu_table_representation>();
+  auto& backend    = target_memory_space->get_io_backend();
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  rmm::cuda_set_device_raii source_device_guard{rmm::cuda_device_id{source.get_device_id()}};
+  wait_for_gpu_source(gpu_source, stream);
   cudf::table_view tv = gpu_source.get_table_view();
 
   // Generate unique file path under the disk memory space's mount directory

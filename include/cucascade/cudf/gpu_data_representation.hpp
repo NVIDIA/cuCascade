@@ -118,13 +118,15 @@ class gpu_table_representation : public idata_representation {
   std::size_t get_uncompressed_data_size_in_bytes() const override;
 
   /**
-   * @brief Create a deep copy of this GPU table representation.
+   * @brief Create an independently owned copy of this GPU table
    *
-   * The cloned representation will have its own copy of the underlying cuDF table,
-   * residing in the same memory space as the original.
+   * Orders the copy after the recorded writer event, or synchronizes the source device if no event
+   * is available. The copy uses this memory space's default allocator on @p stream, and the method
+   * synchronizes @p stream before returning. A stream with a non-null handle is recorded as the
+   * result's writer stream.
    *
-   * @param stream CUDA stream for memory operations
-   * @return std::unique_ptr<idata_representation> A new gpu_table_representation with copied data
+   * @param stream Stream on this representation's device used for the copy
+   * @return Independently owned copy in the same memory space
    */
   std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
 
@@ -136,12 +138,16 @@ class gpu_table_representation : public idata_representation {
   cudf::table_view get_table_view() const;
 
   /**
-   * @brief Release ownership of the underlying cuDF table
+   * @brief Move out an owned cuDF table or materialize a table view
    *
-   * After calling this method, this representation no longer owns the table.
+   * An owned table is moved out without synchronization; the caller must order subsequent access
+   * after any outstanding writer work. A view-backed table is copied on @p stream using this memory
+   * space's default allocator after the recorded writer event, or after synchronizing the source
+   * device when no event exists. The method synchronizes @p stream before releasing the external
+   * owner. In either case, this representation is left without a table.
    *
-   * @param stream CUDA stream (used to materialize the table from a view path before release)
-   * @return std::unique_ptr<cudf::table> The cuDF table
+   * @param stream Stream on this representation's device used only for view materialization
+   * @return Moved table or independently owned materialization of the table view
    */
   std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);
 
