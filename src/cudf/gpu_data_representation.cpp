@@ -23,6 +23,8 @@
 #include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 namespace cucascade {
 
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
@@ -73,11 +75,24 @@ cudf::table_view gpu_table_representation::get_table_view() const
   }
 }
 
-std::unique_ptr<cudf::table> gpu_table_representation::release_table(
-  [[maybe_unused]] rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_stream_view stream)
 {
   if (std::holds_alternative<owning_table_view>(_table)) {
-    _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{get_device_id()}};
+    // Without an event, the producing stream is unknown and requires a device-wide fallback.
+    if (_writer_event != nullptr) {
+      cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
+    } else {
+      CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
+    }
+
+    auto materialized = std::make_unique<cudf::table>(
+      std::get<owning_table_view>(_table).view, stream, get_memory_space().get_default_allocator());
+    // cuDF enqueues the deep copy asynchronously. Replacing the variant destroys the external
+    // owner, so the materialization stream must finish reading the view before that owner can
+    // release its source buffers.
+    stream.synchronize();
+    _table = std::move(materialized);
   }
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
 }
@@ -102,14 +117,21 @@ void gpu_table_representation::rebind_stream(rmm::cuda_stream_view stream)
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)
 {
-  // Create a deep copy of the cuDF table using the provided stream.
-  // STREAM-LINEAGE: the clone has been written by `stream`; record an event on
-  // it so any cross-stream/cross-device reader of the clone honors the
-  // producer-consumer ordering established by record_writer_event().
-  cudf::table_view view = get_table_view();
-  auto cloned           = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(view, stream), get_memory_space(), stream);
-  return cloned;
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{get_device_id()}};
+  // Without an event, the producing stream is unknown and requires a device-wide fallback.
+  if (_writer_event != nullptr) {
+    cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
+  } else {
+    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
+  }
+
+  auto cloned_table = std::make_unique<cudf::table>(
+    get_table_view(), stream, get_memory_space().get_default_allocator());
+  // The source may be destroyed as soon as clone() returns, so finish all asynchronous reads from
+  // it before publishing the independently owned result.
+  stream.synchronize();
+  return std::make_unique<gpu_table_representation>(
+    std::move(cloned_table), get_memory_space(), stream);
 }
 
 void gpu_table_representation::record_writer_event(rmm::cuda_stream_view writer_stream)
