@@ -646,11 +646,7 @@ TEST_CASE("Representations polymorphism",
 
 namespace {
 
-/**
- * @brief Deterministically hold a CUDA stream inside a host callback until released.
- *
- * The callback only uses C++ atomics; CUDA APIs are forbidden from CUDA host callbacks.
- */
+// CUDA host callbacks cannot call CUDA APIs, so use C++ atomics to gate the stream.
 class cuda_stream_gate {
  public:
   cuda_stream_gate()                                   = default;
@@ -757,9 +753,8 @@ TEST_CASE("gpu_table_representation clone waits for a distinct writer stream",
   rmm::cuda_stream producer_stream;
   rmm::cuda_stream consumer_stream;
 
-  constexpr cudf::size_type num_rows = 1024;
-  constexpr std::size_t data_size =
-    static_cast<std::size_t>(num_rows) * sizeof(std::int32_t);
+  constexpr cudf::size_type num_rows    = 1024;
+  constexpr std::size_t data_size       = static_cast<std::size_t>(num_rows) * sizeof(std::int32_t);
   constexpr unsigned char expected_byte = 0x5a;
 
   auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
@@ -769,24 +764,20 @@ TEST_CASE("gpu_table_representation clone waits for a distinct writer stream",
                                           gpu_space->get_default_allocator());
 
   // Establish a known stale value before deliberately blocking the real producer write.
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(
-    column->mutable_view().head(), 0, data_size, consumer_stream.value()));
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(column->mutable_view().head(), 0, data_size, consumer_stream.value()));
   consumer_stream.synchronize();
 
   cuda_stream_gate producer_gate;
   producer_gate.enqueue(producer_stream.view());
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(column->mutable_view().head(),
-                                    expected_byte,
-                                    data_size,
-                                    producer_stream.value()));
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(
+    column->mutable_view().head(), expected_byte, data_size, producer_stream.value()));
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(column));
-  gpu_table_representation source(std::make_unique<cudf::table>(std::move(columns)),
-                                  *gpu_space,
-                                  producer_stream.view());
+  gpu_table_representation source(
+    std::make_unique<cudf::table>(std::move(columns)), *gpu_space, producer_stream.view());
 
-  // Make sure the producer cannot reach either the write or source's recorded writer event.
   producer_gate.wait_until_entered();
   auto const writer_status_while_blocked = cudaEventQuery(source.get_writer_event());
 
@@ -801,12 +792,10 @@ TEST_CASE("gpu_table_representation clone waits for a distinct writer stream",
   });
   clone_started.wait(false, std::memory_order_acquire);
 
-  // The fixed implementation waits for source's writer event and cannot return while the
-  // producer is gated. Main queues the copy without that wait and returns immediately.
+  // clone() must not return until the source writer event can complete.
   auto const status_while_writer_blocked = clone_future.wait_for(1s);
   if (status_while_writer_blocked == std::future_status::ready) {
-    // On the buggy implementation, finish the premature copy while the source still contains the
-    // stale pattern. This turns the ordering failure into deterministic data corruption too.
+    // Complete a premature copy before releasing the producer to make stale data deterministic.
     consumer_stream.synchronize();
   }
 
@@ -822,10 +811,8 @@ TEST_CASE("gpu_table_representation clone waits for a distinct writer stream",
   REQUIRE(clone != nullptr);
 
   std::vector<uint8_t> bytes(data_size);
-  CUCASCADE_CUDA_TRY(cudaMemcpy(bytes.data(),
-                               clone->get_table_view().column(0).head(),
-                               data_size,
-                               cudaMemcpyDeviceToHost));
+  CUCASCADE_CUDA_TRY(cudaMemcpy(
+    bytes.data(), clone->get_table_view().column(0).head(), data_size, cudaMemcpyDeviceToHost));
   REQUIRE(std::all_of(
     bytes.cbegin(), bytes.cend(), [](uint8_t value) { return value == expected_byte; }));
 }

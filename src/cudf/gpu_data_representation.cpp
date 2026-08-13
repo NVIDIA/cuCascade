@@ -79,8 +79,7 @@ std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_s
 {
   if (std::holds_alternative<owning_table_view>(_table)) {
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{get_device_id()}};
-    // Wait for the latest writer before materializing the view. Eventless representations require
-    // a source-device synchronization.
+    // Without an event, the producing stream is unknown and requires a device-wide fallback.
     if (_writer_event != nullptr) {
       cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
     } else {
@@ -119,8 +118,7 @@ void gpu_table_representation::rebind_stream(rmm::cuda_stream_view stream)
 std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)
 {
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{get_device_id()}};
-  // Wait for the latest writer before copying the source. Eventless representations require a
-  // source-device synchronization.
+  // Without an event, the producing stream is unknown and requires a device-wide fallback.
   if (_writer_event != nullptr) {
     cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
   } else {
