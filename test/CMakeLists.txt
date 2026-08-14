@@ -93,6 +93,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     utils/cudf_test_utils.cpp
     # Data tests (cudf-backed representations / converters / profiler)
     data/test_bandwidth_profiler.cpp
+    data/test_consumer_events.cpp
     data/test_data_batch.cpp
     data/test_data_representation.cpp
     data/test_disk_host_converters.cpp
