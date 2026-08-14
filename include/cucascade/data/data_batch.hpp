@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
@@ -31,7 +32,9 @@
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace cucascade {
 namespace memory {
@@ -87,7 +90,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
     std::unique_ptr<idata_representation> data,
     std::unique_ptr<idata_batch_probe> probe = std::make_unique<idata_batch_probe>());
 
-  ~data_batch() = default;
+  ~data_batch();
 
   // -- Deleted move/copy --
   data_batch(data_batch&&)                 = delete;
@@ -185,9 +188,11 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @brief Transition from idle to mutable (exclusive lock) without consuming the caller's pointer.
    *
    * Uses shared_from_this() to obtain a new shared_ptr. Blocks until the
-   * exclusive lock is acquired.
+   * exclusive lock is acquired and all recorded asynchronous readers have completed.
    *
    * @return A mutable_data_batch holding the exclusive lock.
+   * @throws cucascade::cuda_error if a recorded reader event cannot be synchronized.
+   * @throws rmm::cuda_error if a reader event's CUDA device cannot be made current.
    */
   [[nodiscard]] mutable_data_batch to_mutable();
 
@@ -202,8 +207,9 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   /**
    * @brief Try to transition from idle to mutable (non-blocking).
    *
-   * @return An optional containing the mutable accessor on success, or
-   *         std::nullopt if the lock could not be acquired immediately.
+   * @return An optional containing the mutable accessor on success, or std::nullopt if the lock
+   *         could not be acquired immediately or a recorded asynchronous reader is still pending.
+   * @throws rmm::cuda_error if a reader event's CUDA device cannot be made current for its query.
    */
   [[nodiscard]] std::optional<mutable_data_batch> try_to_mutable();
 
@@ -213,11 +219,14 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @brief Transition from read-only to mutable (upgrade lock).
    *
    * Releases the shared lock, then acquires an exclusive lock (may block).
+   * Waits for all recorded asynchronous readers before exposing mutable access.
    * The source accessor is consumed via move.
    * NOTE: The transition is not atomic.
    *
    * @param accessor Rvalue reference to the read-only accessor (consumed).
    * @return A mutable_data_batch holding the exclusive lock.
+   * @throws cucascade::cuda_error if a recorded reader event cannot be synchronized.
+   * @throws rmm::cuda_error if a reader event's CUDA device cannot be made current.
    */
   [[nodiscard]] static mutable_data_batch readonly_to_mutable(read_only_data_batch&& accessor);
 
@@ -262,12 +271,60 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   void set_data(std::unique_ptr<idata_representation> data);
 
+  /**
+   * @brief Record completion of asynchronous work reading the current representation.
+   *
+   * GPU batches retain one event for every outstanding reader stream. Non-GPU tiers are a no-op.
+   * The caller must hold a shared lock while recording so the representation cannot change between
+   * issuing the read and recording its completion.
+   *
+   * @param reader_stream Stream on which work reading the batch was enqueued.
+   */
+  void record_reader_event(rmm::cuda_stream_view reader_stream);
+
+  /**
+   * @brief Block until all recorded asynchronous readers have completed.
+   *
+   * Called while the batch's exclusive lock is held before mutable access is exposed.
+   */
+  void synchronize_reader_events();
+
+  /**
+   * @brief Query and recycle completed reader events without blocking.
+   *
+   * @return true when no recorded asynchronous reader remains in flight.
+   */
+  [[nodiscard]] bool reader_events_complete();
+
+  /**
+   * @brief Destructor-safe form of synchronize_reader_events().
+   */
+  void synchronize_reader_events_no_throw() noexcept;
+
+  struct reader_event_pool {
+    // Events are stored as a pending prefix followed by reusable completed events. This bounds
+    // event creation by the peak number of overlapping reads registered on this CUDA device.
+    std::vector<cuda::cuda_event> events;
+    std::size_t pending_event_count{0};
+  };
+
+  /**
+   * @brief Move completed events from the pending prefix back into the reusable pool.
+   *
+   * Requires _reader_events_mutex to be held and the pool's CUDA device to be current.
+   */
+  void recycle_completed_reader_events(reader_event_pool& pool);
+
   const uint64_t _batch_id;                            ///< Immutable batch identifier
   std::unique_ptr<idata_representation> _data;         ///< Owned data representation
   mutable std::shared_mutex _rw_mutex;                 ///< Reader-writer mutex
   std::atomic<size_t> _subscriber_count{0};            ///< Atomic subscriber interest count
   std::atomic<batch_state> _state{batch_state::idle};  ///< Observable lock state
   std::atomic<size_t> _read_only_count{0};  ///< Count of active read_only_data_batch instances
+
+  // CUDA events are device-associated, so each device needs an independent reusable pool.
+  std::mutex _reader_events_mutex;
+  std::unordered_map<int, reader_event_pool> _reader_event_pools;
 
   std::unique_ptr<idata_batch_probe> _probe;
 };
@@ -318,6 +375,35 @@ class read_only_data_batch {
   {
     auto* repr = get_data();
     return repr ? repr->get_writer_event() : nullptr;
+  }
+
+  /**
+   * @brief Record completion of asynchronous work reading this batch's memory.
+   *
+   * Call this after enqueueing all work that reads the batch on @p reader_stream and before
+   * releasing this accessor. Releasing the shared lock does not wait for the event. The next
+   * mutable accessor waits for every outstanding reader event before exposing the representation,
+   * preventing reuse, replacement, conversion, or downgrade while a device read is still active.
+   *
+   * This is a no-op for non-GPU tiers. Multiple readers and multiple calls are supported.
+   * Events are pooled independently per CUDA device. If event registration fails after the read
+   * has been enqueued, this call synchronizes @p reader_stream before propagating the error so an
+   * untracked read can never escape the shared-lock lifetime.
+   *
+   * @note The shared-lock release itself never synchronizes. If this accessor owns the final
+   *       shared_ptr to the batch, batch destruction synchronizes as a lifetime-safety fallback
+   *       because there is no later reclaimer that can pay the wait.
+   *
+   * @param reader_stream Stream on which work reading the batch was enqueued.
+   * @throws cucascade::cuda_error if the stream cannot be queried, synchronized during fallback,
+   *         or have its event recorded.
+   * @throws rmm::cuda_error if the reader stream's CUDA device cannot be made current.
+   * @throws std::bad_alloc if the per-device event pool cannot grow. The reader stream is
+   *         synchronized before this exception propagates.
+   */
+  void record_reader_event(rmm::cuda_stream_view reader_stream) const
+  {
+    _batch->record_reader_event(reader_stream);
   }
 
   /**
