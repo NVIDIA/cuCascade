@@ -152,6 +152,10 @@ class gpu_table_representation : public idata_representation {
    * premature-reuse note on mutable_data_batch::rebind_stream in cucascade/data/data_batch.hpp
    * and cudf::rebind_stream). This holds for tables produced by cuCascade's built-in
    * converters, which synchronize the conversion stream before publishing the representation.
+   * When foreign-stream reads may still be in flight (recorded via
+   * data_batch::record_consumer_event), calling mutable_data_batch::await_consumers(@p stream)
+   * before release_table is the sanctioned way to satisfy this precondition: the enqueued
+   * waits order the released table's stream-ordered frees after those reads.
    *
    * @param stream Stream that will own deallocation ordering of the returned table's buffers
    *               (also used to materialize the table from a view path before release)

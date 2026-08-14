@@ -728,7 +728,18 @@ class mutable_data_batch {
     bool needs_sync = old_representation != nullptr &&
                       (old_representation->get_current_tier() == memory::Tier::GPU ||
                        _batch->_data->get_current_tier() == memory::Tier::GPU);
-    if (needs_sync) { stream.synchronize(); }
+    if (needs_sync) {
+      stream.synchronize();
+    } else {
+      // Non-GPU tier transitions (e.g. host->disk) skip the stream-sync tail above, so
+      // the device-side waits just enqueued on @p stream never gate this thread — but
+      // recorded GPU-side reads of the old representation's buffers (kernels or copies
+      // reading pinned host memory) must still complete before the old representation
+      // is destroyed host-side at scope exit. Mirror set_data's conservative approach
+      // and block the host on the recorded consumer events directly. Zero cost (one
+      // mutex lock) for batches that never recorded a consumer event.
+      _batch->_consumer_events.synchronize();
+    }
   }
 
   // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
