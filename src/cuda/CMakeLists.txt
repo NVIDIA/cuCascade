@@ -15,4 +15,6 @@
 # the License.
 # =============================================================================
 
-target_sources(cucascade_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp)
+target_sources(cucascade_objects
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp
+                       ${CMAKE_CURRENT_SOURCE_DIR}/event_pool.cpp)

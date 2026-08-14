@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/event_pool.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
@@ -151,6 +152,76 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    */
   size_t get_read_only_count() const { return _read_only_count.load(std::memory_order_acquire); }
 
+  // -- Consumer-event API --
+  //
+  // Mirror of the writer-event mechanism (idata_representation::record_writer_event /
+  // get_writer_event). Writer events let a cross-stream READER order its reads after the
+  // producing stream's writes; consumer events let a RECLAIMER order the destruction of
+  // this batch's buffers after every consumer stream's reads. Without them, freeing a
+  // representation whose buffers were produced on an idle stream while a consumer
+  // stream's kernels/copies still read them is a use-after-free — the only prior defense
+  // was a blunt host stream.synchronize() of the consumer stream at every call site.
+  //
+  // Contract:
+  //   - A consumer calls record_consumer_event(s) AFTER enqueuing its reads of this
+  //     batch's buffers on stream s (typically while still holding the shared lock via
+  //     read_only_data_batch, which also delegates this call).
+  //   - A reclaimer calls await_consumers(t) BEFORE destroying or replacing the batch's
+  //     representation, where t is the stream that processes (or is host-synchronized
+  //     ahead of) the frees. Reclaimers hold the exclusive lock (mutable_data_batch), so
+  //     no new consumer can record concurrently with the await + destroy sequence — any
+  //     reader that could still enqueue reads also still holds the shared lock, which
+  //     blocks the reclaimer from acquiring the exclusive lock in the first place.
+  //   - Consumer events complement rebind_stream (see mutable_data_batch::rebind_stream):
+  //     rebinding only moves which stream frees the buffers and inserts NO cross-stream
+  //     ordering; await_consumers supplies that ordering device-side.
+  //
+  // These methods are internally synchronized by their own mutex and are independent of
+  // the reader-writer lock — like subscribe()/unsubscribe() they may be called on the
+  // idle handle at any time.
+
+  /**
+   * @brief Record that the calling consumer has enqueued reads of this batch's device
+   *        buffers on @p consumer_stream.
+   *
+   * Call AFTER the reads are enqueued (kernels launched / async copies issued) — the
+   * recorded event captures the stream's contents at call time, so reads enqueued later
+   * are not covered. May be called multiple times, from multiple threads, for multiple
+   * streams; each call tracks one more outstanding event.
+   *
+   * Cheap: a pooled cudaEvent record (created lazily with cudaEventDisableTiming and
+   * recycled once complete). Never host-syncs. Thread-safe.
+   *
+   * @param consumer_stream The stream on which the consumer's reads were enqueued.
+   */
+  void record_consumer_event(rmm::cuda_stream_view consumer_stream);
+
+  /**
+   * @brief Enqueue device-side waits on @p stream for all outstanding consumer events
+   *        (reads previously recorded via record_consumer_event()).
+   *
+   * Issues cudaStreamWaitEvent(@p stream, event) per outstanding event, so work enqueued
+   * on @p stream afterwards — notably stream-ordered frees of this batch's buffers — is
+   * ordered after every recorded consumer read. Does NOT host-sync. Completed events are
+   * recycled. Thread-safe.
+   *
+   * Reclaimers must call this on the stream that will process the frees (the buffers'
+   * bound stream) before destroying the representation, or combine it with existing
+   * host-sync semantics (a host sync of @p stream after this call transitively waits on
+   * all consumers, making frees safe on any stream).
+   *
+   * @param stream The stream on which to enqueue the waits.
+   */
+  void await_consumers(rmm::cuda_stream_view stream);
+
+  /**
+   * @brief True if no recorded consumer work is still pending on the device.
+   *
+   * Non-blocking poll (cudaEventQuery) of all outstanding consumer events. Trivially
+   * true for batches that never recorded a consumer event. Thread-safe.
+   */
+  [[nodiscard]] bool consumers_done() const;
+
   /**
    * @brief Transition from read-only back to idle (release shared lock).
    *
@@ -269,6 +340,11 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   std::atomic<batch_state> _state{batch_state::idle};  ///< Observable lock state
   std::atomic<size_t> _read_only_count{0};  ///< Count of active read_only_data_batch instances
 
+  /// Outstanding consumer-read events (see the consumer-event API above). Lazily
+  /// populated: batches that never record a consumer event hold no CUDA events and no
+  /// heap allocations here.
+  cuda::event_pool _consumer_events;
+
   std::unique_ptr<idata_batch_probe> _probe;
 };
 
@@ -319,6 +395,37 @@ class read_only_data_batch {
     auto* repr = get_data();
     return repr ? repr->get_writer_event() : nullptr;
   }
+
+  /**
+   * @brief Record that this consumer has enqueued reads of the batch's device buffers
+   *        on @p consumer_stream.
+   *
+   * Delegates to data_batch::record_consumer_event(). Mirror of get_writer_event():
+   * where the writer event orders this consumer's reads after the producer's writes,
+   * the consumer event orders a later reclaimer's frees after this consumer's reads.
+   * Call after enqueuing the reads, while still holding this shared lock.
+   *
+   * @param consumer_stream The stream on which the reads were enqueued.
+   */
+  void record_consumer_event(rmm::cuda_stream_view consumer_stream) const
+  {
+    _batch->record_consumer_event(consumer_stream);
+  }
+
+  /**
+   * @brief Enqueue device-side waits on @p stream for all outstanding consumer events.
+   *
+   * Delegates to data_batch::await_consumers(). See that method for the reclaim
+   * contract.
+   */
+  void await_consumers(rmm::cuda_stream_view stream) const { _batch->await_consumers(stream); }
+
+  /**
+   * @brief True if no recorded consumer work is still pending on the device.
+   *
+   * Delegates to data_batch::consumers_done().
+   */
+  [[nodiscard]] bool consumers_done() const { return _batch->consumers_done(); }
 
   /**
    * @brief Create an independent deep copy of the batch data.
@@ -492,10 +599,30 @@ class mutable_data_batch {
    * accessor.
    *
    * @note Does NOT insert cross-stream ordering -- see idata_representation::rebind_stream.
+   *       To order the rebound buffers' eventual free after consumer reads still in flight
+   *       on other streams, call await_consumers() on the rebound stream — the two calls
+   *       together make a reclaim fully stream-ordered with no host sync.
    *
    * @param stream Stream used for future asynchronous deallocation of the data's buffers.
    */
   void rebind_stream(rmm::cuda_stream_view stream);
+
+  /**
+   * @brief Enqueue device-side waits on @p stream for all outstanding consumer events.
+   *
+   * Delegates to data_batch::await_consumers(). Reclaimers holding this exclusive lock
+   * call this on the stream that will process the frees BEFORE destroying or replacing
+   * the representation; the exclusive lock guarantees no new consumer can record
+   * concurrently. Does NOT host-sync.
+   */
+  void await_consumers(rmm::cuda_stream_view stream) const { _batch->await_consumers(stream); }
+
+  /**
+   * @brief True if no recorded consumer work is still pending on the device.
+   *
+   * Delegates to data_batch::consumers_done().
+   */
+  [[nodiscard]] bool consumers_done() const { return _batch->consumers_done(); }
 
   /**
    * @brief Create an independent deep copy of the batch data.
@@ -588,6 +715,15 @@ class mutable_data_batch {
   {
     auto old_representation = std::move(_batch->_data);
     _batch->_data           = std::move(new_representation);
+
+    // CONSUMER-EVENTS: consumers may still have reads of the old representation's
+    // buffers in flight on their own streams (recorded via record_consumer_event).
+    // Enqueue device-side waits on @p stream BEFORE the synchronize below so the host
+    // sync — and therefore the destruction of the old representation — is also ordered
+    // after every recorded consumer read, regardless of which stream frees the buffers.
+    // We hold the exclusive lock, so no new consumer can record concurrently. No-op for
+    // batches that never recorded a consumer event.
+    _batch->await_consumers(stream);
 
     bool needs_sync = old_representation != nullptr &&
                       (old_representation->get_current_tier() == memory::Tier::GPU ||
