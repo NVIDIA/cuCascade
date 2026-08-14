@@ -47,7 +47,7 @@ TEST_CASE("data_repository_manager Construction", "[data_repository_manager]")
 
   // Manager should be empty initially
   // Accessing non-existent repository should throw
-  REQUIRE_THROWS_AS(manager.get_repository(0, "default"), std::out_of_range);
+  REQUIRE_THROWS_AS(manager.get_repository_shared(0, "default"), std::out_of_range);
 }
 
 // Test adding a single repository
@@ -60,7 +60,7 @@ TEST_CASE("data_repository_manager Add Single Repository", "[data_repository_man
   manager.add_new_repository(operator_id, "default", std::move(repository));
 
   // Repository should be accessible
-  auto& repo = manager.get_repository(operator_id, "default");
+  auto repo = manager.get_repository_shared(operator_id, "default");
   REQUIRE(repo != nullptr);
 }
 
@@ -79,7 +79,7 @@ TEST_CASE("data_repository_manager Add Multiple Repositories", "[data_repository
 
   // All repositories should be accessible
   for (size_t i = 0; i < num_operators; ++i) {
-    auto& repo = manager.get_repository(i, "default");
+    auto repo = manager.get_repository_shared(i, "default");
     REQUIRE(repo != nullptr);
   }
 }
@@ -133,7 +133,7 @@ TEST_CASE("data_repository_manager Add Data Batch Single Operator", "[data_repos
   manager.add_data_batch(batch, operator_ports);
 
   // Repository should have the batch
-  auto& repo        = manager.get_repository(operator_id, "default");
+  auto repo         = manager.get_repository_shared(operator_id, "default");
   auto pulled_batch = repo->pop_next_data_batch();
   REQUIRE(pulled_batch != nullptr);
   REQUIRE(pulled_batch->get_batch_id() == batch_id);
@@ -163,7 +163,7 @@ TEST_CASE("data_repository_manager Add Data Batch Multiple Operators", "[data_re
 
   // All repositories should have the batch (same shared_ptr)
   for (size_t id : operator_ids) {
-    auto& repo  = manager.get_repository(id, "default");
+    auto repo   = manager.get_repository_shared(id, "default");
     auto pulled = repo->pop_next_data_batch();
     REQUIRE(pulled != nullptr);
     REQUIRE(pulled->get_batch_id() == batch_id);
@@ -241,8 +241,8 @@ TEST_CASE("data_repository_manager Thread-Safe Add Batch", "[data_repository_man
   }
 
   // Repository should have all batches
-  auto& repo = manager.get_repository(operator_id, "default");
-  int count  = 0;
+  auto repo = manager.get_repository_shared(operator_id, "default");
+  int count = 0;
   while (true) {
     auto batch = repo->pop_next_data_batch();
     if (!batch) break;
@@ -300,8 +300,8 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
 
   // Verify: Operator 0 should have 2 batches (batch 0 and 1)
   {
-    auto& repo = manager.get_repository(0, "default");
-    int count  = 0;
+    auto repo = manager.get_repository_shared(0, "default");
+    int count = 0;
     while (true) {
       auto batch = repo->pop_next_data_batch();
       if (!batch) break;
@@ -312,8 +312,8 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
 
   // Verify: Operator 1 should have 2 batches (batch 0 and 2)
   {
-    auto& repo = manager.get_repository(1, "default");
-    int count  = 0;
+    auto repo = manager.get_repository_shared(1, "default");
+    int count = 0;
     while (true) {
       auto batch = repo->pop_next_data_batch();
       if (!batch) break;
@@ -324,8 +324,8 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
 
   // Verify: Operator 2 should have 2 batches (batch 0 and 2)
   {
-    auto& repo = manager.get_repository(2, "default");
-    int count  = 0;
+    auto repo = manager.get_repository_shared(2, "default");
+    int count = 0;
     while (true) {
       auto batch = repo->pop_next_data_batch();
       if (!batch) break;
@@ -349,7 +349,7 @@ TEST_CASE("data_repository_manager Large Number of Operators", "[data_repository
 
   // All operators should be accessible
   for (int i = 0; i < num_operators; ++i) {
-    auto& repo = manager.get_repository(i, "default");
+    auto repo = manager.get_repository_shared(i, "default");
     REQUIRE(repo != nullptr);
   }
 }
@@ -375,8 +375,8 @@ TEST_CASE("data_repository_manager Large Number of Batches", "[data_repository_m
   }
 
   // Repository should have all batches
-  auto& repo = manager.get_repository(operator_id, "default");
-  int count  = 0;
+  auto repo = manager.get_repository_shared(operator_id, "default");
+  int count = 0;
   while (true) {
     auto batch = repo->pop_next_data_batch();
     if (!batch) break;
@@ -412,7 +412,7 @@ TEST_CASE("data_repository_manager Thread-Safe Add Repository", "[data_repositor
 
   // All repositories should be accessible
   for (int i = 0; i < num_threads; ++i) {
-    auto& repo = manager.get_repository(i, "default");
+    auto repo = manager.get_repository_shared(i, "default");
     REQUIRE(repo != nullptr);
   }
 }
@@ -454,7 +454,7 @@ TEST_CASE("data_repository_manager Thread-Safe Mixed Operations", "[data_reposit
 
         // Occasionally pull and store a batch (to test concurrent pull operations)
         if (j % 10 == 0) {
-          auto& repo  = manager.get_repository(operator_id, "default");
+          auto repo   = manager.get_repository_shared(operator_id, "default");
           auto pulled = repo->pop_next_data_batch();
           if (pulled) {
             std::lock_guard<std::mutex> lock(pull_mutex);
@@ -524,7 +524,7 @@ TEST_CASE("data_repository_manager Concurrent Add and Pull", "[data_repository_m
   for (int i = 0; i < num_puller_threads; ++i) {
     threads.emplace_back([&, i]() {
       size_t operator_id = i % num_operators;
-      auto& repo         = manager.get_repository(operator_id, "default");
+      auto repo          = manager.get_repository_shared(operator_id, "default");
 
       // Keep pulling while adders are working
       while (keep_adding.load()) {
@@ -567,7 +567,7 @@ TEST_CASE("data_repository_manager Concurrent Add and Pull", "[data_repository_m
 
   // All repositories should be empty
   for (int i = 0; i < num_operators; ++i) {
-    auto& repo = manager.get_repository(i, "default");
+    auto repo  = manager.get_repository_shared(i, "default");
     auto batch = repo->pop_next_data_batch();
     REQUIRE(batch == nullptr);
   }
@@ -592,7 +592,7 @@ TEST_CASE("data_repository_manager High Contention Add Pull", "[data_repository_
   // Launch threads doing both add and pull operations
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&]() {
-      auto& repo = manager.get_repository(operator_id, "default");
+      auto repo = manager.get_repository_shared(operator_id, "default");
       std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
 
       for (int j = 0; j < operations_per_thread; ++j) {
@@ -619,7 +619,7 @@ TEST_CASE("data_repository_manager High Contention Add Pull", "[data_repository_
   REQUIRE(total_added == num_threads * operations_per_thread);
 
   // Clean up remaining batches
-  auto& repo = manager.get_repository(operator_id, "default");
+  auto repo = manager.get_repository_shared(operator_id, "default");
   while (true) {
     auto batch = repo->pop_next_data_batch();
     if (!batch) break;
@@ -663,7 +663,7 @@ TEST_CASE("data_repository_manager Concurrent Add Multiple Operators Per Batch",
 
   for (int i = 0; i < num_operators; ++i) {
     threads.emplace_back([&, i]() {
-      auto& repo = manager.get_repository(i, "default");
+      auto repo = manager.get_repository_shared(i, "default");
 
       // Pull all batches from this operator
       while (true) {
@@ -685,7 +685,7 @@ TEST_CASE("data_repository_manager Concurrent Add Multiple Operators Per Batch",
 
   // All repositories should be empty
   for (int i = 0; i < num_operators; ++i) {
-    auto& repo = manager.get_repository(i, "default");
+    auto repo  = manager.get_repository_shared(i, "default");
     auto batch = repo->pop_next_data_batch();
     REQUIRE(batch == nullptr);
   }
@@ -703,7 +703,7 @@ TEST_CASE("data_repository_manager Operator ID Zero", "[data_repository_manager]
   // Operator ID 0 should work like any other ID
   manager.add_new_repository(0, "default", std::make_unique<data_repository>());
 
-  auto& repo = manager.get_repository(0, "default");
+  auto repo = manager.get_repository_shared(0, "default");
   REQUIRE(repo != nullptr);
 }
 
@@ -721,7 +721,7 @@ TEST_CASE("data_repository_manager Large Operator IDs", "[data_repository_manage
 
   // All should be accessible
   for (size_t id : large_ids) {
-    auto& repo = manager.get_repository(id, "default");
+    auto repo = manager.get_repository_shared(id, "default");
     REQUIRE(repo != nullptr);
   }
 }
@@ -747,8 +747,8 @@ TEST_CASE("data_repository_manager Batches With Different Sizes", "[data_reposit
   }
 
   // All batches should be accessible
-  auto& repo = manager.get_repository(operator_id, "default");
-  int count  = 0;
+  auto repo = manager.get_repository_shared(operator_id, "default");
+  int count = 0;
   while (true) {
     auto batch = repo->pop_next_data_batch();
     if (!batch) break;
@@ -778,8 +778,8 @@ TEST_CASE("data_repository_manager Batches With Different Tiers", "[data_reposit
   }
 
   // All batches should be accessible
-  auto& repo = manager.get_repository(operator_id, "default");
-  int count  = 0;
+  auto repo = manager.get_repository_shared(operator_id, "default");
+  int count = 0;
   while (true) {
     auto batch = repo->pop_next_data_batch();
     if (!batch) break;
@@ -798,7 +798,7 @@ TEST_CASE("data_repository_manager Rapid Add Pull Cycles", "[data_repository_man
   manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
 
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
-  auto& repo = manager.get_repository(operator_id, "default");
+  auto repo = manager.get_repository_shared(operator_id, "default");
 
   // Perform many cycles of add and pull
   for (int cycle = 0; cycle < 100; ++cycle) {
@@ -815,4 +815,96 @@ TEST_CASE("data_repository_manager Rapid Add Pull Cycles", "[data_repository_man
   // Repository should be empty
   auto empty = repo->pop_next_data_batch();
   REQUIRE(empty == nullptr);
+}
+
+// =============================================================================
+// Regression tests: get_repository_shared is locked and lifetime-safe (the old
+// get_repository returned a reference into the map without taking _mutex, so a
+// concurrent add_new_repository or clear_all_repositories raced both the
+// lookup and the returned reference).
+// =============================================================================
+
+// A repository obtained just before clear_all_repositories must remain usable:
+// the shared_ptr copy keeps it alive past the map erase.
+TEST_CASE("data_repository_manager Repository Survives Clear All", "[data_repository_manager]")
+{
+  data_repository_manager manager;
+  size_t operator_id = 1;
+  manager.add_new_repository(operator_id, "default", std::make_unique<data_repository>());
+
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = data_batch::make(manager.get_next_data_batch_id(), std::move(data));
+  manager.add_data_batch(batch, {{operator_id, "default"}});
+
+  auto repo = manager.get_repository_shared(operator_id, "default");
+  REQUIRE(repo != nullptr);
+
+  manager.clear_all_repositories();
+  REQUIRE_THROWS_AS(manager.get_repository_shared(operator_id, "default"), std::out_of_range);
+
+  // The detached repository is still fully usable through the shared_ptr.
+  REQUIRE(repo->total_size() == 1);
+  auto pulled = repo->pop_next_data_batch();
+  REQUIRE(pulled != nullptr);
+  REQUIRE(repo->pop_next_data_batch() == nullptr);
+}
+
+// Hammer the locked accessor against concurrent add/clear churn. Pre-fix this
+// was a use-after-free of the map node (silent in release builds); post-fix
+// every successfully returned repository must stay dereferenceable.
+TEST_CASE("data_repository_manager Concurrent Get Vs Add And Clear", "[data_repository_manager]")
+{
+  data_repository_manager manager;
+  constexpr size_t num_operators = 8;
+  constexpr int num_iterations   = 2000;
+  constexpr int num_readers      = 4;
+
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> successful_gets{0};
+  std::atomic<uint64_t> failed_derefs{0};
+
+  // Writer: churn the map — register every operator, then clear them all.
+  std::thread writer([&] {
+    for (int iter = 0; iter < num_iterations; ++iter) {
+      for (size_t op = 0; op < num_operators; ++op) {
+        manager.add_new_repository(op, "default", std::make_unique<data_repository>());
+      }
+      manager.clear_all_repositories();
+    }
+    stop.store(true);
+  });
+
+  // Readers: race lookups against the churn and dereference every hit.
+  // (Catch2 assertion macros are not thread-safe — workers only count.)
+  std::vector<std::thread> readers;
+  for (int r = 0; r < num_readers; ++r) {
+    readers.emplace_back([&] {
+      while (!stop.load()) {
+        for (size_t op = 0; op < num_operators; ++op) {
+          try {
+            auto repo = manager.get_repository_shared(op, "default");
+            if (!repo) {
+              failed_derefs.fetch_add(1);
+              continue;
+            }
+            // Dereference: pre-fix this touched a freed map node when the
+            // writer's clear ran between lookup and use.
+            (void)repo->total_size();
+            successful_gets.fetch_add(1);
+          } catch (const std::out_of_range&) {
+            // The operator was between clear and re-add — expected.
+          }
+        }
+      }
+    });
+  }
+
+  writer.join();
+  for (auto& t : readers) {
+    t.join();
+  }
+
+  REQUIRE(failed_derefs.load() == 0);
+  // The interleave actually exercised the racy window.
+  REQUIRE(successful_gets.load() > 0);
 }

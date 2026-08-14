@@ -110,12 +110,15 @@ class data_repository_manager {
                           std::string_view port_id,
                           std::unique_ptr<repository_type> repository)
   {
-    std::unique_ptr<repository_type> old_repository;
+    // Stored as shared_ptr so accessors can hand out lifetime-safe references
+    // under _mutex (see get_repository_shared); callers keep passing
+    // unique_ptr because each repository still has exactly one logical owner.
+    std::shared_ptr<repository_type> shared_repository{std::move(repository)};
     {
       std::lock_guard<std::mutex> lock(_mutex);
       auto it = _repositories.find({operator_id, std::string(port_id)});
       if (it != _repositories.end()) { throw std::runtime_error("Repository already exists"); }
-      _repositories[{operator_id, std::string(port_id)}] = std::move(repository);
+      _repositories[{operator_id, std::string(port_id)}] = std::move(shared_repository);
     }
   }
 
@@ -139,22 +142,40 @@ class data_repository_manager {
   }
 
   /**
-   * @brief Get direct access to a repository for advanced operations.
+   * @brief Get lifetime-safe access to a repository for advanced operations.
    *
-   * Provides direct access to the underlying repository implementation, allowing
-   * for repository-specific operations that aren't covered by the common interface.
+   * Looks the repository up under _mutex and returns a shared_ptr copy, so the
+   * returned repository stays valid even if a concurrent add_new_repository or
+   * clear_all_repositories mutates the map after this call returns. (The old
+   * variant returned a reference into the map without taking _mutex — a
+   * concurrent mutation raced both the lookup and the returned reference.)
    *
    * @param operator_id The unique ID of the operator whose repository is requested
    * @param port_id The port identifier for the repository
-   * @return std::unique_ptr<repository_type>& Reference to the repository
+   * @return std::shared_ptr<repository_type> Shared ownership of the repository
    *
    * @throws std::out_of_range If no repository exists for the specified operator/port
-   * @note Thread-safe for read access, but modifications should use the repository's own thread
-   * safety
+   * @note Thread-safe — the lookup holds the manager mutex; the repository's own
+   *       thread safety covers subsequent operations on it
    */
-  std::unique_ptr<repository_type>& get_repository(size_t operator_id, std::string_view port_id)
+  std::shared_ptr<repository_type> get_repository_shared(size_t operator_id,
+                                                         std::string_view port_id)
   {
+    std::lock_guard<std::mutex> lock(_mutex);
     return _repositories.at({operator_id, std::string(port_id)});
+  }
+
+  /**
+   * @brief DEPRECATED — use get_repository_shared().
+   *
+   * Kept temporarily for source compatibility (callers used `.get()` / `->`,
+   * which keep compiling against the returned shared_ptr). Now forwards to the
+   * locked, lifetime-safe accessor; the historical signature returned a bare
+   * reference into the map without taking _mutex.
+   */
+  std::shared_ptr<repository_type> get_repository(size_t operator_id, std::string_view port_id)
+  {
+    return get_repository_shared(operator_id, port_id);
   }
 
   /**
@@ -244,8 +265,11 @@ class data_repository_manager {
   std::mutex _mutex;  ///< Mutex for thread-safe access
   std::atomic<uint64_t> _next_data_batch_id =
     0;  ///< Atomic counter for generating unique data batch identifiers
-  std::map<operator_port_key, std::unique_ptr<repository_type>>
-    _repositories;  ///< Map of operator ID to data_repository
+  /// Map of operator ID/port to data_repository. Held by shared_ptr so
+  /// get_repository_shared can hand out references that survive a concurrent
+  /// clear_all_repositories / add_new_repository (the manager remains the one
+  /// logical owner; accessors only extend lifetime across their use).
+  std::map<operator_port_key, std::shared_ptr<repository_type>> _repositories;
 };
 
 using shared_data_repository_manager = data_repository_manager;
