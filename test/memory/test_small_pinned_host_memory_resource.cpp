@@ -256,7 +256,6 @@ TEST_CASE("Large allocations do not interfere with slab pool", "[small_pinned]")
   constexpr std::size_t big_size   = 16384;
   constexpr std::size_t small_size = 512;
 
-  // Allocate a large chunk (goes to malloc)
   auto* big = f.slab_mr.allocate(rmm::cuda_stream_view{}, big_size);
   REQUIRE(big != nullptr);
 

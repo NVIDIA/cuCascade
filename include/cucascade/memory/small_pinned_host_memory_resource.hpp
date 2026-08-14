@@ -20,7 +20,11 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <cuda/memory_resource>
+#if __has_include(<cuda/stream>)
+#include <cuda/stream>
+#else
 #include <cuda/stream_ref>
+#endif
 #include <cuda_runtime_api.h>
 
 #include <array>
@@ -35,40 +39,19 @@ namespace cucascade {
 namespace memory {
 
 /**
- * @brief A pinned host memory allocator combining small slab pools with a bucketed reuse cache for
- * large allocations.
+ * @brief Provides pooled pinned host memory for small and large allocations
  *
- * Requests up to MAX_SLAB_SIZE are served from slab pools (SLAB_SIZES) of pinned host memory. Each
- * pool is populated on demand by acquiring one upstream block from the provided
- * fixed_size_host_memory_resource and carving it into slabs of the appropriate size.
+ * Requests up to `MAX_SLAB_SIZE` use slabs carved from the upstream resource. Larger requests whose
+ * power-of-two bucket fits the configured cache limit can reuse released `cudaHostAlloc` buffers.
+ * Requests whose bucket exceeds the limit allocate exactly the requested size and bypass the cache.
  *
- * Requests above MAX_SLAB_SIZE are rounded up to a power-of-two bucket (MIN_LARGE_BUCKET at
- * minimum) and served from per-bucket free lists of previously released `cudaHostAlloc` buffers;
- * misses allocate a fresh buffer. Released buffers are cached rather than freed, up to a
- * configurable byte limit, sparing callers such as cuDF's parquet reader the synchronous
- * `cudaHostAlloc` / `cudaFreeHost` cost on every request. Reuse in both the slab and large paths is
- * ordered by CUDA events recorded on the freeing stream, so a buffer is never handed out while
- * another stream may still be using it.
- *
- * Satisfies the ::cuda::mr::device_accessible and ::cuda::mr::host_accessible
- * properties, making it compatible with rmm::host_device_async_resource_ref
- * and suitable for use as cuDF's default pinned memory resource.
- *
- * Typical use:
- * @code
- *   small_pinned_host_memory_resource slab_mr(host_fixed_mr);
- *   cudf::set_pinned_memory_resource(slab_mr);
- *   cudf::set_allocate_host_as_pinned_threshold(
- *       small_pinned_host_memory_resource::MAX_SLAB_SIZE);
- * @endcode
- *
- * This eliminates the pageable H2D transfers that cuDF would otherwise issue
- * when building column_device_view metadata arrays for cudf::concatenate.
+ * Reuse is ordered after work submitted to the stream passed to `deallocate`. The resource
+ * satisfies the ::cuda::mr::device_accessible and ::cuda::mr::host_accessible properties required
+ * by rmm::host_device_async_resource_ref.
  */
 class small_pinned_host_memory_resource {
  public:
-  /// Maximum allocation size handled by the slab pools. Larger requests are served from the
-  /// large-allocation cache.
+  /// Largest request served by a slab pool.
   static constexpr std::size_t MAX_SLAB_SIZE = 8192;
 
   /// Smallest power-of-two bucket used for allocations above MAX_SLAB_SIZE.
@@ -78,11 +61,11 @@ class small_pinned_host_memory_resource {
   static constexpr std::size_t DEFAULT_LARGE_CACHE_LIMIT = 256ull << 20;
 
   /**
-   * @brief Construct with the upstream fixed-size host memory resource.
+   * @brief Constructs a pinned host memory resource
    *
    * @param upstream Block allocator backed by pinned host memory. Must outlive this object.
-   * @param large_cache_limit_bytes Maximum total bytes, measured in bucket sizes, retained by the
-   * large-allocation cache.
+   * @param large_cache_limit_bytes Maximum total bucket capacity retained for large allocations. A
+   * value below `MIN_LARGE_BUCKET` disables large-allocation caching.
    */
   explicit small_pinned_host_memory_resource(
     fixed_size_host_memory_resource& upstream,
@@ -93,45 +76,58 @@ class small_pinned_host_memory_resource {
   small_pinned_host_memory_resource(small_pinned_host_memory_resource&&)                 = delete;
   small_pinned_host_memory_resource& operator=(small_pinned_host_memory_resource&&)      = delete;
 
+  /**
+   * @brief Releases retained buffers and CUDA events
+   *
+   * All work using allocations returned by this resource must be complete, and no calls may be in
+   * flight when it is destroyed.
+   */
   ~small_pinned_host_memory_resource();
 
   /**
-   * @brief Allocate pinned memory.
+   * @brief Allocates pinned host memory
    *
-   * For @p bytes <= MAX_SLAB_SIZE: rounds up to the next slab boundary (512 / 1 KB / 2 KB / 4 KB /
-   * 8 KB) and returns a pointer from the matching free list, expanding the pool from upstream if
-   * the list is empty.
+   * Requests up to `MAX_SLAB_SIZE` are rounded to the next slab size. A larger request is rounded
+   * to its power-of-two bucket only when that bucket fits the cache limit; otherwise the resource
+   * allocates exactly @p bytes. If a direct pinned allocation fails, retained large buffers are
+   * released and the allocation is retried once.
    *
-   * For @p bytes > MAX_SLAB_SIZE: rounds up to the power-of-two bucket and, when the bucket fits
-   * within the cache limit, returns a cached buffer when the bucket's free list has one, making @p
-   * stream wait on the buffer's ready event first. On a miss (or a never-cacheable size, which
-   * skips the cache lookup), allocates a fresh buffer of large_allocation_size(bytes) with
-   * `cudaHostAlloc(Portable | Mapped)`; if that fails, purges the entire large cache and retries
-   * once before throwing std::bad_alloc.
+   * @throw std::bad_alloc If a direct pinned allocation still fails after retained buffers are
+   * released
+   *
+   * @param stream CUDA stream on which reuse dependencies are inserted
+   * @param bytes Number of bytes requested
+   * @param alignment Requested alignment; currently not used to select storage
+   * @return Pointer to at least @p bytes bytes of pinned memory, or `nullptr` when @p bytes is zero
    */
   void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t));
 
   /**
-   * @brief Return memory to the appropriate free list.
+   * @brief Deallocates pinned host memory
    *
-   * Slabs (@p bytes <= MAX_SLAB_SIZE) are returned to the slab free list. Larger buffers are cached
-   * in their bucket's free list, evicting the oldest cached entries (in insertion order across
-   * buckets) when the total would exceed the cache limit; a buffer whose bucket alone exceeds the
-   * limit is freed with `cudaFreeHost` instead. Both paths record an event on @p stream so reuse
-   * waits for pending work on the buffer. When no event can be recorded, @p stream is synchronized
-   * instead (best effort); a large buffer is then freed rather than cached and a slab is cached
-   * carrying no pending work, so a cached entry never carries pending work that reuse cannot order
-   * against.
+   * Cacheable buffers are retained for reuse, while large buffers whose bucket exceeds the cache
+   * limit are released. The caller must order every prior access to @p ptr before or on @p stream.
    *
-   * @p bytes must equal the value passed to the corresponding allocate.
+   * @param stream CUDA stream ordered after the final use of @p ptr
+   * @param ptr Pointer returned by this resource, or `nullptr` for a no-op
+   * @param bytes Original requested allocation size; must match the corresponding call to
+   * `allocate`
+   * @param alignment Original requested alignment
    */
   void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
+  /**
+   * @brief Allocates pinned host memory and synchronizes the default stream
+   *
+   * @param bytes Number of bytes requested
+   * @param alignment Requested alignment; currently not used to select storage
+   * @return Pointer to at least @p bytes bytes of pinned memory, or `nullptr` when @p bytes is zero
+   */
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
     auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
@@ -139,6 +135,13 @@ class small_pinned_host_memory_resource {
     return ptr;
   }
 
+  /**
+   * @brief Deallocates pinned host memory and synchronizes the default stream
+   *
+   * @param ptr Pointer returned by this resource, or `nullptr` for a no-op
+   * @param bytes Original requested allocation size
+   * @param alignment Original requested alignment
+   */
   void deallocate_sync(void* ptr,
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
@@ -147,13 +150,27 @@ class small_pinned_host_memory_resource {
     rmm::cuda_stream_default.synchronize_no_throw();
   }
 
-  /// Total bytes currently held in the large-allocation cache, measured in bucket sizes.
+  /**
+   * @brief Returns the large-buffer capacity currently accounted to the cache
+   *
+   * This excludes slab storage, live allocations, and entries already removed for eviction or
+   * purge.
+   *
+   * @return Sum of bucket sizes for cached entries available for reuse
+   */
   [[nodiscard]] std::size_t large_cache_bytes() const;
 
+  /**
+   * @brief Compares memory resource identity
+   *
+   * @param other Resource to compare
+   * @return `true` if @p other is this resource
+   */
   bool operator==(small_pinned_host_memory_resource const& other) const noexcept;
 
   /**
-   * @brief Declares that memory allocated here is accessible from GPU devices.
+   * @brief Enables the ::cuda::mr::device_accessible property
+   *
    * Required to satisfy rmm::host_device_async_resource_ref.
    */
   friend void get_property(small_pinned_host_memory_resource const&,
@@ -162,7 +179,8 @@ class small_pinned_host_memory_resource {
   }
 
   /**
-   * @brief Declares that memory allocated here is accessible from the host.
+   * @brief Enables the ::cuda::mr::host_accessible property
+   *
    * Required to satisfy rmm::host_device_async_resource_ref.
    */
   friend void get_property(small_pinned_host_memory_resource const&,
@@ -173,104 +191,86 @@ class small_pinned_host_memory_resource {
   /// Slab sizes in ascending order.
   static constexpr std::array<std::size_t, 5> SLAB_SIZES{512, 1024, 2048, 4096, 8192};
 
-  /// Returns the index into SLAB_SIZES of the smallest slab >= bytes.
+  /**
+   * @brief Finds the smallest slab that can satisfy a request
+   *
+   * @param bytes Request size no greater than `MAX_SLAB_SIZE`
+   * @return Index of the matching entry in `SLAB_SIZES`
+   */
   static std::size_t slab_index_for(std::size_t bytes) noexcept;
 
-  /// Returns the bucket for a request above MAX_SLAB_SIZE: the smallest power of two >= bytes, no
-  /// smaller than MIN_LARGE_BUCKET. The bucket is used for cache keying and eviction accounting;
-  /// the physical size is large_allocation_size(bytes), equal to the bucket only for cacheable
-  /// requests. allocate and deallocate both derive the bucket from the request size, so the pairing
-  /// is deterministic.
+  /**
+   * @brief Computes the cache bucket for a large request
+   *
+   * @param bytes Request size greater than `MAX_SLAB_SIZE`
+   * @return Smallest representable power of two no less than @p bytes and `MIN_LARGE_BUCKET`, or @p
+   * bytes when the next power of two is not representable
+   */
   static std::size_t large_bucket_size_for(std::size_t bytes) noexcept;
 
-  /// Returns the physical size cudaHostAlloc is asked for on a cache miss: the bucket when it fits
-  /// within the cache limit, otherwise exactly @p bytes. A never-cacheable allocation gains nothing
-  /// from bucket rounding and must not overshoot pinned memory (up to 2x for sizes just past a
-  /// bucket boundary). Reads only the immutable cache limit, so no lock is needed.
+  /**
+   * @brief Computes the storage size for a direct large allocation
+   *
+   * @param bytes Requested allocation size
+   * @return Cache bucket size when it fits the limit, or @p bytes otherwise
+   */
   [[nodiscard]] std::size_t large_allocation_size(std::size_t bytes) const noexcept;
 
-  /// Populate the free list for slab @p idx by acquiring one upstream block.
-  /// Must be called with mutex_ held.
+  /// Populates slab pool @p slab_idx from an upstream block. Must hold @c mutex_.
   void expand_pool_locked(std::size_t slab_idx);
 
-  /// A CUDA event paired with the device whose context owns it. cudaEventRecord requires the event
-  /// and the stream to share a CUDA context, so pooled events are segregated by device and an event
-  /// is only ever recorded on a stream of its own device. @c device is meaningful only when @c
-  /// handle is non-null.
+  /// CUDA event and the device on which it was created. Recording succeeds only on a stream
+  /// associated with the same device.
   struct device_event {
     cudaEvent_t handle{nullptr};
     int device{-1};
   };
 
-  /// A free slab plus, when it was just deallocated, a CUDA event recorded on
-  /// the freeing stream. Reusing the slab must wait on this event so an
-  /// in-flight async H2D copy that still reads the slab (e.g. cuDF's parquet
-  /// stats min/max buffers) completes before another stream overwrites it.
-  /// A null @c ready.handle means the slab carries no pending work: it was
-  /// freshly carved and never used, or the freeing stream was synchronized
-  /// before the slab was cached.
+  /// Slab available for reuse and an optional event recording its previous use.
   struct free_slab {
     void* ptr;
     device_event ready;
   };
 
-  /// A released large buffer held for reuse. Like @c free_slab, @c ready captures the freeing
-  /// stream's last use of the buffer; unlike a slab, a large buffer is never cached without a
-  /// recorded event (deallocate frees it instead), so @c ready.handle is non-null for every cached
-  /// entry. @c sequence orders entries across buckets so eviction can drop the oldest first.
+  /// Large buffer available for reuse, its required dependency, and its insertion order.
   struct large_cache_entry {
     void* ptr;
     device_event ready;
     std::uint64_t sequence;
   };
 
-  /// Borrow a timing-disabled CUDA event owned by the calling thread's current device (recycled
-  /// from @c event_pools_ or newly created). Returns a null handle when the device query or event
-  /// creation fails; the caller then falls back to freeing (large path) or synchronizing (slab
-  /// path) instead of caching with ordering. Must hold @c mutex_.
+  /// Borrows a timing-disabled event created on the current device. Returns an empty event if the
+  /// device query or event creation fails. Must hold @c mutex_.
   device_event acquire_event_locked();
 
-  /// Return an event to its device's pool in @c event_pools_ for reuse. Must hold @c mutex_.
+  /// Returns an event to its device's pool in @c event_pools_ for reuse. Must hold @c mutex_.
   void release_event_locked(device_event event) noexcept;
 
-  /// Pop the oldest cached buffer of @p bucket and make @p stream wait on its ready event,
-  /// recycling the event. Returns null when the bucket has no cached entries. Must hold @c mutex_.
+  /// Removes the oldest entry in @p bucket and orders @p stream after its ready event. Returns
+  /// `nullptr` when the bucket is empty. Must hold @c mutex_.
   void* try_take_cached_large_locked(std::size_t bucket, ::cuda::stream_ref stream);
 
-  /// Remove the oldest cached large buffer across all buckets from the bookkeeping and return it
-  /// with its ready event still attached, for the caller to pass to sync_and_free_large_victim
-  /// outside the lock and then recycle the event. Returns a null-ptr entry when the cache is empty.
-  /// Must hold @c mutex_.
+  /// Removes and returns the oldest entry across all buckets. Returns an entry with a null pointer
+  /// when the cache is empty. Must hold @c mutex_.
   large_cache_entry evict_oldest_large_locked() noexcept;
 
-  /// Remove every cached large buffer from the bookkeeping and return them with their ready events
-  /// still attached, for the caller to pass to sync_and_free_large_victim outside the lock and then
-  /// recycle the events. Must hold @c mutex_.
+  /// Removes and returns every cached large buffer. Must hold @c mutex_.
   std::vector<large_cache_entry> purge_large_cache_locked();
 
-  /// Wait for a victim's recorded work and free its buffer. The ready event may have been recorded
-  /// on any device's stream, so the buffer is not unpinned until the event has completed
-  /// (best-effort: a failed or null event skips the wait). Must be called without @c mutex_ held;
-  /// the caller recycles the event afterwards.
+  /// Waits for @p victim's ready event, when present, and frees its buffer. If the wait fails,
+  /// freeing proceeds as a best-effort fallback. Must be called without @c mutex_ held.
   static void sync_and_free_large_victim(large_cache_entry const& victim) noexcept;
 
   fixed_size_host_memory_resource& upstream_;
   mutable std::mutex mutex_;
   std::array<std::vector<free_slab>, 5> free_lists_{};
 
-  /// Idle recycled events keyed by the device that owns them. Events are created in the calling
-  /// thread's current context, so acquire_event_locked keys by cudaGetDevice() at acquire time;
-  /// this avoids cudaSetDevice churn, and in deployment the calling thread's current device is its
-  /// stream's device (the NUMA dispatcher routes by cudaGetDevice()). Should a caller ever pass a
-  /// stream of another device, the record fails and the safe fallback engages, so correctness never
-  /// depends on the key, only cache-hit rate.
+  // Recycled events grouped by the device on which they were created.
   std::map<int, std::vector<cudaEvent_t>> event_pools_;
 
   std::vector<fixed_multiple_blocks_allocation> owned_allocations_;
 
-  /// Large-allocation cache: per-bucket free lists keyed by bucket size, the current total in
-  /// bucket bytes, the retention cap, and a monotonic counter stamping insertion order for
-  /// eviction.
+  // Large-allocation cache and its bucket-capacity accounting.
   std::map<std::size_t, std::deque<large_cache_entry>> large_cache_;
   std::size_t large_cache_bytes_ = 0;
   std::size_t const large_cache_limit_bytes_;
