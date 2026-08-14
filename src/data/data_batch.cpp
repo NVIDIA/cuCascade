@@ -65,6 +65,20 @@ size_t data_batch::get_subscriber_count() const
   return _subscriber_count.load(std::memory_order_relaxed);
 }
 
+// ========== Consumer-event API ==========
+
+void data_batch::record_consumer_event(rmm::cuda_stream_view consumer_stream)
+{
+  _consumer_events.record(consumer_stream);
+}
+
+void data_batch::await_consumers(rmm::cuda_stream_view stream)
+{
+  _consumer_events.enqueue_waits(stream);
+}
+
+bool data_batch::consumers_done() const { return _consumer_events.is_done(); }
+
 // ========== data_batch private data accessors ==========
 
 memory::Tier data_batch::get_current_tier() const { return _data->get_current_tier(); }
@@ -80,6 +94,13 @@ memory::memory_space* data_batch::get_memory_space() const
 void data_batch::set_data(std::unique_ptr<idata_representation> data)
 {
   if (data == nullptr) { throw std::runtime_error("data is null in data_batch::set_data"); }
+  // CONSUMER-EVENTS: the old representation is destroyed here while the batch object
+  // survives, and consumers may still have reads of its buffers in flight on their own
+  // streams. No stream is available in this path to enqueue device-side waits on, so
+  // conservatively block the host until all recorded consumer events complete. This is
+  // a no-op (one mutex lock) for batches that never recorded a consumer event, and the
+  // caller holds the exclusive lock, so no new consumer can record concurrently.
+  _consumer_events.synchronize();
   _data = std::move(data);
   _probe->data_replaced(*_data);
 }
