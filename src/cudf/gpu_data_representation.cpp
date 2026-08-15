@@ -25,28 +25,6 @@
 
 namespace cucascade {
 
-namespace {
-
-/**
- * @brief Rebind every column of @p table so its device buffers deallocate on @p stream.
- *
- * cudf::table move-assignment is deleted, so release the columns, rebind each (cudf::rebind_stream
- * recursively covers data buffers, null masks, and nested children), and rebuild the table in
- * place. No device memory is copied and no kernels are launched. Does not insert cross-stream
- * ordering.
- */
-void rebind_table_to_stream(std::unique_ptr<cudf::table>& table, rmm::cuda_stream_view stream)
-{
-  if (!table || table->num_columns() == 0) { return; }
-  auto columns = table->release();
-  for (auto& col : columns) {
-    col = cudf::rebind_stream(std::move(*col), stream);
-  }
-  table = std::make_unique<cudf::table>(std::move(columns));
-}
-
-}  // namespace
-
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
                                                    cucascade::memory::memory_space& memory_space,
                                                    rmm::cuda_stream_view writer_stream)
@@ -107,7 +85,7 @@ std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_s
     // that destroying (parts of) the returned table enqueues frees in the caller's stream
     // order instead of retiring instantly on the idle foreign stream, where the allocator
     // could recycle the blocks under the caller's in-flight kernels.
-    rebind_table_to_stream(std::get<std::unique_ptr<cudf::table>>(_table), stream);
+    gpu_table_representation::rebind_stream(stream);
   }
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
 }
@@ -118,7 +96,16 @@ void gpu_table_representation::rebind_stream(rmm::cuda_stream_view stream)
   // references memory owned by an external (type-erased) owner, which manages its own
   // deallocation stream.
   if (!std::holds_alternative<std::unique_ptr<cudf::table>>(_table)) { return; }
-  rebind_table_to_stream(std::get<std::unique_ptr<cudf::table>>(_table), stream);
+  auto& table = std::get<std::unique_ptr<cudf::table>>(_table);
+  if (!table || table->num_columns() == 0) { return; }
+
+  // cudf::table move-assignment is deleted, so release the columns, rebind each, and rebuild
+  // the table in place. No device memory is copied and no kernels are launched.
+  auto columns = table->release();
+  for (auto& col : columns) {
+    col = cudf::rebind_stream(std::move(*col), stream);
+  }
+  table = std::make_unique<cudf::table>(std::move(columns));
 }
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)

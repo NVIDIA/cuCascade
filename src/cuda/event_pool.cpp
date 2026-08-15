@@ -29,14 +29,9 @@ void event_pool::record(rmm::cuda_stream_view stream)
   // Opportunistically recycle before taking from the pool so steady-state usage
   // converges to a handful of events instead of growing without bound.
   recycle_completed_locked();
-  cuda_event event = [this]() {
-    if (!available_.empty()) {
-      cuda_event recycled = std::move(available_.back());
-      available_.pop_back();
-      return recycled;
-    }
-    return cuda_event{cudaEventDisableTiming};
-  }();
+  if (available_.empty()) { available_.emplace_back(cudaEventDisableTiming); }
+  cuda_event event = std::move(available_.back());
+  available_.pop_back();
   event.record(stream);
   outstanding_.push_back(std::move(event));
 }
