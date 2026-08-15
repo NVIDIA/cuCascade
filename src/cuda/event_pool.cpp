@@ -17,6 +17,7 @@
 
 #include <cucascade/cuda/event_pool.hpp>
 
+#include <cassert>
 #include <mutex>
 #include <utility>
 
@@ -58,6 +59,20 @@ void event_pool::synchronize()
     available_.push_back(std::move(event));
   }
   outstanding_.clear();
+}
+
+void event_pool::synchronize_no_throw() noexcept
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  // No recycling: pushing into available_ may allocate, which a noexcept
+  // destructor context must not risk. Completed events stay outstanding and are
+  // recycled by the next record() / enqueue_waits().
+  for (auto& event : outstanding_) {
+    // Destructor discipline (as CUCASCADE_ASSERT_CUDA_SUCCESS): assert in debug
+    // builds, discard the error in release — never throw.
+    [[maybe_unused]] cudaError_t const status = event.synchronize_no_throw();
+    assert(status == cudaSuccess);
+  }
 }
 
 bool event_pool::is_done() const

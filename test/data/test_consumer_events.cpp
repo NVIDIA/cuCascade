@@ -671,6 +671,20 @@ TEST_CASE("set_data host-syncs pending consumer reads before destroying the old 
   fixture.verify_no_premature_reclaim();
 }
 
+TEST_CASE("~data_batch host-syncs pending consumer reads before destroying the representation",
+          "[consumer_events][data_batch][reclaim]")
+{
+  pending_consumer_read fixture;
+  REQUIRE_FALSE(fixture.batch->consumers_done());
+
+  // Plain destruction: drop the last reference without any reclaimer transition
+  // (no convert_to / set_data). The destructor itself must block on the recorded
+  // read before the poisoning representation is destroyed.
+  fixture.batch.reset();
+
+  fixture.verify_no_premature_reclaim();
+}
+
 // =============================================================================
 // Negative / edge cases
 // =============================================================================

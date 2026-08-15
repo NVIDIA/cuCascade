@@ -88,7 +88,15 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
     std::unique_ptr<idata_representation> data,
     std::unique_ptr<idata_batch_probe> probe = std::make_unique<idata_batch_probe>());
 
-  ~data_batch() = default;
+  /**
+   * @brief Destructor. Host-syncs any outstanding consumer events (never throws).
+   *
+   * Plain destruction is the one reclaim path that does not go through
+   * install_converted_representation / set_data, so it must block on recorded
+   * consumer reads itself before the member representation (and its buffers) is
+   * destroyed. Free (a mutex lock) for batches that never recorded a consumer event.
+   */
+  ~data_batch();
 
   // -- Deleted move/copy --
   data_batch(data_batch&&)                 = delete;
@@ -174,6 +182,8 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   //   - Consumer events complement rebind_stream (see mutable_data_batch::rebind_stream):
   //     rebinding only moves which stream frees the buffers and inserts NO cross-stream
   //     ordering; await_consumers supplies that ordering device-side.
+  //   - Plain destruction (~data_batch) host-syncs outstanding consumer events itself,
+  //     so dropping the last reference without a reclaimer transition is also safe.
   //
   // These methods are internally synchronized by their own mutex and are independent of
   // the reader-writer lock — like subscribe()/unsubscribe() they may be called on the

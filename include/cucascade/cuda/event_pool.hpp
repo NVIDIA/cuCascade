@@ -87,6 +87,16 @@ class event_pool {
   void synchronize();
 
   /**
+   * @brief Like synchronize(), but never throws — for noexcept / destructor contexts.
+   *
+   * CUDA errors are handled with the destructor discipline (asserted in debug builds,
+   * discarded in release). Allocation-free: completed events are left outstanding
+   * rather than recycled; a later record() or enqueue_waits() recycles them. No-op
+   * (a mutex lock) when nothing is outstanding.
+   */
+  void synchronize_no_throw() noexcept;
+
+  /**
    * @brief True if no outstanding event is still pending on the device.
    *
    * Non-blocking: polls each outstanding event with cudaEventQuery. Only events whose

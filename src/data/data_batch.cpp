@@ -42,6 +42,15 @@ data_batch::data_batch(uint64_t batch_id,
   _probe->created(get_batch_id(), *get_data());
 }
 
+data_batch::~data_batch()
+{
+  // Consumers may still have recorded reads of _data's buffers in flight on their
+  // own streams; _data is destroyed after this body runs, so block the host on them
+  // first. No lock is needed: reaching the destructor means no accessor (and thus no
+  // recorder) can still exist. noexcept-safe via the pool's no-throw sync.
+  _consumer_events.synchronize_no_throw();
+}
+
 uint64_t data_batch::get_batch_id() const { return _batch_id; }
 
 void data_batch::subscribe() { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
