@@ -121,13 +121,6 @@ class small_pinned_host_memory_resource {
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
-  /**
-   * @brief Allocates pinned host memory and synchronizes the default stream
-   *
-   * @param bytes Number of bytes requested
-   * @param alignment Requested alignment; currently not used to select storage
-   * @return Pointer to at least @p bytes bytes of pinned memory, or `nullptr` when @p bytes is zero
-   */
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
     auto* ptr = allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
@@ -135,13 +128,6 @@ class small_pinned_host_memory_resource {
     return ptr;
   }
 
-  /**
-   * @brief Deallocates pinned host memory and synchronizes the default stream
-   *
-   * @param ptr Pointer returned by this resource, or `nullptr` for a no-op
-   * @param bytes Original requested allocation size
-   * @param alignment Original requested alignment
-   */
   void deallocate_sync(void* ptr,
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
@@ -160,17 +146,10 @@ class small_pinned_host_memory_resource {
    */
   [[nodiscard]] std::size_t large_cache_bytes() const;
 
-  /**
-   * @brief Compares memory resource identity
-   *
-   * @param other Resource to compare
-   * @return `true` if @p other is this resource
-   */
   bool operator==(small_pinned_host_memory_resource const& other) const noexcept;
 
   /**
-   * @brief Enables the ::cuda::mr::device_accessible property
-   *
+   * @brief Declares that memory allocated here is accessible from GPU devices.
    * Required to satisfy rmm::host_device_async_resource_ref.
    */
   friend void get_property(small_pinned_host_memory_resource const&,
@@ -179,8 +158,7 @@ class small_pinned_host_memory_resource {
   }
 
   /**
-   * @brief Enables the ::cuda::mr::host_accessible property
-   *
+   * @brief Declares that memory allocated here is accessible from the host.
    * Required to satisfy rmm::host_device_async_resource_ref.
    */
   friend void get_property(small_pinned_host_memory_resource const&,
@@ -191,12 +169,7 @@ class small_pinned_host_memory_resource {
   /// Slab sizes in ascending order.
   static constexpr std::array<std::size_t, 5> SLAB_SIZES{512, 1024, 2048, 4096, 8192};
 
-  /**
-   * @brief Finds the smallest slab that can satisfy a request
-   *
-   * @param bytes Request size no greater than `MAX_SLAB_SIZE`
-   * @return Index of the matching entry in `SLAB_SIZES`
-   */
+  /// Returns the index into SLAB_SIZES of the smallest slab >= bytes.
   static std::size_t slab_index_for(std::size_t bytes) noexcept;
 
   /**
