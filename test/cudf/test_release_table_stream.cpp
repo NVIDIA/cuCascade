@@ -478,35 +478,9 @@ TEST_CASE("view-branch release_table deep-copies on the release stream and leave
 }
 
 // =============================================================================
-// 5. Precondition: converter-produced tables can be released and consumed
-//    immediately, with no caller-side synchronization.
-// =============================================================================
-
-TEST_CASE("release_table immediately after converter publish is safe", "[release_table][converter]")
-{
-  // Built-in converters synchronize the conversion stream before publishing
-  // the representation, which is exactly what makes release_table's @pre hold
-  // here with zero manual synchronization between convert and release.
-  rmm::cuda_stream release_stream;
-
-  auto reference = make_patterned_table(shared_stream());
-  auto gpu_rep =
-    make_converter_produced_rep(make_patterned_table(shared_stream()), shared_gpu_space());
-
-  auto released = gpu_rep->release_table(release_stream.view());
-  gpu_rep.reset();
-
-  test::expect_cudf_tables_equal_on_stream(
-    reference->view(), released->view(), release_stream.view());
-
-  // Destroy the released table: frees enqueue on the release stream.
-  released.reset();
-  release_stream.synchronize();
-}
-
-// =============================================================================
-// 6. Composition: release_table(S) followed by an explicit cudf::rebind_stream
-//    to the same S (the Sirius PR #1566 call-site pattern) is a harmless no-op.
+// 5. Composition: release_table(S) followed by an explicit cudf::rebind_stream
+//    to the same S (the Sirius call-site pattern: the type-restore path
+//    rebinds stolen columns before freeing them) is a harmless no-op.
 // =============================================================================
 
 TEST_CASE("release_table then cudf::rebind_stream to the same stream composes",

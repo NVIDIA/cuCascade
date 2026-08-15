@@ -19,9 +19,13 @@
 // await_consumers / consumers_done (and the accessor delegates), backed by
 // cucascade::cuda::event_pool. Covers:
 //   - event_pool semantics (record / enqueue_waits / synchronize / is_done,
-//     recycling, thread safety, empty fast path)
-//   - data_batch API basics (pending-read visibility, device-side gating of a
-//     reclaimer stream, multi-consumer / multi-thread recording)
+//     recycling, thread safety, empty fast path). event_pool is the canonical
+//     layer for recycling and single-event gating; the data_batch tests below
+//     only add what the batch layer contributes (lock interplay, accessors,
+//     multi-consumer bookkeeping, reclaim hooks).
+//   - data_batch API: trivial fast path, multi-consumer pending visibility +
+//     device-side gating of a reclaimer stream (through the accessors),
+//     multi-thread recording under shared locks
 //   - reclaim-hook integration: install_converted_representation (GPU-tier
 //     sync path AND the non-GPU-tier else-branch host sync) and set_data must
 //     not destroy the old representation while consumer reads are in flight
@@ -471,74 +475,11 @@ TEST_CASE("data_batch consumer events trivial fast path when nothing was recorde
   REQUIRE(batch->consumers_done());
 }
 
-TEST_CASE("data_batch consumers_done reflects a pending consumer read",
-          "[consumer_events][data_batch]")
-{
-  auto batch = make_mock_batch();
-  rmm::cuda_stream consumer;
-  device_buffer_raw scratch(64);
-
-  stream_gate gate;
-  {
-    gate_guard guard{gate, consumer.view()};
-
-    auto ro = batch->to_read_only();
-    enqueue_gate(consumer.view(), gate);
-    CUCASCADE_CUDA_TRY(cudaMemsetAsync(scratch.ptr, 0xAB, scratch.bytes, consumer.value()));
-    ro.record_consumer_event(consumer.view());
-
-    // Gated: the consumer's read cannot have completed yet.
-    REQUIRE_FALSE(batch->consumers_done());
-    REQUIRE_FALSE(ro.consumers_done());
-
-    gate.release();
-    consumer.synchronize();
-    REQUIRE(batch->consumers_done());
-    REQUIRE(ro.consumers_done());
-  }
-}
-
-TEST_CASE("data_batch await_consumers gates reclaim-side work on the awaiting stream",
-          "[consumer_events][data_batch]")
-{
-  auto batch = make_mock_batch();
-  rmm::cuda_stream consumer;
-  rmm::cuda_stream reclaimer;
-
-  device_buffer_raw flag(1);
-  pinned_buffer observed(1);
-  CUCASCADE_CUDA_TRY(cudaMemset(flag.ptr, 0, 1));
-  observed.data()[0] = 0xEE;
-
-  stream_gate gate;
-  {
-    gate_guard guard{gate, consumer.view()};
-
-    {
-      auto ro = batch->to_read_only();
-      enqueue_gate(consumer.view(), gate);
-      CUCASCADE_CUDA_TRY(cudaMemsetAsync(flag.ptr, 1, 1, consumer.value()));
-      ro.record_consumer_event(consumer.view());
-    }  // shared lock released; the read is still in flight
-
-    // Reclaimer path: exclusive lock, then device-side waits before the "free"
-    // (modeled here as a read-back of the flag the consumer writes last).
-    auto mut = batch->to_mutable();
-    mut.await_consumers(reclaimer.view());
-    CUCASCADE_CUDA_TRY(
-      cudaMemcpyAsync(observed.ptr, flag.ptr, 1, cudaMemcpyDeviceToHost, reclaimer.value()));
-
-    // Blocked while the consumer is gated: the wait is real.
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    REQUIRE(cudaStreamQuery(reclaimer.value()) == cudaErrorNotReady);
-
-    gate.release();
-    reclaimer.synchronize();
-    REQUIRE(observed.data()[0] == 1);
-    REQUIRE(batch->consumers_done());
-  }
-}
-
+// The single-consumer pending-visibility and await-gating cases are strict
+// subsets of this multi-consumer test; their unique accessor-path coverage
+// (ro.consumers_done() while pending, mut.await_consumers under load) is
+// folded in here. The underlying single-event device-side gating primitive is
+// pinned at the event_pool layer above.
 TEST_CASE("data_batch awaits every consumer across multiple streams",
           "[consumer_events][data_batch]")
 {
@@ -579,9 +520,16 @@ TEST_CASE("data_batch awaits every consumer across multiple streams",
                                          consumers[static_cast<std::size_t>(i)].value()));
       ro.record_consumer_event(consumers[static_cast<std::size_t>(i)].view());
     }
-  }
+    // Gated: pending reads are visible through the read-only accessor too.
+    REQUIRE_FALSE(ro.consumers_done());
+  }  // shared lock released; the reads are still in flight
 
-  batch->await_consumers(reclaimer.view());
+  // Reclaimer path: exclusive lock, then device-side waits before the "free"
+  // (modeled here as a read-back of the flags each consumer writes last).
+  {
+    auto mut = batch->to_mutable();
+    mut.await_consumers(reclaimer.view());
+  }
   CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
     observed.ptr, flags.ptr, kConsumers, cudaMemcpyDeviceToHost, reclaimer.value()));
 
@@ -649,23 +597,6 @@ TEST_CASE("data_batch record_consumer_event is thread-safe under concurrent reco
   rmm::cuda_stream check_stream;
   batch->await_consumers(check_stream.view());
   check_stream.synchronize();
-  REQUIRE(batch->consumers_done());
-}
-
-TEST_CASE("data_batch sequential record/complete cycles stay correct (event recycling)",
-          "[consumer_events][data_batch]")
-{
-  auto batch = make_mock_batch();
-  rmm::cuda_stream stream;
-  device_buffer_raw scratch(64);
-
-  for (int i = 0; i < 1000; ++i) {
-    CUCASCADE_CUDA_TRY(
-      cudaMemsetAsync(scratch.ptr, static_cast<int>(i & 0xFF), scratch.bytes, stream.value()));
-    batch->record_consumer_event(stream.view());
-    stream.synchronize();
-    if (i % 100 == 0) { REQUIRE(batch->consumers_done()); }
-  }
   REQUIRE(batch->consumers_done());
 }
 
