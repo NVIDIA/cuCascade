@@ -448,8 +448,9 @@ manager.add_new_repository(0, "output", std::make_unique<data_repository>());
 manager.add_new_repository(1, "input", std::make_unique<data_repository>());
 manager.add_new_repository(1, "output", std::make_unique<data_repository>());
 
-// Access a specific repository
-auto& repo = manager.get_repository(1, "input");
+// Access a specific repository (lifetime-safe shared_ptr, looked up under the
+// manager mutex)
+auto repo = manager.get_repository_shared(1, "input");
 ```
 
 ### Batch ID Generation

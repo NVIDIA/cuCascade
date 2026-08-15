@@ -21,7 +21,6 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -166,19 +165,6 @@ class data_repository_manager {
   }
 
   /**
-   * @brief DEPRECATED — use get_repository_shared().
-   *
-   * Kept temporarily for source compatibility (callers used `.get()` / `->`,
-   * which keep compiling against the returned shared_ptr). Now forwards to the
-   * locked, lifetime-safe accessor; the historical signature returned a bare
-   * reference into the map without taking _mutex.
-   */
-  std::shared_ptr<repository_type> get_repository(size_t operator_id, std::string_view port_id)
-  {
-    return get_repository_shared(operator_id, port_id);
-  }
-
-  /**
    * @brief Generate a globally unique data batch identifier.
    *
    * Returns a monotonically increasing ID that's unique across all pipelines
@@ -224,23 +210,6 @@ class data_repository_manager {
   }
 
   /**
-   * @brief Iterate over all repositories, calling the visitor for each one.
-   *
-   * The visitor receives a raw pointer to each repository. The visitor must not
-   * remove or add repositories during iteration.
-   *
-   * @param visitor Callback invoked for each repository
-   * @note Thread-safe — holds the manager mutex for the duration of iteration.
-   */
-  void for_each_repository(std::function<void(repository_type*)> visitor)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& [key, repo] : _repositories) {
-      if (repo) { visitor(repo.get()); }
-    }
-  }
-
-  /**
    * @brief Get a snapshot of all current repository pointers.
    *
    * Returns a vector of raw pointers to each non-null repository. The vector
@@ -272,6 +241,11 @@ class data_repository_manager {
   std::map<operator_port_key, std::shared_ptr<repository_type>> _repositories;
 };
 
+/// Compatibility alias, NOT a distinct type: kept so call sites written
+/// against the pre-merge class keep compiling. Since the map moved to
+/// shared_ptr storage the "shared" in the name is loosely true (accessors hand
+/// out lifetime-safe shared_ptr copies), but the manager remains each
+/// repository's one logical owner. Prefer `data_repository_manager` in new code.
 using shared_data_repository_manager = data_repository_manager;
 
 }  // namespace cucascade

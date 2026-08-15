@@ -316,6 +316,10 @@ class data_repository {
     _data_batches;  ///< Container for data batch pointers (partitioned)
 };
 
+/// Compatibility alias, NOT a distinct type: the historical class that stored
+/// `shared_ptr<data_batch>` was merged into data_repository (which now always
+/// does — one batch can sit in several repositories on fan-out). Kept so old
+/// call sites keep compiling; prefer `data_repository` in new code.
 using shared_data_repository = data_repository;
 
 }  // namespace cucascade
