@@ -22,6 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 
@@ -86,6 +87,12 @@ class exclusive_stream_pool {
    *
    * This function is thread safe with respect to other calls to the same function.
    *
+   * BLOCK-policy checkout is starvation-free: callers that find the pool empty take a FIFO
+   * ticket, and a released stream is handed to the longest-waiting caller. A caller that
+   * releases a stream and immediately re-acquires therefore queues behind every already-parked
+   * waiter instead of racing them for the freed stream. GROW-policy callers never wait and
+   * never take a pooled stream a parked waiter is owed — they mint a fresh stream instead.
+   *
    * @return rmm::cuda_stream_view
    */
   borrowed_stream acquire_stream(
@@ -103,6 +110,12 @@ class exclusive_stream_pool {
   // Streams are acquired from the front and returned to the back so the pool cycles through
   // all streams round-robin, rather than repeatedly reusing the most-recently-returned one.
   std::deque<rmm::cuda_stream> _streams;
+  // FIFO ticket handoff for BLOCK-policy checkout. Every BLOCK caller draws a ticket under
+  // _mutex; only the caller whose ticket equals _grant_ticket may take a stream, so waiters are
+  // served strictly in arrival order (one shared CV would otherwise wake an arbitrary waiter
+  // and let it win the race — a busy caller's re-acquire could starve a parked one forever).
+  std::uint64_t _next_ticket{0};
+  std::uint64_t _grant_ticket{0};
 };
 
 }  // namespace memory
