@@ -158,9 +158,8 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   // get_writer_event). Writer events let a cross-stream READER order its reads after the
   // producing stream's writes; consumer events let a RECLAIMER order the destruction of
   // this batch's buffers after every consumer stream's reads. Without them, freeing a
-  // representation whose buffers were produced on an idle stream while a consumer
-  // stream's kernels/copies still read them is a use-after-free — the only prior defense
-  // was a blunt host stream.synchronize() of the consumer stream at every call site.
+  // representation while a consumer stream's kernels/copies still read its buffers is a
+  // use-after-free unless every call site host-syncs the consumer stream first.
   //
   // Contract:
   //   - A consumer calls record_consumer_event(s) AFTER enqueuing its reads of this
@@ -189,8 +188,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * are not covered. May be called multiple times, from multiple threads, for multiple
    * streams; each call tracks one more outstanding event.
    *
-   * Cheap: a pooled cudaEvent record (created lazily with cudaEventDisableTiming and
-   * recycled once complete). Never host-syncs. Thread-safe.
+   * Cheap: a pooled event record (see cuda::event_pool) — never host-syncs. Thread-safe.
    *
    * @param consumer_stream The stream on which the consumer's reads were enqueued.
    */
@@ -340,9 +338,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   std::atomic<batch_state> _state{batch_state::idle};  ///< Observable lock state
   std::atomic<size_t> _read_only_count{0};  ///< Count of active read_only_data_batch instances
 
-  /// Outstanding consumer-read events (see the consumer-event API above). Lazily
-  /// populated: batches that never record a consumer event hold no CUDA events and no
-  /// heap allocations here.
+  /// Outstanding consumer-read events (see the consumer-event API above).
   cuda::event_pool _consumer_events;
 
   std::unique_ptr<idata_batch_probe> _probe;
@@ -400,10 +396,8 @@ class read_only_data_batch {
    * @brief Record that this consumer has enqueued reads of the batch's device buffers
    *        on @p consumer_stream.
    *
-   * Delegates to data_batch::record_consumer_event(). Mirror of get_writer_event():
-   * where the writer event orders this consumer's reads after the producer's writes,
-   * the consumer event orders a later reclaimer's frees after this consumer's reads.
-   * Call after enqueuing the reads, while still holding this shared lock.
+   * Delegates to data_batch::record_consumer_event(). Call after enqueuing the reads,
+   * while still holding this shared lock.
    *
    * @param consumer_stream The stream on which the reads were enqueued.
    */
@@ -716,13 +710,11 @@ class mutable_data_batch {
     auto old_representation = std::move(_batch->_data);
     _batch->_data           = std::move(new_representation);
 
-    // CONSUMER-EVENTS: consumers may still have reads of the old representation's
-    // buffers in flight on their own streams (recorded via record_consumer_event).
-    // Enqueue device-side waits on @p stream BEFORE the synchronize below so the host
-    // sync — and therefore the destruction of the old representation — is also ordered
-    // after every recorded consumer read, regardless of which stream frees the buffers.
-    // We hold the exclusive lock, so no new consumer can record concurrently. No-op for
-    // batches that never recorded a consumer event.
+    // Consumers may still have reads of the old representation's buffers in flight on
+    // their own streams. Enqueue device-side waits on @p stream BEFORE the synchronize
+    // below so the host sync — and therefore the old representation's destruction — is
+    // ordered after every recorded consumer read, regardless of which stream frees the
+    // buffers. (Exclusive lock held: no new consumer can record concurrently.)
     _batch->await_consumers(stream);
 
     bool needs_sync = old_representation != nullptr &&
@@ -731,13 +723,11 @@ class mutable_data_batch {
     if (needs_sync) {
       stream.synchronize();
     } else {
-      // Non-GPU tier transitions (e.g. host->disk) skip the stream-sync tail above, so
-      // the device-side waits just enqueued on @p stream never gate this thread — but
-      // recorded GPU-side reads of the old representation's buffers (kernels or copies
-      // reading pinned host memory) must still complete before the old representation
-      // is destroyed host-side at scope exit. Mirror set_data's conservative approach
-      // and block the host on the recorded consumer events directly. Zero cost (one
-      // mutex lock) for batches that never recorded a consumer event.
+      // Non-GPU tier transitions (e.g. host->disk) skip the stream sync above, so the
+      // waits just enqueued never gate this thread — yet recorded GPU-side reads of the
+      // old representation's buffers (e.g. copies reading pinned host memory) must still
+      // complete before it is destroyed at scope exit. Block the host on the recorded
+      // consumer events directly.
       _batch->_consumer_events.synchronize();
     }
   }

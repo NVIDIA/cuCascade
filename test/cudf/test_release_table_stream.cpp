@@ -21,15 +21,8 @@
 // device buffers are dealloc-bound to the stream passed to release_table --
 // owned tables are rebound via cudf::rebind_stream (recursively: data buffers,
 // null masks, nested children); the owning_table_view alternative deep-copies
-// directly on the passed stream.
-//
-// Historical context: pre-fix, release_table ignored its stream argument. A
-// converter-produced table stayed dealloc-bound to the (idle, already-synced)
-// conversion-pool stream, so destroying a released column enqueued a
-// stream-ordered free that retired instantly, and the allocator recycled the
-// block under kernels still reading it on the consumer's stream. This was a
-// confirmed use-after-free (258 hazards under compute-sanitizer; TPC-H Q18
-// result corruption via Sirius' cached-serving path).
+// directly on the passed stream. The UAF regression test below documents the
+// pre-fix failure mode this contract exists to prevent.
 
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"

@@ -94,12 +94,10 @@ memory::memory_space* data_batch::get_memory_space() const
 void data_batch::set_data(std::unique_ptr<idata_representation> data)
 {
   if (data == nullptr) { throw std::runtime_error("data is null in data_batch::set_data"); }
-  // CONSUMER-EVENTS: the old representation is destroyed here while the batch object
-  // survives, and consumers may still have reads of its buffers in flight on their own
-  // streams. No stream is available in this path to enqueue device-side waits on, so
-  // conservatively block the host until all recorded consumer events complete. This is
-  // a no-op (one mutex lock) for batches that never recorded a consumer event, and the
-  // caller holds the exclusive lock, so no new consumer can record concurrently.
+  // The old representation is destroyed here while consumers may still have reads of
+  // its buffers in flight. No stream is available in this path to enqueue device-side
+  // waits on, so conservatively block the host until all recorded consumer events
+  // complete. (Exclusive lock held: no new consumer can record concurrently.)
   _consumer_events.synchronize();
   _data = std::move(data);
   _probe->data_replaced(*_data);

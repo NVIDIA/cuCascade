@@ -17,20 +17,10 @@
 
 // Tests for the consumer-event API: data_batch::record_consumer_event /
 // await_consumers / consumers_done (and the accessor delegates), backed by
-// cucascade::cuda::event_pool. Covers:
-//   - event_pool semantics (record / enqueue_waits / synchronize / is_done,
-//     recycling, thread safety, empty fast path). event_pool is the canonical
-//     layer for recycling and single-event gating; the data_batch tests below
-//     only add what the batch layer contributes (lock interplay, accessors,
-//     multi-consumer bookkeeping, reclaim hooks).
-//   - data_batch API: trivial fast path, multi-consumer pending visibility +
-//     device-side gating of a reclaimer stream (through the accessors),
-//     multi-thread recording under shared locks
-//   - reclaim-hook integration: install_converted_representation (GPU-tier
-//     sync path AND the non-GPU-tier else-branch host sync) and set_data must
-//     not destroy the old representation while consumer reads are in flight
-//     (poison-on-reclaim pattern)
-//   - edges: default-stream record, await on the recording stream itself.
+// cucascade::cuda::event_pool. event_pool is the canonical layer for recycling
+// and single-event gating; the data_batch tests only add what the batch layer
+// contributes (lock interplay, accessors, multi-consumer bookkeeping, reclaim
+// hooks).
 
 #include "utils/mock_test_utils.hpp"
 
@@ -157,8 +147,7 @@ std::shared_ptr<data_batch> make_mock_batch(memory::Tier tier = memory::Tier::GP
 }
 
 // =============================================================================
-// Poison-on-reclaim fixture (modeled on Sirius PR #1566's
-// test_owning_table_view.cpp reclaim probe)
+// Poison-on-reclaim fixture
 // =============================================================================
 
 constexpr std::uint8_t kSourcePattern = 0xAB;
@@ -475,10 +464,8 @@ TEST_CASE("data_batch consumer events trivial fast path when nothing was recorde
   REQUIRE(batch->consumers_done());
 }
 
-// The single-consumer pending-visibility and await-gating cases are strict
-// subsets of this multi-consumer test; their unique accessor-path coverage
-// (ro.consumers_done() while pending, mut.await_consumers under load) is
-// folded in here. The underlying single-event device-side gating primitive is
+// Also covers the accessor paths (ro.consumers_done() while pending,
+// mut.await_consumers); the single-event device-side gating primitive is
 // pinned at the event_pool layer above.
 TEST_CASE("data_batch awaits every consumer across multiple streams",
           "[consumer_events][data_batch]")
@@ -678,7 +665,6 @@ TEST_CASE("set_data host-syncs pending consumer reads before destroying the old 
     auto mut = fixture.batch->to_mutable();
     REQUIRE_FALSE(mut.consumers_done());
     mut.set_data(std::make_unique<mock_data_representation>(memory::Tier::HOST, 64));
-    // set_data's conservative host sync completed all consumer events.
     REQUIRE(mut.consumers_done());
   }
 

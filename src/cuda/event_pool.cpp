@@ -54,7 +54,6 @@ void event_pool::synchronize()
   for (auto& event : outstanding_) {
     event.synchronize();
   }
-  // Everything completed — recycle the lot.
   for (auto& event : outstanding_) {
     available_.push_back(std::move(event));
   }

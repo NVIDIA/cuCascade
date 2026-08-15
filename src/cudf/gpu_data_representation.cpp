@@ -80,11 +80,9 @@ std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_s
     // bound to it — no rebind needed.
     _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
   } else {
-    // Owned-table path: the buffers are still dealloc-bound to the stream they were allocated
-    // on (typically an idle conversion-pool stream). Rebind them to the caller's stream so
-    // that destroying (parts of) the returned table enqueues frees in the caller's stream
-    // order instead of retiring instantly on the idle foreign stream, where the allocator
-    // could recycle the blocks under the caller's in-flight kernels.
+    // Owned-table path: rebind the buffers from their allocation stream (typically an idle
+    // conversion-pool stream) to the caller's, so the returned table's frees are ordered on
+    // the caller's stream (see the release_table declaration for the full contract).
     gpu_table_representation::rebind_stream(stream);
   }
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
