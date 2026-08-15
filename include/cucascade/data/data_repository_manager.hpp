@@ -21,11 +21,13 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace cucascade {
@@ -82,6 +84,12 @@ class data_repository_manager {
  public:
   using repository_type = data_repository;
 
+  /// Invoked (via each repository's destructor-side leak callback) when a repository
+  /// dies still holding un-consumed data batches. Receives the {operator_id, port_id}
+  /// the repository was registered under and the batch count.
+  using leak_handler_type =
+    std::function<void(std::size_t operator_id, const std::string& port_id, std::size_t count)>;
+
   /**
    * @brief Default constructor - initializes empty repository manager.
    */
@@ -117,7 +125,35 @@ class data_repository_manager {
       std::lock_guard<std::mutex> lock(_mutex);
       auto it = _repositories.find({operator_id, std::string(port_id)});
       if (it != _repositories.end()) { throw std::runtime_error("Repository already exists"); }
+      if (_leak_handler && shared_repository) {
+        install_leak_callback(*shared_repository, operator_id, std::string(port_id));
+      }
       _repositories[{operator_id, std::string(port_id)}] = std::move(shared_repository);
+    }
+  }
+
+  /**
+   * @brief Install the handler invoked when a repository dies still holding batches.
+   *
+   * Applied to every repository already registered and to every repository added later.
+   * Under shared ownership a repository can outlive its manager (a borrower — e.g. a
+   * memory-pressure sweep — may hold it past the manager's teardown), so leak accounting
+   * lives in the repository's own destructor; this handler is how the owner attributes
+   * that report to an {operator_id, port_id}. The handler runs on whatever thread drops
+   * the last repository reference and must not throw.
+   *
+   * @param handler The attribution hook (empty leaves repositories unhooked from now on;
+   *                already-installed callbacks are not removed)
+   *
+   * @note Thread-safe operation
+   */
+  void set_leak_handler(leak_handler_type handler)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _leak_handler = std::move(handler);
+    if (!_leak_handler) { return; }
+    for (auto& [key, repo] : _repositories) {
+      if (repo) { install_leak_callback(*repo, key.operator_id, key.port_id); }
     }
   }
 
@@ -193,6 +229,11 @@ class data_repository_manager {
    * un-consumed data batches, this is a bug — it means some operator didn't fully
    * drain its input.
    *
+   * @note With a leak handler installed (set_leak_handler), a non-empty repository this
+   *       destroys ALSO fires its destructor-side report — callers should rely on one
+   *       mechanism or the other. Shared-ownership teardown paths simply drop the
+   *       manager instead of calling this, leaving the accounting to the destructors.
+   *
    * @return Per-repository info for each repository that still had un-consumed batches.
    */
   std::vector<leaked_repository_info> clear_all_repositories()
@@ -210,27 +251,40 @@ class data_repository_manager {
   }
 
   /**
-   * @brief Get a snapshot of all current repository pointers.
+   * @brief Get a lifetime-safe snapshot of all current repositories.
    *
-   * Returns a vector of raw pointers to each non-null repository. The vector
-   * is built under the manager mutex, so callers can iterate it externally
-   * without holding the lock (the repositories themselves remain thread-safe).
+   * Returns shared ownership of each non-null repository. The vector is built under
+   * the manager mutex, so callers can iterate it externally without holding the lock —
+   * and because each element co-owns its repository, the snapshot stays valid across
+   * blocking work even if the manager is concurrently cleared or destroyed. (The old
+   * variant returned raw pointers, which dangled the moment a concurrent teardown
+   * destroyed the map's shared_ptrs — exactly what a long memory-pressure sweep racing
+   * a query's end would hit.)
    *
-   * @return std::vector<repository_type*> Snapshot of non-null repository pointers
+   * @return std::vector<std::shared_ptr<repository_type>> Snapshot of non-null repositories
    * @note Thread-safe — holds the manager mutex for the duration of collection.
    */
-  std::vector<repository_type*> get_repositories()
+  std::vector<std::shared_ptr<repository_type>> get_repositories()
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    std::vector<repository_type*> result;
+    std::vector<std::shared_ptr<repository_type>> result;
     result.reserve(_repositories.size());
     for (auto& [key, repo] : _repositories) {
-      if (repo) { result.push_back(repo.get()); }
+      if (repo) { result.push_back(repo); }
     }
     return result;
   }
 
  private:
+  /// Hook @p repo's destructor-side leak report up to _leak_handler with this key's
+  /// attribution. Caller holds _mutex (for _leak_handler); the callback captures a COPY
+  /// of the handler so it stays valid on whatever thread the repository finally dies.
+  void install_leak_callback(repository_type& repo, std::size_t operator_id, std::string port_id)
+  {
+    repo.set_leak_callback([handler = _leak_handler, operator_id, port = std::move(port_id)](
+                             std::size_t count) { handler(operator_id, port, count); });
+  }
+
   std::mutex _mutex;  ///< Mutex for thread-safe access
   std::atomic<uint64_t> _next_data_batch_id =
     0;  ///< Atomic counter for generating unique data batch identifiers
@@ -239,6 +293,9 @@ class data_repository_manager {
   /// clear_all_repositories / add_new_repository (the manager remains the one
   /// logical owner; accessors only extend lifetime across their use).
   std::map<operator_port_key, std::shared_ptr<repository_type>> _repositories;
+  /// Attribution hook for repositories that die still holding batches; see
+  /// set_leak_handler().
+  leak_handler_type _leak_handler;
 };
 
 /// Compatibility alias, NOT a distinct type: kept so call sites written
