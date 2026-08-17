@@ -143,9 +143,14 @@ class gpu_table_representation : public idata_representation {
    * @pre No stream other than @p stream may have in-flight work touching the table's device
    * memory: binding the buffers to @p stream does not insert cross-stream ordering.
    *
+   * @pre @p stream must belong to get_device_id() — the device owning this representation's
+   * memory. Default stream handles resolve to the caller's current device.
+   *
    * @param stream Stream that will own deallocation ordering of the returned table's buffers
    *               (also used to materialize the table from a view path before release)
    * @return std::unique_ptr<cudf::table> The cuDF table
+   * @throws cucascade::logic_error if @p stream belongs to a different CUDA device
+   * @throws cucascade::cuda_error if @p stream's device cannot be queried
    */
   std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);
 
@@ -165,7 +170,13 @@ class gpu_table_representation : public idata_representation {
    * relationship from any stream with in-flight work touching this table's memory to @p stream
    * before the rebound memory is reused or freed. See cudf::rebind_stream.
    *
+   * @pre When the rebind takes effect (owned, non-empty table), @p stream must belong to
+   * get_device_id(). Binding a buffer's free to another device's stream would retire the block
+   * into a pool free-list keyed by the wrong device. The no-op cases above are not checked.
+   *
    * @param stream Stream used for future asynchronous deallocation of the table's buffers.
+   * @throws cucascade::logic_error if @p stream belongs to a different CUDA device
+   * @throws cucascade::cuda_error if @p stream's device cannot be queried
    */
   void rebind_stream(rmm::cuda_stream_view stream) override;
 

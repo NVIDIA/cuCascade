@@ -23,7 +23,34 @@
 #include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <string>
+
 namespace cucascade {
+
+namespace {
+
+/**
+ * @brief Reject streams that do not belong to the device owning this representation's memory.
+ *
+ * RMM binds every device buffer's deallocation to the stream it carries, so a foreign-device
+ * stream would retire the block into a pool free-list keyed by a stream on the wrong device;
+ * a later allocation on that stream then hands out memory the device cannot address without
+ * peer mapping. Default stream handles resolve to the calling thread's current device, so
+ * passing one while another device is current is rejected too — that call would have been
+ * cross-device just the same.
+ */
+void validate_stream_device(rmm::cuda_stream_view stream, int expected_device)
+{
+  int stream_device = -1;
+  CUCASCADE_CUDA_TRY(::cudaStreamGetDevice(stream.value(), &stream_device));
+  if (stream_device != expected_device) {
+    CUCASCADE_FAIL("stream belongs to CUDA device " + std::to_string(stream_device) +
+                   " but this representation's memory lives on device " +
+                   std::to_string(expected_device));
+  }
+}
+
+}  // namespace
 
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
                                                    cucascade::memory::memory_space& memory_space,
@@ -76,9 +103,12 @@ cudf::table_view gpu_table_representation::get_table_view() const
 std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_stream_view stream)
 {
   if (std::holds_alternative<owning_table_view>(_table)) {
+    // The deep copy below is enqueued on `stream`, and its buffers are bound to it.
+    validate_stream_device(stream, get_device_id());
     _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
   } else {
     // Rebind so the returned table's frees stay stream-ordered behind the caller's reads.
+    // rebind_stream() applies the same device guard, so this branch needs no separate check.
     gpu_table_representation::rebind_stream(stream);
   }
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
@@ -92,6 +122,10 @@ void gpu_table_representation::rebind_stream(rmm::cuda_stream_view stream)
   if (!std::holds_alternative<std::unique_ptr<cudf::table>>(_table)) { return; }
   auto& table = std::get<std::unique_ptr<cudf::table>>(_table);
   if (!table || table->num_columns() == 0) { return; }
+
+  // Checked only once the rebind can actually take effect: the no-op paths above bind nothing,
+  // so failing them would reject calls that cannot corrupt anything.
+  validate_stream_device(stream, get_device_id());
 
   // cudf::table move-assignment is deleted, so release the columns, rebind each, and rebuild
   // the table in place. No device memory is copied and no kernels are launched.

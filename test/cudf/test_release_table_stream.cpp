@@ -31,6 +31,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -386,4 +387,93 @@ TEST_CASE("release_table then cudf::rebind_stream to the same stream composes",
     reference->view(), reassembled->view(), release_stream.view());
   int checked = expect_table_buffers_bound_to(*reassembled, release_stream.view());
   REQUIRE(checked >= 5);
+}
+
+// =============================================================================
+// Release-stream device validation
+// =============================================================================
+
+TEST_CASE("release_table accepts every same-device stream handle",
+          "[release_table][stream][device]")
+{
+  // The representation lives on GPU 0, so pin the current device: default stream handles resolve
+  // to whichever device is current, and a stale current device would fail the guard spuriously.
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+
+  rmm::cuda_stream explicit_stream;
+  std::vector<rmm::cuda_stream_view> const streams{rmm::cuda_stream_default,
+                                                   rmm::cuda_stream_per_thread,
+                                                   rmm::cuda_stream_legacy,
+                                                   explicit_stream.view()};
+
+  for (auto const& stream : streams) {
+    CAPTURE(stream.value());
+    // release_table() moves the table out, so each iteration needs its own. Only the guard is
+    // under test here, so a minimal table suffices -- make_patterned_table would add two host
+    // syncs and per-row string building per iteration for no extra coverage.
+    gpu_table_representation rep(
+      std::make_unique<cudf::table>(test::create_simple_cudf_table(4, 1)),
+      *shared_gpu_space(),
+      shared_stream());
+    REQUIRE_NOTHROW(rep.release_table(stream));
+  }
+}
+
+TEST_CASE("release_table rejects a stream whose device differs from the representation's",
+          "[release_table][stream][device]")
+{
+  // Exercises the guard's comparison on any host, including single-GPU CI where the true
+  // multi-GPU cases below can only skip. The space claims device 1 while the table's memory and
+  // stream are really on device 0, so get_device_id() and the stream device disagree — which is
+  // exactly the mismatch the guard exists to catch.
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+  auto mismatched_space = test::make_mock_memory_space(memory::Tier::GPU, 1);
+
+  gpu_table_representation rep(
+    make_patterned_table(shared_stream()), *mismatched_space, shared_stream());
+
+  REQUIRE_THROWS_AS(rep.release_table(shared_stream()), cucascade::logic_error);
+  REQUIRE_THROWS_AS(rep.rebind_stream(shared_stream()), cucascade::logic_error);
+
+  // Rejected before any mutation: the representation still owns its table.
+  REQUIRE(rep.get_table_view().num_columns() == 3);
+}
+
+TEST_CASE("release_table and rebind_stream reject a stream owned by another device",
+          "[release_table][stream][device]")
+{
+  int device_count = 0;
+  CUCASCADE_CUDA_TRY(cudaGetDeviceCount(&device_count));
+  if (device_count < 2) { SKIP("requires at least two CUDA devices"); }
+
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+
+  // Created under device 1, so its deallocation ordering belongs to device 1's pool. Binding
+  // GPU 0 buffers to it would retire them into the wrong device's free list.
+  auto foreign_stream = [] {
+    rmm::cuda_set_device_raii const other_device{rmm::cuda_device_id{1}};
+    return std::make_unique<rmm::cuda_stream>();
+  }();
+
+  gpu_table_representation rep(
+    make_patterned_table(shared_stream()), *shared_gpu_space(), shared_stream());
+
+  SECTION("release_table")
+  {
+    REQUIRE_THROWS_AS(rep.release_table(foreign_stream->view()), cucascade::logic_error);
+
+    // The rejection must leave the representation intact rather than half-released.
+    REQUIRE(rep.get_table_view().num_columns() == 3);
+    REQUIRE_NOTHROW(rep.release_table(shared_stream()));
+  }
+
+  SECTION("rebind_stream")
+  {
+    REQUIRE_THROWS_AS(rep.rebind_stream(foreign_stream->view()), cucascade::logic_error);
+
+    // Buffers keep their original binding: a rejected rebind must not partially apply.
+    auto released = rep.release_table(shared_stream());
+    int checked   = expect_table_buffers_bound_to(*released, shared_stream());
+    REQUIRE(checked >= 5);
+  }
 }
