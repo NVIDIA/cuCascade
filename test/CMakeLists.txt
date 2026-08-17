@@ -99,7 +99,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
-    # cudf-coupled representation tests
     cudf/test_release_table_stream.cpp
     # Main test runner
     unittest.cpp)

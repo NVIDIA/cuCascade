@@ -140,23 +140,8 @@ class gpu_table_representation : public idata_representation {
    *
    * After calling this method, this representation no longer owns the table.
    *
-   * The returned table's device buffers are bound to @p stream for deallocation ordering:
-   * when this representation owns the table, every column is rebound via cudf::rebind_stream
-   * before release; when it holds an owning_table_view, the deep copy is materialized directly
-   * on @p stream. Either way, the caller may destroy the returned table (or individual columns
-   * of it) from work ordered on @p stream without frees retiring early on an idle foreign
-   * stream and the allocator recycling blocks still read by in-flight kernels.
-   *
    * @pre No stream other than @p stream may have in-flight work touching the table's device
-   * memory: rebinding does not insert cross-stream ordering (see the cross-stream
-   * premature-reuse note on mutable_data_batch::rebind_stream in cucascade/data/data_batch.hpp
-   * and cudf::rebind_stream). This holds for tables produced by cuCascade's built-in
-   * converters, which synchronize the conversion stream before publishing the representation.
-   * When foreign-stream reads may still be in flight, the sanctioned remedy is
-   * read_only_data_batch::record_reader_event: mutable acquisition (data_batch::to_mutable /
-   * readonly_to_mutable) host-synchronizes every recorded reader event before exposing the
-   * representation — and try_to_mutable declines while one is pending — so a table released
-   * through a mutable accessor already satisfies this precondition for recorded readers.
+   * memory: binding the buffers to @p stream does not insert cross-stream ordering.
    *
    * @param stream Stream that will own deallocation ordering of the returned table's buffers
    *               (also used to materialize the table from a view path before release)

@@ -1403,7 +1403,6 @@ TEST_CASE("reader event pools remain device-local across representation replacem
   REQUIRE(batch->try_to_mutable().has_value());
 }
 
-// Host callback that flips an atomic flag; used to observe host-visible stream progress.
 static void CUDART_CB set_flag_callback(void* user_data)
 {
   static_cast<std::atomic<bool>*>(user_data)->store(true, std::memory_order_release);
@@ -1427,7 +1426,6 @@ TEST_CASE("record_reader_event is thread-safe under concurrent shared-lock recor
         try {
           rmm::cuda_stream stream;
           rmm::device_buffer scratch(16, stream.view());
-          // Concurrent shared-lock holders all recording, as concurrent pipeline readers do.
           auto reader = batch->to_read_only();
           for (int j = 0; j < records_per_thread; ++j) {
             CUCASCADE_CUDA_TRY(
@@ -1442,9 +1440,7 @@ TEST_CASE("record_reader_event is thread-safe under concurrent shared-lock recor
       });
     }
 
-    // Poll the non-blocking mutable path concurrently with the recorders: it must never throw
-    // or crash while shared locks are held and events are being recorded and recycled. Success
-    // is legal in the windows where no recorder holds the shared lock and nothing is pending.
+    // try_to_mutable may legally succeed between recorders; we assert only that it never throws.
     while (done_threads.load(std::memory_order_acquire) < num_threads) {
       auto maybe_mutable = batch->try_to_mutable();
       maybe_mutable.reset();
@@ -1453,8 +1449,6 @@ TEST_CASE("record_reader_event is thread-safe under concurrent shared-lock recor
   }
   REQUIRE(failures.load() == 0);
 
-  // Every recorder synchronized its stream before exiting, so blocking acquisition drains
-  // instantly and leaves the pools fully recycled.
   {
     auto mutable_batch = batch->to_mutable();
   }
@@ -1470,11 +1464,7 @@ TEST_CASE("reader event pool sustains cycles with a pending head and completed t
   rmm::cuda_stream fast_stream;
   rmm::device_buffer scratch(64, fast_stream.view());
 
-  // Each cycle parks the FIRST recorded event behind a gate while eight later events complete,
-  // so recycle_completed_reader_events must repeatedly compact a completed tail out of the
-  // pending prefix (the swap path) without releasing the still-pending head. Sustained cycles
-  // then reuse the recycled events instead of growing the pool; with no size accessor, the
-  // observable is that recording and both acquisition outcomes stay correct throughout.
+  // With no pool-size accessor, correct behavior across sustained cycles is the only observable.
   for (int cycle = 0; cycle < 64; ++cycle) {
     stream_gate gate;
     stream_gate_release_guard release_gate_on_exit{gate, slow_stream.view()};
@@ -1491,7 +1481,6 @@ TEST_CASE("reader event pool sustains cycles with a pending head and completed t
       batch = data_batch::to_idle(std::move(reader));
     }
 
-    // Head still parked: the non-blocking query must decline while recycling the completed tail.
     REQUIRE_FALSE(batch->try_to_mutable().has_value());
 
     gate.release();
@@ -1509,8 +1498,7 @@ TEST_CASE("record_reader_event accepts the legacy default stream",
     data_batch::make(1, std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 0));
   rmm::device_buffer scratch(64, rmm::cuda_stream_default);
 
-  // The implementation queries the reader stream's device; the legacy default stream is a
-  // sentinel handle, not a created stream, so exercise that path end to end.
+  // The legacy default stream is a sentinel handle; the implementation's device query must cope.
   {
     auto reader = batch->to_read_only();
     CUCASCADE_CUDA_TRY(::cudaMemsetAsync(scratch.data(), 0x5A, scratch.size(), nullptr));
@@ -1536,7 +1524,7 @@ TEST_CASE("~data_batch waits for recorded readers when the final accessor drops 
     auto batch =
       data_batch::make(1, std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 0));
     auto reader = batch->to_read_only();
-    batch.reset();  // the accessor now owns the only reference to the batch
+    batch.reset();
 
     CUCASCADE_CUDA_TRY(::cudaLaunchHostFunc(reader_stream.value(), stream_gate_callback, &gate));
     CUCASCADE_CUDA_TRY(
@@ -1549,9 +1537,7 @@ TEST_CASE("~data_batch waits for recorded readers when the final accessor drops 
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       gate.release();
     });
-    // `reader` leaves scope here: the shared lock is released, then the last shared_ptr drops
-    // and ~data_batch runs. Its documented fallback must block on the parked reader event, so
-    // by the time destruction returns the gated read has retired.
+    // Scope exit drops the last reference; ~data_batch must block until the gated read retires.
   }
   REQUIRE(read_retired.load(std::memory_order_acquire));
 }

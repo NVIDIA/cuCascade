@@ -76,13 +76,9 @@ cudf::table_view gpu_table_representation::get_table_view() const
 std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_stream_view stream)
 {
   if (std::holds_alternative<owning_table_view>(_table)) {
-    // View path: the deep copy is allocated directly on `stream`, so its buffers are already
-    // bound to it — no rebind needed.
     _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
   } else {
-    // Owned-table path: rebind the buffers from their allocation stream (typically an idle
-    // conversion-pool stream) to the caller's, so the returned table's frees are ordered on
-    // the caller's stream (see the release_table declaration for the full contract).
+    // Rebind so the returned table's frees stay stream-ordered behind the caller's reads.
     gpu_table_representation::rebind_stream(stream);
   }
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
