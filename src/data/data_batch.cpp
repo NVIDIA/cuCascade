@@ -100,13 +100,16 @@ void data_batch::recycle_completed_reader_events(reader_event_pool& pool)
 {
   std::size_t index = 0;
   while (index < pool.pending_event_count) {
-    if (pool.events[index].query() == cuda::event::query_result::success) {
-      --pool.pending_event_count;
-      if (index != pool.pending_event_count) {
-        std::swap(pool.events[index], pool.events[pool.pending_event_count]);
-      }
-    } else {
+    cudaError_t const status = pool.events[index].query_raw_status();
+    if (status == cudaErrorNotReady) {
       ++index;
+      continue;
+    }
+    CUCASCADE_CUDA_TRY(status);
+
+    --pool.pending_event_count;
+    if (index != pool.pending_event_count) {
+      std::swap(pool.events[index], pool.events[pool.pending_event_count]);
     }
   }
 }

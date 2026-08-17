@@ -34,6 +34,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
     memory/test_gpu_kernels.cu
+    # CUDA primitive tests
+    cuda/test_event.cpp
     # Data tests
     data/test_data_repository.cpp
     data/test_data_repository_manager.cpp

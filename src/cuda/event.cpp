@@ -72,6 +72,8 @@ std::chrono::duration<float, std::milli> cuda_event::elapsed_time(cuda_event con
 
 event::query_result cuda_event::query() const noexcept { return view().query(); }
 
+cudaError_t cuda_event::query_raw_status() const noexcept { return view().query_raw_status(); }
+
 void cuda_event_view::record(rmm::cuda_stream_view stream)
 {
   CUCASCADE_CUDA_TRY(::cudaEventRecord(event_, stream.value()));
@@ -98,11 +100,13 @@ std::chrono::duration<float, std::milli> cuda_event_view::elapsed_time(cuda_even
 
 event::query_result cuda_event_view::query() const noexcept
 {
-  cudaError_t const status = ::cudaEventQuery(event_);
+  cudaError_t const status = query_raw_status();
   if (status == cudaSuccess) { return event::query_result::success; }
   if (status == cudaErrorNotReady) { return event::query_result::in_progress; }
   return event::query_result::error;
 }
+
+cudaError_t cuda_event_view::query_raw_status() const noexcept { return ::cudaEventQuery(event_); }
 
 }  // namespace cuda
 }  // namespace cucascade

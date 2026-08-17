@@ -210,6 +210,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @return An optional containing the mutable accessor on success, or std::nullopt if the lock
    *         could not be acquired immediately or a recorded asynchronous reader is still pending.
    * @throws rmm::cuda_error if a reader event's CUDA device cannot be made current for its query.
+   * @throws cucascade::cuda_error if a reader event's query reports a CUDA failure.
    */
   [[nodiscard]] std::optional<mutable_data_batch> try_to_mutable();
 
@@ -293,6 +294,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @brief Query and recycle completed reader events without blocking.
    *
    * @return true when no recorded asynchronous reader remains in flight.
+   * @throws cucascade::cuda_error if an event's query reports a CUDA failure.
    */
   [[nodiscard]] bool reader_events_complete();
 
@@ -312,6 +314,11 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @brief Move completed events from the pending prefix back into the reusable pool.
    *
    * Requires _reader_events_mutex to be held and the pool's CUDA device to be current.
+   * A query that reports failure is propagated rather than counted as still-pending: a failed
+   * event never completes, so absorbing it would stall every later mutable acquisition.
+   *
+   * @throws cucascade::cuda_error if an event's query reports a CUDA failure. @p pool is left
+   *         unchanged from the failing event onward.
    */
   void recycle_completed_reader_events(reader_event_pool& pool);
 
@@ -396,7 +403,8 @@ class read_only_data_batch {
    *
    * @param reader_stream Stream on which work reading the batch was enqueued.
    * @throws cucascade::cuda_error if the stream cannot be queried, synchronized during fallback,
-   *         or have its event recorded.
+   *         or have its event recorded, or if recycling finds an already-recorded event whose
+   *         query reports a CUDA failure.
    * @throws rmm::cuda_error if the reader stream's CUDA device cannot be made current.
    * @throws std::bad_alloc if the per-device event pool cannot grow. The reader stream is
    *         synchronized before this exception propagates.
