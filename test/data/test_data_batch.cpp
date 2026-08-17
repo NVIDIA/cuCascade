@@ -17,7 +17,6 @@
 
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
-#include "utils/stream_gate_test_utils.hpp"
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -52,9 +51,6 @@ using cucascade::test::create_simple_cudf_table;
 using cucascade::test::expect_cudf_tables_equal_on_stream;
 using cucascade::test::make_mock_memory_space;
 using cucascade::test::mock_data_representation;
-using cucascade::test::stream_gate;
-using cucascade::test::stream_gate_callback;
-using cucascade::test::stream_gate_release_guard;
 
 // =============================================================================
 // Construction tests (TEST-01)
@@ -1030,6 +1026,38 @@ static void CUDART_CB stream_delay_callback(void* /*userData*/)
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
+struct stream_gate {
+  std::atomic<bool> released{false};
+
+  void release() noexcept
+  {
+    released.store(true, std::memory_order_release);
+    released.notify_all();
+  }
+};
+
+// Releases and drains a parked callback during exception unwinding. Draining is required because
+// the CUDA callback retains a pointer to the gate until the stream has passed it.
+class stream_gate_release_guard {
+ public:
+  stream_gate_release_guard(stream_gate& gate, rmm::cuda_stream_view stream)
+    : _gate(gate), _stream(stream)
+  {
+  }
+  ~stream_gate_release_guard() noexcept
+  {
+    _gate.release();
+    _stream.synchronize_no_throw();
+  }
+
+  stream_gate_release_guard(stream_gate_release_guard const&)            = delete;
+  stream_gate_release_guard& operator=(stream_gate_release_guard const&) = delete;
+
+ private:
+  stream_gate& _gate;
+  rmm::cuda_stream_view _stream;
+};
+
 // Ensures a started reclaimer thread cannot remain parked on its start latch if construction of a
 // later test helper throws. Declare this after the reclaimer so it is destroyed first on unwind.
 class reclaimer_unblock_guard {
@@ -1053,6 +1081,14 @@ class reclaimer_unblock_guard {
   std::atomic<bool>& _start_reclaimer;
   stream_gate& _gate;
 };
+
+// Host callback that keeps one CUDA stream parked until the test releases it. Atomic waiting blocks
+// the callback thread without calling back into CUDA.
+static void CUDART_CB stream_gate_callback(void* user_data)
+{
+  auto* gate = static_cast<stream_gate*>(user_data);
+  gate->released.wait(false, std::memory_order_acquire);
+}
 
 TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync",
           "[data_batch][convert_to]")
