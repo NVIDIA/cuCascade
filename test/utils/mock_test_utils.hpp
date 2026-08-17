@@ -137,8 +137,8 @@ inline std::vector<memory::memory_space_config> create_conversion_test_configs()
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
     // Use shared pooled allocator initialized once for all tests.
     .set_gpu_memory_resource_factory(make_shared_current_device_resource)
-    .use_host_per_gpu()
-    .set_per_host_capacity(4096ull * 1024 * 1024);
+    .use_gpu_id_as_host_id()
+    .set_per_numa_region_capacity(4096ull * 1024 * 1024);
   return builder.build();
 }
 

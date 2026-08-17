@@ -57,6 +57,11 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
+  /// Pool-aggregated perf counters: per-reactor snapshots with totals and
+  /// counts summed, maxes maxed, and ttfb the smallest non-zero reactor value.
+  /// Lock-free; safe to call while the pool is running.
+  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
+
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
   /// per page (a page holds at most 1000 entries, so peak memory is one page
   /// regardless of bucket population).  @p sink returns false to stop early —

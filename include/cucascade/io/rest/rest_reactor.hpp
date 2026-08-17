@@ -28,6 +28,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -103,6 +104,15 @@ struct footer_probe {
   std::size_t object_size{0};
   std::size_t window_lo{0};
   shared_byte_span bytes;
+  /// ETag from the verified 206, quotes preserved; empty otherwise.
+  std::string etag;
+};
+
+/// Result of a blocking HEAD: the object's size plus its ETag when the server
+/// sent one (quotes preserved, empty otherwise).
+struct head_object_result {
+  std::size_t object_size{0};
+  std::string etag;
 };
 
 // ---------------------------------------------------------------------------
@@ -112,14 +122,18 @@ struct footer_probe {
 /**
  * @brief Concrete @c io_object backed by a RESTful object-store key.
  *
- * Passive bag of identity: the original URL/path (also the cache id), the
- * bucket + key the reactor authorizes against, and the object size discovered
- * by a one-time HEAD at construction.  Does no I/O of its own.
+ * Stores the object identity and metadata captured when it was opened.
+ * Does no I/O of its own.
  */
 class rest_io_object : public io_object {
  public:
-  rest_io_object(std::string path, std::string bucket, std::string key, size_t size)
-    : _path(std::move(path)), _bucket(std::move(bucket)), _key(std::move(key)), _file_size(size)
+  rest_io_object(
+    std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
+    : _path(std::move(path)),
+      _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _file_size(size),
+      _etag(std::move(etag))
   {
   }
 
@@ -131,19 +145,22 @@ class rest_io_object : public io_object {
                  std::string key,
                  size_t object_size,
                  size_t window_lo,
-                 shared_byte_span stash)
+                 shared_byte_span stash,
+                 std::string etag = {})
     : _path(std::move(path)),
       _bucket(std::move(bucket)),
       _key(std::move(key)),
       _file_size(object_size),
       _window_lo(window_lo),
-      _stash(std::move(stash))
+      _stash(std::move(stash)),
+      _etag(std::move(etag))
   {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
@@ -162,7 +179,52 @@ class rest_io_object : public io_object {
   size_t _file_size{0};
   size_t _window_lo{0};
   shared_byte_span _stash;
+  std::string _etag;
 };
+
+// ---------------------------------------------------------------------------
+// rest_perf_snapshot
+// ---------------------------------------------------------------------------
+
+/// Plain-value perf counters read out of a reactor, or summed across the pool
+/// by @c rest_ioctx.  The ns totals/maxes and ttfb stay 0 unless the reactor's
+/// @c perf_instrumentation is on; retry / terminal / device-stream-sync and
+/// payload-bytes counts are populated regardless.  The layout is not
+/// ABI-stable: consumers build from the same source pin, and fields are
+/// appended, never reordered or removed.
+struct rest_perf_snapshot {
+  std::uint64_t chunk_get_ns_total{0};
+  std::uint64_t chunk_get_count{0};
+  std::uint64_t chunk_get_ns_max{0};
+  std::uint64_t queue_wait_ns_total{0};
+  std::uint64_t queue_wait_count{0};
+  // ttfb = span from GET submission to completion of the reactor's first
+  // completed GET (async chunk or footer probe) — not first byte on the wire.
+  std::uint64_t ttfb_ns{0};
+  // h2d_observed_* time the copy_h2d_async call itself — the host-side async
+  // launch cost, not the copy, which completes later on the stream.
+  std::uint64_t h2d_observed_ns_total{0};
+  std::uint64_t h2d_observed_count{0};
+  std::uint64_t h2d_observed_ns_max{0};
+  std::uint64_t retries_total{0};
+  std::uint64_t terminal_failures_total{0};
+  std::uint64_t device_stream_sync_total{0};
+  // Always-on: HTTP response *body* bytes received (sink.total_received), summed
+  // over every completed curl attempt incl. retries / partial / failed bodies.
+  // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
+  std::uint64_t payload_bytes_read_total{0};
+  // perf_instrumentation-gated. Blocking host GETs remain part of chunk_get_*
+  // and are also attributed to blocking_host_get_*. Stash hits issue no GET and
+  // increment neither.
+  std::uint64_t blocking_host_get_count{0};
+  std::uint64_t blocking_host_get_wall_ns_total{0};
+  std::uint64_t blocking_host_get_wall_ns_max{0};
+};
+
+/// How @c prep_host_rx_request attributes the resulting GETs in the perf
+/// snapshot: a @c blocking read (synchronous host_read) is counted in
+/// blocking_host_get_* in addition to chunk_get_*.
+enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
 
 // ---------------------------------------------------------------------------
 // rest_reactor
@@ -237,6 +299,10 @@ class rest_reactor {
   static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
                                                const io_object_type& file,
                                                const io_object_segment& segment);
+  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
+                                               const io_object_type& file,
+                                               const io_object_segment& segment,
+                                               host_read_attribution attribution);
 
   static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
                                                 const io_object_type& file,
@@ -275,27 +341,35 @@ class rest_reactor {
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  /// Blocking HEAD to discover an object's size.  Used by the ioctx to build
-  /// an @c rest_io_object.  @p bucket / @p key identify the object.
+  /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
+  /// build an @c rest_io_object.  @p bucket / @p key identify the object.
+  head_object_result head_object(std::string_view bucket, std::string_view key);
+
+  /// Size-only convenience wrapper around @c head_object.
   size_t head_object_size(std::string_view bucket, std::string_view key);
 
   /// Blocking suffix-range GET of the last @p n bytes of an object, resolving
   /// the size and stashing the parquet footer in a single round-trip.  On a
   /// well-formed 206 the returned @c footer_probe carries the object size, the
-  /// window origin, and the trailing bytes; on any unusable response (200 full
-  /// body, missing / unsatisfied Content-Range) @c bytes is null so the caller
-  /// falls back to a HEAD.  @p bucket / @p key identify the object.
+  /// window origin, the trailing bytes, and the ETag; on any unusable response
+  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so
+  /// the caller falls back to a HEAD.  @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
 
   /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML
   /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
   /// request query (no auth params — authorization is added via
   /// @c authorize_list).  @p prefix is only for retry-log / error text.
-  /// Control-plane op: retries are WARN-logged like every retry loop here, but
-  /// the XML body is never treated as object-read payload.
+  /// Control-plane op: retries/terminals are counted (and retries WARN-logged)
+  /// like every retry loop here, but the XML body never touches the chunk-GET /
+  /// payload byte counters.
   std::string list_page(std::string_view bucket,
                         std::string_view prefix,
                         std::string_view canonical_query);
+
+  /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
+  /// loads); safe to call while the reactor is running.
+  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
   // -- capabilities / factory ----------------------------------------------
 
@@ -344,6 +418,29 @@ class rest_reactor {
 
   std::stop_source _stop_source;
   blocking_concurrent_queue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+
+  // Instrumentation counters, owned by the reactor (not worker_loop locals) so
+  // rest_ioctx can read them cross-thread.  Gating: see rest_perf_snapshot.
+  struct perf_counters {
+    std::atomic<std::uint64_t> chunk_get_ns_total{0};
+    std::atomic<std::uint64_t> chunk_get_count{0};
+    std::atomic<std::uint64_t> chunk_get_ns_max{0};
+    std::atomic<std::uint64_t> queue_wait_ns_total{0};
+    std::atomic<std::uint64_t> queue_wait_count{0};
+    std::atomic<std::uint64_t> ttfb_ns{0};
+    std::atomic<std::uint64_t> h2d_observed_ns_total{0};
+    std::atomic<std::uint64_t> h2d_observed_count{0};
+    std::atomic<std::uint64_t> h2d_observed_ns_max{0};
+    std::atomic<std::uint64_t> retries_total{0};
+    std::atomic<std::uint64_t> terminal_failures_total{0};
+    std::atomic<std::uint64_t> device_stream_sync_total{0};
+    std::atomic<std::uint64_t> payload_bytes_read_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_count{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
+  };
+  perf_counters _perf;
+
   std::jthread _worker;
 };
 

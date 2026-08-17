@@ -49,11 +49,34 @@ if (discovery.discover()) {
     topo.hostname;           // System hostname
     topo.num_gpus;           // Total GPU count
     topo.num_numa_nodes;     // Total NUMA node count
+    topo.numa_nodes;         // Per-NUMA-node capacity and memory kind
     topo.gpus;               // Per-GPU topology info
     topo.network_devices;    // NICs with NUMA affinity
     topo.storage_devices;    // NVMe/SATA drives with NUMA affinity
+
+    // Lookups return nullopt for an unknown node rather than a silent 0.
+    topo.get_numa_memory_capacity(0);      // std::optional<std::size_t>
+    topo.get_numa_free_memory(0);          // std::optional<std::size_t>
+    topo.get_total_numa_memory_capacity(); // host memory only
+    topo.find_numa_node(0);                // numa_topology_info const*
 }
 ```
+
+**Per-NUMA-node information** (`numa_topology_info`), read from
+`/sys/devices/system/node/node<id>/`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `int` | NUMA node ID |
+| `memory_capacity` | `std::size_t` | `MemTotal` in bytes (0 if unknown) |
+| `free_memory` | `std::size_t` | `MemFree` in bytes (0 if unknown) |
+| `has_cpus` | `bool` | Whether `cpulist` names any CPU |
+| `is_device_memory` | `bool` | Node has memory but no CPUs -- device memory, not host memory |
+
+A node with memory and no CPUs is not host memory. DGX Station and Grace-Hopper expose GPU
+HBM as its own CPU-less node, and CXL memory expanders do the same. Such nodes are excluded
+from `get_total_numa_memory_capacity()`, and `set_usage_limit_ratio_per_numa_region()`
+throws rather than sizing a host space from device memory.
 
 **Per-GPU information** (`gpu_topology_info`):
 
@@ -151,8 +174,8 @@ configurator
     .set_number_of_gpus(2)
     .set_gpu_usage_limit(4ULL << 30)           // 4 GB per GPU
     .set_reservation_fraction_per_gpu(0.85)    // 85% reservable
-    .set_per_host_capacity(16ULL << 30)        // 16 GB per host space
-    .use_host_per_numa();                      // One host space per NUMA node
+    .set_per_numa_region_capacity(16ULL << 30)        // 16 GB per host space
+    .use_numa_id_as_host_id();                      // One host space per NUMA node
 
 // With topology
 topology_discovery discovery;
@@ -186,19 +209,22 @@ Note: `set_gpu_usage_limit()` and `set_usage_limit_ratio_per_gpu()` are mutually
 
 | Method | Description | Default |
 |--------|-------------|---------|
-| `use_host_per_gpu()` | One host space per GPU (testing) | N/A |
-| `use_host_per_numa()` | One host space per NUMA node (production) | `use_host_per_numa()` |
+| `use_gpu_id_as_host_id()` | One host space per GPU (testing) | N/A |
+| `use_numa_id_as_host_id()` | One host space per NUMA node (production) | `use_numa_id_as_host_id()` |
 | `set_total_host_capacity(bytes)` | Total host memory across all spaces | 4 GB |
-| `set_per_host_capacity(bytes)` | Memory per host space | 4 GB |
-| `set_reservation_fraction_per_host(0.85)` | Fraction reservable | 0.85 |
-| `set_reservation_limit_per_host(bytes)` | Absolute reservation limit | N/A |
-| `set_downgrade_fractions_per_host(0.85, 0.65)` | (trigger, stop) fractions | (0.85, 0.65) |
+| `set_per_numa_region_capacity(bytes)` | Memory per host space | 4 GB |
+| `set_usage_limit_ratio_per_numa_region(0.25)` | Memory per host space as a fraction of its NUMA region's capacity | N/A |
+| `set_reservation_fraction_per_numa_region(0.85)` | Fraction reservable | 0.85 |
+| `set_reservation_limit_per_numa_region(bytes)` | Absolute reservation limit | N/A |
+| `set_downgrade_fractions_per_numa_region(0.85, 0.65)` | (trigger, stop) fractions | (0.85, 0.65) |
 | `set_host_pool_features(chunk, block, count)` | Block allocator settings | (1MB, 128, 4) |
 | `set_host_memory_resource_factory(fn)` | Custom host allocator factory | NUMA-pinned |
 
 Host creation policies:
-- **`use_host_per_gpu()`** -- creates one host space per GPU, regardless of NUMA topology. Useful for testing.
-- **`use_host_per_numa()`** -- creates one host space per NUMA node, shared by GPUs on that node. Optimal for production.
+- **`use_gpu_id_as_host_id()`** -- creates one host space per GPU and identifies it by the GPU id. The space is still bound to that GPU's NUMA node for allocation; only the space id differs. Useful for testing.
+- **`use_numa_id_as_host_id()`** -- creates one host space per NUMA node, identified by the NUMA node id and shared by GPUs on that node. Default, and optimal for production.
+
+`set_total_host_capacity()` is the only host-wide setting: it is divided evenly across the host spaces. Every other capacity setting applies per space, i.e. per NUMA region.
 
 ### Disk Configuration
 
@@ -233,8 +259,8 @@ reservation_manager_configurator configurator;
 configurator
     .set_gpu_usage_limit(4ULL << 30)       // 4 GB GPU
     .set_reservation_fraction_per_gpu(0.8) // 80% reservable
-    .set_per_host_capacity(8ULL << 30)     // 8 GB host
-    .use_host_per_gpu();
+    .set_per_numa_region_capacity(8ULL << 30)     // 8 GB host
+    .use_gpu_id_as_host_id();
 
 auto configs = configurator.build();
 memory_reservation_manager manager(std::move(configs));
@@ -252,8 +278,8 @@ configurator
     .set_usage_limit_ratio_per_gpu(0.8)          // 80% of each GPU
     .set_reservation_fraction_per_gpu(0.85)
     .set_downgrade_fractions_per_gpu(0.85, 0.65)
-    .set_per_host_capacity(32ULL << 30)           // 32 GB per NUMA node
-    .use_host_per_numa()
+    .set_per_numa_region_capacity(32ULL << 30)           // 32 GB per NUMA node
+    .use_numa_id_as_host_id()
     .set_host_pool_features(
         2ULL << 20,  // 2 MB blocks
         64,          // 64 blocks per pool
@@ -302,10 +328,10 @@ configurator
 
 // Host: NUMA-aware, 64 GB per node, 2 MB blocks
 configurator
-    .use_host_per_numa()
-    .set_per_host_capacity(64ULL << 30)
-    .set_reservation_fraction_per_host(0.85)
-    .set_downgrade_fractions_per_host(0.85, 0.65)
+    .use_numa_id_as_host_id()
+    .set_per_numa_region_capacity(64ULL << 30)
+    .set_reservation_fraction_per_numa_region(0.85)
+    .set_downgrade_fractions_per_numa_region(0.85, 0.65)
     .set_host_pool_features(2ULL << 20, 128, 8);
 
 // Disk: 1 TB NVMe
@@ -334,7 +360,7 @@ memory_reservation_manager manager(std::move(configs));
 | Host block size | 1 MB (`1 << 20`) |
 | Host pool size | 128 blocks per pool |
 | Host initial pools | 4 |
-| Host creation policy | `use_host_per_numa()` |
+| Host creation policy | `use_numa_id_as_host_id()` |
 | GPU allocator | `rmm::cuda_async_memory_resource` |
 | Host allocator | `numa_region_pinned_host_memory_resource` |
 | Stream pool size | 16 streams |

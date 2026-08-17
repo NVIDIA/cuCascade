@@ -20,6 +20,7 @@
 #include <cucascade/io/rest/s3/sigv4.hpp>
 #include <cucascade/io/uri_parser.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -33,6 +34,34 @@ rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::rea
       return std::make_unique<rest_reactor>(ctx, "rest-" + std::to_string(i++));
     })
 {
+}
+
+rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
+{
+  rest_perf_snapshot agg;
+  for (auto const& r : _reactors) {
+    auto const s = r->perf_snapshot();
+    agg.chunk_get_ns_total += s.chunk_get_ns_total;
+    agg.chunk_get_count += s.chunk_get_count;
+    agg.chunk_get_ns_max = std::max(agg.chunk_get_ns_max, s.chunk_get_ns_max);
+    agg.queue_wait_ns_total += s.queue_wait_ns_total;
+    agg.queue_wait_count += s.queue_wait_count;
+    if (s.ttfb_ns != 0 && (agg.ttfb_ns == 0 || s.ttfb_ns < agg.ttfb_ns)) {
+      agg.ttfb_ns = s.ttfb_ns;  // smallest non-zero first-GET latency across the pool
+    }
+    agg.h2d_observed_ns_total += s.h2d_observed_ns_total;
+    agg.h2d_observed_count += s.h2d_observed_count;
+    agg.h2d_observed_ns_max = std::max(agg.h2d_observed_ns_max, s.h2d_observed_ns_max);
+    agg.retries_total += s.retries_total;
+    agg.terminal_failures_total += s.terminal_failures_total;
+    agg.device_stream_sync_total += s.device_stream_sync_total;
+    agg.payload_bytes_read_total += s.payload_bytes_read_total;
+    agg.blocking_host_get_count += s.blocking_host_get_count;
+    agg.blocking_host_get_wall_ns_total += s.blocking_host_get_wall_ns_total;
+    agg.blocking_host_get_wall_ns_max =
+      std::max(agg.blocking_host_get_wall_ns_max, s.blocking_host_get_wall_ns_max);
+  }
+  return agg;
 }
 
 void rest_ioctx::list_objects_paged(
@@ -134,11 +163,14 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
   if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
   // A blocking HEAD on the caller thread (a one-time metadata round-trip) via
-  // any reactor's authorizer — head_object_size uses a local easy handle and
-  // does not touch worker state, so any reactor is equivalent.
-  size_t const size = _reactors.front()->head_object_size(parsed.host, parsed.path);
-  return std::make_shared<rest_io_object>(
-    std::move(path), std::move(parsed.host), std::move(parsed.path), size);
+  // any reactor's authorizer — head_object uses a local easy handle and does
+  // not touch worker state, so any reactor is equivalent.
+  auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+  return std::make_shared<rest_io_object>(std::move(path),
+                                          std::move(parsed.host),
+                                          std::move(parsed.path),
+                                          head.object_size,
+                                          std::move(head.etag));
 }
 
 std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, open_hint hint)
@@ -180,16 +212,20 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
   if (!probe.bytes) {
     // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
     // fall back to a plain HEAD for the size, with no stash.
-    size_t const size = _reactors.front()->head_object_size(parsed.host, parsed.path);
-    return std::make_shared<rest_io_object>(
-      std::move(path), std::move(parsed.host), std::move(parsed.path), size);
+    auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+    return std::make_shared<rest_io_object>(std::move(path),
+                                            std::move(parsed.host),
+                                            std::move(parsed.path),
+                                            head.object_size,
+                                            std::move(head.etag));
   }
   return std::make_shared<rest_io_object>(std::move(path),
                                           std::move(parsed.host),
                                           std::move(parsed.path),
                                           probe.object_size,
                                           probe.window_lo,
-                                          probe.bytes);
+                                          probe.bytes,
+                                          std::move(probe.etag));
 }
 
 }  // namespace cucascade::io::rest
