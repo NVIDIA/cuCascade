@@ -350,6 +350,10 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
  * Copyable. Copying acquires a new shared lock on the same parent data_batch,
  * incrementing the reader count. The shared lock is released when this object
  * is destroyed, moved-from, or overwritten by assignment.
+ *
+ * @note Destruction never blocks on reader events recorded via record_reader_event(), with one
+ *       exception: if this accessor releases the final shared_ptr to the batch, ~data_batch
+ *       synchronizes outstanding reader events before destroying the representation.
  */
 class read_only_data_batch {
  public:
