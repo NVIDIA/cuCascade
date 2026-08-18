@@ -5,9 +5,6 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
-#include <rmm/cuda_device.hpp>
-#include <rmm/detail/runtime_capabilities.hpp>
-
 #include <dlfcn.h>
 #include <ifaddrs.h>
 #include <nvml.h>
@@ -63,23 +60,18 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
 /**
  * @brief Query whether a CUDA device supports hardware-accelerated decompression.
  *
- * Delegates to `rmm::detail::hwdecompress::is_supported()`, which checks the CUDA
- * driver version. RMM's capability queries are scoped to the current device, so the
- * call is wrapped in an `rmm::cuda_set_device_raii`. Best-effort: any failure while
- * setting the device or probing yields false.
+ * Hardware decompression requires CUDA driver 12.8 or newer. Use NVML rather than
+ * the CUDA runtime so topology discovery neither initializes CUDA nor observes the
+ * process's CUDA_VISIBLE_DEVICES setting.
  *
- * @param cuda_ordinal CUDA device ordinal (matches the runtime device index used
- * elsewhere in discovery under the same CUDA_VISIBLE_DEVICES ordering).
  * @return true iff the hardware decompression engine is available.
  */
-bool query_hw_decompression(unsigned int cuda_ordinal)
+bool query_hw_decompression()
 {
-  try {
-    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{static_cast<int>(cuda_ordinal)}};
-    return rmm::detail::hwdecompress::is_supported();
-  } catch (...) {
-    return false;
-  }
+  constexpr int min_hw_decompression_cuda_version = 12080;
+  int driver_version                              = 0;
+  return nvmlSystemGetCudaDriverVersion(&driver_version) == NVML_SUCCESS &&
+         driver_version >= min_hw_decompression_cuda_version;
 }
 
 /**
@@ -991,13 +983,14 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 
   auto visible_indices =
     resolve_visible_gpu_indices(nvml_gpus, nvml_index_by_pci, nvml_index_by_uuid);
-  topology.num_gpus = static_cast<unsigned int>(visible_indices.size());
+  auto const hw_decompression_available = query_hw_decompression();
+  topology.num_gpus                     = static_cast<unsigned int>(visible_indices.size());
   for (size_t visible_idx = 0; visible_idx < visible_indices.size(); ++visible_idx) {
     size_t nvml_idx = visible_indices[visible_idx];
     if (nvml_idx >= nvml_gpus.size()) { continue; }
     auto gpu                       = nvml_gpus[nvml_idx];
     gpu.id                         = static_cast<unsigned int>(visible_idx);
-    gpu.hw_decompression_available = query_hw_decompression(gpu.id);
+    gpu.hw_decompression_available = hw_decompression_available;
     topology.gpus.push_back(std::move(gpu));
   }
 

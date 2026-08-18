@@ -132,8 +132,10 @@ target_include_directories(
                                              ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 
 # Link dependencies
-target_link_libraries(cucascade_topology_discovery_tests
-                      PRIVATE cucascade_topology_discovery Catch2::Catch2)
+target_link_libraries(
+  cucascade_topology_discovery_tests
+  PRIVATE cucascade_topology_discovery Catch2::Catch2 CUDA::cuda_driver
+          CUDA::cudart CUDA::nvml_static)
 
 # Register tests with CTest
 add_test(NAME cucascade_topology_discovery_tests
