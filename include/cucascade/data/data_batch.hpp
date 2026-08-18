@@ -187,8 +187,10 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   /**
    * @brief Transition from idle to mutable (exclusive lock) without consuming the caller's pointer.
    *
-   * Uses shared_from_this() to obtain a new shared_ptr. Blocks until the
-   * exclusive lock is acquired and all recorded asynchronous readers have completed.
+   * Uses shared_from_this() to obtain a new shared_ptr. Blocks until all recorded asynchronous
+   * readers have completed and the exclusive lock is acquired. The reader wait happens before
+   * lock acquisition (re-checked under the lock), so reader-registered work may safely depend
+   * on threads that themselves need a lock on this batch.
    *
    * @return A mutable_data_batch holding the exclusive lock.
    * @throws cucascade::cuda_error if a recorded reader event cannot be synchronized.
@@ -220,7 +222,8 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @brief Transition from read-only to mutable (upgrade lock).
    *
    * Releases the shared lock, then acquires an exclusive lock (may block).
-   * Waits for all recorded asynchronous readers before exposing mutable access.
+   * Waits for all recorded asynchronous readers before acquiring the exclusive lock
+   * (re-checked under the lock) and exposing mutable access.
    * The source accessor is consumed via move.
    * NOTE: The transition is not atomic.
    *

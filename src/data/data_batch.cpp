@@ -225,9 +225,15 @@ read_only_data_batch data_batch::to_read_only()
 mutable_data_batch data_batch::to_mutable()
 {
   auto self = shared_from_this();
-  std::unique_lock<std::shared_mutex> lock(_rw_mutex);
-  synchronize_reader_events();
-  return mutable_data_batch(std::move(self), std::move(lock));
+  // Drain reader events before taking the exclusive lock: a registered read may only retire
+  // after CPU work that itself needs a lock on this batch, so waiting while holding the lock
+  // could deadlock. Readers may record again between the drain and the acquisition, so re-check
+  // under the lock and retry.
+  while (true) {
+    synchronize_reader_events();
+    std::unique_lock<std::shared_mutex> lock(_rw_mutex);
+    if (reader_events_complete()) { return mutable_data_batch(std::move(self), std::move(lock)); }
+  }
 }
 
 std::optional<read_only_data_batch> data_batch::try_to_read_only()
@@ -256,9 +262,14 @@ mutable_data_batch data_batch::readonly_to_mutable(read_only_data_batch&& access
     // destructor decrements _read_only_count, releases the shared lock and sets state to idle
     auto _ = std::move(accessor);  // move into temporary, destroyed at }
   }
-  std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
-  ptr->synchronize_reader_events();
-  return mutable_data_batch(std::move(ptr), std::move(lock));
+  // Same drain-then-recheck pattern as to_mutable().
+  while (true) {
+    ptr->synchronize_reader_events();
+    std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+    if (ptr->reader_events_complete()) {
+      return mutable_data_batch(std::move(ptr), std::move(lock));
+    }
+  }
 }
 
 read_only_data_batch data_batch::mutable_to_readonly(mutable_data_batch&& accessor)
