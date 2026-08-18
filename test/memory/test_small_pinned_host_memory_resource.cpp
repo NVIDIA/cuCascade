@@ -17,6 +17,7 @@
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 
@@ -24,6 +25,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <set>
 #include <thread>
 #include <vector>
@@ -95,7 +97,7 @@ TEST_CASE("Sub-slab sizes round up correctly", "[small_pinned]")
   f.slab_mr.deallocate(rmm::cuda_stream_view{}, p3, 4097);
 }
 
-TEST_CASE("Large allocation falls back to malloc", "[small_pinned]")
+TEST_CASE("Large allocation is served by the bucketed pinned path", "[small_pinned]")
 {
   test_fixture f;
   constexpr std::size_t big = small_pinned_host_memory_resource::MAX_SLAB_SIZE + 1;
@@ -254,7 +256,6 @@ TEST_CASE("Large allocations do not interfere with slab pool", "[small_pinned]")
   constexpr std::size_t big_size   = 16384;
   constexpr std::size_t small_size = 512;
 
-  // Allocate a large chunk (goes to malloc)
   auto* big = f.slab_mr.allocate(rmm::cuda_stream_view{}, big_size);
   REQUIRE(big != nullptr);
 
@@ -271,4 +272,230 @@ TEST_CASE("Large allocations do not interfere with slab pool", "[small_pinned]")
 
   f.slab_mr.deallocate(rmm::cuda_stream_view{}, small1, small_size);
   f.slab_mr.deallocate(rmm::cuda_stream_view{}, small2, small_size);
+}
+
+TEST_CASE("large_bucket_size_for rounds to power-of-two buckets", "[small_pinned]")
+{
+  using mr = small_pinned_host_memory_resource;
+  REQUIRE(mr::large_bucket_size_for(mr::MAX_SLAB_SIZE + 1) == mr::MIN_LARGE_BUCKET);
+  REQUIRE(mr::large_bucket_size_for(16384) == 16384);
+  REQUIRE(mr::large_bucket_size_for(16385) == 32768);
+  REQUIRE(mr::large_bucket_size_for(100000) == 131072);
+  REQUIRE(mr::large_bucket_size_for(std::size_t{1} << 20) == std::size_t{1} << 20);
+}
+
+TEST_CASE("large_allocation_size rounds only cacheable requests", "[small_pinned]")
+{
+  // allocate sizes its cudaHostAlloc calls with this same helper, so these checks pin down the
+  // physical size behavior: bucket rounding for cacheable requests, the exact request otherwise.
+  test_fixture f;
+  using mr_t = small_pinned_host_memory_resource;
+  REQUIRE(f.slab_mr.large_allocation_size(100000) == 131072);
+  REQUIRE(f.slab_mr.large_allocation_size(mr_t::MIN_LARGE_BUCKET) == mr_t::MIN_LARGE_BUCKET);
+  REQUIRE(f.slab_mr.large_allocation_size(mr_t::DEFAULT_LARGE_CACHE_LIMIT) ==
+          mr_t::DEFAULT_LARGE_CACHE_LIMIT);
+  REQUIRE(f.slab_mr.large_allocation_size(mr_t::DEFAULT_LARGE_CACHE_LIMIT + 1) ==
+          mr_t::DEFAULT_LARGE_CACHE_LIMIT + 1);
+
+  small_pinned_host_memory_resource tiny{f.upstream, 64 * 1024};
+  REQUIRE(tiny.large_allocation_size(9000) == 16384);
+  REQUIRE(tiny.large_allocation_size(100000) == 100000);
+}
+
+TEST_CASE("Large allocations are cached and reused", "[small_pinned]")
+{
+  test_fixture f;
+  constexpr std::size_t big = 100000;  // rounds up to a 128 KB bucket
+
+  auto* slab = f.slab_mr.allocate(rmm::cuda_stream_view{}, 512);
+  auto* p1   = f.slab_mr.allocate(rmm::cuda_stream_view{}, big);
+  REQUIRE(p1 != nullptr);
+  REQUIRE(p1 != slab);
+  std::memset(p1, 0xEF, big);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, p1, big);
+
+  // The freed buffer is cached, so an allocation of the same size gets it back.
+  auto* p2 = f.slab_mr.allocate(rmm::cuda_stream_view{}, big);
+  REQUIRE(p2 == p1);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, p2, big);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, slab, 512);
+}
+
+TEST_CASE("Large cache serves within a bucket but not across buckets", "[small_pinned]")
+{
+  test_fixture f;
+
+  // 12 KB and 40 KB round to different buckets (16 KB and 64 KB): no cross-serving. The 12 KB
+  // buffer stays cached (still allocated), so the 64 KB miss cannot alias it.
+  auto* p16 = f.slab_mr.allocate(rmm::cuda_stream_view{}, 12 * 1024);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, p16, 12 * 1024);
+  auto* p64 = f.slab_mr.allocate(rmm::cuda_stream_view{}, 40 * 1024);
+  REQUIRE(p64 != p16);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, p64, 40 * 1024);
+
+  // 33 KB and 40 KB round to the same 64 KB bucket: the cached buffer is reused.
+  auto* p1 = f.slab_mr.allocate(rmm::cuda_stream_view{}, 33 * 1024);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, p1, 33 * 1024);
+  auto* p2 = f.slab_mr.allocate(rmm::cuda_stream_view{}, 40 * 1024);
+  REQUIRE(p2 == p1);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, p2, 40 * 1024);
+}
+
+TEST_CASE("large_cache_bytes reflects bucket-size accounting", "[small_pinned]")
+{
+  test_fixture f;
+  REQUIRE(f.slab_mr.large_cache_bytes() == 0);
+
+  // 100000 bytes occupy a 128 KB bucket; the cache counts the bucket, not the request.
+  constexpr std::size_t bytes = 100000;
+  auto* p                     = f.slab_mr.allocate(rmm::cuda_stream_view{}, bytes);
+  REQUIRE(f.slab_mr.large_cache_bytes() == 0);  // live buffers are not cached
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, p, bytes);
+  REQUIRE(f.slab_mr.large_cache_bytes() == 128 * 1024);
+
+  // A size one past a bucket boundary lands in the next bucket.
+  auto* q = f.slab_mr.allocate(rmm::cuda_stream_view{}, 16 * 1024 + 1);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, q, 16 * 1024 + 1);
+  REQUIRE(f.slab_mr.large_cache_bytes() == 128 * 1024 + 32 * 1024);
+
+  // Cache hits remove the bucket from the total.
+  auto* r = f.slab_mr.allocate(rmm::cuda_stream_view{}, bytes);
+  REQUIRE(r == p);
+  REQUIRE(f.slab_mr.large_cache_bytes() == 32 * 1024);
+  f.slab_mr.deallocate(rmm::cuda_stream_view{}, r, bytes);
+}
+
+TEST_CASE("Large cache respects its cap and evicts oldest entries", "[small_pinned]")
+{
+  test_fixture f;
+  constexpr std::size_t cap = 64 * 1024;
+  small_pinned_host_memory_resource mr{f.upstream, cap};
+
+  constexpr std::size_t bytes = 9000;  // bucket = 16 KB, so the cap holds four buffers
+  std::array<void*, 5> ptrs{};
+  for (auto& p : ptrs) {
+    p = mr.allocate(rmm::cuda_stream_view{}, bytes);
+    REQUIRE(p != nullptr);
+  }
+  for (auto* p : ptrs) {
+    mr.deallocate(rmm::cuda_stream_view{}, p, bytes);
+    REQUIRE(mr.large_cache_bytes() <= cap);
+  }
+  // Four 16 KB buckets fill the cap; caching the fifth evicted the oldest entry (ptrs[0]).
+  REQUIRE(mr.large_cache_bytes() == cap);
+
+  std::set<void*> reused;
+  for (int i = 0; i < 4; ++i) {
+    reused.insert(mr.allocate(rmm::cuda_stream_view{}, bytes));
+  }
+  REQUIRE(mr.large_cache_bytes() == 0);
+  REQUIRE(reused == std::set<void*>{ptrs[1], ptrs[2], ptrs[3], ptrs[4]});
+  for (auto* p : reused) {
+    mr.deallocate(rmm::cuda_stream_view{}, p, bytes);
+  }
+}
+
+TEST_CASE("Buffers larger than the whole cap are freed, not cached", "[small_pinned]")
+{
+  test_fixture f;
+  small_pinned_host_memory_resource mr{f.upstream, 64 * 1024};
+
+  // Seed the cache so we can also verify the oversized free evicts nothing.
+  auto* seeded = mr.allocate(rmm::cuda_stream_view{}, 9000);
+  mr.deallocate(rmm::cuda_stream_view{}, seeded, 9000);
+  auto const cached_before = mr.large_cache_bytes();
+  REQUIRE(cached_before == 16 * 1024);
+
+  constexpr std::size_t huge = 128 * 1024;  // bucket exceeds the whole 64 KB cap
+  auto* p                    = mr.allocate(rmm::cuda_stream_view{}, huge);
+  REQUIRE(p != nullptr);
+  mr.deallocate(rmm::cuda_stream_view{}, p, huge);
+  REQUIRE(mr.large_cache_bytes() == cached_before);
+}
+
+TEST_CASE("Never-cacheable sizes round trip without polluting the cache", "[small_pinned]")
+{
+  // A non-power-of-two size whose bucket exceeds the whole cap is allocated at exactly the
+  // requested size and freed on deallocate rather than cached.
+  test_fixture f;
+  small_pinned_host_memory_resource mr{f.upstream, 64 * 1024};
+
+  constexpr std::size_t bytes = 100000;  // 128 KB bucket, beyond the 64 KB cap
+  auto* p                     = mr.allocate(rmm::cuda_stream_view{}, bytes);
+  REQUIRE(p != nullptr);
+  std::memset(p, 0x5A, bytes);  // the full requested size must be usable
+  mr.deallocate(rmm::cuda_stream_view{}, p, bytes);
+  REQUIRE(mr.large_cache_bytes() == 0);
+
+  auto* q = mr.allocate(rmm::cuda_stream_view{}, bytes);
+  REQUIRE(q != nullptr);
+  mr.deallocate(rmm::cuda_stream_view{}, q, bytes);
+}
+
+TEST_CASE("Slab and large reuse work on a real stream", "[small_pinned]")
+{
+  // Exercises the deallocate-time event record and allocate-time wait on a genuine
+  // (non-default) stream, driving the device-keyed event pool end to end.
+  test_fixture f;
+  rmm::cuda_stream stream;
+
+  constexpr std::size_t slab_bytes = 2048;
+  auto* s1                         = f.slab_mr.allocate(stream.view(), slab_bytes);
+  REQUIRE(s1 != nullptr);
+  std::memset(s1, 0x11, slab_bytes);
+  f.slab_mr.deallocate(stream.view(), s1, slab_bytes);
+  auto* s2 = f.slab_mr.allocate(stream.view(), slab_bytes);
+  REQUIRE(s2 == s1);
+  f.slab_mr.deallocate(stream.view(), s2, slab_bytes);
+
+  constexpr std::size_t big_bytes = 100000;
+  auto* p1                        = f.slab_mr.allocate(stream.view(), big_bytes);
+  REQUIRE(p1 != nullptr);
+  std::memset(p1, 0x22, big_bytes);
+  f.slab_mr.deallocate(stream.view(), p1, big_bytes);
+  auto* p2 = f.slab_mr.allocate(stream.view(), big_bytes);
+  REQUIRE(p2 == p1);
+  f.slab_mr.deallocate(stream.view(), p2, big_bytes);
+  stream.synchronize();
+}
+
+TEST_CASE("Destruction with a populated large cache is safe", "[small_pinned]")
+{
+  test_fixture f;
+  {
+    // Deallocate -> allocate -> deallocate cycles on both paths recycle events through the idle
+    // pool, so the events destroyed with this resource include recycled ones, not only fresh
+    // ones, attached to a free slab as well as to cached large buffers.
+    small_pinned_host_memory_resource mr{f.upstream};
+    auto* s = mr.allocate(rmm::cuda_stream_view{}, 512);
+    mr.deallocate(rmm::cuda_stream_view{}, s, 512);
+    auto* s2 = mr.allocate(rmm::cuda_stream_view{}, 512);
+    REQUIRE(s2 == s);
+    mr.deallocate(rmm::cuda_stream_view{}, s2, 512);
+
+    auto* p1 = mr.allocate(rmm::cuda_stream_view{}, 10 * 1024);
+    auto* p2 = mr.allocate(rmm::cuda_stream_view{}, 100 * 1024);
+    mr.deallocate(rmm::cuda_stream_view{}, p1, 10 * 1024);
+    mr.deallocate(rmm::cuda_stream_view{}, p2, 100 * 1024);
+    auto* p3 = mr.allocate(rmm::cuda_stream_view{}, 10 * 1024);
+    REQUIRE(p3 == p1);
+    mr.deallocate(rmm::cuda_stream_view{}, p3, 10 * 1024);
+    REQUIRE(mr.large_cache_bytes() == 16 * 1024 + 128 * 1024);
+  }
+  {
+    // A 32 KB insertion into a cap-full cache of two 16 KB entries evicts both victims but
+    // re-acquires only one event, so this resource is destroyed while its pool holds an idle
+    // recycled event alongside the events still attached to a free slab and a cached buffer.
+    small_pinned_host_memory_resource mr{f.upstream, 32 * 1024};
+    auto* s = mr.allocate(rmm::cuda_stream_view{}, 512);
+    mr.deallocate(rmm::cuda_stream_view{}, s, 512);
+    auto* a = mr.allocate(rmm::cuda_stream_view{}, 9000);
+    auto* b = mr.allocate(rmm::cuda_stream_view{}, 9000);
+    auto* c = mr.allocate(rmm::cuda_stream_view{}, 20 * 1024);
+    mr.deallocate(rmm::cuda_stream_view{}, a, 9000);
+    mr.deallocate(rmm::cuda_stream_view{}, b, 9000);
+    mr.deallocate(rmm::cuda_stream_view{}, c, 20 * 1024);
+    REQUIRE(mr.large_cache_bytes() == 32 * 1024);
+  }
+  SUCCEED("resources destroyed with cached buffers, attached events, and pooled idle events");
 }

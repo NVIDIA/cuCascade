@@ -148,7 +148,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 #include <cucascade/data/representation_converter.hpp>
 #include <cudf/column/column_factories.hpp>  // cuDF
 #include <rmm/cuda_stream.hpp>  // RMM
-#include <catch2/catch.hpp>  // system with dot
+#include <catch2/catch_all.hpp>  // system with dot
 #include <memory>   // STL
 #include <vector>
 ## Namespace Usage

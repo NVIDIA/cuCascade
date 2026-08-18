@@ -39,7 +39,11 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#if __has_include(<cuda/stream>)
+#include <cuda/stream>
+#else
 #include <cuda/stream_ref>
+#endif
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
