@@ -26,6 +26,7 @@
 #include <array>
 #include <cstddef>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace cucascade {
@@ -149,24 +150,42 @@ class small_pinned_host_memory_resource {
   /// the freeing stream. Reusing the slab must wait on this event so an
   /// in-flight async H2D copy that still reads the slab (e.g. cuDF's parquet
   /// stats min/max buffers) completes before another stream overwrites it.
-  /// @c ready_event is null for freshly-carved slabs that were never used.
+  /// @c ready_event is null for freshly-carved slabs that were never used, and
+  /// for slabs whose freeing stream was synchronized outright (see deallocate).
+  ///
+  /// @c event_device records the device the event belongs to. A CUDA event is
+  /// bound to the device that was current when it was created, and
+  /// cudaEventRecord rejects an event/stream pair from different devices with
+  /// cudaErrorInvalidResourceHandle. This resource is shared by every GPU in a
+  /// NUMA domain, so events must be pooled per device rather than globally.
   struct free_slab {
     void* ptr;
     cudaEvent_t ready_event;
+    int event_device;
   };
 
-  /// Borrow a timing-disabled CUDA event (recycled from @c event_pool_ or newly
-  /// created). Returns null if event creation fails. Must hold @c mutex_.
-  cudaEvent_t acquire_event_locked();
+  /// The device @p stream belongs to, or the current device if that cannot be
+  /// determined. Events must be created on, and recorded against, this device.
+  static int device_of_stream(::cuda::stream_ref stream) noexcept;
 
-  /// Return an event to @c event_pool_ for reuse. Must hold @c mutex_.
-  void release_event_locked(cudaEvent_t event) noexcept;
+  /// Borrow a timing-disabled CUDA event owned by @p device (recycled from that
+  /// device's pool, or newly created with @p device current). Returns null if
+  /// event creation fails. Must hold @c mutex_.
+  cudaEvent_t acquire_event_locked(int device);
+
+  /// Return an event to @p device's pool for reuse, or destroy it if caching
+  /// would allocate and fail. Must hold @c mutex_.
+  void release_event_locked(cudaEvent_t event, int device) noexcept;
 
   fixed_size_host_memory_resource& upstream_;
   mutable std::mutex mutex_;
   std::array<std::vector<free_slab>, 5> free_lists_{};
-  std::vector<cudaEvent_t> event_pool_;
+  /// Idle events keyed by the device they were created on.
+  std::unordered_map<int, std::vector<cudaEvent_t>> event_pool_;
   std::vector<fixed_multiple_blocks_allocation> owned_allocations_;
+  /// A failed synchronization quarantines a slab and prevents its backing block
+  /// from being returned upstream during destruction.
+  bool has_quarantined_slab_{false};
 };
 
 static_assert(::cuda::mr::resource_with<small_pinned_host_memory_resource,
