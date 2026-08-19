@@ -158,7 +158,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * @param accessor Rvalue reference to the read-only accessor (consumed).
    * @return The batch pointer, now in idle state. Use `std::ignore =
-   * data_batch::to_idle(read_handle)` to simple let go of the read accessor.
+   * data_batch::to_idle(read_handle)` to simply let go of the read accessor.
    */
   static std::shared_ptr<const data_batch> to_idle(read_only_data_batch&& accessor);
 
@@ -167,7 +167,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * @param accessor Rvalue reference to the mutable accessor (consumed).
    * @return The batch pointer, now in idle state.  Use `std::ignore =
-   * data_batch::to_idle(write_handle)` to simple let go of the mutable accessor
+   * data_batch::to_idle(write_handle)` to simply let go of the mutable accessor
    */
   static std::shared_ptr<data_batch> to_idle(mutable_data_batch&& accessor);
 
