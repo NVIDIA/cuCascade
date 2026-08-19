@@ -243,6 +243,20 @@ TEST_CASE("data_batch mutable blocks until readonly released", "[data_batch]")
 }
 
 // =============================================================================
+// Locked-to-locked conversions through idle (TEST-01)
+// =============================================================================
+
+TEST_CASE("data_batch mutable to readonly through idle", "[data_batch]")
+{
+  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto batch = data_batch::make(1, std::move(data));
+
+  auto rw   = batch->to_mutable();
+  auto idle = data_batch::to_idle(std::move(rw));
+  auto ro   = idle->to_read_only();
+  REQUIRE(ro.get_batch_id() == 1);
+}
+// =============================================================================
 // Destruction order safety (TEST-02)
 // =============================================================================
 
