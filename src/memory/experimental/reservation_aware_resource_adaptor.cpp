@@ -34,6 +34,22 @@ reservation_aware_resource_adaptor<Upstream>::reservation_aware_resource_adaptor
 
 template <typename Upstream>
   requires ::cuda::mr::resource<Upstream>
+memory_reservation reservation_aware_resource_adaptor<Upstream>::make_reservation_impl(
+  std::size_t size,
+  allow_overbooking overbooking_policy,
+  std::shared_ptr<const over_reservation_policy> policy)
+{
+  auto const [granted, overbooking] =
+    this->get().reserve(size, overbooking_policy == allow_overbooking::YES);
+
+  using impl_t = detail::memory_reservation_impl<reservation_aware_resource_adaptor<Upstream>>;
+  return memory_reservation{
+    memory_reservation::handle_variant{::cuda::mr::make_shared_resource<impl_t>(
+      *this, detail::safe_cast<std::int64_t>(granted), overbooking, std::move(policy))}};
+}
+
+template <typename Upstream>
+  requires ::cuda::mr::resource<Upstream>
 std::int64_t reservation_aware_resource_adaptor<Upstream>::limit() const noexcept
 {
   return this->get().limit();
@@ -84,29 +100,11 @@ Upstream const& reservation_aware_resource_adaptor<Upstream>::get_upstream_resou
 template <typename Upstream>
   requires ::cuda::mr::resource<Upstream>
 memory_reservation reservation_aware_resource_adaptor<Upstream>::reserve(
-  std::size_t size, allow_overbooking overbooking_policy)
+  std::size_t size,
+  allow_overbooking overbooking_policy,
+  std::shared_ptr<const over_reservation_policy> policy)
 {
-  auto const [granted, overbooking] =
-    this->get().reserve(size, overbooking_policy == allow_overbooking::YES);
-
-  using impl_t = detail::memory_reservation_impl<reservation_aware_resource_adaptor<Upstream>>;
-  return memory_reservation{
-    memory_reservation::handle_variant{::cuda::mr::make_shared_resource<impl_t>(
-      *this, detail::safe_cast<std::int64_t>(granted), overbooking, grant_enforcement::STRICT)}};
-}
-
-template <typename Upstream>
-  requires ::cuda::mr::resource<Upstream>
-memory_reservation reservation_aware_resource_adaptor<Upstream>::reserve_soft(
-  std::size_t size, allow_overbooking overbooking_policy)
-{
-  auto const [granted, overbooking] =
-    this->get().reserve(size, overbooking_policy == allow_overbooking::YES);
-
-  using impl_t = detail::memory_reservation_impl<reservation_aware_resource_adaptor<Upstream>>;
-  return memory_reservation{
-    memory_reservation::handle_variant{::cuda::mr::make_shared_resource<impl_t>(
-      *this, detail::safe_cast<std::int64_t>(granted), overbooking, grant_enforcement::SOFT)}};
+  return make_reservation_impl(size, overbooking_policy, std::move(policy));
 }
 
 template class reservation_aware_resource_adaptor<any_device_resource>;

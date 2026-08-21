@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/error.hpp>
+#include <cucascade/memory/experimental/over_reservation_policy.hpp>
 #include <cucascade/utils/atomics.hpp>
 
 #include <rmm/aligned.hpp>
@@ -33,6 +34,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -87,17 +89,6 @@ struct memory_record {
 enum class allow_overbooking : bool {
   NO,   ///< Fail the request rather than exceed the limit.
   YES,  ///< Grant the request even when the memory isn't available.
-};
-
-/**
- * @brief Whether a reservation caps the allocations made through it.
- *
- * Orthogonal to `allow_overbooking`, which governs the size of the grant rather than
- * what may be drawn against it.
- */
-enum class grant_enforcement : bool {
-  STRICT,  ///< Allocating past the grant throws `rmm::out_of_memory`.
-  SOFT,    ///< Allocating past the grant is permitted and drives the balance negative.
 };
 
 namespace detail {
@@ -390,37 +381,21 @@ class reservation_aware_resource_adaptor
    *
    * If overbooking isn't allowed, a reservation of size zero is returned on failure,
    * with `memory_reservation::overbooking()` reporting by how much the request missed.
-   * A zero-sized reservation fails at allocation time: the first allocation through it
-   * throws `rmm::out_of_memory`.
+   * The per-reservation policy determines what happens when an allocation exceeds the
+   * remaining balance. The default soft policy permits the allocation; a custom policy
+   * may instead grow the reservation or throw.
    *
    * @param size The number of bytes to reserve.
    * @param overbooking_policy Whether overbooking is allowed.
+   * @param policy Per-reservation policy invoked when an allocation exceeds the balance.
+   * Must not be null.
    * @return The reservation. On success its grant always equals @p size and on
    * failure it always equals zero (a zero-sized reservation never fails).
    */
-  [[nodiscard]] memory_reservation reserve(std::size_t size, allow_overbooking overbooking_policy);
-
-  /**
-   * @brief Reserve an amount of memory without capping allocations at the grant.
-   *
-   * Identical to `reserve()` in how the grant is sized and accounted, but allocations
-   * through the returned reservation are never refused for exceeding it. Going past the
-   * grant drives `memory_reservation::balance()` negative by the overdraft. The overdrawn
-   * bytes count only in `current_allocated()` and contribute nothing to
-   * `total_reserved()`, so `available()` treats the overdraft as consumed rather than as
-   * free space for as long as it lasts.
-   *
-   * Nothing throttles an overdraft. It is charged against the adaptor's limit but not
-   * bounded by it, so `available()` can go negative and stay there until the memory is
-   * released. Use this when the total is not known up front and a hard failure
-   * mid-pipeline is worse than temporarily exceeding the budget.
-   *
-   * @param size The number of bytes to reserve.
-   * @param overbooking_policy Whether overbooking is allowed.
-   * @return The reservation, which reports `memory_reservation::is_soft() == true`.
-   */
-  [[nodiscard]] memory_reservation reserve_soft(std::size_t size,
-                                                allow_overbooking overbooking_policy);
+  [[nodiscard]] memory_reservation reserve(
+    std::size_t size,
+    allow_overbooking overbooking_policy,
+    std::shared_ptr<const over_reservation_policy> policy = ignore_on_over_reservation_instance());
 
   /**
    * @brief Get the memory limit.
@@ -490,6 +465,12 @@ class reservation_aware_resource_adaptor
    * @return Reference to the erased upstream resource.
    */
   [[nodiscard]] Upstream const& get_upstream_resource() const noexcept;
+
+ private:
+  [[nodiscard]] memory_reservation make_reservation_impl(
+    std::size_t size,
+    allow_overbooking overbooking_policy,
+    std::shared_ptr<const over_reservation_policy> policy);
 };
 
 }  // namespace experimental

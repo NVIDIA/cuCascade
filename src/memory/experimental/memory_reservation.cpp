@@ -138,11 +138,6 @@ std::int64_t memory_reservation::balance() const noexcept
   return std::visit([](auto const& handle) { return handle->balance(); }, handle_);
 }
 
-bool memory_reservation::is_soft() const noexcept
-{
-  return std::visit([](auto const& handle) { return handle->is_soft(); }, handle_);
-}
-
 std::size_t memory_reservation::overbooking() const noexcept
 {
   return std::visit([](auto const& handle) { return handle->overbooking(); }, handle_);

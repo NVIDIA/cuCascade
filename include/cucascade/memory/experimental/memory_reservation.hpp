@@ -23,7 +23,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <string>
+#include <memory>
 #include <utility>
 #include <variant>
 
@@ -38,7 +38,8 @@ namespace detail {
  * Satisfies the `cuda::mr::resource` concept so it can be a `cuda::mr::shared_resource`.
  * Allocating moves bytes from the adaptor's reserved counter to its allocated counter;
  * the unspent balance is refunded only when the last reference dies.
- *
+ *    std::shared_ptr<const over_reservation_policy> policy);
+
  * The reservation's claim on `reservation_aware_resource_adaptor::total_reserved()` is
  * `reserved_part(balance())`, never the raw balance, so a soft reservation that has
  * overdrawn claims nothing rather than crediting back memory it is still using. Every
@@ -55,18 +56,20 @@ namespace detail {
 template <typename Adaptor>
   requires reservation_adaptor<Adaptor>
 class memory_reservation_impl
-  : public ::cuda::forward_property<memory_reservation_impl<Adaptor>, Adaptor> {
+  : public reservation_control,
+    public ::cuda::forward_property<memory_reservation_impl<Adaptor>, Adaptor> {
  public:
   memory_reservation_impl(Adaptor adaptor,
                           std::int64_t grant,
                           std::size_t overbooking,
-                          grant_enforcement enforcement)
+                          std::shared_ptr<const over_reservation_policy> policy)
     : adaptor_{std::move(adaptor)},
       grant_{grant},
       overbooking_{overbooking},
-      enforcement_{enforcement},
+      policy_{std::move(policy)},
       balance_{grant}
   {
+    if (!policy_) { CUCASCADE_FAIL("over_reservation_policy must not be null"); }
   }
 
   ~memory_reservation_impl()
@@ -79,32 +82,35 @@ class memory_reservation_impl
   memory_reservation_impl& operator=(memory_reservation_impl const&) = delete;
   memory_reservation_impl& operator=(memory_reservation_impl&&)      = delete;
 
-  [[nodiscard]] std::int64_t grant() const noexcept { return grant_; }
+  [[nodiscard]] std::int64_t grant() const noexcept override { return grant_; }
 
-  [[nodiscard]] std::size_t overbooking() const noexcept { return overbooking_; }
-
-  [[nodiscard]] bool is_soft() const noexcept { return enforcement_ == grant_enforcement::SOFT; }
-
-  [[nodiscard]] std::int64_t balance() const noexcept
+  [[nodiscard]] std::int64_t balance() const noexcept override
   {
     return balance_.load(std::memory_order_acquire);
   }
+
+  [[nodiscard]] std::size_t overbooking() const noexcept override { return overbooking_; }
 
   void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
   {
-    auto const amount = safe_cast<std::int64_t>(bytes);
-    auto const before = draw_down_res(amount);
-    void* ptr         = nullptr;
+    auto const amount      = safe_cast<std::int64_t>(bytes);
+    auto const before      = draw_down_res(amount);
+    auto const after       = before - amount;
+    auto const claim_delta = calc_delta(before, after);
+
+    adaptor_->total_reserved_.sub(claim_delta, std::memory_order_acq_rel);
+
+    void* ptr = nullptr;
     try {
       ptr = adaptor_->allocate(stream, bytes, alignment);
     } catch (...) {
-      balance_.fetch_add(amount, std::memory_order_acq_rel);
+      auto const rollback_before = balance_.fetch_add(amount, std::memory_order_acq_rel);
+      auto const rollback_delta  = calc_delta(rollback_before + amount, rollback_before);
+      adaptor_->total_reserved_.add(rollback_delta, std::memory_order_acq_rel);
       throw;
     }
-    adaptor_->total_reserved_.sub(reserved_part(before) - reserved_part(before - amount),
-                                  std::memory_order_acq_rel);
     return ptr;
   }
 
@@ -115,8 +121,7 @@ class memory_reservation_impl
   {
     auto const amount = safe_cast<std::int64_t>(bytes);
     auto const before = balance_.fetch_add(amount, std::memory_order_acq_rel);
-    adaptor_->total_reserved_.add(reserved_part(before + amount) - reserved_part(before),
-                                  std::memory_order_acq_rel);
+    adaptor_->total_reserved_.add(calc_delta(before + amount, before), std::memory_order_acq_rel);
     adaptor_->deallocate(stream, ptr, bytes, alignment);
   }
 
@@ -151,30 +156,33 @@ class memory_reservation_impl
     return balance > 0 ? balance : 0;
   }
 
+  /// @return The difference between two reserved portions.
+  static constexpr std::int64_t calc_delta(std::int64_t lhs, std::int64_t rhs) noexcept
+  {
+    return reserved_part(lhs) - reserved_part(rhs);
+  }
+
   /// @return The balance before the draw-down.
   std::int64_t draw_down_res(std::int64_t bytes)
   {
-    // Nothing to enforce, so skip the compare-exchange entirely and let the balance
-    // go negative; the overdraft still shows up in the adaptor's `current_allocated()`.
-    if (is_soft()) { return balance_.fetch_sub(bytes, std::memory_order_acq_rel); }
-
     auto balance = balance_.load(std::memory_order_relaxed);
-    do {
+    while (true) {
       if (bytes > balance) {
-        CUCASCADE_FAIL("allocation of " + std::to_string(bytes) +
-                         " bytes exceeds reservation (grant: " + std::to_string(grant_) +
-                         ", remaining: " + std::to_string(balance) + ")",
-                       rmm::out_of_memory);
+        policy_->handle_over_reservation(bytes, balance, *this);
+        return balance_.fetch_sub(bytes, std::memory_order_acq_rel);
       }
-    } while (!balance_.compare_exchange_weak(
-      balance, balance - bytes, std::memory_order_acq_rel, std::memory_order_relaxed));
-    return balance;
+
+      if (balance_.compare_exchange_weak(
+            balance, balance - bytes, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return balance;
+      }
+    }
   }
 
   Adaptor adaptor_;
   std::int64_t const grant_;
   std::size_t const overbooking_;
-  grant_enforcement const enforcement_;
+  std::shared_ptr<const over_reservation_policy> policy_;
   std::atomic<std::int64_t> balance_;
 };
 
@@ -194,10 +202,10 @@ using reservation_handle = ::cuda::mr::shared_resource<memory_reservation_impl<A
  * charged against that budget: an allocation exceeding the remaining `balance()` throws
  * `rmm::out_of_memory`, and deallocating returns the bytes to the balance.
  *
- * A reservation from `reserve_soft()` is not capped. It accounts identically but permits
- * allocations past the grant, reporting the overdraft as a negative `balance()`. Only the
- * grant is backed by the adaptor's reserve; the overdraft is spent against the limit
- * without a claim on it, so it shows up in `current_allocated()` alone.
+ * The default soft over-reservation policy permits allocations past the grant, reporting
+ * the overdraft as a negative `balance()`. Only the grant is backed by the adaptor's
+ * reserve; the overdraft is spent against the limit without a claim on it, so it shows up
+ * in `current_allocated()` alone.
  *
  * This is a single type regardless of where the memory lives. Internally it holds one of
  * three shared states, chosen by the granting adaptor's upstream, and its own type says
@@ -304,13 +312,6 @@ class memory_reservation {
    * @return The remaining size in bytes.
    */
   [[nodiscard]] std::int64_t balance() const noexcept;
-
-  /**
-   * @brief Whether allocations may exceed the grant.
-   *
-   * @return True when the reservation was granted by `reserve_soft()`.
-   */
-  [[nodiscard]] bool is_soft() const noexcept;
 
   /**
    * @brief The number of bytes by which the grant overbooks the adaptor's limit.
