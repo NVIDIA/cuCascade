@@ -17,8 +17,8 @@
  */
 
 #include "loopback_range_server.hpp"
+#include "mock_authorizer.hpp"
 
-#include <cucascade/io/rest/mock_authorizer.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 

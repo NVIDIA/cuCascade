@@ -17,9 +17,9 @@
  */
 
 #include "loopback_range_server.hpp"
+#include "mock_authorizer.hpp"
 
 #include <cucascade/io/io_context.hpp>
-#include <cucascade/io/rest/mock_authorizer.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 
 #include <arpa/inet.h>
