@@ -16,9 +16,8 @@
  * limitations under the License.
  */
 
-#include <cucascade/memory/experimental/over_reservation_policy.hpp>
-
 #include <cucascade/error.hpp>
+#include <cucascade/memory/experimental/over_reservation_policy.hpp>
 
 #include <rmm/error.hpp>
 
@@ -31,8 +30,8 @@ over_reservation_policy::~over_reservation_policy() = default;
 throw_on_over_reservation::throw_on_over_reservation() = default;
 
 void throw_on_over_reservation::handle_over_reservation(std::int64_t requested_bytes,
-                                                           std::int64_t observed_balance,
-                                                           reservation_control& reservation) const
+                                                        std::int64_t observed_balance,
+                                                        reservation_control& reservation) const
 {
   CUCASCADE_FAIL("allocation of " + std::to_string(requested_bytes) +
                    " bytes exceeds reservation (grant: " + std::to_string(reservation.grant()) +
