@@ -8,6 +8,7 @@ Hardware topology discovery, NUMA-aware memory placement, and system configurati
 - [Hardware Topology Discovery](#hardware-topology-discovery)
   - [What Gets Detected](#what-gets-detected)
   - [How Detection Works](#how-detection-works)
+  - [CUDA Context Independence](#cuda-context-independence)
   - [GPU-to-NUMA Affinity](#gpu-to-numa-affinity)
   - [PCIe Path Types](#pcie-path-types)
 - [Configuring cuCascade](#configuring-cucascade)
@@ -104,6 +105,13 @@ throws rather than sizing a host space from device memory.
 4. **CPU affinity** -- reads `/sys/bus/pci/devices/<bus_id>/local_cpulist`
 5. **Network devices** -- scans `/sys/class/infiniband/` for NICs with NUMA info, with configurable verification (see [Network Device Verification](#network-device-verification))
 6. **Storage devices** -- scans `/sys/block/` for NVMe and SATA devices with NUMA info
+
+### CUDA Context Independence
+
+Topology discovery is independent of CUDA runtime and context state. `discover()` may be called
+before or after CUDA initialization, but it must never initialize CUDA, create or require a CUDA
+context, or otherwise alter CUDA process state. This is a public API invariant, not merely an
+implementation detail.
 
 ### Network Device Verification
 

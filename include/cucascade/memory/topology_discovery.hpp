@@ -192,6 +192,10 @@ class topology_discovery {
    * This method performs the actual discovery of GPUs, NUMA nodes, CPU affinity,
    * and network devices. It must be called before `get_topology()`.
    *
+   * @note CUDA-context invariant: this method is CUDA runtime and context agnostic.
+   * It must not initialize CUDA, create a CUDA context, require an active CUDA context,
+   * or otherwise alter CUDA process state.
+   *
    * @param net_verification Controls how strictly network devices are validated.
    * @return true if discovery was successful, false otherwise.
    */

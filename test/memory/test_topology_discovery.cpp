@@ -31,7 +31,13 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+
 #include <catch2/catch_all.hpp>
+#include <nvml.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -289,4 +295,51 @@ TEST_CASE("Topology Discovery rejects overflow CUDA_VISIBLE_DEVICES", "[hw_topol
   topology_discovery discovery;
   REQUIRE_THROWS_WITH(discovery.discover(),
                       "Invalid numeric CUDA_VISIBLE_DEVICES entry: 999999999999999999999999999999");
+}
+
+TEST_CASE("Topology Discovery does not initialize CUDA while visibility is widened",
+          "[hw_topology][cuda-context]")
+{
+  auto const child = fork();
+  REQUIRE(child >= 0);
+
+  if (child == 0) {
+    // NVML is used only to make this test meaningful on a multi-GPU host. It
+    // does not create a CUDA context or initialize the CUDA runtime.
+    if (nvmlInit_v2() != NVML_SUCCESS) { _exit(77); }
+    unsigned int device_count = 0;
+    auto const count_status   = nvmlDeviceGetCount_v2(&device_count);
+    nvmlShutdown();
+    if (count_status != NVML_SUCCESS || device_count < 2) { _exit(77); }
+
+    // This mirrors callers that temporarily widen visibility to collect
+    // physical topology, then restore the process's assigned GPU. If
+    // discover() initializes the CUDA runtime while CVD is unset, the runtime
+    // permanently sees all GPUs and the final cudaGetDeviceCount() is wrong.
+    setenv("CUDA_VISIBLE_DEVICES", "1", 1);
+    unsetenv("CUDA_VISIBLE_DEVICES");
+    topology_discovery discovery;
+    bool const discovered = discovery.discover();
+    setenv("CUDA_VISIBLE_DEVICES", "1", 1);
+    if (!discovered) { _exit(1); }
+
+    CUcontext context = nullptr;
+    if (cuInit(0) != CUDA_SUCCESS || cuCtxGetCurrent(&context) != CUDA_SUCCESS ||
+        context != nullptr) {
+      _exit(1);
+    }
+
+    int visible_count = 0;
+    if (cudaGetDeviceCount(&visible_count) != cudaSuccess || visible_count != 1) { _exit(1); }
+    _exit(0);
+  }
+
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
+    SUCCEED("Skipped: requires NVML and at least two visible GPUs");
+    return;
+  }
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
 }
