@@ -37,7 +37,7 @@
 
 namespace cucascade::io {
 
-enum class io_context_type { uring, restful, kvikio };
+enum class io_context_type { uring, restful, kvikio, s3rdma };
 
 /// Hint passed to @c open_io_object so a backend can tailor how it resolves an
 /// object's metadata.  @c generic resolves the size however is cheapest for the

@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/exec/admission_control.hpp>
+#include <cucascade/io/rest/object_store_lister.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
@@ -150,6 +151,8 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// footer reads are served locally.  Falls back to a plain HEAD (no stash)
   /// when the response is unusable.
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
+
+  object_store_lister _lister;
 
   /// The effective resolve_footer_objects concurrency cap: the configured
   /// knob, or n_reactors * max_connections under footer_resolve_auto.  0 =
