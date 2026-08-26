@@ -87,6 +87,17 @@ class cuda_event_view {
    */
   [[nodiscard]] event::query_result query() const noexcept;
 
+  /**
+   * @brief Query completion without blocking, preserving the raw CUDA status.
+   *
+   * query() collapses every failure into query_result::error, which callers cannot distinguish
+   * from "not finished yet". Use this when a failure must be propagated as a checked CUDA error.
+   *
+   * @return cudaSuccess when complete, cudaErrorNotReady while still in progress, otherwise the
+   *         failing CUDA error code.
+   */
+  [[nodiscard]] cudaError_t query_raw_status() const noexcept;
+
  private:
   cudaEvent_t event_{};
 };
@@ -141,6 +152,13 @@ class cuda_event {
    * @brief Query whether the event has completed without blocking.
    */
   [[nodiscard]] event::query_result query() const noexcept;
+
+  /**
+   * @brief Query completion without blocking, preserving the raw CUDA status.
+   *
+   * @copydetails cuda_event_view::query_raw_status()
+   */
+  [[nodiscard]] cudaError_t query_raw_status() const noexcept;
 
  private:
   cudaEvent_t event_{nullptr};

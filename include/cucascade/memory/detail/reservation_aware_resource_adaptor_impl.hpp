@@ -200,7 +200,7 @@ class reservation_aware_resource_adaptor_impl {
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    auto def_stream = cuda::stream_ref{cudaStream_t{nullptr}};
+    auto def_stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
     auto* ptr       = allocate(def_stream, bytes, alignment);
     def_stream.sync();
     return ptr;
@@ -210,7 +210,7 @@ class reservation_aware_resource_adaptor_impl {
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    auto def_stream = cuda::stream_ref{cudaStream_t{nullptr}};
+    auto def_stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
     deallocate(def_stream, ptr, bytes, alignment);
     def_stream.sync();
   }
