@@ -37,39 +37,107 @@ small_pinned_host_memory_resource::~small_pinned_host_memory_resource()
   // free_lists_ entries are raw pointers into those blocks; no individual cleanup needed.
   // Destroy every CUDA event we own — both idle (pooled) and still attached to a
   // free slab that was never re-allocated.
-  for (auto& event : event_pool_) {
-    if (event != nullptr) { CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(event)); }
+  bool retain_backing_allocations = has_quarantined_slab_;
+  int prev_device                 = 0;
+  bool const have_prev            = (::cudaGetDevice(&prev_device) == cudaSuccess);
+  auto destroy_on                 = [&retain_backing_allocations](cudaEvent_t event, int device) {
+    if (event == nullptr) { return; }
+    // cudaEventDestroy is device-agnostic, but making the owning device current
+    // keeps the call on the context the event was created in.
+    if (device >= 0) { (void)::cudaSetDevice(device); }
+    // Destroying an incomplete event does not wait for its captured work. Wait
+    // explicitly before owned_allocations_ returns the backing slabs upstream.
+    if (::cudaEventSynchronize(event) != cudaSuccess) {
+      // Fail closed: cudaEventDestroy is non-blocking for incomplete events.
+      // Retain every backing allocation so upstream cannot reuse its slabs.
+      (void)::cudaGetLastError();
+      retain_backing_allocations = true;
+    }
+    CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(event));
+  };
+  for (auto& [device, events] : event_pool_) {
+    for (auto& event : events) {
+      destroy_on(event, device);
+    }
   }
   for (auto& list : free_lists_) {
     for (auto& slab : list) {
-      if (slab.ready_event != nullptr) {
-        CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(slab.ready_event));
-      }
+      destroy_on(slab.ready_event, slab.event_device);
+    }
+  }
+  if (have_prev) { (void)::cudaSetDevice(prev_device); }
+  if (retain_backing_allocations) {
+    // Intentionally leak the allocation handles on an unrecoverable CUDA error.
+    // Returning their blocks upstream would risk use-after-free or unordered reuse.
+    for (auto& allocation : owned_allocations_) {
+      (void)allocation.release();
     }
   }
 }
 
-cudaEvent_t small_pinned_host_memory_resource::acquire_event_locked()
+int small_pinned_host_memory_resource::device_of_stream(::cuda::stream_ref stream) noexcept
 {
-  if (!event_pool_.empty()) {
-    cudaEvent_t event = event_pool_.back();
-    event_pool_.pop_back();
+  int device = -1;
+  // A CUDA event is bound to the device current at creation time, and
+  // cudaEventRecord requires the event and stream to be on the same device.
+  // Ask the driver which device this stream belongs to rather than assuming it
+  // matches the calling thread's current device.
+  if (::cudaStreamGetDevice(stream.get(), &device) == cudaSuccess) { return device; }
+  (void)::cudaGetLastError();
+  if (::cudaGetDevice(&device) == cudaSuccess) { return device; }
+  (void)::cudaGetLastError();
+  return -1;
+}
+
+cudaEvent_t small_pinned_host_memory_resource::acquire_event_locked(int device)
+{
+  auto const pool_it = event_pool_.find(device);
+  if (pool_it != event_pool_.end() && !pool_it->second.empty()) {
+    auto& pool        = pool_it->second;
+    cudaEvent_t event = pool.back();
+    pool.pop_back();
     return event;
   }
+
+  // Create the event on the device it will be recorded against. Without this,
+  // an event created while another GPU was current fails cudaEventRecord with
+  // cudaErrorInvalidResourceHandle, and the slab would be recycled unordered.
+  int prev_device = -1;
+  bool switched   = false;
+  if (device >= 0 && ::cudaGetDevice(&prev_device) == cudaSuccess && prev_device != device) {
+    if (::cudaSetDevice(device) == cudaSuccess) {
+      switched = true;
+    } else {
+      (void)::cudaGetLastError();
+      return nullptr;
+    }
+  }
+
   cudaEvent_t event = nullptr;
   // Timing is not needed; disabling it makes record/wait cheaper.
-  if (::cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
-    // Best effort: without an event this deallocation loses stream ordering, but
-    // allocation must never throw here. Clear the sticky error and carry on.
+  bool const created = (::cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess);
+  if (!created) {
+    // The caller synchronizes the freeing stream when no event is available, so
+    // losing an event costs performance but never ordering.
     (void)::cudaGetLastError();
-    return nullptr;
+    event = nullptr;
   }
+
+  if (switched) { (void)::cudaSetDevice(prev_device); }
   return event;
 }
 
-void small_pinned_host_memory_resource::release_event_locked(cudaEvent_t event) noexcept
+void small_pinned_host_memory_resource::release_event_locked(cudaEvent_t event, int device) noexcept
 {
-  if (event != nullptr) { event_pool_.push_back(event); }
+  if (event == nullptr) { return; }
+  try {
+    event_pool_[device].push_back(event);
+  } catch (...) {
+    // Pool growth is only a cache optimization. Avoid terminating a noexcept
+    // deallocation if host allocation fails; an already-enqueued wait is not
+    // affected by destroying the event handle.
+    CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(event));
+  }
 }
 
 void* small_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
@@ -105,8 +173,16 @@ void* small_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_
   // that copy completes. Recording the event again (on a later deallocate) does
   // not disturb this already-enqueued wait, so the event is safe to recycle.
   if (slab.ready_event != nullptr) {
-    CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaStreamWaitEvent(stream.get(), slab.ready_event, 0));
-    release_event_locked(slab.ready_event);
+    // cudaStreamWaitEvent is legal across devices, so the reusing stream may
+    // belong to a different GPU than the one that recorded the event.
+    cudaError_t const wait_status = ::cudaStreamWaitEvent(stream.get(), slab.ready_event, 0);
+    if (wait_status != cudaSuccess) {
+      // The wait was not established, so returning this pointer would recreate
+      // the unordered-reuse race. Keep the slab tracked and propagate the error.
+      free_lists_[idx].push_back(slab);
+      CUCASCADE_CUDA_TRY(wait_status);
+    }
+    release_event_locked(slab.ready_event, slab.event_device);
   }
   return slab.ptr;
 }
@@ -122,18 +198,35 @@ void small_pinned_host_memory_resource::deallocate([[maybe_unused]] cuda::stream
     return;
   }
 
-  std::size_t idx = slab_index_for(bytes);
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::size_t idx         = slab_index_for(bytes);
+  int const stream_device = device_of_stream(stream);
+  std::unique_lock<std::mutex> lock(mutex_);
   // Record an event on the freeing stream so a future reuse of this slab can wait
   // for any still-pending work on it (the async H2D copy in cuDF's stats filter).
-  // Best effort: a null event just means this slab is recycled without ordering.
-  cudaEvent_t event = acquire_event_locked();
+  cudaEvent_t event = acquire_event_locked(stream_device);
   if (event != nullptr && ::cudaEventRecord(event, stream.get()) != cudaSuccess) {
     (void)::cudaGetLastError();
-    release_event_locked(event);
+    release_event_locked(event, stream_device);
     event = nullptr;
   }
-  free_lists_[idx].push_back(free_slab{ptr, event});
+  if (event == nullptr) {
+    // No event means no ordering, and an unordered slab hands still-in-flight
+    // source memory to the next writer. Pay for a synchronize instead: dropping
+    // ordering here silently corrupts whatever the pending copy was reading.
+    // The slab is not published yet, so do not hold the allocator-wide mutex
+    // while waiting for unrelated work on this stream to complete.
+    lock.unlock();
+    if (::cudaStreamSynchronize(stream.get()) != cudaSuccess) {
+      // Synchronization failure leaves ordering unknown. Quarantine this slab
+      // instead of making it available for unsafe reuse.
+      (void)::cudaGetLastError();
+      lock.lock();
+      has_quarantined_slab_ = true;
+      return;
+    }
+    lock.lock();
+  }
+  free_lists_[idx].push_back(free_slab{ptr, event, stream_device});
 }
 
 bool small_pinned_host_memory_resource::operator==(
@@ -161,7 +254,7 @@ void small_pinned_host_memory_resource::expand_pool_locked(std::size_t slab_idx)
   for (std::byte* block : allocation->get_blocks()) {
     for (std::size_t i = 0; i < num_slabs; ++i) {
       // Freshly-carved slabs were never used, so they carry no pending-work event.
-      free_lists_[slab_idx].push_back(free_slab{block + i * slab_size, nullptr});
+      free_lists_[slab_idx].push_back(free_slab{block + i * slab_size, nullptr, -1});
     }
   }
   owned_allocations_.push_back(std::move(allocation));
