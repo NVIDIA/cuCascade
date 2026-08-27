@@ -18,21 +18,25 @@
 if(TARGET cucascade_objects)
   target_sources(
     cucascade_objects
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/disk_access_limiter.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/fixed_size_host_memory_resource.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/memory_reservation.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/memory_reservation_manager.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/memory_space.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/notification_channel.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/null_device_memory_resource.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/numa_region_pinned_host_allocator.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/oom_handling_policy.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/reservation_aware_resource_adaptor.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/reservation_manager_configurator.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/small_pinned_host_memory_resource.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/stream_pool.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/error.cpp)
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/common.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/disk_access_limiter.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/fixed_size_host_memory_resource.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/memory_reservation.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/memory_reservation_manager.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/memory_space.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/notification_channel.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/null_device_memory_resource.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/numa_region_pinned_host_allocator.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/oom_handling_policy.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/reservation_aware_resource_adaptor.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/experimental/memory_reservation.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/experimental/over_reservation_policy.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/experimental/reservation_aware_resource_adaptor.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/reservation_manager_configurator.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/small_pinned_host_memory_resource.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/stream_pool.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/error.cpp)
 endif()
 target_sources(cucascade_topology_discovery_objects
                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/topology_discovery.cpp)
