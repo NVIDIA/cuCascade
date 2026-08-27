@@ -22,6 +22,7 @@
 // virtual interface (device_read_async_io_using).  Extracted here to break the
 // circular include between io_context.hpp and prefetching_cache.hpp.
 
+#include <cucascade/exec/spin_lock.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -45,6 +46,25 @@
 #include <vector>
 
 namespace cucascade::io::cache {
+
+// ---------------------------------------------------------------------------
+// Page-alignment helpers
+// ---------------------------------------------------------------------------
+//
+// @c a must be a power of two (in practice @c io::IO_BLOCK_SIZE, the O_DIRECT
+// page size).  @c align_down rounds @p x down to the nearest multiple of @p a;
+// @c align_up rounds up.  Used to page-align cache sub-range reads so partial
+// fills stay O_DIRECT-compatible — never hardcode 4096 at call sites.
+
+[[nodiscard]] constexpr std::size_t align_down(std::size_t x, std::size_t a) noexcept
+{
+  return x & ~(a - 1);
+}
+
+[[nodiscard]] constexpr std::size_t align_up(std::size_t x, std::size_t a) noexcept
+{
+  return (x + a - 1) & ~(a - 1);
+}
 
 /**
  * @brief How the prefetching layer should behave on top of a given backend.
@@ -128,12 +148,19 @@ class buffer_pool {
 };
 
 // ---------------------------------------------------------------------------
-// entry_state — packed atomic state + pin_count
+// entry_state — mutex-guarded state + pin_count
 // ---------------------------------------------------------------------------
 //
-// Packs a 4-bit state enum and a 28-bit reader pin count into a single
-// atomic uint32_t.  Every transition is a single CAS, which eliminates the
-// TOCTOU race between checking state and modifying pin_count.
+// Holds a state enum and a reader pin count guarded by a single lock
+// (@c entry_lock).  Every transition takes the lock, verifies its precondition,
+// and mutates plain members, which eliminates the TOCTOU race between checking
+// state and modifying pin_count.  @c entry_lock is a type alias — currently a
+// @c cucascade::exec::spin_lock (a folly-derived micro spinlock).  The critical
+// sections are a handful of branch/assign instructions, so a spinlock avoids the
+// syscall overhead of a blocking mutex under the fine-grained per-chunk locking
+// here.  There is no blocking wait: a reader that observes an in-flight `loading`
+// chunk does not park on it — @c acquire_read() / @c mark_loading() simply fail
+// and the reader falls back to reading the bytes itself.
 //
 // State machine — each row is the complete set of valid outbound transitions
 // for that state.  Any other transition is rejected by the corresponding
@@ -155,10 +182,8 @@ class buffer_pool {
 // `empty` is the only state with no inbound transitions other than from
 // `evicting` — once an entry leaves `empty`, it can only return through the
 // `evicting` reclamation path.  `evicting` is a one-way transit state.
-//
-// `loading` is the only non-terminal state with a wait point: readers that
-// observe `loading` park on wait_while_pending() until the IO settles to one
-// of cached / in_use(1) / allocated.
+
+using entry_lock = cucascade::exec::spin_lock;
 
 class entry_state {
  public:
@@ -176,27 +201,33 @@ class entry_state {
 
   [[nodiscard]] value get_state() const noexcept
   {
-    return unpack_state(_packed.load(std::memory_order_acquire));
+    std::lock_guard<entry_lock> lk(_mtx);
+    return _state;
   }
 
   [[nodiscard]] uint32_t get_pin_count() const noexcept
   {
-    return unpack_pins(_packed.load(std::memory_order_acquire));
+    std::lock_guard<entry_lock> lk(_mtx);
+    return _pins;
   }
 
   /// empty → queued.  Returns false on precondition mismatch.
   [[nodiscard]] bool mark_queued() noexcept
   {
-    auto expected = pack(empty, 0);
-    return _packed.compare_exchange_strong(expected, pack(queued, 0), std::memory_order_acq_rel);
+    std::lock_guard<entry_lock> lk(_mtx);
+    if (_state != empty) return false;
+    _state = queued;
+    return true;
   }
 
   /// queued → allocated.  Returns false on precondition mismatch.  Called by
   /// the allocator when it attaches chunks to a previously-queued entry.
   [[nodiscard]] bool mark_allocated() noexcept
   {
-    auto expected = pack(queued, 0);
-    return _packed.compare_exchange_strong(expected, pack(allocated, 0), std::memory_order_acq_rel);
+    std::lock_guard<entry_lock> lk(_mtx);
+    if (_state != queued) return false;
+    _state = allocated;
+    return true;
   }
 
   /// loading → allocated (IO-failure revert).  Returns false on precondition
@@ -204,140 +235,106 @@ class entry_state {
   /// whose IO did not complete: the entry's chunks stay attached so a
   /// subsequent allocated-steal read can retry the load with a fresh
   /// request_context, instead of discarding the entry to `empty` and forcing
-  /// the next reader through a fresh queue/allocate roundtrip.  Wakes any
-  /// threads parked in @c wait_while_pending().
+  /// the next reader through a fresh queue/allocate roundtrip.
   [[nodiscard]] bool mark_load_failed() noexcept
   {
-    auto expected = pack(loading, 0);
-    bool ok =
-      _packed.compare_exchange_strong(expected, pack(allocated, 0), std::memory_order_acq_rel);
-    if (ok) { _packed.notify_all(); }
-    return ok;
+    std::lock_guard<entry_lock> lk(_mtx);
+    if (_state != loading) return false;
+    _state = allocated;
+    return true;
   }
 
   /// allocated → loading.  Returns false on precondition mismatch.
   [[nodiscard]] bool mark_loading() noexcept
   {
-    auto expected = pack(allocated, 0);
-    return _packed.compare_exchange_strong(expected, pack(loading, 0), std::memory_order_acq_rel);
+    std::lock_guard<entry_lock> lk(_mtx);
+    if (_state != allocated) return false;
+    _state = loading;
+    return true;
   }
 
-  /// loading → cached.  Returns false on precondition mismatch.  Wakes any
-  /// threads parked in @c wait_while_pending().
+  /// loading → cached.  Returns false on precondition mismatch.
   [[nodiscard]] bool mark_cached() noexcept
   {
-    auto expected = pack(loading, 0);
-    bool ok = _packed.compare_exchange_strong(expected, pack(cached, 0), std::memory_order_acq_rel);
-    if (ok) { _packed.notify_all(); }
-    return ok;
+    std::lock_guard<entry_lock> lk(_mtx);
+    if (_state != loading) return false;
+    _state = cached;
+    return true;
   }
 
+  /// loading → in_use(pin = 1).  Returns false on precondition mismatch.
   [[nodiscard]] bool mark_loading_in_use() noexcept
   {
-    auto expected = pack(loading, 0);
-    bool ok = _packed.compare_exchange_strong(expected, pack(in_use, 1), std::memory_order_acq_rel);
-    if (ok) { _packed.notify_all(); }
-    return ok;
+    std::lock_guard<entry_lock> lk(_mtx);
+    if (_state != loading) return false;
+    _state = in_use;
+    _pins  = 1;
+    return true;
   }
 
   /// allocated → evicting, or cached → evicting.  Returns false on
   /// precondition mismatch.  Both source states have pin_count == 0 by
   /// invariant (allocated is set with pin==0 by mark_allocated(); cached is
   /// only entered from in_use via release_read() when pin → 0), so the two
-  /// strong-CAS attempts below cover every legal transition exactly.
+  /// accepted source states below cover every legal transition exactly.
   [[nodiscard]] bool mark_evicting() noexcept
   {
-    auto expected_allocated = pack(allocated, 0);
-    if (_packed.compare_exchange_strong(
-          expected_allocated, pack(evicting, 0), std::memory_order_acq_rel)) {
-      return true;
-    }
-    auto expected_cached = pack(cached, 0);
-    return _packed.compare_exchange_strong(
-      expected_cached, pack(evicting, 0), std::memory_order_acq_rel);
+    std::lock_guard<entry_lock> lk(_mtx);
+    if ((_state != allocated && _state != cached) || _pins != 0) return false;
+    _state = evicting;
+    return true;
   }
 
   /// evicting → empty.  Returns false on precondition mismatch.
   [[nodiscard]] bool mark_empty() noexcept
   {
-    auto expected = pack(evicting, 0);
-    return _packed.compare_exchange_strong(expected, pack(empty, 0), std::memory_order_acq_rel);
-  }
-
-  /// Block while state is @c loading.  Returns when the state transitions to
-  /// any other state (i.e. to cached, in_use(1), or allocated — the three
-  /// outbound transitions from `loading`).
-  void wait_while_pending() noexcept
-  {
-    uint32_t cur = _packed.load(std::memory_order_acquire);
-    while (unpack_state(cur) == loading) {
-      _packed.wait(cur, std::memory_order_relaxed);
-      cur = _packed.load(std::memory_order_acquire);
-    }
-  }
-
-  /// Park while state is @c loading, then acquire a read pin via the normal
-  /// (cached | in_use) → in_use(pin++) path.  Returns true if a read pin was
-  /// acquired (load completed successfully and the entry is now readable),
-  /// false if the load reverted to @c allocated (IO failure) or the entry was
-  /// otherwise made non-readable (evicted / drained) while we were parked.
-  /// Safe to call from any state: if the state is already past @c loading on
-  /// entry, the wait loop is skipped and we go straight to @c acquire_read().
-  [[nodiscard]] bool acquire_read_after_loading() noexcept
-  {
-    wait_while_pending();
-    return acquire_read();
+    std::lock_guard<entry_lock> lk(_mtx);
+    if (_state != evicting) return false;
+    _state = empty;
+    return true;
   }
 
   /// (cached | in_use) → in_use with pin_count += 1.
   /// Returns false if the entry is not in a readable state.
   [[nodiscard]] bool acquire_read() noexcept
   {
-    uint32_t cur = _packed.load(std::memory_order_acquire);
-    while (true) {
-      auto st = unpack_state(cur);
-      if (st != cached && st != in_use) return false;
-      auto pins = unpack_pins(cur);
-      auto next = pack(in_use, pins + 1);
-      if (_packed.compare_exchange_weak(
-            cur, next, std::memory_order_acq_rel, std::memory_order_acquire))
-        return true;
-    }
+    std::lock_guard<entry_lock> lk(_mtx);
+    if (_state != cached && _state != in_use) return false;
+    _state = in_use;
+    ++_pins;
+    return true;
   }
 
   /// Decrement pin_count.  If it reaches 0, transition in_use → cached.
   /// Returns true if this was the last reader.
   bool release_read() noexcept
   {
-    uint32_t cur = _packed.load(std::memory_order_acquire);
-    assert(unpack_state(cur) == in_use && unpack_pins(cur) > 0);
-    while (true) {
-      auto pins      = unpack_pins(cur);
-      auto new_pins  = pins - 1;
-      auto new_state = new_pins == 0 ? cached : in_use;
-      auto next      = pack(new_state, new_pins);
-      if (_packed.compare_exchange_weak(
-            cur, next, std::memory_order_acq_rel, std::memory_order_acquire))
-        return new_pins == 0;
-    }
+    std::lock_guard<entry_lock> lk(_mtx);
+    assert(_state == in_use && _pins > 0);
+    --_pins;
+    if (_pins == 0) { _state = cached; }
+    return _pins == 0;
   }
+
+  /// Acquire the entry lock and hand it to the caller.  Lets a caller perform a
+  /// multi-step read-modify-write against the entry (e.g. merging cache_from)
+  /// atomically with respect to the state transitions above.
+  [[nodiscard]] std::unique_lock<entry_lock> get_lock() noexcept
+  {
+    return std::unique_lock<entry_lock>(_mtx);
+  }
+
+  /// Read the current state WITHOUT locking.  Precondition: the caller must
+  /// already hold this entry's lock (via @c get_lock()); otherwise the read
+  /// races with concurrent transitions.
+  [[nodiscard]] value state_locked() const noexcept { return _state; }
 
  private:
-  static constexpr uint32_t STATE_BITS = 4;
-  static constexpr uint32_t STATE_MASK = (1U << STATE_BITS) - 1;
-  static constexpr uint32_t PIN_SHIFT  = STATE_BITS;
-
-  static constexpr uint32_t pack(value s, uint32_t pins) noexcept
-  {
-    return static_cast<uint32_t>(s) | (pins << PIN_SHIFT);
-  }
-  static constexpr value unpack_state(uint32_t v) noexcept
-  {
-    return static_cast<value>(v & STATE_MASK);
-  }
-  static constexpr uint32_t unpack_pins(uint32_t v) noexcept { return v >> PIN_SHIFT; }
-
-  std::atomic<uint32_t> _packed{pack(empty, 0)};
+  value _state{empty};
+  uint32_t _pins{0};
+  // spin_lock is a POD with no constructor; value-initialize so it starts in the
+  // FREE (all-bits-zero) state rather than indeterminate.
+  mutable entry_lock _mtx{};
 };
 
 struct alignas(64) chunk_lifecycle {
@@ -437,8 +434,100 @@ struct alignas(64) cached_chunk {
   uint8_t* data;
   int numa_node{-1};
   entry_state state;
+  // Signed, page-aligned extent (in bytes, relative to @c offset) that this
+  // chunk's buffer is populated with:
+  //   0    -> the whole chunk is populated (a "full" chunk);
+  //   +n   -> only the left prefix [offset, offset + n) is populated;
+  //   -n   -> only the right suffix [offset + chunk_size - n, offset + chunk_size)
+  //           is populated.
+  // See @c needed_cache_from / @c merge_cache_from / @c chunk_covers below.
+  std::atomic<int32_t> cache_from{0};
   chunk_lifecycle lifecycle;
 };
+
+// The signed, page-aligned @c cache_from a single request over the byte range
+// [@p req_lo, @p req_hi) (NOT yet clamped to the chunk) implies for the chunk at
+// [@p chunk_off, @p chunk_off + @p chunk_size).  Returns 0 for a full (or
+// non-overlapping) chunk, +n for a left prefix, -n for a right suffix.  The
+// magnitudes are page-aligned (io::IO_BLOCK_SIZE) so the resulting sub-range
+// reads stay O_DIRECT-compatible, matching the partial reads in prefetch_loop
+// and device_read_async.
+[[nodiscard]] inline int32_t needed_cache_from(size_t chunk_off,
+                                               size_t chunk_size,
+                                               size_t req_lo,
+                                               size_t req_hi) noexcept
+{
+  const size_t page = io::IO_BLOCK_SIZE;
+  const size_t lo   = std::max(req_lo, chunk_off);
+  const size_t hi   = std::min(req_hi, chunk_off + chunk_size);
+  if (lo >= hi) { return 0; }  // no overlap -- caller should not call in this case
+  if (lo <= chunk_off && hi >= chunk_off + chunk_size) { return 0; }  // full chunk
+  if (lo <= chunk_off) {
+    // Touches the left edge -> populate a page-aligned left prefix.
+    const size_t bytes = std::min(align_up(hi - chunk_off, page), chunk_size);
+    return static_cast<int32_t>(bytes);
+  }
+  // Right side -> populate a page-aligned right suffix.
+  const size_t right_bytes = (chunk_off + chunk_size) - align_down(lo, page);
+  return -static_cast<int32_t>(right_bytes);
+}
+
+// Fold @p want into @p c.cache_from under the merge rule.  The caller MUST hold
+// @c c.state.get_lock() so the read-modify-write is atomic with respect to the
+// state transitions that read cache_from.
+//   0 (either side) wins        -> the chunk is/becomes full;
+//   same sign                   -> keep the larger magnitude (wider coverage);
+//   opposite signs              -> the two sides together span the chunk -> full.
+inline void merge_cache_from(cached_chunk& c, int32_t want) noexcept
+{
+  const int32_t cur = c.cache_from.load(std::memory_order_relaxed);
+  if (cur == 0) { return; }  // already full
+  if (want == 0) {
+    c.cache_from.store(0, std::memory_order_relaxed);
+    return;
+  }
+  const bool same_sign = (cur > 0) == (want > 0);
+  if (!same_sign) {
+    c.cache_from.store(0, std::memory_order_relaxed);  // opposite sides cover the whole chunk
+    return;
+  }
+  const int32_t cur_mag  = cur < 0 ? -cur : cur;
+  const int32_t want_mag = want < 0 ? -want : want;
+  c.cache_from.store(want_mag > cur_mag ? want : cur, std::memory_order_relaxed);
+}
+
+// True iff the populated extent of @p c covers the request [@p req_lo, @p req_hi)
+// (which the caller has clamped to the chunk's extent).
+[[nodiscard]] inline bool chunk_covers(const cached_chunk& c,
+                                       size_t chunk_size,
+                                       size_t req_lo,
+                                       size_t req_hi) noexcept
+{
+  const int32_t cf = c.cache_from.load(std::memory_order_relaxed);
+  if (cf == 0) { return true; }  // full chunk
+  if (cf > 0) { return req_hi <= c.offset + static_cast<size_t>(cf); }
+  return req_lo >= c.offset + chunk_size - static_cast<size_t>(-cf);
+}
+
+// The half-open file byte span [seg_lo, seg_hi) that must be read to populate a
+// chunk at @p offset (size @p chunk_size) to exactly the extent that its stored
+// @p cache_from advertises.  cache_from is edge-anchored, so the fill span is
+// too — deriving the span FROM cache_from (rather than from the request range)
+// guarantees the bytes read match the bytes @c chunk_covers will later claim.
+// This is the single source of truth shared by prefetch_loop and
+// device_read_async's load branch.
+[[nodiscard]] inline std::pair<size_t, size_t> chunk_fill_span(size_t offset,
+                                                               size_t chunk_size,
+                                                               int32_t cache_from,
+                                                               size_t page) noexcept
+{
+  if (cache_from == 0) { return {offset, offset + chunk_size}; }  // full chunk
+  if (cache_from > 0) {
+    return {offset, offset + std::min(chunk_size, align_up(static_cast<size_t>(cache_from), page))};
+  }
+  return {offset + align_down(chunk_size - static_cast<size_t>(-cache_from), page),
+          offset + chunk_size};
+}
 
 // Coverage requirement for find_entry.
 enum class coverage_policy {
@@ -513,6 +602,11 @@ find_entry(const Chunks& chunks,
     // Coverage confirmed by the invariant: sorted + non-overlapping + fixed-size
     // means consecutive chunks differ by exactly chunk_size, so the intermediates
     // are forced once the first and last are at the expected positions.
+    //
+    // NOTE: this confirms POSITIONAL coverage only (the requested byte span maps
+    // onto existing chunks) — it does NOT confirm those chunks are populated over
+    // the requested sub-range.  Populated-ness (cache_from) is enforced by the
+    // pin-holding caller via chunk_covers() after acquire_read() (Steps 6/7).
     std::vector<chunk_ptr_t> result;
     result.reserve(expected_count);
     for (std::size_t i = 0; i < expected_count; ++i) {

@@ -39,6 +39,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_data_repository_manager.cpp
     data/test_disk_io_backend.cpp
     data/test_io_worker.cpp
+    # Exec tests
+    exec/test_spin_lock.cpp
+    # IO tests
+    io/test_io_config.cpp
+    io/test_prefetching_cache_chunking.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20

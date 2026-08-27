@@ -173,9 +173,45 @@ prefetching_handle::prefetching_handle(std::unique_ptr<prefetch_lifecycle_manage
 prefetching_handle::operator bool() const noexcept { return _state != nullptr; }
 
 std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
-  std::span<size_t> incoming, uint32_t ticker)
+  std::span<const size_t> incoming, std::span<const int32_t> desired_cache_from, uint32_t ticker)
 {
   std::vector<cached_chunk*> result(incoming.size());
+
+  // Fold the desired cache_from into an already-present chunk, gated on its
+  // state (held stable under the entry lock).  Only PRE-LOAD chunks may have
+  // their extent widened: their buffer has not been filled yet, so the pending
+  // load reads the final (widened) extent before any reader can hit it.
+  //   empty              -> an evicted-and-reset chunk: cache_from is 0, which
+  //                         merge_cache_from would misread as "already full" and
+  //                         drop the partial desire, forcing a full reload after
+  //                         every eviction.  Treat it like a fresh insert and
+  //                         store the desired extent DIRECTLY;
+  //   queued / allocated -> not yet loaded: widen via the merge rule.  prefetch_loop
+  //                         and device_read take the same entry lock at mark_loading
+  //                         before reading cache_from, so the widened value is either
+  //                         read by that load or the merge is skipped (loading);
+  //   loading / evicting -> being written by its sole loader / torn down; leave
+  //                         cache_from untouched (widening would race);
+  //   cached / in_use    -> already populated to its current extent and never
+  //                         re-read.  Widening would advertise never-written bytes
+  //                         (a false hit / data corruption), so leave it unchanged;
+  //                         a request needing more correctly MISSES via chunk_covers
+  //                         and falls back to a bounce/direct read.
+  auto merge_into_existing = [&](cached_chunk* c, int32_t desired) {
+    auto lk       = c->state.get_lock();
+    auto const st = c->state.state_locked();
+    switch (st) {
+      case entry_state::empty:  // evicted-and-reset -> fresh insert
+        c->cache_from.store(desired, std::memory_order_relaxed);
+        return;
+      case entry_state::queued:
+      case entry_state::allocated:  // not yet loaded -> pending load reads final extent
+        merge_cache_from(*c, desired);
+        return;
+      default:  // loading/evicting: racing; cached/in_use: already populated -> leave unchanged
+        return;
+    }
+  };
 
   // Phase 1: classify under shared lock — find which offsets already exist.
   // Track the indices of incoming items that need to be inserted.
@@ -192,6 +228,7 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
 
       if (s != s_end && (*s)->offset == off) {
         s->get()->lifecycle.on_request(ticker);
+        merge_into_existing(s->get(), desired_cache_from[i]);
         result[i] = s->get();  // existing
       } else {
         missing_indices.push_back(i);  // mark for insertion
@@ -220,10 +257,15 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
       s                = gallop_lower_bound(s, s_end, off);
 
       if (s != s_end && (*s)->offset == off) {
+        merge_into_existing(s->get(), desired_cache_from[idx]);
         result[idx] = s->get();  // someone else inserted it
       } else {
         auto chunk = std::make_unique<cached_chunk>(off);
         chunk->lifecycle.on_request(ticker);
+        // First creation: store the desired cache_from directly.  merge_cache_from
+        // must NOT be used here — it treats a stored 0 as "already full", which
+        // would misread a freshly-created chunk (default 0) as fully populated.
+        chunk->cache_from.store(desired_cache_from[idx], std::memory_order_relaxed);
         result[idx] = chunk.get();  // capture raw ptr before move
         to_insert.push_back(std::move(chunk));
       }
@@ -350,8 +392,40 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
     }
   }
 
-  auto chunks_to_fetch =
-    file.update_and_get_chunks(chunk_offsets, _ticker.load(std::memory_order_relaxed));
+  // Derive, in parallel with chunk_offsets, the signed page-aligned cache_from
+  // each chunk should be populated with.  The coalesced ranges above dictate the
+  // set of chunks, but the ORIGINAL (pre-coalesce) ranges dictate how much of
+  // each boundary chunk is actually wanted — so a chunk touched only at its head
+  // or tail is loaded partially instead of in full.  Chunks pulled in purely by
+  // coalescing (overlapping no original range) default to 0 == full, matching
+  // the coalesced read that pulled them in.
+  auto fold_cache_from = [](int32_t cur, int32_t next) -> int32_t {
+    if (cur == 0 || next == 0) { return 0; }    // 0 == full wins
+    if ((cur > 0) != (next > 0)) { return 0; }  // opposite sides span the chunk
+    const int32_t cur_mag  = cur < 0 ? -cur : cur;
+    const int32_t next_mag = next < 0 ? -next : next;
+    return next_mag > cur_mag ? next : cur;
+  };
+  std::vector<int32_t> desired_cache_from(chunk_offsets.size(), 0);
+  std::vector<char> touched(chunk_offsets.size(), 0);
+  for (const auto& r : ranges) {
+    if (r.size() <= 0) { continue; }
+    const size_t r_lo        = static_cast<size_t>(r.offset());
+    const size_t r_hi        = r_lo + static_cast<size_t>(r.size());
+    const size_t first_chunk = (r_lo / chunk_bytes) * chunk_bytes;
+    const size_t last_chunk  = ((r_hi - 1) / chunk_bytes) * chunk_bytes;
+    for (size_t off = first_chunk; off <= last_chunk; off += chunk_bytes) {
+      auto it = std::lower_bound(chunk_offsets.begin(), chunk_offsets.end(), off);
+      if (it == chunk_offsets.end() || *it != off) { continue; }
+      const auto idx          = static_cast<size_t>(it - chunk_offsets.begin());
+      const int32_t nc        = needed_cache_from(off, chunk_bytes, r_lo, r_hi);
+      desired_cache_from[idx] = touched[idx] ? fold_cache_from(desired_cache_from[idx], nc) : nc;
+      touched[idx]            = 1;
+    }
+  }
+
+  auto chunks_to_fetch = file.update_and_get_chunks(
+    chunk_offsets, desired_cache_from, _ticker.load(std::memory_order_relaxed));
 
   auto work    = std::make_shared<prefetch_request_context>(obj, _ticker.load());
   work->chunks = std::move(chunks_to_fetch);
@@ -386,17 +460,29 @@ bool prefetching_cache::host_read_from_cache_only(
     }
   }
 
+  auto const end_offset = offset + size;
+  auto const chunk_size = _chunk_size;
+
   while (!chunks.empty()) {
-    auto iter =
-      std::ranges::find_if(chunks, [](cached_chunk* c) { return !c->state.acquire_read(); });
+    // Sweep that both pins each chunk and confirms it is populated over the
+    // requested sub-range.  A chunk we cannot pin, OR one whose populated extent
+    // (cache_from) does not cover the request, is treated as a failed pin: we
+    // undo it and bail so the caller does a full fallback IO (no partial memcpy).
+    auto iter = std::ranges::find_if(chunks, [&](cached_chunk* c) {
+      if (!c->state.acquire_read()) { return true; }
+      size_t const req_lo = std::max(offset, c->offset);
+      size_t const req_hi = std::min(end_offset, c->offset + chunk_size);
+      if (!chunk_covers(*c, chunk_size, req_lo, req_hi)) {
+        c->state.release_read();
+        return true;
+      }
+      return false;
+    });
 
     if (iter != chunks.end()) {
       std::for_each(chunks.begin(), iter, [](cached_chunk* c) { c->state.release_read(); });
       break;
     }
-
-    auto const end_offset = offset + size;
-    auto const chunk_size = _chunk_size;
 
     for (auto* chunk : chunks) {
       auto const chunk_begin = std::max(offset, chunk->offset);
@@ -497,39 +583,51 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
       }
       cached_chunk* c = (ci < chunks.size() && chunks[ci]->offset == off) ? chunks[ci] : nullptr;
 
+      // The portion of this chunk the request actually needs, clamped to both the
+      // request and the chunk extent.  Hoisted above the branch so both the hit
+      // coverage gate and the load/miss span share it.
+      size_t const need_lo = std::max(off, offset);
+      size_t const need_hi = std::min(off + chunk_bytes, offset + size);
+
+      bool hit = false;
       if (c != nullptr && c->state.acquire_read()) {
-        cached_chunks.push_back(c);  // (1) hit -- a cached chunk is always fully valid
-        hits++;
-      } else {
+        // A read pin alone is not sufficient: a partially-populated chunk may not
+        // cover the requested sub-range.  Confirm coverage (cache_from) before
+        // treating it as a hit -- THIS IS THE KEY CORRECTNESS GATE.  If it does
+        // not cover, release the pin and fall through to the load/miss path.
+        if (chunk_covers(*c, chunk_bytes, need_lo, need_hi)) {
+          cached_chunks.push_back(c);  // (1) hit
+          hits++;
+          hit = true;
+        } else {
+          c->state.release_read();
+        }
+      }
+
+      if (!hit) {
         if (!cache_while_reading_enabled) {
           every_chunk_is_cached = false;
           break;  // (3) miss, but we can't do H2D IO, so fall back to direct device read
         }
-        // Stage a read through the chunk's cache buffer only when caching the
-        // WHOLE chunk is cheap enough -- a cached chunk must be fully valid, so
-        // caching a partially-requested chunk costs reading its non-overlapping
-        // remainder from disk (boundary over-read, the dominant cold-pass cost).
-        // Cache when that over-read is < 25% of the chunk (so a read covering
-        // >75% of the chunk still warms it); otherwise read just the needed,
-        // block-aligned span through an internal bounce slot (null host buffer)
-        // and leave the chunk uncached -- zero over-read.  (Short-term: a heavily
-        // partial boundary chunk is re-read each pass; full partial caching is a
-        // larger redesign.)
-        size_t const need_lo     = std::max(off, offset);
-        size_t const need_hi     = std::min(off + chunk_bytes, offset + size);
-        size_t const overread    = chunk_bytes - (need_hi - need_lo);
-        bool const worth_caching = overread * 4 < chunk_bytes;  // over-read < 25% of chunk
-        if (worth_caching && c != nullptr && c->state.mark_loading()) {
+        if (c != nullptr && c->state.mark_loading()) {
+          // Loader is the sole writer during allocated -> loading -> cached, so a
+          // plain relaxed store of the populated extent is safe here.  Derive the
+          // fill span FROM the stored cache_from (the single source of truth), so
+          // the bytes we read match EXACTLY what chunk_covers will later claim.
+          // cache_from is edge-anchored, so an interior read conservatively fills
+          // to the chunk edge (over-reads the tail/head, never the full chunk).
           assert(c->data != nullptr);
+          int32_t const cf = needed_cache_from(off, chunk_bytes, need_lo, need_hi);
+          c->cache_from.store(cf, std::memory_order_relaxed);
+          auto const [seg_lo, seg_hi] = chunk_fill_span(off, chunk_bytes, cf, io::IO_BLOCK_SIZE);
           io_chunks.push_back(c);  // (2) host-to-device load into the cache buffer
-          io_segments.emplace_back(off, chunk_bytes, c->data);
+          io_segments.emplace_back(seg_lo, seg_hi - seg_lo, c->data + (seg_lo - c->offset));
           h2d++;
         } else {
-          // (3) partial head/tail (or busy / missing chunk): read just the needed,
-          // block-aligned span via an internal bounce slot; do not touch the cache.
-          size_t const seg_lo = need_lo & ~(io::IO_BLOCK_SIZE - 1);
-          size_t const seg_hi = std::min(
-            off + chunk_bytes, (need_hi + io::IO_BLOCK_SIZE - 1) & ~(io::IO_BLOCK_SIZE - 1));
+          // (3) busy / missing chunk: read just the needed, block-aligned span via
+          // an internal bounce slot (null host buffer); do not touch the cache.
+          size_t const seg_lo = align_down(need_lo, io::IO_BLOCK_SIZE);
+          size_t const seg_hi = std::min(off + chunk_bytes, align_up(need_hi, io::IO_BLOCK_SIZE));
           io_segments.emplace_back(seg_lo, seg_hi - seg_lo, nullptr);  // (3) miss
           misses++;
         }
@@ -740,21 +838,31 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
     std::vector<io::io_object_segment> segments;
 
     segments.reserve(allocated_chunks.size());
-    allocated_chunks.erase(std::remove_if(allocated_chunks.begin(),
-                                          allocated_chunks.end(),
-                                          [&](cached_chunk* c) {
-                                            if (c->state.mark_loading()) {
-                                              segments.emplace_back(
-                                                c->offset, _chunk_size, c->data);
-                                              return false;
-                                            }
-                                            return true;
-                                          }),
-                           allocated_chunks.end());
+    allocated_chunks.erase(
+      std::remove_if(allocated_chunks.begin(),
+                     allocated_chunks.end(),
+                     [&](cached_chunk* c) {
+                       if (c->state.mark_loading()) {
+                         // Read only the page-aligned sub-range this chunk was
+                         // requested for (cache_from), not always the whole chunk.
+                         auto const [seg_lo, seg_hi] =
+                           chunk_fill_span(c->offset,
+                                           _chunk_size,
+                                           c->cache_from.load(std::memory_order_relaxed),
+                                           io::IO_BLOCK_SIZE);
+                         segments.emplace_back(
+                           seg_lo, seg_hi - seg_lo, c->data + (seg_lo - c->offset));
+                         return false;
+                       }
+                       return true;
+                     }),
+      allocated_chunks.end());
 
     std::ignore = req->state->mark_loading();
 
-    auto token = _rate_limiter.acquire(segments.size());
+    // One unit per in-flight prefetch task (not per chunk): reserve on dispatch,
+    // release on completion when the token below is dropped in the continuation.
+    auto token = _rate_limiter.acquire(1);
 
     if (req->is_cancelled() || st.stop_requested()) {
       std::ranges::for_each(allocated_chunks,
@@ -875,6 +983,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
         if (c->state.mark_evicting()) {
           reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
           c->data = nullptr;
+          c->cache_from.store(0, std::memory_order_relaxed);  // reset populated extent
           static_cast<void>(c->state.mark_empty());
           ++reclaimed;
           ++er.n_evicted;
