@@ -24,10 +24,8 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
-#include <condition_variable>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -272,9 +270,9 @@ class memory_reservation_manager {
 
   void build_lookup_tables();
 
-  // Synchronization for cross-space waiting when no memory_space can currently satisfy a request
-  mutable std::mutex _wait_mutex;
-  std::condition_variable _wait_cv;
+  // Blocking-until-memory-frees is per-space state: each memory_space's notification channel
+  // keeps a FIFO wait list and hands a released reservation to its longest-waiting caller. No
+  // cross-space wait state lives at the manager level.
 };
 
 }  // namespace memory

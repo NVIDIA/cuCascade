@@ -20,6 +20,7 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -58,8 +59,45 @@ class data_repository {
 
   /**
    * @brief Virtual destructor for proper cleanup of derived classes.
+   *
+   * If a leak callback is installed (see set_leak_callback) and the repository still
+   * holds data batches, the callback is invoked with the un-consumed count before the
+   * batches are released. Under shared-ownership teardown the repository dies when its
+   * LAST holder releases it — the owning manager may already be gone — so the
+   * destructor is the one place that reliably observes what died un-consumed.
    */
-  virtual ~data_repository() = default;
+  virtual ~data_repository()
+  {
+    if (!_leak_callback) { return; }
+    // No lock: destruction implies exclusive access.
+    std::size_t remaining = 0;
+    for (const auto& partition : _data_batches) {
+      remaining += partition.size();
+    }
+    if (remaining == 0) { return; }
+    try {
+      _leak_callback(remaining);
+    } catch (...) {  // a reporting hook must never throw out of a destructor
+    }
+  }
+
+  /**
+   * @brief Install a callback invoked by the destructor when batches die un-consumed.
+   *
+   * The callback receives the number of data batches still held at destruction time.
+   * It runs on whatever thread drops the last reference to the repository and must not
+   * throw (exceptions are swallowed). Typically installed by the owning manager so the
+   * report can be attributed to an {operator, port} — and by extension a query.
+   *
+   * @param callback The leak-report hook (empty disables reporting).
+   *
+   * @note Thread-safe operation protected by internal mutex
+   */
+  void set_leak_callback(std::function<void(std::size_t)> callback)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _leak_callback = std::move(callback);
+  }
 
   /**
    * @brief Add a new data batch to this repository.
@@ -314,8 +352,16 @@ class data_repository {
   mutable std::mutex _mutex;  ///< Mutex for thread-safe access to repository operations
   std::vector<std::vector<std::shared_ptr<data_batch>>>
     _data_batches;  ///< Container for data batch pointers (partitioned)
+
+ private:
+  /// Invoked by the destructor with the count of batches that died un-consumed.
+  std::function<void(std::size_t)> _leak_callback;
 };
 
+/// Compatibility alias, NOT a distinct type: the historical class that stored
+/// `shared_ptr<data_batch>` was merged into data_repository (which now always
+/// does — one batch can sit in several repositories on fan-out). Kept so old
+/// call sites keep compiling; prefer `data_repository` in new code.
 using shared_data_repository = data_repository;
 
 }  // namespace cucascade

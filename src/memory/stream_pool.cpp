@@ -76,20 +76,35 @@ exclusive_stream_pool::exclusive_stream_pool(rmm::cuda_device_id device_id,
 borrowed_stream exclusive_stream_pool::acquire_stream(stream_acquire_policy policy) noexcept
 {
   std::unique_lock lock(_mutex);
-  if (_streams.empty()) {
-    if (policy == stream_acquire_policy::GROW) {
+  if (policy == stream_acquire_policy::GROW) {
+    // GROW never waits — and never takes a pooled stream a parked BLOCK waiter is owed
+    // (_grant_ticket != _next_ticket means at least one waiter is still unserved). Minting a
+    // fresh stream costs the same either way: the pool ends up one stream larger once it is
+    // released.
+    if (_streams.empty() || _grant_ticket != _next_ticket) {
       rmm::cuda_set_device_raii set_device{_device_id};
       return borrowed_stream(rmm::cuda_stream(_flags),
                              std::bind_front(&exclusive_stream_pool::release_stream, this));
-    } else {
-      _cv.wait(lock, [this]() { return !_streams.empty(); });
     }
+  } else {
+    // FIFO ticket handoff: a released stream goes to the LONGEST-WAITING caller. The ticket is
+    // drawn under the lock, so arrival order is the service order; a caller that releases and
+    // immediately re-acquires draws a fresh ticket and queues behind every parked waiter
+    // instead of winning the wake-up race against them. When the pool has streams and no
+    // earlier waiter is unserved, the predicate is immediately true and nothing blocks.
+    const std::uint64_t ticket = _next_ticket++;
+    _cv.wait(lock, [&]() { return ticket == _grant_ticket && !_streams.empty(); });
+    ++_grant_ticket;
   }
   // Acquire from the front; release_stream() returns to the back. This cycles through all
   // streams round-robin so every stream's prior async work has maximal time to drain before
   // it is handed out again, instead of hammering the most-recently-returned stream.
   auto stream = std::move(_streams.front());
   _streams.pop_front();
+  // A single release wakes every waiter (they must all re-check the head ticket); if streams
+  // remain for the next-in-line, pass the baton before leaving so it does not sleep until the
+  // next release.
+  if (!_streams.empty() && _grant_ticket != _next_ticket) { _cv.notify_all(); }
   return borrowed_stream(std::move(stream),
                          std::bind_front(&exclusive_stream_pool::release_stream, this));
 }
@@ -104,7 +119,10 @@ void exclusive_stream_pool::release_stream(rmm::cuda_stream&& s) noexcept
 {
   std::lock_guard lock(_mutex);
   _streams.emplace_back(std::move(s));
-  _cv.notify_one();
+  // notify_all, not notify_one: only the head-ticket waiter may take the stream, and with one
+  // shared CV a notify_one could wake a non-head waiter that just goes back to sleep while the
+  // head never learns a stream arrived.
+  _cv.notify_all();
 }
 
 }  // namespace memory

@@ -27,7 +27,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <mutex>
 #include <stdexcept>
 #include <variant>
 
@@ -146,22 +145,15 @@ memory_reservation_manager::~memory_reservation_manager() { shutdown(); }
 std::unique_ptr<reservation> memory_reservation_manager::request_reservation(
   const reservation_request_strategy& request, size_t size)
 {
-  // Fast path: try to make a reservation immediately
+  // All blocking happens inside memory_space::make_reservation, which parks on the space's
+  // per-space FIFO wait list and which select_memory_space_and_make_reservation already calls
+  // for every candidate. Reaching this point without a reservation therefore means no
+  // candidate space exists for the request, or every candidate is shutting down — report that
+  // as nullptr, mirroring make_reservation's shutdown contract.
   if (auto res = select_memory_space_and_make_reservation(request, size); res.has_value()) {
     return std::move(res.value());
   }
-
-  // If none available, block until any memory_space can satisfy the request
-  std::unique_lock<std::mutex> lock(_wait_mutex);
-  for (;;) {
-    if (auto res = select_memory_space_and_make_reservation(request, size); res.has_value()) {
-      // Release the wait lock before returning the reservation
-      lock.unlock();
-      return std::move(res.value());
-    }
-    // Wait until notified that memory may be available again
-    _wait_cv.wait(lock);
-  }
+  return nullptr;
 }
 
 const memory_space* memory_reservation_manager::get_memory_space(Tier tier, int32_t device_id) const
