@@ -256,18 +256,6 @@ TEST_CASE("data_batch mutable to readonly through idle", "[data_batch]")
   auto ro   = idle->to_read_only();
   REQUIRE(ro.get_batch_id() == 1);
 }
-
-TEST_CASE("data_batch readonly to mutable through idle", "[data_batch]")
-{
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = data_batch::make(1, std::move(data));
-
-  auto ro   = batch->to_read_only();
-  auto idle = data_batch::to_idle(std::move(ro));
-  auto rw   = idle->to_mutable();
-  REQUIRE(rw.get_batch_id() == 1);
-}
-
 // =============================================================================
 // Destruction order safety (TEST-02)
 // =============================================================================
@@ -1265,7 +1253,10 @@ TEST_CASE("mutable acquisition waits for all recorded asynchronous GPU readers",
       try {
         std::optional<mutable_data_batch> mutable_batch;
         if (upgrade_from_read_only) {
-          mutable_batch.emplace(data_batch::readonly_to_mutable(std::move(*upgrade_reader)));
+          // Accessors no longer support a locked-to-locked upgrade. Release the shared
+          // accessor, then acquire exclusive access through the retained batch handle.
+          upgrade_reader.reset();
+          mutable_batch.emplace(batch->to_mutable());
         } else {
           mutable_batch.emplace(batch->to_mutable());
         }
@@ -1340,7 +1331,7 @@ TEST_CASE("reader event registration is a no-op for non-GPU batches", "[data_bat
     auto reader         = batch->to_read_only();
     auto invalid_stream = rmm::cuda_stream_view{reinterpret_cast<cudaStream_t>(std::uintptr_t{1})};
     REQUIRE_NOTHROW(reader.record_reader_event(invalid_stream));
-    batch = data_batch::to_idle(std::move(reader));
+    std::ignore = data_batch::to_idle(std::move(reader));
     REQUIRE(batch->try_to_mutable().has_value());
   };
 
@@ -1359,7 +1350,7 @@ TEST_CASE("completed reader events are recycled across mutable acquisitions",
     auto reader = batch->to_read_only();
     reader.record_reader_event(reader_stream.view());
     reader_stream.synchronize();
-    batch = data_batch::to_idle(std::move(reader));
+    std::ignore = data_batch::to_idle(std::move(reader));
 
     auto mutable_batch = batch->try_to_mutable();
     REQUIRE(mutable_batch.has_value());
@@ -1384,7 +1375,7 @@ TEST_CASE("reader event pools remain device-local across representation replacem
     auto reader = batch->to_read_only();
     reader.record_reader_event(reader_stream.view());
     reader_stream.synchronize();
-    batch = data_batch::to_idle(std::move(reader));
+    std::ignore = data_batch::to_idle(std::move(reader));
   }
 
   auto mutable_batch = batch->to_mutable();
@@ -1397,7 +1388,7 @@ TEST_CASE("reader event pools remain device-local across representation replacem
     auto reader = batch->to_read_only();
     REQUIRE_NOTHROW(reader.record_reader_event(reader_stream.view()));
     reader_stream.synchronize();
-    batch = data_batch::to_idle(std::move(reader));
+    std::ignore = data_batch::to_idle(std::move(reader));
   }
 
   REQUIRE(batch->try_to_mutable().has_value());
@@ -1478,7 +1469,7 @@ TEST_CASE("reader event pool sustains cycles with a pending head and completed t
         reader.record_reader_event(fast_stream.view());
       }
       fast_stream.synchronize();
-      batch = data_batch::to_idle(std::move(reader));
+      std::ignore = data_batch::to_idle(std::move(reader));
     }
 
     REQUIRE_FALSE(batch->try_to_mutable().has_value());
@@ -1503,7 +1494,7 @@ TEST_CASE("record_reader_event accepts the legacy default stream",
     auto reader = batch->to_read_only();
     CUCASCADE_CUDA_TRY(::cudaMemsetAsync(scratch.data(), 0x5A, scratch.size(), nullptr));
     REQUIRE_NOTHROW(reader.record_reader_event(rmm::cuda_stream_default));
-    batch = data_batch::to_idle(std::move(reader));
+    std::ignore = data_batch::to_idle(std::move(reader));
   }
 
   CUCASCADE_CUDA_TRY(::cudaStreamSynchronize(nullptr));
@@ -1540,50 +1531,6 @@ TEST_CASE("~data_batch waits for recorded readers when the final accessor drops 
     // Scope exit drops the last reference; ~data_batch must block until the gated read retires.
   }
   REQUIRE(read_retired.load(std::memory_order_acquire));
-}
-
-// =============================================================================
-// Locked-to-locked transition tests
-// =============================================================================
-
-TEST_CASE("data_batch readonly_to_mutable", "[data_batch]")
-{
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = data_batch::make(1, std::move(data));
-
-  auto ro  = batch->to_read_only();
-  auto mut = data_batch::readonly_to_mutable(std::move(ro));
-  REQUIRE(mut.get_batch_id() == 1);
-
-  auto idle = data_batch::to_idle(std::move(mut));
-  REQUIRE(idle->get_state() == batch_state::idle);
-}
-
-TEST_CASE("data_batch mutable_to_readonly", "[data_batch]")
-{
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = data_batch::make(1, std::move(data));
-
-  auto mut = batch->to_mutable();
-  auto ro  = data_batch::mutable_to_readonly(std::move(mut));
-  REQUIRE(ro.get_batch_id() == 1);
-
-  auto idle = data_batch::to_idle(std::move(ro));
-  REQUIRE(idle->get_state() == batch_state::idle);
-}
-
-TEST_CASE("data_batch full cycle: idle -> ro -> mutable -> ro -> idle", "[data_batch]")
-{
-  auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-  auto batch = data_batch::make(1, std::move(data));
-
-  auto ro1  = batch->to_read_only();
-  auto mut  = data_batch::readonly_to_mutable(std::move(ro1));
-  auto ro2  = data_batch::mutable_to_readonly(std::move(mut));
-  auto idle = data_batch::to_idle(std::move(ro2));
-
-  REQUIRE(idle->get_state() == batch_state::idle);
-  REQUIRE(idle->get_batch_id() == 1);
 }
 
 // =============================================================================
