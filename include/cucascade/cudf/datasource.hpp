@@ -95,16 +95,13 @@ class datasource : public cudf::io::datasource {
 
   std::unique_ptr<datasource::buffer> device_read(size_t offset,
                                                   size_t size,
-                                                  rmm::cuda_stream_view stream) override;
-  size_t device_read(size_t offset,
-                     size_t size,
-                     uint8_t* dst,
-                     rmm::cuda_stream_view stream) override;
+                                                  cuda::stream_ref stream) override;
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, cuda::stream_ref stream) override;
 
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
-                                        rmm::cuda_stream_view stream) override;
+                                        cuda::stream_ref stream) override;
 
   // ---- Advisory IO ---------------------------------------------------------
 
@@ -150,8 +147,7 @@ class datasource : public cudf::io::datasource {
    * @param segments File offsets, sizes, and destination buffers.
    * @return A future that resolves when every segment has been written.
    */
-  [[nodiscard]] std::future<size_t> host_read_ranges_async(
-    std::span<io_object_segment> segments);
+  [[nodiscard]] std::future<size_t> host_read_ranges_async(std::span<io_object_segment> segments);
 
   [[nodiscard]] std::future<size_t> host_read_ranges_async(
     std::vector<io_object_segment>& segments);

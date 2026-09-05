@@ -132,7 +132,7 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read
 
 std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(size_t offset,
                                                                       size_t size,
-                                                                      rmm::cuda_stream_view stream)
+                                                                      cuda::stream_ref stream)
 {
   rmm::device_buffer buf(size, stream);
   auto n = device_read(offset, size, reinterpret_cast<uint8_t*>(buf.data()), stream);
@@ -141,21 +141,18 @@ std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(size_t off
   return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
-size_t datasource::device_read(size_t offset,
-                               size_t size,
-                               uint8_t* dst,
-                               rmm::cuda_stream_view stream)
+size_t datasource::device_read(size_t offset, size_t size, uint8_t* dst, cuda::stream_ref stream)
 {
   auto f = device_read_async(offset, size, dst, stream);
   auto n = f.get();
-  stream.synchronize();
+  stream.sync();
   return n;
 }
 
 std::future<size_t> datasource::device_read_async(size_t offset,
                                                   size_t size,
                                                   uint8_t* dst,
-                                                  rmm::cuda_stream_view stream)
+                                                  cuda::stream_ref stream)
 {
   return bridge_semi_to_std(
     _io_ctx->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle));

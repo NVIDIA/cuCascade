@@ -28,8 +28,7 @@ rest_datasource_engine::rest_datasource_engine(std::string access_key_id,
                                                std::size_t chunk_size,
                                                std::size_t max_n_chunks,
                                                bool enable_cache)
-  : _upstream(0, true),
-    _host_mr(0, _upstream, pool_capacity, pool_capacity, block_size, 128, 1)
+  : _upstream(0, true), _host_mr(0, _upstream, pool_capacity, pool_capacity, block_size, 128, 1)
 {
   rest::s3::static_credentials creds{.access_key_id     = std::move(access_key_id),
                                      .secret_access_key = std::move(secret_access_key),
@@ -60,18 +59,16 @@ rest_datasource_engine::rest_datasource_engine(std::string access_key_id,
 
     auto configs = memory::reservation_manager_configurator{}
                      .set_number_of_gpus(1)
-                     .use_host_per_numa()
+                     .use_numa_id_as_host_id()
                      .set_total_host_capacity(pool_capacity)
                      .build(topology);
 
-    _reservation_manager =
-      std::make_unique<memory::memory_reservation_manager>(std::move(configs));
+    _reservation_manager = std::make_unique<memory::memory_reservation_manager>(std::move(configs));
 
     io::cache::config cache_cfg{};
     cache_cfg.dispose_after_use = true;
 
-    auto topo_index =
-      std::make_shared<memory::topology_index>(topology, std::vector<int>{0});
+    auto topo_index = std::make_shared<memory::topology_index>(topology, std::vector<int>{0});
 
     _io_ctx->initialize_cache(*_reservation_manager, cache_cfg, std::move(topo_index));
   }
