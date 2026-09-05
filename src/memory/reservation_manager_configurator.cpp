@@ -28,6 +28,7 @@
 #include <memory>
 #include <numeric>
 #include <set>
+#include <stdexcept>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -93,48 +94,55 @@ builder_reference& reservation_manager_configurator::track_reservation_per_strea
   return *this;
 }
 
-// --- cpu / host settings ---
+// --- cpu / numa region settings ---
 
-builder_reference& reservation_manager_configurator::use_host_per_gpu()
+builder_reference& reservation_manager_configurator::use_gpu_id_as_host_id()
 {
-  _host_creation_policy = bind_host_to_gpu_id{};
+  _host_id_policy = bind_host_id_to_gpu_id{};
   return *this;
 }
 
-builder_reference& reservation_manager_configurator::use_host_per_numa()
+builder_reference& reservation_manager_configurator::use_numa_id_as_host_id()
 {
-  _host_creation_policy = bind_cpu_to_gpu_numa{};
+  _host_id_policy = bind_host_id_to_numa_id{};
   return *this;
 }
 
-/// set capacity per host tier
-/// @param bytes Memory capacity per NUMA node in bytes.
 builder_reference& reservation_manager_configurator::set_total_host_capacity(std::size_t bytes)
 {
-  assert(bytes > 0 && "Total host capacity must be positive");
-  _host_capacity         = bytes;
+  assert(bytes > 0 && "Total NUMA region capacity must be positive");
+  _numa_region_capacity  = bytes;
   _is_capacity_per_space = false;
   return *this;
 }
 
-builder_reference& reservation_manager_configurator::set_per_host_capacity(std::size_t bytes)
+builder_reference& reservation_manager_configurator::set_per_numa_region_capacity(std::size_t bytes)
 {
-  assert(bytes > 0 && "Capacity per NUMA node must be positive");
-  _host_capacity         = bytes;
+  assert(bytes > 0 && "Capacity per NUMA region must be positive");
+  _numa_region_capacity  = bytes;
   _is_capacity_per_space = true;
   return *this;
 }
 
-builder_reference& reservation_manager_configurator::set_downgrade_fractions_per_host(double start,
-                                                                                      double end)
+builder_reference& reservation_manager_configurator::set_usage_limit_ratio_per_numa_region(
+  double fraction)
 {
-  assert(start > 0.0 && start <= 1.0 && "Start fraction must be in (0.0, 1.0]");
-  assert(end > 0.0 && end <= 1.0 && "End fraction must be in (0.0, 1.0]");
-  downgrade_fractions_per_host_ = {start, end};
+  assert(fraction > 0.0 && fraction <= 1.0 && "Usage limit ratio must be in (0.0, 1.0]");
+  _numa_region_capacity  = fraction;
+  _is_capacity_per_space = true;
   return *this;
 }
 
-builder_reference& reservation_manager_configurator::set_reservation_fraction_per_host(
+builder_reference& reservation_manager_configurator::set_downgrade_fractions_per_numa_region(
+  double start, double end)
+{
+  assert(start > 0.0 && start <= 1.0 && "Start fraction must be in (0.0, 1.0]");
+  assert(end > 0.0 && end <= 1.0 && "End fraction must be in (0.0, 1.0]");
+  downgrade_fractions_per_numa_region_ = {start, end};
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_reservation_fraction_per_numa_region(
   double fraction)
 {
   assert(fraction > 0.0 && fraction <= 1.0 && "Reservation limit ratio must be in (0.0, 1.0]");
@@ -142,7 +150,8 @@ builder_reference& reservation_manager_configurator::set_reservation_fraction_pe
   return *this;
 }
 
-builder_reference& reservation_manager_configurator::set_reservation_limit_per_host(size_t bytes)
+builder_reference& reservation_manager_configurator::set_reservation_limit_per_numa_region(
+  size_t bytes)
 {
   _cpu_reservation = bytes;
   return *this;
@@ -203,7 +212,7 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
   const system_topology_info& topology) const
 {
   auto gpus_info                = extract_gpu_ids(topology);
-  auto host_infos               = extract_host_ids(gpus_info, topology);
+  auto numa_region_infos        = extract_numa_region_ids(gpus_info, topology);
   bool const make_host_portable = _host_memory_portability.value_or(gpus_info.size() > 1);
 
   std::vector<memory_space_config> configs;
@@ -225,15 +234,35 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
     configs.emplace_back(config);
   };
 
-  size_t per_host_capacity =
-    (host_infos.size() <= 1)
-      ? _host_capacity
-      : (_is_capacity_per_space ? _host_capacity : _host_capacity / host_infos.size());
+  // Absolute capacities are either per-space or split evenly across spaces; a fraction is
+  // always relative to the capacity of the NUMA region backing the space.
+  auto numa_region_capacity_of = [&](const numa_region_info& info) -> std::size_t {
+    if (_numa_region_capacity.holds_fraction()) {
+      if (info.is_device_memory) {
+        throw std::runtime_error("NUMA region capacity fraction requested but NUMA node " +
+                                 std::to_string(info.numa_id) +
+                                 " is device memory, not host memory; size this space with "
+                                 "set_per_numa_region_capacity() instead");
+      }
+      if (!info.numa_capacity.has_value()) {
+        throw std::runtime_error(
+          "NUMA region capacity fraction requested but the memory capacity of NUMA node " +
+          std::to_string(info.numa_id) + " is unknown");
+      }
+      return _numa_region_capacity.get_capacity(*info.numa_capacity);
+    }
+    auto const bytes = _numa_region_capacity.get_size();
+    return (_is_capacity_per_space || numa_region_infos.size() <= 1)
+             ? bytes
+             : bytes / numa_region_infos.size();
+  };
 
-  for (auto& info : host_infos) {
+  for (auto& info : numa_region_infos) {
+    size_t const per_numa_region_capacity = numa_region_capacity_of(info);
+
     host_memory_space_config config;
     config.numa_id         = info.space_id;
-    config.memory_capacity = per_host_capacity;
+    config.memory_capacity = per_numa_region_capacity;
     config.make_portable   = make_host_portable;
     DeviceMemoryResourceFactoryFn host_mr_fn =
       [current_mr_fn = _cpu_mr_fn, numa_id = info.numa_id, make_host_portable](
@@ -242,9 +271,9 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
       return make_default_host_memory_resource(numa_id, capacity, make_host_portable);
     };
     config.mr_factory_fn              = std::move(host_mr_fn);
-    config.reservation_limit_fraction = _cpu_reservation.get_fraction(per_host_capacity);
-    config.downgrade_trigger_fraction = downgrade_fractions_per_host_.first;
-    config.downgrade_stop_fraction    = downgrade_fractions_per_host_.second;
+    config.reservation_limit_fraction = _cpu_reservation.get_fraction(per_numa_region_capacity);
+    config.downgrade_trigger_fraction = downgrade_fractions_per_numa_region_.first;
+    config.downgrade_stop_fraction    = downgrade_fractions_per_numa_region_.second;
     config.block_size                 = chunk_size.value_or(memory::default_block_size);
     config.pool_size                  = block_size.value_or(memory::default_pool_size);
     config.initial_number_pools =
@@ -312,23 +341,32 @@ reservation_manager_configurator::extract_gpu_ids(const system_topology_info& to
   return gpu_infos;
 }
 
-std::vector<reservation_manager_configurator::host_info>
-reservation_manager_configurator::extract_host_ids(
-  const std::vector<gpu_info>& gpus, [[maybe_unused]] const system_topology_info& topology) const
+std::vector<reservation_manager_configurator::numa_region_info>
+reservation_manager_configurator::extract_numa_region_ids(
+  const std::vector<gpu_info>& gpus, const system_topology_info& topology) const
 {
-  std::vector<host_info> host_infos;
-  std::set<int> host_ids_set;
+  std::vector<numa_region_info> numa_region_infos;
+  std::set<int> numa_region_ids;
   for (const auto& gpu : gpus) {
-    if (std::holds_alternative<bind_host_to_gpu_id>(_host_creation_policy)) {
-      host_infos.emplace_back(host_info{.space_id = gpu.space_id, .numa_id = gpu.numa_id});
-    } else if (std::holds_alternative<bind_cpu_to_gpu_numa>(_host_creation_policy)) {
-      if (!host_ids_set.contains(gpu.numa_id)) {
-        host_infos.emplace_back(host_info{.space_id = gpu.numa_id, .numa_id = gpu.numa_id});
-        host_ids_set.insert(gpu.numa_id);
+    auto const* node            = topology.find_numa_node(gpu.numa_id);
+    auto const numa_capacity    = topology.get_numa_memory_capacity(gpu.numa_id);
+    bool const is_device_memory = node != nullptr && node->is_device_memory;
+    if (std::holds_alternative<bind_host_id_to_gpu_id>(_host_id_policy)) {
+      numa_region_infos.emplace_back(numa_region_info{.space_id         = gpu.space_id,
+                                                      .numa_id          = gpu.numa_id,
+                                                      .numa_capacity    = numa_capacity,
+                                                      .is_device_memory = is_device_memory});
+    } else if (std::holds_alternative<bind_host_id_to_numa_id>(_host_id_policy)) {
+      if (!numa_region_ids.contains(gpu.numa_id)) {
+        numa_region_infos.emplace_back(numa_region_info{.space_id         = gpu.numa_id,
+                                                        .numa_id          = gpu.numa_id,
+                                                        .numa_capacity    = numa_capacity,
+                                                        .is_device_memory = is_device_memory});
+        numa_region_ids.insert(gpu.numa_id);
       }
     }
   }
-  return host_infos;
+  return numa_region_infos;
 }
 
 }  // namespace memory

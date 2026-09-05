@@ -18,9 +18,12 @@
 
 #pragma once
 
+#include <cucascade/io/io_errors.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -115,6 +118,38 @@ class request_authorizer {
   [[nodiscard]] virtual authorized_request authorize(object_ref const& obj,
                                                      request_method method,
                                                      std::chrono::seconds timeout) = 0;
+
+  /**
+   * @brief Authorize a bucket-level ListObjectsV2 GET.
+   *
+   * @param bucket           Bucket name (no scheme / slashes).
+   * @param canonical_query  The request query string, already percent-encoded,
+   *                          `&`-joined, and **sorted by encoded key** (SigV4
+   *                          canonical order), WITHOUT any auth params — e.g.
+   *                          @c "list-type=2&max-keys=1000&prefix=a%2Fb" (with
+   *                          @c "continuation-token=..." sorted in first). The
+   *                          header-signing path signs this string verbatim, so
+   *                          an unsorted query would be signed but rejected by
+   *                          S3; the presigned path re-sorts when merging the
+   *                          @c X-Amz-* params, but callers should pass sorted
+   *                          regardless. Must not contain any @c X-Amz-* key —
+   *                          implementations reject those so callers cannot
+   *                          smuggle / override signing parameters.
+   * @param timeout          Per-call URL lifetime (presigned @c X-Amz-Expires);
+   *                          ignored by header-signing authorizers.
+   *
+   * Default: throws — LIST is opt-in, so a pluggable authorizer that only knows
+   * how to sign object GET/HEAD need not implement it.
+   *
+   * @throw cucascade::io::credential_error when unsupported, or on signing failure.
+   */
+  [[nodiscard]] virtual authorized_request authorize_list(std::string_view /*bucket*/,
+                                                          std::string_view /*canonical_query*/,
+                                                          std::chrono::seconds /*timeout*/)
+  {
+    throw cucascade::io::credential_error(
+      "request_authorizer: ListObjectsV2 is not supported by this authorizer");
+  }
 };
 
 }  // namespace cucascade::io::rest

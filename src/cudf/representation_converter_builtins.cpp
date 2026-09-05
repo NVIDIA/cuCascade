@@ -50,6 +50,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
 #include <cassert>
@@ -73,6 +74,14 @@ namespace cucascade {
 // =============================================================================
 
 namespace {
+
+// RAII NVTX range for profiling converter phases (thread-local push/pop stack).
+struct nvtx_scope {
+  explicit nvtx_scope(const char* name) { nvtxRangePushA(name); }
+  ~nvtx_scope() { nvtxRangePop(); }
+  nvtx_scope(const nvtx_scope&)            = delete;
+  nvtx_scope& operator=(const nvtx_scope&) = delete;
+};
 
 // memory::column_metadata::type_id is a generic int32_t type tag; the cudf layer interprets it
 // as the numeric value of a cudf::type_id. These helpers convert across that boundary.
@@ -962,7 +971,11 @@ static rmm::device_buffer alloc_and_schedule_h2d(
   rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
-  rmm::device_buffer buf(size, stream, mr);
+  rmm::device_buffer buf;
+  {
+    nvtx_scope alloc_range{"hg:dev_alloc"};
+    buf = rmm::device_buffer(size, stream, mr);
+  }
   if (size == 0) { return buf; }
   if (alloc.size() == 0) {
     throw std::invalid_argument(
@@ -1005,7 +1018,12 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
-  rmm::device_buffer buf(size, stream, mr);
+  nvtx_scope range{"hg:nullmask_sync"};
+  rmm::device_buffer buf;
+  {
+    nvtx_scope alloc_range{"hg:dev_alloc"};
+    buf = rmm::device_buffer(size, stream, mr);
+  }
   if (size == 0) { return buf; }
 
   const std::size_t block_size = alloc.block_size();
@@ -1051,9 +1069,12 @@ static std::unique_ptr<cudf::column> reconstruct_column(
   rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
-  // Null mask — copied synchronously because cudf factories access it on construction
+  // Null mask — copied synchronously because cudf factories access it on construction.
+  // An all-valid mask (null_count == 0) is semantically identical to no mask: skip its
+  // upload entirely and construct the column non-nullable, avoiding a per-column
+  // blocking memcpy + stream sync.
   rmm::device_buffer null_mask{};
-  if (meta.has_null_mask) {
+  if (meta.has_null_mask && meta.null_count > 0) {
     null_mask =
       alloc_and_copy_h2d_sync(alloc, meta.null_mask_offset, meta.null_mask_size, stream, mr);
   }
@@ -1075,6 +1096,7 @@ static std::unique_ptr<cudf::column> reconstruct_column(
       // Flush pending H2D copies so the INT32 offsets buffer has valid data on device
       // before the cast reads from it. The cast replaces offsets_col, freeing the old
       // INT32 buffer, so batch must not hold dangling pointers to it.
+      nvtx_scope cast_range{"hg:offsets_cast"};
       batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
       offsets_col =
         cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
@@ -1167,6 +1189,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   rmm::cuda_stream_view stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"hg:convert"};
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
   if (!fast_table) { throw std::runtime_error("convert_host_fast_to_gpu: host table is null"); }
@@ -1178,7 +1201,10 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // host_data_representation is flushed before we read the pinned host blocks.
   // The caller's stream may be bound to a non-target device under multi-GPU;
   // synchronize is safe across devices.
-  stream.synchronize();
+  {
+    nvtx_scope presync_range{"hg:presync"};
+    stream.synchronize();
+  }
 
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
 
@@ -1186,22 +1212,34 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // Using the caller's stream for the H2D batch under a target-device RAII
   // guard raises cudaErrorInvalidValue when stream and current device belong
   // to different CUDA contexts (multi-GPU case).
-  auto target_stream = target_memory_space->acquire_stream();
-  auto mr            = target_memory_space->get_default_allocator();
+  auto target_stream = [&] {
+    nvtx_scope acquire_range{"hg:acquire_stream"};
+    return target_memory_space->acquire_stream();
+  }();
+  auto mr = target_memory_space->get_default_allocator();
 
   // Collect all H→D copy ops across all columns, then fire one batched call.
   BatchCopyAccumulator batch;
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(fast_table->columns.size());
-  for (const auto& col_meta : fast_table->columns) {
-    gpu_columns.push_back(
-      reconstruct_column(col_meta, *fast_table->allocation, target_stream, mr, batch));
+  {
+    nvtx_scope reconstruct_range{"hg:reconstruct"};
+    for (const auto& col_meta : fast_table->columns) {
+      gpu_columns.push_back(
+        reconstruct_column(col_meta, *fast_table->allocation, target_stream, mr, batch));
+    }
   }
   // Source is CPU-written pinned host memory: fully prepared before this call.
-  batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
+  {
+    nvtx_scope flush_range{"hg:flush_submit"};
+    batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
+  }
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
-  target_stream.synchronize();
+  {
+    nvtx_scope final_sync_range{"hg:final_sync"};
+    target_stream.synchronize();
+  }
 
   // STREAM-LINEAGE: writes happened on target_stream; record event so
   // cross-stream readers observe ordering.

@@ -20,6 +20,7 @@
 
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/types.hpp>
+#include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
@@ -28,8 +29,6 @@
 
 #include <cuda_runtime.h>
 
-#include <blockingconcurrentqueue.h>
-#include <concurrentqueue.h>
 #include <liburing.h>
 
 #include <array>
@@ -309,7 +308,7 @@ class uring_reactor {
   std::size_t _bounce_slot_size;
   std::stop_source _stop_source;
   std::jthread _worker;
-  moodycamel::BlockingConcurrentQueue<chunk_io_request_type_ptr> _requests;
+  blocking_concurrent_queue<chunk_io_request_type_ptr> _requests;
 };
 
 }  // namespace cucascade::io::uring

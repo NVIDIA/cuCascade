@@ -226,4 +226,22 @@ std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx, std::
   return std::make_unique<datasource>(std::move(io_ctx), std::move(obj));
 }
 
+std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx,
+                                            std::string path,
+                                            open_hint hint)
+{
+  if (!io_ctx) { throw std::invalid_argument("open_datasource: io_ctx must be non-null"); }
+  auto obj = io_ctx->open_io_object(std::move(path), hint);
+  return std::make_unique<datasource>(std::move(io_ctx), std::move(obj));
+}
+
+std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx,
+                                            std::string path,
+                                            std::uint64_t known_size)
+{
+  if (!io_ctx) { throw std::invalid_argument("open_datasource: io_ctx must be non-null"); }
+  auto obj = io_ctx->open_io_object(std::move(path), known_size);
+  return std::make_unique<datasource>(std::move(io_ctx), std::move(obj));
+}
+
 }  // namespace cucascade::io

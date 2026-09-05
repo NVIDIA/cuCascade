@@ -20,7 +20,8 @@ include(FetchContent)
 FetchContent_Declare(
   Catch2
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-  GIT_TAG v2.13.10)
+  GIT_TAG v3.8.1
+  GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(Catch2)
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
@@ -29,6 +30,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     cucascade_tests
     # Memory tests
     memory/test_memory_reservation_manager.cpp
+    memory/test_reservation_aware_resource_adaptor.cpp
+    memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
     memory/test_gpu_kernels.cu
     # Data tests
@@ -43,9 +46,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   # Set include directories
   target_include_directories(
-    cucascade_tests
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
-            ${Catch2_SOURCE_DIR}/single_include)
+    cucascade_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                            ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 
   # Link dependencies
   target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
@@ -53,6 +55,39 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   # Register tests with CTest
   add_test(NAME cucascade_tests COMMAND cucascade_tests)
+endif()
+
+if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
+  # IO test executable - links the cudf-free cucascade-io datasource layer.
+  add_executable(
+    cucascade_io_tests
+    io/test_datasource_registry.cpp
+    io/test_dispatch_failure_hook.cpp
+    io/test_uri_parser.cpp
+    io/cache/test_metadata_store.cpp
+    io/kvikio/test_kvikio_config.cpp
+    io/rest/test_object_store_lister.cpp
+    io/rest/test_rest_footer_resolve.cpp
+    io/rest/test_rest_perf_snapshot.cpp
+    io/rest/test_rest_validation_tag.cpp
+    io/rest/test_shared_byte_span.cpp
+    io/rest/s3/test_sigv4.cpp
+    io/rest/s3/test_sigv4_authorizer.cpp
+    io/rest/s3/test_static_credentials.cpp
+    # Main test runner
+    unittest.cpp)
+  set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
+                                                      CUDA_STANDARD_REQUIRED ON)
+
+  target_include_directories(
+    cucascade_io_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${Catch2_SOURCE_DIR}/single_include)
+
+  target_link_libraries(cucascade_io_tests PRIVATE cucascade_io Catch2::Catch2
+                                                   CUDA::cudart_static)
+
+  add_test(NAME cucascade_io_tests COMMAND cucascade_io_tests)
 endif()
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
@@ -68,6 +103,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
+    cudf/test_release_table_stream.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_cudf_tests
@@ -75,9 +111,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Set include directories
   target_include_directories(
-    cucascade_cudf_tests
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
-            ${Catch2_SOURCE_DIR}/single_include)
+    cucascade_cudf_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 
   # Link dependencies
   target_link_libraries(
@@ -97,9 +132,8 @@ set_target_properties(cucascade_topology_discovery_tests
 
 # Set include directories
 target_include_directories(
-  cucascade_topology_discovery_tests
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
-          ${Catch2_SOURCE_DIR}/single_include)
+  cucascade_topology_discovery_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                                             ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 
 # Link dependencies
 target_link_libraries(cucascade_topology_discovery_tests

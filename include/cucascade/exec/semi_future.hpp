@@ -20,7 +20,7 @@
 
 #pragma once
 
-#include <cucascade/exec/unique_function.hpp>
+#include <cucascade/exec/invocable.hpp>
 
 #include <atomic>
 #include <cassert>
@@ -45,7 +45,7 @@
 namespace cucascade::exec {
 
 // Task type submitted to an executor.
-using executor_func = unique_function<void()>;
+using executor_func = invocable<void()>;
 
 // Concept: any type with a void enqueue(executor_func) member.
 template <class exec_t>
@@ -271,7 +271,7 @@ inline void futex_wake_all(std::atomic<std::uint32_t>& atom)
 template <class value_t>
 class core {
  public:
-  using callback = unique_function<void(try_t<value_t>&&)>;
+  using callback = invocable<void(try_t<value_t>&&)>;
 
   core()                       = default;
   core(core const&)            = delete;
@@ -389,7 +389,7 @@ class core {
 
 template <class value_t>
 struct state {
-  using callback = unique_function<void(try_t<value_t>&&)>;
+  using callback = invocable<void(try_t<value_t>&&)>;
 
   virtual ~state()                                                         = default;
   virtual void await()                                                     = 0;

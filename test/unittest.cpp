@@ -15,8 +15,6 @@
  * limitations under the License.
  */
 
-#define CATCH_CONFIG_RUNNER
-
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -26,7 +24,7 @@
 #include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -98,8 +96,8 @@ test_gpu_pool global_pool;
 }  // namespace
 
 namespace {
-struct device_sync_listener : Catch::TestEventListenerBase {
-  using Catch::TestEventListenerBase::TestEventListenerBase;
+struct device_sync_listener : Catch::EventListenerBase {
+  using Catch::EventListenerBase::EventListenerBase;
 
   void testCaseEnded(Catch::TestCaseStats const&) override { cudaDeviceSynchronize(); }
 };

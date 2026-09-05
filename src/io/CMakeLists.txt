@@ -21,12 +21,16 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma/s3rdma_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_reactor.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4_authorizer.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/list_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/prefetching_cache.cpp)

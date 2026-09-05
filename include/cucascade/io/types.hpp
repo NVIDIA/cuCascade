@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cucascade::io {
@@ -93,6 +94,12 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// Total size of the underlying object, populated by the reactor at
   /// construction time and stored on the io_object thereafter.
   [[nodiscard]] virtual size_t size() const noexcept = 0;
+
+  /// Opaque cache validator observed when the object was opened; empty when
+  /// unavailable.  HTTP backends preserve quotes and a weak W/ prefix.  This
+  /// is not an If-Match or If-Range token.  The view is valid for this
+  /// object's lifetime.
+  [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
 };
 
 class io_object_metadata {

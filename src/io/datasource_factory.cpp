@@ -19,6 +19,7 @@
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
@@ -76,6 +77,20 @@ std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_
 
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
+
+factory_type make_kvikio_ioctx_factory()
+{
+  return [](const io_config& config) -> std::shared_ptr<ioctx> {
+    try {
+      // Applies config.kvikio to kvikIO's process-global defaults (see
+      // kvikio_config): unset fields keep kvikIO's env-var-seeded values.
+      return std::make_shared<kvikio_context>(config.kvikio);
+    } catch (const std::exception& e) {
+      CUCASCADE_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
 
 factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
@@ -143,7 +158,13 @@ io_context_registry::io_context_registry(
   : _config(std::move(config)), _reservation_manager(reservation_manager)
 {
   // uring / rest claim paths via their reactor's static supports() (local
-  // files and s3:// URLs respectively).
+  // files and s3:// URLs respectively).  kvikio is the universal fallback —
+  // it can open any local path — so it matches everything and lookup_path
+  // defers it behind the explicit backends.
+  _entries.emplace(
+    io_context_type::kvikio,
+    entry{
+      io_context_type::kvikio, [](std::string_view) { return true; }, make_kvikio_ioctx_factory()});
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
@@ -164,13 +185,49 @@ void io_context_registry::register_ioctx(io_context_type type,
   _entries[type] = {type, std::move(checker), std::move(factory)};
 }
 
-std::optional<io_context_type> io_context_registry::lookup(std::string_view scheme) const noexcept
+void io_context_registry::replace_ioctx(io_context_type old_type,
+                                        io_context_type new_type,
+                                        scheme_checker_type checker,
+                                        factory_type factory)
+{
+  if (!checker) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: null scheme checker");
+  }
+  if (!factory) { throw std::invalid_argument("datasource_registry: replace_ioctx: null factory"); }
+  std::lock_guard lk{_mtx};
+  if (_lookup_latched.load(std::memory_order_acquire)) {
+    throw std::logic_error(
+      "datasource_registry: replace_ioctx after the first lookup_path (bootstrap-only)");
+  }
+  if (!_entries.contains(old_type)) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: old type not registered");
+  }
+  if (_entries.contains(new_type)) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: new type already registered");
+  }
+  // Strong guarantee: the emplace is the only throwing step and precedes the
+  // erase; erase by KEY, not by a pre-emplace iterator (emplace may rehash).
+  _entries.emplace(new_type, entry{new_type, std::move(checker), std::move(factory)});
+  _entries.erase(old_type);
+}
+
+std::optional<io_context_type> io_context_registry::lookup_path(
+  std::string_view path) const noexcept
 {
   std::shared_lock lk{_mtx};
+  _lookup_latched.store(true, std::memory_order_release);
+  // kvikio's checker matches everything; _entries iterates in unspecified order,
+  // so defer the catch-all and let an explicit backend (uring/restful) win.
+  std::optional<io_context_type> fallback;
   for (const auto& [type, entry] : _entries) {
-    if (entry.checker(scheme)) return type;
+    if (!entry.checker(path)) continue;
+    if (type == io_context_type::kvikio) {
+      fallback = type;
+      continue;
+    }
+    return type;
   }
-  return std::nullopt;
+  return fallback;
 }
 
 std::shared_ptr<ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept

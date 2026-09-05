@@ -639,6 +639,7 @@ std::string prefetching_cache::summary() const
 
 void prefetching_cache::prepare_for_query() noexcept
 {
+  CUCASCADE_LOG_TRACE("prefetching_cache: summary of cache performance {}", summary());
   _ticker.fetch_add(1, std::memory_order_relaxed);
 
   // Snapshot the counters so the next summary() can report this cycle's deltas.
@@ -656,6 +657,7 @@ void prefetching_cache::prepare_for_query() noexcept
 void prefetching_cache::prepare_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
+    CUCASCADE_LOG_TRACE("prefetching_cache: prepare_loop received stop request, unblocking queue");
     _preparation_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
 
@@ -697,6 +699,10 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
         c->numa_node = numa_allocated;
         if (!c->state.mark_allocated()) {
           buffers.push_back(buffer);  // return the buffer to the pool
+          CUCASCADE_LOG_ERROR(
+            "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
+            "allocated",
+            c->offset);
         }
       }
     }
@@ -721,6 +727,7 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
 void prefetching_cache::prefetch_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
+    CUCASCADE_LOG_TRACE("prefetching_cache: prefetch_loop received stop request, unblocking queue");
     _prefetch_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
   while (!_shutting_down && !st.stop_requested()) {
@@ -752,6 +759,7 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
     if (req->is_cancelled() || st.stop_requested()) {
       std::ranges::for_each(allocated_chunks,
                             [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
+      std::ignore = req->state->mark_load_failed();
       continue;
     }
 
@@ -771,6 +779,7 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
 void prefetching_cache::evict_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
+    CUCASCADE_LOG_TRACE("prefetching_cache: evict_loop received stop request, unblocking queue");
     _eviction_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
 

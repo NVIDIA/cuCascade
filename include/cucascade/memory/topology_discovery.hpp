@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@ struct gpu_topology_info {
   std::vector<int> cpu_cores;                ///< List of CPU core IDs.
   std::vector<int> memory_binding;           ///< NUMA nodes for memory binding.
   std::vector<std::string> network_devices;  ///< Network devices (NICs) optimal for this GPU.
+  bool hw_decompression_available{false};    ///< Hardware-accelerated decompression engine present.
 };
 
 /**
@@ -50,6 +52,26 @@ struct storage_device_info {
 };
 
 /**
+ * @brief NUMA node memory information.
+ *
+ * Capacities are reported in bytes and are read from
+ * `/sys/devices/system/node/node<id>/meminfo`. They are 0 when the kernel does not
+ * expose the corresponding entry.
+ *
+ * @note Not every NUMA node backs host memory. Systems such as DGX Station and
+ *       Grace-Hopper expose device memory (GPU HBM) as its own CPU-less NUMA node, and
+ *       CXL memory expanders do the same. Those nodes are flagged with
+ *       `is_device_memory` and must not be used to size a host memory space.
+ */
+struct numa_topology_info {
+  int id{-1};                      ///< NUMA node ID.
+  std::size_t memory_capacity{0};  ///< Total memory of the node in bytes (0 if unknown).
+  std::size_t free_memory{0};      ///< Currently free memory of the node in bytes (0 if unknown).
+  bool has_cpus{false};            ///< Whether any CPU is assigned to this node.
+  bool is_device_memory{false};    ///< Whether this node is device memory rather than host memory.
+};
+
+/**
  * @brief System topology information.
  */
 struct system_topology_info {
@@ -60,6 +82,67 @@ struct system_topology_info {
   std::vector<gpu_topology_info> gpus;               ///< GPU topology information.
   std::vector<network_device_info> network_devices;  ///< Network device information.
   std::vector<storage_device_info> storage_devices;  ///< Storage device information.
+  std::vector<numa_topology_info> numa_nodes;        ///< NUMA node information, sorted by id.
+
+  /**
+   * @brief Find a NUMA node by ID.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Pointer to the node, or `nullptr` if no such node was discovered.
+   */
+  [[nodiscard]] numa_topology_info const* find_numa_node(int numa_id) const
+  {
+    for (auto const& node : numa_nodes) {
+      if (node.id == numa_id) { return &node; }
+    }
+    return nullptr;
+  }
+
+  /**
+   * @brief Get the memory capacity of a NUMA node.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Capacity of the node in bytes, or `std::nullopt` if the node was not
+   *         discovered or the kernel did not report its capacity. The two cases are
+   *         distinguishable via `find_numa_node()`.
+   */
+  [[nodiscard]] std::optional<std::size_t> get_numa_memory_capacity(int numa_id) const
+  {
+    auto const* node = find_numa_node(numa_id);
+    if (node == nullptr || node->memory_capacity == 0) { return std::nullopt; }
+    return node->memory_capacity;
+  }
+
+  /**
+   * @brief Get the free memory of a NUMA node.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Free memory of the node in bytes, or `std::nullopt` if the node was not
+   *         discovered or the kernel did not report its free memory.
+   */
+  [[nodiscard]] std::optional<std::size_t> get_numa_free_memory(int numa_id) const
+  {
+    auto const* node = find_numa_node(numa_id);
+    if (node == nullptr || node->free_memory == 0) { return std::nullopt; }
+    return node->free_memory;
+  }
+
+  /**
+   * @brief Get the summed memory capacity of all host-backing NUMA nodes.
+   *
+   * Nodes flagged as device memory are excluded, so the result is usable host memory.
+   *
+   * @return Total host memory capacity in bytes.
+   */
+  [[nodiscard]] std::size_t get_total_numa_memory_capacity() const
+  {
+    std::size_t total = 0;
+    for (auto const& node : numa_nodes) {
+      if (node.is_device_memory) { continue; }
+      total += node.memory_capacity;
+    }
+    return total;
+  }
 };
 
 /**

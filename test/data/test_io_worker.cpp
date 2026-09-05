@@ -25,7 +25,7 @@
 
 #include "../../src/data/io_worker.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <atomic>
 #include <chrono>

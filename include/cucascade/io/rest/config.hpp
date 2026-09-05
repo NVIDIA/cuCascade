@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <cucascade/io/rest/s3/list_parser.hpp>
+
 #include <chrono>
 #include <cstddef>
 
@@ -84,6 +86,55 @@ struct config {
   std::chrono::milliseconds retry_backoff_base{50};
   std::chrono::milliseconds retry_jitter{50};
   bool honor_retry_after{true};
+
+  /// When set, the reactor records the per-chunk micro timings (chunk_get,
+  /// queue_wait, ttfb, h2d_observed) into its perf counters.  The retry,
+  /// terminal-failure, device-stream-sync and payload-byte counters are always
+  /// recorded, independent of this flag.
+  bool perf_instrumentation{false};
+
+  /// Suffix-range window (bytes) for the parquet footer probe
+  /// (@c open_hint::parquet_footer_probe): one `Range: bytes=-N` GET resolves the
+  /// object size and stashes its last N bytes, so cuDF's trailer/footer reads are
+  /// served locally.  Tradeoff — a parquet footer is ~0.037% of the file (SF1
+  /// lineitem 207 MB -> 78 KiB, SF10 2.2 GB -> 771 KiB): N must cover the footer,
+  /// else the probe wastes the suffix and re-GETs the footer body (worse than a
+  /// plain HEAD), so err large; the over-read when N exceeds the footer is a
+  /// one-time bind transfer (~10 ms on a high-bandwidth link).  The 512 KiB
+  /// default covers files up to ~1.4 GB in one GET (the common range); raise it
+  /// for multi-GB single files, lower it for many-tiny-file / low-bandwidth
+  /// workloads.
+  std::size_t footer_probe_bytes{512UL << 10};  // 512 KiB
+
+  /// S3 LIST / glob safety caps (both throw "narrow the glob prefix", never
+  /// truncate).  @c list_max_matches bounds the files a glob keeps / a
+  /// whole-listing accumulates (result memory); @c list_max_scanned bounds the
+  /// objects a LIST sweep looks at across pages (time / LIST round-trips).  The
+  /// two axes diverge when a prefix is huge but few keys match, so both exist.
+  std::size_t list_max_matches{s3::default_max_list_objects};     // 100'000
+  std::size_t list_max_scanned{s3::default_max_scanned_objects};  // 1'000'000
+
+  /// Sentinel for the footer_resolve_* knobs below: derive the value from the
+  /// ioctx shape instead of using an explicit setting.
+  static constexpr std::size_t footer_resolve_auto{static_cast<std::size_t>(-1)};
+
+  /// Concurrency cap for one @c rest_ioctx::resolve_footer_objects batch: at
+  /// most this many probe/HEAD transfers are on the wire at once, and the
+  /// batch's curl multi pools at most this many connections.
+  /// @c footer_resolve_auto derives n_reactors * max_connections at the ioctx;
+  /// 0 disables the API entirely (resolve_footer_objects throws) — the
+  /// rollback switch.
+  std::size_t footer_resolve_max_inflight{footer_resolve_auto};
+
+  /// Aggregate cap (bytes) on live footer payloads across all batches of one
+  /// ioctx.  Each entry reserves @c footer_probe_bytes just before its GET is
+  /// issued; the bytes return when the delivered payload buffer is freed, so
+  /// the cap paces resolve-ahead to how fast the caller drops payloads.
+  /// @c footer_resolve_auto derives 2 * effective-inflight *
+  /// footer_probe_bytes.  An explicit value smaller than
+  /// @c footer_probe_bytes is rejected at resolve time — a sub-window budget
+  /// cannot be honored as a hard cap.
+  std::size_t footer_resolve_stash_budget{footer_resolve_auto};
 };
 
 }  // namespace cucascade::io::rest

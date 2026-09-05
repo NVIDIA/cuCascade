@@ -22,16 +22,20 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime_api.h>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1022,6 +1026,70 @@ static void CUDART_CB stream_delay_callback(void* /*userData*/)
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
+struct stream_gate {
+  std::atomic<bool> released{false};
+
+  void release() noexcept
+  {
+    released.store(true, std::memory_order_release);
+    released.notify_all();
+  }
+};
+
+// Releases and drains a parked callback during exception unwinding. Draining is required because
+// the CUDA callback retains a pointer to the gate until the stream has passed it.
+class stream_gate_release_guard {
+ public:
+  stream_gate_release_guard(stream_gate& gate, rmm::cuda_stream_view stream)
+    : _gate(gate), _stream(stream)
+  {
+  }
+  ~stream_gate_release_guard() noexcept
+  {
+    _gate.release();
+    _stream.synchronize_no_throw();
+  }
+
+  stream_gate_release_guard(stream_gate_release_guard const&)            = delete;
+  stream_gate_release_guard& operator=(stream_gate_release_guard const&) = delete;
+
+ private:
+  stream_gate& _gate;
+  rmm::cuda_stream_view _stream;
+};
+
+// Ensures a started reclaimer thread cannot remain parked on its start latch if construction of a
+// later test helper throws. Declare this after the reclaimer so it is destroyed first on unwind.
+class reclaimer_unblock_guard {
+ public:
+  reclaimer_unblock_guard(std::atomic<bool>& start_reclaimer, stream_gate& gate)
+    : _start_reclaimer(start_reclaimer), _gate(gate)
+  {
+  }
+
+  ~reclaimer_unblock_guard()
+  {
+    _start_reclaimer.store(true, std::memory_order_release);
+    _start_reclaimer.notify_all();
+    _gate.release();
+  }
+
+  reclaimer_unblock_guard(reclaimer_unblock_guard const&)            = delete;
+  reclaimer_unblock_guard& operator=(reclaimer_unblock_guard const&) = delete;
+
+ private:
+  std::atomic<bool>& _start_reclaimer;
+  stream_gate& _gate;
+};
+
+// Host callback that keeps one CUDA stream parked until the test releases it. Atomic waiting blocks
+// the callback thread without calling back into CUDA.
+static void CUDART_CB stream_gate_callback(void* user_data)
+{
+  auto* gate = static_cast<stream_gate*>(user_data);
+  gate->released.wait(false, std::memory_order_acquire);
+}
+
 TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync",
           "[data_batch][convert_to]")
 {
@@ -1101,6 +1169,377 @@ TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync
   REQUIRE(batch->get_state() == batch_state::idle);
 
   CUCASCADE_CUDA_TRY(cudaFreeHost(pinned_host));
+}
+
+// =============================================================================
+// Reader-event stream ordering tests
+// =============================================================================
+
+TEST_CASE("mutable acquisition waits for all recorded asynchronous GPU readers",
+          "[data_batch][reader_event][gpu]")
+{
+  auto exercise_reclaim = [](bool upgrade_from_read_only) {
+    constexpr std::size_t buffer_size = 4 * 1024 * 1024;
+    constexpr auto num_rows           = static_cast<cudf::size_type>(buffer_size / sizeof(int32_t));
+
+    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+    rmm::cuda_stream initialization_stream;
+    rmm::cuda_stream slow_reader_stream;
+    rmm::cuda_stream fast_reader_stream;
+    rmm::cuda_stream reclaim_stream;
+
+    auto source_column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                   num_rows,
+                                                   cudf::mask_state::UNALLOCATED,
+                                                   initialization_stream.view(),
+                                                   gpu_space->get_default_allocator());
+    void* source       = source_column->mutable_view().head();
+    CUCASCADE_CUDA_TRY(cudaMemsetAsync(source, 0xAB, buffer_size, initialization_stream.value()));
+    initialization_stream.synchronize();
+
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(source_column));
+    auto representation = std::make_unique<gpu_table_representation>(
+      std::make_unique<cudf::table>(std::move(columns)), *gpu_space, initialization_stream.view());
+    auto batch = data_batch::make(1, std::move(representation));
+
+    void* slow_output = nullptr;
+    void* fast_output = nullptr;
+    CUCASCADE_CUDA_TRY(cudaMallocHost(&slow_output, buffer_size));
+    CUCASCADE_CUDA_TRY(cudaMallocHost(&fast_output, buffer_size));
+
+    cucascade::cuda::cuda_event slow_copy_done;
+    cucascade::cuda::cuda_event fast_copy_done;
+    stream_gate slow_reader_gate;
+    stream_gate_release_guard release_gate_on_exit{slow_reader_gate, slow_reader_stream.view()};
+    std::optional<read_only_data_batch> upgrade_reader;
+    if (upgrade_from_read_only) { upgrade_reader.emplace(batch->to_read_only()); }
+
+    {
+      auto slow_reader = batch->to_read_only();
+      auto fast_reader = batch->to_read_only();
+
+      // The slow reader is recorded first. An incorrect single-event/latest-reader
+      // implementation would overwrite its dependency with the faster second reader.
+      CUCASCADE_CUDA_TRY(
+        cudaLaunchHostFunc(slow_reader_stream.value(), stream_gate_callback, &slow_reader_gate));
+      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+        slow_output, source, buffer_size, cudaMemcpyDeviceToHost, slow_reader_stream.value()));
+      slow_copy_done.record(slow_reader_stream.view());
+      slow_reader.record_reader_event(slow_reader_stream.view());
+
+      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+        fast_output, source, buffer_size, cudaMemcpyDeviceToHost, fast_reader_stream.value()));
+      fast_copy_done.record(fast_reader_stream.view());
+      fast_reader.record_reader_event(fast_reader_stream.view());
+      fast_reader_stream.synchronize();
+    }
+
+    // The slow stream is still parked while the later reader is already complete. This proves
+    // that releasing the shared accessors did not wait for registered device work.
+    bool const readers_still_in_flight_after_unlock =
+      slow_copy_done.query() == cucascade::cuda::event::query_result::in_progress &&
+      fast_copy_done.query() == cucascade::cuda::event::query_result::success;
+
+    // The try variant must remain non-blocking and decline mutable access while a registered
+    // reader is pending (or, in the upgrade section, while its shared lock is held).
+    auto try_mutable                = batch->try_to_mutable();
+    bool const try_mutable_rejected = !try_mutable.has_value();
+    try_mutable.reset();
+
+    std::atomic<bool> start_reclaimer{false};
+    std::atomic<bool> reclaimer_ready{false};
+    std::atomic<bool> reclaimer_finished{false};
+    bool mutable_returned_while_gate_closed     = false;
+    bool all_readers_done_when_mutable_returned = false;
+    std::exception_ptr reclaimer_error;
+
+    // A worker attempts reclamation only after an explicit handshake. A bounded watchdog releases
+    // the parked stream if the correct implementation is waiting for its event. Without the
+    // barrier, the worker returns first, poisons the source while the gate is closed, and releases
+    // the reader itself, making the ordering failure deterministic.
+    std::jthread reclaimer([&]() {
+      reclaimer_ready.store(true, std::memory_order_release);
+      reclaimer_ready.notify_all();
+      start_reclaimer.wait(false, std::memory_order_acquire);
+      try {
+        std::optional<mutable_data_batch> mutable_batch;
+        if (upgrade_from_read_only) {
+          mutable_batch.emplace(data_batch::readonly_to_mutable(std::move(*upgrade_reader)));
+        } else {
+          mutable_batch.emplace(batch->to_mutable());
+        }
+
+        mutable_returned_while_gate_closed =
+          !slow_reader_gate.released.load(std::memory_order_acquire);
+        all_readers_done_when_mutable_returned =
+          slow_copy_done.query() == cucascade::cuda::event::query_result::success &&
+          fast_copy_done.query() == cucascade::cuda::event::query_result::success;
+
+        // Model immediate cache reuse by poisoning the source on an independent stream.
+        CUCASCADE_CUDA_TRY(cudaMemsetAsync(source, 0xCD, buffer_size, reclaim_stream.value()));
+        reclaim_stream.synchronize();
+        if (mutable_returned_while_gate_closed) { slow_reader_gate.release(); }
+      } catch (...) {
+        reclaimer_error = std::current_exception();
+        slow_reader_gate.release();
+      }
+      reclaimer_finished.store(true, std::memory_order_release);
+    });
+    reclaimer_unblock_guard unblock_reclaimer_on_unwind{start_reclaimer, slow_reader_gate};
+
+    std::jthread watchdog([&]() {
+      start_reclaimer.wait(false, std::memory_order_acquire);
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (!reclaimer_finished.load(std::memory_order_acquire)) { slow_reader_gate.release(); }
+    });
+
+    reclaimer_ready.wait(false, std::memory_order_acquire);
+    start_reclaimer.store(true, std::memory_order_release);
+    start_reclaimer.notify_all();
+    reclaimer.join();
+    watchdog.join();
+    if (reclaimer_error) { std::rethrow_exception(reclaimer_error); }
+
+    slow_reader_stream.synchronize();
+    fast_reader_stream.synchronize();
+
+    auto const* slow_bytes = static_cast<uint8_t const*>(slow_output);
+    auto const* fast_bytes = static_cast<uint8_t const*>(fast_output);
+    bool const slow_copy_preserved =
+      std::all_of(slow_bytes, slow_bytes + buffer_size, [](uint8_t byte) { return byte == 0xAB; });
+    bool const fast_copy_preserved =
+      std::all_of(fast_bytes, fast_bytes + buffer_size, [](uint8_t byte) { return byte == 0xAB; });
+
+    std::vector<uint8_t> poisoned_source(buffer_size);
+    CUCASCADE_CUDA_TRY(
+      cudaMemcpy(poisoned_source.data(), source, buffer_size, cudaMemcpyDeviceToHost));
+    bool const source_was_reclaimed = std::all_of(
+      poisoned_source.begin(), poisoned_source.end(), [](uint8_t byte) { return byte == 0xCD; });
+
+    CUCASCADE_CUDA_TRY(cudaFreeHost(slow_output));
+    CUCASCADE_CUDA_TRY(cudaFreeHost(fast_output));
+
+    REQUIRE(readers_still_in_flight_after_unlock);
+    REQUIRE(try_mutable_rejected);
+    REQUIRE_FALSE(mutable_returned_while_gate_closed);
+    REQUIRE(all_readers_done_when_mutable_returned);
+    REQUIRE(slow_copy_preserved);
+    REQUIRE(fast_copy_preserved);
+    REQUIRE(source_was_reclaimed);
+  };
+
+  SECTION("idle-to-mutable acquisition") { exercise_reclaim(false); }
+  SECTION("read-only-to-mutable acquisition") { exercise_reclaim(true); }
+}
+
+TEST_CASE("reader event registration is a no-op for non-GPU batches", "[data_batch][reader_event]")
+{
+  auto exercise_tier = [](memory::Tier tier) {
+    auto batch          = data_batch::make(1, std::make_unique<mock_data_representation>(tier));
+    auto reader         = batch->to_read_only();
+    auto invalid_stream = rmm::cuda_stream_view{reinterpret_cast<cudaStream_t>(std::uintptr_t{1})};
+    REQUIRE_NOTHROW(reader.record_reader_event(invalid_stream));
+    batch = data_batch::to_idle(std::move(reader));
+    REQUIRE(batch->try_to_mutable().has_value());
+  };
+
+  SECTION("host") { exercise_tier(memory::Tier::HOST); }
+  SECTION("disk") { exercise_tier(memory::Tier::DISK); }
+}
+
+TEST_CASE("completed reader events are recycled across mutable acquisitions",
+          "[data_batch][reader_event][gpu]")
+{
+  auto batch =
+    data_batch::make(1, std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 0));
+  rmm::cuda_stream reader_stream;
+
+  for (int iteration = 0; iteration < 2; ++iteration) {
+    auto reader = batch->to_read_only();
+    reader.record_reader_event(reader_stream.view());
+    reader_stream.synchronize();
+    batch = data_batch::to_idle(std::move(reader));
+
+    auto mutable_batch = batch->try_to_mutable();
+    REQUIRE(mutable_batch.has_value());
+    batch = data_batch::to_idle(std::move(*mutable_batch));
+  }
+}
+
+TEST_CASE("reader event pools remain device-local across representation replacement",
+          "[data_batch][reader_event][gpu][.multi-device]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+    SUCCEED("Fewer than two CUDA devices available; skipping cross-device reader-event test");
+    return;
+  }
+
+  auto batch =
+    data_batch::make(1, std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 0));
+  {
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{0}};
+    rmm::cuda_stream reader_stream;
+    auto reader = batch->to_read_only();
+    reader.record_reader_event(reader_stream.view());
+    reader_stream.synchronize();
+    batch = data_batch::to_idle(std::move(reader));
+  }
+
+  auto mutable_batch = batch->to_mutable();
+  mutable_batch.set_data(std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 1));
+  batch = data_batch::to_idle(std::move(mutable_batch));
+
+  {
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{1}};
+    rmm::cuda_stream reader_stream;
+    auto reader = batch->to_read_only();
+    REQUIRE_NOTHROW(reader.record_reader_event(reader_stream.view()));
+    reader_stream.synchronize();
+    batch = data_batch::to_idle(std::move(reader));
+  }
+
+  REQUIRE(batch->try_to_mutable().has_value());
+}
+
+static void CUDART_CB set_flag_callback(void* user_data)
+{
+  static_cast<std::atomic<bool>*>(user_data)->store(true, std::memory_order_release);
+}
+
+TEST_CASE("record_reader_event is thread-safe under concurrent shared-lock recording",
+          "[data_batch][reader_event][gpu]")
+{
+  auto batch =
+    data_batch::make(1, std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 0));
+  constexpr int num_threads        = 8;
+  constexpr int records_per_thread = 50;
+
+  std::atomic<int> failures{0};
+  std::atomic<int> done_threads{0};
+  {
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+    for (int t = 0; t < num_threads; ++t) {
+      threads.emplace_back([&batch, &failures, &done_threads]() {
+        try {
+          rmm::cuda_stream stream;
+          rmm::device_buffer scratch(16, stream.view());
+          auto reader = batch->to_read_only();
+          for (int j = 0; j < records_per_thread; ++j) {
+            CUCASCADE_CUDA_TRY(
+              ::cudaMemsetAsync(scratch.data(), j & 0xFF, scratch.size(), stream.value()));
+            reader.record_reader_event(stream.view());
+          }
+          stream.synchronize();
+        } catch (...) {
+          failures.fetch_add(1);
+        }
+        done_threads.fetch_add(1);
+      });
+    }
+
+    // try_to_mutable may legally succeed between recorders; we assert only that it never throws.
+    while (done_threads.load(std::memory_order_acquire) < num_threads) {
+      auto maybe_mutable = batch->try_to_mutable();
+      maybe_mutable.reset();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  REQUIRE(failures.load() == 0);
+
+  {
+    auto mutable_batch = batch->to_mutable();
+  }
+  REQUIRE(batch->try_to_mutable().has_value());
+}
+
+TEST_CASE("reader event pool sustains cycles with a pending head and completed tail",
+          "[data_batch][reader_event][gpu]")
+{
+  auto batch =
+    data_batch::make(1, std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 0));
+  rmm::cuda_stream slow_stream;
+  rmm::cuda_stream fast_stream;
+  rmm::device_buffer scratch(64, fast_stream.view());
+
+  // With no pool-size accessor, correct behavior across sustained cycles is the only observable.
+  for (int cycle = 0; cycle < 64; ++cycle) {
+    stream_gate gate;
+    stream_gate_release_guard release_gate_on_exit{gate, slow_stream.view()};
+    {
+      auto reader = batch->to_read_only();
+      CUCASCADE_CUDA_TRY(::cudaLaunchHostFunc(slow_stream.value(), stream_gate_callback, &gate));
+      reader.record_reader_event(slow_stream.view());
+      for (int j = 0; j < 8; ++j) {
+        CUCASCADE_CUDA_TRY(
+          ::cudaMemsetAsync(scratch.data(), j & 0xFF, scratch.size(), fast_stream.value()));
+        reader.record_reader_event(fast_stream.view());
+      }
+      fast_stream.synchronize();
+      batch = data_batch::to_idle(std::move(reader));
+    }
+
+    REQUIRE_FALSE(batch->try_to_mutable().has_value());
+
+    gate.release();
+    slow_stream.synchronize();
+    auto mutable_batch = batch->try_to_mutable();
+    REQUIRE(mutable_batch.has_value());
+    batch = data_batch::to_idle(std::move(*mutable_batch));
+  }
+}
+
+TEST_CASE("record_reader_event accepts the legacy default stream",
+          "[data_batch][reader_event][gpu]")
+{
+  auto batch =
+    data_batch::make(1, std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 0));
+  rmm::device_buffer scratch(64, rmm::cuda_stream_default);
+
+  // The legacy default stream is a sentinel handle; the implementation's device query must cope.
+  {
+    auto reader = batch->to_read_only();
+    CUCASCADE_CUDA_TRY(::cudaMemsetAsync(scratch.data(), 0x5A, scratch.size(), nullptr));
+    REQUIRE_NOTHROW(reader.record_reader_event(rmm::cuda_stream_default));
+    batch = data_batch::to_idle(std::move(reader));
+  }
+
+  CUCASCADE_CUDA_TRY(::cudaStreamSynchronize(nullptr));
+  REQUIRE(batch->try_to_mutable().has_value());
+}
+
+TEST_CASE("~data_batch waits for recorded readers when the final accessor drops the last reference",
+          "[data_batch][reader_event][gpu]")
+{
+  rmm::cuda_stream reader_stream;
+  rmm::device_buffer scratch(64, reader_stream.view());
+  std::atomic<bool> read_retired{false};
+  stream_gate gate;
+  stream_gate_release_guard release_gate_on_exit{gate, reader_stream.view()};
+
+  std::jthread releaser;
+  {
+    auto batch =
+      data_batch::make(1, std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024, 0));
+    auto reader = batch->to_read_only();
+    batch.reset();
+
+    CUCASCADE_CUDA_TRY(::cudaLaunchHostFunc(reader_stream.value(), stream_gate_callback, &gate));
+    CUCASCADE_CUDA_TRY(
+      ::cudaMemsetAsync(scratch.data(), 0x5A, scratch.size(), reader_stream.value()));
+    CUCASCADE_CUDA_TRY(
+      ::cudaLaunchHostFunc(reader_stream.value(), set_flag_callback, &read_retired));
+    reader.record_reader_event(reader_stream.view());
+
+    releaser = std::jthread([&gate]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      gate.release();
+    });
+    // Scope exit drops the last reference; ~data_batch must block until the gated read retires.
+  }
+  REQUIRE(read_retired.load(std::memory_order_acquire));
 }
 
 // =============================================================================

@@ -18,6 +18,42 @@
 
 #pragma once
 
+/**
+ * @file invocable.hpp
+ * @brief Move-only type-erased callable used across the exec layer.
+ *
+ * `cucascade::exec::invocable<Signature>` is the single spelling used by the
+ * thread pool, dispatcher, and future/promise continuations. Two backing
+ * implementations are selected at configure time:
+ *
+ *   - Default (standard-library only): a minimal in-tree implementation, a
+ *     stand-in for C++23 `std::move_only_function` on the C++20 toolchain.
+ *   - `CUCASCADE_USE_ABSEIL_INVOCABLE` defined: an alias for
+ *     `absl::AnyInvocable`. Enable via the `CUCASCADE_USE_ABSEIL_INVOCABLE`
+ *     CMake option so the library reuses a host project's abseil (e.g. when
+ *     embedded in a codebase that already depends on it).
+ *
+ * The macro must be defined consistently for the library build and every
+ * consumer that includes this header; the CMake option propagates it as a
+ * public compile definition to guarantee that.
+ */
+
+#ifdef CUCASCADE_USE_ABSEIL_INVOCABLE
+
+#include <absl/functional/any_invocable.h>
+
+namespace cucascade::exec {
+
+/**
+ * @brief Move-only type-erased callable, backed by `absl::AnyInvocable`.
+ */
+template <typename Signature>
+using invocable = absl::AnyInvocable<Signature>;
+
+}  // namespace cucascade::exec
+
+#else  // CUCASCADE_USE_ABSEIL_INVOCABLE
+
 #include <concepts>
 #include <cstddef>
 #include <functional>
@@ -35,29 +71,29 @@ namespace cucascade::exec {
  * std::function (copyable target required) cannot hold.
  */
 template <typename Signature>
-class unique_function;
+class invocable;
 
 template <typename R, typename... Args>
-class unique_function<R(Args...)> {
+class invocable<R(Args...)> {
  public:
-  unique_function() noexcept = default;
-  unique_function(std::nullptr_t) noexcept {}  // NOLINT(google-explicit-constructor)
+  invocable() noexcept = default;
+  invocable(std::nullptr_t) noexcept {}  // NOLINT(google-explicit-constructor)
 
   template <typename F>
-    requires(!std::same_as<std::remove_cvref_t<F>, unique_function> &&
+    requires(!std::same_as<std::remove_cvref_t<F>, invocable> &&
              std::invocable<std::decay_t<F>&, Args...>)
-  unique_function(F&& f)  // NOLINT(google-explicit-constructor)
+  invocable(F&& f)  // NOLINT(google-explicit-constructor)
     : _impl(std::make_unique<model<std::decay_t<F>>>(std::forward<F>(f)))
   {
   }
 
-  unique_function(unique_function&&) noexcept            = default;
-  unique_function& operator=(unique_function&&) noexcept = default;
-  unique_function(const unique_function&)                = delete;
-  unique_function& operator=(const unique_function&)     = delete;
-  ~unique_function()                                     = default;
+  invocable(invocable&&) noexcept            = default;
+  invocable& operator=(invocable&&) noexcept = default;
+  invocable(const invocable&)                = delete;
+  invocable& operator=(const invocable&)     = delete;
+  ~invocable()                               = default;
 
-  unique_function& operator=(std::nullptr_t) noexcept
+  invocable& operator=(std::nullptr_t) noexcept
   {
     _impl.reset();
     return *this;
@@ -65,7 +101,7 @@ class unique_function<R(Args...)> {
 
   [[nodiscard]] explicit operator bool() const noexcept { return _impl != nullptr; }
 
-  friend bool operator==(const unique_function& f, std::nullptr_t) noexcept { return !f; }
+  friend bool operator==(const invocable& f, std::nullptr_t) noexcept { return !f; }
 
   R operator()(Args... args) { return _impl->invoke(std::forward<Args>(args)...); }
 
@@ -86,3 +122,5 @@ class unique_function<R(Args...)> {
 };
 
 }  // namespace cucascade::exec
+
+#endif  // CUCASCADE_USE_ABSEIL_INVOCABLE

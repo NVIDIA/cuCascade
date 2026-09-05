@@ -18,8 +18,8 @@
 
 #pragma once
 
+#include <cucascade/exec/invocable.hpp>
 #include <cucascade/exec/thread_pool.hpp>
-#include <cucascade/exec/unique_function.hpp>
 
 #include <cassert>
 #include <concepts>
@@ -111,7 +111,7 @@ class scoped_dispatcher {
   }
 
  private:
-  using task_t = unique_function<void()>;
+  using task_t = invocable<void()>;
 
   template <typename F>
   task_t wrap(F&& f)

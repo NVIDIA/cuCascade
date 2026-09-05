@@ -111,17 +111,17 @@ memory_space::memory_space(const gpu_memory_space_config& config)
       return std::make_unique<rmm::cuda_stream_pool>(16, rmm::cuda_stream::flags::non_blocking);
     }()}
 {
-  cudaMemPool_t pool_handle{nullptr};
-
   if (config.mr_factory_fn) {
     _allocator = config.mr_factory_fn(config.device_id, config.memory_capacity);
   } else {
     rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
-    rmm::mr::cuda_async_memory_resource concrete_mr(config.memory_capacity);
-    pool_handle = concrete_mr.pool_handle();
-    _allocator  = cuda::mr::any_resource<cuda::mr::device_accessible>(std::move(concrete_mr));
+    _allocator = cuda::mr::any_resource<cuda::mr::device_accessible>(
+      rmm::mr::cuda_async_memory_resource(config.memory_capacity));
   }
 
+  // The reservation adaptor recovers the CUDA memory pool handle (used for OOM
+  // diagnostics) from the upstream resource itself, so it works regardless of
+  // whether the allocator came from a factory or the default path above.
   _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
     _id,
     rmm::device_async_resource_ref(_allocator),
@@ -131,8 +131,7 @@ memory_space::memory_space(const gpu_memory_space_config& config)
     nullptr,
     config.per_stream_reservation
       ? reservation_aware_resource_adaptor::AllocationTrackingScope::PER_STREAM
-      : reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD,
-    pool_handle);
+      : reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD);
 }
 
 memory_space::memory_space(const host_memory_space_config& config)

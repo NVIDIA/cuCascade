@@ -18,7 +18,9 @@
 
 #pragma once
 
+#include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/cache/types.hpp>
+#include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/types.hpp>
@@ -27,11 +29,12 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <blockingconcurrentqueue.h>
-
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -43,6 +46,103 @@
 
 namespace cucascade::io::rest {
 
+/// Parse the total object length out of a Content-Range value of the form
+/// "bytes <first>-<last>/<total>".  Returns nullopt when the unit is not
+/// "bytes", the range is unsatisfied ("bytes */..."), or the total is unknown
+/// ("*") — i.e. any response the footer probe cannot trust.
+[[nodiscard]] std::optional<std::size_t> content_range_total(std::string_view content_range);
+
+// ---------------------------------------------------------------------------
+// shared_byte_span
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// Owns a byte buffer plus a span over it.  Exists so @ref make_shared_byte_span
+/// can hand out a shared_ptr to the *span* (via the aliasing constructor) while
+/// the shared_ptr's control block keeps the *buffer* alive.  Never held
+/// directly by callers.
+struct byte_storage {
+  std::vector<std::uint8_t> bytes;
+  std::span<const std::uint8_t> view;
+
+  // `bytes` is declared first, so it is already initialised when `view` binds
+  // to it — the span never sees a moved-from buffer.
+  explicit byte_storage(std::vector<std::uint8_t> b) : bytes(std::move(b)), view(bytes) {}
+
+  // Non-copyable, non-movable: `view` points into `bytes`, so copying would
+  // deep-copy the buffer and leave the copy's span aimed at the original's
+  // allocation.  Only ever built in place by make_shared, so neither is needed.
+  byte_storage(byte_storage const&)            = delete;
+  byte_storage& operator=(byte_storage const&) = delete;
+  byte_storage(byte_storage&&)                 = delete;
+  byte_storage& operator=(byte_storage&&)      = delete;
+};
+
+}  // namespace detail
+
+/// A shared, immutable view over a byte buffer.
+///
+/// Deliberately a span rather than a @c vector: consumers only ever read
+/// through it (@c data / @c size / @c subspan), so exposing the container type —
+/// and with it its allocator, growth policy and mutation API — would leak an
+/// implementation detail into the interface.  Ownership still rides along: the
+/// shared_ptr is built with the aliasing constructor, so the control block
+/// retains the underlying buffer while the pointer itself refers to the span.
+using shared_byte_span = std::shared_ptr<const std::span<const std::uint8_t>>;
+
+/// Take ownership of @p bytes and return a @ref shared_byte_span over it.
+/// A single allocation: the buffer and its span live in one control block.
+[[nodiscard]] shared_byte_span make_shared_byte_span(std::vector<std::uint8_t> bytes);
+
+// ---------------------------------------------------------------------------
+// footer_probe
+// ---------------------------------------------------------------------------
+
+/// Result of a suffix-range footer probe: the object's total size plus the
+/// trailing window [window_lo, object_size) captured in @c bytes.  @c bytes is
+/// null when the probe could not be satisfied (the caller then falls back to a
+/// HEAD).  Shared, not copied, with the io_object that carries it for this open.
+struct footer_probe {
+  std::size_t object_size{0};
+  std::size_t window_lo{0};
+  shared_byte_span bytes;
+  /// ETag from the verified 206, quotes preserved; empty otherwise.
+  std::string etag;
+};
+
+/// Result of a blocking HEAD: the object's size plus its ETag when the server
+/// sent one (quotes preserved, empty otherwise).
+struct head_object_result {
+  std::size_t object_size{0};
+  std::string etag;
+};
+
+// ---------------------------------------------------------------------------
+// footer_resolve_result
+// ---------------------------------------------------------------------------
+
+/// One resolved entry of a batched footer resolve
+/// (@c rest_ioctx::resolve_footer_objects).  Exactly one of {object, error}
+/// is set.
+///
+/// @c object is stashless — identity, size and validation tag only.  The
+/// suffix window bytes arrive in @c footer instead, whose buffer is the byte
+/// lease: it is allocated against the ioctx-wide footer budget
+/// (@c config::footer_resolve_stash_budget) and the bytes return to that
+/// budget when the buffer is freed, so the intended lifetime is parse-only.
+/// Reads on @c object inside the window re-GET over the network.  @c footer
+/// is null on the HEAD-fallback path (probe unusable), where @c window_lo
+/// stays 0.
+struct footer_resolve_result {
+  std::size_t index{0};               ///< position in the submitted span
+  std::string path;                   ///< the submitted path, verbatim
+  std::shared_ptr<io_object> object;  ///< stashless: size + validation tag
+  shared_byte_span footer;            ///< suffix window bytes (the lease)
+  std::size_t window_lo{0};           ///< file offset of footer->front()
+  std::exception_ptr error;           ///< per-entry failure, isolated
+};
+
 // ---------------------------------------------------------------------------
 // rest_io_object
 // ---------------------------------------------------------------------------
@@ -50,31 +150,114 @@ namespace cucascade::io::rest {
 /**
  * @brief Concrete @c io_object backed by a RESTful object-store key.
  *
- * Passive bag of identity: the original URL/path (also the cache id), the
- * bucket + key the reactor authorizes against, and the object size discovered
- * by a one-time HEAD at construction.  Does no I/O of its own.
+ * Stores the object identity and metadata captured when it was opened.
+ * Does no I/O of its own.
  */
 class rest_io_object : public io_object {
  public:
-  rest_io_object(std::string path, std::string bucket, std::string key, size_t size)
-    : _path(std::move(path)), _bucket(std::move(bucket)), _key(std::move(key)), _file_size(size)
+  rest_io_object(
+    std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
+    : _path(std::move(path)),
+      _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _file_size(size),
+      _etag(std::move(etag))
+  {
+  }
+
+  /// As above, but carrying a suffix-range footer stash: @p stash holds the
+  /// object's bytes over [window_lo, object_size), so @c rest_reactor::host_read
+  /// serves any read fully inside that window from memory instead of a GET.
+  rest_io_object(std::string path,
+                 std::string bucket,
+                 std::string key,
+                 size_t object_size,
+                 size_t window_lo,
+                 shared_byte_span stash,
+                 std::string etag = {})
+    : _path(std::move(path)),
+      _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _file_size(object_size),
+      _window_lo(window_lo),
+      _stash(std::move(stash)),
+      _etag(std::move(etag))
   {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
   [[nodiscard]] object_ref get_object_ref() const { return object_ref{_bucket, _key}; }
+
+  /// Trailing bytes prefetched at open (a suffix-range footer probe), or null
+  /// when the object was opened without one.  A read fully inside
+  /// [stash_window_lo, size) is served from here by @c host_read.
+  [[nodiscard]] shared_byte_span const& stash() const noexcept { return _stash; }
+  [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
 
  private:
   std::string _path;
   std::string _bucket;
   std::string _key;
   size_t _file_size{0};
+  size_t _window_lo{0};
+  shared_byte_span _stash;
+  std::string _etag;
 };
+
+// ---------------------------------------------------------------------------
+// rest_perf_snapshot
+// ---------------------------------------------------------------------------
+
+/// Plain-value perf counters read out of a reactor, or summed across the pool
+/// by @c rest_ioctx.  The ns totals/maxes and ttfb stay 0 unless the reactor's
+/// @c perf_instrumentation is on; retry / terminal / device-stream-sync and
+/// payload-bytes counts are populated regardless.  The layout is not
+/// ABI-stable: consumers build from the same source pin, and fields are
+/// appended, never reordered or removed.
+struct rest_perf_snapshot {
+  std::uint64_t chunk_get_ns_total{0};
+  std::uint64_t chunk_get_count{0};
+  std::uint64_t chunk_get_ns_max{0};
+  std::uint64_t queue_wait_ns_total{0};
+  std::uint64_t queue_wait_count{0};
+  // ttfb = span from GET submission to completion of the reactor's first
+  // completed GET (async chunk or footer probe) — not first byte on the wire.
+  std::uint64_t ttfb_ns{0};
+  // h2d_observed_* time the copy_h2d_async call itself — the host-side async
+  // launch cost, not the copy, which completes later on the stream.
+  std::uint64_t h2d_observed_ns_total{0};
+  std::uint64_t h2d_observed_count{0};
+  std::uint64_t h2d_observed_ns_max{0};
+  std::uint64_t retries_total{0};
+  std::uint64_t terminal_failures_total{0};
+  std::uint64_t device_stream_sync_total{0};
+  // Always-on: HTTP response *body* bytes received (sink.total_received), summed
+  // over every completed curl attempt incl. retries / partial / failed bodies.
+  // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
+  std::uint64_t payload_bytes_read_total{0};
+  // perf_instrumentation-gated. Blocking host GETs remain part of chunk_get_*
+  // and are also attributed to blocking_host_get_*. Stash hits issue no GET and
+  // increment neither.
+  std::uint64_t blocking_host_get_count{0};
+  std::uint64_t blocking_host_get_wall_ns_total{0};
+  std::uint64_t blocking_host_get_wall_ns_max{0};
+  // Ioctx-level (not summed across reactors): live / high-water bytes reserved
+  // from the footer-resolve stash budget.  0 when the batched footer API has
+  // never run on this ioctx.
+  std::uint64_t footer_stash_reserved_bytes{0};
+  std::uint64_t footer_stash_reserved_peak_bytes{0};
+};
+
+/// How @c prep_host_rx_request attributes the resulting GETs in the perf
+/// snapshot: a @c blocking read (synchronous host_read) is counted in
+/// blocking_host_get_* in addition to chunk_get_*.
+enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
 
 // ---------------------------------------------------------------------------
 // rest_reactor
@@ -149,6 +332,10 @@ class rest_reactor {
   static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
                                                const io_object_type& file,
                                                const io_object_segment& segment);
+  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
+                                               const io_object_type& file,
+                                               const io_object_segment& segment,
+                                               host_read_attribution attribution);
 
   static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
                                                 const io_object_type& file,
@@ -187,9 +374,58 @@ class rest_reactor {
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  /// Blocking HEAD to discover an object's size.  Used by the ioctx to build
-  /// an @c rest_io_object.  @p bucket / @p key identify the object.
+  /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
+  /// build an @c rest_io_object.  @p bucket / @p key identify the object.
+  head_object_result head_object(std::string_view bucket, std::string_view key);
+
+  /// Size-only convenience wrapper around @c head_object.
   size_t head_object_size(std::string_view bucket, std::string_view key);
+
+  /// Blocking suffix-range GET of the last @p n bytes of an object, resolving
+  /// the size and stashing the parquet footer in a single round-trip.  On a
+  /// well-formed 206 the returned @c footer_probe carries the object size, the
+  /// window origin, the trailing bytes, and the ETag; on any unusable response
+  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so
+  /// the caller falls back to a HEAD.  @p bucket / @p key identify the object.
+  footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
+
+  /// Batched footer resolve engine: every entry gets the same per-attempt
+  /// semantics as @c fetch_footer_suffix plus the HEAD fallback, but all
+  /// entries share one curl multi driven on the caller's thread, so
+  /// connections are reused across entries (at most @p max_inflight pooled)
+  /// and at most @p max_inflight transfers are on the wire at once.
+  /// @p paths / @p objects / @p indices are parallel: @p indices carries each
+  /// entry's position in the caller's original batch.  Each probe reserves
+  /// @c footer_probe_bytes from @p budget before its GET is issued
+  /// (non-blocking while any transfer is active; a blocking, stop-aware wait
+  /// only when none is) and the delivered payload buffer carries the
+  /// reservation until it is freed.  @p on_result runs on the caller's
+  /// thread, serially, as entries land; see
+  /// @c rest_ioctx::resolve_footer_objects for the delivery contract.
+  /// Assumes non-empty input and max_inflight >= 1; concurrent-batch
+  /// serialization is the ioctx's job, not this method's.
+  void resolve_footer_batch(std::span<std::string const> paths,
+                            std::span<object_ref const> objects,
+                            std::span<std::size_t const> indices,
+                            std::size_t max_inflight,
+                            std::shared_ptr<exec::admission_control> budget,
+                            std::function<void(footer_resolve_result)> const& on_result,
+                            std::stop_token stop);
+
+  /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML
+  /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
+  /// request query (no auth params — authorization is added via
+  /// @c authorize_list).  @p prefix is only for retry-log / error text.
+  /// Control-plane op: retries/terminals are counted (and retries WARN-logged)
+  /// like every retry loop here, but the XML body never touches the chunk-GET /
+  /// payload byte counters.
+  std::string list_page(std::string_view bucket,
+                        std::string_view prefix,
+                        std::string_view canonical_query);
+
+  /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
+  /// loads); safe to call while the reactor is running.
+  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
   // -- capabilities / factory ----------------------------------------------
 
@@ -204,7 +440,7 @@ class rest_reactor {
   {
     // Network round-trips are high-latency; read ahead on demand rather than
     // eagerly prefilling the whole working set.
-    return cache::prefetching_stage::opportunistic;
+    return cache::prefetching_stage::just_in_time;
   }
 
   /// REST has no physical block alignment, so this only coalesces overlapping /
@@ -237,7 +473,30 @@ class rest_reactor {
   file_descriptor _wakeup_fd;
 
   std::stop_source _stop_source;
-  moodycamel::BlockingConcurrentQueue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+  blocking_concurrent_queue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+
+  // Instrumentation counters, owned by the reactor (not worker_loop locals) so
+  // rest_ioctx can read them cross-thread.  Gating: see rest_perf_snapshot.
+  struct perf_counters {
+    std::atomic<std::uint64_t> chunk_get_ns_total{0};
+    std::atomic<std::uint64_t> chunk_get_count{0};
+    std::atomic<std::uint64_t> chunk_get_ns_max{0};
+    std::atomic<std::uint64_t> queue_wait_ns_total{0};
+    std::atomic<std::uint64_t> queue_wait_count{0};
+    std::atomic<std::uint64_t> ttfb_ns{0};
+    std::atomic<std::uint64_t> h2d_observed_ns_total{0};
+    std::atomic<std::uint64_t> h2d_observed_count{0};
+    std::atomic<std::uint64_t> h2d_observed_ns_max{0};
+    std::atomic<std::uint64_t> retries_total{0};
+    std::atomic<std::uint64_t> terminal_failures_total{0};
+    std::atomic<std::uint64_t> device_stream_sync_total{0};
+    std::atomic<std::uint64_t> payload_bytes_read_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_count{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
+  };
+  perf_counters _perf;
+
   std::jthread _worker;
 };
 

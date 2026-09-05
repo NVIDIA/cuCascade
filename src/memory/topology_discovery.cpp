@@ -5,6 +5,9 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/detail/runtime_capabilities.hpp>
+
 #include <dlfcn.h>
 #include <ifaddrs.h>
 #include <nvml.h>
@@ -55,6 +58,28 @@ struct NetworkDeviceWithTopology {
 void report_nvml_error(nvmlReturn_t result, std::string const& context)
 {
   std::cerr << "Warning: " << context << ": " << nvmlErrorString(result) << std::endl;
+}
+
+/**
+ * @brief Query whether a CUDA device supports hardware-accelerated decompression.
+ *
+ * Delegates to `rmm::detail::hwdecompress::is_supported()`, which checks the CUDA
+ * driver version. RMM's capability queries are scoped to the current device, so the
+ * call is wrapped in an `rmm::cuda_set_device_raii`. Best-effort: any failure while
+ * setting the device or probing yields false.
+ *
+ * @param cuda_ordinal CUDA device ordinal (matches the runtime device index used
+ * elsewhere in discovery under the same CUDA_VISIBLE_DEVICES ordering).
+ * @return true iff the hardware decompression engine is available.
+ */
+bool query_hw_decompression(unsigned int cuda_ordinal)
+{
+  try {
+    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{static_cast<int>(cuda_ordinal)}};
+    return rmm::detail::hwdecompress::is_supported();
+  } catch (...) {
+    return false;
+  }
 }
 
 /**
@@ -670,32 +695,119 @@ std::string get_hostname()
 }
 
 /**
- * @brief Count NUMA nodes on the system.
+ * @brief Read the total and free memory of a NUMA node.
  *
- * Counts subdirectories named "node*" under /sys/devices/system/node. Returns 0 if
- * the directory does not exist or cannot be iterated.
+ * Parses /sys/devices/system/node/node<id>/meminfo, whose lines have the form
+ * "Node 0 MemTotal:       263950224 kB". Values are reported in kB and converted
+ * to bytes. Missing entries are reported as 0.
  *
- * @return Number of NUMA nodes; 0 if unavailable.
+ * @param numa_path Path to the NUMA node directory.
+ * @param info NUMA node info to populate.
  */
-int count_numa_nodes()
+void read_numa_node_memory(fs::path const& numa_path, numa_topology_info& info)
 {
-  std::string numa_path = "/sys/devices/system/node";
-  int count             = 0;
+  std::ifstream meminfo(numa_path / "meminfo");
+  if (!meminfo.is_open()) { return; }
 
-  if (!fs::exists(numa_path)) { return 0; }
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    // Each line is "Node <id> <key>: <value> kB".
+    auto const colon = line.find(':');
+    if (colon == std::string::npos) { continue; }
+
+    std::size_t const key_end   = colon;
+    std::size_t const key_start = line.find_last_of(' ', key_end) + 1;
+    std::string const key       = line.substr(key_start, key_end - key_start);
+    if (key != "MemTotal" && key != "MemFree") { continue; }
+
+    std::size_t value_kb = 0;
+    try {
+      value_kb = std::stoull(line.substr(colon + 1));
+    } catch (...) {
+      continue;
+    }
+
+    if (key == "MemTotal") {
+      info.memory_capacity = value_kb * 1024;
+    } else {
+      info.free_memory = value_kb * 1024;
+    }
+  }
+}
+
+/**
+ * @brief Read whether a NUMA node has any CPU assigned to it.
+ *
+ * Reads /sys/devices/system/node/node<id>/cpulist, which is empty for CPU-less nodes.
+ *
+ * @param numa_path Path to the NUMA node directory.
+ * @return True if at least one CPU is assigned to the node; false if none or unreadable.
+ */
+bool numa_node_has_cpus(fs::path const& numa_path)
+{
+  std::ifstream cpulist(numa_path / "cpulist");
+  if (!cpulist.is_open()) { return false; }
+
+  std::string line;
+  while (std::getline(cpulist, line)) {
+    if (line.find_first_not_of(" \t\r\n") != std::string::npos) { return true; }
+  }
+  return false;
+}
+
+/**
+ * @brief Discover NUMA nodes and their memory capacities.
+ *
+ * Scans subdirectories named "node<id>" under /sys/devices/system/node and reads each
+ * node's memory capacity. Returns an empty vector if the directory does not exist or
+ * cannot be iterated.
+ *
+ * A node that has memory but no CPU is not host memory: on DGX Station and Grace-Hopper
+ * the GPU's own HBM is exposed as such a node, as is CXL-attached memory. Those nodes are
+ * flagged with `is_device_memory` so that host memory spaces are never sized from them.
+ *
+ * @return NUMA node information sorted by node id; empty if unavailable.
+ */
+std::vector<numa_topology_info> discover_numa_nodes()
+{
+  std::string const numa_path = "/sys/devices/system/node";
+  std::vector<numa_topology_info> nodes;
+
+  if (!fs::exists(numa_path)) { return nodes; }
 
   try {
     for (auto const& entry : fs::directory_iterator(numa_path)) {
-      std::string name = entry.path().filename().string();
-      if (name.starts_with("node")) {  // starts with "node"
-        count++;
+      std::string const name = entry.path().filename().string();
+      if (!name.starts_with("node")) { continue; }
+
+      std::string const id_str = name.substr(4);
+      if (id_str.empty() || !std::all_of(id_str.begin(), id_str.end(), [](unsigned char c) {
+            return std::isdigit(c);
+          })) {
+        continue;
       }
+
+      numa_topology_info info;
+      try {
+        info.id = std::stoi(id_str);
+      } catch (...) {
+        continue;
+      }
+      read_numa_node_memory(entry.path(), info);
+      info.has_cpus         = numa_node_has_cpus(entry.path());
+      info.is_device_memory = !info.has_cpus && info.memory_capacity > 0;
+      nodes.push_back(info);
     }
   } catch (...) {
-    return 0;
+    return {};
   }
 
-  return count;
+  std::sort(
+    nodes.begin(), nodes.end(), [](numa_topology_info const& lhs, numa_topology_info const& rhs) {
+      return lhs.id < rhs.id;
+    });
+
+  return nodes;
 }
 
 nvmlReturn_t initialize_nvml_for_current_process()
@@ -755,7 +867,8 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 
   // Get system information
   topology.hostname            = get_hostname();
-  topology.num_numa_nodes      = count_numa_nodes();
+  topology.numa_nodes          = discover_numa_nodes();
+  topology.num_numa_nodes      = static_cast<int>(topology.numa_nodes.size());
   topology.num_gpus            = device_count;
   topology.num_network_devices = static_cast<int>(network_devices_with_topology.size());
 
@@ -882,8 +995,9 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
   for (size_t visible_idx = 0; visible_idx < visible_indices.size(); ++visible_idx) {
     size_t nvml_idx = visible_indices[visible_idx];
     if (nvml_idx >= nvml_gpus.size()) { continue; }
-    auto gpu = nvml_gpus[nvml_idx];
-    gpu.id   = static_cast<unsigned int>(visible_idx);
+    auto gpu                       = nvml_gpus[nvml_idx];
+    gpu.id                         = static_cast<unsigned int>(visible_idx);
+    gpu.hw_decompression_available = query_hw_decompression(gpu.id);
     topology.gpus.push_back(std::move(gpu));
   }
 

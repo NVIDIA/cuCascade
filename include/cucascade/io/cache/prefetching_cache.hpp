@@ -24,9 +24,7 @@
 #include <cucascade/exec/thread_pool.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/types.hpp>
-
-#include <blockingconcurrentqueue.h>
-#include <concurrentqueue.h>
+#include <cucascade/io/concurrent_queue.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -138,7 +136,7 @@ class prefetching_cache {
  public:
   using byte_range         = cucascade::io::byte_range;
   using prefetch_request   = std::shared_ptr<prefetch_request_context>;
-  using request_queue_type = moodycamel::BlockingConcurrentQueue<prefetch_request>;
+  using request_queue_type = blocking_concurrent_queue<prefetch_request>;
 
   prefetching_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
                     ioctx* io_ctx,

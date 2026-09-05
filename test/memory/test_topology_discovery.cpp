@@ -31,7 +31,7 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -203,6 +203,74 @@ TEST_CASE("Topology Discovery resolves GPU NUMA node on NUMA-aware hosts", "[hw_
     // memory_binding is populated from numa_node whenever the latter is known.
     REQUIRE(!gpu.memory_binding.empty());
     REQUIRE(gpu.memory_binding.front() == gpu.numa_node);
+  }
+}
+
+TEST_CASE("Topology Discovery reports NUMA node capacities", "[hw_topology]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto const& topology = discovery.get_topology();
+
+  // num_numa_nodes is derived from the discovered node list.
+  REQUIRE(topology.numa_nodes.size() == static_cast<size_t>(topology.num_numa_nodes));
+
+  if (topology.numa_nodes.empty()) {
+    SUCCEED("Skipped: host does not expose NUMA topology");
+    return;
+  }
+
+  size_t summed_host_capacity = 0;
+  int previous_id             = -1;
+  for (auto const& node : topology.numa_nodes) {
+    INFO("NUMA node " << node.id);
+    REQUIRE(node.id >= 0);
+    // Nodes are reported sorted by id and each id appears once.
+    REQUIRE(node.id > previous_id);
+    previous_id = node.id;
+
+    // /sys/devices/system/node/node<id>/meminfo always reports MemTotal and MemFree.
+    REQUIRE(node.memory_capacity > 0);
+    REQUIRE(node.free_memory <= node.memory_capacity);
+
+    // A node with memory but no CPUs is device memory (GPU HBM, CXL), not host memory.
+    REQUIRE(node.is_device_memory == !node.has_cpus);
+
+    REQUIRE(topology.find_numa_node(node.id) != nullptr);
+    REQUIRE(topology.get_numa_memory_capacity(node.id).value() == node.memory_capacity);
+    REQUIRE(topology.get_numa_free_memory(node.id).value_or(0) == node.free_memory);
+    if (!node.is_device_memory) { summed_host_capacity += node.memory_capacity; }
+  }
+
+  REQUIRE(topology.get_total_numa_memory_capacity() == summed_host_capacity);
+
+  // Unknown node ids are reported as such rather than silently resolving to 0.
+  REQUIRE_FALSE(topology.get_numa_memory_capacity(-1).has_value());
+  REQUIRE_FALSE(topology.get_numa_memory_capacity(topology.numa_nodes.back().id + 1).has_value());
+  REQUIRE_FALSE(topology.get_numa_free_memory(-1).has_value());
+  REQUIRE(topology.find_numa_node(-1) == nullptr);
+}
+
+// Every GPU's NUMA node must be one of the discovered NUMA nodes with a known capacity,
+// so host memory spaces can be sized from it.
+TEST_CASE("Topology Discovery maps GPUs to NUMA nodes with known capacity", "[hw_topology]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto const& topology = discovery.get_topology();
+
+  if (topology.num_gpus == 0 || topology.numa_nodes.empty()) {
+    SUCCEED("Skipped: requires at least one GPU and NUMA node");
+    return;
+  }
+
+  for (auto const& gpu : topology.gpus) {
+    INFO("GPU " << gpu.id << " on NUMA node " << gpu.numa_node);
+    auto const capacity = topology.get_numa_memory_capacity(gpu.numa_node);
+    REQUIRE(capacity.has_value());
+    REQUIRE(*capacity > 0);
   }
 }
 

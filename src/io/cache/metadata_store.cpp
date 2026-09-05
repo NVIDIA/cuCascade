@@ -19,6 +19,7 @@
 #include <cucascade/io/cache/metadata_store.hpp>
 
 #include <mutex>
+#include <string_view>
 #include <utility>
 
 namespace cucascade::io::cache {
@@ -34,9 +35,15 @@ void metadata_store::register_metadata(io_object const& obj,
 
 std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
 {
-  auto const& key = obj.raw_file_cache_id();
+  return get_metadata(obj.raw_file_cache_id());
+}
+
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string_view cache_key) const
+{
   std::shared_lock lk(_mtx);
-  auto it = _by_key.find(key);
+  // Heterogeneous find (transparent hash + std::equal_to<>): no temporary
+  // std::string is built for the probe.
+  auto it = _by_key.find(cache_key);
   if (it == _by_key.end()) return nullptr;
   return it->second;
 }
