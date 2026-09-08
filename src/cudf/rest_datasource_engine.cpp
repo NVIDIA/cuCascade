@@ -5,6 +5,8 @@
 
 #include <cucascade/cudf/rest_datasource_engine.hpp>
 #include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
@@ -83,6 +85,13 @@ rest_datasource_engine::~rest_datasource_engine()
 std::unique_ptr<datasource> rest_datasource_engine::open(std::string path) const
 {
   return open_datasource(_io_ctx, std::move(path));
+}
+
+std::string rest_datasource_engine::cache_summary() const
+{
+  auto* cache = _io_ctx->cache();
+  if (cache == nullptr) { return "prefetching cache not initialized"; }
+  return cache->summary();
 }
 
 }  // namespace cucascade::io

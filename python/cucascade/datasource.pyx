@@ -365,3 +365,22 @@ cdef class RestEngine:
         with nogil:
             ds._ds = move(deref(self._engine).open(c_path))
         return ds
+
+    def cache_summary(self):
+        """Report the prefetching cache's cumulative read/hit/miss/eviction counters.
+
+        Returns
+        -------
+        str
+            ``"prefetching cache not initialized"`` if ``enable_cache`` was
+            False at construction, or if cache construction failed
+            internally (e.g. an exception during topology discovery or
+            reservation-manager setup) -- cuCascade's own logging is
+            compiled out, so this is the only way to observe that failure
+            from Python. Otherwise a summary of global and last-cycle
+            reads/hits/h2d/misses/evictions.
+        """
+        cdef string c_summary
+        with nogil:
+            c_summary = deref(self._engine).cache_summary()
+        return c_summary.decode()

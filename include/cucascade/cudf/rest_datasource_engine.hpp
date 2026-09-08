@@ -63,13 +63,13 @@ class rest_datasource_engine {
                                   std::string region,
                                   std::string endpoint,
                                   std::size_t n_reactors      = 4,
-                                  bool        tls_verify      = true,
+                                  bool tls_verify             = true,
                                   std::size_t pool_capacity   = default_pool_capacity,
                                   std::size_t block_size      = default_block_size,
                                   std::size_t max_connections = 16,
                                   std::size_t chunk_size      = 8UL << 20,
                                   std::size_t max_n_chunks    = 16,
-                                  bool        enable_cache    = false);
+                                  bool enable_cache           = false);
 
   ~rest_datasource_engine();
 
@@ -88,11 +88,24 @@ class rest_datasource_engine {
    */
   [[nodiscard]] std::unique_ptr<datasource> open(std::string path) const;
 
+  /**
+   * @brief Report the prefetching cache's cumulative read/hit/miss/eviction
+   * counters as a human-readable string.
+   *
+   * Returns "prefetching cache not initialized" if `enable_cache` was false
+   * at construction, or if cache construction failed internally (e.g. an
+   * exception during topology discovery or reservation-manager setup) --
+   * cuCascade's own logging is compiled out (see
+   * `cucascade/log/logging.hpp`), so this is the only way to observe that
+   * failure from a caller.
+   */
+  [[nodiscard]] std::string cache_summary() const;
+
  private:
-  cucascade::memory::numa_region_pinned_host_memory_resource          _upstream;
-  cucascade::memory::fixed_size_host_memory_resource                  _host_mr;
-  std::shared_ptr<ioctx>                                              _io_ctx;
-  std::unique_ptr<cucascade::memory::memory_reservation_manager>      _reservation_manager;
+  cucascade::memory::numa_region_pinned_host_memory_resource _upstream;
+  cucascade::memory::fixed_size_host_memory_resource _host_mr;
+  std::shared_ptr<ioctx> _io_ctx;
+  std::unique_ptr<cucascade::memory::memory_reservation_manager> _reservation_manager;
 };
 
 }  // namespace cucascade::io

@@ -5,10 +5,8 @@ from __future__ import annotations
 
 from pylibcudf.io.datasource import Datasource
 
-
 class ReadFuture:
     def get(self) -> int: ...
-
 
 class CuCascadeDatasource(Datasource):
     def fadvise(self, ranges: list[tuple[int, int]], dev_id: int = -1) -> None: ...
@@ -20,7 +18,6 @@ class CuCascadeDatasource(Datasource):
         self, ranges: list[tuple[int, int]], buffer: memoryview
     ) -> ReadFuture: ...
 
-
 class UringEngine:
     def __init__(
         self,
@@ -31,7 +28,6 @@ class UringEngine:
         numa_node: int = 0,
     ) -> None: ...
     def open(self, path: str) -> CuCascadeDatasource: ...
-
 
 class RestEngine:
     def __init__(
@@ -51,3 +47,4 @@ class RestEngine:
         enable_cache: bool = False,
     ) -> None: ...
     def open(self, path: str) -> CuCascadeDatasource: ...
+    def cache_summary(self) -> str: ...
