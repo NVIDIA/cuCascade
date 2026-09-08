@@ -38,6 +38,7 @@ if(cuCascade_io_FOUND AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
   pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
   pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
   find_dependency(OpenSSL REQUIRED)
+  find_dependency(kvikio REQUIRED CONFIG)
 
   # Best-effort check that the moodycamel headers the installed io headers
   # include are reachable. They are not shipped (the consumer provides the same
