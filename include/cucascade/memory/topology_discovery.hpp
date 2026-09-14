@@ -207,14 +207,16 @@ class topology_discovery {
    * and network devices. It must be called before `get_topology()`.
    *
    * By default this call uses only NVML and Linux sysfs and therefore does not
-   * initialize a CUDA context. Set @p with_runtime_attributes to true to also
+   * touch the CUDA driver. Set @p with_runtime_attributes to true to also
    * populate per-hardware runtime attributes (e.g. `gpu_runtime_attributes`),
-   * which requires loading the CUDA driver and querying CUDA device attributes.
+   * which queries CUDA driver device attributes.
    *
    * @param net_verification Controls how strictly network devices are validated.
    * @param with_runtime_attributes If true, also discover runtime attributes for
    * each hardware class (see `discover_runtime_attributes`). Defaults to false so
-   * that discovery does not touch the CUDA driver.
+   * that discovery does not touch the CUDA driver. When true, the caller must
+   * have already initialized the CUDA driver API (see
+   * `discover_runtime_attributes` for the exact precondition).
    * @return true if discovery was successful, false otherwise.
    */
   [[nodiscard]] bool discover(
@@ -226,11 +228,17 @@ class topology_discovery {
    *
    * Populates the `runtime_attributes` field of each entry in `topology.gpus`
    * (and, in the future, other hardware classes). This is the only path in this
-   * component that may initialize a CUDA context — every other discovery step
-   * relies solely on NVML and sysfs.
+   * component that issues CUDA driver calls — every other discovery step relies
+   * solely on NVML and sysfs.
    *
    * Safe to call multiple times; existing runtime attribute values are
    * overwritten.
+   *
+   * @pre The CUDA driver API has already been initialized by the caller —
+   * either via an explicit `cuInit(0)` or via any prior CUDA runtime call that
+   * transitively initializes the driver. This function does not call `cuInit`
+   * and does not create a CUDA context; per-GPU queries that fail (e.g.
+   * because the driver is uninitialized) leave `hw_decomp` as `false`.
    *
    * @param topology Topology to enrich in place.
    */

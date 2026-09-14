@@ -59,25 +59,6 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
 }
 
 /**
- * @brief Initialize the CUDA driver API once per process.
- *
- * Called only from the runtime-attributes path — the plain topology discovery
- * path never reaches here, so hosts without an NVIDIA driver are not affected
- * unless the caller explicitly opts in to runtime attribute discovery.
- *
- * `cuInit(0)` is safe to invoke repeatedly per NVIDIA's driver docs, but we
- * gate it behind a static-local so the return code is cached and the call
- * happens exactly once regardless of how many GPUs are queried.
- *
- * @return true if the driver was successfully initialized.
- */
-bool ensure_cuda_driver_initialized()
-{
-  static bool const initialized = (cuInit(0) == CUDA_SUCCESS);
-  return initialized;
-}
-
-/**
  * @brief Query whether a GPU has a hardware-accelerated decompression engine.
  *
  * The device is identified by PCI bus id rather than by ordinal. Device ordinals are
@@ -90,9 +71,11 @@ bool ensure_cuda_driver_initialized()
  * `cuDeviceGetAttribute` takes its device explicitly, so no context is created and
  * the calling thread's current device is left untouched.
  *
- * Best-effort: a driver init failure, a bus id CUDA does not expose (e.g. masked
- * out by `CUDA_VISIBLE_DEVICES`), or an attribute unsupported by the running
- * driver all yield false.
+ * Best-effort: a bus id CUDA does not expose (e.g. masked out by
+ * `CUDA_VISIBLE_DEVICES`) or an attribute unsupported by the running driver both
+ * yield false.
+ *
+ * @note The caller is responsible for having invoked `cuInit(0)` beforehand.
  *
  * @param pci_bus_id PCI bus id of the GPU, in NVML's `domain:bus:device.function`
  * form. For a MIG instance this is the parent physical GPU's bus id, which is the
@@ -101,7 +84,7 @@ bool ensure_cuda_driver_initialized()
  */
 bool query_hw_decompression(std::string const& pci_bus_id)
 {
-  if (pci_bus_id.empty() || !ensure_cuda_driver_initialized()) { return false; }
+  if (pci_bus_id.empty()) { return false; }
 
   CUdevice device = 0;
   if (cuDeviceGetByPCIBusId(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) { return false; }
@@ -1030,8 +1013,12 @@ void topology_discovery::discover_runtime_attributes(system_topology_info& topol
 {
   // Currently only GPUs expose runtime attributes. New hardware classes should
   // be enriched here so callers have a single entry point that isolates the
-  // "needs a CUDA context / driver call" side of discovery from the passive
-  // NVML/sysfs side handled by discover().
+  // "needs a CUDA driver call" side of discovery from the passive NVML/sysfs
+  // side handled by discover().
+  //
+  // Precondition: the CUDA driver API has already been initialized by the
+  // caller (cuInit(0), or any prior CUDA runtime call that transitively did so).
+  // This function does not call cuInit and does not create a CUDA context.
   for (auto& gpu : topology.gpus) {
     gpu_runtime_attributes attrs;
     attrs.hw_decomp        = query_hw_decompression(gpu.pci_bus_id);
