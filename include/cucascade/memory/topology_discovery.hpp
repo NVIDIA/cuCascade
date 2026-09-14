@@ -13,6 +13,18 @@
 namespace cucascade::memory {
 
 /**
+ * @brief GPU runtime attributes.
+ *
+ * Attributes whose discovery requires initializing a CUDA context (via the CUDA
+ * driver API). Populated only when `discover()` / `discover_runtime_attributes()`
+ * are explicitly asked to. Kept separate so passive topology discovery via NVML
+ * and sysfs never has to spin up a CUDA context.
+ */
+struct gpu_runtime_attributes {
+  bool hw_decomp{false};  ///< Hardware-accelerated decompression engine present.
+};
+
+/**
  * @brief GPU information.
  */
 struct gpu_topology_info {
@@ -25,7 +37,9 @@ struct gpu_topology_info {
   std::vector<int> cpu_cores;                ///< List of CPU core IDs.
   std::vector<int> memory_binding;           ///< NUMA nodes for memory binding.
   std::vector<std::string> network_devices;  ///< Network devices (NICs) optimal for this GPU.
-  bool hw_decompression_available{false};    ///< Hardware-accelerated decompression engine present.
+  std::optional<gpu_runtime_attributes>
+    runtime_attributes;  ///< Runtime attributes (populated only when explicitly requested; empty
+                         ///< means "not queried", not "unsupported").
 };
 
 /**
@@ -192,11 +206,35 @@ class topology_discovery {
    * This method performs the actual discovery of GPUs, NUMA nodes, CPU affinity,
    * and network devices. It must be called before `get_topology()`.
    *
+   * By default this call uses only NVML and Linux sysfs and therefore does not
+   * initialize a CUDA context. Set @p with_runtime_attributes to true to also
+   * populate per-hardware runtime attributes (e.g. `gpu_runtime_attributes`),
+   * which requires loading the CUDA driver and querying CUDA device attributes.
+   *
    * @param net_verification Controls how strictly network devices are validated.
+   * @param with_runtime_attributes If true, also discover runtime attributes for
+   * each hardware class (see `discover_runtime_attributes`). Defaults to false so
+   * that discovery does not touch the CUDA driver.
    * @return true if discovery was successful, false otherwise.
    */
   [[nodiscard]] bool discover(
-    NetworkDeviceVerification net_verification = NetworkDeviceVerification::EXISTS_ACTIVE_IP);
+    NetworkDeviceVerification net_verification = NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+    bool with_runtime_attributes               = false);
+
+  /**
+   * @brief Discover runtime attributes for each hardware class in @p topology.
+   *
+   * Populates the `runtime_attributes` field of each entry in `topology.gpus`
+   * (and, in the future, other hardware classes). This is the only path in this
+   * component that may initialize a CUDA context — every other discovery step
+   * relies solely on NVML and sysfs.
+   *
+   * Safe to call multiple times; existing runtime attribute values are
+   * overwritten.
+   *
+   * @param topology Topology to enrich in place.
+   */
+  static void discover_runtime_attributes(system_topology_info& topology);
 
   /**
    * @brief Get the discovered topology information.

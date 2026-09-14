@@ -7,7 +7,6 @@
 
 #include <cuda.h>
 
-#include <dlfcn.h>
 #include <ifaddrs.h>
 #include <nvml.h>
 #include <sys/socket.h>
@@ -60,69 +59,22 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
 }
 
 /**
- * @brief Minimal subset of the CUDA driver API used for device capability queries.
+ * @brief Initialize the CUDA driver API once per process.
  *
- * Resolved with dlopen/dlsym rather than linked, so this library keeps loading on
- * hosts without an NVIDIA driver, matching how NVML is treated here.
+ * Called only from the runtime-attributes path — the plain topology discovery
+ * path never reaches here, so hosts without an NVIDIA driver are not affected
+ * unless the caller explicitly opts in to runtime attribute discovery.
+ *
+ * `cuInit(0)` is safe to invoke repeatedly per NVIDIA's driver docs, but we
+ * gate it behind a static-local so the return code is cached and the call
+ * happens exactly once regardless of how many GPUs are queried.
+ *
+ * @return true if the driver was successfully initialized.
  */
-struct cuda_driver_api {
-  CUresult (*init)(unsigned int){nullptr};
-  CUresult (*device_get_by_pci_bus_id)(CUdevice*, char const*){nullptr};
-  CUresult (*device_get_attribute)(int*, CUdevice_attribute, CUdevice){nullptr};
-  bool available{false};
-};
-
-/**
- * @brief Resolve a symbol from an already-opened shared object.
- *
- * A null return from `dlsym` is not by itself an error — a symbol may legitimately
- * have a null value — so failure is detected by clearing `dlerror()` beforehand and
- * inspecting it afterwards.
- *
- * @tparam Fn Function pointer type of the symbol.
- * @param fn Set to the resolved symbol on success; left untouched on failure.
- * @param handle Handle returned by `dlopen`.
- * @param name Symbol name.
- * @return true if the symbol was resolved.
- */
-template <typename Fn>
-bool load_symbol(Fn& fn, void* handle, char const* name)
+bool ensure_cuda_driver_initialized()
 {
-  ::dlerror();
-  auto* symbol = reinterpret_cast<Fn>(dlsym(handle, name));
-  if (::dlerror() != nullptr) { return false; }
-  fn = symbol;
-  return true;
-}
-
-/**
- * @brief Load and initialize the CUDA driver API once per process.
- *
- * The library handle is intentionally never `dlclose`d — it is held for the process
- * lifetime, mirroring the init-once treatment of NVML in `discover()`.
- *
- * @return The resolved entry points; `available` is false if the driver is missing,
- * a symbol could not be resolved, or `cuInit` failed.
- */
-cuda_driver_api const& load_cuda_driver_api()
-{
-  static cuda_driver_api const api = [] {
-    cuda_driver_api resolved;
-
-    void* handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (handle == nullptr) { return resolved; }
-
-    if (!load_symbol(resolved.init, handle, "cuInit") ||
-        !load_symbol(resolved.device_get_by_pci_bus_id, handle, "cuDeviceGetByPCIBusId") ||
-        !load_symbol(resolved.device_get_attribute, handle, "cuDeviceGetAttribute")) {
-      return cuda_driver_api{};
-    }
-    if (resolved.init(0) != CUDA_SUCCESS) { return cuda_driver_api{}; }
-
-    resolved.available = true;
-    return resolved;
-  }();
-  return api;
+  static bool const initialized = (cuInit(0) == CUDA_SUCCESS);
+  return initialized;
 }
 
 /**
@@ -138,9 +90,9 @@ cuda_driver_api const& load_cuda_driver_api()
  * `cuDeviceGetAttribute` takes its device explicitly, so no context is created and
  * the calling thread's current device is left untouched.
  *
- * Best-effort: a missing driver, a bus id CUDA does not expose (e.g. masked out by
- * `CUDA_VISIBLE_DEVICES`), or an attribute unsupported by the running driver all
- * yield false.
+ * Best-effort: a driver init failure, a bus id CUDA does not expose (e.g. masked
+ * out by `CUDA_VISIBLE_DEVICES`), or an attribute unsupported by the running
+ * driver all yield false.
  *
  * @param pci_bus_id PCI bus id of the GPU, in NVML's `domain:bus:device.function`
  * form. For a MIG instance this is the parent physical GPU's bus id, which is the
@@ -149,16 +101,15 @@ cuda_driver_api const& load_cuda_driver_api()
  */
 bool query_hw_decompression(std::string const& pci_bus_id)
 {
-  auto const& api = load_cuda_driver_api();
-  if (!api.available || pci_bus_id.empty()) { return false; }
+  if (pci_bus_id.empty() || !ensure_cuda_driver_initialized()) { return false; }
 
   CUdevice device = 0;
-  if (api.device_get_by_pci_bus_id(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) { return false; }
+  if (cuDeviceGetByPCIBusId(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) { return false; }
 
   int algorithm_mask = 0;
-  if (api.device_get_attribute(&algorithm_mask,
-                               CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
-                               device) != CUDA_SUCCESS) {
+  if (cuDeviceGetAttribute(&algorithm_mask,
+                           CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
+                           device) != CUDA_SUCCESS) {
     return false;
   }
   return algorithm_mask != 0;
@@ -895,7 +846,8 @@ nvmlReturn_t initialize_nvml_for_current_process()
 
 }  // namespace
 
-bool topology_discovery::discover(NetworkDeviceVerification net_verification)
+bool topology_discovery::discover(NetworkDeviceVerification net_verification,
+                                  bool with_runtime_attributes)
 {
   system_topology_info topology;
   // NVML is initialized exactly once per process. Calling nvmlInit_v2 +
@@ -1058,17 +1010,33 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
   for (size_t visible_idx = 0; visible_idx < visible_indices.size(); ++visible_idx) {
     size_t nvml_idx = visible_indices[visible_idx];
     if (nvml_idx >= nvml_gpus.size()) { continue; }
-    auto gpu                       = nvml_gpus[nvml_idx];
-    gpu.id                         = static_cast<unsigned int>(visible_idx);
-    gpu.hw_decompression_available = query_hw_decompression(gpu.pci_bus_id);
+    auto gpu = nvml_gpus[nvml_idx];
+    gpu.id   = static_cast<unsigned int>(visible_idx);
+    // Runtime attributes are populated below only when explicitly requested,
+    // so that plain discovery never initializes a CUDA context.
     topology.gpus.push_back(std::move(gpu));
   }
 
   // Do not call nvmlShutdown here — NVML is initialized once per process via
   // the static-local in this function. See the comment at the top of discover().
 
+  if (with_runtime_attributes) { discover_runtime_attributes(topology); }
+
   _topology = std::move(topology);
   return true;
+}
+
+void topology_discovery::discover_runtime_attributes(system_topology_info& topology)
+{
+  // Currently only GPUs expose runtime attributes. New hardware classes should
+  // be enriched here so callers have a single entry point that isolates the
+  // "needs a CUDA context / driver call" side of discovery from the passive
+  // NVML/sysfs side handled by discover().
+  for (auto& gpu : topology.gpus) {
+    gpu_runtime_attributes attrs;
+    attrs.hw_decomp        = query_hw_decompression(gpu.pci_bus_id);
+    gpu.runtime_attributes = attrs;
+  }
 }
 
 }  // namespace cucascade::memory
