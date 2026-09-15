@@ -55,7 +55,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `libnuma` - NUMA-aware pinned host memory allocation in `src/memory/numa_region_pinned_host_allocator.cpp`; found via `find_library(NUMA_LIB numa REQUIRED)`
 - `Threads::Threads` (pthreads) - Thread support; `std::mutex`, `std::condition_variable`, `std::async` throughout
 - `fmt` - Format library (pixi dependency; available in environment)
-- `nvtx3::nvtx3-cpp` - NVIDIA NVTX profiling annotations; only linked when `CUCASCADE_NVTX=ON`; used via `CUCASCADE_FUNC_RANGE()` macro in `include/cucascade/error.hpp`
+- `CUDA::nvtx3` - Header-only NVIDIA NVTX profiling annotations; ranges use the `libcucascade` domain and become active when a profiler injects NVTX tooling
 ## Configuration
 - `CUDAARCHS` - Set by pixi environment activation to select CUDA architecture targets
 - `CMAKE_PREFIX_PATH` - Passed through from pixi environment for dependency resolution
@@ -63,7 +63,6 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `CUCASCADE_BUILD_BENCHMARKS` (default ON) - Adds `benchmark/` subdirectory
 - `CUCASCADE_BUILD_SHARED_LIBS` (default ON) - Builds `libcucascade.so`
 - `CUCASCADE_BUILD_STATIC_LIBS` (default ON) - Builds `libcucascade.a`
-- `CUCASCADE_NVTX` (default OFF) - Enables NVTX profiling ranges
 - `CUCASCADE_BUILD_CUDF` (default ON) - Builds the cudf-coupled `cucascade-cudf` library (cudf representations, built-in converters, bandwidth profiler) and gates `find_package(cudf)`; OFF yields a cudf-free core build
 - `CUCASCADE_WARNINGS_AS_ERRORS` (default ON) - Treats all compiler warnings as errors
 - `debug` → `build/debug/`
@@ -208,10 +207,10 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `std::span` (in memory layer)
 - Three-way comparison `<=>` (in `include/cucascade/memory/common.hpp`)
 ## NVTX Profiling
-- Enabled via `CUCASCADE_NVTX` CMake option (default OFF)
-- `CUCASCADE_FUNC_RANGE()` macro at function entry points for profiling
+- Always-compiled, with negligible overhead until a profiler injects NVTX tooling
+- `CUCASCADE_FUNC_RANGE()` macro at function entry points and named scoped ranges for profiling
 - Custom domain: `cucascade::libcucascade_domain` (in `include/cucascade/error.hpp`)
-- Links `nvtx3::nvtx3-cpp` when enabled
+- Links the header-only `CUDA::nvtx3` target
 <!-- GSD:conventions-end -->
 
 <!-- GSD:architecture-start source:ARCHITECTURE.md -->
@@ -366,7 +365,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `data_batch::convert_to()` and `clone_to()` assert `_processing_count == 0` before allowing representation swap
 - `pop_data_batch(batch_state::processing)` throws immediately — callers must use `task_created` + `try_to_lock_for_processing()`
 - `disk_data_representation::clone()` always throws `cucascade::logic_error` — disk representations must be materialized to another tier via converter
-- `CUCASCADE_FUNC_RANGE()` macro emits NVTX range when `CUCASCADE_NVTX` compile definition is present
+- `CUCASCADE_FUNC_RANGE()` emits an NVTX range in the `libcucascade` domain
 - Custom domain: `cucascade::libcucascade_domain` (defined in `include/cucascade/error.hpp`)
 <!-- GSD:architecture-end -->
 

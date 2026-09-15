@@ -50,7 +50,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvToolsExt.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -75,13 +75,8 @@ namespace cucascade {
 
 namespace {
 
-// RAII NVTX range for profiling converter phases (thread-local push/pop stack).
-struct nvtx_scope {
-  explicit nvtx_scope(const char* name) { nvtxRangePushA(name); }
-  ~nvtx_scope() { nvtxRangePop(); }
-  nvtx_scope(const nvtx_scope&)            = delete;
-  nvtx_scope& operator=(const nvtx_scope&) = delete;
-};
+// RAII NVTX range for profiling converter phases in the libcucascade domain.
+using nvtx_scope = nvtx3::scoped_range_in<libcucascade_domain>;
 
 // memory::column_metadata::type_id is a generic int32_t type tag; the cudf layer interprets it
 // as the numeric value of a cudf::type_id. These helpers convert across that boundary.
