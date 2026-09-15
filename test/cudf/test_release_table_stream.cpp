@@ -30,6 +30,7 @@
 #include <cudf/column/column_stream.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/version_config.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
@@ -149,13 +150,23 @@ void expect_column_buffers_bound_to(std::unique_ptr<cudf::column> col,
 {
   auto contents = col->release();
   if (contents.data && contents.data->size() > 0) {
-    CAPTURE(contents.data->stream().get(), expected.get());
-    CHECK(contents.data->stream().get() == expected.get());
+#if CUDF_VERSION_MINOR >= 12
+    auto actual_stream = contents.data->stream().get();
+#else
+    auto actual_stream = contents.data->stream().value();
+#endif
+    CAPTURE(actual_stream, expected.get());
+    CHECK(actual_stream == expected.get());
     ++buffers_checked;
   }
   if (contents.null_mask && contents.null_mask->size() > 0) {
-    CAPTURE(contents.null_mask->stream().get(), expected.get());
-    CHECK(contents.null_mask->stream().get() == expected.get());
+#if CUDF_VERSION_MINOR >= 12
+    auto actual_stream = contents.null_mask->stream().get();
+#else
+    auto actual_stream = contents.null_mask->stream().value();
+#endif
+    CAPTURE(actual_stream, expected.get());
+    CHECK(actual_stream == expected.get());
     ++buffers_checked;
   }
   for (auto& child : contents.children) {
