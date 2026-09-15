@@ -26,8 +26,9 @@
 #include <cucascade/log/logging.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <cuda/stream>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
 
 #include <algorithm>
 #include <atomic>

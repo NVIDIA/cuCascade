@@ -424,11 +424,9 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
   rmm::cuda_stream stream;
 
   // Create GPU representation
-  auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = create_benchmark_table_from_bytes(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   // Warmup
   auto warmup_table = create_benchmark_table_from_bytes(1 * KiB, 2);
@@ -444,8 +442,7 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
+    auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -479,11 +476,9 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
   rmm::cuda_stream stream;
 
   // Create GPU representation then convert to disk once
-  auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = create_benchmark_table_from_bytes(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   auto disk_rep = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
   stream.synchronize();
@@ -492,8 +487,7 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto gpu_result =
-      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream);
+    auto gpu_result = registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream);
     stream.synchronize();
   }
 
@@ -528,11 +522,9 @@ void BM_ConvertHostToDisk(benchmark::State& state)
   rmm::cuda_stream stream;
 
   // Create GPU table, convert to host_data first
-  auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = create_benchmark_table_from_bytes(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   auto host_rep = registry->convert<host_data_representation>(*gpu_rep, host_space, stream);
   stream.synchronize();
@@ -541,8 +533,7 @@ void BM_ConvertHostToDisk(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*host_rep, disk_space, stream);
+    auto disk_result = registry->convert<disk_data_representation>(*host_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -578,11 +569,9 @@ void BM_ConvertDiskToHost(benchmark::State& state)
   rmm::cuda_stream stream;
 
   // Create GPU table, convert to host, then to disk
-  auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = create_benchmark_table_from_bytes(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   auto host_rep = registry->convert<host_data_representation>(*gpu_rep, host_space, stream);
   stream.synchronize();
@@ -594,8 +583,7 @@ void BM_ConvertDiskToHost(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto host_result =
-      registry->convert<host_data_representation>(*disk_rep, host_space, stream);
+    auto host_result = registry->convert<host_data_representation>(*disk_rep, host_space, stream);
     stream.synchronize();
   }
 
@@ -631,18 +619,15 @@ void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
 
   rmm::cuda_stream stream;
 
-  auto table = create_string_benchmark_table(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = create_string_benchmark_table(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
+    auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -675,18 +660,15 @@ void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
 
   rmm::cuda_stream stream;
 
-  auto table = create_list_benchmark_table(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = create_list_benchmark_table(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
+    auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -719,18 +701,15 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 
   rmm::cuda_stream stream;
 
-  auto table = create_struct_benchmark_table(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = create_struct_benchmark_table(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
+    auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -834,18 +813,15 @@ void BM_ConvertGpuToDiskPipeline(benchmark::State& state)
 
   rmm::cuda_stream stream;
 
-  auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = create_benchmark_table_from_bytes(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
     // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
+    auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -904,10 +880,8 @@ void BM_ConvertDiskToGpuPipeline(benchmark::State& state)
 
   rmm::cuda_stream stream;
 
-  auto disk_rep = write_table_to_disk(create_benchmark_table_from_bytes(total_bytes, num_columns),
-                                      gpu_space,
-                                      disk_space,
-                                      stream);
+  auto disk_rep = write_table_to_disk(
+    create_benchmark_table_from_bytes(total_bytes, num_columns), gpu_space, disk_space, stream);
 
   auto registry = make_benchmark_registry();
 
@@ -916,8 +890,7 @@ void BM_ConvertDiskToGpuPipeline(benchmark::State& state)
 
   for ([[maybe_unused]] auto _ : state) {
     drop_os_cache(disk_file);
-    auto gpu_result =
-      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream);
+    auto gpu_result = registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream);
     stream.synchronize();
   }
 
@@ -962,17 +935,14 @@ void pipeline_write_benchmark(benchmark::State& state, TableFactory table_factor
 
   rmm::cuda_stream stream;
 
-  auto table = table_factory(total_bytes, num_columns);
-  auto gpu_rep =
-    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
-                                               *const_cast<memory_space*>(gpu_space),
-                                               stream);
+  auto table   = table_factory(total_bytes, num_columns);
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
 
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
-    auto disk_result =
-      registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
+    auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
   }
@@ -1002,8 +972,8 @@ void pipeline_read_benchmark(benchmark::State& state, TableFactory table_factory
 
   rmm::cuda_stream stream;
 
-  auto disk_rep = write_table_to_disk(
-    table_factory(total_bytes, num_columns), gpu_space, disk_space, stream);
+  auto disk_rep =
+    write_table_to_disk(table_factory(total_bytes, num_columns), gpu_space, disk_space, stream);
 
   auto registry = make_benchmark_registry();
 
@@ -1012,8 +982,7 @@ void pipeline_read_benchmark(benchmark::State& state, TableFactory table_factory
 
   for ([[maybe_unused]] auto _ : state) {
     drop_os_cache(disk_file);
-    auto gpu_result =
-      registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream);
+    auto gpu_result = registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream);
     stream.synchronize();
   }
 

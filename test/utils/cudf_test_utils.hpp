@@ -25,10 +25,10 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
-#include <cuda/stream>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -61,7 +61,7 @@ inline cudf::table create_simple_cudf_table(
   int num_rows,
   int num_columns,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  ::cuda::stream_ref stream      = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}})
+  ::cuda::stream_ref stream         = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}})
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
 
@@ -94,14 +94,14 @@ inline cudf::table create_simple_cudf_table(
 inline cudf::table create_simple_cudf_table(
   int num_rows,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  ::cuda::stream_ref stream      = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}})
+  ::cuda::stream_ref stream         = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}})
 {
   return create_simple_cudf_table(num_rows, 2, mr, stream);
 }
 
 inline cudf::table create_simple_cudf_table(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  ::cuda::stream_ref stream      = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}})
+  ::cuda::stream_ref stream         = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}})
 {
   return create_simple_cudf_table(100, 2, mr, stream);
 }

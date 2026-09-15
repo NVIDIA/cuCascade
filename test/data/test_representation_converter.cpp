@@ -24,6 +24,7 @@
 #include <cucascade/data/representation_converter.hpp>
 
 #include <rmm/cuda_stream.hpp>
+
 #include <cuda/stream>
 
 #include <catch2/catch_all.hpp>
@@ -51,8 +52,7 @@ class custom_test_representation : public idata_representation {
   std::size_t get_size_in_bytes() const override { return sizeof(_value); }
   std::size_t get_uncompressed_data_size_in_bytes() const override { return sizeof(_value); }
 
-  std::unique_ptr<idata_representation> clone(
-    [[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
   {
     return std::make_unique<custom_test_representation>(_value, get_memory_space());
   }
@@ -74,8 +74,7 @@ class another_test_representation : public idata_representation {
   std::size_t get_size_in_bytes() const override { return sizeof(_value); }
   std::size_t get_uncompressed_data_size_in_bytes() const override { return sizeof(_value); }
 
-  std::unique_ptr<idata_representation> clone(
-    [[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
   {
     return std::make_unique<another_test_representation>(_value, get_memory_space());
   }
@@ -308,9 +307,10 @@ TEST_CASE("representation_converter_registry convert with custom types",
   {
     another_test_representation source(3.14, *mock_space);
 
-    REQUIRE_THROWS_AS(registry.convert<custom_test_representation>(
-                        source, mock_space.get(), ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}),
-                      std::runtime_error);
+    REQUIRE_THROWS_AS(
+      registry.convert<custom_test_representation>(
+        source, mock_space.get(), ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}),
+      std::runtime_error);
   }
 }
 
@@ -334,7 +334,8 @@ TEST_CASE("representation_converter_registry convert with type_index", "[represe
   SECTION("Runtime type_index conversion works")
   {
     std::type_index target_type = typeid(another_test_representation);
-    auto result = registry.convert(source, target_type, mock_space.get(), ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto result                 = registry.convert(
+      source, target_type, mock_space.get(), ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
     REQUIRE(result != nullptr);
     auto& typed_result = result->cast<another_test_representation>();
@@ -344,9 +345,11 @@ TEST_CASE("representation_converter_registry convert with type_index", "[represe
   SECTION("Runtime conversion throws for unregistered pair")
   {
     std::type_index wrong_target = typeid(custom_test_representation);
-    REQUIRE_THROWS_AS(
-      registry.convert(source, wrong_target, mock_space.get(), ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}),
-      std::runtime_error);
+    REQUIRE_THROWS_AS(registry.convert(source,
+                                       wrong_target,
+                                       mock_space.get(),
+                                       ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}),
+                      std::runtime_error);
   }
 }
 

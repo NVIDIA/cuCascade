@@ -131,10 +131,7 @@ std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(size_t off
   return cudf::io::datasource::buffer::create(std::move(buf));
 }
 
-size_t datasource::device_read(size_t offset,
-                               size_t size,
-                               uint8_t* dst,
-                               ::cuda::stream_ref stream)
+size_t datasource::device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref stream)
 {
   auto f = device_read_async(offset, size, dst, stream);
   auto n = f.get();

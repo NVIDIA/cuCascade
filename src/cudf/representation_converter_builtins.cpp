@@ -600,8 +600,8 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
 
   if (memory::probe_peer_dma_works(src_device, dst_device)) {
     // Real peer DMA works on this hardware — direct path.
-    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
-      buf.data(), dst_device, src_ptr, src_device, size, target_stream.get()));
+    CUCASCADE_CUDA_TRY(
+      cudaMemcpyPeerAsync(buf.data(), dst_device, src_ptr, src_device, size, target_stream.get()));
     return buf;
   }
 

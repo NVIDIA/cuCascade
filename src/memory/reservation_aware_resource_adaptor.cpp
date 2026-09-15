@@ -22,12 +22,12 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <rmm/aligned.hpp>
-#include <cuda/stream>
 #include <rmm/mr/cuda_async_managed_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
 #include <cuda/memory_resource>
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <atomic>
@@ -634,8 +634,7 @@ std::size_t reservation_aware_resource_adaptor::get_available_memory_print(
   return get().get_available_memory_print(stream);
 }
 
-std::size_t reservation_aware_resource_adaptor::get_allocated_bytes(
-  ::cuda::stream_ref stream) const
+std::size_t reservation_aware_resource_adaptor::get_allocated_bytes(::cuda::stream_ref stream) const
 {
   return get().get_allocated_bytes(stream);
 }

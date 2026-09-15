@@ -18,7 +18,6 @@
 #pragma once
 
 #include <cuda/stream>
-
 #include <cuda_runtime_api.h>
 
 #include <chrono>

@@ -20,7 +20,6 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cuda/stream>
-
 #include <cuda_runtime.h>
 
 #include <concepts>

@@ -65,8 +65,10 @@ fixed_size_host_memory_resource::~fixed_size_host_memory_resource()
 #pragma GCC diagnostic ignored "-Wnull-dereference"
   for (auto& block : _allocated_blocks) {
     const std::size_t dealloc_size = _block_size * _pool_size;
-    _upstream_mr.deallocate(
-      ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, block, dealloc_size, alignof(std::max_align_t));
+    _upstream_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                            block,
+                            dealloc_size,
+                            alignof(std::max_align_t));
   }
 #pragma GCC diagnostic pop
   _allocated_blocks.clear();
@@ -288,8 +290,8 @@ void fixed_size_host_memory_resource::expand_pool()
   // See constructor for explanation of this suppression.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  void* large_allocation =
-    _upstream_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, total_size, alignof(std::max_align_t));
+  void* large_allocation = _upstream_mr.allocate(
+    ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, total_size, alignof(std::max_align_t));
 #pragma GCC diagnostic pop
 
   _allocated_blocks.push_back(large_allocation);

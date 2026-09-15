@@ -29,8 +29,8 @@
 #include <cucascade/exec/semi_future.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <cuda/stream>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <atomic>

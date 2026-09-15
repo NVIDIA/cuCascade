@@ -27,9 +27,10 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_pool.hpp>
-#include <cuda/stream>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
+
+#include <cuda/stream>
 
 #include <mutex>
 #include <optional>

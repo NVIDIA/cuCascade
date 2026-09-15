@@ -568,8 +568,10 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
   auto original_rows    = table.num_rows();
   auto original_columns = table.num_columns();
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                               *gpu_space,
+                                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->to_read_only();
@@ -599,8 +601,10 @@ TEST_CASE("data_batch clone creates independent memory copies", "[data_batch][gp
   rmm::cuda_stream stream;
 
   auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                               *gpu_space,
+                                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->to_read_only();
@@ -624,8 +628,10 @@ TEST_CASE("data_batch multiple clones are all independent", "[data_batch][gpu]")
   rmm::cuda_stream stream;
 
   auto table = create_simple_cudf_table(30, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                               *gpu_space,
+                                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   // Clone 3 times from the same read_only accessor (clone does not consume the accessor)
@@ -661,9 +667,11 @@ TEST_CASE("data_batch clone with empty table", "[data_batch][gpu]")
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
   rmm::cuda_stream stream;
 
-  auto table    = create_simple_cudf_table(0, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto table = create_simple_cudf_table(0, 2, gpu_space->get_default_allocator(), stream.view());
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                               *gpu_space,
+                                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->to_read_only();
@@ -684,8 +692,10 @@ TEST_CASE("data_batch clone with large table", "[data_batch][gpu]")
 
   auto table =
     create_simple_cudf_table(10000, 2, gpu_space->get_default_allocator(), stream.view());
-  auto gpu_repr = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                               *gpu_space,
+                                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
   auto batch = data_batch::make(1, std::move(gpu_repr));
 
   auto ro     = batch->to_read_only();
@@ -858,8 +868,7 @@ class observed_gpu_representation : private cucascade::test::mock_memory_space_h
   void const* data() const { return _buf.data(); }
   std::size_t get_size_in_bytes() const override { return _buf.size(); }
   std::size_t get_uncompressed_data_size_in_bytes() const override { return _buf.size(); }
-  std::unique_ptr<idata_representation> clone(
-    [[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
   {
     return nullptr;
   }
@@ -958,8 +967,7 @@ class observed_host_representation : private cucascade::test::mock_memory_space_
   void const* data() const { return _pinned_ptr; }
   std::size_t get_size_in_bytes() const override { return _size; }
   std::size_t get_uncompressed_data_size_in_bytes() const override { return _size; }
-  std::unique_ptr<idata_representation> clone(
-    [[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
   {
     return nullptr;
   }
@@ -1502,7 +1510,8 @@ TEST_CASE("record_reader_event accepts the legacy default stream",
   {
     auto reader = batch->to_read_only();
     CUCASCADE_CUDA_TRY(::cudaMemsetAsync(scratch.data(), 0x5A, scratch.size(), nullptr));
-    REQUIRE_NOTHROW(reader.record_reader_event(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}));
+    REQUIRE_NOTHROW(
+      reader.record_reader_event(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}));
     batch = data_batch::to_idle(std::move(reader));
   }
 

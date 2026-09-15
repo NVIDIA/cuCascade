@@ -36,8 +36,9 @@
 // RMM includes for memory resource management
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_pool.hpp>
-#include <cuda/stream>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 namespace cucascade {
 

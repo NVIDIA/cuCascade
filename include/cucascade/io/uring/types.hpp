@@ -23,8 +23,8 @@
 #include <cucascade/io/types.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <cuda/stream>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <sys/uio.h>

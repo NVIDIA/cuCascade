@@ -94,10 +94,7 @@ class datasource : public cudf::io::datasource {
   std::unique_ptr<datasource::buffer> device_read(size_t offset,
                                                   size_t size,
                                                   ::cuda::stream_ref stream) override;
-  size_t device_read(size_t offset,
-                     size_t size,
-                     uint8_t* dst,
-                     ::cuda::stream_ref stream) override;
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref stream) override;
 
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,

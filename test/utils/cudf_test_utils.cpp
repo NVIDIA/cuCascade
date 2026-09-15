@@ -26,13 +26,13 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <cuda/stream>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 #include <rmm/version_config.hpp>
 
 #include <cuda/memory_resource>
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>

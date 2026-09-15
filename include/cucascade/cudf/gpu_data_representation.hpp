@@ -24,7 +24,6 @@
 #include <cudf/table/table_view.hpp>
 
 #include <cuda/stream>
-
 #include <cuda_runtime.h>
 
 #include <any>

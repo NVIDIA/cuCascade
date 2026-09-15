@@ -135,12 +135,11 @@ exec::semi_future<size_t> kvikio_context::host_read_async_io(const io_object& ob
     [&obj, offset, size, dst]() { return as_kvikio(obj).handle().pread(dst, size, offset).get(); });
 }
 
-exec::semi_future<size_t> kvikio_context::device_read_async_io(
-  const io_object& obj,
-  size_t offset,
-  size_t size,
-  uint8_t* dst,
-  ::cuda::stream_ref stream) noexcept
+exec::semi_future<size_t> kvikio_context::device_read_async_io(const io_object& obj,
+                                                               size_t offset,
+                                                               size_t size,
+                                                               uint8_t* dst,
+                                                               ::cuda::stream_ref stream) noexcept
 {
   return exec::make_semi_future_with([&obj, offset, size, dst, stream]() {
     // read_async enqueues the transfer on `stream` (so it is ordered against

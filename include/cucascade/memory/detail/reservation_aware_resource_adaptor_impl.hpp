@@ -25,10 +25,10 @@
 #include <cucascade/memory/oom_handling_policy.hpp>
 #include <cucascade/utils/atomics.hpp>
 
-#include <cuda/stream>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <atomic>

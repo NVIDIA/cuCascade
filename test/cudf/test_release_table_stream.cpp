@@ -33,11 +33,11 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
-#include <cuda/stream>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
 #include <cuda/memory_resource>
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
@@ -402,9 +402,9 @@ TEST_CASE("release_table accepts every same-device stream handle",
 
   rmm::cuda_stream explicit_stream;
   std::vector<::cuda::stream_ref> const streams{::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
-                                                   rmm::cuda_stream_per_thread,
-                                                   rmm::cuda_stream_legacy,
-                                                   explicit_stream.view()};
+                                                rmm::cuda_stream_per_thread,
+                                                rmm::cuda_stream_legacy,
+                                                explicit_stream.view()};
 
   for (auto const& stream : streams) {
     CAPTURE(stream.get());

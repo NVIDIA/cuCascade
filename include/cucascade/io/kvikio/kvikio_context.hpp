@@ -148,13 +148,12 @@ class kvikio_context final : public ioctx {
 
   /// Unsupported: kvikIO has no bounce-staged host->device path here.  Returns
   /// a failed future rather than misbehaving silently.
-  exec::semi_future<size_t> host_to_device_read_async_io(
-    const io_object& obj,
-    std::span<io_object_segment> slices,
-    size_t offset,
-    size_t size,
-    uint8_t* device_dst,
-    ::cuda::stream_ref stream) noexcept final;
+  exec::semi_future<size_t> host_to_device_read_async_io(const io_object& obj,
+                                                         std::span<io_object_segment> slices,
+                                                         size_t offset,
+                                                         size_t size,
+                                                         uint8_t* device_dst,
+                                                         ::cuda::stream_ref stream) noexcept final;
 
   /// Unsupported: no batched dispatch (hence @c supports_vector_host_read()
   /// is false and the prefetching cache stays unarmed).

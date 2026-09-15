@@ -655,8 +655,8 @@ int main(int argc, char** argv)
           futs.reserve(hi - lo);
           for (size_t i = lo; i < hi; ++i) {
             auto const& r = ranges[i];
-            futs.push_back(io_ctx->device_read_async(
-              *io_objects[r.obj_idx], r.offset, r.size, dsts[i], stream));
+            futs.push_back(
+              io_ctx->device_read_async(*io_objects[r.obj_idx], r.offset, r.size, dsts[i], stream));
           }
           for (auto& f : futs)
             std::move(f).get();

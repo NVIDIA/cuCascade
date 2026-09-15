@@ -28,8 +28,9 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <cuda/stream>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <fcntl.h>
 #include <unistd.h>

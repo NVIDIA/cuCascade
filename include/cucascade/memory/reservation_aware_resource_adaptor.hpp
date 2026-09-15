@@ -19,10 +19,10 @@
 
 #include <cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp>
 
-#include <cuda/stream>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <memory>

@@ -17,8 +17,9 @@
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
-#include <cuda/stream>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
+
+#include <cuda/stream>
 
 #include <catch2/catch_all.hpp>
 
@@ -99,7 +100,7 @@ TEST_CASE("Large allocation falls back to malloc", "[small_pinned]")
 {
   test_fixture f;
   constexpr std::size_t big = small_pinned_host_memory_resource::MAX_SLAB_SIZE + 1;
-  auto* ptr                 = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, big);
+  auto* ptr = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, big);
   REQUIRE(ptr != nullptr);
   std::memset(ptr, 0xCD, big);
   f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, ptr, big);
@@ -195,7 +196,8 @@ TEST_CASE("Concurrent allocations are thread-safe", "[small_pinned][threading]")
     threads.emplace_back([&, t]() {
       per_thread_allocs[t].reserve(allocs_per_thread);
       for (int i = 0; i < allocs_per_thread; ++i) {
-        auto* p = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, alloc_size);
+        auto* p =
+          f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, alloc_size);
         REQUIRE(p != nullptr);
         // Touch the memory
         std::memset(p, static_cast<int>(t), alloc_size);
@@ -259,14 +261,16 @@ TEST_CASE("Large allocations do not interfere with slab pool", "[small_pinned]")
   REQUIRE(big != nullptr);
 
   // Allocate a small chunk (goes to slab pool)
-  auto* small1 = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, small_size);
+  auto* small1 =
+    f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, small_size);
   REQUIRE(small1 != nullptr);
 
   // Free the large one
   f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, big, big_size);
 
   // Small allocations should still work
-  auto* small2 = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, small_size);
+  auto* small2 =
+    f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, small_size);
   REQUIRE(small2 != nullptr);
 
   f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, small1, small_size);
