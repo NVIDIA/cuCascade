@@ -256,14 +256,32 @@ std::unique_ptr<reservation> memory_space::make_reservation_upto(size_t size)
 
 std::unique_ptr<reservation> memory_space::make_reservation(size_t size)
 {
-  std::unique_ptr<reservation> res = make_reservation_or_null(size);
-  while (!res) {
-    auto status = _notification_channel->wait();
+  // Fast path: with nobody parked on this space, an immediately-satisfiable reservation is
+  // granted without touching the wait list.
+  if (!_notification_channel->has_waiters()) {
+    if (auto res = make_reservation_or_null(size)) { return res; }
+  }
+
+  // Blocking path: join the space's FIFO wait list. A released reservation is offered to the
+  // LONGEST-WAITING caller first (scoped_waiter only returns NOTIFIED at the head of the
+  // list), and the has_waiters() gate above keeps a fresh blocking caller from barging past
+  // parked waiters through the fast path, so a heavy caller's release-and-re-request loop
+  // cannot perpetually beat a light caller's single wait. Non-blocking callers
+  // (make_reservation_or_null / make_reservation_upto direct users) keep their try-semantics
+  // and may claim memory ahead of the queue; they never park, so nothing can starve behind
+  // them indefinitely.
+  notification_channel::scoped_waiter waiter(*_notification_channel);
+  for (;;) {
+    // Retry only at the head; an attempt from the middle of the queue would barge past the
+    // waiters registered earlier.
+    if (waiter.is_head()) {
+      if (auto res = make_reservation_or_null(size)) { return res; }
+    }
+    auto status = waiter.wait();
     if (status == notification_channel::wait_status::SHUTDOWN) { return nullptr; }
     if (status == notification_channel::wait_status::IDLE) { return make_reservation_upto(size); }
-    res = make_reservation_or_null(size);
+    // NOTIFIED: we are the head and a release arrived — retry.
   }
-  return res;
 }
 
 rmm::cuda_stream_view memory_space::acquire_stream() const
