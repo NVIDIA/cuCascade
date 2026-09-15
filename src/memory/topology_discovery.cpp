@@ -995,8 +995,6 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
     if (nvml_idx >= nvml_gpus.size()) { continue; }
     auto gpu = nvml_gpus[nvml_idx];
     gpu.id   = static_cast<unsigned int>(visible_idx);
-    // Runtime attributes are populated below only when explicitly requested,
-    // so that plain discovery never initializes a CUDA context.
     topology.gpus.push_back(std::move(gpu));
   }
 
