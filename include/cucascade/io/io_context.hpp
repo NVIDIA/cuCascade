@@ -24,7 +24,7 @@
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
@@ -247,7 +247,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     size_t offset,
     size_t size,
     uint8_t* dst,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     cache::prefetching_handle* handle = nullptr);
 
   // -- Backend primitives (cache-unaware) ----------------------------------------
@@ -263,7 +263,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
                                                          size_t offset,
                                                          size_t size,
                                                          uint8_t* dst,
-                                                         rmm::cuda_stream_view stream) noexcept = 0;
+                                                         ::cuda::stream_ref stream) noexcept = 0;
 
   virtual exec::semi_future<size_t> host_to_device_read_async_io(
     const io_object& obj,
@@ -271,7 +271,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     size_t offset,
     size_t size,
     uint8_t* device_dst,
-    rmm::cuda_stream_view stream) noexcept = 0;
+    ::cuda::stream_ref stream) noexcept = 0;
 
   virtual exec::semi_future<size_t> host_read_ranges_async_io(
     const io_object& obj, std::span<io_object_segment> segments) noexcept = 0;

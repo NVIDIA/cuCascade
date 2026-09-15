@@ -21,7 +21,7 @@
 #include <cucascade/memory/notification_channel.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 #include <rmm/resource_ref.hpp>
 
 #include <concepts>
@@ -92,7 +92,7 @@ class reservation_limit_policy {
    * @param reserved_bytes Pointer to the reservation object
    * @throws rmm::out_of_memory if the policy decides to reject the allocation
    */
-  virtual void handle_over_reservation(rmm::cuda_stream_view stream,
+  virtual void handle_over_reservation(::cuda::stream_ref stream,
                                        std::size_t requested_bytes,
                                        std::size_t current_allocated,
                                        reserved_arena* reserved_bytes) = 0;
@@ -114,7 +114,7 @@ class ignore_reservation_limit_policy : public reservation_limit_policy {
  public:
   ignore_reservation_limit_policy();
 
-  void handle_over_reservation(rmm::cuda_stream_view stream,
+  void handle_over_reservation(::cuda::stream_ref stream,
                                std::size_t requested_bytes,
                                std::size_t current_allocated,
                                reserved_arena* reserved_bytes) final;
@@ -132,7 +132,7 @@ class fail_reservation_limit_policy : public reservation_limit_policy {
  public:
   fail_reservation_limit_policy();
 
-  void handle_over_reservation(rmm::cuda_stream_view stream,
+  void handle_over_reservation(::cuda::stream_ref stream,
                                std::size_t requested_bytes,
                                std::size_t current_allocated,
                                reserved_arena* reserved_bytes) final;
@@ -156,7 +156,7 @@ class increase_reservation_limit_policy : public reservation_limit_policy {
   explicit increase_reservation_limit_policy(double padding_factor,
                                              bool allow_beyond_limit = false);
 
-  void handle_over_reservation(rmm::cuda_stream_view stream,
+  void handle_over_reservation(::cuda::stream_ref stream,
                                std::size_t requested_bytes,
                                std::size_t current_allocated,
                                reserved_arena* reserved_bytes) override;

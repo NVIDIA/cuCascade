@@ -27,7 +27,7 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <atomic>
 #include <chrono>
@@ -346,7 +346,7 @@ class rest_reactor {
                                                  uint8_t* dst,
                                                  size_t offset,
                                                  size_t size,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  int device_id);
 
   static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
@@ -355,7 +355,7 @@ class rest_reactor {
                                                          uint8_t* dst,
                                                          size_t offset,
                                                          size_t size,
-                                                         rmm::cuda_stream_view stream,
+                                                         ::cuda::stream_ref stream,
                                                          int device_id);
 
   // -- dispatch / lifecycle ------------------------------------------------

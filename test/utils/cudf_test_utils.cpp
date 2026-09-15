@@ -26,7 +26,7 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
@@ -196,8 +196,8 @@ static bool columns_equal_recursive(const cudf::column_view& left,
 
       // Compare chars data
       rmm::cuda_stream stream;
-      auto left_chars_size  = left_scv.chars_size(stream.view());
-      auto right_chars_size = right_scv.chars_size(stream.view());
+      auto left_chars_size  = left_scv.chars_size(stream);
+      auto right_chars_size = right_scv.chars_size(stream);
       if (left_chars_size != right_chars_size) {
         std::cout << "[cudf-equal] " << path
                   << " STRING chars_size mismatch: left=" << left_chars_size
@@ -308,7 +308,7 @@ static bool columns_equal_recursive(const cudf::column_view& left,
 // and tolerates INT32 vs INT64 offset differences in STRING/LIST columns.
 bool cudf_tables_have_equal_contents_on_stream(const cudf::table_view& left,
                                                const cudf::table_view& right,
-                                               rmm::cuda_stream_view stream_view)
+                                               ::cuda::stream_ref stream_view)
 {
   if (left.num_rows() != right.num_rows()) {
     std::cout << "[cudf-equal] row count mismatch: left=" << left.num_rows()
@@ -323,7 +323,7 @@ bool cudf_tables_have_equal_contents_on_stream(const cudf::table_view& left,
     return false;
   }
 
-  stream_view.synchronize();
+  stream_view.sync();
 
   for (int col_idx = 0; col_idx < left.num_columns(); ++col_idx) {
     if (!columns_equal_recursive(
@@ -337,7 +337,7 @@ bool cudf_tables_have_equal_contents_on_stream(const cudf::table_view& left,
 
 void expect_cudf_tables_equal_on_stream(const cudf::table_view& left,
                                         const cudf::table_view& right,
-                                        rmm::cuda_stream_view stream_view)
+                                        ::cuda::stream_ref stream_view)
 {
   REQUIRE(cudf_tables_have_equal_contents_on_stream(left, right, stream_view));
 }
@@ -349,7 +349,7 @@ class logging_device_resource {
 
   ~logging_device_resource() = default;
 
-  void* allocate(cuda::stream_ref stream,
+  void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t))
   {
@@ -361,7 +361,7 @@ class logging_device_resource {
     return ptr;
   }
 
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept
@@ -375,14 +375,14 @@ class logging_device_resource {
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    return allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
   }
 
   void deallocate_sync(void* ptr,
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
   }
 
   bool operator==(logging_device_resource const& other) const noexcept { return this == &other; }

@@ -22,7 +22,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <condition_variable>
 #include <filesystem>

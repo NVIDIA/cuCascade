@@ -36,7 +36,7 @@
 // RMM includes for memory resource management
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_pool.hpp>
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 #include <rmm/resource_ref.hpp>
 
 namespace cucascade {
@@ -102,7 +102,7 @@ class memory_space {
   std::unique_ptr<reservation> make_reservation_or_null(size_t size);
   std::unique_ptr<reservation> make_reservation_upto(size_t size);
   std::unique_ptr<reservation> make_reservation(size_t size);
-  [[nodiscard]] rmm::cuda_stream_view acquire_stream() const;
+  [[nodiscard]] ::cuda::stream_ref acquire_stream() const;
 
   [[nodiscard]] std::size_t get_active_reservation_count() const;
   [[nodiscard]] bool should_downgrade_memory() const;
@@ -110,7 +110,7 @@ class memory_space {
   [[nodiscard]] size_t get_amount_to_downgrade() const;
 
   // State queries
-  [[nodiscard]] size_t get_available_memory(rmm::cuda_stream_view stream) const;
+  [[nodiscard]] size_t get_available_memory(::cuda::stream_ref stream) const;
   [[nodiscard]] size_t get_available_memory() const;
   [[nodiscard]] size_t get_total_reserved_memory() const;
   [[nodiscard]] size_t get_max_memory() const noexcept;

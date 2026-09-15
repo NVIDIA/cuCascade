@@ -140,7 +140,7 @@ void small_pinned_host_memory_resource::release_event_locked(cudaEvent_t event, 
   }
 }
 
-void* small_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+void* small_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda::stream_ref stream,
                                                   std::size_t bytes,
                                                   [[maybe_unused]] std::size_t alignment)
 {
@@ -187,7 +187,7 @@ void* small_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_
   return slab.ptr;
 }
 
-void small_pinned_host_memory_resource::deallocate([[maybe_unused]] cuda::stream_ref stream,
+void small_pinned_host_memory_resource::deallocate([[maybe_unused]] ::cuda::stream_ref stream,
                                                    void* ptr,
                                                    std::size_t bytes,
                                                    [[maybe_unused]] std::size_t alignment) noexcept

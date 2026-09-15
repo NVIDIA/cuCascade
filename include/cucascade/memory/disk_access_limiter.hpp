@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <atomic>
 #include <memory>

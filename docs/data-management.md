@@ -57,7 +57,7 @@ All data in cuCascade is accessed through the `idata_representation` interface:
 class idata_representation {
 public:
     virtual std::size_t get_size_in_bytes() const = 0;
-    virtual std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) = 0;
+    virtual std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) = 0;
 
     template <class TargetType>
     TargetType& cast();  // Unsafe downcast (no dynamic_cast overhead)
@@ -81,10 +81,10 @@ class gpu_table_representation : public idata_representation {
     std::unique_ptr<cudf::table> _table;
 
 public:
-    std::unique_ptr<cudf::table> release_table(rmm::cuda_stream_view stream);  // Transfer ownership
+    std::unique_ptr<cudf::table> release_table(::cuda::stream_ref stream);  // Transfer ownership
 
     std::size_t get_size_in_bytes() const override;
-    std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+    std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) override;
 };
 ```
 
@@ -107,7 +107,7 @@ public:
     const std::unique_ptr<memory::host_table_allocation>& get_host_table() const;
 
     std::size_t get_size_in_bytes() const override;
-    std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+    std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) override;
 };
 ```
 
@@ -141,7 +141,7 @@ public:
     const std::unique_ptr<memory::host_table_packed_allocation>& get_host_table() const;
 
     std::size_t get_size_in_bytes() const override;
-    std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+    std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) override;
 };
 ```
 
@@ -299,7 +299,7 @@ The `representation_converter_registry` stores conversion functions indexed by `
 registry.register_converter<gpu_table_representation, host_data_representation>(
     [](idata_representation& source,
        const memory_space* target,
-       rmm::cuda_stream_view stream,
+       ::cuda::stream_ref stream,
        memory::reservation* reservation)
         -> std::unique_ptr<idata_representation> {
         // Convert GPU table to host (direct copy)

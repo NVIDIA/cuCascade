@@ -29,7 +29,7 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
@@ -116,7 +116,7 @@ class mock_data_representation : private mock_memory_space_holder, public idata_
   std::size_t get_uncompressed_data_size_in_bytes() const override { return _size; }
 
   std::unique_ptr<idata_representation> clone(
-    [[maybe_unused]] rmm::cuda_stream_view stream) override
+    [[maybe_unused]] ::cuda::stream_ref stream) override
   {
     return std::make_unique<mock_data_representation>(get_current_tier(), _size, get_device_id());
   }

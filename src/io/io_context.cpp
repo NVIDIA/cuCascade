@@ -91,7 +91,7 @@ exec::semi_future<size_t> ioctx::device_read_async(const io_object& obj,
                                                    size_t offset,
                                                    size_t size,
                                                    uint8_t* dst,
-                                                   rmm::cuda_stream_view stream,
+                                                   ::cuda::stream_ref stream,
                                                    cache::prefetching_handle* handle)
 {
   if (uses_prefetching_cache()) {

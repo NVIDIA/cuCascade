@@ -144,7 +144,7 @@ class kvikio_context final : public ioctx {
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
-                                                 rmm::cuda_stream_view stream) noexcept final;
+                                                 ::cuda::stream_ref stream) noexcept final;
 
   /// Unsupported: kvikIO has no bounce-staged host->device path here.  Returns
   /// a failed future rather than misbehaving silently.
@@ -154,7 +154,7 @@ class kvikio_context final : public ioctx {
     size_t offset,
     size_t size,
     uint8_t* device_dst,
-    rmm::cuda_stream_view stream) noexcept final;
+    ::cuda::stream_ref stream) noexcept final;
 
   /// Unsupported: no batched dispatch (hence @c supports_vector_host_read()
   /// is false and the prefetching cache stays unarmed).

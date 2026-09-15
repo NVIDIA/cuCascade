@@ -192,7 +192,7 @@ void BM_ConvertGpuToHost(benchmark::State& state)
     thread_gpu_reprs.push_back(
       std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
                                                  *const_cast<memory_space*>(gpu_space),
-                                                 rmm::cuda_stream_view{}));
+                                                 ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}));
   }
 
   // Warm-up
@@ -201,7 +201,7 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   auto warmup_repr  = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(warmup_table)),
     *const_cast<memory_space*>(gpu_space),
-    warmup_stream.view());
+    warmup_stream);
   auto warmup_result =
     registry->convert<host_data_packed_representation>(*warmup_repr, host_space, warmup_stream);
   warmup_stream.synchronize();
@@ -268,7 +268,7 @@ void BM_ConvertHostToGpu(benchmark::State& state)
     auto gpu_repr_temp =
       std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
                                                  *const_cast<memory_space*>(gpu_space),
-                                                 setup_stream.view());
+                                                 setup_stream);
     auto host_repr =
       registry->convert<host_data_packed_representation>(*gpu_repr_temp, host_space, setup_stream);
     setup_stream.synchronize();
@@ -344,7 +344,7 @@ void BM_ConvertGpuToHostFast(benchmark::State& state)
     thread_gpu_reprs.push_back(
       std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
                                                  *const_cast<memory_space*>(gpu_space),
-                                                 rmm::cuda_stream_view{}));
+                                                 ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}));
   }
 
   // Warm-up: small transfer to prime CUDA driver
@@ -353,7 +353,7 @@ void BM_ConvertGpuToHostFast(benchmark::State& state)
   auto warmup_repr  = std::make_unique<gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(warmup_table)),
     *const_cast<memory_space*>(gpu_space),
-    warmup_stream.view());
+    warmup_stream);
   auto warmup_result =
     registry->convert<host_data_representation>(*warmup_repr, host_space, warmup_stream);
   warmup_stream.synchronize();
@@ -414,7 +414,7 @@ void BM_ConvertHostFastToGpu(benchmark::State& state)
     auto gpu_repr_temp =
       std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
                                                  *const_cast<memory_space*>(gpu_space),
-                                                 setup_stream.view());
+                                                 setup_stream);
     auto host_repr =
       registry->convert<host_data_representation>(*gpu_repr_temp, host_space, setup_stream);
     setup_stream.synchronize();

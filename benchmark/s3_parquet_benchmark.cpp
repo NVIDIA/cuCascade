@@ -276,7 +276,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
   [[nodiscard]] bool supports_device_read() const override { return true; }
 
-  size_t device_read(size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view) override
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref) override
   {
     size_t const n = clamp(offset, size);
     if (n == 0) { return 0; }
@@ -288,7 +288,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
-                                        rmm::cuda_stream_view) override
+                                        ::cuda::stream_ref) override
   {
     size_t const n = clamp(offset, size);
     return _handle.pread(dst, n, offset);
@@ -296,7 +296,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
   std::unique_ptr<buffer> device_read(size_t offset,
                                       size_t size,
-                                      rmm::cuda_stream_view stream) override
+                                      ::cuda::stream_ref stream) override
   {
     size_t const n = clamp(offset, size);
     rmm::device_buffer out(n, stream);

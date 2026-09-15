@@ -66,7 +66,7 @@ fixed_size_host_memory_resource::~fixed_size_host_memory_resource()
   for (auto& block : _allocated_blocks) {
     const std::size_t dealloc_size = _block_size * _pool_size;
     _upstream_mr.deallocate(
-      rmm::cuda_stream_view{}, block, dealloc_size, alignof(std::max_align_t));
+      ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, block, dealloc_size, alignof(std::max_align_t));
   }
 #pragma GCC diagnostic pop
   _allocated_blocks.clear();
@@ -195,7 +195,7 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
   return {};
 }
 
-void* fixed_size_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+void* fixed_size_host_memory_resource::allocate([[maybe_unused]] ::cuda::stream_ref stream,
                                                 [[maybe_unused]] std::size_t bytes,
                                                 [[maybe_unused]] std::size_t alignment)
 {
@@ -203,7 +203,7 @@ void* fixed_size_host_memory_resource::allocate([[maybe_unused]] cuda::stream_re
     "fixed_size_host_memory_resource doesn't support allocate, use allocate_multiple_blocks");
 }
 
-void fixed_size_host_memory_resource::deallocate([[maybe_unused]] cuda::stream_ref stream,
+void fixed_size_host_memory_resource::deallocate([[maybe_unused]] ::cuda::stream_ref stream,
                                                  [[maybe_unused]] void* ptr,
                                                  [[maybe_unused]] std::size_t bytes,
                                                  [[maybe_unused]] std::size_t alignment) noexcept
@@ -289,7 +289,7 @@ void fixed_size_host_memory_resource::expand_pool()
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
   void* large_allocation =
-    _upstream_mr.allocate(rmm::cuda_stream_view{}, total_size, alignof(std::max_align_t));
+    _upstream_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, total_size, alignof(std::max_align_t));
 #pragma GCC diagnostic pop
 
   _allocated_blocks.push_back(large_allocation);
