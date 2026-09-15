@@ -29,7 +29,6 @@ option(CUCASCADE_BUILD_TESTS "Build the test suite" ON)
 option(CUCASCADE_BUILD_BENCHMARKS "Build the benchmark suite" ON)
 option(CUCASCADE_BUILD_SHARED_LIBS "Build shared library" ON)
 option(CUCASCADE_BUILD_STATIC_LIBS "Build static library" ON)
-option(CUCASCADE_NVTX "Enable NVTX range annotations" OFF)
 option(CUCASCADE_TOPOLOGY_ONLY
        "Build only the topology discovery library (no cudf/rmm dependency)" OFF)
 option(
@@ -283,13 +282,6 @@ foreach(flag ${CUCASCADE_CXX_WARNING_FLAGS})
 endforeach()
 
 # =============================================================================
-# NVTX support
-# =============================================================================
-if(CUCASCADE_NVTX AND NOT CUCASCADE_TOPOLOGY_ONLY)
-  find_package(nvtx3 REQUIRED)
-endif()
-
-# =============================================================================
 # Object library (compiles sources once, used by both static and shared libs)
 # =============================================================================
 add_library(cucascade_topology_discovery_objects OBJECT)
@@ -329,12 +321,6 @@ target_compile_options(
   PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
           ${CUCASCADE_CUDA_WARNING_FLAGS})
 
-# NVTX compile definition
-if(CUCASCADE_NVTX AND NOT CUCASCADE_TOPOLOGY_ONLY)
-  target_compile_definitions(cucascade_objects PUBLIC CUCASCADE_NVTX)
-  target_link_libraries(cucascade_objects PUBLIC nvtx3::nvtx3-cpp)
-endif()
-
 # Add source directories (they will add sources to cucascade_objects)
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_subdirectory(src/cuda)
@@ -357,8 +343,8 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<INSTALL_INTERFACE:include>)
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
-  set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static Threads::Threads
-                                 Numa::Numa)
+  set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static CUDA::nvtx3
+                                 Threads::Threads Numa::Numa)
 
   # Set include directories for the object library
   target_include_directories(cucascade_objects
