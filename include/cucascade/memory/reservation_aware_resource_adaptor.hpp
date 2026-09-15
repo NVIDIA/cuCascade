@@ -17,12 +17,12 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp>
 
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <memory>

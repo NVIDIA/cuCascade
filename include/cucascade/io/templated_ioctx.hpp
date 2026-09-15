@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
@@ -27,8 +28,6 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
-
-#include <cuda/stream>
 
 #include <algorithm>
 #include <atomic>

@@ -17,10 +17,10 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
+
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
-
-#include <cuda/stream>
 
 #include <condition_variable>
 #include <deque>

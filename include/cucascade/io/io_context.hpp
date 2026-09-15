@@ -18,13 +18,12 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/metadata_store.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/types.hpp>
-
-#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>

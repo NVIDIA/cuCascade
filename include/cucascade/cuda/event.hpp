@@ -17,7 +17,8 @@
 
 #pragma once
 
-#include <cuda/stream>
+#include <cucascade/cuda/stream.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <chrono>

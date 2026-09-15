@@ -34,11 +34,11 @@
 #include <variant>
 
 // RMM includes for memory resource management
+#include <cucascade/cuda/stream.hpp>
+
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/resource_ref.hpp>
-
-#include <cuda/stream>
 
 namespace cucascade {
 

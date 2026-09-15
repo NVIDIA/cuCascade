@@ -17,13 +17,13 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
-#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <any>

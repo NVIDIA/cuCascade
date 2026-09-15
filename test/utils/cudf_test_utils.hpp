@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
 
 #include <cudf/column/column.hpp>
@@ -28,7 +29,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cstddef>

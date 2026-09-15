@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 #include <rmm/mr/pinned_host_memory_resource.hpp>
-
-#include <cuda/stream>
 
 #include <catch2/catch_all.hpp>
 

@@ -17,6 +17,7 @@
  */
 
 #include <cucascade/cuda/event.hpp>
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
@@ -29,7 +30,6 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>

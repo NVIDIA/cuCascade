@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -27,7 +28,6 @@
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <atomic>

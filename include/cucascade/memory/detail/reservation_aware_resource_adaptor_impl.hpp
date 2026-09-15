@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/error.hpp>
@@ -28,7 +29,6 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <atomic>

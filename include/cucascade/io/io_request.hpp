@@ -26,11 +26,11 @@
 // reads.  rx_request_t is the per-reactor container that the templated_ioctx
 // dispatch layer splits across the reactor pool.
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/semi_future.hpp>
 
 #include <rmm/cuda_device.hpp>
 
-#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <atomic>

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
 
 #include <cudf/column/column_view.hpp>
@@ -32,7 +33,6 @@
 #include <rmm/version_config.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>

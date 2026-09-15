@@ -135,7 +135,7 @@ size_t datasource::device_read(size_t offset, size_t size, uint8_t* dst, cudf_st
 {
   auto f = device_read_async(offset, size, dst, stream);
   auto n = f.get();
-#if CUDF_VERSION_MINOR >= 12
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
   stream.sync();
 #else
   ::cuda::stream_ref{stream.value()}.sync();

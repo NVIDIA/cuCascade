@@ -18,6 +18,7 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -38,7 +39,6 @@
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
@@ -150,7 +150,7 @@ void expect_column_buffers_bound_to(std::unique_ptr<cudf::column> col,
 {
   auto contents = col->release();
   if (contents.data && contents.data->size() > 0) {
-#if CUDF_VERSION_MINOR >= 12
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
     auto actual_stream = contents.data->stream().get();
 #else
     auto actual_stream = contents.data->stream().value();
@@ -160,7 +160,7 @@ void expect_column_buffers_bound_to(std::unique_ptr<cudf::column> col,
     ++buffers_checked;
   }
   if (contents.null_mask && contents.null_mask->size() > 0) {
-#if CUDF_VERSION_MINOR >= 12
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
     auto actual_stream = contents.null_mask->stream().get();
 #else
     auto actual_stream = contents.null_mask->stream().value();

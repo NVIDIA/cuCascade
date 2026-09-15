@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/cudf/bandwidth_profiler.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -29,8 +30,6 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/resource_ref.hpp>
-
-#include <cuda/stream>
 
 #include <fcntl.h>
 #include <unistd.h>

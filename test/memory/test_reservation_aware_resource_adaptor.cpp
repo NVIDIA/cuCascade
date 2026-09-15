@@ -29,6 +29,7 @@
  * null for resources that do not expose a pool.
  */
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -39,7 +40,6 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>

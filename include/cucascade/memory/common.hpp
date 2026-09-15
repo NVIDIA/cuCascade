@@ -17,11 +17,12 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
+
 #include <rmm/error.hpp>
 #include <rmm/version_config.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>

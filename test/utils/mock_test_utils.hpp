@@ -19,6 +19,7 @@
 
 #include "utils/test_memory_resources.hpp"
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
@@ -34,7 +35,6 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <memory>

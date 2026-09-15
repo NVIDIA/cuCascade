@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/chunked_resource_info.hpp>
 #include <cucascade/memory/common.hpp>
@@ -30,7 +31,6 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 
 #include <cstddef>
 #include <memory>

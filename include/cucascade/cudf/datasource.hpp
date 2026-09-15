@@ -29,7 +29,7 @@
 
 namespace cucascade::io {
 
-#if CUDF_VERSION_MINOR >= 12
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
 using cudf_stream_type = ::cuda::stream_ref;
 #else
 using cudf_stream_type = rmm::cuda_stream_view;

@@ -373,12 +373,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   target_compile_features(cucascade_objects PUBLIC cxx_std_20)
   target_compile_features(cucascade_objects PRIVATE cuda_std_20)
 
-  # CUDA 13's stable CCCL still reaches the deprecated <cuda/stream_ref> header
-  # through <cuda/stream>. Suppress its upstream migration warning, which
-  # otherwise becomes an error under our -Werror policy.
-  target_compile_definitions(cucascade_objects
-                             PUBLIC CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
-
   set_target_properties(
     cucascade_objects PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
                                                     ON)

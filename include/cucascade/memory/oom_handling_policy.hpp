@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <cuda/stream>
+#include <cucascade/cuda/stream.hpp>
 
 #include <exception>
 #include <functional>
