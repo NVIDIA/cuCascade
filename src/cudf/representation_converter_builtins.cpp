@@ -886,6 +886,10 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   auto const src_device_id = gpu_source.get_device_id();
   auto const dst_device_id = target_memory_space->get_device_id();
+  auto const copy_path     = memory::probe_peer_dma_works(src_device_id, dst_device_id)
+                               ? "convert:gpu_to_gpu:peer_copy"
+                               : "convert:gpu_to_gpu:host_staging";
+  nvtx_scope copy_path_range{copy_path};
 
   // STREAM-LINEAGE INVARIANT: cross-device peer copies of cudaMallocAsync
   // allocations require explicit event-ordered synchronization with the
@@ -1253,6 +1257,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
   ::cuda::stream_ref /*stream*/,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:host_to_host"};
   auto& host_source    = source.cast<host_data_representation>();
   auto& host_table     = host_source.get_host_table();
   auto const data_size = host_table->data_size;
