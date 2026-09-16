@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cucascade/cuda/stream.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -34,7 +34,7 @@ enum class query_result { success, in_progress, error };
 /**
  * @brief Non-owning view of a CUDA event.
  *
- * Mirrors the rmm::cuda_stream / rmm::cuda_stream_view relationship: cuda_event owns
+ * Mirrors the rmm::cuda_stream / ::cuda::stream_ref relationship: cuda_event owns
  * the underlying cudaEvent_t handle, while cuda_event_view is a copyable, non-owning
  * reference. Pass cuda_event_view by value through APIs that only need to query or
  * record an event but should not affect its lifetime.
@@ -61,8 +61,8 @@ class cuda_event_view {
   [[nodiscard]] cudaEvent_t value() const noexcept { return event_; }
   operator cudaEvent_t() const noexcept { return event_; }
 
-  void record(rmm::cuda_stream_view stream = rmm::cuda_stream_default);
-  void wait(rmm::cuda_stream_view stream = rmm::cuda_stream_default) const;
+  void record(::cuda::stream_ref stream = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  void wait(::cuda::stream_ref stream = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}) const;
   void synchronize() const;
 
   /**
@@ -126,8 +126,8 @@ class cuda_event {
    */
   operator cuda_event_view() const noexcept;
 
-  void record(rmm::cuda_stream_view stream = rmm::cuda_stream_default);
-  void wait(rmm::cuda_stream_view stream = rmm::cuda_stream_default) const;
+  void record(::cuda::stream_ref stream = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  void wait(::cuda::stream_ref stream = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}) const;
   void synchronize() const;
 
   /**

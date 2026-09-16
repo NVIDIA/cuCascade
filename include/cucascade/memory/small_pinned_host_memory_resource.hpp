@@ -17,10 +17,10 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <cuda/memory_resource>
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <array>
@@ -104,7 +104,7 @@ class small_pinned_host_memory_resource {
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
     auto* ptr = allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
-    rmm::cuda_stream_default.synchronize();
+    ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}.sync();
     return ptr;
   }
 
@@ -113,7 +113,7 @@ class small_pinned_host_memory_resource {
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
     deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
-    rmm::cuda_stream_default.synchronize_no_throw();
+    CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaStreamSynchronize(cudaStreamDefault));
   }
 
   bool operator==(small_pinned_host_memory_resource const& other) const noexcept;

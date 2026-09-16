@@ -17,11 +17,10 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <functional>
 #include <memory>
@@ -55,7 +54,7 @@ namespace cucascade {
 using representation_converter_fn = std::function<std::unique_ptr<idata_representation>(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   memory::reservation* reservation)>;
 
 /**
@@ -127,7 +126,7 @@ class representation_converter_registry {
    * registry.register_converter<SourceType, TargetType>(
    *   [](idata_representation& source,
    *      const memory::memory_space* target_memory_space,
-   *      rmm::cuda_stream_view stream,
+   *      ::cuda::stream_ref stream,
    *      memory::reservation* reservation) -> std::unique_ptr<idata_representation> {
    *     auto& src = source.cast<SourceType>();
    *     // ... conversion logic ...
@@ -196,7 +195,8 @@ class representation_converter_registry {
   template <typename TargetType>
   std::unique_ptr<TargetType> convert(idata_representation& source,
                                       const memory::memory_space* target_memory_space,
-                                      rmm::cuda_stream_view stream = rmm::cuda_stream_default) const
+                                      ::cuda::stream_ref stream = ::cuda::stream_ref{
+                                        cudaStream_t{cudaStreamDefault}}) const
   {
     converter_key key{std::type_index(typeid(source)), std::type_index(typeid(TargetType))};
     auto result = convert_impl(key, source, target_memory_space, stream, nullptr);
@@ -221,7 +221,8 @@ class representation_converter_registry {
   template <typename TargetType>
   std::unique_ptr<TargetType> convert(idata_representation& source,
                                       memory::reservation& reservation,
-                                      rmm::cuda_stream_view stream = rmm::cuda_stream_default) const
+                                      ::cuda::stream_ref stream = ::cuda::stream_ref{
+                                        cudaStream_t{cudaStreamDefault}}) const
   {
     converter_key key{std::type_index(typeid(source)), std::type_index(typeid(TargetType))};
     auto result = convert_impl(key, source, &reservation.get_memory_space(), stream, &reservation);
@@ -243,11 +244,11 @@ class representation_converter_registry {
    * @note This runtime-typed overload always allocates without a reservation. Callers that hold a
    *       reservation should use the templated convert<TargetType>(source, reservation, stream).
    */
-  std::unique_ptr<idata_representation> convert(
-    idata_representation& source,
-    std::type_index target_type,
-    const memory::memory_space* target_memory_space,
-    rmm::cuda_stream_view stream = rmm::cuda_stream_default) const;
+  std::unique_ptr<idata_representation> convert(idata_representation& source,
+                                                std::type_index target_type,
+                                                const memory::memory_space* target_memory_space,
+                                                ::cuda::stream_ref stream = ::cuda::stream_ref{
+                                                  cudaStream_t{cudaStreamDefault}}) const;
 
   /**
    * @brief Unregister a converter for the given type pair.
@@ -277,7 +278,7 @@ class representation_converter_registry {
     const converter_key& key,
     idata_representation& source,
     const memory::memory_space* target_memory_space,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     memory::reservation* reservation) const;
   bool unregister_converter_impl(const converter_key& key);
 

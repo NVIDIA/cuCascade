@@ -18,11 +18,10 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -88,7 +87,7 @@ class s3rdma_ioctx : public ioctx {
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
-                                                 rmm::cuda_stream_view stream) noexcept override;
+                                                 ::cuda::stream_ref stream) noexcept override;
 
   exec::semi_future<size_t> host_to_device_read_async_io(
     const io_object& obj,
@@ -96,7 +95,7 @@ class s3rdma_ioctx : public ioctx {
     size_t offset,
     size_t size,
     uint8_t* dst,
-    rmm::cuda_stream_view stream) noexcept override;
+    ::cuda::stream_ref stream) noexcept override;
 
   exec::semi_future<size_t> host_read_ranges_async_io(
     const io_object& obj, std::span<io_object_segment> segments) noexcept override;

@@ -283,7 +283,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
   [[nodiscard]] bool supports_device_read() const override { return true; }
 
-  size_t device_read(size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view) override
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref) override
   {
     size_t const n = clamp(offset, size);
     if (n == 0) { return 0; }
@@ -293,7 +293,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
-                                        rmm::cuda_stream_view) override
+                                        ::cuda::stream_ref) override
   {
     size_t const n = clamp(offset, size);
     return _handle.pread(dst, n, offset);
@@ -301,7 +301,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
   std::unique_ptr<buffer> device_read(size_t offset,
                                       size_t size,
-                                      rmm::cuda_stream_view stream) override
+                                      ::cuda::stream_ref stream) override
   {
     size_t const n = clamp(offset, size);
     rmm::device_buffer out(n, stream);
@@ -585,7 +585,7 @@ int main(int argc, char** argv)
   } else {
     dev_bufs.reserve(ranges.size());
     for (size_t i = 0; i < ranges.size(); ++i) {
-      dev_bufs.emplace_back(ranges[i].size, alloc_stream.view());
+      dev_bufs.emplace_back(ranges[i].size, alloc_stream);
       dsts[i] = static_cast<uint8_t*>(dev_bufs[i].data());
     }
     alloc_stream.synchronize();
@@ -655,8 +655,8 @@ int main(int argc, char** argv)
           futs.reserve(hi - lo);
           for (size_t i = lo; i < hi; ++i) {
             auto const& r = ranges[i];
-            futs.push_back(io_ctx->device_read_async(
-              *io_objects[r.obj_idx], r.offset, r.size, dsts[i], stream.view()));
+            futs.push_back(
+              io_ctx->device_read_async(*io_objects[r.obj_idx], r.offset, r.size, dsts[i], stream));
           }
           for (auto& f : futs)
             std::move(f).get();
@@ -676,7 +676,7 @@ int main(int argc, char** argv)
           for (size_t i = lo; i < hi; ++i) {
             auto const& r = ranges[i];
             futs.push_back(
-              datasources[r.obj_idx]->device_read_async(r.offset, r.size, dsts[i], stream.view()));
+              datasources[r.obj_idx]->device_read_async(r.offset, r.size, dsts[i], stream));
           }
           for (auto& f : futs)
             f.get();

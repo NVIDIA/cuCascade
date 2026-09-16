@@ -29,6 +29,7 @@
  * null for resources that do not expose a pool.
  */
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -39,7 +40,6 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
-#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
@@ -70,7 +70,7 @@ cudaMemPool_t oom_pool_handle_for(rmm::device_async_resource_ref upstream)
     memory_space_id{Tier::GPU, 0}, upstream, tiny_capacity, tiny_capacity};
 
   try {
-    adaptor.allocate(cuda::stream_ref{cudaStream_t{nullptr}}, oversized_bytes, 256);
+    adaptor.allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, oversized_bytes, 256);
   } catch (const cucascade_out_of_memory& e) {
     // Compare underlying values rather than the enums directly: MemoryError has an
     // is_error_code_enum specialization, so a Catch2 comparison of MemoryError would
@@ -163,7 +163,7 @@ TEST_CASE("An explicitly supplied pool handle overrides upstream introspection",
     explicit_pool};
 
   try {
-    adaptor.allocate(cuda::stream_ref{cudaStream_t{nullptr}}, oversized_bytes, 256);
+    adaptor.allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, oversized_bytes, 256);
     FAIL("expected the oversized allocation to throw cucascade_out_of_memory");
   } catch (const cucascade_out_of_memory& e) {
     CHECK(e.pool_handle == explicit_pool);

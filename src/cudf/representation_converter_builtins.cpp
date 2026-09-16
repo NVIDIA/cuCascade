@@ -93,7 +93,7 @@ inline cudf::type_id as_cudf_type_id(int32_t type_id)
 std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation);
 
 /**
@@ -102,12 +102,12 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 std::unique_ptr<idata_representation> convert_gpu_to_host(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
   // Synchronize the stream to ensure any prior operations (like table creation)
   // are complete before we read from the source table
-  stream.synchronize();
+  stream.sync();
 
   auto& gpu_source = source.cast<gpu_table_representation>();
   auto packed_data = cudf::pack(gpu_source.get_table_view(), stream);
@@ -128,7 +128,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
                       static_cast<const uint8_t*>(packed_data.gpu_data->data()) + source_offset,
                       bytes_to_copy,
                       cudaMemcpyDeviceToHost,
-                      stream.value()));
+                      stream.get()));
     source_offset += bytes_to_copy;
     block_offset += bytes_to_copy;
     if (block_offset == block_size) {
@@ -136,7 +136,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
       block_offset = 0;
     }
   }
-  stream.synchronize();
+  stream.sync();
   auto host_table_packed_allocation = std::make_unique<memory::host_table_packed_allocation>(
     std::move(allocation), std::move(packed_data.metadata), packed_data.gpu_data->size());
   return std::make_unique<host_data_packed_representation>(
@@ -150,7 +150,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
 std::unique_ptr<idata_representation> convert_host_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
   auto& host_source    = source.cast<host_data_packed_representation>();
@@ -174,7 +174,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
                                        src_block.data() + src_block_offset,
                                        bytes_to_copy,
                                        cudaMemcpyHostToDevice,
-                                       stream.value()));
+                                       stream.get()));
     dst_offset += bytes_to_copy;
     src_block_offset += bytes_to_copy;
     if (src_block_offset == src_block_size) {
@@ -190,7 +190,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
   auto new_table_view =
     cudf::unpack(host_table->metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
   auto new_table = std::make_unique<cudf::table>(new_table_view, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   // STREAM-LINEAGE: the resulting representation was written by `stream`;
   // record an event on it so cross-stream/cross-device readers honor producer
@@ -206,7 +206,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
 std::unique_ptr<idata_representation> convert_host_to_host(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view /*stream*/,
+  ::cuda::stream_ref /*stream*/,
   memory::reservation* reservation)
 {
   auto& host_source    = source.cast<host_data_packed_representation>();
@@ -317,7 +317,7 @@ struct BatchCopyAccumulator {
 
   std::size_t count() const { return dsts.size(); }
 
-  void flush(rmm::cuda_stream_view stream, cudaMemcpySrcAccessOrder src_order)
+  void flush(::cuda::stream_ref stream, cudaMemcpySrcAccessOrder src_order)
   {
     if (count() == 0) { return; }
 #if CUDART_VERSION >= 12080
@@ -329,17 +329,17 @@ struct BatchCopyAccumulator {
     // CUDA 12.x has a failIdx parameter that was removed in CUDA 13.
 #if CUDART_VERSION < 13000
     CUCASCADE_CUDA_TRY(cudaMemcpyBatchAsync(
-      dsts.data(), srcs.data(), sizes.data(), count(), attr, nullptr, stream.value()));
+      dsts.data(), srcs.data(), sizes.data(), count(), attr, nullptr, stream.get()));
 #else
     CUCASCADE_CUDA_TRY(
-      cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), count(), attr, stream.value()));
+      cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), count(), attr, stream.get()));
 #endif
 #else
     // cudaMemcpyBatchAsync requires CUDA 12.8+; fall back to individual copies.
     (void)src_order;
     for (std::size_t i = 0; i < count(); ++i) {
       CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.value()));
+        cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.get()));
     }
 #endif
     // Clear so subsequent add()+flush() cycles do not resubmit already-issued ops.
@@ -359,7 +359,7 @@ struct BatchCopyAccumulator {
  */
 static memory::column_metadata plan_column_copy(const cudf::column_view& col,
                                                 std::size_t& current_offset,
-                                                rmm::cuda_stream_view stream)
+                                                ::cuda::stream_ref stream)
 {
   assert(col.offset() == 0 && "column_view with non-zero offset is not supported");
 
@@ -498,7 +498,7 @@ static void collect_column_d2h_ops(
 std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
   auto& gpu_source            = source.cast<gpu_table_representation>();
@@ -524,7 +524,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
       view.column(i), columns[static_cast<std::size_t>(i)], *allocation, batch);
   }
   batch.flush(stream, cudaMemcpySrcAccessOrderStream);
-  stream.synchronize();
+  stream.sync();
 
   auto host_alloc =
     memory::host_table_allocation::create(std::move(allocation), std::move(columns), total_size);
@@ -587,7 +587,7 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
                                                     int src_device,
                                                     std::size_t size,
                                                     int dst_device,
-                                                    rmm::cuda_stream_view target_stream,
+                                                    ::cuda::stream_ref target_stream,
                                                     rmm::device_async_resource_ref target_mr)
 {
   rmm::device_buffer buf(size, target_stream, target_mr);
@@ -595,8 +595,8 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
 
   if (memory::probe_peer_dma_works(src_device, dst_device)) {
     // Real peer DMA works on this hardware — direct path.
-    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
-      buf.data(), dst_device, src_ptr, src_device, size, target_stream.value()));
+    CUCASCADE_CUDA_TRY(
+      cudaMemcpyPeerAsync(buf.data(), dst_device, src_ptr, src_device, size, target_stream.get()));
     return buf;
   }
 
@@ -619,14 +619,14 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
     {
       rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
       CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(host_buf, src_ptr, size, cudaMemcpyDeviceToHost, target_stream.value()));
-      target_stream.synchronize();
+        cudaMemcpyAsync(host_buf, src_ptr, size, cudaMemcpyDeviceToHost, target_stream.get()));
+      target_stream.sync();
     }
     {
       rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
       CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(buf.data(), host_buf, size, cudaMemcpyHostToDevice, target_stream.value()));
-      target_stream.synchronize();
+        cudaMemcpyAsync(buf.data(), host_buf, size, cudaMemcpyHostToDevice, target_stream.get()));
+      target_stream.sync();
     }
     mr.deallocate_sync(host_buf, size);
     return buf;
@@ -652,7 +652,7 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
                                          static_cast<const std::uint8_t*>(src_ptr) + src_offset,
                                          to_copy,
                                          cudaMemcpyDeviceToHost,
-                                         target_stream.value()));
+                                         target_stream.get()));
       src_offset += to_copy;
       block_offset += to_copy;
       if (block_offset == block_sz) {
@@ -660,7 +660,7 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
         block_offset = 0;
       }
     }
-    target_stream.synchronize();
+    target_stream.sync();
   }
 
   // Pass 2: host-to-device, chunked across the same blocks. Switch the CUDA
@@ -681,7 +681,7 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
                                          block.data() + block_offset,
                                          to_copy,
                                          cudaMemcpyHostToDevice,
-                                         target_stream.value()));
+                                         target_stream.get()));
       dst_offset += to_copy;
       block_offset += to_copy;
       if (block_offset == block_sz) {
@@ -689,7 +689,7 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
         block_offset = 0;
       }
     }
-    target_stream.synchronize();
+    target_stream.sync();
   }
   // allocation's destructor returns blocks to the host pool — no cudaFreeHost.
   return buf;
@@ -703,13 +703,13 @@ static rmm::device_buffer alloc_and_peer_copy_sync(const void* src_ptr,
                                                    int src_device,
                                                    std::size_t size,
                                                    int dst_device,
-                                                   rmm::cuda_stream_view target_stream,
+                                                   ::cuda::stream_ref target_stream,
                                                    rmm::device_async_resource_ref target_mr)
 {
   auto buf =
     alloc_and_peer_copy_async(src_ptr, src_device, size, dst_device, target_stream, target_mr);
   if (size == 0 || src_ptr == nullptr) { return buf; }
-  target_stream.synchronize();
+  target_stream.sync();
   return buf;
 }
 
@@ -730,7 +730,7 @@ static rmm::device_buffer alloc_and_peer_copy_sync(const void* src_ptr,
 static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_view& src,
                                                             int src_device,
                                                             int dst_device,
-                                                            rmm::cuda_stream_view stream,
+                                                            ::cuda::stream_ref stream,
                                                             rmm::device_async_resource_ref mr)
 {
   assert(src.offset() == 0 && "column_view with non-zero offset is not supported");
@@ -768,15 +768,15 @@ static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_v
       auto const offsets_view = offsets_col->view();
       auto const last_idx     = offsets_view.size() - 1;
       int64_t chars_bytes     = 0;
-      stream.synchronize();
+      stream.sync();
       if (offsets_view.type().id() == cudf::type_id::INT32) {
         int32_t value = 0;
         CUCASCADE_CUDA_TRY(cudaMemcpyAsync(&value,
                                            offsets_view.head<int32_t>() + last_idx,
                                            sizeof(int32_t),
                                            cudaMemcpyDeviceToHost,
-                                           stream.value()));
-        stream.synchronize();
+                                           stream.get()));
+        stream.sync();
         chars_bytes = value;
       } else {
         int64_t value = 0;
@@ -784,8 +784,8 @@ static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_v
                                            offsets_view.head<int64_t>() + last_idx,
                                            sizeof(int64_t),
                                            cudaMemcpyDeviceToHost,
-                                           stream.value()));
-        stream.synchronize();
+                                           stream.get()));
+        stream.sync();
         chars_bytes = value;
       }
       if (chars_bytes > 0) {
@@ -867,13 +867,13 @@ static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_v
 std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
   // Sync the caller's stream so the source table's buffers are stable on the source
   // device before we issue peer copies. The caller's stream is the one that produced
   // (or last touched) the source representation.
-  stream.synchronize();
+  stream.sync();
 
   auto& gpu_source = source.cast<gpu_table_representation>();
 
@@ -939,7 +939,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto new_table = std::make_unique<cudf::table>(std::move(target_columns));
   // Sync so all peer copies and any cudf::cast launches complete before the new
   // table is observed by another stream.
-  target_stream.synchronize();
+  target_stream.sync();
 
   // STREAM-LINEAGE: the resulting representation was written by target_stream;
   // the constructor records an event on it so any subsequent cross-device
@@ -962,7 +962,7 @@ static rmm::device_buffer alloc_and_schedule_h2d(
   memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
   std::size_t alloc_offset,
   std::size_t size,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
@@ -1010,7 +1010,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
   memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
   std::size_t alloc_offset,
   std::size_t size,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   nvtx_scope range{"hg:nullmask_sync"};
@@ -1036,7 +1036,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
                                        block.data() + block_off,
                                        bytes_to_copy,
                                        cudaMemcpyHostToDevice,
-                                       stream.value()));
+                                       stream.get()));
     dst_off += bytes_to_copy;
     block_off += bytes_to_copy;
     if (block_off == block_size) {
@@ -1044,7 +1044,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
       block_off = 0;
     }
   }
-  stream.synchronize();
+  stream.sync();
   return buf;
 }
 
@@ -1060,7 +1060,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
 static std::unique_ptr<cudf::column> reconstruct_column(
   const memory::column_metadata& meta,
   memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   BatchCopyAccumulator& batch)
 {
@@ -1181,7 +1181,7 @@ static std::unique_ptr<cudf::column> reconstruct_column(
 std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
   nvtx_scope convert_range{"hg:convert"};
@@ -1198,7 +1198,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // synchronize is safe across devices.
   {
     nvtx_scope presync_range{"hg:presync"};
-    stream.synchronize();
+    stream.sync();
   }
 
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
@@ -1233,7 +1233,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   {
     nvtx_scope final_sync_range{"hg:final_sync"};
-    target_stream.synchronize();
+    target_stream.sync();
   }
 
   // STREAM-LINEAGE: writes happened on target_stream; record event so
@@ -1248,7 +1248,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
 std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view /*stream*/,
+  ::cuda::stream_ref /*stream*/,
   memory::reservation* reservation)
 {
   auto& host_source    = source.cast<host_data_representation>();
@@ -1524,7 +1524,7 @@ static void read_column_buffers(
 static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  [[maybe_unused]] rmm::cuda_stream_view stream,
+  [[maybe_unused]] ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
   auto& backend          = target_memory_space->get_io_backend();
@@ -1570,7 +1570,7 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
 static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  [[maybe_unused]] rmm::cuda_stream_view stream,
+  [[maybe_unused]] ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
   auto& backend          = source.get_memory_space().get_io_backend();
@@ -1644,7 +1644,7 @@ static void collect_gpu_column_io_entries(const cudf::column_view& col,
 static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
   auto& backend       = target_memory_space->get_io_backend();
@@ -1699,7 +1699,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
 static rmm::device_buffer alloc_and_read_from_disk(const std::filesystem::path& file_path,
                                                    std::size_t file_offset,
                                                    std::size_t size,
-                                                   rmm::cuda_stream_view stream,
+                                                   ::cuda::stream_ref stream,
                                                    rmm::device_async_resource_ref mr,
                                                    idisk_io_backend& backend)
 {
@@ -1715,7 +1715,7 @@ static rmm::device_buffer alloc_and_read_from_disk(const std::filesystem::path& 
 static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   const memory::column_metadata& meta,
   const std::filesystem::path& file_path,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   idisk_io_backend& backend)
 {
@@ -1830,7 +1830,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   idata_representation& source,
   const memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
   auto& backend          = source.get_memory_space().get_io_backend();
@@ -1853,7 +1853,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
     gpu_columns.push_back(reconstruct_column_from_disk(col_meta, file_path, stream, mr, backend));
   }
 
-  stream.synchronize();
+  stream.sync();
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   // STREAM-LINEAGE: writes happened on `stream`; record event so cross-stream

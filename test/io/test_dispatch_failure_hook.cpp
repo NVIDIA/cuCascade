@@ -125,7 +125,7 @@ class stub_reactor {
                                                  std::uint8_t*,
                                                  std::size_t,
                                                  std::size_t size,
-                                                 rmm::cuda_stream_view,
+                                                 ::cuda::stream_ref,
                                                  int)
   {
     if (file.controls()->throw_device_prep) { throw std::runtime_error("device prep failure"); }
@@ -139,7 +139,7 @@ class stub_reactor {
     std::uint8_t*,
     std::size_t,
     std::size_t size,
-    rmm::cuda_stream_view,
+    ::cuda::stream_ref,
     int)
   {
     if (file.controls()->throw_staged_prep) {
@@ -252,8 +252,8 @@ TEST_CASE("device prep failure fires the dispatch hook once", "[io][hook]")
   auto object                 = make_object(controls);
   hooked_ioctx ioctx;
 
-  auto future =
-    ioctx.device_read_async_io(*object, 0, object->size(), nullptr, rmm::cuda_stream_default);
+  auto future = ioctx.device_read_async_io(
+    *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   check_error(std::move(future), "device prep failure");
   CHECK(ioctx.hook_calls() == 1);
@@ -266,8 +266,8 @@ TEST_CASE("device enqueue failure fires the dispatch hook once", "[io][hook]")
   auto object             = make_object(controls);
   hooked_ioctx ioctx;
 
-  auto future =
-    ioctx.device_read_async_io(*object, 0, object->size(), nullptr, rmm::cuda_stream_default);
+  auto future = ioctx.device_read_async_io(
+    *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   check_error(std::move(future), "enqueue failure");
   CHECK(ioctx.hook_calls() == 1);
@@ -281,8 +281,13 @@ TEST_CASE("host to device prep failure fires the dispatch hook once", "[io][hook
   std::array<cucascade::io::io_object_segment, 1> bounce{};
   hooked_ioctx ioctx;
 
-  auto future = ioctx.host_to_device_read_async_io(
-    *object, bounce, 0, object->size(), nullptr, rmm::cuda_stream_default);
+  auto future =
+    ioctx.host_to_device_read_async_io(*object,
+                                       bounce,
+                                       0,
+                                       object->size(),
+                                       nullptr,
+                                       ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   check_error(std::move(future), "host-to-device prep failure");
   CHECK(ioctx.hook_calls() == 1);
@@ -296,8 +301,13 @@ TEST_CASE("host to device enqueue failure fires the dispatch hook once", "[io][h
   std::array<cucascade::io::io_object_segment, 1> bounce{};
   hooked_ioctx ioctx;
 
-  auto future = ioctx.host_to_device_read_async_io(
-    *object, bounce, 0, object->size(), nullptr, rmm::cuda_stream_default);
+  auto future =
+    ioctx.host_to_device_read_async_io(*object,
+                                       bounce,
+                                       0,
+                                       object->size(),
+                                       nullptr,
+                                       ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   check_error(std::move(future), "enqueue failure");
   CHECK(ioctx.hook_calls() == 1);
@@ -311,8 +321,8 @@ TEST_CASE("empty reactor selection returns errors without firing the hook", "[io
 
   SECTION("device read")
   {
-    auto future =
-      ioctx.device_read_async_io(*object, 0, object->size(), nullptr, rmm::cuda_stream_default);
+    auto future = ioctx.device_read_async_io(
+      *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
     check_error(std::move(future), "device_read_async_io: no available reactors");
     CHECK(ioctx.hook_calls() == 0);
   }
@@ -320,8 +330,13 @@ TEST_CASE("empty reactor selection returns errors without firing the hook", "[io
   SECTION("host to device read")
   {
     std::array<cucascade::io::io_object_segment, 1> bounce{};
-    auto future = ioctx.host_to_device_read_async_io(
-      *object, bounce, 0, object->size(), nullptr, rmm::cuda_stream_default);
+    auto future =
+      ioctx.host_to_device_read_async_io(*object,
+                                         bounce,
+                                         0,
+                                         object->size(),
+                                         nullptr,
+                                         ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
     check_error(std::move(future), "host_to_device_read_async_io: no available reactors");
     CHECK(ioctx.hook_calls() == 0);
   }
@@ -335,8 +350,8 @@ TEST_CASE("successful device dispatches do not fire the hook", "[io][hook]")
 
   SECTION("device read")
   {
-    auto future =
-      ioctx.device_read_async_io(*object, 0, object->size(), nullptr, rmm::cuda_stream_default);
+    auto future = ioctx.device_read_async_io(
+      *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
     CHECK(std::move(future).get() == object->size());
     CHECK(ioctx.hook_calls() == 0);
   }
@@ -344,8 +359,13 @@ TEST_CASE("successful device dispatches do not fire the hook", "[io][hook]")
   SECTION("host to device read")
   {
     std::array<cucascade::io::io_object_segment, 1> bounce{};
-    auto future = ioctx.host_to_device_read_async_io(
-      *object, bounce, 0, object->size(), nullptr, rmm::cuda_stream_default);
+    auto future =
+      ioctx.host_to_device_read_async_io(*object,
+                                         bounce,
+                                         0,
+                                         object->size(),
+                                         nullptr,
+                                         ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
     CHECK(std::move(future).get() == object->size());
     CHECK(ioctx.hook_calls() == 0);
   }
@@ -358,8 +378,8 @@ TEST_CASE("the default dispatch failure hook preserves error futures", "[io][hoo
   auto object                 = make_object(controls);
   plain_ioctx ioctx;
 
-  auto future =
-    ioctx.device_read_async_io(*object, 0, object->size(), nullptr, rmm::cuda_stream_default);
+  auto future = ioctx.device_read_async_io(
+    *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   check_error(std::move(future), "device prep failure");
 }

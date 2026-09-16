@@ -348,7 +348,7 @@ int main(int argc, char** argv)
   } else {
     dev_bufs.reserve(ranges.size());
     for (size_t i = 0; i < ranges.size(); ++i) {
-      dev_bufs.emplace_back(ranges[i].size, alloc_stream.view());
+      dev_bufs.emplace_back(ranges[i].size, alloc_stream);
       dsts[i] = static_cast<uint8_t*>(dev_bufs[i].data());
     }
     alloc_stream.synchronize();
@@ -413,7 +413,7 @@ int main(int argc, char** argv)
           for (size_t i = lo; i < hi; ++i) {
             auto const& r = ranges[i];
             futs.push_back(io_ctx->device_read_async(
-              *io_objects[r.file_idx], r.offset, r.size, dsts[i], stream.view()));
+              *io_objects[r.file_idx], r.offset, r.size, dsts[i], stream));
           }
           for (auto& f : futs)
             std::move(f).get();
@@ -433,7 +433,7 @@ int main(int argc, char** argv)
           for (size_t i = lo; i < hi; ++i) {
             auto const& r = ranges[i];
             futs.push_back(
-              datasources[r.file_idx]->device_read_async(r.offset, r.size, dsts[i], stream.view()));
+              datasources[r.file_idx]->device_read_async(r.offset, r.size, dsts[i], stream));
           }
           for (auto& f : futs)
             f.get();

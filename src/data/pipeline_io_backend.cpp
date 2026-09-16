@@ -192,7 +192,7 @@ class pipeline_io_backend : public idisk_io_backend {
              const void* dev_ptr,
              std::size_t size,
              std::size_t file_offset,
-             rmm::cuda_stream_view stream) override
+             ::cuda::stream_ref stream) override
   {
     if (size == 0) return;
 
@@ -204,7 +204,7 @@ class pipeline_io_backend : public idisk_io_backend {
 
     // Ensure all GPU work on the caller's stream completes before D2H copies begin
     res.order_event.record(stream);
-    res.order_event.wait(res.copy_stream.view());
+    res.order_event.wait(res.copy_stream);
 
     int flags = O_CREAT | O_WRONLY;
     if (_direct_io) { flags |= O_DIRECT; }
@@ -271,7 +271,7 @@ class pipeline_io_backend : public idisk_io_backend {
             void* dev_ptr,
             std::size_t size,
             std::size_t file_offset,
-            rmm::cuda_stream_view stream) override
+            ::cuda::stream_ref stream) override
   {
     if (size == 0) return;
 
@@ -283,7 +283,7 @@ class pipeline_io_backend : public idisk_io_backend {
 
     // Ensure caller's stream work completes before we use the destination buffer
     res.order_event.record(stream);
-    res.order_event.wait(res.copy_stream.view());
+    res.order_event.wait(res.copy_stream);
 
     int flags = O_RDONLY;
     if (_direct_io) { flags |= O_DIRECT; }
@@ -407,7 +407,7 @@ class pipeline_io_backend : public idisk_io_backend {
    */
   void write_batch(const std::filesystem::path& path,
                    const std::vector<io_batch_entry>& entries,
-                   rmm::cuda_stream_view stream) override
+                   ::cuda::stream_ref stream) override
   {
     if (entries.empty()) return;
 
@@ -419,7 +419,7 @@ class pipeline_io_backend : public idisk_io_backend {
 
     // Ensure all GPU work on the caller's stream completes before D2H copies begin
     res.order_event.record(stream);
-    res.order_event.wait(res.copy_stream.view());
+    res.order_event.wait(res.copy_stream);
 
     int flags = O_CREAT | O_WRONLY;
     if (_direct_io) { flags |= O_DIRECT; }

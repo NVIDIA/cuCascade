@@ -523,7 +523,7 @@ TEST_CASE("device read records h2d timings", "[rest][perf][gpu]")
   rmm::cuda_stream stream;
 
   auto future =
-    fixture.ioctx->device_read_async_io(*object, 0, payload.size(), device.data(), stream.view());
+    fixture.ioctx->device_read_async_io(*object, 0, payload.size(), device.data(), stream);
   REQUIRE(std::move(future).get(5s) == payload.size());
   stream.synchronize();
 
