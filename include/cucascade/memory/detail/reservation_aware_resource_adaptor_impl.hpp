@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/error.hpp>
@@ -25,7 +26,6 @@
 #include <cucascade/memory/oom_handling_policy.hpp>
 #include <cucascade/utils/atomics.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
@@ -93,7 +93,7 @@ class reservation_aware_resource_adaptor_impl {
 
     std::size_t check_reservation_and_handle_overflow(reservation_aware_resource_adaptor_impl& impl,
                                                       std::size_t allocation_size,
-                                                      rmm::cuda_stream_view stream);
+                                                      ::cuda::stream_ref stream);
 
    private:
     mutable std::mutex _arbitration_mutex;
@@ -105,17 +105,17 @@ class reservation_aware_resource_adaptor_impl {
   struct allocation_tracker_iface {
     virtual ~allocation_tracker_iface() = default;
 
-    virtual void reset_tracker_state(rmm::cuda_stream_view stream) = 0;
+    virtual void reset_tracker_state(::cuda::stream_ref stream) = 0;
 
-    virtual void assign_reservation_to_tracker(rmm::cuda_stream_view stream,
+    virtual void assign_reservation_to_tracker(::cuda::stream_ref stream,
                                                std::unique_ptr<device_reserved_arena> reservation,
                                                std::unique_ptr<reservation_limit_policy> policy,
                                                std::unique_ptr<oom_handling_policy> oom_policy) = 0;
 
-    virtual stream_ordered_tracker_state* get_tracker_state(rmm::cuda_stream_view stream) = 0;
+    virtual stream_ordered_tracker_state* get_tracker_state(::cuda::stream_ref stream) = 0;
 
     virtual const stream_ordered_tracker_state* get_tracker_state(
-      rmm::cuda_stream_view stream) const = 0;
+      ::cuda::stream_ref stream) const = 0;
   };
 
   enum class AllocationTrackingScope {
@@ -154,15 +154,15 @@ class reservation_aware_resource_adaptor_impl {
 
   rmm::device_async_resource_ref get_upstream_resource() const noexcept;
   std::size_t get_available_memory() const noexcept;
-  std::size_t get_available_memory(rmm::cuda_stream_view stream) const noexcept;
-  std::size_t get_available_memory_print(rmm::cuda_stream_view stream) const noexcept;
-  std::size_t get_allocated_bytes(rmm::cuda_stream_view stream) const;
-  std::size_t get_peak_allocated_bytes(rmm::cuda_stream_view stream) const;
+  std::size_t get_available_memory(::cuda::stream_ref stream) const noexcept;
+  std::size_t get_available_memory_print(::cuda::stream_ref stream) const noexcept;
+  std::size_t get_allocated_bytes(::cuda::stream_ref stream) const;
+  std::size_t get_peak_allocated_bytes(::cuda::stream_ref stream) const;
   std::size_t get_total_allocated_bytes() const;
   std::size_t get_peak_total_allocated_bytes() const;
-  void reset_peak_allocated_bytes(rmm::cuda_stream_view stream);
+  void reset_peak_allocated_bytes(::cuda::stream_ref stream);
   std::size_t get_total_reserved_bytes() const;
-  bool is_stream_tracked(rmm::cuda_stream_view stream) const;
+  bool is_stream_tracked(::cuda::stream_ref stream) const;
 
   //===----------------------------------------------------------------------===//
   // Reservation Management
@@ -177,12 +177,12 @@ class reservation_aware_resource_adaptor_impl {
   std::size_t get_active_reservation_count() const noexcept;
 
   bool attach_reservation_to_tracker(
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     std::unique_ptr<reservation> reserved_bytes,
     std::unique_ptr<reservation_limit_policy> stream_reservation_policy = nullptr,
     std::unique_ptr<oom_handling_policy> stream_oom_policy              = nullptr);
 
-  void reset_stream_reservation(rmm::cuda_stream_view stream);
+  void reset_stream_reservation(::cuda::stream_ref stream);
   void set_default_policy(std::unique_ptr<reservation_limit_policy> policy);
   const reservation_limit_policy& get_default_reservation_policy() const;
   const oom_handling_policy& get_default_oom_handling_policy() const;
@@ -225,13 +225,13 @@ class reservation_aware_resource_adaptor_impl {
  private:
   bool grow_reservation_by(device_reserved_arena& arena, std::size_t bytes);
   void shrink_reservation_to_fit(device_reserved_arena& arena);
-  void* do_allocate_managed(std::size_t bytes, rmm::cuda_stream_view stream);
+  void* do_allocate_managed(std::size_t bytes, ::cuda::stream_ref stream);
   void* do_allocate_managed(std::size_t bytes,
                             stream_ordered_tracker_state* state,
-                            rmm::cuda_stream_view stream);
+                            ::cuda::stream_ref stream);
   void* do_allocate_unmanaged(std::size_t bytes,
                               std::size_t tracking_bytes,
-                              rmm::cuda_stream_view stream);
+                              ::cuda::stream_ref stream);
   bool do_reserve(std::size_t size_bytes, std::size_t limit_bytes);
   std::size_t do_reserve_upto(std::size_t size_bytes, std::size_t limit_bytes);
   void do_release_reservation(device_reserved_arena* reservation) noexcept;

@@ -23,10 +23,17 @@
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
+#include <cudf/version_config.hpp>
 
 #include <span>
 
 namespace cucascade::io {
+
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+using cudf_stream_type = ::cuda::stream_ref;
+#else
+using cudf_stream_type = rmm::cuda_stream_view;
+#endif
 
 // ---------------------------------------------------------------------------
 // datasource
@@ -93,16 +100,13 @@ class datasource : public cudf::io::datasource {
 
   std::unique_ptr<datasource::buffer> device_read(size_t offset,
                                                   size_t size,
-                                                  rmm::cuda_stream_view stream) override;
-  size_t device_read(size_t offset,
-                     size_t size,
-                     uint8_t* dst,
-                     rmm::cuda_stream_view stream) override;
+                                                  cudf_stream_type stream) override;
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, cudf_stream_type stream) override;
 
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
-                                        rmm::cuda_stream_view stream) override;
+                                        cudf_stream_type stream) override;
 
   // ---- Advisory IO ---------------------------------------------------------
 

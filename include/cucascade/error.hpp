@@ -20,15 +20,12 @@
 #include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <cassert>
 #include <iostream>
 #include <stdexcept>
 #include <string>
-
-#if defined(CUCASCADE_NVTX)
-#include <nvtx3/nvtx3.hpp>
-#endif
 
 namespace cucascade {
 
@@ -40,11 +37,9 @@ struct logic_error : public std::logic_error {
   using std::logic_error::logic_error;
 };
 
-#if defined(CUCASCADE_NVTX)
 struct libcucascade_domain {
   static constexpr char const* name{"libcucascade"};
 };
-#endif
 
 }  // namespace cucascade
 
@@ -155,14 +150,9 @@ struct libcucascade_domain {
 #endif
 
 // ---------------------------------------------------------------------------
-// CUCASCADE_FUNC_RANGE – NVTX function-level range for profiling.
-// Enabled when CUCASCADE_NVTX is defined at compile time.
+// CUCASCADE_FUNC_RANGE – NVTX function-level range in the libcucascade domain.
 // ---------------------------------------------------------------------------
 
-#if defined(CUCASCADE_NVTX)
 #define CUCASCADE_FUNC_RANGE() NVTX3_FUNC_RANGE_IN(cucascade::libcucascade_domain)
-#else
-#define CUCASCADE_FUNC_RANGE()
-#endif
 
 // clang-format on

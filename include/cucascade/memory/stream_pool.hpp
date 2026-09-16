@@ -17,9 +17,10 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
+
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
 #include <condition_variable>
 #include <deque>
@@ -34,10 +35,10 @@ class borrowed_stream {
  public:
   friend class exclusive_stream_pool;
 
-  [[nodiscard]] rmm::cuda_stream_view get() const noexcept;
+  [[nodiscard]] ::cuda::stream_ref get() const noexcept;
   [[nodiscard]] const rmm::cuda_stream* operator->() const noexcept;
   [[nodiscard]] const rmm::cuda_stream* operator->() noexcept;
-  operator rmm::cuda_stream_view() const;
+  operator ::cuda::stream_ref() const;
 
   ~borrowed_stream() noexcept;
 
@@ -82,11 +83,11 @@ class exclusive_stream_pool {
   exclusive_stream_pool& operator=(exclusive_stream_pool const&) = delete;
 
   /**
-   * @brief Get a `cuda_stream_view` of a stream in the pool.
+   * @brief Get a `stream_ref` of a stream in the pool.
    *
    * This function is thread safe with respect to other calls to the same function.
    *
-   * @return rmm::cuda_stream_view
+   * @return ::cuda::stream_ref
    */
   borrowed_stream acquire_stream(
     stream_acquire_policy policy = stream_acquire_policy::BLOCK) noexcept;

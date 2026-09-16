@@ -18,6 +18,8 @@
 
 #include <cucascade/exec/admission_control.hpp>
 
+#include <algorithm>
+
 namespace cucascade::exec {
 
 admission_control::admission_control(size_t budget) noexcept : _budget(budget) {}
@@ -45,8 +47,31 @@ admission_control::slot admission_control::acquire(size_t size, std::stop_token 
     reserved = _budget;
   }
   _in_use += reserved;
+  _peak = std::max(_peak, _in_use);
   ++_active_slots;
   return slot{this, reserved};
+}
+
+admission_control::slot admission_control::try_acquire(size_t size)
+{
+  std::lock_guard lk(_mtx);
+  if (_in_use + size > _budget) { return {}; }
+  _in_use += size;
+  _peak = std::max(_peak, _in_use);
+  ++_active_slots;
+  return slot{this, size};
+}
+
+size_t admission_control::reserved() const
+{
+  std::lock_guard lk(_mtx);
+  return _in_use;
+}
+
+size_t admission_control::peak_reserved() const
+{
+  std::lock_guard lk(_mtx);
+  return _peak;
 }
 
 bool admission_control::wait_for_all(std::stop_token stop)

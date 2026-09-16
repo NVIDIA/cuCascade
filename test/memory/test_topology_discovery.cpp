@@ -297,7 +297,7 @@ TEST_CASE("Topology Discovery rejects overflow CUDA_VISIBLE_DEVICES", "[hw_topol
                       "Invalid numeric CUDA_VISIBLE_DEVICES entry: 999999999999999999999999999999");
 }
 
-TEST_CASE("Topology Discovery does not initialize CUDA while visibility is widened",
+TEST_CASE("Default Topology Discovery does not initialize CUDA while visibility is widened",
           "[hw_topology][cuda-context]")
 {
   auto const child = fork();
@@ -309,13 +309,12 @@ TEST_CASE("Topology Discovery does not initialize CUDA while visibility is widen
     if (nvmlInit_v2() != NVML_SUCCESS) { _exit(77); }
     unsigned int device_count = 0;
     auto const count_status   = nvmlDeviceGetCount_v2(&device_count);
-    nvmlShutdown();
     if (count_status != NVML_SUCCESS || device_count < 2) { _exit(77); }
 
     // This mirrors callers that temporarily widen visibility to collect
     // physical topology, then restore the process's assigned GPU. If
-    // discover() initializes the CUDA runtime while CVD is unset, the runtime
-    // permanently sees all GPUs and the final cudaGetDeviceCount() is wrong.
+    // default discover() initializes the CUDA runtime while CVD is unset, the
+    // runtime permanently sees all GPUs and the final cudaGetDeviceCount() is wrong.
     setenv("CUDA_VISIBLE_DEVICES", "1", 1);
     unsetenv("CUDA_VISIBLE_DEVICES");
     topology_discovery discovery;

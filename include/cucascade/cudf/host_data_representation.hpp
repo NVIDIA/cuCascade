@@ -68,7 +68,7 @@ class host_data_representation : public idata_representation {
    * @param stream CUDA stream (unused for host-side copies)
    * @return std::unique_ptr<idata_representation> A new host_data_representation
    */
-  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) override;
 
   /**
    * @brief Access the underlying host table allocation.
@@ -143,7 +143,7 @@ class host_data_packed_representation : public idata_representation {
    * @return std::unique_ptr<idata_representation> A new host_data_packed_representation with
    * copied data
    */
-  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) override;
 
   /**
    * @brief Get the underlying host table allocation

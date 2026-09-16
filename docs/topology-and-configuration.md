@@ -108,10 +108,13 @@ throws rather than sizing a host space from device memory.
 
 ### CUDA Context Independence
 
-Topology discovery is independent of CUDA runtime and context state. `discover()` may be called
-before or after CUDA initialization, but it must never initialize CUDA, create or require a CUDA
-context, or otherwise alter CUDA process state. This is a public API invariant, not merely an
-implementation detail.
+By default, `discover()` uses only NVML and Linux sysfs. It may be called before or after CUDA
+initialization, but it does not initialize the CUDA driver or runtime, create or require a CUDA
+context, or otherwise alter CUDA process state.
+
+Runtime attributes are explicitly opt-in. Passing `true` for `with_runtime_attributes`, or calling
+`discover_runtime_attributes()` directly, queries the CUDA driver and requires the caller to have
+initialized it first. These queries do not create a CUDA context.
 
 ### Network Device Verification
 

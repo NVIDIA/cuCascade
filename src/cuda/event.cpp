@@ -54,9 +54,9 @@ cuda_event_view cuda_event::view() const noexcept { return cuda_event_view{event
 
 cuda_event::operator cuda_event_view() const noexcept { return cuda_event_view{event_}; }
 
-void cuda_event::record(rmm::cuda_stream_view stream) { view().record(stream); }
+void cuda_event::record(::cuda::stream_ref stream) { view().record(stream); }
 
-void cuda_event::wait(rmm::cuda_stream_view stream) const { view().wait(stream); }
+void cuda_event::wait(::cuda::stream_ref stream) const { view().wait(stream); }
 
 void cuda_event::synchronize() const { view().synchronize(); }
 
@@ -74,14 +74,14 @@ event::query_result cuda_event::query() const noexcept { return view().query(); 
 
 cudaError_t cuda_event::query_raw_status() const noexcept { return view().query_raw_status(); }
 
-void cuda_event_view::record(rmm::cuda_stream_view stream)
+void cuda_event_view::record(::cuda::stream_ref stream)
 {
-  CUCASCADE_CUDA_TRY(::cudaEventRecord(event_, stream.value()));
+  CUCASCADE_CUDA_TRY(::cudaEventRecord(event_, stream.get()));
 }
 
-void cuda_event_view::wait(rmm::cuda_stream_view stream) const
+void cuda_event_view::wait(::cuda::stream_ref stream) const
 {
-  CUCASCADE_CUDA_TRY(::cudaStreamWaitEvent(stream.value(), event_, 0));
+  CUCASCADE_CUDA_TRY(::cudaStreamWaitEvent(stream.get(), event_, 0));
 }
 
 void cuda_event_view::synchronize() const { CUCASCADE_CUDA_TRY(::cudaEventSynchronize(event_)); }

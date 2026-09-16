@@ -26,10 +26,10 @@
 // reads.  rx_request_t is the per-reactor container that the templated_ioctx
 // dispatch layer splits across the reactor pool.
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/semi_future.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
@@ -174,15 +174,15 @@ struct device_cpy_request {
           reinterpret_cast<std::uintptr_t>(src_ptr) < 4096U) {
         return cudaErrorInvalidValue;
       }
-      err = cudaMemcpyAsync(c.dst, src_ptr, c.size, cudaMemcpyHostToDevice, stream);
+      err = cudaMemcpyAsync(c.dst, src_ptr, c.size, cudaMemcpyHostToDevice, stream.get());
       if (err != cudaSuccess) { return err; }
     }
-    if (event != nullptr) { err = cudaEventRecord(event, stream); }
+    if (event != nullptr) { err = cudaEventRecord(event, stream.get()); }
     return err;
   }
 
   std::vector<copy> copies;
-  rmm::cuda_stream_view stream;
+  ::cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
   int device_id{-1};
 };
 

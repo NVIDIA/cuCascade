@@ -17,8 +17,9 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
+
 #include <cuda/memory_resource>
-#include <cuda/stream>
 
 #include <cstddef>
 

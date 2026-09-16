@@ -5,7 +5,8 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
-#include <dlfcn.h>
+#include <cuda.h>
+
 #include <ifaddrs.h>
 #include <nvml.h>
 #include <sys/socket.h>
@@ -58,20 +59,43 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
 }
 
 /**
- * @brief Query whether a CUDA device supports hardware-accelerated decompression.
+ * @brief Query whether a GPU has a hardware-accelerated decompression engine.
  *
- * Hardware decompression requires CUDA driver 12.8 or newer. Use NVML rather than
- * the CUDA runtime so topology discovery neither initializes CUDA nor observes the
- * process's CUDA_VISIBLE_DEVICES setting.
+ * The device is identified by PCI bus id rather than by ordinal. Device ordinals are
+ * not a stable identity across APIs: NVML enumerates in PCI-bus order while the CUDA
+ * runtime defaults to `CUDA_DEVICE_ORDER=FASTEST_FIRST`, so the index of a GPU in
+ * this discovery's list need not name the same device to CUDA on a heterogeneous
+ * host. `cuDeviceGetByPCIBusId` sidesteps both that reordering and any
+ * `CUDA_VISIBLE_DEVICES` remapping.
  *
- * @return true iff the hardware decompression engine is available.
+ * `cuDeviceGetAttribute` takes its device explicitly, so no context is created and
+ * the calling thread's current device is left untouched.
+ *
+ * Best-effort: a bus id CUDA does not expose (e.g. masked out by
+ * `CUDA_VISIBLE_DEVICES`) or an attribute unsupported by the running driver both
+ * yield false.
+ *
+ * @note The caller is responsible for having invoked `cuInit(0)` beforehand.
+ *
+ * @param pci_bus_id PCI bus id of the GPU, in NVML's `domain:bus:device.function`
+ * form. For a MIG instance this is the parent physical GPU's bus id, which is the
+ * correct scope: the decompression engine is a property of the physical device.
+ * @return true iff the device reports at least one hardware decompression algorithm.
  */
-bool query_hw_decompression()
+bool query_hw_decompression(std::string const& pci_bus_id)
 {
-  constexpr int min_hw_decompression_cuda_version = 12080;
-  int driver_version                              = 0;
-  return nvmlSystemGetCudaDriverVersion(&driver_version) == NVML_SUCCESS &&
-         driver_version >= min_hw_decompression_cuda_version;
+  if (pci_bus_id.empty()) { return false; }
+
+  CUdevice device = 0;
+  if (cuDeviceGetByPCIBusId(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) { return false; }
+
+  int algorithm_mask = 0;
+  if (cuDeviceGetAttribute(&algorithm_mask,
+                           CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
+                           device) != CUDA_SUCCESS) {
+    return false;
+  }
+  return algorithm_mask != 0;
 }
 
 /**
@@ -91,7 +115,6 @@ std::string read_file_content(std::string const& path)
   std::stringstream buffer;
   buffer << file.rdbuf();
   std::string content = buffer.str();
-  // Trim trailing newline
   if (!content.empty() && content.back() == '\n') { content.pop_back(); }
   return content;
 }
@@ -117,14 +140,12 @@ std::vector<int> parse_cpu_list(std::string const& cpulist)
   while (std::getline(iss, token, ',')) {
     size_t dash_pos = token.find('-');
     if (dash_pos != std::string::npos) {
-      // Range, e.g., "0-31"
       int start = std::stoi(token.substr(0, dash_pos));
       int end   = std::stoi(token.substr(dash_pos + 1));
       for (int i = start; i <= end; ++i) {
         cores.push_back(i);
       }
     } else {
-      // Single core, e.g., "5"
       cores.push_back(std::stoi(token));
     }
   }
@@ -150,7 +171,6 @@ std::string normalize_pci_bus_id(std::string const& pci_bus_id)
   std::string domain = pci_bus_id.substr(0, colon_pos);
   if (domain.length() > 4) { domain = domain.substr(domain.length() - 4); }
 
-  // Convert to lowercase
   std::string normalized_id = domain + pci_bus_id.substr(colon_pos);
   std::ranges::transform(normalized_id, normalized_id.begin(), ::tolower);
 
@@ -373,7 +393,6 @@ PciePathType get_pcie_path_type(std::string const& gpu_pci_id, std::string const
   std::string gpu_norm = normalize_pci_bus_id(gpu_pci_id);
   std::string nic_norm = normalize_pci_bus_id(nic_pci_id);
 
-  // Read NUMA nodes
   int gpu_numa = -1, nic_numa = -1;
   std::string gpu_numa_str = read_file_content("/sys/bus/pci/devices/" + gpu_norm + "/numa_node");
   std::string nic_numa_str = read_file_content("/sys/bus/pci/devices/" + nic_norm + "/numa_node");
@@ -381,7 +400,6 @@ PciePathType get_pcie_path_type(std::string const& gpu_pci_id, std::string const
   if (!gpu_numa_str.empty()) { gpu_numa = std::stoi(gpu_numa_str); }
   if (!nic_numa_str.empty()) { nic_numa = std::stoi(nic_numa_str); }
 
-  // If different NUMA nodes, it's a SYS connection
   if (gpu_numa != nic_numa && gpu_numa >= 0 && nic_numa >= 0) { return PciePathType::SYS; }
 
   // Use PCI bus number proximity as a heuristic for connection quality
@@ -556,7 +574,6 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
       NetworkDeviceWithTopology dev;
       dev.name = entry.path().filename().string();
 
-      // Get device's NUMA node and PCI bus ID
       std::string numa_path = entry.path().string() + "/device/numa_node";
       std::string numa_str  = read_file_content(numa_path);
       dev.numa_node         = numa_str.empty() ? -1 : std::stoi(numa_str);
@@ -586,7 +603,6 @@ std::vector<storage_device_info> discover_storage_devices_with_topology()
       dev.name = entry.path().filename().string();
       dev.type = StorageDriveType::NVME;
 
-      // Get device's NUMA node and PCI bus ID
       std::string numa_path = entry.path().string() + "/device/numa_node";
       std::string numa_str  = read_file_content(numa_path);
       dev.numa_node         = numa_str.empty() ? -1 : std::stoi(numa_str);
@@ -620,7 +636,6 @@ std::vector<std::string> map_network_devices_to_gpu(
 {
   std::vector<std::string> mapped_devices;
 
-  // Structure to hold NIC with its topology path type
   struct NicWithPath {
     std::string name;
     PciePathType path_type;
@@ -628,7 +643,6 @@ std::vector<std::string> map_network_devices_to_gpu(
 
   std::vector<NicWithPath> nics_with_paths;
 
-  // Query topology distance for each NIC
   for (auto const& dev : network_devices) {
     if (dev.pci_bus_id.empty()) {
       continue;  // Skip devices without PCI info
@@ -641,7 +655,6 @@ std::vector<std::string> map_network_devices_to_gpu(
     nics_with_paths.push_back(nic);
   }
 
-  // Find the best (lowest) path type
   if (nics_with_paths.empty()) { return mapped_devices; }
 
   PciePathType best_path_type = PciePathType::SYS;
@@ -649,19 +662,16 @@ std::vector<std::string> map_network_devices_to_gpu(
     if (nic.path_type < best_path_type) { best_path_type = nic.path_type; }
   }
 
-  // Return all NICs with the best path type
   for (auto const& nic : nics_with_paths) {
     if (nic.path_type == best_path_type) { mapped_devices.push_back(nic.name); }
   }
 
-  // If no devices found, fall back to NUMA-based mapping
   if (mapped_devices.empty()) {
     for (auto const& dev : network_devices) {
       if (dev.numa_node == gpu_numa_node) { mapped_devices.push_back(dev.name); }
     }
   }
 
-  // Last resort: return all devices
   if (mapped_devices.empty() && !network_devices.empty()) {
     for (auto const& dev : network_devices) {
       mapped_devices.push_back(dev.name);
@@ -819,7 +829,8 @@ nvmlReturn_t initialize_nvml_for_current_process()
 
 }  // namespace
 
-bool topology_discovery::discover(NetworkDeviceVerification net_verification)
+bool topology_discovery::discover(NetworkDeviceVerification net_verification,
+                                  bool with_runtime_attributes)
 {
   system_topology_info topology;
   // NVML is initialized exactly once per process. Calling nvmlInit_v2 +
@@ -840,7 +851,6 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     // Continue anyway to report system info even without GPUs
   }
 
-  // Get GPU count
   unsigned int device_count = 0;
   bool nvml_available       = false;
   if (result == NVML_SUCCESS) {
@@ -853,18 +863,15 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
     }
   }
 
-  // Discover network devices
   std::vector<NetworkDeviceWithTopology> network_devices_with_topology =
     discover_network_devices_with_topology(net_verification);
 
-  // Get system information
   topology.hostname            = get_hostname();
   topology.numa_nodes          = discover_numa_nodes();
   topology.num_numa_nodes      = static_cast<int>(topology.numa_nodes.size());
   topology.num_gpus            = device_count;
   topology.num_network_devices = static_cast<int>(network_devices_with_topology.size());
 
-  // Convert network devices to public format
   topology.network_devices.clear();
   for (auto const& dev : network_devices_with_topology) {
     network_device_info info;
@@ -876,7 +883,6 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 
   topology.storage_devices = discover_storage_devices_with_topology();
 
-  // Collect GPU information
   topology.gpus.clear();
 
   std::vector<gpu_topology_info> nvml_gpus;
@@ -983,22 +989,39 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification)
 
   auto visible_indices =
     resolve_visible_gpu_indices(nvml_gpus, nvml_index_by_pci, nvml_index_by_uuid);
-  auto const hw_decompression_available = query_hw_decompression();
-  topology.num_gpus                     = static_cast<unsigned int>(visible_indices.size());
+  topology.num_gpus = static_cast<unsigned int>(visible_indices.size());
   for (size_t visible_idx = 0; visible_idx < visible_indices.size(); ++visible_idx) {
     size_t nvml_idx = visible_indices[visible_idx];
     if (nvml_idx >= nvml_gpus.size()) { continue; }
-    auto gpu                       = nvml_gpus[nvml_idx];
-    gpu.id                         = static_cast<unsigned int>(visible_idx);
-    gpu.hw_decompression_available = hw_decompression_available;
+    auto gpu = nvml_gpus[nvml_idx];
+    gpu.id   = static_cast<unsigned int>(visible_idx);
     topology.gpus.push_back(std::move(gpu));
   }
 
   // Do not call nvmlShutdown here — NVML is initialized once per process via
   // the static-local in this function. See the comment at the top of discover().
 
+  if (with_runtime_attributes) { discover_runtime_attributes(topology); }
+
   _topology = std::move(topology);
   return true;
+}
+
+void topology_discovery::discover_runtime_attributes(system_topology_info& topology)
+{
+  // Currently only GPUs expose runtime attributes. New hardware classes should
+  // be enriched here so callers have a single entry point that isolates the
+  // "needs a CUDA driver call" side of discovery from the passive NVML/sysfs
+  // side handled by discover().
+  //
+  // Precondition: the CUDA driver API has already been initialized by the
+  // caller (cuInit(0), or any prior CUDA runtime call that transitively did so).
+  // This function does not call cuInit and does not create a CUDA context.
+  for (auto& gpu : topology.gpus) {
+    gpu_runtime_attributes attrs;
+    attrs.hw_decomp        = query_hw_decompression(gpu.pci_bus_id);
+    gpu.runtime_attributes = attrs;
+  }
 }
 
 }  // namespace cucascade::memory
