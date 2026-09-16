@@ -501,6 +501,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"gh:convert"};
   auto& gpu_source            = source.cast<gpu_table_representation>();
   const cudf::table_view view = gpu_source.get_table_view();
 
@@ -870,6 +871,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"gg:convert"};
   // Sync the caller's stream so the source table's buffers are stable on the source
   // device before we issue peer copies. The caller's stream is the one that produced
   // (or last touched) the source representation.
@@ -1527,6 +1529,7 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   [[maybe_unused]] ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"hd:convert"};
   auto& backend          = target_memory_space->get_io_backend();
   auto& host_source      = source.cast<host_data_representation>();
   const auto& host_table = host_source.get_host_table();
@@ -1573,6 +1576,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   [[maybe_unused]] ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"dh:convert"};
   auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
@@ -1647,6 +1651,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"gd:convert"};
   auto& backend       = target_memory_space->get_io_backend();
   auto& gpu_source    = source.cast<gpu_table_representation>();
   cudf::table_view tv = gpu_source.get_table_view();
@@ -1833,6 +1838,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"dg:convert"};
   auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
