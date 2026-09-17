@@ -21,11 +21,53 @@
 #include <rmm/cuda_device.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 
 namespace cucascade {
+namespace {
+
+using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
+
+struct wait_reader_events_message {
+  static constexpr char const* message{"wait:reader_events"};
+};
+
+struct wait_batch_write_lock_message {
+  static constexpr char const* message{"wait:batch_write_lock"};
+};
+
+struct wait_batch_read_lock_message {
+  static constexpr char const* message{"wait:batch_read_lock"};
+};
+
+std::unique_lock<std::shared_mutex> acquire_batch_write_lock(std::shared_mutex& mutex)
+{
+  std::unique_lock<std::shared_mutex> lock{mutex, std::try_to_lock};
+  if (!lock.owns_lock()) {
+    auto const& message =
+      nvtx3::registered_string_in<libcucascade_domain>::get<wait_batch_write_lock_message>();
+    nvtx_range const wait_range{message};
+    lock.lock();
+  }
+  return lock;
+}
+
+std::shared_lock<std::shared_mutex> acquire_batch_read_lock(std::shared_mutex& mutex)
+{
+  std::shared_lock<std::shared_mutex> lock{mutex, std::try_to_lock};
+  if (!lock.owns_lock()) {
+    auto const& message =
+      nvtx3::registered_string_in<libcucascade_domain>::get<wait_batch_read_lock_message>();
+    nvtx_range const wait_range{message};
+    lock.lock();
+  }
+  return lock;
+}
+
+}  // namespace
 
 // ========== data_batch implementation ==========
 
@@ -149,6 +191,16 @@ void data_batch::record_reader_event(::cuda::stream_ref reader_stream)
 void data_batch::synchronize_reader_events()
 {
   std::lock_guard<std::mutex> lock(_reader_events_mutex);
+  std::size_t pending_event_count = 0;
+  for (auto const& entry : _reader_event_pools) {
+    pending_event_count += entry.second.pending_event_count;
+  }
+  if (pending_event_count == 0) { return; }
+
+  auto const& message =
+    nvtx3::registered_string_in<libcucascade_domain>::get<wait_reader_events_message>();
+  nvtx_range const wait_range{message,
+                              nvtx3::payload{static_cast<std::uint64_t>(pending_event_count)}};
   for (auto& [device_id, pool] : _reader_event_pools) {
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
     for (std::size_t index = 0; index < pool.pending_event_count; ++index) {
@@ -218,7 +270,7 @@ std::shared_ptr<data_batch> data_batch::to_idle(mutable_data_batch&& accessor)
 read_only_data_batch data_batch::to_read_only()
 {
   auto self = shared_from_this();
-  std::shared_lock<std::shared_mutex> lock(_rw_mutex);
+  auto lock = acquire_batch_read_lock(_rw_mutex);
   return read_only_data_batch(std::move(self), std::move(lock));
 }
 
@@ -231,7 +283,7 @@ mutable_data_batch data_batch::to_mutable()
   // under the lock and retry.
   while (true) {
     synchronize_reader_events();
-    std::unique_lock<std::shared_mutex> lock(_rw_mutex);
+    auto lock = acquire_batch_write_lock(_rw_mutex);
     if (reader_events_complete()) { return mutable_data_batch(std::move(self), std::move(lock)); }
   }
 }
@@ -265,7 +317,7 @@ mutable_data_batch data_batch::readonly_to_mutable(read_only_data_batch&& access
   // Same drain-then-recheck pattern as to_mutable().
   while (true) {
     ptr->synchronize_reader_events();
-    std::unique_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+    auto lock = acquire_batch_write_lock(ptr->_rw_mutex);
     if (ptr->reader_events_complete()) {
       return mutable_data_batch(std::move(ptr), std::move(lock));
     }
@@ -279,7 +331,7 @@ read_only_data_batch data_batch::mutable_to_readonly(mutable_data_batch&& access
     // destructor frees the exclusive lock and sets state to idle
     auto _ = std::move(accessor);  // move into temporary, destroyed at }
   }
-  std::shared_lock<std::shared_mutex> lock(ptr->_rw_mutex);
+  auto lock = acquire_batch_read_lock(ptr->_rw_mutex);
   return read_only_data_batch(std::move(ptr), std::move(lock));
 }
 
