@@ -29,6 +29,7 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <set>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -202,8 +203,9 @@ builder_reference& reservation_manager_configurator::set_disk_mounting_point(
 std::vector<memory_space_config> reservation_manager_configurator::build() const
 {
   topology_discovery discovery;
-  [[maybe_unused]] bool status = discovery.discover();
-  assert(status);
+  if (!discovery.discover()) {
+    throw std::runtime_error("Failed to discover system topology");
+  }
   auto& topology = discovery.get_topology();
   return build(topology);
 }
