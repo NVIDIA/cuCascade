@@ -312,7 +312,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
 
   // CUDA events are device-associated, so each device needs an independent reusable pool.
   // mutable is for read_only case which holds `const data_batch`, but is OK because this
-  // internally uses a separate mutex.
+  // internally uses an independent mutex.
   mutable reader_event_pool_map _reader_event_pools;
 
   std::unique_ptr<idata_batch_probe> _probe;

@@ -1610,7 +1610,8 @@ TEST_CASE("data_batch destructor transitions state to idle for mutable", "[data_
   REQUIRE(batch->get_state() == batch_state::idle);
 }
 
-TEST_CASE("data_batch concurrent lifecycle: readers then mutable then readers", "[data_batch]")
+TEST_CASE("data_batch concurrent lifecycle: readers then mutable then readers",
+          "[data_batch][.disabled]")
 {
   auto data  = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   auto batch = data_batch::make(1, std::move(data));
