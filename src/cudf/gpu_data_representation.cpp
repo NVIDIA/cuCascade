@@ -58,13 +58,8 @@ gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> 
   : idata_representation(memory_space), _table(std::move(table))
 {
   // STREAM-LINEAGE: record the writer event in the constructor body so every
-  // representation is born with a recorded event. Skipping when the caller
-  // passes a default-constructed (per-thread default) stream view preserves
-  // legacy behavior for callers that genuinely have no writer stream — they
-  // will fall back to cudaDeviceSynchronize on the source device in
-  // convert_gpu_to_gpu(). All non-legacy callers MUST pass a real writer
-  // stream.
-  if (writer_stream.get() != nullptr) { record_writer_event(writer_stream); }
+  // representation is born with a recorded event, including on the CUDA default stream.
+  record_writer_event(writer_stream);
 }
 
 gpu_table_representation::~gpu_table_representation()
@@ -105,11 +100,13 @@ std::unique_ptr<cudf::table> gpu_table_representation::release_table(::cuda::str
   if (std::holds_alternative<owning_table_view>(_table)) {
     // The deep copy below is enqueued on `stream`, and its buffers are bound to it.
     validate_stream_device(stream, get_device_id());
+    cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
     _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
   } else {
     // Rebind so the returned table's frees stay stream-ordered behind the caller's reads.
     // rebind_stream() applies the same device guard, so this branch needs no separate check.
     gpu_table_representation::rebind_stream(stream);
+    cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
   }
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
 }
@@ -138,6 +135,7 @@ void gpu_table_representation::rebind_stream(::cuda::stream_ref stream)
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone(::cuda::stream_ref stream)
 {
+  cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
   // Create a deep copy of the cuDF table using the provided stream.
   // STREAM-LINEAGE: the clone has been written by `stream`; record an event on
   // it so any cross-stream/cross-device reader of the clone honors the
