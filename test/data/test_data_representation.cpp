@@ -39,6 +39,7 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/aligned.hpp>
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -168,6 +169,34 @@ TEST_CASE("gpu_table_representation Construction", "[gpu_data_representation]")
   REQUIRE(repr.get_size_in_bytes() > 0);
 }
 
+TEST_CASE("gpu_table_representation constructors record the default stream",
+          "[gpu_data_representation][stream]")
+{
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+  auto gpu_space            = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto const default_stream = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}};
+
+  SECTION("owning table")
+  {
+    auto table = create_simple_cudf_table(4, gpu_space->get_default_allocator());
+    gpu_table_representation repr(
+      std::make_unique<cudf::table>(std::move(table)), *gpu_space, default_stream);
+    REQUIRE(repr.get_writer_event() != nullptr);
+  }
+
+  SECTION("view-backed table")
+  {
+    auto owner = std::make_shared<cudf::table>(
+      create_simple_cudf_table(4, gpu_space->get_default_allocator()));
+    gpu_table_representation repr(owner->view(),
+                                  std::shared_ptr<cudf::table>{owner},
+                                  owner->alloc_size(),
+                                  *gpu_space,
+                                  default_stream);
+    REQUIRE(repr.get_writer_event() != nullptr);
+  }
+}
+
 TEST_CASE("gpu_table_representation get_size_in_bytes", "[gpu_data_representation]")
 {
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
@@ -259,6 +288,7 @@ TEST_CASE("gpu_table_representation device_id", "[gpu_data_representation]")
       return;
     }
 
+    rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{1}};
     auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 1);
     auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
     gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),

@@ -23,6 +23,8 @@
 #include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <string>
 
 namespace cucascade {
@@ -58,13 +60,8 @@ gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> 
   : idata_representation(memory_space), _table(std::move(table))
 {
   // STREAM-LINEAGE: record the writer event in the constructor body so every
-  // representation is born with a recorded event. Skipping when the caller
-  // passes a default-constructed (per-thread default) stream view preserves
-  // legacy behavior for callers that genuinely have no writer stream — they
-  // will fall back to cudaDeviceSynchronize on the source device in
-  // convert_gpu_to_gpu(). All non-legacy callers MUST pass a real writer
-  // stream.
-  if (writer_stream.get() != nullptr) { record_writer_event(writer_stream); }
+  // representation is born with a recorded event, including on the default stream.
+  record_writer_event(writer_stream);
 }
 
 gpu_table_representation::~gpu_table_representation()
@@ -105,7 +102,23 @@ std::unique_ptr<cudf::table> gpu_table_representation::release_table(::cuda::str
   if (std::holds_alternative<owning_table_view>(_table)) {
     // The deep copy below is enqueued on `stream`, and its buffers are bound to it.
     validate_stream_device(stream, get_device_id());
-    _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{get_device_id()}};
+    if (_writer_event != nullptr) {
+      cuda::cuda_event_view{_writer_event}.wait(stream);
+    } else {
+      CUCASCADE_CUDA_TRY(::cudaDeviceSynchronize());
+    }
+
+    try {
+      auto materialized = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view,
+                                                        stream,
+                                                        get_memory_space().get_default_allocator());
+      stream.sync();
+      _table = std::move(materialized);
+    } catch (...) {
+      CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaStreamSynchronize(stream.get()));
+      throw;
+    }
   } else {
     // Rebind so the returned table's frees stay stream-ordered behind the caller's reads.
     // rebind_stream() applies the same device guard, so this branch needs no separate check.
@@ -142,10 +155,24 @@ std::unique_ptr<idata_representation> gpu_table_representation::clone(::cuda::st
   // STREAM-LINEAGE: the clone has been written by `stream`; record an event on
   // it so any cross-stream/cross-device reader of the clone honors the
   // producer-consumer ordering established by record_writer_event().
-  cudf::table_view view = get_table_view();
-  auto cloned           = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(view, stream), get_memory_space(), stream);
-  return cloned;
+  validate_stream_device(stream, get_device_id());
+  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{get_device_id()}};
+  if (_writer_event != nullptr) {
+    cuda::cuda_event_view{_writer_event}.wait(stream);
+  } else {
+    CUCASCADE_CUDA_TRY(::cudaDeviceSynchronize());
+  }
+
+  try {
+    auto cloned_table = std::make_unique<cudf::table>(
+      get_table_view(), stream, get_memory_space().get_default_allocator());
+    stream.sync();
+    return std::make_unique<gpu_table_representation>(
+      std::move(cloned_table), get_memory_space(), stream);
+  } catch (...) {
+    CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaStreamSynchronize(stream.get()));
+    throw;
+  }
 }
 
 void gpu_table_representation::record_writer_event(::cuda::stream_ref writer_stream)
@@ -153,7 +180,16 @@ void gpu_table_representation::record_writer_event(::cuda::stream_ref writer_str
   // STREAM-LINEAGE: lazily create the event on first call (cudaEventDisableTiming —
   // used solely for cross-stream ordering, never for elapsed-time queries).
   if (_writer_event == nullptr) {
-    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&_writer_event, cudaEventDisableTiming));
+    cudaEvent_t new_event = nullptr;
+    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&new_event, cudaEventDisableTiming));
+    try {
+      cucascade::cuda::cuda_event_view{new_event}.record(writer_stream);
+    } catch (...) {
+      CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(new_event));
+      throw;
+    }
+    _writer_event = new_event;
+    return;
   }
   cucascade::cuda::cuda_event_view{_writer_event}.record(writer_stream);
 }
