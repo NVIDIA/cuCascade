@@ -45,6 +45,22 @@ option(
   "Build the S3 parquet benchmark (requires aws-sdk-cpp; NOT a cuCascade dependency)"
   OFF)
 
+# Compile-time floor for the CUCASCADE_LOG_* macros, as the underlying value of
+# a cucascade::log::level (0 = trace ... 6 = off). The default keeps every call
+# site and leaves filtering to the runtime threshold; raising it strips the
+# cheaper levels from the binary entirely.
+#
+# Propagated PUBLIC because consumers expand the same macros. That is safe even
+# if a consumer overrides it: the definition is read only inside the macros, not
+# inside any inline function body or type, so a mismatch prunes call sites
+# differently rather than violating the ODR.
+set(CUCASCADE_MIN_LOG_LEVEL
+    "0"
+    CACHE
+      STRING
+      "Compile out CUCASCADE_LOG_* call sites below this level (0=trace, 1=debug, 2=info, 3=warn, 4=error, 5=fatal, 6=off)"
+)
+
 # Swappable third-party backends for the io layer. The io code was ported from a
 # codebase with its own vendored dependencies. These knobs let an embedding host
 # (e.g. sirius) reuse the copies it already links instead of the
@@ -342,6 +358,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_subdirectory(src/cuda)
 endif()
 add_subdirectory(src/memory)
+add_subdirectory(src/log)
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_subdirectory(src/data)
 endif()
@@ -358,6 +375,13 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
+# Carried by every target that exposes include/cucascade/log/logging.hpp. The
+# object libraries need it for cuCascade's own call sites; the installable
+# static/shared targets are assembled from $<TARGET_OBJECTS:...> rather than by
+# linking, so PUBLIC usage requirements do not flow across and must be repeated.
+set(CUCASCADE_PUBLIC_COMPILE_DEFS
+    CUCASCADE_MIN_LOG_LEVEL=${CUCASCADE_MIN_LOG_LEVEL})
+
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static CUDA::nvtx3
                                  Threads::Threads Numa::Numa)
@@ -365,6 +389,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   # Set include directories for the object library
   target_include_directories(cucascade_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_definitions(cucascade_objects
+                             PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
 
   # Link dependencies to object library
   target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
@@ -429,6 +455,8 @@ endif()
 
 target_include_directories(cucascade_topology_discovery_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+target_compile_definitions(cucascade_topology_discovery_objects
+                           PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
 target_link_libraries(cucascade_topology_discovery_objects
                       PUBLIC CUDA::nvml_static CUDA::cuda_driver)
 target_compile_features(cucascade_topology_discovery_objects PUBLIC cxx_std_20)
@@ -451,6 +479,8 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
                         PRIVATE CUDA::nvml_static CUDA::cuda_driver)
   target_include_directories(cucascade_topology_discovery_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_definitions(cucascade_topology_discovery_static
+                             PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
   target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
   # Work around a bug in libnvidia-ml.so - it attempts to call back into the
   # stub library (https://nvbugspro.nvidia.com/bug/6174166)
@@ -468,6 +498,8 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
 
     target_include_directories(cucascade_static
                                PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+    target_compile_definitions(cucascade_static
+                               PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
     target_link_libraries(
       cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
                               cucascade_topology_discovery_static)
@@ -529,6 +561,8 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
                         PRIVATE CUDA::nvml_static CUDA::cuda_driver)
   target_include_directories(cucascade_topology_discovery_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_definitions(cucascade_topology_discovery_shared
+                             PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
   target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)
   # Work around a bug in libnvidia-ml.so - it attempts to call back into the
   # stub library (https://nvbugspro.nvidia.com/bug/6174166)
@@ -544,6 +578,8 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
 
     target_include_directories(cucascade_shared
                                PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+    target_compile_definitions(cucascade_shared
+                               PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
     target_link_libraries(
       cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
                               cucascade_topology_discovery_shared)
