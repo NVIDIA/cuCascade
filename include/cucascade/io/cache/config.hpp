@@ -23,7 +23,10 @@
 namespace cucascade::io::cache {
 
 struct config {
-  size_t inflight_io_chunk_budget = 2048;
+  // Maximum number of in-flight prefetch IO *tasks* (not chunks): the prefetch
+  // loop reserves one unit per dispatched read task and releases it on
+  // completion, so this caps how many prefetch reads are outstanding at once.
+  size_t inflight_io_chunk_budget = 16;
   double min_prefetching_budget_fraction{0.05};
   double eviction_threshold_fraction{0.6};
   bool dispose_after_use = false;
