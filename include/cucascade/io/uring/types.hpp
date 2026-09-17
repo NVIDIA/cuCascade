@@ -18,12 +18,12 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 

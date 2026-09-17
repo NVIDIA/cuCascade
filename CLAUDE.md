@@ -34,8 +34,8 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Lockfile: `pixi.lock` (committed)
 - Channels: `rapidsai-nightly`, `conda-forge` (default); `rapidsai`, `conda-forge` (cudf-stable feature)
 ## Frameworks
-- RMM (RAPIDS Memory Manager) - GPU/host memory resource abstraction; provides `rmm::mr::device_memory_resource`, `rmm::cuda_stream_view`, `rmm::out_of_memory`, `rmm::bad_alloc`; pulled in via `find_package(rmm REQUIRED CONFIG)` from libcudf installation
-- libcudf 26.08 (nightly) / 26.06 (stable) - Columnar data representation for the **`cucascade-cudf` layer only** (not the core); provides `cudf::table`, `cudf::column`, `cudf::type_id`, `cudf::pack`/`unpack`; pulled in via `find_package(cudf REQUIRED CONFIG)`, gated on `CUCASCADE_BUILD_CUDF`
+- RMM (RAPIDS Memory Manager) - GPU/host memory resource abstraction; provides `rmm::mr::device_memory_resource`, `::cuda::stream_ref`, `rmm::out_of_memory`, `rmm::bad_alloc`; pulled in via `find_package(rmm REQUIRED CONFIG)` from libcudf installation
+- libcudf 26.12 (nightly) / 26.06 (stable) - Columnar data representation for the **`cucascade-cudf` layer only** (not the core); provides `cudf::table`, `cudf::column`, `cudf::type_id`, `cudf::pack`/`unpack`; pulled in via `find_package(cudf REQUIRED CONFIG)`, gated on `CUCASCADE_BUILD_CUDF`
 - Catch2 v2.13.10 - Unit test framework; fetched via `FetchContent` in `test/CMakeLists.txt`; test executable: `cucascade_tests`
 - Google Benchmark v1.8.3 - Microbenchmark framework; fetched via `FetchContent` in `benchmark/CMakeLists.txt`; benchmark executable: `cucascade_benchmarks`
 - Ninja - Build generator (configured in `CMakePresets.json`)
@@ -46,16 +46,16 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - codespell v2.4.1 - Spell checking via pre-commit (ignore list: `.codespell_words`)
 - Doxygen - API documentation generation; config: `Doxyfile`; output parsed by `scripts/generate_api_docs.py`
 ## Key Dependencies
-- `libcudf` 26.08 / 26.06 - Data representation for the `cucascade-cudf` layer (not the cudf-free core); `cudf::table` is the GPU-tier data container; all column type handling (LIST, STRUCT, STRING, DICTIONARY32, etc.) delegates to cudf
-- `RMM` (via cudf) - `rmm::mr::device_memory_resource` is the base class for all custom allocators; `rmm::cuda_stream_view` is used throughout for CUDA stream propagation
+- `libcudf` 26.12 / 26.06 - Data representation for the `cucascade-cudf` layer (not the cudf-free core); `cudf::table` is the GPU-tier data container; all column type handling (LIST, STRUCT, STRING, DICTIONARY32, etc.) delegates to cudf
+- `RMM` (via cudf) - `rmm::mr::device_memory_resource` is the base class for all custom allocators; `::cuda::stream_ref` is used throughout for CUDA stream propagation
 - `CUDA::cudart` - Direct CUDA runtime API calls (`cudaMalloc`, `cudaMemcpyAsync`, `cudaStreamSynchronize`, `cudaFree`, `cudaMallocHost`, `cudaFreeHost`)
 - `CUDA::nvml` - GPU topology discovery via NVML in `src/memory/topology_discovery.cpp`
-- `kvikio` 26.08 / 26.06 - Async disk I/O with automatic GDS/POSIX fallback; used in `src/data/kvikio_io_backend.cpp` via `kvikio::FileHandle`; linked PRIVATE via `kvikio::kvikio`
+- `kvikio` 26.12 / 26.06 - Async disk I/O with automatic GDS/POSIX fallback; used in `src/data/kvikio_io_backend.cpp` via `kvikio::FileHandle`; linked PRIVATE via `kvikio::kvikio`
 - `libcufile` (cuFile / GDS) - NVIDIA GPUDirect Storage for direct GPU↔NVMe transfers; `<cufile.h>` used in `src/data/gds_io_backend.cpp`; found via `find_library(CUFILE_LIB cufile ...)` — optional at configure time, required at runtime for GDS backend
 - `libnuma` - NUMA-aware pinned host memory allocation in `src/memory/numa_region_pinned_host_allocator.cpp`; found via `find_library(NUMA_LIB numa REQUIRED)`
 - `Threads::Threads` (pthreads) - Thread support; `std::mutex`, `std::condition_variable`, `std::async` throughout
 - `fmt` - Format library (pixi dependency; available in environment)
-- `nvtx3::nvtx3-cpp` - NVIDIA NVTX profiling annotations; only linked when `CUCASCADE_NVTX=ON`; used via `CUCASCADE_FUNC_RANGE()` macro in `include/cucascade/error.hpp`
+- `CUDA::nvtx3` - Header-only NVIDIA NVTX profiling annotations; ranges use the `libcucascade` domain and become active when a profiler injects NVTX tooling
 ## Configuration
 - `CUDAARCHS` - Set by pixi environment activation to select CUDA architecture targets
 - `CMAKE_PREFIX_PATH` - Passed through from pixi environment for dependency resolution
@@ -63,7 +63,6 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `CUCASCADE_BUILD_BENCHMARKS` (default ON) - Adds `benchmark/` subdirectory
 - `CUCASCADE_BUILD_SHARED_LIBS` (default ON) - Builds `libcucascade.so`
 - `CUCASCADE_BUILD_STATIC_LIBS` (default ON) - Builds `libcucascade.a`
-- `CUCASCADE_NVTX` (default OFF) - Enables NVTX profiling ranges
 - `CUCASCADE_BUILD_CUDF` (default ON) - Builds the cudf-coupled `cucascade-cudf` library (cudf representations, built-in converters, bandwidth profiler) and gates `find_package(cudf)`; OFF yields a cudf-free core build
 - `CUCASCADE_WARNINGS_AS_ERRORS` (default ON) - Treats all compiler warnings as errors
 - `debug` → `build/debug/`
@@ -203,15 +202,15 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `std::derived_from` concept in `requires` clauses: `requires std::derived_from<TargetType, idata_representation>`
 - `static_assert` with `std::is_base_of_v` at template registration sites
 - `[[nodiscard]]` attribute on getters
-- `[[maybe_unused]]` on interface default parameters (e.g., `clone([[maybe_unused]] rmm::cuda_stream_view stream)`)
+- `[[maybe_unused]]` on interface default parameters (e.g., `clone([[maybe_unused]] ::cuda::stream_ref stream)`)
 - Structured bindings: `auto [free_bytes, total_bytes] = rmm::available_device_memory();`
 - `std::span` (in memory layer)
 - Three-way comparison `<=>` (in `include/cucascade/memory/common.hpp`)
 ## NVTX Profiling
-- Enabled via `CUCASCADE_NVTX` CMake option (default OFF)
-- `CUCASCADE_FUNC_RANGE()` macro at function entry points for profiling
+- Always-compiled, with negligible overhead until a profiler injects NVTX tooling
+- `CUCASCADE_FUNC_RANGE()` macro at function entry points and named scoped ranges for profiling
 - Custom domain: `cucascade::libcucascade_domain` (in `include/cucascade/error.hpp`)
-- Links `nvtx3::nvtx3-cpp` when enabled
+- Links the header-only `CUDA::nvtx3` target
 <!-- GSD:conventions-end -->
 
 <!-- GSD:architecture-start source:ARCHITECTURE.md -->
@@ -366,7 +365,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `data_batch::convert_to()` and `clone_to()` assert `_processing_count == 0` before allowing representation swap
 - `pop_data_batch(batch_state::processing)` throws immediately — callers must use `task_created` + `try_to_lock_for_processing()`
 - `disk_data_representation::clone()` always throws `cucascade::logic_error` — disk representations must be materialized to another tier via converter
-- `CUCASCADE_FUNC_RANGE()` macro emits NVTX range when `CUCASCADE_NVTX` compile definition is present
+- `CUCASCADE_FUNC_RANGE()` emits an NVTX range in the `libcucascade` domain
 - Custom domain: `cucascade::libcucascade_domain` (defined in `include/cucascade/error.hpp`)
 <!-- GSD:architecture-end -->
 

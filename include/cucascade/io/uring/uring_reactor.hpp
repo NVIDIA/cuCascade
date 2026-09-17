@@ -192,7 +192,7 @@ class uring_reactor {
                                                  uint8_t* dst,
                                                  size_t offset,
                                                  size_t size,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  int device_id);
 
   static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
@@ -201,7 +201,7 @@ class uring_reactor {
                                                          uint8_t* dst,
                                                          size_t offset,
                                                          size_t size,
-                                                         rmm::cuda_stream_view stream,
+                                                         ::cuda::stream_ref stream,
                                                          int device_id);
 
   /// Build a host-read request that fuses runs of contiguous segments sharing

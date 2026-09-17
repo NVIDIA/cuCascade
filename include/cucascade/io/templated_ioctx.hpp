@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
@@ -26,7 +27,6 @@
 #include <cucascade/log/logging.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <algorithm>
@@ -134,7 +134,7 @@ concept reactor_has_device_rx = requires(R r,
                                          uint8_t* dst,
                                          size_t offset,
                                          size_t size,
-                                         rmm::cuda_stream_view stream) {
+                                         ::cuda::stream_ref stream) {
   {
     r.prep_device_rx_request(cfg, file, dst, offset, size, stream, 1)
   } -> std::same_as<typename R::request_type_ptr>;
@@ -147,7 +147,7 @@ concept reactor_has_host_to_device_rx = requires(R r,
                                                  uint8_t* dst,
                                                  size_t offset,
                                                  size_t size,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  std::span<io_object_segment> bounce) {
   {
     r.prep_host_to_device_rx_request(cfg, file, bounce, dst, offset, size, stream, 1)
@@ -357,7 +357,7 @@ class templated_ioctx : public ioctx {
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
-                                                 rmm::cuda_stream_view stream) noexcept override
+                                                 ::cuda::stream_ref stream) noexcept override
   {
     if constexpr (reactor_traits_t::supports_device_read) {
       try {
@@ -380,6 +380,7 @@ class templated_ioctx : public ioctx {
                       });
         return semi;
       } catch (...) {
+        on_device_dispatch_failure();
         return exec::make_semi_future<size_t>(std::current_exception());
       }
     } else {
@@ -388,13 +389,33 @@ class templated_ioctx : public ioctx {
     }
   }
 
+ protected:
+  /**
+   * @brief Applies backend policy after synchronous device dispatch fails.
+   *
+   * Called from the exception handlers in device_read_async_io() and
+   * host_to_device_read_async_io(), before the exception is returned through
+   * an errored future.
+   *
+   * An S3-over-RDMA backend overrides this hook to check for a sticky CUDA
+   * context error. Returning such an error as an ordinary request failure
+   * could allow registered GPU memory to be reused or released before RDMA
+   * writes and CUDA work are known to be quiescent. In that case the backend
+   * must invoke its fatal policy instead of returning.
+   *
+   * The default implementation does nothing. An override must not throw or
+   * re-enter this ioctx.
+   */
+  virtual void on_device_dispatch_failure() noexcept {}
+
+ public:
   exec::semi_future<size_t> host_to_device_read_async_io(
     const io_object& obj,
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
     uint8_t* dst,
-    rmm::cuda_stream_view stream) noexcept override
+    ::cuda::stream_ref stream) noexcept override
   {
     if constexpr (reactor_traits_t::supports_host_to_device_read) {
       try {
@@ -417,6 +438,7 @@ class templated_ioctx : public ioctx {
                       });
         return semi;
       } catch (...) {
+        on_device_dispatch_failure();
         return exec::make_semi_future<size_t>(std::current_exception());
       }
     } else {

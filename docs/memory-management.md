@@ -232,9 +232,9 @@ The `oom_handling_policy` interface provides a hook for custom recovery:
 
 ```cpp
 struct oom_handling_policy {
-    using RetryFunc = std::function<void*(std::size_t, rmm::cuda_stream_view)>;
+    using RetryFunc = std::function<void*(std::size_t, ::cuda::stream_ref)>;
 
-    void* handle_oom(std::size_t bytes, rmm::cuda_stream_view stream,
+    void* handle_oom(std::size_t bytes, ::cuda::stream_ref stream,
                      std::exception_ptr eptr, RetryFunc retry_function);
 };
 ```

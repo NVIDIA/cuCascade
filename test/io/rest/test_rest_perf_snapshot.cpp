@@ -17,8 +17,8 @@
  */
 
 #include "loopback_range_server.hpp"
+#include "mock_authorizer.hpp"
 
-#include <cucascade/io/rest/mock_authorizer.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
@@ -523,7 +523,7 @@ TEST_CASE("device read records h2d timings", "[rest][perf][gpu]")
   rmm::cuda_stream stream;
 
   auto future =
-    fixture.ioctx->device_read_async_io(*object, 0, payload.size(), device.data(), stream.view());
+    fixture.ioctx->device_read_async_io(*object, 0, payload.size(), device.data(), stream);
   REQUIRE(std::move(future).get(5s) == payload.size());
   stream.synchronize();
 

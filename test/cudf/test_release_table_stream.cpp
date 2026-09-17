@@ -18,6 +18,7 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -30,10 +31,10 @@
 #include <cudf/column/column_stream.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/version_config.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
@@ -88,13 +89,13 @@ auto& async_gpu_space()
   return s;
 }
 
-rmm::cuda_stream_view shared_stream()
+::cuda::stream_ref shared_stream()
 {
   static rmm::cuda_stream s;
   return s.view();
 }
 
-std::unique_ptr<cudf::table> make_patterned_table(rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::table> make_patterned_table(::cuda::stream_ref stream)
 {
   auto const num_rows = cudf::size_type{257};  // not a multiple of 8: partial mask byte
 
@@ -106,7 +107,7 @@ std::unique_ptr<cudf::table> make_patterned_table(rmm::cuda_stream_view stream)
                                      int_values.data(),
                                      int_values.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     stream.value()));
+                                     stream.get()));
 
   std::vector<int32_t> host_offsets(static_cast<std::size_t>(num_rows) + 1);
   std::vector<char> host_chars;
@@ -123,8 +124,8 @@ std::unique_ptr<cudf::table> make_patterned_table(rmm::cuda_stream_view stream)
                                      host_offsets.data(),
                                      host_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     stream.value()));
-  stream.synchronize();
+                                     stream.get()));
+  stream.sync();
   auto str_col = cudf::make_strings_column(
     num_rows, std::move(offsets_col), std::move(dev_chars), 0, rmm::device_buffer{});
 
@@ -133,29 +134,39 @@ std::unique_ptr<cudf::table> make_patterned_table(rmm::cuda_stream_view stream)
   CUCASCADE_CUDA_TRY(cudaMemsetAsync(const_cast<void*>(long_col->mutable_view().head()),
                                      0x5A,
                                      static_cast<std::size_t>(num_rows) * sizeof(int64_t),
-                                     stream.value()));
+                                     stream.get()));
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(int_col));
   cols.push_back(std::move(str_col));
   cols.push_back(std::move(long_col));
-  stream.synchronize();
+  stream.sync();
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
 void expect_column_buffers_bound_to(std::unique_ptr<cudf::column> col,
-                                    rmm::cuda_stream_view expected,
+                                    ::cuda::stream_ref expected,
                                     int& buffers_checked)
 {
   auto contents = col->release();
   if (contents.data && contents.data->size() > 0) {
-    CAPTURE(contents.data->stream().value(), expected.value());
-    CHECK(contents.data->stream().value() == expected.value());
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+    auto actual_stream = contents.data->stream().get();
+#else
+    auto actual_stream = contents.data->stream().value();
+#endif
+    CAPTURE(actual_stream, expected.get());
+    CHECK(actual_stream == expected.get());
     ++buffers_checked;
   }
   if (contents.null_mask && contents.null_mask->size() > 0) {
-    CAPTURE(contents.null_mask->stream().value(), expected.value());
-    CHECK(contents.null_mask->stream().value() == expected.value());
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+    auto actual_stream = contents.null_mask->stream().get();
+#else
+    auto actual_stream = contents.null_mask->stream().value();
+#endif
+    CAPTURE(actual_stream, expected.get());
+    CHECK(actual_stream == expected.get());
     ++buffers_checked;
   }
   for (auto& child : contents.children) {
@@ -164,7 +175,7 @@ void expect_column_buffers_bound_to(std::unique_ptr<cudf::column> col,
 }
 
 /// Destructive; returns #buffers checked so callers can REQUIRE a non-vacuous minimum.
-int expect_table_buffers_bound_to(cudf::table& table, rmm::cuda_stream_view expected)
+int expect_table_buffers_bound_to(cudf::table& table, ::cuda::stream_ref expected)
 {
   int buffers_checked = 0;
   auto columns        = table.release();
@@ -289,8 +300,8 @@ TEST_CASE("released table freed mid-read is not recycled under the read (Q18 UAF
                                        host_values.data(),
                                        payload_bytes,
                                        cudaMemcpyHostToDevice,
-                                       shared_stream().value()));
-    shared_stream().synchronize();
+                                       shared_stream().get()));
+    shared_stream().sync();
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.push_back(std::move(src_col));
     auto gpu_rep0 = std::make_unique<gpu_table_representation>(
@@ -401,13 +412,13 @@ TEST_CASE("release_table accepts every same-device stream handle",
   rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
 
   rmm::cuda_stream explicit_stream;
-  std::vector<rmm::cuda_stream_view> const streams{rmm::cuda_stream_default,
-                                                   rmm::cuda_stream_per_thread,
-                                                   rmm::cuda_stream_legacy,
-                                                   explicit_stream.view()};
+  std::vector<::cuda::stream_ref> const streams{::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                                                rmm::cuda_stream_per_thread,
+                                                rmm::cuda_stream_legacy,
+                                                explicit_stream.view()};
 
   for (auto const& stream : streams) {
-    CAPTURE(stream.value());
+    CAPTURE(stream.get());
     // release_table() moves the table out, so each iteration needs its own. Only the guard is
     // under test here, so a minimal table suffices -- make_patterned_table would add two host
     // syncs and per-row string building per iteration for no extra coverage.

@@ -39,10 +39,10 @@ namespace {
  * passing one while another device is current is rejected too — that call would have been
  * cross-device just the same.
  */
-void validate_stream_device(rmm::cuda_stream_view stream, int expected_device)
+void validate_stream_device(::cuda::stream_ref stream, int expected_device)
 {
   int stream_device = -1;
-  CUCASCADE_CUDA_TRY(::cudaStreamGetDevice(stream.value(), &stream_device));
+  CUCASCADE_CUDA_TRY(::cudaStreamGetDevice(stream.get(), &stream_device));
   if (stream_device != expected_device) {
     CUCASCADE_FAIL("stream belongs to CUDA device " + std::to_string(stream_device) +
                    " but this representation's memory lives on device " +
@@ -54,7 +54,7 @@ void validate_stream_device(rmm::cuda_stream_view stream, int expected_device)
 
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
                                                    cucascade::memory::memory_space& memory_space,
-                                                   rmm::cuda_stream_view writer_stream)
+                                                   ::cuda::stream_ref writer_stream)
   : idata_representation(memory_space), _table(std::move(table))
 {
   // STREAM-LINEAGE: record the writer event in the constructor body so every
@@ -64,7 +64,7 @@ gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> 
   // will fall back to cudaDeviceSynchronize on the source device in
   // convert_gpu_to_gpu(). All non-legacy callers MUST pass a real writer
   // stream.
-  if (writer_stream.value() != nullptr) { record_writer_event(writer_stream); }
+  if (writer_stream.get() != nullptr) { record_writer_event(writer_stream); }
 }
 
 gpu_table_representation::~gpu_table_representation()
@@ -100,7 +100,7 @@ cudf::table_view gpu_table_representation::get_table_view() const
   }
 }
 
-std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::table> gpu_table_representation::release_table(::cuda::stream_ref stream)
 {
   if (std::holds_alternative<owning_table_view>(_table)) {
     // The deep copy below is enqueued on `stream`, and its buffers are bound to it.
@@ -114,7 +114,7 @@ std::unique_ptr<cudf::table> gpu_table_representation::release_table(rmm::cuda_s
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
 }
 
-void gpu_table_representation::rebind_stream(rmm::cuda_stream_view stream)
+void gpu_table_representation::rebind_stream(::cuda::stream_ref stream)
 {
   // Only the owned-table alternative can be rebound: the owning_table_view alternative
   // references memory owned by an external (type-erased) owner, which manages its own
@@ -136,7 +136,7 @@ void gpu_table_representation::rebind_stream(rmm::cuda_stream_view stream)
   table = std::make_unique<cudf::table>(std::move(columns));
 }
 
-std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_stream_view stream)
+std::unique_ptr<idata_representation> gpu_table_representation::clone(::cuda::stream_ref stream)
 {
   // Create a deep copy of the cuDF table using the provided stream.
   // STREAM-LINEAGE: the clone has been written by `stream`; record an event on
@@ -148,7 +148,7 @@ std::unique_ptr<idata_representation> gpu_table_representation::clone(rmm::cuda_
   return cloned;
 }
 
-void gpu_table_representation::record_writer_event(rmm::cuda_stream_view writer_stream)
+void gpu_table_representation::record_writer_event(::cuda::stream_ref writer_stream)
 {
   // STREAM-LINEAGE: lazily create the event on first call (cudaEventDisableTiming —
   // used solely for cross-stream ordering, never for elapsed-time queries).

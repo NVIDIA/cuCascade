@@ -115,11 +115,11 @@ void data_batch::reader_event_pool_map::recycle_completed_reader_events(
   }
 }
 
-void data_batch::reader_event_pool_map::record_reader_event(rmm::cuda_stream_view reader_stream)
+void data_batch::reader_event_pool_map::record_reader_event(::cuda::stream_ref reader_stream)
 {
   int reader_device = -1;
   try {
-    CUCASCADE_CUDA_TRY(::cudaStreamGetDevice(reader_stream.value(), &reader_device));
+    CUCASCADE_CUDA_TRY(::cudaStreamGetDevice(reader_stream.get(), &reader_device));
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{reader_device}};
     std::lock_guard<std::mutex> lock(reader_events_mutex);
     auto& pool = reader_event_pools[reader_device];
@@ -136,9 +136,9 @@ void data_batch::reader_event_pool_map::record_reader_event(rmm::cuda_stream_vie
     // otherwise the caller could release the shared lock with an untracked read still in flight.
     if (reader_device >= 0) {
       rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{reader_device}};
-      CUCASCADE_CUDA_TRY(::cudaStreamSynchronize(reader_stream.value()));
+      CUCASCADE_CUDA_TRY(::cudaStreamSynchronize(reader_stream.get()));
     } else {
-      CUCASCADE_CUDA_TRY(::cudaStreamSynchronize(reader_stream.value()));
+      CUCASCADE_CUDA_TRY(::cudaStreamSynchronize(reader_stream.get()));
     }
     throw;
   }
@@ -330,9 +330,7 @@ read_only_data_batch::~read_only_data_batch()
 }
 
 std::shared_ptr<data_batch> read_only_data_batch::clone(
-  uint64_t new_batch_id,
-  rmm::cuda_stream_view stream,
-  std::unique_ptr<idata_batch_probe> probe) const
+  uint64_t new_batch_id, ::cuda::stream_ref stream, std::unique_ptr<idata_batch_probe> probe) const
 {
   if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
   auto cloned_data = _batch->_data->clone(stream);
@@ -377,15 +375,13 @@ mutable_data_batch::~mutable_data_batch()
   }
 }
 
-void mutable_data_batch::rebind_stream(rmm::cuda_stream_view stream)
+void mutable_data_batch::rebind_stream(::cuda::stream_ref stream)
 {
   if (auto* repr = _batch->get_data()) { repr->rebind_stream(stream); }
 }
 
 std::shared_ptr<data_batch> mutable_data_batch::clone(
-  uint64_t new_batch_id,
-  rmm::cuda_stream_view stream,
-  std::unique_ptr<idata_batch_probe> probe) const
+  uint64_t new_batch_id, ::cuda::stream_ref stream, std::unique_ptr<idata_batch_probe> probe) const
 {
   if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
   auto cloned_data = _batch->_data->clone(stream);
