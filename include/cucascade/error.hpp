@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <cucascade/nvtx.hpp>
+
 #include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
@@ -35,10 +37,6 @@ struct cuda_error : public std::runtime_error {
 
 struct logic_error : public std::logic_error {
   using std::logic_error::logic_error;
-};
-
-struct libcucascade_domain {
-  static constexpr char const* name{"libcucascade"};
 };
 
 }  // namespace cucascade

@@ -501,6 +501,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:gpu_to_host"};
   auto& gpu_source            = source.cast<gpu_table_representation>();
   const cudf::table_view view = gpu_source.get_table_view();
 
@@ -870,6 +871,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:gpu_to_gpu"};
   // Sync the caller's stream so the source table's buffers are stable on the source
   // device before we issue peer copies. The caller's stream is the one that produced
   // (or last touched) the source representation.
@@ -884,6 +886,10 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   auto const src_device_id = gpu_source.get_device_id();
   auto const dst_device_id = target_memory_space->get_device_id();
+  auto const copy_path     = memory::probe_peer_dma_works(src_device_id, dst_device_id)
+                               ? "convert:gpu_to_gpu:peer_copy"
+                               : "convert:gpu_to_gpu:host_staging";
+  nvtx_scope copy_path_range{copy_path};
 
   // STREAM-LINEAGE INVARIANT: cross-device peer copies of cudaMallocAsync
   // allocations require explicit event-ordered synchronization with the
@@ -968,7 +974,7 @@ static rmm::device_buffer alloc_and_schedule_h2d(
 {
   rmm::device_buffer buf;
   {
-    nvtx_scope alloc_range{"hg:dev_alloc"};
+    nvtx_scope alloc_range{"convert:host_to_gpu:device_alloc"};
     buf = rmm::device_buffer(size, stream, mr);
   }
   if (size == 0) { return buf; }
@@ -1013,10 +1019,10 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
-  nvtx_scope range{"hg:nullmask_sync"};
+  nvtx_scope range{"convert:host_to_gpu:nullmask_sync"};
   rmm::device_buffer buf;
   {
-    nvtx_scope alloc_range{"hg:dev_alloc"};
+    nvtx_scope alloc_range{"convert:host_to_gpu:device_alloc"};
     buf = rmm::device_buffer(size, stream, mr);
   }
   if (size == 0) { return buf; }
@@ -1091,7 +1097,7 @@ static std::unique_ptr<cudf::column> reconstruct_column(
       // Flush pending H2D copies so the INT32 offsets buffer has valid data on device
       // before the cast reads from it. The cast replaces offsets_col, freeing the old
       // INT32 buffer, so batch must not hold dangling pointers to it.
-      nvtx_scope cast_range{"hg:offsets_cast"};
+      nvtx_scope cast_range{"convert:host_to_gpu:offsets_cast"};
       batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
       offsets_col =
         cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
@@ -1184,7 +1190,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
-  nvtx_scope convert_range{"hg:convert"};
+  nvtx_scope convert_range{"convert:host_to_gpu"};
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
   if (!fast_table) { throw std::runtime_error("convert_host_fast_to_gpu: host table is null"); }
@@ -1197,7 +1203,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // The caller's stream may be bound to a non-target device under multi-GPU;
   // synchronize is safe across devices.
   {
-    nvtx_scope presync_range{"hg:presync"};
+    nvtx_scope presync_range{"convert:host_to_gpu:presync"};
     stream.sync();
   }
 
@@ -1208,7 +1214,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // guard raises cudaErrorInvalidValue when stream and current device belong
   // to different CUDA contexts (multi-GPU case).
   auto target_stream = [&] {
-    nvtx_scope acquire_range{"hg:acquire_stream"};
+    nvtx_scope acquire_range{"convert:host_to_gpu:acquire_stream"};
     return target_memory_space->acquire_stream();
   }();
   auto mr = target_memory_space->get_default_allocator();
@@ -1218,7 +1224,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(fast_table->columns.size());
   {
-    nvtx_scope reconstruct_range{"hg:reconstruct"};
+    nvtx_scope reconstruct_range{"convert:host_to_gpu:reconstruct"};
     for (const auto& col_meta : fast_table->columns) {
       gpu_columns.push_back(
         reconstruct_column(col_meta, *fast_table->allocation, target_stream, mr, batch));
@@ -1226,13 +1232,13 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   }
   // Source is CPU-written pinned host memory: fully prepared before this call.
   {
-    nvtx_scope flush_range{"hg:flush_submit"};
+    nvtx_scope flush_range{"convert:host_to_gpu:flush_submit"};
     batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
   }
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   {
-    nvtx_scope final_sync_range{"hg:final_sync"};
+    nvtx_scope final_sync_range{"convert:host_to_gpu:final_sync"};
     target_stream.sync();
   }
 
@@ -1251,6 +1257,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
   ::cuda::stream_ref /*stream*/,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:host_to_host"};
   auto& host_source    = source.cast<host_data_representation>();
   auto& host_table     = host_source.get_host_table();
   auto const data_size = host_table->data_size;
@@ -1527,6 +1534,7 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   [[maybe_unused]] ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:host_to_disk"};
   auto& backend          = target_memory_space->get_io_backend();
   auto& host_source      = source.cast<host_data_representation>();
   const auto& host_table = host_source.get_host_table();
@@ -1573,6 +1581,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   [[maybe_unused]] ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:disk_to_host"};
   auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
@@ -1647,6 +1656,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:gpu_to_disk"};
   auto& backend       = target_memory_space->get_io_backend();
   auto& gpu_source    = source.cast<gpu_table_representation>();
   cudf::table_view tv = gpu_source.get_table_view();
@@ -1833,6 +1843,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:disk_to_gpu"};
   auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();

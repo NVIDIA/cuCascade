@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/error.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/prefetching_cache.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -24,11 +25,21 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <utility>
 
 namespace cucascade::io {
+namespace {
+
+using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
+
+struct io_read_to_host_message {
+  static constexpr char const* message{"io:read_to_host"};
+};
+
+}  // namespace
 
 ioctx::ioctx()  = default;
 ioctx::~ioctx() = default;
@@ -76,6 +87,9 @@ std::shared_ptr<io_object> ioctx::create_io_object(std::string path, std::uint64
 size_t ioctx::host_read(
   const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache::prefetching_handle* handle)
 {
+  auto const& message =
+    nvtx3::registered_string_in<libcucascade_domain>::get<io_read_to_host_message>();
+  nvtx_range const read_range{message, nvtx3::payload{static_cast<std::uint64_t>(size)}};
   if (uses_prefetching_cache()) { return _cache->host_read(obj, offset, size, dst, handle); }
   return host_read_io(obj, offset, size, dst);
 }

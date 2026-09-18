@@ -4,8 +4,10 @@
  */
 
 #include <cucascade/memory/topology_discovery.hpp>
+#include <cucascade/nvtx.hpp>
 
 #include <cuda.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <ifaddrs.h>
 #include <nvml.h>
@@ -832,6 +834,7 @@ nvmlReturn_t initialize_nvml_for_current_process()
 bool topology_discovery::discover(NetworkDeviceVerification net_verification,
                                   bool with_runtime_attributes)
 {
+  nvtx3::scoped_range_in<libcucascade_domain> discover_range{"topology:discover"};
   system_topology_info topology;
   // NVML is initialized exactly once per process. Calling nvmlInit_v2 +
   // nvmlShutdown in sequence (which discover() used to do on every call)
