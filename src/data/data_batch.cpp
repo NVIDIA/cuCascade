@@ -190,7 +190,7 @@ void data_batch::reader_event_pool_map::synchronize_reader_events()
 {
   std::lock_guard<std::mutex> lock(reader_events_mutex);
   std::size_t pending_event_count = 0;
-  for (auto const& entry : _reader_event_pools) {
+  for (auto const& entry : reader_event_pools) {
     pending_event_count += entry.second.pending_event_count;
   }
   if (pending_event_count == 0) { return; }
@@ -268,7 +268,7 @@ std::shared_ptr<data_batch> data_batch::to_idle(mutable_data_batch&& accessor)
 read_only_data_batch data_batch::to_read_only() const
 {
   std::shared_ptr<const data_batch> self = shared_from_this();
-  auto lock = acquire_batch_read_lock(_rw_mutex);
+  auto lock                              = acquire_batch_read_lock(_rw_mutex);
   return read_only_data_batch(std::move(self), std::move(lock));
 }
 
