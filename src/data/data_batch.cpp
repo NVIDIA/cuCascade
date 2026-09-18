@@ -56,9 +56,9 @@ data_batch::~data_batch()
 
 uint64_t data_batch::get_batch_id() const { return _batch_id; }
 
-void data_batch::subscribe() { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
+void data_batch::subscribe() const { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
 
-void data_batch::unsubscribe()
+void data_batch::unsubscribe() const
 {
   size_t current = _subscriber_count.load(std::memory_order_relaxed);
   while (true) {

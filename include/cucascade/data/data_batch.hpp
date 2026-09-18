@@ -113,7 +113,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * Atomic, lock-free.
    */
-  void subscribe();
+  void subscribe() const;
 
   /**
    * @brief Decrement the subscriber interest count.
@@ -122,7 +122,7 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    *
    * @throws std::runtime_error if subscriber count is already zero.
    */
-  void unsubscribe();
+  void unsubscribe() const;
 
   /**
    * @brief Get the current subscriber count.
