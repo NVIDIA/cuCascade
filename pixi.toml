@@ -50,7 +50,7 @@ dependencies = { "libcudf" = "26.12.*" }
 
 [feature.cudf-stable]
 channels = [{ channel = "rapidsai", priority = 1 }]
-dependencies = { "libcudf" = "26.06.*" }
+dependencies = { "libcudf" = "26.08.*" }
 
 # AWS SDK is only needed by the optional S3 parquet benchmark
 # (CUCASCADE_BUILD_S3_BENCHMARK=ON). It is deliberately NOT a dependency of
