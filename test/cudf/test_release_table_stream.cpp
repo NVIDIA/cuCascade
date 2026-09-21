@@ -18,6 +18,7 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -43,9 +44,12 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -205,6 +209,88 @@ void CUDART_CB stall_stream_callback(void* /*user_data*/)
   std::this_thread::sleep_for(std::chrono::milliseconds(40));
 }
 
+struct writer_event_gate {
+  std::atomic<bool> entered{false};
+  std::atomic<bool> released{false};
+
+  void release() noexcept
+  {
+    released.store(true, std::memory_order_release);
+    released.notify_all();
+  }
+};
+
+void CUDART_CB wait_on_writer_event_gate(void* user_data)
+{
+  auto* gate = static_cast<writer_event_gate*>(user_data);
+  gate->entered.store(true, std::memory_order_release);
+  gate->entered.notify_all();
+  gate->released.wait(false, std::memory_order_acquire);
+}
+
+bool wait_until_set(std::atomic<bool> const& value, std::chrono::steady_clock::duration timeout)
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (!value.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return value.load(std::memory_order_acquire);
+}
+
+cudaError_t wait_until_stream_pending(::cuda::stream_ref stream,
+                                      std::chrono::steady_clock::duration timeout)
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  cudaError_t status  = cudaSuccess;
+  do {
+    status = cudaStreamQuery(stream.get());
+    if (status != cudaSuccess) { return status; }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  } while (std::chrono::steady_clock::now() < deadline);
+  return status;
+}
+
+cudaError_t observe_event_pending_for(cudaEvent_t event,
+                                      std::chrono::steady_clock::duration duration)
+{
+  auto const deadline = std::chrono::steady_clock::now() + duration;
+  do {
+    auto const status = cudaEventQuery(event);
+    if (status != cudaErrorNotReady) { return status; }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  } while (std::chrono::steady_clock::now() < deadline);
+  return cudaErrorNotReady;
+}
+
+class writer_event_gate_cleanup {
+ public:
+  writer_event_gate_cleanup(writer_event_gate& gate, ::cuda::stream_ref stream)
+    : _gate(gate), _stream(stream)
+  {
+  }
+
+  ~writer_event_gate_cleanup() noexcept { drain(); }
+
+  writer_event_gate_cleanup(writer_event_gate_cleanup const&)            = delete;
+  writer_event_gate_cleanup& operator=(writer_event_gate_cleanup const&) = delete;
+
+  cudaError_t drain() noexcept
+  {
+    if (!_drained) {
+      _gate.release();
+      _status  = cudaStreamSynchronize(_stream.get());
+      _drained = true;
+    }
+    return _status;
+  }
+
+ private:
+  writer_event_gate& _gate;
+  ::cuda::stream_ref _stream;
+  cudaError_t _status{cudaSuccess};
+  bool _drained{false};
+};
+
 /// Pinned so the D2H readback enqueues asynchronously instead of staging synchronously.
 struct pinned_buffer {
   void* ptr{nullptr};
@@ -218,6 +304,111 @@ struct pinned_buffer {
 };
 
 }  // namespace
+
+TEST_CASE("gpu_table_representation clone waits for pending writer work without host blocking",
+          "[gpu_data_representation][clone][writer_event]")
+{
+  using namespace std::chrono_literals;
+
+  CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+  auto& gpu_space = shared_gpu_space();
+  rmm::cuda_stream writer_stream;
+  rmm::cuda_stream clone_stream;
+
+  constexpr cudf::size_type num_rows      = 1 << 18;
+  constexpr std::size_t num_bytes         = static_cast<std::size_t>(num_rows) * sizeof(int32_t);
+  constexpr unsigned char stale_pattern   = 0x11;
+  constexpr unsigned char written_pattern = 0x5A;
+
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          num_rows,
+                                          cudf::mask_state::UNALLOCATED,
+                                          writer_stream.view(),
+                                          gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(
+    column->mutable_view().head(), stale_pattern, num_bytes, writer_stream.value()));
+  writer_stream.synchronize();
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(column));
+  auto source = std::make_shared<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(columns)), *gpu_space, writer_stream.view());
+
+  auto const consumer_initial_status = cudaStreamQuery(clone_stream.value());
+  writer_event_gate gate;
+  std::future<std::unique_ptr<idata_representation>> clone_future;
+  CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(writer_stream.value(), wait_on_writer_event_gate, &gate));
+  writer_event_gate_cleanup gate_cleanup{gate, writer_stream.view()};
+
+  bool const gate_entered = wait_until_set(gate.entered, 5s);
+  if (!gate_entered) {
+    auto const cleanup_status = gate_cleanup.drain();
+    REQUIRE(cleanup_status == cudaSuccess);
+    REQUIRE(gate_entered);
+    return;
+  }
+
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(const_cast<void*>(source->get_table_view().column(0).head()),
+                                     written_pattern,
+                                     num_bytes,
+                                     writer_stream.value()));
+  source->record_writer_event(writer_stream.view());
+
+  clone_future = std::async(std::launch::async, [&] {
+    CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+    return source->clone(clone_stream.view());
+  });
+
+  auto const consumer_pending_status = wait_until_stream_pending(clone_stream.view(), 5s);
+  bool const returned_while_gated    = clone_future.wait_for(5s) == std::future_status::ready;
+
+  std::unique_ptr<idata_representation> cloned_base;
+  std::exception_ptr clone_error;
+  auto consume_clone_result = [&] {
+    try {
+      cloned_base = clone_future.get();
+    } catch (...) {
+      clone_error = std::current_exception();
+    }
+  };
+
+  if (returned_while_gated) { consume_clone_result(); }
+
+  auto* cloned                   = dynamic_cast<gpu_table_representation*>(cloned_base.get());
+  auto const clone_writer_status = cloned != nullptr && cloned->get_writer_event() != nullptr
+                                     ? observe_event_pending_for(cloned->get_writer_event(), 100ms)
+                                     : cudaErrorInvalidValue;
+
+  auto const writer_cleanup_status = gate_cleanup.drain();
+  if (!returned_while_gated) {
+    clone_future.wait();
+    consume_clone_result();
+  }
+  auto const clone_sync_status = cudaStreamSynchronize(clone_stream.value());
+
+  std::vector<unsigned char> actual(num_bytes);
+  auto const readback_status = cloned != nullptr
+                                 ? cudaMemcpy(actual.data(),
+                                              cloned->get_table_view().column(0).head(),
+                                              actual.size(),
+                                              cudaMemcpyDeviceToHost)
+                                 : cudaErrorInvalidValue;
+  bool const copied_post_gate_bytes =
+    readback_status == cudaSuccess &&
+    std::all_of(
+      actual.cbegin(), actual.cend(), [](unsigned char value) { return value == written_pattern; });
+
+  REQUIRE(consumer_initial_status == cudaSuccess);
+  REQUIRE(consumer_pending_status == cudaErrorNotReady);
+  REQUIRE(returned_while_gated);
+  REQUIRE(clone_error == nullptr);
+  REQUIRE(clone_writer_status == cudaErrorNotReady);
+  REQUIRE(writer_cleanup_status == cudaSuccess);
+  REQUIRE(clone_sync_status == cudaSuccess);
+  REQUIRE(cloned != nullptr);
+  REQUIRE(readback_status == cudaSuccess);
+  REQUIRE(copied_post_gate_bytes);
+}
 
 TEST_CASE("release_table rebinds owned-table buffers to the release stream",
           "[release_table][stream]")
@@ -373,6 +564,143 @@ TEST_CASE("view-branch release_table deep-copies on the release stream and leave
   test::expect_cudf_tables_equal_on_stream(reference->view(), owner->view(), release_stream.view());
   int src_checked = expect_table_buffers_bound_to(*owner, alloc_stream.view());
   REQUIRE(src_checked >= 5);
+}
+
+TEST_CASE("release_table waits for pending writer work without host blocking",
+          "[release_table][writer_event]")
+{
+  using namespace std::chrono_literals;
+
+  CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+  auto& gpu_space = shared_gpu_space();
+  rmm::cuda_stream writer_stream;
+  rmm::cuda_stream release_stream;
+
+  constexpr cudf::size_type num_rows      = 1 << 18;
+  constexpr std::size_t num_bytes         = static_cast<std::size_t>(num_rows) * sizeof(int32_t);
+  constexpr unsigned char stale_pattern   = 0x22;
+  constexpr unsigned char written_pattern = 0x6B;
+
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          num_rows,
+                                          cudf::mask_state::UNALLOCATED,
+                                          writer_stream.view(),
+                                          gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(
+    column->mutable_view().head(), stale_pattern, num_bytes, writer_stream.value()));
+  writer_stream.synchronize();
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(column));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  bool view_backed = false;
+  std::shared_ptr<cudf::table> owner;
+  std::weak_ptr<cudf::table> owner_lifetime;
+  std::unique_ptr<gpu_table_representation> rep;
+  SECTION("owned table")
+  {
+    rep = std::make_unique<gpu_table_representation>(
+      std::move(table), *gpu_space, writer_stream.view());
+  }
+  SECTION("view-backed table")
+  {
+    view_backed    = true;
+    owner          = std::shared_ptr<cudf::table>{std::move(table)};
+    owner_lifetime = owner;
+    rep            = std::make_unique<gpu_table_representation>(owner->view(),
+                                                     std::shared_ptr<cudf::table>{owner},
+                                                     owner->alloc_size(),
+                                                     *gpu_space,
+                                                     writer_stream.view());
+  }
+
+  auto const consumer_initial_status = cudaStreamQuery(release_stream.value());
+  writer_event_gate gate;
+  std::future<std::unique_ptr<cudf::table>> release_future;
+  CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(writer_stream.value(), wait_on_writer_event_gate, &gate));
+  writer_event_gate_cleanup gate_cleanup{gate, writer_stream.view()};
+
+  bool const gate_entered = wait_until_set(gate.entered, 5s);
+  if (!gate_entered) {
+    auto const cleanup_status = gate_cleanup.drain();
+    REQUIRE(cleanup_status == cudaSuccess);
+    REQUIRE(gate_entered);
+    return;
+  }
+
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(const_cast<void*>(rep->get_table_view().column(0).head()),
+                                     written_pattern,
+                                     num_bytes,
+                                     writer_stream.value()));
+  rep->record_writer_event(writer_stream.view());
+
+  release_future = std::async(std::launch::async, [&] {
+    CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+    return rep->release_table(release_stream.view());
+  });
+
+  auto const consumer_pending_status = wait_until_stream_pending(release_stream.view(), 5s);
+  bool const returned_while_gated    = release_future.wait_for(5s) == std::future_status::ready;
+
+  std::unique_ptr<cudf::table> released;
+  std::exception_ptr release_error;
+  auto consume_release_result = [&] {
+    try {
+      released = release_future.get();
+    } catch (...) {
+      release_error = std::current_exception();
+    }
+  };
+
+  if (returned_while_gated) { consume_release_result(); }
+
+  auto const post_return_stream_status = returned_while_gated && released != nullptr
+                                           ? cudaStreamQuery(release_stream.value())
+                                           : cudaErrorInvalidValue;
+  std::unique_ptr<cucascade::cuda::cuda_event> release_tail;
+  cudaError_t release_tail_status = cudaSuccess;
+  if (view_backed && returned_while_gated && released != nullptr) {
+    release_tail = std::make_unique<cucascade::cuda::cuda_event>();
+    release_tail->record(release_stream.view());
+    release_tail_status = observe_event_pending_for(release_tail->get(), 100ms);
+  }
+  bool const owner_retained_while_copy_pending =
+    !view_backed || (!owner_lifetime.expired() && owner.use_count() == 1);
+
+  auto const writer_cleanup_status = gate_cleanup.drain();
+  if (!returned_while_gated) {
+    release_future.wait();
+    consume_release_result();
+  }
+  auto const release_sync_status = cudaStreamSynchronize(release_stream.value());
+
+  std::vector<unsigned char> actual(num_bytes);
+  auto const readback_status =
+    released != nullptr
+      ? cudaMemcpy(
+          actual.data(), released->view().column(0).head(), actual.size(), cudaMemcpyDeviceToHost)
+      : cudaErrorInvalidValue;
+  bool const copied_post_gate_bytes =
+    readback_status == cudaSuccess &&
+    std::all_of(
+      actual.cbegin(), actual.cend(), [](unsigned char value) { return value == written_pattern; });
+  if (view_backed) { owner.reset(); }
+  bool const owner_released_after_copy = !view_backed || owner_lifetime.expired();
+
+  REQUIRE(consumer_initial_status == cudaSuccess);
+  REQUIRE(consumer_pending_status == cudaErrorNotReady);
+  REQUIRE(returned_while_gated);
+  REQUIRE(release_error == nullptr);
+  REQUIRE(released != nullptr);
+  REQUIRE(post_return_stream_status == cudaErrorNotReady);
+  if (view_backed) { REQUIRE(release_tail_status == cudaErrorNotReady); }
+  REQUIRE(owner_retained_while_copy_pending);
+  REQUIRE(writer_cleanup_status == cudaSuccess);
+  REQUIRE(release_sync_status == cudaSuccess);
+  REQUIRE(readback_status == cudaSuccess);
+  REQUIRE(copied_post_gate_bytes);
+  REQUIRE(owner_released_after_copy);
 }
 
 TEST_CASE("release_table then cudf::rebind_stream to the same stream composes",

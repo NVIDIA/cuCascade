@@ -53,9 +53,11 @@ class gpu_table_representation : public idata_representation {
    * writer event so cross-stream / cross-device readers (notably
    * representation_converter.cpp's convert_gpu_to_gpu()) can establish ordering
    * via cudaStreamWaitEvent. The constructor calls record_writer_event(@p
-   * writer_stream) automatically — passing a default-constructed
-   * stream_ref records no event (legacy, only acceptable for paths whose
-   * data was never produced on any stream).
+   * writer_stream) automatically, including when it is the CUDA default stream.
+   *
+   * @pre The calling thread's current CUDA device, @p writer_stream, @p memory_space, and every
+   * allocation in @p table refer to the same device.
+   * @pre @p writer_stream is the stream on which writes to @p table were last enqueued.
    *
    * @param table Unique pointer to the cuDF table with the data (ownership is transferred)
    * @param memory_space The memory space where the GPU table resides
@@ -73,6 +75,10 @@ class gpu_table_representation : public idata_representation {
    * STREAM-LINEAGE: writer_stream is REQUIRED — must be the stream on which the
    * underlying data of @p table_view was last written. See the simple-table ctor
    * docstring for the writer_stream contract.
+   *
+   * @pre The calling thread's current CUDA device, @p writer_stream, @p memory_space, and every
+   * allocation viewed by @p table_view refer to the same device.
+   * @pre @p writer_stream is the stream on which writes to @p table_view were last enqueued.
    *
    * @param table_view View of the cuDF table (data ownership lives in @p owner)
    * @tparam Owner The type of the owner of the cuDF table (e.g., a specific operator or component)
@@ -121,6 +127,13 @@ class gpu_table_representation : public idata_representation {
    *
    * The cloned representation will have its own copy of the underlying cuDF table,
    * residing in the same memory space as the original.
+   * The copy waits for this representation's writer event and records its own writer event on
+   * @p stream. This method returns without synchronizing @p stream.
+   *
+   * @pre The calling thread's current CUDA device, @p stream, this representation's memory space,
+   * and its allocations refer to the same device.
+   * @pre This representation, its allocations, and their contents remain alive and unmodified
+   * until the work enqueued on @p stream completes.
    *
    * @param stream CUDA stream for memory operations
    * @return std::unique_ptr<idata_representation> A new gpu_table_representation with copied data
@@ -138,12 +151,21 @@ class gpu_table_representation : public idata_representation {
    * @brief Release ownership of the underlying cuDF table
    *
    * After calling this method, this representation no longer owns the table.
+   * The returned table is ordered after this representation's writer event on @p stream. For a
+   * view-backed representation, materialization is also enqueued on @p stream. This method returns
+   * without synchronizing @p stream.
    *
-   * @pre No stream other than @p stream may have in-flight work touching the table's device
+   * @pre Except for work represented by the writer event, no stream other than @p stream may have
+   * in-flight work touching the table's device
    * memory: binding the buffers to @p stream does not insert cross-stream ordering.
+   *
+   * @pre The calling thread's current CUDA device must match get_device_id().
    *
    * @pre @p stream must belong to get_device_id() — the device owning this representation's
    * memory. Default stream handles resolve to the caller's current device.
+   *
+   * @pre For a view-backed representation, the external owner must keep the viewed allocations
+   * alive and unmodified until the work enqueued on @p stream completes.
    *
    * @param stream Stream that will own deallocation ordering of the returned table's buffers
    *               (also used to materialize the table from a view path before release)
@@ -189,8 +211,12 @@ class gpu_table_representation : public idata_representation {
    * source buffers.
    *
    * Calling this multiple times overwrites the previously recorded event (the
-   * representation owns a single writer event handle that is reused). Passing a
-   * default-constructed stream_ref records no event and clears any prior one.
+   * representation owns a single writer event handle that is reused). The CUDA default stream is
+   * a valid writer stream and records an event on the calling thread's current device.
+   *
+   * @pre The calling thread's current CUDA device, @p writer_stream, this representation's memory
+   * space, and its allocations refer to the same device.
+   * @pre @p writer_stream is the stream on which writes to this representation were last enqueued.
    *
    * @param writer_stream The stream on which the most recent writes to this
    *                      representation's memory were enqueued.
@@ -198,16 +224,13 @@ class gpu_table_representation : public idata_representation {
   void record_writer_event(::cuda::stream_ref writer_stream) override;
 
   /**
-   * @brief Get the writer event recorded by record_writer_event(), or nullptr if none.
+   * @brief Get the writer event recorded by record_writer_event().
    *
    * Readers that cross stream / device boundaries must call cudaStreamWaitEvent on
-   * this event (when non-null) before reading the underlying memory. When this
-   * returns nullptr, callers should fall back to a coarser sync (e.g.
-   * cudaDeviceSynchronize on the source device) — this is the legacy behavior
-   * preserved for representations constructed by code paths that have not yet
-   * been migrated to record writer events.
+   * this event before reading the underlying memory. Every successfully constructed
+   * gpu_table_representation has a non-null writer event.
    *
-   * @return cudaEvent_t The writer event, or nullptr if none has been recorded.
+   * @return cudaEvent_t The writer event
    */
   [[nodiscard]] cudaEvent_t get_writer_event() const override;
 
@@ -221,9 +244,9 @@ class gpu_table_representation : public idata_representation {
   std::variant<std::unique_ptr<cudf::table>, owning_table_view>
     _table;  ///< cudf::table is the underlying representation of the data
 
-  /// Lazily-created CUDA event recording the completion of the most recent
-  /// writer-stream work that produced this representation. Null until the first
-  /// call to record_writer_event().
+  /// CUDA event recording the completion of the most recent writer-stream work that produced this
+  /// representation. Created and recorded during construction, then reused by
+  /// record_writer_event().
   cudaEvent_t _writer_event{nullptr};
 };
 
@@ -239,7 +262,7 @@ gpu_table_representation::gpu_table_representation(cudf::table_view table_view,
 {
   // STREAM-LINEAGE: record writer event so cross-stream/cross-device readers
   // can establish ordering via cudaStreamWaitEvent.
-  if (writer_stream.get() != nullptr) { record_writer_event(writer_stream); }
+  record_writer_event(writer_stream);
 }
 
 }  // namespace cucascade
