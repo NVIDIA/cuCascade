@@ -93,14 +93,14 @@ data_batch::~data_batch()
   // Usually the cache/repository retains the batch and mutable acquisition performs this wait.
   // This fallback is load-bearing when the final read-only accessor owns the last shared_ptr: the
   // representation must remain alive until its registered device reads finish.
-  synchronize_reader_events_no_throw();
+  _reader_event_pools.synchronize_reader_events_no_throw();
 }
 
 uint64_t data_batch::get_batch_id() const { return _batch_id; }
 
-void data_batch::subscribe() { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
+void data_batch::subscribe() const { _subscriber_count.fetch_add(1, std::memory_order_relaxed); }
 
-void data_batch::unsubscribe()
+void data_batch::unsubscribe() const
 {
   size_t current = _subscriber_count.load(std::memory_order_relaxed);
   while (true) {
@@ -138,7 +138,8 @@ void data_batch::set_data(std::unique_ptr<idata_representation> data)
   _probe->data_replaced(*_data);
 }
 
-void data_batch::recycle_completed_reader_events(reader_event_pool& pool)
+void data_batch::reader_event_pool_map::recycle_completed_reader_events(
+  reader_event_pool& pool) const
 {
   std::size_t index = 0;
   while (index < pool.pending_event_count) {
@@ -156,17 +157,14 @@ void data_batch::recycle_completed_reader_events(reader_event_pool& pool)
   }
 }
 
-void data_batch::record_reader_event(::cuda::stream_ref reader_stream)
+void data_batch::reader_event_pool_map::record_reader_event(::cuda::stream_ref reader_stream)
 {
-  // Host and disk representations do not expose stream-ordered device memory.
-  if (_data == nullptr || _data->get_current_tier() != memory::Tier::GPU) { return; }
-
   int reader_device = -1;
   try {
     CUCASCADE_CUDA_TRY(::cudaStreamGetDevice(reader_stream.get(), &reader_device));
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{reader_device}};
-    std::lock_guard<std::mutex> lock(_reader_events_mutex);
-    auto& pool = _reader_event_pools[reader_device];
+    std::lock_guard<std::mutex> lock(reader_events_mutex);
+    auto& pool = reader_event_pools[reader_device];
     recycle_completed_reader_events(pool);
 
     if (pool.pending_event_count == pool.events.size()) {
@@ -188,11 +186,11 @@ void data_batch::record_reader_event(::cuda::stream_ref reader_stream)
   }
 }
 
-void data_batch::synchronize_reader_events()
+void data_batch::reader_event_pool_map::synchronize_reader_events()
 {
-  std::lock_guard<std::mutex> lock(_reader_events_mutex);
+  std::lock_guard<std::mutex> lock(reader_events_mutex);
   std::size_t pending_event_count = 0;
-  for (auto const& entry : _reader_event_pools) {
+  for (auto const& entry : reader_event_pools) {
     pending_event_count += entry.second.pending_event_count;
   }
   if (pending_event_count == 0) { return; }
@@ -201,7 +199,7 @@ void data_batch::synchronize_reader_events()
     nvtx3::registered_string_in<libcucascade_domain>::get<wait_reader_events_message>();
   nvtx_range const wait_range{message,
                               nvtx3::payload{static_cast<std::uint64_t>(pending_event_count)}};
-  for (auto& [device_id, pool] : _reader_event_pools) {
+  for (auto& [device_id, pool] : reader_event_pools) {
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
     for (std::size_t index = 0; index < pool.pending_event_count; ++index) {
       pool.events[index].synchronize();
@@ -210,10 +208,10 @@ void data_batch::synchronize_reader_events()
   }
 }
 
-bool data_batch::reader_events_complete()
+bool data_batch::reader_event_pool_map::reader_events_complete()
 {
-  std::lock_guard<std::mutex> lock(_reader_events_mutex);
-  for (auto& [device_id, pool] : _reader_event_pools) {
+  std::lock_guard<std::mutex> lock(reader_events_mutex);
+  for (auto& [device_id, pool] : reader_event_pools) {
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
     recycle_completed_reader_events(pool);
     if (pool.pending_event_count != 0) { return false; }
@@ -221,10 +219,10 @@ bool data_batch::reader_events_complete()
   return true;
 }
 
-void data_batch::synchronize_reader_events_no_throw() noexcept
+void data_batch::reader_event_pool_map::synchronize_reader_events_no_throw() noexcept
 {
-  std::lock_guard<std::mutex> lock(_reader_events_mutex);
-  if (_reader_event_pools.empty()) { return; }
+  std::lock_guard<std::mutex> lock(reader_events_mutex);
+  if (reader_event_pools.empty()) { return; }
 
   int original_device                 = -1;
   cudaError_t const get_device_status = ::cudaGetDevice(&original_device);
@@ -232,7 +230,7 @@ void data_batch::synchronize_reader_events_no_throw() noexcept
 
   // Destroy every event under the device where it was created. Clearing the pools here also makes
   // the unordered_map's later member destruction independent of the caller's current device.
-  for (auto& [device_id, pool] : _reader_event_pools) {
+  for (auto& [device_id, pool] : reader_event_pools) {
     CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaSetDevice(device_id));
     for (std::size_t index = 0; index < pool.pending_event_count; ++index) {
       CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventSynchronize(pool.events[index].get()));
@@ -240,16 +238,16 @@ void data_batch::synchronize_reader_events_no_throw() noexcept
     pool.pending_event_count = 0;
     pool.events.clear();
   }
-  _reader_event_pools.clear();
+  reader_event_pools.clear();
 
   if (restore_original_device) { CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaSetDevice(original_device)); }
 }
 
 // ========== Static transition methods ==========
 
-std::shared_ptr<data_batch> data_batch::to_idle(read_only_data_batch&& accessor)
+std::shared_ptr<const data_batch> data_batch::to_idle(read_only_data_batch&& accessor)
 {
-  auto ptr = accessor._batch;
+  std::shared_ptr<const data_batch> ptr = accessor._batch;
   {
     auto _ = std::move(accessor);
   }  // destroy accessor, releasing shared lock
@@ -267,10 +265,10 @@ std::shared_ptr<data_batch> data_batch::to_idle(mutable_data_batch&& accessor)
 
 // ========== Non-static transition methods ==========
 
-read_only_data_batch data_batch::to_read_only()
+read_only_data_batch data_batch::to_read_only() const
 {
-  auto self = shared_from_this();
-  auto lock = acquire_batch_read_lock(_rw_mutex);
+  std::shared_ptr<const data_batch> self = shared_from_this();
+  auto lock                              = acquire_batch_read_lock(_rw_mutex);
   return read_only_data_batch(std::move(self), std::move(lock));
 }
 
@@ -282,62 +280,34 @@ mutable_data_batch data_batch::to_mutable()
   // could deadlock. Readers may record again between the drain and the acquisition, so re-check
   // under the lock and retry.
   while (true) {
-    synchronize_reader_events();
+    _reader_event_pools.synchronize_reader_events();
     auto lock = acquire_batch_write_lock(_rw_mutex);
-    if (reader_events_complete()) { return mutable_data_batch(std::move(self), std::move(lock)); }
+    if (_reader_event_pools.reader_events_complete()) {
+      return mutable_data_batch(std::move(self), std::move(lock));
+    }
   }
 }
 
-std::optional<read_only_data_batch> data_batch::try_to_read_only()
+std::optional<read_only_data_batch> data_batch::try_to_read_only() const
 {
-  std::shared_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
+  std::shared_lock lock(_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
-  auto self = shared_from_this();
+  std::shared_ptr<const data_batch> self = shared_from_this();
   return read_only_data_batch(std::move(self), std::move(lock));
 }
 
 std::optional<mutable_data_batch> data_batch::try_to_mutable()
 {
-  std::unique_lock<std::shared_mutex> lock(_rw_mutex, std::try_to_lock);
+  std::unique_lock lock(_rw_mutex, std::try_to_lock);
   if (!lock.owns_lock()) { return std::nullopt; }
-  if (!reader_events_complete()) { return std::nullopt; }
+  if (!_reader_event_pools.reader_events_complete()) { return std::nullopt; }
   auto self = shared_from_this();
   return mutable_data_batch(std::move(self), std::move(lock));
 }
 
-// ========== Locked-to-locked static transitions ==========
-
-mutable_data_batch data_batch::readonly_to_mutable(read_only_data_batch&& accessor)
-{
-  auto ptr = accessor._batch;
-  {
-    // destructor decrements _read_only_count, releases the shared lock and sets state to idle
-    auto _ = std::move(accessor);  // move into temporary, destroyed at }
-  }
-  // Same drain-then-recheck pattern as to_mutable().
-  while (true) {
-    ptr->synchronize_reader_events();
-    auto lock = acquire_batch_write_lock(ptr->_rw_mutex);
-    if (ptr->reader_events_complete()) {
-      return mutable_data_batch(std::move(ptr), std::move(lock));
-    }
-  }
-}
-
-read_only_data_batch data_batch::mutable_to_readonly(mutable_data_batch&& accessor)
-{
-  auto ptr = accessor._batch;
-  {
-    // destructor frees the exclusive lock and sets state to idle
-    auto _ = std::move(accessor);  // move into temporary, destroyed at }
-  }
-  auto lock = acquire_batch_read_lock(ptr->_rw_mutex);
-  return read_only_data_batch(std::move(ptr), std::move(lock));
-}
-
 // ========== read_only_data_batch ==========
 
-read_only_data_batch::read_only_data_batch(std::shared_ptr<data_batch> parent,
+read_only_data_batch::read_only_data_batch(std::shared_ptr<const data_batch> parent,
                                            std::shared_lock<std::shared_mutex> lock)
   : _batch(std::move(parent)), _lock(std::move(lock))
 {
