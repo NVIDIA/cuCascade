@@ -149,3 +149,89 @@ target_link_libraries(
 # Register tests with CTest
 add_test(NAME cucascade_topology_discovery_tests
          COMMAND cucascade_topology_discovery_tests)
+
+# Exercise runtime CUDA loading in separate processes so each case gets an
+# independent loader state and search path.
+add_library(cucascade_fake_cuda_driver_available SHARED
+            fake_cuda_driver_available.cpp)
+target_link_libraries(cucascade_fake_cuda_driver_available
+                      PRIVATE CUDA::toolkit)
+set_target_properties(
+  cucascade_fake_cuda_driver_available
+  PROPERTIES OUTPUT_NAME cuda
+             SOVERSION 1
+             LIBRARY_OUTPUT_DIRECTORY
+             "${CMAKE_CURRENT_BINARY_DIR}/fake_cuda_driver/available")
+
+add_library(cucascade_fake_cuda_driver_incomplete SHARED
+            fake_cuda_driver_incomplete.cpp)
+target_link_libraries(cucascade_fake_cuda_driver_incomplete
+                      PRIVATE CUDA::toolkit)
+set_target_properties(
+  cucascade_fake_cuda_driver_incomplete
+  PROPERTIES OUTPUT_NAME cuda
+             SOVERSION 1
+             LIBRARY_OUTPUT_DIRECTORY
+             "${CMAKE_CURRENT_BINARY_DIR}/fake_cuda_driver/incomplete")
+
+add_library(cucascade_fake_cuda_driver_load_sentinel SHARED
+            fake_cuda_driver_load_sentinel.cpp)
+set_target_properties(
+  cucascade_fake_cuda_driver_load_sentinel
+  PROPERTIES OUTPUT_NAME cuda
+             SOVERSION 1
+             LIBRARY_OUTPUT_DIRECTORY
+             "${CMAKE_CURRENT_BINARY_DIR}/fake_cuda_driver/load_sentinel")
+
+add_executable(cucascade_cuda_driver_loading_test
+               cuda_driver_loading_test.cpp)
+target_link_libraries(cucascade_cuda_driver_loading_test
+                      PRIVATE cucascade_topology_discovery)
+
+function(add_cuda_driver_loading_test test_name fake_driver mode)
+  add_test(
+    NAME ${test_name}
+    COMMAND
+      ${CMAKE_COMMAND} -E env
+      "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:${fake_driver}>:$ENV{LD_LIBRARY_PATH}"
+      $<TARGET_FILE:cucascade_cuda_driver_loading_test> ${mode})
+endfunction()
+
+add_cuda_driver_loading_test(cucascade_runtime_attributes_use_available_driver
+                             cucascade_fake_cuda_driver_available available)
+add_cuda_driver_loading_test(cucascade_runtime_attributes_tolerate_missing_symbols
+                             cucascade_fake_cuda_driver_incomplete unavailable)
+add_cuda_driver_loading_test(cucascade_passive_discovery_does_not_load_driver
+                             cucascade_fake_cuda_driver_load_sentinel passive)
+add_cuda_driver_loading_test(cucascade_cuda_driver_loader_has_process_lifetime
+                             cucascade_fake_cuda_driver_available shutdown)
+
+# Verify that topology discovery remains loadable on systems without the CUDA
+# driver. Shared libraries can be inspected directly. Static libraries need a
+# small consumer to force their object files and transitive dependencies into a
+# dynamic executable before inspection.
+function(add_no_cuda_driver_dependency_test test_name target)
+  add_test(
+    NAME ${test_name}
+    COMMAND
+      ${CMAKE_COMMAND} "-DBINARY=$<TARGET_FILE:${target}>"
+      "-DREADELF=${CMAKE_READELF}" -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_no_cuda_driver_dependency.cmake"
+  )
+endfunction()
+
+if(CUCASCADE_BUILD_SHARED_LIBS)
+  add_no_cuda_driver_dependency_test(
+    cucascade_topology_discovery_shared_has_no_cuda_driver_dependency
+    cucascade_topology_discovery_shared)
+endif()
+
+if(CUCASCADE_BUILD_STATIC_LIBS)
+  add_executable(cucascade_topology_discovery_link_probe
+                 topology_discovery_link_probe.cpp)
+  target_link_libraries(cucascade_topology_discovery_link_probe
+                        PRIVATE cucascade_topology_discovery_static)
+  add_no_cuda_driver_dependency_test(
+    cucascade_topology_discovery_static_has_no_cuda_driver_dependency
+    cucascade_topology_discovery_link_probe)
+endif()
