@@ -126,8 +126,12 @@ std::unique_ptr<cudf::table> make_patterned_table(::cuda::stream_ref stream)
                                      cudaMemcpyHostToDevice,
                                      stream.get()));
   stream.sync();
-  auto str_col = cudf::make_strings_column(
-    num_rows, std::move(offsets_col), std::move(dev_chars), 0, rmm::device_buffer{});
+  auto str_col =
+    cudf::make_strings_column(num_rows,
+                              std::move(offsets_col),
+                              std::move(dev_chars),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto long_col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT64}, num_rows, cudf::mask_state::UNALLOCATED, stream);
