@@ -144,7 +144,9 @@ using DeviceMemoryResourceFactoryFn =
  * and enables or disables legacy peer access across visible device pairs. The original current
  * device is restored before return; a restoration failure is reported as
  * pool_peer_access_status::CUDA_ERROR. Verified peer results are cached process-wide;
- * CUDA errors are retried on a later request.
+ * CUDA errors are retried on a later explicit grant request. If a requested peer check fails and
+ * the pool already grants read/write access, this function attempts to revoke that access for the
+ * requesting device. A revocation failure is reported as pool_peer_access_status::CUDA_ERROR.
  *
  * The caller must supply a live non-null pool, valid visible CUDA device IDs, and the device that
  * actually owns the pool's allocations as owner_device.
@@ -174,9 +176,10 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
 /**
  * @brief Report whether a peer copy moves bytes from one GPU to another
  *
- * A same-device request returns true. For distinct devices, the process-wide cache enables legacy
- * peer access for capable directions before testing a 64-byte copy. It disables the matching
- * direction only after a confirmed byte mismatch. CUDA errors are retried on later requests.
+ * A same-device request returns true. For distinct devices, the process-wide cache enables both
+ * legacy peer-access directions before testing a 64-byte copy. Unverified directions are disabled
+ * after CUDA errors. A cached CUDA error returns false without repeating the probe on every copy;
+ * grant_pool_peer_access() or disable_peer_access_where_broken() can retry it.
  *
  * @return True for a same-device request or a verified directional byte copy; false for unsupported
  * directions, failed verification, or CUDA errors
@@ -187,8 +190,8 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
  * @brief Trigger cached peer verification and count verified fallback directions
  *
  * On first cache use, every visible direction is probed with legacy peer access enabled where
- * needed. Only a confirmed byte mismatch causes that direction to be disabled. Later calls retry
- * directions with CUDA errors. CUDA memory pool permissions are not changed.
+ * needed. A byte mismatch or inconclusive CUDA error disables the unverified direction. Later
+ * calls retry directions with CUDA errors. CUDA memory pool permissions are not changed here.
  *
  * @param pools_by_device Ignored; retained for API compatibility
  * @return Number of verified mismatched directions whose legacy peer access was disabled or was

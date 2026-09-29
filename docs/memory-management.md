@@ -201,10 +201,11 @@ accessing GPU and reports whether access was granted, unsupported, rejected by b
 verification, or failed in the CUDA runtime. The pool must be live, the device IDs must be valid and
 visible, and `owner_device` must identify the pool's allocation device. A successful permission
 persists until changed through CUDA or the pool is destroyed. It does not promise bandwidth or
-prove the route of a later copy. A failed result neither proves an older permission is absent nor
-establishes a host-staged fallback. Verified peer results are cached process-wide; a transient CUDA
-error is retried on a later request. Legacy peer access is disabled only after a byte mismatch is
-confirmed.
+prove the route of a later copy. If peer verification fails for a pool that already grants access,
+the function attempts to revoke that pool's peer permission; a failed revocation is reported as a
+CUDA error. Verified peer results are cached process-wide. Explicit grant and fallback-count
+requests retry CUDA errors; frequent GPU-to-GPU conversions use host staging while an error is
+cached. Unverified legacy peer directions are disabled after probe errors or byte mismatches.
 
 The legacy `enable_pool_peer_access_for_all_visible_devices()` helper remains best effort. It
 visits every visible peer for both the supplied pool and the owner's currently selected pool,

@@ -31,7 +31,7 @@ namespace detail {
 
 enum class peer_dma_probe_status {
   SUPPORTED,            ///< The directional copy probe succeeded
-  UNSUPPORTED,          ///< CUDA reports that the direction is unsupported
+  UNSUPPORTED,          ///< CUDA reports that required peer capability is unavailable
   VERIFICATION_FAILED,  ///< CUDA reports that the direction is supported, but the sentinel bytes
                         ///< did not arrive correctly
   CUDA_ERROR
@@ -56,7 +56,8 @@ struct peer_dma_probe_operations {
 /** @brief Run requests through a fresh probe cache with supplied CUDA operations. */
 [[nodiscard]] std::vector<peer_dma_probe_result> probe_peer_dma_sequence(
   std::vector<std::pair<int, int>> const& requests,
-  peer_dma_probe_operations const& operations);
+  peer_dma_probe_operations const& operations,
+  bool retry_errors = true);
 
 struct pool_peer_access_operations {
   cudaError_t (*get_device_count)(int* count);
