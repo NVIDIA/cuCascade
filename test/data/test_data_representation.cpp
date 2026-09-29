@@ -1283,7 +1283,7 @@ TEST_CASE("Fast converter: STRING column metadata structure", "[fast][string]")
     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                    static_cast<cudf::size_type>(host_offsets.size()),
                                    std::move(offsets_buf),
-                                   rmm::device_buffer{},
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                    0);
 
   std::vector<int8_t> host_chars(total_chars, 'x');
@@ -1292,8 +1292,12 @@ TEST_CASE("Fast converter: STRING column metadata structure", "[fast][string]")
 
   stream.synchronize();
 
-  auto strings_col = cudf::make_strings_column(
-    num_strings, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+  auto strings_col =
+    cudf::make_strings_column(num_strings,
+                              std::move(offsets_col),
+                              std::move(chars_buf),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto repr = wrap_column(std::move(strings_col),
                           *const_cast<memory::memory_space*>(gpu_space),
@@ -1345,7 +1349,7 @@ TEST_CASE("Fast converter: LIST<INT32> column metadata structure", "[fast][list]
     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                    static_cast<cudf::size_type>(host_offsets.size()),
                                    std::move(offsets_buf),
-                                   rmm::device_buffer{},
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                    0);
 
   auto values_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
@@ -1355,8 +1359,11 @@ TEST_CASE("Fast converter: LIST<INT32> column metadata structure", "[fast][list]
                                               gpu_space->get_default_allocator());
   stream.synchronize();
 
-  auto list_col =
-    cudf::make_lists_column(num_lists, std::move(offsets_col), std::move(values_col), 0, {});
+  auto list_col = cudf::make_lists_column(num_lists,
+                                          std::move(offsets_col),
+                                          std::move(values_col),
+                                          0,
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto repr = wrap_column(std::move(list_col),
                           *const_cast<memory::memory_space*>(gpu_space),
@@ -1406,7 +1413,7 @@ TEST_CASE("Fast converter: nullable LIST<INT32> preserves parent null mask", "[f
     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                    static_cast<cudf::size_type>(host_offsets.size()),
                                    std::move(offsets_buf),
-                                   rmm::device_buffer{},
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                    0);
 
   auto values_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
@@ -1464,7 +1471,8 @@ TEST_CASE("Fast converter: STRUCT<INT32, FLOAT64> column metadata structure", "[
   std::vector<std::unique_ptr<cudf::column>> children;
   children.push_back(std::move(field0));
   children.push_back(std::move(field1));
-  auto struct_col = cudf::make_structs_column(N, std::move(children), 0, {});
+  auto struct_col = cudf::make_structs_column(
+    N, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto repr = wrap_column(std::move(struct_col),
                           *const_cast<memory::memory_space*>(gpu_space),
@@ -1528,12 +1536,16 @@ TEST_CASE("Fast converter: LIST<LIST<INT32>> nested metadata", "[fast][nested]")
     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                    static_cast<cudf::size_type>(inner_offs_h.size()),
                                    std::move(inner_offs_buf),
-                                   rmm::device_buffer{},
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                    0);
   stream.synchronize();
 
   auto inner_list =
-    cudf::make_lists_column(num_inner, std::move(inner_offsets), std::move(values), 0, {});
+    cudf::make_lists_column(num_inner,
+                            std::move(inner_offsets),
+                            std::move(values),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   std::vector<int32_t> outer_offs_h = {0, 2, 3};
   rmm::device_buffer outer_offs_buf(outer_offs_h.data(),
@@ -1544,12 +1556,16 @@ TEST_CASE("Fast converter: LIST<LIST<INT32>> nested metadata", "[fast][nested]")
     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                    static_cast<cudf::size_type>(outer_offs_h.size()),
                                    std::move(outer_offs_buf),
-                                   rmm::device_buffer{},
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                    0);
   stream.synchronize();
 
   auto outer_list =
-    cudf::make_lists_column(num_outer, std::move(outer_offsets), std::move(inner_list), 0, {});
+    cudf::make_lists_column(num_outer,
+                            std::move(outer_offsets),
+                            std::move(inner_list),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto repr = wrap_column(std::move(outer_list),
                           *const_cast<memory::memory_space*>(gpu_space),
@@ -1623,7 +1639,11 @@ TEST_CASE("Fast converter: LIST<STRUCT<INT32,FLOAT64>> nested metadata", "[fast]
   std::vector<std::unique_ptr<cudf::column>> struct_fields;
   struct_fields.push_back(std::move(f0));
   struct_fields.push_back(std::move(f1));
-  auto struct_col = cudf::make_structs_column(num_structs, std::move(struct_fields), 0, {});
+  auto struct_col =
+    cudf::make_structs_column(num_structs,
+                              std::move(struct_fields),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   // Build the offsets column for the LIST
   std::vector<int32_t> offsets_h = {0, 2, 2, 5};
@@ -1631,15 +1651,19 @@ TEST_CASE("Fast converter: LIST<STRUCT<INT32,FLOAT64>> nested metadata", "[fast]
                                  offsets_h.size() * sizeof(int32_t),
                                  stream.view(),
                                  gpu_space->get_default_allocator());
-  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
-                                                    static_cast<cudf::size_type>(offsets_h.size()),
-                                                    std::move(offsets_buf),
-                                                    rmm::device_buffer{},
-                                                    0);
+  auto offsets_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(offsets_h.size()),
+                                   std::move(offsets_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
   stream.synchronize();
 
-  auto list_col =
-    cudf::make_lists_column(num_lists, std::move(offsets_col), std::move(struct_col), 0, {});
+  auto list_col = cudf::make_lists_column(num_lists,
+                                          std::move(offsets_col),
+                                          std::move(struct_col),
+                                          0,
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto repr = wrap_column(std::move(list_col),
                           *const_cast<memory::memory_space*>(gpu_space),
@@ -1708,11 +1732,12 @@ TEST_CASE("Fast converter: STRUCT<LIST<INT32>,FLOAT64> nested metadata", "[fast]
                               offs_h.size() * sizeof(int32_t),
                               stream.view(),
                               gpu_space->get_default_allocator());
-  auto offs_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
-                                                 static_cast<cudf::size_type>(offs_h.size()),
-                                                 std::move(offs_buf),
-                                                 rmm::device_buffer{},
-                                                 0);
+  auto offs_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(offs_h.size()),
+                                   std::move(offs_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
 
   auto vals_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                             num_values,
@@ -1722,7 +1747,11 @@ TEST_CASE("Fast converter: STRUCT<LIST<INT32>,FLOAT64> nested metadata", "[fast]
   stream.synchronize();
 
   auto list_field =
-    cudf::make_lists_column(num_rows, std::move(offs_col), std::move(vals_col), 0, {});
+    cudf::make_lists_column(num_rows,
+                            std::move(offs_col),
+                            std::move(vals_col),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   // Build FLOAT64 field
   auto float_field = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
@@ -1736,7 +1765,8 @@ TEST_CASE("Fast converter: STRUCT<LIST<INT32>,FLOAT64> nested metadata", "[fast]
   std::vector<std::unique_ptr<cudf::column>> fields;
   fields.push_back(std::move(list_field));
   fields.push_back(std::move(float_field));
-  auto struct_col = cudf::make_structs_column(num_rows, std::move(fields), 0, {});
+  auto struct_col = cudf::make_structs_column(
+    num_rows, std::move(fields), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto repr = wrap_column(std::move(struct_col),
                           *const_cast<memory::memory_space*>(gpu_space),
@@ -2190,7 +2220,7 @@ TEST_CASE("Round-trip fast: STRING column content preserved", "[fast][roundtrip]
     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                    static_cast<cudf::size_type>(host_offsets.size()),
                                    std::move(offsets_buf),
-                                   rmm::device_buffer{},
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                    0);
 
   std::vector<int8_t> host_chars(total_chars, 'x');
@@ -2198,8 +2228,12 @@ TEST_CASE("Round-trip fast: STRING column content preserved", "[fast][roundtrip]
     host_chars.data(), host_chars.size(), stream.view(), gpu_space->get_default_allocator());
   stream.synchronize();
 
-  auto strings_col = cudf::make_strings_column(
-    num_strings, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+  auto strings_col =
+    cudf::make_strings_column(num_strings,
+                              std::move(offsets_col),
+                              std::move(chars_buf),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto orig_repr = wrap_column(std::move(strings_col),
                                *const_cast<memory::memory_space*>(gpu_space),
@@ -2243,7 +2277,7 @@ TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]
     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                    static_cast<cudf::size_type>(host_offsets.size()),
                                    std::move(offsets_buf),
-                                   rmm::device_buffer{},
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                    0);
   auto values_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                               num_values,
@@ -2254,8 +2288,11 @@ TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]
     values_col->mutable_view().head(), 0x33, num_values * sizeof(int32_t), stream.view()));
   stream.synchronize();
 
-  auto list_col =
-    cudf::make_lists_column(num_lists, std::move(offsets_col), std::move(values_col), 0, {});
+  auto list_col = cudf::make_lists_column(num_lists,
+                                          std::move(offsets_col),
+                                          std::move(values_col),
+                                          0,
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto orig_repr = wrap_column(std::move(list_col),
                                *const_cast<memory::memory_space*>(gpu_space),
@@ -2306,7 +2343,8 @@ TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][rou
   std::vector<std::unique_ptr<cudf::column>> fields;
   fields.push_back(std::move(f0));
   fields.push_back(std::move(f1));
-  auto struct_col = cudf::make_structs_column(N, std::move(fields), 0, {});
+  auto struct_col = cudf::make_structs_column(
+    N, std::move(fields), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto orig_repr = wrap_column(std::move(struct_col),
                                *const_cast<memory::memory_space*>(gpu_space),
