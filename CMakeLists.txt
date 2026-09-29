@@ -430,7 +430,7 @@ endif()
 target_include_directories(cucascade_topology_discovery_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
 target_link_libraries(cucascade_topology_discovery_objects
-                      PUBLIC CUDA::nvml_static CUDA::cuda_driver)
+                      PUBLIC CUDA::nvml_static CUDA::cuda_driver CUDA::nvtx3)
 target_compile_features(cucascade_topology_discovery_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_topology_discovery_objects
                         PRIVATE cuda_std_20)
@@ -448,7 +448,7 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
               cucascade_topology_discovery_static)
 
   target_link_libraries(cucascade_topology_discovery_static
-                        PRIVATE CUDA::nvml_static CUDA::cuda_driver)
+                        PRIVATE CUDA::nvml_static CUDA::cuda_driver CUDA::nvtx3)
   target_include_directories(cucascade_topology_discovery_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
@@ -526,7 +526,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
               cucascade_topology_discovery_shared)
 
   target_link_libraries(cucascade_topology_discovery_shared
-                        PRIVATE CUDA::nvml_static CUDA::cuda_driver)
+                        PRIVATE CUDA::nvml_static CUDA::cuda_driver CUDA::nvtx3)
   target_include_directories(cucascade_topology_discovery_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)
@@ -638,6 +638,8 @@ include(CMakePackageConfigHelpers)
 if(CUCASCADE_TOPOLOGY_ONLY)
   install(FILES include/cucascade/memory/topology_discovery.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
+  install(FILES include/cucascade/nvtx.hpp
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade)
 elseif(CUCASCADE_BUILD_CUDF)
   install(
     DIRECTORY include/
