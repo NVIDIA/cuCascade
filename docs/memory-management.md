@@ -187,6 +187,29 @@ The `reservation_aware_resource_adaptor` wraps an RMM `device_memory_resource` (
 2. **Per-stream reservation enforcement** -- each stream has its own reservation and policy
 3. **Memory limit enforcement** -- hard cap on total allocations
 4. **OOM handling** -- pluggable retry policies
+5. **Pool identity** -- nullable borrowed access to the CUDA pool known to back the upstream resource
+
+### CUDA Pool Peer Access
+
+`reservation_aware_resource_adaptor::pool_handle()` returns the adaptor's borrowed pool handle, or
+`nullptr` when the upstream pool cannot be discovered. The adaptor does not own or reconfigure
+that pool. An explicitly supplied constructor handle must identify the pool that actually backs
+upstream allocations before callers use it as access evidence.
+
+`grant_pool_peer_access(pool, owner_device, accessing_device)` configures one pool for one
+accessing GPU and reports whether access was granted, unsupported, rejected by bidirectional byte
+verification, or failed in the CUDA runtime. The pool must be live, the device IDs must be valid and
+visible, and `owner_device` must identify the pool's allocation device. A successful permission
+persists until changed through CUDA or the pool is destroyed. It does not promise bandwidth or
+prove the route of a later copy. A failed result neither proves an older permission is absent nor
+establishes a host-staged fallback. Verified peer results are cached process-wide; a transient CUDA
+error is retried on a later request. Legacy peer access is disabled only after a byte mismatch is
+confirmed.
+
+The legacy `enable_pool_peer_access_for_all_visible_devices()` helper remains best effort. It
+visits every visible peer for both the supplied pool and the owner's currently selected pool,
+discards individual outcomes, and on first use can synchronize devices and change legacy
+peer-access state process-wide.
 
 ### Per-Stream vs Per-Thread Tracking
 

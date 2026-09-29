@@ -19,14 +19,12 @@
  * Test Tags:
  * [reservation_aware] - reservation_aware_resource_adaptor behavior
  * [oom]               - out-of-memory diagnostics
+ * [pool]              - borrowed CUDA memory-pool identity
  * [gpu]               - requires a CUDA device
  *
- * These tests drive the adaptor into an out-of-memory condition by giving it a
- * tiny capacity, then assert that the cudaMemPool_t reported in the resulting
- * cucascade_out_of_memory matches the pool of whatever upstream allocator was
- * supplied. The adaptor recovers the handle from the upstream itself (via
- * cuda::mr::resource_cast), so it must be present for pool-owning resources and
- * null for resources that do not expose a pool.
+ * These tests cover the adaptor's borrowed pool accessor and its OOM diagnostics. The adaptor
+ * recovers a handle from supported upstream resources via cuda::mr::resource_cast, accepts an
+ * explicit handle for resources that cannot expose one, and otherwise reports a null handle.
  */
 
 #include <cucascade/cuda/stream.hpp>
@@ -45,6 +43,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <cstddef>
+#include <cstdint>
 
 using namespace cucascade::memory;
 
@@ -55,6 +54,20 @@ namespace {
 // deterministic OOM without depending on how much GPU memory is actually free.
 constexpr std::size_t tiny_capacity   = 1024;
 constexpr std::size_t oversized_bytes = 1ULL << 20;  // 1 MiB >> tiny_capacity
+
+reservation_aware_resource_adaptor make_adaptor(rmm::device_async_resource_ref upstream,
+                                                cudaMemPool_t pool = nullptr)
+{
+  return reservation_aware_resource_adaptor{
+    memory_space_id{Tier::GPU, 0},
+    upstream,
+    tiny_capacity,
+    tiny_capacity,
+    nullptr,
+    nullptr,
+    reservation_aware_resource_adaptor::AllocationTrackingScope::PER_STREAM,
+    pool};
+}
 
 bool has_cuda_device()
 {
@@ -84,6 +97,81 @@ cudaMemPool_t oom_pool_handle_for(rmm::device_async_resource_ref upstream)
 }
 
 }  // namespace
+
+TEST_CASE("Pool accessor exposes pools discovered from supported RMM resources",
+          "[reservation_aware][pool][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  SECTION("cuda_async_memory_resource")
+  {
+    rmm::mr::cuda_async_memory_resource upstream{};
+    auto adaptor = make_adaptor(rmm::device_async_resource_ref{upstream});
+    CHECK(adaptor.pool_handle() == upstream.pool_handle());
+  }
+
+  SECTION("cuda_async_view_memory_resource")
+  {
+    cudaMemPool_t default_pool = nullptr;
+    REQUIRE(cudaDeviceGetDefaultMemPool(&default_pool, 0) == cudaSuccess);
+    rmm::mr::cuda_async_view_memory_resource upstream{default_pool};
+    auto adaptor = make_adaptor(rmm::device_async_resource_ref{upstream});
+    CHECK(adaptor.pool_handle() == upstream.pool_handle());
+  }
+
+#if CUDART_VERSION >= 13000
+  SECTION("cuda_async_managed_memory_resource")
+  {
+    rmm::mr::cuda_async_managed_memory_resource upstream{};
+    auto adaptor = make_adaptor(rmm::device_async_resource_ref{upstream});
+    CHECK(adaptor.pool_handle() == upstream.pool_handle());
+  }
+#endif
+}
+
+TEST_CASE("Pool accessor is null when the upstream pool is unknown",
+          "[reservation_aware][pool][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  rmm::mr::cuda_memory_resource upstream{};
+  auto adaptor = make_adaptor(rmm::device_async_resource_ref{upstream});
+  CHECK(adaptor.pool_handle() == nullptr);
+}
+
+TEST_CASE("Pool accessor preserves explicit handles through shared wrapper copies",
+          "[reservation_aware][pool][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  rmm::mr::cuda_async_memory_resource upstream{};
+  cudaMemPool_t explicit_pool = nullptr;
+  REQUIRE(cudaDeviceGetDefaultMemPool(&explicit_pool, 0) == cudaSuccess);
+
+  auto copy = [&] {
+    auto adaptor = make_adaptor(rmm::device_async_resource_ref{upstream}, explicit_pool);
+    CHECK(adaptor.pool_handle() == explicit_pool);
+    return adaptor;
+  }();
+
+  CHECK(copy.pool_handle() == explicit_pool);
+}
+
+TEST_CASE("Pool accessor returns a borrowed handle", "[reservation_aware][pool][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  rmm::mr::cuda_async_memory_resource upstream{};
+  auto borrowed = upstream.pool_handle();
+  {
+    auto adaptor = make_adaptor(rmm::device_async_resource_ref{upstream});
+    REQUIRE(adaptor.pool_handle() == borrowed);
+  }
+
+  std::uint64_t release_threshold = 0;
+  CHECK(cudaMemPoolGetAttribute(borrowed, cudaMemPoolAttrReleaseThreshold, &release_threshold) ==
+        cudaSuccess);
+}
 
 TEST_CASE("OOM reports the pool of a cuda_async_memory_resource upstream",
           "[reservation_aware][oom][gpu]")
@@ -161,6 +249,8 @@ TEST_CASE("An explicitly supplied pool handle overrides upstream introspection",
     nullptr,
     reservation_aware_resource_adaptor::AllocationTrackingScope::PER_STREAM,
     explicit_pool};
+
+  CHECK(adaptor.pool_handle() == explicit_pool);
 
   try {
     adaptor.allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, oversized_bytes, 256);

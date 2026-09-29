@@ -16,6 +16,7 @@
  */
 
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/detail/pool_peer_access.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/null_device_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
@@ -25,6 +26,7 @@
 
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace cucascade {
@@ -32,191 +34,380 @@ namespace cucascade {
 namespace memory {
 
 namespace {
-// Cached per-pair result of an empirical peer-DMA probe. p2p_dma_supported(i,j)
-// is true iff cudaMemcpyPeer from device i to device j actually moves bytes
-// on this hardware. The probe is run lazily on first access and pinned for
-// the lifetime of the process. On consumer Intel chipsets (Core Ultra etc.)
-// the standard CUDA peer-access APIs all report success but the underlying
-// PCIe/chipset hardware can't actually do peer DMA — cudaMemcpyPeer returns
-// success without moving bytes. The probe catches this empirically.
-constexpr int kMaxDevices                      = 16;
-bool g_p2p_supported[kMaxDevices][kMaxDevices] = {};
-bool g_p2p_probed                              = false;
-std::mutex& p2p_probe_mutex()
+using detail::peer_dma_probe_result;
+using detail::peer_dma_probe_status;
+
+[[nodiscard]] peer_dma_probe_result make_probe_result(peer_dma_probe_status status) noexcept
 {
-  static std::mutex m;
-  return m;
+  return peer_dma_probe_result{status, cudaSuccess};
 }
 
-void run_p2p_probe_locked(int device_count)
+[[nodiscard]] peer_dma_probe_result make_probe_error(cudaError_t error) noexcept
 {
-  // Save the current device so the probe does not clobber the caller's
-  // RAII device guard. The probe issues many raw cudaSetDevice() calls;
-  // without saving the original, it leaves device 0 active and subsequent
-  // CUDA calls (e.g. cudaEventRecord) that expect the RAII-guarded device
-  // will fail.
-  int saved_device = 0;
-  (void)cudaGetDevice(&saved_device);
+  return peer_dma_probe_result{peer_dma_probe_status::CUDA_ERROR, error};
+}
 
-  // Step 1: enable legacy peer access for all P2P-capable pairs. The probe
-  // needs peer access enabled to detect the "lying enable" failure mode —
-  // with peer access disabled, cudaMemcpyPeer auto-host-stages and the probe
-  // would always report success, which would conflate working hardware with
-  // the host-fallback path.
-  for (int i = 0; i < device_count; ++i) {
-    for (int j = 0; j < device_count; ++j) {
-      if (i == j) continue;
-      int can = 0;
-      if (cudaDeviceCanAccessPeer(&can, i, j) != cudaSuccess || !can) {
-        (void)cudaGetLastError();
-        continue;
-      }
-      if (cudaSetDevice(i) != cudaSuccess) {
-        (void)cudaGetLastError();
-        continue;
-      }
-      cudaError_t e = cudaDeviceEnablePeerAccess(j, 0);
-      if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) { (void)cudaGetLastError(); }
+void record_probe_error(peer_dma_probe_result& result, cudaError_t error) noexcept
+{
+  if (error != cudaSuccess && result.status != peer_dma_probe_status::CUDA_ERROR) {
+    result = make_probe_error(error);
+  }
+}
+
+[[nodiscard]] peer_dma_probe_result probe_peer_dma_direction(int source_device,
+                                                             int destination_device)
+{
+  constexpr std::size_t probe_bytes = 64;
+  unsigned char source_pattern[probe_bytes]{};
+  unsigned char destination_sentinel[probe_bytes]{};
+  for (std::size_t index = 0; index < probe_bytes; ++index) {
+    source_pattern[index]       = static_cast<unsigned char>(0x40 + (index & 0x3F));
+    destination_sentinel[index] = 0xAA;
+  }
+
+  void* source      = nullptr;
+  void* destination = nullptr;
+  auto result       = make_probe_result(peer_dma_probe_status::VERIFICATION_FAILED);
+
+  auto check = [&result](cudaError_t error) {
+    if (error == cudaSuccess) { return true; }
+    record_probe_error(result, error);
+    return false;
+  };
+
+  if (check(cudaSetDevice(source_device)) && check(cudaMalloc(&source, probe_bytes)) &&
+      check(cudaMemcpy(source, source_pattern, probe_bytes, cudaMemcpyHostToDevice)) &&
+      check(cudaSetDevice(destination_device)) && check(cudaMalloc(&destination, probe_bytes)) &&
+      check(cudaMemcpy(destination, destination_sentinel, probe_bytes, cudaMemcpyHostToDevice)) &&
+      check(cudaMemcpyPeer(destination, destination_device, source, source_device, probe_bytes)) &&
+      check(cudaDeviceSynchronize())) {
+    unsigned char readback[probe_bytes]{};
+    if (check(cudaMemcpy(readback, destination, probe_bytes, cudaMemcpyDeviceToHost)) &&
+        std::memcmp(readback, source_pattern, probe_bytes) == 0) {
+      result = make_probe_result(peer_dma_probe_status::SUPPORTED);
     }
   }
 
-  // Step 2: probe each direction. Allocate tiny test buffers, fill src with a
-  // known sentinel, peer-copy, verify dst == src.
-  constexpr std::size_t kProbeBytes       = 64;
-  unsigned char src_pat[kProbeBytes]      = {};
-  unsigned char dst_sentinel[kProbeBytes] = {};
-  for (std::size_t k = 0; k < kProbeBytes; ++k) {
-    src_pat[k]      = static_cast<unsigned char>(0x40 + (k & 0x3F));
-    dst_sentinel[k] = 0xAA;
+  if (destination != nullptr) {
+    auto error = cudaSetDevice(destination_device);
+    record_probe_error(result, error);
+    if (error == cudaSuccess) { record_probe_error(result, cudaFree(destination)); }
   }
-  for (int i = 0; i < device_count; ++i) {
-    for (int j = 0; j < device_count; ++j) {
-      if (i == j) {
-        g_p2p_supported[i][j] = true;
-        continue;
+  if (source != nullptr) {
+    auto error = cudaSetDevice(source_device);
+    record_probe_error(result, error);
+    if (error == cudaSuccess) { record_probe_error(result, cudaFree(source)); }
+  }
+  return result;
+}
+
+/** @brief A process-wide cache for storing peer DMA probe results. */
+class peer_dma_probe_cache {
+ public:
+  explicit peer_dma_probe_cache(detail::peer_dma_probe_operations operations) noexcept
+    : _operations(operations)
+  {
+  }
+
+  [[nodiscard]] peer_dma_probe_result result(int source_device, int destination_device)
+  {
+    std::lock_guard lock(_mutex);
+    auto const was_initialized = _initialized;
+    auto const error           = initialize_locked();
+    if (error != cudaSuccess) { return make_probe_error(error); }
+    if (source_device < 0 || destination_device < 0 || source_device >= _device_count ||
+        destination_device >= _device_count) {
+      return make_probe_error(cudaErrorInvalidDevice);
+    }
+    auto& cached = entry(source_device, destination_device);
+    if (was_initialized && cached.status == peer_dma_probe_status::CUDA_ERROR) {
+      cached = probe_direction(source_device, destination_device);
+    }
+    return cached;
+  }
+
+  [[nodiscard]] int broken_direction_count()
+  {
+    std::lock_guard lock(_mutex);
+    auto const was_initialized = _initialized;
+    if (initialize_locked() != cudaSuccess) {
+      (void)_operations.get_last_error();
+      return 0;
+    }
+    int broken = 0;
+    for (int source = 0; source < _device_count; ++source) {
+      for (int destination = 0; destination < _device_count; ++destination) {
+        auto& cached = entry(source, destination);
+        if (was_initialized && cached.status == peer_dma_probe_status::CUDA_ERROR) {
+          cached = probe_direction(source, destination);
+        }
+        if (cached.status == peer_dma_probe_status::VERIFICATION_FAILED) { ++broken; }
       }
-      int can = 0;
-      if (cudaDeviceCanAccessPeer(&can, i, j) != cudaSuccess || !can) {
-        (void)cudaGetLastError();
-        g_p2p_supported[i][j] = false;
-        continue;
+    }
+    return broken;
+  }
+
+ private:
+  [[nodiscard]] peer_dma_probe_result& entry(int source_device, int destination_device) noexcept
+  {
+    auto const index =
+      static_cast<std::size_t>(source_device) * static_cast<std::size_t>(_device_count) +
+      static_cast<std::size_t>(destination_device);
+    return _results[index];
+  }
+
+  [[nodiscard]] cudaError_t initialize_locked()
+  {
+    if (_initialized) { return cudaSuccess; }
+    int device_count = 0;
+    auto const error = _operations.get_device_count(&device_count);
+    if (error != cudaSuccess) { return error; }
+    if (device_count < 0) { return cudaErrorInvalidValue; }
+    int original_device     = 0;
+    auto const device_error = _operations.get_device(&original_device);
+    if (device_error != cudaSuccess) { return device_error; }
+    try {
+      auto const count = static_cast<std::size_t>(device_count);
+      _results.assign(count * count, peer_dma_probe_result{});
+    } catch (...) {
+      return cudaErrorMemoryAllocation;
+    }
+    _device_count = device_count;
+    for (int source = 0; source < device_count; ++source) {
+      for (int destination = 0; destination < device_count; ++destination) {
+        entry(source, destination) = probe_direction(source, destination);
       }
-      void* src = nullptr;
-      void* dst = nullptr;
-      bool ok   = false;
-      if (cudaSetDevice(i) == cudaSuccess && cudaMalloc(&src, kProbeBytes) == cudaSuccess &&
-          cudaMemcpy(src, src_pat, kProbeBytes, cudaMemcpyHostToDevice) == cudaSuccess &&
-          cudaSetDevice(j) == cudaSuccess && cudaMalloc(&dst, kProbeBytes) == cudaSuccess &&
-          cudaMemcpy(dst, dst_sentinel, kProbeBytes, cudaMemcpyHostToDevice) == cudaSuccess) {
-        if (cudaMemcpyPeer(dst, j, src, i, kProbeBytes) == cudaSuccess &&
-            cudaDeviceSynchronize() == cudaSuccess) {
-          unsigned char readback[kProbeBytes] = {};
-          if (cudaMemcpy(readback, dst, kProbeBytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
-            ok = std::memcmp(readback, src_pat, kProbeBytes) == 0;
-          }
+    }
+    auto const restoration_error = _operations.set_device(original_device);
+    if (restoration_error != cudaSuccess) { return restoration_error; }
+    _initialized      = true;
+    auto const broken = count_broken_locked();
+    if (broken > 0) {
+      fprintf(stderr,
+              "[cucascade] direct GPU-to-GPU byte verification failed on %d direction(s); "
+              "pool peer access will not be granted.\n",
+              broken);
+    }
+    return cudaSuccess;
+  }
+
+  [[nodiscard]] int count_broken_locked() const noexcept
+  {
+    int broken = 0;
+    for (auto const& result : _results) {
+      if (result.status == peer_dma_probe_status::VERIFICATION_FAILED) { ++broken; }
+    }
+    return broken;
+  }
+
+  [[nodiscard]] peer_dma_probe_result probe_direction(int source_device, int destination_device)
+  {
+    if (source_device == destination_device) {
+      return make_probe_result(peer_dma_probe_status::SUPPORTED);
+    }
+    int can_access = 0;
+    auto error     = _operations.can_access_peer(&can_access, destination_device, source_device);
+    if (error != cudaSuccess) { return make_probe_error(error); }
+    if (can_access == 0) { return make_probe_result(peer_dma_probe_status::UNSUPPORTED); }
+
+    int saved_device = 0;
+    error            = _operations.get_device(&saved_device);
+    if (error != cudaSuccess) { return make_probe_error(error); }
+    auto result = make_probe_result(peer_dma_probe_status::SUPPORTED);
+    error       = _operations.set_device(destination_device);
+    if (error == cudaSuccess) {
+      error = _operations.enable_peer_access(source_device, 0);
+      if (error == cudaErrorPeerAccessAlreadyEnabled) {
+        (void)_operations.get_last_error();
+        error = cudaSuccess;
+      }
+    }
+    if (error == cudaSuccess) {
+      result = _operations.probe_peer_dma(source_device, destination_device);
+      if (result.status == peer_dma_probe_status::VERIFICATION_FAILED) {
+        error = detail::disable_peer_access_for_failed_probe(source_device,
+                                                             destination_device,
+                                                             _operations.set_device,
+                                                             _operations.disable_peer_access);
+        if (error == cudaErrorPeerAccessNotEnabled) {
+          (void)_operations.get_last_error();
+          error = cudaSuccess;
         }
       }
-      if (dst) {
-        cudaSetDevice(j);
-        cudaFree(dst);
-      }
-      if (src) {
-        cudaSetDevice(i);
-        cudaFree(src);
-      }
-      g_p2p_supported[i][j] = ok;
     }
+    if (error != cudaSuccess) { result = make_probe_error(error); }
+    error = detail::finish_peer_dma_probe(saved_device, result.error, _operations.set_device);
+    if (error != result.error) { result = make_probe_error(error); }
+    return result;
   }
 
-  // Step 3: for any pair where the probe failed, disable legacy peer access so
-  // subsequent cudaMemcpyPeer* calls fall back to the driver's host-stage path.
-  for (int i = 0; i < device_count; ++i) {
-    for (int j = 0; j < device_count; ++j) {
-      if (i == j) continue;
-      if (g_p2p_supported[i][j]) continue;
-      int can = 0;
-      if (cudaDeviceCanAccessPeer(&can, i, j) != cudaSuccess || !can) {
-        (void)cudaGetLastError();
-        continue;
-      }
-      cudaSetDevice(i);
-      cudaError_t e = cudaDeviceDisablePeerAccess(j);
-      if (e != cudaSuccess && e != cudaErrorPeerAccessNotEnabled) { (void)cudaGetLastError(); }
-    }
-  }
-  // Restore the device the caller had active before the probe ran.
-  cudaSetDevice(saved_device);
-  (void)cudaGetLastError();
+  detail::peer_dma_probe_operations _operations;
+  std::mutex _mutex;
+  std::vector<peer_dma_probe_result> _results;
+  int _device_count{0};
+  bool _initialized{false};
+};
 
-  // Report.
-  int broken = 0;
-  for (int i = 0; i < device_count; ++i) {
-    for (int j = 0; j < device_count; ++j) {
-      if (i != j && !g_p2p_supported[i][j]) {
-        int can = 0;
-        if (cudaDeviceCanAccessPeer(&can, i, j) == cudaSuccess && can) ++broken;
-        (void)cudaGetLastError();
-      }
-    }
-  }
-  if (broken > 0) {
-    fprintf(stderr,
-            "[cucascade] direct GPU↔GPU peer DMA broken on %d direction(s); "
-            "cudaMemcpyPeer* will host-stage automatically.\n",
-            broken);
-  }
+cudaError_t runtime_get_device(int* device) { return cudaGetDevice(device); }
+cudaError_t runtime_set_device(int device) { return cudaSetDevice(device); }
+cudaError_t runtime_enable_peer_access(int device, unsigned int flags)
+{
+  return cudaDeviceEnablePeerAccess(device, flags);
+}
+cudaError_t runtime_disable_peer_access(int device) { return cudaDeviceDisablePeerAccess(device); }
+cudaError_t runtime_get_last_error() { return cudaGetLastError(); }
+
+cudaError_t runtime_get_device_count(int* count) { return cudaGetDeviceCount(count); }
+
+cudaError_t runtime_can_access_peer(int* can_access, int device, int peer_device)
+{
+  return cudaDeviceCanAccessPeer(can_access, device, peer_device);
 }
 
-bool ensure_p2p_probed()
+peer_dma_probe_cache& global_peer_dma_probe_cache()
 {
-  std::lock_guard<std::mutex> lk(p2p_probe_mutex());
-  if (g_p2p_probed) return true;
-  int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
-    (void)cudaGetLastError();
-    g_p2p_probed = true;  // pin the empty result
-    return false;
-  }
-  if (device_count > kMaxDevices) device_count = kMaxDevices;
-  run_p2p_probe_locked(device_count);
-  g_p2p_probed = true;
-  return true;
+  static peer_dma_probe_cache cache{{runtime_get_device_count,
+                                     runtime_get_device,
+                                     runtime_set_device,
+                                     runtime_can_access_peer,
+                                     runtime_enable_peer_access,
+                                     runtime_disable_peer_access,
+                                     runtime_get_last_error,
+                                     probe_peer_dma_direction}};
+  return cache;
 }
 
-bool p2p_dma_works_cached(int src, int dst)
+peer_dma_probe_result runtime_probe_peer_dma(int source_device, int destination_device)
 {
-  if (src < 0 || dst < 0 || src >= kMaxDevices || dst >= kMaxDevices) return false;
-  ensure_p2p_probed();
-  return g_p2p_supported[src][dst];
+  return global_peer_dma_probe_cache().result(source_device, destination_device);
 }
 
-void set_access_on_pool(cudaMemPool_t pool, int owner_device_id, int device_count)
+cudaError_t runtime_get_pool_access(cudaMemAccessFlags* flags,
+                                    cudaMemPool_t pool,
+                                    cudaMemLocation* location)
 {
-  for (int peer = 0; peer < device_count; ++peer) {
-    if (peer == owner_device_id) { continue; }
-    int can_access = 0;
-    if (cudaDeviceCanAccessPeer(&can_access, peer, owner_device_id) != cudaSuccess || !can_access) {
-      (void)cudaGetLastError();
-      continue;
-    }
-    // Skip pairs where the empirical probe shows that direct peer DMA does NOT
-    // actually move bytes on this hardware (consumer Intel platforms etc.).
-    // Granting cudaMemPoolSetAccess(ProtReadWrite) on those pairs would force
-    // cudaMemcpyPeer* down a silent-no-op path for pool-allocated memory; with
-    // pool access left at the default ProtNone instead, the driver host-stages
-    // automatically. cudaDeviceEnablePeerAccess for the broken pair has
-    // already been disabled by the probe.
-    if (!p2p_dma_works_cached(peer, owner_device_id)) continue;
-    cudaMemAccessDesc desc{};
-    desc.location.type = cudaMemLocationTypeDevice;
-    desc.location.id   = peer;
-    desc.flags         = cudaMemAccessFlagsProtReadWrite;
-    if (cudaMemPoolSetAccess(pool, &desc, 1) != cudaSuccess) {
-      (void)cudaGetLastError();  // best effort
-    }
-  }
+  return cudaMemPoolGetAccess(flags, pool, location);
+}
+
+cudaError_t runtime_set_pool_access(cudaMemPool_t pool,
+                                    cudaMemAccessDesc const* descriptors,
+                                    std::size_t count)
+{
+  return cudaMemPoolSetAccess(pool, descriptors, count);
 }
 }  // namespace
+
+namespace detail {
+
+std::vector<peer_dma_probe_result> probe_peer_dma_sequence(
+  std::vector<std::pair<int, int>> const& requests, peer_dma_probe_operations const& operations)
+{
+  peer_dma_probe_cache cache{operations};
+  std::vector<peer_dma_probe_result> results;
+  results.reserve(requests.size());
+  for (auto const& [source, destination] : requests) {
+    results.push_back(cache.result(source, destination));
+  }
+  return results;
+}
+
+cudaError_t disable_peer_access_for_failed_probe(int source_device,
+                                                 int destination_device,
+                                                 cudaError_t (*set_device)(int),
+                                                 cudaError_t (*disable_peer_access)(int)) noexcept
+{
+  auto const set_error = set_device(destination_device);
+  if (set_error != cudaSuccess) { return set_error; }
+  return disable_peer_access(source_device);
+}
+
+cudaError_t finish_peer_dma_probe(int saved_device,
+                                  cudaError_t probe_error,
+                                  cudaError_t (*set_device)(int)) noexcept
+{
+  auto const restoration_error = set_device(saved_device);
+  return restoration_error == cudaSuccess ? probe_error : restoration_error;
+}
+
+pool_peer_access_result grant_pool_peer_access(
+  cudaMemPool_t pool,
+  int owner_device,
+  int accessing_device,
+  pool_peer_access_operations const& operations) noexcept
+{
+  int device_count = 0;
+  auto error       = operations.get_device_count(&device_count);
+  if (error != cudaSuccess) { return {pool_peer_access_status::CUDA_ERROR, error}; }
+  if (owner_device < 0 || accessing_device < 0 || owner_device >= device_count ||
+      accessing_device >= device_count) {
+    return {pool_peer_access_status::CUDA_ERROR, cudaErrorInvalidDevice};
+  }
+  if (pool == nullptr) { return {pool_peer_access_status::CUDA_ERROR, cudaErrorInvalidValue}; }
+
+  cudaMemLocation location{};
+  location.type = cudaMemLocationTypeDevice;
+  location.id   = accessing_device;
+
+  cudaMemAccessFlags flags{};
+  error = operations.get_pool_access(&flags, pool, &location);
+  if (error != cudaSuccess) { return {pool_peer_access_status::CUDA_ERROR, error}; }
+  auto const already_read_write = flags == cudaMemAccessFlagsProtReadWrite;
+
+  if (owner_device == accessing_device) {
+    // CUDA pool allocations are always read/write accessible from their resident device.
+    // A different answer means the supplied owner does not describe this pool.
+    return already_read_write
+             ? pool_peer_access_result{pool_peer_access_status::GRANTED, cudaSuccess}
+             : pool_peer_access_result{pool_peer_access_status::CUDA_ERROR, cudaErrorInvalidValue};
+  }
+
+  int can_access = 0;
+  error          = operations.can_access_peer(&can_access, accessing_device, owner_device);
+  if (error != cudaSuccess) { return {pool_peer_access_status::CUDA_ERROR, error}; }
+  if (can_access == 0) { return {pool_peer_access_status::UNSUPPORTED, cudaSuccess}; }
+  error = operations.can_access_peer(&can_access, owner_device, accessing_device);
+  if (error != cudaSuccess) { return {pool_peer_access_status::CUDA_ERROR, error}; }
+  if (can_access == 0) { return {pool_peer_access_status::UNSUPPORTED, cudaSuccess}; }
+
+  std::pair<int, int> const directions[]{{owner_device, accessing_device},
+                                         {accessing_device, owner_device}};
+  for (auto [source, destination] : directions) {
+    auto probe = operations.probe_peer_dma(source, destination);
+    switch (probe.status) {
+      case peer_dma_probe_status::SUPPORTED: break;
+      case peer_dma_probe_status::UNSUPPORTED:
+        return {pool_peer_access_status::UNSUPPORTED, cudaSuccess};
+      case peer_dma_probe_status::VERIFICATION_FAILED:
+        return {pool_peer_access_status::VERIFICATION_FAILED, cudaSuccess};
+      case peer_dma_probe_status::CUDA_ERROR:
+        return {pool_peer_access_status::CUDA_ERROR, probe.error};
+    }
+  }
+
+  if (already_read_write) { return {pool_peer_access_status::GRANTED, cudaSuccess}; }
+
+  cudaMemAccessDesc descriptor{};
+  descriptor.location = location;
+  descriptor.flags    = cudaMemAccessFlagsProtReadWrite;
+  error               = operations.set_pool_access(pool, &descriptor, 1);
+  return error == cudaSuccess
+           ? pool_peer_access_result{pool_peer_access_status::GRANTED, cudaSuccess}
+           : pool_peer_access_result{pool_peer_access_status::CUDA_ERROR, error};
+}
+
+}  // namespace detail
+
+pool_peer_access_result grant_pool_peer_access(cudaMemPool_t pool,
+                                               int owner_device,
+                                               int accessing_device) noexcept
+{
+  static constexpr detail::pool_peer_access_operations operations{runtime_get_device_count,
+                                                                  runtime_can_access_peer,
+                                                                  runtime_probe_peer_dma,
+                                                                  runtime_get_pool_access,
+                                                                  runtime_set_pool_access};
+  return detail::grant_pool_peer_access(pool, owner_device, accessing_device, operations);
+}
 
 void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int owner_device_id)
 {
@@ -225,24 +416,19 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
     (void)cudaGetLastError();
     return;
   }
-  // Make sure the empirical peer-DMA probe has run before we grant pool
-  // access. The probe needs cudaDeviceEnablePeerAccess to be in its enabled
-  // state to detect the "lying enable" failure mode, and disables peer access
-  // for any pair where direct DMA doesn't actually move bytes. Subsequent
-  // cudaMemPoolSetAccess calls then skip the broken pairs.
-  ensure_p2p_probed();
 
-  set_access_on_pool(pool, owner_device_id, device_count);
+  auto grant_to_visible_peers = [owner_device_id, device_count](cudaMemPool_t target_pool) {
+    for (int peer = 0; peer < device_count; ++peer) {
+      if (peer == owner_device_id) { continue; }
+      [[maybe_unused]] auto result = grant_pool_peer_access(target_pool, owner_device_id, peer);
+    }
+  };
 
-  // Also set access on the device's DEFAULT pool. cudf and other libraries may
-  // route allocations through the default pool (e.g. cudf::concatenate when
-  // its resource_ref points back to the device default), and without
-  // peer-access set on the default pool, cudaMemcpyPeer* between two default
-  // pools silently no-ops the same way it does for cudaMallocAsync pools.
-  rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{owner_device_id});
-  cudaMemPool_t default_pool{};
-  if (cudaDeviceGetMemPool(&default_pool, owner_device_id) == cudaSuccess) {
-    set_access_on_pool(default_pool, owner_device_id, device_count);
+  grant_to_visible_peers(pool);
+
+  cudaMemPool_t current_pool{};
+  if (cudaDeviceGetMemPool(&current_pool, owner_device_id) == cudaSuccess) {
+    if (current_pool != pool) { grant_to_visible_peers(current_pool); }
   } else {
     (void)cudaGetLastError();
   }
@@ -287,7 +473,8 @@ DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)
 bool probe_peer_dma_works(int src_device, int dst_device)
 {
   if (src_device == dst_device) return true;
-  return p2p_dma_works_cached(src_device, dst_device);
+  return global_peer_dma_probe_cache().result(src_device, dst_device).status ==
+         peer_dma_probe_status::SUPPORTED;
 }
 
 int disable_peer_access_where_broken(std::vector<cudaMemPool_t> const& pools_by_device)
@@ -300,26 +487,7 @@ int disable_peer_access_where_broken(std::vector<cudaMemPool_t> const& pools_by_
   // architecture (cucascade pools that exist before the probe runs would never
   // have peer access granted to broken peers in the first place).
   (void)pools_by_device;
-  ensure_p2p_probed();
-  int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
-    (void)cudaGetLastError();
-    return 0;
-  }
-  if (device_count > kMaxDevices) device_count = kMaxDevices;
-  int disabled = 0;
-  for (int i = 0; i < device_count; ++i) {
-    for (int j = 0; j < device_count; ++j) {
-      if (i == j) continue;
-      int can = 0;
-      if (cudaDeviceCanAccessPeer(&can, i, j) != cudaSuccess || !can) {
-        (void)cudaGetLastError();
-        continue;
-      }
-      if (!g_p2p_supported[j][i]) ++disabled;
-    }
-  }
-  return disabled;
+  return global_peer_dma_probe_cache().broken_direction_count();
 }
 
 // =============================================================================

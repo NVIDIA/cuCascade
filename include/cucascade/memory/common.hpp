@@ -23,6 +23,7 @@
 #include <rmm/version_config.hpp>
 
 #include <cuda/memory_resource>
+#include <cuda_runtime_api.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,67 @@
 
 namespace cucascade {
 namespace memory {
+
+/** @brief Outcome of a CUDA memory-pool peer-access request. */
+enum class pool_peer_access_status {
+  GRANTED,              ///< Read/write pool access is established
+  UNSUPPORTED,          ///< The device pair lacks required peer capability
+  VERIFICATION_FAILED,  ///< Bidirectional byte-transfer verification was rejected
+  CUDA_ERROR            ///< The request is invalid or a CUDA runtime operation failed
+};
+
+class pool_peer_access_result;
+
+namespace detail {
+struct pool_peer_access_operations;
+
+[[nodiscard]] pool_peer_access_result grant_pool_peer_access(
+  cudaMemPool_t pool,
+  int owner_device,
+  int accessing_device,
+  pool_peer_access_operations const& operations) noexcept;
+}  // namespace detail
+
+/**
+ * @brief Result of a targeted CUDA memory-pool peer-access request
+ *
+ * A granted cross-device result establishes that byte-transfer verification succeeded in both
+ * directions and that the CUDA runtime accepted or already reported read/write access to the
+ * requested pool for the accessing device.
+ */
+class pool_peer_access_result {
+ public:
+  /** @brief Returns the outcome category. */
+  [[nodiscard]] pool_peer_access_status status() const noexcept { return _status; }
+
+  /**
+   * @brief Returns the associated CUDA error for CUDA_ERROR, otherwise cudaSuccess
+   *
+   * Errors returned by CUDA operations are preserved unchanged. Argument-validation failures use
+   * the corresponding CUDA runtime error code.
+   */
+  [[nodiscard]] cudaError_t error() const noexcept { return _error; }
+
+  /** @brief Returns true only when read/write access is established. */
+  [[nodiscard]] bool granted() const noexcept
+  {
+    return _status == pool_peer_access_status::GRANTED;
+  }
+
+ private:
+  constexpr pool_peer_access_result(pool_peer_access_status status, cudaError_t error) noexcept
+    : _status(status), _error(error)
+  {
+  }
+
+  friend pool_peer_access_result grant_pool_peer_access(cudaMemPool_t, int, int) noexcept;
+  friend pool_peer_access_result detail::grant_pool_peer_access(
+    cudaMemPool_t, int, int, detail::pool_peer_access_operations const&) noexcept;
+
+  pool_peer_access_status _status;
+  cudaError_t _error;
+};
+
 /**
  * Memory tier enumeration representing different types of memory storage.
  * Ordered roughly by performance (fastest to slowest access).
@@ -74,55 +136,63 @@ using DeviceMemoryResourceFactoryFn =
   int device_id, std::size_t capacity);
 
 /**
+ * @brief Grants one device persistent read/write access to allocations from one CUDA memory pool
+ *
+ * The pool is borrowed and remains owned by its creator. A successful grant persists until it is
+ * changed through the CUDA runtime or the pool is destroyed. On first cross-device use, peer
+ * verification synchronizes CUDA work, temporarily changes the caller thread's current device,
+ * and enables or disables legacy peer access across visible device pairs. The original current
+ * device is restored before return; a restoration failure is reported as
+ * pool_peer_access_status::CUDA_ERROR. Verified peer results are cached process-wide;
+ * CUDA errors are retried on a later request.
+ *
+ * The caller must supply a live non-null pool, valid visible CUDA device IDs, and the device that
+ * actually owns the pool's allocations as owner_device.
+ *
+ * @param pool The actual pool backing the allocations to share
+ * @param owner_device The device on which the pool's allocations reside
+ * @param accessing_device The device that needs read/write access
+ * @return The grant outcome and any associated CUDA runtime error
+ */
+[[nodiscard]] pool_peer_access_result grant_pool_peer_access(cudaMemPool_t pool,
+                                                             int owner_device,
+                                                             int accessing_device) noexcept;
+
+/**
  * @brief Grant cross-device peer ReadWrite access on a cudaMallocAsync pool.
  *
- * cudaMallocAsync pools require explicit `cudaMemPoolSetAccess` for cross-device peer copy
- * (cudaMemcpyPeer*) to actually transfer bytes; `cudaDeviceEnablePeerAccess` alone only
- * governs legacy cudaMalloc memory. This helper iterates all visible CUDA devices and
- * declares that each peer (other than `owner_device_id`) may read/write the pool.
- * Best effort — non-P2P-capable peers are skipped silently.
+ * This best-effort helper attempts access for every visible peer on both @p pool and the owner's
+ * currently selected pool. It discards individual outcomes. On first use it also performs the
+ * process-wide synchronization and legacy peer-state changes documented by
+ * grant_pool_peer_access().
+ *
+ * @param pool The pool to configure
+ * @param owner_device_id The device on which the pool's allocations reside
  */
 void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int owner_device_id);
 
 /**
- * @brief Empirical probe: does direct peer DMA actually move bytes between two GPUs?
+ * @brief Report whether a peer copy moves bytes from one GPU to another
  *
- * `cudaDeviceCanAccessPeer`, `cudaDeviceEnablePeerAccess`, and `cudaMemPoolGetAccess`
- * report peer access as available on hardware that physically cannot do peer DMA
- * (notably consumer Intel chipsets — Core i9 / Core Ultra desktop platforms — where
- * GPUDirect P2P is not supported). The standard APIs return success, but
- * `cudaMemcpyPeer*` then silently no-ops: it returns success without moving bytes.
+ * A same-device request returns true. For distinct devices, the process-wide cache enables legacy
+ * peer access for capable directions before testing a 64-byte copy. It disables the matching
+ * direction only after a confirmed byte mismatch. CUDA errors are retried on later requests.
  *
- * This probe allocates a tiny (64-byte) test buffer on each device, writes a known
- * sentinel pattern on the source, peer-copies to a different sentinel on the
- * destination, and verifies the destination matches the source. Returns true iff
- * bytes actually moved.
- *
- * Caller policy: call this AFTER `cudaDeviceEnablePeerAccess` so the probe sees the
- * "lying enable" failure mode. With peer access disabled, the driver auto-stages
- * through host and the probe always passes — which is correct, but doesn't
- * distinguish "real peer DMA" from "host fallback".
+ * @return True for a same-device request or a verified directional byte copy; false for unsupported
+ * directions, failed verification, or CUDA errors
  */
 [[nodiscard]] bool probe_peer_dma_works(int src_device, int dst_device);
 
 /**
- * @brief Run the empirical probe across every P2P-capable GPU pair and DISABLE
- * peer access wherever direct DMA does not actually work.
+ * @brief Trigger cached peer verification and count verified fallback directions
  *
- * On consumer platforms where peer DMA is broken, leaving peer access enabled
- * forces the driver onto a silent-no-op path. Disabling peer access (and resetting
- * pool access to ProtNone) tells the driver to fall back to its internal pinned
- * host-staging path for `cudaMemcpyPeer*` — slower than real peer DMA but correct.
+ * On first cache use, every visible direction is probed with legacy peer access enabled where
+ * needed. Only a confirmed byte mismatch causes that direction to be disabled. Later calls retry
+ * directions with CUDA errors. CUDA memory pool permissions are not changed.
  *
- * Intended call site: once after memory_spaces are constructed and the application has
- * called `cudaDeviceEnablePeerAccess` for each pair (e.g. by the cucascade-cudf layer that
- * registers tier converters). Idempotent.
- *
- * @param pools_by_device A vector indexed by device id (0..N-1) of the cucascade
- *        pool to also reset access on. Pass an empty vector if cucascade pools
- *        don't need pool-level peer access reset (legacy memory only).
- * @return Number of (i, j) pairs where peer access was disabled because the probe
- *         failed.
+ * @param pools_by_device Ignored; retained for API compatibility
+ * @return Number of verified mismatched directions whose legacy peer access was disabled or was
+ * already disabled
  */
 int disable_peer_access_where_broken(std::vector<cudaMemPool_t> const& pools_by_device = {});
 

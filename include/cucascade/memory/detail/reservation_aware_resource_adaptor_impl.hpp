@@ -153,6 +153,7 @@ class reservation_aware_resource_adaptor_impl {
     delete;
 
   rmm::device_async_resource_ref get_upstream_resource() const noexcept;
+  [[nodiscard]] cudaMemPool_t pool_handle() const noexcept;
   std::size_t get_available_memory() const noexcept;
   std::size_t get_available_memory(::cuda::stream_ref stream) const noexcept;
   std::size_t get_available_memory_print(::cuda::stream_ref stream) const noexcept;
