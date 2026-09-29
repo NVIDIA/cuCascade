@@ -47,9 +47,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   # Set include directories
   target_include_directories(
-    cucascade_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                            ${CMAKE_CURRENT_SOURCE_DIR}/utils
-                            ${PROJECT_SOURCE_DIR}/src)
+    cucascade_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${PROJECT_SOURCE_DIR}/src)
 
   # Link dependencies
   target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2

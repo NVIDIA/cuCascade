@@ -15,8 +15,9 @@
  * limitations under the License.
  */
 
-#include <cucascade/memory/common.hpp>
 #include "pool_peer_access_detail.hpp"
+
+#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/null_device_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
@@ -170,7 +171,7 @@ class peer_dma_probe_cache {
   {
     if (_initialized) { return cudaSuccess; }
     _initialization_attempted = true;
-    auto fail = [this](cudaError_t error) {
+    auto fail                 = [this](cudaError_t error) {
       _initialization_error = error;
       (void)_operations.get_last_error();
       return error;
@@ -198,7 +199,7 @@ class peer_dma_probe_cache {
         entry(source, destination) = probe_direction(source, destination);
       }
     }
-    _initialized      = true;
+    _initialized                 = true;
     auto const restoration_error = _operations.set_device(original_device);
     if (restoration_error != cudaSuccess) { return fail(restoration_error); }
     auto const broken = count_broken_locked();
@@ -286,9 +287,7 @@ class peer_dma_probe_cache {
     }
     auto const restoration_error = _operations.set_device(saved_device);
     record_probe_error(result, restoration_error);
-    if (result.status == peer_dma_probe_status::CUDA_ERROR) {
-      (void)_operations.get_last_error();
-    }
+    if (result.status == peer_dma_probe_status::CUDA_ERROR) { (void)_operations.get_last_error(); }
     return result;
   }
 
