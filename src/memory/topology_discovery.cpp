@@ -48,7 +48,7 @@ class cuda_driver_api {
   {
     // Retain both the wrapper and its dlopen handle for the lifetime of the process.
     // Runtime-attribute discovery may be called from another global destructor after
-    // function-local statics would otherwise have been destroyed.
+    // function-local statistics would otherwise have been destroyed.
     static auto const api = new cuda_driver_api;
     return *api;
   }
@@ -61,15 +61,14 @@ class cuda_driver_api {
     return _device_get_by_pci_bus_id != nullptr && _device_get_attribute != nullptr;
   }
 
-  [[nodiscard]] CUresult device_get_by_pci_bus_id(CUdevice* device,
-                                                   char const* pci_bus_id) const
+  [[nodiscard]] CUresult device_get_by_pci_bus_id(CUdevice* device, char const* pci_bus_id) const
   {
     return _device_get_by_pci_bus_id(device, pci_bus_id);
   }
 
   [[nodiscard]] CUresult device_get_attribute(int* value,
-                                               CUdevice_attribute attribute,
-                                               CUdevice device) const
+                                              CUdevice_attribute attribute,
+                                              CUdevice device) const
   {
     return _device_get_attribute(value, attribute, device);
   }
@@ -81,22 +80,34 @@ class cuda_driver_api {
   template <typename Function>
   static Function load_symbol(void* library, char const* name) noexcept
   {
-    void* symbol = dlsym(library, name);
+    dlerror();  // Clear any error left by an earlier dynamic-loader call.
+    void* symbol      = dlsym(library, name);
+    char const* error = dlerror();
+    if (error != nullptr || symbol == nullptr) {
+      std::cerr << "Warning: Failed to load CUDA driver symbol " << name << ": "
+                << (error != nullptr ? error : "symbol resolved to null") << std::endl;
+      return {};
+    }
     Function function{};
     static_assert(sizeof(function) == sizeof(symbol));
     std::memcpy(&function, &symbol, sizeof(function));
     return function;
   }
 
-  cuda_driver_api() noexcept
-    : _library(dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL))
+  cuda_driver_api() noexcept : _library(dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL))
   {
-    if (_library == nullptr) { return; }
+    if (_library == nullptr) {
+      std::cerr << "Warning: Failed to load CUDA driver library libcuda.so.1: " << dlerror()
+                << std::endl;
+      return;
+    }
 
     _device_get_by_pci_bus_id =
       load_symbol<device_get_by_pci_bus_id_fn>(_library, "cuDeviceGetByPCIBusId");
-    _device_get_attribute =
-      load_symbol<device_get_attribute_fn>(_library, "cuDeviceGetAttribute");
+    if (_device_get_by_pci_bus_id != nullptr) {
+      _device_get_attribute =
+        load_symbol<device_get_attribute_fn>(_library, "cuDeviceGetAttribute");
+    }
 
     if (!available()) {
       dlclose(_library);
