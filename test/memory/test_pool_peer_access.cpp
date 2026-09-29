@@ -362,6 +362,22 @@ TEST_CASE("Failed peer teardown remains retryable", "[pool_peer_access]")
   CHECK(cache_state.current_device == 0);
 }
 
+TEST_CASE("Probe CUDA error survives cleanup failures", "[pool_peer_access]")
+{
+  cache_state                   = fake_cache_state{};
+  cache_state.first_probe       = {peer_dma_probe_status::CUDA_ERROR, cudaErrorMemoryAllocation};
+  cache_state.disable_error     = cudaErrorInvalidDevice;
+  cache_state.fail_disable_once = true;
+  auto const results = cucascade::memory::detail::probe_peer_dma_sequence(
+    {{0, 1}}, cache_operations);
+
+  REQUIRE(results.size() == 1);
+  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(results[0].error == cudaErrorMemoryAllocation);
+  CHECK(cache_state.disable_calls_by_direction[1][0] >= 1);
+  CHECK(cache_state.last_error == cudaSuccess);
+}
+
 TEST_CASE("Final device restoration failure does not repeat the full probe scan",
           "[pool_peer_access]")
 {
@@ -410,6 +426,17 @@ TEST_CASE("Failed probe cleanup targets the matching asymmetric peer direction",
   CHECK(error == cudaSuccess);
   CHECK(restored_device == 0);
   CHECK(disabled_peer_device == 1);
+}
+
+TEST_CASE("Probe restoration preserves the first CUDA error", "[pool_peer_access]")
+{
+  reset_fake_runtime();
+  restore_error = cudaErrorInvalidDevice;
+
+  auto const error = cucascade::memory::detail::finish_peer_dma_probe(
+    0, cudaErrorMemoryAllocation, fake_set_device);
+  CHECK(error == cudaErrorMemoryAllocation);
+  CHECK(restored_device == 0);
 }
 
 TEST_CASE("Pool peer access handles self-access and repeated grants", "[pool_peer_access]")
@@ -488,7 +515,7 @@ TEST_CASE("Pool peer access distinguishes unsupported and asymmetric verificatio
   CHECK(fake_state.set_access_calls == 0);
 }
 
-TEST_CASE("Failed verification revokes existing pool peer access", "[pool_peer_access]")
+TEST_CASE("Failed verification preserves existing pool peer access", "[pool_peer_access]")
 {
   reset_fake_runtime();
   fake_state.access = cudaMemAccessFlagsProtReadWrite;
@@ -498,13 +525,12 @@ TEST_CASE("Failed verification revokes existing pool peer access", "[pool_peer_a
   auto const result = cucascade::memory::detail::grant_pool_peer_access(
     fake_pool(), 0, 1, fake_operations);
   CHECK(result.status() == pool_peer_access_status::VERIFICATION_FAILED);
-  CHECK(fake_state.set_access_calls == 1);
-  CHECK(fake_state.granted_descriptor.location.id == 1);
-  CHECK(fake_state.granted_descriptor.flags == cudaMemAccessFlagsProtNone);
-  CHECK(fake_state.access == cudaMemAccessFlagsProtNone);
+  CHECK(fake_state.probe_calls[1][0] == 1);
+  CHECK(fake_state.set_access_calls == 0);
+  CHECK(fake_state.access == cudaMemAccessFlagsProtReadWrite);
 }
 
-TEST_CASE("Inconclusive verification revokes existing pool peer access", "[pool_peer_access]")
+TEST_CASE("Inconclusive verification preserves existing pool peer access", "[pool_peer_access]")
 {
   reset_fake_runtime();
   fake_state.access = cudaMemAccessFlagsProtReadWrite;
@@ -515,23 +541,40 @@ TEST_CASE("Inconclusive verification revokes existing pool peer access", "[pool_
     fake_pool(), 0, 1, fake_operations);
   CHECK(result.status() == pool_peer_access_status::CUDA_ERROR);
   CHECK(result.error() == cudaErrorMemoryAllocation);
-  CHECK(fake_state.set_access_calls == 1);
-  CHECK(fake_state.access == cudaMemAccessFlagsProtNone);
+  CHECK(fake_state.set_access_calls == 0);
+  CHECK(fake_state.access == cudaMemAccessFlagsProtReadWrite);
 }
 
-TEST_CASE("A failed pool revocation is reported", "[pool_peer_access]")
+TEST_CASE("Capability-query errors preserve existing pool peer access", "[pool_peer_access]")
 {
   reset_fake_runtime();
   fake_state.access = cudaMemAccessFlagsProtReadWrite;
-  fake_state.probes[0][1] =
-    peer_dma_probe_result{peer_dma_probe_status::VERIFICATION_FAILED, cudaSuccess};
-  fake_state.set_access_error = cudaErrorNotSupported;
+  fake_state.can_access_error[1][0] = cudaErrorInvalidDevice;
 
   auto const result = cucascade::memory::detail::grant_pool_peer_access(
     fake_pool(), 0, 1, fake_operations);
   CHECK(result.status() == pool_peer_access_status::CUDA_ERROR);
-  CHECK(result.error() == cudaErrorNotSupported);
+  CHECK(result.error() == cudaErrorInvalidDevice);
+  CHECK(fake_state.set_access_calls == 0);
   CHECK(fake_state.access == cudaMemAccessFlagsProtReadWrite);
+}
+
+TEST_CASE("Reverse CUDA error takes precedence over forward byte mismatch",
+          "[pool_peer_access]")
+{
+  reset_fake_runtime();
+  fake_state.probes[0][1] =
+    peer_dma_probe_result{peer_dma_probe_status::VERIFICATION_FAILED, cudaSuccess};
+  fake_state.probes[1][0] =
+    peer_dma_probe_result{peer_dma_probe_status::CUDA_ERROR, cudaErrorMemoryAllocation};
+
+  auto const result = cucascade::memory::detail::grant_pool_peer_access(
+    fake_pool(), 0, 1, fake_operations);
+  CHECK(result.status() == pool_peer_access_status::CUDA_ERROR);
+  CHECK(result.error() == cudaErrorMemoryAllocation);
+  CHECK(fake_state.probe_calls[0][1] == 1);
+  CHECK(fake_state.probe_calls[1][0] == 1);
+  CHECK(fake_state.set_access_calls == 0);
 }
 
 TEST_CASE("Pool peer access preserves CUDA runtime errors", "[pool_peer_access]")

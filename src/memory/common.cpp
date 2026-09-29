@@ -276,16 +276,16 @@ class peer_dma_probe_cache {
     // An inconclusive probe must not leave an unverified direct path enabled.
     if (result.status != peer_dma_probe_status::SUPPORTED) {
       auto const disable_error = disable(source_device, destination_device);
-      if (disable_error != cudaSuccess) { result = make_probe_error(disable_error); }
+      record_probe_error(result, disable_error);
     }
     // The opposite direction may have been enabled only to make this probe
     // conclusive. Preserve it only if a previous byte probe verified it.
     if (entry(destination_device, source_device).status != peer_dma_probe_status::SUPPORTED) {
       auto const disable_error = disable(destination_device, source_device);
-      if (disable_error != cudaSuccess) { result = make_probe_error(disable_error); }
+      record_probe_error(result, disable_error);
     }
     auto const restoration_error = _operations.set_device(saved_device);
-    if (restoration_error != cudaSuccess) { result = make_probe_error(restoration_error); }
+    record_probe_error(result, restoration_error);
     if (result.status == peer_dma_probe_status::CUDA_ERROR) {
       (void)_operations.get_last_error();
     }
@@ -399,7 +399,7 @@ cudaError_t finish_peer_dma_probe(int saved_device,
                                   cudaError_t (*set_device)(int)) noexcept
 {
   auto const restoration_error = set_device(saved_device);
-  return restoration_error == cudaSuccess ? probe_error : restoration_error;
+  return probe_error == cudaSuccess ? restoration_error : probe_error;
 }
 
 pool_peer_access_result grant_pool_peer_access(
@@ -434,41 +434,41 @@ pool_peer_access_result grant_pool_peer_access(
              : pool_peer_access_result{pool_peer_access_status::CUDA_ERROR, cudaErrorInvalidValue};
   }
 
-  auto reject = [&](pool_peer_access_status status, cudaError_t cause) {
-    if (already_read_write) {
-      cudaMemAccessDesc descriptor{};
-      descriptor.location = location;
-      descriptor.flags    = cudaMemAccessFlagsProtNone;
-      auto const revoke_error = operations.set_pool_access(pool, &descriptor, 1);
-      if (revoke_error != cudaSuccess) {
-        return pool_peer_access_result{pool_peer_access_status::CUDA_ERROR, revoke_error};
-      }
-    }
-    return pool_peer_access_result{status, cause};
-  };
-
   int can_access = 0;
   error          = operations.can_access_peer(&can_access, accessing_device, owner_device);
-  if (error != cudaSuccess) { return reject(pool_peer_access_status::CUDA_ERROR, error); }
-  if (can_access == 0) { return reject(pool_peer_access_status::UNSUPPORTED, cudaSuccess); }
+  if (error != cudaSuccess) { return {pool_peer_access_status::CUDA_ERROR, error}; }
+  if (can_access == 0) { return {pool_peer_access_status::UNSUPPORTED, cudaSuccess}; }
   error = operations.can_access_peer(&can_access, owner_device, accessing_device);
-  if (error != cudaSuccess) { return reject(pool_peer_access_status::CUDA_ERROR, error); }
-  if (can_access == 0) { return reject(pool_peer_access_status::UNSUPPORTED, cudaSuccess); }
+  if (error != cudaSuccess) { return {pool_peer_access_status::CUDA_ERROR, error}; }
+  if (can_access == 0) { return {pool_peer_access_status::UNSUPPORTED, cudaSuccess}; }
 
   std::pair<int, int> const directions[]{{owner_device, accessing_device},
                                          {accessing_device, owner_device}};
+  auto status = pool_peer_access_status::GRANTED;
+  auto cause  = cudaSuccess;
   for (auto [source, destination] : directions) {
-    auto probe = operations.probe_peer_dma(source, destination);
+    auto const probe = operations.probe_peer_dma(source, destination);
     switch (probe.status) {
       case peer_dma_probe_status::SUPPORTED: break;
       case peer_dma_probe_status::UNSUPPORTED:
-        return reject(pool_peer_access_status::UNSUPPORTED, cudaSuccess);
+        if (status == pool_peer_access_status::GRANTED) {
+          status = pool_peer_access_status::UNSUPPORTED;
+        }
+        break;
       case peer_dma_probe_status::VERIFICATION_FAILED:
-        return reject(pool_peer_access_status::VERIFICATION_FAILED, cudaSuccess);
+        if (status != pool_peer_access_status::CUDA_ERROR) {
+          status = pool_peer_access_status::VERIFICATION_FAILED;
+        }
+        break;
       case peer_dma_probe_status::CUDA_ERROR:
-        return reject(pool_peer_access_status::CUDA_ERROR, probe.error);
+        if (status != pool_peer_access_status::CUDA_ERROR) {
+          status = pool_peer_access_status::CUDA_ERROR;
+          cause  = probe.error;
+        }
+        break;
     }
   }
+  if (status != pool_peer_access_status::GRANTED) { return {status, cause}; }
 
   if (already_read_write) { return {pool_peer_access_status::GRANTED, cudaSuccess}; }
 

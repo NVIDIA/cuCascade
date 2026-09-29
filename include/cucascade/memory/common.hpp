@@ -144,9 +144,10 @@ using DeviceMemoryResourceFactoryFn =
  * and enables or disables legacy peer access across visible device pairs. The original current
  * device is restored before return; a restoration failure is reported as
  * pool_peer_access_status::CUDA_ERROR. Verified peer results are cached process-wide;
- * CUDA errors are retried on a later explicit grant request. If a requested peer check fails and
- * the pool already grants read/write access, this function attempts to revoke that access for the
- * requesting device. A revocation failure is reported as pool_peer_access_status::CUDA_ERROR.
+ * CUDA errors are retried on a later explicit grant request. A failed request leaves existing pool
+ * permissions unchanged; callers must coordinate any revocation with other users of the pool.
+ * If both directional probes fail, a CUDA error takes precedence over a verification failure or
+ * an unsupported result.
  *
  * The caller must supply a live non-null pool, valid visible CUDA device IDs, and the device that
  * actually owns the pool's allocations as owner_device.
