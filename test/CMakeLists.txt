@@ -174,18 +174,15 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY
              "${CMAKE_CURRENT_BINARY_DIR}/fake_cuda_driver/incomplete")
 
-add_library(cucascade_fake_cuda_driver_load_sentinel SHARED
-            fake_cuda_driver_load_sentinel.cpp)
-set_target_properties(
-  cucascade_fake_cuda_driver_load_sentinel
-  PROPERTIES OUTPUT_NAME cuda
-             SOVERSION 1
-             LIBRARY_OUTPUT_DIRECTORY
-             "${CMAKE_CURRENT_BINARY_DIR}/fake_cuda_driver/load_sentinel")
-
 add_executable(cucascade_cuda_driver_loading_test cuda_driver_loading_test.cpp)
 target_link_libraries(cucascade_cuda_driver_loading_test
-                      PRIVATE cucascade_topology_discovery)
+                      PRIVATE cucascade_topology_discovery ${CMAKE_DL_LIBS})
+# The test interposes dlopen to attribute CUDA driver loads to their caller.
+# Export it so every module resolves to the interposer, and compile as PIE so
+# the address of a shared-library function is its real definition rather than a
+# local PLT stub.
+set_target_properties(cucascade_cuda_driver_loading_test
+                      PROPERTIES ENABLE_EXPORTS ON POSITION_INDEPENDENT_CODE ON)
 
 function(add_cuda_driver_loading_test test_name fake_driver mode)
   add_test(
@@ -201,8 +198,11 @@ add_cuda_driver_loading_test(cucascade_runtime_attributes_use_available_driver
 add_cuda_driver_loading_test(
   cucascade_runtime_attributes_tolerate_missing_symbols
   cucascade_fake_cuda_driver_incomplete unavailable)
-add_cuda_driver_loading_test(cucascade_passive_discovery_does_not_load_driver
-                             cucascade_fake_cuda_driver_load_sentinel passive)
+# NVML may legitimately load the real CUDA driver during nvmlInit, so passive
+# discovery runs against the system loader state and the test checks only loads
+# requested by cuCascade itself.
+add_test(NAME cucascade_passive_discovery_does_not_load_driver
+         COMMAND cucascade_cuda_driver_loading_test passive)
 add_cuda_driver_loading_test(cucascade_cuda_driver_loader_has_process_lifetime
                              cucascade_fake_cuda_driver_available shutdown)
 
