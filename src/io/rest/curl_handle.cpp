@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -107,40 +106,40 @@ void configure_easy_handle(CURL* handle,
 
   // Connection reuse / sharing.
   if (share_handle != nullptr) {
-    CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_SHARE, share_handle));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_SHARE, share_handle));
   }
   if (conn_max_age_s > 0) {
-    CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, conn_max_age_s));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, conn_max_age_s));
   }
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_DNS_CACHE_TIMEOUT, kDnsCacheTimeoutSec));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_DNS_CACHE_TIMEOUT, kDnsCacheTimeoutSec));
 
   // TCP tuning.
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, 1L));
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_TCP_NODELAY, 1L));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, 1L));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_TCP_NODELAY, 1L));
 
   // Multithreaded safety: no SIGALRM-based DNS timeouts.
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L));
 
   // HTTP behavior.
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0));
   // Never follow redirects.  A presigned SigV4 URL is signed for one exact
   // host/path/query; transparently following an S3 region-mismatch 301/307 to a
   // different endpoint would re-issue the GET with an invalid signature (and
   // curl drops the custom Range header across the redirect), so a 3xx must
   // surface as an explicit error rather than silently producing a 403 or wrong
   // bytes.  Region selection belongs at the authorizer/endpoint level.
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L));
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_BUFFERSIZE, kRecvBufferSize));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_BUFFERSIZE, kRecvBufferSize));
 
   // Default timeouts; the reactor may override the whole-transfer timeout per
   // request based on its configuration.
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, kConnectTimeoutMs));
-  CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, kTransferTimeoutMs));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, kConnectTimeoutMs));
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, kTransferTimeoutMs));
 
   // Minimum gap between curl_easy_upkeep PINGs per connection (the reactor
   // drives the actual upkeep calls on an idle timer).
   if (upkeep_interval_ms > 0) {
-    CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_UPKEEP_INTERVAL_MS, upkeep_interval_ms));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_UPKEEP_INTERVAL_MS, upkeep_interval_ms));
   }
 }
 

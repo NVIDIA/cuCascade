@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -18,22 +17,17 @@
 
 #pragma once
 
-#include <cucascade/exec/admission_control.hpp>
-#include <cucascade/io/rest/object_store_lister.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
-#include <condition_variable>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -48,7 +42,7 @@ namespace cucascade::io::rest {
  * @brief RESTful object-store (s3://) ioctx. Specialisation of
  *        @c templated_ioctx<rest_reactor>.
  *
- * Owns a pool of @c rest_reactor workers (round-robined by the base) that share
+ * Owns a pool of @c rest_reactor workers (load-balanced by the base) that share
  * one @p authorizer.  Overrides @c create_io_object to resolve an object's size
  * via a blocking HEAD before constructing the @c rest_io_object — the static
  * reactor factory cannot do this since it needs the authorizer + a round-trip.
@@ -63,12 +57,6 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
-
-  /// Pool-aggregated perf counters: per-reactor snapshots with totals and
-  /// counts summed, maxes maxed, and ttfb the smallest non-zero reactor value.
-  /// Reactor counters are lock-free; the footer-budget gauge takes one short
-  /// mutex.  Safe to call while the pool is running.
-  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
   /// per page (a page holds at most 1000 entries, so peak memory is one page
@@ -94,49 +82,35 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
     std::size_t page_size               = 1000,
     std::optional<std::size_t> max_keys = std::nullopt);
 
-  /// The configured matched cap (@c config.list_max_matches) — exposed so a
-  /// glob layer one level up can bound its match set without a reactor handle.
-  /// Falls back to the built-in default when the pool is empty (never in
-  /// practice).
+  /// The configured matched cap (@c config.list_max_matches) — exposed so the
+  /// glob layer (@c sirius_httpfs::expand_glob, one level up) can bound its
+  /// match set without a reactor handle.  Falls back to the built-in default
+  /// when the pool is empty (never in practice).
   [[nodiscard]] std::size_t list_max_matches() const;
 
-  /// Resolve many objects' footers concurrently.  Per-entry semantics are
-  /// IDENTICAL to @c open_io_object(path, parquet_footer_probe): one verified
-  /// suffix GET; 200/416/unverifiable-206 fall back to a HEAD supplying
-  /// size+tag; the same retry policy per entry, never stalling siblings.  The
-  /// caller's thread drives one curl multi with connection reuse across
-  /// entries, and @p on_result is invoked ON THE CALLER'S THREAD, SERIALLY,
-  /// as each entry lands — completion order, no all-entries barrier.
+  /// Open every reactor's connection pool against @p bucket_url's bucket, so the
+  /// query's first reads find pooled connections instead of paying TCP+TLS on
+  /// the hot path.  Fans the work out to the reactors and returns immediately:
+  /// each reactor's connection cache is thread-confined, so only its own worker
+  /// can fill it.
   ///
-  /// Every input occurrence is delivered exactly once (duplicates delivered
-  /// per occurrence, disambiguated by index); no callback runs after the
-  /// call returns.  On @p stop, in-flight transfers abort and every
-  /// undelivered entry receives one std::system_error(operation_canceled) —
-  /// including a batch cancelled while queued behind another batch (one
-  /// active batch per ioctx; concurrent calls FIFO-serialize).  If
-  /// @p on_result throws, the remaining entries are cancelled (delivered as
-  /// canceled, their callback throws suppressed) and the first exception is
-  /// rethrown after the sweep.  Throws directly only on submission errors:
-  /// an empty batch, the API disabled via
-  /// @c config::footer_resolve_max_inflight == 0, or an explicit
-  /// @c footer_resolve_stash_budget smaller than @c footer_probe_bytes.  An
-  /// unparsable or non-s3 path is a per-entry error, not a batch error.
-  /// Should the transfer driver itself fail mid-batch (a curl multi error),
-  /// every undelivered entry is delivered as canceled before that failure
-  /// is rethrown — exactly-once holds on every exit path.  This ioctx must
-  /// outlive the call.
-  void resolve_footer_objects(std::span<std::string const> paths,
-                              std::function<void(footer_resolve_result)> const& on_result,
-                              std::stop_token stop = {});
+  /// Rate-limited rather than run once, because what goes stale is the
+  /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
+  /// pooled connection (@c CURLOPT_MAXAGE_CONN), so a pool warmed before an idle
+  /// gap longer than that is cold again by the next query -- a warm-once flag
+  /// would serve the first query and no other.  Re-warms when the endpoint
+  /// changes or the last warm-up is at least @c conn_max_age old, which is free
+  /// for back-to-back queries and self-correcting for spaced-out ones.
+  void warmup(std::string_view bucket_url) noexcept override;
 
  protected:
-  /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
+  /// Backend hook invoked by @c ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
 
-  /// Hinted open: @c open_hint::parquet_footer_probe resolves the size AND stashes
-  /// the object's trailing bytes in one suffix-range GET, stashed on the
+  /// @c open_hint::parquet_footer_probe resolves the size and stashes the
+  /// parquet footer together via a single suffix-range GET, carried on the
   /// returned io_object; every other hint falls back to the plain HEAD path above.
   std::shared_ptr<io_object> create_io_object(std::string path, open_hint hint) override;
 
@@ -148,28 +122,18 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
  private:
   /// Resolve @p path with a single suffix-range GET: it discovers the size and
   /// stashes the object's trailing bytes on the returned io_object so cuDF's
-  /// footer reads are served locally.  Falls back to a plain HEAD (no stash)
-  /// when the response is unusable.
+  /// footer reads are served locally by @c rest_reactor::host_read.  Falls back
+  /// to a HEAD when the suffix response is unusable.  The stash lives only as
+  /// long as the returned io_object — a per-open transport shortcut, not a cache.
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
 
-  object_store_lister _lister;
-
-  /// The effective resolve_footer_objects concurrency cap: the configured
-  /// knob, or n_reactors * max_connections under footer_resolve_auto.  0 =
-  /// the API is disabled.
-  [[nodiscard]] std::size_t footer_resolve_inflight_cap() const;
-
-  // Batched-footer-resolve coordination: one active batch per ioctx, later
-  // calls FIFO-parked on the ticket queue (stop-aware — a queued batch whose
-  // token fires is removed without ever becoming active).  _footer_budget is
-  // created in the constructor and never reassigned, so perf_snapshot() may
-  // read it without the mutex.
-  mutable std::mutex _footer_resolve_mutex;
-  std::condition_variable_any _footer_resolve_cv;
-  std::deque<std::uint64_t> _footer_resolve_queue;
-  std::uint64_t _footer_resolve_next_ticket{0};
-  bool _footer_resolve_active{false};
-  std::shared_ptr<exec::admission_control> _footer_budget;
+  /// Guards the warm-up rate limiter.  Contended once per query at most, and
+  /// never on a read path.
+  std::mutex _warm_mtx;
+  /// Bucket the pools were last warmed against, and when.  An unset time means
+  /// "never warmed", which no elapsed comparison can express.
+  std::string _warmed_bucket;
+  std::optional<std::chrono::steady_clock::time_point> _warmed_at;
 };
 
 }  // namespace cucascade::io::rest

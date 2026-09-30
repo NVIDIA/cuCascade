@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cucascade/io/byte_range.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -10,7 +10,7 @@
 
 namespace io_utils {
 
-using range = cucascade::io::byte_range;
+using range = cudf::io::text::byte_range_info;
 
 /**
  * @brief Expands each range outward so its start is aligned down and its end

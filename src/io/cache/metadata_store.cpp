@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -18,8 +17,6 @@
 
 #include <cucascade/io/cache/metadata_store.hpp>
 
-#include <mutex>
-#include <string_view>
 #include <utility>
 
 namespace cucascade::io::cache {
@@ -41,8 +38,6 @@ std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const
 std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string_view cache_key) const
 {
   std::shared_lock lk(_mtx);
-  // Heterogeneous find (transparent hash + std::equal_to<>): no temporary
-  // std::string is built for the probe.
   auto it = _by_key.find(cache_key);
   if (it == _by_key.end()) return nullptr;
   return it->second;

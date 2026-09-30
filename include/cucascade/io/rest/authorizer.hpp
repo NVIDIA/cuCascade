@@ -1,7 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
- *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,7 +45,7 @@ struct object_ref {
 /// HTTP method (a presigned-GET URL != a presigned-HEAD URL; a signed header
 /// also covers the method) — passing the wrong method to the underlying HTTP
 /// client results in a signature-mismatch error from the store.
-/// cuCascade needs only read-only operations; PUT / DELETE etc. are
+/// Sirius needs only read-only operations; PUT / DELETE etc. are
 /// intentionally absent.
 enum class request_method : std::uint8_t { GET, HEAD };
 
@@ -66,7 +65,7 @@ struct authorized_request {
  * Lets downstream projects plug in their own credential / signer
  * implementation (AWS SDK presigner, Azure SAS generator, GCS signed URLs,
  * internal auth broker, IMDS-backed STS chain, SSO, ...) without forcing
- * cuCascade to depend on any provider SDK. cuCascade ships the SigV4-based S3
+ * Sirius to depend on any provider SDK. Sirius ships the SigV4-based S3
  * authorizers (see rest/s3/) as the default implementation over
  * @c static_credentials.
  *

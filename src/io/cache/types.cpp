@@ -3,7 +3,6 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,10 +16,11 @@
  * limitations under the License.
  */
 
+#include "cucascade/memory/fixed_size_host_memory_resource.hpp"
+#include "cucascade/memory/memory_reservation.hpp"
+#include "cucascade/memory/memory_space.hpp"
+
 #include <cucascade/io/cache/types.hpp>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/memory_reservation.hpp>
-#include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/aligned.hpp>
 
@@ -52,21 +52,21 @@ buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservat
     host_mrs.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>()->get_block_size();
 
   std::for_each(host_mrs.begin(), host_mrs.end(), [&](auto* mr) {
-    auto* mmr            = const_cast<cucascade::memory::memory_space*>(mr);
-    auto max_reservation = rmm::align_up(std::size_t(static_cast<double>(mmr->get_max_memory()) *
-                                                     reservation_fraction_for_prefetching),
-                                         std::size_t(_chunk_bytes));
-    auto reservation     = mmr->make_reservation_upto(max_reservation);
-    max_reservation      = reservation->size();  // may be less than requested
+    auto* mmr = const_cast<cucascade::memory::memory_space*>(mr);
+    auto max_reservation =
+      rmm::align_up(std::size_t(mmr->get_max_memory() * reservation_fraction_for_prefetching),
+                    std::size_t(_chunk_bytes));
+    auto reservation                          = mmr->make_reservation_upto(max_reservation);
+    max_reservation                           = reservation->size();  // may be less than requested
     _numa_to_arena_index[mr->get_device_id()] = _host_arenas.size();
     _host_arenas.push_back(
       host_arena{mr->get_device_id(),
                  std::move(reservation),
                  mmr->get_memory_resource_of<cucascade::memory::Tier::HOST>()});
     _reserved_size += max_reservation;
-    _max_allowed_budget_for_prefetching += rmm::align_down(
-      std::size_t(static_cast<double>(mmr->get_max_memory()) * max_prefetching_budget_fraction),
-      std::size_t(_chunk_bytes));
+    _max_allowed_budget_for_prefetching +=
+      rmm::align_down(std::size_t(mmr->get_max_memory() * max_prefetching_budget_fraction),
+                      std::size_t(_chunk_bytes));
   });
 }
 

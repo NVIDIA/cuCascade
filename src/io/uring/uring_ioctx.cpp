@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -19,13 +18,14 @@
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 
+#include <format>
 #include <memory>
 
 namespace cucascade::io::uring {
 
 uring_ioctx::uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx)
   : templated_ioctx<uring_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
-      return std::make_unique<uring_reactor>(ctx, "reactor-" + std::to_string(i++));
+      return std::make_unique<uring_reactor>(ctx, std::format("reactor-{}", i++));
     })
 {
 }

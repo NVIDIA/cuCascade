@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,231 +16,26 @@
  */
 
 #include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/rest/s3/sigv4.hpp>
 #include <cucascade/io/uri_parser.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <span>
+#include <format>
+#include <memory>
+#include <optional>
 #include <stdexcept>
-#include <string>
-#include <system_error>
+#include <string_view>
 #include <utility>
-#include <vector>
 
 namespace cucascade::io::rest {
 
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
-  : templated_ioctx<rest_reactor>(n_reactors,
-                                  [ctx = std::move(ctx), i = 0]() mutable {
-                                    return std::make_unique<rest_reactor>(
-                                      ctx, "rest-" + std::to_string(i++));
-                                  }),
-    _lister(
-      [this](std::string_view bucket, std::string_view prefix, std::string_view canonical_query) {
-        if (_reactors.empty()) {
-          throw std::runtime_error("rest_ioctx::list_objects: no reactors");
-        }
-        return _reactors.front()->list_page(bucket, prefix, canonical_query);
-      },
-      _reactors.empty() ? s3::default_max_scanned_objects
-                        : _reactors.front()->get_config().list_max_scanned,
-      _reactors.empty() ? s3::default_max_list_objects
-                        : _reactors.front()->get_config().list_max_matches,
-      "rest_ioctx::list_objects")
+  : templated_ioctx<rest_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
+      return std::make_unique<rest_reactor>(ctx, std::format("rest-{}", i++));
+    })
 {
-  // Created once here and never reassigned: payload leases capture it by
-  // shared_ptr (so they may outlive this ioctx) and perf_snapshot() reads it
-  // without the coordination mutex.
-  if (std::size_t const inflight = footer_resolve_inflight_cap(); inflight > 0) {
-    auto const& cfg   = _reactors.front()->get_config();
-    std::size_t bytes = cfg.footer_resolve_stash_budget;
-    if (bytes == config::footer_resolve_auto) { bytes = 2 * inflight * cfg.footer_probe_bytes; }
-    _footer_budget = std::make_shared<exec::admission_control>(std::max<std::size_t>(bytes, 1));
-  }
-}
-
-std::size_t rest_ioctx::footer_resolve_inflight_cap() const
-{
-  if (_reactors.empty()) { return 0; }
-  auto const& cfg = _reactors.front()->get_config();
-  if (cfg.footer_resolve_max_inflight == config::footer_resolve_auto) {
-    return std::max<std::size_t>(1, _reactors.size() * cfg.max_connections);
-  }
-  return cfg.footer_resolve_max_inflight;
-}
-
-void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
-                                        std::function<void(footer_resolve_result)> const& on_result,
-                                        std::stop_token stop)
-{
-  if (paths.empty()) {
-    throw std::invalid_argument("rest_ioctx::resolve_footer_objects: empty batch");
-  }
-  if (_reactors.empty()) {
-    throw std::runtime_error("rest_ioctx::resolve_footer_objects: no reactors");
-  }
-  std::size_t const max_inflight = footer_resolve_inflight_cap();
-  if (max_inflight == 0 || !_footer_budget) {
-    throw std::invalid_argument(
-      "rest_ioctx::resolve_footer_objects: disabled (footer_resolve_max_inflight == 0)");
-  }
-  if (_footer_budget->budget() < _reactors.front()->get_config().footer_probe_bytes) {
-    // A budget below one probe window cannot admit any entry without
-    // over-committing past the cap, so it cannot be honored as a hard cap.
-    throw std::invalid_argument(
-      "rest_ioctx::resolve_footer_objects: footer_resolve_stash_budget smaller than "
-      "footer_probe_bytes");
-  }
-
-  // Parse up front; a bad scheme is a per-entry error (isolation), not a
-  // batch error.
-  std::vector<std::string> valid_paths;
-  std::vector<object_ref> valid_objects;
-  std::vector<std::size_t> valid_indices;
-  std::vector<std::pair<std::size_t, std::exception_ptr>> parse_errors;
-  valid_paths.reserve(paths.size());
-  valid_objects.reserve(paths.size());
-  valid_indices.reserve(paths.size());
-  for (std::size_t i = 0; i < paths.size(); ++i) {
-    try {
-      auto parsed = cucascade::io::parse(paths[i]);
-      if (parsed.scheme != "s3") {
-        throw std::invalid_argument("rest_ioctx::resolve_footer_objects: unsupported scheme '" +
-                                    parsed.scheme + "'");
-      }
-      valid_paths.push_back(paths[i]);
-      valid_objects.push_back(object_ref{std::move(parsed.host), std::move(parsed.path)});
-      valid_indices.push_back(i);
-    } catch (...) {
-      // A malformed path joins bad-scheme paths as a per-entry error —
-      // parsing must never cost the batch its exactly-once delivery.
-      parse_errors.emplace_back(i, std::current_exception());
-    }
-  }
-
-  std::exception_ptr callback_error;
-  auto deliver_guarded = [&](footer_resolve_result&& r) {
-    try {
-      on_result(std::move(r));
-    } catch (...) {
-      // First exception wins; later throws during a cancel sweep are
-      // suppressed.
-      if (!callback_error) { callback_error = std::current_exception(); }
-    }
-  };
-  auto canceled = [] {
-    return std::make_exception_ptr(
-      std::system_error(std::make_error_code(std::errc::operation_canceled),
-                        "rest_ioctx::resolve_footer_objects: canceled"));
-  };
-
-  // FIFO admission: one active batch per ioctx; the wait is stop-aware, so a
-  // queued batch whose token fires is removed without ever becoming active.
-  {
-    std::unique_lock lk(_footer_resolve_mutex);
-    std::uint64_t const ticket = _footer_resolve_next_ticket++;
-    _footer_resolve_queue.push_back(ticket);
-    bool const admitted = _footer_resolve_cv.wait(lk, stop, [&] {
-      return !_footer_resolve_active && !_footer_resolve_queue.empty() &&
-             _footer_resolve_queue.front() == ticket;
-    });
-    if (!admitted) {
-      std::erase(_footer_resolve_queue, ticket);
-      lk.unlock();
-      _footer_resolve_cv.notify_all();
-      for (std::size_t i = 0; i < paths.size(); ++i) {
-        footer_resolve_result r;
-        r.index = i;
-        r.path  = paths[i];
-        r.error = canceled();
-        deliver_guarded(std::move(r));
-      }
-      if (callback_error) { std::rethrow_exception(callback_error); }
-      return;
-    }
-    _footer_resolve_active = true;
-    _footer_resolve_queue.pop_front();
-  }
-
-  struct gate_release {
-    rest_ioctx* self;
-    ~gate_release()
-    {
-      {
-        std::lock_guard lk(self->_footer_resolve_mutex);
-        self->_footer_resolve_active = false;
-      }
-      self->_footer_resolve_cv.notify_all();
-    }
-  } release{this};
-
-  // Deliver parse failures first (serial, on this thread); if a callback
-  // throws, every not-yet-delivered entry is swept as canceled and the first
-  // exception is rethrown — same rule as the engine.
-  std::size_t parse_pos = 0;
-  for (; parse_pos < parse_errors.size() && !callback_error; ++parse_pos) {
-    footer_resolve_result r;
-    r.index = parse_errors[parse_pos].first;
-    r.path  = paths[parse_errors[parse_pos].first];
-    r.error = std::move(parse_errors[parse_pos].second);
-    deliver_guarded(std::move(r));
-  }
-  if (callback_error) {
-    for (std::size_t p = parse_pos; p < parse_errors.size(); ++p) {
-      footer_resolve_result r;
-      r.index = parse_errors[p].first;
-      r.path  = paths[parse_errors[p].first];
-      r.error = canceled();
-      deliver_guarded(std::move(r));
-    }
-    for (std::size_t v = 0; v < valid_indices.size(); ++v) {
-      footer_resolve_result r;
-      r.index = valid_indices[v];
-      r.path  = valid_paths[v];
-      r.error = canceled();
-      deliver_guarded(std::move(r));
-    }
-    std::rethrow_exception(callback_error);
-  }
-
-  if (valid_indices.empty()) { return; }
-
-  _reactors.front()->resolve_footer_batch(
-    valid_paths, valid_objects, valid_indices, max_inflight, _footer_budget, on_result, stop);
-}
-
-rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
-{
-  rest_perf_snapshot agg;
-  for (auto const& r : _reactors) {
-    auto const s = r->perf_snapshot();
-    agg.chunk_get_ns_total += s.chunk_get_ns_total;
-    agg.chunk_get_count += s.chunk_get_count;
-    agg.chunk_get_ns_max = std::max(agg.chunk_get_ns_max, s.chunk_get_ns_max);
-    agg.queue_wait_ns_total += s.queue_wait_ns_total;
-    agg.queue_wait_count += s.queue_wait_count;
-    if (s.ttfb_ns != 0 && (agg.ttfb_ns == 0 || s.ttfb_ns < agg.ttfb_ns)) {
-      agg.ttfb_ns = s.ttfb_ns;  // smallest non-zero first-GET latency across the pool
-    }
-    agg.h2d_observed_ns_total += s.h2d_observed_ns_total;
-    agg.h2d_observed_count += s.h2d_observed_count;
-    agg.h2d_observed_ns_max = std::max(agg.h2d_observed_ns_max, s.h2d_observed_ns_max);
-    agg.retries_total += s.retries_total;
-    agg.terminal_failures_total += s.terminal_failures_total;
-    agg.device_stream_sync_total += s.device_stream_sync_total;
-    agg.payload_bytes_read_total += s.payload_bytes_read_total;
-    agg.blocking_host_get_count += s.blocking_host_get_count;
-    agg.blocking_host_get_wall_ns_total += s.blocking_host_get_wall_ns_total;
-    agg.blocking_host_get_wall_ns_max =
-      std::max(agg.blocking_host_get_wall_ns_max, s.blocking_host_get_wall_ns_max);
-  }
-  if (_footer_budget) {
-    agg.footer_stash_reserved_bytes      = _footer_budget->reserved();
-    agg.footer_stash_reserved_peak_bytes = _footer_budget->peak_reserved();
-  }
-  return agg;
 }
 
 void rest_ioctx::list_objects_paged(
@@ -252,7 +46,60 @@ void rest_ioctx::list_objects_paged(
   std::optional<std::size_t> max_scanned)
 {
   if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::list_objects: no reactors"); }
-  _lister.list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
+  std::size_t const clamped = (page_size == 0 || page_size > 1000) ? 1000 : page_size;
+  std::size_t const scanned_cap =
+    max_scanned.value_or(_reactors.front()->get_config().list_max_scanned);
+
+  std::size_t scanned = 0;
+  std::string token;
+  bool truncated = false;
+  do {
+    // SigV4 canonical order = byte order of the encoded keys; for these params
+    // that is continuation-token < list-type < max-keys < prefix.
+    std::string query;
+    if (!token.empty()) {
+      query += "continuation-token=";
+      query += s3::uri_encode(token, /*encode_slash=*/true);
+      query += '&';
+    }
+    query += "list-type=2&max-keys=";
+    query += std::to_string(clamped);
+    query += "&prefix=";
+    query += s3::uri_encode(prefix, /*encode_slash=*/true);
+
+    auto const page =
+      s3::parse_list_objects_v2(_reactors.front()->list_page(bucket, prefix, query));
+
+    scanned += page.entries.size();
+    if (scanned > scanned_cap) {
+      throw std::runtime_error("rest_ioctx::list_objects: scanned more than " +
+                               std::to_string(scanned_cap) + " objects under s3://" +
+                               std::string(bucket) + "/" + std::string(prefix) +
+                               " — narrow the glob prefix");
+    }
+    if (page.is_truncated && page.next_continuation_token.empty()) {
+      throw std::runtime_error(
+        "rest_ioctx::list_objects: truncated ListObjectsV2 page without a continuation token for "
+        "s3://" +
+        std::string(bucket) + "/" + std::string(prefix));
+    }
+    // A truncated page must contain entries and advance the token. Together
+    // with scanned_cap these bound pagination for non-conforming backends that
+    // would otherwise loop on empty or non-advancing pages.
+    if (page.is_truncated && page.entries.empty()) {
+      throw std::runtime_error(
+        "rest_ioctx::list_objects: truncated ListObjectsV2 page with no entries for s3://" +
+        std::string(bucket) + "/" + std::string(prefix));
+    }
+    if (page.is_truncated && page.next_continuation_token == token) {
+      throw std::runtime_error(
+        "rest_ioctx::list_objects: ListObjectsV2 continuation token did not advance for s3://" +
+        std::string(bucket) + "/" + std::string(prefix));
+    }
+    truncated = page.is_truncated;
+    token     = page.next_continuation_token;
+    if (!sink(page)) { return; }
+  } while (truncated);
 }
 
 std::vector<s3::list_entry> rest_ioctx::list_objects(std::string_view bucket,
@@ -260,10 +107,25 @@ std::vector<s3::list_entry> rest_ioctx::list_objects(std::string_view bucket,
                                                      std::size_t page_size,
                                                      std::optional<std::size_t> max_keys)
 {
-  return _lister.list_objects(bucket, prefix, page_size, max_keys);
+  std::size_t const keys_cap = max_keys.value_or(list_max_matches());
+  std::vector<s3::list_entry> out;
+  list_objects_paged(bucket, prefix, page_size, [&](s3::list_objects_v2_page const& page) {
+    if (out.size() + page.entries.size() > keys_cap) {
+      throw std::runtime_error("rest_ioctx::list_objects: more than " + std::to_string(keys_cap) +
+                               " objects under s3://" + std::string(bucket) + "/" +
+                               std::string(prefix) + " — narrow the glob prefix");
+    }
+    out.insert(out.end(), page.entries.begin(), page.entries.end());
+    return true;
+  });
+  return out;
 }
 
-std::size_t rest_ioctx::list_max_matches() const { return _lister.list_max_matches(); }
+std::size_t rest_ioctx::list_max_matches() const
+{
+  return _reactors.empty() ? s3::default_max_list_objects
+                           : _reactors.front()->get_config().list_max_matches;
+}
 
 std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
 {
@@ -275,8 +137,8 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
   if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
   // A blocking HEAD on the caller thread (a one-time metadata round-trip) via
-  // any reactor's authorizer — head_object uses a local easy handle and does
-  // not touch worker state, so any reactor is equivalent.
+  // any reactor's authorizer — head_object uses a local easy handle and
+  // does not touch worker state, so any reactor is equivalent.
   auto head = _reactors.front()->head_object(parsed.host, parsed.path);
   return std::make_shared<rest_io_object>(std::move(path),
                                           std::move(parsed.host),
@@ -306,6 +168,64 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, std::u
                                           std::move(parsed.host),
                                           std::move(parsed.path),
                                           static_cast<size_t>(known_size));
+}
+
+namespace {
+
+/// The bucket out of an @c s3:// URL, whether or not it names an object.
+///
+/// @c io::parse cannot serve this: it rejects a bucket-only URL with "empty
+/// object key", which is exactly the shape a warm-up takes -- warming is about
+/// the endpoint, and naming a data file to reach it would be beside the point.
+std::optional<std::string> bucket_of(std::string_view url)
+{
+  constexpr std::string_view k_scheme = "s3://";
+  if (url.size() <= k_scheme.size()) { return std::nullopt; }
+  for (std::size_t i = 0; i < k_scheme.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(url[i])) != k_scheme[i]) { return std::nullopt; }
+  }
+  auto const rest   = url.substr(k_scheme.size());
+  auto const bucket = rest.substr(0, rest.find('/'));
+  if (bucket.empty()) { return std::nullopt; }
+  return std::string{bucket};
+}
+
+}  // namespace
+
+void rest_ioctx::warmup(std::string_view bucket_url) noexcept
+{
+  try {
+    // Only the bucket is read: an object key, if the caller passed one, names
+    // nothing the connection pool cares about.
+    auto const bucket = bucket_of(bucket_url);
+    if (!bucket.has_value()) { return; }
+
+    // Connections are per-endpoint, so the bucket -- not the object -- is the
+    // identity that decides whether a warm-up is redundant. A thousand-file
+    // scan calling this per file collapses to one round.
+    {
+      std::lock_guard lk{_warm_mtx};
+      auto const now = std::chrono::steady_clock::now();
+      // conn_max_age of 0 means "no cap" to libcurl, which leaves us no honest
+      // staleness horizon; fall back to a minute rather than re-warm forever.
+      auto const stale_after =
+        _config.conn_max_age.count() > 0
+          ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(_config.conn_max_age)
+          : std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::seconds{60});
+      bool const same_bucket = _warmed_bucket == *bucket;
+      if (same_bucket && _warmed_at.has_value() && now - *_warmed_at < stale_after) { return; }
+      _warmed_bucket = *bucket;
+      _warmed_at     = now;
+    }
+
+    for (auto& reactor : _reactors) {
+      if (reactor) { reactor->warmup(*bucket); }
+    }
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // Warming is an optimization; a query that would have run without it still
+    // runs. Nothing here is worth failing a read over.
+  }
 }
 
 std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string path)
