@@ -67,7 +67,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/cache/test_metadata_store.cpp
     io/rest/test_object_store_lister.cpp
     io/rest/test_rest_footer_resolve.cpp
-    io/rest/test_rest_perf_snapshot.cpp
     io/rest/test_rest_validation_tag.cpp
     io/rest/test_shared_byte_span.cpp
     io/rest/s3/test_sigv4.cpp

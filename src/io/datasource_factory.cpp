@@ -1,6 +1,7 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
+ *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,22 +16,21 @@
  * limitations under the License.
  */
 
-#include "log/logging.hpp"
-#include "scan_manager/config.hpp"
-
+#include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#ifdef CUCASCADE_HAS_KVIKIO
 #include <cucascade/io/kvikio/kvikio_context.hpp>
+#endif
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
 #include <cucascade/io/rest/s3/static_credentials.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <cudf/io/datasource.hpp>
 
 #include <cctype>
 #include <exception>
@@ -43,20 +43,6 @@
 namespace cucascade::io {
 
 namespace {
-
-// RFC 3986 §3.1: schemes are case-insensitive. uri_parser lowercases the
-// parsed scheme on the read side; registry must normalize the same way on
-// the write side so callers don't need to remember which side does it. Used
-// by both register_ioctx and lookup so a register("S3", ...) is found by a
-// lookup("s3"), and vice versa.
-[[maybe_unused]] std::string to_lower_scheme(std::string_view s)
-{
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s)
-    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-  return out;
-}
 
 /// First HOST-tier pinned staging resource, or nullptr when none exists.  The
 /// uring / rest reactors stage device reads through it and size their bounce
@@ -94,27 +80,30 @@ std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
 
+#ifdef CUCASCADE_HAS_KVIKIO
 factory_type make_kvikio_ioctx_factory()
 {
-  return [](const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
+  return [](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
+      // Applies config.kvikio to kvikIO's process-global defaults (see
+      // kvikio_config): unset fields keep kvikIO's env-var-seeded values.
       return std::make_shared<kvikio_context>(config.kvikio, config.object_store);
     } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
+      CUCASCADE_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
     }
   };
 }
+#endif
 
 factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
-  return [&reservation_manager](
-           const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
+  return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto* host_mr = first_host_resource(reservation_manager);
       if (host_mr == nullptr) {
-        SIRIUS_LOG_ERROR(
+        CUCASCADE_LOG_ERROR(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
@@ -122,7 +111,7 @@ factory_type make_uring_ioctx_factory(
       auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
       return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
+      CUCASCADE_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
     }
   };
@@ -131,12 +120,11 @@ factory_type make_uring_ioctx_factory(
 factory_type make_rest_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
-  return [&reservation_manager](
-           const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
+  return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto authorizer = make_s3_authorizer(config.object_store);
       if (!authorizer) {
-        SIRIUS_LOG_WARN(
+        CUCASCADE_LOG_WARN(
           "make_rest_ioctx_factory: object store not configured (endpoint / credentials / "
           "region missing); REST backend disabled");
         return nullptr;
@@ -152,7 +140,7 @@ factory_type make_rest_ioctx_factory(
         std::move(rest_cfg), std::move(authorizer), host_mr);
       return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
+      CUCASCADE_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
     }
   };
@@ -166,15 +154,19 @@ io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
-    _prefer_kvikio(_config.backend == scan_manager::io_backend::kvikio)
+    _prefer_kvikio(_config.backend == io_backend::kvikio)
 {
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  kvikio is the universal fallback —
-  // cudf's default datasource handles any path — so it matches everything.
+  // it can open any local path — so it matches everything and lookup_path
+  // defers it behind the explicit backends.  Without kvikIO (a cudf-free
+  // build) there is no catch-all and unmatched paths resolve to nothing.
+#ifdef CUCASCADE_HAS_KVIKIO
   _entries.emplace(
     io_context_type::kvikio,
     entry{
       io_context_type::kvikio, [](std::string_view) { return true; }, make_kvikio_ioctx_factory()});
+#endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
@@ -195,10 +187,37 @@ void io_context_registry::register_ioctx(io_context_type type,
   _entries[type] = {type, std::move(checker), std::move(factory)};
 }
 
+void io_context_registry::replace_ioctx(io_context_type old_type,
+                                        io_context_type new_type,
+                                        scheme_checker_type checker,
+                                        factory_type factory)
+{
+  if (!checker) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: null scheme checker");
+  }
+  if (!factory) { throw std::invalid_argument("datasource_registry: replace_ioctx: null factory"); }
+  std::lock_guard lk{_mtx};
+  if (_lookup_latched.load(std::memory_order_acquire)) {
+    throw std::logic_error(
+      "datasource_registry: replace_ioctx after the first lookup_path (bootstrap-only)");
+  }
+  if (!_entries.contains(old_type)) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: old type not registered");
+  }
+  if (_entries.contains(new_type)) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: new type already registered");
+  }
+  // Strong guarantee: the emplace is the only throwing step and precedes the
+  // erase; erase by KEY, not by a pre-emplace iterator (emplace may rehash).
+  _entries.emplace(new_type, entry{new_type, std::move(checker), std::move(factory)});
+  _entries.erase(old_type);
+}
+
 std::optional<io_context_type> io_context_registry::lookup_path(
   std::string_view path) const noexcept
 {
   std::shared_lock lk{_mtx};
+  _lookup_latched.store(true, std::memory_order_release);
   // kvikio's checker matches everything; _entries iterates in unspecified order,
   // so defer the catch-all and let an explicit backend (uring/restful) win.
   std::optional<io_context_type> fallback;

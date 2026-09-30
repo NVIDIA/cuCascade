@@ -1,6 +1,7 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
+ *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +37,7 @@ namespace cucascade::io::rest::s3 {
  * rotation; these impls do not refresh). Downstream projects that want
  * refresh-aware credentials (IMDS / STS chain / SSO) ship their own
  * @c request_authorizer; the public surface is a single @c authorize() call
- * so they can do so without exposing raw keys to Sirius.
+ * so they can do so without exposing raw keys to cuCascade.
  */
 class sigv4_authorizer_base : public request_authorizer {
  protected:
@@ -80,8 +81,8 @@ class sigv4_presigned_authorizer final : public sigv4_authorizer_base {
   /// Presigned bucket-level ListObjectsV2: the request params are merged into
   /// the signed query, so the returned URL carries both the list params and the
   /// X-Amz-* auth params; headers are empty.
-  /// @throw cucascade::io::credential_error on empty bucket, an X-Amz-* key inside
-  ///        @p canonical_query (signing-param smuggling), or SigV4 failure.
+  /// @throw cucascade::io::credential_error on empty bucket, an X-Amz-* key
+  ///        inside @p canonical_query (signing-param smuggling), or SigV4 failure.
   authorized_request authorize_list(std::string_view bucket,
                                     std::string_view canonical_query,
                                     std::chrono::seconds timeout) override;
@@ -118,8 +119,8 @@ class sigv4_header_authorizer final : public sigv4_authorizer_base {
   /// @c "{scheme}://{host}/{bucket}?{canonical_query}" URL plus the signed
   /// Authorization / x-amz-* headers. @c timeout is unused (header auth carries
   /// no explicit expiry).
-  /// @throw cucascade::io::credential_error on empty bucket, an X-Amz-* key inside
-  ///        @p canonical_query (signing-param smuggling), or SigV4 failure.
+  /// @throw cucascade::io::credential_error on empty bucket, an X-Amz-* key
+  ///        inside @p canonical_query (signing-param smuggling), or SigV4 failure.
   authorized_request authorize_list(std::string_view bucket,
                                     std::string_view canonical_query,
                                     std::chrono::seconds timeout) override;

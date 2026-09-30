@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,9 +18,8 @@
 
 #pragma once
 
-#include "cuda/device_copy_batch.hpp"
-#include "exec/semi_future.hpp"
-
+#include <cucascade/cuda/device_copy_batch.hpp>
+#include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/types.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -323,7 +323,7 @@ struct device_cpy_request {
       auto* device_dst      = d_buffer.data + (copy_rng.offset - req_rng.offset);
       std::size_t remaining = copy_rng.size;
 
-      sirius::cuda::device_copy_batch batch;
+      cucascade::cuda::device_copy_batch batch;
       batch.reserve(host_buf.size());
       for (auto const& entry : host_buf) {
         auto const length = entry.iov_len;

@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -15,21 +16,20 @@
  * limitations under the License.
  */
 
-#include "cucascade/cuda/event.hpp"
-#include "exec/thread_util.hpp"
-
+#include <cucascade/cuda/event.hpp>
+#include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
 
 #include <fcntl.h>
-#include <log/logging.hpp>
 #include <sys/stat.h>
 #include <sys/uio.h>
 
@@ -140,7 +140,7 @@ class unique_ring {
 
   [[nodiscard]] unsigned peek(std::span<io_uring_cqe*> cqes) const noexcept
   {
-    return io_uring_peek_batch_cqe(_ring.get(), cqes.data(), cqes.size());
+    return io_uring_peek_batch_cqe(_ring.get(), cqes.data(), static_cast<unsigned>(cqes.size()));
   }
 
   void seen(io_uring_cqe* cqe) const noexcept { io_uring_cqe_seen(_ring.get(), cqe); }
@@ -194,9 +194,10 @@ class unique_ring {
 
   [[nodiscard]] bool register_buffers(std::span<iovec> buffers) const noexcept
   {
-    auto const rc = io_uring_register_buffers(_ring.get(), buffers.data(), buffers.size());
+    auto const rc =
+      io_uring_register_buffers(_ring.get(), buffers.data(), static_cast<unsigned>(buffers.size()));
     if (rc < 0) {
-      SIRIUS_LOG_WARN("uring_reactor: fixed buffers disabled: {}", strerror(-rc));
+      CUCASCADE_LOG_WARN("uring_reactor: fixed buffers disabled: {}", strerror(-rc));
       return false;
     }
     return true;
@@ -277,7 +278,7 @@ struct io_slot {
                           static_cast<__u64>(offset));
       used_fixed = false;
     }
-    io_uring_sqe_set_data64(sqe, static_cast<std::uint64_t>(index));
+    io_uring_sqe_set_data64(sqe, static_cast<__u64>(index));
   }
 };
 
@@ -502,7 +503,7 @@ void uring_reactor::start()
   }
   if (!_tname.empty()) {
     auto const name = _tname + "_worker";
-    std::ignore     = sirius::exec::thread_util::set_thread_name(_worker, name);
+    std::ignore     = cucascade::exec::thread_util::set_thread_name(_worker, name);
   }
 }
 
@@ -576,9 +577,9 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
 
   file_descriptor direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
   if (!direct) {
-    SIRIUS_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
-                    path,
-                    strerror(errno));
+    CUCASCADE_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
+                       path,
+                       strerror(errno));
   }
 
   auto const file_size = size(buffered.get());
@@ -616,8 +617,7 @@ std::size_t uring_reactor::host_read(local_io_object const& file,
   return completed;
 }
 
-cudf::io::text::byte_range_info uring_reactor::align_to_physical(
-  cudf::io::text::byte_range_info logical, std::size_t file_size)
+byte_range uring_reactor::align_to_physical(byte_range logical, std::size_t file_size)
 {
   if (logical.offset() < 0 || logical.size() <= 0) return {0, 0};
 
@@ -626,20 +626,19 @@ cudf::io::text::byte_range_info uring_reactor::align_to_physical(
   auto const begin  = align_down(offset, IO_BLOCK_SIZE);
   auto const end    = std::min(align_up(saturating_add(offset, bytes), IO_BLOCK_SIZE),
                             align_up(file_size, IO_BLOCK_SIZE));
-  return end > begin ? cudf::io::text::byte_range_info{static_cast<std::int64_t>(begin),
-                                                       static_cast<std::int64_t>(end - begin)}
-                     : cudf::io::text::byte_range_info{static_cast<std::int64_t>(begin), 0};
+  return end > begin
+           ? byte_range{static_cast<std::int64_t>(begin), static_cast<std::int64_t>(end - begin)}
+           : byte_range{static_cast<std::int64_t>(begin), 0};
 }
 
-std::vector<cudf::io::text::byte_range_info> uring_reactor::align_and_coalesce(
-  std::span<cudf::io::text::byte_range_info const> ranges,
-  std::optional<std::size_t> alignment) noexcept
+std::vector<byte_range> uring_reactor::align_and_coalesce(
+  std::span<byte_range const> ranges, std::optional<std::size_t> alignment) noexcept
 {
   try {
     auto const requested = alignment.value_or(IO_BLOCK_SIZE);
     auto const effective = std::max<std::size_t>(requested, IO_BLOCK_SIZE);
 
-    std::vector<cudf::io::text::byte_range_info> aligned;
+    std::vector<byte_range> aligned;
     aligned.reserve(ranges.size());
     for (auto const& input : ranges) {
       if (input.offset() < 0 || input.size() <= 0) continue;
@@ -655,7 +654,7 @@ std::vector<cudf::io::text::byte_range_info> uring_reactor::align_and_coalesce(
       return lhs.offset() < rhs.offset();
     });
 
-    std::vector<cudf::io::text::byte_range_info> merged;
+    std::vector<byte_range> merged;
     merged.reserve(aligned.size());
     for (auto const& input : aligned) {
       if (merged.empty()) {
@@ -772,7 +771,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     auto poll_copy_completions = [&]() noexcept {
       auto output = copying.begin();
       for (auto it = copying.begin(); it != copying.end(); ++it) {
-        auto& slot = slots[*it];
+        auto& slot = slots[static_cast<std::size_t>(*it)];
         // An index is in `copying` only while its slot still owns the copying op.  Drop any
         // entry that was already settled elsewhere instead of completing a foreign op.
         assert(slot.state == slot_state::copying && slot.op != nullptr);
@@ -817,7 +816,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         if (inflight != 0) --inflight;
 
         if (index < 0 || static_cast<std::size_t>(index) >= slots.size()) continue;
-        auto& slot = slots[index];
+        auto& slot = slots[static_cast<std::size_t>(index)];
         if (slot.op == nullptr || slot.state != slot_state::reading) continue;
 
         if (result < 0) {
@@ -891,7 +890,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       submitted.reserve(incomplete.size());
       auto input = incomplete.begin();
       while (input != incomplete.end()) {
-        auto& slot = slots[*input];
+        auto& slot = slots[static_cast<std::size_t>(*input)];
         try {
           slot.prepare_remaining_iovecs();
           auto* sqe = ring.get_sqe();
@@ -940,7 +939,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
             std::size_t remaining = op->request.io_rng.size;
             for (auto const& token : lease->tokens) {
               auto const bytes = std::min(remaining, _bounce_slot_size);
-              op->request.iovecs.push_back(iovec{blocks[token.slot_index()], bytes});
+              op->request.iovecs.push_back(
+                iovec{blocks[static_cast<std::size_t>(token.slot_index())], bytes});
               remaining -= bytes;
             }
             if (remaining != 0) {
@@ -949,7 +949,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           }
           op->request.staging_owner = lease;
 
-          auto& slot = slots[leader];
+          auto& slot = slots[static_cast<std::size_t>(leader)];
           assert(slot.state == slot_state::idle && slot.op == nullptr);
           slot.op         = std::move(op);
           slot.state      = slot_state::reading;
@@ -964,8 +964,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           slot.prepare_sqe(sqe);
           submitted.push_back(leader);
         } catch (...) {
-          if (slots[leader].op != nullptr) {
-            settle_slot_error(slots[leader], std::current_exception());
+          if (slots[static_cast<std::size_t>(leader)].op != nullptr) {
+            settle_slot_error(slots[static_cast<std::size_t>(leader)], std::current_exception());
           } else if (op != nullptr) {
             op->request.finish_error(std::current_exception());
           }
@@ -1062,7 +1062,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         } else if (!copying.empty() && pending.empty() && active == nullptr) {
           auto const index = copying.back();
           copying.pop_back();
-          auto& slot        = slots[index];
+          auto& slot        = slots[static_cast<std::size_t>(index)];
           auto const status = slot.copy_event->synchronize_no_throw();
           if (status == cudaSuccess) {
             slot.op->request.finish_success();
@@ -1108,7 +1108,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         return true;
       }
       sync_cancel_available = false;
-      SIRIUS_LOG_WARN("uring_reactor: synchronous cancel-all failed: {}", strerror(-rc));
+      CUCASCADE_LOG_WARN("uring_reactor: synchronous cancel-all failed: {}", strerror(-rc));
       return false;
     };
 
@@ -1152,7 +1152,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       // deferred task work when the preferred DEFER_TASKRUN ring is active.
       if (auto const enter_error = ring.run_deferred_taskwork(); enter_error != 0) {
         if (!terminal_enter_error_logged) {
-          SIRIUS_LOG_WARN("uring_reactor: terminal GETEVENTS failed: {}", strerror(enter_error));
+          CUCASCADE_LOG_WARN("uring_reactor: terminal GETEVENTS failed: {}", strerror(enter_error));
           terminal_enter_error_logged = true;
         }
         std::this_thread::sleep_for(POLL_INTERVAL);
@@ -1168,7 +1168,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     }
 
     for (auto const index : copying) {
-      auto& slot        = slots[index];
+      auto& slot        = slots[static_cast<std::size_t>(index)];
       auto const status = slot.copy_event->synchronize_no_throw();
       if (status == cudaSuccess) {
         slot.op->request.finish_success();

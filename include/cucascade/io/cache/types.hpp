@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -21,13 +22,10 @@
 // slices. Extracted here to keep the shared request contracts independent of
 // the cache implementation.
 
-#include "cucascade/memory/memory_reservation.hpp"
-#include "cucascade/memory/memory_reservation_manager.hpp"
-
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-
-#include <cudf/io/datasource.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <cuda_runtime.h>
 

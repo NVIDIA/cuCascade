@@ -310,9 +310,7 @@ int main(int argc, char** argv)
                                                              1);               // initial_pools
 
   auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-    cucascade::io::uring::uring_reactor::reactor_config_type{
-      .bounce_size = host_mr.get_block_size(), .use_odirect = true},
-    &host_mr);
+    cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect = true}, &host_mr);
   std::shared_ptr<cucascade::io::ioctx> io_ctx =
     std::make_shared<cucascade::io::uring::uring_ioctx>(n_threads, std::move(uring_ctx));
   io_ctx->start();
@@ -381,9 +379,9 @@ int main(int argc, char** argv)
         rmm::cuda_stream stream;  // per-worker stream for device reads
 
         if (backend == Backend::io_context && dest == Dest::host) {
-          // Vector I/O: one host_read_ranges_async_io per file, over that
-          // file's segments.  Segment vectors must outlive the futures.
-          std::vector<std::vector<cucascade::io::io_object_segment>> seg_sets;
+          // Vector I/O: one host_readv_async_io per file, over that file's
+          // slices.  Slice vectors must outlive the futures.
+          std::vector<std::vector<cucascade::io::slice>> seg_sets;
           std::vector<cucascade::exec::semi_future<size_t>> futs;
           size_t cur_file = SIZE_MAX;
           for (size_t i = lo; i < hi; ++i) {
@@ -392,7 +390,7 @@ int main(int argc, char** argv)
               seg_sets.emplace_back();
               cur_file = r.file_idx;
             }
-            seg_sets.back().push_back(cucascade::io::io_object_segment{r.offset, r.size, dsts[i]});
+            seg_sets.back().push_back(cucascade::io::slice{r.offset, r.size, dsts[i]});
           }
           // Re-walk to bind each segment set to its io_object and dispatch.
           size_t set = 0;
@@ -401,8 +399,8 @@ int main(int argc, char** argv)
             if (ranges[i].file_idx != cur_file) {
               cur_file  = ranges[i].file_idx;
               auto& seg = seg_sets[set++];
-              futs.push_back(io_ctx->host_read_ranges_async_io(
-                *io_objects[cur_file], std::span<cucascade::io::io_object_segment>(seg)));
+              futs.push_back(io_ctx->host_readv_async_io(
+                *io_objects[cur_file], std::span<cucascade::io::slice const>(seg)));
             }
           }
           for (auto& f : futs)

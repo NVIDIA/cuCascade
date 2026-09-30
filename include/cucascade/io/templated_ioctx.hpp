@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,12 +18,11 @@
 
 #pragma once
 
-#include "exec/semi_future.hpp"
-#include "log/logging.hpp"
-
+#include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -94,9 +94,8 @@ concept io_reactor_c = requires(R reactor,
   } -> std::same_as<std::unique_ptr<typename R::io_object_type>>;
   { R::supports(path_view) } -> std::same_as<bool>;
   {
-    R::align_and_coalesce(std::span<cudf::io::text::byte_range_info const>{},
-                          std::optional<std::size_t>{})
-  } -> std::same_as<std::vector<cudf::io::text::byte_range_info>>;
+    R::align_and_coalesce(std::span<byte_range const>{}, std::optional<std::size_t>{})
+  } -> std::same_as<std::vector<byte_range>>;
 };
 
 template <class R>
@@ -169,9 +168,9 @@ class templated_ioctx : public ioctx {
       try {
         reactor->shutdown();
       } catch (std::exception const& error) {
-        SIRIUS_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", error.what());
+        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", error.what());
       } catch (...) {
-        SIRIUS_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
+        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
       }
     }
   }
@@ -228,8 +227,8 @@ class templated_ioctx : public ioctx {
     return _reactors.empty() ? 0 : _reactors.front()->staging_block_size();
   }
 
-  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<cudf::io::text::byte_range_info const> ranges,
+  [[nodiscard]] std::vector<byte_range> align_and_coalesce(
+    std::span<byte_range const> ranges,
     std::optional<std::size_t> alignment = std::nullopt) const noexcept override
   {
     return Reactor::align_and_coalesce(ranges, alignment);
@@ -259,7 +258,8 @@ class templated_ioctx : public ioctx {
     }
 
     auto const selected = std::min(count, dispatch_fanout);
-    std::partial_sort(ranked.begin(), ranked.begin() + selected, ranked.end());
+    std::partial_sort(
+      ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(selected), ranked.end());
 
     std::vector<Reactor*> result;
     result.reserve(selected);
@@ -289,6 +289,7 @@ class templated_ioctx : public ioctx {
     if (input_slices.empty()) return exec::make_semi_future<std::size_t>(0);
 
     std::vector<prepared_io_slice> slices;
+    bool has_device_slice = false;
     try {
       auto const& typed = as_typed(object);
       auto owner        = object.shared_from_this();
@@ -302,7 +303,7 @@ class templated_ioctx : public ioctx {
         // success would publish never-filled cache chunks as `cached`.
         if (slice.rng.size == 0 || slice.rng.offset >= typed.size()) {
           if (slice.is_fragmented()) {
-            SIRIUS_LOG_WARN(
+            CUCASCADE_LOG_WARN(
               "templated_ioctx: dropping fragmented slice [{}, +{}) outside object '{}' of {} "
               "bytes; caller must clamp to EOF",
               slice.rng.offset,
@@ -324,6 +325,7 @@ class templated_ioctx : public ioctx {
         total_bytes += slice.rng.size;
 
         if (slice.has_device_request()) {
+          has_device_slice = true;
           if (device_id < 0) device_id = detail::current_cuda_device();
           if (slice.d_buffer.device_id < 0) slice.d_buffer.device_id = device_id;
         }
@@ -379,6 +381,7 @@ class templated_ioctx : public ioctx {
         return future;
       } catch (...) {
         auto const error = std::current_exception();
+        if (has_device_slice) on_device_dispatch_failure();
         for (auto& slice : slices) {
           if (slice.on_complete != nullptr) {
             (*slice.on_complete)(slice.h_buffer.fragments(), false);
@@ -388,7 +391,8 @@ class templated_ioctx : public ioctx {
         return future;
       }
     } catch (...) {
-      auto const error      = std::current_exception();
+      auto const error = std::current_exception();
+      if (has_device_slice) on_device_dispatch_failure();
       auto fail_unsubmitted = [](auto& pending) noexcept {
         for (auto& slice : pending) {
           if (slice.on_complete != nullptr) {
@@ -404,6 +408,24 @@ class templated_ioctx : public ioctx {
   }
 
  protected:
+  /**
+   * @brief Applies backend policy after synchronous device dispatch fails.
+   *
+   * Called from the exception handlers in mixed_readv_async_io() when the failed
+   * request carried at least one device slice, before the exception is returned
+   * through an errored future or reported to the request's coordinator.
+   *
+   * An S3-over-RDMA backend overrides this hook to check for a sticky CUDA
+   * context error. Returning such an error as an ordinary request failure
+   * could allow registered GPU memory to be reused or released before RDMA
+   * writes and CUDA work are known to be quiescent. In that case the backend
+   * must invoke its fatal policy instead of returning.
+   *
+   * The default implementation does nothing. An override must not throw or
+   * re-enter this ioctx.
+   */
+  virtual void on_device_dispatch_failure() noexcept {}
+
   std::shared_ptr<io_object> create_io_object(std::string path) override
   {
     return std::shared_ptr<io_object>(Reactor::create_io_object(std::move(path)));

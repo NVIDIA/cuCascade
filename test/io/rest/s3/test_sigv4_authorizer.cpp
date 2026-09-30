@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
+#include "io/rest/mock_authorizer.hpp"
+
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/object_store_config.hpp>
-#include <cucascade/io/rest/mock_authorizer.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
 #include <cucascade/io/rest/s3/static_credentials.hpp>

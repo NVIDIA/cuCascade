@@ -323,8 +323,7 @@ int main(int argc, char** argv)
                                                                1);               // initial_pools
 
     auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-      cucascade::io::uring::uring_reactor::reactor_config_type{
-        .bounce_size = host_mr.get_block_size(), .use_odirect = use_odirect},
+      cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect = use_odirect},
       &host_mr);
     auto io_ctx =
       std::make_shared<cucascade::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));

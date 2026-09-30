@@ -781,11 +781,23 @@ class semi_future {
   // when the chain produces its final try_t<value_t>, cb is invoked inline.
   // Any executor dispatch must be baked into cb by the caller.
   // Used by future<value_t, exec_t>::thenX and flat_map_state's flattening.
+  //
+  // `cb` may also be a one-shot (`&&`-qualified) callable such as
+  // `invocable<void(try_t<value_t>&&) &&>`; it cannot be stored as-is (the slot
+  // is invoked as an lvalue), so it is adapted by a forwarding wrapper.
   template <class cb_t>
   void install_callback(cb_t&& cb) &&
   {
     throw_if_invalid();
-    _state->set_callback(typename detail::state<value_t>::callback(std::forward<cb_t>(cb)));
+    using callback_t = typename detail::state<value_t>::callback;
+    if constexpr (std::is_constructible_v<callback_t, cb_t&&>) {
+      _state->set_callback(callback_t(std::forward<cb_t>(cb)));
+    } else {
+      _state->set_callback(
+        callback_t([inner = std::forward<cb_t>(cb)](try_t<value_t>&& result) mutable {
+          std::move(inner)(std::move(result));
+        }));
+    }
     _state.reset();
   }
 

@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -22,10 +23,10 @@
 #include <cstddef>
 #include <optional>
 
-// NOTE ON NAMESPACING: this lives in `sirius::io`, not `cucascade::io::kvikio`,
+// NOTE ON NAMESPACING: this lives in `cucascade::io`, not `cucascade::io::kvikio`,
 // deliberately.  A `cucascade::io::kvikio` namespace would shadow the upstream
 // `::kvikio` namespace for every unqualified `kvikio::` use inside
-// `sirius::io` (e.g. `kvikio::FileHandle` in kvikio_context.hpp), forcing
+// `cucascade::io` (e.g. `kvikio::FileHandle` in kvikio_context.hpp), forcing
 // global qualification everywhere.  The header still lives under io/kvikio/ so
 // the file layout matches the uring / rest backends.
 namespace cucascade::io {
@@ -36,35 +37,41 @@ namespace cucascade::io {
  * Every field is optional and means "leave kvikIO's own default alone".  kvikIO
  * seeds each setting from an environment variable at first use
  * (@c KVIKIO_NTHREADS, @c KVIKIO_TASK_SIZE, ...), so an unset field here keeps
- * that env-var value; an engaged field overrides it.
+ * that env-var value; an engaged field overrides it.  This makes the config an
+ * explicit, in-process override layered on top of the env-var defaults rather
+ * than a replacement for them.
  *
  * @warning PROCESS-GLOBAL.  Every field except @c compat_mode maps to a setter
  *          on kvikIO's @c kvikio::defaults singleton, so applying a config
- *          mutates state shared by ALL kvikIO users in the process.  Two
+ *          mutates state shared by ALL kvikIO users in the process — including
+ *          other cuCascade ioctxs and any direct kvikIO use elsewhere.  Two
  *          @c kvikio_context instances built with different configs do not get
  *          independent settings; the last one constructed wins.  Treat this as
- *          startup configuration, applied once.  @c nthreads is especially
- *          disruptive: kvikIO's setter waits for all running tasks, destroys
- *          the pool, and rebuilds it.
+ *          startup configuration, applied once.
+ *
+ * @warning @c nthreads is especially disruptive: kvikIO's setter waits for all
+ *          currently running tasks, destroys the pool, and rebuilds it.  Do not
+ *          change it while other kvikIO I/O is in flight.
  *
  * @c compat_mode is the exception — it is passed per @c FileHandle at open
  * time, so it affects only files this ioctx opens and mutates nothing global.
  *
- * Write-side knobs are intentionally absent: @c kvikio_context opens every file
- * read-only, so they would be dead config.  So is a readahead budget: the
- * backend cannot use the prefetching cache, so there is nowhere to read ahead
- * into.
+ * Write-side knobs (@c KVIKIO_AUTO_DIRECT_IO_WRITE) are intentionally absent:
+ * @c kvikio_context opens every file read-only, so they would be dead config.
  */
 struct kvikio_config {
   /// Threads in kvikIO's task pool — the parallelism bound for a single
-  /// @c pread (it splits the read into @c task_size chunks across this pool).
-  /// Env: @c KVIKIO_NTHREADS (default 1).  Must be non-zero.
+  /// @c pread (it splits the read into @c task_size chunks and runs them on
+  /// this pool).  This is the local-file analogue of a connection count; kvikIO
+  /// has no per-file connection concept.  Env: @c KVIKIO_NTHREADS (default 1).
+  /// Must be non-zero.
   std::optional<unsigned int> nthreads;
 
   /// Chunk size a parallel read is split into.  Env: @c KVIKIO_TASK_SIZE
-  /// (default 4 MiB).  Must be non-zero.  With @c auto_direct_io_read on, keep
-  /// it a multiple of the page size so tasks start page-aligned — otherwise
-  /// kvikIO falls back to buffered I/O for the misaligned head/tail.
+  /// (default 4 MiB).  Must be non-zero.  When @c auto_direct_io_read is on,
+  /// keep this a multiple of the page size (typically 4 KiB) so tasks start at
+  /// page-aligned offsets — otherwise kvikIO falls back to buffered I/O for the
+  /// misaligned head/tail.
   std::optional<std::size_t> task_size;
 
   /// Minimum read size that goes through GDS + the thread pool; smaller reads
@@ -78,16 +85,16 @@ struct kvikio_config {
   std::optional<std::size_t> bounce_buffer_size;
 
   /// Use Direct I/O (@c O_DIRECT) for POSIX reads where possible.  Env:
-  /// @c KVIKIO_AUTO_DIRECT_IO_READ.  Applies to the POSIX path only — the
-  /// cuFile/GDS path manages its own I/O mode — so it matters most in
-  /// compatibility mode or below @c gds_threshold.
+  /// @c KVIKIO_AUTO_DIRECT_IO_READ.  This is the O_DIRECT switch: it applies to
+  /// the POSIX path only — the cuFile/GDS path manages its own I/O mode — so it
+  /// matters most in compatibility mode or below @c gds_threshold.
   std::optional<bool> auto_direct_io_read;
 
   /// For device reads, align offsets down and sizes up to page boundaries so
   /// the whole transfer is pure Direct I/O, at the cost of reading extra bytes.
   /// When false (kvikIO's default) the unaligned head/tail falls back to
-  /// buffered I/O.  Env: @c KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD.  Requires
-  /// @c auto_direct_io_read to have any effect; device path only.
+  /// buffered I/O instead.  Env: @c KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD.
+  /// Requires @c auto_direct_io_read to have any effect; device path only.
   std::optional<bool> auto_direct_io_read_overread;
 
   /// Give each block device its own thread pool (each sized @c nthreads)

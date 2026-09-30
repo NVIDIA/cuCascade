@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -28,13 +29,13 @@ namespace cucascade::io::cache {
 enum class cache_mode {
   /// O_DIRECT reads, no cache anywhere.
   none,
-  /// Buffered reads through the OS page cache; Sirius keeps no cache of its own.
+  /// Buffered reads through the OS page cache; cuCascade keeps no cache of its own.
   os,
-  /// O_DIRECT reads into Sirius's own pinned prefetching cache.
+  /// O_DIRECT reads into cuCascade's own pinned prefetching cache.
   sirius,
 };
 
-/// What retires a chunk from the Sirius cache once nothing is reading it.
+/// What retires a chunk from the cuCascade cache once nothing is reading it.
 /// Only meaningful under @ref cache_mode::sirius.
 enum class eviction_policy {
   /// Drop a chunk as soon as it goes idle: the cache is a prefetch staging area,
@@ -106,7 +107,7 @@ struct config {
   /// Which cache the read path goes through.
   cache_mode mode{cache_mode::none};
 
-  /// What retires an idle chunk from the Sirius cache.
+  /// What retires an idle chunk from the cuCascade cache.
   eviction_policy eviction{eviction_policy::lru};
 
   /// Floor of the cache pool reserved for prefetching, as a fraction of the pool.
@@ -123,7 +124,7 @@ struct config {
   /// demand, so this is also what gates the readahead by default.
   [[nodiscard]] bool enabled() const noexcept { return mode != cache_mode::none; }
 
-  /// Whether reads are served through Sirius's own pinned prefetching cache.
+  /// Whether reads are served through cuCascade's own pinned prefetching cache.
   [[nodiscard]] bool use_prefetching_cache() const noexcept { return mode == cache_mode::sirius; }
 
   /// Whether the local backend reads with O_DIRECT: everything but @c os, which

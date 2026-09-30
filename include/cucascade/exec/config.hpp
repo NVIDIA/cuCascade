@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -16,18 +15,21 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/uring/uring_ioctx.hpp>
-#include <cucascade/io/uring/uring_reactor.hpp>
+#pragma once
 
-#include <memory>
+#include <string>
+#include <vector>
 
-namespace cucascade::io::uring {
+namespace cucascade::exec {
 
-uring_ioctx::uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx)
-  : templated_ioctx<uring_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
-      return std::make_unique<uring_reactor>(ctx, "reactor-" + std::to_string(i++));
-    })
-{
-}
+/// Default width of the GPU pipeline executor pool.  The io reactors size their
+/// per-backend scan budgets from it (see uring::config::n_max_concurrent_scans).
+inline constexpr int default_gpu_pipeline_num_threads = 4;
 
-}  // namespace cucascade::io::uring
+struct thread_pool_config {
+  int num_threads{0};
+  std::string thread_name_prefix{"thread"};
+  std::vector<int> cpu_affinity_list;
+};
+
+}  // namespace cucascade::exec

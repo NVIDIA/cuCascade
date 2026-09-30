@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,8 +18,7 @@
 
 #pragma once
 
-#include "exec/config.hpp"
-
+#include <cucascade/exec/config.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
 
 #include <chrono>
@@ -41,8 +41,9 @@ struct config {
   /// Object-store reads are latency-bound rather than bandwidth-bound, so more
   /// concurrency is needed to cover the round trips before the link itself is
   /// the limit.  This struct default can only name the compile-time pipeline
-  /// width; @c sirius_config::derive_rest_scan_budget scales it to the
-  /// configured pipeline pool size unless the config sets it explicitly.
+  /// width; an embedding engine that sizes its pipeline at run time is expected
+  /// to scale it to the configured pipeline pool size unless the config sets it
+  /// explicitly (see @c n_max_concurrent_scans_explicit).
   std::size_t n_max_concurrent_scans{8};
 
   /// Whether the config named @c n_max_concurrent_scans explicitly.  Needed
@@ -138,6 +139,28 @@ struct config {
   /// two axes diverge when a prefix is huge but few keys match, so both exist.
   std::size_t list_max_matches{s3::default_max_list_objects};     // 100'000
   std::size_t list_max_scanned{s3::default_max_scanned_objects};  // 1'000'000
+
+  /// Sentinel for the footer_resolve_* knobs below: derive the value from the
+  /// ioctx shape instead of using an explicit setting.
+  static constexpr std::size_t footer_resolve_auto{static_cast<std::size_t>(-1)};
+
+  /// Concurrency cap for one @c rest_ioctx::resolve_footer_objects batch: at
+  /// most this many probe/HEAD transfers are on the wire at once, and the
+  /// batch's curl multi pools at most this many connections.
+  /// @c footer_resolve_auto derives n_reactors * max_connections at the ioctx;
+  /// 0 disables the API entirely (resolve_footer_objects throws) — the
+  /// rollback switch.
+  std::size_t footer_resolve_max_inflight{footer_resolve_auto};
+
+  /// Aggregate cap (bytes) on live footer payloads across all batches of one
+  /// ioctx.  Each entry reserves @c footer_probe_bytes just before its GET is
+  /// issued; the bytes return when the delivered payload buffer is freed, so
+  /// the cap paces resolve-ahead to how fast the caller drops payloads.
+  /// @c footer_resolve_auto derives 2 * effective-inflight *
+  /// footer_probe_bytes.  An explicit value smaller than
+  /// @c footer_probe_bytes is rejected at resolve time — a sub-window budget
+  /// cannot be honored as a hard cap.
+  std::size_t footer_resolve_stash_budget{footer_resolve_auto};
 };
 
 }  // namespace cucascade::io::rest

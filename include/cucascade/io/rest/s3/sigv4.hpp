@@ -1,6 +1,7 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
+ *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -95,7 +96,7 @@ sigv4_signed_request sign_request(
  * signature.
  *
  * @param method        HTTP method (@c "GET" / @c "HEAD" — the only methods
- *                      Sirius uses for read-only S3).
+ *                      cuCascade uses for read-only S3).
  * @param scheme        URL scheme (@c "http" / @c "https"), already lowercase.
  * @param host          Host[:port], already lowercase.
  * @param canonical_uri URI path, already RFC3986-encoded

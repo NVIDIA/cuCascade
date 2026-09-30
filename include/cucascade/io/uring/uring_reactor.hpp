@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,9 +18,9 @@
 
 #pragma once
 
-#include "exec/semi_future.hpp"
-
+#include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/types.hpp>
+#include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
@@ -30,8 +31,6 @@
 
 #include <cuda_runtime.h>
 
-#include <blockingconcurrentqueue.h>
-#include <concurrentqueue.h>
 #include <liburing.h>
 
 #include <array>
@@ -215,8 +214,7 @@ class uring_reactor {
 
  public:
   /// O_DIRECT requires 4 KiB alignment of both file offset and length.
-  static cudf::io::text::byte_range_info align_to_physical(cudf::io::text::byte_range_info logical,
-                                                           size_t file_size);
+  static byte_range align_to_physical(byte_range logical, size_t file_size);
 
   /// Align every input range's ends outward to the effective alignment, then
   /// coalesce overlapping or adjacent results into a minimal set of aligned,
@@ -226,9 +224,8 @@ class uring_reactor {
   /// viable alignment and is used when @p alignment is unset.  A caller-supplied
   /// alignment is honored only when it is at least @c IO_BLOCK_SIZE; a smaller
   /// value is ignored in favor of the reactor's own alignment.
-  static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<const cudf::io::text::byte_range_info> ranges,
-    std::optional<size_t> alignment = std::nullopt) noexcept;
+  static std::vector<byte_range> align_and_coalesce(
+    std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
   void worker_loop(const std::stop_token& stop_token);
@@ -247,7 +244,7 @@ class uring_reactor {
   std::size_t _bounce_slot_size;
   std::stop_source _stop_source;
   std::jthread _worker;
-  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<grouped_io_request>> _requests;
+  blocking_concurrent_queue<std::unique_ptr<grouped_io_request>> _requests;
   mutable std::mutex _enqueue_mutex;
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};

@@ -23,7 +23,7 @@
 namespace cucascade::io {
 
 /**
- * @brief Raised by @c request_authorizer implementations when credential
+ * @brief Raised by @c s3_request_authorizer implementations when credential
  *        acquisition or signing fails.
  *
  * Surfaces from:

@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,9 +18,8 @@
 
 #pragma once
 
-#include "exec/invocable.hpp"
-
-#include <cudf/io/datasource.hpp>
+#include <cucascade/exec/invocable.hpp>
+#include <cucascade/io/byte_range.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
@@ -107,11 +107,10 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// construction time and stored on the io_object thereafter.
   [[nodiscard]] virtual size_t size() const noexcept = 0;
 
-  /// Opaque validation tag associated with this open (the HTTP ETag for
-  /// object-store backends, quotes preserved); empty when unavailable.
-  /// Consumers compare it only for equality against a tag they captured
-  /// earlier; an empty tag disables validation-based caching above —
-  /// degraded performance, never wrong bytes.
+  /// Opaque cache validator observed when the object was opened; empty when
+  /// unavailable.  HTTP backends preserve quotes and a weak W/ prefix.  This
+  /// is not an If-Match or If-Range token.  The view is valid for this
+  /// object's lifetime.
   [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
 };
 

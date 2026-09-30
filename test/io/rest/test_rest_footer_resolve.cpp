@@ -57,7 +57,6 @@ using cucascade::io::rest::config;
 using cucascade::io::rest::footer_resolve_result;
 using cucascade::io::rest::rest_io_object;
 using cucascade::io::rest::rest_ioctx;
-using cucascade::io::rest::rest_perf_snapshot;
 using cucascade::io::rest::rest_reactor;
 using cucascade::io::rest::shared_byte_span;
 using cucascade::test::key_response_script;
@@ -81,9 +80,7 @@ std::vector<std::uint8_t> test_payload()
 
 std::string object_uri(std::string_view key) { return "s3://bucket/" + std::string{key}; }
 
-config test_config(std::size_t max_inflight = 2,
-                   std::size_t budget       = 4 * probe_size,
-                   bool instrumentation     = true)
+config test_config(std::size_t max_inflight = 2, std::size_t budget = 4 * probe_size)
 {
   config cfg{};
   cfg.request_timeout_s           = 5;
@@ -94,7 +91,6 @@ config test_config(std::size_t max_inflight = 2,
   cfg.retry_backoff_base          = 10ms;
   cfg.retry_jitter                = 0ms;
   cfg.honor_retry_after           = false;
-  cfg.perf_instrumentation        = instrumentation;
   cfg.footer_probe_bytes          = probe_size;
   cfg.footer_resolve_max_inflight = max_inflight;
   cfg.footer_resolve_stash_budget = budget;
@@ -292,20 +288,6 @@ struct payload_gate {
   }
 };
 
-rest_perf_snapshot snapshot_after_single_opens(loopback_range_server const& server,
-                                               config cfg,
-                                               std::vector<std::string> const& paths)
-{
-  auto fixture = make_ioctx(server, cfg);
-  for (auto const& path : paths) {
-    try {
-      (void)fixture.ioctx->open_io_object(path, open_hint::parquet_footer_probe);
-    } catch (...) {
-    }
-  }
-  return fixture.ioctx->perf_snapshot();
-}
-
 class per_key_authorizer_error : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -394,8 +376,7 @@ TEST_CASE("batched footer resolve uses HEAD only when the probe window is zero",
   results.reserve(paths.size());
   std::uint64_t max_reserved = 0;
   fixture.ioctx->resolve_footer_objects(paths, [&](footer_resolve_result result) {
-    max_reserved =
-      std::max(max_reserved, fixture.ioctx->perf_snapshot().footer_stash_reserved_bytes);
+    max_reserved = std::max(max_reserved, fixture.ioctx->footer_stash_reserved_bytes());
     results.push_back(std::move(result));
   });
 
@@ -413,7 +394,7 @@ TEST_CASE("batched footer resolve uses HEAD only when the probe window is zero",
   CHECK(server.get_count() == 0);
   CHECK(server.head_count() == path_count);
   CHECK(max_reserved == 0);
-  CHECK(fixture.ioctx->perf_snapshot().footer_stash_reserved_bytes == 0);
+  CHECK(fixture.ioctx->footer_stash_reserved_bytes() == 0);
 }
 
 TEST_CASE("batched footer resolve isolates per-object authorization and not-found errors",
@@ -483,7 +464,7 @@ TEST_CASE("batched footer resolve releases malformed probe buffers before HEAD f
   for (auto& result : results) {
     result.footer.reset();
   }
-  CHECK(fixture.ioctx->perf_snapshot().footer_stash_reserved_bytes == 0);
+  CHECK(fixture.ioctx->footer_stash_reserved_bytes() == 0);
 }
 
 TEST_CASE("batched footer resolve isolates a per-key authorizer exception",
@@ -898,9 +879,8 @@ TEST_CASE("batched footer resolve bounds retained payloads across concurrent bat
   REQUIRE(retained->wait_for_payload(1s));
   CHECK(retained->resident() == budget);
   CHECK(server->get_count("second.parquet") == 0);
-  auto const held_snapshot = fixture.ioctx->perf_snapshot();
-  CHECK(held_snapshot.footer_stash_reserved_bytes == budget);
-  CHECK(held_snapshot.footer_stash_reserved_peak_bytes == budget);
+  CHECK(fixture.ioctx->footer_stash_reserved_bytes() == budget);
+  CHECK(fixture.ioctx->footer_stash_reserved_peak_bytes() == budget);
   retained->release_one();
   REQUIRE(wait_until([&] { return server->get_count("second.parquet") == 1; }, 1s));
 
@@ -915,13 +895,12 @@ TEST_CASE("batched footer resolve bounds retained payloads across concurrent bat
   require_ready(second);
   retained->release_all();
 
-  auto const drained_snapshot = fixture.ioctx->perf_snapshot();
   CHECK(errors->load() == 0);
   CHECK(stayed_within_budget);
   CHECK(retained->resident() == 0);
   CHECK(retained->peak() <= budget);
-  CHECK(drained_snapshot.footer_stash_reserved_bytes == 0);
-  CHECK(drained_snapshot.footer_stash_reserved_peak_bytes == budget);
+  CHECK(fixture.ioctx->footer_stash_reserved_bytes() == 0);
+  CHECK(fixture.ioctx->footer_stash_reserved_peak_bytes() == budget);
   CHECK(server->get_count() == first_paths.size() + second_paths.size());
 
   auto disabled = make_ioctx(*server, test_config(0, budget));
@@ -1136,34 +1115,4 @@ TEST_CASE("batched footer resolve reuses at most the configured in-flight connec
   }
   CHECK(server.get_count() == paths.size());
   CHECK(server.accepted_connection_count() <= inflight);
-}
-
-TEST_CASE("batched footer resolve folds equivalent request outcomes into the ioctx snapshot",
-          "[rest][footer_resolve]")
-{
-  auto scripts = [] {
-    std::unordered_map<std::string, key_response_script> value;
-    value["retry.parquet"].gets   = {scripted_response{.status = 503}, scripted_response{}};
-    value["missing.parquet"].gets = {scripted_response{.status = 404}};
-    return value;
-  };
-  std::vector<std::string> paths{
-    object_uri("ok.parquet"), object_uri("retry.parquet"), object_uri("missing.parquet")};
-  loopback_range_server single_server(test_payload(), {}, {}, scripts());
-  auto const single = snapshot_after_single_opens(single_server, test_config(2), paths);
-
-  loopback_range_server batch_server(test_payload(), {}, {}, scripts());
-  auto batch_fixture = make_ioctx(batch_server, test_config(2));
-  auto const results = resolve(*batch_fixture.ioctx, paths);
-  auto const batch   = batch_fixture.ioctx->perf_snapshot();
-
-  REQUIRE(results.size() == paths.size());
-  require_success(result_at(results, 0));
-  require_success(result_at(results, 1));
-  require_failure(result_at(results, 2));
-  CHECK(batch.chunk_get_count == single.chunk_get_count);
-  CHECK(batch.blocking_host_get_count == single.blocking_host_get_count);
-  CHECK(batch.payload_bytes_read_total == single.payload_bytes_read_total);
-  CHECK(batch.retries_total == single.retries_total);
-  CHECK(batch.terminal_failures_total == single.terminal_failures_total);
 }

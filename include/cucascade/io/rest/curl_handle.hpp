@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -39,7 +40,7 @@ namespace cucascade::io::rest {
 // ---------------------------------------------------------------------------
 
 /// Evaluate a libcurl easy-interface call and throw on a non-OK code.
-#define SIRIUS_CURL_CHECK(call)                                                         \
+#define CUCASCADE_CURL_CHECK(call)                                                      \
   do {                                                                                  \
     CURLcode _ec = (call);                                                              \
     if (_ec != CURLE_OK) {                                                              \
@@ -49,7 +50,7 @@ namespace cucascade::io::rest {
   } while (false)
 
 /// Evaluate a libcurl multi-interface call and throw on a non-OK code.
-#define SIRIUS_CURLM_CHECK(call)                                                        \
+#define CUCASCADE_CURLM_CHECK(call)                                                     \
   do {                                                                                  \
     CURLMcode _mc = (call);                                                             \
     if (_mc != CURLM_OK) {                                                              \

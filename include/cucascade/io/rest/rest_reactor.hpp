@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,20 +18,21 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
+#include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/cache/types.hpp>
+#include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/types.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
-#include <cudf/io/text/byte_range_info.hpp>
-
-#include <blockingconcurrentqueue.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -99,13 +101,12 @@ using shared_byte_span = std::shared_ptr<const std::span<const std::uint8_t>>;
 /// Result of a suffix-range footer probe: the object's total size plus the
 /// trailing window [window_lo, object_size) captured in @c bytes.  @c bytes is
 /// null when the probe could not be satisfied (the caller then falls back to a
-/// HEAD).  Held by shared_ptr so the trailing bytes are shared, not copied, with
-/// the io_object that carries them for this open.
+/// HEAD).  Shared, not copied, with the io_object that carries it for this open.
 struct footer_probe {
   std::size_t object_size{0};
   std::size_t window_lo{0};
   shared_byte_span bytes;
-  // ETag from the verified 206, quotes preserved; empty otherwise.
+  /// ETag from the verified 206, quotes preserved; empty otherwise.
   std::string etag;
 };
 
@@ -117,15 +118,39 @@ struct head_object_result {
 };
 
 // ---------------------------------------------------------------------------
+// footer_resolve_result
+// ---------------------------------------------------------------------------
+
+/// One resolved entry of a batched footer resolve
+/// (@c rest_ioctx::resolve_footer_objects).  Exactly one of {object, error}
+/// is set.
+///
+/// @c object is stashless — identity, size and validation tag only.  The
+/// suffix window bytes arrive in @c footer instead, whose buffer is the byte
+/// lease: it is allocated against the ioctx-wide footer budget
+/// (@c config::footer_resolve_stash_budget) and the bytes return to that
+/// budget when the buffer is freed, so the intended lifetime is parse-only.
+/// Reads on @c object inside the window re-GET over the network.  @c footer
+/// is null on the HEAD-fallback path (probe unusable), where @c window_lo
+/// stays 0.
+struct footer_resolve_result {
+  std::size_t index{0};               ///< position in the submitted span
+  std::string path;                   ///< the submitted path, verbatim
+  std::shared_ptr<io_object> object;  ///< stashless: size + validation tag
+  shared_byte_span footer;            ///< suffix window bytes (the lease)
+  std::size_t window_lo{0};           ///< file offset of footer->front()
+  std::exception_ptr error;           ///< per-entry failure, isolated
+};
+
+// ---------------------------------------------------------------------------
 // rest_io_object
 // ---------------------------------------------------------------------------
 
 /**
  * @brief Concrete @c io_object backed by a RESTful object-store key.
  *
- * Passive bag of identity: the original URL/path (also the cache id), the
- * bucket + key the reactor authorizes against, and the object size discovered
- * by a one-time HEAD at construction.  Does no I/O of its own.
+ * Stores the object identity and metadata captured when it was opened.
+ * Does no I/O of its own.
  */
 class rest_io_object : public io_object {
  public:
@@ -196,7 +221,7 @@ class rest_io_object : public io_object {
  * CuCascade staging for device reads, a timerfd + min-heap retry
  * scheduler, and an MPSC request queue.  Models the reactor concept consumed
  * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
- * @c request_authorizer, re-issued on every attempt.
+ * @c s3_request_authorizer, re-issued on every attempt.
  */
 class rest_reactor {
  public:
@@ -327,9 +352,32 @@ class rest_reactor {
   /// the size and stashing the parquet footer in a single round-trip.  On a
   /// well-formed 206 the returned @c footer_probe carries the object size, the
   /// window origin, the trailing bytes, and the ETag; on any unusable response
-  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so the caller
-  /// falls back to a HEAD.  @p bucket / @p key identify the object.
+  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so
+  /// the caller falls back to a HEAD.  @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
+
+  /// Batched footer resolve engine: every entry gets the same per-attempt
+  /// semantics as @c fetch_footer_suffix plus the HEAD fallback, but all
+  /// entries share one curl multi driven on the caller's thread, so
+  /// connections are reused across entries (at most @p max_inflight pooled)
+  /// and at most @p max_inflight transfers are on the wire at once.
+  /// @p paths / @p objects / @p indices are parallel: @p indices carries each
+  /// entry's position in the caller's original batch.  Each probe reserves
+  /// @c footer_probe_bytes from @p budget before its GET is issued
+  /// (non-blocking while any transfer is active; a blocking, stop-aware wait
+  /// only when none is) and the delivered payload buffer carries the
+  /// reservation until it is freed.  @p on_result runs on the caller's
+  /// thread, serially, as entries land; see
+  /// @c rest_ioctx::resolve_footer_objects for the delivery contract.
+  /// Assumes non-empty input and max_inflight >= 1; concurrent-batch
+  /// serialization is the ioctx's job, not this method's.
+  void resolve_footer_batch(std::span<std::string const> paths,
+                            std::span<object_ref const> objects,
+                            std::span<std::size_t const> indices,
+                            std::size_t max_inflight,
+                            std::shared_ptr<exec::admission_control> budget,
+                            std::function<void(footer_resolve_result)> const& on_result,
+                            std::stop_token stop);
 
   /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML
   /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
@@ -352,9 +400,8 @@ class rest_reactor {
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
   /// bound) into a minimal sorted set — fewer ranges means fewer GETs.
-  static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<const cudf::io::text::byte_range_info> ranges,
-    std::optional<size_t> alignment = std::nullopt);
+  static std::vector<byte_range> align_and_coalesce(std::span<const byte_range> ranges,
+                                                    std::optional<size_t> alignment = std::nullopt);
 
  private:
   void worker_loop(const std::stop_token& stop_token);
@@ -378,7 +425,7 @@ class rest_reactor {
   file_descriptor _wakeup_fd;
 
   std::stop_source _stop_source;
-  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<grouped_io_request>> _requests;
+  blocking_concurrent_queue<std::unique_ptr<grouped_io_request>> _requests;
   mutable std::mutex _enqueue_mutex;
   bool _running{false};
   bool _accepting{false};

@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -230,7 +231,7 @@ class slot_pool {
       const word_t bit = word_t{1} << b;
       if (_words[w].bits.compare_exchange_weak(
             mask, mask & ~bit, std::memory_order_acquire, std::memory_order_relaxed))
-        return static_cast<int>(w * bits_per_word + b);
+        return static_cast<int>(w * bits_per_word + static_cast<std::size_t>(b));
     }
     return no_slot;
   }

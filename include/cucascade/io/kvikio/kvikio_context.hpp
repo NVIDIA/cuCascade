@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -17,8 +18,7 @@
 
 #pragma once
 
-#include "exec/semi_future.hpp"
-
+#include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/kvikio/config.hpp>
 #include <cucascade/io/object_store_config.hpp>
@@ -206,8 +206,8 @@ class kvikio_context final : public ioctx {
 
   /// kvikIO applies no physical block alignment of its own, so ranges pass
   /// through unchanged.
-  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<const cudf::io::text::byte_range_info> ranges,
+  [[nodiscard]] std::vector<byte_range> align_and_coalesce(
+    std::span<const byte_range> ranges,
     std::optional<size_t> /*alignment*/) const noexcept override;
 
   // -- Backend primitives ---------------------------------------------------

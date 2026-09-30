@@ -15,21 +15,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #pragma once
 
-#include "sirius_config.hpp"
-
+#include <cucascade/io/config.hpp>
 #include <cucascade/io/io_context.hpp>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
-
-namespace sirius {
-struct sirius_config;
-}
 
 namespace cucascade::memory {
 class memory_reservation_manager;
@@ -44,20 +41,20 @@ namespace cucascade::io {
 /**
  * @brief Thread-safe registry of @c ioctx backends, resolved by full path.
  *
- * The engine constructs a registry at startup and registers one entry per backend
- * (kvikio / uring / restful), each carrying a path-capability checker.  At
- * datasource-creation time @c lookup_path runs the checkers against a full path
- * (the checkers parse the URI / stat the filesystem themselves) and picks the
- * backend, preferring an explicit backend over the kvikio catch-all.
+ * The engine constructs a registry at startup and registers one entry per
+ * backend (kvikio / uring / restful), each carrying a path-capability checker.
+ * At datasource-creation time @c lookup_path runs the checkers against a full
+ * path (the checkers parse the URI / stat the filesystem themselves) and picks
+ * the backend, preferring an explicit backend over the kvikio catch-all.
  *
  * All operations are safe under concurrent reads; mutations take an exclusive
  * lock but are expected only at engine bootstrap / shutdown.
  */
 class io_context_registry {
  public:
-  using config_type = scan_manager::scan_manager_config;
+  using config_type = io_config;
 
-  /// @param config              Scan-manager configuration consumed by the
+  /// @param config              IO configuration consumed by the
   ///                            per-backend factories at construction time.
   /// @param reservation_manager Source of the tier-specific memory resources the
   ///                            backends need (e.g. the HOST-tier pinned staging
@@ -84,13 +81,47 @@ class io_context_registry {
    */
   void register_ioctx(io_context_type type, scheme_checker_type checker, factory_type factory);
 
+  /**
+   * @brief Replaces one backend registration before path routing begins.
+   *
+   * A URI scheme may have more than one backend implementation, but only one
+   * of them should claim that scheme explicitly. For example, the registry
+   * initially assigns `s3://` paths to @c io_context_type::restful; when
+   * S3-over-RDMA is selected, the caller replaces that registration with
+   * @c io_context_type::s3rdma.
+   *
+   * The checker and factory for @p new_type are installed and the @p old_type
+   * entry is removed while holding the registry's exclusive lock, so no lookup
+   * observes an intermediate routing state.
+   *
+   * This operation changes registration metadata only. It does not construct,
+   * shut down, or migrate any ioctx instance.
+   *
+   * @param old_type Registered backend to remove.
+   * @param new_type Backend type to register.
+   * @param checker  Predicate used to claim paths for @p new_type.
+   * @param factory  Factory used by @c make_ioctx for @p new_type.
+   *
+   * @throws std::invalid_argument if @p old_type is absent, @p new_type is
+   *         already registered, or @p checker or @p factory is empty.
+   * @throws std::logic_error if @c lookup_path has already been called.
+   *
+   * Provides the strong exception guarantee: the registry is unchanged if the
+   * replacement fails. Intended for single-threaded bootstrap.
+   */
+  void replace_ioctx(io_context_type old_type,
+                     io_context_type new_type,
+                     scheme_checker_type checker,
+                     factory_type factory);
+
   /// Resolve the backend for a full @p path (not a bare scheme — the checkers
   /// parse the URI / stat the filesystem themselves).  Explicit backends
   /// (uring / restful) take precedence over the kvikio catch-all, so `s3://`
   /// never resolves to kvikio and a local file routes to uring before the
   /// universal fallback.  When the registry was built with
-  /// `backend: kvikio`, the uring local backend is suppressed so local
-  /// files fall through to kvikio.  std::nullopt when nothing matches.
+  /// `backend = io_backend::kvikio`, the uring local backend and the REST
+  /// backend are suppressed so local files and `s3://` objects fall through to
+  /// kvikio.  std::nullopt when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
@@ -111,27 +142,26 @@ class io_context_registry {
   cucascade::memory::memory_reservation_manager& _reservation_manager;
   /// Set when @c backend=kvikio: kvikIO then serves BOTH local files (instead
   /// of uring) and @c s3:// objects (instead of rest) for reads.  LIST / glob
-  /// still goes to the REST backend, which the scan manager obtains by type.
+  /// still goes to the REST backend, which callers obtain by type.
   bool _prefer_kvikio{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
+  /// Set by the first @c lookup_path; @c replace_ioctx refuses afterwards
+  /// (bootstrap-only — see its contract).
+  mutable std::atomic<bool> _lookup_latched{false};
 };
 
 // ---------------------------------------------------------------------------
 // Per-backend factory builders
 // ---------------------------------------------------------------------------
 //
-// Each returns a @c factory_type closure that builds one backend ioctx from a
-// @c scan_manager_config.  The closure captures @p reservation_manager by
+// Each returns a @c factory_type closure that builds one backend ioctx from an
+// @c io_config.  The closure captures @p reservation_manager by
 // reference (it sources the HOST-tier staging resource the reactors need), so
 // @p reservation_manager must outlive every ioctx the returned factory creates.
 // The closures are @c noexcept-safe: a construction failure (missing resource,
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
-
-/// kvikio fallback backend (drives @c kvikio::FileHandle directly).  Takes no
-/// reservation manager — kvikio owns no reactor staging.
-io_context_registry::factory_type make_kvikio_ioctx_factory();
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
 /// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
