@@ -374,14 +374,8 @@ class read_only_data_batch {
   /**
    * @brief Get the writer event from the underlying representation, or nullptr.
    *
-   * Delegates polymorphically to idata_representation::get_writer_event().
-   * Returns nullptr when there is no underlying representation, when the representation's
-   * tier records no writer event (the base-class default, e.g. host or disk tier), or when
-   * no writer event has been recorded yet.
-   *
-   * STREAM-LINEAGE: callers that cross stream / device boundaries should call
-   * cudaStreamWaitEvent on the returned event (when non-null) before reading the
-   * underlying memory of this batch.
+   * Delegates to idata_representation::get_writer_event(), which documents how readers must handle
+   * both a non-null event and nullptr, and returns nullptr when the batch holds no representation.
    *
    * @return cudaEvent_t The writer event, or nullptr if none is available.
    */

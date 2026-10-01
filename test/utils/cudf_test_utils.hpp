@@ -71,8 +71,8 @@ inline cudf::table create_simple_cudf_table(
   if (num_rows > 0) {
     auto view  = col1->mutable_view();
     auto bytes = static_cast<size_t>(num_rows) * sizeof(int32_t);
-    CUCASCADE_CUDA_TRY(
-      cudaMemset(const_cast<void*>(view.head()), (num_columns == 1) ? 0x42 : 0x11, bytes));
+    CUCASCADE_CUDA_TRY(cudaMemsetAsync(
+      const_cast<void*>(view.head()), (num_columns == 1) ? 0x42 : 0x11, bytes, stream.get()));
   }
   columns.push_back(std::move(col1));
 
@@ -83,7 +83,8 @@ inline cudf::table create_simple_cudf_table(
     if (num_rows > 0) {
       auto view  = col2->mutable_view();
       auto bytes = static_cast<size_t>(num_rows) * sizeof(int64_t);
-      CUCASCADE_CUDA_TRY(cudaMemset(const_cast<void*>(view.head()), 0x22, bytes));
+      CUCASCADE_CUDA_TRY(
+        cudaMemsetAsync(const_cast<void*>(view.head()), 0x22, bytes, stream.get()));
     }
     columns.push_back(std::move(col2));
   }

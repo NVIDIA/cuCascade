@@ -169,27 +169,70 @@ TEST_CASE("gpu_table_representation Construction", "[gpu_data_representation]")
   REQUIRE(repr.get_size_in_bytes() > 0);
 }
 
-TEST_CASE("gpu_table_representation constructors record the CUDA default stream",
+TEST_CASE("gpu_table_representation records a writer event only for a known writer stream",
           "[gpu_data_representation][writer_event]")
 {
-  CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
-  auto stream    = ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}};
 
-  gpu_table_representation owned(
-    std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{}),
-    *gpu_space,
-    stream);
+  auto make_owned = [&](::cuda::stream_ref writer_stream) {
+    return std::make_unique<gpu_table_representation>(
+      std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{}),
+      *gpu_space,
+      writer_stream);
+  };
+  auto make_view_backed = [&](::cuda::stream_ref writer_stream) {
+    auto owner      = std::make_shared<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
+    auto const view = owner->view();
+    auto const alloc_size = owner->alloc_size();
+    return std::make_unique<gpu_table_representation>(
+      view, std::move(owner), alloc_size, *gpu_space, writer_stream);
+  };
 
-  auto view_owner = std::make_shared<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
-  gpu_table_representation view_backed(view_owner->view(),
-                                       std::shared_ptr<cudf::table>{view_owner},
-                                       view_owner->alloc_size(),
-                                       *gpu_space,
-                                       stream);
+  SECTION("a null handle leaves the writer unknown until record_writer_event()")
+  {
+    auto const null_stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+    auto owned             = make_owned(null_stream);
+    auto view_backed       = make_view_backed(null_stream);
+    REQUIRE(owned->get_writer_event() == nullptr);
+    REQUIRE(view_backed->get_writer_event() == nullptr);
 
-  REQUIRE(owned.get_writer_event() != nullptr);
-  REQUIRE(view_backed.get_writer_event() != nullptr);
+    // An explicit call records on the default stream instead.
+    owned->record_writer_event(null_stream);
+    REQUIRE(owned->get_writer_event() != nullptr);
+  }
+
+  SECTION("the legacy and per-thread default streams are known writers")
+  {
+    for (auto const writer_stream :
+         {::cuda::stream_ref{cudaStreamLegacy}, ::cuda::stream_ref{cudaStreamPerThread}}) {
+      CAPTURE(writer_stream.get());
+      REQUIRE(make_owned(writer_stream)->get_writer_event() != nullptr);
+      REQUIRE(make_view_backed(writer_stream)->get_writer_event() != nullptr);
+    }
+  }
+}
+
+TEST_CASE("gpu_table_representation clone on the default stream records the clone's writer",
+          "[gpu_data_representation][clone][writer_event]")
+{
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+  auto gpu_space            = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto const default_stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+
+  auto table = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+  gpu_table_representation source(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space, default_stream);
+  REQUIRE(source.get_writer_event() == nullptr);
+
+  auto cloned = source.clone(default_stream);
+  REQUIRE(cloned->get_writer_event() != nullptr);
+  REQUIRE(source.get_writer_event() == nullptr);
+
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    source.get_table_view(),
+    cloned->cast<gpu_table_representation>().get_table_view(),
+    default_stream);
 }
 
 TEST_CASE("gpu_table_representation get_size_in_bytes", "[gpu_data_representation]")
@@ -309,7 +352,7 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
   auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), chain_stream);
   gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
                                 *const_cast<memory::memory_space*>(gpu_space),
-                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+                                chain_stream);
 
   auto cpu_any = registry.convert<host_data_packed_representation>(repr, host_space, chain_stream);
   auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);

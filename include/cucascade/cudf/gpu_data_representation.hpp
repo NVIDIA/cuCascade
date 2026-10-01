@@ -41,6 +41,24 @@ namespace cucascade {
  * directly passed to cuDF APIs for processing without any additional copying while the underlying
  * memory is still owned/tracked by our memory allocator.
  *
+ * The constructors and record_writer_event() record a writer event (see get_writer_event()) on the
+ * stream that last wrote the table. A constructor given a null writer stream handle records none
+ * because the writer is unknown, and until record_writer_event() is called, clone(),
+ * release_table(), and the GPU-to-GPU converter registered by register_builtin_converters()
+ * synchronize the whole device returned by get_device_id() before reading. That synchronization
+ * waits for all work on the device, including unrelated work and work that itself waits on the
+ * calling thread, so a caller holding up such work deadlocks. Callers should therefore pass the
+ * actual writer stream, which avoids both the stall and the hang, and pass the legacy default
+ * stream (`cudaStreamLegacy`) only when the writes really were enqueued on it: an event recorded
+ * there does not cover work on non-blocking streams, and it makes every later reader wait for all
+ * work on the blocking streams of that device.
+ *
+ * Every stream that a member function records on, waits on, copies on, or binds buffers to must
+ * belong to the device returned by get_device_id(), and a null stream handle names the default
+ * stream of the calling thread's current device. On a mismatch, the member function throws
+ * cucascade::logic_error before it enqueues work or changes state. Member functions that allocate
+ * do so on that device, whichever device is current.
+ *
  * TODO: Once the GPU memory resource is implemented, replace the allocation type from
  * IAllocatedMemory to the concrete type returned by the GPU memory allocator.
  */
@@ -49,21 +67,15 @@ class gpu_table_representation : public idata_representation {
   /**
    * @brief Construct a new gpu_table_representation object.
    *
-   * STREAM-LINEAGE: every gpu_table_representation must be born with a recorded
-   * writer event so cross-stream / cross-device readers (notably
-   * representation_converter.cpp's convert_gpu_to_gpu()) can establish ordering
-   * via cudaStreamWaitEvent. The constructor calls record_writer_event(@p
-   * writer_stream) automatically, including when it is the CUDA default stream.
-   *
-   * @pre The calling thread's current CUDA device, @p writer_stream, @p memory_space, and every
-   * allocation in @p table refer to the same device.
-   * @pre @p writer_stream is the stream on which writes to @p table were last enqueued.
+   * @pre Every allocation in @p table lives on the device of @p memory_space.
    *
    * @param table Unique pointer to the cuDF table with the data (ownership is transferred)
    * @param memory_space The memory space where the GPU table resides
-   * @param writer_stream The stream on which @p table's data was last written.
-   *                      MUST be the actual writer stream — passing the wrong
-   *                      stream re-introduces the race this contract closes.
+   * @param writer_stream The stream on which @p table's data was last written, or a null handle if
+   * the writer is unknown
+   * @throws cucascade::logic_error if @p writer_stream is not null and belongs to a different CUDA
+   * device
+   * @throws cucascade::cuda_error if a CUDA runtime call fails
    */
   gpu_table_representation(std::unique_ptr<cudf::table> table,
                            cucascade::memory::memory_space& memory_space,
@@ -72,20 +84,18 @@ class gpu_table_representation : public idata_representation {
   /**
    * @brief Construct a new gpu_table_representation object from a cudf::table_view.
    *
-   * STREAM-LINEAGE: writer_stream is REQUIRED — must be the stream on which the
-   * underlying data of @p table_view was last written. See the simple-table ctor
-   * docstring for the writer_stream contract.
-   *
-   * @pre The calling thread's current CUDA device, @p writer_stream, @p memory_space, and every
-   * allocation viewed by @p table_view refer to the same device.
-   * @pre @p writer_stream is the stream on which writes to @p table_view were last enqueued.
+   * @pre Every allocation viewed by @p table_view lives on the device of @p memory_space.
    *
    * @param table_view View of the cuDF table (data ownership lives in @p owner)
    * @tparam Owner The type of the owner of the cuDF table (e.g., a specific operator or component)
    * @param owner Owner of the underlying data (transferred via std::any storage)
    * @param alloc_size Allocation size in bytes for the data
    * @param memory_space The memory space where the GPU table resides
-   * @param writer_stream The stream on which @p table_view's data was last written.
+   * @param writer_stream The stream on which @p table_view's data was last written, or a null
+   * handle if the writer is unknown
+   * @throws cucascade::logic_error if @p writer_stream is not null and belongs to a different CUDA
+   * device
+   * @throws cucascade::cuda_error if a CUDA runtime call fails
    */
   template <typename Owner>
   gpu_table_representation(cudf::table_view table_view,
@@ -127,16 +137,19 @@ class gpu_table_representation : public idata_representation {
    *
    * The cloned representation will have its own copy of the underlying cuDF table,
    * residing in the same memory space as the original.
-   * The copy waits for this representation's writer event and records its own writer event on
-   * @p stream. This method returns without synchronizing @p stream.
    *
-   * @pre The calling thread's current CUDA device, @p stream, this representation's memory space,
-   * and its allocations refer to the same device.
-   * @pre This representation, its allocations, and their contents remain alive and unmodified
-   * until the work enqueued on @p stream completes.
+   * The copy is enqueued on @p stream after the writer of this representation, and @p stream
+   * becomes the writer of the clone, also when it is a null handle. This method does not wait for
+   * the copy to complete.
+   *
+   * @pre This representation and its contents remain alive and unmodified until the work enqueued
+   * on @p stream completes.
    *
    * @param stream CUDA stream for memory operations
    * @return std::unique_ptr<idata_representation> A new gpu_table_representation with copied data
+   * @throws cucascade::logic_error if @p stream belongs to a different CUDA device
+   * @throws rmm::bad_alloc if allocating the copy fails
+   * @throws cucascade::cuda_error if a CUDA runtime call fails
    */
   std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) override;
 
@@ -151,27 +164,28 @@ class gpu_table_representation : public idata_representation {
    * @brief Release ownership of the underlying cuDF table
    *
    * After calling this method, this representation no longer owns the table.
-   * The returned table is ordered after this representation's writer event on @p stream. For a
-   * view-backed representation, materialization is also enqueued on @p stream. This method returns
-   * without synchronizing @p stream.
    *
-   * @pre Except for work represented by the writer event, no stream other than @p stream may have
-   * in-flight work touching the table's device
-   * memory: binding the buffers to @p stream does not insert cross-stream ordering.
+   * Work enqueued on @p stream after this call is ordered after the writer of this representation.
+   * An owned table is returned without synchronizing @p stream. A view-backed table is first copied
+   * on @p stream, and this method then blocks until @p stream has finished all of its work,
+   * including work enqueued before this call, because releasing the view destroys its owner and
+   * possibly the viewed memory with it.
    *
-   * @pre The calling thread's current CUDA device must match get_device_id().
+   * @note Afterwards the representation holds no table. get_table_view(), get_size_in_bytes(),
+   * get_uncompressed_data_size_in_bytes(), and clone() must not be called, and neither may the
+   * built-in converters, because they would dereference the missing table. A second release_table()
+   * returns nullptr, and destroying the representation remains valid.
    *
-   * @pre @p stream must belong to get_device_id() — the device owning this representation's
-   * memory. Default stream handles resolve to the caller's current device.
-   *
-   * @pre For a view-backed representation, the external owner must keep the viewed allocations
-   * alive and unmodified until the work enqueued on @p stream completes.
+   * @pre Apart from the writer, no stream other than @p stream may have in-flight work touching the
+   * table's device memory, because this method orders nothing else before that memory is bound to
+   * @p stream (owned table) or released with its owner (view-backed table).
    *
    * @param stream Stream that will own deallocation ordering of the returned table's buffers
    *               (also used to materialize the table from a view path before release)
    * @return std::unique_ptr<cudf::table> The cuDF table
    * @throws cucascade::logic_error if @p stream belongs to a different CUDA device
-   * @throws cucascade::cuda_error if @p stream's device cannot be queried
+   * @throws rmm::bad_alloc if allocating the copy of a view-backed table fails
+   * @throws cucascade::cuda_error if a CUDA runtime call fails
    */
   std::unique_ptr<cudf::table> release_table(::cuda::stream_ref stream);
 
@@ -191,46 +205,40 @@ class gpu_table_representation : public idata_representation {
    * relationship from any stream with in-flight work touching this table's memory to @p stream
    * before the rebound memory is reused or freed. See cudf::rebind_stream.
    *
-   * @pre When the rebind takes effect (owned, non-empty table), @p stream must belong to
-   * get_device_id(). Binding a buffer's free to another device's stream would retire the block
-   * into a pool free-list keyed by the wrong device. The no-op cases above are not checked.
+   * @p stream is checked only when the rebind takes effect (owned, non-empty table), because the
+   * no-op cases above bind nothing.
    *
    * @param stream Stream used for future asynchronous deallocation of the table's buffers.
    * @throws cucascade::logic_error if @p stream belongs to a different CUDA device
-   * @throws cucascade::cuda_error if @p stream's device cannot be queried
+   * @throws cucascade::cuda_error if a CUDA runtime call fails
    */
   void rebind_stream(::cuda::stream_ref stream) override;
 
   /**
    * @brief Record a CUDA event on @p writer_stream and store it as the writer event.
    *
-   * STREAM-LINEAGE: any cross-stream / cross-device reader of this representation's
-   * memory must wait on this event before issuing reads. Concretely,
-   * representation_converter.cpp's convert_gpu_to_gpu() will call
-   * cudaStreamWaitEvent(reader_stream, get_writer_event(), 0) before peer-copying
-   * source buffers.
-   *
-   * Calling this multiple times overwrites the previously recorded event (the
-   * representation owns a single writer event handle that is reused). The CUDA default stream is
-   * a valid writer stream and records an event on the calling thread's current device.
-   *
-   * @pre The calling thread's current CUDA device, @p writer_stream, this representation's memory
-   * space, and its allocations refer to the same device.
-   * @pre @p writer_stream is the stream on which writes to this representation were last enqueued.
+   * Call this after enqueueing new writes to the table so that later readers order themselves after
+   * them. The representation owns a single event, created on the device returned by get_device_id()
+   * at the first call and re-recorded by later calls. If the event cannot be created or recorded,
+   * the representation is left without one, so the writer becomes unknown. Unlike the constructors,
+   * this method treats a null @p writer_stream as the default stream rather than as an unknown
+   * writer.
    *
    * @param writer_stream The stream on which the most recent writes to this
    *                      representation's memory were enqueued.
+   * @throws cucascade::logic_error if @p writer_stream belongs to a different CUDA device
+   * @throws cucascade::cuda_error if a CUDA runtime call fails
    */
   void record_writer_event(::cuda::stream_ref writer_stream) override;
 
   /**
-   * @brief Get the writer event recorded by record_writer_event().
+   * @brief Get the writer event, or nullptr if the writer is unknown.
    *
-   * Readers that cross stream / device boundaries must call cudaStreamWaitEvent on
-   * this event before reading the underlying memory. Every successfully constructed
-   * gpu_table_representation has a non-null writer event.
+   * Readers handle both results as idata_representation::get_writer_event() describes. A returned
+   * event stays valid until this representation is destroyed or a later record_writer_event()
+   * fails, because that failure destroys the event and leaves the writer unknown.
    *
-   * @return cudaEvent_t The writer event
+   * @return cudaEvent_t The writer event, or nullptr if the writer is unknown
    */
   [[nodiscard]] cudaEvent_t get_writer_event() const override;
 
@@ -244,9 +252,8 @@ class gpu_table_representation : public idata_representation {
   std::variant<std::unique_ptr<cudf::table>, owning_table_view>
     _table;  ///< cudf::table is the underlying representation of the data
 
-  /// CUDA event recording the completion of the most recent writer-stream work that produced this
-  /// representation. Created and recorded during construction, then reused by
-  /// record_writer_event().
+  /// Event recorded on the most recent writer stream and created on the device returned by
+  /// get_device_id(); null while the writer is unknown.
   cudaEvent_t _writer_event{nullptr};
 };
 
@@ -260,9 +267,10 @@ gpu_table_representation::gpu_table_representation(cudf::table_view table_view,
     _table(
       owning_table_view{std::make_any<Owner>(std::forward<Owner>(owner)), alloc_size, table_view})
 {
-  // STREAM-LINEAGE: record writer event so cross-stream/cross-device readers
-  // can establish ordering via cudaStreamWaitEvent.
-  record_writer_event(writer_stream);
+  // A null handle means the writer is unknown, so there is nothing to record.
+  if (writer_stream.get() != nullptr) {
+    gpu_table_representation::record_writer_event(writer_stream);
+  }
 }
 
 }  // namespace cucascade

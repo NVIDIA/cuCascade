@@ -23,7 +23,14 @@
 #include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/cuda_device.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 namespace cucascade {
 
@@ -50,6 +57,58 @@ void validate_stream_device(::cuda::stream_ref stream, int expected_device)
   }
 }
 
+/**
+ * @brief Order work enqueued next on @p reader_stream after the table's most recent writer.
+ *
+ * Without a writer event the writer is unknown, so the calling thread instead synchronizes the
+ * whole device @p device_id.
+ */
+void wait_for_writer(cudaEvent_t writer_event, int device_id, ::cuda::stream_ref reader_stream)
+{
+  if (writer_event != nullptr) {
+    cucascade::cuda::cuda_event_view{writer_event}.wait(reader_stream);
+  } else {
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{device_id}};
+    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
+  }
+}
+
+/**
+ * @brief Deep-copy @p view on @p stream and block until @p stream has finished all of its work.
+ *
+ * Once this returns, the memory behind @p view may be freed. If the copy fails, the copies already
+ * enqueued may still be reading that memory, so @p stream is synchronized before the exception
+ * propagates.
+ */
+[[nodiscard]] std::unique_ptr<cudf::table> materialize_and_wait(cudf::table_view view,
+                                                                ::cuda::stream_ref stream)
+{
+  try {
+    auto table = std::make_unique<cudf::table>(view, stream);
+    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    return table;
+  } catch (...) {
+    // Best effort drain: a second failure must neither replace the original exception nor stay
+    // pending for later CUDA calls on this thread.
+    if (cudaStreamSynchronize(stream.get()) != cudaSuccess) {
+      static_cast<void>(cudaGetLastError());
+    }
+    throw;
+  }
+}
+
+/**
+ * @brief Destroys a CUDA event that has not been handed to its owner.
+ */
+struct event_destroyer {
+  void operator()(cudaEvent_t event) const noexcept
+  {
+    if (cudaEventDestroy(event) != cudaSuccess) { static_cast<void>(cudaGetLastError()); }
+  }
+};
+
+using unique_event = std::unique_ptr<std::remove_pointer_t<cudaEvent_t>, event_destroyer>;
+
 }  // namespace
 
 gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> table,
@@ -57,9 +116,10 @@ gpu_table_representation::gpu_table_representation(std::unique_ptr<cudf::table> 
                                                    ::cuda::stream_ref writer_stream)
   : idata_representation(memory_space), _table(std::move(table))
 {
-  // STREAM-LINEAGE: record the writer event in the constructor body so every
-  // representation is born with a recorded event, including on the CUDA default stream.
-  record_writer_event(writer_stream);
+  // A null handle means the writer is unknown, so there is nothing to record.
+  if (writer_stream.get() != nullptr) {
+    gpu_table_representation::record_writer_event(writer_stream);
+  }
 }
 
 gpu_table_representation::~gpu_table_representation()
@@ -97,16 +157,18 @@ cudf::table_view gpu_table_representation::get_table_view() const
 
 std::unique_ptr<cudf::table> gpu_table_representation::release_table(::cuda::stream_ref stream)
 {
-  if (std::holds_alternative<owning_table_view>(_table)) {
-    // The deep copy below is enqueued on `stream`, and its buffers are bound to it.
-    validate_stream_device(stream, get_device_id());
-    cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
-    _table = std::make_unique<cudf::table>(std::get<owning_table_view>(_table).view, stream);
+  CUCASCADE_FUNC_RANGE();
+  validate_stream_device(stream, get_device_id());
+  wait_for_writer(_writer_event, get_device_id(), stream);
+  if (auto const* const viewed = std::get_if<owning_table_view>(&_table)) {
+    // The copy allocates from the current device's memory resource, so make this device current.
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{get_device_id()}};
+    // Replacing the view destroys its owner, which may free the viewed memory, so the copy must
+    // complete first.
+    _table = materialize_and_wait(viewed->view, stream);
   } else {
     // Rebind so the returned table's frees stay stream-ordered behind the caller's reads.
-    // rebind_stream() applies the same device guard, so this branch needs no separate check.
     gpu_table_representation::rebind_stream(stream);
-    cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
   }
   return std::move(std::get<std::unique_ptr<cudf::table>>(_table));
 }
@@ -135,25 +197,34 @@ void gpu_table_representation::rebind_stream(::cuda::stream_ref stream)
 
 std::unique_ptr<idata_representation> gpu_table_representation::clone(::cuda::stream_ref stream)
 {
-  cucascade::cuda::cuda_event_view{_writer_event}.wait(stream);
-  // Create a deep copy of the cuDF table using the provided stream.
-  // STREAM-LINEAGE: the clone has been written by `stream`; record an event on
-  // it so any cross-stream/cross-device reader of the clone honors the
-  // producer-consumer ordering established by record_writer_event().
-  cudf::table_view view = get_table_view();
-  auto cloned           = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(view, stream), get_memory_space(), stream);
+  CUCASCADE_FUNC_RANGE();
+  validate_stream_device(stream, get_device_id());
+  // The copy allocates from the current device's memory resource, so make this device current.
+  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{get_device_id()}};
+  wait_for_writer(_writer_event, get_device_id(), stream);
+  auto cloned = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(get_table_view(), stream), get_memory_space(), stream);
+  // The constructor treats a null handle as an unknown writer, but the copy above was written on
+  // the default stream that the null handle names.
+  if (stream.get() == nullptr) { cloned->record_writer_event(stream); }
   return cloned;
 }
 
 void gpu_table_representation::record_writer_event(::cuda::stream_ref writer_stream)
 {
-  // STREAM-LINEAGE: lazily create the event on first call (cudaEventDisableTiming —
-  // used solely for cross-stream ordering, never for elapsed-time queries).
-  if (_writer_event == nullptr) {
-    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&_writer_event, cudaEventDisableTiming));
+  validate_stream_device(writer_stream, get_device_id());
+  // The writer stays unknown until the record succeeds: on any failure the event is destroyed
+  // rather than left to claim writes it does not cover.
+  unique_event event{std::exchange(_writer_event, nullptr)};
+  if (!event) {
+    // An event can only be recorded on a stream of the device it was created on.
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{get_device_id()}};
+    cudaEvent_t created{};
+    CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&created, cudaEventDisableTiming));
+    event.reset(created);
   }
-  cucascade::cuda::cuda_event_view{_writer_event}.record(writer_stream);
+  cucascade::cuda::cuda_event_view{event.get()}.record(writer_stream);
+  _writer_event = event.release();
 }
 
 cudaEvent_t gpu_table_representation::get_writer_event() const { return _writer_event; }
