@@ -597,7 +597,7 @@ int main(int argc, char** argv)
         auto tbl = cudf::io::read_parquet(std::move(thread_sources[static_cast<size_t>(t)]),
                                           std::move(thread_metadata[static_cast<size_t>(t)]),
                                           opts,
-                                          streams[static_cast<size_t>(t)].view());
+                                          streams[static_cast<size_t>(t)]);
       });
     }
     for (auto& w : workers)
