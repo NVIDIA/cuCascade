@@ -32,11 +32,11 @@ enum class cache_mode {
   /// Buffered reads through the OS page cache; cuCascade keeps no cache of its own.
   os,
   /// O_DIRECT reads into cuCascade's own pinned prefetching cache.
-  sirius,
+  cucs,
 };
 
 /// What retires a chunk from the cuCascade cache once nothing is reading it.
-/// Only meaningful under @ref cache_mode::sirius.
+/// Only meaningful under @ref cache_mode::cucs.
 enum class eviction_policy {
   /// Drop a chunk as soon as it goes idle: the cache is a prefetch staging area,
   /// sized for the reads in flight rather than for reuse.
@@ -52,7 +52,7 @@ inline bool string_to_enum(std::string_view sv, cache_mode& out)
   static const std::unordered_map<std::string_view, cache_mode> map = {
     {"none", cache_mode::none},
     {"os", cache_mode::os},
-    {"sirius", cache_mode::sirius},
+    {"cucs", cache_mode::cucs},
   };
   auto it = map.find(sv);
   if (it == map.end()) { return false; }
@@ -66,7 +66,7 @@ inline bool enum_to_string(cache_mode mode, std::string& out)
   switch (mode) {
     case cache_mode::none: out = "none"; return true;
     case cache_mode::os: out = "os"; return true;
-    case cache_mode::sirius: out = "sirius"; return true;
+    case cache_mode::cucs: out = "cucs"; return true;
   }
   return false;
 }
@@ -101,7 +101,7 @@ inline bool enum_to_string(eviction_policy policy, std::string& out)
  * from caching (O_DIRECT vs buffered reads, whether the prefetching cache is
  * armed, whether idle chunks are dropped) follows from them, so those derived
  * settings are not separately configurable. The remaining fields size the
- * prefetching cache and only matter under @ref cache_mode::sirius.
+ * prefetching cache and only matter under @ref cache_mode::cucs.
  */
 struct config {
   /// Which cache the read path goes through.
@@ -125,7 +125,7 @@ struct config {
   [[nodiscard]] bool enabled() const noexcept { return mode != cache_mode::none; }
 
   /// Whether reads are served through cuCascade's own pinned prefetching cache.
-  [[nodiscard]] bool use_prefetching_cache() const noexcept { return mode == cache_mode::sirius; }
+  [[nodiscard]] bool use_prefetching_cache() const noexcept { return mode == cache_mode::cucs; }
 
   /// Whether the local backend reads with O_DIRECT: everything but @c os, which
   /// exists precisely to read through the kernel page cache.

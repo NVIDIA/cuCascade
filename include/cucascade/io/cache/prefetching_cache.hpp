@@ -474,7 +474,7 @@ class prefetching_cache {
 
   ioctx* const _io_ctx;
 
-  // Hardware GPU/NUMA topology index, shared from the scan_manager.  Used to
+  // Hardware GPU/NUMA topology index, shared by the embedding engine.  Used to
   // place prefetch staging buffers on the NUMA node closest to the target GPU.
   std::shared_ptr<const cucascade::memory::topology_index> const _topology_index;
 
