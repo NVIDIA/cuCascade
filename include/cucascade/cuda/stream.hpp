@@ -10,8 +10,6 @@
 #define CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
 #endif
 
-#include <rmm/cuda_stream_view.hpp>
-
 #include <cuda/stream>
 
 #if defined(CUCASCADE_UNDEFINE_CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
