@@ -97,22 +97,29 @@ class cuda_driver_api {
   cuda_driver_api() noexcept : _library(dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL))
   {
     if (_library == nullptr) {
-      std::cerr << "Warning: Failed to load CUDA driver library libcuda.so.1: " << dlerror()
-                << std::endl;
+      char const* const error = dlerror();
+      std::cerr << "Warning: Failed to load CUDA driver library libcuda.so.1: "
+                << (error != nullptr ? error : "unknown error") << std::endl;
       return;
     }
 
-    _device_get_by_pci_bus_id =
+    // Resolve into locals and publish only a complete set, so no member ever points into a
+    // library image that is unloaded below.
+    auto const device_get_by_pci_bus_id =
       load_symbol<device_get_by_pci_bus_id_fn>(_library, "cuDeviceGetByPCIBusId");
-    if (_device_get_by_pci_bus_id != nullptr) {
-      _device_get_attribute =
-        load_symbol<device_get_attribute_fn>(_library, "cuDeviceGetAttribute");
-    }
+    auto const device_get_attribute =
+      device_get_by_pci_bus_id != nullptr
+        ? load_symbol<device_get_attribute_fn>(_library, "cuDeviceGetAttribute")
+        : nullptr;
 
-    if (!available()) {
+    if (device_get_by_pci_bus_id == nullptr || device_get_attribute == nullptr) {
       dlclose(_library);
       _library = nullptr;
+      return;
     }
+
+    _device_get_by_pci_bus_id = device_get_by_pci_bus_id;
+    _device_get_attribute     = device_get_attribute;
   }
 
   void* _library{nullptr};

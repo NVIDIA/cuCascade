@@ -66,8 +66,11 @@ bool is_in_topology_discovery_module(void const* address) noexcept
  */
 extern "C" void* dlopen(char const* filename, int flags) noexcept
 {
-  using dlopen_fn               = void* (*)(char const*, int);
-  static auto const next_dlopen = bit_copy<dlopen_fn>(dlsym(RTLD_NEXT, "dlopen"));
+  using dlopen_fn = void* (*)(char const*, int);
+  // Resolve on every call rather than caching in a function-local static: a static's init
+  // guard held across dlsym (which takes the loader lock) could deadlock against another
+  // thread whose library constructor calls dlopen while holding the loader lock.
+  auto const next_dlopen = bit_copy<dlopen_fn>(dlsym(RTLD_NEXT, "dlopen"));
   if (names_cuda_driver(filename) && is_in_topology_discovery_module(__builtin_return_address(0))) {
     topology_driver_dlopen_count.fetch_add(1);
   }
