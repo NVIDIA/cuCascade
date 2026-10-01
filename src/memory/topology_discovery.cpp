@@ -9,6 +9,7 @@
 #include <cuda.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <dlfcn.h>
 #include <ifaddrs.h>
 #include <nvml.h>
 #include <sys/socket.h>
@@ -34,6 +35,98 @@ namespace fs = std::filesystem;
 namespace cucascade::memory {
 
 namespace {
+/**
+ * @brief Lazily resolved subset of the CUDA Driver API used by topology discovery.
+ *
+ * Keeping the driver behind dlopen allows passive NVML/sysfs topology discovery to
+ * remain usable on systems where libcuda is unavailable. Loading this wrapper does
+ * not initialize the CUDA driver or create a CUDA context.
+ */
+class cuda_driver_api {
+ public:
+  static cuda_driver_api const& instance()
+  {
+    // Retain both the wrapper and its dlopen handle for the lifetime of the process.
+    // Runtime-attribute discovery may be called from another global destructor after
+    // function-local statistics would otherwise have been destroyed.
+    static auto const api = new cuda_driver_api;
+    return *api;
+  }
+
+  cuda_driver_api(cuda_driver_api const&)            = delete;
+  cuda_driver_api& operator=(cuda_driver_api const&) = delete;
+
+  [[nodiscard]] bool available() const noexcept
+  {
+    return _device_get_by_pci_bus_id != nullptr && _device_get_attribute != nullptr;
+  }
+
+  [[nodiscard]] CUresult device_get_by_pci_bus_id(CUdevice* device, char const* pci_bus_id) const
+  {
+    return _device_get_by_pci_bus_id(device, pci_bus_id);
+  }
+
+  [[nodiscard]] CUresult device_get_attribute(int* value,
+                                              CUdevice_attribute attribute,
+                                              CUdevice device) const
+  {
+    return _device_get_attribute(value, attribute, device);
+  }
+
+ private:
+  using device_get_by_pci_bus_id_fn = CUresult (*)(CUdevice*, char const*);
+  using device_get_attribute_fn     = CUresult (*)(int*, CUdevice_attribute, CUdevice);
+
+  template <typename Function>
+  static Function load_symbol(void* library, char const* name) noexcept
+  {
+    dlerror();  // Clear any error left by an earlier dynamic-loader call.
+    void* symbol      = dlsym(library, name);
+    char const* error = dlerror();
+    if (error != nullptr || symbol == nullptr) {
+      std::cerr << "Warning: Failed to load CUDA driver symbol " << name << ": "
+                << (error != nullptr ? error : "symbol resolved to null") << std::endl;
+      return {};
+    }
+    Function function{};
+    static_assert(sizeof(function) == sizeof(symbol));
+    std::memcpy(&function, &symbol, sizeof(function));
+    return function;
+  }
+
+  cuda_driver_api() noexcept : _library(dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL))
+  {
+    if (_library == nullptr) {
+      char const* const error = dlerror();
+      std::cerr << "Warning: Failed to load CUDA driver library libcuda.so.1: "
+                << (error != nullptr ? error : "unknown error") << std::endl;
+      return;
+    }
+
+    // Resolve into locals and publish only a complete set, so no member ever points into a
+    // library image that is unloaded below.
+    auto const device_get_by_pci_bus_id =
+      load_symbol<device_get_by_pci_bus_id_fn>(_library, "cuDeviceGetByPCIBusId");
+    auto const device_get_attribute =
+      device_get_by_pci_bus_id != nullptr
+        ? load_symbol<device_get_attribute_fn>(_library, "cuDeviceGetAttribute")
+        : nullptr;
+
+    if (device_get_by_pci_bus_id == nullptr || device_get_attribute == nullptr) {
+      dlclose(_library);
+      _library = nullptr;
+      return;
+    }
+
+    _device_get_by_pci_bus_id = device_get_by_pci_bus_id;
+    _device_get_attribute     = device_get_attribute;
+  }
+
+  void* _library{nullptr};
+  device_get_by_pci_bus_id_fn _device_get_by_pci_bus_id{nullptr};
+  device_get_attribute_fn _device_get_attribute{nullptr};
+};
+
 /**
  * @brief Network device with topology information.
  */
@@ -88,13 +181,18 @@ bool query_hw_decompression(std::string const& pci_bus_id)
 {
   if (pci_bus_id.empty()) { return false; }
 
+  auto const& driver = cuda_driver_api::instance();
+  if (!driver.available()) { return false; }
+
   CUdevice device = 0;
-  if (cuDeviceGetByPCIBusId(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) { return false; }
+  if (driver.device_get_by_pci_bus_id(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) {
+    return false;
+  }
 
   int algorithm_mask = 0;
-  if (cuDeviceGetAttribute(&algorithm_mask,
-                           CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
-                           device) != CUDA_SUCCESS) {
+  if (driver.device_get_attribute(&algorithm_mask,
+                                  CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
+                                  device) != CUDA_SUCCESS) {
     return false;
   }
   return algorithm_mask != 0;

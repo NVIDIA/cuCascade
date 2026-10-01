@@ -114,7 +114,10 @@ context, or otherwise alter CUDA process state.
 
 Runtime attributes are explicitly opt-in. Passing `true` for `with_runtime_attributes`, or calling
 `discover_runtime_attributes()` directly, queries the CUDA driver and requires the caller to have
-initialized it first. These queries do not create a CUDA context.
+initialized it first. The driver library is loaded dynamically only when runtime attributes are
+requested, so passive topology discovery remains available when `libcuda.so.1` is absent. These
+queries do not initialize the driver or create a CUDA context, therefore, unavailable drivers and
+failed queries leave the corresponding runtime attributes unsupported.
 
 ### Network Device Verification
 
