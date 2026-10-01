@@ -24,6 +24,7 @@ namespace cucascade::cuda {
 
 namespace {
 
+#if CUDART_VERSION >= 13000
 /// Copies at or below this size are latency-bound small transfers that overlap
 /// well with compute; any larger copy in the batch makes the whole batch use the
 /// default flag.
@@ -34,6 +35,7 @@ constexpr std::size_t overlap_with_compute_max_bytes = 128ULL << 10;
 {
   return stream == nullptr || stream == cudaStreamLegacy || stream == cudaStreamPerThread;
 }
+#endif  // CUDART_VERSION >= 13000
 
 }  // namespace
 
