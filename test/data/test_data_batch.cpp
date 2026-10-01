@@ -552,8 +552,8 @@ TEST_CASE("data_batch clone with real GPU data verifies data integrity", "[data_
   auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
   rmm::cuda_stream stream;
 
-  auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream);
-  auto original_rows    = table.num_rows();
+  auto table         = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream);
+  auto original_rows = table.num_rows();
   auto original_columns = table.num_columns();
 
   auto gpu_repr =

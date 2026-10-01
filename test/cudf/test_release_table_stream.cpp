@@ -470,7 +470,7 @@ TEST_CASE("release_table and rebind_stream reject a stream owned by another devi
 
   SECTION("release_table")
   {
-    REQUIRE_THROWS_AS(rep.release_table(foreign_stream->view()), cucascade::logic_error);
+    REQUIRE_THROWS_AS(rep.release_table(*foreign_stream), cucascade::logic_error);
 
     // The rejection must leave the representation intact rather than half-released.
     REQUIRE(rep.get_table_view().num_columns() == 3);
@@ -479,7 +479,7 @@ TEST_CASE("release_table and rebind_stream reject a stream owned by another devi
 
   SECTION("rebind_stream")
   {
-    REQUIRE_THROWS_AS(rep.rebind_stream(foreign_stream->view()), cucascade::logic_error);
+    REQUIRE_THROWS_AS(rep.rebind_stream(*foreign_stream), cucascade::logic_error);
 
     // Buffers keep their original binding: a rejected rebind must not partially apply.
     auto released = rep.release_table(shared_stream());

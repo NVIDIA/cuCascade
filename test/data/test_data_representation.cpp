@@ -105,7 +105,7 @@ TEST_CASE("host_data_packed_representation converts to GPU and preserves content
   // Use the same stream for table creation and packing to avoid stream-ordered races
   rmm::cuda_stream pack_stream;
   auto original = create_simple_cudf_table(128, 2, gpu_space->get_default_allocator(), pack_stream);
-  auto view   = original.view();
+  auto view     = original.view();
   auto packed   = cudf::pack(view, pack_stream);
   pack_stream.synchronize();
   auto host_mr = host_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
@@ -2047,7 +2047,7 @@ TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
                                        stream,
                                        gpu_space->get_default_allocator());
   CUCASCADE_CUDA_TRY(
-    cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream));
+    cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream.value()));
 
   auto orig_repr = wrap_column(std::move(col),
                                *const_cast<memory::memory_space*>(gpu_space),
@@ -2085,7 +2085,7 @@ TEST_CASE("Round-trip fast: all-valid null mask is elided on reconstruction", "[
                                        stream,
                                        gpu_space->get_default_allocator());
   CUCASCADE_CUDA_TRY(
-    cudaMemsetAsync(col->mutable_view().head(), 0x77, N * sizeof(int64_t), stream));
+    cudaMemsetAsync(col->mutable_view().head(), 0x77, N * sizeof(int64_t), stream.value()));
   stream.synchronize();
 
   auto orig_repr = wrap_column(std::move(col),
@@ -2127,7 +2127,7 @@ TEST_CASE("Round-trip fast: null mask with real nulls is uploaded and preserved"
                                        stream,
                                        gpu_space->get_default_allocator());
   CUCASCADE_CUDA_TRY(
-    cudaMemsetAsync(col->mutable_view().head(), 0x55, N * sizeof(int64_t), stream));
+    cudaMemsetAsync(col->mutable_view().head(), 0x55, N * sizeof(int64_t), stream.value()));
   // Null out rows [3, 7) — 4 nulls.
   cudf::set_null_mask(col->mutable_view().null_mask(), 3, 7, false, stream);
   stream.synchronize();
@@ -2176,7 +2176,8 @@ TEST_CASE("Round-trip fast: FLOAT64 byte integrity", "[fast][roundtrip]")
                                        cudf::mask_state::UNALLOCATED,
                                        stream,
                                        gpu_space->get_default_allocator());
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(col->mutable_view().head(), 0xCD, N * sizeof(double), stream));
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xCD, N * sizeof(double), stream.value()));
 
   auto orig_repr = wrap_column(std::move(col),
                                *const_cast<memory::memory_space*>(gpu_space),
@@ -2279,8 +2280,8 @@ TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]
                                               cudf::mask_state::UNALLOCATED,
                                               stream,
                                               gpu_space->get_default_allocator());
-  CUCASCADE_CUDA_TRY(
-    cudaMemsetAsync(values_col->mutable_view().head(), 0x33, num_values * sizeof(int32_t), stream));
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(
+    values_col->mutable_view().head(), 0x33, num_values * sizeof(int32_t), stream.value()));
   stream.synchronize();
 
   auto list_col = cudf::make_lists_column(num_lists,
@@ -2329,8 +2330,10 @@ TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][rou
                                       cudf::mask_state::UNALLOCATED,
                                       stream,
                                       gpu_space->get_default_allocator());
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(f0->mutable_view().head(), 0x11, N * sizeof(int32_t), stream));
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(f1->mutable_view().head(), 0x22, N * sizeof(double), stream));
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(f0->mutable_view().head(), 0x11, N * sizeof(int32_t), stream.value()));
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(f1->mutable_view().head(), 0x22, N * sizeof(double), stream.value()));
   stream.synchronize();
 
   std::vector<std::unique_ptr<cudf::column>> fields;
