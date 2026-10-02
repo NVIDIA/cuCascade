@@ -112,6 +112,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
   stream.sync();
 
   auto& gpu_source = source.cast<gpu_table_representation>();
+  gpu_source.wait_for_writer(stream);
   auto packed_data = cudf::pack(gpu_source.get_table_view(), stream);
 
   auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
@@ -194,10 +195,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
   auto new_table = std::make_unique<cudf::table>(new_table_view, stream, mr);
   stream.sync();
 
-  // STREAM-LINEAGE: the resulting representation was written by `stream`;
-  // record an event on it so cross-stream/cross-device readers honor producer
-  // ordering.
-  return std::make_unique<gpu_table_representation>(
+  return gpu_table_representation::make_written_on(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
 }
 
@@ -504,7 +502,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:gpu_to_host"};
-  auto& gpu_source            = source.cast<gpu_table_representation>();
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  // Planning reads string offsets on the device, so it must already be ordered after the writer.
+  gpu_source.wait_for_writer(stream);
   const cudf::table_view view = gpu_source.get_table_view();
 
   // --- Pass 1: plan the allocation layout ---
@@ -906,6 +906,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   // Same-device case: clone via source's own clone() method.
   if (source.get_device_id() == target_memory_space->get_device_id()) {
+    // A null stream handle represents the default stream of the current device: ensure it's the
+    // device attached to the representation, or clone() will throw.
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
     return source.clone(stream);
   }
 
@@ -916,25 +919,6 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
                                : "convert:gpu_to_gpu:host_staging";
   nvtx_scope copy_path_range{copy_path};
 
-  // STREAM-LINEAGE INVARIANT: cross-device peer copies of cudaMallocAsync
-  // allocations require explicit event-ordered synchronization with the
-  // writer stream. A source-device-wide cudaDeviceSynchronize() does NOT
-  // establish the cross-mempool visibility the driver needs — under
-  // compute-sanitizer this site emits hundreds of stream-ordered-race errors
-  // even with a brute-force device sync. Producer-consumer pairing:
-  //   producer = the stream that wrote gpu_source (recorded via
-  //              gpu_table_representation::record_writer_event)
-  //   consumer = target_stream (acquired from target memory space below)
-  // We resolve this in two passes:
-  //   1) Wait on the writer event (if recorded) on the *target* stream so the
-  //      reader sees the writer's allocation/copy ordering. This is the precise
-  //      primitive the sanitizer recognizes as closing the race.
-  //   2) Keep the source-device cudaDeviceSynchronize() as defense-in-depth for
-  //      callers that have not yet been migrated to record writer events
-  //      (get_writer_event() == nullptr). When the writer event is set the
-  //      cudaDeviceSynchronize is technically redundant but harmless.
-  cudaEvent_t const writer_event = gpu_source.get_writer_event();
-
   rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
 
   // Target-bound stream from the target memory_space's stream pool. All peer copies
@@ -943,20 +927,11 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto target_stream = target_memory_space->acquire_stream();
   auto mr            = target_memory_space->get_default_allocator();
 
-  if (writer_event != nullptr) {
-    // STREAM-LINEAGE pass 1: tie the reader stream's timeline to the writer's
-    // recorded event. After this point the target_stream observes all
-    // writer-side cudaMallocAsync allocations and writes in proper order.
-    cucascade::cuda::cuda_event_view{writer_event}.wait(target_stream);
-  } else {
-    // STREAM-LINEAGE pass 2 (fallback): no writer event recorded — fall back to
-    // a coarser source-device sync. This path is documented as insufficient for
-    // cross-mempool cudaMallocAsync allocations but is preserved for
-    // representations produced by code paths that have not yet been migrated to
-    // record_writer_event().
-    rmm::cuda_set_device_raii src_sync_guard{rmm::cuda_device_id{src_device_id}};
-    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
-  }
+  // Order the peer copies below after the most recent writer of gpu_source. With an unknown writer
+  // this synchronizes the whole source device, which is correct but invisible to compute-sanitizer:
+  // its stream-ordered race tracking ignores host-side synchronization, so it may report races here
+  // that a recorded writer event avoids.
+  gpu_source.wait_for_writer(target_stream);
 
   cudf::table_view const src_view = gpu_source.get_table_view();
 
@@ -1681,8 +1656,10 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   [[maybe_unused]] memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:gpu_to_disk"};
-  auto& backend       = target_memory_space->get_io_backend();
-  auto& gpu_source    = source.cast<gpu_table_representation>();
+  auto& backend    = target_memory_space->get_io_backend();
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  // Planning reads string offsets on the device, and the backend orders its reads after `stream`.
+  gpu_source.wait_for_writer(stream);
   cudf::table_view tv = gpu_source.get_table_view();
 
   // Generate unique file path under the disk memory space's mount directory
@@ -1899,9 +1876,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   stream.sync();
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
-  // STREAM-LINEAGE: writes happened on `stream`; record event so cross-stream
-  // readers observe ordering.
-  return std::make_unique<gpu_table_representation>(
+  return gpu_table_representation::make_written_on(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
 }
 

@@ -126,9 +126,14 @@ class idata_representation {
   /**
    * @brief Get the writer event recorded by record_writer_event(), or nullptr if none.
    *
-   * Readers that cross stream / device boundaries should call cudaStreamWaitEvent on the
-   * returned event (when non-null) before reading this representation's memory. The default
-   * implementation returns nullptr; representations that record writer events override this.
+   * A reader on another stream or device must wait for a non-null event (e.g. with
+   * cudaStreamWaitEvent) before reading this representation's memory. What nullptr means depends on
+   * the representation: one whose memory is written asynchronously on a GPU (e.g. a GPU
+   * representation) returns nullptr when its writer is unknown, and the reader must then
+   * synchronize the device returned by get_device_id() before reading; one with no GPU writer (e.g.
+   * a host or disk representation) returns nullptr because its memory needs no ordering. The
+   * default implementation returns nullptr; representations that record writer events override
+   * this.
    *
    * @return cudaEvent_t The writer event, or nullptr if none has been recorded.
    */
