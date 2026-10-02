@@ -17,6 +17,7 @@
 
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
+#include "utils/range_test_utils.hpp"
 
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
@@ -26,9 +27,12 @@
 #include <cucascade/cudf/host_table_packed.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
+#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -39,6 +43,7 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/aligned.hpp>
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -47,7 +52,9 @@
 #include <catch2/catch_all.hpp>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <vector>
@@ -302,49 +309,110 @@ static std::unique_ptr<memory::memory_reservation_manager> create_multi_gpu_mana
                                                                                     int dev_b)
 {
   using namespace cucascade::memory;
+  constexpr std::size_t capacity = 2048ull * 1024 * 1024;
   std::vector<memory_space_config> configs;
-  configs.emplace_back(gpu_memory_space_config(dev_a, 2048ull * 1024 * 1024));
-  configs.emplace_back(gpu_memory_space_config(dev_b, 2048ull * 1024 * 1024));
+  configs.emplace_back(gpu_memory_space_config{.device_id = dev_a, .memory_capacity = capacity});
+  configs.emplace_back(gpu_memory_space_config{.device_id = dev_b, .memory_capacity = capacity});
   return std::make_unique<memory_reservation_manager>(std::move(configs));
 }
 
-TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
-          "[gpu_data_representation][.multi-device]")
+// A distinct value per row, so a shifted, truncated, or partly stale copy cannot match.
+template <typename T>
+static std::vector<T> make_row_pattern(std::size_t rows, std::uint64_t seed)
+{
+  std::vector<T> values(rows);
+  for (std::size_t row = 0; row < rows; ++row) {
+    values[row] = static_cast<T>((static_cast<std::uint64_t>(row) * 0x9E3779B97F4A7C15ull) ^ seed);
+  }
+  return values;
+}
+
+template <typename T>
+static std::unique_ptr<cudf::column> make_column_from_host(std::vector<T> const& values,
+                                                           rmm::device_async_resource_ref mr,
+                                                           ::cuda::stream_ref stream)
+{
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_to_id<T>()},
+                                          static_cast<cudf::size_type>(values.size()),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<T>(),
+                                     values.data(),
+                                     values.size() * sizeof(T),
+                                     cudaMemcpyHostToDevice,
+                                     stream.get()));
+  return column;
+}
+
+// Reads on the owning device, so the copy does not depend on peer access to the column's pool.
+template <typename T>
+static std::vector<T> copy_column_to_host(cudf::column_view const& column, int device)
+{
+  rmm::cuda_set_device_raii select_owner{rmm::cuda_device_id{device}};
+  std::vector<T> values(static_cast<std::size_t>(column.size()));
+  CUCASCADE_CUDA_TRY(
+    cudaMemcpy(values.data(), column.data<T>(), values.size() * sizeof(T), cudaMemcpyDefault));
+  return values;
+}
+
+// The converter's copy route depends on whether the pools are granted to each other, so the test
+// covers both the ungranted pools that cuCascade creates and pools granted by the application.
+TEST_CASE("gpu cross-device conversion copies every byte in both directions",
+          "[gpu_data_representation][gpu][.multi-device]")
 {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
-    SUCCEED("Single GPU or CUDA not available; skipping cross-device test");
-    return;
+    SKIP("requires two available CUDA devices");
   }
+  auto const source      = GENERATE(0, 1);
+  auto const destination = 1 - source;
+  auto const grant_pools = GENERATE(false, true);
+  CAPTURE(source, destination, grant_pools);
 
-  // Pick first two GPUs
-  int dev_src = 0;
-  int dev_dst = 1;
-
-  auto mgr = create_multi_gpu_manager(dev_src, dev_dst);
+  auto mgr = create_multi_gpu_manager(0, 1);
   representation_converter_registry registry;
   register_builtin_converters(registry);
-
-  const memory::memory_space* src_space = mgr->get_memory_space(memory::Tier::GPU, dev_src);
-  const memory::memory_space* dst_space = mgr->get_memory_space(memory::Tier::GPU, dev_dst);
+  const memory::memory_space* src_space = mgr->get_memory_space(memory::Tier::GPU, source);
+  const memory::memory_space* dst_space = mgr->get_memory_space(memory::Tier::GPU, destination);
   REQUIRE(src_space != nullptr);
   REQUIRE(dst_space != nullptr);
+  if (grant_pools) {
+    for (auto const* owner : {src_space, dst_space}) {
+      auto const pool = owner->get_memory_resource_of<memory::Tier::GPU>()->pool_handle();
+      if (pool == nullptr) { SKIP("the memory space does not expose its CUDA pool"); }
+      auto const accessor = owner == src_space ? destination : source;
+      if (!memory::grant_pool_peer_access(pool, owner->get_device_id(), accessor).granted()) {
+        SKIP("pool peer access was not granted on this hardware");
+      }
+    }
+  }
 
-  // Use a single stream for table creation and peer copy to avoid stream-ordered races
+  // More than one 1 MiB host staging block per column, with a partial final block.
+  constexpr std::size_t rows = (1u << 18) + 3;
+  auto const wide            = make_row_pattern<std::int64_t>(rows, 0x0123456789ABCDEFull);
+  auto const narrow          = make_row_pattern<std::int32_t>(rows, 0xFEDCBA98ull);
+
+  rmm::cuda_set_device_raii select_source{rmm::cuda_device_id{source}};
   auto xfer_stream = src_space->acquire_stream();
-
-  // Build a simple cudf table on source GPU and wrap it
-  auto table = create_simple_cudf_table(256, 2, src_space->get_default_allocator(), xfer_stream);
-  gpu_table_representation src_repr(std::make_unique<cudf::table>(std::move(table)),
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_column_from_host(wide, src_space->get_default_allocator(), xfer_stream));
+  columns.push_back(make_column_from_host(narrow, src_space->get_default_allocator(), xfer_stream));
+  gpu_table_representation src_repr(std::make_unique<cudf::table>(std::move(columns)),
                                     *const_cast<memory::memory_space*>(src_space),
                                     ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
-  auto dst_any   = registry.convert<gpu_table_representation>(src_repr, dst_space, xfer_stream);
-  auto& dst_repr = *dst_any;
+  auto dst_any = registry.convert<gpu_table_representation>(src_repr, dst_space, xfer_stream);
+  xfer_stream.sync();
 
-  // Compare content equality using the same stream used for transfer
-  cucascade::test::expect_cudf_tables_equal_on_stream(
-    src_repr.get_table_view(), dst_repr.get_table_view(), xfer_stream);
+  REQUIRE(dst_any->get_device_id() == destination);
+  auto const view = dst_any->get_table_view();
+  REQUIRE(view.num_columns() == 2);
+  REQUIRE(view.num_rows() == static_cast<cudf::size_type>(rows));
+  CHECK(cucascade::test::first_mismatch(
+          copy_column_to_host<std::int64_t>(view.column(0), destination), wide) == rows);
+  CHECK(cucascade::test::first_mismatch(
+          copy_column_to_host<std::int32_t>(view.column(1), destination), narrow) == rows);
 }
 
 // =============================================================================

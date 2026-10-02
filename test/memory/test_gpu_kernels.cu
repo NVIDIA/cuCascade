@@ -78,7 +78,52 @@ __global__ void gpu_memory_verification_kernel(uint32_t* data,
             static_cast<unsigned long long>(local_checksum));
 }
 
+namespace {
+
+__global__ void copy_peer_bytes_kernel(unsigned char* destination,
+                                       unsigned char const* source,
+                                       std::size_t bytes)
+{
+  for (std::size_t index = threadIdx.x; index < bytes; index += blockDim.x) {
+    destination[index] = source[index];
+  }
+}
+
+__device__ unsigned long long global_timer_ns()
+{
+  unsigned long long time = 0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(time));
+  return time;
+}
+
+__global__ void spin_until_released_kernel(int const volatile* release,
+                                           unsigned long long timeout_ns)
+{
+  auto const start = global_timer_ns();
+  while (*release == 0 && global_timer_ns() - start < timeout_ns) {}
+}
+
+}  // namespace
+
 extern "C" {
+
+cudaError_t spin_until_released(int const* release,
+                                unsigned long long timeout_ns,
+                                cudaStream_t stream)
+{
+  spin_until_released_kernel<<<1, 1, 0, stream>>>(release, timeout_ns);
+  return cudaGetLastError();
+}
+
+cudaError_t copy_peer_bytes(void* destination,
+                            void const* source,
+                            std::size_t bytes,
+                            cudaStream_t stream)
+{
+  copy_peer_bytes_kernel<<<1, 256, 0, stream>>>(
+    static_cast<unsigned char*>(destination), static_cast<unsigned char const*>(source), bytes);
+  return cudaGetLastError();
+}
 
 cudaError_t performGpuMemoryWork(void* gpu_ptr, size_t size_bytes, uint64_t* result_checksum)
 {
