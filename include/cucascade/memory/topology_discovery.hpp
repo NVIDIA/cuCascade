@@ -229,7 +229,8 @@ class topology_discovery {
    * Populates the `runtime_attributes` field of each entry in `topology.gpus`
    * (and, in the future, other hardware classes). This is the only path in this
    * component that issues CUDA driver calls — every other discovery step relies
-   * solely on NVML and sysfs.
+   * solely on NVML and sysfs. The CUDA driver library is loaded dynamically,
+   * therefore, systems without it remain able to use passive topology discovery.
    *
    * Safe to call multiple times; existing runtime attribute values are
    * overwritten.
@@ -238,7 +239,8 @@ class topology_discovery {
    * either via an explicit `cuInit(0)` or via any prior CUDA runtime call that
    * transitively initializes the driver. This function does not call `cuInit`
    * and does not create a CUDA context; per-GPU queries that fail (e.g.
-   * because the driver is uninitialized) leave `hw_decomp` as `false`.
+   * because the driver library is unavailable or uninitialized) leave
+   * `hw_decomp` as `false`.
    *
    * @param topology Topology to enrich in place.
    */

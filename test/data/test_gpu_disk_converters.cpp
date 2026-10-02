@@ -60,7 +60,7 @@ auto& shared_disk_space()
 ::cuda::stream_ref shared_stream()
 {
   static rmm::cuda_stream s;
-  return s.view();
+  return s;
 }
 
 /// Round-trip test helper: GPU -> disk -> GPU (direct 3-step), compare tables.
