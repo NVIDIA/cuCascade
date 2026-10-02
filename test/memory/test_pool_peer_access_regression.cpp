@@ -19,8 +19,9 @@
  * Test Tags:
  * [pool_peer_access]       - pool peer-access grants and peer DMA probe behavior
  * [peer_access_regression] - regressions for shared peer state, caller devices, and copy routes
- * [gpu]                    - requires CUDA devices; most cases need two with bidirectional peer
- *                            capability and skip otherwise
+ * [gpu]                    - requires CUDA devices
+ * [.multi-device]          - hidden; needs two devices with bidirectional peer capability and skips
+ *                            otherwise. Select with "[multi-device]" or a matching positive tag
  * [peer_route_working]     - requires hardware whose direct peer route delivers correct bytes
  * [.peer_route_broken]     - hidden; only for hardware whose direct peer route corrupts bytes
  *
@@ -353,7 +354,7 @@ TEST_CASE("Retrying an inconclusive peer probe restores the caller device",
 }
 
 TEST_CASE("Private-pool probe verifies both directions",
-          "[pool_peer_access][peer_access_regression][gpu][peer_route_working]")
+          "[pool_peer_access][peer_access_regression][gpu][peer_route_working][.multi-device]")
 {
   require_peer_devices();
   int saved_device = 0;
@@ -368,7 +369,7 @@ TEST_CASE("Private-pool probe verifies both directions",
 }
 
 TEST_CASE("Private-pool probe leaves ordinary peer access unchanged",
-          "[pool_peer_access][peer_access_regression][gpu]")
+          "[pool_peer_access][peer_access_regression][gpu][.multi-device]")
 {
   require_peer_devices();
   auto const initial_bits = GENERATE(0, 1, 2, 3);
@@ -387,7 +388,7 @@ TEST_CASE("Private-pool probe leaves ordinary peer access unchanged",
 }
 
 TEST_CASE("Private-pool probe leaves caller pool permissions unchanged",
-          "[pool_peer_access][peer_access_regression][gpu]")
+          "[pool_peer_access][peer_access_regression][gpu][.multi-device]")
 {
   require_peer_devices();
   int saved_device = 0;
@@ -416,7 +417,7 @@ TEST_CASE("Private-pool probe leaves caller pool permissions unchanged",
 }
 
 TEST_CASE("Private-pool probe restores the caller device",
-          "[pool_peer_access][peer_access_regression][gpu]")
+          "[pool_peer_access][peer_access_regression][gpu][.multi-device]")
 {
   require_peer_devices();
   auto const device = GENERATE(0, 1);
@@ -437,7 +438,7 @@ TEST_CASE("Private-pool probe restores the caller device",
 // taken by cudaMemcpyPeer in the probe tests above; those tests check bytes and caller-visible
 // state.
 TEST_CASE("Pool grants permit GPU kernel copies without host staging",
-          "[pool_peer_access][peer_access_regression][gpu][peer_route_working]")
+          "[pool_peer_access][peer_access_regression][gpu][peer_route_working][.multi-device]")
 {
   require_peer_devices();
   auto const owner   = GENERATE(0, 1);
@@ -522,7 +523,7 @@ TEST_CASE("Pool grants permit GPU kernel copies without host staging",
 }
 
 TEST_CASE("Private-pool probe does not wait for work on other streams",
-          "[pool_peer_access][peer_access_regression][gpu]")
+          "[pool_peer_access][peer_access_regression][gpu][.multi-device]")
 {
   require_peer_devices();
   int saved_device = 0;
@@ -573,7 +574,7 @@ TEST_CASE("Private-pool probe reports invalid devices as clean CUDA errors",
 // cache, so the probe's own effect on ordinary peer access is covered by "Private-pool probe leaves
 // ordinary peer access unchanged".
 TEST_CASE("Pool grants leave ordinary peer access unchanged",
-          "[pool_peer_access][peer_access_regression][gpu][peer_route_working]")
+          "[pool_peer_access][peer_access_regression][gpu][peer_route_working][.multi-device]")
 {
   require_peer_devices();
   auto const initial_bits = GENERATE(0, 1, 2, 3);
@@ -627,7 +628,7 @@ TEST_CASE("Broken pool peer route refuses grants without changing state", "[.pee
 }
 
 TEST_CASE("Public peer verification reports a working route and no broken directions",
-          "[pool_peer_access][gpu][peer_route_working]")
+          "[pool_peer_access][gpu][peer_route_working][.multi-device]")
 {
   require_peer_devices();
   int saved_device = 0;

@@ -152,10 +152,12 @@ using DeviceMemoryResourceFactoryFn =
  * pool_peer_access_status::CUDA_ERROR.
  *
  * The caller must supply a live non-null pool, valid visible CUDA device IDs, and the device that
- * actually owns the pool's allocations as owner_device. A request where owner_device equals
- * accessing_device runs no verification: it reports GRANTED when the pool already grants that
- * device read/write access, and pool_peer_access_status::CUDA_ERROR with cudaErrorInvalidValue
- * otherwise, which means owner_device does not describe this pool.
+ * actually owns the pool's allocations as owner_device. For distinct devices this is not checked,
+ * because CUDA exposes no query for a pool's owning device: a wrong owner_device verifies one
+ * device pair and grants access for another. A request where owner_device equals accessing_device
+ * runs no verification: it reports GRANTED when the pool already grants that device read/write
+ * access, and pool_peer_access_status::CUDA_ERROR with cudaErrorInvalidValue otherwise, which means
+ * owner_device does not describe this pool.
  *
  * @param pool The actual pool backing the allocations to share
  * @param owner_device The device on which the pool's allocations reside
@@ -190,9 +192,16 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
  * `cudaMemcpyPeerAsync` between two private memory pools that are granted to each other, then
  * compares the bytes. Pool grants, not ordinary peer access, select the copy route for pool
  * allocations, so the result applies to pools created with the allocation properties of the pool
- * owned by `rmm::mr::cuda_async_memory_resource`; pools with other properties are not verified
- * separately. Verification changes neither ordinary peer access nor the permissions of any pool it
- * did not create, and waits only for its own streams.
+ * owned by `rmm::mr::cuda_async_memory_resource`; pools with other properties, including
+ * managed-memory pools such as the one owned by `rmm::mr::cuda_async_managed_memory_resource`, are
+ * not verified separately. Verification changes neither ordinary peer access nor the permissions of
+ * any pool it did not create, and waits only for its own streams.
+ *
+ * cuCascade never enables or disables ordinary peer access. Copies of memory that does not come
+ * from a pool, such as `cudaMalloc` allocations, follow the application's own
+ * `cudaDeviceEnablePeerAccess` setting; while it is disabled the CUDA driver uses an indirect route
+ * that is correct but may be slower. An application may enable ordinary peer access itself, but
+ * this verification does not cover that route.
  *
  * Results are cached as described for grant_pool_peer_access(). A cached CUDA error returns false
  * without repeating the probe on every copy; grant_pool_peer_access() or

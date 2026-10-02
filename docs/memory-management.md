@@ -199,7 +199,9 @@ upstream allocations before callers use it as access evidence.
 `grant_pool_peer_access(pool, owner_device, accessing_device)` configures one pool for one
 accessing GPU and reports whether access was granted, unsupported, rejected by bidirectional byte
 verification, or failed in the CUDA runtime. The pool must be live, the device IDs must be valid and
-visible, and `owner_device` must identify the pool's allocation device. A successful permission
+visible, and `owner_device` must identify the pool's allocation device. For distinct devices this
+is not checked, because CUDA exposes no query for a pool's owning device: a wrong `owner_device`
+verifies one device pair and grants access for another. A successful permission
 persists until changed through CUDA or the pool is destroyed. It does not promise bandwidth or
 prove the route of a later copy. A failed grant leaves existing pool permissions unchanged; any
 revocation must be coordinated by the application with other users of that pool. CUDA errors take
@@ -213,11 +215,18 @@ to each other and compares the bytes. Pool grants, not ordinary peer access
 (`cudaDeviceEnablePeerAccess`), select the copy route for pool allocations, so the result applies to
 pools created with the allocation properties of the pool owned by
 `rmm::mr::cuda_async_memory_resource` (pinned device memory, no export handle). Pools with other
-properties are not verified separately. The probe owns every pool, stream, and allocation it uses:
+properties, including managed-memory pools such as the one owned by
+`rmm::mr::cuda_async_managed_memory_resource`, are not verified separately. The probe owns every pool, stream, and allocation it uses:
 it leaves ordinary peer access and all caller-visible pool permissions unchanged and waits only for
 its own stream. The first request that needs verification checks every ordered pair of visible
 devices, a few milliseconds per pair, under a process-wide lock. When verification fails,
 GPU-to-GPU conversions stage through pinned host memory instead of copying directly.
+
+cuCascade never enables or disables ordinary peer access. Copies of memory that does not come from a
+pool, such as `cudaMalloc` allocations, follow the application's own `cudaDeviceEnablePeerAccess`
+setting; while it is disabled the CUDA driver uses an indirect route that is correct but may be
+slower. An application may enable ordinary peer access itself, but the verification above does not
+cover that route.
 
 The legacy `enable_pool_peer_access_for_all_visible_devices()` helper remains best effort. It
 visits every visible peer for both the supplied pool and the owner's currently selected pool,

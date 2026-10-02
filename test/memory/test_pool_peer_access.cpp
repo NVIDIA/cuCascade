@@ -19,6 +19,7 @@
  * Test Tags:
  * [pool_peer_access]   - pool peer-access grants and peer DMA probe behavior
  * [gpu]                - requires two CUDA devices with bidirectional peer capability
+ * [.multi-device]      - hidden; select with "[multi-device]" or a matching positive tag
  * [peer_route_working] - requires hardware whose direct peer route delivers correct bytes
  *
  * Two independent fake CUDA runtimes back these tests: `fake_operations` drives
@@ -789,7 +790,7 @@ struct current_device_guard {
 // Byte transfer through a granted pool is covered by "Pool grants permit GPU kernel copies without
 // host staging"; cudaMemcpyPeer would succeed here even without a grant.
 TEST_CASE("Pool peer access grants are per pool, repeatable, and include self-access",
-          "[pool_peer_access][gpu][peer_route_working]")
+          "[pool_peer_access][gpu][peer_route_working][.multi-device]")
 {
   int device_count              = 0;
   auto const device_count_error = cudaGetDeviceCount(&device_count);

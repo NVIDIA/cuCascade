@@ -360,7 +360,7 @@ static std::vector<T> copy_column_to_host(cudf::column_view const& column, int d
 // The converter's copy route depends on whether the pools are granted to each other, so the test
 // covers both the ungranted pools that cuCascade creates and pools granted by the application.
 TEST_CASE("gpu cross-device conversion copies every byte in both directions",
-          "[gpu_data_representation][gpu][multi-device]")
+          "[gpu_data_representation][gpu][.multi-device]")
 {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
