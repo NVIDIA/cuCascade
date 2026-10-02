@@ -270,7 +270,7 @@ cudf::table create_string_benchmark_table(int64_t total_bytes, int num_columns)
       std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                      static_cast<cudf::size_type>(host_offsets.size()),
                                      std::move(offsets_buf),
-                                     rmm::device_buffer{},
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                      0);
 
     // Build chars: repeated "benchstr"
@@ -284,11 +284,12 @@ cudf::table create_string_benchmark_table(int64_t total_bytes, int num_columns)
 
     stream.synchronize();
 
-    auto str_col = cudf::make_strings_column(static_cast<cudf::size_type>(num_strings),
-                                             std::move(offsets_col),
-                                             std::move(chars_buf),
-                                             0,
-                                             rmm::device_buffer{});
+    auto str_col =
+      cudf::make_strings_column(static_cast<cudf::size_type>(num_strings),
+                                std::move(offsets_col),
+                                std::move(chars_buf),
+                                0,
+                                cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
     columns.push_back(std::move(str_col));
   }
 
@@ -329,7 +330,7 @@ cudf::table create_list_benchmark_table(int64_t total_bytes, int num_columns)
       std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                      static_cast<cudf::size_type>(host_offsets.size()),
                                      std::move(offsets_buf),
-                                     rmm::device_buffer{},
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                      0);
 
     // Build values column
@@ -345,11 +346,12 @@ cudf::table create_list_benchmark_table(int64_t total_bytes, int num_columns)
 
     stream.synchronize();
 
-    auto list_col = cudf::make_lists_column(static_cast<cudf::size_type>(num_lists),
-                                            std::move(offsets_col),
-                                            std::move(values_col),
-                                            0,
-                                            {});
+    auto list_col =
+      cudf::make_lists_column(static_cast<cudf::size_type>(num_lists),
+                              std::move(offsets_col),
+                              std::move(values_col),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
     columns.push_back(std::move(list_col));
   }
 
@@ -391,7 +393,10 @@ cudf::table create_struct_benchmark_table(int64_t total_bytes, int num_columns)
     children.push_back(std::move(field0));
     children.push_back(std::move(field1));
     auto struct_col =
-      cudf::make_structs_column(static_cast<cudf::size_type>(num_rows), std::move(children), 0, {});
+      cudf::make_structs_column(static_cast<cudf::size_type>(num_rows),
+                                std::move(children),
+                                0,
+                                cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
     columns.push_back(std::move(struct_col));
   }

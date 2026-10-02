@@ -22,6 +22,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -31,6 +32,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include <catch2/catch_all.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -38,6 +41,18 @@
 
 namespace cucascade {
 namespace test {
+
+inline auto make_null_mask_from_host(cudf::size_type rows,
+                                     std::vector<std::uint8_t> const& host_mask,
+                                     ::cuda::stream_ref stream)
+{
+  auto mask = cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream);
+  REQUIRE(host_mask.size() <= mask.size());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+    mask.data(), host_mask.data(), host_mask.size(), cudaMemcpyHostToDevice, stream.get()));
+  stream.sync();
+  return mask;
+}
 
 // Stream-aware variants to enforce stream ordering with async allocations
 bool cudf_tables_have_equal_contents_on_stream(const cudf::table_view& left,

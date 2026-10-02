@@ -17,6 +17,7 @@
  */
 
 #include <cucascade/cudf/datasource.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/byte_range.hpp>
@@ -35,6 +36,12 @@
 namespace cucascade::io {
 
 namespace {
+
+using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
+
+struct io_read_to_gpu_message {
+  static constexpr char const* message{"io:read_to_gpu"};
+};
 
 // Bridge a semi_future into a real (promise-backed) std::future.  The result is
 // pushed in via install_callback when the IO settles, so the std::future
@@ -133,6 +140,9 @@ std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(size_t off
 
 size_t datasource::device_read(size_t offset, size_t size, uint8_t* dst, cudf_stream_type stream)
 {
+  auto const& message =
+    nvtx3::registered_string_in<libcucascade_domain>::get<io_read_to_gpu_message>();
+  nvtx_range const read_range{message, nvtx3::payload{static_cast<std::uint64_t>(size)}};
   auto f = device_read_async(offset, size, dst, stream);
   auto n = f.get();
 #if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)

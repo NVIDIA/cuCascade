@@ -111,7 +111,7 @@ auto& async_gpu_space()
 ::cuda::stream_ref shared_stream()
 {
   static rmm::cuda_stream s;
-  return s.view();
+  return s;
 }
 
 std::unique_ptr<cudf::table> make_patterned_table(::cuda::stream_ref stream)
@@ -145,8 +145,12 @@ std::unique_ptr<cudf::table> make_patterned_table(::cuda::stream_ref stream)
                                      cudaMemcpyHostToDevice,
                                      stream.get()));
   stream.sync();
-  auto str_col = cudf::make_strings_column(
-    num_rows, std::move(offsets_col), std::move(dev_chars), 0, rmm::device_buffer{});
+  auto str_col =
+    cudf::make_strings_column(num_rows,
+                              std::move(offsets_col),
+                              std::move(dev_chars),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   auto long_col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT64}, num_rows, cudf::mask_state::UNALLOCATED, stream);
@@ -417,7 +421,7 @@ TEST_CASE("gpu_table_representation clone waits for pending writer work without 
   auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                           num_rows,
                                           cudf::mask_state::UNALLOCATED,
-                                          writer_stream.view(),
+                                          writer_stream,
                                           gpu_space->get_default_allocator());
   CUCASCADE_CUDA_TRY(cudaMemsetAsync(
     column->mutable_view().head(), stale_pattern, num_bytes, writer_stream.value()));
@@ -426,13 +430,13 @@ TEST_CASE("gpu_table_representation clone waits for pending writer work without 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(column));
   auto source = std::make_shared<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(columns)), *gpu_space, writer_stream.view());
+    std::make_unique<cudf::table>(std::move(columns)), *gpu_space, writer_stream);
 
   auto const consumer_initial_status = cudaStreamQuery(consumer_stream.get());
   writer_event_gate gate;
   std::future<std::unique_ptr<idata_representation>> clone_future;
   CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(writer_stream.value(), wait_on_writer_event_gate, &gate));
-  writer_event_gate_cleanup gate_cleanup{gate, writer_stream.view()};
+  writer_event_gate_cleanup gate_cleanup{gate, writer_stream};
 
   bool const gate_entered = wait_until_set(gate.entered, 5s);
   if (!gate_entered) {
@@ -446,7 +450,7 @@ TEST_CASE("gpu_table_representation clone waits for pending writer work without 
                                      written_pattern,
                                      num_bytes,
                                      writer_stream.value()));
-  source->record_writer_event(writer_stream.view());
+  source->record_writer_event(writer_stream);
 
   clone_future = std::async(std::launch::async, [&] {
     CUCASCADE_CUDA_TRY(cudaSetDevice(0));
@@ -513,24 +517,23 @@ TEST_CASE("release_table rebinds owned-table buffers to the release stream",
 
   // Control: guards the accessor -- without it the rebind checks below could pass vacuously.
   {
-    auto control = make_patterned_table(alloc_stream.view());
-    int checked  = expect_table_buffers_bound_to(*control, alloc_stream.view());
+    auto control = make_patterned_table(alloc_stream);
+    int checked  = expect_table_buffers_bound_to(*control, alloc_stream);
     REQUIRE(checked >= 5);  // int32 data+mask, string chars+offsets, int64 data
   }
 
   auto reference = make_patterned_table(shared_stream());
   gpu_table_representation rep(
-    make_patterned_table(alloc_stream.view()), *shared_gpu_space(), alloc_stream.view());
+    make_patterned_table(alloc_stream), *shared_gpu_space(), alloc_stream);
 
-  auto released = rep.release_table(release_stream.view());
+  auto released = rep.release_table(release_stream);
   REQUIRE(released != nullptr);
   // The representation holds no table any more; destroying it at scope end must remain valid.
   REQUIRE(rep.release_table(release_stream) == nullptr);
 
-  test::expect_cudf_tables_equal_on_stream(
-    reference->view(), released->view(), release_stream.view());
+  test::expect_cudf_tables_equal_on_stream(reference->view(), released->view(), release_stream);
 
-  int checked = expect_table_buffers_bound_to(*released, release_stream.view());
+  int checked = expect_table_buffers_bound_to(*released, release_stream);
   REQUIRE(checked >= 5);
 }
 
@@ -578,14 +581,13 @@ TEST_CASE("release_table rebinds converter-produced tables to the release stream
   auto gpu_rep =
     make_converter_produced_rep(make_patterned_table(shared_stream()), shared_gpu_space());
 
-  auto released = gpu_rep->release_table(release_stream.view());
+  auto released = gpu_rep->release_table(release_stream);
   REQUIRE(released != nullptr);
 
-  test::expect_cudf_tables_equal_on_stream(
-    reference->view(), released->view(), release_stream.view());
+  test::expect_cudf_tables_equal_on_stream(reference->view(), released->view(), release_stream);
 
   // >= 4: the host round trip may drop the redundant ALL_VALID mask (null_count == 0).
-  int checked = expect_table_buffers_bound_to(*released, release_stream.view());
+  int checked = expect_table_buffers_bound_to(*released, release_stream);
   REQUIRE(checked >= 4);
 }
 
@@ -695,7 +697,7 @@ TEST_CASE("released table freed mid-read is not recycled under the read (Q18 UAF
     auto gpu_rep =
       registry.convert<gpu_table_representation>(*host_rep, gpu_space.get(), shared_stream());
 
-    auto released = gpu_rep->release_table(release_stream.view());
+    auto released = gpu_rep->release_table(release_stream);
     auto columns  = released->release();
     REQUIRE(columns.size() == 1);
     const void* data_ptr = columns[0]->view().head();
@@ -710,8 +712,7 @@ TEST_CASE("released table freed mid-read is not recycled under the read (Q18 UAF
     gpu_rep.reset();
 
     for (int k = 0; k < 8; ++k) {
-      rmm::device_buffer scratch(
-        payload_bytes, clobber_stream.view(), gpu_space->get_default_allocator());
+      rmm::device_buffer scratch(payload_bytes, clobber_stream, gpu_space->get_default_allocator());
       CUCASCADE_CUDA_TRY(
         cudaMemsetAsync(scratch.data(), 0xFF, payload_bytes, clobber_stream.value()));
     }
@@ -729,23 +730,22 @@ TEST_CASE("view-branch release_table deep-copies on the release stream and leave
   rmm::cuda_stream alloc_stream;
   rmm::cuda_stream release_stream;
 
-  auto owner     = std::shared_ptr<cudf::table>(make_patterned_table(alloc_stream.view()));
+  auto owner     = std::shared_ptr<cudf::table>(make_patterned_table(alloc_stream));
   auto reference = make_patterned_table(shared_stream());
 
   gpu_table_representation rep(owner->view(),
                                std::shared_ptr<cudf::table>{owner},
                                owner->alloc_size(),
                                *shared_gpu_space(),
-                               alloc_stream.view());
+                               alloc_stream);
 
-  auto released = rep.release_table(release_stream.view());
+  auto released = rep.release_table(release_stream);
   REQUIRE(released != nullptr);
 
   REQUIRE(released->view().column(0).head() != owner->view().column(0).head());
 
-  test::expect_cudf_tables_equal_on_stream(
-    reference->view(), released->view(), release_stream.view());
-  int checked = expect_table_buffers_bound_to(*released, release_stream.view());
+  test::expect_cudf_tables_equal_on_stream(reference->view(), released->view(), release_stream);
+  int checked = expect_table_buffers_bound_to(*released, release_stream);
   REQUIRE(checked >= 5);
 
   // The rep dropped its owner reference; destructively inspecting the source below is safe.
@@ -753,8 +753,8 @@ TEST_CASE("view-branch release_table deep-copies on the release stream and leave
   CHECK(owner.use_count() == 1);
 
   // Source untouched: view-branch release must not rebind memory it does not own.
-  test::expect_cudf_tables_equal_on_stream(reference->view(), owner->view(), release_stream.view());
-  int src_checked = expect_table_buffers_bound_to(*owner, alloc_stream.view());
+  test::expect_cudf_tables_equal_on_stream(reference->view(), owner->view(), release_stream);
+  int src_checked = expect_table_buffers_bound_to(*owner, alloc_stream);
   REQUIRE(src_checked >= 5);
 }
 
@@ -776,7 +776,7 @@ TEST_CASE("owned-table release_table waits for pending writer work without host 
   auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                           num_rows,
                                           cudf::mask_state::UNALLOCATED,
-                                          writer_stream.view(),
+                                          writer_stream,
                                           gpu_space->get_default_allocator());
   CUCASCADE_CUDA_TRY(cudaMemsetAsync(
     column->mutable_view().head(), stale_pattern, num_bytes, writer_stream.value()));
@@ -791,7 +791,7 @@ TEST_CASE("owned-table release_table waits for pending writer work without host 
   writer_event_gate gate;
   std::future<std::unique_ptr<cudf::table>> release_future;
   CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(writer_stream.value(), wait_on_writer_event_gate, &gate));
-  writer_event_gate_cleanup gate_cleanup{gate, writer_stream.view()};
+  writer_event_gate_cleanup gate_cleanup{gate, writer_stream};
 
   bool const gate_entered = wait_until_set(gate.entered, 5s);
   if (!gate_entered) {
@@ -805,14 +805,14 @@ TEST_CASE("owned-table release_table waits for pending writer work without host 
                                      written_pattern,
                                      num_bytes,
                                      writer_stream.value()));
-  rep->record_writer_event(writer_stream.view());
+  rep->record_writer_event(writer_stream);
 
   release_future = std::async(std::launch::async, [&] {
     CUCASCADE_CUDA_TRY(cudaSetDevice(0));
-    return rep->release_table(release_stream.view());
+    return rep->release_table(release_stream);
   });
 
-  auto const consumer_pending_status = wait_until_stream_pending(release_stream.view(), 5s);
+  auto const consumer_pending_status = wait_until_stream_pending(release_stream, 5s);
   bool const returned_while_gated    = release_future.wait_for(5s) == std::future_status::ready;
 
   std::unique_ptr<cudf::table> released;
@@ -1203,20 +1203,19 @@ TEST_CASE("release_table then cudf::rebind_stream to the same stream composes",
 
   auto reference = make_patterned_table(shared_stream());
   gpu_table_representation rep(
-    make_patterned_table(alloc_stream.view()), *shared_gpu_space(), alloc_stream.view());
+    make_patterned_table(alloc_stream), *shared_gpu_space(), alloc_stream);
 
-  auto released = rep.release_table(release_stream.view());
+  auto released = rep.release_table(release_stream);
   REQUIRE(released != nullptr);
 
   auto columns = released->release();
   for (auto& col : columns) {
-    col = cudf::rebind_stream(std::move(*col), release_stream.view());
+    col = cudf::rebind_stream(std::move(*col), release_stream);
   }
   auto reassembled = std::make_unique<cudf::table>(std::move(columns));
 
-  test::expect_cudf_tables_equal_on_stream(
-    reference->view(), reassembled->view(), release_stream.view());
-  int checked = expect_table_buffers_bound_to(*reassembled, release_stream.view());
+  test::expect_cudf_tables_equal_on_stream(reference->view(), reassembled->view(), release_stream);
+  int checked = expect_table_buffers_bound_to(*reassembled, release_stream);
   REQUIRE(checked >= 5);
 }
 
@@ -1233,9 +1232,9 @@ TEST_CASE("release_table accepts every same-device stream handle",
 
   rmm::cuda_stream explicit_stream;
   std::vector<::cuda::stream_ref> const streams{::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
-                                                rmm::cuda_stream_per_thread,
-                                                rmm::cuda_stream_legacy,
-                                                explicit_stream.view()};
+                                                ::cuda::stream_ref{cudaStreamPerThread},
+                                                ::cuda::stream_ref{cudaStreamLegacy},
+                                                explicit_stream};
 
   for (auto const& stream : streams) {
     CAPTURE(stream.get());
@@ -1363,7 +1362,7 @@ TEST_CASE("gpu_table_representation rejects a stream owned by another device",
 
   SECTION("release_table")
   {
-    REQUIRE_THROWS_AS(rep.release_table(foreign_stream->view()), cucascade::logic_error);
+    REQUIRE_THROWS_AS(rep.release_table(*foreign_stream), cucascade::logic_error);
 
     // The rejection must leave the representation intact rather than half-released.
     REQUIRE(rep.get_table_view().num_columns() == 3);
@@ -1372,7 +1371,7 @@ TEST_CASE("gpu_table_representation rejects a stream owned by another device",
 
   SECTION("rebind_stream")
   {
-    REQUIRE_THROWS_AS(rep.rebind_stream(foreign_stream->view()), cucascade::logic_error);
+    REQUIRE_THROWS_AS(rep.rebind_stream(*foreign_stream), cucascade::logic_error);
 
     // Buffers keep their original binding: a rejected rebind must not partially apply.
     auto released = rep.release_table(shared_stream());

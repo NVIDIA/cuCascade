@@ -399,7 +399,7 @@ TEST_CASE("Built-in GPU to HOST conversion works", "[representation_converter][b
 
   // Use the same stream for table creation and conversion to avoid stream-ordered races
   rmm::cuda_stream stream;
-  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
+  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream);
   gpu_table_representation gpu_repr(std::make_unique<cudf::table>(std::move(table)),
                                     *const_cast<memory::memory_space*>(gpu_space),
                                     ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
@@ -426,7 +426,7 @@ TEST_CASE("Built-in HOST to GPU conversion works", "[representation_converter][b
   rmm::cuda_stream stream;
 
   // First create a GPU repr then convert to host to get a valid host_data_packed_representation
-  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream.view());
+  auto table = create_simple_cudf_table(50, 2, gpu_space->get_default_allocator(), stream);
   gpu_table_representation gpu_repr(std::make_unique<cudf::table>(std::move(table)),
                                     *const_cast<memory::memory_space*>(gpu_space),
                                     ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
@@ -457,7 +457,7 @@ TEST_CASE("Built-in roundtrip GPU->HOST->GPU preserves data",
   rmm::cuda_stream stream;
 
   auto original_table =
-    create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream.view());
+    create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), stream);
   gpu_table_representation original_repr(std::make_unique<cudf::table>(std::move(original_table)),
                                          *const_cast<memory::memory_space*>(gpu_space),
                                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});

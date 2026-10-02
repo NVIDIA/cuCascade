@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "cudf_compat.hpp"
+
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -499,6 +501,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:gpu_to_host"};
   auto& gpu_source = source.cast<gpu_table_representation>();
   // Planning reads string offsets on the device, so it must already be ordered after the writer.
   gpu_source.wait_for_writer(stream);
@@ -565,8 +568,8 @@ static int resolve_gpu_numa_node(int device_id) noexcept
 }
 
 /**
- * @brief Allocate a target-side device buffer and copy @p size bytes from @p src_ptr
- * (on @p src_device) into it.
+ * @brief Copy @p size bytes from @p src_ptr
+ * (on @p src_device) into a buffer.
  *
  * Routing is decided per-pair by the empirical probe in cucascade::memory
  * (see ensure_p2p_probed):
@@ -583,14 +586,14 @@ static int resolve_gpu_numa_node(int device_id) noexcept
  *   NEVER calls cudaHostAlloc per transfer — the pool is allocated once at
  *   memory_reservation_manager construction time.
  */
-static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
-                                                    int src_device,
-                                                    std::size_t size,
-                                                    int dst_device,
-                                                    ::cuda::stream_ref target_stream,
-                                                    rmm::device_async_resource_ref target_mr)
+template <typename Buffer>
+static Buffer peer_copy_into(Buffer buf,
+                             const void* src_ptr,
+                             int src_device,
+                             std::size_t size,
+                             int dst_device,
+                             ::cuda::stream_ref target_stream)
 {
-  rmm::device_buffer buf(size, target_stream, target_mr);
   if (size == 0 || src_ptr == nullptr) { return buf; }
 
   if (memory::probe_peer_dma_works(src_device, dst_device)) {
@@ -677,7 +680,7 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
       const std::size_t bytes_left = block_sz - block_offset;
       const std::size_t to_copy    = std::min(remaining, bytes_left);
       std::span<std::byte> block   = allocation->at(block_index);
-      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(static_cast<std::uint8_t*>(buf.data()) + dst_offset,
+      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(reinterpret_cast<std::uint8_t*>(buf.data()) + dst_offset,
                                          block.data() + block_offset,
                                          to_copy,
                                          cudaMemcpyHostToDevice,
@@ -696,18 +699,42 @@ static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
 }
 
 /**
- * @brief Synchronous version of alloc_and_peer_copy_async. Used for null masks
+ * @brief Allocate a null mask sized for @p rows rows and fill it, synchronously, from the
+ * host block allocation starting at @p alloc_offset.
+ */
+static rmm::device_buffer alloc_and_peer_copy_async(const void* src_ptr,
+                                                    int src_device,
+                                                    std::size_t size,
+                                                    int dst_device,
+                                                    ::cuda::stream_ref target_stream,
+                                                    rmm::device_async_resource_ref target_mr)
+{
+  return peer_copy_into(rmm::device_buffer(size, target_stream, target_mr),
+                        src_ptr,
+                        src_device,
+                        size,
+                        dst_device,
+                        target_stream);
+}
+
+/**
+ * @brief Allocate a null mask sized for @p rows rows and copy it from @p src_ptr
+ * (on @p src_device), synchronizing before returning. Note @p rows is a row count,
+ * not a byte count - the allocation size comes from cudf::create_null_mask. Used for null masks
  * because cudf column factories may inspect them during column construction.
  */
-static rmm::device_buffer alloc_and_peer_copy_sync(const void* src_ptr,
-                                                   int src_device,
-                                                   std::size_t size,
-                                                   int dst_device,
-                                                   ::cuda::stream_ref target_stream,
-                                                   rmm::device_async_resource_ref target_mr)
+static cudf_compat::null_mask_buffer alloc_and_peer_copy_sync(
+  const void* src_ptr,
+  int src_device,
+  cudf::size_type rows,
+  int dst_device,
+  ::cuda::stream_ref target_stream,
+  rmm::device_async_resource_ref target_mr)
 {
   auto buf =
-    alloc_and_peer_copy_async(src_ptr, src_device, size, dst_device, target_stream, target_mr);
+    cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, target_stream, target_mr);
+  auto const size = buf.size();
+  buf = peer_copy_into(std::move(buf), src_ptr, src_device, size, dst_device, target_stream);
   if (size == 0 || src_ptr == nullptr) { return buf; }
   target_stream.sync();
   return buf;
@@ -735,11 +762,10 @@ static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_v
 {
   assert(src.offset() == 0 && "column_view with non-zero offset is not supported");
 
-  rmm::device_buffer null_mask{};
+  auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED);
   if (src.nullable()) {
-    auto const null_mask_size = cudf::bitmask_allocation_size_bytes(src.size());
     null_mask =
-      alloc_and_peer_copy_sync(src.null_mask(), src_device, null_mask_size, dst_device, stream, mr);
+      alloc_and_peer_copy_sync(src.null_mask(), src_device, src.size(), dst_device, stream, mr);
   }
   cudf::size_type const null_count = src.nullable() ? src.null_count() : 0;
 
@@ -870,6 +896,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:gpu_to_gpu"};
   // Sync the caller's stream so the source table's buffers are stable on the source
   // device before we issue peer copies. The caller's stream is the one that produced
   // (or last touched) the source representation.
@@ -887,6 +914,10 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   auto const src_device_id = gpu_source.get_device_id();
   auto const dst_device_id = target_memory_space->get_device_id();
+  auto const copy_path     = memory::probe_peer_dma_works(src_device_id, dst_device_id)
+                               ? "convert:gpu_to_gpu:peer_copy"
+                               : "convert:gpu_to_gpu:host_staging";
+  nvtx_scope copy_path_range{copy_path};
 
   rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
 
@@ -943,7 +974,7 @@ static rmm::device_buffer alloc_and_schedule_h2d(
 {
   rmm::device_buffer buf;
   {
-    nvtx_scope alloc_range{"hg:dev_alloc"};
+    nvtx_scope alloc_range{"convert:host_to_gpu:device_alloc"};
     buf = rmm::device_buffer(size, stream, mr);
   }
   if (size == 0) { return buf; }
@@ -981,19 +1012,19 @@ static rmm::device_buffer alloc_and_schedule_h2d(
  * the stream. Used for null masks which cudf column factories access on construction
  * (before batch.flush() runs).
  */
-static rmm::device_buffer alloc_and_copy_h2d_sync(
+static cudf_compat::null_mask_buffer alloc_and_copy_h2d_sync(
   memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
   std::size_t alloc_offset,
-  std::size_t size,
+  cudf::size_type rows,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
-  nvtx_scope range{"hg:nullmask_sync"};
-  rmm::device_buffer buf;
-  {
-    nvtx_scope alloc_range{"hg:dev_alloc"};
-    buf = rmm::device_buffer(size, stream, mr);
-  }
+  nvtx_scope range{"convert:host_to_gpu:nullmask_sync"};
+  auto buf = [&] {
+    nvtx_scope alloc_range{"convert:host_to_gpu:device_alloc"};
+    return cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream, mr);
+  }();
+  auto const size = buf.size();
   if (size == 0) { return buf; }
 
   const std::size_t block_size = alloc.block_size();
@@ -1007,7 +1038,7 @@ static rmm::device_buffer alloc_and_copy_h2d_sync(
     std::size_t bytes_to_copy  = std::min(remaining, space_in_block);
 
     auto block = alloc.at(block_idx);
-    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(static_cast<uint8_t*>(buf.data()) + dst_off,
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(buf.data()) + dst_off,
                                        block.data() + block_off,
                                        bytes_to_copy,
                                        cudaMemcpyHostToDevice,
@@ -1043,10 +1074,9 @@ static std::unique_ptr<cudf::column> reconstruct_column(
   // An all-valid mask (null_count == 0) is semantically identical to no mask: skip its
   // upload entirely and construct the column non-nullable, avoiding a per-column
   // blocking memcpy + stream sync.
-  rmm::device_buffer null_mask{};
+  auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED);
   if (meta.has_null_mask && meta.null_count > 0) {
-    null_mask =
-      alloc_and_copy_h2d_sync(alloc, meta.null_mask_offset, meta.null_mask_size, stream, mr);
+    null_mask = alloc_and_copy_h2d_sync(alloc, meta.null_mask_offset, meta.num_rows, stream, mr);
   }
   const cudf::size_type null_count = meta.has_null_mask ? meta.null_count : 0;
 
@@ -1066,7 +1096,7 @@ static std::unique_ptr<cudf::column> reconstruct_column(
       // Flush pending H2D copies so the INT32 offsets buffer has valid data on device
       // before the cast reads from it. The cast replaces offsets_col, freeing the old
       // INT32 buffer, so batch must not hold dangling pointers to it.
-      nvtx_scope cast_range{"hg:offsets_cast"};
+      nvtx_scope cast_range{"convert:host_to_gpu:offsets_cast"};
       batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
       offsets_col =
         cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
@@ -1159,7 +1189,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
-  nvtx_scope convert_range{"hg:convert"};
+  nvtx_scope convert_range{"convert:host_to_gpu"};
   auto& fast_source      = source.cast<host_data_representation>();
   const auto& fast_table = fast_source.get_host_table();
   if (!fast_table) { throw std::runtime_error("convert_host_fast_to_gpu: host table is null"); }
@@ -1172,7 +1202,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // The caller's stream may be bound to a non-target device under multi-GPU;
   // synchronize is safe across devices.
   {
-    nvtx_scope presync_range{"hg:presync"};
+    nvtx_scope presync_range{"convert:host_to_gpu:presync"};
     stream.sync();
   }
 
@@ -1183,7 +1213,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   // guard raises cudaErrorInvalidValue when stream and current device belong
   // to different CUDA contexts (multi-GPU case).
   auto target_stream = [&] {
-    nvtx_scope acquire_range{"hg:acquire_stream"};
+    nvtx_scope acquire_range{"convert:host_to_gpu:acquire_stream"};
     return target_memory_space->acquire_stream();
   }();
   auto mr = target_memory_space->get_default_allocator();
@@ -1193,7 +1223,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(fast_table->columns.size());
   {
-    nvtx_scope reconstruct_range{"hg:reconstruct"};
+    nvtx_scope reconstruct_range{"convert:host_to_gpu:reconstruct"};
     for (const auto& col_meta : fast_table->columns) {
       gpu_columns.push_back(
         reconstruct_column(col_meta, *fast_table->allocation, target_stream, mr, batch));
@@ -1201,13 +1231,13 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
   }
   // Source is CPU-written pinned host memory: fully prepared before this call.
   {
-    nvtx_scope flush_range{"hg:flush_submit"};
+    nvtx_scope flush_range{"convert:host_to_gpu:flush_submit"};
     batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
   }
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   {
-    nvtx_scope final_sync_range{"hg:final_sync"};
+    nvtx_scope final_sync_range{"convert:host_to_gpu:final_sync"};
     target_stream.sync();
   }
 
@@ -1226,6 +1256,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
   ::cuda::stream_ref /*stream*/,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:host_to_host"};
   auto& host_source    = source.cast<host_data_representation>();
   auto& host_table     = host_source.get_host_table();
   auto const data_size = host_table->data_size;
@@ -1502,6 +1533,7 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   [[maybe_unused]] ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:host_to_disk"};
   auto& backend          = target_memory_space->get_io_backend();
   auto& host_source      = source.cast<host_data_representation>();
   const auto& host_table = host_source.get_host_table();
@@ -1548,6 +1580,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
   [[maybe_unused]] ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:disk_to_host"};
   auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
@@ -1622,6 +1655,7 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:gpu_to_disk"};
   auto& backend    = target_memory_space->get_io_backend();
   auto& gpu_source = source.cast<gpu_table_representation>();
   // Planning reads string offsets on the device, and the backend orders its reads after `stream`.
@@ -1696,11 +1730,19 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   rmm::device_async_resource_ref mr,
   idisk_io_backend& backend)
 {
-  // Null mask (shared by all type categories)
-  rmm::device_buffer null_mask{};
+  // Null mask (shared by all type categories). create_null_mask(num_rows) allocates exactly
+  // cudf::bitmask_allocation_size_bytes(num_rows), which is what the writer recorded as
+  // meta.null_mask_size, so null_mask.size() is the correct on-disk extent to read.
+  auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   if (meta.has_null_mask) {
-    null_mask = alloc_and_read_from_disk(
-      file_path, meta.null_mask_offset, meta.null_mask_size, stream, mr, backend);
+    null_mask = cudf::create_null_mask(meta.num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
+    if (null_mask.size() > 0) {
+      backend.read(file_path,
+                   null_mask.data(),
+                   std::min(null_mask.size(), meta.null_mask_size),
+                   meta.null_mask_offset,
+                   stream);
+    }
   }
   const cudf::size_type null_count = meta.has_null_mask ? meta.null_count : 0;
 
@@ -1810,6 +1852,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
+  nvtx_scope convert_range{"convert:disk_to_gpu"};
   auto& backend          = source.get_memory_space().get_io_backend();
   auto& disk_source      = source.cast<disk_data_representation>();
   const auto& disk_table = disk_source.get_disk_table();
