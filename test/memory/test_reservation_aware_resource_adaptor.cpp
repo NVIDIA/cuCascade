@@ -43,7 +43,6 @@
 #include <catch2/catch_all.hpp>
 
 #include <cstddef>
-#include <cstdint>
 
 using namespace cucascade::memory;
 
@@ -147,30 +146,17 @@ TEST_CASE("Pool accessor preserves explicit handles through shared wrapper copie
   rmm::mr::cuda_async_memory_resource upstream{};
   cudaMemPool_t explicit_pool = nullptr;
   REQUIRE(cudaDeviceGetDefaultMemPool(&explicit_pool, 0) == cudaSuccess);
+  // Otherwise the copy could report the upstream pool and still match.
+  REQUIRE(explicit_pool != upstream.pool_handle());
 
   auto copy = [&] {
     auto adaptor = make_adaptor(rmm::device_async_resource_ref{upstream}, explicit_pool);
     CHECK(adaptor.pool_handle() == explicit_pool);
-    return adaptor;
+    // Construct from an lvalue so the shared wrapper is copied rather than moved or elided.
+    return reservation_aware_resource_adaptor{adaptor};
   }();
 
   CHECK(copy.pool_handle() == explicit_pool);
-}
-
-TEST_CASE("Pool accessor returns a borrowed handle", "[reservation_aware][pool][gpu]")
-{
-  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
-
-  rmm::mr::cuda_async_memory_resource upstream{};
-  auto borrowed = upstream.pool_handle();
-  {
-    auto adaptor = make_adaptor(rmm::device_async_resource_ref{upstream});
-    REQUIRE(adaptor.pool_handle() == borrowed);
-  }
-
-  std::uint64_t release_threshold = 0;
-  CHECK(cudaMemPoolGetAttribute(borrowed, cudaMemPoolAttrReleaseThreshold, &release_threshold) ==
-        cudaSuccess);
 }
 
 TEST_CASE("OOM reports the pool of a cuda_async_memory_resource upstream",

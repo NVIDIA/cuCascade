@@ -571,17 +571,16 @@ static int resolve_gpu_numa_node(int device_id) noexcept
  * @brief Copy @p size bytes from @p src_ptr
  * (on @p src_device) into a buffer.
  *
- * Routing is decided per-pair by the empirical probe in cucascade::memory
- * (see ensure_p2p_probed):
- *   - probe says peer DMA works → cudaMemcpyPeerAsync (direct device-to-device
- *     DMA over NVLink / supported PCIe)
- *   - probe says peer DMA broken → explicit host-staged copy through the
- *     pre-pinned HOST memory_space pool (registered by memory_space's HOST
- *     constructor in register_host_pool). The staging copy chunks across the
- *     pool's fixed block size (1 MB by default), exactly like
- *     convert_gpu_to_host. We do the staging ourselves rather than relying on
- *     the driver's auto-fallback, so the correctness path is identical and
- *     observable regardless of driver/CUDA version quirks.
+ * Routing is decided per direction by cucascade::memory::probe_peer_dma_works(), which verifies a
+ * peer copy between two mutually granted private memory pools:
+ *   - verified: cudaMemcpyPeerAsync (direct device-to-device copy over NVLink or supported PCIe)
+ *   - wrong bytes or a CUDA error during verification: explicit host-staged copy
+ *
+ * The host-staged copy goes through the pre-pinned HOST memory_space pool (registered by
+ * memory_space's HOST constructor in register_host_pool) and chunks across the pool's fixed block
+ * size, exactly like convert_gpu_to_host. We do the staging ourselves rather than relying on the
+ * driver's auto-fallback, so the correctness path is identical and observable regardless of
+ * driver/CUDA version quirks.
  *
  *   NEVER calls cudaHostAlloc per transfer — the pool is allocated once at
  *   memory_reservation_manager construction time.
@@ -1909,13 +1908,11 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 
 void register_builtin_converters(representation_converter_registry& registry)
 {
-  // GPU -> GPU (cross-device copy). The convert_gpu_to_gpu implementation uses
-  // cudaMemcpyPeerAsync for each column buffer. Whether that takes the direct
-  // peer-DMA fast path or falls back to the driver's host-stage path is
-  // decided by cucascade::memory::ensure_p2p_probed() at the first
-  // memory_space construction — the probe runs once per process, detects the
-  // "lying enable" failure mode on consumer Intel chipsets, and disables peer
-  // access for any GPU pair where direct DMA does not actually move bytes.
+  // GPU -> GPU (cross-device copy). convert_gpu_to_gpu copies each column buffer with
+  // cudaMemcpyPeerAsync when cucascade::memory::probe_peer_dma_works() verifies the direction, and
+  // stages through pinned host memory otherwise. The cached probe copies bytes between two mutually
+  // granted private pools, so a verification failure means the pool peer route delivered wrong
+  // bytes, as on platforms whose direct route reports success but leaves stale data.
   registry.register_converter<gpu_table_representation, gpu_table_representation>(
     convert_gpu_to_gpu);
 

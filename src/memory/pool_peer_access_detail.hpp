@@ -15,6 +15,15 @@
  * limitations under the License.
  */
 
+/**
+ * @file
+ * The `*_operations` structs below are injection seams: production code binds them to the CUDA
+ * runtime and tests substitute fakes. Each function pointer other than probe_peer_dma mirrors the
+ * like-named CUDA runtime call (for example, get_pool_access mirrors `cudaMemPoolGetAccess`), and a
+ * real implementation must clear CUDA's thread-local last error after a failure so that it cannot
+ * leak into unrelated calls.
+ */
+
 #pragma once
 
 #include <cucascade/memory/common.hpp>
@@ -34,7 +43,7 @@ enum class peer_dma_probe_status {
   UNSUPPORTED,          ///< CUDA reports that required peer capability is unavailable
   VERIFICATION_FAILED,  ///< CUDA reports that the direction is supported, but the sentinel bytes
                         ///< did not arrive correctly
-  CUDA_ERROR
+  CUDA_ERROR            ///< A CUDA runtime operation failed; the result carries the first error
 };
 
 struct peer_dma_probe_result {
@@ -42,15 +51,19 @@ struct peer_dma_probe_result {
   cudaError_t error{cudaErrorUnknown};
 };
 
+/**
+ * @brief Operations used by the process-wide peer DMA probe cache
+ *
+ * Production code binds probe_peer_dma to probe_peer_dma_with_private_pools(); tests drive the
+ * cache through probe_peer_dma_sequence() and count_broken_directions().
+ */
 struct peer_dma_probe_operations {
   cudaError_t (*get_device_count)(int* count);
   cudaError_t (*get_device)(int* device);
   cudaError_t (*set_device)(int device);
   cudaError_t (*can_access_peer)(int* can_access, int device, int peer_device);
-  cudaError_t (*enable_peer_access)(int peer_device, unsigned int flags);
-  cudaError_t (*disable_peer_access)(int peer_device);
   cudaError_t (*get_last_error)();
-  peer_dma_probe_result (*probe_peer_dma)(int source_device, int destination_device);
+  peer_dma_probe_result (*probe_peer_dma)(int source_device, int destination_device) noexcept;
 };
 
 /** @brief Run requests through a fresh probe cache with supplied CUDA operations. */
@@ -59,6 +72,20 @@ struct peer_dma_probe_operations {
   peer_dma_probe_operations const& operations,
   bool retry_errors = true);
 
+/**
+ * @brief Call the broken-direction count behind disable_peer_access_where_broken() @p calls times
+ * on one fresh probe cache with supplied CUDA operations
+ *
+ * @return The count returned by each call, in order
+ */
+[[nodiscard]] std::vector<int> count_broken_directions(peer_dma_probe_operations const& operations,
+                                                       std::size_t calls);
+
+/**
+ * @brief Operations used by grant_pool_peer_access()
+ *
+ * Production code binds probe_peer_dma to a lookup in the process-wide probe cache.
+ */
 struct pool_peer_access_operations {
   cudaError_t (*get_device_count)(int* count);
   cudaError_t (*can_access_peer)(int* can_access, int device, int peer_device);
@@ -72,23 +99,25 @@ struct pool_peer_access_operations {
 };
 
 /**
- * @brief Disable the CUDA peer-access direction used by one directional copy probe.
+ * @brief Verify one peer copy direction on memory pools that only this call can see
  *
- * A copy from source to destination uses destination as the accessing device and source as the
- * allocation owner.
+ * Creates a non-blocking stream on @p destination_device and one private pool on each device,
+ * grants each pool to the other device, and copies 64 bytes from the source pool to the destination
+ * pool with `cudaMemcpyPeerAsync`. The guarantees that reach callers are documented on
+ * probe_peer_dma_works(); in addition, this call releases every resource it created and clears the
+ * calling thread's last CUDA error after a failure.
+ *
+ * The devices are expected to be distinct and peer capable in both directions; an invalid device
+ * yields CUDA_ERROR. The probe leaves @p destination_device current, and the probe cache restores
+ * the caller's device.
+ *
+ * @param source_device The device that owns the copied bytes
+ * @param destination_device The device that receives the bytes and issues the copy
+ * @return SUPPORTED when the bytes match, VERIFICATION_FAILED when they do not, or CUDA_ERROR with
+ * the first CUDA runtime error, including a cleanup failure
  */
-[[nodiscard]] cudaError_t disable_peer_access_for_failed_probe(
-  int source_device,
-  int destination_device,
-  cudaError_t (*set_device)(int),
-  cudaError_t (*disable_peer_access)(int)) noexcept;
-
-/**
- * @brief Restore the device that was current before the peer DMA probe.
- */
-[[nodiscard]] cudaError_t finish_peer_dma_probe(int saved_device,
-                                                cudaError_t probe_error,
-                                                cudaError_t (*set_device)(int)) noexcept;
+[[nodiscard]] peer_dma_probe_result probe_peer_dma_with_private_pools(
+  int source_device, int destination_device) noexcept;
 
 }  // namespace detail
 }  // namespace memory

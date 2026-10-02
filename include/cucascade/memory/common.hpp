@@ -88,7 +88,6 @@ class pool_peer_access_result {
   {
   }
 
-  friend pool_peer_access_result grant_pool_peer_access(cudaMemPool_t, int, int) noexcept;
   friend pool_peer_access_result detail::grant_pool_peer_access(
     cudaMemPool_t, int, int, detail::pool_peer_access_operations const&) noexcept;
 
@@ -139,18 +138,24 @@ using DeviceMemoryResourceFactoryFn =
  * @brief Grants one device persistent read/write access to allocations from one CUDA memory pool
  *
  * The pool is borrowed and remains owned by its creator. A successful grant persists until it is
- * changed through the CUDA runtime or the pool is destroyed. On first cross-device use, peer
- * verification synchronizes CUDA work, temporarily changes the caller thread's current device,
- * and enables or disables legacy peer access across visible device pairs. The original current
- * device is restored before return; a restoration failure is reported as
- * pool_peer_access_status::CUDA_ERROR. Verified peer results are cached process-wide;
- * CUDA errors are retried on a later explicit grant request. A failed request leaves existing pool
+ * changed through the CUDA runtime or the pool is destroyed. A failed request leaves existing pool
  * permissions unchanged; callers must coordinate any revocation with other users of the pool.
- * If both directional probes fail, a CUDA error takes precedence over a verification failure or
- * an unsupported result.
+ *
+ * Access is granted only after the byte verification described for probe_peer_dma_works() passes in
+ * both directions. The first request that needs verification, through this function,
+ * probe_peer_dma_works(), or disable_peer_access_where_broken(), verifies every ordered pair of
+ * visible devices while holding a process-wide lock, so concurrent requests wait for it. Results
+ * are cached for the process lifetime; directions that ended in a CUDA error are verified again on
+ * a later grant request. If both directional probes fail, a CUDA error takes precedence over a
+ * verification failure or an unsupported result. Verification temporarily changes the caller
+ * thread's current device and restores it before return; a restoration failure is reported as
+ * pool_peer_access_status::CUDA_ERROR.
  *
  * The caller must supply a live non-null pool, valid visible CUDA device IDs, and the device that
- * actually owns the pool's allocations as owner_device.
+ * actually owns the pool's allocations as owner_device. A request where owner_device equals
+ * accessing_device runs no verification: it reports GRANTED when the pool already grants that
+ * device read/write access, and pool_peer_access_status::CUDA_ERROR with cudaErrorInvalidValue
+ * otherwise, which means owner_device does not describe this pool.
  *
  * @param pool The actual pool backing the allocations to share
  * @param owner_device The device on which the pool's allocations reside
@@ -164,10 +169,10 @@ using DeviceMemoryResourceFactoryFn =
 /**
  * @brief Grant cross-device peer ReadWrite access on a cudaMallocAsync pool.
  *
- * This best-effort helper attempts access for every visible peer on both @p pool and the owner's
- * currently selected pool. It discards individual outcomes. On first use it also performs the
- * process-wide synchronization and legacy peer-state changes documented by
- * grant_pool_peer_access().
+ * This best-effort helper calls grant_pool_peer_access() for every visible peer on both @p pool and
+ * the owner's currently selected pool. It writes one line to stderr for each grant that fails with
+ * a CUDA error and otherwise discards the outcomes, including unsupported pairs and failed
+ * verification.
  *
  * @param pool The pool to configure
  * @param owner_device_id The device on which the pool's allocations reside
@@ -175,28 +180,43 @@ using DeviceMemoryResourceFactoryFn =
 void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int owner_device_id);
 
 /**
- * @brief Report whether a peer copy moves bytes from one GPU to another
+ * @brief Report whether a peer copy between two GPUs' memory pools delivers correct bytes
  *
- * A same-device request returns true. For distinct devices, the process-wide cache enables both
- * legacy peer-access directions before testing a 64-byte copy. Unverified directions are disabled
- * after CUDA errors. A cached CUDA error returns false without repeating the probe on every copy;
- * grant_pool_peer_access() or disable_peer_access_where_broken() can retry it.
+ * CUDA can report peer capability on hardware whose direct peer route delivers wrong bytes while
+ * every call returns cudaSuccess, so a byte comparison, not `cudaDeviceCanAccessPeer`, decides
+ * whether peer copies are used.
  *
- * @return True for a same-device request or a verified directional byte copy; false for unsupported
- * directions, failed verification, or CUDA errors
+ * A same-device request returns true. For distinct devices, verification copies 64 bytes with
+ * `cudaMemcpyPeerAsync` between two private memory pools that are granted to each other, then
+ * compares the bytes. Pool grants, not ordinary peer access, select the copy route for pool
+ * allocations, so the result applies to pools created with the allocation properties of the pool
+ * owned by `rmm::mr::cuda_async_memory_resource`; pools with other properties are not verified
+ * separately. Verification changes neither ordinary peer access nor the permissions of any pool it
+ * did not create, and waits only for its own streams.
+ *
+ * Results are cached as described for grant_pool_peer_access(). A cached CUDA error returns false
+ * without repeating the probe on every copy; grant_pool_peer_access() or
+ * disable_peer_access_where_broken() retries it.
+ *
+ * @param src_device The device that owns the copied bytes
+ * @param dst_device The device that receives the copied bytes
+ * @return True for a same-device request or a verified direction; false for unsupported directions,
+ * failed verification, or CUDA errors
  */
 [[nodiscard]] bool probe_peer_dma_works(int src_device, int dst_device);
 
 /**
- * @brief Trigger cached peer verification and count verified fallback directions
+ * @brief Trigger cached peer verification and count the directions that failed it
  *
- * On first cache use, every visible direction is probed with legacy peer access enabled where
- * needed. A byte mismatch or inconclusive CUDA error disables the unverified direction. Later
- * calls retry directions with CUDA errors. CUDA memory pool permissions are not changed here.
+ * Despite its name, which is kept for API compatibility, this function changes no peer access and
+ * no pool permission. It runs the verification described for probe_peer_dma_works() if it has not
+ * run yet, and retries directions with cached CUDA errors.
  *
  * @param pools_by_device Ignored; retained for API compatibility
- * @return Number of verified mismatched directions whose legacy peer access was disabled or was
- * already disabled
+ * @return Number of directions whose copied bytes did not match, where directions with CUDA errors
+ * are not counted; or -1 when verification could not run because the device count or current device
+ * could not be queried or an internal error occurred. A completed verification is counted even if
+ * restoring the caller's device afterwards fails.
  */
 int disable_peer_access_where_broken(std::vector<cudaMemPool_t> const& pools_by_device = {});
 

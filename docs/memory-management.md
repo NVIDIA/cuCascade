@@ -204,14 +204,26 @@ persists until changed through CUDA or the pool is destroyed. It does not promis
 prove the route of a later copy. A failed grant leaves existing pool permissions unchanged; any
 revocation must be coordinated by the application with other users of that pool. CUDA errors take
 precedence over non-error rejections when the two directional probes disagree. Verified peer
-results are cached process-wide. Explicit grant and fallback-count requests retry CUDA errors;
-frequent GPU-to-GPU conversions use host staging while an error is cached. Unverified legacy peer
-directions are disabled after probe errors or byte mismatches.
+results are cached process-wide. `grant_pool_peer_access()` and
+`disable_peer_access_where_broken()` retry cached CUDA errors; `probe_peer_dma_works()`, which gates
+the GPU-to-GPU converter path, reports false and the converter host-stages while an error is cached.
+
+Verification copies 64 bytes in each direction between two private memory pools that are granted
+to each other and compares the bytes. Pool grants, not ordinary peer access
+(`cudaDeviceEnablePeerAccess`), select the copy route for pool allocations, so the result applies to
+pools created with the allocation properties of the pool owned by
+`rmm::mr::cuda_async_memory_resource` (pinned device memory, no export handle). Pools with other
+properties are not verified separately. The probe owns every pool, stream, and allocation it uses:
+it leaves ordinary peer access and all caller-visible pool permissions unchanged and waits only for
+its own stream. The first request that needs verification checks every ordered pair of visible
+devices, a few milliseconds per pair, under a process-wide lock. When verification fails,
+GPU-to-GPU conversions stage through pinned host memory instead of copying directly.
 
 The legacy `enable_pool_peer_access_for_all_visible_devices()` helper remains best effort. It
 visits every visible peer for both the supplied pool and the owner's currently selected pool,
-discards individual outcomes, and on first use can synchronize devices and change legacy
-peer-access state process-wide.
+writes one stderr line per grant that fails with a CUDA error, and discards other outcomes.
+`disable_peer_access_where_broken()` keeps its name for compatibility but changes no state; it
+reports how many directions failed byte verification, or -1 when verification could not run.
 
 ### Per-Stream vs Per-Thread Tracking
 
