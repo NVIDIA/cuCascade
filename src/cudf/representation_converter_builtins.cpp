@@ -110,6 +110,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
   stream.sync();
 
   auto& gpu_source = source.cast<gpu_table_representation>();
+  gpu_source.wait_for_writer(stream);
   auto packed_data = cudf::pack(gpu_source.get_table_view(), stream);
 
   auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
@@ -192,12 +193,8 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
   auto new_table = std::make_unique<cudf::table>(new_table_view, stream, mr);
   stream.sync();
 
-  // The result was written on `stream`. The constructor treats a null handle as an unknown writer,
-  // but here it names the default stream of the target device, which wrote the result.
-  auto gpu_rep = std::make_unique<gpu_table_representation>(
+  return gpu_table_representation::make_written_on(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
-  if (stream.get() == nullptr) { gpu_rep->record_writer_event(stream); }
-  return gpu_rep;
 }
 
 /**
@@ -502,7 +499,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
-  auto& gpu_source            = source.cast<gpu_table_representation>();
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  // Planning reads string offsets on the device, so it must already be ordered after the writer.
+  gpu_source.wait_for_writer(stream);
   const cudf::table_view view = gpu_source.get_table_view();
 
   // --- Pass 1: plan the allocation layout ---
@@ -880,16 +879,14 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   // Same-device case: clone via source's own clone() method.
   if (source.get_device_id() == target_memory_space->get_device_id()) {
+    // A null stream handle represents the default stream of the current device: ensure it's the
+    // device attached to the representation, or clone() will throw.
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
     return source.clone(stream);
   }
 
   auto const src_device_id = gpu_source.get_device_id();
   auto const dst_device_id = target_memory_space->get_device_id();
-
-  // Order the peer copies below after the most recent writer of gpu_source, following the same
-  // policy as gpu_table_representation's clone() and release_table() (see the
-  // gpu_table_representation class documentation).
-  cudaEvent_t const writer_event = gpu_source.get_writer_event();
 
   rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
 
@@ -899,17 +896,11 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto target_stream = target_memory_space->acquire_stream();
   auto mr            = target_memory_space->get_default_allocator();
 
-  if (writer_event != nullptr) {
-    // The target stream waits for the writer event, which orders the peer copies after the writer
-    // without blocking the calling thread.
-    cucascade::cuda::cuda_event_view{writer_event}.wait(target_stream);
-  } else {
-    // The writer is unknown (for example, gpu_source was constructed with a null writer stream
-    // handle), so the calling thread synchronizes the whole source device, which waits for all work
-    // previously submitted there.
-    rmm::cuda_set_device_raii src_sync_guard{rmm::cuda_device_id{src_device_id}};
-    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
-  }
+  // Order the peer copies below after the most recent writer of gpu_source. With an unknown writer
+  // this synchronizes the whole source device, which is correct but invisible to compute-sanitizer:
+  // its stream-ordered race tracking ignores host-side synchronization, so it may report races here
+  // that a recorded writer event avoids.
+  gpu_source.wait_for_writer(target_stream);
 
   cudf::table_view const src_view = gpu_source.get_table_view();
 
@@ -1631,8 +1622,10 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
-  auto& backend       = target_memory_space->get_io_backend();
-  auto& gpu_source    = source.cast<gpu_table_representation>();
+  auto& backend    = target_memory_space->get_io_backend();
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  // Planning reads string offsets on the device, and the backend orders its reads after `stream`.
+  gpu_source.wait_for_writer(stream);
   cudf::table_view tv = gpu_source.get_table_view();
 
   // Generate unique file path under the disk memory space's mount directory
@@ -1840,12 +1833,8 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   stream.sync();
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
-  // The result was written on `stream`. The constructor treats a null handle as an unknown writer,
-  // but here it names the default stream of the target device, which wrote the result.
-  auto gpu_rep = std::make_unique<gpu_table_representation>(
+  return gpu_table_representation::make_written_on(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
-  if (stream.get() == nullptr) { gpu_rep->record_writer_event(stream); }
-  return gpu_rep;
 }
 
 }  // namespace

@@ -534,6 +534,41 @@ TEST_CASE("release_table rebinds owned-table buffers to the release stream",
   REQUIRE(checked >= 5);
 }
 
+TEST_CASE("a second release_table returns at once, even with an unknown writer",
+          "[release_table][writer_event]")
+{
+  using namespace std::chrono_literals;
+
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+  rmm::cuda_stream release_stream;
+  gpu_table_representation rep(make_patterned_table(shared_stream()),
+                               *shared_gpu_space(),
+                               ::cuda::stream_ref{cudaStream_t{nullptr}});
+  REQUIRE(rep.get_writer_event() == nullptr);
+  REQUIRE(rep.release_table(release_stream) != nullptr);
+
+  // Unrelated work on the device that only another thread can let finish.
+  writer_event_gate gate;
+  rmm::cuda_stream gated_stream{rmm::cuda_stream::flags::non_blocking};
+  CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(gated_stream.value(), wait_on_writer_event_gate, &gate));
+  writer_event_gate_cleanup gate_cleanup{gate, gated_stream};
+  REQUIRE(wait_until_set(gate.entered, 5s));
+
+  std::atomic<bool> gate_opened{false};
+  std::jthread gate_opener{[&] {
+    std::this_thread::sleep_for(200ms);
+    gate_opened.store(true, std::memory_order_release);
+    gate.release();
+  }};
+  // Synchronizing the device for the unknown writer would wait until the gate opens.
+  auto const released                    = rep.release_table(release_stream);
+  bool const returned_before_gate_opened = !gate_opened.load(std::memory_order_acquire);
+  gate_opener.join();
+
+  REQUIRE(released == nullptr);
+  REQUIRE(returned_before_gate_opened);
+}
+
 TEST_CASE("release_table rebinds converter-produced tables to the release stream",
           "[release_table][stream][converter]")
 {
@@ -949,6 +984,107 @@ TEST_CASE("blocking reads of a gpu_table_representation return only after its ga
   }
 }
 
+TEST_CASE("GPU-to-host and GPU-to-disk converters read only after the source's writer",
+          "[gpu_data_representation][converter][writer_event]")
+{
+  using namespace std::chrono_literals;
+
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+  auto& gpu_space = shared_gpu_space();
+  // Non-blocking, so implicit ordering through the legacy default stream cannot hide a missing
+  // wait.
+  rmm::cuda_stream writer_stream{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream reader_stream{rmm::cuda_stream::flags::non_blocking};
+
+  constexpr cudf::size_type num_rows      = 1 << 18;
+  constexpr std::size_t num_bytes         = static_cast<std::size_t>(num_rows) * sizeof(int32_t);
+  constexpr unsigned char stale_pattern   = 0x2D;
+  constexpr unsigned char written_pattern = 0x6E;
+
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          num_rows,
+                                          cudf::mask_state::UNALLOCATED,
+                                          writer_stream,
+                                          gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(
+    column->mutable_view().head(), stale_pattern, num_bytes, writer_stream.value()));
+  writer_stream.synchronize();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(column));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  bool writer_known = true;
+  std::unique_ptr<gpu_table_representation> source;
+  std::function<std::unique_ptr<idata_representation>()> convert;
+  auto to_packed_host = [&] {
+    return registry.convert<host_data_packed_representation>(
+      *source, shared_host_space().get(), reader_stream);
+  };
+  auto to_host = [&] {
+    return registry.convert<host_data_representation>(
+      *source, shared_host_space().get(), reader_stream);
+  };
+  auto to_disk = [&] {
+    return registry.convert<disk_data_representation>(
+      *source, shared_disk_space().get(), reader_stream);
+  };
+  SECTION("packed host") { convert = to_packed_host; }
+  SECTION("host") { convert = to_host; }
+  SECTION("disk") { convert = to_disk; }
+  SECTION("host with an unknown writer")
+  {
+    writer_known = false;
+    convert      = to_host;
+  }
+  source = std::make_unique<gpu_table_representation>(
+    std::move(table),
+    *gpu_space,
+    writer_known ? ::cuda::stream_ref{writer_stream} : ::cuda::stream_ref{cudaStream_t{nullptr}});
+  // CUDA loads kernels lazily on first use, and loading waits for the whole device, which would
+  // hide a missing wait for the writer. Converting once now loads them before the writer is gated.
+  static_cast<void>(convert());
+
+  writer_event_gate gate;
+  CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(writer_stream.value(), wait_on_writer_event_gate, &gate));
+  writer_event_gate_cleanup gate_cleanup{gate, writer_stream};
+  REQUIRE(wait_until_set(gate.entered, 5s));
+
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(const_cast<void*>(source->get_table_view().column(0).head()),
+                                     written_pattern,
+                                     num_bytes,
+                                     writer_stream.value()));
+  if (writer_known) { source->record_writer_event(writer_stream); }
+
+  // Every conversion blocks the calling thread until it has read the source, so the gate has to be
+  // opened by another thread. The delay leaves a conversion that does not wait ample time to read
+  // the stale bytes and return first.
+  std::atomic<bool> gate_opened{false};
+  std::jthread gate_opener{[&] {
+    std::this_thread::sleep_for(200ms);
+    gate_opened.store(true, std::memory_order_release);
+    gate.release();
+  }};
+  auto const converted                  = convert();
+  bool const returned_after_gate_opened = gate_opened.load(std::memory_order_acquire);
+  gate_opener.join();
+
+  auto const round_trip =
+    registry.convert<gpu_table_representation>(*converted, gpu_space.get(), reader_stream);
+  CUCASCADE_CUDA_TRY(cudaStreamSynchronize(reader_stream.value()));
+  std::vector<unsigned char> actual(num_bytes);
+  CUCASCADE_CUDA_TRY(cudaMemcpy(actual.data(),
+                                round_trip->get_table_view().column(0).head(),
+                                actual.size(),
+                                cudaMemcpyDeviceToHost));
+
+  REQUIRE(returned_after_gate_opened);
+  REQUIRE(std::all_of(
+    actual.cbegin(), actual.cend(), [](unsigned char value) { return value == written_pattern; }));
+}
+
 TEST_CASE("view-backed release_table keeps its sole owner alive until the copy completes",
           "[release_table][view][uaf]")
 {
@@ -1286,6 +1422,36 @@ TEST_CASE("gpu_table_representation rejects a stream owned by another device",
 
     REQUIRE_THROWS_AS(construct_owned(), cucascade::logic_error);
     REQUIRE_THROWS_AS(construct_view_backed(), cucascade::logic_error);
+    REQUIRE_THROWS_AS(
+      gpu_table_representation::make_written_on(
+        make_patterned_table(shared_stream()), *shared_gpu_space(), *foreign_stream),
+      cucascade::logic_error);
+
+    // The rejection must leave the owner with the caller: destroying it could free memory that the
+    // writer is still writing.
+    auto handed_owner = std::shared_ptr<cudf::table>{owner};
+    REQUIRE_THROWS_AS(std::make_unique<gpu_table_representation>(owner->view(),
+                                                                 std::move(handed_owner),
+                                                                 owner->alloc_size(),
+                                                                 *shared_gpu_space(),
+                                                                 *foreign_stream),
+                      cucascade::logic_error);
+    REQUIRE(handed_owner == owner);
+
+    // Likewise, a rejected owned table must stay with the caller.
+    auto handed_table     = make_patterned_table(shared_stream());
+    auto const* raw_table = handed_table.get();
+    REQUIRE_THROWS_AS(std::make_unique<gpu_table_representation>(
+                        std::move(handed_table), *shared_gpu_space(), *foreign_stream),
+                      cucascade::logic_error);
+    REQUIRE(handed_table.get() == raw_table);
+
+    auto written_table      = make_patterned_table(shared_stream());
+    auto const* raw_written = written_table.get();
+    REQUIRE_THROWS_AS(gpu_table_representation::make_written_on(
+                        std::move(written_table), *shared_gpu_space(), *foreign_stream),
+                      cucascade::logic_error);
+    REQUIRE(written_table.get() == raw_written);
   }
 }
 
@@ -1386,6 +1552,24 @@ TEST_CASE("gpu_table_representation works on its own device whichever device is 
     REQUIRE(device_of(cloned->cast<gpu_table_representation>().get_table_view().column(0).head()) ==
             1);
     REQUIRE(device_of(released->view().column(0).head()) == 1);
+    REQUIRE(rmm::get_current_cuda_device().value() == 0);
+  }
+
+  SECTION("same-device conversion with the default stream copies on device 1")
+  {
+    gpu_table_representation rep(std::move(table), *device1_space, *device1_stream);
+    representation_converter_registry registry;
+    register_builtin_converters(registry);
+
+    // The default stream argument is a null handle, which names device 0's default stream unless
+    // the converter makes device 1 current.
+    std::unique_ptr<gpu_table_representation> converted;
+    REQUIRE_NOTHROW(converted =
+                      registry.convert<gpu_table_representation>(rep, device1_space.get()));
+    REQUIRE(converted->get_device_id() == 1);
+    REQUIRE(device_of(converted->get_table_view().column(0).head()) == 1);
+    REQUIRE(converted->get_writer_event() != nullptr);
+    CUCASCADE_CUDA_TRY(cudaEventSynchronize(converted->get_writer_event()));
     REQUIRE(rmm::get_current_cuda_device().value() == 0);
   }
 }
