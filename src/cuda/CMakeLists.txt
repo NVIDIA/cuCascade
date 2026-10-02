@@ -15,4 +15,6 @@
 # the License.
 # =============================================================================
 
-target_sources(cucascade_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp)
+target_sources(
+  cucascade_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device_copy_batch.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp)

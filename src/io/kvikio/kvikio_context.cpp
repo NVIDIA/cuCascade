@@ -19,27 +19,77 @@
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 
 #include <kvikio/defaults.hpp>
+#include <kvikio/remote_handle.hpp>
 
+#include <rmm/cuda_device.hpp>
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace cucascade::io {
 
 namespace {
 
-const kvikio_io_object& as_kvikio(const io_object& obj)
+constexpr std::string_view k_s3_scheme = "s3://";
+
+[[nodiscard]] bool is_s3_uri(std::string_view path) noexcept
 {
-  // Concrete type is enforced by create_io_object below; a mismatch is a
-  // programmer error (e.g. mixing io_objects across backends), not user
-  // input, so a static_cast is appropriate.
-  return static_cast<const kvikio_io_object&>(obj);
+  return path.size() > k_s3_scheme.size() && path.compare(0, k_s3_scheme.size(), k_s3_scheme) == 0;
+}
+
+const kvikio_object& as_kvikio(const io_object& obj)
+{
+  // A mismatch is a programmer error (mixing io_objects across backends), but
+  // the cast is checked so it surfaces as a clear error instead of UB.
+  const auto* typed = dynamic_cast<const kvikio_object*>(&obj);
+  if (typed == nullptr) {
+    throw std::invalid_argument("kvikio_context: io_object '" + obj.object_path() +
+                                "' was not created by this backend");
+  }
+  return *typed;
+}
+
+/// Bytes actually available at @p offset.  kvikIO reads are unclamped, unlike
+/// the @c cudf::io::datasource this backend used to wrap, so callers past EOF
+/// would otherwise depend on kvikIO's short-read behaviour.
+[[nodiscard]] size_t clamp_to_object(const io_object& obj, size_t offset, size_t size) noexcept
+{
+  return obj.size() > offset ? std::min(size, obj.size() - offset) : 0;
+}
+
+/// kvikIO falls back to the AWS_* environment when an argument is nullopt, so
+/// every credential is passed engaged — an unconfigured store is rejected in
+/// create_io_object before we get here.
+[[nodiscard]] std::optional<std::string> engaged(std::string const& value)
+{
+  return std::optional<std::string>{value};
 }
 
 }  // namespace
+
+std::size_t kvikio_io_object::read_at(void* dst, std::size_t size, std::size_t offset) const
+{
+  size = clamp_to_object(*this, offset, size);
+  if (size == 0) { return 0; }
+  return handle().pread(dst, size, offset).get();
+}
+
+std::size_t kvikio_remote_io_object::read_at(void* dst, std::size_t size, std::size_t offset) const
+{
+  size = clamp_to_object(*this, offset, size);
+  if (size == 0) { return 0; }
+  return handle().pread(dst, size, offset).get();
+}
 
 void apply_kvikio_defaults(kvikio_config const& cfg)
 {
@@ -78,13 +128,33 @@ void apply_kvikio_defaults(kvikio_config const& cfg)
   // constructor in create_io_object so it scopes to this ioctx's files.
 }
 
-kvikio_context::kvikio_context(kvikio_config cfg) : _config(std::move(cfg))
+kvikio_context::kvikio_context(kvikio_config cfg, object_store_config os)
+  : _config(std::move(cfg)), _object_store(std::move(os))
 {
   apply_kvikio_defaults(_config);
 }
 
 std::shared_ptr<io_object> kvikio_context::create_io_object(std::string path)
 {
+  if (is_s3_uri(path)) {
+    if (_object_store.endpoint.empty() || _object_store.region.empty() ||
+        _object_store.access_key.empty() || _object_store.secret_key.empty()) {
+      throw std::runtime_error(
+        "kvikio_context: cannot open '" + path +
+        "': object store not configured (endpoint / region / credentials missing)");
+    }
+    auto bucket_and_object = kvikio::S3Endpoint::parse_s3_url(path);
+    auto endpoint          = std::make_unique<kvikio::S3Endpoint>(std::move(bucket_and_object),
+                                                         engaged(_object_store.region),
+                                                         engaged(_object_store.access_key),
+                                                         engaged(_object_store.secret_key),
+                                                         engaged(_object_store.endpoint),
+                                                         engaged(_object_store.session_token));
+    kvikio::RemoteHandle handle{std::move(endpoint)};
+    auto const object_size = handle.nbytes();
+    return std::make_shared<kvikio_remote_io_object>(
+      std::move(path), std::move(handle), object_size);
+  }
   // Read-only: this ioctx serves the scan path only.  The handle owns the fd
   // (and any cuFile registration) for the io_object's lifetime, and the
   // io_object outlives any single datasource wrapping it.
@@ -116,62 +186,105 @@ std::vector<byte_range> kvikio_context::align_and_coalesce(
 
 size_t kvikio_context::host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst)
 {
-  // pread dispatches on the destination pointer type, so the same call serves
+  // read_at dispatches on the destination pointer type, so the same call serves
   // host and device buffers; here it is always host memory.
-  return as_kvikio(obj).handle().pread(dst, size, offset).get();
+  return as_kvikio(obj).read_at(dst, size, offset);
 }
 
-exec::semi_future<size_t> kvikio_context::host_read_async_io(const io_object& obj,
-                                                             size_t offset,
-                                                             size_t size,
-                                                             uint8_t* dst) noexcept
+exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
+  const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept
 {
-  // make_semi_future_with invokes eagerly, so the kvikIO future is consumed
-  // here and the returned semi_future is already satisfied.  That matches the
-  // contract's "noexcept, never blocks the caller on IO completion downstream"
-  // only insofar as kvikIO's own thread pool did the transfer; callers that
-  // need true overlap use the uring backend.
-  return exec::make_semi_future_with(
-    [&obj, offset, size, dst]() { return as_kvikio(obj).handle().pread(dst, size, offset).get(); });
-}
+  // make_semi_future_with invokes eagerly. KvikIO remains the simple fallback
+  // backend while sharing the exact prepared-slice contract with reactors.
+  return exec::make_semi_future_with([&obj, slices = std::move(slices)]() mutable -> size_t {
+    auto const& object = as_kvikio(obj);
+    std::size_t total  = 0;
 
-exec::semi_future<size_t> kvikio_context::device_read_async_io(const io_object& obj,
-                                                               size_t offset,
-                                                               size_t size,
-                                                               uint8_t* dst,
-                                                               ::cuda::stream_ref stream) noexcept
-{
-  return exec::make_semi_future_with([&obj, offset, size, dst, stream]() {
-    // read_async enqueues the transfer on `stream` (so it is ordered against
-    // the caller's other stream work, unlike pread); check_bytes_done then
-    // synchronizes that stream and yields the byte count.
-    auto fut = as_kvikio(obj).handle().read_async(dst,
-                                                  size,
-                                                  static_cast<off_t>(offset),
-                                                  /*devPtr_offset=*/0,
-                                                  stream.get());
-    return fut.check_bytes_done();
+    for (std::size_t index = 0; index < slices.size(); ++index) {
+      auto& slice = slices[index];
+      try {
+        auto const bytes = clamp_to_object(obj, slice.offset(), slice.size());
+        slice.rng.size   = bytes;
+
+        if (bytes != 0) {
+          if (slice.is_fragmented()) {
+            throw std::runtime_error("kvikio_context does not accept fragmented cache buffers");
+          }
+
+          std::size_t completed = 0;
+          if (slice.is_contiguous()) {
+            auto* host = std::get<std::uint8_t*>(slice.h_buffer.buffer);
+            completed  = object.read_at(host, bytes, slice.offset());
+
+            if (completed == bytes && slice.has_device_request()) {
+              int device_id = slice.d_buffer.device_id;
+              if (device_id < 0) {
+                auto const status = cudaGetDevice(&device_id);
+                if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+              }
+              rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+              auto const copy_status = cudaMemcpyAsync(
+                slice.d_buffer.data, host, bytes, cudaMemcpyDefault, slice.d_buffer.stream.get());
+              if (copy_status != cudaSuccess) {
+                throw std::runtime_error(cudaGetErrorString(copy_status));
+              }
+              auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
+              if (sync_status != cudaSuccess) {
+                throw std::runtime_error(cudaGetErrorString(sync_status));
+              }
+            }
+          } else if (slice.has_device_request()) {
+            int device_id = slice.d_buffer.device_id;
+            if (device_id < 0) {
+              auto const status = cudaGetDevice(&device_id);
+              if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+            }
+            rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+
+            auto const* local = dynamic_cast<kvikio_io_object const*>(&object);
+            if (local == nullptr) {
+              // kvikIO copies the HTTP body H2D on its own per-thread stream and only
+              // synchronizes that stream, so the destination — possibly a stream-ordered
+              // pool block still in use on the caller's stream — must be drained first.
+              auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
+              if (sync_status != cudaSuccess) {
+                throw std::runtime_error(cudaGetErrorString(sync_status));
+              }
+              completed = object.read_at(slice.d_buffer.data, bytes, slice.offset());
+            } else {
+              auto future = local->handle().read_async(slice.d_buffer.data,
+                                                       bytes,
+                                                       static_cast<off_t>(slice.offset()),
+                                                       0,
+                                                       slice.d_buffer.stream.get());
+              completed   = future.check_bytes_done();
+            }
+          } else {
+            throw std::invalid_argument("prepared slice has no destination");
+          }
+
+          if (completed != bytes) { throw std::runtime_error("kvikio_context: short read"); }
+          total += completed;
+        }
+
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(slice.h_buffer.fragments(), true);
+        }
+      } catch (...) {
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(slice.h_buffer.fragments(), false);
+        }
+        for (++index; index < slices.size(); ++index) {
+          auto& skipped = slices[index];
+          if (skipped.on_complete != nullptr) {
+            (*skipped.on_complete)(skipped.h_buffer.fragments(), false);
+          }
+        }
+        throw;
+      }
+    }
+    return total;
   });
-}
-
-exec::semi_future<size_t> kvikio_context::host_to_device_read_async_io(
-  const io_object& /*obj*/,
-  std::span<io_object_segment> /*slices*/,
-  size_t /*offset*/,
-  size_t /*size*/,
-  uint8_t* /*device_dst*/,
-  ::cuda::stream_ref /*stream*/) noexcept
-{
-  return exec::make_semi_future<size_t>(std::make_exception_ptr(
-    std::runtime_error("kvikio_context does not support host_to_device_read_async_io; use "
-                       "device_read_async instead")));
-}
-
-exec::semi_future<size_t> kvikio_context::host_read_ranges_async_io(
-  const io_object& /*obj*/, std::span<io_object_segment> /*segments*/) noexcept
-{
-  return exec::make_semi_future<size_t>(std::make_exception_ptr(
-    std::runtime_error("kvikio_context does not support host_read_ranges_async_io")));
 }
 
 }  // namespace cucascade::io

@@ -24,6 +24,7 @@
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -48,7 +49,7 @@ namespace cucascade::io::rest {
  * @brief RESTful object-store (s3://) ioctx. Specialisation of
  *        @c templated_ioctx<rest_reactor>.
  *
- * Owns a pool of @c rest_reactor workers (round-robined by the base) that share
+ * Owns a pool of @c rest_reactor workers (load-balanced by the base) that share
  * one @p authorizer.  Overrides @c create_io_object to resolve an object's size
  * via a blocking HEAD before constructing the @c rest_io_object — the static
  * reactor factory cannot do this since it needs the authorizer + a round-trip.
@@ -63,12 +64,6 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
-
-  /// Pool-aggregated perf counters: per-reactor snapshots with totals and
-  /// counts summed, maxes maxed, and ttfb the smallest non-zero reactor value.
-  /// Reactor counters are lock-free; the footer-budget gauge takes one short
-  /// mutex.  Safe to call while the pool is running.
-  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
   /// per page (a page holds at most 1000 entries, so peak memory is one page
@@ -129,6 +124,27 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
                               std::function<void(footer_resolve_result)> const& on_result,
                               std::stop_token stop = {});
 
+  /// Live / high-water bytes reserved from the footer-resolve stash budget.
+  /// Both are 0 when the batched footer API is disabled or has never run on
+  /// this ioctx.  Safe to call while the pool is running.
+  [[nodiscard]] std::size_t footer_stash_reserved_bytes() const noexcept;
+  [[nodiscard]] std::size_t footer_stash_reserved_peak_bytes() const noexcept;
+
+  /// Open every reactor's connection pool against @p bucket_url's bucket, so the
+  /// query's first reads find pooled connections instead of paying TCP+TLS on
+  /// the hot path.  Fans the work out to the reactors and returns immediately:
+  /// each reactor's connection cache is thread-confined, so only its own worker
+  /// can fill it.
+  ///
+  /// Rate-limited rather than run once, because what goes stale is the
+  /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
+  /// pooled connection (@c CURLOPT_MAXAGE_CONN), so a pool warmed before an idle
+  /// gap longer than that is cold again by the next query -- a warm-once flag
+  /// would serve the first query and no other.  Re-warms when the endpoint
+  /// changes or the last warm-up is at least @c conn_max_age old, which is free
+  /// for back-to-back queries and self-correcting for spaced-out ones.
+  void warmup(std::string_view bucket_url) noexcept override;
+
  protected:
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
@@ -162,7 +178,7 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   // Batched-footer-resolve coordination: one active batch per ioctx, later
   // calls FIFO-parked on the ticket queue (stop-aware — a queued batch whose
   // token fires is removed without ever becoming active).  _footer_budget is
-  // created in the constructor and never reassigned, so perf_snapshot() may
+  // created in the constructor and never reassigned, so the stash gauges may
   // read it without the mutex.
   mutable std::mutex _footer_resolve_mutex;
   std::condition_variable_any _footer_resolve_cv;
@@ -170,6 +186,14 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::uint64_t _footer_resolve_next_ticket{0};
   bool _footer_resolve_active{false};
   std::shared_ptr<exec::admission_control> _footer_budget;
+
+  /// Guards the warm-up rate limiter.  Contended once per query at most, and
+  /// never on a read path.
+  std::mutex _warm_mtx;
+  /// Bucket the pools were last warmed against, and when.  An unset time means
+  /// "never warmed", which no elapsed comparison can express.
+  std::string _warmed_bucket;
+  std::optional<std::chrono::steady_clock::time_point> _warmed_at;
 };
 
 }  // namespace cucascade::io::rest

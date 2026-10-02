@@ -101,9 +101,6 @@ static void usage(char const* prog)
     << "REST config overrides (rest only; key=value, any order after num_rows):\n"
     << "  n_reactors=<N>          REST reactor threads (same as positional)\n"
     << "  max_connections=<N>     max concurrent in-flight easy handles per reactor (def 16)\n"
-    << "  chunk_size=<bytes>      target max bytes per ranged GET (def 8388608)\n"
-    << "  max_n_chunks=<N>        max buffers fused into one scatter GET (def 16)\n"
-    << "  max_read_split=<N>      parallel GETs a contiguous host read splits into (def 16)\n"
     << "  request_timeout_s=<S>   whole-request timeout, 0 = no limit (def 30)\n"
     << "  max_retry_attempts=<N>  retry attempts (def 10)\n"
     << "\n"
@@ -131,12 +128,6 @@ static bool apply_rest_override(std::string const& key,
     n_reactors = ull();
   } else if (key == "max_connections") {
     cfg.max_connections = ull();
-  } else if (key == "chunk_size") {
-    cfg.chunk_size = ull();
-  } else if (key == "max_n_chunks") {
-    cfg.max_n_chunks = ull();
-  } else if (key == "max_read_split") {
-    cfg.max_read_split = ull();
   } else if (key == "request_timeout_s") {
     cfg.request_timeout_s = std::stol(val);
   } else if (key == "max_retry_attempts") {
@@ -446,13 +437,8 @@ int main(int argc, char** argv)
 
   std::shared_ptr<cucascade::io::rest::rest_ioctx> io_ctx;  // rest path only
   if (source == DataSource::rest) {
-    rest_cfg.bounce_block_size = host_mr.get_block_size();
-
     std::cout << "REST   : n_reactors=" << n_reactors
-              << "  max_connections=" << rest_cfg.max_connections
-              << "  chunk_size=" << rest_cfg.chunk_size
-              << "  max_n_chunks=" << rest_cfg.max_n_chunks
-              << "  max_read_split=" << rest_cfg.max_read_split << "\n\n";
+              << "  max_connections=" << rest_cfg.max_connections << "\n\n";
 
     auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
     auto rest_ctx   = std::make_shared<cucascade::io::rest::rest_reactor::reactor_context>(

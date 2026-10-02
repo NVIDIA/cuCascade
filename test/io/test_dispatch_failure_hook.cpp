@@ -20,10 +20,10 @@
 
 #include <catch2/catch_all.hpp>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -34,9 +34,8 @@
 namespace {
 
 struct dispatch_controls {
-  bool throw_device_prep{false};
-  bool throw_staged_prep{false};
-  bool throw_enqueue{false};
+  bool throw_selection{false};
+  bool empty_selection{false};
 };
 
 class stub_io_object final : public cucascade::io::io_object {
@@ -63,96 +62,32 @@ class stub_io_object final : public cucascade::io::io_object {
   std::size_t _size;
 };
 
-class stub_request {
- public:
-  stub_request(std::size_t bytes, std::shared_ptr<dispatch_controls> controls)
-    : _state(std::make_shared<state>(bytes, std::move(controls)))
-  {
-  }
+struct stub_reactor_config {
+  [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
+  [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
 
-  [[nodiscard]] cucascade::exec::semi_future<std::size_t> get_future() noexcept
-  {
-    return _state->promise.get_semi_future();
-  }
-
-  static std::vector<std::unique_ptr<stub_request>> splits(std::unique_ptr<stub_request> request,
-                                                           std::size_t n_splits) noexcept
-  {
-    std::vector<std::unique_ptr<stub_request>> result;
-    if (request != nullptr && n_splits != 0) { result.push_back(std::move(request)); }
-    return result;
-  }
-
-  [[nodiscard]] dispatch_controls const& controls() const noexcept { return *_state->controls; }
-
-  void complete() { _state->promise.set_value(std::size_t{_state->bytes}); }
-
- private:
-  struct state {
-    state(std::size_t bytes, std::shared_ptr<dispatch_controls> controls)
-      : bytes(bytes), controls(std::move(controls))
-    {
-    }
-
-    std::size_t bytes;
-    std::shared_ptr<dispatch_controls> controls;
-    cucascade::exec::promise<std::size_t> promise;
-  };
-
-  std::shared_ptr<state> _state;
+  std::size_t n_max_concurrent_scans{0};
 };
-
-struct stub_reactor_config {};
 
 class stub_reactor {
  public:
   using io_object_type      = stub_io_object;
-  using request_type        = stub_request;
-  using request_type_ptr    = std::unique_ptr<request_type>;
   using reactor_config_type = stub_reactor_config;
 
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  static request_type_ptr prep_host_rx_request(const reactor_config_type&,
-                                               const io_object_type& file,
-                                               cucascade::io::io_object_segment segment)
+  /// Completes every slice immediately, settling the shared coordinator exactly
+  /// as a real reactor would once its physical operations finish.
+  void enqueue(std::unique_ptr<cucascade::io::grouped_io_request> request) noexcept
   {
-    return std::make_unique<request_type>(segment.size, file.controls());
-  }
-
-  static request_type_ptr prep_device_rx_request(const reactor_config_type&,
-                                                 const io_object_type& file,
-                                                 std::uint8_t*,
-                                                 std::size_t,
-                                                 std::size_t size,
-                                                 ::cuda::stream_ref,
-                                                 int)
-  {
-    if (file.controls()->throw_device_prep) { throw std::runtime_error("device prep failure"); }
-    return std::make_unique<request_type>(size, file.controls());
-  }
-
-  static request_type_ptr prep_host_to_device_rx_request(
-    const reactor_config_type&,
-    const io_object_type& file,
-    std::span<cucascade::io::io_object_segment>,
-    std::uint8_t*,
-    std::size_t,
-    std::size_t size,
-    ::cuda::stream_ref,
-    int)
-  {
-    if (file.controls()->throw_staged_prep) {
-      throw std::runtime_error("host-to-device prep failure");
+    while (!request->empty()) {
+      static_cast<void>(request->take_front());
+      request->coordinator->on_complete();
     }
-    return std::make_unique<request_type>(size, file.controls());
   }
 
-  void enqueue(request_type_ptr request)
-  {
-    if (request->controls().throw_enqueue) { throw std::runtime_error("enqueue failure"); }
-    request->complete();
-  }
+  [[nodiscard]] std::size_t queued_bytes() const noexcept { return 0; }
+  [[nodiscard]] std::size_t staging_block_size() const noexcept { return 0; }
 
   std::size_t host_read(const io_object_type&, std::size_t, std::size_t size, std::uint8_t*)
   {
@@ -170,10 +105,10 @@ class stub_reactor {
 
   [[nodiscard]] static bool supports(std::string_view) { return true; }
 
-  [[nodiscard]] static constexpr cucascade::io::cache::prefetching_stage
-  preferred_prefetching_stage() noexcept
+  [[nodiscard]] static std::vector<cucascade::io::byte_range> align_and_coalesce(
+    std::span<cucascade::io::byte_range const> ranges, std::optional<std::size_t>)
   {
-    return cucascade::io::cache::prefetching_stage::none;
+    return {ranges.begin(), ranges.end()};
   }
 
  private:
@@ -181,8 +116,6 @@ class stub_reactor {
 };
 
 static_assert(cucascade::io::io_reactor_c<stub_reactor>);
-static_assert(cucascade::io::reactor_has_device_rx<stub_reactor>);
-static_assert(cucascade::io::reactor_has_host_to_device_rx<stub_reactor>);
 
 std::vector<std::unique_ptr<stub_reactor>> make_reactors()
 {
@@ -191,13 +124,25 @@ std::vector<std::unique_ptr<stub_reactor>> make_reactors()
   return reactors;
 }
 
-class hooked_ioctx final : public cucascade::io::templated_ioctx<stub_reactor> {
+/// Reactor selection is the failure seam: it runs inside the dispatch try-block,
+/// before any request is published.
+class stub_ioctx : public cucascade::io::templated_ioctx<stub_reactor> {
  public:
-  explicit hooked_ioctx(bool empty_selection = false)
-    : templated_ioctx(make_reactors()), _empty_selection(empty_selection)
-  {
-  }
+  stub_ioctx() : templated_ioctx(make_reactors()) {}
 
+  std::vector<stub_reactor*> next_reactor(const stub_io_object& object,
+                                          std::size_t n_slices,
+                                          io_op_type operation,
+                                          int device_id = -1) override
+  {
+    if (object.controls()->throw_selection) { throw std::runtime_error("selection failure"); }
+    if (object.controls()->empty_selection) { return {}; }
+    return templated_ioctx::next_reactor(object, n_slices, operation, device_id);
+  }
+};
+
+class hooked_ioctx final : public stub_ioctx {
+ public:
   [[nodiscard]] cucascade::io::io_context_type type() const noexcept override
   {
     return cucascade::io::io_context_type::s3rdma;
@@ -205,27 +150,15 @@ class hooked_ioctx final : public cucascade::io::templated_ioctx<stub_reactor> {
 
   [[nodiscard]] std::size_t hook_calls() const noexcept { return _hook_calls; }
 
-  std::vector<stub_reactor*> next_reactor(const stub_io_object& object,
-                                          std::size_t n_chunks,
-                                          io_op_type operation,
-                                          int device_id = -1) noexcept override
-  {
-    if (_empty_selection) { return {}; }
-    return templated_ioctx::next_reactor(object, n_chunks, operation, device_id);
-  }
-
  protected:
   void on_device_dispatch_failure() noexcept override { ++_hook_calls; }
 
  private:
-  bool _empty_selection;
   std::size_t _hook_calls{0};
 };
 
-class plain_ioctx final : public cucascade::io::templated_ioctx<stub_reactor> {
+class plain_ioctx final : public stub_ioctx {
  public:
-  plain_ioctx() : templated_ioctx(make_reactors()) {}
-
   [[nodiscard]] cucascade::io::io_context_type type() const noexcept override
   {
     return cucascade::io::io_context_type::kvikio;
@@ -237,6 +170,27 @@ std::shared_ptr<stub_io_object> make_object(std::shared_ptr<dispatch_controls> c
   return std::make_shared<stub_io_object>(std::move(controls));
 }
 
+/// One slice covering the whole object, bound to a device destination.  The
+/// pointer is never dereferenced: the stub reactor completes slices without I/O.
+std::vector<cucascade::io::prepared_io_slice> device_slices(stub_io_object const& object,
+                                                            std::uint8_t* destination)
+{
+  std::vector<cucascade::io::prepared_io_slice> slices;
+  slices.emplace_back(
+    cucascade::io::range{0, object.size()},
+    cucascade::io::device_buffer{destination, ::cuda::stream_ref{cudaStream_t{nullptr}}});
+  return slices;
+}
+
+std::vector<cucascade::io::prepared_io_slice> host_slices(stub_io_object const& object,
+                                                          std::uint8_t* destination)
+{
+  std::vector<cucascade::io::prepared_io_slice> slices;
+  slices.emplace_back(cucascade::io::range{0, object.size()},
+                      cucascade::io::host_buffer{destination});
+  return slices;
+}
+
 void check_error(cucascade::exec::semi_future<std::size_t> future, std::string_view message)
 {
   CHECK_THROWS_WITH(std::move(future).get(),
@@ -245,141 +199,88 @@ void check_error(cucascade::exec::semi_future<std::size_t> future, std::string_v
 
 }  // namespace
 
-TEST_CASE("device prep failure fires the dispatch hook once", "[io][hook]")
+TEST_CASE("device dispatch failure fires the dispatch hook once", "[io][hook]")
 {
-  auto controls               = std::make_shared<dispatch_controls>();
-  controls->throw_device_prep = true;
-  auto object                 = make_object(controls);
+  auto controls             = std::make_shared<dispatch_controls>();
+  controls->throw_selection = true;
+  auto object               = make_object(controls);
+  std::uint8_t byte{};
   hooked_ioctx ioctx;
 
-  auto future = ioctx.device_read_async_io(
-    *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto future = ioctx.mixed_readv_async_io(*object, device_slices(*object, &byte));
 
-  check_error(std::move(future), "device prep failure");
+  check_error(std::move(future), "selection failure");
   CHECK(ioctx.hook_calls() == 1);
 }
 
-TEST_CASE("device enqueue failure fires the dispatch hook once", "[io][hook]")
+TEST_CASE("a mixed host and device dispatch failure fires the hook once", "[io][hook]")
 {
-  auto controls           = std::make_shared<dispatch_controls>();
-  controls->throw_enqueue = true;
-  auto object             = make_object(controls);
+  auto controls             = std::make_shared<dispatch_controls>();
+  controls->throw_selection = true;
+  auto object               = make_object(controls);
+  std::uint8_t byte{};
+  auto slices = host_slices(*object, &byte);
+  slices.emplace_back(
+    cucascade::io::range{0, object->size()},
+    cucascade::io::device_buffer{&byte, ::cuda::stream_ref{cudaStream_t{nullptr}}});
   hooked_ioctx ioctx;
 
-  auto future = ioctx.device_read_async_io(
-    *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto future = ioctx.mixed_readv_async_io(*object, std::move(slices));
 
-  check_error(std::move(future), "enqueue failure");
+  check_error(std::move(future), "selection failure");
   CHECK(ioctx.hook_calls() == 1);
 }
 
-TEST_CASE("host to device prep failure fires the dispatch hook once", "[io][hook]")
+TEST_CASE("host-only dispatch failure does not fire the hook", "[io][hook]")
 {
-  auto controls               = std::make_shared<dispatch_controls>();
-  controls->throw_staged_prep = true;
-  auto object                 = make_object(controls);
-  std::array<cucascade::io::io_object_segment, 1> bounce{};
+  auto controls             = std::make_shared<dispatch_controls>();
+  controls->throw_selection = true;
+  auto object               = make_object(controls);
+  std::uint8_t byte{};
   hooked_ioctx ioctx;
 
-  auto future =
-    ioctx.host_to_device_read_async_io(*object,
-                                       bounce,
-                                       0,
-                                       object->size(),
-                                       nullptr,
-                                       ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto future = ioctx.mixed_readv_async_io(*object, host_slices(*object, &byte));
 
-  check_error(std::move(future), "host-to-device prep failure");
-  CHECK(ioctx.hook_calls() == 1);
-}
-
-TEST_CASE("host to device enqueue failure fires the dispatch hook once", "[io][hook]")
-{
-  auto controls           = std::make_shared<dispatch_controls>();
-  controls->throw_enqueue = true;
-  auto object             = make_object(controls);
-  std::array<cucascade::io::io_object_segment, 1> bounce{};
-  hooked_ioctx ioctx;
-
-  auto future =
-    ioctx.host_to_device_read_async_io(*object,
-                                       bounce,
-                                       0,
-                                       object->size(),
-                                       nullptr,
-                                       ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
-
-  check_error(std::move(future), "enqueue failure");
-  CHECK(ioctx.hook_calls() == 1);
+  check_error(std::move(future), "selection failure");
+  CHECK(ioctx.hook_calls() == 0);
 }
 
 TEST_CASE("empty reactor selection returns errors without firing the hook", "[io][hook]")
 {
-  auto controls = std::make_shared<dispatch_controls>();
-  auto object   = make_object(controls);
-  hooked_ioctx ioctx{true};
+  auto controls             = std::make_shared<dispatch_controls>();
+  controls->empty_selection = true;
+  auto object               = make_object(controls);
+  std::uint8_t byte{};
+  hooked_ioctx ioctx;
 
-  SECTION("device read")
-  {
-    auto future = ioctx.device_read_async_io(
-      *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
-    check_error(std::move(future), "device_read_async_io: no available reactors");
-    CHECK(ioctx.hook_calls() == 0);
-  }
+  auto future = ioctx.mixed_readv_async_io(*object, device_slices(*object, &byte));
 
-  SECTION("host to device read")
-  {
-    std::array<cucascade::io::io_object_segment, 1> bounce{};
-    auto future =
-      ioctx.host_to_device_read_async_io(*object,
-                                         bounce,
-                                         0,
-                                         object->size(),
-                                         nullptr,
-                                         ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
-    check_error(std::move(future), "host_to_device_read_async_io: no available reactors");
-    CHECK(ioctx.hook_calls() == 0);
-  }
+  check_error(std::move(future), "mixed_readv_async_io: no available reactors");
+  CHECK(ioctx.hook_calls() == 0);
 }
 
 TEST_CASE("successful device dispatches do not fire the hook", "[io][hook]")
 {
   auto controls = std::make_shared<dispatch_controls>();
   auto object   = make_object(controls);
+  std::uint8_t byte{};
   hooked_ioctx ioctx;
 
-  SECTION("device read")
-  {
-    auto future = ioctx.device_read_async_io(
-      *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
-    CHECK(std::move(future).get() == object->size());
-    CHECK(ioctx.hook_calls() == 0);
-  }
+  auto future = ioctx.mixed_readv_async_io(*object, device_slices(*object, &byte));
 
-  SECTION("host to device read")
-  {
-    std::array<cucascade::io::io_object_segment, 1> bounce{};
-    auto future =
-      ioctx.host_to_device_read_async_io(*object,
-                                         bounce,
-                                         0,
-                                         object->size(),
-                                         nullptr,
-                                         ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
-    CHECK(std::move(future).get() == object->size());
-    CHECK(ioctx.hook_calls() == 0);
-  }
+  CHECK(std::move(future).get() == object->size());
+  CHECK(ioctx.hook_calls() == 0);
 }
 
 TEST_CASE("the default dispatch failure hook preserves error futures", "[io][hook]")
 {
-  auto controls               = std::make_shared<dispatch_controls>();
-  controls->throw_device_prep = true;
-  auto object                 = make_object(controls);
+  auto controls             = std::make_shared<dispatch_controls>();
+  controls->throw_selection = true;
+  auto object               = make_object(controls);
+  std::uint8_t byte{};
   plain_ioctx ioctx;
 
-  auto future = ioctx.device_read_async_io(
-    *object, 0, object->size(), nullptr, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto future = ioctx.mixed_readv_async_io(*object, device_slices(*object, &byte));
 
-  check_error(std::move(future), "device prep failure");
+  check_error(std::move(future), "selection failure");
 }

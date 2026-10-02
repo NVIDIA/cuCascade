@@ -77,4 +77,24 @@ struct parsed_uri {
  */
 parsed_uri parse(std::string_view uri);
 
+/**
+ * @brief Strip a leading `file:` URI scheme (case-insensitive) so @p path can be
+ *        handed to a local-file backend.
+ *
+ * All three spellings of a local file URI are handled — `file:/abs`,
+ * `file:///abs` and `file://localhost/abs` — and the stripped path is
+ * percent-decoded (a malformed escape keeps the stripped bytes as they are).
+ * The non-standard double-slash path form (`file://relative/path`) keeps the
+ * plain prefix strip.  Anything else — bare absolute or relative paths,
+ * `s3://`, `gs://`, ... — is returned byte-identical, so this is safe to apply
+ * unconditionally at an I/O boundary.  Never throws.
+ *
+ * Iceberg manifests written by the Apache implementations record fully-qualified
+ * URIs (`file:///abs/path/x.parquet`), while the local reactors only open bare
+ * paths. An un-stripped URI reaches `create_io_object` and throws
+ * "unsupported path" — which surfaces as a RUNTIME fallback, not a clean
+ * plan-time decline.
+ */
+[[nodiscard]] std::string strip_file_scheme(std::string_view path);
+
 }  // namespace cucascade::io

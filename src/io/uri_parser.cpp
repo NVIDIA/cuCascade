@@ -231,4 +231,60 @@ parsed_uri parse(std::string_view uri)
   return out;
 }
 
+std::string strip_file_scheme(std::string_view path)
+{
+  // Deliberately NOT implemented via parse(): this runs on every datasource open,
+  // must not throw on inputs parse() rejects (relative paths, empty keys), and
+  // must return the ORIGINAL bytes for everything it does not strip — no
+  // normalization of any other scheme.
+  //
+  // Do NOT reduce the `file:` handling to a `file://` prefix test: that strips one of the three
+  // forms the URI scheme admits and leaves `file:/abs` unopenable by any local datasource.
+  constexpr std::string_view file_scheme = "file:";
+  if (path.size() <= file_scheme.size()) { return std::string{path}; }
+  // The scheme is case-insensitive per RFC 3986 and manifests spell it FILE:// and File://.
+  // A missed match pairs a delete file with no data file, which silently returns deleted rows.
+  for (std::size_t i = 0; i < file_scheme.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(path[i])) !=
+        static_cast<unsigned char>(file_scheme[i])) {
+      return std::string{path};
+    }
+  }
+  auto const rest = path.substr(file_scheme.size());
+
+  // The non-standard "double-slash path" form (`file://relative/path`).  Repo fixtures use it
+  // for repo-RELATIVE paths, which committed metadata cannot spell as absolute URIs, so it keeps
+  // the plain strip.  Any other shape is not a file URI this function understands: hand the
+  // original bytes back rather than mangle them.
+  auto const bare_prefix_strip = [&]() -> std::string {
+    constexpr std::string_view double_slash = "file://";
+    return rest.starts_with("//") && path.size() > double_slash.size()
+             ? std::string{path.substr(double_slash.size())}
+             : std::string{path};
+  };
+
+  std::string_view local;
+  if (rest.starts_with("//")) {
+    // `file://<authority>/<path>`: only an empty authority or `localhost` names this host.
+    auto const after = rest.substr(2);
+    auto const slash = after.find('/');
+    if (slash == std::string_view::npos) { return bare_prefix_strip(); }
+    auto const authority = after.substr(0, slash);
+    if (!authority.empty() && to_lower(authority) != "localhost") { return bare_prefix_strip(); }
+    local = after.substr(slash);
+  } else if (rest.starts_with('/')) {
+    // `file:/abs`: the host-omitted spelling.
+    local = rest;
+  } else {
+    return std::string{path};
+  }
+
+  // Only what was stripped is a URI, so only there is `%20` a space.
+  try {
+    return percent_decode(local, path);
+  } catch (...) {
+    return std::string{local};
+  }
+}
+
 }  // namespace cucascade::io
