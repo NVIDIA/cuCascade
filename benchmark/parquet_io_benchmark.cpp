@@ -23,7 +23,7 @@
 //
 // Two read paths over the SAME uring backend are compared:
 //   io_context – the native cucascade::io ioctx.  host reads go through the
-//                vector-I/O primitive (host_read_ranges_async_io); device reads
+//                vector-I/O primitive (host_readv_async_io); device reads
 //                through device_read_async.
 //   cudf       – the cucascade::io::datasource (a cudf::io::datasource) whose
 //                host_read_async / device_read_async are issued per range.

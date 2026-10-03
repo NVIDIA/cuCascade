@@ -21,14 +21,18 @@
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/cache/types.hpp>
-#include <cucascade/io/concurrent_queue.hpp>
+#include <cucascade/io/details/request_hub.hpp>
+#include <cucascade/io/details/runner_registry.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/rest_engine.hpp>
+#include <cucascade/io/rest/rest_upload.hpp>
 #include <cucascade/io/rest/types.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -40,7 +44,6 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 namespace cucascade::io::rest {
@@ -151,9 +154,27 @@ struct footer_resolve_result {
  *
  * Stores the object identity and metadata captured when it was opened.
  * Does no I/O of its own.
+ *
+ * An object opened for write (@c rest_ioctx::open_io_object_for_write) carries
+ * an @ref upload_session: it is writable until committed, @ref size reports
+ * the written high-water mark, and it becomes readable (and read-only) once
+ * @c commit_async succeeded -- before that the object does not exist on the
+ * store.
  */
 class rest_io_object : public io_object {
  public:
+  /// Writable object backed by @p session (see @c rest_reactor::create_io_object_for_write).
+  rest_io_object(std::string path,
+                 std::string bucket,
+                 std::string key,
+                 std::shared_ptr<upload_session> session)
+    : _path(std::move(path)),
+      _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _session(std::move(session))
+  {
+  }
+
   rest_io_object(
     std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
     : _path(std::move(path)),
@@ -186,7 +207,10 @@ class rest_io_object : public io_object {
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
-  [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] size_t size() const noexcept override
+  {
+    return _session != nullptr ? _session->size() : _file_size;
+  }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
@@ -199,6 +223,12 @@ class rest_io_object : public io_object {
   [[nodiscard]] shared_byte_span const& stash() const noexcept { return _stash; }
   [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
 
+  /// Upload state of an object opened for write; null for read-only objects.
+  [[nodiscard]] std::shared_ptr<upload_session> const& session() const noexcept { return _session; }
+
+  /// Whether writes are accepted (opened for write and not committed / failed).
+  [[nodiscard]] bool writable() const { return _session != nullptr && _session->writable(); }
+
  private:
   std::string _path;
   std::string _bucket;
@@ -207,6 +237,7 @@ class rest_io_object : public io_object {
   size_t _window_lo{0};
   shared_byte_span _stash;
   std::string _etag;
+  std::shared_ptr<upload_session> _session;
 };
 
 // ---------------------------------------------------------------------------
@@ -214,14 +245,18 @@ class rest_io_object : public io_object {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Single-threaded I/O reactor for RESTful object storage (s3://...).
+ * @brief Shared, thread-safe dispatcher for RESTful object storage (s3://...).
  *
- * Owns one worker thread driving a libcurl multi handle over an epoll event
- * loop (curl_multi_socket_action), a pool of reusable easy handles, dynamic
- * CuCascade staging for device reads, a timerfd + min-heap retry
- * scheduler, and an MPSC request queue.  Models the reactor concept consumed
- * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
- * @c s3_request_authorizer, re-issued on every attempt.
+ * Models the reactor concept (v2) consumed by @c templated_ioctx: it owns the
+ * context-wide @c request_hub (admission, per-class queue, runner registry),
+ * the shared @ref reactor_context (config, presigning authorizer, pinned
+ * staging resource) and the caller-thread blocking helpers (HEAD, LIST,
+ * footer probes).  The transfers themselves run on runner threads, each in
+ * its own @ref rest_engine built by @ref make_engine (curl multi + epoll loop,
+ * connection cache, easy-handle pool, retry heap).  Presigned GET/HEAD URLs
+ * come from the context's @c request_authorizer, re-issued on every attempt.
+ *
+ * Thread-safety: every public member may be called from any thread.
  */
 class rest_reactor {
  public:
@@ -230,6 +265,10 @@ class rest_reactor {
   /// reactor can fuse adjacent ranges and keep every connection busy, which it
   /// cannot do when ranges arrive one at a time as a reader walks the file.
   static constexpr bool prefers_bulk_io = true;
+
+  /// Whole-object uploads (PUT / multipart), from host and device sources.
+  static constexpr bool supports_write        = true;
+  static constexpr bool supports_device_write = true;
 
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c rest_ioctx and shared (via shared_ptr) across every reactor in the
@@ -267,6 +306,14 @@ class rest_reactor {
   using io_object_type       = rest_io_object;
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
+  using engine_type          = rest_engine;
+
+  /// A warm-up target recorded by @ref warmup (see @ref current_warm_request).
+  struct warm_request {
+    std::uint64_t generation{0};  ///< 0: no warm-up was ever requested
+    std::string bucket;
+    std::chrono::steady_clock::time_point requested_at{};
+  };
 
   explicit rest_reactor(std::shared_ptr<reactor_context> ctx,
                         std::string_view tname = "rest_reactor");
@@ -297,40 +344,80 @@ class rest_reactor {
              : _ctx->host_memory_resource()->get_block_size();
   }
 
-  // -- dispatch / lifecycle ------------------------------------------------
+  // -- runner model ---------------------------------------------------------
 
-  /// Launch the worker thread. Split out of the constructor so a reactor can be
-  /// built cheaply and parked until it is actually needed. Idempotent while
-  /// running; shutdown is terminal and a later start is ignored.
-  void start();
+  /// The request hub shared by the ioctx front end and every engine.
+  [[nodiscard]] ::cucascade::io::detail::request_hub& hub() noexcept { return _hub; }
+  [[nodiscard]] ::cucascade::io::detail::request_hub const& hub() const noexcept { return _hub; }
 
-  void enqueue(std::unique_ptr<grouped_io_request> req) noexcept;
-  void interrupt();
-  void shutdown() noexcept;
+  /// Build the engine of the runner owning @p slot (called on that runner's thread).
+  /// @throws std::runtime_error if the engine's curl / epoll setup fails.
+  [[nodiscard]] std::unique_ptr<rest_engine> make_engine(
+    ::cucascade::io::detail::runner_slot& slot);
 
-  /// Bytes of queued-but-not-yet-submitted work — the reactor's backlog, and the
-  /// signal @c rest_ioctx::next_reactor balances dispatch against.  Counts only
-  /// what is waiting: a chunk stops counting the moment a connection picks it up,
-  /// because in-flight work is already bounded by @c max_connections and is
-  /// therefore the same ceiling on every reactor, while the queue is where an
-  /// unevenly-loaded pool actually diverges.
-  ///
-  /// A hint, not a synchronization point: it is read without ordering against
-  /// the queue itself, so a concurrent enqueue or dequeue may not be reflected
-  /// yet.  Dispatch only needs to be right on average.
-  [[nodiscard]] std::size_t queued_bytes() const noexcept
-  {
-    return _queued_bytes.load(std::memory_order_relaxed);
-  }
+  /// Shared services (authorizer, staging resource, config) for the engines.
+  [[nodiscard]] reactor_context const& context() const noexcept { return *_ctx; }
 
-  /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
+  /// Name given at construction (log context only).
+  [[nodiscard]] std::string const& name() const noexcept { return _tname; }
+
+  /// Bytes not yet taken of all queued requests (a hint; see @c request_hub::queued_bytes).
+  [[nodiscard]] std::size_t queued_bytes() const noexcept { return _hub.queued_bytes(); }
+
+  /**
+   * @brief Open @p path (s3://bucket/key) for a whole-object upload.
+   *
+   * No network I/O: the multipart upload (if any) is created lazily by the
+   * first part.  Only @c write_mode::create_or_truncate is supported -- an
+   * object store has no in-place update of an existing object.
+   *
+   * @throws std::invalid_argument for a non-s3 path.
+   * @throws std::system_error (@c std::errc::not_supported) for any other mode.
+   */
+  [[nodiscard]] std::unique_ptr<io_object_type> create_io_object_for_write(std::string path,
+                                                                           write_open_options opts);
+
+  /**
+   * @brief Synchronous host write: publishes a write request and waits for it.
+   *
+   * Like @ref host_read it needs a runner (@c start() or an external
+   * @c run*); without one it fails with @c std::errc::operation_canceled.
+   */
+  std::size_t host_write(io_object_type const& object,
+                         std::size_t offset,
+                         std::size_t size,
+                         std::uint8_t const* source,
+                         write_options opts);
+
+  /**
+   * @brief Abort every live, uncommitted upload of this reactor
+   *        (AbortMultipartUpload, synchronous, best effort) and fail its
+   *        session with @c std::errc::operation_canceled.
+   *
+   * Called by @c rest_ioctx::shutdown once every runner has stopped, so no
+   * part upload races the abort.  Also aborts the orphaned uploads still
+   * pending in @ref orphan_uploads.
+   */
+  void abort_live_uploads() noexcept;
+
+  /// Uploads of sessions destroyed without commit, waiting for an engine to
+  /// abort them (see @c orphan_upload_sink).
+  [[nodiscard]] orphan_upload_sink& orphan_uploads() noexcept { return *_orphans; }
+
+  /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller
+  /// until a runner served it: needs a runner (@c start() or an external
+  /// @c run*); without one admission is closed and it fails fast with
+  /// @c std::errc::operation_canceled.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  /// Ask the worker to open its connection pool against @p bucket before any
-  /// read needs it.  Returns immediately: the worker does the HEADs on its own
+  /// Ask every runner to open its connection pool against @p bucket before any
+  /// read needs it.  Returns immediately: the request is recorded here and the
+  /// registered runners are woken; each engine primes its own pool on its own
   /// thread at the top of its next pass, because the connection cache it fills
   /// is thread-confined (see the @c curl_share warning) and is reachable from
-  /// nowhere else.  Coalescing is the caller's job -- a second call before the
+  /// nowhere else.  An engine created later (a new @c run* call) primes from
+  /// a request younger than @c conn_max_age, so warming before @c start()
+  /// still works.  Coalescing is the caller's job -- a second call before the
   /// first is serviced simply replaces the target.
   ///
   /// The request is a bucket-scoped @c ListObjectsV2 capped at zero keys, not a
@@ -340,6 +427,16 @@ class rest_reactor {
   /// signing path.  The response is discarded and never inspected -- the
   /// handshake is what is being bought, so even a 403 is a success.
   void warmup(std::string bucket);
+
+  /// Generation of the latest @ref warmup request (0: none).  Lock-free; polled
+  /// by the engines.
+  [[nodiscard]] std::uint64_t warm_generation() const noexcept
+  {
+    return _warm_generation.load(std::memory_order_acquire);
+  }
+
+  /// The latest @ref warmup request (consistent snapshot).
+  [[nodiscard]] warm_request current_warm_request() const;
 
   /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
   /// build an @c rest_io_object.  @p bucket / @p key identify the object.
@@ -404,38 +501,31 @@ class rest_reactor {
                                                     std::optional<size_t> alignment = std::nullopt);
 
  private:
-  void worker_loop(const std::stop_token& stop_token);
-
-  // Shared services + tunables for the whole reactor pool; kept alive for this
+  // Shared services + tunables for the whole reactor; kept alive for this
   // reactor's lifetime (the authorizer is used on every request).
   std::shared_ptr<reactor_context> _ctx;
-  config _config;  // copy of _ctx->cfg() for hot-path access
-  // Thread name prefix captured at construction; applied to the worker in start().
+  config _config;  // copy of _ctx->cfg(), clamped to legal values
+  // Name captured at construction (log context).
   std::string _tname;
 
-  // Set by warmup() on a caller thread, consumed by the worker at the top of a
-  // pass.  The bucket is guarded because a std::string is not atomically
-  // publishable; the flag is what the worker actually polls.
-  std::atomic<bool> _warm_requested{false};
-  std::mutex _warm_mtx;
-  std::string _warm_bucket;
+  // Set by warmup() on a caller thread and polled by every engine at the top
+  // of a pass.  The bucket is guarded because a std::string is not atomically
+  // publishable; the generation is what the engines actually poll.
+  mutable std::mutex _warm_mtx;
+  std::string _warm_bucket;                                    // guarded by _warm_mtx
+  std::chrono::steady_clock::time_point _warm_requested_at{};  // guarded by _warm_mtx
+  std::atomic<std::uint64_t> _warm_generation{0};              // written under _warm_mtx
 
-  // Cross-thread wakeup: written by enqueue()/interrupt() to break the worker
-  // out of epoll_wait.
-  file_descriptor _wakeup_fd;
+  ::cucascade::io::detail::request_hub _hub;
 
-  std::stop_source _stop_source;
-  blocking_concurrent_queue<std::unique_ptr<grouped_io_request>> _requests;
-  mutable std::mutex _enqueue_mutex;
-  bool _running{false};
-  bool _accepting{false};
-  bool _stopped{false};
+  // Upload sessions of the objects opened for write (pruned when expired),
+  // aborted by abort_live_uploads() at context shutdown.
+  std::mutex _sessions_mtx;
+  std::vector<std::weak_ptr<upload_session>> _sessions;  // guarded by _sessions_mtx
 
-  // Logical bytes not yet assigned to a curl slot. Retries are already claimed
-  // work and therefore never get counted a second time.
-  std::atomic<std::size_t> _queued_bytes{0};
-
-  std::jthread _worker;
+  // Shared with every session created here; closed by the destructor.
+  std::shared_ptr<orphan_upload_sink> _orphans{
+    std::make_shared<orphan_upload_sink>(_hub.registry())};
 };
 
 }  // namespace cucascade::io::rest

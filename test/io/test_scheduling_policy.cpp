@@ -1,0 +1,248 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <cucascade/io/details/scheduling_policy.hpp>
+#include <cucascade/io/types.hpp>
+
+#include <catch2/catch_all.hpp>
+
+#include <chrono>
+#include <cstddef>
+#include <optional>
+
+namespace {
+
+using cucascade::io::request_class;
+using cucascade::io::detail::resource_need;
+using cucascade::io::detail::scheduling_config;
+using cucascade::io::detail::scheduling_policy;
+using cucascade::io::detail::scheduling_view;
+
+/// A view with @p slots slots and @p ops ops, all free.
+scheduling_view make_view(std::size_t slots = 64, std::size_t ops = 128)
+{
+  scheduling_view view;
+  view.total_slots = slots;
+  view.free_slots  = slots;
+  view.total_ops   = ops;
+  view.free_ops    = ops;
+  return view;
+}
+
+/// Account @p n in-flight operations of @p cls holding @p slots_each slots.
+void occupy(scheduling_view& view, request_class cls, std::size_t n, std::size_t slots_each = 1)
+{
+  view[cls].ops_in_flight += n;
+  view[cls].slots_in_use += n * slots_each;
+  view.free_ops -= n;
+  view.free_slots -= n * slots_each;
+}
+
+}  // namespace
+
+TEST_CASE("pick returns nothing when nothing is queued", "[io][policy]")
+{
+  scheduling_policy policy;
+  CHECK_FALSE(policy.pick(make_view()).has_value());
+}
+
+TEST_CASE("pick order is latency, read, background, write", "[io][policy]")
+{
+  scheduling_policy policy;
+  auto view                              = make_view();
+  view[request_class::write].queued      = 1;
+  view[request_class::background].queued = 1;
+  view[request_class::read].queued       = 1;
+  view[request_class::latency].queued    = 1;
+  CHECK(policy.pick(view) == request_class::latency);
+
+  view[request_class::latency].queued = 0;
+  CHECK(policy.pick(view) == request_class::read);
+
+  view[request_class::read].queued = 0;
+  CHECK(policy.pick(view) == request_class::background);
+
+  view[request_class::background].queued = 0;
+  CHECK(policy.pick(view) == request_class::write);
+}
+
+TEST_CASE("the write starvation guard overtakes other classes", "[io][policy]")
+{
+  scheduling_config config;
+  config.write_max_wait = std::chrono::milliseconds(20);
+  scheduling_policy policy(config);
+
+  auto view                             = make_view();
+  view[request_class::latency].queued   = 3;
+  view[request_class::read].queued      = 3;
+  view[request_class::write].queued     = 1;
+  view[request_class::write].oldest_age = std::chrono::milliseconds(19);
+  CHECK(policy.pick(view) == request_class::latency);
+
+  view[request_class::write].oldest_age = std::chrono::milliseconds(20);
+  CHECK(policy.pick(view) == request_class::write);
+
+  // ...but only within the write budget.
+  occupy(view, request_class::write, 32);  // 50% of 64 slots
+  CHECK(policy.pick(view) == request_class::latency);
+}
+
+TEST_CASE("pick respects the group limits", "[io][policy]")
+{
+  scheduling_config config;
+  config.max_active_groups  = 2;
+  config.max_latency_groups = 1;
+  scheduling_policy policy(config);
+
+  auto view                                   = make_view();
+  view[request_class::read].queued            = 5;
+  view[request_class::read].active_groups     = 1;
+  view[request_class::read].expanding_groups  = 1;
+  view[request_class::write].active_groups    = 1;
+  view[request_class::write].expanding_groups = 1;
+  CHECK_FALSE(policy.pick(view).has_value());
+
+  // Latency has its own allowance on top of the bulk groups.
+  view[request_class::latency].queued = 1;
+  CHECK(policy.pick(view) == request_class::latency);
+  view[request_class::latency].active_groups    = 1;
+  view[request_class::latency].expanding_groups = 1;
+  CHECK_FALSE(policy.pick(view).has_value());
+
+  view[request_class::write].active_groups    = 0;
+  view[request_class::write].expanding_groups = 0;
+  CHECK(policy.pick(view) == request_class::read);
+}
+
+TEST_CASE("groups with all operations dispatched do not count against the group limits",
+          "[io][policy]")
+{
+  scheduling_config config;
+  config.max_active_groups  = 2;
+  config.max_latency_groups = 1;
+  scheduling_policy policy(config);
+
+  // Many held groups whose operations are all in flight: still room to pull.
+  auto view                                  = make_view();
+  view[request_class::read].queued           = 5;
+  view[request_class::read].active_groups    = 10;
+  view[request_class::latency].active_groups = 3;
+  view[request_class::latency].queued        = 1;
+  CHECK(policy.pick(view) == request_class::latency);
+  view[request_class::latency].queued = 0;
+  CHECK(policy.pick(view) == request_class::read);
+
+  // Two of them still expanding: the bulk limit applies again.
+  view[request_class::read].expanding_groups = 2;
+  CHECK_FALSE(policy.pick(view).has_value());
+  view[request_class::latency].queued           = 1;
+  view[request_class::latency].expanding_groups = 1;
+  CHECK_FALSE(policy.pick(view).has_value());
+
+  // Held (in-flight) latency groups still keep the latency reservation armed.
+  view[request_class::latency].queued           = 0;
+  view[request_class::latency].expanding_groups = 0;
+  CHECK(scheduling_policy::latency_pressure(view));
+}
+
+TEST_CASE("background is held back by its share under foreground pressure", "[io][policy]")
+{
+  scheduling_policy policy;  // background share 75%
+  auto view                              = make_view(64, 128);
+  view[request_class::background].queued = 1;
+  occupy(view, request_class::background, 48);            // 75% of 64
+  view.total_ops = 0;                                     // ops axis unconstrained
+  CHECK(policy.pick(view) == request_class::background);  // no foreground work: allowed
+
+  view[request_class::read].active_groups = 1;
+  CHECK_FALSE(policy.pick(view).has_value());
+  CHECK_FALSE(policy.may_dispatch(request_class::background, resource_need{1, 1}, view));
+  CHECK(policy.may_dispatch(request_class::read, resource_need{1, 1}, view));
+}
+
+TEST_CASE("writes never exceed their share of slots and ops", "[io][policy]")
+{
+  scheduling_policy policy;  // 50% / 50%
+  auto view = make_view(64, 128);
+
+  CHECK(policy.may_dispatch(request_class::write, resource_need{16, 1}, view));
+  occupy(view, request_class::write, 2, 16);  // 32 of 64 slots
+  CHECK_FALSE(policy.may_dispatch(request_class::write, resource_need{1, 1}, view));
+  CHECK(policy.may_dispatch(request_class::read, resource_need{16, 1}, view));
+
+  // Ops axis: host-direct writes need no slots but still count against the ring share.
+  auto ops_view = make_view(64, 8);
+  occupy(ops_view, request_class::write, 4, 0);
+  CHECK_FALSE(policy.may_dispatch(request_class::write, resource_need{0, 1}, ops_view));
+  CHECK(policy.may_dispatch(request_class::read, resource_need{0, 1}, ops_view));
+}
+
+TEST_CASE("an operation larger than a share is admitted when its class is idle", "[io][policy]")
+{
+  scheduling_policy policy;
+  auto view = make_view(8, 16);
+  CHECK(policy.may_dispatch(request_class::write, resource_need{6, 1}, view));  // > 50% of 8
+  occupy(view, request_class::write, 1, 6);
+  CHECK_FALSE(policy.may_dispatch(request_class::write, resource_need{1, 1}, view));
+}
+
+TEST_CASE("physical capacity is always enforced", "[io][policy]")
+{
+  scheduling_policy policy;
+  auto view = make_view(4, 4);
+  occupy(view, request_class::read, 3, 1);
+  CHECK_FALSE(policy.may_dispatch(request_class::latency, resource_need{2, 1}, view));
+  CHECK(policy.may_dispatch(request_class::latency, resource_need{1, 1}, view));
+
+  // An unconstrained axis (total 0) never blocks.
+  scheduling_view open;
+  CHECK(policy.may_dispatch(request_class::write, resource_need{1000, 1000}, open));
+}
+
+TEST_CASE("slots are reserved for latency work while it is pending", "[io][policy]")
+{
+  scheduling_config config;
+  config.reserved_latency_slots = 2;
+  scheduling_policy policy(config);
+
+  auto view = make_view(16, 128);
+  occupy(view, request_class::read, 13, 1);  // 3 free
+  view.total_ops = 0;
+  CHECK(policy.may_dispatch(request_class::read, resource_need{1, 1}, view));
+
+  view[request_class::latency].queued = 1;
+  CHECK(policy.may_dispatch(request_class::read, resource_need{1, 1}, view));  // leaves 2
+  occupy(view, request_class::read, 1, 1);                                     // 2 free
+  CHECK_FALSE(policy.may_dispatch(request_class::read, resource_need{1, 1}, view));
+  CHECK_FALSE(policy.may_dispatch(request_class::background, resource_need{1, 1}, view));
+  CHECK(policy.may_dispatch(request_class::latency, resource_need{1, 1}, view));
+
+  // The reservation is clamped to half the capacity.
+  auto tiny                           = make_view(2, 0);
+  tiny.total_ops                      = 0;
+  tiny[request_class::latency].queued = 1;
+  CHECK(policy.may_dispatch(request_class::read, resource_need{1, 1}, tiny));
+}
+
+TEST_CASE("share_of floors and keeps at least one", "[io][policy]")
+{
+  CHECK(scheduling_policy::share_of(64, 0.5) == 32);
+  CHECK(scheduling_policy::share_of(3, 0.5) == 1);
+  CHECK(scheduling_policy::share_of(1, 0.1) == 1);
+  CHECK(scheduling_policy::share_of(0, 0.5) == 0);
+  CHECK(scheduling_policy::share_of(10, 2.0) == 10);
+}

@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/cuda/device_copy_batch.hpp>
+#include <cucascade/exec/invocable.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/types.hpp>
 
@@ -31,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -56,10 +58,26 @@ namespace cucascade::io {
  * success, failure, or cancellation settles exactly one credit. The first
  * error stops further dispatch immediately, but the future is not fulfilled
  * until all already-published operations have drained.
+ *
+ * An optional finalizer (@ref set_finalizer) runs once when the last credit is
+ * about to settle without an error, letting a backend append trailing work
+ * (a linked fsync, a multipart Complete, ...) before the future resolves.
  */
 class grouped_coordinator final {
  public:
   using error_type = std::variant<std::exception_ptr, cudaError_t, std::error_code>;
+
+  /**
+   * @brief Callback run once when all credits but the finalizing one settled.
+   *
+   * Runs synchronously on the thread that settles the last credit, outside any
+   * coordinator lock.  While it runs the coordinator still holds one credit,
+   * so the finalizer may call @ref add_tasks to schedule extra work (and must
+   * do so before publishing that work).  To fail the request from inside the
+   * finalizer, call @c add_tasks(1) followed by @ref report_error.  If it
+   * schedules nothing the request resolves right after it returns.
+   */
+  using finalize_fn = exec::invocable<void(grouped_coordinator&) noexcept>;
 
   grouped_coordinator(std::size_t bytes_requested, std::size_t initial_tasks)
     : _bytes_requested(bytes_requested), _tasks_remaining(initial_tasks)
@@ -106,6 +124,41 @@ class grouped_coordinator final {
   }
 
   void on_complete() noexcept { settle_one(); }
+
+  /**
+   * @brief Install the finalizer (see @ref finalize_fn).
+   *
+   * Must be called by a thread that holds an unsettled credit of this
+   * coordinator (so the count cannot reach zero concurrently); it may be
+   * called before or after @ref get_future.  The finalizer is skipped when the
+   * request has already failed when the last credit settles.
+   *
+   * @param fn Finalizer to run; must hold a target.
+   * @throws std::invalid_argument if @p fn is empty.
+   * @throws std::logic_error if a finalizer was already installed.
+   */
+  void set_finalizer(finalize_fn fn)
+  {
+    if (!fn) throw std::invalid_argument("grouped_coordinator finalizer is empty");
+    std::lock_guard lock(_state_mutex);
+    if (_has_finalizer.load(std::memory_order_acquire)) {
+      throw std::logic_error("grouped_coordinator finalizer may only be set once");
+    }
+    _finalizer = std::move(fn);
+    _has_finalizer.store(true, std::memory_order_release);
+  }
+
+  /// Whether a finalizer was installed.
+  [[nodiscard]] bool has_finalizer() const noexcept
+  {
+    return _has_finalizer.load(std::memory_order_acquire);
+  }
+
+  /// Whether the finalizer has started (it runs at most once).
+  [[nodiscard]] bool finalizer_started() const noexcept
+  {
+    return _finalizer_started.load(std::memory_order_acquire);
+  }
 
   void report_error(error_type const& error,
                     std::source_location loc = std::source_location::current()) noexcept
@@ -161,10 +214,41 @@ class grouped_coordinator final {
       value, "System error at " + std::string(loc.file_name()) + ":" + std::to_string(loc.line())));
   }
 
+  /// Claim the finalizer when the caller holds the last outstanding credit.
+  /// With a single credit left no other thread can add or settle credits, so
+  /// the claim cannot race with the count; the CAS guards against re-entry.
+  [[nodiscard]] bool try_claim_finalizer() noexcept
+  {
+    if (!_has_finalizer.load(std::memory_order_acquire) || has_error()) return false;
+    bool expected = false;
+    return _finalizer_started.compare_exchange_strong(
+      expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+  }
+
+  void run_finalizer() noexcept
+  {
+    finalize_fn fn;
+    {
+      std::lock_guard lock(_state_mutex);
+      fn = std::move(_finalizer);
+    }
+    // Invoked without _state_mutex: the finalizer calls add_tasks and may
+    // complete work inline (which re-enters settle_one / resolve_if_ready).
+    if (fn) fn(*this);
+  }
+
   void settle_one() noexcept
   {
     auto current = _tasks_remaining.load(std::memory_order_acquire);
     while (current != 0) {
+      if (current == 1 && try_claim_finalizer()) {
+        // Keep the last credit while the finalizer runs so that the work it
+        // schedules (add_tasks) cannot drive the count to zero underneath it,
+        // then settle that credit normally.
+        run_finalizer();
+        current = _tasks_remaining.load(std::memory_order_acquire);
+        continue;
+      }
       if (_tasks_remaining.compare_exchange_weak(
             current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         if (current == 1) resolve_if_ready();
@@ -202,6 +286,53 @@ class grouped_coordinator final {
   bool _future_taken{false};
   bool _fulfilled{false};
   exec::promise<std::size_t> _promise;
+  finalize_fn _finalizer;  // guarded by _state_mutex
+  std::atomic<bool> _has_finalizer{false};
+  std::atomic<bool> _finalizer_started{false};
+};
+
+namespace detail {
+
+/// Process-wide monotonically increasing request id (starts at 1).
+[[nodiscard]] inline std::uint64_t next_request_id() noexcept
+{
+  static std::atomic<std::uint64_t> counter{0};
+  return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+}  // namespace detail
+
+/**
+ * @brief Scheduling / observability metadata carried by every grouped request.
+ *
+ * @c state is atomic so statistics may read it from any thread; the
+ * timestamps are written by the single thread that owns the request at that
+ * point of its lifecycle (submitter, queue, runner) and must only be read by
+ * the owner or after the request completed.
+ */
+struct request_meta {
+  using clock      = std::chrono::steady_clock;
+  using time_point = clock::time_point;
+
+  request_meta() noexcept = default;
+  request_meta(request_class request_cls, io_kind request_kind) noexcept
+    : cls(request_cls), kind(request_kind)
+  {
+  }
+
+  request_meta(request_meta const&)            = delete;
+  request_meta& operator=(request_meta const&) = delete;
+
+  std::uint64_t id{detail::next_request_id()};              ///< process-wide unique id
+  request_class cls{request_class::read};                   ///< resolved scheduling class
+  io_kind kind{io_kind::read};                              ///< carried operation
+  std::atomic<request_state> state{request_state::queued};  ///< lifecycle state
+  time_point created_at{clock::now()};                      ///< request construction
+  time_point enqueued_at{};                                 ///< pushed to the shared queue
+  time_point assigned_at{};                                 ///< pulled by a runner
+  time_point first_io_at{};                                 ///< first physical op submitted
+  time_point completed_at{};                                ///< last physical op settled
+  std::uint64_t runner_id{0};                               ///< runner that pulled the request
 };
 
 /**
@@ -211,23 +342,41 @@ class grouped_coordinator final {
  * lifetime. Reactors keep an active request locally and consume its slices in
  * order; they do not explode the group into queue entries before slot capacity
  * is known.
+ *
+ * A request carries exactly one kind of work (@c meta.kind):
+ *  - @c io_kind::read: @ref slices, one coordinator credit per slice;
+ *  - @c io_kind::write: @ref write_segments, one credit per segment;
+ *  - @c io_kind::flush / @c io_kind::commit: a single control operation, one
+ *    credit, taken with @ref take_control.
  */
 class grouped_io_request final {
  public:
+  /**
+   * @brief Build a read request.
+   *
+   * @param object Object to read; must be non-null.
+   * @param slices Prepared slices (one coordinator credit each).
+   * @param coordinator Shared fan-in; must be non-null.
+   * @param opts Scheduling options; @c automatic is resolved from the byte count.
+   * @throws std::invalid_argument if @p object or @p coordinator is null.
+   */
   static std::unique_ptr<grouped_io_request> create(
     std::shared_ptr<const io_object> object,
     std::vector<prepared_io_slice> slices,
-    std::shared_ptr<grouped_coordinator> coordinator)
+    std::shared_ptr<grouped_coordinator> coordinator,
+    io_options opts = {})
   {
-    if (object == nullptr || coordinator == nullptr) {
-      throw std::invalid_argument("grouped_io_request requires an object and coordinator");
-    }
-    return std::unique_ptr<grouped_io_request>(
-      new grouped_io_request(std::move(object), std::move(slices), std::move(coordinator)));
+    check_args(object, coordinator);
+    auto const cls = resolve_request_class(opts.cls, io_kind::read, coordinator->bytes_requested());
+    auto request   = std::unique_ptr<grouped_io_request>(
+      new grouped_io_request(std::move(object), std::move(coordinator), cls, io_kind::read));
+    request->slices = std::move(slices);
+    return request;
   }
 
   static std::unique_ptr<grouped_io_request> create(std::shared_ptr<const io_object> object,
-                                                    std::vector<prepared_io_slice> slices)
+                                                    std::vector<prepared_io_slice> slices,
+                                                    io_options opts = {})
   {
     std::size_t bytes = 0;
     for (auto const& slice : slices) {
@@ -237,56 +386,189 @@ class grouped_io_request final {
       bytes += slice.size();
     }
     auto coordinator = std::make_shared<grouped_coordinator>(bytes, slices.size());
-    return create(std::move(object), std::move(slices), std::move(coordinator));
+    return create(std::move(object), std::move(slices), std::move(coordinator), opts);
   }
 
-  [[nodiscard]] bool empty() const noexcept { return _next == slices.size(); }
+  /**
+   * @brief Build a write request.
+   *
+   * The caller validates the segments (@ref validate_write_segments) and sizes
+   * @p coordinator with one credit per segment.
+   *
+   * @param object Object to write; must be non-null.
+   * @param segments Disjoint write segments.
+   * @param opts Write options; @c automatic class resolves to @c write.
+   * @param coordinator Shared fan-in; must be non-null.
+   * @throws std::invalid_argument if @p object or @p coordinator is null.
+   */
+  static std::unique_ptr<grouped_io_request> create_write(
+    std::shared_ptr<const io_object> object,
+    std::vector<write_segment> segments,
+    write_options opts,
+    std::shared_ptr<grouped_coordinator> coordinator)
+  {
+    check_args(object, coordinator);
+    auto const cls =
+      resolve_request_class(opts.cls, io_kind::write, coordinator->bytes_requested());
+    auto request = std::unique_ptr<grouped_io_request>(
+      new grouped_io_request(std::move(object), std::move(coordinator), cls, io_kind::write));
+    request->write_segments = std::move(segments);
+    request->wopts          = opts;
+    return request;
+  }
+
+  /// As above, building a coordinator with one credit per segment and the
+  /// segments' total byte count.
+  static std::unique_ptr<grouped_io_request> create_write(std::shared_ptr<const io_object> object,
+                                                          std::vector<write_segment> segments,
+                                                          write_options opts = {})
+  {
+    auto const bytes = validate_write_segments(segments);
+    auto coordinator = std::make_shared<grouped_coordinator>(bytes, segments.size());
+    return create_write(std::move(object), std::move(segments), opts, std::move(coordinator));
+  }
+
+  /**
+   * @brief Build a control request (@c io_kind::flush or @c io_kind::commit).
+   *
+   * @param object Target object; must be non-null.
+   * @param kind @c io_kind::flush or @c io_kind::commit.
+   * @param opts Write options (durability for commit); class resolves to @c write.
+   * @param coordinator Shared fan-in holding one credit; must be non-null.
+   * @throws std::invalid_argument on null arguments or a non-control @p kind.
+   */
+  static std::unique_ptr<grouped_io_request> create_control(
+    std::shared_ptr<const io_object> object,
+    io_kind kind,
+    write_options opts,
+    std::shared_ptr<grouped_coordinator> coordinator)
+  {
+    check_args(object, coordinator);
+    if (kind != io_kind::flush && kind != io_kind::commit) {
+      throw std::invalid_argument("grouped_io_request::create_control requires flush or commit");
+    }
+    auto const cls = resolve_request_class(opts.cls, kind, 0);
+    auto request   = std::unique_ptr<grouped_io_request>(
+      new grouped_io_request(std::move(object), std::move(coordinator), cls, kind));
+    request->wopts            = opts;
+    request->_control_pending = true;
+    return request;
+  }
+
+  [[nodiscard]] io_kind kind() const noexcept { return meta.kind; }
+
+  [[nodiscard]] bool is_write() const noexcept { return meta.kind == io_kind::write; }
+
+  [[nodiscard]] bool is_control() const noexcept
+  {
+    return meta.kind == io_kind::flush || meta.kind == io_kind::commit;
+  }
+
+  /// True when no slice, segment or control operation remains to be taken.
+  [[nodiscard]] bool empty() const noexcept
+  {
+    return _next == slices.size() && _next_segment == write_segments.size() && !_control_pending;
+  }
 
   [[nodiscard]] std::size_t remaining_slices() const noexcept { return slices.size() - _next; }
 
+  [[nodiscard]] std::size_t remaining_write_segments() const noexcept
+  {
+    return write_segments.size() - _next_segment;
+  }
+
+  /// Bytes of the slices and write segments not yet taken.
   [[nodiscard]] std::size_t remaining_bytes() const noexcept
   {
     std::size_t bytes = 0;
     for (std::size_t i = _next; i < slices.size(); ++i) {
       bytes += slices[i].size();
     }
+    for (std::size_t i = _next_segment; i < write_segments.size(); ++i) {
+      bytes += write_segments[i].size();
+    }
     return bytes;
   }
 
   [[nodiscard]] prepared_io_slice& front() noexcept
   {
-    assert(!empty());
+    assert(_next < slices.size());
     return slices[_next];
   }
 
   [[nodiscard]] prepared_io_slice take_front() noexcept
   {
-    assert(!empty());
+    assert(_next < slices.size());
     return std::move(slices[_next++]);
   }
 
+  [[nodiscard]] write_segment& front_write_segment() noexcept
+  {
+    assert(_next_segment < write_segments.size());
+    return write_segments[_next_segment];
+  }
+
+  [[nodiscard]] write_segment take_front_write_segment() noexcept
+  {
+    assert(_next_segment < write_segments.size());
+    return write_segments[_next_segment++];
+  }
+
+  /// Whether the control operation of a flush / commit request is still untaken.
+  [[nodiscard]] bool control_pending() const noexcept { return _control_pending; }
+
+  /// Take the control operation (its credit now belongs to the caller).
+  void take_control() noexcept
+  {
+    assert(_control_pending);
+    _control_pending = false;
+  }
+
+  /// Settle every untaken slice / segment / control credit with @p error.
   void cancel_remaining(grouped_coordinator::error_type const& error) noexcept
   {
-    while (!empty()) {
+    while (_next < slices.size()) {
       auto slice = take_front();
       if (slice.on_complete != nullptr) { (*slice.on_complete)(slice.h_buffer.fragments(), false); }
+      coordinator->report_error(error);
+    }
+    while (_next_segment < write_segments.size()) {
+      ++_next_segment;
+      coordinator->report_error(error);
+    }
+    if (_control_pending) {
+      _control_pending = false;
       coordinator->report_error(error);
     }
   }
 
   std::shared_ptr<const io_object> obj;
-  std::vector<prepared_io_slice> slices;
+  std::vector<prepared_io_slice> slices;  ///< io_kind::read only
   std::shared_ptr<grouped_coordinator> coordinator;
+  request_meta meta;                          ///< scheduling / observability metadata
+  std::vector<write_segment> write_segments;  ///< io_kind::write only
+  write_options wopts{};                      ///< io_kind::write / flush / commit
 
  private:
   grouped_io_request(std::shared_ptr<const io_object> object,
-                     std::vector<prepared_io_slice> request_slices,
-                     std::shared_ptr<grouped_coordinator> group)
-    : obj(std::move(object)), slices(std::move(request_slices)), coordinator(std::move(group))
+                     std::shared_ptr<grouped_coordinator> group,
+                     request_class cls,
+                     io_kind kind)
+    : obj(std::move(object)), coordinator(std::move(group)), meta(cls, kind)
   {
   }
 
+  static void check_args(std::shared_ptr<const io_object> const& object,
+                         std::shared_ptr<grouped_coordinator> const& coordinator)
+  {
+    if (object == nullptr || coordinator == nullptr) {
+      throw std::invalid_argument("grouped_io_request requires an object and coordinator");
+    }
+  }
+
   std::size_t _next{0};
+  std::size_t _next_segment{0};
+  bool _control_pending{false};
 };
 
 struct device_cpy_request {

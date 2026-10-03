@@ -26,6 +26,7 @@
 #include <kvikio/file_handle.hpp>
 #include <kvikio/remote_handle.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -70,17 +71,28 @@ class kvikio_object : public io_object {
  * forward straight to it.  kvikIO picks GDS or a POSIX/compat path per call
  * based on the pointer type and its own compatibility mode, so this backend
  * serves both host and device destinations from the same handle.
+ *
+ * Objects opened through @c ioctx::open_io_object_for_write are *writable*:
+ * their handle is read-write, @ref size reports the live high-water mark
+ * (the larger of the size at open and the end of every completed write), and
+ * they accept writes until @ref mark_committed is called.  Objects opened for
+ * reading are never writable; their size is frozen at open.
  */
 class kvikio_io_object final : public kvikio_object {
  public:
-  kvikio_io_object(std::string path, kvikio::FileHandle handle, size_t file_size)
-    : _path(std::move(path)), _handle(std::move(handle)), _file_size(file_size)
+  /// @param writable Whether the handle was opened read-write through the
+  ///                 write API (see @ref is_writable).
+  kvikio_io_object(std::string path,
+                   kvikio::FileHandle handle,
+                   size_t file_size,
+                   bool writable = false)
+    : _path(std::move(path)), _handle(std::move(handle)), _size(file_size), _writable(writable)
   {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept final { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept final { return _path; }
-  [[nodiscard]] size_t size() const noexcept final { return _file_size; }
+  [[nodiscard]] size_t size() const noexcept final { return _size.load(std::memory_order_acquire); }
 
   /// Mutable: kvikIO's read entry points are non-const, and the reads issued
   /// through them do not mutate observable file state.
@@ -88,10 +100,34 @@ class kvikio_io_object final : public kvikio_object {
 
   [[nodiscard]] std::size_t read_at(void* dst, std::size_t size, std::size_t offset) const final;
 
+  /// True while the object accepts writes: opened for writing and not yet
+  /// committed.
+  [[nodiscard]] bool is_writable() const noexcept
+  {
+    return _writable.load(std::memory_order_acquire);
+  }
+
+  /// Raise the reported size to at least @p end (a completed write's end
+  /// offset).  Thread-safe.
+  void note_written(std::size_t end) const noexcept
+  {
+    auto current = _size.load(std::memory_order_relaxed);
+    while (current < end && !_size.compare_exchange_weak(
+                              current, end, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    }
+  }
+
+  /// Flip the object to read-only.  @return Whether it was writable before.
+  [[nodiscard]] bool mark_committed() const noexcept
+  {
+    return _writable.exchange(false, std::memory_order_acq_rel);
+  }
+
  private:
   std::string _path;
   mutable kvikio::FileHandle _handle;
-  size_t _file_size{0};
+  mutable std::atomic<std::size_t> _size{0};
+  mutable std::atomic<bool> _writable{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -158,6 +194,18 @@ class kvikio_remote_io_object final : public kvikio_object {
  *     where the platform allows).
  *   - @c supports_vector_host_read: false — no batched dispatch path.
  *   - @c supports_host_to_device_read: false — no bounce-staging path.
+ *   - @c supports_write / @c supports_device_write: true for local files.
+ *
+ * Writes (local files only; @c s3:// is @c std::errc::not_supported) are
+ * eager, like the reads: every write hook runs to completion on the calling
+ * thread (fanning large transfers out over kvikIO's thread pool) and returns
+ * an already-resolved future.  A resolved write means kvikIO's pwrite()
+ * returned for every segment, i.e. the kernel (page cache, or the device for
+ * O_DIRECT / GDS paths, which kvikIO selects internally) accepted the bytes;
+ * @c write_durability::data_sync additionally fdatasync()s the file.  Device
+ * sources are ordered after prior work on their stream by synchronizing that
+ * stream before the transfer.  No padding is ever written: the file grows to
+ * exactly the end of the furthest write.
  */
 class kvikio_context final : public ioctx {
  public:
@@ -195,6 +243,8 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_write() const noexcept override { return true; }
+  [[nodiscard]] bool supports_device_write() const noexcept override { return true; }
 
   /// Always false: kvikIO is a local-file path, and its whole point is streaming
   /// straight to device per read rather than assembling a batch first.
@@ -217,8 +267,10 @@ class kvikio_context final : public ioctx {
   /// KvikIO has no reactor queue, so it consumes prepared slices eagerly.
   /// This is the backend's only asynchronous hook; the base scalar/vector
   /// wrappers all forward here.
-  exec::semi_future<size_t> mixed_readv_async_io(
-    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept final;
+  /// @p opts is ignored: reads execute eagerly on the calling thread.
+  exec::semi_future<size_t> mixed_readv_async_io(const io_object& obj,
+                                                 std::vector<prepared_io_slice>&& slices,
+                                                 io_options opts = {}) noexcept final;
 
   /// The config this context was built with (default-constructed when none was
   /// supplied).  Only @c compat_mode is still consulted after construction; the
@@ -236,6 +288,45 @@ class kvikio_context final : public ioctx {
   /// @c config().compat_mode when set.  Throws when the object cannot be
   /// opened.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
+
+  // -- Write hooks (eager; local files only) --------------------------------
+
+  /// Open (creating / truncating per @p opts.mode) the local file @p path
+  /// read-write.  The file is opened with POSIX semantics first
+  /// (@c O_RDWR plus @c O_CREAT / @c O_TRUNC), @p opts.size_hint is applied
+  /// as a best-effort @c fallocate(FALLOC_FL_KEEP_SIZE), and the kvikIO handle
+  /// is then opened @c "r+" (honouring @c config().compat_mode).
+  /// @throws std::system_error @c not_supported for @c s3:// URIs; the
+  ///         @c open(2) errno otherwise (e.g. @c ENOENT for
+  ///         @c write_mode::open_existing on a missing file).
+  [[nodiscard]] std::shared_ptr<io_object> create_io_object_for_write(
+    std::string path, write_open_options opts) override;
+
+  /// Blocking kvikIO pwrite from host memory.
+  /// @throws std::invalid_argument if @p obj is not a writable object of this
+  ///         backend; @c std::system_error on I/O failure / short write.
+  std::size_t host_write_io(const io_object& obj,
+                            std::size_t offset,
+                            std::size_t size,
+                            const std::uint8_t* src,
+                            write_options opts) override;
+
+  /// Eager vectored write: syncs each distinct device-source stream, issues
+  /// every segment's kvikIO pwrite concurrently, waits for all of them (so no
+  /// transfer outlives the call even on error), then applies @p opts.durability.
+  [[nodiscard]] exec::semi_future<std::size_t> mixed_writev_async_io(
+    const io_object& obj,
+    std::vector<write_segment>&& segments,
+    write_options opts) noexcept override;
+
+  /// fdatasync() of a local file; resolved eagerly.
+  [[nodiscard]] exec::semi_future<void> flush_async_io(const io_object& obj) noexcept override;
+
+  /// Optional fdatasync(), then flip the object read-only; resolved eagerly.
+  /// Fails with @c std::invalid_argument if @p obj is not (or no longer)
+  /// writable.
+  [[nodiscard]] exec::semi_future<void> commit_async_io(
+    const io_object& obj, write_durability durability) noexcept override;
 
  private:
   kvikio_config _config;

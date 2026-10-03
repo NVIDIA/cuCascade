@@ -46,9 +46,25 @@ struct object_ref {
 /// HTTP method (a presigned-GET URL != a presigned-HEAD URL; a signed header
 /// also covers the method) — passing the wrong method to the underlying HTTP
 /// client results in a signature-mismatch error from the store.
-/// cuCascade needs only read-only operations; PUT / DELETE etc. are
-/// intentionally absent.
-enum class request_method : std::uint8_t { GET, HEAD };
+///
+/// @c authorize() is only ever called with the read methods (@c GET / @c HEAD);
+/// the write / control methods (@c PUT, @c POST, @c DELETE_) are authorized via
+/// @c request_authorizer::authorize_request(). @c DELETE_ carries a trailing
+/// underscore because @c DELETE is a macro on some platforms.
+enum class request_method : std::uint8_t { GET, HEAD, PUT, POST, DELETE_ };
+
+/// HTTP verb for @p method (@c "GET", @c "HEAD", @c "PUT", @c "POST", @c "DELETE").
+[[nodiscard]] constexpr std::string_view to_string(request_method method) noexcept
+{
+  switch (method) {
+    case request_method::GET: return "GET";
+    case request_method::HEAD: return "HEAD";
+    case request_method::PUT: return "PUT";
+    case request_method::POST: return "POST";
+    case request_method::DELETE_: return "DELETE";
+  }
+  return "GET";  // unreachable; all enumerators handled
+}
 
 /// Result of authorizing one request: the URL to fetch plus headers to attach
 /// verbatim. Query-authorized schemes (S3 presigned URLs, Azure SAS, GCS
@@ -58,6 +74,39 @@ enum class request_method : std::uint8_t { GET, HEAD };
 struct authorized_request {
   std::string url;
   std::vector<std::pair<std::string, std::string>> headers;
+};
+
+/// Payload-hash marker for requests whose body is not covered by the signature
+/// (SigV4 @c UNSIGNED-PAYLOAD). Over plain HTTP, AWS S3 rejects unsigned
+/// payloads for header-signed requests; MinIO / Ceph accept them.
+inline constexpr std::string_view unsigned_payload = "UNSIGNED-PAYLOAD";
+
+/**
+ * @brief Description of one object-level request of any method, for
+ *        @c request_authorizer::authorize_request().
+ *
+ * Covers the write / control-plane requests (S3 PutObject, the multipart-upload
+ * family) as well as plain GET / HEAD.
+ */
+struct request_spec {
+  request_method method{request_method::GET};  ///< HTTP method the request is sent with
+  object_ref object;                           ///< bucket + raw (unencoded) key
+  /// Request query, already percent-encoded and `&`-joined, WITHOUT auth params,
+  /// e.g. @c "uploads=" or @c "partNumber=3&uploadId=abc". Empty for none.
+  /// Implementations canonicalize it (a bare subresource @c "uploads" becomes
+  /// @c "uploads=", pairs are sorted by key then value) and use the canonical
+  /// form both for signing and in the returned URL. Must not contain an
+  /// @c X-Amz-* key.
+  std::string canonical_query;
+  /// Hex SHA-256 of the request body, or @c unsigned_payload. Used by
+  /// header-signing implementations; query-signing implementations always sign
+  /// with @c UNSIGNED-PAYLOAD and ignore it.
+  std::string payload_sha256_hex{unsigned_payload};
+  /// Extra request headers (e.g. @c Content-Type, @c Content-MD5). Header-signing
+  /// implementations sign them; query-signing implementations return them
+  /// unsigned. Either way they are part of @c authorized_request::headers, so
+  /// the caller attaches them verbatim and must not send them a second time.
+  std::vector<std::pair<std::string, std::string>> extra_headers;
 };
 
 /**
@@ -149,6 +198,35 @@ class request_authorizer {
   {
     throw cucascade::io::credential_error(
       "request_authorizer: ListObjectsV2 is not supported by this authorizer");
+  }
+
+  /**
+   * @brief Authorize an arbitrary object-level request (any method, optional
+   *        subresource query, optional payload hash / extra headers).
+   *
+   * Used by the write path: S3 PutObject (@c PUT, empty query),
+   * CreateMultipartUpload (@c POST, @c "uploads="), UploadPart (@c PUT,
+   * @c "partNumber=N&uploadId=ID"), CompleteMultipartUpload (@c POST,
+   * @c "uploadId=ID") and AbortMultipartUpload (@c DELETE_, @c "uploadId=ID").
+   * The returned URL carries the (canonicalized) request query; query-signing
+   * implementations add their auth params to it, header-signing implementations
+   * return auth in @c authorized_request::headers.
+   *
+   * @param spec     Method, object, query, payload hash and extra headers.
+   * @param timeout  Per-call URL lifetime (presigned expiry); non-positive means
+   *                 "implementation default". Ignored by header signing.
+   *
+   * Default: throws — writes are opt-in, so a pluggable read-only authorizer
+   * need not implement it.
+   *
+   * @throw cucascade::io::credential_error when unsupported, on an invalid spec
+   *        (empty bucket / key, @c X-Amz-* query key), or on signing failure.
+   */
+  [[nodiscard]] virtual authorized_request authorize_request(request_spec const& /*spec*/,
+                                                             std::chrono::seconds /*timeout*/)
+  {
+    throw cucascade::io::credential_error(
+      "request_authorizer: authorize_request is not supported by this authorizer");
   }
 };
 

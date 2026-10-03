@@ -37,34 +37,41 @@
 
 namespace cucascade::io::rest {
 
-rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
-  : templated_ioctx<rest_reactor>(n_reactors,
-                                  [ctx = std::move(ctx), i = 0]() mutable {
-                                    return std::make_unique<rest_reactor>(
-                                      ctx, "rest-" + std::to_string(i++));
-                                  }),
+rest_ioctx::rest_ioctx(std::size_t n_runner_threads,
+                       std::shared_ptr<rest_reactor::reactor_context> ctx)
+  : templated_ioctx<rest_reactor>(n_runner_threads,
+                                  std::make_unique<rest_reactor>(std::move(ctx), "rest")),
     _lister(
       [this](std::string_view bucket, std::string_view prefix, std::string_view canonical_query) {
-        if (_reactors.empty()) {
-          throw std::runtime_error("rest_ioctx::list_objects: no reactors");
-        }
-        return _reactors.front()->list_page(bucket, prefix, canonical_query);
+        return reactor().list_page(bucket, prefix, canonical_query);
       },
-      _reactors.empty() ? s3::default_max_scanned_objects
-                        : _reactors.front()->get_config().list_max_scanned,
-      _reactors.empty() ? s3::default_max_list_objects
-                        : _reactors.front()->get_config().list_max_matches,
+      reactor().get_config().list_max_scanned,
+      reactor().get_config().list_max_matches,
       "rest_ioctx::list_objects")
 {
   // Created once here and never reassigned: payload leases capture it by
   // shared_ptr (so they may outlive this ioctx) and the stash gauges read it
   // without the coordination mutex.
   if (std::size_t const inflight = footer_resolve_inflight_cap(); inflight > 0) {
-    auto const& cfg   = _reactors.front()->get_config();
+    auto const& cfg   = reactor().get_config();
     std::size_t bytes = cfg.footer_resolve_stash_budget;
     if (bytes == config::footer_resolve_auto) { bytes = 2 * inflight * cfg.footer_probe_bytes; }
     _footer_budget = std::make_shared<exec::admission_control>(std::max<std::size_t>(bytes, 1));
   }
+}
+
+rest_ioctx::~rest_ioctx()
+{
+  // The base destructor would only reach templated_ioctx::shutdown; run the
+  // REST override (upload abort sweep) while this object is still complete.
+  this->pre_destroy();
+  shutdown();
+}
+
+void rest_ioctx::shutdown() noexcept
+{
+  templated_ioctx<rest_reactor>::shutdown();
+  reactor().abort_live_uploads();
 }
 
 std::size_t rest_ioctx::footer_stash_reserved_bytes() const noexcept
@@ -79,10 +86,9 @@ std::size_t rest_ioctx::footer_stash_reserved_peak_bytes() const noexcept
 
 std::size_t rest_ioctx::footer_resolve_inflight_cap() const
 {
-  if (_reactors.empty()) { return 0; }
-  auto const& cfg = _reactors.front()->get_config();
+  auto const& cfg = reactor().get_config();
   if (cfg.footer_resolve_max_inflight == config::footer_resolve_auto) {
-    return std::max<std::size_t>(1, _reactors.size() * cfg.max_connections);
+    return std::max<std::size_t>(1, n_runner_threads()) * cfg.max_connections;
   }
   return cfg.footer_resolve_max_inflight;
 }
@@ -94,15 +100,12 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
   if (paths.empty()) {
     throw std::invalid_argument("rest_ioctx::resolve_footer_objects: empty batch");
   }
-  if (_reactors.empty()) {
-    throw std::runtime_error("rest_ioctx::resolve_footer_objects: no reactors");
-  }
   std::size_t const max_inflight = footer_resolve_inflight_cap();
   if (max_inflight == 0 || !_footer_budget) {
     throw std::invalid_argument(
       "rest_ioctx::resolve_footer_objects: disabled (footer_resolve_max_inflight == 0)");
   }
-  if (_footer_budget->budget() < _reactors.front()->get_config().footer_probe_bytes) {
+  if (_footer_budget->budget() < reactor().get_config().footer_probe_bytes) {
     // A budget below one probe window cannot admit any entry without
     // over-committing past the cap, so it cannot be honored as a hard cap.
     throw std::invalid_argument(
@@ -223,7 +226,7 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
 
   if (valid_indices.empty()) { return; }
 
-  _reactors.front()->resolve_footer_batch(
+  reactor().resolve_footer_batch(
     valid_paths, valid_objects, valid_indices, max_inflight, _footer_budget, on_result, stop);
 }
 
@@ -234,7 +237,6 @@ void rest_ioctx::list_objects_paged(
   std::function<bool(s3::list_objects_v2_page const&)> const& sink,
   std::optional<std::size_t> max_scanned)
 {
-  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::list_objects: no reactors"); }
   _lister.list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
 }
 
@@ -255,12 +257,11 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
     throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
                                 parsed.scheme + "'");
   }
-  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
   // A blocking HEAD on the caller thread (a one-time metadata round-trip) via
-  // any reactor's authorizer — head_object uses a local easy handle and
-  // does not touch worker state, so any reactor is equivalent.
-  auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+  // the reactor's authorizer — head_object uses a local easy handle and does
+  // not touch any runner's state.
+  auto head = reactor().head_object(parsed.host, parsed.path);
   return std::make_shared<rest_io_object>(std::move(path),
                                           std::move(parsed.host),
                                           std::move(parsed.path),
@@ -340,9 +341,9 @@ void rest_ioctx::warmup(std::string_view bucket_url) noexcept
       _warmed_at     = now;
     }
 
-    for (auto& reactor : _reactors) {
-      if (reactor) { reactor->warmup(*bucket); }
-    }
+    // Recorded once on the shared reactor; every runner's engine primes its
+    // own (thread-confined) connection pool on its next pass.
+    reactor().warmup(*bucket);
   } catch (...) {  // NOLINT(bugprone-empty-catch)
     // Warming is an optimization; a query that would have run without it still
     // runs. Nothing here is worth failing a read over.
@@ -356,16 +357,15 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
     throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
                                 parsed.scheme + "'");
   }
-  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
   // One suffix-range GET resolves the size and stashes the footer; cuDF's
   // trailer/footer reads are then served from the stash by host_read.
-  footer_probe probe = _reactors.front()->fetch_footer_suffix(
-    parsed.host, parsed.path, _reactors.front()->get_config().footer_probe_bytes);
+  footer_probe probe = reactor().fetch_footer_suffix(
+    parsed.host, parsed.path, reactor().get_config().footer_probe_bytes);
   if (!probe.bytes) {
     // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
     // fall back to a plain HEAD for the size, with no stash.
-    auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+    auto head = reactor().head_object(parsed.host, parsed.path);
     return std::make_shared<rest_io_object>(std::move(path),
                                             std::move(parsed.host),
                                             std::move(parsed.path),
