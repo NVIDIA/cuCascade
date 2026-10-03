@@ -224,6 +224,68 @@ class prefetching_handle {
   prefetch_request _req;
 };
 
+class prefetching_cache;
+
+/// Test-only access to @ref prefetching_cache internals (populating chunks
+/// without the cudf @c datasource).  Defined by the tests, never by the library.
+struct prefetching_cache_test_access;
+
+// ---------------------------------------------------------------------------
+// write_invalidation_gate
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Lifetime-safe route from an asynchronous write completion to the
+ *        prefetching cache it must invalidate.
+ *
+ * A write's second invalidation pass runs on whichever runner thread completes
+ * the write -- possibly after the owning ioctx has torn the cache down
+ * (@c ioctx::shutdown_cache runs before the backend drains its in-flight
+ * writes).  Such a completion must therefore not reach the cache through the
+ * ioctx.  It holds a @c std::shared_ptr to this gate instead: the gate outlives
+ * the cache, and @c ~prefetching_cache @ref close "closes" it first thing,
+ * waiting out any invalidation already inside.  Afterwards every call is a
+ * no-op that never touches the (destroyed) cache -- there is nothing left to
+ * invalidate.
+ *
+ * Entering and leaving cost one atomic RMW each; there is no lock.
+ */
+class write_invalidation_gate {
+ public:
+  explicit write_invalidation_gate(prefetching_cache& cache) noexcept : _cache(&cache) {}
+
+  write_invalidation_gate(write_invalidation_gate const&)            = delete;
+  write_invalidation_gate& operator=(write_invalidation_gate const&) = delete;
+
+  /**
+   * @brief Invalidate [@p offset, @p offset + @p size) of @p obj if the cache
+   *        is still alive.
+   *
+   * @return false when the gate is closed (the cache is gone or going), in
+   *         which case nothing was touched.
+   */
+  bool invalidate_range(const io_object& obj, std::size_t offset, std::size_t size) noexcept;
+
+  /// True until @ref close was called.
+  [[nodiscard]] bool is_open() const noexcept
+  {
+    return (_state.load(std::memory_order_acquire) & CLOSED_BIT) == 0;
+  }
+
+  /// Refuse new entries and block until every invalidation already inside has
+  /// left.  Idempotent.  Must not be called from inside @ref invalidate_range.
+  void close() noexcept;
+
+ private:
+  void leave() noexcept;
+
+  static constexpr std::uint64_t CLOSED_BIT = 1ULL << 63;
+
+  /// CLOSED_BIT | number of callers currently inside.
+  std::atomic<std::uint64_t> _state{0};
+  prefetching_cache* const _cache;
+};
+
 // ---------------------------------------------------------------------------
 // prefetching_cache
 // ---------------------------------------------------------------------------
@@ -241,6 +303,7 @@ class prefetching_cache {
   // fadvise dispatch through it.
   friend class cucascade::io::datasource;
   friend class prefetching_handle;
+  friend struct prefetching_cache_test_access;
 
  public:
   using byte_range = cucascade::io::byte_range;
@@ -336,6 +399,40 @@ class prefetching_cache {
   /// request has been processed. This acknowledges an eviction pass, not that
   /// the requested number of bytes could necessarily be reclaimed.
   void evict_sync(std::size_t bytes_to_free);
+
+  /**
+   * @brief Make sure no read served by this cache after the call returns sees
+   *        bytes of [@p offset, @p offset + @p size) of @p obj that were
+   *        cached (or were being loaded) before the call.
+   *
+   * Called by the ioctx write wrappers twice per write: before the write is
+   * submitted and again once it completed (see @c ioctx::writev_async).  Per
+   * overlapping chunk (@ref chunk_state::invalidate): a `cached` chunk is
+   * unpublished at once (it keeps its buffer and reloads on the next read); a
+   * pinned or loading chunk is marked STALE, so no new reader can pin it and
+   * an in-flight prefetch / demand load landing later is not published.
+   * Readers that pinned a chunk before the call keep reading the old bytes --
+   * their reads raced the write, whose ordering against reads is undefined.
+   *
+   * Chunks are keyed by @c io_object::raw_file_cache_id, so a write through
+   * any io_object of the same file invalidates.  Bytes past the file size the
+   * cache recorded when it first saw the file have no chunk and need nothing.
+   *
+   * Lock-free on chunk state; takes @c _map_mtx and the file entry's mutex
+   * shared.  Safe to call concurrently with every read, prefetch and the
+   * evictor, but not concurrently with the cache's destruction -- asynchronous
+   * callers go through @ref write_invalidation_gate.
+   *
+   * @return number of chunks that were unpublished or marked stale.
+   */
+  std::size_t invalidate_range(const io_object& obj, std::size_t offset, std::size_t size) noexcept;
+
+  /// The gate asynchronous write completions invalidate through (see
+  /// @ref write_invalidation_gate).  Closed by the destructor.
+  [[nodiscard]] std::shared_ptr<write_invalidation_gate> invalidation_gate() const noexcept
+  {
+    return _invalidation_gate;
+  }
 
   [[nodiscard]] std::string summary() const;
 
@@ -469,6 +566,8 @@ class prefetching_cache {
   file_entry& get_or_create_file_entry(const io_object& obj);
 
   const config _cfg;
+  /// Closed first thing in the destructor; see @ref write_invalidation_gate.
+  std::shared_ptr<write_invalidation_gate> const _invalidation_gate;
   std::unique_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;
 

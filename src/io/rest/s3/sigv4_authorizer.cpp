@@ -24,7 +24,9 @@
 #include <cctype>
 #include <ctime>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io::rest::s3 {
 
@@ -98,13 +100,17 @@ sigv4_signer_config make_signer(static_credentials const& creds, std::string con
   return signer;
 }
 
-std::string_view method_to_str(request_method method)
+std::string_view method_to_str(request_method method) { return to_string(method); }
+
+/// True when @p key starts with @c "x-amz-" (case-insensitive).
+bool is_amz_key(std::string_view key) noexcept
 {
-  switch (method) {
-    case request_method::GET: return "GET";
-    case request_method::HEAD: return "HEAD";
+  constexpr std::string_view k_amz = "x-amz-";
+  if (key.size() < k_amz.size()) { return false; }
+  for (std::size_t i = 0; i < k_amz.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(key[i])) != k_amz[i]) { return false; }
   }
-  return "GET";  // unreachable; all enumerators handled
+  return true;
 }
 
 // Reject X-Amz-* parameters case-insensitively to prevent signing-parameter
@@ -113,32 +119,71 @@ std::string_view method_to_str(request_method method)
 // overriding the authorizer's own signing parameters.
 void reject_amz_query_params(std::string_view canonical_query)
 {
-  constexpr std::string_view k_amz = "x-amz-";
   for (std::size_t b = 0; b < canonical_query.size();) {
     auto const amp     = canonical_query.find('&', b);
     auto const len     = (amp == std::string::npos ? canonical_query.size() : amp) - b;
     auto const key_end = std::min(std::string_view{canonical_query}.substr(b, len).find('='), len);
     auto const key     = std::string_view{canonical_query}.substr(b, key_end);
-    if (key.size() >= k_amz.size()) {
-      bool amz = true;
-      for (std::size_t i = 0; i < k_amz.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(key[i])) != k_amz[i]) {
-          amz = false;
-          break;
-        }
-      }
-      if (amz) {
-        throw credential_error(
-          "sigv4_authorizer: X-Amz-* keys are not allowed in a LIST canonical query (got '" +
-          std::string{key} + "')");
-      }
+    if (is_amz_key(key)) {
+      throw credential_error(
+        "sigv4_authorizer: X-Amz-* keys are not allowed in a LIST canonical query (got '" +
+        std::string{key} + "')");
     }
     if (amp == std::string::npos) { break; }
     b = amp + 1;
   }
 }
 
+/// Fold a query-presign / header-sign failure into credential_error.
+[[noreturn]] void rethrow_as_credential_error(std::string_view who)
+{
+  try {
+    throw;
+  } catch (credential_error const&) {
+    throw;
+  } catch (std::exception const& e) {
+    throw credential_error(std::string{who} + ": " + e.what());
+  }
+}
+
 }  // namespace
+
+std::string canonicalize_query(std::string_view query)
+{
+  std::vector<std::pair<std::string_view, std::string_view>> pairs;
+  for (std::size_t b = 0; b <= query.size();) {
+    auto const amp = query.find('&', b);
+    auto const pair =
+      query.substr(b, amp == std::string_view::npos ? std::string_view::npos : amp - b);
+    if (!pair.empty()) {
+      auto const eq  = pair.find('=');
+      auto const key = pair.substr(0, eq);
+      auto const val = eq == std::string_view::npos ? std::string_view{} : pair.substr(eq + 1);
+      if (key.empty()) {
+        throw credential_error("sigv4_authorizer: empty key in request query '" +
+                               std::string{query} + "'");
+      }
+      if (is_amz_key(key)) {
+        throw credential_error(
+          "sigv4_authorizer: X-Amz-* keys are not allowed in a request query (got '" +
+          std::string{key} + "')");
+      }
+      pairs.emplace_back(key, val);
+    }
+    if (amp == std::string_view::npos) { break; }
+    b = amp + 1;
+  }
+  // SigV4: sort by key, then by value (only relevant for repeated keys).
+  std::sort(pairs.begin(), pairs.end());
+  std::string out;
+  for (auto const& [key, val] : pairs) {
+    if (!out.empty()) { out += '&'; }
+    out += key;
+    out += '=';
+    out += val;
+  }
+  return out;
+}
 
 sigv4_authorizer_base::sigv4_authorizer_base(static_credentials creds,
                                              std::string region,
@@ -291,6 +336,65 @@ authorized_request sigv4_header_authorizer::authorize_list(std::string_view buck
     throw;
   } catch (std::exception const& e) {
     throw credential_error(std::string("sigv4_header_authorizer: ") + e.what());
+  }
+}
+
+authorized_request sigv4_presigned_authorizer::authorize_request(request_spec const& spec,
+                                                                 std::chrono::seconds timeout)
+{
+  auto const canonical_uri = make_canonical_uri(spec.object);
+  auto const query         = canonicalize_query(spec.canonical_query);
+  auto const signer        = make_signer(_creds, _region);
+  auto const effective_ttl = timeout.count() > 0 ? timeout : _ttl;
+
+  try {
+    // presign_url merges the request params into the signed X-Amz-* query and
+    // always signs UNSIGNED-PAYLOAD with SignedHeaders=host, so the payload hash
+    // is irrelevant here and the extra headers ride along unsigned.
+    return authorized_request{presign_url(method_to_str(spec.method),
+                                          _scheme,
+                                          _host,
+                                          canonical_uri,
+                                          signer,
+                                          std::time(nullptr),
+                                          effective_ttl,
+                                          query),
+                              spec.extra_headers};
+  } catch (...) {
+    rethrow_as_credential_error("sigv4_presigned_authorizer");
+  }
+}
+
+authorized_request sigv4_header_authorizer::authorize_request(request_spec const& spec,
+                                                              std::chrono::seconds /*timeout*/)
+{
+  auto const canonical_uri = make_canonical_uri(spec.object);
+  auto const query         = canonicalize_query(spec.canonical_query);
+  auto const signer        = make_signer(_creds, _region);
+  if (spec.payload_sha256_hex.empty()) {
+    throw credential_error(
+      "sigv4_header_authorizer: empty payload hash (use sha256_hex(body) or UNSIGNED-PAYLOAD)");
+  }
+
+  try {
+    // The canonical query is signed verbatim and sent verbatim in the URL, so
+    // both sides agree byte for byte.
+    auto signed_req = sign_request(method_to_str(spec.method),
+                                   _host,
+                                   canonical_uri,
+                                   query,
+                                   spec.payload_sha256_hex,
+                                   spec.extra_headers,
+                                   signer,
+                                   std::time(nullptr));
+    std::string url = _scheme + "://" + _host + canonical_uri;
+    if (!query.empty()) {
+      url += '?';
+      url += query;
+    }
+    return authorized_request{std::move(url), std::move(signed_req.headers)};
+  } catch (...) {
+    rethrow_as_credential_error("sigv4_header_authorizer");
   }
 }
 

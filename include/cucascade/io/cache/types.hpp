@@ -270,7 +270,9 @@ struct chunk_fill {
 //   bit  [30]     fill_side    1b   0 = prefix from chunk start, 1 = suffix to chunk end
 //   bit  [31]     fill_full    1b   whole chunk populated (overrides the two above)
 //   bits [47:32]  subscribers 16b   live prefetch requests naming this chunk
-//   bits [63:48]  spare
+//   bit  [48]     stale        1b   a write overlapped the chunk while it was
+//                                   loading / pinned (see @ref chunk_state::invalidate)
+//   bits [63:49]  spare
 //
 // Packing buys three things beyond size.  (1) Every transition is one CAS, so
 // there is no TOCTOU window between reading the state and mutating the pins or
@@ -303,6 +305,19 @@ struct chunk_fill {
 // The subscriber count is orthogonal to the state machine: it is incremented
 // when a request names the chunk and decremented when that request is retired,
 // and it survives every state transition including `mark_empty()`.
+//
+// Write invalidation (@ref chunk_state::invalidate) adds three edges and the
+// STALE flag.  STALE is only ever set on `loading` / `in_use` and is cleared by
+// every transition out of them; a STALE chunk is never readable:
+//
+//   cached           ──invalidate()─────►  allocated     (bytes dropped, buffer kept)
+//   loading|in_use   ──invalidate()─────►  same state + STALE
+//   loading+STALE    ──mark_cached()────►  allocated     (returns false: not published)
+//   in_use+STALE     ──release_read()───►  allocated     (when pin → 0)
+//
+// `allocated` keeps the buffer and the recorded extent (exactly as after
+// mark_load_failed), so the chunk stays evictable and the next reader simply
+// reloads it from the backend.
 
 class chunk_state {
  public:
@@ -354,6 +369,9 @@ class chunk_state {
       return static_cast<std::uint32_t>((_w & SUB_MASK) >> SUB_SHIFT);
     }
     [[nodiscard]] constexpr chunk_fill fill() const noexcept { return decode(_w); }
+    /// A write invalidated the chunk while it was loading or pinned; its bytes
+    /// will not be (re)published.
+    [[nodiscard]] constexpr bool is_stale() const noexcept { return (_w & STALE_BIT) != 0; }
 
     /// The chunk owns a staging buffer and no reader is holding it — i.e. it is
     /// a candidate for @ref mark_evicting.  Says nothing about subscribers; the
@@ -386,13 +404,34 @@ class chunk_state {
 
   /// loading → cached.  Publishes the loader's writes to subsequent readers:
   /// this is the release half of the pair @ref acquire_read completes.
-  [[nodiscard]] bool mark_cached() noexcept { return transition(loading, cached); }
+  ///
+  /// A load a write invalidated while in flight (STALE) is NOT published: the
+  /// chunk reverts to `allocated` exactly as @ref mark_load_failed would, and
+  /// this returns false.  Callers therefore treat false like a failed load —
+  /// nothing became readable — which every caller already does by ignoring it.
+  [[nodiscard]] bool mark_cached() noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      if ((cur & (STATE_MASK | PIN_MASK)) != static_cast<std::uint64_t>(loading)) { return false; }
+      bool const stale = (cur & STALE_BIT) != 0;
+      std::uint64_t const next =
+        (cur & ~(STATE_MASK | STALE_BIT)) | static_cast<std::uint64_t>(stale ? allocated : cached);
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return !stale;
+      }
+    }
+  }
 
   /// loading → allocated (IO-failure revert).  The buffer stays attached so a
   /// later reader can retry the load without a fresh queue/allocate roundtrip.
   /// The recorded extent is left alone: `allocated` is not readable, and the
   /// next loader re-derives its fill span from whatever the extent then holds.
-  [[nodiscard]] bool mark_load_failed() noexcept { return transition(loading, allocated); }
+  [[nodiscard]] bool mark_load_failed() noexcept
+  {
+    return transition(loading, allocated, STALE_BIT);
+  }
 
   /// allocated → loading, handing back the extent the loader must populate.
   /// Reading the extent out of the claiming CAS (rather than with a second,
@@ -404,7 +443,8 @@ class chunk_state {
       if ((cur & (STATE_MASK | PIN_MASK)) != static_cast<std::uint64_t>(allocated)) {
         return false;
       }
-      std::uint64_t const next = (cur & ~STATE_MASK) | static_cast<std::uint64_t>(loading);
+      std::uint64_t const next =
+        (cur & ~(STATE_MASK | STALE_BIT)) | static_cast<std::uint64_t>(loading);
       if (_w.compare_exchange_weak(
             cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
         out = decode(cur);
@@ -424,9 +464,9 @@ class chunk_state {
       if ((cur & (STATE_MASK | PIN_MASK)) != static_cast<std::uint64_t>(allocated)) {
         return false;
       }
-      chunk_fill const merged = merge(decode(cur), want);
-      std::uint64_t const next =
-        (cur & ~(STATE_MASK | FILL_MASK)) | static_cast<std::uint64_t>(loading) | encode(merged);
+      chunk_fill const merged  = merge(decode(cur), want);
+      std::uint64_t const next = (cur & ~(STATE_MASK | FILL_MASK | STALE_BIT)) |
+                                 static_cast<std::uint64_t>(loading) | encode(merged);
       if (_w.compare_exchange_weak(
             cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
         out = merged;
@@ -489,7 +529,9 @@ class chunk_state {
     }
   }
 
-  /// Decrement the pin count, returning to `cached` at zero.
+  /// Decrement the pin count, returning to `cached` at zero — or to
+  /// `allocated` (buffer kept, bytes unpublished, STALE cleared) when a write
+  /// invalidated the chunk while it was pinned.
   /// Returns true if this was the last reader.
   bool release_read() noexcept
   {
@@ -498,9 +540,10 @@ class chunk_state {
       auto const pins = static_cast<std::uint64_t>((cur & PIN_MASK) >> PIN_SHIFT);
       assert(static_cast<value>(cur & STATE_MASK) == in_use && pins > 0);
       std::uint64_t const left = pins - 1;
-      std::uint64_t const next = (cur & ~(STATE_MASK | PIN_MASK)) |
-                                 static_cast<std::uint64_t>(left == 0 ? cached : in_use) |
-                                 (left << PIN_SHIFT);
+      bool const stale         = (cur & STALE_BIT) != 0;
+      value const to           = left != 0 ? in_use : (stale ? allocated : cached);
+      std::uint64_t const next = (cur & ~(STATE_MASK | PIN_MASK | (left == 0 ? STALE_BIT : 0))) |
+                                 static_cast<std::uint64_t>(to) | (left << PIN_SHIFT);
       if (_w.compare_exchange_weak(
             cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return left == 0;
@@ -532,7 +575,58 @@ class chunk_state {
   /// reclaimed chunk can never advertise the previous tenant's bytes.
   /// Subscribers are preserved: a request may have named the chunk again while
   /// it was in transit, and it still has to be able to drop its reference.
-  [[nodiscard]] bool mark_empty() noexcept { return transition(evicting, empty, FILL_MASK); }
+  [[nodiscard]] bool mark_empty() noexcept
+  {
+    return transition(evicting, empty, FILL_MASK | STALE_BIT);
+  }
+
+  /// Outcome of @ref invalidate.
+  enum class invalidation : std::uint8_t {
+    none,      ///< nothing published or being loaded (empty|queued|allocated|evicting)
+    dropped,   ///< was `cached`: now `allocated`, buffer and extent kept, bytes unpublished
+    deferred,  ///< `loading` / `in_use`: marked STALE, unpublished when the load settles or
+               ///< the last pin drops; no new reader can pin it meanwhile
+  };
+
+  /// A write overlapped this chunk: make sure no reader observes the chunk's
+  /// current (or in-flight) bytes after this call returns.
+  ///
+  /// - `cached` (no pins by definition) → `allocated` immediately.  The buffer
+  ///   stays attached so the next reader reloads it in place; the chunk stays
+  ///   reclaimable by the evictor exactly like any `allocated` chunk.
+  /// - `in_use` → STALE.  Existing pins keep reading the old bytes (their reads
+  ///   raced the write); new pins fail, and the last @ref release_read moves
+  ///   the chunk to `allocated`.
+  /// - `loading` → STALE.  The in-flight load still lands in the buffer, but
+  ///   @ref mark_cached refuses to publish it and reverts to `allocated`.
+  /// - any other state holds no readable bytes and is left untouched.
+  ///
+  /// Lock-free, idempotent, safe against every concurrent transition.
+  [[nodiscard]] invalidation invalidate() noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      std::uint64_t next = 0;
+      invalidation result{invalidation::none};
+      switch (static_cast<value>(cur & STATE_MASK)) {
+        case cached:
+          next   = (cur & ~STATE_MASK) | static_cast<std::uint64_t>(allocated);
+          result = invalidation::dropped;
+          break;
+        case loading:
+        case in_use:
+          if ((cur & STALE_BIT) != 0) { return invalidation::deferred; }
+          next   = cur | STALE_BIT;
+          result = invalidation::deferred;
+          break;
+        default: return invalidation::none;
+      }
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return result;
+      }
+    }
+  }
 
   /// Count one more live request naming this chunk.  Saturates rather than
   /// wrapping — an overflowed count would make the chunk permanently evictable.
@@ -578,6 +672,7 @@ class chunk_state {
   static constexpr std::uint64_t FILL_MASK  = PAGE_MASK | SIDE_BIT | FULL_BIT;
   static constexpr int SUB_SHIFT            = 32;
   static constexpr std::uint64_t SUB_MASK   = 0xFFFFULL << SUB_SHIFT;
+  static constexpr std::uint64_t STALE_BIT  = 1ULL << 48;
 
   static constexpr std::uint64_t encode(chunk_fill f) noexcept
   {
@@ -595,7 +690,7 @@ class chunk_state {
   static constexpr bool readable(std::uint64_t w) noexcept
   {
     auto const st = static_cast<value>(w & STATE_MASK);
-    return st == cached || st == in_use;
+    return (st == cached || st == in_use) && (w & STALE_BIT) == 0;
   }
 
   /// One attempt at (cached | in_use) → in_use, pins += 1.  Returns false when

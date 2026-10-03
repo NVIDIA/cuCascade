@@ -261,6 +261,7 @@ prefetching_cache::prefetching_cache(
   const config& cfg,
   std::shared_ptr<const cucascade::memory::topology_index> topology_index)
   : _cfg(cfg),
+    _invalidation_gate(std::make_shared<write_invalidation_gate>(*this)),
     _pool(std::make_unique<buffer_pool>(
       reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
     _io_ctx(io_ctx),
@@ -341,6 +342,10 @@ void prefetching_cache::reclaim_all_chunks() noexcept
 
 prefetching_cache::~prefetching_cache()
 {
+  // Write completions still in flight on runner threads reach this cache only
+  // through the gate; once it is closed (and any invalidation already inside
+  // has left) none of them can touch the state torn down below.
+  _invalidation_gate->close();
   _shutting_down.store(true, std::memory_order_release);
   _evictor_stop_source.request_stop();
 
@@ -363,6 +368,79 @@ prefetching_cache::~prefetching_cache()
   // rest of the process's life. Reclaim everything ourselves now that no IO
   // or evictor activity can race chunk state.
   reclaim_all_chunks();
+}
+
+// ===========================================================================
+// write invalidation
+// ===========================================================================
+
+bool write_invalidation_gate::invalidate_range(const io_object& obj,
+                                               std::size_t offset,
+                                               std::size_t size) noexcept
+{
+  // Entering and the closer's fetch_or are RMWs on one atomic, so they are
+  // totally ordered: either close() sees this caller inside and waits for it,
+  // or this caller sees CLOSED_BIT and never dereferences the cache.
+  if ((_state.fetch_add(1, std::memory_order_acquire) & CLOSED_BIT) != 0) {
+    leave();
+    return false;
+  }
+  _cache->invalidate_range(obj, offset, size);
+  leave();
+  return true;
+}
+
+void write_invalidation_gate::leave() noexcept
+{
+  // The last caller out of a closed gate wakes the closer.
+  if (_state.fetch_sub(1, std::memory_order_release) == (CLOSED_BIT | 1)) { _state.notify_all(); }
+}
+
+void write_invalidation_gate::close() noexcept
+{
+  auto cur = _state.fetch_or(CLOSED_BIT, std::memory_order_acq_rel) | CLOSED_BIT;
+  while (cur != CLOSED_BIT) {
+    _state.wait(cur, std::memory_order_acquire);
+    cur = _state.load(std::memory_order_acquire);
+  }
+}
+
+std::size_t prefetching_cache::invalidate_range(const io_object& obj,
+                                                std::size_t offset,
+                                                std::size_t size) noexcept
+{
+  if (size == 0 || !_armed) { return 0; }
+
+  file_entry* file = nullptr;
+  {
+    std::shared_lock lk(_map_mtx);
+    auto const it = _file_cache.find(obj.raw_file_cache_id());
+    if (it == _file_cache.end()) { return 0; }
+    // Entries are only erased by reclaim_all_chunks() at teardown, which
+    // cannot run concurrently with this call (see the gate).
+    file = it->second.get();
+  }
+
+  // Shared: slots are only mutated under the exclusive lock (materialising a
+  // chunk in update_and_get_chunks).  A chunk materialised right after this
+  // scan starts out `empty` and so holds nothing that predates the write.
+  std::shared_lock lk(file->mtx);
+  auto const n_slots = file->slots.size();
+  if (n_slots == 0) { return 0; }
+  auto const first = file->slot_of(offset);
+  if (first >= n_slots) { return 0; }  // past the recorded EOF: nothing cached there
+  auto const end  = size > std::numeric_limits<std::size_t>::max() - offset
+                      ? std::numeric_limits<std::size_t>::max()
+                      : offset + size;
+  auto const last = std::min(file->slot_of(end - 1), n_slots - 1);
+
+  std::size_t touched = 0;
+  for (auto slot = first; slot <= last; ++slot) {
+    auto* chunk = file->slots[slot];
+    if (chunk == nullptr) { continue; }
+    if (chunk->state.invalidate() != chunk_state::invalidation::none) { ++touched; }
+  }
+  return touched;
 }
 
 // ===========================================================================

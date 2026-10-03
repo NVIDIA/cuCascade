@@ -23,8 +23,23 @@
 
 #include <chrono>
 #include <string>
+#include <string_view>
 
 namespace cucascade::io::rest::s3 {
+
+/**
+ * @brief Canonicalize a pre-encoded request query for SigV4.
+ *
+ * Splits @p query on '&', drops empty pairs, gives a bare key (a subresource
+ * such as @c "uploads") an empty value (@c "uploads="), and sorts the pairs by
+ * key, then value. Keys and values are taken verbatim (the caller encodes).
+ * E.g. @c "uploadId=x&partNumber=2" -> @c "partNumber=2&uploadId=x",
+ * @c "uploads" -> @c "uploads=".
+ *
+ * @throw cucascade::io::credential_error when a key is empty or is an
+ *        @c X-Amz-* signing parameter (case-insensitive).
+ */
+[[nodiscard]] std::string canonicalize_query(std::string_view query);
 
 /**
  * @brief Common base for the built-in SigV4 authorizers: hand-rolled SigV4 over
@@ -87,6 +102,16 @@ class sigv4_presigned_authorizer final : public sigv4_authorizer_base {
                                     std::string_view canonical_query,
                                     std::chrono::seconds timeout) override;
 
+  /// Presigned request of any method: @c "{scheme}://{host}/{bucket}/{key}?..."
+  /// with the canonicalized @c spec.canonical_query merged into the signed
+  /// X-Amz-* query. The payload is always signed as @c UNSIGNED-PAYLOAD (the
+  /// presigned form signs only @c host); @c spec.extra_headers are returned
+  /// unsigned in @c authorized_request::headers.
+  /// @throw cucascade::io::credential_error on empty bucket / key, an X-Amz-*
+  ///        query key, or SigV4 failure.
+  authorized_request authorize_request(request_spec const& spec,
+                                       std::chrono::seconds timeout) override;
+
  private:
   std::chrono::seconds _ttl;
 };
@@ -124,6 +149,16 @@ class sigv4_header_authorizer final : public sigv4_authorizer_base {
   authorized_request authorize_list(std::string_view bucket,
                                     std::string_view canonical_query,
                                     std::chrono::seconds timeout) override;
+
+  /// Header-signed request of any method: plain
+  /// @c "{scheme}://{host}/{bucket}/{key}[?{canonical query}]" URL plus the signed
+  /// Authorization / x-amz-* headers and the (signed) @c spec.extra_headers.
+  /// @c x-amz-content-sha256 is @c spec.payload_sha256_hex (default
+  /// @c UNSIGNED-PAYLOAD). @c timeout is unused.
+  /// @throw cucascade::io::credential_error on empty bucket / key, an empty or
+  ///        X-Amz-* query key, an empty payload hash, or SigV4 failure.
+  authorized_request authorize_request(request_spec const& spec,
+                                       std::chrono::seconds timeout) override;
 };
 
 }  // namespace cucascade::io::rest::s3
