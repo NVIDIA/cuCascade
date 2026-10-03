@@ -67,6 +67,28 @@ All benchmarks measure different thread counts.
 The multi-threading is explicitly implemented instead of relying on googlebenchmark's built-in threading functionality,
 because that resulted in improper results.
 
+### I/O Write Benchmark (`cucascade_io_write_benchmark`)
+
+Standalone CLI (not Google Benchmark) in `io_write_benchmark.cpp`, built when
+`CUCASCADE_BUILD_IO=ON`. All arguments are `key=value`; run with `help` for the list.
+
+- `mode=write`: writes `size` bytes in `block`-sized requests through the uring or kvikIO
+  ioctx (`backend=uring|kvikio`, `source=host|device`, `runners`, `threads`, `qd`,
+  `odirect=0|1`, `durability=none|data_sync`, `path=<dir>`), then `flush_async()`. Reports GB/s
+  with and without the flush, interleaved with a dd-equivalent single-thread `pwrite` baseline
+  and a parallel `pwrite` baseline (`baseline_threads`).
+- `mode=mixed`: small-read latency (`read_size` at random aligned offsets of a cache-evicted
+  file) on an idle context and while the write workload runs; reports p50/p99/max next to a
+  `pread`-during-`pwrite` reference.
+
+```bash
+./benchmark/cucascade_io_write_benchmark backend=uring source=host size=2G block=16M \
+  runners=2 odirect=1 reps=5 pause_ms=10000 path=/mnt/nvme
+```
+
+Consumer SSDs absorb writes in an SLC cache; keep `size` below it and use `pause_ms` between
+measurements, or results measure the drive's cache state rather than the I/O path.
+
 ## Adding New Benchmarks
 
 To add new benchmarks:

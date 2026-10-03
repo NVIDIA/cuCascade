@@ -71,6 +71,8 @@ class mock_authorizer final : public request_authorizer {
       _last_bucket  = obj.bucket;
       _last_key     = obj.key;
       _last_timeout = timeout;
+      _last_method  = method;
+      _last_query.clear();
     }
     if (_should_throw.load()) {
       std::string msg;
@@ -81,6 +83,42 @@ class mock_authorizer final : public request_authorizer {
       throw credential_error(msg);
     }
     return _canned;
+  }
+
+  /// Any-method request (write path). Returns the canned URL with
+  /// @c spec.canonical_query appended verbatim (after '?', or '&' when the canned
+  /// URL already has a query) and the canned headers followed by
+  /// @c spec.extra_headers, so a loopback server can route on method + query.
+  authorized_request authorize_request(request_spec const& spec,
+                                       std::chrono::seconds timeout) override
+  {
+    ++_call_count;
+    ++_request_count;
+    if (spec.method == request_method::GET) ++_get_count;
+    if (spec.method == request_method::HEAD) ++_head_count;
+    {
+      std::scoped_lock lk{_last_mtx};
+      _last_bucket  = spec.object.bucket;
+      _last_key     = spec.object.key;
+      _last_timeout = timeout;
+      _last_method  = spec.method;
+      _last_query   = spec.canonical_query;
+    }
+    if (_should_throw.load()) {
+      std::string msg;
+      {
+        std::scoped_lock lk{_last_mtx};
+        msg = _throw_msg.empty() ? std::string{"mock_authorizer: forced failure"} : _throw_msg;
+      }
+      throw credential_error(msg);
+    }
+    authorized_request out = _canned;
+    if (!spec.canonical_query.empty()) {
+      out.url += out.url.find('?') == std::string::npos ? '?' : '&';
+      out.url += spec.canonical_query;
+    }
+    out.headers.insert(out.headers.end(), spec.extra_headers.begin(), spec.extra_headers.end());
+    return out;
   }
 
   /// Subsequent calls throw @c credential_error with @p msg (or default).
@@ -106,6 +144,19 @@ class mock_authorizer final : public request_authorizer {
   [[nodiscard]] int call_count() const noexcept { return _call_count.load(); }
   [[nodiscard]] int get_count() const noexcept { return _get_count.load(); }
   [[nodiscard]] int head_count() const noexcept { return _head_count.load(); }
+  /// Number of @c authorize_request calls (any method).
+  [[nodiscard]] int request_count() const noexcept { return _request_count.load(); }
+
+  [[nodiscard]] request_method last_method() const
+  {
+    std::scoped_lock lk{_last_mtx};
+    return _last_method;
+  }
+  [[nodiscard]] std::string last_query() const
+  {
+    std::scoped_lock lk{_last_mtx};
+    return _last_query;
+  }
 
   [[nodiscard]] std::string last_bucket() const
   {
@@ -128,11 +179,14 @@ class mock_authorizer final : public request_authorizer {
   std::atomic<int> _call_count{0};
   std::atomic<int> _get_count{0};
   std::atomic<int> _head_count{0};
+  std::atomic<int> _request_count{0};
   std::atomic<bool> _should_throw{false};
   mutable std::mutex _last_mtx;
   std::string _last_bucket;
   std::string _last_key;
   std::chrono::seconds _last_timeout{0};
+  request_method _last_method{request_method::GET};
+  std::string _last_query;
   std::string _throw_msg;
 };
 

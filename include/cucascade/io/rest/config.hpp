@@ -26,6 +26,32 @@
 
 namespace cucascade::io::rest {
 
+/**
+ * @brief Tunables of whole-object uploads (S3 PutObject / multipart upload).
+ *
+ * Written bytes are staged into pinned host blocks (the context's host memory
+ * resource; plain heap memory when it has none) and assembled into parts of
+ * @c part_size bytes.  An object whose final size is at most
+ * @c multipart_threshold is sent with one PUT at commit; a larger one (or one
+ * opened with a larger @c size_hint) uses a multipart upload whose parts are
+ * sent as soon as they are fully staged.
+ */
+struct rest_write_config {
+  /// Bytes per multipart part.  Clamped to [5 MiB, 5 GiB] (S3 limits; only
+  /// the last part of an upload may be smaller).  Raised automatically for a
+  /// @c size_hint that would otherwise need more than 10'000 parts.
+  std::size_t part_size{16UL << 20};
+  /// Objects at most this large are uploaded with a single PUT at commit;
+  /// clamped to at most 5 GiB (the single-PUT limit).
+  std::size_t multipart_threshold{16UL << 20};
+  /// Back-pressure: staged (not yet uploaded) parts one object may hold before
+  /// further writes wait for part uploads to finish (at least 1).  A soft
+  /// limit: when no upload is in flight that could free a part (e.g. parts held
+  /// for a single PUT, or writes that leave every staged part incomplete), the
+  /// write proceeds over the limit instead of waiting forever.
+  std::size_t max_buffered_parts{4};
+};
+
 struct config {
   /// An object store addresses single bytes: a ranged GET for an odd offset
   /// costs exactly what it asks for, so nothing is gained by widening.
@@ -161,6 +187,9 @@ struct config {
   /// @c footer_probe_bytes is rejected at resolve time — a sub-window budget
   /// cannot be honored as a hard cap.
   std::size_t footer_resolve_stash_budget{footer_resolve_auto};
+
+  /// Whole-object upload tunables (see @ref rest_write_config).
+  rest_write_config write{};
 };
 
 }  // namespace cucascade::io::rest

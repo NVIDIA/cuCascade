@@ -17,6 +17,7 @@
  */
 
 #include <cucascade/io/rest/s3/list_parser.hpp>
+#include <cucascade/io/rest/s3/xml_utils.hpp>
 
 #include <cctype>
 #include <limits>
@@ -27,79 +28,9 @@ namespace cucascade::io::rest::s3 {
 
 namespace {
 
-// Single-pass unescape of the five predefined XML entities. Unknown sequences
-// (e.g. numeric character references, which S3 does not emit for keys) pass
-// through verbatim.
-std::string xml_unescape(std::string_view s)
-{
-  std::string out;
-  out.reserve(s.size());
-  for (std::size_t i = 0; i < s.size();) {
-    if (s[i] == '&') {
-      if (s.compare(i, 5, "&amp;") == 0) {
-        out += '&';
-        i += 5;
-        continue;
-      }
-      if (s.compare(i, 4, "&lt;") == 0) {
-        out += '<';
-        i += 4;
-        continue;
-      }
-      if (s.compare(i, 4, "&gt;") == 0) {
-        out += '>';
-        i += 4;
-        continue;
-      }
-      if (s.compare(i, 6, "&quot;") == 0) {
-        out += '"';
-        i += 6;
-        continue;
-      }
-      if (s.compare(i, 6, "&apos;") == 0) {
-        out += '\'';
-        i += 6;
-        continue;
-      }
-    }
-    out += s[i];
-    ++i;
-  }
-  return out;
-}
-
-std::string_view trim(std::string_view s)
-{
-  std::size_t b = 0;
-  std::size_t e = s.size();
-  while (b < e && std::isspace(static_cast<unsigned char>(s[b])) != 0) {
-    ++b;
-  }
-  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1])) != 0) {
-    --e;
-  }
-  return s.substr(b, e - b);
-}
-
-// Raw text between the first `<tag>` and its `</tag>` (these S3 elements carry
-// no attributes), searching from @p from. nullopt when the element is absent.
-std::optional<std::string_view> element_text(std::string_view xml,
-                                             std::string_view tag,
-                                             std::size_t from = 0)
-{
-  std::string const open  = "<" + std::string{tag} + ">";
-  std::string const close = "</" + std::string{tag} + ">";
-  auto const o            = xml.find(open, from);
-  if (o == std::string_view::npos) { return std::nullopt; }
-  auto const s = o + open.size();
-  auto const c = xml.find(close, s);
-  if (c == std::string_view::npos) { return std::nullopt; }
-  return xml.substr(s, c - s);
-}
-
 std::uint64_t parse_size(std::string_view raw)
 {
-  auto const text = trim(raw);
+  auto const text = xml_trim(raw);
   if (text.empty()) {
     throw std::runtime_error("parse_list_objects_v2: empty <Size> in <Contents>");
   }
@@ -146,12 +77,12 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
       "parse_list_objects_v2: not a ListObjectsV2 response (no <ListBucketResult>)");
   }
   // Only an optional XML declaration may precede the root.
-  auto const pre = trim(xml.substr(0, root_open));
+  auto const pre = xml_trim(xml.substr(0, root_open));
   if (!pre.empty()) {
     bool prologue_only = false;
     if (pre.substr(0, 5) == "<?xml") {
       auto const end = pre.find("?>");
-      prologue_only  = end != std::string_view::npos && trim(pre.substr(end + 2)).empty();
+      prologue_only  = end != std::string_view::npos && xml_trim(pre.substr(end + 2)).empty();
     }
     if (!prologue_only) {
       throw std::runtime_error(
@@ -194,7 +125,7 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
         "parse_list_objects_v2: truncated ListObjectsV2 page (unclosed <Contents>)");
     }
     auto const block = body.substr(block_begin, ce - block_begin);
-    auto const key   = element_text(block, "Key");
+    auto const key   = xml_element_text(block, "Key");
     if (!key.has_value()) {
       throw std::runtime_error(
         "parse_list_objects_v2: malformed ListObjectsV2 page (<Contents> without <Key>)");
@@ -204,7 +135,7 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
       throw std::runtime_error(
         "parse_list_objects_v2: malformed ListObjectsV2 page (empty <Key> in <Contents>)");
     }
-    auto const size = element_text(block, "Size");
+    auto const size = xml_element_text(block, "Size");
     if (!size.has_value()) {
       throw std::runtime_error("parse_list_objects_v2: <Contents> without <Size> for key '" +
                                object_key + "'");
@@ -215,12 +146,12 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
 
   // IsTruncated is required and strictly boolean; defaulting a missing/garbage
   // value to "not truncated" would end the paged loop on a partial listing.
-  auto const truncated = element_text(body, "IsTruncated");
+  auto const truncated = xml_element_text(body, "IsTruncated");
   if (!truncated.has_value()) {
     throw std::runtime_error(
       "parse_list_objects_v2: malformed ListObjectsV2 page (missing <IsTruncated>)");
   }
-  auto const truncated_text = trim(*truncated);
+  auto const truncated_text = xml_trim(*truncated);
   if (truncated_text == "true") {
     page.is_truncated = true;
   } else if (truncated_text == "false") {
@@ -230,8 +161,8 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
                              std::string{truncated_text} + "'");
   }
 
-  if (auto const token = element_text(body, "NextContinuationToken"); token.has_value()) {
-    page.next_continuation_token = xml_unescape(trim(*token));
+  if (auto const token = xml_element_text(body, "NextContinuationToken"); token.has_value()) {
+    page.next_continuation_token = xml_unescape(xml_trim(*token));
   } else if (page.is_truncated) {
     // A truncated page must carry the token for the next page. (An empty token
     // element passes here and is rejected by the paged caller.)
@@ -242,7 +173,7 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
 
   // Reject non-whitespace content after the root close. Checked last so a
   // malformed window reports its own, more specific error first.
-  if (!trim(xml.substr(root_close + k_root_close.size())).empty()) {
+  if (!xml_trim(xml.substr(root_close + k_root_close.size())).empty()) {
     throw std::runtime_error("parse_list_objects_v2: unexpected content after </ListBucketResult>");
   }
 

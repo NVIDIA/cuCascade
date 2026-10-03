@@ -56,8 +56,11 @@ namespace cucascade::io {
  * @c compat_mode is the exception — it is passed per @c FileHandle at open
  * time, so it affects only files this ioctx opens and mutates nothing global.
  *
- * Write-side knobs (@c KVIKIO_AUTO_DIRECT_IO_WRITE) are intentionally absent:
- * @c kvikio_context opens every file read-only, so they would be dead config.
+ * Write-side knobs (@c KVIKIO_AUTO_DIRECT_IO_WRITE) are not exposed here:
+ * objects opened with @c open_io_object_for_write are written through kvikIO
+ * (@c FileHandle opened @c "r+", @c pwrite on the task pool), so they follow
+ * kvikIO's own default / environment setting for it.  Objects opened with
+ * @c open_io_object stay read-only.
  */
 struct kvikio_config {
   /// Threads in kvikIO's task pool — the parallelism bound for a single

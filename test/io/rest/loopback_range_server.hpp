@@ -22,6 +22,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -219,6 +220,11 @@ class loopback_range_server {
         continue;
       }
       _accepted_connection_count.fetch_add(1, std::memory_order_relaxed);
+      // Responses go out as two writes (headers, body); without TCP_NODELAY a
+      // reused keep-alive connection stalls ~40 ms per response on Nagle vs.
+      // the client's delayed ACK.
+      int nodelay = 1;
+      (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
       std::scoped_lock lock{_workers_mutex};
       _workers.emplace_back([this, fd] {
         handle_client(fd);

@@ -49,19 +49,41 @@ namespace cucascade::io::rest {
  * @brief RESTful object-store (s3://) ioctx. Specialisation of
  *        @c templated_ioctx<rest_reactor>.
  *
- * Owns a pool of @c rest_reactor workers (load-balanced by the base) that share
- * one @p authorizer.  Overrides @c create_io_object to resolve an object's size
- * via a blocking HEAD before constructing the @c rest_io_object — the static
- * reactor factory cannot do this since it needs the authorizer + a round-trip.
+ * Owns one shared @c rest_reactor (dispatcher: request hub, presigning
+ * authorizer, blocking helpers); transfers run on runner threads (spawned by
+ * @c start() or driven by callers via @c run / @c run_for / @c run_until), each
+ * with its own @c rest_engine.  Overrides @c create_io_object to resolve an
+ * object's size via a blocking HEAD before constructing the
+ * @c rest_io_object — the static reactor factory cannot do this since it
+ * needs the authorizer + a round-trip.
  */
 class rest_ioctx : public templated_ioctx<rest_reactor> {
  public:
-  /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context per
-  /// pool: it carries the per-reactor @c config, the presigning authorizer, and
-  /// the pinned bounce-staging resource — all of which must outlive this ioctx).
-  /// The ioctx config is sourced from the reactors themselves — see
-  /// @c templated_ioctx.
-  rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
+  /// Build the context over @p ctx (it carries the @c config, the presigning
+  /// authorizer, and the pinned bounce-staging resource — the latter two must
+  /// outlive this ioctx).  @p n_runner_threads is the number of runner threads
+  /// @c start() spawns (each owns up to @c config::max_connections
+  /// connections); 0 means callers drive the context with @c run*.  The ioctx
+  /// config is sourced from the reactor — see @c templated_ioctx.
+  rest_ioctx(std::size_t n_runner_threads, std::shared_ptr<rest_reactor::reactor_context> ctx);
+
+  /// Shuts down (including the upload abort sweep, see @ref shutdown).
+  ~rest_ioctx() override;
+
+  rest_ioctx(rest_ioctx const&)            = delete;
+  rest_ioctx& operator=(rest_ioctx const&) = delete;
+
+  /**
+   * @brief Stop the context (see @c templated_ioctx::shutdown), then abort
+   *        every uncommitted upload of an object opened for write.
+   *
+   * Once every runner has stopped, each live upload session is failed with
+   * @c std::errc::operation_canceled (its staging released) and an existing
+   * multipart upload is aborted with a synchronous AbortMultipartUpload on the
+   * calling thread (best effort, a few attempts bounded by
+   * @c config::request_timeout_s).  Objects already committed are untouched.
+   */
+  void shutdown() noexcept override;
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
@@ -91,8 +113,6 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
 
   /// The configured matched cap (@c config.list_max_matches) — exposed so a
   /// glob layer one level up can bound its match set without a reactor handle.
-  /// Falls back to the built-in default when the pool is empty (never in
-  /// practice).
   [[nodiscard]] std::size_t list_max_matches() const;
 
   /// Resolve many objects' footers concurrently.  Per-entry semantics are
@@ -130,11 +150,12 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   [[nodiscard]] std::size_t footer_stash_reserved_bytes() const noexcept;
   [[nodiscard]] std::size_t footer_stash_reserved_peak_bytes() const noexcept;
 
-  /// Open every reactor's connection pool against @p bucket_url's bucket, so the
+  /// Open every runner's connection pool against @p bucket_url's bucket, so the
   /// query's first reads find pooled connections instead of paying TCP+TLS on
-  /// the hot path.  Fans the work out to the reactors and returns immediately:
-  /// each reactor's connection cache is thread-confined, so only its own worker
-  /// can fill it.
+  /// the hot path.  Records the request on the reactor and returns
+  /// immediately: each runner's connection cache is thread-confined, so only
+  /// its own engine can fill it (runners started later still honor a fresh
+  /// request).
   ///
   /// Rate-limited rather than run once, because what goes stale is the
   /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
@@ -171,7 +192,8 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   object_store_lister _lister;
 
   /// The effective resolve_footer_objects concurrency cap: the configured
-  /// knob, or n_reactors * max_connections under footer_resolve_auto.  0 =
+  /// knob, or max(1, n_runner_threads) * max_connections under
+  /// footer_resolve_auto.  0 =
   /// the API is disabled.
   [[nodiscard]] std::size_t footer_resolve_inflight_cap() const;
 

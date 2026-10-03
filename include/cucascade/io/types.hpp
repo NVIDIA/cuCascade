@@ -27,13 +27,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -274,6 +277,220 @@ struct prepared_io_slice {
   [[nodiscard]] size_t size() const noexcept { return rng.size; }
 
   [[nodiscard]] size_t offset() const noexcept { return rng.offset; }
+};
+
+// ---------------------------------------------------------------------------
+// Request scheduling vocabulary
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Scheduling class of an asynchronous request.
+ *
+ * Runners pull queued work per class (see the scheduling policy of the runner
+ * model): @c latency before @c read before @c background, with @c write served
+ * when nothing else is queued or when the oldest write has waited too long.
+ * @c automatic lets the ioctx classify the request (see
+ * @ref resolve_request_class).
+ */
+enum class request_class : std::uint8_t { automatic = 0, latency, read, write, background };
+
+/// Number of concrete (non-@c automatic) request classes; per-class arrays are
+/// indexed with @ref request_class_index.
+inline constexpr std::size_t request_class_count = 4;
+
+/// Requests whose total size is at or below this bound are classified as
+/// @c request_class::latency when submitted with @c request_class::automatic.
+inline constexpr std::size_t latency_class_max_bytes = 256UL << 10;
+
+/// Which backend operation a grouped request carries.
+enum class io_kind : std::uint8_t { read, write, flush, commit };
+
+/// Observable lifecycle of a request (internal bookkeeping and statistics; no
+/// public per-request handle exists).
+enum class request_state : std::uint8_t {
+  queued,
+  assigned,
+  in_flight,
+  copying,
+  completed,
+  failed,
+  cancelled
+};
+
+/**
+ * @brief Index of a concrete request class in a per-class array.
+ *
+ * @c latency -> 0, @c read -> 1, @c write -> 2, @c background -> 3.  The
+ * @c automatic sentinel maps to the @c read slot; callers are expected to
+ * resolve it first with @ref resolve_request_class.
+ */
+[[nodiscard]] constexpr std::size_t request_class_index(request_class cls) noexcept
+{
+  switch (cls) {
+    case request_class::latency: return 0;
+    case request_class::read: return 1;
+    case request_class::write: return 2;
+    case request_class::background: return 3;
+    case request_class::automatic: break;
+  }
+  return 1;
+}
+
+/**
+ * @brief Resolve @c request_class::automatic to a concrete class.
+ *
+ * Explicit classes are returned unchanged.  For @c automatic: writes, flushes
+ * and commits are @c write; reads issued on behalf of a prefetch
+ * (@p background_hint) are @c background; reads of at most
+ * @ref latency_class_max_bytes are @c latency; other reads are @c read.
+ *
+ * @param cls Requested class.
+ * @param kind Operation carried by the request.
+ * @param total_bytes Total bytes requested across all slices / segments.
+ * @param background_hint True when the read was issued by the prefetching layer.
+ * @return A class other than @c request_class::automatic.
+ */
+[[nodiscard]] constexpr request_class resolve_request_class(request_class cls,
+                                                            io_kind kind,
+                                                            std::size_t total_bytes,
+                                                            bool background_hint = false) noexcept
+{
+  if (cls != request_class::automatic) return cls;
+  if (kind != io_kind::read) return request_class::write;
+  if (background_hint) return request_class::background;
+  return total_bytes <= latency_class_max_bytes ? request_class::latency : request_class::read;
+}
+
+/// Options accepted by every asynchronous read entry point.
+struct io_options {
+  request_class cls{request_class::automatic};  ///< scheduling class; automatic -> classified
+};
+
+// ---------------------------------------------------------------------------
+// Write vocabulary
+// ---------------------------------------------------------------------------
+
+/// Durability requested for a write request.
+enum class write_durability : std::uint8_t {
+  none,       ///< resolves when the kernel / object store accepted the bytes
+  data_sync,  ///< additionally fdatasync() the file after the request's last byte landed
+};
+
+/// Options accepted by every write entry point.
+struct write_options {
+  write_durability durability{write_durability::none};  ///< durability on completion
+  request_class cls{request_class::automatic};          ///< automatic -> request_class::write
+};
+
+/// How a file / object is opened for writing.
+enum class write_mode : std::uint8_t {
+  create_or_truncate,  ///< O_CREAT|O_TRUNC (local); fresh upload session (REST)
+  create_or_open,      ///< O_CREAT without truncation; writes extend/overwrite (local only)
+  open_existing,       ///< fail if missing (local only)
+};
+
+/// Options accepted by @c ioctx::open_io_object_for_write.
+struct write_open_options {
+  write_mode mode{write_mode::create_or_truncate};  ///< open / create behaviour
+  /// Expected final size in bytes; 0 = unknown.  Local: fallocate(KEEP_SIZE)
+  /// hint.  REST: lets the backend pick single PUT vs multipart early.
+  std::uint64_t size_hint{0};
+  unsigned permissions{0644};  ///< file mode for newly created local files
+};
+
+/// Host-memory write source.  The buffer MUST stay valid until the returned
+/// future resolves.
+struct host_source {
+  const std::uint8_t* data{nullptr};  ///< first byte to write
+};
+
+/// Device-memory write source.  The buffer MUST stay valid until the returned
+/// future resolves; the write observes all work enqueued on @c stream before
+/// the call.
+struct device_source {
+  const std::uint8_t* data{nullptr};  ///< first byte to write (device pointer)
+  /// The device-to-host copy is ordered after work already enqueued here.
+  ::cuda::stream_ref stream{cudaStream_t{nullptr}};
+  int device_id{-1};  ///< -1: filled from cudaGetDevice() by the ioctx
+};
+
+/// One segment of a (vectored) write: a file / object byte range and its source.
+struct write_segment {
+  range rng;                                     ///< {offset, size} in the file / object
+  std::variant<host_source, device_source> src;  ///< where the bytes come from
+
+  /// True when the source lives in device memory.
+  [[nodiscard]] bool is_device() const noexcept
+  {
+    return std::holds_alternative<device_source>(src);
+  }
+
+  /// Source pointer regardless of the source kind.
+  [[nodiscard]] const std::uint8_t* data() const noexcept
+  {
+    return is_device() ? std::get<device_source>(src).data : std::get<host_source>(src).data;
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept { return rng.size; }
+
+  [[nodiscard]] std::size_t offset() const noexcept { return rng.offset; }
+};
+
+/**
+ * @brief Validate the segments of one write request.
+ *
+ * @param segments Segments of a single request (any order).
+ * @return Total number of bytes across all segments.
+ * @throws std::invalid_argument if a non-empty segment has a null source, a
+ *         segment's range overflows, or two segments overlap.
+ * @throws std::overflow_error if the total byte count overflows.
+ */
+[[nodiscard]] inline std::size_t validate_write_segments(std::span<const write_segment> segments)
+{
+  std::vector<range> ranges;
+  ranges.reserve(segments.size());
+  std::size_t total = 0;
+  for (auto const& segment : segments) {
+    if (segment.size() == 0) continue;
+    if (segment.data() == nullptr) throw std::invalid_argument("write segment source is null");
+    if (segment.size() > std::numeric_limits<std::size_t>::max() - segment.offset()) {
+      throw std::invalid_argument("write segment range overflows");
+    }
+    if (segment.size() > std::numeric_limits<std::size_t>::max() - total) {
+      throw std::overflow_error("write byte count overflow");
+    }
+    total += segment.size();
+    ranges.push_back(segment.rng);
+  }
+  std::sort(ranges.begin(), ranges.end(), [](range const& lhs, range const& rhs) {
+    return lhs.offset < rhs.offset;
+  });
+  for (std::size_t i = 1; i < ranges.size(); ++i) {
+    if (ranges[i].offset < ranges[i - 1].end()) {
+      throw std::invalid_argument("write segments overlap");
+    }
+  }
+  return total;
+}
+
+// ---------------------------------------------------------------------------
+// Queue observability
+// ---------------------------------------------------------------------------
+
+/// Per-class queue statistics.
+struct class_stats {
+  std::size_t queued_requests{0};               ///< requests waiting in the queue
+  std::size_t queued_bytes{0};                  ///< bytes of the waiting requests
+  std::chrono::nanoseconds last_queue_wait{0};  ///< queue wait of the last pulled request
+  std::chrono::nanoseconds max_queue_wait{0};   ///< longest observed queue wait
+};
+
+/// Aggregate queue / runner statistics of one ioctx.
+struct queue_stats {
+  std::array<class_stats, request_class_count> per_class{};  ///< by request_class_index
+  std::size_t active_runners{0};                             ///< threads currently inside run*()
+  std::size_t idle_runners{0};                               ///< runners blocked waiting for work
+  std::size_t in_flight_requests{0};  ///< grouped requests assigned to runners
 };
 
 }  // namespace cucascade::io

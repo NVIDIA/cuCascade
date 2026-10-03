@@ -61,23 +61,38 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   # IO test executable - links the cudf-free cucascade-io datasource layer.
   add_executable(
     cucascade_io_tests
+    io/test_coordinator_finalizer.cpp
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
+    io/test_request_queue.cpp
+    io/test_runner_registry.cpp
+    io/test_scheduling_policy.cpp
+    io/test_templated_ioctx_runner.cpp
     io/test_uri_parser.cpp
+    io/test_chunk_state_stale.cpp
+    io/cache/test_invalidate_range.cpp
     io/cache/test_metadata_store.cpp
     io/rest/test_object_store_lister.cpp
     io/rest/test_rest_footer_resolve.cpp
+    io/rest/test_rest_runner.cpp
     io/rest/test_rest_validation_tag.cpp
+    io/rest/test_rest_write.cpp
     io/rest/test_shared_byte_span.cpp
+    io/rest/test_sync_request.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
+    io/rest/s3/test_sigv4_write.cpp
     io/rest/s3/test_static_credentials.cpp
+    io/rest/s3/test_xml_utils.cpp
+    io/uring/test_uring_runner.cpp
+    io/uring/test_uring_write.cpp
     # Main test runner
     unittest.cpp)
 
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
   if(CUCASCADE_BUILD_CUDF)
-    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp)
+    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp
+                                              io/kvikio/test_kvikio_write.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
