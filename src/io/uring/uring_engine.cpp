@@ -70,6 +70,8 @@ namespace {
 constexpr std::size_t STAGING_BUDGET_BYTES = 64UL << 20;
 constexpr std::size_t MAX_NUM_SLOTS        = 64;
 constexpr std::size_t MAX_PLAIN_READ_SIZE  = 1UL << 30;
+static_assert(max_slices_per_pass == MAX_NUM_SLOTS,
+              "config::slices_per_pass is validated against the engine's slot cap");
 /// Wait period of the terminal drain loops (in-flight reads only; CQEs end it early).
 constexpr std::chrono::milliseconds DRAIN_POLL_INTERVAL{20};
 /// user_data of the runner-eventfd poll SQE.  Never a slot index, and distinct
@@ -653,6 +655,12 @@ void plan_device_write(std::shared_ptr<const io_object> const& object,
   return std::clamp(STAGING_BUDGET_BYTES / block_size, std::size_t{1}, MAX_NUM_SLOTS);
 }
 
+/// config::slices_per_pass as a per-pass expansion budget (0 = no cap).
+[[nodiscard]] constexpr std::size_t effective_slices_per_pass(std::size_t configured) noexcept
+{
+  return configured == 0 ? std::numeric_limits<std::size_t>::max() : configured;
+}
+
 [[nodiscard]] cucascade::memory::fixed_multiple_blocks_allocation allocate_staging(
   uring_reactor const& owner, std::size_t block_size, std::size_t slot_count)
 {
@@ -787,6 +795,7 @@ class uring_engine::impl {
                      bool& capacity_blocked,
                      bool& sqes_exhausted,
                      bool draining);
+  [[nodiscard]] std::size_t staging_free_slots(active_group const& group) const noexcept;
   void plan_next(active_group& group);
   void plan_next_slice(active_group& group);
   void plan_next_write(active_group& group);
@@ -830,7 +839,8 @@ class uring_engine::impl {
   io::detail::runner_slot& _slot;
   io::detail::request_hub& _hub;
   config const _cfg;
-  io::detail::scheduling_policy const _policy{};
+  io::detail::scheduling_policy const _policy;  ///< from _cfg.scheduling
+  std::size_t const _slices_per_pass;           ///< plan_next calls per group per pass
   std::size_t const _block_size;
   std::size_t const _slot_count;
 
@@ -840,6 +850,9 @@ class uring_engine::impl {
   std::array<std::size_t, request_class_count> _class_ops{};
   std::size_t _inflight{0};  ///< published data SQEs not yet reaped
   std::size_t _prepared{0};  ///< prepared data SQEs not yet submitted
+  /// Bytes of the physical operations handed to the ring (once per operation;
+  /// published as runner_stats::bytes_submitted).
+  std::uint64_t _bytes_submitted{0};
   bool _wake_armed{false};
   bool _wake_poll_ok{true};
   bool _wake_multishot{true};
@@ -868,6 +881,8 @@ uring_engine::impl::impl(uring_reactor& owner, io::detail::runner_slot& slot)
   : _slot(slot),
     _hub(owner.hub()),
     _cfg(owner.get_config()),
+    _policy(_cfg.scheduling),
+    _slices_per_pass(effective_slices_per_pass(_cfg.slices_per_pass)),
     _block_size(checked_block_size(owner)),
     _slot_count(staging_slot_count(_block_size)),
     _staging(allocate_staging(owner, _block_size, _slot_count)),
@@ -908,6 +923,9 @@ std::size_t uring_engine::impl::run(std::stop_token const& stop,
       progressed      = process_groups(/*draining=*/false) || progressed;
       progressed      = retire_groups() || progressed;
       progressed      = pull_work() || progressed;
+      // Once per pass, after this pass's submissions and before any wait (so the
+      // peak sees the deepest point and an idle runner reports 0 in flight).
+      _slot.publish_gauges(static_cast<std::uint32_t>(_inflight), _bytes_submitted);
       // Unconditional wait whenever nothing moved: in particular "pending
       // operations blocked, nothing in flight, copies outstanding" waits for
       // the copies instead of spinning.
@@ -999,15 +1017,19 @@ bool uring_engine::impl::process_groups(bool draining)
   auto view             = build_view();
   bool capacity_blocked = false;
   bool sqes_exhausted   = false;
-  // Latency groups first (they own the reserved slots), then the others in
-  // pull order.  Once a non-latency group's next operation does not fit the
-  // free slots, later non-latency groups may not take slots this round either
-  // (first come, first served -- a large staged operation cannot be starved
-  // by a stream of smaller ones).
-  for (int pass = 0; pass < 2 && !sqes_exhausted; ++pass) {
-    bool const latency_pass = pass == 0;
+  // Latency groups first (they own the reserved slots), then demand read /
+  // write groups in pull order, then background groups: a demand group pulled
+  // after a prefetch group still gets freed slots first.  Once a non-latency
+  // group's next operation does not fit the free slots, later non-latency
+  // groups may not take slots this round either (first come, first served --
+  // a large staged operation cannot be starved by a stream of smaller ones).
+  constexpr auto tier_of = [](request_class cls) noexcept {
+    if (cls == request_class::latency) return 0;
+    return cls == request_class::background ? 2 : 1;
+  };
+  for (int tier = 0; tier < 3 && !sqes_exhausted; ++tier) {
     for (auto& entry : _active) {
-      if ((entry->cls == request_class::latency) != latency_pass) continue;
+      if (tier_of(entry->cls) != tier) continue;
       progressed =
         advance_group(*entry, view, capacity_blocked, sqes_exhausted, draining) || progressed;
       if (sqes_exhausted) break;
@@ -1023,7 +1045,8 @@ bool uring_engine::impl::advance_group(active_group& group,
                                        bool& sqes_exhausted,
                                        bool draining)
 {
-  bool progressed = false;
+  bool progressed      = false;
+  std::size_t expanded = 0;  // plan_next calls for this group in this pass
   for (;;) {
     // Cooperative cancellation: a failed request stops only its own work.
     auto const* coordinator =
@@ -1042,7 +1065,13 @@ bool uring_engine::impl::advance_group(active_group& group,
 
     if (group.pending.empty()) {
       if (draining || group.group == nullptr || group.group->empty()) return progressed;
+      // config::slices_per_pass: leave the rest of this group's untaken work to
+      // the next pass so the other groups this runner holds get their turn at
+      // the free slots.  progressed is true here (expanded > 0), so run() loops
+      // again without waiting, and the group still counts as expanding.
+      if (expanded >= _slices_per_pass) return progressed;
       plan_next(group);
+      ++expanded;
       progressed = true;
       continue;
     }
@@ -1053,11 +1082,24 @@ bool uring_engine::impl::advance_group(active_group& group,
     if (draining) {
       allowed = need.slots <= view.free_slots;
     } else {
-      bool const fifo_blocked = capacity_blocked && group.cls != request_class::latency;
-      allowed                 = !fifo_blocked && _policy.may_dispatch(group.cls, need, view);
+      // Background operations fitting inside the background reservation are
+      // exempt from the first-come rule, so a prefetch keeps that many slots
+      // cycling even under sustained large demand (the floor's promise).
+      bool const within_reserve = group.cls == request_class::background &&
+                                  view[request_class::background].slots_in_use + need.slots <=
+                                    _policy.background_reserve(view.total_slots);
+      bool const fifo_blocked =
+        capacity_blocked && group.cls != request_class::latency && !within_reserve;
+      allowed = !fifo_blocked && _policy.may_dispatch(group.cls, need, view);
     }
     if (!allowed) {
-      if (need.slots > view.free_slots) capacity_blocked = true;
+      // A misfit, or a demand operation held back only by the background floor:
+      // later non-latency groups take no slots this pass, so it dispatches as
+      // soon as completions free enough (instead of background growing first).
+      if (need.slots > view.free_slots ||
+          _policy.refused_by_background_floor(group.cls, need, view)) {
+        capacity_blocked = true;
+      }
       return progressed;
     }
 
@@ -1068,6 +1110,18 @@ bool uring_engine::impl::advance_group(active_group& group,
       return progressed;
     }
   }
+}
+
+std::size_t uring_engine::impl::staging_free_slots(active_group const& group) const noexcept
+{
+  // Free slots a staged operation of @p group is sized by.  While background
+  // work is undispatched, demand may leave only the background reservation
+  // free; a background operation larger than it would wait for a lull in
+  // demand while the reserved slots idle, so it is planned to fit inside.
+  auto const free = _pool.approx_free();
+  if (group.cls != request_class::background) return free;
+  auto const reserve = _policy.background_reserve(_slot_count);
+  return reserve == 0 ? free : std::min(free, reserve);
 }
 
 void uring_engine::impl::plan_next(active_group& group)
@@ -1089,8 +1143,12 @@ void uring_engine::impl::plan_next_slice(active_group& group)
   auto slice         = request.take_front();
 
   try {
-    auto planned = plan_slice(
-      request.obj, slice, request.coordinator, _cfg, _block_size, backlog, _pool.approx_free());
+    // Staged operations hold one slot per block; host operations hold one
+    // slot whatever their size, so only staged ones are fitted to the
+    // background reservation.
+    auto const free_slots = slice.needs_staging() ? staging_free_slots(group) : _pool.approx_free();
+    auto planned =
+      plan_slice(request.obj, slice, request.coordinator, _cfg, _block_size, backlog, free_slots);
     if (planned.empty()) {
       throw std::logic_error("uring_engine: slice produced no physical operations");
     }
@@ -1166,7 +1224,7 @@ void uring_engine::impl::plan_next_write(active_group& group)
                         _odirect_staging,
                         _block_size,
                         backlog,
-                        _pool.approx_free(),
+                        staging_free_slots(group),
                         first,
                         planned);
     } else {
@@ -1314,6 +1372,9 @@ uring_engine::impl::dispatch_outcome uring_engine::impl::dispatch_one(
     set_group_state(*slot.op, request_state::in_flight);
 
     slot.prepare_remaining_iovecs();
+    // The operation enters the SQE path (now, or from _incomplete once the
+    // ring has room); staged writes enter it in begin_staged_write.
+    _bytes_submitted += slot.op->request.io_rng.size;
     auto* sqe = _ring.get_sqe();
     if (sqe == nullptr) {
       _incomplete.push_back(leader);
@@ -1412,7 +1473,9 @@ void uring_engine::impl::set_group_state(uring_io_op const& op, request_state st
   auto const current = meta.state.load(std::memory_order_relaxed);
   if (state == request_state::in_flight) {
     if (current == request_state::assigned) {
-      meta.first_io_at = clock::now();
+      // Once per request: a group handed back by a retiring runner (requeue)
+      // is assigned again but keeps the time of its first operation.
+      if (meta.first_io_at == clock::time_point{}) meta.first_io_at = clock::now();
       meta.state.store(request_state::in_flight, std::memory_order_release);
     } else if (current == request_state::copying) {
       meta.state.store(request_state::in_flight, std::memory_order_release);
@@ -1518,6 +1581,7 @@ void uring_engine::impl::begin_staged_write(io_slot& slot) noexcept
       return;
     }
   }
+  _bytes_submitted += slot.op->request.io_rng.size;
   _incomplete.push_back(slot.index);
 }
 
