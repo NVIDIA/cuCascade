@@ -101,11 +101,11 @@ void validate(config const& cfg)
     throw std::invalid_argument(
       "uring_reactor: config::scheduling.max_latency_groups must be >= 1");
   }
-  if (sched.max_background_groups == 0 || sched.max_background_groups > sched.max_active_groups) {
+  // A value above max_active_groups is accepted: the policy clamps it, so a host
+  // lowering max_active_groups alone does not trip over the background default.
+  if (sched.max_background_groups == 0) {
     throw std::invalid_argument(
-      "uring_reactor: config::scheduling.max_background_groups must be in 1..max_active_groups (" +
-      std::to_string(sched.max_active_groups) + "), got " +
-      std::to_string(sched.max_background_groups));
+      "uring_reactor: config::scheduling.max_background_groups must be >= 1");
   }
   struct named_fraction {
     char const* name;

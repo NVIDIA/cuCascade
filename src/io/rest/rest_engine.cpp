@@ -943,7 +943,10 @@ bool rest_engine::impl::dispatch_one(active_group& group, bool expand)
   }
   if (group.group != nullptr &&
       group.group->meta.state.load(std::memory_order_acquire) == request_state::assigned) {
-    group.group->meta.first_io_at = clock::now();
+    // Once per request: a requeued group keeps the time of its first operation.
+    if (group.group->meta.first_io_at == clock::time_point{}) {
+      group.group->meta.first_io_at = clock::now();
+    }
     group.group->meta.state.store(request_state::in_flight, std::memory_order_release);
   }
   launch(std::move(token), std::move(request));
@@ -1640,7 +1643,8 @@ bool rest_engine::impl::stage_step(active_group& entry)
     entry.pieces_left  = pieces;
     entry.staging      = true;
     if (group.meta.state.load(std::memory_order_acquire) == request_state::assigned) {
-      group.meta.first_io_at = clock::now();
+      // Once per request: a requeued group keeps the time of its first operation.
+      if (group.meta.first_io_at == clock::time_point{}) group.meta.first_io_at = clock::now();
       group.meta.state.store(request_state::in_flight, std::memory_order_release);
     }
   }

@@ -212,6 +212,25 @@ TEST_CASE("background groups are capped by max_background_groups", "[io][policy]
   CHECK_FALSE(scheduling_policy(config).pick(view).has_value());
 }
 
+TEST_CASE("max_background_groups above max_active_groups behaves as max_active_groups",
+          "[io][policy]")
+{
+  scheduling_config config;
+  config.max_active_groups     = 1;
+  config.max_background_groups = 2;  // effective limit: 1
+  scheduling_policy policy(config);
+
+  // No background group expanding and bulk room left: background is pickable.
+  auto view                              = make_view();
+  view[request_class::background].queued = 1;
+  CHECK(policy.pick(view) == request_class::background);
+
+  // One expanding: the clamped sub-limit (and the bulk limit) is reached.
+  view[request_class::background].active_groups    = 1;
+  view[request_class::background].expanding_groups = 1;
+  CHECK_FALSE(policy.pick(view).has_value());
+}
+
 TEST_CASE("reads keep a floor of slots free while background work is expanding", "[io][policy]")
 {
   scheduling_policy policy;  // reserve min(8, 64 / 4, 48) = 8
@@ -252,11 +271,59 @@ TEST_CASE("reads keep a floor of slots free while background work is expanding",
   CHECK(scheduling_policy(config).may_dispatch(request_class::read, resource_need{1, 1}, view));
 }
 
+TEST_CASE("only refusals caused by the background floor are reported as such", "[io][policy]")
+{
+  scheduling_policy policy;  // floor min(8, 64 / 4, 48) = 8, write share 32 slots
+  auto view = make_view(64, 0);
+  occupy(view, request_class::background, 10);  // below its share: pressure
+  view[request_class::background].active_groups    = 1;
+  view[request_class::background].expanding_groups = 1;
+  view.free_slots                                  = 20;
+  REQUIRE(policy.background_pressure(view));
+
+  // A 16-slot read fits (20 free) but would leave 4 < 8 free: the floor.
+  CHECK_FALSE(policy.may_dispatch(request_class::read, resource_need{16, 1}, view));
+  CHECK(policy.refused_by_background_floor(request_class::read, resource_need{16, 1}, view));
+  // Allowed, physical misfit, or a class the floor does not apply to: not reported.
+  CHECK_FALSE(policy.refused_by_background_floor(request_class::read, resource_need{12, 1}, view));
+  CHECK_FALSE(policy.refused_by_background_floor(request_class::read, resource_need{24, 1}, view));
+  CHECK_FALSE(
+    policy.refused_by_background_floor(request_class::background, resource_need{16, 1}, view));
+  CHECK_FALSE(
+    policy.refused_by_background_floor(request_class::latency, resource_need{16, 1}, view));
+
+  // A write at its share is refused by the share, floor or not.
+  auto writes = view;
+  occupy(writes, request_class::write, 2, 16);  // 32 slots = the write share
+  writes.free_slots = 20;
+  CHECK_FALSE(policy.may_dispatch(request_class::write, resource_need{1, 1}, writes));
+  CHECK_FALSE(
+    policy.refused_by_background_floor(request_class::write, resource_need{1, 1}, writes));
+  CHECK_FALSE(
+    policy.refused_by_background_floor(request_class::write, resource_need{16, 1}, writes));
+  // ...while a read in the same state is held back by the floor alone.
+  CHECK(policy.refused_by_background_floor(request_class::read, resource_need{16, 1}, writes));
+
+  // Refused by the latency reservation: not reported, with or without the floor.
+  auto latency                           = view;
+  latency[request_class::latency].queued = 1;
+  CHECK_FALSE(policy.may_dispatch(request_class::read, resource_need{19, 1}, latency));
+  CHECK_FALSE(
+    policy.refused_by_background_floor(request_class::read, resource_need{19, 1}, latency));
+  latency[request_class::background].expanding_groups = 0;  // no floor
+  CHECK_FALSE(policy.may_dispatch(request_class::read, resource_need{19, 1}, latency));
+  CHECK_FALSE(
+    policy.refused_by_background_floor(request_class::read, resource_need{19, 1}, latency));
+}
+
 TEST_CASE("the background floor is clamped to a quarter of the axis and to the share",
           "[io][policy]")
 {
   // 16 slots: min(8, 16 / 4, share_of(16, 0.75) = 12) = 4.
   scheduling_policy policy;
+  CHECK(policy.background_reserve(16) == 4);
+  CHECK(policy.background_reserve(64) == 8);
+  CHECK(policy.background_reserve(0) == 0);
   auto view                                        = make_view(16, 0);
   view[request_class::background].active_groups    = 1;
   view[request_class::background].expanding_groups = 1;
@@ -271,6 +338,7 @@ TEST_CASE("the background floor is clamped to a quarter of the axis and to the s
   scheduling_config config;
   config.background_slot_fraction = 0.1;
   scheduling_policy narrow(config);
+  CHECK(narrow.background_reserve(64) == 6);
   auto wide                                        = make_view(64, 0);
   wide[request_class::background].active_groups    = 1;
   wide[request_class::background].expanding_groups = 1;
