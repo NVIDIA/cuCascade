@@ -30,10 +30,27 @@
 //               mode=write runs on the same context.  Reports p50/p99/max and
 //               the concurrent write throughput.  A pread/pwrite baseline of the
 //               same experiment is reported for reference.
+// mode=readmix: demand-read latency while a large background read runs on the
+//               same context -- the prefetch-isolation scenario.  One vectored
+//               read of `bg_size` in `bg_slice` slices, submitted with class
+//               `bg_class` (background = how prefetching_cache::prefetch tags
+//               its reads; read = the pre-tagging classification of a
+//               prefetch), is timed alone, then concurrently with a loop of
+//               host_read_async (demand_dst=host) or device_read_async
+//               (demand_dst=device: staged through pinned slots, so a 16 MiB
+//               read is one 16-slot op) demand reads (automatic class: latency
+//               for <= 256 KiB, read above -- never background) for each of
+//               `demand_sizes`.  Reports idle and concurrent p50/p99/max, the
+//               concurrent background GB/s and per-window ctx.stats() (first-I/O
+//               delay per class, per-runner peak in-flight ops) as key=value
+//               `RESULT` / `STATS` lines.
 //
-// All arguments are key=value; run with `help` for the list.
+// The uring scheduling knobs (slices_per_pass, bg_groups, bg_share,
+// bg_reserve) apply to every mode.  All arguments are key=value; run with
+// `help` for the list.
 
 #include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/details/scheduling_policy.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/io/types.hpp>
@@ -57,6 +74,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <iomanip>
@@ -89,7 +107,7 @@ using clock_type = std::chrono::steady_clock;
 //===----------------------------------------------------------------------===//
 
 struct options {
-  std::string mode{"write"};     // write | mixed
+  std::string mode{"write"};     // write | mixed | readmix
   std::string backend{"uring"};  // uring | kvikio
   std::string source{"host"};    // host | device
   std::size_t size{4 * GiB};     // bytes written per repetition
@@ -104,10 +122,19 @@ struct options {
   bool baseline{true};
   std::size_t baseline_threads{4};
   std::size_t pause_ms{0};  // idle time between measurements
-  // mixed mode
+  // mixed mode (read_file_size, idle_reads also readmix)
   std::size_t read_size{4 * KiB};
   std::size_t read_file_size{1 * GiB};
   std::size_t idle_reads{2000};
+  // uring scheduling knobs (all modes); defaults are the library defaults
+  std::size_t slices_per_pass{io::uring::config{}.slices_per_pass};
+  io::detail::scheduling_config scheduling{};
+  // readmix mode
+  std::size_t bg_size{2 * GiB};
+  std::size_t bg_slice{1 * MiB};
+  io::request_class bg_class{io::request_class::background};
+  std::vector<std::size_t> demand_sizes{4 * KiB, 1 * MiB, 16 * MiB};
+  std::string demand_dst{"host"};  // host | device
 };
 
 std::size_t parse_size(std::string_view s)
@@ -127,6 +154,18 @@ std::size_t parse_size(std::string_view s)
   return static_cast<std::size_t>(std::stoull(std::string(s))) * mult;
 }
 
+/// Comma-separated list of sizes, e.g. "4K,1M,16M".
+std::vector<std::size_t> parse_size_list(std::string_view s)
+{
+  std::vector<std::size_t> out;
+  while (!s.empty()) {
+    auto const comma = s.find(',');
+    out.push_back(parse_size(s.substr(0, comma)));
+    s = comma == std::string_view::npos ? std::string_view{} : s.substr(comma + 1);
+  }
+  return out;
+}
+
 bool parse_bool(std::string_view s)
 {
   if (s == "1" || s == "on" || s == "true") { return true; }
@@ -134,11 +173,32 @@ bool parse_bool(std::string_view s)
   throw std::invalid_argument("expected 0|1, got " + std::string(s));
 }
 
+/// Short label of a byte count: "4K", "16M", "2G" when exact, else bytes.
+std::string size_label(std::size_t bytes)
+{
+  if (bytes != 0 && bytes % GiB == 0) { return std::to_string(bytes / GiB) + "G"; }
+  if (bytes != 0 && bytes % MiB == 0) { return std::to_string(bytes / MiB) + "M"; }
+  if (bytes != 0 && bytes % KiB == 0) { return std::to_string(bytes / KiB) + "K"; }
+  return std::to_string(bytes);
+}
+
+char const* class_name(io::request_class cls)
+{
+  switch (cls) {
+    case io::request_class::latency: return "latency";
+    case io::request_class::read: return "read";
+    case io::request_class::write: return "write";
+    case io::request_class::background: return "background";
+    case io::request_class::automatic: break;
+  }
+  return "automatic";
+}
+
 void usage(char const* prog)
 {
   std::cerr
     << "usage: " << prog << " [key=value ...]\n"
-    << "  mode=write|mixed           (default write)\n"
+    << "  mode=write|mixed|readmix   (default write)\n"
     << "  backend=uring|kvikio       (default uring)\n"
     << "  source=host|device         write source memory (default host)\n"
     << "  size=<bytes>[K|M|G]        bytes written per repetition (default 4G)\n"
@@ -154,8 +214,19 @@ void usage(char const* prog)
     << "  baseline_threads=N         threads of the parallel pwrite baseline (default 4)\n"
     << "  pause_ms=N                 idle time between measurements (default 0)\n"
     << "  read_size=<bytes>          mixed: bytes per latency read (default 4K)\n"
-    << "  read_file_size=<bytes>     mixed: size of the file read from (default 1G)\n"
-    << "  idle_reads=N               mixed: reads in the idle phase (default 2000)\n";
+    << "  read_file_size=<bytes>     mixed/readmix: size of the file read from (default 1G)\n"
+    << "  idle_reads=N               mixed/readmix: reads in an idle phase (default 2000)\n"
+    << "  slices_per_pass=N          uring: slices of one request planned per runner pass\n"
+    << "                             (default 8, 0 = no cap)\n"
+    << "  bg_groups=N                uring: scheduling.max_background_groups (default 2)\n"
+    << "  bg_share=F                 uring: scheduling.background_slot_fraction (default 0.75)\n"
+    << "  bg_reserve=N               uring: scheduling.reserved_background_slots (default 8)\n"
+    << "  bg_size=<bytes>            readmix: background read size (default 2G)\n"
+    << "  bg_slice=<bytes>           readmix: slice size of the background read (default 1M)\n"
+    << "  bg_class=background|read   readmix: class of the background read (default\n"
+    << "                             background; read = pre-tagging prefetch class)\n"
+    << "  demand_sizes=<list>        readmix: demand read sizes (default 4K,1M,16M)\n"
+    << "  demand_dst=host|device     readmix: demand read destination (default host)\n";
 }
 
 options parse_args(int argc, char** argv)
@@ -217,11 +288,37 @@ options parse_args(int argc, char** argv)
       o.read_file_size = parse_size(val);
     } else if (key == "idle_reads") {
       o.idle_reads = parse_size(val);
+    } else if (key == "slices_per_pass") {
+      o.slices_per_pass = parse_size(val);
+    } else if (key == "bg_groups") {
+      o.scheduling.max_background_groups = parse_size(val);
+    } else if (key == "bg_share") {
+      o.scheduling.background_slot_fraction = std::stod(std::string(val));
+    } else if (key == "bg_reserve") {
+      o.scheduling.reserved_background_slots = parse_size(val);
+    } else if (key == "bg_size") {
+      o.bg_size = parse_size(val);
+    } else if (key == "bg_slice") {
+      o.bg_slice = parse_size(val);
+    } else if (key == "bg_class") {
+      if (val == "background") {
+        o.bg_class = io::request_class::background;
+      } else if (val == "read") {
+        o.bg_class = io::request_class::read;
+      } else {
+        throw std::invalid_argument("bg_class must be background|read");
+      }
+    } else if (key == "demand_sizes") {
+      o.demand_sizes = parse_size_list(val);
+    } else if (key == "demand_dst") {
+      o.demand_dst = val;
     } else {
       throw std::invalid_argument("unknown key: " + std::string(key));
     }
   }
-  if (o.mode != "write" && o.mode != "mixed") { throw std::invalid_argument("mode=write|mixed"); }
+  if (o.mode != "write" && o.mode != "mixed" && o.mode != "readmix") {
+    throw std::invalid_argument("mode=write|mixed|readmix");
+  }
   if (o.backend != "uring" && o.backend != "kvikio") {
     throw std::invalid_argument("backend=uring|kvikio");
   }
@@ -235,6 +332,21 @@ options parse_args(int argc, char** argv)
   if (o.block % PAGE != 0) { throw std::invalid_argument("block must be a multiple of 4 KiB"); }
   if (o.read_size == 0 || o.read_size % PAGE != 0 || o.read_file_size < o.read_size) {
     throw std::invalid_argument("read_size must be a non-zero multiple of 4 KiB <= read_file_size");
+  }
+  if (o.mode == "readmix") {
+    if (o.bg_slice == 0 || o.bg_slice % PAGE != 0 || o.bg_size < o.bg_slice) {
+      throw std::invalid_argument("bg_slice must be a non-zero multiple of 4 KiB <= bg_size");
+    }
+    if (o.demand_sizes.empty()) { throw std::invalid_argument("demand_sizes is empty"); }
+    if (o.demand_dst != "host" && o.demand_dst != "device") {
+      throw std::invalid_argument("demand_dst=host|device");
+    }
+    for (auto const s : o.demand_sizes) {
+      if (s == 0 || s % PAGE != 0 || s > o.read_file_size) {
+        throw std::invalid_argument(
+          "demand_sizes must be non-zero multiples of 4 KiB <= read_file_size");
+      }
+    }
   }
   return o;
 }
@@ -254,13 +366,18 @@ double median(std::vector<double> v)
   return v.empty() ? 0.0 : v[v.size() / 2];
 }
 
-/// Page-aligned host buffer filled with pseudo-random bytes.
+/// Page-aligned host buffer filled with pseudo-random bytes (or zeroes, which
+/// still faults every page in up front: read destinations).
 struct aligned_buffer {
-  explicit aligned_buffer(std::size_t bytes)
+  explicit aligned_buffer(std::size_t bytes, bool random_fill = true)
     : _size((bytes + PAGE - 1) / PAGE * PAGE),
       _data(static_cast<std::uint8_t*>(std::aligned_alloc(PAGE, _size)), &std::free)
   {
     if (_data == nullptr) { throw std::bad_alloc(); }
+    if (!random_fill) {
+      std::memset(_data.get(), 0, _size);
+      return;
+    }
     std::mt19937_64 rng{42};
     for (std::size_t i = 0; i + sizeof(std::uint64_t) <= _size; i += sizeof(std::uint64_t)) {
       auto const v = rng();
@@ -284,6 +401,11 @@ void check_cuda(cudaError_t err, char const* what)
 
 /// Device copy of the host source buffer (modest: one block).
 struct device_buffer {
+  /// Uninitialised device memory (a read destination).
+  explicit device_buffer(std::size_t bytes) : _size(bytes)
+  {
+    check_cuda(cudaMalloc(&_ptr, _size), "cudaMalloc");
+  }
   explicit device_buffer(aligned_buffer const& src) : _size(src.size())
   {
     check_cuda(cudaMalloc(&_ptr, _size), "cudaMalloc (try source=host if the GPU is full)");
@@ -319,6 +441,15 @@ void remove_file(std::string const& file)
   std::error_code ec;
   std::filesystem::remove(file, ec);
 }
+
+/// Removes its file on scope exit (also when a measurement throws).
+struct scoped_file {
+  explicit scoped_file(std::string p) : path(std::move(p)) {}
+  ~scoped_file() { remove_file(path); }
+  scoped_file(scoped_file const&)            = delete;
+  scoped_file& operator=(scoped_file const&) = delete;
+  std::string path;
+};
 
 void evict_page_cache(std::string const& file)
 {
@@ -368,7 +499,9 @@ std::unique_ptr<backend_holder> make_backend(options const& o)
     h->staging = std::make_unique<cucascade::memory::fixed_size_host_memory_resource>(
       0, *h->upstream, capacity, capacity, MiB, chunks_per_slab, 1);
     io::uring::config cfg{};
-    cfg.use_odirect = o.odirect;
+    cfg.use_odirect     = o.odirect;
+    cfg.slices_per_pass = o.slices_per_pass;
+    cfg.scheduling      = o.scheduling;
     auto rctx = std::make_shared<io::uring::uring_reactor::reactor_context>(cfg, h->staging.get());
     h->ctx    = std::make_shared<io::uring::uring_ioctx>(o.runners, std::move(rctx));
   } else {
@@ -502,6 +635,12 @@ std::string describe(options const& o)
     << " durability=" << (o.durability == io::write_durability::none ? "none" : "data_sync")
     << " size=" << o.size / MiB << "MiB block=" << o.block / KiB << "KiB runners=" << o.runners
     << " threads=" << o.threads << " qd=" << o.qd;
+  if (o.backend == "uring") {
+    s << " slices_per_pass=" << o.slices_per_pass
+      << " bg_groups=" << o.scheduling.max_background_groups
+      << " bg_share=" << o.scheduling.background_slot_fraction
+      << " bg_reserve=" << o.scheduling.reserved_background_slots;
+  }
   return s.str();
 }
 
@@ -606,7 +745,7 @@ std::vector<double> latency_reads(std::size_t file_size,
                                   std::function<bool(std::size_t)> const& keep_going,
                                   std::function<void(std::size_t, std::uint8_t*)> const& read_one)
 {
-  aligned_buffer dst(read_size);
+  aligned_buffer dst(read_size, /*random_fill=*/false);
   std::mt19937_64 rng{7};
   std::uniform_int_distribution<std::size_t> pick(0, (file_size - read_size) / PAGE);
   std::vector<double> lat;
@@ -713,12 +852,252 @@ int run_mixed_mode(options const& o)
   return 0;
 }
 
+//===----------------------------------------------------------------------===//
+// mode=readmix
+//===----------------------------------------------------------------------===//
+
+std::string kv_latency(latency_stats const& s)
+{
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1) << "reads=" << s.count << " p50_us=" << s.p50_us
+      << " p99_us=" << s.p99_us << " max_us=" << s.max_us;
+  return out.str();
+}
+
+/// Run configuration repeated on every RESULT / STATS line, so the lines of
+/// several invocations can be pooled and grouped by key.
+std::string readmix_tag(options const& o)
+{
+  std::ostringstream s;
+  s << "backend=" << o.backend << " runners=" << o.runners << " odirect=" << o.odirect
+    << " bg_class=" << class_name(o.bg_class) << " bg_size=" << size_label(o.bg_size)
+    << " bg_slice=" << size_label(o.bg_slice) << " slices_per_pass=" << o.slices_per_pass
+    << " bg_groups=" << o.scheduling.max_background_groups
+    << " bg_share=" << o.scheduling.background_slot_fraction
+    << " bg_reserve=" << o.scheduling.reserved_background_slots << " demand_dst=" << o.demand_dst;
+  return s.str();
+}
+
+double to_us(std::chrono::nanoseconds d)
+{
+  return std::chrono::duration<double, std::micro>(d).count();
+}
+
+/// Start a statistics window: clear the peaks, return the counters to diff.
+io::queue_stats open_stats_window(io::ioctx& ctx)
+{
+  ctx.reset_stats_peaks();
+  return ctx.stats();
+}
+
+/// One STATS line for the window opened by @p before.  Per class that retired
+/// requests in the window: first-I/O count, mean and max delay, max queue wait
+/// (absent class = no request).  Per runner, in registration order: peak
+/// in-flight physical ops and MiB submitted in the window.
+void print_stats(std::string const& prefix, io::ioctx const& ctx, io::queue_stats const& before)
+{
+  auto const after = ctx.stats();
+  std::ostringstream s;
+  s << std::fixed << std::setprecision(1) << "STATS " << prefix;
+  for (auto const cls : {io::request_class::latency,
+                         io::request_class::read,
+                         io::request_class::write,
+                         io::request_class::background}) {
+    auto const& a = after.per_class[io::request_class_index(cls)];
+    auto const& b = before.per_class[io::request_class_index(cls)];
+    auto const n  = a.first_io_count - b.first_io_count;
+    if (n == 0) { continue; }
+    std::string const c = class_name(cls);
+    s << " " << c << ".first_io_n=" << n << " " << c
+      << ".first_io_mean_us=" << to_us(a.first_io_total - b.first_io_total) / static_cast<double>(n)
+      << " " << c << ".first_io_max_us=" << to_us(a.first_io_max) << " " << c
+      << ".max_queue_wait_us=" << to_us(a.max_queue_wait);
+  }
+  std::ostringstream inflight;
+  std::ostringstream submitted;
+  inflight << std::fixed << std::setprecision(1);
+  submitted << std::fixed << std::setprecision(1);
+  for (std::size_t i = 0; i < after.runners.size(); ++i) {
+    auto const& r       = after.runners[i];
+    std::uint64_t start = 0;
+    for (auto const& b : before.runners) {
+      if (b.id == r.id) { start = b.bytes_submitted; }
+    }
+    char const* sep = i == 0 ? "" : ",";
+    inflight << sep << r.max_inflight_ops;
+    submitted << sep << static_cast<double>(r.bytes_submitted - start) / static_cast<double>(MiB);
+  }
+  s << " runner_max_inflight_ops=" << inflight.str() << " runner_submitted_mib=" << submitted.str();
+  std::cout << s.str() << "\n";
+}
+
+int run_readmix_mode(options const& o)
+{
+  auto const tag   = readmix_tag(o);
+  auto const pause = [&] { std::this_thread::sleep_for(std::chrono::milliseconds(o.pause_ms)); };
+  std::cout << std::fixed << std::setprecision(2) << "== readmix: " << tag
+            << " read_file=" << size_label(o.read_file_size) << " idle_reads=" << o.idle_reads
+            << " reps=" << o.reps << "\n   path=" << o.path << "\n\n";
+
+  // Device demand reads need a GPU: without one the run is skipped, not failed.
+  std::unique_ptr<device_buffer> demand_dev;
+  std::unique_ptr<cuda_stream> demand_stream;
+  if (o.demand_dst == "device") {
+    try {
+      demand_dev = std::make_unique<device_buffer>(
+        *std::max_element(o.demand_sizes.begin(), o.demand_sizes.end()));
+      demand_stream = std::make_unique<cuda_stream>();
+    } catch (std::exception const& e) {
+      std::cout << "SKIP readmix " << tag << " reason=\"no usable GPU: " << e.what() << "\"\n";
+      return 0;
+    }
+  }
+
+  // Built first: an invalid scheduling knob fails before the files are written.
+  auto backend = make_backend(o);
+  auto& ctx    = *backend->ctx;
+
+  // The demand file and the background file: written once, then evicted from
+  // the page cache before every measurement so buffered reads reach the device.
+  aligned_buffer host_src(o.block);
+  scoped_file const read_file{test_file(o, "read")};
+  scoped_file const bg_file{test_file(o, "background")};
+  auto const create = [&](std::string const& file, std::size_t bytes) {
+    options fill = o;
+    fill.size    = bytes;
+    fill.odirect = false;
+    static_cast<void>(pwrite_write(fill, file, host_src, 1));
+    evict_page_cache(file);
+  };
+  create(read_file.path, o.read_file_size);
+  create(bg_file.path, o.bg_size);
+  auto const robj = ctx.open_io_object(read_file.path);
+  auto const bobj = ctx.open_io_object(bg_file.path);
+
+  // The background request: one vectored read of the whole file into one
+  // buffer, like a prefetch of many chunks.
+  aligned_buffer bg_dst(o.bg_size, /*random_fill=*/false);
+  std::vector<io::slice> bg_slices;
+  for (std::size_t off = 0; off < o.bg_size; off += o.bg_slice) {
+    bg_slices.emplace_back(off, std::min(o.bg_slice, o.bg_size - off), bg_dst.data() + off);
+  }
+  io::io_options const bg_opts{o.bg_class};
+
+  // -- (1) background read alone ----------------------------------------------
+  std::vector<double> alone;
+  for (std::size_t r = 0; r < o.reps; ++r) {
+    evict_page_cache(bg_file.path);
+    auto const before = open_stats_window(ctx);
+    auto const t0     = clock_type::now();
+    auto const got    = ctx.host_readv_async_io(*bobj, bg_slices, bg_opts).get();
+    auto const t      = clock_type::now() - t0;
+    if (got != o.bg_size) { throw std::runtime_error("short background read"); }
+    alone.push_back(gbps(o.bg_size, t));
+    auto const prefix = "readmix " + tag + " phase=bg_alone rep=" + std::to_string(r + 1);
+    std::cout << "RESULT " << prefix << " bg_gbps=" << alone.back() << "\n";
+    print_stats(prefix, ctx, before);
+    pause();
+  }
+  double const alone_gbps = median(alone);
+  std::cout << "RESULT readmix " << tag << " phase=bg_alone_median reps=" << o.reps
+            << " bg_gbps=" << alone_gbps << "\n\n";
+
+  // -- (2) per demand size: idle, then during the background read -------------
+  for (auto const size : o.demand_sizes) {
+    // Demand reads go through host_read_async / device_read_async with the
+    // automatic class (no prefetch handle), i.e. latency or read by size --
+    // never background.  A device read counts until its copy is on the GPU.
+    auto const demand_class =
+      io::resolve_request_class(io::request_class::automatic, io::io_kind::read, size);
+    auto const dprefix = "readmix " + tag + " demand_size=" + size_label(size) +
+                         " demand_class=" + class_name(demand_class);
+    auto const read_one = [&](std::size_t off, std::uint8_t* host_dst) {
+      std::size_t got = 0;
+      if (demand_dev != nullptr) {
+        got = ctx
+                .device_read_async(
+                  *robj, off, size, demand_dev->data(), ::cuda::stream_ref{demand_stream->s})
+                .get();
+        check_cuda(cudaStreamSynchronize(demand_stream->s), "cudaStreamSynchronize");
+      } else {
+        got = ctx.host_read_async(*robj, off, size, host_dst).get();
+      }
+      if (got != size) { throw std::runtime_error("short demand read"); }
+    };
+
+    evict_page_cache(read_file.path);
+    auto const idle_before = open_stats_window(ctx);
+    auto const idle        = summarize(latency_reads(
+      o.read_file_size, size, [&](std::size_t n) { return n < o.idle_reads; }, read_one));
+    std::cout << "RESULT " << dprefix << " phase=idle " << kv_latency(idle) << "\n";
+    print_stats(dprefix + " phase=idle", ctx, idle_before);
+    pause();
+
+    std::vector<double> pooled;
+    std::vector<double> bg_rates;
+    for (std::size_t r = 0; r < o.reps; ++r) {
+      evict_page_cache(read_file.path);
+      evict_page_cache(bg_file.path);
+      auto const before = open_stats_window(ctx);
+      std::atomic<bool> bg_done{false};
+      clock_type::time_point bg_end{};
+      std::size_t bg_got{0};
+      std::exception_ptr bg_err;
+      auto const t0 = clock_type::now();
+      // Submitted here (before the first demand read); the waiter only records
+      // when it resolved.
+      std::thread waiter([&, f = ctx.host_readv_async_io(*bobj, bg_slices, bg_opts)]() mutable {
+        try {
+          bg_got = std::move(f).get();
+        } catch (...) {
+          bg_err = std::current_exception();
+        }
+        bg_end = clock_type::now();
+        bg_done.store(true, std::memory_order_release);
+      });
+      std::vector<double> lat;
+      std::exception_ptr demand_err;
+      try {
+        lat = latency_reads(
+          o.read_file_size,
+          size,
+          [&](std::size_t) { return !bg_done.load(std::memory_order_acquire); },
+          read_one);
+      } catch (...) {
+        demand_err = std::current_exception();
+      }
+      waiter.join();
+      if (bg_err) { std::rethrow_exception(bg_err); }
+      if (demand_err) { std::rethrow_exception(demand_err); }
+      if (bg_got != o.bg_size) { throw std::runtime_error("short background read"); }
+      bg_rates.push_back(gbps(o.bg_size, bg_end - t0));
+      auto const prefix = dprefix + " phase=concurrent rep=" + std::to_string(r + 1);
+      std::cout << "RESULT " << prefix << " " << kv_latency(summarize(lat))
+                << " bg_gbps=" << bg_rates.back() << "\n";
+      print_stats(prefix, ctx, before);
+      pooled.insert(pooled.end(), lat.begin(), lat.end());
+      pause();
+    }
+    // All repetitions pooled: concurrent phases are short, so one repetition
+    // may hold too few samples for a meaningful p99.
+    auto const all      = summarize(std::move(pooled));
+    double const bg_med = median(bg_rates);
+    double const p99_x  = idle.p99_us > 0 ? all.p99_us / idle.p99_us : 0.0;
+    double const bg_x   = alone_gbps > 0 ? bg_med / alone_gbps : 0.0;
+    std::cout << "RESULT " << dprefix << " phase=concurrent_all reps=" << o.reps << " "
+              << kv_latency(all) << " bg_gbps_median=" << bg_med << " p99_x_idle=" << p99_x
+              << " bg_x_alone=" << bg_x << "\n\n";
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
   try {
     auto const o = parse_args(argc, argv);
+    if (o.mode == "readmix") { return run_readmix_mode(o); }
     return o.mode == "write" ? run_write_mode(o) : run_mixed_mode(o);
   } catch (std::exception const& e) {
     std::cerr << "error: " << e.what() << "\n";
