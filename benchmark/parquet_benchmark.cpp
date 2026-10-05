@@ -19,7 +19,7 @@
 // vs the cucascade::io uring datasource (O_DIRECT io_uring + DMA to GPU).
 
 #include <cucascade/cudf/datasource.hpp>
-#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
