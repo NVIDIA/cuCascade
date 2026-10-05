@@ -77,8 +77,10 @@ enum class wait_action : std::uint8_t {
  *  - @ref try_pull: @c state = assigned, @c assigned_at, @c runner_id; the
  *    runner's active-group count and the in-flight count go up;
  *  - @ref finish_group: @c state = completed / failed / cancelled,
- *    @c completed_at; counts go down;
- *  - @ref requeue: counts go down (the request is queued again).
+ *    @c completed_at; counts go down; the first-I/O delay
+ *    (@c first_io_at - @c enqueued_at) is recorded if an operation was submitted;
+ *  - @ref requeue: counts go down (the request is queued again, keeping
+ *    @c enqueued_at; nothing is recorded, so a request is counted once).
  * Engines set the intermediate states themselves (@c in_flight when the first
  * physical operation is submitted, plus @c first_io_at; @c copying while a
  * CUDA copy is outstanding).
@@ -227,8 +229,10 @@ class request_hub {
    *
    * Sets @c meta.completed_at and the terminal @c meta.state: @p state when
    * given, otherwise @c failed if the coordinator has an error and
-   * @c completed if not.  The request must not be touched afterwards (the
-   * caller usually destroys it right away).
+   * @c completed if not.  If the engine stamped @c meta.first_io_at, records
+   * the request's first-I/O delay in its class (see @ref class_stats).  The
+   * request must not be touched afterwards (the caller usually destroys it
+   * right away).
    */
   void finish_group(grouped_io_request& request,
                     runner_slot& slot,
@@ -239,8 +243,22 @@ class request_hub {
 
   // -- observability --------------------------------------------------------------
 
-  /// Aggregate statistics: per-class queue state, runner counts, in-flight groups.
+  /**
+   * @brief Aggregate statistics: per-class queue state and first-I/O delay,
+   *        runner counts and per-runner gauges, in-flight groups.
+   *
+   * Takes the registry lock briefly and allocates @c queue_stats::runners; if
+   * that allocation fails the vector is left empty (everything else is filled).
+   */
   [[nodiscard]] queue_stats stats() const noexcept;
+
+  /// Clear the peak statistics: per-class max queue wait and max first-I/O
+  /// delay, per-runner max in-flight operations.  Monotonic counters are untouched.
+  void reset_stats_peaks() noexcept
+  {
+    _queue.reset_peaks();
+    _registry.reset_peaks();
+  }
 
   /// Bytes not yet taken of all queued requests.
   [[nodiscard]] std::size_t queued_bytes() const noexcept { return _queue.total_queued_bytes(); }

@@ -18,7 +18,9 @@
 
 #include <cucascade/io/details/request_hub.hpp>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -149,6 +151,15 @@ void request_hub::finish_group(grouped_io_request& request,
 {
   auto const terminal = state.value_or(request.coordinator->has_error() ? request_state::failed
                                                                         : request_state::completed);
+  auto const& meta    = request.meta;
+  // Recorded here, once per request: requeue() records nothing and keeps
+  // enqueued_at.  Without first_io_at no operation was ever submitted (e.g.
+  // cancelled before any I/O): not counted.
+  if (meta.first_io_at != time_point{} && meta.enqueued_at != time_point{}) {
+    auto const delay =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(meta.first_io_at - meta.enqueued_at);
+    _queue.record_first_io(meta.cls, std::max(delay, std::chrono::nanoseconds{0}));
+  }
   request.meta.completed_at = clock::now();
   request.meta.state.store(terminal, std::memory_order_release);
   release_from_runner(slot);
@@ -179,10 +190,16 @@ queue_stats request_hub::stats() const noexcept
     entry.queued_bytes    = _queue.queued_bytes(cls);
     entry.last_queue_wait = _queue.last_wait(cls);
     entry.max_queue_wait  = _queue.max_wait(cls);
+    _queue.fill_first_io(cls, entry);
   }
   result.active_runners     = _registry.size();
   result.idle_runners       = _registry.idle_count();
   result.in_flight_requests = _in_flight.load(std::memory_order_relaxed);
+  try {
+    result.runners = _registry.snapshot();
+  } catch (...) {
+    result.runners.clear();  // stats() is noexcept: report no runner gauges instead
+  }
   return result;
 }
 

@@ -309,3 +309,58 @@ TEST_CASE("close_admission rejects with its reason until admission reopens",
   CHECK_FALSE(hub.rejection_reason().has_value());
   CHECK_THROWS_AS(submit().get(), std::system_error);
 }
+
+TEST_CASE("runner gauges snapshot and peak reset", "[io][runner_registry][runner]")
+{
+  request_hub hub;
+  auto& registry = hub.registry();
+  auto slot      = registry.register_runner();
+  CHECK(slot->inflight_ops() == 0);
+  CHECK(slot->max_inflight_ops() == 0);
+  CHECK(slot->bytes_submitted() == 0);
+
+  slot->publish_gauges(5, 100);
+  slot->publish_gauges(2, 150);
+  auto snapshot = registry.snapshot();
+  REQUIRE(snapshot.size() == 1);
+  CHECK(snapshot[0].id == slot->id());
+  CHECK_FALSE(snapshot[0].parked);
+  CHECK(snapshot[0].active_groups == 0);
+  CHECK(snapshot[0].retired_groups == 0);
+  CHECK(snapshot[0].inflight_ops == 2);
+  CHECK(snapshot[0].max_inflight_ops == 5);
+  CHECK(snapshot[0].bytes_submitted == 150);
+
+  // The same gauges through the hub's stats(), in registration order.
+  std::shared_ptr<runner_slot> other;
+  std::jthread([&] { other = registry.register_runner(); }).join();
+  REQUIRE(other != nullptr);
+  other->publish_gauges(7, 4096);
+  registry.park(*other);
+  auto stats = hub.stats();
+  REQUIRE(stats.runners.size() == 2);
+  CHECK(stats.runners[0].id == slot->id());
+  CHECK(stats.runners[0].max_inflight_ops == 5);
+  CHECK(stats.runners[1].id == other->id());
+  CHECK(stats.runners[1].parked);
+  CHECK(stats.runners[1].inflight_ops == 7);
+  CHECK(stats.runners[1].bytes_submitted == 4096);
+  CHECK(stats.active_runners == 2);
+  registry.unpark(*other);
+
+  // Peak reset restarts the window at the current depth; counters stay.
+  registry.reset_peaks();
+  CHECK(slot->max_inflight_ops() == 2);
+  CHECK(slot->bytes_submitted() == 150);
+  other->publish_gauges(0, 8192);
+  hub.reset_stats_peaks();
+  CHECK(other->max_inflight_ops() == 0);
+  CHECK(other->bytes_submitted() == 8192);
+  slot->publish_gauges(3, 200);
+  CHECK(registry.snapshot()[0].max_inflight_ops == 3);
+
+  registry.unregister_runner(*other);
+  registry.unregister_runner(*slot);
+  CHECK(registry.snapshot().empty());
+  CHECK(hub.stats().runners.empty());
+}
