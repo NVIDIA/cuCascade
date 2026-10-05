@@ -564,6 +564,8 @@ class templated_ioctx : public ioctx {
 
   [[nodiscard]] queue_stats stats() const noexcept override { return _reactor->hub().stats(); }
 
+  void reset_stats_peaks() noexcept override { _reactor->hub().reset_stats_peaks(); }
+
   /// Threads @ref start spawns.
   [[nodiscard]] std::size_t n_runner_threads() const noexcept { return _n_runner_threads; }
 

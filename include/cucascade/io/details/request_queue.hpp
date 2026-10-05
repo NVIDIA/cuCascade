@@ -22,6 +22,7 @@
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -43,7 +44,8 @@ namespace cucascade::io::detail {
  * raw owning pointers (ownership moves into the queue only when the push
  * succeeds, so a failed push leaves the request with the caller), plus atomic
  * counters for the per-class request count, queued bytes, an approximate
- * "oldest enqueue time", and queue-wait statistics.
+ * "oldest enqueue time", queue-wait statistics, and first-I/O delay statistics
+ * (recorded by @ref request_hub::finish_group via @ref record_first_io).
  *
  * Ordering: FIFO per producer thread within one lane; no ordering between
  * producers or between lanes (moodycamel semantics).
@@ -257,17 +259,67 @@ class request_queue {
       _last_wait_ns[request_class_index(cls)].load(std::memory_order_relaxed)};
   }
 
-  /// Longest queue wait observed in lane @p cls.
+  /// Longest queue wait observed in lane @p cls since the last @ref reset_peaks.
   [[nodiscard]] std::chrono::nanoseconds max_wait(request_class cls) const noexcept
   {
     return std::chrono::nanoseconds{
       _max_wait_ns[request_class_index(cls)].load(std::memory_order_relaxed)};
   }
 
+  /**
+   * @brief Record the first-I/O delay of one retired request of class @p cls.
+   *
+   * Called by @ref request_hub::finish_group, once per grouped request; a few
+   * relaxed atomic updates, never blocks.
+   *
+   * @param cls Concrete class (never @c automatic).
+   * @param delay Time from enqueue to the first physical operation (negative
+   *        values count as 0).
+   */
+  void record_first_io(request_class cls, std::chrono::nanoseconds delay) noexcept
+  {
+    auto const lane = request_class_index(cls);
+    auto const ns =
+      delay.count() <= 0 ? std::uint64_t{0} : static_cast<std::uint64_t>(delay.count());
+    _first_io_hist[lane][first_io_delay_bucket(delay)].fetch_add(1, std::memory_order_relaxed);
+    _first_io_sum_ns[lane].fetch_add(ns, std::memory_order_relaxed);
+    auto max_ns = _first_io_max_ns[lane].load(std::memory_order_relaxed);
+    while (ns > max_ns &&
+           !_first_io_max_ns[lane].compare_exchange_weak(max_ns, ns, std::memory_order_relaxed)) {}
+    _first_io_count[lane].fetch_add(1, std::memory_order_relaxed);
+  }
+
+  /// Copy the first-I/O statistics of lane @p cls into the @c first_io_* fields of @p out.
+  void fill_first_io(request_class cls, class_stats& out) const noexcept
+  {
+    auto const lane    = request_class_index(cls);
+    out.first_io_count = _first_io_count[lane].load(std::memory_order_relaxed);
+    out.first_io_total = to_duration(_first_io_sum_ns[lane].load(std::memory_order_relaxed));
+    out.first_io_max   = to_duration(_first_io_max_ns[lane].load(std::memory_order_relaxed));
+    for (std::size_t b = 0; b < first_io_delay_buckets; ++b) {
+      out.first_io_histogram[b] = _first_io_hist[lane][b].load(std::memory_order_relaxed);
+    }
+  }
+
+  /// Clear the peak statistics (@ref max_wait and the first-I/O maximum) of every lane.
+  void reset_peaks() noexcept
+  {
+    for (std::size_t lane = 0; lane < request_class_count; ++lane) {
+      _max_wait_ns[lane].store(0, std::memory_order_relaxed);
+      _first_io_max_ns[lane].store(0, std::memory_order_relaxed);
+    }
+  }
+
  private:
   [[nodiscard]] static std::int64_t to_ns(time_point tp) noexcept
   {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch()).count();
+  }
+
+  [[nodiscard]] static std::chrono::nanoseconds to_duration(std::uint64_t ns) noexcept
+  {
+    constexpr auto max_ns = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    return std::chrono::nanoseconds{static_cast<std::int64_t>(std::min(ns, max_ns))};
   }
 
   void lower_oldest(std::size_t lane, std::int64_t value) noexcept
@@ -283,6 +335,12 @@ class request_queue {
   std::array<std::atomic<std::int64_t>, request_class_count> _oldest_ns{};
   std::array<std::atomic<std::int64_t>, request_class_count> _last_wait_ns{};
   std::array<std::atomic<std::int64_t>, request_class_count> _max_wait_ns{};
+  // First-I/O delay per lane (written once per request at retirement).
+  std::array<std::atomic<std::uint64_t>, request_class_count> _first_io_count{};
+  std::array<std::atomic<std::uint64_t>, request_class_count> _first_io_sum_ns{};
+  std::array<std::atomic<std::uint64_t>, request_class_count> _first_io_max_ns{};
+  std::array<std::array<std::atomic<std::uint64_t>, first_io_delay_buckets>, request_class_count>
+    _first_io_hist{};
   std::atomic<std::size_t> _total{0};
 };
 

@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -477,12 +478,67 @@ struct write_segment {
 // Queue observability
 // ---------------------------------------------------------------------------
 
-/// Per-class queue statistics.
+/// Buckets of the first-I/O delay histogram (@ref class_stats::first_io_histogram):
+/// bucket @c b counts delays of @c d whole microseconds with
+/// @c std::bit_width(d) == b, i.e. bucket 0 holds delays below 1 µs and bucket
+/// @c b > 0 holds [2^(b-1), 2^b) µs; the last bucket is open-ended (>= ~16.8 s).
+inline constexpr std::size_t first_io_delay_buckets = 26;
+
+/**
+ * @brief Histogram bucket of a first-I/O delay; see @ref first_io_delay_buckets.
+ *
+ * @param delay Delay; negative values count as 0.
+ * @return Bucket index in [0, first_io_delay_buckets).
+ */
+[[nodiscard]] constexpr std::size_t first_io_delay_bucket(std::chrono::nanoseconds delay) noexcept
+{
+  auto const us     = std::chrono::duration_cast<std::chrono::microseconds>(delay).count();
+  auto const bucket = us <= 0
+                        ? std::size_t{0}
+                        : static_cast<std::size_t>(std::bit_width(static_cast<std::uint64_t>(us)));
+  return std::min(bucket, first_io_delay_buckets - 1);
+}
+
+/**
+ * @brief Per-class queue statistics.
+ *
+ * The first-I/O fields measure, per grouped request, the time from its enqueue
+ * to the submission of its first physical operation (queue wait plus the time
+ * the runner held it before any operation fitted).  They are recorded once,
+ * when a runner retires the request, and only for requests that submitted at
+ * least one operation (a request cancelled before any I/O is not counted).  A
+ * large read fanned out into several grouped requests counts once per group.
+ * Counts, sums and the histogram are monotonic (hosts diff two samples); the
+ * maxima are peaks since the last @ref ioctx::reset_stats_peaks.
+ */
 struct class_stats {
   std::size_t queued_requests{0};               ///< requests waiting in the queue
   std::size_t queued_bytes{0};                  ///< bytes of the waiting requests
   std::chrono::nanoseconds last_queue_wait{0};  ///< queue wait of the last pulled request
-  std::chrono::nanoseconds max_queue_wait{0};   ///< longest observed queue wait
+  std::chrono::nanoseconds max_queue_wait{0};   ///< peak queue wait (reset_stats_peaks clears)
+  std::uint64_t first_io_count{0};              ///< retired requests that submitted an op
+  std::chrono::nanoseconds first_io_total{0};   ///< sum of (first op submitted - enqueued)
+  std::chrono::nanoseconds first_io_max{0};     ///< peak first-I/O delay (reset_stats_peaks clears)
+  /// First-I/O delays by @ref first_io_delay_bucket (log2 µs); sums to @c first_io_count.
+  std::array<std::uint64_t, first_io_delay_buckets> first_io_histogram{};
+};
+
+/**
+ * @brief Gauges of one runner (a thread inside @c run*()).
+ *
+ * The group counts are maintained by the request hub; the operation gauges are
+ * published by the runner's engine once per loop pass (relaxed stores), so they
+ * are approximate and may be one pass stale.  Backends whose engine does not
+ * publish them report zeros.
+ */
+struct runner_stats {
+  std::uint64_t id{0};                ///< registry-unique runner id (> 0)
+  bool parked{false};                 ///< blocked waiting for work (approximate)
+  std::size_t active_groups{0};       ///< grouped requests the runner currently owns
+  std::size_t retired_groups{0};      ///< grouped requests it retired (monotonic)
+  std::uint32_t inflight_ops{0};      ///< physical ops submitted and not yet reaped
+  std::uint32_t max_inflight_ops{0};  ///< peak of inflight_ops since the last reset_stats_peaks
+  std::uint64_t bytes_submitted{0};   ///< bytes of all physical ops submitted (monotonic)
 };
 
 /// Aggregate queue / runner statistics of one ioctx.
@@ -491,6 +547,9 @@ struct queue_stats {
   std::size_t active_runners{0};                             ///< threads currently inside run*()
   std::size_t idle_runners{0};                               ///< runners blocked waiting for work
   std::size_t in_flight_requests{0};  ///< grouped requests assigned to runners
+  /// One entry per registered runner, in registration order (empty if the
+  /// snapshot could not be allocated).
+  std::vector<runner_stats> runners;
 };
 
 }  // namespace cucascade::io
