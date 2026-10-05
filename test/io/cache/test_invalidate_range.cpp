@@ -21,7 +21,7 @@
 
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/config.hpp>
-#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
@@ -59,15 +59,15 @@
 
 namespace cucascade::io::cache {
 
-struct prefetching_cache_test_access {
-  static prefetching_handle insert(prefetching_cache& cache,
-                                   io_object const& obj,
-                                   std::span<byte_range const> ranges)
+struct fs_cache_test_access {
+  static cache_handle insert(fs_cache& cache,
+                             io_object const& obj,
+                             std::span<byte_range const> ranges)
   {
     return cache.initiate_prefetching_request(obj, ranges);
   }
 
-  static prepare_result prepare(prefetching_cache& cache, prefetching_handle& handle)
+  static prepare_result prepare(fs_cache& cache, cache_handle& handle)
   {
     return cache.prepare(handle, /*wait_for_eviction=*/true);
   }
@@ -87,10 +87,10 @@ using cucascade::io::range;
 using cucascade::io::request_class;
 using cucascade::io::write_options;
 using cucascade::io::write_segment;
+using cucascade::io::cache::cache_handle;
 using cucascade::io::cache::chunk_state;
-using cucascade::io::cache::prefetching_cache;
-using cucascade::io::cache::prefetching_cache_test_access;
-using cucascade::io::cache::prefetching_handle;
+using cucascade::io::cache::fs_cache;
+using cucascade::io::cache::fs_cache_test_access;
 using cucascade::io::cache::prepare_result;
 
 constexpr std::size_t chunk_bytes = 64 * 1024;
@@ -444,22 +444,22 @@ struct cache_fixture {
     return tmpl;
   }
 
-  [[nodiscard]] prefetching_cache& cache() { return *ctx->cache(); }
+  [[nodiscard]] fs_cache& cache() { return *ctx->cache(); }
 
   /// Register the whole file with the cache and attach buffers to its chunks.
-  prefetching_handle insert_and_prepare()
+  cache_handle insert_and_prepare()
   {
     byte_range const whole{0, static_cast<std::int64_t>(file_bytes)};
     auto handle =
-      prefetching_cache_test_access::insert(cache(), *obj, std::span<byte_range const>{&whole, 1});
+      fs_cache_test_access::insert(cache(), *obj, std::span<byte_range const>{&whole, 1});
     REQUIRE(handle);
-    REQUIRE(prefetching_cache_test_access::prepare(cache(), handle) == prepare_result::prepared);
+    REQUIRE(fs_cache_test_access::prepare(cache(), handle) == prepare_result::prepared);
     REQUIRE(handle.chunks()->size() == n_chunks);
     return handle;
   }
 
   /// Prefetch every chunk of @p handle and wait for the outcome.
-  bool prefetch(prefetching_handle& handle)
+  bool prefetch(cache_handle& handle)
   {
     std::atomic<int> result{-1};
     std::ignore = cache().prefetch(handle, [&result](bool ok) noexcept { result = ok ? 1 : 0; });
@@ -482,7 +482,7 @@ struct cache_fixture {
   std::shared_ptr<io_object> obj;
 };
 
-chunk_state::value state_of(prefetching_handle const& handle, std::size_t index)
+chunk_state::value state_of(cache_handle const& handle, std::size_t index)
 {
   return (*handle.chunks())[index]->state.get_state();
 }
@@ -629,7 +629,7 @@ TEST_CASE("a write completing after shutdown_cache never touches the destroyed c
   REQUIRE(fx.prefetch(handle));
   auto gate = fx.cache().invalidation_gate();
   REQUIRE(gate->is_open());
-  handle = prefetching_handle{};
+  handle = cache_handle{};
 
   fx.ctx->hold_writes(true);
   std::vector<std::uint8_t> payload(4096, 0xAB);
@@ -811,7 +811,7 @@ TEST_CASE("a commit settling after shutdown_cache never touches the destroyed ca
   REQUIRE(fx.prefetch(handle));
   fx.ctx->hold_commit();
   auto pending = fx.ctx->commit_async(*fx.obj);
-  handle       = prefetching_handle{};
+  handle       = cache_handle{};
   fx.ctx->shutdown_cache();
   fx.ctx->finish_commit(true);
   CHECK_NOTHROW(std::move(pending).get());
@@ -824,10 +824,10 @@ TEST_CASE("prefetch reads are background class, demand reads are not", "[io][cac
   cache_fixture fx;
   // A request naming chunks 0 and 1 only: chunks 2 and 3 stay uncovered.
   byte_range const head{0, static_cast<std::int64_t>(2 * chunk_bytes)};
-  auto handle = prefetching_cache_test_access::insert(
-    fx.cache(), *fx.obj, std::span<byte_range const>{&head, 1});
+  auto handle =
+    fs_cache_test_access::insert(fx.cache(), *fx.obj, std::span<byte_range const>{&head, 1});
   REQUIRE(handle);
-  REQUIRE(prefetching_cache_test_access::prepare(fx.cache(), handle) == prepare_result::prepared);
+  REQUIRE(fs_cache_test_access::prepare(fx.cache(), handle) == prepare_result::prepared);
   REQUIRE(handle.chunks()->size() == 2);
   CHECK(handle.demand_wait_ns() == 0);
 
@@ -876,10 +876,10 @@ TEST_CASE("prefetch reads are background class, demand reads are not", "[io][cac
   CHECK(handle.demand_wait_ns() == waited);  // no prefetch in flight: no further wait
 
   // Moves transfer the accumulated wait; the moved-from handle reports 0.
-  prefetching_handle moved{std::move(handle)};
+  cache_handle moved{std::move(handle)};
   CHECK(handle.demand_wait_ns() == 0);  // NOLINT(bugprone-use-after-move)
   CHECK(moved.demand_wait_ns() == waited);
-  prefetching_handle assigned;
+  cache_handle assigned;
   assigned = std::move(moved);
   CHECK(moved.demand_wait_ns() == 0);  // NOLINT(bugprone-use-after-move)
   CHECK(assigned.demand_wait_ns() == waited);

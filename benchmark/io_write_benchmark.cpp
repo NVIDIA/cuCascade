@@ -33,7 +33,7 @@
 // mode=readmix: demand-read latency while a large background read runs on the
 //               same context -- the prefetch-isolation scenario.  One vectored
 //               read of `bg_size` in `bg_slice` slices, submitted with class
-//               `bg_class` (background = how prefetching_cache::prefetch tags
+//               `bg_class` (background = how fs_cache::prefetch tags
 //               its reads; read = the pre-tagging classification of a
 //               prefetch), is timed alone, then concurrently with a loop of
 //               host_read_async (demand_dst=host) or device_read_async

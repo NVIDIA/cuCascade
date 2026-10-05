@@ -39,7 +39,7 @@ why, and where each concern now lives.
    dispatch (write budgets, latency reservation, background throttle), so writes cannot
    starve reads. Each runner holds several groups concurrently, which removes head-of-line
    blocking.
-4. **Cache coherence.** Writes invalidate overlapping `prefetching_cache` chunks, both before
+4. **Cache coherence.** Writes invalidate overlapping `fs_cache` chunks, both before
    submission and on completion. A commit invalidates the whole object. A new STALE chunk
    bit stops stale loads from being published.
 5. **Designed for a future manager** (NOT implemented). A component that scales runner threads
@@ -562,10 +562,10 @@ runners**, and writes are eager: `mixed_writev_async_io` returns an already-reso
   - A short write raises `system_error(io_error)`.
 - **Scheme:** `s3://` gives `not_supported`.
 
-### 5.4 Cache coherence — `include/cucascade/io/cache/`, `src/io/cache/prefetching_cache.cpp`, `src/io/io_context.cpp`
+### 5.4 Cache coherence — `include/cucascade/io/cache/`, `src/io/cache/fs_cache.cpp`, `src/io/io_context.cpp`
 
 ```cpp
-std::size_t prefetching_cache::invalidate_range(const io_object&, std::size_t offset, std::size_t size) noexcept;
+std::size_t fs_cache::invalidate_range(const io_object&, std::size_t offset, std::size_t size) noexcept;
 ```
 
 **Chunk states:**
@@ -590,7 +590,7 @@ bytes only appear at commit.
 loading before the call. A reader racing a write may see old or new bytes.
 
 **Lifetime.** Completion callbacks hold a `shared_ptr<write_invalidation_gate>`, not `this`.
-`~prefetching_cache` closes the gate and waits for any invalidation in progress. Re-running
+`~fs_cache` closes the gate and waits for any invalidation in progress. Re-running
 `initialize_cache` while writes are in flight is unsupported.
 
 **Keying.** The cache key is `raw_file_cache_id`, the path. A write that grows a file gets no
@@ -710,7 +710,7 @@ New test files (phase 1; phase 2 cases are listed in §11.7):
 | Coordinator | `test_coordinator_finalizer.cpp` |
 | uring | `uring/test_uring_runner.cpp`, `uring/test_uring_write.cpp` |
 | REST | `rest/test_rest_runner.cpp`, `rest/test_rest_write.cpp`, `rest/test_sync_request.cpp`, `rest/s3/test_sigv4_write.cpp`, `rest/s3/test_xml_utils.cpp`, `rest/loopback_object_store.hpp` (in-memory S3 with fault injection and a query-routing authorizer), `mock_authorizer.hpp::authorize_request` |
-| Cache | `test_chunk_state_stale.cpp`, `cache/test_invalidate_range.cpp` (needs `friend struct prefetching_cache_test_access`) |
+| Cache | `test_chunk_state_stale.cpp`, `cache/test_invalidate_range.cpp` (needs `friend struct fs_cache_test_access`) |
 | kvikio | `kvikio/test_kvikio_write.cpp`, compiled under `CUCASCADE_BUILD_CUDF` |
 | Scheduling (phase 2) | `uring/test_uring_scheduling.cpp` (new, `[io][uring][scheduling]`); new cases in `test_scheduling_policy.cpp`, `test_request_queue.cpp`, `test_runner_registry.cpp`, `cache/test_invalidate_range.cpp` |
 
@@ -744,7 +744,7 @@ touched them since `bd4aeed`:
 | `include/cucascade/io/io_context.hpp`, `src/io/io_context.cpp` | Write/run API, cache bridge, `io_options` on reads |
 | `include/cucascade/io/io_request.hpp` | `request_meta`, write segments, control ops, finalizer, settle refactor |
 | `include/cucascade/io/types.hpp` | New types (§2.1) |
-| `include/cucascade/io/cache/{types,prefetching_cache}.hpp`, `src/io/cache/prefetching_cache.cpp` | STALE bit, `invalidate_range`, gate |
+| `include/cucascade/io/cache/{types,fs_cache}.hpp`, `src/io/cache/fs_cache.cpp` | STALE bit, `invalidate_range`, gate |
 | `include/cucascade/io/rest/{authorizer,config,types,rest_ioctx}.hpp`, `src/io/rest/s3/{sigv4_authorizer,list_parser}.cpp` | New methods, write config, shared XML |
 | `include/cucascade/io/kvikio/kvikio_context.hpp`, `src/io/kvikio/kvikio_context.cpp` | Write support |
 | `test/CMakeLists.txt`, `src/io/CMakeLists.txt` | Many new sources and tests (append-only; usually easy) |
@@ -795,7 +795,7 @@ touched them since `bd4aeed`:
   or background op sizing, and cannot configure them.
 - A demand read blocked on an in-flight prefetch (`await_inflight_prefetch`) does not promote
   it; the prefetch keeps only the background floor while demand is busy. The cost is visible
-  in `prefetching_handle::demand_wait_ns()`.
+  in `cache_handle::demand_wait_ns()`.
 - Runner gauges vanish from `stats().runners` when a runner leaves `run*()`, with its
   counters; REST publishes no op gauges (zeros).
 - Every `run*()` call rebuilds its engine (64 MiB pinned staging per uring engine), so short
@@ -839,13 +839,13 @@ and keeps its own `src/io`, so the port is one-way and changes nothing in sirius
 |---|---|
 | `uring::config::slices_per_pass{8}`, `max_slices_per_pass = 64`, YAML range check (`88bb31faa`) | Same field, default and bound (`458109f`), applied per group per pass in `advance_group` (`90372a1`); validated by the `uring_reactor` constructor (no YAML layer here). **Different semantics:** a fairness cap, not a depth bound; `slices_per_pass = 1` does not reproduce sirius's legacy QD 1–2 (§11.3) |
 | One `submit_prepared()` per pass (`88bb31faa`) | Already present (`_prepared` + `flush_submissions`) |
-| `io_class {demand, prefetch}` on `prepared_io_slice`, set in `prefetching_cache::prefetch` (`1703b0dfd`) | `io_options{request_class::background}` at the same call site (`db813e0`). No new enum or slice field: cuCascade classifies per request. Demand loads stay `automatic` (`latency` ≤ 256 KiB, else `read`) |
+| `io_class {demand, prefetch}` on `prepared_io_slice`, set in `fs_cache::prefetch` (`1703b0dfd`) | `io_options{request_class::background}` at the same call site (`db813e0`). No new enum or slice field: cuCascade classifies per request. Demand loads stay `automatic` (`latency` ≤ 256 KiB, else `read`) |
 | `uring.prefetch_reactors`: the last K reactors serve only prefetch (derived 1 when the readahead runs), routed by `templated_ioctx::next_reactor` (`1703b0dfd`) | **Not ported as routing** — `next_reactor` and per-reactor queues no longer exist. Re-expressed as per-runner policy (`458109f`, `90372a1`): 3-tier pass order, `max_background_groups` sub-limit (clamped), always-on `background_slot_fraction`, `reserved_background_slots` floor, background staged ops sized to the reserve, floor-refusal FIFO block with a reserve exemption (§11.5). The global bound sirius got from "K of N reactors" maps to `background_slot_fraction` ≈ K/N per runner. Dedicated prefetch runners: follow-up (§11.10) |
 | `default_uring_n_reactors` 1 → 4 (`3bbd30a83`) | **Not ported.** `io_config::uring_n_reactors{1}` (runner threads). Sirius needed more reactors to escape QD 1–2 each; one runner here already runs up to 64 ops over several groups. Each runner costs up to 64 MiB of pinned staging, and `start()` throws if it cannot get it. Measured (P4, §11.8): the default stays 1 |
 | `uring::config::n_max_concurrent_scans` → 0, plus the `resolve_readahead` zero-budget opt-out (`3bbd30a83`) | **Not ported.** Advisory here (`ioctx::n_max_concurrent_scans()`, no cuCascade consumer). Sirius's own medians favour readahead *on* once head-of-line blocking is fixed (off 36.7 s, on 34.5 s, on + isolation 33.7 s), so "0" would encode a conclusion drawn from the old reactor |
 | Reactor gauges, `take_gauges()`, a 250 ms sampler thread and a DEBUG `[uring_gauges]` line (`88bb31faa`, `1703b0dfd`) | Data, not logs (`aadc902`, `90372a1`): `class_stats::first_io_*`, `queue_stats::runners`, `ioctx::reset_stats_peaks()`. No sampler thread: `CUCASCADE_LOG_*` is compiled out, so the host samples and logs (§11.6) |
 | Queue delay = enqueue → first slice expanded, per `io_class`, counted when the first slice is taken | First-I/O delay = enqueue → first physical op submitted, per `request_class`, recorded when the request retires (§11.6) |
-| `cache_handle::demand_wait_ns()`, `sirius_datasource::demand_wait_ns()` / `cache_chunk_count()` | Mechanical port (`db813e0`): `prefetching_handle::demand_wait_ns()`, `datasource::demand_wait_ns()`, `datasource::cache_chunk_count()`. No consumer in cuCascade |
+| `cache_handle::demand_wait_ns()`, `sirius_datasource::demand_wait_ns()` / `cache_chunk_count()` | Mechanical port (`db813e0`): `cache_handle::demand_wait_ns()`, `datasource::demand_wait_ns()`, `datasource::cache_chunk_count()`. No consumer in cuCascade |
 | `SIRIUS_PREFETCH_WINDOW_MIB` (temporary env knob) | Added and removed within the sirius branch; nothing to port |
 | `test_uring_readv.cpp` cases (depth per spp, queue delay per class, byte-exactness, uncapped shutdown) | Re-expressed for runners in `test_uring_scheduling.cpp` (`4b1decc`, §11.7) |
 | Sirius-only, not ported | Scan manager (readahead arming, `[readahead]` / `[split]` timelines, cache-cycle line, REST budget derivation); `sirius_config` YAML keys, derivation and validation; the `SiriusContext` pinned-resource rollback (`2eb20830c`); test YAML pins `uring_n_reactors: 1` (`7fd9b8df3`); `test_templated_ioctx.cpp` routing tests; `test_scan_manager_config.cpp` |
@@ -971,10 +971,10 @@ Caveats:
   with the number of runners holding background groups (p99 ≈ 8 ms at 1 runner, ≈ 20–28 ms
   at 2–4).
 - A demand read that touches a loading chunk blocks on the whole in-flight prefetch of its
-  handle (`prefetching_cache::await_inflight_prefetch`): prefetch throughput is demand
+  handle (`fs_cache::await_inflight_prefetch`): prefetch throughput is demand
   latency in disguise. The policy slows background under demand, never stalls it (floor plus
   reserve exemption); nothing promotes a prefetch a reader is waiting on.
-  `prefetching_handle::demand_wait_ns()` measures that cost.
+  `cache_handle::demand_wait_ns()` measures that cost.
 - A runner whose background groups are at the sub-limit while only background is queued gets
   `wait_bounded` from `prepare_wait`: it waits at most `blocked_retry_interval` (1 ms), and its
   own completions wake it earlier.
@@ -987,7 +987,7 @@ Caveats:
 | `class_stats::first_io_max`, `max_queue_wait` | Peaks | Cleared by `reset_stats_peaks()` (`max_queue_wait` was a lifetime max at `b2e8eee`) |
 | `queue_stats::runners` (`runner_stats`) | Per registered runner, in registration order: `id`, `parked`, `active_groups`, `retired_groups`, `inflight_ops`, `max_inflight_ops`, `bytes_submitted` | Op gauges published by the uring engine once per pass (relaxed; up to one pass stale). REST publishes none (zeros). Empty if the snapshot cannot be allocated (`stats()` stays `noexcept`) |
 | `ioctx::reset_stats_peaks()` | New virtual; default no-op (kvikio) | Zeroes `max_queue_wait` and `first_io_max`; sets each runner's `max_inflight_ops` to its current `inflight_ops` |
-| `prefetching_handle::demand_wait_ns()`, `datasource::demand_wait_ns()` | ns demand reads spent blocked on the handle's in-flight prefetch; concurrent waiters each add theirs | Monotonic per handle; moves transfer it |
+| `cache_handle::demand_wait_ns()`, `datasource::demand_wait_ns()` | ns demand reads spent blocked on the handle's in-flight prefetch; concurrent waiters each add theirs | Monotonic per handle; moves transfer it |
 | `datasource::cache_chunk_count()` | Chunks named by the datasource's prefetch request (0 without one) | |
 
 **First-I/O delay.**
@@ -1151,7 +1151,7 @@ across runners (§11.10).
 
 | Area | `b2e8eee` | Phase 2 |
 |---|---|---|
-| Prefetch class (`prefetching_cache::prefetch`) | automatic: `latency` ≤ 256 KiB, else `read` | `background` (uring and REST) |
+| Prefetch class (`fs_cache::prefetch`) | automatic: `latency` ≤ 256 KiB, else `read` | `background` (uring and REST) |
 | Background share | only under latency / read pressure | always |
 | Background groups per runner | up to `max_active_groups` (4) | up to `min(max_background_groups, max_active_groups)` (2) |
 | Read / write next to background | no floor | leave `background_reserve` (8) free under background pressure |
@@ -1169,7 +1169,7 @@ across runners (§11.10).
 Phase-2 conflict hotspots: `scheduling_policy.hpp`; `uring_engine.cpp` (`run`,
 `process_groups`, `advance_group`, `staging_free_slots`, `plan_next_slice`, `plan_next_write`,
 `dispatch_one`, `begin_staged_write`, `set_group_state`); the queue-observability block of
-`types.hpp`; `request_queue.hpp`; `runner_registry.hpp`; `prefetching_cache.{hpp,cpp}`
+`types.hpp`; `request_queue.hpp`; `runner_registry.hpp`; `fs_cache.{hpp,cpp}`
 (`prefetch`, `await_inflight_prefetch`, handle moves). New invariant: a `runner_slot`'s
 gauges have one writer, its runner thread (relaxed stores). The only cross-thread write is
 `reset_peaks`, which stores the current depth into `max_inflight_ops`; `publish_gauges`

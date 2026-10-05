@@ -63,7 +63,7 @@ struct config {
 
   /// Per-runner scheduling tunables (group limits, class shares, reservations);
   /// validated by the uring reactor.  Prefetch reads are background class
-  /// (prefetching_cache::prefetch), so @c scheduling.max_background_groups,
+  /// (fs_cache::prefetch), so @c scheduling.max_background_groups,
   /// @c background_slot_fraction and @c reserved_background_slots are the
   /// prefetch-isolation knobs -- the analogue of sirius's dedicated prefetch
   /// reactors (K of N reactors ~ background_slot_fraction K/N).
