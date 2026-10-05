@@ -31,6 +31,8 @@
 #include <rmm/cuda_stream_view.hpp>
 #endif
 
+#include <cstddef>
+#include <cstdint>
 #include <span>
 
 namespace cucascade::io {
@@ -199,6 +201,21 @@ class datasource : public cudf::io::datasource {
   prefetch_refusal prefetch_async(exec::invocable<void(bool) noexcept> on_done);
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
+
+  /// Diagnostics: nanoseconds demand reads through this datasource spent blocked
+  /// on its in-flight prefetch (see @c cache::prefetching_handle::demand_wait_ns).
+  [[nodiscard]] std::uint64_t demand_wait_ns() const noexcept
+  {
+    return _prefetch_handle.demand_wait_ns();
+  }
+
+  /// Diagnostics: cache chunks named by this datasource's prefetch request (0
+  /// without one).
+  [[nodiscard]] std::size_t cache_chunk_count() const noexcept
+  {
+    auto const chunks = _prefetch_handle.chunks();
+    return chunks ? chunks->size() : 0;
+  }
 
   /// Whether the backend serving this datasource would rather be handed one
   /// batched request than a stream of small reads.  See @c ioctx::prefers_bulk_io.
