@@ -361,3 +361,136 @@ TEST_CASE("request_hub cancel_queued settles every queued request", "[io][queue]
     CHECK_THROWS_AS(std::move(future).get(), std::system_error);
   }
 }
+
+TEST_CASE("first-I/O delay buckets are log2 microseconds", "[io][queue]")
+{
+  using cucascade::io::first_io_delay_bucket;
+  using cucascade::io::first_io_delay_buckets;
+  using namespace std::chrono_literals;
+  STATIC_REQUIRE(first_io_delay_bucket(0ns) == 0);
+  STATIC_REQUIRE(first_io_delay_bucket(-5ns) == 0);
+  STATIC_REQUIRE(first_io_delay_bucket(999ns) == 0);
+  STATIC_REQUIRE(first_io_delay_bucket(1us) == 1);
+  STATIC_REQUIRE(first_io_delay_bucket(2us) == 2);
+  STATIC_REQUIRE(first_io_delay_bucket(3us) == 2);
+  STATIC_REQUIRE(first_io_delay_bucket(3ms) == 12);
+  STATIC_REQUIRE(first_io_delay_bucket(1h) == first_io_delay_buckets - 1);
+  STATIC_REQUIRE(first_io_delay_buckets - 1 == 25);
+}
+
+TEST_CASE("request_queue records first-I/O delays per lane", "[io][queue]")
+{
+  using namespace std::chrono_literals;
+  request_queue queue;
+  queue.record_first_io(request_class::latency, 10us);
+  queue.record_first_io(request_class::latency, 30us);
+  queue.record_first_io(request_class::latency, -1us);  // clock skew counts as 0
+
+  cucascade::io::class_stats latency;
+  queue.fill_first_io(request_class::latency, latency);
+  CHECK(latency.first_io_count == 3);
+  CHECK(latency.first_io_total == 40us);
+  CHECK(latency.first_io_max == 30us);
+  CHECK(latency.first_io_histogram[0] == 1);
+  CHECK(latency.first_io_histogram[cucascade::io::first_io_delay_bucket(10us)] == 1);
+  CHECK(latency.first_io_histogram[cucascade::io::first_io_delay_bucket(30us)] == 1);
+
+  cucascade::io::class_stats write;
+  queue.fill_first_io(request_class::write, write);
+  CHECK(write.first_io_count == 0);
+  CHECK(write.first_io_total == 0ns);
+
+  queue.reset_peaks();
+  queue.fill_first_io(request_class::latency, latency);
+  CHECK(latency.first_io_max == 0ns);
+  CHECK(latency.first_io_count == 3);
+  CHECK(latency.first_io_total == 40us);
+}
+
+TEST_CASE("first-I/O delay is recorded once per request at retirement", "[io][queue]")
+{
+  using namespace std::chrono_literals;
+  using cucascade::io::request_class_index;
+  request_hub hub;
+  hub.set_accepting(true);
+  auto slot   = hub.registry().register_runner();
+  auto object = make_object();
+  auto settle = [](grouped_io_request& request) {
+    while (!request.empty()) {
+      static_cast<void>(request.take_front());
+      request.coordinator->on_complete();
+    }
+  };
+  auto const read_lane = request_class_index(request_class::read);
+
+  // Started request: the engine stamped first_io_at (here: exactly 3 ms after enqueue).
+  auto started        = make_read(object, request_class::read);
+  auto started_future = started->coordinator->get_future();
+  hub.enqueue(std::move(started));
+  auto pulled = hub.try_pull(request_class::read, *slot);
+  REQUIRE(pulled != nullptr);
+  pulled->meta.first_io_at = pulled->meta.enqueued_at + 3ms;
+  settle(*pulled);
+  hub.finish_group(*pulled, *slot);
+  CHECK(std::move(started_future).get() == 4096);
+
+  auto stats = hub.stats().per_class[read_lane];
+  CHECK(stats.first_io_count == 1);
+  CHECK(stats.first_io_total == 3ms);
+  CHECK(stats.first_io_max == stats.first_io_total);
+  CHECK(stats.first_io_histogram[cucascade::io::first_io_delay_bucket(3ms)] == 1);
+  std::uint64_t histogram_sum = 0;
+  for (auto const count : stats.first_io_histogram) {
+    histogram_sum += count;
+  }
+  CHECK(histogram_sum == 1);
+
+  // Never started (cancelled before any operation): not counted.
+  auto idle        = make_read(object, request_class::read);
+  auto idle_future = idle->coordinator->get_future();
+  hub.enqueue(std::move(idle));
+  pulled = hub.try_pull(request_class::read, *slot);
+  REQUIRE(pulled != nullptr);
+  pulled->cancel_remaining(std::make_error_code(std::errc::operation_canceled));
+  hub.finish_group(*pulled, *slot, request_state::cancelled);
+  CHECK_THROWS_AS(std::move(idle_future).get(), std::system_error);
+  CHECK(hub.stats().per_class[read_lane].first_io_count == 1);
+
+  // Handed back by a retiring runner after it started: requeue records nothing,
+  // keeps enqueued_at, and the final retirement counts the request once.
+  auto handed        = make_read(object, request_class::read, 4096, 2);
+  auto handed_future = handed->coordinator->get_future();
+  hub.enqueue(std::move(handed));
+  pulled = hub.try_pull(request_class::read, *slot);
+  REQUIRE(pulled != nullptr);
+  auto const enqueued      = pulled->meta.enqueued_at;
+  pulled->meta.first_io_at = enqueued + 1ms;
+  static_cast<void>(pulled->take_front());
+  pulled->coordinator->on_complete();
+  hub.requeue(std::move(pulled), *slot);
+  CHECK(hub.stats().per_class[read_lane].first_io_count == 1);
+  pulled = hub.try_pull(request_class::read, *slot);
+  REQUIRE(pulled != nullptr);
+  CHECK(pulled->meta.enqueued_at == enqueued);
+  settle(*pulled);
+  hub.finish_group(*pulled, *slot);
+  CHECK(std::move(handed_future).get() == 2 * 4096);
+
+  stats = hub.stats().per_class[read_lane];
+  CHECK(stats.first_io_count == 2);
+  CHECK(stats.first_io_total == 4ms);
+  CHECK(stats.first_io_max == 3ms);
+  for (auto const cls : {request_class::latency, request_class::write, request_class::background}) {
+    CHECK(hub.stats().per_class[request_class_index(cls)].first_io_count == 0);
+  }
+
+  // Peaks clear; monotonic counters stay.
+  hub.reset_stats_peaks();
+  stats = hub.stats().per_class[read_lane];
+  CHECK(stats.first_io_max == 0ns);
+  CHECK(stats.max_queue_wait == 0ns);
+  CHECK(stats.first_io_count == 2);
+  CHECK(stats.first_io_total == 4ms);
+
+  hub.registry().unregister_runner(*slot);
+}

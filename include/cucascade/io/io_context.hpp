@@ -471,8 +471,14 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Number of threads currently inside run*() for this context.
   [[nodiscard]] virtual std::size_t active_runners() const noexcept { return 0; }
 
-  /// Aggregate queue / runner statistics.
+  /// Aggregate queue / runner statistics.  Counters are monotonic (sample
+  /// periodically and diff); peaks are since the last @ref reset_stats_peaks.
   [[nodiscard]] virtual queue_stats stats() const noexcept { return {}; }
+
+  /// Clear peak statistics (max queue wait, first-I/O max, per-runner max
+  /// in-flight); monotonic counters are untouched.  The default (backends
+  /// without runners) does nothing.
+  virtual void reset_stats_peaks() noexcept {}
 
   // -- Backend primitives (cache-unaware) ----------------------------------------
 

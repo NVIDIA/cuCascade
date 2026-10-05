@@ -94,6 +94,54 @@ class runner_slot {
     return _notifications.load(std::memory_order_relaxed);
   }
 
+  // -- engine-published gauges (see runner_stats) --------------------------------
+
+  /**
+   * @brief Publish the engine's operation gauges; call once per loop pass.
+   *
+   * Single writer (the runner thread that owns this slot), relaxed stores: a
+   * couple of uncontended atomic operations per pass.  Call after submitting
+   * and before blocking, so the peak sees the deepest point of the pass.
+   *
+   * @param inflight_ops Physical operations submitted and not yet reaped.
+   * @param bytes_submitted Bytes of all physical operations submitted so far
+   *        (monotonic, engine lifetime).
+   */
+  void publish_gauges(std::uint32_t inflight_ops, std::uint64_t bytes_submitted) noexcept
+  {
+    _inflight_ops.store(inflight_ops, std::memory_order_relaxed);
+    _bytes_submitted.store(bytes_submitted, std::memory_order_relaxed);
+    // reset_peaks may run concurrently on another thread, hence a CAS-max.
+    auto peak = _max_inflight_ops.load(std::memory_order_relaxed);
+    while (inflight_ops > peak && !_max_inflight_ops.compare_exchange_weak(
+                                    peak, inflight_ops, std::memory_order_relaxed)) {}
+  }
+
+  /// Last published number of operations in flight.
+  [[nodiscard]] std::uint32_t inflight_ops() const noexcept
+  {
+    return _inflight_ops.load(std::memory_order_relaxed);
+  }
+
+  /// Peak of the published in-flight count since the last @ref reset_peaks.
+  [[nodiscard]] std::uint32_t max_inflight_ops() const noexcept
+  {
+    return _max_inflight_ops.load(std::memory_order_relaxed);
+  }
+
+  /// Last published bytes-submitted counter (monotonic).
+  [[nodiscard]] std::uint64_t bytes_submitted() const noexcept
+  {
+    return _bytes_submitted.load(std::memory_order_relaxed);
+  }
+
+  /// Restart the peak window: @ref max_inflight_ops becomes the current @ref inflight_ops.
+  void reset_peaks() noexcept
+  {
+    _max_inflight_ops.store(_inflight_ops.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+  }
+
  private:
   friend class runner_registry;
   friend class request_hub;
@@ -105,6 +153,9 @@ class runner_slot {
   std::atomic<std::size_t> _active_groups{0};
   std::atomic<std::size_t> _retired_groups{0};
   std::atomic<std::uint64_t> _notifications{0};
+  std::atomic<std::uint32_t> _inflight_ops{0};
+  std::atomic<std::uint32_t> _max_inflight_ops{0};
+  std::atomic<std::uint64_t> _bytes_submitted{0};
 };
 
 /**
@@ -188,6 +239,16 @@ class runner_registry {
 
   /// Number of parked runners that own no grouped request (truly idle).
   [[nodiscard]] std::size_t idle_count() const noexcept;
+
+  /**
+   * @brief Gauges of every registered runner, in registration order.
+   *
+   * @throws std::bad_alloc if the result cannot be allocated.
+   */
+  [[nodiscard]] std::vector<runner_stats> snapshot() const;
+
+  /// @ref runner_slot::reset_peaks on every registered runner.
+  void reset_peaks() noexcept;
 
  private:
   mutable std::mutex _mutex;

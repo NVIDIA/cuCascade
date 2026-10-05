@@ -26,6 +26,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace cucascade::io::detail {
 
@@ -142,6 +143,31 @@ std::size_t runner_registry::idle_count() const noexcept
   return static_cast<std::size_t>(std::count_if(_slots.begin(), _slots.end(), [](auto const& slot) {
     return slot->parked() && slot->active_groups() == 0;
   }));
+}
+
+std::vector<runner_stats> runner_registry::snapshot() const
+{
+  std::lock_guard lock(_mutex);
+  std::vector<runner_stats> result;
+  result.reserve(_slots.size());
+  for (auto const& slot : _slots) {
+    result.push_back(runner_stats{.id               = slot->id(),
+                                  .parked           = slot->parked(),
+                                  .active_groups    = slot->active_groups(),
+                                  .retired_groups   = slot->retired_groups(),
+                                  .inflight_ops     = slot->inflight_ops(),
+                                  .max_inflight_ops = slot->max_inflight_ops(),
+                                  .bytes_submitted  = slot->bytes_submitted()});
+  }
+  return result;
+}
+
+void runner_registry::reset_peaks() noexcept
+{
+  std::lock_guard lock(_mutex);
+  for (auto const& slot : _slots) {
+    slot->reset_peaks();
+  }
 }
 
 }  // namespace cucascade::io::detail
