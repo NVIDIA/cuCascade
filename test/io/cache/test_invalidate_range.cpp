@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -83,6 +84,7 @@ using cucascade::io::io_object;
 using cucascade::io::ioctx;
 using cucascade::io::prepared_io_slice;
 using cucascade::io::range;
+using cucascade::io::request_class;
 using cucascade::io::write_options;
 using cucascade::io::write_segment;
 using cucascade::io::cache::chunk_state;
@@ -143,7 +145,8 @@ class fake_file final : public io_object {
 };
 
 /// Synchronous pread/pwrite backend.  Reads and writes complete inline unless
-/// held, in which case their work is parked until release_*().
+/// held, in which case their work is parked until release_*().  Records the
+/// request class of every read that reaches it.
 class fake_ioctx final : public ioctx {
  public:
   ~fake_ioctx() override { pre_destroy(); }
@@ -175,7 +178,7 @@ class fake_ioctx final : public ioctx {
   cucascade::exec::semi_future<std::size_t> mixed_readv_async_io(
     io_object const& obj,
     std::vector<prepared_io_slice>&& slices,
-    cucascade::io::io_options) noexcept override
+    cucascade::io::io_options opts) noexcept override
   {
     auto work = [owner = obj.shared_from_this(), slices = std::move(slices), this](
                   std::function<void()> const& between_read_and_publish) mutable -> std::size_t {
@@ -212,6 +215,10 @@ class fake_ioctx final : public ioctx {
     };
 
     try {
+      {
+        std::lock_guard lock(_mutex);
+        _seen_classes.push_back(opts.cls);
+      }
       if (!_hold_reads.load()) {
         return cucascade::exec::make_semi_future<std::size_t>(work(std::function<void()>{}));
       }
@@ -266,6 +273,21 @@ class fake_ioctx final : public ioctx {
   {
     std::lock_guard lock(_mutex);
     return _held_writes.size();
+  }
+
+  /// Request class of every read that reached the backend, in arrival order.
+  [[nodiscard]] std::vector<request_class> seen_classes() const
+  {
+    std::lock_guard lock(_mutex);
+    return _seen_classes;
+  }
+
+  /// Request class of the most recent read, if any reached the backend.
+  [[nodiscard]] std::optional<request_class> last_class() const
+  {
+    std::lock_guard lock(_mutex);
+    if (_seen_classes.empty()) { return std::nullopt; }
+    return _seen_classes.back();
   }
 
   /// The next commit stays pending until finish_commit().
@@ -364,6 +386,7 @@ class fake_ioctx final : public ioctx {
   std::vector<std::function<void(std::function<void()> const&)>> _held_reads;
   std::vector<std::function<void()>> _held_writes;
   std::optional<cucascade::exec::promise<void>> _held_commit;
+  std::vector<request_class> _seen_classes;
 };
 
 std::vector<cucascade::memory::memory_space_config> host_space_configs()
@@ -792,4 +815,72 @@ TEST_CASE("a commit settling after shutdown_cache never touches the destroyed ca
   fx.ctx->shutdown_cache();
   fx.ctx->finish_commit(true);
   CHECK_NOTHROW(std::move(pending).get());
+}
+
+TEST_CASE("prefetch reads are background class, demand reads are not", "[io][cache]")
+{
+  using namespace std::chrono_literals;
+
+  cache_fixture fx;
+  // A request naming chunks 0 and 1 only: chunks 2 and 3 stay uncovered.
+  byte_range const head{0, static_cast<std::int64_t>(2 * chunk_bytes)};
+  auto handle = prefetching_cache_test_access::insert(
+    fx.cache(), *fx.obj, std::span<byte_range const>{&head, 1});
+  REQUIRE(handle);
+  REQUIRE(prefetching_cache_test_access::prepare(fx.cache(), handle) == prepare_result::prepared);
+  REQUIRE(handle.chunks()->size() == 2);
+  CHECK(handle.demand_wait_ns() == 0);
+
+  // The prefetch reaches the backend as background class; hold it there so a
+  // demand read through the handle has to wait for it.
+  fx.ctx->hold_reads(true);
+  std::atomic<int> outcome{-1};
+  REQUIRE(fx.cache().prefetch(handle, [&outcome](bool ok) noexcept { outcome = ok ? 1 : 0; }));
+  fx.ctx->hold_reads(false);
+  REQUIRE(fx.ctx->seen_classes() == std::vector<request_class>{request_class::background});
+  REQUIRE(handle.is_prefetch_in_flight());
+
+  // A demand read inside chunk 0 blocks on the in-flight prefetch, then is
+  // served from the chunk it published: no backend read of its own.
+  std::thread releaser([&fx] {
+    std::this_thread::sleep_for(50ms);
+    fx.ctx->release_reads();
+  });
+  std::size_t const head_offset = 100;
+  std::vector<std::uint8_t> head_bytes(1024);
+  auto const head_got =
+    std::move(
+      fx.ctx->host_read_async(*fx.obj, head_offset, head_bytes.size(), head_bytes.data(), &handle))
+      .get();
+  releaser.join();
+  REQUIRE(head_got == head_bytes.size());
+  REQUIRE(outcome.load() == 1);
+  CHECK(matches(head_bytes, head_offset, head_offset, head_offset + head_bytes.size(), 0));
+  CHECK(fx.ctx->seen_classes().size() == 1);
+  auto const waited = handle.demand_wait_ns();
+  CHECK(waited > 0);
+
+  // A demand read of a range the request does not cover goes to the backend
+  // with a demand class, never background.
+  std::size_t const tail_offset = 3 * chunk_bytes;
+  std::vector<std::uint8_t> tail_bytes(chunk_bytes);
+  REQUIRE(std::move(fx.ctx->host_read_async(
+                      *fx.obj, tail_offset, tail_bytes.size(), tail_bytes.data(), &handle))
+            .get() == tail_bytes.size());
+  CHECK(matches(tail_bytes, tail_offset, tail_offset, file_bytes, 0));
+  REQUIRE(fx.ctx->seen_classes().size() == 2);
+  auto const demand_class = fx.ctx->last_class();
+  REQUIRE(demand_class.has_value());
+  CHECK(*demand_class != request_class::background);
+  CHECK((*demand_class == request_class::latency || *demand_class == request_class::read));
+  CHECK(handle.demand_wait_ns() == waited);  // no prefetch in flight: no further wait
+
+  // Moves transfer the accumulated wait; the moved-from handle reports 0.
+  prefetching_handle moved{std::move(handle)};
+  CHECK(handle.demand_wait_ns() == 0);  // NOLINT(bugprone-use-after-move)
+  CHECK(moved.demand_wait_ns() == waited);
+  prefetching_handle assigned;
+  assigned = std::move(moved);
+  CHECK(moved.demand_wait_ns() == 0);  // NOLINT(bugprone-use-after-move)
+  CHECK(assigned.demand_wait_ns() == waited);
 }

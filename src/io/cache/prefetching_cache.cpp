@@ -34,9 +34,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <format>
 #include <latch>
@@ -120,7 +123,9 @@ prefetching_handle::~prefetching_handle()
   if (_req.consumer) { _req.consumer->mark_disposed(); }
 }
 
-prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept : _req(std::move(o._req))
+prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept
+  : _req(std::move(o._req)),
+    _demand_wait_ns(o._demand_wait_ns.exchange(0, std::memory_order_relaxed))
 {
   o._req = {};
 }
@@ -131,6 +136,8 @@ prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexce
     if (_req.consumer) { _req.consumer->mark_disposed(); }
     _req   = std::move(o._req);
     o._req = {};
+    _demand_wait_ns.store(o._demand_wait_ns.exchange(0, std::memory_order_relaxed),
+                          std::memory_order_relaxed);
   }
   return *this;
 }
@@ -175,6 +182,11 @@ bool prefetching_handle::wait_until_prepared() noexcept
 std::shared_ptr<const std::vector<cached_chunk*>> prefetching_handle::chunks() const noexcept
 {
   return _req.chunks;
+}
+
+std::uint64_t prefetching_handle::demand_wait_ns() const noexcept
+{
+  return _demand_wait_ns.load(std::memory_order_relaxed);
 }
 
 prefetching_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
@@ -737,7 +749,13 @@ void prefetching_cache::await_inflight_prefetch(const io_object& obj,
       return chunk->state.get_state() == chunk_state::loading;
     });
     if (has_loading_chunk && handle->is_prefetch_in_flight()) {
-      std::ignore = handle->wait_until_ready();
+      auto const wait_start = std::chrono::steady_clock::now();
+      std::ignore           = handle->wait_until_ready();
+      auto const waited     = std::chrono::steady_clock::now() - wait_start;
+      handle->_demand_wait_ns.fetch_add(
+        static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+        std::memory_order_relaxed);
       return;
     }
   }
@@ -1312,7 +1330,10 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
     return fail_setup();
   }
 
-  auto io_future = _io_ctx->host_device_readv_async_io(*req.obj, std::move(prepared));
+  // Nobody waits on a prefetch yet: background class keeps it out of the demand
+  // lanes and under the background share / group limit of each runner.
+  auto io_future = _io_ctx->host_device_readv_async_io(
+    *req.obj, std::move(prepared), io_options{request_class::background});
   std::move(io_future).install_callback(std::move(terminal));
   return true;
 }

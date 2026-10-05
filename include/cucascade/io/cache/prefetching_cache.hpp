@@ -214,6 +214,12 @@ class prefetching_handle {
   /// The chunks of the underlying request.  Null when the handle is empty.
   [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
 
+  /// Total nanoseconds demand reads through this handle spent blocked on its
+  /// in-flight prefetch (see @c prefetching_cache::await_inflight_prefetch).
+  /// Concurrent waiters each add their own wait.  Moves transfer the total; a
+  /// moved-from handle reports 0.
+  [[nodiscard]] std::uint64_t demand_wait_ns() const noexcept;
+
   explicit operator bool() const noexcept;
 
  private:
@@ -222,6 +228,8 @@ class prefetching_handle {
   explicit prefetching_handle(prefetch_request req) noexcept;
 
   prefetch_request _req;
+  /// Accumulated by @c prefetching_cache::await_inflight_prefetch; relaxed.
+  std::atomic<std::uint64_t> _demand_wait_ns{0};
 };
 
 class prefetching_cache;
@@ -500,7 +508,8 @@ class prefetching_cache {
   /// Wait for an active prefetch only when one of this read call's handle chunks
   /// is currently loading. Loading chunks owned by demand IO are left alone;
   /// the normal planner will route those pieces through backend-owned bounce
-  /// staging instead of serialising two executor reads.
+  /// staging instead of serialising two executor reads.  The time spent waiting
+  /// is added to @p handle's @ref prefetching_handle::demand_wait_ns.
   void await_inflight_prefetch(const io_object& obj,
                                std::span<const slice> requests,
                                prefetching_handle* handle) const;
