@@ -110,7 +110,7 @@ default 2G), then:
 
 1. **Background alone**, `reps` times: one `host_readv_async_io` of the whole background file in
    `bg_slice`-sized slices (default 1M) into one host buffer, with class `bg_class`.
-   `bg_class=background` (default) is how `prefetching_cache::prefetch` classifies its reads;
+   `bg_class=background` (default) is how `fs_cache::prefetch` classifies its reads;
    `bg_class=read` is what a prefetch was classified as before that (automatic class, which
    resolves to `read` above 256 KiB). Reports GB/s per repetition and the median.
 2. **Per demand size** in `demand_sizes` (default `4K,1M,16M`): `idle_reads` demand reads on an

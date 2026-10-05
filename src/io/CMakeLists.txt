@@ -39,7 +39,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/xml_utils.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/cache/prefetching_cache.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
 
 # kvikIO reaches the environment only via libcudf's dependency closure, so the
 # fallback ioctx is built only alongside the cudf layer.

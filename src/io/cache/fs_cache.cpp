@@ -19,7 +19,7 @@
 #include <cucascade/cuda/device_copy_batch.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/exec/try.hpp>
-#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_request.hpp>
@@ -62,7 +62,7 @@ namespace {
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 }
 
-struct prefetching_cache::cached_copy_retirement {
+struct fs_cache::cached_copy_retirement {
   std::vector<cached_chunk*> pins;
   std::shared_ptr<exec::completion_controller::slot> lifetime;
   std::shared_ptr<grouped_coordinator> coordinator;
@@ -116,21 +116,21 @@ struct prefetching_cache::cached_copy_retirement {
   }
 };
 
-prefetching_handle::prefetching_handle(prefetch_request req) noexcept : _req(std::move(req)) {}
+cache_handle::cache_handle(prefetch_request req) noexcept : _req(std::move(req)) {}
 
-prefetching_handle::~prefetching_handle()
+cache_handle::~cache_handle()
 {
   if (_req.consumer) { _req.consumer->mark_disposed(); }
 }
 
-prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept
+cache_handle::cache_handle(cache_handle&& o) noexcept
   : _req(std::move(o._req)),
     _demand_wait_ns(o._demand_wait_ns.exchange(0, std::memory_order_relaxed))
 {
   o._req = {};
 }
 
-prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexcept
+cache_handle& cache_handle::operator=(cache_handle&& o) noexcept
 {
   if (this != &o) {
     if (_req.consumer) { _req.consumer->mark_disposed(); }
@@ -142,7 +142,7 @@ prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexce
   return *this;
 }
 
-void prefetching_handle::update(scan_stage stage) noexcept
+void cache_handle::update(scan_stage stage) noexcept
 {
   if (!_req.consumer) { return; }
   auto const mapped = to_consumer_stage(stage);
@@ -150,48 +150,48 @@ void prefetching_handle::update(scan_stage stage) noexcept
   std::ignore = _req.consumer->mark(*mapped);
 }
 
-bool prefetching_handle::is_active() const noexcept { return _req.is_active(); }
+bool cache_handle::is_active() const noexcept { return _req.is_active(); }
 
-producer_stage::value prefetching_handle::producer_state() const noexcept
+producer_stage::value cache_handle::producer_state() const noexcept
 {
   return _req.producer ? _req.producer->get() : producer_stage::initialized;
 }
 
-bool prefetching_handle::is_prefetch_in_flight() const noexcept
+bool cache_handle::is_prefetch_in_flight() const noexcept
 {
   return _req.producer && _req.producer->get() == producer_stage::loading;
 }
 
-bool prefetching_handle::has_started_reading() const noexcept
+bool cache_handle::has_started_reading() const noexcept
 {
   return _req.consumer && _req.consumer->get() >= consumer_stage::reading;
 }
 
-bool prefetching_handle::wait_until_ready() noexcept
+bool cache_handle::wait_until_ready() noexcept
 {
   if (!_req.producer) { return false; }
   return _req.producer->wait_till_not_loading();
 }
 
-bool prefetching_handle::wait_until_prepared() noexcept
+bool cache_handle::wait_until_prepared() noexcept
 {
   if (!_req.producer) { return false; }
   return _req.producer->wait_until_prepared();
 }
 
-std::shared_ptr<const std::vector<cached_chunk*>> prefetching_handle::chunks() const noexcept
+std::shared_ptr<const std::vector<cached_chunk*>> cache_handle::chunks() const noexcept
 {
   return _req.chunks;
 }
 
-std::uint64_t prefetching_handle::demand_wait_ns() const noexcept
+std::uint64_t cache_handle::demand_wait_ns() const noexcept
 {
   return _demand_wait_ns.load(std::memory_order_relaxed);
 }
 
-prefetching_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
+cache_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
 
-std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
+std::vector<cached_chunk*> fs_cache::file_entry::update_and_get_chunks(
   std::span<const size_t> incoming, std::span<const chunk_fill> desired)
 {
   assert(incoming.size() == desired.size());
@@ -241,9 +241,9 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
   return result;
 }
 
-std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size_t offset,
-                                                                       std::size_t size,
-                                                                       coverage_policy policy) const
+std::vector<cached_chunk*> fs_cache::file_entry::fetch_chunks(std::size_t offset,
+                                                              std::size_t size,
+                                                              coverage_policy policy) const
 {
   if (size == 0) { return {}; }
 
@@ -267,41 +267,38 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size
   return result;
 }
 
-prefetching_cache::prefetching_cache(
-  cucascade::memory::memory_reservation_manager& reservation_manager,
-  ioctx* io_ctx,
-  const config& cfg,
-  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
+fs_cache::fs_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
+                   ioctx* io_ctx,
+                   const config& cfg,
+                   std::shared_ptr<const cucascade::memory::topology_index> topology_index)
   : _cfg(cfg),
     _invalidation_gate(std::make_shared<write_invalidation_gate>(*this)),
     _pool(std::make_unique<buffer_pool>(
       reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
-    _armed(_io_ctx->can_use_prefetching_cache())
+    _armed(_io_ctx->can_use_fs_cache())
 {
   _chunk_size          = _pool->chunk_size();
   auto const max_bytes = chunk_state::max_chunk_bytes();
-  if (_chunk_size == 0) {
-    throw std::invalid_argument("prefetching_cache: chunk size must be non-zero");
-  }
+  if (_chunk_size == 0) { throw std::invalid_argument("fs_cache: chunk size must be non-zero"); }
   if (_chunk_size > max_bytes) {
-    throw std::invalid_argument(std::format(
-      "prefetching_cache: chunk size {} exceeds the {}-byte maximum", _chunk_size, max_bytes));
+    throw std::invalid_argument(
+      std::format("fs_cache: chunk size {} exceeds the {}-byte maximum", _chunk_size, max_bytes));
   }
 
   _evictor_thread = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
                                  _evictor_stop_source.get_token());
 }
 
-exec::completion_controller::slot prefetching_cache::acquire_inflight_io() noexcept
+exec::completion_controller::slot fs_cache::acquire_inflight_io() noexcept
 {
   std::lock_guard lock(_inflight_io_mtx);
   if (_shutting_down.load(std::memory_order_acquire)) { return {}; }
   return _inflight_io.acquire();
 }
 
-void prefetching_cache::drain_inflight_io() noexcept
+void fs_cache::drain_inflight_io() noexcept
 {
   std::latch drained{1};
   // Armed before close(), so both orderings land exactly once: with no IO
@@ -315,7 +312,7 @@ void prefetching_cache::drain_inflight_io() noexcept
   drained.wait();
 }
 
-void prefetching_cache::reclaim_all_chunks() noexcept
+void fs_cache::reclaim_all_chunks() noexcept
 {
   std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
   std::size_t stuck = 0;
@@ -346,13 +343,13 @@ void prefetching_cache::reclaim_all_chunks() noexcept
   }
   if (stuck > 0) {
     CUCASCADE_LOG_WARN(
-      "[prefetching_cache] {} chunk(s) still pinned at cache teardown; their buffers were not "
+      "[fs_cache] {} chunk(s) still pinned at cache teardown; their buffers were not "
       "reclaimed",
       stuck);
   }
 }
 
-prefetching_cache::~prefetching_cache()
+fs_cache::~fs_cache()
 {
   // Write completions still in flight on runner threads reach this cache only
   // through the gate; once it is closed (and any invalidation already inside
@@ -417,9 +414,9 @@ void write_invalidation_gate::close() noexcept
   }
 }
 
-std::size_t prefetching_cache::invalidate_range(const io_object& obj,
-                                                std::size_t offset,
-                                                std::size_t size) noexcept
+std::size_t fs_cache::invalidate_range(const io_object& obj,
+                                       std::size_t offset,
+                                       std::size_t size) noexcept
 {
   if (size == 0 || !_armed) { return 0; }
 
@@ -459,7 +456,7 @@ std::size_t prefetching_cache::invalidate_range(const io_object& obj,
 // insert
 // ===========================================================================
 
-prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(const io_object& obj)
+fs_cache::file_entry& fs_cache::get_or_create_file_entry(const io_object& obj)
 {
   const auto& key = obj.raw_file_cache_id();
   std::shared_lock lk(_map_mtx);
@@ -483,10 +480,11 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(const
   return *it->second;
 }
 
-prefetching_handle prefetching_cache::initiate_prefetching_request(
-  const io_object& obj, std::span<const byte_range> ranges, std::optional<int> gpu_id)
+cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
+                                                    std::span<const byte_range> ranges,
+                                                    std::optional<int> gpu_id)
 {
-  if (!_armed) { return prefetching_handle(); }
+  if (!_armed) { return cache_handle(); }
 
   auto& file = get_or_create_file_entry(obj);
 
@@ -582,10 +580,10 @@ prefetching_handle prefetching_cache::initiate_prefetching_request(
   std::ignore = req.producer->mark_queued();
   _eviction_queue.enqueue(cache_request{req});
 
-  return prefetching_handle(std::move(req));
+  return cache_handle(std::move(req));
 }
 
-prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wait_for_eviction)
+prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_eviction)
 {
   // Never allocate for a request the consumer has already moved past.  A request
   // is handed to the evictor when it is created, and once its consumer disposes
@@ -706,11 +704,11 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
   return prepare_result::prepared;
 }
 
-std::vector<cached_chunk*> prefetching_cache::ranges_in_cache(const io_object& obj,
-                                                              size_t offset,
-                                                              size_t size,
-                                                              coverage_policy policy,
-                                                              prefetching_handle* handle) const
+std::vector<cached_chunk*> fs_cache::ranges_in_cache(const io_object& obj,
+                                                     size_t offset,
+                                                     size_t size,
+                                                     coverage_policy policy,
+                                                     cache_handle* handle) const
 {
   auto chunks = ranges_in_handle(offset, size, policy, handle);
   if (!chunks.empty()) { return chunks; }
@@ -723,10 +721,10 @@ std::vector<cached_chunk*> prefetching_cache::ranges_in_cache(const io_object& o
   return file->fetch_chunks(offset, size, policy);
 }
 
-std::vector<cached_chunk*> prefetching_cache::ranges_in_handle(std::size_t offset,
-                                                               std::size_t size,
-                                                               coverage_policy policy,
-                                                               prefetching_handle* handle) const
+std::vector<cached_chunk*> fs_cache::ranges_in_handle(std::size_t offset,
+                                                      std::size_t size,
+                                                      coverage_policy policy,
+                                                      cache_handle* handle) const
 {
   if (handle == nullptr || !*handle) { return {}; }
   auto requested = handle->chunks();
@@ -734,9 +732,9 @@ std::vector<cached_chunk*> prefetching_cache::ranges_in_handle(std::size_t offse
   return find_entry(*requested, offset, size, policy, _chunk_size);
 }
 
-void prefetching_cache::await_inflight_prefetch(const io_object& obj,
-                                                std::span<const slice> requests,
-                                                prefetching_handle* handle) const
+void fs_cache::await_inflight_prefetch(const io_object& obj,
+                                       std::span<const slice> requests,
+                                       cache_handle* handle) const
 {
   if (handle == nullptr || !*handle) { return; }
 
@@ -761,8 +759,8 @@ void prefetching_cache::await_inflight_prefetch(const io_object& obj,
   }
 }
 
-exec::semi_future<std::size_t> prefetching_cache::host_read_async(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* handle)
+exec::semi_future<std::size_t> fs_cache::host_read_async(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle)
 {
   if (size == 0) { return exec::make_semi_future<std::size_t>(0); }
   if (dst == nullptr) {
@@ -775,15 +773,16 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_async(
   return host_read_ranges_async(obj, std::span<slice const>{&request, 1}, handle);
 }
 
-std::size_t prefetching_cache::host_read(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* handle)
+std::size_t fs_cache::host_read(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle)
 {
   auto future = host_read_async(obj, offset, size, dst, handle);
   return std::move(future).get();
 }
 
-exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
-  const io_object& obj, std::span<const slice> requests, prefetching_handle* handle)
+exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object& obj,
+                                                                std::span<const slice> requests,
+                                                                cache_handle* handle)
 {
   if (requests.empty()) { return exec::make_semi_future<std::size_t>(0); }
 
@@ -804,7 +803,7 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
     std::size_t n_loads       = 0;
     std::size_t n_misses      = 0;
     auto admission            = acquire_inflight_io();
-    if (!admission) { throw std::runtime_error("prefetching_cache is shutting down"); }
+    if (!admission) { throw std::runtime_error("fs_cache is shutting down"); }
     auto lifetime = std::make_shared<exec::completion_controller::slot>(std::move(admission));
 
     for (auto const& raw : requests) {
@@ -928,12 +927,12 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
   }
 }
 
-exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_object& obj,
-                                                                    size_t offset,
-                                                                    size_t size,
-                                                                    uint8_t* dst,
-                                                                    ::cuda::stream_ref stream,
-                                                                    prefetching_handle* handle)
+exec::semi_future<std::size_t> fs_cache::device_read_async(const io_object& obj,
+                                                           size_t offset,
+                                                           size_t size,
+                                                           uint8_t* dst,
+                                                           ::cuda::stream_ref stream,
+                                                           cache_handle* handle)
 {
   if (size == 0) { return exec::make_semi_future<std::size_t>(0); }
   if (dst == nullptr) {
@@ -946,11 +945,11 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
   return device_read_ranges_async(obj, std::span<slice const>{&request, 1}, stream, handle);
 }
 
-exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
+exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
   const io_object& obj,
   std::span<const io::slice> requests,
   ::cuda::stream_ref stream,
-  prefetching_handle* handle)
+  cache_handle* handle)
 {
   if (requests.empty()) { return exec::make_semi_future<std::size_t>(0); }
 
@@ -980,7 +979,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
     std::ignore = _completion_poll.drain_all();
     await_inflight_prefetch(obj, requests, handle);
     auto admission = acquire_inflight_io();
-    if (!admission) { throw std::runtime_error("prefetching_cache is shutting down"); }
+    if (!admission) { throw std::runtime_error("fs_cache is shutting down"); }
     lifetime   = std::make_shared<exec::completion_controller::slot>(std::move(admission));
     completion = std::make_shared<prepared_io_completion>(
       [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
@@ -1104,10 +1103,9 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
   return exec::make_semi_future<std::size_t>(logical_bytes);
 }
 
-void prefetching_cache::retire_pins_after_stream(
-  ::cuda::stream_ref stream,
-  cucascade::cuda::device_copy_batch const& copies,
-  std::shared_ptr<cached_copy_retirement> retirement) noexcept
+void fs_cache::retire_pins_after_stream(::cuda::stream_ref stream,
+                                        cucascade::cuda::device_copy_batch const& copies,
+                                        std::shared_ptr<cached_copy_retirement> retirement) noexcept
 {
   exec::retire_lane* lane = nullptr;
   try {
@@ -1145,7 +1143,7 @@ void prefetching_cache::retire_pins_after_stream(
     auto const commit_status = submission.commit();
     retirement->signal_published();
     if (commit_status != cudaSuccess) {
-      CUCASCADE_LOG_ERROR("prefetching_cache: failed to publish cached-copy completion: {}",
+      CUCASCADE_LOG_ERROR("fs_cache: failed to publish cached-copy completion: {}",
                           cudaGetErrorString(commit_status));
     }
   } catch (...) {
@@ -1162,7 +1160,7 @@ void prefetching_cache::retire_pins_after_stream(
   }
 }
 
-std::string prefetching_cache::summary() const
+std::string fs_cache::summary() const
 {
   // Global totals plus the deltas since the last refresh (the most recent
   // query cycle), reported separately.
@@ -1173,7 +1171,7 @@ std::string prefetching_cache::summary() const
   uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
 
   return std::format(
-    "prefetching_cache: "
+    "fs_cache: "
     "global[reads={} hits={} h2d={} miss={} evictions={}] "
     "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
     reads,
@@ -1188,9 +1186,9 @@ std::string prefetching_cache::summary() const
     evict - _last_reported.evictions);
 }
 
-void prefetching_cache::prepare_for_query() noexcept
+void fs_cache::prepare_for_query() noexcept
 {
-  CUCASCADE_LOG_TRACE("prefetching_cache: summary of cache performance {}", summary());
+  CUCASCADE_LOG_TRACE("fs_cache: summary of cache performance {}", summary());
 
   _ticker.fetch_add(1, std::memory_order_relaxed);
 
@@ -1206,12 +1204,12 @@ void prefetching_cache::prepare_for_query() noexcept
 
 // ===========================================================================
 
-std::size_t prefetching_cache::claimed_bytes() const noexcept
+std::size_t fs_cache::claimed_bytes() const noexcept
 {
   return _pool ? _pool->total_allocated_bytes() : 0;
 }
 
-void prefetching_cache::evict(std::size_t bytes_to_free)
+void fs_cache::evict(std::size_t bytes_to_free)
 {
   // Nothing to free, nothing holding memory, or a cache on its way down -- in
   // the last case the evictor is already reclaiming everything it can, and a
@@ -1220,7 +1218,7 @@ void prefetching_cache::evict(std::size_t bytes_to_free)
   _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, nullptr}});
 }
 
-void prefetching_cache::evict_sync(std::size_t bytes_to_free)
+void fs_cache::evict_sync(std::size_t bytes_to_free)
 {
   if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return; }
   auto processed = std::make_shared<std::latch>(1);
@@ -1230,7 +1228,7 @@ void prefetching_cache::evict_sync(std::size_t bytes_to_free)
   processed->wait();
 }
 
-void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
+void fs_cache::drain_and_abandon(request_queue_type& queue) noexcept
 {
   cache_request entry;
   while (queue.try_dequeue(entry)) {
@@ -1244,14 +1242,13 @@ void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
   }
 }
 
-prepare_result prefetching_cache::prepare(prefetching_handle& handle, bool wait_for_eviction)
+prepare_result fs_cache::prepare(cache_handle& handle, bool wait_for_eviction)
 {
   if (!handle) { return prepare_result::unavailable; }
   return prepare_request(handle._req, wait_for_eviction);
 }
 
-bool prefetching_cache::prefetch(prefetching_handle& handle,
-                                 exec::invocable<void(bool) noexcept> on_done)
+bool fs_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcept> on_done)
 {
   auto& req   = handle._req;
   auto settle = [&on_done](bool ok) {
@@ -1308,7 +1305,7 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
 
   try {
     auto admission = acquire_inflight_io();
-    if (!admission) { throw std::runtime_error("prefetching_cache is shutting down"); }
+    if (!admission) { throw std::runtime_error("fs_cache is shutting down"); }
     auto lifetime   = std::make_shared<exec::completion_controller::slot>(std::move(admission));
     auto completion = std::make_shared<prepared_io_completion>(
       [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
@@ -1338,10 +1335,10 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
   return true;
 }
 
-void prefetching_cache::evict_loop(const std::stop_token& st)
+void fs_cache::evict_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
-    CUCASCADE_LOG_TRACE("prefetching_cache: evict_loop received stop request, unblocking queue");
+    CUCASCADE_LOG_TRACE("fs_cache: evict_loop received stop request, unblocking queue");
     // unblock the worker if it's waiting on an empty queueue
     _eviction_queue.enqueue(cache_request{});
   });

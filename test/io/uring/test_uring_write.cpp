@@ -22,7 +22,7 @@
 
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/config.hpp>
-#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
@@ -65,15 +65,15 @@
 namespace cucascade::io::cache {
 
 // Same definition as in test/io/cache/test_invalidate_range.cpp (ODR: identical).
-struct prefetching_cache_test_access {
-  static prefetching_handle insert(prefetching_cache& cache,
-                                   io_object const& obj,
-                                   std::span<byte_range const> ranges)
+struct fs_cache_test_access {
+  static cache_handle insert(fs_cache& cache,
+                             io_object const& obj,
+                             std::span<byte_range const> ranges)
   {
     return cache.initiate_prefetching_request(obj, ranges);
   }
 
-  static prepare_result prepare(prefetching_cache& cache, prefetching_handle& handle)
+  static prepare_result prepare(fs_cache& cache, cache_handle& handle)
   {
     return cache.prepare(handle, /*wait_for_eviction=*/true);
   }
@@ -823,10 +823,10 @@ TEST_CASE("uring writes invalidate the prefetching cache", "[io][uring][write][c
   {
     auto& cache = *ctx->cache();
     cucascade::io::byte_range const whole{0, static_cast<std::int64_t>(file_bytes)};
-    auto handle = cucascade::io::cache::prefetching_cache_test_access::insert(
+    auto handle = cucascade::io::cache::fs_cache_test_access::insert(
       cache, *object, std::span<cucascade::io::byte_range const>{&whole, 1});
     REQUIRE(handle);
-    REQUIRE(cucascade::io::cache::prefetching_cache_test_access::prepare(cache, handle) ==
+    REQUIRE(cucascade::io::cache::fs_cache_test_access::prepare(cache, handle) ==
             cucascade::io::cache::prepare_result::prepared);
     std::atomic<int> prefetched{-1};
     std::ignore = cache.prefetch(handle, [&](bool ok) noexcept { prefetched = ok ? 1 : 0; });
