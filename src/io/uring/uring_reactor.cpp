@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +83,46 @@ void sync_file_data(int fd, std::string const& path)
   }
 }
 
+/// Rejects a @ref config the engines cannot honour.  The config (and its
+/// scheduling tunables) is shared by every runner of the reactor, so a group
+/// limit of 0 would leave a whole class of requests unserved.
+void validate(config const& cfg)
+{
+  if (cfg.slices_per_pass > max_slices_per_pass) {
+    throw std::invalid_argument("uring_reactor: config::slices_per_pass must be 0.." +
+                                std::to_string(max_slices_per_pass) + " (0 = no cap), got " +
+                                std::to_string(cfg.slices_per_pass));
+  }
+  auto const& sched = cfg.scheduling;
+  if (sched.max_active_groups == 0) {
+    throw std::invalid_argument("uring_reactor: config::scheduling.max_active_groups must be >= 1");
+  }
+  if (sched.max_latency_groups == 0) {
+    throw std::invalid_argument(
+      "uring_reactor: config::scheduling.max_latency_groups must be >= 1");
+  }
+  if (sched.max_background_groups == 0 || sched.max_background_groups > sched.max_active_groups) {
+    throw std::invalid_argument(
+      "uring_reactor: config::scheduling.max_background_groups must be in 1..max_active_groups (" +
+      std::to_string(sched.max_active_groups) + "), got " +
+      std::to_string(sched.max_background_groups));
+  }
+  struct named_fraction {
+    char const* name;
+    double value;
+  };
+  for (auto const& [name, value] :
+       std::array{named_fraction{"write_slot_fraction", sched.write_slot_fraction},
+                  named_fraction{"write_ring_fraction", sched.write_ring_fraction},
+                  named_fraction{"background_slot_fraction", sched.background_slot_fraction}}) {
+    // Negated so that NaN is rejected too.
+    if (!(value >= 0.0 && value <= 1.0)) {
+      throw std::invalid_argument(std::string("uring_reactor: config::scheduling.") + name +
+                                  " must be within [0, 1], got " + std::to_string(value));
+    }
+  }
+}
+
 }  // namespace
 
 uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
@@ -94,6 +135,7 @@ uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_v
     throw std::invalid_argument("uring_reactor: host memory resource must be non-null");
   }
   _config = _ctx->cfg();
+  validate(_config);
 }
 
 // Runners (and their engines) are gone by now: templated_ioctx shuts the

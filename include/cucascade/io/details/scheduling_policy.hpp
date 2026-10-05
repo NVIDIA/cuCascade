@@ -58,8 +58,9 @@ struct scheduling_config {
   double write_slot_fraction{0.5};
   /// Share of the ops write-class operations may hold (min. one operation).
   double write_ring_fraction{0.5};
-  /// Share of the slots / ops background operations may hold while latency or
-  /// read work is queued or active (min. one operation).
+  /// Share of the slots / ops background operations may hold at any time (min.
+  /// one operation); the rest stays free for demand classes, so a read never
+  /// waits for a background completion to find a slot.
   double background_slot_fraction{0.75};
   /// Starvation guard: a write that waited this long is pulled ahead of
   /// latency / read / background work.
@@ -67,6 +68,19 @@ struct scheduling_config {
   /// Slots and ops kept free for latency-class operations while latency work
   /// is queued or active (clamped to half of each axis).
   std::size_t reserved_latency_slots{2};
+  /// Background-class grouped requests one runner may expand at once.  Counted
+  /// inside (never above) @ref max_active_groups, so read / write groups always
+  /// keep @c max_active_groups - @c max_background_groups expansion slots.
+  /// Must be >= 1 (and <= @ref max_active_groups): the config is shared by every
+  /// runner, so 0 would leave background requests unserved.
+  std::size_t max_background_groups{2};
+  /// Slots (and ops) kept free of read / write operations while this runner
+  /// holds background work it has not dispatched and background is below its
+  /// share (clamped to a quarter of each axis and to the background share):
+  /// demand pressure slows a prefetch down but never stalls it, which matters
+  /// because a demand read may be blocked on that prefetch.  Latency
+  /// operations are exempt.
+  std::size_t reserved_background_slots{8};
 };
 
 /// Resources one physical operation needs.
@@ -127,14 +141,27 @@ struct scheduling_view {
  *    2. @c latency, if queued and fewer than @c max_latency_groups latency
  *       groups are expanding;
  *    3. if fewer than @c max_active_groups non-latency groups are expanding:
- *       @c read if queued; else @c background if queued and (no latency/read
- *       work is queued or active, or background holds less than its share);
- *       else @c write if queued and within budget.
+ *       @c read if queued; else @c background if queued, fewer than
+ *       @c max_background_groups background groups are expanding and
+ *       background holds less than its share; else @c write if queued and
+ *       within budget.  The background sub-limit counts inside
+ *       @c max_active_groups, so a read group can always be pulled while
+ *       background work fills the other expansion slots.
  * 2. @ref may_dispatch -- whether one physical operation of a class may be
  *    started now.  Enforces physical capacity, the latency reservation, the
- *    write share and the background share.  A group whose next operation is
- *    refused stays in the engine's active set while other groups proceed (no
- *    head-of-line blocking).
+ *    background reservation, the write share and the background share.  A
+ *    group whose next operation is refused stays in the engine's active set
+ *    while other groups proceed (no head-of-line blocking).
+ *
+ * Background (prefetch) isolation: the background share
+ * (@c background_slot_fraction) applies at all times, not only under demand
+ * pressure, so a demand operation finds free slots at once instead of waiting
+ * for background completions.  Conversely, while this engine holds background
+ * work it has not dispatched and background is below its share
+ * (@ref background_pressure), read / write operations may not take the last
+ * @c reserved_background_slots free slots / ops (clamped to a quarter of the
+ * axis and to the share): demand slows a prefetch down but never stalls it,
+ * since a demand read may itself be waiting on that prefetch.
  *
  * "Expanding" (@ref class_view::expanding_groups) means the group still has
  * work the engine has not dispatched.  Groups whose operations are all in
@@ -162,8 +189,9 @@ class scheduling_policy {
 
     auto const bulk_expanding =
       read.expanding_groups + write.expanding_groups + background.expanding_groups;
-    bool const bulk_room = bulk_expanding < _config.max_active_groups;
-    bool const write_ok  = write.queued != 0 && bulk_room && write_budget_left(view);
+    bool const bulk_room       = bulk_expanding < _config.max_active_groups;
+    bool const background_room = background.expanding_groups < _config.max_background_groups;
+    bool const write_ok        = write.queued != 0 && bulk_room && write_budget_left(view);
 
     if (write_ok && write.oldest_age >= _config.write_max_wait) return request_class::write;
     if (latency.queued != 0 && latency.expanding_groups < _config.max_latency_groups) {
@@ -171,7 +199,7 @@ class scheduling_policy {
     }
     if (!bulk_room) return std::nullopt;
     if (read.queued != 0) return request_class::read;
-    if (background.queued != 0 && background_budget_left(view)) {
+    if (background.queued != 0 && background_room && background_budget_left(view)) {
       return request_class::background;
     }
     if (write_ok) return request_class::write;
@@ -208,6 +236,18 @@ class scheduling_policy {
       }
     }
 
+    // Background reservation: demand slows a prefetch down, never stalls it.
+    if ((cls == request_class::read || cls == request_class::write) && background_pressure(view)) {
+      if (slots_bounded && need.slots != 0 &&
+          view.free_slots - need.slots < background_reserve(view.total_slots)) {
+        return false;
+      }
+      if (ops_bounded && need.ops != 0 &&
+          view.free_ops - need.ops < background_reserve(view.total_ops)) {
+        return false;
+      }
+    }
+
     auto const& own = view[cls];
     if (cls == request_class::write) {
       return within_share(own.slots_in_use,
@@ -221,7 +261,7 @@ class scheduling_policy {
                           _config.write_ring_fraction,
                           own.ops_in_flight);
     }
-    if (cls == request_class::background && foreground_pressure(view)) {
+    if (cls == request_class::background) {
       return within_share(own.slots_in_use,
                           need.slots,
                           view.total_slots,
@@ -252,17 +292,36 @@ class scheduling_policy {
     return latency.queued != 0 || latency.active_groups != 0;
   }
 
-  /// Latency or read work is queued or active.
+  /// Latency or read work is queued or active.  No longer gates the
+  /// background share (which applies at all times); kept as a view predicate.
   [[nodiscard]] static bool foreground_pressure(scheduling_view const& view) noexcept
   {
     auto const& read = view[request_class::read];
     return latency_pressure(view) || read.queued != 0 || read.active_groups != 0;
   }
 
+  /// This engine holds background work it has not dispatched while background
+  /// still has room under its share on every bounded axis (so the slots the
+  /// background reservation keeps free can actually be used by it).
+  [[nodiscard]] bool background_pressure(scheduling_view const& view) const noexcept
+  {
+    return view[request_class::background].expanding_groups != 0 && background_budget_left(view);
+  }
+
  private:
   [[nodiscard]] std::size_t reserve(std::size_t total) const noexcept
   {
     return std::min(_config.reserved_latency_slots, total / 2);
+  }
+
+  /// Slots / ops of an axis of @p total kept free for background work under
+  /// @ref background_pressure: @c reserved_background_slots, clamped to a
+  /// quarter of the axis and to the background share.
+  [[nodiscard]] std::size_t background_reserve(std::size_t total) const noexcept
+  {
+    return std::min({_config.reserved_background_slots,
+                     total / 4,
+                     share_of(total, _config.background_slot_fraction)});
   }
 
   /// @p in_use + @p need fits the share, or the class has nothing in flight.
@@ -288,9 +347,9 @@ class scheduling_policy {
     return slots_ok && ops_ok;
   }
 
+  /// Background holds less than its share on every bounded axis.
   [[nodiscard]] bool background_budget_left(scheduling_view const& view) const noexcept
   {
-    if (!foreground_pressure(view)) return true;
     auto const& background = view[request_class::background];
     bool const slots_ok =
       view.total_slots == 0 ||
