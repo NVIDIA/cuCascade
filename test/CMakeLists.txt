@@ -85,6 +85,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_static_credentials.cpp
     io/rest/s3/test_xml_utils.cpp
     io/uring/test_uring_runner.cpp
+    io/uring/test_uring_scheduling.cpp
     io/uring/test_uring_write.cpp
     # Main test runner
     unittest.cpp)
