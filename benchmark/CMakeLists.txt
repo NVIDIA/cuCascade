@@ -112,20 +112,6 @@ if(CUCASCADE_BUILD_IO)
 
   target_link_libraries(cucascade_parquet_io_benchmark
                         PRIVATE cucascade_cudf cucascade_io CUDA::cudart_static)
-
-  # Local-file write benchmark: cucascade::io write API (uring / kvikio, host or
-  # device source) vs pwrite baselines, plus small-read latency under writes.
-  add_executable(cucascade_io_write_benchmark
-                 ${CMAKE_CURRENT_SOURCE_DIR}/io_write_benchmark.cpp)
-
-  target_compile_options(
-    cucascade_io_write_benchmark
-    PRIVATE
-      $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
-      ${CUCASCADE_CUDA_WARNING_FLAGS})
-
-  target_link_libraries(cucascade_io_write_benchmark
-                        PRIVATE cucascade_cudf cucascade_io CUDA::cudart_static)
 endif()
 
 # =============================================================================

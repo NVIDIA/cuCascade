@@ -22,78 +22,12 @@
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/types.hpp>
 
-#include <sys/uio.h>
-
-#include <algorithm>
 #include <cstddef>
-#include <cstdint>
-#include <cstring>
 #include <memory>
 #include <span>
 #include <string>
-#include <vector>
 
 namespace cucascade::io::rest {
-
-class upload_session;
-
-/// What one REST transfer does.  @c get is a ranged data GET (reads); the
-/// others implement whole-object uploads (see @c upload_session).
-enum class rest_op_kind : std::uint8_t {
-  get,           ///< ranged GET into the read's destination / staging
-  put_object,    ///< single PUT of a whole staged object (commit, small objects)
-  initiate_mpu,  ///< POST ?uploads= (CreateMultipartUpload)
-  upload_part,   ///< PUT ?partNumber=N&uploadId=ID of one staged part
-  complete_mpu,  ///< POST ?uploadId=ID with the part list (commit)
-  abort_mpu,     ///< DELETE ?uploadId=ID (failure clean-up, best effort)
-};
-
-/// Read-callback source of one upload: libcurl pulls the request body from
-/// @c buffers (staged part blocks, in object order) at a running cursor.  The
-/// seek callback rewinds it (libcurl rewinds a body to resend it, e.g. on a
-/// redirect or a reused connection that died), so the staged bytes are read as
-/// many times as needed; they stay untouched until the upload succeeded.
-struct buf_source {
-  std::vector<iovec> buffers;   ///< body bytes, in order
-  std::size_t size{0};          ///< sum of buffers[i].iov_len
-  std::size_t cursor{0};        ///< body bytes handed to libcurl so far
-  std::size_t active{0};        ///< buffer index of @c cursor
-  std::size_t block_offset{0};  ///< offset of @c cursor inside buffers[active]
-
-  /// Move the cursor to @p position (<= size).
-  void seek(std::size_t position) noexcept
-  {
-    cursor       = position;
-    active       = 0;
-    block_offset = 0;
-    while (active < buffers.size() && position >= buffers[active].iov_len) {
-      position -= buffers[active].iov_len;
-      ++active;
-    }
-    block_offset = position;
-  }
-
-  /// Copy up to @p capacity bytes at the cursor into @p out; returns the count.
-  std::size_t read(char* out, std::size_t capacity) noexcept
-  {
-    std::size_t copied = 0;
-    while (copied < capacity && active < buffers.size()) {
-      auto const& block = buffers[active];
-      auto const n      = std::min(block.iov_len - block_offset, capacity - copied);
-      if (n > 0) {
-        std::memcpy(out + copied, static_cast<char const*>(block.iov_base) + block_offset, n);
-      }
-      copied += n;
-      block_offset += n;
-      if (block_offset >= block.iov_len) {
-        ++active;
-        block_offset = 0;
-      }
-    }
-    cursor += copied;
-    return copied;
-  }
-};
 
 /// Write-callback target for one in-flight transfer.  libcurl hands the
 /// response body to the reactor in arbitrarily-sized pieces; @c buf_sink
@@ -127,14 +61,11 @@ struct buf_sink {
 struct header_capture {
   std::string content_range;
   std::string retry_after;
-  /// ETag of the final response block (uploads: the part's ETag).
-  std::string etag;
 
   void reset() noexcept
   {
     content_range.clear();
     retry_after.clear();
-    etag.clear();
   }
 };
 
@@ -148,25 +79,6 @@ struct rest_io_op_request {
   std::size_t auth_attempt{0};
   bool needs_staging{false};
   std::size_t logical_bytes{0};
-  /// Engine bookkeeping: id of the grouped request the operation was planned
-  /// from (@c request_meta::id) and its scheduling class.
-  std::uint64_t group_id{0};
-  request_class cls{request_class::read};
-  /// Engine bookkeeping: the operation's terminal state was accounted for.
-  bool settled{false};
-
-  // -- uploads (kind != get) ----------------------------------------------------
-  rest_op_kind kind{rest_op_kind::get};
-  /// Upload session the operation belongs to (null for reads).
-  std::shared_ptr<upload_session> session;
-  /// Part number of an @c upload_part.
-  std::uint32_t part_number{0};
-  /// Request body of a PUT (staged bytes) ...
-  buf_source source;
-  /// ... or of a POST (CompleteMultipartUpload XML; empty for Initiate).
-  std::string request_body;
-  /// Response body of the current attempt (control-plane XML).
-  std::string response_body;
 
   [[nodiscard]] bool is_device() const noexcept
   {

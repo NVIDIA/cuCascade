@@ -20,26 +20,19 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uri_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/details/request_hub.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/details/runner_registry.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/details/sync_request.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_engine.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_upload.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma/s3rdma_ioctx.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_engine.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_reactor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4_authorizer.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/list_parser.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/xml_utils.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/cache/prefetching_cache.cpp)
 
 # kvikIO reaches the environment only via libcudf's dependency closure, so the
 # fallback ioctx is built only alongside the cudf layer.

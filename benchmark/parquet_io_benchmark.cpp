@@ -23,7 +23,7 @@
 //
 // Two read paths over the SAME uring backend are compared:
 //   io_context – the native cucascade::io ioctx.  host reads go through the
-//                vector-I/O primitive (host_readv_async_io); device reads
+//                vector-I/O primitive (host_read_ranges_async_io); device reads
 //                through device_read_async.
 //   cudf       – the cucascade::io::datasource (a cudf::io::datasource) whose
 //                host_read_async / device_read_async are issued per range.
@@ -33,7 +33,6 @@
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
-#include <cucascade/io/uring/config.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
@@ -126,17 +125,13 @@ static std::vector<std::string> expand_paths(std::string const& spec)
 static void usage(char const* prog)
 {
   std::cerr << "usage: " << prog
-            << " <path|glob> <io_context|cudf> <host|device> <num_rows> [n_threads]"
-               " [slices_per_pass] [odirect]\n"
+            << " <path|glob> <io_context|cudf> <host|device> <num_rows> [n_threads]\n"
             << "  path|glob  – parquet file path, or shell glob (e.g. 'dir/*.parquet')\n"
             << "  io_context – native cucascade::io ioctx (host=vector-io, device=device_read)\n"
             << "  cudf       – cucascade::io::datasource per-range host_read/device_read_async\n"
             << "  host|device– destination tier the ranges are read into\n"
             << "  num_rows   – rows to read (0 = all)\n"
-            << "  n_threads  – reader threads / uring reactors (default 2)\n"
-            << "  slices_per_pass – slices of one request a runner plans per loop pass "
-               "(default 8, 0 = no cap)\n"
-            << "  odirect    – 1 = O_DIRECT (default), 0 = buffered/page-cache\n";
+            << "  n_threads  – reader threads / uring reactors (default 2)\n";
 }
 
 // One coalesced column-chunk byte range in a specific file.
@@ -148,7 +143,7 @@ struct coalesced_range {
 
 int main(int argc, char** argv)
 {
-  if (argc < 5 || argc > 8) {
+  if (argc < 5 || argc > 6) {
     usage(argv[0]);
     return 1;
   }
@@ -174,7 +169,7 @@ int main(int argc, char** argv)
   size_t num_rows = static_cast<size_t>(num_rows_arg);  // 0 means all
 
   size_t n_threads = 2;
-  if (argc >= 6) {
+  if (argc == 6) {
     long long n_threads_arg = std::stoll(argv[5]);
     if (n_threads_arg <= 0) {
       std::cerr << "n_threads must be > 0\n";
@@ -182,21 +177,6 @@ int main(int argc, char** argv)
     }
     n_threads = static_cast<size_t>(n_threads_arg);
   }
-
-  size_t slices_per_pass = cucascade::io::uring::config{}.slices_per_pass;
-  if (argc >= 7) {
-    long long slices_per_pass_arg = std::stoll(argv[6]);
-    if (slices_per_pass_arg < 0 ||
-        static_cast<size_t>(slices_per_pass_arg) > cucascade::io::uring::max_slices_per_pass) {
-      std::cerr << "slices_per_pass must be 0.." << cucascade::io::uring::max_slices_per_pass
-                << "\n";
-      return 1;
-    }
-    slices_per_pass = static_cast<size_t>(slices_per_pass_arg);
-  }
-
-  bool use_odirect = true;
-  if (argc == 8) { use_odirect = std::stoll(argv[7]) != 0; }
 
   auto paths = expand_paths(path_spec);
   if (paths.empty()) {
@@ -211,7 +191,6 @@ int main(int argc, char** argv)
     std::cout << "  " << p << "\n";
   std::cout << "Rows   : " << (num_rows == 0 ? "all" : std::to_string(num_rows)) << "\n"
             << "Threads: " << n_threads << "\n"
-            << "Uring  : odirect=" << use_odirect << " slices_per_pass=" << slices_per_pass << "\n"
             << "Columns: ";
   for (auto const& c : COLUMNS)
     std::cout << c << "  ";
@@ -331,9 +310,7 @@ int main(int argc, char** argv)
                                                              1);               // initial_pools
 
   auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-    cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect     = use_odirect,
-                                                             .slices_per_pass = slices_per_pass},
-    &host_mr);
+    cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect = true}, &host_mr);
   std::shared_ptr<cucascade::io::ioctx> io_ctx =
     std::make_shared<cucascade::io::uring::uring_ioctx>(n_threads, std::move(uring_ctx));
   io_ctx->start();

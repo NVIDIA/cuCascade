@@ -74,7 +74,7 @@ namespace cucascade::io::cache {
 }
 
 /// One prefetch request: the two stage machines plus the chunk set they cover.
-/// Held by value — the cache's queues and the owning @ref cache_handle
+/// Held by value — the cache's queues and the owning @ref prefetching_handle
 /// each carry a copy, so the stages outlive whichever side finishes first.
 struct prefetch_request {
   std::shared_ptr<const io_object> obj;
@@ -165,21 +165,21 @@ struct eviction_request {
 /// field, so the queue carries the variant and the loop visits it.
 ///
 /// A default-constructed value holds an empty @ref prefetch_request, which is
-/// the queue's wakeup sentinel -- see @ref fs_cache::evict_loop.
+/// the queue's wakeup sentinel -- see @ref prefetching_cache::evict_loop.
 using cache_request = std::variant<prefetch_request, eviction_request>;
 
 using request_queue_type = blocking_concurrent_queue<cache_request>;
 
-class cache_handle {
+class prefetching_handle {
  public:
-  cache_handle() noexcept = default;
+  prefetching_handle() noexcept = default;
   /// Marks the consumer disposed so the evictor can reclaim the request.
-  ~cache_handle();
-  cache_handle(cache_handle const&)            = delete;
-  cache_handle& operator=(cache_handle const&) = delete;
+  ~prefetching_handle();
+  prefetching_handle(prefetching_handle const&)            = delete;
+  prefetching_handle& operator=(prefetching_handle const&) = delete;
 
-  cache_handle(cache_handle&& o) noexcept;
-  cache_handle& operator=(cache_handle&& o) noexcept;
+  prefetching_handle(prefetching_handle&& o) noexcept;
+  prefetching_handle& operator=(prefetching_handle&& o) noexcept;
 
   /// Drive the consumer-side stage machine.
   void update(scan_stage stage) noexcept;
@@ -214,88 +214,18 @@ class cache_handle {
   /// The chunks of the underlying request.  Null when the handle is empty.
   [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
 
-  /// Total nanoseconds demand reads through this handle spent blocked on its
-  /// in-flight prefetch (see @c fs_cache::await_inflight_prefetch).
-  /// Concurrent waiters each add their own wait.  Moves transfer the total; a
-  /// moved-from handle reports 0.
-  [[nodiscard]] std::uint64_t demand_wait_ns() const noexcept;
-
   explicit operator bool() const noexcept;
 
  private:
-  friend class fs_cache;
+  friend class prefetching_cache;
 
-  explicit cache_handle(prefetch_request req) noexcept;
+  explicit prefetching_handle(prefetch_request req) noexcept;
 
   prefetch_request _req;
-  /// Accumulated by @c fs_cache::await_inflight_prefetch; relaxed.
-  std::atomic<std::uint64_t> _demand_wait_ns{0};
-};
-
-class fs_cache;
-
-/// Test-only access to @ref fs_cache internals (populating chunks
-/// without the cudf @c datasource).  Defined by the tests, never by the library.
-struct fs_cache_test_access;
-
-// ---------------------------------------------------------------------------
-// write_invalidation_gate
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Lifetime-safe route from an asynchronous write completion to the
- *        prefetching cache it must invalidate.
- *
- * A write's second invalidation pass runs on whichever runner thread completes
- * the write -- possibly after the owning ioctx has torn the cache down
- * (@c ioctx::shutdown_cache runs before the backend drains its in-flight
- * writes).  Such a completion must therefore not reach the cache through the
- * ioctx.  It holds a @c std::shared_ptr to this gate instead: the gate outlives
- * the cache, and @c ~fs_cache @ref close "closes" it first thing,
- * waiting out any invalidation already inside.  Afterwards every call is a
- * no-op that never touches the (destroyed) cache -- there is nothing left to
- * invalidate.
- *
- * Entering and leaving cost one atomic RMW each; there is no lock.
- */
-class write_invalidation_gate {
- public:
-  explicit write_invalidation_gate(fs_cache& cache) noexcept : _cache(&cache) {}
-
-  write_invalidation_gate(write_invalidation_gate const&)            = delete;
-  write_invalidation_gate& operator=(write_invalidation_gate const&) = delete;
-
-  /**
-   * @brief Invalidate [@p offset, @p offset + @p size) of @p obj if the cache
-   *        is still alive.
-   *
-   * @return false when the gate is closed (the cache is gone or going), in
-   *         which case nothing was touched.
-   */
-  bool invalidate_range(const io_object& obj, std::size_t offset, std::size_t size) noexcept;
-
-  /// True until @ref close was called.
-  [[nodiscard]] bool is_open() const noexcept
-  {
-    return (_state.load(std::memory_order_acquire) & CLOSED_BIT) == 0;
-  }
-
-  /// Refuse new entries and block until every invalidation already inside has
-  /// left.  Idempotent.  Must not be called from inside @ref invalidate_range.
-  void close() noexcept;
-
- private:
-  void leave() noexcept;
-
-  static constexpr std::uint64_t CLOSED_BIT = 1ULL << 63;
-
-  /// CLOSED_BIT | number of callers currently inside.
-  std::atomic<std::uint64_t> _state{0};
-  fs_cache* const _cache;
 };
 
 // ---------------------------------------------------------------------------
-// fs_cache
+// prefetching_cache
 // ---------------------------------------------------------------------------
 //
 // Locking hierarchy:
@@ -303,27 +233,26 @@ class write_invalidation_gate {
 //   Level 1: file_entry::mtx   — protects one file's entry vector
 //   (independent): cache_entry atomics — lock-free
 
-class fs_cache {
+class prefetching_cache {
   // The cache only accepts new prefetch requests through
   // datasource::fadvise — that's the single entry point for the
   // fadvise(scan_stage) protocol.  Friending the
   // datasource keeps insert() out of the public API while still letting
   // fadvise dispatch through it.
   friend class cucascade::io::datasource;
-  friend class cache_handle;
-  friend struct fs_cache_test_access;
+  friend class prefetching_handle;
 
  public:
   using byte_range = cucascade::io::byte_range;
 
-  fs_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
-           ioctx* io_ctx,
-           const config& cfg,
-           std::shared_ptr<const cucascade::memory::topology_index> topology_index);
-  ~fs_cache();
+  prefetching_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
+                    ioctx* io_ctx,
+                    const config& cfg,
+                    std::shared_ptr<const cucascade::memory::topology_index> topology_index);
+  ~prefetching_cache();
 
-  fs_cache(fs_cache const&)            = delete;
-  fs_cache& operator=(fs_cache const&) = delete;
+  prefetching_cache(prefetching_cache const&)            = delete;
+  prefetching_cache& operator=(prefetching_cache const&) = delete;
 
   [[nodiscard]] bool is_armed() const noexcept { return _armed; }
 
@@ -333,18 +262,26 @@ class fs_cache {
   /// outside the cache.
   [[nodiscard]] std::size_t chunk_size() const noexcept { return _chunk_size; }
 
-  [[nodiscard]] std::size_t host_read(
-    const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle = nullptr);
+  [[nodiscard]] std::size_t host_read(const io_object& obj,
+                                      size_t offset,
+                                      size_t size,
+                                      uint8_t* dst,
+                                      prefetching_handle* handle = nullptr);
 
   [[nodiscard]] exec::semi_future<std::size_t> host_read_async(
-    const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle = nullptr);
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    prefetching_handle* handle = nullptr);
 
-  [[nodiscard]] exec::semi_future<std::size_t> device_read_async(const io_object& obj,
-                                                                 size_t offset,
-                                                                 size_t size,
-                                                                 uint8_t* device_ptr,
-                                                                 ::cuda::stream_ref stream,
-                                                                 cache_handle* handle = nullptr);
+  [[nodiscard]] exec::semi_future<std::size_t> device_read_async(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* device_ptr,
+    ::cuda::stream_ref stream,
+    prefetching_handle* handle = nullptr);
 
   /// Vectored form of @ref device_read_async: each range is served from the
   /// cache where it is populated, loaded through the cache where it can be, and
@@ -355,19 +292,19 @@ class fs_cache {
     const io_object& obj,
     std::span<const slice> slices,
     ::cuda::stream_ref stream,
-    cache_handle* handle = nullptr);
+    prefetching_handle* handle = nullptr);
 
   /// Vectored form of @ref host_read_async: each range is served from the cache
   /// where populated, claimed and populated when possible, and read directly
   /// into the caller buffer otherwise. Reports the clamped logical byte count
   /// once every physical operation has settled.
   [[nodiscard]] exec::semi_future<std::size_t> host_read_ranges_async(
-    const io_object& obj, std::span<const slice> slices, cache_handle* handle = nullptr);
+    const io_object& obj, std::span<const slice> slices, prefetching_handle* handle = nullptr);
 
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
   /// completion.  Returns whether IO was issued.
-  bool prefetch(cache_handle& handle, exec::invocable<void(bool) noexcept> on_done);
+  bool prefetch(prefetching_handle& handle, exec::invocable<void(bool) noexcept> on_done);
 
   /// Bytes of staging memory the cache currently holds: every chunk buffer
   /// handed out by the pool and not yet reclaimed.  This is what an explicit
@@ -400,40 +337,6 @@ class fs_cache {
   /// the requested number of bytes could necessarily be reclaimed.
   void evict_sync(std::size_t bytes_to_free);
 
-  /**
-   * @brief Make sure no read served by this cache after the call returns sees
-   *        bytes of [@p offset, @p offset + @p size) of @p obj that were
-   *        cached (or were being loaded) before the call.
-   *
-   * Called by the ioctx write wrappers twice per write: before the write is
-   * submitted and again once it completed (see @c ioctx::writev_async).  Per
-   * overlapping chunk (@ref chunk_state::invalidate): a `cached` chunk is
-   * unpublished at once (it keeps its buffer and reloads on the next read); a
-   * pinned or loading chunk is marked STALE, so no new reader can pin it and
-   * an in-flight prefetch / demand load landing later is not published.
-   * Readers that pinned a chunk before the call keep reading the old bytes --
-   * their reads raced the write, whose ordering against reads is undefined.
-   *
-   * Chunks are keyed by @c io_object::raw_file_cache_id, so a write through
-   * any io_object of the same file invalidates.  Bytes past the file size the
-   * cache recorded when it first saw the file have no chunk and need nothing.
-   *
-   * Lock-free on chunk state; takes @c _map_mtx and the file entry's mutex
-   * shared.  Safe to call concurrently with every read, prefetch and the
-   * evictor, but not concurrently with the cache's destruction -- asynchronous
-   * callers go through @ref write_invalidation_gate.
-   *
-   * @return number of chunks that were unpublished or marked stale.
-   */
-  std::size_t invalidate_range(const io_object& obj, std::size_t offset, std::size_t size) noexcept;
-
-  /// The gate asynchronous write completions invalidate through (see
-  /// @ref write_invalidation_gate).  Closed by the destructor.
-  [[nodiscard]] std::shared_ptr<write_invalidation_gate> invalidation_gate() const noexcept
-  {
-    return _invalidation_gate;
-  }
-
   [[nodiscard]] std::string summary() const;
 
   void prepare_for_query() noexcept;
@@ -453,9 +356,9 @@ class fs_cache {
  private:
   struct cached_copy_retirement;
 
-  [[nodiscard]] cache_handle initiate_prefetching_request(const io_object& obj,
-                                                          std::span<const byte_range> ranges,
-                                                          std::optional<int> gpu_id = {});
+  [[nodiscard]] prefetching_handle initiate_prefetching_request(const io_object& obj,
+                                                                std::span<const byte_range> ranges,
+                                                                std::optional<int> gpu_id = {});
 
   /// Attach staging buffers to @p handle's request, so a following @ref prefetch
   /// has chunks it can claim: a chunk without a buffer cannot be taken for
@@ -474,7 +377,7 @@ class fs_cache {
   /// @return why the request was or was not prepared. Allocation failure leaves
   ///         the request queued and retryable; a nonblocking failure also
   ///         requests asynchronous eviction. Falling behind abandons it.
-  prepare_result prepare(cache_handle& handle, bool wait_for_eviction);
+  prepare_result prepare(prefetching_handle& handle, bool wait_for_eviction);
 
   [[nodiscard]] prepare_result prepare_request(prefetch_request& req,
                                                bool wait_for_eviction = false);
@@ -486,7 +389,7 @@ class fs_cache {
                                                            size_t offset,
                                                            size_t size,
                                                            coverage_policy policy,
-                                                           cache_handle* handle) const;
+                                                           prefetching_handle* handle) const;
 
   /// Return only the chunks named by @p handle that overlap one logical read.
   /// Unlike @ref ranges_in_cache this never falls back to the file-wide cache:
@@ -495,16 +398,15 @@ class fs_cache {
   [[nodiscard]] std::vector<cached_chunk*> ranges_in_handle(std::size_t offset,
                                                             std::size_t size,
                                                             coverage_policy policy,
-                                                            cache_handle* handle) const;
+                                                            prefetching_handle* handle) const;
 
   /// Wait for an active prefetch only when one of this read call's handle chunks
   /// is currently loading. Loading chunks owned by demand IO are left alone;
   /// the normal planner will route those pieces through backend-owned bounce
-  /// staging instead of serialising two executor reads.  The time spent waiting
-  /// is added to @p handle's @ref cache_handle::demand_wait_ns.
+  /// staging instead of serialising two executor reads.
   void await_inflight_prefetch(const io_object& obj,
                                std::span<const slice> requests,
-                               cache_handle* handle) const;
+                               prefetching_handle* handle) const;
 
   struct file_entry {
     /// Materialise a chunk for every offset in @p incoming, fold the matching
@@ -567,8 +469,6 @@ class fs_cache {
   file_entry& get_or_create_file_entry(const io_object& obj);
 
   const config _cfg;
-  /// Closed first thing in the destructor; see @ref write_invalidation_gate.
-  std::shared_ptr<write_invalidation_gate> const _invalidation_gate;
   std::unique_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;
 

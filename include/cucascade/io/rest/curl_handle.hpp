@@ -18,7 +18,6 @@
 
 #pragma once
 
-#include <cucascade/io/details/event_fd.hpp>
 #include <cucascade/io/types.hpp>  // file_descriptor
 
 #include <curl/curl.h>
@@ -130,9 +129,16 @@ using curl_share_ptr = std::unique_ptr<CURLSH, curl_share_deleter>;
 }
 
 /// Create a non-blocking eventfd (@c EFD_NONBLOCK | @c EFD_CLOEXEC), initial 0.
-/// Moved to @c cucascade/io/details/event_fd.hpp (shared with the runner
-/// registry); re-exported here so REST code keeps its spelling.
-using ::cucascade::io::detail::make_event_fd;
+/// Used as the cross-thread wakeup that bridges the lock-free request queue and
+/// CUDA copy-completion callbacks into the epoll loop.
+[[nodiscard]] inline file_descriptor make_event_fd()
+{
+  int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (fd < 0) {
+    throw std::runtime_error(std::string("rest: eventfd failed: ") + std::strerror(errno));
+  }
+  return file_descriptor{fd};
+}
 
 // ---------------------------------------------------------------------------
 // curl_share
