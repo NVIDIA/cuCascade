@@ -235,25 +235,46 @@ class templated_ioctx : public ioctx {
   }
 
   /**
-   * @brief Select at most two least-backlogged reactors.
+   * @brief Select at most two least-backlogged reactors for a read of class @p cls.
    *
    * Rotation breaks load ties and keeps synchronous reads from sticking to
    * reactor zero. queued_bytes is advisory; slot limits remain authoritative.
+   *
+   * Prefetch isolation: when prefetch_reactor_count() returns K > 0, the last K
+   * reactors serve only io_class::prefetch reads and the first n - K serve only
+   * demand reads. A reactor runs its queue in order, so without the split a
+   * small demand read can queue behind gigabytes of whole-split prefetch on
+   * every reactor; with it, demand only ever waits behind other demand. A class
+   * whose partition would be empty ranks among all reactors.
    */
   virtual std::vector<Reactor*> next_reactor([[maybe_unused]] io_object_type const& object,
                                              [[maybe_unused]] std::size_t n_slices,
                                              [[maybe_unused]] io_op_type type,
-                                             [[maybe_unused]] int device_id = -1)
+                                             [[maybe_unused]] int device_id = -1,
+                                             io_class cls                   = io_class::demand)
   {
     constexpr std::size_t dispatch_fanout = 2;
-    auto const count                      = _reactors.size();
-    if (count == 0) return {};
+    auto const total                      = _reactors.size();
+    if (total == 0) return {};
+
+    // [first, first + count) is the partition this class may use.
+    std::size_t first = 0;
+    std::size_t count = total;
+    auto const k      = prefetch_reactor_count();
+    if (k > 0 && k < total) {
+      if (cls == io_class::prefetch) {
+        first = total - k;
+        count = k;
+      } else {
+        count = total - k;
+      }
+    }
 
     auto const start = _next.fetch_add(1, std::memory_order_relaxed) % count;
     std::vector<std::pair<std::size_t, std::size_t>> ranked;
     ranked.reserve(count);
     for (std::size_t distance = 0; distance < count; ++distance) {
-      auto const index = (start + distance) % count;
+      auto const index = first + (start + distance) % count;
       ranked.emplace_back(_reactors[index]->queued_bytes(), distance);
     }
 
@@ -264,9 +285,21 @@ class templated_ioctx : public ioctx {
     std::vector<Reactor*> result;
     result.reserve(selected);
     for (std::size_t i = 0; i < selected; ++i) {
-      result.push_back(_reactors[(start + ranked[i].second) % count].get());
+      result.push_back(_reactors[first + (start + ranked[i].second) % count].get());
     }
     return result;
+  }
+
+  /// Reactors reserved for prefetch reads (see next_reactor); 0 = no isolation.
+  /// Read from the reactor config's @c prefetch_reactors when it has one (uring);
+  /// backends without the knob never isolate.
+  [[nodiscard]] std::size_t prefetch_reactor_count() const noexcept
+  {
+    if constexpr (requires { _config.prefetch_reactors; }) {
+      return static_cast<std::size_t>(_config.prefetch_reactors);
+    } else {
+      return 0;
+    }
   }
 
   std::size_t host_read_io(io_object const& object,
@@ -334,7 +367,9 @@ class templated_ioctx : public ioctx {
 
       if (slices.empty()) return exec::make_semi_future<std::size_t>(0);
 
-      auto reactors = next_reactor(typed, slices.size(), io_op_type::host_vector_async, device_id);
+      // One call site issues one class, so the first slice speaks for the request.
+      auto reactors = next_reactor(
+        typed, slices.size(), io_op_type::host_vector_async, device_id, slices.front().cls);
       auto coordinator = std::make_shared<grouped_coordinator>(total_bytes, slices.size());
       auto future      = coordinator->get_future();
 

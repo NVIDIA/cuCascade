@@ -18,32 +18,61 @@
 
 #pragma once
 
-#include <cucascade/exec/config.hpp>
 #include <cucascade/io/types.hpp>
 
 #include <cstddef>
 
 namespace cucascade::io::uring {
 
+/// Largest accepted @c config::slices_per_pass: a reactor never owns more than
+/// this many staging slots (each in-flight operation holds at least one), so a
+/// larger cap could never take effect.
+inline constexpr std::size_t max_slices_per_pass = 64;
+
 struct config {
   /// How many scan tasks the readahead manager may keep in flight against this
   /// backend at once.  Zero disables readahead for it entirely.
   ///
-  /// Local NVMe saturates at modest queue depth and every in-flight scan pins
-  /// staging buffers, so one scan per pipeline executor thread is enough to
-  /// keep the decoders fed without over-committing the pinned pool.
-  std::size_t n_max_concurrent_scans{
-    static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads)};
+  /// Local NVMe has no round trip to hide, so a readahead competes with the
+  /// executor's own reads for the same device and just reorders the queue
+  /// rather than adding throughput.  Measured on SF1000 local-parquet, turning
+  /// it off is a large net win, so the local backend defaults to 0 (off).  Set
+  /// a positive value (or `max_readahead_scans`) to opt the local path back in.
+  std::size_t n_max_concurrent_scans{0};
 
-  /// Whether the config named @c n_max_concurrent_scans explicitly. Needed
-  /// because the derived default follows the configured pipeline width and can
-  /// legitimately equal the struct default. Without this provenance, an
-  /// explicit value equal to the struct default is silently overwritten.
+  /// Whether the config named @c n_max_concurrent_scans explicitly. Preserved
+  /// for parity with the REST backend (whose budget is still derived from the
+  /// pipeline width) so an explicit value is always distinguishable from the
+  /// struct default -- including an explicit 0, which opts the local path out
+  /// as deliberately as the default does.
   bool n_max_concurrent_scans_explicit{false};
 
   /// When false, worker-planned operations use the buffered page-cache handle.
   /// Defaults to O_DIRECT when a physical operation satisfies its constraints.
   bool use_odirect{true};
+
+  /// How many slices of its active request a reactor may turn into physical
+  /// reads per loop pass before it waits for a completion; 0 means no cap (keep
+  /// going while every planned read finds a free staging slot).  With 1, a
+  /// single many-slice request (a whole-split prefetch, a wide demand read)
+  /// runs at a queue depth of 1-2 per reactor.  The default of 8 keeps such a
+  /// request deep without letting one pass claim every free slot ahead of the
+  /// requests queued behind it.
+  std::size_t slices_per_pass{8};
+
+  /// How many reactors, taken from the end of the pool, serve only prefetch
+  /// (readahead) reads; the others serve only demand reads.  A reactor runs
+  /// its queue in order, so without the split a small demand read can wait
+  /// behind gigabytes of whole-split prefetch on every reactor.  0 disables the
+  /// split: every read ranks among all reactors (see
+  /// templated_ioctx::next_reactor).  Must be below the reactor count; with a
+  /// single reactor it is ignored.  When not named in the config it stays 0;
+  /// an embedding application may derive it (e.g. 1 when uring readahead runs).
+  std::size_t prefetch_reactors{0};
+
+  /// Whether the config named @c prefetch_reactors explicitly, so an explicit
+  /// value (0 included) is never replaced by the derived default.
+  bool prefetch_reactors_explicit{false};
 
   /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
   /// either way -- naming it lets the caller align once, up front, instead of

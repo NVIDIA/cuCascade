@@ -35,6 +35,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -200,6 +201,39 @@ class uring_reactor {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
 
+  /// Log2 histogram of queue delays: bucket b counts delays d (microseconds) with
+  /// std::bit_width(d) == b, i.e. [2^(b-1), 2^b) us; the last bucket is open-ended.
+  static constexpr std::size_t queue_delay_buckets = 26;
+
+  /// One io_class's queue-delay window (see @ref gauges::queue_delay).
+  struct queue_delay_stats {
+    std::uint64_t count{0};
+    std::uint64_t sum_ns{0};
+    std::uint64_t max_ns{0};
+    std::array<std::uint32_t, queue_delay_buckets> histogram{};
+  };
+
+  /// Diagnostic view of the worker's depth and queueing.  The worker publishes
+  /// these with relaxed stores once per loop pass (right before it waits for a
+  /// completion), so every field is approximate and may be one pass stale.
+  struct gauges {
+    std::uint32_t inflight_ops{0};      ///< physical ops owned by the kernel
+    std::uint32_t max_inflight_ops{0};  ///< peak since the previous take_gauges()
+    std::uint32_t pending_ops{0};       ///< planned ops waiting for a staging slot
+    /// Slices of the active request not yet expanded into physical ops.
+    std::uint32_t active_remaining_slices{0};
+    std::size_t queued_requests{0};     ///< requests queued behind the active one
+    std::size_t queued_bytes{0};        ///< see @ref queued_bytes
+    std::uint64_t requests_started{0};  ///< cumulative requests taken off the queue
+    std::uint64_t bytes_submitted{0};   ///< cumulative physical bytes submitted
+    /// Queue delay (enqueue -> first slice expanded) of requests whose first slice
+    /// was expanded since the previous take_gauges(), per @ref io_class.
+    queue_delay_stats queue_delay[2]{};
+  };
+
+  /// Snapshot the gauges and restart the @c max_inflight_ops window.
+  [[nodiscard]] gauges take_gauges() noexcept;
+
   /// Whether @p path can be served by this reactor.  Local-disk only:
   /// returns true iff the path refers to an existing, accessible file.
   [[nodiscard]] static bool supports(std::string_view path);
@@ -248,6 +282,29 @@ class uring_reactor {
   mutable std::mutex _enqueue_mutex;
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
+
+  // Gauges (see @ref gauges): written only by the worker, read by take_gauges().
+  std::atomic<std::uint32_t> _gauge_inflight{0};
+  std::atomic<std::uint32_t> _gauge_max_inflight{0};
+  std::atomic<std::uint32_t> _gauge_pending{0};
+  std::atomic<std::uint32_t> _gauge_active_slices{0};
+  std::atomic<std::uint64_t> _gauge_requests_started{0};
+  std::atomic<std::uint64_t> _gauge_bytes_submitted{0};
+
+  /// Worker-side accumulators behind gauges::queue_delay; take_gauges() swaps them out.
+  struct queue_delay_atomics {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> sum_ns{0};
+    std::atomic<std::uint64_t> max_ns{0};
+    std::array<std::atomic<std::uint32_t>, queue_delay_buckets> histogram{};
+  };
+  queue_delay_atomics _gauge_queue_delay[2];
+  /// Record one request's queue delay (worker thread only).
+  void record_queue_delay(grouped_io_request const& request) noexcept;
+
+  /// config::slices_per_pass with 0 (no cap) mapped to SIZE_MAX; read once at
+  /// construction.
+  std::size_t _slices_per_pass{1};
 };
 
 }  // namespace cucascade::io::uring

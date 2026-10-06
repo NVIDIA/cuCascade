@@ -63,6 +63,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
+    io/test_templated_ioctx.cpp
     io/test_uri_parser.cpp
     io/cache/test_metadata_store.cpp
     io/rest/test_object_store_lister.cpp
@@ -72,6 +73,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
+    io/uring/test_uring_readv.cpp
     # Main test runner
     unittest.cpp)
 

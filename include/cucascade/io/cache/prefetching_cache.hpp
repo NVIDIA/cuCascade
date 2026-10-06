@@ -214,6 +214,14 @@ class prefetching_handle {
   /// The chunks of the underlying request.  Null when the handle is empty.
   [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
 
+  /// Total time demand reads through this handle spent parked on its in-flight
+  /// prefetch (see @c prefetching_cache::await_inflight_prefetch).  Concurrent
+  /// waiters each contribute their own wait.
+  [[nodiscard]] std::uint64_t demand_wait_ns() const noexcept
+  {
+    return _demand_wait_ns.load(std::memory_order_relaxed);
+  }
+
   explicit operator bool() const noexcept;
 
  private:
@@ -222,6 +230,7 @@ class prefetching_handle {
   explicit prefetching_handle(prefetch_request req) noexcept;
 
   prefetch_request _req;
+  std::atomic<std::uint64_t> _demand_wait_ns{0};
 };
 
 // ---------------------------------------------------------------------------
