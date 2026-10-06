@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <exception>
@@ -120,7 +121,9 @@ prefetching_handle::~prefetching_handle()
   if (_req.consumer) { _req.consumer->mark_disposed(); }
 }
 
-prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept : _req(std::move(o._req))
+prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept
+  : _req(std::move(o._req)),
+    _demand_wait_ns(o._demand_wait_ns.exchange(0, std::memory_order_relaxed))
 {
   o._req = {};
 }
@@ -131,6 +134,8 @@ prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexce
     if (_req.consumer) { _req.consumer->mark_disposed(); }
     _req   = std::move(o._req);
     o._req = {};
+    _demand_wait_ns.store(o._demand_wait_ns.exchange(0, std::memory_order_relaxed),
+                          std::memory_order_relaxed);
   }
   return *this;
 }
@@ -659,7 +664,13 @@ void prefetching_cache::await_inflight_prefetch(const io_object& obj,
       return chunk->state.get_state() == chunk_state::loading;
     });
     if (has_loading_chunk && handle->is_prefetch_in_flight()) {
-      std::ignore = handle->wait_until_ready();
+      auto const wait_start = std::chrono::steady_clock::now();
+      std::ignore           = handle->wait_until_ready();
+      auto const waited     = std::chrono::steady_clock::now() - wait_start;
+      handle->_demand_wait_ns.fetch_add(
+        static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+        std::memory_order_relaxed);
       return;
     }
   }
@@ -1229,6 +1240,7 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
     }};
     for (auto& slice : prepared) {
       slice.on_complete = completion;
+      slice.cls         = io_class::prefetch;
     }
   } catch (...) {
     return fail_setup();

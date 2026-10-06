@@ -130,14 +130,16 @@ class stub_ioctx : public cucascade::io::templated_ioctx<stub_reactor> {
  public:
   stub_ioctx() : templated_ioctx(make_reactors()) {}
 
-  std::vector<stub_reactor*> next_reactor(const stub_io_object& object,
-                                          std::size_t n_slices,
-                                          io_op_type operation,
-                                          int device_id = -1) override
+  std::vector<stub_reactor*> next_reactor(
+    const stub_io_object& object,
+    std::size_t n_slices,
+    io_op_type operation,
+    int device_id               = -1,
+    cucascade::io::io_class cls = cucascade::io::io_class::demand) override
   {
     if (object.controls()->throw_selection) { throw std::runtime_error("selection failure"); }
     if (object.controls()->empty_selection) { return {}; }
-    return templated_ioctx::next_reactor(object, n_slices, operation, device_id);
+    return templated_ioctx::next_reactor(object, n_slices, operation, device_id, cls);
   }
 };
 

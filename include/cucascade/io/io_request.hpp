@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -274,9 +275,16 @@ class grouped_io_request final {
     }
   }
 
+  /// True until the first slice has been taken (expanded) by a reactor.
+  [[nodiscard]] bool not_started() const noexcept { return _next == 0; }
+
   std::shared_ptr<const io_object> obj;
   std::vector<prepared_io_slice> slices;
   std::shared_ptr<grouped_coordinator> coordinator;
+  /// Class of the first slice (a request never mixes classes: one call site, one class).
+  io_class cls{io_class::demand};
+  /// Stamped by the reactor at enqueue; diagnostic (queue-delay gauge) only.
+  std::chrono::steady_clock::time_point enqueued_at{};
 
  private:
   grouped_io_request(std::shared_ptr<const io_object> object,
@@ -284,6 +292,7 @@ class grouped_io_request final {
                      std::shared_ptr<grouped_coordinator> group)
     : obj(std::move(object)), slices(std::move(request_slices)), coordinator(std::move(group))
   {
+    if (!slices.empty()) cls = slices.front().cls;
   }
 
   std::size_t _next{0};

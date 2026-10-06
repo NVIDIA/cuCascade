@@ -21,6 +21,8 @@
 #include <cucascade/io/templated_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 
+#include <vector>
+
 namespace cucascade::io::uring {
 
 // ---------------------------------------------------------------------------
@@ -40,6 +42,13 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
   uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
+
+  /// One gauge snapshot per reactor, in reactor order.  Each call restarts the
+  /// reactors' max-inflight and queue-delay windows.
+  ///
+  /// @note Unlike sirius, no background sampler thread logs these periodically:
+  /// cuCascade logging is compiled out, so callers poll this directly.
+  [[nodiscard]] std::vector<uring_reactor::gauges> reactor_gauges() noexcept;
 };
 
 }  // namespace cucascade::io::uring

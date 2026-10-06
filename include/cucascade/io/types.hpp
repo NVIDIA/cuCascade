@@ -239,6 +239,12 @@ class prepared_io_completion final {
   callback_type _callback;
 };
 
+/// Who is waiting for a read: @c demand (a consumer blocks on it now) or
+/// @c prefetch (speculative readahead nobody waits on yet). templated_ioctx::next_reactor
+/// routes by it when reactors are reserved for prefetch (uring prefetch_reactors), and
+/// reactors keep per-class queue-delay gauges.
+enum class io_class : std::uint8_t { demand, prefetch };
+
 struct prepared_io_slice {
   /// The logical caller-requested window. A reactor may widen the physical I/O
   /// for alignment or a cached chunk's advertised fill, but device copies and
@@ -247,6 +253,7 @@ struct prepared_io_slice {
   host_buffer h_buffer;  // monostate if using reactor-owned staging
   device_buffer d_buffer;
   std::shared_ptr<prepared_io_completion> on_complete;
+  io_class cls{io_class::demand};
 
   prepared_io_slice() noexcept = default;
   explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}
