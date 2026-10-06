@@ -33,12 +33,11 @@ namespace cucascade::io::uring {
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
-  /// Build the context over one @c uring_reactor sharing @p ctx (it carries the
-  /// @c config and the pinned bounce-staging resource, which must outlive this
-  /// ioctx).  @p n_runner_threads is the number of runner threads @c start()
-  /// spawns (each owns its own ring and 64 MiB of pinned staging); callers may
-  /// additionally drive the context with @c run / @c run_for / @c run_until.
-  uring_ioctx(size_t n_runner_threads, std::shared_ptr<uring_reactor::reactor_context> ctx);
+  /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context
+  /// per pool: it carries the per-reactor @c config and the pinned bounce-staging
+  /// resource, which must outlive this ioctx).  The ioctx config is sourced from
+  /// the reactors themselves — see @c templated_ioctx.
+  uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
 };

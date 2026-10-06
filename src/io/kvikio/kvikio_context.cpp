@@ -16,9 +16,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/error.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
-#include <cucascade/log/logging.hpp>
 
 #include <kvikio/defaults.hpp>
 #include <kvikio/remote_handle.hpp>
@@ -27,24 +25,16 @@
 
 #include <cuda_runtime.h>
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
-#include <vector>
 
 namespace cucascade::io {
 
@@ -75,79 +65,6 @@ const kvikio_object& as_kvikio(const io_object& obj)
 [[nodiscard]] size_t clamp_to_object(const io_object& obj, size_t offset, size_t size) noexcept
 {
   return obj.size() > offset ? std::min(size, obj.size() - offset) : 0;
-}
-
-/// The writable local object behind @p obj, or std::invalid_argument when the
-/// object is remote, was opened read-only, or was already committed.
-const kvikio_io_object& as_writable(const io_object& obj)
-{
-  const auto* local = dynamic_cast<const kvikio_io_object*>(&as_kvikio(obj));
-  if (local == nullptr || !local->is_writable()) {
-    throw std::invalid_argument("kvikio_context: io_object '" + obj.object_path() +
-                                "' is not open for writing (read-only or committed)");
-  }
-  return *local;
-}
-
-/// The local object behind @p obj; remote objects have no file to sync.
-const kvikio_io_object& as_local(const io_object& obj)
-{
-  const auto* local = dynamic_cast<const kvikio_io_object*>(&as_kvikio(obj));
-  if (local == nullptr) {
-    throw std::system_error(std::make_error_code(std::errc::not_supported),
-                            "kvikio_context: remote objects cannot be flushed");
-  }
-  return *local;
-}
-
-/// fdatasync() the file behind @p object, retrying EINTR.  A filesystem that
-/// does not support syncing (EINVAL) is treated as success.
-void sync_data(const kvikio_io_object& object)
-{
-  int const fd = object.handle().fd(false);
-  while (::fdatasync(fd) != 0) {
-    int const err = errno;
-    if (err == EINTR) { continue; }
-    if (err == EINVAL) {
-      CUCASCADE_LOG_WARN("kvikio_context: fdatasync unsupported for '{}'; ignoring",
-                         object.object_path());
-      return;
-    }
-    throw std::system_error(
-      err, std::generic_category(), "kvikio_context: fdatasync '" + object.object_path() + "'");
-  }
-}
-
-/// Check a completed transfer and publish its end to the object's size.
-void finish_write(const kvikio_io_object& object,
-                  std::size_t offset,
-                  std::size_t requested,
-                  std::size_t written)
-{
-  if (written != requested) {
-    throw std::system_error(std::make_error_code(std::errc::io_error),
-                            "kvikio_context: short write to '" + object.object_path() + "' (" +
-                              std::to_string(written) + " of " + std::to_string(requested) +
-                              " bytes)");
-  }
-  object.note_written(offset + written);
-}
-
-/// Make every device source observe the work already enqueued on its stream:
-/// kvikIO's pwrite only orders against the legacy default stream.  Each
-/// distinct (device, stream) pair is synchronized once.
-void sync_device_sources(std::vector<write_segment> const& segments)
-{
-  std::vector<std::pair<int, cudaStream_t>> synced;
-  for (auto const& segment : segments) {
-    auto const* device = std::get_if<device_source>(&segment.src);
-    if (device == nullptr) { continue; }
-    std::pair<int, cudaStream_t> const key{device->device_id, device->stream.get()};
-    if (std::find(synced.begin(), synced.end(), key) != synced.end()) { continue; }
-    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device->device_id}};
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(key.second));
-    synced.push_back(key);
-  }
 }
 
 /// kvikIO falls back to the AWS_* environment when an argument is nullopt, so
@@ -238,7 +155,7 @@ std::shared_ptr<io_object> kvikio_context::create_io_object(std::string path)
     return std::make_shared<kvikio_remote_io_object>(
       std::move(path), std::move(handle), object_size);
   }
-  // Read-only open (writes go through create_io_object_for_write).  The handle owns the fd
+  // Read-only: this ioctx serves the scan path only.  The handle owns the fd
   // (and any cuFile registration) for the io_object's lifetime, and the
   // io_object outlives any single datasource wrapping it.
   //
@@ -275,7 +192,7 @@ size_t kvikio_context::host_read_io(const io_object& obj, size_t offset, size_t 
 }
 
 exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
-  const io_object& obj, std::vector<prepared_io_slice>&& slices, io_options /*opts*/) noexcept
+  const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept
 {
   // make_semi_future_with invokes eagerly. KvikIO remains the simple fallback
   // backend while sharing the exact prepared-slice contract with reactors.
@@ -367,130 +284,6 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
       }
     }
     return total;
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Writes
-// ---------------------------------------------------------------------------
-
-std::shared_ptr<io_object> kvikio_context::create_io_object_for_write(std::string path,
-                                                                      write_open_options opts)
-{
-  if (is_s3_uri(path)) {
-    throw std::system_error(
-      std::make_error_code(std::errc::not_supported),
-      "kvikio_context: writing to object stores is not supported ('" + path + "')");
-  }
-
-  // Create / truncate with plain POSIX semantics so errors carry the real
-  // errno; kvikIO's "w" would truncate both of its descriptors and offers no
-  // create-without-truncate mode ("a" means O_APPEND, which breaks pwrite).
-  int flags = O_RDWR | O_CLOEXEC;
-  switch (opts.mode) {
-    case write_mode::create_or_truncate: flags |= O_CREAT | O_TRUNC; break;
-    case write_mode::create_or_open: flags |= O_CREAT; break;
-    case write_mode::open_existing: break;
-  }
-  auto const permissions = static_cast<mode_t>(opts.permissions);
-  {
-    file_descriptor const fd{::open(path.c_str(), flags, permissions)};
-    if (!fd) {
-      throw std::system_error(
-        errno, std::generic_category(), "kvikio_context: open '" + path + "' for writing");
-    }
-    if (opts.size_hint > 0) {
-      // Best effort: reserve blocks without changing the visible size.
-      if (::fallocate(fd.get(), FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(opts.size_hint)) != 0) {
-        CUCASCADE_LOG_WARN("kvikio_context: fallocate size hint ignored for '{}'", path);
-      }
-    }
-  }
-
-  kvikio::FileHandle handle = _config.compat_mode
-                                ? kvikio::FileHandle{path, "r+", permissions, *_config.compat_mode}
-                                : kvikio::FileHandle{path, "r+", permissions};
-  auto const file_size      = handle.nbytes();
-  return std::make_shared<kvikio_io_object>(
-    std::move(path), std::move(handle), file_size, /*writable=*/true);
-}
-
-std::size_t kvikio_context::host_write_io(const io_object& obj,
-                                          std::size_t offset,
-                                          std::size_t size,
-                                          const std::uint8_t* src,
-                                          write_options opts)
-{
-  auto const& object = as_writable(obj);
-  auto const written = object.handle().pwrite(src, size, offset).get();
-  finish_write(object, offset, size, written);
-  if (opts.durability == write_durability::data_sync) { sync_data(object); }
-  return written;
-}
-
-exec::semi_future<std::size_t> kvikio_context::mixed_writev_async_io(
-  const io_object& obj, std::vector<write_segment>&& segments, write_options opts) noexcept
-{
-  // Eager, like the reads: the returned future is already resolved.
-  return exec::make_semi_future_with([&obj, segments = std::move(segments), opts]() -> std::size_t {
-    auto const& object = as_writable(obj);
-    sync_device_sources(segments);
-
-    // Issue every segment before waiting on any, so independent segments
-    // overlap on kvikIO's thread pool.
-    std::vector<std::future<std::size_t>> transfers;
-    transfers.reserve(segments.size());
-    std::exception_ptr first_error;
-    for (auto const& segment : segments) {
-      try {
-        if (auto const* device = std::get_if<device_source>(&segment.src)) {
-          rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device->device_id}};
-          transfers.push_back(
-            object.handle().pwrite(device->data, segment.size(), segment.offset()));
-        } else {
-          transfers.push_back(
-            object.handle().pwrite(segment.data(), segment.size(), segment.offset()));
-        }
-      } catch (...) {
-        first_error = std::current_exception();
-        break;
-      }
-    }
-
-    // Wait for everything that was issued (even after a failure) so no
-    // transfer outlives the caller's source buffers.
-    std::size_t total = 0;
-    for (std::size_t i = 0; i < transfers.size(); ++i) {
-      try {
-        auto const written = transfers[i].get();
-        finish_write(object, segments[i].offset(), segments[i].size(), written);
-        total += written;
-      } catch (...) {
-        if (!first_error) { first_error = std::current_exception(); }
-      }
-    }
-    if (first_error) { std::rethrow_exception(first_error); }
-
-    if (opts.durability == write_durability::data_sync) { sync_data(object); }
-    return total;
-  });
-}
-
-exec::semi_future<void> kvikio_context::flush_async_io(const io_object& obj) noexcept
-{
-  return exec::make_semi_future_with([&obj]() { sync_data(as_local(obj)); });
-}
-
-exec::semi_future<void> kvikio_context::commit_async_io(const io_object& obj,
-                                                        write_durability durability) noexcept
-{
-  return exec::make_semi_future_with([&obj, durability]() {
-    auto const& object = as_writable(obj);
-    if (durability == write_durability::data_sync) { sync_data(object); }
-    if (!object.mark_committed()) {
-      throw std::invalid_argument("kvikio_context: io_object '" + obj.object_path() +
-                                  "' was already committed");
-    }
   });
 }
 

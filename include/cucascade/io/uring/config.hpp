@@ -19,17 +19,11 @@
 #pragma once
 
 #include <cucascade/exec/config.hpp>
-#include <cucascade/io/details/scheduling_policy.hpp>
 #include <cucascade/io/types.hpp>
 
 #include <cstddef>
 
 namespace cucascade::io::uring {
-
-/// Largest accepted @ref config::slices_per_pass: an engine never owns more than
-/// this many staging slots (every in-flight operation holds at least one), so a
-/// larger cap could never take effect.
-inline constexpr std::size_t max_slices_per_pass = 64;
 
 struct config {
   /// How many scan tasks the readahead manager may keep in flight against this
@@ -50,24 +44,6 @@ struct config {
   /// When false, worker-planned operations use the buffered page-cache handle.
   /// Defaults to O_DIRECT when a physical operation satisfies its constraints.
   bool use_odirect{true};
-
-  /// How many slices (or write segments) of one grouped request a runner may
-  /// turn into physical operations per loop pass before it moves on to the
-  /// next group it holds; 0 means no cap.  A runner loops again at once while
-  /// anything progressed, so this does not bound the queue depth of a request
-  /// (it fills the free staging slots either way); it bounds how much of one
-  /// pass a single request may claim, so the groups a runner holds share
-  /// freed slots instead of being served strictly first come, first served.
-  /// Valid: 0..@ref max_slices_per_pass; the uring reactor rejects other values.
-  std::size_t slices_per_pass{8};
-
-  /// Per-runner scheduling tunables (group limits, class shares, reservations);
-  /// validated by the uring reactor.  Prefetch reads are background class
-  /// (fs_cache::prefetch), so @c scheduling.max_background_groups,
-  /// @c background_slot_fraction and @c reserved_background_slots are the
-  /// prefetch-isolation knobs -- the analogue of sirius's dedicated prefetch
-  /// reactors (K of N reactors ~ background_slot_fraction K/N).
-  io::detail::scheduling_config scheduling{};
 
   /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
   /// either way -- naming it lets the caller align once, up front, instead of

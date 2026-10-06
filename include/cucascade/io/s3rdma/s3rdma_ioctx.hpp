@@ -80,9 +80,8 @@ class s3rdma_ioctx : public ioctx {
 
   /// The sole asynchronous backend hook; every scalar / vector host / device
   /// read is lowered to prepared slices and forwarded here.
-  exec::semi_future<size_t> mixed_readv_async_io(const io_object& obj,
-                                                 std::vector<prepared_io_slice>&& slices,
-                                                 io_options opts = {}) noexcept override;
+  exec::semi_future<size_t> mixed_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept override;
 
  protected:
   std::shared_ptr<io_object> create_io_object(std::string path) override;

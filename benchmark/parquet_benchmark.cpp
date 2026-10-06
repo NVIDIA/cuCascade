@@ -19,9 +19,8 @@
 // vs the cucascade::io uring datasource (O_DIRECT io_uring + DMA to GPU).
 
 #include <cucascade/cudf/datasource.hpp>
-#include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/cache/prefetching_cache.hpp>
 #include <cucascade/io/types.hpp>
-#include <cucascade/io/uring/config.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
@@ -103,8 +102,7 @@ static std::vector<std::string> expand_paths(std::string const& spec)
 
 static void usage(char const* prog)
 {
-  std::cerr << "usage: " << prog
-            << " <path|glob> <cudf|uring> <num_rows> [n_reactors] [odirect] [slices_per_pass]\n"
+  std::cerr << "usage: " << prog << " <path|glob> <cudf|uring> <num_rows> [n_reactors] [odirect]\n"
             << "  path|glob  – parquet file path, or shell glob (e.g. "
                "'dir/*.parquet')\n"
             << "  cudf       – cudf default (mmap/pread)\n"
@@ -112,14 +110,12 @@ static void usage(char const* prog)
             << "  num_rows   – rows to read (0 = all)\n"
             << "  n_reactors – uring reactor threads (default 2; uring only)\n"
             << "  odirect    – 1 = O_DIRECT (default), 0 = buffered/page-cache "
-               "(uring only)\n"
-            << "  slices_per_pass – slices of one request a runner plans per loop pass "
-               "(default 8, 0 = no cap; uring only)\n";
+               "(uring only)\n";
 }
 
 int main(int argc, char** argv)
 {
-  if (argc < 4 || argc > 7) {
+  if (argc < 4 || argc > 6) {
     usage(argv[0]);
     return 1;
   }
@@ -153,19 +149,7 @@ int main(int argc, char** argv)
   }
 
   bool use_odirect = true;
-  if (argc >= 6) { use_odirect = std::stoll(argv[5]) != 0; }
-
-  size_t slices_per_pass = cucascade::io::uring::config{}.slices_per_pass;
-  if (argc == 7) {
-    long long slices_per_pass_arg = std::stoll(argv[6]);
-    if (slices_per_pass_arg < 0 ||
-        static_cast<size_t>(slices_per_pass_arg) > cucascade::io::uring::max_slices_per_pass) {
-      std::cerr << "slices_per_pass must be 0.." << cucascade::io::uring::max_slices_per_pass
-                << "\n";
-      return 1;
-    }
-    slices_per_pass = static_cast<size_t>(slices_per_pass_arg);
-  }
+  if (argc == 6) { use_odirect = std::stoll(argv[5]) != 0; }
 
   auto paths = expand_paths(path_spec);
   if (paths.empty()) {
@@ -177,12 +161,8 @@ int main(int argc, char** argv)
             << "Files  : " << paths.size() << "\n";
   for (auto const& p : paths)
     std::cout << "  " << p << "\n";
-  std::cout << "Rows   : " << (num_rows == 0 ? "all" : std::to_string(num_rows)) << "\n";
-  if (source == DataSource::uring) {
-    std::cout << "Uring  : n_reactors=" << n_reactors << " odirect=" << use_odirect
-              << " slices_per_pass=" << slices_per_pass << "\n";
-  }
-  std::cout << "Columns: ";
+  std::cout << "Rows   : " << (num_rows == 0 ? "all" : std::to_string(num_rows)) << "\n"
+            << "Columns: ";
   for (auto const& c : COLUMNS)
     std::cout << c << "  ";
   std::cout << "\n\n";
@@ -343,8 +323,7 @@ int main(int argc, char** argv)
                                                                1);               // initial_pools
 
     auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-      cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect     = use_odirect,
-                                                               .slices_per_pass = slices_per_pass},
+      cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect = use_odirect},
       &host_mr);
     auto io_ctx =
       std::make_shared<cucascade::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));

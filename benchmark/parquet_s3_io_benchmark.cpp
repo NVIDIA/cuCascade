@@ -23,7 +23,7 @@
 // Two read paths are compared:
 //   rest   – the native cucascade::io REST reactor (libcurl scatter GETs
 //            authorized via AWS-SDK presigned URLs).  host reads go through the
-//            vector-I/O primitive (host_readv_async_io); device reads
+//            vector-I/O primitive (host_read_ranges_async_io); device reads
 //            through device_read_async (reactor-staged: the reactor streams
 //            each range network->pinned-bounce->device on its own slots).
 //   kvikio – kvikIO's RemoteHandle S3 endpoint wrapped as a cudf datasource;
@@ -609,9 +609,9 @@ int main(int argc, char** argv)
         rmm::cuda_stream stream;  // per-worker stream for device reads
 
         if (backend == Backend::rest && dest == Dest::host) {
-          // Vector I/O: one host_readv_async_io per object, over that
-          // object's slices.  Slice vectors must outlive the futures.
-          std::vector<std::vector<cucascade::io::slice>> seg_sets;
+          // Vector I/O: one host_read_ranges_async_io per object, over that
+          // object's segments.  Segment vectors must outlive the futures.
+          std::vector<std::vector<cucascade::io::io_object_segment>> seg_sets;
           std::vector<cucascade::exec::semi_future<size_t>> futs;
           size_t cur_obj = SIZE_MAX;
           for (size_t i = lo; i < hi; ++i) {
@@ -620,7 +620,7 @@ int main(int argc, char** argv)
               seg_sets.emplace_back();
               cur_obj = r.obj_idx;
             }
-            seg_sets.back().push_back(cucascade::io::slice{r.offset, r.size, dsts[i]});
+            seg_sets.back().push_back(cucascade::io::io_object_segment{r.offset, r.size, dsts[i]});
           }
           size_t set = 0;
           cur_obj    = SIZE_MAX;
@@ -628,8 +628,8 @@ int main(int argc, char** argv)
             if (ranges[i].obj_idx != cur_obj) {
               cur_obj   = ranges[i].obj_idx;
               auto& seg = seg_sets[set++];
-              futs.push_back(io_ctx->host_readv_async_io(
-                *io_objects[cur_obj], std::span<cucascade::io::slice const>(seg)));
+              futs.push_back(io_ctx->host_read_ranges_async_io(
+                *io_objects[cur_obj], std::span<cucascade::io::io_object_segment>(seg)));
             }
           }
           for (auto& f : futs)
