@@ -18,7 +18,7 @@
 
 #pragma once
 
-// Shared cache entry types used by both prefetching_cache and prepared IO
+// Shared cache entry types used by both fs_cache and prepared IO
 // slices. Extracted here to keep the shared request contracts independent of
 // the cache implementation.
 
