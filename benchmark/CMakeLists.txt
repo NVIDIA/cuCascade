@@ -49,7 +49,8 @@ FetchContent_MakeAvailable(benchmark)
 # Collect all benchmark sources
 set(BENCHMARK_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_representation_converter.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_disk_converter.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_disk_converter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_reservation_aware_memory_resource.cpp)
 
 # Create benchmark executable
 add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})

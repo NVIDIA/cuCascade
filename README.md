@@ -176,6 +176,8 @@ cuCascade/
 │       ├── memory_reservation.hpp # Reservation types and policies
 │       ├── memory_space.hpp       # Memory space abstraction
 │       ├── reservation_aware_resource_adaptor.hpp  # GPU memory resource
+│       ├── reservation_aware_memory_resource.hpp   # Reservation-aware GPU resource
+│       ├── reservation_aware_memory_resource_adaptor.hpp  # Per-stream view over it
 │       ├── fixed_size_host_memory_resource.hpp     # Host memory resource
 │       ├── disk_access_limiter.hpp                 # Disk tier limiter
 │       ├── reservation_manager_configurator.hpp    # Builder for config
