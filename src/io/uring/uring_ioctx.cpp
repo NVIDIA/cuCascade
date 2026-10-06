@@ -20,14 +20,13 @@
 #include <cucascade/io/uring/uring_reactor.hpp>
 
 #include <memory>
-#include <utility>
 
 namespace cucascade::io::uring {
 
-uring_ioctx::uring_ioctx(size_t n_runner_threads,
-                         std::shared_ptr<uring_reactor::reactor_context> ctx)
-  : templated_ioctx<uring_reactor>(n_runner_threads,
-                                   std::make_unique<uring_reactor>(std::move(ctx)))
+uring_ioctx::uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx)
+  : templated_ioctx<uring_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
+      return std::make_unique<uring_reactor>(ctx, "reactor-" + std::to_string(i++));
+    })
 {
 }
 

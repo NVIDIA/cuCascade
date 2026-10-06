@@ -19,7 +19,7 @@
 #pragma once
 
 #include <cucascade/exec/invocable.hpp>
-#include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/cache/prefetching_cache.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
 
@@ -31,8 +31,6 @@
 #include <rmm/cuda_stream_view.hpp>
 #endif
 
-#include <cstddef>
-#include <cstdint>
 #include <span>
 
 namespace cucascade::io {
@@ -59,7 +57,7 @@ using cudf_stream_type = rmm::cuda_stream_view;
  * Ownership model: one scan owns one @c datasource.  The underlying
  * @c io_object can be shared across multiple datasources (e.g. when
  * the same file is scanned in different pipelines), but the datasource
- * itself stores per-scan state (notably the @c cache_handle returned
+ * itself stores per-scan state (notably the @c prefetching_handle returned
  * by an @c fadvise call) and is therefore not safe to share.
  */
 /// Why a datasource did or did not start a prefetch, so the readahead can
@@ -166,7 +164,7 @@ class datasource : public cudf::io::datasource {
 
   /// \brief Return a fresh datasource that shares this one's @c ioctx and
   /// @c io_object (so it points at the same file) but carries an
-  /// empty @c cache_handle.
+  /// empty @c prefetching_handle.
   ///
   /// \note Used when a single file is split across multiple scans (e.g. several
   /// row_group_slices from the same parquet file).  Each split owns its
@@ -179,7 +177,7 @@ class datasource : public cudf::io::datasource {
   /// soon.
   ///
   /// Hands @p ranges to the prefetching cache, stashes the returned
-  /// @c cache_handle on this datasource (which disposes the request when
+  /// @c prefetching_handle on this datasource (which disposes the request when
   /// it goes away) and drives it to @c scan_stage::initialized.  No-op when the
   /// cache is unavailable.  A second inserting call while an active handle is
   /// already stored is a caller bug and only logs a warning: the datasource
@@ -191,7 +189,7 @@ class datasource : public cudf::io::datasource {
 
   /// Allocate staging buffers for the stashed request, ahead of prefetching it.
   /// @p wait_for_eviction lets the call wait on the evictor rather than fail on
-  /// a momentarily empty pool.  See @c fs_cache::prepare.
+  /// a momentarily empty pool.  See @c prefetching_cache::prepare.
   prepare_result prepare_prefetch(bool wait_for_eviction);
 
   /// Issue prefetch IO for the stashed handle.  @p on_done fires exactly once
@@ -200,35 +198,20 @@ class datasource : public cudf::io::datasource {
   /// otherwise why it did not.
   prefetch_refusal prefetch_async(exec::invocable<void(bool) noexcept> on_done);
 
-  [[nodiscard]] bool uses_fs_cache() const noexcept;
-
-  /// Diagnostics: nanoseconds demand reads through this datasource spent blocked
-  /// on its in-flight prefetch (see @c cache::cache_handle::demand_wait_ns).
-  [[nodiscard]] std::uint64_t demand_wait_ns() const noexcept
-  {
-    return _prefetch_handle.demand_wait_ns();
-  }
-
-  /// Diagnostics: cache chunks named by this datasource's prefetch request (0
-  /// without one).
-  [[nodiscard]] std::size_t cache_chunk_count() const noexcept
-  {
-    auto const chunks = _prefetch_handle.chunks();
-    return chunks ? chunks->size() : 0;
-  }
+  [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
   /// Whether the backend serving this datasource would rather be handed one
   /// batched request than a stream of small reads.  See @c ioctx::prefers_bulk_io.
   [[nodiscard]] bool prefers_bulk_io() const noexcept;
 
  private:
-  [[nodiscard]] bool uses_fs_cache();
+  [[nodiscard]] bool uses_prefetching_cache();
 
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
   /// Handle of the most recent insert into the prefetching cache, or empty
   /// if none was made.  Disposing it lets the cache reclaim the request.
-  cache::cache_handle _prefetch_handle;
+  cache::prefetching_handle _prefetch_handle;
 };
 
 /// Open a datasource for @p path on @p io_ctx: creates the backend-appropriate
