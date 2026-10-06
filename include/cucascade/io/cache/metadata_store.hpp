@@ -53,7 +53,7 @@ struct string_hash {
  *        raw_file_cache_id().
  *
  * Owned by @c ioctx and always present, independent of the
- * @c prefetching_cache.  Callers that have parsed file metadata (e.g.
+ * @c fs_cache.  Callers that have parsed file metadata (e.g.
  * a parquet footer) park it here so a later scan of the same path can
  * skip the parse — without depending on whether the prefetching cache
  * has been initialised.
@@ -71,7 +71,7 @@ class metadata_store {
 
   /// Record (or overwrite) the metadata for @p obj's cache key.  A null
   /// @p metadata is silently ignored — symmetric with the older
-  /// @c prefetching_cache::register_metadata contract so callers that
+  /// @c fs_cache::register_metadata contract so callers that
   /// pass through pre-parsed metadata don't have to null-check.
   void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
 
