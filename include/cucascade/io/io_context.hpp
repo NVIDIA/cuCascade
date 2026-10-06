@@ -48,8 +48,8 @@ enum class io_context_type { uring, restful, kvikio, s3rdma };
 enum class open_hint { generic, parquet_footer_probe };
 
 namespace cache {
-class prefetching_cache;
-class prefetching_handle;
+class fs_cache;
+class cache_handle;
 }  // namespace cache
 
 class datasource;
@@ -214,7 +214,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Size of one staging block on this backend's reactors, in bytes.  A reactor
   /// that fills cache chunks computes each fragmented fill's extent with
   /// @c cache::fill_span(fill, chunk->offset, staging_block_size), so this MUST
-  /// equal @c prefetching_cache::chunk_size() — @ref initialize_cache checks it.
+  /// equal @c fs_cache::chunk_size() — @ref initialize_cache checks it.
   ///
   /// Conservatively 0 — a backend that has not opted in does not stage through
   /// cache chunks and is not checked.
@@ -254,15 +254,12 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// fine.  Cheap when no cache was ever initialised.
   void pre_destroy() noexcept { shutdown_cache(); }
 
-  [[nodiscard]] cache::prefetching_cache* cache() noexcept { return _cache.get(); }
+  [[nodiscard]] cache::fs_cache* cache() noexcept { return _cache.get(); }
 
   /// True iff @c host_read / @c device_read should consult the cache
   /// before falling through to the backend.  Computed live so it tracks
   /// @ref initialize_cache / @ref shutdown_cache transitions.
-  [[nodiscard]] inline bool uses_prefetching_cache() const noexcept
-  {
-    return can_use_prefetching_cache() && _cache;
-  }
+  [[nodiscard]] inline bool uses_fs_cache() const noexcept { return can_use_fs_cache() && _cache; }
 
   /// Per-file metadata cache that lives independently of the prefetching
   /// cache.  Always available — callers that have parsed file metadata
@@ -291,7 +288,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   // The read entry points callers should use: when the prefetching cache is
   // armed they serve (and account) the read through it, otherwise they fall
   // through to the backend primitives (*_io below).  @p handle is the scan's
-  // prefetching_handle (from a prior fadvise/insert), passed as a raw pointer
+  // cache_handle (from a prior fadvise/insert), passed as a raw pointer
   // so the cache can consume/observe it; it may be null when the caller made
   // no prefetch reservation.  All async variants return @c exec::semi_future.
 
@@ -299,22 +296,20 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
                    size_t offset,
                    size_t size,
                    uint8_t* dst,
-                   cache::prefetching_handle* handle = nullptr);
+                   cache::cache_handle* handle = nullptr);
 
-  [[nodiscard]] exec::semi_future<size_t> host_read_async(
-    const io_object& obj,
-    size_t offset,
-    size_t size,
-    uint8_t* dst,
-    cache::prefetching_handle* handle = nullptr);
+  [[nodiscard]] exec::semi_future<size_t> host_read_async(const io_object& obj,
+                                                          size_t offset,
+                                                          size_t size,
+                                                          uint8_t* dst,
+                                                          cache::cache_handle* handle = nullptr);
 
-  [[nodiscard]] exec::semi_future<size_t> device_read_async(
-    const io_object& obj,
-    size_t offset,
-    size_t size,
-    uint8_t* dst,
-    ::cuda::stream_ref stream,
-    cache::prefetching_handle* handle = nullptr);
+  [[nodiscard]] exec::semi_future<size_t> device_read_async(const io_object& obj,
+                                                            size_t offset,
+                                                            size_t size,
+                                                            uint8_t* dst,
+                                                            ::cuda::stream_ref stream,
+                                                            cache::cache_handle* handle = nullptr);
 
   // -- Backend primitives (cache-unaware) ----------------------------------------
 
@@ -350,7 +345,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     return mixed_readv_async_io(obj, std::move(slices));
   }
 
-  bool can_use_prefetching_cache() const noexcept
+  bool can_use_fs_cache() const noexcept
   {
     return supports_vector_host_read() || supports_host_to_device_read();
   }
@@ -380,7 +375,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
   /// though callers are expected to drive the lifecycle explicitly so
   /// reactors stay alive while workers drain).
-  std::unique_ptr<cache::prefetching_cache> _cache;
+  std::unique_ptr<cache::fs_cache> _cache;
 
   /// Independent of the prefetching machinery — exposed via @c metadata_store().
   cache::metadata_store _metadata_store;
