@@ -65,7 +65,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_dispatch_failure_hook.cpp
     io/test_templated_ioctx.cpp
     io/test_uri_parser.cpp
+    io/cache/test_chunk_state.cpp
     io/cache/test_metadata_store.cpp
+    io/cache/test_stage_machines.cpp
     io/rest/test_object_store_lister.cpp
     io/rest/test_rest_footer_resolve.cpp
     io/rest/test_rest_validation_tag.cpp
