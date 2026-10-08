@@ -74,6 +74,10 @@ struct range_fault_policy {
   std::string interim_get_retry_after;
   std::string interim_head_etag;
   std::string interim_head_retry_after;
+  /// Answer every ranged data GET with a 200 carrying the whole object.
+  bool full_object_with_200{false};
+  /// Failed GETs advertise a 64-byte error body, send 5 bytes, then close.
+  bool truncate_error_body{false};
 };
 
 struct listed_object {
@@ -88,6 +92,9 @@ struct scripted_response {
   std::optional<std::string> etag;
   std::optional<std::string> retry_after;
   bool malformed_content_range{false};
+  /// XORed into every body byte of a successful GET at this step, so that
+  /// successive versions of one key can carry different bytes.
+  std::uint8_t body_xor{0};
 };
 
 struct key_response_script {
@@ -97,6 +104,19 @@ struct key_response_script {
 
 class loopback_range_server {
  public:
+  struct get_record {
+    std::vector<std::string> if_match;
+    std::vector<std::string> ranges;
+    bool header_authorized{false};
+    bool presigned{false};
+  };
+
+  [[nodiscard]] std::vector<get_record> get_requests() const
+  {
+    std::scoped_lock lock{_get_records_mutex};
+    return _get_records;
+  }
+
   explicit loopback_range_server(std::vector<std::uint8_t> object,
                                  range_fault_policy fault                                     = {},
                                  std::vector<listed_object> listed                            = {},
@@ -175,6 +195,32 @@ class loopback_range_server {
 
  private:
   static std::string errno_message() { return std::strerror(errno); }
+
+  static std::vector<std::string> header_values(std::string_view request, std::string_view name)
+  {
+    std::vector<std::string> values;
+    auto position = request.find("\r\n");
+    while (position != std::string_view::npos) {
+      position += 2;
+      auto const end = request.find("\r\n", position);
+      if (end == std::string_view::npos || end == position) { break; }
+      auto const line  = request.substr(position, end - position);
+      auto const colon = line.find(':');
+      if (colon == name.size() &&
+          std::equal(name.begin(), name.end(), line.begin(), [](unsigned char a, unsigned char b) {
+            return std::tolower(a) == std::tolower(b);
+          })) {
+        auto value       = line.substr(colon + 1);
+        auto const begin = value.find_first_not_of(" \t");
+        auto const last  = value.find_last_not_of(" \t");
+        values.emplace_back(begin == std::string_view::npos
+                              ? std::string_view{}
+                              : value.substr(begin, last - begin + 1));
+      }
+      position = end;
+    }
+    return values;
+  }
 
   static void append_etag_header(std::string& response, std::string const& etag)
   {
@@ -297,11 +343,20 @@ class loopback_range_server {
       return close_connection;
     }
 
+    {
+      std::scoped_lock lock{_get_records_mutex};
+      _get_records.push_back(
+        {header_values(request, "if-match"),
+         header_values(request, "range"),
+         !header_values(request, "authorization").empty(),
+         request_target(request).find("X-Amz-Signature=") != std::string::npos});
+    }
     auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
     auto const key_idx = increment_request_count(_get_counts_by_key, key);
     wait_at_get_response_barrier();
     auto const scripted = scripted_step(key, true, key_idx);
     delay_response(scripted);
+    auto const body_xor = scripted ? scripted->body_xor : std::uint8_t{0};
     send_interim_headers(fd,
                          _fault.interim_get_etag,
                          _fault.interim_get_content_range,
@@ -311,13 +366,19 @@ class loopback_range_server {
       !scripted && (_fault.fail_all_gets || get_idx < _fault.fail_first_gets);
     if (scripted_failure || policy_failure) {
       auto const status    = scripted_failure ? scripted->status : _fault.fail_status;
-      std::string response = "HTTP/1.1 " + std::to_string(status) + " Error\r\nContent-Length: 0";
+      bool const truncate  = _fault.truncate_error_body;
+      std::string response = "HTTP/1.1 " + std::to_string(status) +
+                             " Error\r\nContent-Length: " + (truncate ? "64" : "0");
       append_etag_header(response, response_etag(scripted, _fault.failed_get_etag));
       append_header(
         response, "Retry-After", response_retry_after(scripted, _fault.failed_get_retry_after));
-      append_connection_header(response, close_connection);
+      append_connection_header(response, close_connection || truncate);
       response += "\r\n\r\n";
       send_all(fd, response);
+      if (truncate) {
+        send_all(fd, std::string_view{"short"});
+        return true;
+      }
       return close_connection;
     }
 
@@ -330,6 +391,16 @@ class loopback_range_server {
         send_all(fd, response);
         return close_connection;
       }
+      if (_fault.full_object_with_200) {
+        std::string response =
+          "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
+        append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
+        append_connection_header(response, close_connection);
+        response += "\r\n\r\n";
+        send_all(fd, response);
+        send_body(fd, 0, _object.size(), body_xor);
+        return close_connection;
+      }
       if (_fault.ignore_range_with_200) {
         std::string response =
           "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
@@ -337,7 +408,7 @@ class loopback_range_server {
         append_connection_header(response, close_connection);
         response += "\r\n\r\n";
         send_all(fd, response);
-        send_all(fd, _object.data(), _object.size());
+        send_body(fd, 0, _object.size(), body_xor);
         return close_connection;
       }
       auto const [start, end] = *range;
@@ -357,7 +428,7 @@ class loopback_range_server {
       append_connection_header(response, close_connection);
       response += "\r\n\r\n";
       send_all(fd, response);
-      send_all(fd, _object.data() + start, size);
+      send_body(fd, start, size, body_xor);
       return close_connection;
     }
 
@@ -366,7 +437,7 @@ class loopback_range_server {
     append_connection_header(response, close_connection);
     response += "\r\n\r\n";
     send_all(fd, response);
-    send_all(fd, _object.data(), _object.size());
+    send_body(fd, 0, _object.size(), body_xor);
     return close_connection;
   }
 
@@ -541,6 +612,20 @@ class loopback_range_server {
     }
   }
 
+  void send_body(int fd, std::size_t start, std::size_t size, std::uint8_t mask) const
+  {
+    if (mask == 0) {
+      send_all(fd, _object.data() + start, size);
+      return;
+    }
+    std::vector<std::uint8_t> masked(_object.begin() + static_cast<std::ptrdiff_t>(start),
+                                     _object.begin() + static_cast<std::ptrdiff_t>(start + size));
+    for (auto& byte : masked) {
+      byte = static_cast<std::uint8_t>(byte ^ mask);
+    }
+    send_all(fd, masked.data(), masked.size());
+  }
+
   static void send_all(int fd, std::string_view bytes)
   {
     send_all(fd, reinterpret_cast<std::uint8_t const*>(bytes.data()), bytes.size());
@@ -573,6 +658,8 @@ class loopback_range_server {
   mutable std::mutex _request_counts_mutex;
   std::unordered_map<std::string, std::size_t> _head_counts_by_key;
   std::unordered_map<std::string, std::size_t> _get_counts_by_key;
+  mutable std::mutex _get_records_mutex;
+  std::vector<get_record> _get_records;
   std::thread _thread;
   std::mutex _workers_mutex;
   std::vector<std::thread> _workers;

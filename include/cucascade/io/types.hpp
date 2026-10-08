@@ -108,8 +108,10 @@ class io_object : public std::enable_shared_from_this<io_object> {
   [[nodiscard]] virtual size_t size() const noexcept = 0;
 
   /// Opaque cache validator observed when the object was opened; empty when
-  /// unavailable.  HTTP backends preserve quotes and a weak W/ prefix.  This
-  /// is not an If-Match or If-Range token.  The view is valid for this
+  /// unavailable.  HTTP backends preserve quotes and a weak W/ prefix.  A
+  /// backend decides whether it may be sent back as a request condition: the
+  /// REST reactor sends a strong tag as @c If-Match on its data GETs and never
+  /// sends a weak or otherwise unusable one.  The view is valid for this
   /// object's lifetime.
   [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
 };
