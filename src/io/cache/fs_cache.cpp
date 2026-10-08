@@ -58,10 +58,68 @@ namespace cucascade::io::cache {
 
 namespace {
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
+
+std::size_t reclaim_chunk_buffers(cache_generation& generation,
+                                  buffer_pool& pool,
+                                  bool only_unsubscribed) noexcept
+{
+  auto& claimed = generation.reclaim_claimed;
+  auto& batch   = generation.reclaim_batch;
+  claimed.clear();
+  std::size_t stuck = 0;
+  for (cached_chunk* c : generation.slots) {
+    if (c == nullptr) { continue; }
+    auto const snap = c->state.load();
+    if (snap.state() == chunk_state::empty) { continue; }
+    if (only_unsubscribed && snap.subscribers() != 0) { continue; }
+    if (!c->state.mark_evicting(only_unsubscribed)) {
+      ++stuck;  // pinned, loading, or already being evicted by someone else
+      continue;
+    }
+    claimed.push_back(c);  // capacity reserved at creation: one per slot
+  }
+  std::ranges::sort(claimed, {}, [](cached_chunk const* c) { return c->numa_node; });
+  for (auto run = claimed.begin(); run != claimed.end();) {
+    int const numa = (*run)->numa_node;
+    batch.clear();
+    for (; run != claimed.end() && (*run)->numa_node == numa; ++run) {
+      cached_chunk* c = *run;
+      batch.push_back(reinterpret_cast<std::byte*>(c->data));
+      c->data     = nullptr;
+      std::ignore = c->state.mark_empty();
+    }
+    pool.deallocate_bulk(std::span<std::byte* const>(batch), numa);
+  }
+  claimed.clear();
+  batch.clear();
+  return stuck;
 }
+
+struct generation_deleter {
+  std::shared_ptr<buffer_pool> pool;
+  std::shared_ptr<std::shared_mutex> retire_mtx;
+
+  void operator()(cache_generation* generation) const noexcept
+  {
+    std::size_t stuck = 0;
+    {
+      std::unique_lock lk(*retire_mtx);
+      stuck = reclaim_chunk_buffers(*generation, *pool, /*only_unsubscribed=*/false);
+      delete generation;
+    }
+    if (stuck > 0) {
+      CUCASCADE_LOG_WARN(
+        "[fs_cache] {} chunk(s) still pinned or loading when their generation was "
+        "released; their buffers were not reclaimed",
+        stuck);
+    }
+  }
+};
+}  // namespace
 
 struct fs_cache::cached_copy_retirement {
   std::vector<cached_chunk*> pins;
+  std::shared_ptr<cache_generation> generation;
   std::shared_ptr<exec::completion_controller::slot> lifetime;
   std::shared_ptr<grouped_coordinator> coordinator;
   std::latch published{1};
@@ -106,6 +164,7 @@ struct fs_cache::cached_copy_retirement {
   {
     if (finished.exchange(true, std::memory_order_acq_rel)) { return; }
     release_pins();
+    generation.reset();
     if (status == cudaSuccess) {
       coordinator->on_complete();
     } else {
@@ -114,7 +173,11 @@ struct fs_cache::cached_copy_retirement {
   }
 };
 
-cache_handle::cache_handle(prefetch_request req) noexcept : _req(std::move(req)) {}
+cache_handle::cache_handle(prefetch_request req,
+                           std::shared_ptr<cache_generation> generation) noexcept
+  : _generation(std::move(generation)), _req(std::move(req))
+{
+}
 
 cache_handle::~cache_handle()
 {
@@ -122,7 +185,8 @@ cache_handle::~cache_handle()
 }
 
 cache_handle::cache_handle(cache_handle&& o) noexcept
-  : _req(std::move(o._req)),
+  : _generation(std::move(o._generation)),
+    _req(std::move(o._req)),
     _demand_wait_ns(o._demand_wait_ns.exchange(0, std::memory_order_relaxed))
 {
   o._req = {};
@@ -132,8 +196,9 @@ cache_handle& cache_handle::operator=(cache_handle&& o) noexcept
 {
   if (this != &o) {
     if (_req.consumer) { _req.consumer->mark_disposed(); }
-    _req   = std::move(o._req);
-    o._req = {};
+    _req        = std::move(o._req);
+    o._req      = {};
+    _generation = std::move(o._generation);
     _demand_wait_ns.store(o._demand_wait_ns.exchange(0, std::memory_order_relaxed),
                           std::memory_order_relaxed);
   }
@@ -177,6 +242,13 @@ bool cache_handle::wait_until_prepared() noexcept
   return _req.producer->wait_until_prepared();
 }
 
+std::exception_ptr cache_handle::failure() const noexcept
+{
+  if (!_req.failure) { return nullptr; }
+  std::lock_guard lk(_req.failure->mtx);
+  return _req.failure->failure;
+}
+
 std::shared_ptr<const std::vector<cached_chunk*>> cache_handle::chunks() const noexcept
 {
   return _req.chunks;
@@ -184,7 +256,7 @@ std::shared_ptr<const std::vector<cached_chunk*>> cache_handle::chunks() const n
 
 cache_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
 
-std::vector<cached_chunk*> fs_cache::file_entry::update_and_get_chunks(
+std::vector<cached_chunk*> cache_generation::update_and_get_chunks(
   std::span<const size_t> incoming, std::span<const chunk_fill> desired)
 {
   assert(incoming.size() == desired.size());
@@ -234,9 +306,9 @@ std::vector<cached_chunk*> fs_cache::file_entry::update_and_get_chunks(
   return result;
 }
 
-std::vector<cached_chunk*> fs_cache::file_entry::fetch_chunks(std::size_t offset,
-                                                              std::size_t size,
-                                                              coverage_policy policy) const
+std::vector<cached_chunk*> cache_generation::fetch_chunks(std::size_t offset,
+                                                          std::size_t size,
+                                                          coverage_policy policy) const
 {
   if (size == 0) { return {}; }
 
@@ -265,11 +337,12 @@ fs_cache::fs_cache(cucascade::memory::memory_reservation_manager& reservation_ma
                    const config& cfg,
                    std::shared_ptr<const cucascade::memory::topology_index> topology_index)
   : _cfg(cfg),
-    _pool(std::make_unique<buffer_pool>(
+    _pool(std::make_shared<buffer_pool>(
       reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
-    _armed(_io_ctx->can_use_fs_cache())
+    _armed(_io_ctx->can_use_fs_cache()),
+    _retire_mtx(std::make_shared<std::shared_mutex>())
 {
   _chunk_size          = _pool->chunk_size();
   auto const max_bytes = chunk_state::max_chunk_bytes();
@@ -306,33 +379,24 @@ void fs_cache::drain_inflight_io() noexcept
 
 void fs_cache::reclaim_all_chunks() noexcept
 {
-  std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
   std::size_t stuck = 0;
+  std::vector<std::shared_ptr<cache_generation>> current;
   {
     std::unique_lock lk(_map_mtx);
-    for (auto& [_, entry] : _file_cache) {
-      std::unique_lock elk(entry->mtx);
-      for (cached_chunk* c : entry->slots) {
-        if (c == nullptr) { continue; }
-        if (c->state.load().state() == chunk_state::empty) { continue; }
-        // Ignoring subscribers is safe here: no query can be concurrently
-        // executing while a cache is reset/torn down. mark_evicting() still
-        // unconditionally refuses a chunk with an active pin, so this can
-        // never pull a buffer out from under a live reader.
-        if (!c->state.mark_evicting(/*only_unsubscribed=*/false)) {
-          ++stuck;
-          continue;
-        }
-        reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
-        c->data     = nullptr;
-        std::ignore = c->state.mark_empty();
-      }
+    std::unique_lock glk(*_retire_mtx);
+    for (auto& [_, generation] : _file_cache) {
+      std::unique_lock elk(generation->mtx);
+      // Ignoring subscribers is safe here: no query can be concurrently
+      // executing while a cache is reset/torn down. mark_evicting() still
+      // unconditionally refuses a chunk with an active pin, so this can
+      // never pull a buffer out from under a live reader.
+      stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false);
+      current.push_back(std::move(generation));
     }
     _file_cache.clear();
+    _generations_by_path.clear();
   }
-  for (auto& [numa, buffers] : reclaim_by_numa) {
-    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa); }
-  }
+  current.clear();
   if (stuck > 0) {
     CUCASCADE_LOG_WARN(
       "[fs_cache] {} chunk(s) still pinned at cache teardown; their buffers were not "
@@ -371,28 +435,91 @@ fs_cache::~fs_cache()
 // insert
 // ===========================================================================
 
-fs_cache::file_entry& fs_cache::get_or_create_file_entry(const io_object& obj)
+std::shared_ptr<cache_generation> fs_cache::get_or_create_generation(const io_object& obj)
 {
   const auto& key = obj.raw_file_cache_id();
-  std::shared_lock lk(_map_mtx);
-  auto it = _file_cache.find(key);
-  if (it == _file_cache.end()) {
-    lk.unlock();
+  {
+    std::shared_lock lk(_map_mtx);
+    if (auto it = _file_cache.find(key); it != _file_cache.end()) { return it->second; }
+  }
+
+  std::vector<std::shared_ptr<cache_generation>> superseded;
+  std::shared_ptr<cache_generation> created;
+  {
     std::unique_lock ulk(_map_mtx);
-    auto [new_it, inserted] = _file_cache.try_emplace(key, std::make_unique<file_entry>());
-    it                      = new_it;
-    if (inserted) {
-      it->second->file_size  = obj.size();
-      it->second->io_obj     = obj.shared_from_this();
-      it->second->chunk_size = _chunk_size;
-      // One slot per chunk-aligned position in the file — the same capacity the
-      // sorted chunk vector used to reserve, but indexable instead of searchable.
-      auto const n_slots =
-        obj.size() / _chunk_size + static_cast<size_t>(obj.size() % _chunk_size != 0);
-      it->second->slots.assign(n_slots, nullptr);
+    auto it = _file_cache.find(key);
+    if (it != _file_cache.end()) { return it->second; }
+
+    auto& family = _generations_by_path[obj.object_path()];
+    std::erase_if(family, [](auto const& weak) { return weak.expired(); });
+    for (auto const& weak : family) {
+      if (auto alive = weak.lock(); alive && alive->key == key) { return alive; }
+    }
+
+    created              = std::shared_ptr<cache_generation>(new cache_generation(),
+                                                generation_deleter{_pool, _retire_mtx});
+    created->file_size   = obj.size();
+    created->io_obj      = obj.shared_from_this();
+    created->key         = key;
+    created->object_path = obj.object_path();
+    created->chunk_size  = _chunk_size;
+    // One slot per chunk-aligned position in the file — the same capacity the
+    // sorted chunk vector used to reserve, but indexable instead of searchable.
+    auto const n_slots =
+      obj.size() / _chunk_size + static_cast<size_t>(obj.size() % _chunk_size != 0);
+    created->slots.assign(n_slots, nullptr);
+    created->reclaim_claimed.reserve(n_slots);
+    created->reclaim_batch.reserve(n_slots);
+    family.reserve(family.size() + 1);
+    superseded.reserve(family.size());
+    _file_cache.emplace(key, created);
+
+    for (auto const& weak : family) {
+      auto older = weak.lock();
+      if (!older || older->retired.load(std::memory_order_acquire)) { continue; }
+      older->retired.store(true, std::memory_order_release);
+      if (auto old_it = _file_cache.find(older->key);
+          old_it != _file_cache.end() && old_it->second == older) {
+        _file_cache.erase(old_it);
+      }
+      superseded.push_back(std::move(older));
+    }
+    family.push_back(created);
+  }
+  for (auto const& older : superseded) {
+    reclaim_idle_chunks(*older);
+  }
+  return created;
+}
+
+void fs_cache::reclaim_idle_chunks(cache_generation& generation) noexcept
+{
+  std::unique_lock elk(generation.mtx);
+  std::ignore = reclaim_chunk_buffers(generation, *_pool, /*only_unsubscribed=*/true);
+}
+
+std::size_t fs_cache::generation_count(std::string_view object_path) const noexcept
+{
+  std::shared_lock lk(_map_mtx);
+  auto const it = _generations_by_path.find(object_path);
+  if (it == _generations_by_path.end()) { return 0; }
+  return static_cast<std::size_t>(
+    std::ranges::count_if(it->second, [](auto const& weak) { return !weak.expired(); }));
+}
+
+std::size_t fs_cache::retired_generation_count() const noexcept
+{
+  std::shared_lock lk(_map_mtx);
+  std::size_t retired = 0;
+  for (auto const& [_, family] : _generations_by_path) {
+    for (auto const& weak : family) {
+      if (auto generation = weak.lock();
+          generation && generation->retired.load(std::memory_order_acquire)) {
+        ++retired;
+      }
     }
   }
-  return *it->second;
+  return retired;
 }
 
 cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
@@ -401,7 +528,8 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
 {
   if (!_armed) { return cache_handle(); }
 
-  auto& file = get_or_create_file_entry(obj);
+  auto generation = get_or_create_generation(obj);
+  auto& file      = *generation;
 
   const size_t chunk_bytes = _chunk_size;
 
@@ -479,23 +607,27 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
     }
   }
 
+  prefetch_request req;
+  req.obj        = obj.shared_from_this();
+  req.producer   = std::make_shared<producer_stage>();
+  req.consumer   = std::make_shared<consumer_stage>();
+  req.failure    = std::make_shared<prefetch_failure_slot>();
+  req.generation = generation;
+  req.timestamp  = _ticker.load(std::memory_order_relaxed);
+
   auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
   std::erase(chunks_to_fetch, nullptr);  // offsets past EOF have no slot
-
-  prefetch_request req;
-  req.obj       = obj.shared_from_this();
-  req.producer  = std::make_shared<producer_stage>();
-  req.consumer  = std::make_shared<consumer_stage>();
-  req.chunks    = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
-  req.timestamp = _ticker.load(std::memory_order_relaxed);
+  req.chunks = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
   if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
 
-  std::ignore = req.producer->mark_queued();
-  _eviction_queue.enqueue(cache_request{req});
+  std::ignore              = req.producer->mark_queued();
+  prefetch_request tracked = req;
+  tracked.obj.reset();
+  _eviction_queue.enqueue(cache_request{std::move(tracked)});
 
-  return cache_handle(std::move(req));
+  return cache_handle(std::move(req), std::move(generation));
 }
 
 prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_eviction)
@@ -619,7 +751,16 @@ prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_ev
   return prepare_result::prepared;
 }
 
-std::vector<cached_chunk*> fs_cache::ranges_in_cache(const io_object& obj,
+std::shared_ptr<cache_generation> fs_cache::generation_for(const io_object& obj,
+                                                           cache_handle* handle) const
+{
+  if (handle != nullptr && *handle && handle->_generation) { return handle->_generation; }
+  std::shared_lock lk(_map_mtx);
+  auto const it = _file_cache.find(obj.raw_file_cache_id());
+  return it == _file_cache.end() ? nullptr : it->second;
+}
+
+std::vector<cached_chunk*> fs_cache::ranges_in_cache(cache_generation const* generation,
                                                      size_t offset,
                                                      size_t size,
                                                      coverage_policy policy,
@@ -627,13 +768,8 @@ std::vector<cached_chunk*> fs_cache::ranges_in_cache(const io_object& obj,
 {
   auto chunks = ranges_in_handle(offset, size, policy, handle);
   if (!chunks.empty()) { return chunks; }
-
-  std::shared_lock lk(_map_mtx);
-  auto const it = _file_cache.find(obj.raw_file_cache_id());
-  if (it == _file_cache.end()) { return {}; }
-  auto* file = it->second.get();
-  lk.unlock();
-  return file->fetch_chunks(offset, size, policy);
+  if (generation == nullptr) { return {}; }
+  return generation->fetch_chunks(offset, size, policy);
 }
 
 std::vector<cached_chunk*> fs_cache::ranges_in_handle(std::size_t offset,
@@ -709,6 +845,7 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
 
   std::vector<cached_chunk*> claimed;
   std::vector<hit_copy> hits;
+  std::shared_ptr<cache_generation> generation;
   try {
     std::ignore = _completion_poll.drain_all();
     await_inflight_prefetch(obj, requests, handle);
@@ -720,6 +857,7 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
     auto admission            = acquire_inflight_io();
     if (!admission) { throw std::runtime_error("fs_cache is shutting down"); }
     auto lifetime = std::make_shared<exec::completion_controller::slot>(std::move(admission));
+    generation    = generation_for(obj, handle);
 
     for (auto const& raw : requests) {
       if (raw.size() == 0) { continue; }
@@ -733,7 +871,7 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
 
       range const request_rng{raw.offset(), request_size};
       auto chunks = ranges_in_cache(
-        obj, request_rng.offset, request_rng.size, coverage_policy::partial, handle);
+        generation.get(), request_rng.offset, request_rng.size, coverage_policy::partial, handle);
       std::size_t ci       = 0;
       auto const first     = (request_rng.offset / _chunk_size) * _chunk_size;
       auto const last      = ((request_rng.end() - 1) / _chunk_size) * _chunk_size;
@@ -800,13 +938,15 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
     if (has_backend) {
       auto coordinator = std::make_shared<grouped_coordinator>(logical_bytes, 1);
       result_future    = coordinator->get_future();
-      size_terminal terminal{[coordinator](exec::try_t<std::size_t>&& result) mutable noexcept {
-        if (result.has_exception()) {
-          coordinator->report_error(std::move(result).exception());
-        } else {
-          coordinator->on_complete();
-        }
-      }};
+      size_terminal terminal{
+        [coordinator, owner = generation](exec::try_t<std::size_t>&& result) mutable noexcept {
+          owner.reset();
+          if (result.has_exception()) {
+            coordinator->report_error(std::move(result).exception());
+          } else {
+            coordinator->on_complete();
+          }
+        }};
 
       auto io_future = _io_ctx->host_device_readv_async_io(obj, std::move(prepared));
       claimed.clear();
@@ -882,6 +1022,7 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
   std::size_t misses        = 0;
 
   std::shared_ptr<exec::completion_controller::slot> lifetime;
+  std::shared_ptr<cache_generation> generation;
   std::shared_ptr<prepared_io_completion> completion;
   std::shared_ptr<cached_copy_retirement> retirement;
   std::shared_ptr<grouped_coordinator> coordinator;
@@ -896,6 +1037,7 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
     auto admission = acquire_inflight_io();
     if (!admission) { throw std::runtime_error("fs_cache is shutting down"); }
     lifetime   = std::make_shared<exec::completion_controller::slot>(std::move(admission));
+    generation = generation_for(obj, handle);
     completion = std::make_shared<prepared_io_completion>(
       [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
         std::ignore = lifetime;
@@ -916,7 +1058,7 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
 
       range const request_rng{raw.offset(), request_size};
       auto chunks = ranges_in_cache(
-        obj, request_rng.offset, request_rng.size, coverage_policy::partial, handle);
+        generation.get(), request_rng.offset, request_rng.size, coverage_policy::partial, handle);
       std::size_t ci       = 0;
       auto const first     = (request_rng.offset / _chunk_size) * _chunk_size;
       auto const last      = ((request_rng.end() - 1) / _chunk_size) * _chunk_size;
@@ -967,8 +1109,9 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
       coordinator   = std::make_shared<grouped_coordinator>(logical_bytes, task_count);
       result_future = coordinator->get_future();
       if (has_backend) {
-        backend_terminal =
-          size_terminal{[coordinator](exec::try_t<std::size_t>&& result) mutable noexcept {
+        backend_terminal = size_terminal{
+          [coordinator, owner = generation](exec::try_t<std::size_t>&& result) mutable noexcept {
+            owner.reset();
             if (result.has_exception()) {
               coordinator->report_error(std::move(result).exception());
             } else {
@@ -980,6 +1123,7 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
       if (has_cached) {
         retirement              = std::make_shared<cached_copy_retirement>();
         retirement->pins        = std::move(pinned);
+        retirement->generation  = generation;
         retirement->lifetime    = lifetime;
         retirement->coordinator = coordinator;
 
@@ -1230,11 +1374,17 @@ bool fs_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcep
         }
       });
     done_owner = std::make_shared<exec::invocable<void(bool) noexcept>>(std::move(on_done));
-    terminal   = size_terminal{[req, done_owner](exec::try_t<size_t>&& res) mutable noexcept {
-      auto const ok = res.has_value();
-      std::ignore   = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
-      (*done_owner)(ok);
-    }};
+    terminal   = size_terminal{
+      [req, done_owner, owner = handle._generation](exec::try_t<size_t>&& res) mutable noexcept {
+        owner.reset();
+        auto const ok = res.has_value();
+        if (!ok && req.failure) {
+          std::lock_guard lk(req.failure->mtx);
+          req.failure->failure = std::move(res).exception();
+        }
+        std::ignore = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
+        (*done_owner)(ok);
+      }};
     for (auto& slice : prepared) {
       slice.on_complete = completion;
       slice.cls         = io_class::prefetch;
@@ -1321,6 +1471,10 @@ void fs_cache::evict_loop(const std::stop_token& st)
     }
 
     std::ignore = _completion_poll.drain_all();
+
+    std::shared_lock generation_lk(*_retire_mtx);
+    std::erase_if(eviction_batch,
+                  [](tracked_request const& er) { return er.req.generation.expired(); });
 
     // Hand back the subscriber reference of every request whose consumer is
     // gone — exactly once, which is what makes the count an accurate reference
@@ -1412,6 +1566,8 @@ void fs_cache::evict_loop(const std::stop_token& st)
         }
       }
     }
+
+    generation_lk.unlock();
 
     // Return each NUMA group to its own arena (origin-safe).
     for (auto& [numa, buffers] : reclaim_by_numa) {
