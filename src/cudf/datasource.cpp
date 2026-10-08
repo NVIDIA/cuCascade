@@ -298,6 +298,11 @@ prefetch_refusal datasource::prefetch_async(exec::invocable<void(bool) noexcept>
                                                 : prefetch_refusal::other;
 }
 
+std::exception_ptr datasource::prefetch_failure() const noexcept
+{
+  return _prefetch_handle ? _prefetch_handle.failure() : nullptr;
+}
+
 bool datasource::uses_fs_cache()
 {
   auto* cache = _io_ctx->cache();

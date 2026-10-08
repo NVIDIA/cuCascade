@@ -31,6 +31,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #endif
 
+#include <exception>
 #include <span>
 
 namespace cucascade::io {
@@ -197,6 +198,11 @@ class datasource : public cudf::io::datasource {
   /// completion.  Returns @c prefetch_refusal::issued when IO went out, and
   /// otherwise why it did not.
   prefetch_refusal prefetch_async(exec::invocable<void(bool) noexcept> on_done);
+
+  /// Why this datasource's prefetch failed, if it did: null otherwise, and
+  /// null when no prefetch was ever issued.  Set before the prefetch's
+  /// completion callback fires and before @c wait_until_ready would return.
+  [[nodiscard]] std::exception_ptr prefetch_failure() const noexcept;
 
   [[nodiscard]] bool uses_fs_cache() const noexcept;
 
