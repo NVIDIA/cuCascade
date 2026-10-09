@@ -55,10 +55,10 @@ struct config {
   /// reads per loop pass before it waits for a completion; 0 means no cap (keep
   /// going while every planned read finds a free staging slot).  With 1, a
   /// single many-slice request (a whole-split prefetch, a wide demand read)
-  /// runs at a queue depth of 1-2 per reactor.  The default of 8 keeps such a
+  /// runs at a queue depth of 1-2 per reactor.  The default of 4 keeps such a
   /// request deep without letting one pass claim every free slot ahead of the
   /// requests queued behind it.
-  std::size_t slices_per_pass{8};
+  std::size_t slices_per_pass{4};
 
   /// Most slices one queue entry may hold when a host-only multi-range read is
   /// dispatched (see templated_ioctx::mixed_readv_async_io): a local read does
