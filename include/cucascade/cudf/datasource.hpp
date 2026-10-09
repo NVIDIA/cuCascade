@@ -204,6 +204,10 @@ class datasource : public cudf::io::datasource {
   /// completion callback fires and before @c wait_until_ready would return.
   [[nodiscard]] std::exception_ptr prefetch_failure() const noexcept;
 
+  /// True iff reads and prefetches through this datasource consult the
+  /// ioctx's @c fs_cache: the ioctx has one initialized and its backend can use
+  /// it.  Computed live, so it tracks the ioctx's @c initialize_cache /
+  /// @c shutdown_cache transitions.  Defers to @c ioctx::uses_fs_cache.
   [[nodiscard]] bool uses_fs_cache() const noexcept;
 
   /// Diagnostics: how long demand reads through this datasource waited on its
@@ -225,8 +229,6 @@ class datasource : public cudf::io::datasource {
   [[nodiscard]] bool prefers_bulk_io() const noexcept;
 
  private:
-  [[nodiscard]] bool uses_fs_cache();
-
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
   /// Handle of the most recent insert into the prefetching cache, or empty
