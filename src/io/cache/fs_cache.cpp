@@ -1412,7 +1412,6 @@ bool fs_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcep
       }};
     for (auto& slice : prepared) {
       slice.on_complete = completion;
-      slice.cls         = io_class::prefetch;
       slice.priority    = io_priority::low;
     }
   } catch (...) {
