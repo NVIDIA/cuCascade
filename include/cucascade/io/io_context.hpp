@@ -291,47 +291,64 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   // cache_handle (from a prior fadvise/insert), passed as a raw pointer
   // so the cache can consume/observe it; it may be null when the caller made
   // no prefetch reservation.  All async variants return @c exec::semi_future.
+  //
+  // @p priority picks the reactor queue tier (see @ref io_priority).  Left at
+  // @c automatic, device reads and single-range host reads go high and
+  // multi-range host reads go low.  A backend without tiered queues ignores it.
 
   size_t host_read(const io_object& obj,
                    size_t offset,
                    size_t size,
                    uint8_t* dst,
-                   cache::cache_handle* handle = nullptr);
+                   cache::cache_handle* handle = nullptr,
+                   io_priority priority        = io_priority::automatic);
 
-  [[nodiscard]] exec::semi_future<size_t> host_read_async(const io_object& obj,
-                                                          size_t offset,
-                                                          size_t size,
-                                                          uint8_t* dst,
-                                                          cache::cache_handle* handle = nullptr);
+  [[nodiscard]] exec::semi_future<size_t> host_read_async(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    cache::cache_handle* handle = nullptr,
+    io_priority priority        = io_priority::automatic);
 
-  [[nodiscard]] exec::semi_future<size_t> device_read_async(const io_object& obj,
-                                                            size_t offset,
-                                                            size_t size,
-                                                            uint8_t* dst,
-                                                            ::cuda::stream_ref stream,
-                                                            cache::cache_handle* handle = nullptr);
+  [[nodiscard]] exec::semi_future<size_t> device_read_async(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    ::cuda::stream_ref stream,
+    cache::cache_handle* handle = nullptr,
+    io_priority priority        = io_priority::automatic);
 
   // -- Backend primitives (cache-unaware) ----------------------------------------
 
   virtual size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
 
-  virtual exec::semi_future<size_t> host_read_async_io(const io_object& obj,
-                                                       size_t offset,
-                                                       size_t size,
-                                                       uint8_t* dst) noexcept;
+  virtual exec::semi_future<size_t> host_read_async_io(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    io_priority priority = io_priority::automatic) noexcept;
 
-  virtual exec::semi_future<size_t> device_read_async_io(const io_object& obj,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         uint8_t* dst,
-                                                         ::cuda::stream_ref stream) noexcept;
+  virtual exec::semi_future<size_t> device_read_async_io(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    ::cuda::stream_ref stream,
+    io_priority priority = io_priority::automatic) noexcept;
 
-  virtual exec::semi_future<size_t> host_readv_async_io(const io_object& obj,
-                                                        std::span<const slice> slices) noexcept;
+  virtual exec::semi_future<size_t> host_readv_async_io(
+    const io_object& obj,
+    std::span<const slice> slices,
+    io_priority priority = io_priority::automatic) noexcept;
 
-  virtual exec::semi_future<size_t> device_readv_async_io(const io_object& obj,
-                                                          std::span<const slice> slices,
-                                                          ::cuda::stream_ref stream) noexcept;
+  virtual exec::semi_future<size_t> device_readv_async_io(
+    const io_object& obj,
+    std::span<const slice> slices,
+    ::cuda::stream_ref stream,
+    io_priority priority = io_priority::automatic) noexcept;
 
   /// The sole asynchronous backend hook. All scalar/vector host/device APIs
   /// construct prepared slices and forward here; reactors perform physical

@@ -22,6 +22,7 @@
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
+#include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/io/uring/types.hpp>
@@ -105,9 +106,12 @@ class local_io_object : public io_object {
  * @brief Single-threaded local-file I/O reactor.
  *
  * Owns one @c io_uring, one worker thread, a fixed pool of pinned staging
- * blocks, and an MPSC request queue. Physical operations use O_DIRECT only
- * when the worker determines that the complete transfer is compatible.
- * Models the reactor concept consumed by @c templated_ioctx.
+ * blocks, and a two-tier request queue (see @ref io_priority). The worker
+ * always takes a high-priority request before a low one, and parks an active
+ * low request at a slice boundary while high requests are waiting, so a demand
+ * read never waits behind a whole-split readahead. Physical operations use
+ * O_DIRECT only when the worker determines that the complete transfer is
+ * compatible. Models the reactor concept consumed by @c templated_ioctx.
  */
 class uring_reactor {
  public:
@@ -205,7 +209,7 @@ class uring_reactor {
   /// std::bit_width(d) == b, i.e. [2^(b-1), 2^b) us; the last bucket is open-ended.
   static constexpr std::size_t queue_delay_buckets = 26;
 
-  /// One io_class's queue-delay window (see @ref gauges::queue_delay).
+  /// One io_priority tier's queue-delay window (see @ref gauges::queue_delay).
   struct queue_delay_stats {
     std::uint64_t count{0};
     std::uint64_t sum_ns{0};
@@ -222,12 +226,16 @@ class uring_reactor {
     std::uint32_t pending_ops{0};       ///< planned ops waiting for a staging slot
     /// Slices of the active request not yet expanded into physical ops.
     std::uint32_t active_remaining_slices{0};
-    std::size_t queued_requests{0};     ///< requests queued behind the active one
-    std::size_t queued_bytes{0};        ///< see @ref queued_bytes
-    std::uint64_t requests_started{0};  ///< cumulative requests taken off the queue
-    std::uint64_t bytes_submitted{0};   ///< cumulative physical bytes submitted
+    std::size_t queued_requests{0};      ///< requests queued behind the active one
+    std::size_t queued_low_requests{0};  ///< of which on the low-priority tier
+    std::size_t queued_bytes{0};         ///< see @ref queued_bytes
+    std::uint64_t requests_started{0};   ///< cumulative requests taken off the queue
+    std::uint64_t bytes_submitted{0};    ///< cumulative physical bytes submitted
+    /// Cumulative times an active low request was parked for a high one.
+    std::uint64_t preemptions{0};
     /// Queue delay (enqueue -> first slice expanded) of requests whose first slice
-    /// was expanded since the previous take_gauges(), per @ref io_class.
+    /// was expanded since the previous take_gauges(), per priority tier:
+    /// [0] = @c io_priority::high, [1] = @c io_priority::low.
     queue_delay_stats queue_delay[2]{};
   };
 
@@ -278,7 +286,7 @@ class uring_reactor {
   std::size_t _bounce_slot_size;
   std::stop_source _stop_source;
   std::jthread _worker;
-  blocking_concurrent_queue<std::unique_ptr<grouped_io_request>> _requests;
+  tiered_blocking_queue<std::unique_ptr<grouped_io_request>> _requests;
   mutable std::mutex _enqueue_mutex;
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
@@ -290,6 +298,7 @@ class uring_reactor {
   std::atomic<std::uint32_t> _gauge_active_slices{0};
   std::atomic<std::uint64_t> _gauge_requests_started{0};
   std::atomic<std::uint64_t> _gauge_bytes_submitted{0};
+  std::atomic<std::uint64_t> _gauge_preemptions{0};
 
   /// Worker-side accumulators behind gauges::queue_delay; take_gauges() swaps them out.
   struct queue_delay_atomics {

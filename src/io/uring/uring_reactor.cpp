@@ -492,9 +492,11 @@ uring_reactor::gauges uring_reactor::take_gauges() noexcept
   out.pending_ops             = _gauge_pending.load(std::memory_order_relaxed);
   out.active_remaining_slices = _gauge_active_slices.load(std::memory_order_relaxed);
   out.queued_requests         = _requests.size_approx();
+  out.queued_low_requests     = _requests.size_approx(io_priority::low);
   out.queued_bytes            = _queued_bytes.load(std::memory_order_relaxed);
   out.requests_started        = _gauge_requests_started.load(std::memory_order_relaxed);
   out.bytes_submitted         = _gauge_bytes_submitted.load(std::memory_order_relaxed);
+  out.preemptions             = _gauge_preemptions.load(std::memory_order_relaxed);
   for (std::size_t c = 0; c < 2; ++c) {
     auto& src  = _gauge_queue_delay[c];
     auto& dst  = out.queue_delay[c];
@@ -517,7 +519,7 @@ void uring_reactor::record_queue_delay(grouped_io_request const& request) noexce
                                                          request.enqueued_at)
       .count()));
   constexpr auto relaxed = std::memory_order_relaxed;
-  auto& dst              = _gauge_queue_delay[request.cls == io_class::prefetch ? 1 : 0];
+  auto& dst              = _gauge_queue_delay[request.priority == io_priority::low ? 1 : 0];
   dst.count.fetch_add(1, relaxed);
   dst.sum_ns.fetch_add(ns, relaxed);
   // Only the worker raises the max; a racing take_gauges() reset can lose one sample's peak.
@@ -602,7 +604,8 @@ void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcep
     if (_accepting.load(std::memory_order_acquire)) {
       _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
       try {
-        enqueued = _requests.enqueue(std::move(request));
+        auto const priority = request->priority;
+        enqueued            = _requests.enqueue(std::move(request), priority);
         if (!enqueued) { error = std::make_error_code(std::errc::no_buffer_space); }
       } catch (...) {
         enqueued = false;
@@ -777,10 +780,15 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     copying.reserve(slot_count);
     std::vector<std::unique_ptr<uring_io_op>> pending;
     std::unique_ptr<grouped_io_request> active;
+    // A low-priority request set aside, part-expanded, while high requests run.
+    // Holds at most one: only a low active request is parked, and it is resumed
+    // before any further low request is taken.
+    std::unique_ptr<grouped_io_request> parked;
     std::size_t inflight = 0;
     // Gauge accumulators: worker-local, published by publish_gauges().
     std::uint64_t requests_started = 0;
     std::uint64_t bytes_submitted  = 0;
+    std::uint64_t preemptions      = 0;
 
     auto publish_gauges = [&]() noexcept {
       constexpr auto relaxed = std::memory_order_relaxed;
@@ -792,6 +800,35 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         active != nullptr ? static_cast<std::uint32_t>(active->remaining_slices()) : 0U, relaxed);
       _gauge_requests_started.store(requests_started, relaxed);
       _gauge_bytes_submitted.store(bytes_submitted, relaxed);
+      _gauge_preemptions.store(preemptions, relaxed);
+    };
+
+    // Make the next request active without blocking: a waiting high request
+    // first, then the parked low one, then anything queued.
+    auto take_next = [&]() -> bool {
+      std::unique_ptr<grouped_io_request> next;
+      if (parked != nullptr) {
+        if (!_requests.try_dequeue_high(next) || next == nullptr) {
+          active = std::move(parked);
+          return true;
+        }
+      } else if (!_requests.try_dequeue(next) || next == nullptr) {
+        return false;
+      }
+      active = std::move(next);
+      ++requests_started;
+      return true;
+    };
+
+    // Park an active low request at this slice boundary when a high one waits.
+    auto preempt_low = [&]() {
+      if (active == nullptr || parked != nullptr || active->priority != io_priority::low) return;
+      std::unique_ptr<grouped_io_request> next;
+      if (!_requests.try_dequeue_high(next) || next == nullptr) return;
+      parked = std::move(active);
+      active = std::move(next);
+      ++requests_started;
+      ++preemptions;
     };
 
     auto reset_slot = [&](io_slot& slot) noexcept { slot.reset(); };
@@ -1066,12 +1103,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       }
     };
 
-    auto cancel_active = [&](grouped_coordinator::error_type const& error) noexcept {
-      if (active == nullptr) return;
-      auto const bytes = active->remaining_bytes();
+    auto cancel_request = [&](std::unique_ptr<grouped_io_request>& request,
+                              grouped_coordinator::error_type const& error) noexcept {
+      if (request == nullptr) return;
+      auto const bytes = request->remaining_bytes();
       _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-      active->cancel_remaining(error);
-      active.reset();
+      request->cancel_remaining(error);
+      request.reset();
+    };
+    auto cancel_active = [&](grouped_coordinator::error_type const& error) noexcept {
+      cancel_request(active, error);
     };
 
     std::exception_ptr fatal_error;
@@ -1082,12 +1123,21 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         resubmit_incomplete();
 
         if (!pending.empty() && !pending.back()->request.coordinator->should_continue()) {
+          // Pending ops all come from one slice, so share one coordinator; that
+          // request may be the active one or, after a preemption, the parked one.
+          auto const cancelled = pending.back()->request.coordinator;
           cancel_pending(canceled_error());
-          cancel_active(canceled_error());
+          if (active != nullptr && active->coordinator == cancelled)
+            cancel_active(canceled_error());
+          if (parked != nullptr && parked->coordinator == cancelled) {
+            cancel_request(parked, canceled_error());
+          }
         }
 
         dispatch_pending();
         submit_prepared();
+
+        preempt_low();
 
         // Expand up to _slices_per_pass slices of the active request (config::
         // slices_per_pass), so one many-slice request can fill the free slots instead of
@@ -1141,15 +1191,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         }
         submit_prepared();
 
-        if (active == nullptr && pending.empty()) {
-          std::unique_ptr<grouped_io_request> next;
-          if (_requests.try_dequeue(next)) {
-            if (next == nullptr) break;
-            active = std::move(next);
-            ++requests_started;
-            continue;
-          }
-        }
+        if (active == nullptr && pending.empty() && take_next()) continue;
 
         publish_gauges();
         if (inflight != 0) {
@@ -1196,6 +1238,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
                              : grouped_coordinator::error_type{cancellation};
     cancel_pending(terminal_error);
     cancel_active(terminal_error);
+    cancel_request(parked, terminal_error);
     cancel_queued(terminal_error);
 
     bool sync_cancel_available = true;

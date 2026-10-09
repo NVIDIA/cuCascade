@@ -810,8 +810,12 @@ void fs_cache::await_inflight_prefetch(const io_object& obj,
   }
 }
 
-exec::semi_future<std::size_t> fs_cache::host_read_async(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle)
+exec::semi_future<std::size_t> fs_cache::host_read_async(const io_object& obj,
+                                                         size_t offset,
+                                                         size_t size,
+                                                         uint8_t* dst,
+                                                         cache_handle* handle,
+                                                         io_priority priority)
 {
   if (size == 0) { return exec::make_semi_future<std::size_t>(0); }
   if (dst == nullptr) {
@@ -821,19 +825,27 @@ exec::semi_future<std::size_t> fs_cache::host_read_async(
   if (offset >= obj.size()) { return exec::make_semi_future<std::size_t>(0); }
   size = std::min(size, obj.size() - offset);
   slice request{offset, size, dst};
-  return host_read_ranges_async(obj, std::span<slice const>{&request, 1}, handle);
+  return host_read_ranges_async(obj,
+                                std::span<slice const>{&request, 1},
+                                handle,
+                                resolve_priority(priority, io_priority::high));
 }
 
-std::size_t fs_cache::host_read(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle)
+std::size_t fs_cache::host_read(const io_object& obj,
+                                size_t offset,
+                                size_t size,
+                                uint8_t* dst,
+                                cache_handle* handle,
+                                io_priority priority)
 {
-  auto future = host_read_async(obj, offset, size, dst, handle);
+  auto future = host_read_async(obj, offset, size, dst, handle, priority);
   return std::move(future).get();
 }
 
 exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object& obj,
                                                                 std::span<const slice> requests,
-                                                                cache_handle* handle)
+                                                                cache_handle* handle,
+                                                                io_priority priority)
 {
   if (requests.empty()) { return exec::make_semi_future<std::size_t>(0); }
 
@@ -936,6 +948,10 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
     bool const has_backend = !prepared.empty();
     exec::semi_future<std::size_t> result_future;
     if (has_backend) {
+      auto const resolved = resolve_priority(priority, io_priority::low);
+      for (auto& io_slice : prepared) {
+        io_slice.priority = resolved;
+      }
       auto coordinator = std::make_shared<grouped_coordinator>(logical_bytes, 1);
       result_future    = coordinator->get_future();
       size_terminal terminal{
@@ -987,7 +1003,8 @@ exec::semi_future<std::size_t> fs_cache::device_read_async(const io_object& obj,
                                                            size_t size,
                                                            uint8_t* dst,
                                                            ::cuda::stream_ref stream,
-                                                           cache_handle* handle)
+                                                           cache_handle* handle,
+                                                           io_priority priority)
 {
   if (size == 0) { return exec::make_semi_future<std::size_t>(0); }
   if (dst == nullptr) {
@@ -997,14 +1014,16 @@ exec::semi_future<std::size_t> fs_cache::device_read_async(const io_object& obj,
   if (offset >= obj.size()) { return exec::make_semi_future<std::size_t>(0); }
   size = std::min(size, obj.size() - offset);
   slice request{offset, size, dst};
-  return device_read_ranges_async(obj, std::span<slice const>{&request, 1}, stream, handle);
+  return device_read_ranges_async(
+    obj, std::span<slice const>{&request, 1}, stream, handle, priority);
 }
 
 exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
   const io_object& obj,
   std::span<const io::slice> requests,
   ::cuda::stream_ref stream,
-  cache_handle* handle)
+  cache_handle* handle,
+  io_priority priority)
 {
   if (requests.empty()) { return exec::make_semi_future<std::size_t>(0); }
 
@@ -1148,6 +1167,10 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
   _counters.misses.fetch_add(misses, std::memory_order_relaxed);
 
   if (has_backend) {
+    auto const resolved = resolve_priority(priority, io_priority::high);
+    for (auto& io_slice : prepared) {
+      io_slice.priority = resolved;
+    }
     auto io_future = _io_ctx->host_device_readv_async_io(obj, std::move(prepared));
     // From this point the prepared-slice callbacks own every loading transition.
     claimed.clear();
@@ -1390,6 +1413,7 @@ bool fs_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcep
     for (auto& slice : prepared) {
       slice.on_complete = completion;
       slice.cls         = io_class::prefetch;
+      slice.priority    = io_priority::low;
     }
   } catch (...) {
     return fail_setup();

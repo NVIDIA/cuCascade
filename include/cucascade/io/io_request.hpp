@@ -283,6 +283,9 @@ class grouped_io_request final {
   std::shared_ptr<grouped_coordinator> coordinator;
   /// Class of the first slice (a request never mixes classes: one call site, one class).
   io_class cls{io_class::demand};
+  /// Queue this request waits in; never @c automatic once a templated_ioctx has
+  /// dispatched it (it resolves that before enqueueing).
+  io_priority priority{io_priority::high};
   /// Stamped by the reactor at enqueue; diagnostic (queue-delay gauge) only.
   std::chrono::steady_clock::time_point enqueued_at{};
 
@@ -292,7 +295,11 @@ class grouped_io_request final {
                      std::shared_ptr<grouped_coordinator> group)
     : obj(std::move(object)), slices(std::move(request_slices)), coordinator(std::move(group))
   {
-    if (!slices.empty()) cls = slices.front().cls;
+    if (!slices.empty()) {
+      cls      = slices.front().cls;
+      priority = slices.front().priority == io_priority::automatic ? io_priority::high
+                                                                   : slices.front().priority;
+    }
   }
 
   std::size_t _next{0};
