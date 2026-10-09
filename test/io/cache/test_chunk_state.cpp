@@ -299,6 +299,43 @@ TEST_CASE("pins keep a chunk readable and block eviction", "[cache][state]")
   CHECK(s.mark_evicting());
 }
 
+TEST_CASE("a saturated pin count is a miss, not a pin", "[cache][state]")
+{
+  chunk_state s;
+  make_cached(s, chunk_fill::whole());
+
+  for (std::uint32_t i = 0; i < chunk_state::MAX_PINS; ++i) {
+    REQUIRE(s.acquire_read());
+  }
+  REQUIRE(s.get_state() == chunk_state::in_use);
+  REQUIRE(s.get_pin_count() == chunk_state::MAX_PINS);
+
+  // The pin field is full.  Neither entry point may claim a pin it did not take:
+  // a caller that believed it held one would use the buffer after the other
+  // readers' releases made the chunk evictable, and its own release_read would
+  // then underflow the field.
+  CHECK_FALSE(s.acquire_read());
+  CHECK_FALSE(s.try_pin_covering(OFF, CHUNK, OFF, OFF + PAGE));
+  CHECK(s.get_state() == chunk_state::in_use);
+  CHECK(s.get_pin_count() == chunk_state::MAX_PINS);
+  CHECK_FALSE(s.mark_evicting());
+
+  // Draining exactly MAX_PINS pins returns the chunk to `cached` with none left.
+  for (std::uint32_t i = 1; i < chunk_state::MAX_PINS; ++i) {
+    REQUIRE_FALSE(s.release_read());  // not the last reader
+  }
+  CHECK(s.get_pin_count() == 1);
+  CHECK(s.release_read());  // last one out
+  CHECK(s.get_state() == chunk_state::cached);
+  CHECK(s.get_pin_count() == 0);
+
+  // Pinning works again once the field has room.
+  CHECK(s.try_pin_covering(OFF, CHUNK, OFF, OFF + PAGE));
+  CHECK(s.get_pin_count() == 1);
+  CHECK(s.release_read());
+  CHECK(s.mark_evicting());
+}
+
 TEST_CASE("try_pin_covering refuses a chunk that is not populated far enough", "[cache][state]")
 {
   chunk_state s;

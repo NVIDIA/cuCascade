@@ -297,7 +297,7 @@ struct chunk_fill {
 //   loading    ──mark_load_failed()─────►  allocated     (IO failure)
 //   cached     ──mark_evicting()────────►  evicting
 //   cached     ──acquire_read()─────────►  in_use(pin = 1)
-//   in_use     ──acquire_read()─────────►  in_use(pin += 1)
+//   in_use     ──acquire_read()─────────►  in_use(pin += 1)   (rejected at MAX_PINS)
 //   in_use     ──release_read()─────────►  in_use(pin -= 1) | cached (when pin → 0)
 //   evicting   ──mark_empty()───────────►  empty         (clears the extent)
 //
@@ -321,6 +321,9 @@ class chunk_state {
     evicting  = 6,
   };
 
+  /// Concurrent readers one chunk can hold (the pin field is 12 bits wide).  A
+  /// reader that arrives with the field saturated is NOT pinned — see
+  /// @ref acquire_read and @ref try_pin_covering.
   static constexpr std::uint32_t MAX_PINS        = (1U << 12) - 1;
   static constexpr std::uint32_t MAX_SUBSCRIBERS = (1U << 16) - 1;
 
@@ -468,12 +471,18 @@ class chunk_state {
   }
 
   /// (cached | in_use) → in_use with pins += 1.
+  ///
+  /// Returns true only if a pin was taken, and every true must be paired with a
+  /// @ref release_read.  Returns false — taking no pin — when the chunk is not
+  /// readable OR the pin count is already at @ref MAX_PINS: a saturated chunk is
+  /// a miss, and the caller reads from the backend for itself.
   [[nodiscard]] bool acquire_read() noexcept
   {
     std::uint64_t cur = _w.load(std::memory_order_acquire);
     for (;;) {
       if (!readable(cur)) { return false; }
-      if (!pin_once(cur)) { return true; }
+      auto const attempt = pin_once(cur);
+      if (attempt != pin_attempt::retry) { return attempt == pin_attempt::pinned; }
     }
   }
 
@@ -481,6 +490,10 @@ class chunk_state {
   /// extent already covers [@p lo, @p hi).  A coverage miss costs one relaxed
   /// load and no atomic RMW — with partial fills in play that is the common
   /// case, and the pin/unpin pair it replaces was two.
+  ///
+  /// Returns true only if a pin was taken (pair it with @ref release_read).  A
+  /// chunk whose pin count is already at @ref MAX_PINS is likewise a miss: the
+  /// caller reads the bytes from the backend instead of sharing the buffer.
   [[nodiscard]] bool try_pin_covering(std::size_t chunk_off,
                                       std::size_t chunk_bytes,
                                       std::size_t lo,
@@ -490,7 +503,8 @@ class chunk_state {
     for (;;) {
       if (!readable(cur)) { return false; }
       if (!covers(decode(cur), chunk_off, chunk_bytes, lo, hi)) { return false; }
-      if (!pin_once(cur)) { return true; }
+      auto const attempt = pin_once(cur);
+      if (attempt != pin_attempt::retry) { return attempt == pin_attempt::pinned; }
     }
   }
 
@@ -603,17 +617,26 @@ class chunk_state {
     return st == cached || st == in_use;
   }
 
-  /// One attempt at (cached | in_use) → in_use, pins += 1.  Returns false when
-  /// the CAS succeeded (or the pin count is saturated, which cannot be retried);
-  /// true means @p cur was refreshed and the caller must re-check its guards.
-  bool pin_once(std::uint64_t& cur) noexcept
+  /// Outcome of one @ref pin_once attempt.
+  enum class pin_attempt : std::uint8_t {
+    pinned,     ///< the CAS succeeded: a pin was taken
+    retry,      ///< the CAS lost a race: @c cur was refreshed, re-check the guards
+    saturated,  ///< the pin count is at @ref MAX_PINS: no pin can be taken, do not retry
+  };
+
+  /// One attempt at (cached | in_use) → in_use, pins += 1.  The caller has
+  /// already established that @p cur is readable.  A saturated pin field is
+  /// reported as @c saturated, never as @c pinned: the caller must treat it as
+  /// "not pinned" so the pin/release pairing stays balanced.
+  pin_attempt pin_once(std::uint64_t& cur) noexcept
   {
     auto const pins = (cur & PIN_MASK) >> PIN_SHIFT;
-    if (pins >= MAX_PINS) { return false; }
+    if (pins >= MAX_PINS) { return pin_attempt::saturated; }
     std::uint64_t const next = (cur & ~(STATE_MASK | PIN_MASK)) |
                                static_cast<std::uint64_t>(in_use) | ((pins + 1) << PIN_SHIFT);
-    return !_w.compare_exchange_weak(
-      cur, next, std::memory_order_acq_rel, std::memory_order_acquire);
+    return _w.compare_exchange_weak(cur, next, std::memory_order_acq_rel, std::memory_order_acquire)
+             ? pin_attempt::pinned
+             : pin_attempt::retry;
   }
 
   /// Exact-precondition transition: requires state == @p from AND no reader
