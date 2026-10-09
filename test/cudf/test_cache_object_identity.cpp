@@ -254,7 +254,6 @@ struct held_config {
   [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
 
   std::size_t n_max_concurrent_scans{1};
-  std::size_t prefetch_reactors{0};
 };
 
 class held_backend {

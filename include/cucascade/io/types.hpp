@@ -241,12 +241,6 @@ class prepared_io_completion final {
   callback_type _callback;
 };
 
-/// Who is waiting for a read: @c demand (a consumer blocks on it now) or
-/// @c prefetch (speculative readahead nobody waits on yet). templated_ioctx::next_reactor
-/// routes by it when reactors are reserved for prefetch (uring prefetch_reactors), and
-/// reactors keep per-class queue-delay gauges.
-enum class io_class : std::uint8_t { demand, prefetch };
-
 /// Which of a reactor's two queues a read waits in.  A reactor always takes the
 /// next request from its @c high queue before its @c low one, and parks an
 /// active @c low request at a slice boundary when a @c high one arrives, so a
@@ -272,7 +266,6 @@ struct prepared_io_slice {
   host_buffer h_buffer;  // monostate if using reactor-owned staging
   device_buffer d_buffer;
   std::shared_ptr<prepared_io_completion> on_complete;
-  io_class cls{io_class::demand};
   /// Reactor queue for this slice (see @ref io_priority); a request takes its
   /// first slice's value, resolving @c automatic by call shape.
   io_priority priority{io_priority::automatic};
