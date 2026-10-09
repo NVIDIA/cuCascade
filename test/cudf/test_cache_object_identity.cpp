@@ -29,6 +29,9 @@
 // reactor), and a held backend whose fills the test completes or fails by hand
 // (deterministic lifetime and ordering checks).  The wire-level conditional-GET
 // contract is covered by test/io/rest/test_rest_cache_identity.cpp.
+//
+// The same fixture also hosts the fs_cache summary snapshot test, which needs a
+// cache with live read counters but nothing about object identity.
 
 #include "io/rest/loopback_range_server.hpp"
 #include "io/rest/mock_authorizer.hpp"
@@ -66,6 +69,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -444,6 +448,18 @@ void require_changed(std::exception_ptr failure,
   } catch (...) {
     FAIL("expected object_changed_error");
   }
+}
+
+/// The counters of one fs_cache::summary() line: the five `global[...]` values
+/// followed by the five `last_cycle[...]` values (reads, hits, h2d, miss,
+/// evictions), taken from the integers after each `=`.
+std::vector<std::uint64_t> summary_counts(std::string const& text)
+{
+  std::vector<std::uint64_t> counts;
+  for (auto pos = text.find('='); pos != std::string::npos; pos = text.find('=', pos + 1)) {
+    counts.push_back(std::stoull(text.substr(pos + 1)));
+  }
+  return counts;
 }
 
 }  // namespace
@@ -1005,4 +1021,77 @@ TEST_CASE("cache identity delivers a held fill's failure through the datasource"
   CHECK(cache.claimed_bytes() == chunk_bytes);
   source.reset();
   context->shutdown_cache();
+}
+
+// ===========================================================================
+// Summary snapshots
+// ===========================================================================
+
+TEST_CASE("cache summary snapshots stay consistent under concurrent queries",
+          "[cache][cache_summary][rest]")
+{
+  range_fault_policy fault;
+  fault.successful_head_etag = "\"generation-one\"";
+  fault.successful_get_etag  = fault.successful_head_etag;
+  loopback_range_server server(base_object(), fault);
+  rest_cache_fixture fixture(server);
+  auto& cache = *fixture.context->cache();
+  auto source = fixture.open_resident(server, object_uri, base_object());
+
+  auto const before = summary_counts(cache.summary());
+  REQUIRE(before.size() == 10);
+
+  // Embedders call prepare_for_query() once per query and summary() whenever
+  // they report, from concurrent connections, while reads keep moving the
+  // counters.  Both touch the per-cycle snapshot.  Each summary must read the
+  // counters and that snapshot as one unit: a snapshot taken after the counters
+  // were read would put a cycle delta above its running total.
+  constexpr int iterations = 100000;
+  std::atomic<bool> readers_done{false};
+  std::atomic<bool> bad_snapshot{false};
+  std::atomic<bool> malformed{false};
+
+  std::thread reader([&] {
+    std::vector<std::uint8_t> bytes(source->size());
+    while (!readers_done.load()) {
+      std::ignore = source->host_read(0, bytes.size(), bytes.data());
+    }
+  });
+
+  auto const query_cycle = [&] {
+    for (int i = 0; i < iterations; ++i) {
+      cache.prepare_for_query();
+    }
+  };
+  auto const report = [&] {
+    for (int i = 0; i < iterations; ++i) {
+      auto const counts = summary_counts(cache.summary());
+      if (counts.size() != 10) {
+        malformed.store(true);
+        continue;
+      }
+      for (std::size_t field = 0; field < 5; ++field) {
+        if (counts[5 + field] > counts[field]) { bad_snapshot.store(true); }
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.emplace_back(query_cycle);
+  workers.emplace_back(query_cycle);
+  workers.emplace_back(report);
+  workers.emplace_back(report);
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  readers_done.store(true);
+  reader.join();
+
+  CHECK_FALSE(malformed.load());
+  CHECK_FALSE(bad_snapshot.load());
+  // The reader really was moving the counters while the snapshots were taken.
+  auto const after = summary_counts(cache.summary());
+  REQUIRE(after.size() == 10);
+  CHECK(after[1] > before[1]);
+  CHECK(server.get_count() == 1);
 }

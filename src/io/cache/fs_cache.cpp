@@ -1221,6 +1221,7 @@ void fs_cache::retire_pins_after_stream(::cuda::stream_ref stream,
 
 std::string fs_cache::summary() const
 {
+  std::lock_guard lock(_summary_mutex);
   // Global totals plus the deltas since the last refresh (the most recent
   // query cycle), reported separately.
   uint64_t const reads = _counters.n_reads.load(std::memory_order_relaxed);
@@ -1251,6 +1252,7 @@ void fs_cache::prepare_for_query() noexcept
 
   _ticker.fetch_add(1, std::memory_order_relaxed);
 
+  std::lock_guard lock(_summary_mutex);
   // Snapshot the counters so the next summary() can report this cycle's deltas.
   _last_reported = {
     _counters.n_reads.load(std::memory_order_relaxed),
