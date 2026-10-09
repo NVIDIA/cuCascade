@@ -22,8 +22,8 @@
 
 namespace cucascade::exec {
 
-/// Default width of the GPU pipeline executor pool.  The io reactors size their
-/// per-backend scan budgets from it (see uring::config::n_max_concurrent_scans).
+/// Default width of the GPU pipeline executor pool.  An embedding engine may
+/// scale per-backend scan budgets from it (see rest::config::n_max_concurrent_scans).
 inline constexpr int default_gpu_pipeline_num_threads = 4;
 
 struct thread_pool_config {

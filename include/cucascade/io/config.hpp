@@ -65,7 +65,7 @@ struct io_config {
   io_backend backend{io_backend::native};
 
   /// Number of uring reactor worker threads for the local-disk IO path.
-  std::size_t uring_n_reactors{1};
+  std::size_t uring_n_reactors{4};
 
   /// Number of REST reactor worker threads for the S3/object-store IO path
   /// (each its own libcurl event loop + connection pool).

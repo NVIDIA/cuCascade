@@ -18,6 +18,7 @@
 
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uri_parser.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -261,11 +262,32 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
   // any reactor's authorizer — head_object uses a local easy handle and
   // does not touch worker state, so any reactor is equivalent.
   auto head = _reactors.front()->head_object(parsed.host, parsed.path);
-  return std::make_shared<rest_io_object>(std::move(path),
-                                          std::move(parsed.host),
-                                          std::move(parsed.path),
-                                          head.object_size,
-                                          std::move(head.etag));
+  return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
+                                                           std::move(parsed.host),
+                                                           std::move(parsed.path),
+                                                           head.object_size,
+                                                           std::move(head.etag)));
+}
+
+std::shared_ptr<io_object> rest_ioctx::note_unqualified(std::shared_ptr<io_object> obj)
+{
+  if (rest_io_object::is_strong_tag(obj->validation_tag())) { return obj; }
+  constexpr std::size_t k_max_warned_paths = 64;
+  auto const& path                         = obj->object_path();
+  {
+    std::lock_guard lk(_unqualified_mtx);
+    if (std::ranges::find(_unqualified_paths, path) != _unqualified_paths.end()) { return obj; }
+    if (_unqualified_paths.size() == k_max_warned_paths) { _unqualified_paths.clear(); }
+    _unqualified_paths.push_back(path);
+  }
+  auto const tag = obj->validation_tag();
+  CUCASCADE_LOG_WARN(
+    "rest_ioctx: '{}' opened with {} ETag; its bytes and metadata are cached only within this open",
+    path,
+    tag.empty()             ? "no"
+    : tag.starts_with("W/") ? "a weak"
+                            : "a malformed");
+  return obj;
 }
 
 std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, open_hint hint)
@@ -285,10 +307,10 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, std::u
   }
   // The size came from a ListObjectsV2 response: build the io_object with zero
   // network — no HEAD, no probe.
-  return std::make_shared<rest_io_object>(std::move(path),
-                                          std::move(parsed.host),
-                                          std::move(parsed.path),
-                                          static_cast<size_t>(known_size));
+  return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
+                                                           std::move(parsed.host),
+                                                           std::move(parsed.path),
+                                                           static_cast<size_t>(known_size)));
 }
 
 namespace {
@@ -366,19 +388,19 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
     // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
     // fall back to a plain HEAD for the size, with no stash.
     auto head = _reactors.front()->head_object(parsed.host, parsed.path);
-    return std::make_shared<rest_io_object>(std::move(path),
-                                            std::move(parsed.host),
-                                            std::move(parsed.path),
-                                            head.object_size,
-                                            std::move(head.etag));
+    return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
+                                                             std::move(parsed.host),
+                                                             std::move(parsed.path),
+                                                             head.object_size,
+                                                             std::move(head.etag)));
   }
-  return std::make_shared<rest_io_object>(std::move(path),
-                                          std::move(parsed.host),
-                                          std::move(parsed.path),
-                                          probe.object_size,
-                                          probe.window_lo,
-                                          probe.bytes,
-                                          std::move(probe.etag));
+  return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
+                                                           std::move(parsed.host),
+                                                           std::move(parsed.path),
+                                                           probe.object_size,
+                                                           probe.window_lo,
+                                                           probe.bytes,
+                                                           std::move(probe.etag)));
 }
 
 }  // namespace cucascade::io::rest

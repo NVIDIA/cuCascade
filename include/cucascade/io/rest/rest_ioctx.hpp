@@ -187,9 +187,13 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   bool _footer_resolve_active{false};
   std::shared_ptr<exec::admission_control> _footer_budget;
 
+  std::shared_ptr<io_object> note_unqualified(std::shared_ptr<io_object> obj);
+
   /// Guards the warm-up rate limiter.  Contended once per query at most, and
   /// never on a read path.
   std::mutex _warm_mtx;
+  std::mutex _unqualified_mtx;
+  std::vector<std::string> _unqualified_paths;
   /// Bucket the pools were last warmed against, and when.  An unset time means
   /// "never warmed", which no elapsed comparison can express.
   std::string _warmed_bucket;
