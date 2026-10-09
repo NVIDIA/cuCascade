@@ -303,11 +303,7 @@ std::exception_ptr datasource::prefetch_failure() const noexcept
   return _prefetch_handle ? _prefetch_handle.failure() : nullptr;
 }
 
-bool datasource::uses_fs_cache()
-{
-  auto* cache = _io_ctx->cache();
-  return cache != nullptr && _io_ctx->can_use_fs_cache();
-}
+bool datasource::uses_fs_cache() const noexcept { return _io_ctx->uses_fs_cache(); }
 
 std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx, std::string path)
 {
