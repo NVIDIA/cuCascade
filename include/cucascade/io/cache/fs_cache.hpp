@@ -550,6 +550,10 @@ class fs_cache {
   };
 
   counters _counters;
+  /// Serializes @c _last_reported: summary() reads it and prepare_for_query()
+  /// rewrites it, and an embedder may call both from concurrent queries.  The
+  /// counters themselves are atomics and need no lock.
+  mutable std::mutex _summary_mutex;
   counters_snapshot _last_reported;
 
   /// One slot per issued cache-backed IO, retained by its physical completion
