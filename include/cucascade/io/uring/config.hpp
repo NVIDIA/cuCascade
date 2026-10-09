@@ -67,22 +67,6 @@ struct config {
   /// than one that holds a reactor until its last slice.  0 disables the split.
   std::size_t range_batch_slices{8};
 
-  /// How many reactors, taken from the end of the pool, serve only prefetch
-  /// (readahead) reads; the others serve only demand reads.  A reactor runs
-  /// its queue in order, so without the split a small demand read can wait
-  /// behind gigabytes of whole-split prefetch on every reactor.  The reactor's
-  /// two-tier queue (see @ref io_priority) now keeps demand ahead of prefetch
-  /// without reserving a reactor, so this is normally 0.  0 disables the
-  /// split: every read ranks among all reactors (see
-  /// templated_ioctx::next_reactor).  Must be below the reactor count; with a
-  /// single reactor it is ignored.  When not named in the config it stays 0;
-  /// an embedding application may derive it (e.g. 1 when uring readahead runs).
-  std::size_t prefetch_reactors{0};
-
-  /// Whether the config named @c prefetch_reactors explicitly, so an explicit
-  /// value (0 included) is never replaced by the derived default.
-  bool prefetch_reactors_explicit{false};
-
   /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
   /// either way -- naming it lets the caller align once, up front, instead of
   /// every layer rediscovering it.  Reported even when @ref use_odirect is

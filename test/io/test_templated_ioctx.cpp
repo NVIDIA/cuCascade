@@ -41,7 +41,6 @@ struct fake_config {
   [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
 
   std::size_t n_max_concurrent_scans{0};
-  std::size_t prefetch_reactors{0};
   std::size_t range_batch_slices{0};
 };
 
@@ -228,26 +227,25 @@ TEST_CASE("mixed dispatch reports failure for a dropped fragmented slice past EO
 namespace {
 
 /// A pool of fake reactors with the given backlogs; the pool reads
-/// prefetch_reactors and range_batch_slices from the first reactor's config, as
-/// uring_ioctx does.
+/// range_batch_slices from the first reactor's config, as uring_ioctx does.
 struct reactor_pool {
-  reactor_pool(std::initializer_list<std::size_t> backlogs,
-               std::size_t prefetch_reactors,
-               std::size_t range_batch_slices = 0)
+  explicit reactor_pool(std::initializer_list<std::size_t> backlogs,
+                        std::size_t range_batch_slices = 0)
   {
     std::vector<std::unique_ptr<fake_reactor>> reactors;
     for (auto const backlog : backlogs) {
       reactors.push_back(std::make_unique<fake_reactor>(backlog));
-      reactors.back()->config.prefetch_reactors  = prefetch_reactors;
       reactors.back()->config.range_batch_slices = range_batch_slices;
       raw.push_back(reactors.back().get());
     }
     context = std::make_unique<fake_context>(std::move(reactors));
   }
 
-  /// Dispatch one request of @p n_slices slices of class @p cls; return how many
-  /// requests each reactor received from it.
-  std::vector<std::size_t> dispatch(cucascade::io::io_class cls, std::size_t n_slices = 3)
+  /// Dispatch one request of @p n_slices slices stamped @p priority; return how
+  /// many requests each reactor received from it.
+  std::vector<std::size_t> dispatch(
+    std::size_t n_slices                = 3,
+    cucascade::io::io_priority priority = cucascade::io::io_priority::automatic)
   {
     std::vector<std::size_t> before;
     for (auto* reactor : raw) {
@@ -256,7 +254,7 @@ struct reactor_pool {
     std::vector<cucascade::io::prepared_io_slice> slices;
     for (std::size_t i = 0; i < n_slices; ++i) {
       slices.emplace_back(cucascade::io::range{i * 100, 40}, cucascade::io::host_buffer{&byte});
-      slices.back().cls = cls;
+      slices.back().priority = priority;
     }
     static_cast<void>(context->mixed_readv_async_io(*object, std::move(slices)));
     std::vector<std::size_t> received;
@@ -274,62 +272,22 @@ struct reactor_pool {
 
 }  // namespace
 
-TEST_CASE("prefetch_reactors routes prefetch reads to the last K reactors and demand to the rest",
-          "[io][templated_ioctx][prefetch_reactors]")
+TEST_CASE("next_reactor sends a read to the two least-backlogged reactors",
+          "[io][templated_ioctx][next_reactor]")
 {
-  using cucascade::io::io_class;
-
-  SECTION("K = 1: prefetch goes to the last reactor even when it is the busiest")
-  {
-    reactor_pool pool{{1000, 10, 20, 5000}, 1};
-    for (int round = 0; round < 8; ++round) {
-      CHECK(pool.dispatch(io_class::prefetch) == std::vector<std::size_t>{0, 0, 0, 1});
-      // Demand ranks only among reactors 0-2: the two least busy of those.
-      CHECK(pool.dispatch(io_class::demand) == std::vector<std::size_t>{0, 1, 1, 0});
-    }
-    // A request carries the class of its slices.
-    CHECK(pool.raw[3]->requests.front()->cls == io_class::prefetch);
-    CHECK(pool.raw[1]->requests.front()->cls == io_class::demand);
-  }
-
-  SECTION("K = 2: prefetch fans out over the last two, demand over the first two")
-  {
-    reactor_pool pool{{30, 20, 1000, 2000}, 2};
-    for (int round = 0; round < 8; ++round) {
-      CHECK(pool.dispatch(io_class::prefetch) == std::vector<std::size_t>{0, 0, 1, 1});
-      CHECK(pool.dispatch(io_class::demand) == std::vector<std::size_t>{1, 1, 0, 0});
-      // A single-slice request goes to the least busy reactor of its partition.
-      CHECK(pool.dispatch(io_class::prefetch, 1) == std::vector<std::size_t>{0, 0, 1, 0});
-      CHECK(pool.dispatch(io_class::demand, 1) == std::vector<std::size_t>{0, 1, 0, 0});
-    }
-  }
-
-  SECTION("K at or above the reactor count leaves no demand partition: all reactors rank")
-  {
-    reactor_pool pool{{1000, 10, 20, 500}, 4};
-    CHECK(pool.dispatch(io_class::prefetch) == std::vector<std::size_t>{0, 1, 1, 0});
-    CHECK(pool.dispatch(io_class::demand) == std::vector<std::size_t>{0, 1, 1, 0});
-  }
-}
-
-TEST_CASE("prefetch_reactors = 0 ranks every class among all reactors",
-          "[io][templated_ioctx][prefetch_reactors]")
-{
-  using cucascade::io::io_class;
-  reactor_pool pool{{1000, 10, 20, 500}, 0};
+  reactor_pool pool{{1000, 10, 20, 500}};
   for (int round = 0; round < 4; ++round) {
-    CHECK(pool.dispatch(io_class::prefetch) == std::vector<std::size_t>{0, 1, 1, 0});
-    CHECK(pool.dispatch(io_class::demand) == std::vector<std::size_t>{0, 1, 1, 0});
+    CHECK(pool.dispatch() == std::vector<std::size_t>{0, 1, 1, 0});
+    // A single-slice request goes to the least busy reactor.
+    CHECK(pool.dispatch(1) == std::vector<std::size_t>{0, 1, 0, 0});
   }
-  CHECK(pool.context->prefetch_reactor_count() == 0);
 }
 
 TEST_CASE("automatic priority resolves by call shape; an explicit priority wins",
           "[io][templated_ioctx][priority]")
 {
-  using cucascade::io::io_class;
   using cucascade::io::io_priority;
-  reactor_pool pool{{0}, 0};
+  reactor_pool pool{{0}};
   auto& requests = pool.raw[0]->requests;
   std::uint8_t buffer[64]{};
   std::array<cucascade::io::slice, 2> const ranges{cucascade::io::slice{0, 16, buffer},
@@ -349,19 +307,18 @@ TEST_CASE("automatic priority resolves by call shape; an explicit priority wins"
   CHECK(requests.back()->priority == io_priority::low);
 
   // Slices handed straight to mixed_readv_async_io resolve the same way.
-  static_cast<void>(pool.dispatch(io_class::demand, 1));
+  static_cast<void>(pool.dispatch(1));
   CHECK(requests.back()->priority == io_priority::high);
-  static_cast<void>(pool.dispatch(io_class::demand, 3));
+  static_cast<void>(pool.dispatch(3));
   CHECK(requests.back()->priority == io_priority::low);
-  static_cast<void>(pool.dispatch(io_class::prefetch, 1));
+  // A cache prefetch stamps its single slice low, which beats the call shape.
+  static_cast<void>(pool.dispatch(1, io_priority::low));
   CHECK(requests.back()->priority == io_priority::low);
 }
 
 TEST_CASE("a host-only range read is split into range_batch_slices-sized requests",
           "[io][templated_ioctx][range_batch_slices]")
 {
-  using cucascade::io::io_class;
-
   auto slice_counts = [](fake_reactor const& reactor) {
     std::vector<std::size_t> counts;
     for (auto const& request : reactor.requests) {
@@ -372,17 +329,17 @@ TEST_CASE("a host-only range read is split into range_batch_slices-sized request
 
   SECTION("batch 3: each reactor's 5-slice partition becomes a 3 + 2 pair")
   {
-    reactor_pool pool{{0, 0}, 0, 3};
+    reactor_pool pool{{0, 0}, 3};
     CHECK(pool.context->range_batch_slices() == 3);
-    CHECK(pool.dispatch(io_class::demand, 10) == std::vector<std::size_t>{2, 2});
+    CHECK(pool.dispatch(10) == std::vector<std::size_t>{2, 2});
     CHECK(slice_counts(*pool.raw[0]) == std::vector<std::size_t>{3, 2});
     CHECK(slice_counts(*pool.raw[1]) == std::vector<std::size_t>{3, 2});
   }
 
   SECTION("batch 0 keeps one request per selected reactor")
   {
-    reactor_pool pool{{0, 0}, 0};
+    reactor_pool pool{{0, 0}};
     CHECK(pool.context->range_batch_slices() == 0);
-    CHECK(pool.dispatch(io_class::demand, 10) == std::vector<std::size_t>{1, 1});
+    CHECK(pool.dispatch(10) == std::vector<std::size_t>{1, 1});
   }
 }
