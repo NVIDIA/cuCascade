@@ -60,10 +60,19 @@ struct config {
   /// requests queued behind it.
   std::size_t slices_per_pass{8};
 
+  /// Most slices one queue entry may hold when a host-only multi-range read is
+  /// dispatched (see templated_ioctx::mixed_readv_async_io): a local read does
+  /// not prefer bulk I/O, so a wide range read (a whole-split prefetch, a
+  /// decoder's column-chunk set) is queued as several smaller requests rather
+  /// than one that holds a reactor until its last slice.  0 disables the split.
+  std::size_t range_batch_slices{8};
+
   /// How many reactors, taken from the end of the pool, serve only prefetch
   /// (readahead) reads; the others serve only demand reads.  A reactor runs
   /// its queue in order, so without the split a small demand read can wait
-  /// behind gigabytes of whole-split prefetch on every reactor.  0 disables the
+  /// behind gigabytes of whole-split prefetch on every reactor.  The reactor's
+  /// two-tier queue (see @ref io_priority) now keeps demand ahead of prefetch
+  /// without reserving a reactor, so this is normally 0.  0 disables the
   /// split: every read ranks among all reactors (see
   /// templated_ioctx::next_reactor).  Must be below the reactor count; with a
   /// single reactor it is ignored.  When not named in the config it stays 0;

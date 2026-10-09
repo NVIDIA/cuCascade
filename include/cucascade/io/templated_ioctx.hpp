@@ -302,6 +302,19 @@ class templated_ioctx : public ioctx {
     }
   }
 
+  /// Most slices one queue entry of a host-only range read may hold when the
+  /// backend does not prefer bulk I/O (see mixed_readv_async_io); 0 = one entry
+  /// per selected reactor.  Read from the reactor config's @c range_batch_slices
+  /// when it has one (uring); other backends never split.
+  [[nodiscard]] std::size_t range_batch_slices() const noexcept
+  {
+    if constexpr (requires { _config.range_batch_slices; }) {
+      return static_cast<std::size_t>(_config.range_batch_slices);
+    } else {
+      return 0;
+    }
+  }
+
   std::size_t host_read_io(io_object const& object,
                            std::size_t offset,
                            std::size_t size,
@@ -367,6 +380,14 @@ class templated_ioctx : public ioctx {
 
       if (slices.empty()) return exec::make_semi_future<std::size_t>(0);
 
+      // One call site issues one priority, so the first slice speaks for the
+      // request; stamp the resolved value on every slice so each queue entry
+      // built below carries it.
+      auto const priority = request_priority(slices, has_device_slice);
+      for (auto& slice : slices) {
+        slice.priority = priority;
+      }
+
       // One call site issues one class, so the first slice speaks for the request.
       auto reactors = next_reactor(
         typed, slices.size(), io_op_type::host_vector_async, device_id, slices.front().cls);
@@ -401,17 +422,37 @@ class templated_ioctx : public ioctx {
           partitions[smallest].push_back(slice);
         }
 
-        std::vector<std::unique_ptr<grouped_io_request>> requests;
+        // A backend that does not prefer bulk I/O gets a host-only range read as
+        // several queue entries of at most range_batch_slices() slices each, not
+        // one entry holding every slice.  Coordinator credits are per slice, so
+        // the split does not change how the read settles.
+        auto const batch = !reactor_traits_t::prefers_bulk_io && !has_device_slice
+                             ? range_batch_slices()
+                             : std::size_t{0};
+
+        std::vector<std::pair<Reactor*, std::unique_ptr<grouped_io_request>>> requests;
         requests.reserve(partition_count);
         for (std::size_t i = 0; i < partition_count; ++i) {
-          requests.push_back(
-            grouped_io_request::create(owner, std::move(partitions[i]), coordinator));
+          auto& partition = partitions[i];
+          if (batch == 0 || partition.size() <= batch) {
+            requests.emplace_back(
+              reactors[i], grouped_io_request::create(owner, std::move(partition), coordinator));
+            continue;
+          }
+          for (std::size_t first = 0; first < partition.size(); first += batch) {
+            auto const last = std::min(partition.size(), first + batch);
+            std::vector<prepared_io_slice> part(
+              std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(first)),
+              std::make_move_iterator(partition.begin() + static_cast<std::ptrdiff_t>(last)));
+            requests.emplace_back(reactors[i],
+                                  grouped_io_request::create(owner, std::move(part), coordinator));
+          }
         }
 
         // enqueue is noexcept by reactor contract, so once publication starts
         // ownership cannot be stranded between reactors.
-        for (std::size_t i = 0; i < partition_count; ++i) {
-          reactors[i]->enqueue(std::move(requests[i]));
+        for (auto& [reactor, request] : requests) {
+          reactor->enqueue(std::move(request));
         }
         return future;
       } catch (...) {
@@ -443,6 +484,21 @@ class templated_ioctx : public ioctx {
   }
 
  protected:
+  /// Resolve the queue tier for a request whose slices are @p slices.  An
+  /// explicit priority on the first slice wins.  @c automatic follows the call
+  /// shape: a cache prefetch, or a multi-range host read, waits on the low tier;
+  /// a device read or a single host range is something the caller is blocked
+  /// on, so it goes high.
+  [[nodiscard]] static io_priority request_priority(std::vector<prepared_io_slice> const& slices,
+                                                    bool has_device_slice) noexcept
+  {
+    auto const& front = slices.front();
+    if (front.priority != io_priority::automatic) return front.priority;
+    if (front.cls == io_class::prefetch) return io_priority::low;
+    if (has_device_slice || slices.size() == 1) return io_priority::high;
+    return io_priority::low;
+  }
+
   /**
    * @brief Applies backend policy after synchronous device dispatch fails.
    *

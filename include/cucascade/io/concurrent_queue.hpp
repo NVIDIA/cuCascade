@@ -42,6 +42,7 @@
 
 #include <blockingconcurrentqueue.h>
 #include <concurrentqueue.h>
+#include <lightweightsemaphore.h>
 
 namespace cucascade::io {
 
@@ -56,5 +57,9 @@ using concurrent_queue = detail::moodycamel_ns::ConcurrentQueue<T, Traits>;
 /// Blocking lock-free MPMC queue (alias for moodycamel::BlockingConcurrentQueue).
 template <typename T, typename Traits = detail::moodycamel_ns::ConcurrentQueueDefaultTraits>
 using blocking_concurrent_queue = detail::moodycamel_ns::BlockingConcurrentQueue<T, Traits>;
+
+/// Counting semaphore that spins briefly before sleeping (alias for
+/// moodycamel::LightweightSemaphore).
+using lightweight_semaphore = detail::moodycamel_ns::LightweightSemaphore;
 
 }  // namespace cucascade::io

@@ -204,14 +204,14 @@ class spp_reactor {
   std::shared_ptr<cucascade::io::io_object const> object,
   std::vector<range> const& ranges,
   std::uint8_t* destination,
-  cucascade::io::io_class cls = cucascade::io::io_class::demand)
+  cucascade::io::io_priority priority = cucascade::io::io_priority::high)
 {
   std::size_t bytes = 0;
   std::vector<prepared_io_slice> slices;
   slices.reserve(ranges.size());
   for (auto const& r : ranges) {
     slices.emplace_back(r, host_buffer{destination + r.offset});
-    slices.back().cls = cls;
+    slices.back().priority = priority;
     bytes += r.size;
   }
   auto coordinator = std::make_shared<grouped_coordinator>(bytes, slices.size());
@@ -538,10 +538,10 @@ TEST_CASE("io_uring slices_per_pass sets how deep a single request queues",
   CHECK(max_inflight(0) >= 32);
 }
 
-TEST_CASE("io_uring queue-delay gauge counts each request once, per io_class",
+TEST_CASE("io_uring queue-delay gauge counts each request once, per priority tier",
           "[io][uring][queue_delay]")
 {
-  using cucascade::io::io_class;
+  using cucascade::io::io_priority;
   constexpr std::size_t n_slices = 16;
   constexpr std::size_t stride   = 64UL << 10;
   pattern_file const file{n_slices * stride};
@@ -551,16 +551,17 @@ TEST_CASE("io_uring queue-delay gauge counts each request once, per io_class",
   aligned_bytes prefetch_dst{n_slices * stride};
   aligned_bytes demand_dst{n_slices * stride};
   auto prefetch =
-    enqueue_ranges(reactor.get(), file.open(), ranges, prefetch_dst.get(), io_class::prefetch);
+    enqueue_ranges(reactor.get(), file.open(), ranges, prefetch_dst.get(), io_priority::low);
   auto demand_a = enqueue_ranges(reactor.get(), file.open(), ranges, demand_dst.get());
   auto demand_b = enqueue_ranges(reactor.get(), file.open(), ranges, demand_dst.get());
   CHECK(std::move(prefetch).get(std::chrono::seconds(30)) == n_slices * stride);
   CHECK(std::move(demand_a).get(std::chrono::seconds(30)) == n_slices * stride);
   CHECK(std::move(demand_b).get(std::chrono::seconds(30)) == n_slices * stride);
 
+  // [0] = high tier, [1] = low tier.
   auto const g    = reactor.get().take_gauges();
-  auto const& d   = g.queue_delay[static_cast<std::size_t>(io_class::demand)];
-  auto const& p   = g.queue_delay[static_cast<std::size_t>(io_class::prefetch)];
+  auto const& d   = g.queue_delay[0];
+  auto const& p   = g.queue_delay[1];
   auto hist_total = [](auto const& s) {
     std::uint64_t n = 0;
     for (auto c : s.histogram)
@@ -579,6 +580,45 @@ TEST_CASE("io_uring queue-delay gauge counts each request once, per io_class",
   CHECK(again.queue_delay[0].count == 0);
   CHECK(again.queue_delay[1].count == 0);
   CHECK(again.queue_delay[0].max_ns == 0);
+}
+
+TEST_CASE("io_uring parks an active low request for a high one and resumes it",
+          "[io][uring][priority]")
+{
+  using cucascade::io::io_priority;
+  // A long low request at one slice per pass, so it is still active when the
+  // high request lands behind it.
+  constexpr std::size_t n_slices = 512;
+  constexpr std::size_t stride   = 64UL << 10;
+  constexpr std::size_t total    = n_slices * stride;
+  pattern_file const file{total};
+  auto const ranges = slice_ranges(n_slices, stride, false);
+
+  spp_reactor reactor{1};
+  aligned_bytes low_dst{total};
+  aligned_bytes high_dst{total};
+  auto low = enqueue_ranges(reactor.get(), file.open(), ranges, low_dst.get(), io_priority::low);
+  // Wait until the worker has taken the low request; otherwise the high one could
+  // simply be dequeued first, with nothing to preempt.
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (reactor.get().take_gauges().requests_started == 0) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::yield();
+  }
+  std::vector<range> const one{ranges.back()};
+  auto high = enqueue_ranges(reactor.get(), file.open(), one, high_dst.get(), io_priority::high);
+
+  CHECK(std::move(high).get(std::chrono::seconds(30)) == stride);
+  CHECK(std::move(low).get(std::chrono::seconds(30)) == total);
+  CHECK(reactor.get().take_gauges().preemptions >= 1);
+
+  // Parking loses nothing: both destinations hold the file's bytes.
+  for (std::size_t i = 0; i < total; i += 4093) {
+    REQUIRE(low_dst.get()[i] == pattern_byte(i));
+  }
+  for (std::size_t i = ranges.back().offset; i < total; ++i) {
+    REQUIRE(high_dst.get()[i] == pattern_byte(i));
+  }
 }
 
 TEST_CASE("io_uring slices_per_pass never changes the bytes read", "[io][uring][slices_per_pass]")

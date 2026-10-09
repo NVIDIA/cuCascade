@@ -332,18 +332,33 @@ class fs_cache {
   /// outside the cache.
   [[nodiscard]] std::size_t chunk_size() const noexcept { return _chunk_size; }
 
-  [[nodiscard]] std::size_t host_read(
-    const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle = nullptr);
+  // @p priority on the reads below is the reactor queue tier for whatever the
+  // cache cannot serve itself (see @ref io_priority); @c automatic resolves to
+  // high for the single-range and device forms and low for host ranges.
+
+  [[nodiscard]] std::size_t host_read(const io_object& obj,
+                                      size_t offset,
+                                      size_t size,
+                                      uint8_t* dst,
+                                      cache_handle* handle = nullptr,
+                                      io_priority priority = io_priority::automatic);
 
   [[nodiscard]] exec::semi_future<std::size_t> host_read_async(
-    const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle = nullptr);
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    cache_handle* handle = nullptr,
+    io_priority priority = io_priority::automatic);
 
-  [[nodiscard]] exec::semi_future<std::size_t> device_read_async(const io_object& obj,
-                                                                 size_t offset,
-                                                                 size_t size,
-                                                                 uint8_t* device_ptr,
-                                                                 ::cuda::stream_ref stream,
-                                                                 cache_handle* handle = nullptr);
+  [[nodiscard]] exec::semi_future<std::size_t> device_read_async(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* device_ptr,
+    ::cuda::stream_ref stream,
+    cache_handle* handle = nullptr,
+    io_priority priority = io_priority::automatic);
 
   /// Vectored form of @ref device_read_async: each range is served from the
   /// cache where it is populated, loaded through the cache where it can be, and
@@ -354,14 +369,18 @@ class fs_cache {
     const io_object& obj,
     std::span<const slice> slices,
     ::cuda::stream_ref stream,
-    cache_handle* handle = nullptr);
+    cache_handle* handle = nullptr,
+    io_priority priority = io_priority::automatic);
 
   /// Vectored form of @ref host_read_async: each range is served from the cache
   /// where populated, claimed and populated when possible, and read directly
   /// into the caller buffer otherwise. Reports the clamped logical byte count
   /// once every physical operation has settled.
   [[nodiscard]] exec::semi_future<std::size_t> host_read_ranges_async(
-    const io_object& obj, std::span<const slice> slices, cache_handle* handle = nullptr);
+    const io_object& obj,
+    std::span<const slice> slices,
+    cache_handle* handle = nullptr,
+    io_priority priority = io_priority::automatic);
 
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
