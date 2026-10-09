@@ -1095,3 +1095,24 @@ TEST_CASE("cache summary snapshots stay consistent under concurrent queries",
   CHECK(after[1] > before[1]);
   CHECK(server.get_count() == 1);
 }
+
+// ===========================================================================
+// Datasource cache query
+// ===========================================================================
+
+TEST_CASE("a datasource reports whether its ioctx reads through an fs_cache",
+          "[cache][cache_identity]")
+{
+  auto memory  = identity_memory();
+  auto context = std::make_shared<held_context>();
+  datasource const source(context, held_object("s3://controlled/uses-cache.bin", "\"one\""));
+
+  // The query is part of the public const surface, and follows the ioctx's cache
+  // as it is initialized and shut down.
+  CHECK_FALSE(source.uses_fs_cache());
+  context->initialize_cache(*memory, identity_cache_config(), nullptr);
+  REQUIRE(context->cache() != nullptr);
+  CHECK(source.uses_fs_cache());
+  context->shutdown_cache();
+  CHECK_FALSE(source.uses_fs_cache());
+}
