@@ -41,7 +41,7 @@
 #include <vector>
 
 namespace cucascade::io::cache {
-class cached_chunk;
+struct cached_chunk;
 }
 
 namespace cucascade::io {
