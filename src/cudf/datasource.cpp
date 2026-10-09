@@ -181,25 +181,28 @@ std::future<size_t> datasource::device_read_async(size_t offset,
 }
 
 std::future<size_t> datasource::device_read_ranges_async(std::span<const slice> ranges,
-                                                         ::cuda::stream_ref stream)
+                                                         ::cuda::stream_ref stream,
+                                                         io_priority priority)
 {
   return bridge_semi_to_std([&] {
     if (uses_fs_cache()) {
       auto* cache = _io_ctx->cache();
-      return cache->device_read_ranges_async(*_io_object, ranges, stream, &_prefetch_handle);
+      return cache->device_read_ranges_async(
+        *_io_object, ranges, stream, &_prefetch_handle, priority);
     }
-    return _io_ctx->device_readv_async_io(*_io_object, ranges, stream);
+    return _io_ctx->device_readv_async_io(*_io_object, ranges, stream, priority);
   });
 }
 
-std::future<size_t> datasource::host_read_ranges_async(std::span<const slice> ranges)
+std::future<size_t> datasource::host_read_ranges_async(std::span<const slice> ranges,
+                                                       io_priority priority)
 {
   return bridge_semi_to_std([&] {
     if (uses_fs_cache()) {
       auto* cache = _io_ctx->cache();
-      return cache->host_read_ranges_async(*_io_object, ranges, &_prefetch_handle);
+      return cache->host_read_ranges_async(*_io_object, ranges, &_prefetch_handle, priority);
     }
-    return _io_ctx->host_readv_async_io(*_io_object, ranges);
+    return _io_ctx->host_readv_async_io(*_io_object, ranges, priority);
   });
 }
 

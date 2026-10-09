@@ -156,10 +156,17 @@ class datasource : public cudf::io::datasource {
   /// read.  Callers holding many ranges (e.g. a parquet scan's column chunks)
   /// should prefer this over one @c device_read_async per range: it costs one
   /// request instead of N, and lets the backend fuse and order the whole batch.
+  ///
+  /// \p priority is the reactor queue tier (see @c io_priority); @c automatic
+  /// resolves to high, as for every device read.
   std::future<size_t> device_read_ranges_async(std::span<const slice> slices,
-                                               ::cuda::stream_ref stream);
+                                               ::cuda::stream_ref stream,
+                                               io_priority priority = io_priority::automatic);
 
-  std::future<size_t> host_read_ranges_async(std::span<const slice> slices);
+  /// \brief Vectored host read.  \p priority as above; @c automatic resolves to
+  /// low, since a multi-range host read is treated as bulk.
+  std::future<size_t> host_read_ranges_async(std::span<const slice> slices,
+                                             io_priority priority = io_priority::automatic);
 
   // ---- Advisory IO ---------------------------------------------------------
 
