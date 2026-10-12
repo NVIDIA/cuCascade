@@ -176,7 +176,8 @@ class rest_io_object : public io_object {
   [[nodiscard]] static bool is_strong_tag(std::string_view etag) noexcept
   {
     if (etag.size() < 2 || etag.front() != '"' || etag.back() != '"') { return false; }
-    for (unsigned char const c : etag.substr(1, etag.size() - 2)) {
+    for (char const ch : etag.substr(1, etag.size() - 2)) {
+      auto const c = static_cast<unsigned char>(ch);
       if (c == '"' || c < 0x21 || c == 0x7F) { return false; }
     }
     return true;
