@@ -544,10 +544,6 @@ TEST_CASE("cache identity pins retired bytes until a gated device copy completes
   CHECK(copying.get() == object_bytes);
   // Once the stream has passed the copy the retirement lets go and the generation
   // is reclaimed.
-  auto const deadline = std::chrono::steady_clock::now() + 5s;
-  while (cache.retired_generation_count() != 0 && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
   require_generations(cache, object_uri, 1, 0);
   CHECK(cache.claimed_bytes() == chunk_bytes);
 
@@ -593,10 +589,17 @@ TEST_CASE("cache identity rejects mid-open replacement on allocated fills",
 TEST_CASE("cache identity rejects mid-open replacement on bypass reads",
           "[cache][cache_identity][rest]")
 {
+  bool conditional_failure = false;
+  SECTION("a 206 carries a different validator") {}
+  SECTION("a 412 refuses the original condition") { conditional_failure = true; }
   std::unordered_map<std::string, key_response_script> scripts;
   scripts["object.bin"].heads = {scripted_response{.etag = version_tag(1)}};
-  // The replacement answers the conditional GET with a 206 of its own version.
-  scripts["object.bin"].gets = {scripted_response{.etag = version_tag(2)}};
+  if (conditional_failure) {
+    scripts["object.bin"].gets = {scripted_response{.status = 412}};
+  } else {
+    // The replacement answers the conditional GET with a 206 of its own version.
+    scripts["object.bin"].gets = {scripted_response{.etag = version_tag(2)}};
+  }
   loopback_range_server server(base_object(), {}, {}, std::move(scripts));
   rest_cache_fixture fixture(server);
   auto& cache = *fixture.context->cache();
@@ -610,7 +613,7 @@ TEST_CASE("cache identity rejects mid-open replacement on bypass reads",
   std::vector<std::uint8_t> bytes(source->size());
   for (std::size_t attempt = 1; attempt <= 2; ++attempt) {
     auto failure = capture_failure([&] { source->host_read(0, bytes.size(), bytes.data()); });
-    require_changed(failure, object_uri, expected, version_tag(2));
+    require_changed(failure, object_uri, expected, conditional_failure ? "" : version_tag(2));
     CHECK(server.get_count() == attempt);
     CHECK(cache.claimed_bytes() == 0);
   }

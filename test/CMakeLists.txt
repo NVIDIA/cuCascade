@@ -82,12 +82,14 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     unittest.cpp)
 
   target_sources(
-    cucascade_io_tests PRIVATE io/rest/test_rest_reactor.cpp
-                               io/rest/test_rest_ioctx_contracts.cpp)
+    cucascade_io_tests
+    PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
+            io/test_io_request.cpp)
 
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
   if(CUCASCADE_BUILD_CUDF)
-    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp)
+    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp
+                                              io/kvikio/test_kvikio_remote.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
@@ -124,8 +126,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   # The datasource bridge and its cache-level tests exist only in an io build.
   if(CUCASCADE_BUILD_IO)
     target_sources(
-      cucascade_cudf_tests PRIVATE cudf/test_cache_object_identity.cpp
-                                   cudf/test_rest_datasource_contracts.cpp)
+      cucascade_cudf_tests
+      PRIVATE cudf/test_cache_object_identity.cpp
+              cudf/test_rest_datasource_contracts.cpp
+              cudf/test_cache_read_arbitration.cpp
+              cudf/test_dispose_eviction.cpp
+              cudf/test_explicit_eviction.cpp)
   endif()
 
   set_target_properties(cucascade_cudf_tests

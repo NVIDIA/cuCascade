@@ -1041,7 +1041,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumul
 }
 
 TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
-          "[.][rest][listing][stress]")
+          "[rest][listing][stress]")
 {
   if (auto const* child = std::getenv("CUCASCADE_REST_LIST_STRESS_CHILD");
       child == nullptr || std::string_view{child} != "1") {
