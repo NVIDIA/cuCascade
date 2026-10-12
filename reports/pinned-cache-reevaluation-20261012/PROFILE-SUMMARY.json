@@ -1,0 +1,730 @@
+{
+  "baseline": {
+    "cuda_api_counts": {
+      "cudaEventRecord_v3020": 184,
+      "cudaEventSynchronize_v3020": 15,
+      "cudaFreeHost_v3020": 13,
+      "cudaHostAlloc_v3020": 14,
+      "cudaStreamWaitEvent_v3020": 189
+    },
+    "gpu_kernels": 272,
+    "gpu_copies": 136,
+    "nvtx_schema": [
+      [
+        0,
+        "start",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        1,
+        "end",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        2,
+        "eventType",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "rangeId",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        4,
+        "category",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        5,
+        "color",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        6,
+        "text",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        7,
+        "globalTid",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        8,
+        "endGlobalTid",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        9,
+        "textId",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        10,
+        "domainId",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        11,
+        "uint64Value",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        12,
+        "int64Value",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        13,
+        "doubleValue",
+        "REAL",
+        0,
+        null,
+        0
+      ],
+      [
+        14,
+        "uint32Value",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        15,
+        "int32Value",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        16,
+        "floatValue",
+        "REAL",
+        0,
+        null,
+        0
+      ],
+      [
+        17,
+        "jsonTextId",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        18,
+        "jsonText",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        19,
+        "binaryData",
+        "TEXT",
+        0,
+        null,
+        0
+      ]
+    ],
+    "read_labels": [
+      [
+        32,
+        "read_parquet"
+      ]
+    ],
+    "diagnostic_schema": [
+      [
+        0,
+        "timestamp",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        1,
+        "timestampType",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        2,
+        "source",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "severity",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        4,
+        "text",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        5,
+        "globalPid",
+        "INTEGER",
+        0,
+        null,
+        0
+      ]
+    ],
+    "diagnostics": [
+      [
+        0,
+        1,
+        3,
+        1,
+        "Profiling has started.",
+        -144115188075855872
+      ],
+      [
+        127008,
+        1,
+        2,
+        1,
+        "Process was launched by the profiler, see /tmp/nvidia/nsight_systems/quadd_session_10652769/streams/pid_652783_stdout.log and stderr.log for program output",
+        292426858102784
+      ],
+      [
+        12553888,
+        1,
+        1,
+        1,
+        "Common injection library initialized successfully.",
+        292426858102784
+      ],
+      [
+        13798912,
+        1,
+        1,
+        1,
+        "Buffers holding CUDA trace data will be flushed on CudaProfilerStop() call. See --flush-on-cudaprofilerstop to control this behavior.",
+        292426858102784
+      ],
+      [
+        17208085,
+        2,
+        3,
+        1,
+        "Number of NVTX events collected: \t393.",
+        292426858102784
+      ],
+      [
+        17212597,
+        2,
+        3,
+        1,
+        "Number of CUDA events collected: \t4898.",
+        292426858102784
+      ],
+      [
+        19643664,
+        1,
+        1,
+        1,
+        "Loaded CUPTI library: /opt/nvidia/nsight-systems/2025.3.2/target-linux-sbsa-armv8/libcupti-sbsa.so.13.1",
+        292426858102784
+      ],
+      [
+        168866816,
+        1,
+        1,
+        1,
+        "Enabling trace for device graph launch",
+        292426858102784
+      ],
+      [
+        172825136,
+        1,
+        1,
+        1,
+        "CUDA injection initialized successfully.",
+        292426858102784
+      ],
+      [
+        211738256,
+        1,
+        1,
+        3,
+        "CUDA device 0: Unified Memory trace is not supported by the current driver version or configuration.",
+        292426858102784
+      ],
+      [
+        435610672,
+        1,
+        1,
+        1,
+        "NVTX injection initialized successfully.",
+        292426858102784
+      ],
+      [
+        692042224,
+        1,
+        1,
+        1,
+        "Number of CUPTI events produced: \t5768, CUPTI buffers: 50.",
+        292426858102784
+      ],
+      [
+        1006740736,
+        1,
+        3,
+        1,
+        "Profiling has stopped.",
+        -144115188075855872
+      ]
+    ],
+    "read_windows": [
+      {
+        "iteration": 0,
+        "regime": "initial/warmup",
+        "host_api_counts": {
+          "cudaFreeHost_v3020": 3,
+          "cudaHostAlloc_v3020": 3
+        }
+      },
+      {
+        "iteration": 1,
+        "regime": "initial/warmup",
+        "host_api_counts": {
+          "cudaFreeHost_v3020": 3,
+          "cudaHostAlloc_v3020": 3
+        }
+      },
+      {
+        "iteration": 2,
+        "regime": "initial/warmup",
+        "host_api_counts": {
+          "cudaFreeHost_v3020": 3,
+          "cudaHostAlloc_v3020": 3
+        }
+      },
+      {
+        "iteration": 3,
+        "regime": "hot",
+        "host_api_counts": {
+          "cudaFreeHost_v3020": 3,
+          "cudaHostAlloc_v3020": 3
+        }
+      }
+    ]
+  },
+  "candidate": {
+    "cuda_api_counts": {
+      "cudaEventRecord_v3020": 196,
+      "cudaEventSynchronize_v3020": 21,
+      "cudaFreeHost_v3020": 4,
+      "cudaHostAlloc_v3020": 5,
+      "cudaStreamWaitEvent_v3020": 198
+    },
+    "gpu_kernels": 272,
+    "gpu_copies": 136,
+    "nvtx_schema": [
+      [
+        0,
+        "start",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        1,
+        "end",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        2,
+        "eventType",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "rangeId",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        4,
+        "category",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        5,
+        "color",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        6,
+        "text",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        7,
+        "globalTid",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        8,
+        "endGlobalTid",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        9,
+        "textId",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        10,
+        "domainId",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        11,
+        "uint64Value",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        12,
+        "int64Value",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        13,
+        "doubleValue",
+        "REAL",
+        0,
+        null,
+        0
+      ],
+      [
+        14,
+        "uint32Value",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        15,
+        "int32Value",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        16,
+        "floatValue",
+        "REAL",
+        0,
+        null,
+        0
+      ],
+      [
+        17,
+        "jsonTextId",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        18,
+        "jsonText",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        19,
+        "binaryData",
+        "TEXT",
+        0,
+        null,
+        0
+      ]
+    ],
+    "read_labels": [
+      [
+        32,
+        "read_parquet"
+      ]
+    ],
+    "diagnostic_schema": [
+      [
+        0,
+        "timestamp",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        1,
+        "timestampType",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        2,
+        "source",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "severity",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        4,
+        "text",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        5,
+        "globalPid",
+        "INTEGER",
+        0,
+        null,
+        0
+      ]
+    ],
+    "diagnostics": [
+      [
+        0,
+        1,
+        3,
+        1,
+        "Profiling has started.",
+        -144115188075855872
+      ],
+      [
+        75120,
+        1,
+        2,
+        1,
+        "Process was launched by the profiler, see /tmp/nvidia/nsight_systems/quadd_session_10652896/streams/pid_652910_stdout.log and stderr.log for program output",
+        292428988809216
+      ],
+      [
+        19541056,
+        1,
+        1,
+        1,
+        "Common injection library initialized successfully.",
+        292428988809216
+      ],
+      [
+        21717264,
+        1,
+        1,
+        1,
+        "Buffers holding CUDA trace data will be flushed on CudaProfilerStop() call. See --flush-on-cudaprofilerstop to control this behavior.",
+        292428988809216
+      ],
+      [
+        30035490,
+        2,
+        3,
+        1,
+        "Number of NVTX events collected: \t393.",
+        292428988809216
+      ],
+      [
+        30041906,
+        2,
+        3,
+        1,
+        "Number of CUDA events collected: \t4925.",
+        292428988809216
+      ],
+      [
+        32099712,
+        1,
+        1,
+        1,
+        "Loaded CUPTI library: /opt/nvidia/nsight-systems/2025.3.2/target-linux-sbsa-armv8/libcupti-sbsa.so.13.1",
+        292428988809216
+      ],
+      [
+        170938880,
+        1,
+        1,
+        1,
+        "Enabling trace for device graph launch",
+        292428988809216
+      ],
+      [
+        174850336,
+        1,
+        1,
+        1,
+        "CUDA injection initialized successfully.",
+        292428988809216
+      ],
+      [
+        213511312,
+        1,
+        1,
+        3,
+        "CUDA device 0: Unified Memory trace is not supported by the current driver version or configuration.",
+        292428988809216
+      ],
+      [
+        433704432,
+        1,
+        1,
+        1,
+        "NVTX injection initialized successfully.",
+        292428988809216
+      ],
+      [
+        689326656,
+        1,
+        1,
+        1,
+        "Number of CUPTI events produced: \t5822, CUPTI buffers: 50.",
+        292428988809216
+      ],
+      [
+        1006929072,
+        1,
+        3,
+        1,
+        "Profiling has stopped.",
+        -144115188075855872
+      ]
+    ],
+    "read_windows": [
+      {
+        "iteration": 0,
+        "regime": "initial/warmup",
+        "host_api_counts": {
+          "cudaHostAlloc_v3020": 3
+        }
+      },
+      {
+        "iteration": 1,
+        "regime": "initial/warmup",
+        "host_api_counts": {}
+      },
+      {
+        "iteration": 2,
+        "regime": "initial/warmup",
+        "host_api_counts": {}
+      },
+      {
+        "iteration": 3,
+        "regime": "hot",
+        "host_api_counts": {}
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+name, utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
+NVIDIA GB10, 0 %, 42, 208 MHz
+pid, process_name, used_gpu_memory [MiB]
+GPU stable after 3 samples, UTC 2026-10-12T21:47:39Z
+PASS pending_dma_destructor
+1 fault cases passed

@@ -1,0 +1,13 @@
+{"type":"config","candidate":false,"pinned_threshold":0,"copy_threshold":0}
+{"type":"parquet","iteration":0,"warm":false,"ms":80.4605,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":1,"warm":false,"ms":49.2931,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":2,"warm":false,"ms":49.2068,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":3,"warm":true,"ms":48.8178,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":4,"warm":true,"ms":48.9358,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":5,"warm":true,"ms":48.8988,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":6,"warm":true,"ms":48.8659,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":7,"warm":true,"ms":48.8506,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":8,"warm":true,"ms":49.3407,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":9,"warm":true,"ms":48.9193,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"parquet","iteration":10,"warm":true,"ms":48.7732,"rows":600572,"columns":16,"digest":16342477538070118188,"allocations":37,"large_allocations":3,"requested_bytes":71199}
+{"type":"path","size_log2_counts":[22,0,88,88,11,11,0,44,22,33,11,44,11,22,11,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}

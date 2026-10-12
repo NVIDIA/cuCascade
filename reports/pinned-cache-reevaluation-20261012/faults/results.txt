@@ -1,0 +1,25 @@
+name, utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
+NVIDIA GB10, 0 %, 43, 208 MHz
+pid, process_name, used_gpu_memory [MiB]
+GPU stable after 3 samples, UTC 2026-10-12T21:43:23Z
+PASS large_wait_failure
+PASS slab_wait_failure
+PASS large_create_and_sync_failure
+PASS large_record_and_sync_failure
+PASS slab_create_and_sync_failure
+PASS slab_record_and_sync_failure
+PASS eviction_sync_failure
+PASS purge_sync_failure
+PASS destructor_sync_failure
+PASS host_oom_recovery
+PASS host_oom_recovery_with_metadata_oom
+PASS host_oom_retry_failure
+PASS metadata_oom_first_allocation
+PASS metadata_oom_second_allocation
+PASS metadata_oom_third_allocation
+PASS event_recycling_metadata_oom
+PASS record_failure_and_metadata_oom
+PASS uncached_sync_failure
+observed cudaHostAlloc requested flags=3
+PASS mapped_portable_flags
+19 fault cases passed

@@ -1,0 +1,100 @@
+{
+  "B": {
+    "scope": "Q18 first hot iteration; explicitly clipped to profiler API markers",
+    "clip_start_ns": 4724304,
+    "clip_end_ns": 1351083552,
+    "range_seconds": 1.346359248,
+    "sirius_query_ranges": [
+      [
+        17379728,
+        1348803856
+      ]
+    ],
+    "runtime": {
+      "cudaHostAlloc_v3020": {
+        "count": 186,
+        "profiled_total_ms": 158.302624,
+        "max_return_value": 0
+      },
+      "cudaStreamSynchronize_v3020": {
+        "count": 1955,
+        "profiled_total_ms": 328.94104,
+        "max_return_value": 0
+      },
+      "cudaStreamWaitEvent_v3020": {
+        "count": 901,
+        "profiled_total_ms": 2.224816,
+        "max_return_value": 0
+      },
+      "cudaFreeHost_v3020": {
+        "count": 186,
+        "profiled_total_ms": 45.932512,
+        "max_return_value": 0
+      },
+      "cudaEventSynchronize_v3020": {
+        "count": 12,
+        "profiled_total_ms": 23.189872,
+        "max_return_value": 0
+      }
+    },
+    "kernels": 1608,
+    "copies": 2389,
+    "copy_bytes": 3166494775,
+    "CUDA_API_nonzero_return_codes": [
+      {
+        "name": "cudaEventQuery_v3020",
+        "code": 600,
+        "count": 1442
+      }
+    ]
+  },
+  "C": {
+    "scope": "Q18 first hot iteration; explicitly clipped to profiler API markers",
+    "clip_start_ns": 4431184,
+    "clip_end_ns": 1327938544,
+    "range_seconds": 1.32350736,
+    "sirius_query_ranges": [
+      [
+        17456640,
+        1325692336
+      ]
+    ],
+    "runtime": {
+      "cudaStreamWaitEvent_v3020": {
+        "count": 1087,
+        "profiled_total_ms": 2.49184,
+        "max_return_value": 0
+      },
+      "cudaStreamSynchronize_v3020": {
+        "count": 1955,
+        "profiled_total_ms": 262.884624,
+        "max_return_value": 0
+      },
+      "cudaEventSynchronize_v3020": {
+        "count": 17,
+        "profiled_total_ms": 33.35592,
+        "max_return_value": 0
+      },
+      "cudaHostAlloc_v3020": {
+        "count": 0,
+        "profiled_total_ms": 0,
+        "max_return_value": null
+      },
+      "cudaFreeHost_v3020": {
+        "count": 0,
+        "profiled_total_ms": 0,
+        "max_return_value": null
+      }
+    },
+    "kernels": 1608,
+    "copies": 2383,
+    "copy_bytes": 3166494775,
+    "CUDA_API_nonzero_return_codes": [
+      {
+        "name": "cudaEventQuery_v3020",
+        "code": 600,
+        "count": 606
+      }
+    ]
+  }
+}

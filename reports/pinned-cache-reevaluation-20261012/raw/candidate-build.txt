@@ -1,0 +1,13 @@
+[1/42] Scanning /home/kkristensen/Code/cuCascade/src/memory/small_pinned_host_memory_resource.cpp for CXX dependencies
+[2/42] Generating CXX dyndep file CMakeFiles/cucascade_objects.dir/CXX.dd
+[3/21] Scanning /home/kkristensen/Code/cuCascade/test/memory/test_small_pinned_host_memory_resource.cpp for CXX dependencies
+[4/21] Generating CXX dyndep file test/CMakeFiles/cucascade_tests.dir/CXX.dd
+[5/13] Building CXX object CMakeFiles/cucascade_objects.dir/src/memory/small_pinned_host_memory_resource.cpp.o
+[6/13] Linking CXX shared library libcucascade.so
+[7/13] Linking CXX shared library libcucascade_io.so
+[8/13] Linking CXX shared library libcucascade_cudf.so
+[9/13] Linking CXX executable test/cucascade_io_tests
+[10/13] Linking CXX executable benchmark/cucascade_benchmarks
+[11/13] Linking CXX executable test/cucascade_cudf_tests
+[12/13] Building CXX object test/CMakeFiles/cucascade_tests.dir/memory/test_small_pinned_host_memory_resource.cpp.o
+[13/13] Linking CXX executable test/cucascade_tests

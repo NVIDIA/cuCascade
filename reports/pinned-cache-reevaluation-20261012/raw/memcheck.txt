@@ -1,0 +1,11 @@
+name, utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
+NVIDIA GB10, 0 %, 43, 208 MHz
+pid, process_name, used_gpu_memory [MiB]
+GPU stable after 3 samples, UTC 2026-10-12T21:43:01Z
+========= COMPUTE-SANITIZER
+Filters: [small_pinned] [stream_ordering]
+RNG seed: 3621014912
+All tests passed (12 assertions in 2 test cases)
+
+
+========= ERROR SUMMARY: 0 errors

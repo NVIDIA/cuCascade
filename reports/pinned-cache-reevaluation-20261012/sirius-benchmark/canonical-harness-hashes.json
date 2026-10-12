@@ -1,0 +1,13 @@
+{
+  "/home/kkristensen/Code/sirius/test/tpch_performance/tpch_power_throughput.py": "7ecb3b922c58f352e91ff0f2367a41e04a1420fca9440b2ef54ccc442a8d80ff",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/prep_analysis_bundles.py": "5f4f0399fdfd9cf2405579429b02c97b315d12a2700fcfc3601de8f8933a8a0a",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/tpch_pin_columns.py": "ce76484cc2e475ed9e60adf9cd60b57dc1851f75dc556a0be75e6dc80c0e910a",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/compare_results.py": "76a2562d12336f7677adbf519e4d449d0077d17c2cf414a047d096ed1a3ad46e",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/performance_test.py": "2ed334bace04c17979f79ef1dd00b302fda0d44502d1917310515c23f1dae329",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/test_performance_test_s3.py": "28ac4f6e4e3726fae728119e72eafc02151671b346c796d1c7bd5ae69351527e",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/queries.py": "c9ae5a51870ced2e1f7aec82eb58517536fa66615c94ba1d3e3953d6b41d0e8b",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/generate_test_data.py": "c203a23c9150083522c11f31b7003c59308d32f67f992e5fb00b6613d1c366bf",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/tpch_stream_permutations.py": "d2547c4b8b6ef226f2c013bfdf7ef603011304d6dcaf51c2820cdaa7e0c8bd41",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/test_queries.py": "53331125cdb96d957053afa72d20ec9004378b764a44f6640c75ed7141bb15a1",
+  "/home/kkristensen/Code/sirius/test/tpch_performance/tpch_query_streams.py": "b5de09539c03bc7f0c4f9f22d65d7f3b5d5cf0a08926818a0eced43f2ae7895f"
+}
