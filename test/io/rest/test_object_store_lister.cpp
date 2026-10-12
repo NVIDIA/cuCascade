@@ -27,13 +27,16 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -77,9 +80,16 @@ struct observed_query {
 
 class scripted_list_server {
  public:
-  explicit scripted_list_server(std::vector<scripted_page> pages) : _pages(std::move(pages))
+  using page_source = std::function<std::optional<scripted_page>(observed_query const&)>;
+
+  explicit scripted_list_server(std::vector<scripted_page> pages,
+                                page_source source            = {},
+                                std::size_t observation_limit = 2048)
+    : _pages(std::move(pages)), _source(std::move(source)), _observation_limit(observation_limit)
   {
-    if (_pages.empty()) { throw std::invalid_argument("scripted LIST server needs a page"); }
+    if (_pages.empty() && !_source) {
+      throw std::invalid_argument("scripted LIST server needs a page");
+    }
 
     _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (_listen_fd < 0) { throw std::runtime_error("socket failed: " + errno_message()); }
@@ -117,6 +127,10 @@ class scripted_list_server {
   {
     _stop.store(true, std::memory_order_relaxed);
     if (_listen_fd >= 0) { (void)::shutdown(_listen_fd, SHUT_RDWR); }
+    {
+      std::scoped_lock lock{_client_mutex};
+      if (_client_fd >= 0) { (void)::shutdown(_client_fd, SHUT_RDWR); }
+    }
     if (_thread.joinable()) { _thread.join(); }
     close_listener();
   }
@@ -130,6 +144,9 @@ class scripted_list_server {
   {
     return _request_count.load(std::memory_order_relaxed);
   }
+  [[nodiscard]] std::size_t get_count() const noexcept { return _get_count.load(); }
+  [[nodiscard]] std::size_t head_count() const noexcept { return _head_count.load(); }
+  [[nodiscard]] std::size_t max_page_entries() const noexcept { return _max_page_entries.load(); }
 
   [[nodiscard]] std::vector<observed_query> observations() const
   {
@@ -157,8 +174,20 @@ class scripted_list_server {
         if (_stop.load(std::memory_order_relaxed)) { return; }
         continue;
       }
+      {
+        std::scoped_lock lock{_client_mutex};
+        if (_stop.load(std::memory_order_relaxed)) {
+          (void)::close(fd);
+          return;
+        }
+        _client_fd = fd;
+      }
       handle_client(fd);
-      (void)::close(fd);
+      {
+        std::scoped_lock lock{_client_mutex};
+        _client_fd = -1;
+        (void)::close(fd);
+      }
     }
   }
 
@@ -167,6 +196,7 @@ class scripted_list_server {
     timeval timeout{};
     timeout.tv_sec = 5;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     std::string request;
     std::array<char, 4096> buffer{};
@@ -177,7 +207,11 @@ class scripted_list_server {
     }
 
     std::string const target = request_target(request);
-    if (request.rfind("GET ", 0) != 0 || target.find("list-type=2") == std::string::npos) {
+    bool const is_get        = request.rfind("GET ", 0) == 0;
+    bool const is_list       = is_get && target.find("list-type=2") != std::string::npos;
+    if (request.rfind("HEAD ", 0) == 0) { _head_count.fetch_add(1); }
+    if (is_get && !is_list) { _get_count.fetch_add(1); }
+    if (!is_list) {
       send_all(fd,
                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: "
                "close\r\n\r\n");
@@ -189,14 +223,19 @@ class scripted_list_server {
                                .prefix             = query_value(target, "prefix")};
     {
       std::scoped_lock lock{_observations_mutex};
-      _observations.push_back(observation);
+      if (_observations.size() < _observation_limit) { _observations.push_back(observation); }
     }
     _request_count.fetch_add(1, std::memory_order_relaxed);
 
-    auto const* page = find_page(observation.continuation_token);
+    auto generated = _source ? _source(observation) : std::optional<scripted_page>{};
+    auto const* page =
+      _source ? (generated ? &*generated : nullptr) : find_page(observation.continuation_token);
     if (page == nullptr) {
       send_all(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
       return;
+    }
+    if (page->objects.size() > _max_page_entries.load()) {
+      _max_page_entries.store(page->objects.size());
     }
 
     std::string const body = page_xml(*page);
@@ -315,12 +354,62 @@ class scripted_list_server {
   int _listen_fd{-1};
   std::uint16_t _port{0};
   std::vector<scripted_page> _pages;
+  page_source _source;
+  std::size_t _observation_limit;
+  std::mutex _client_mutex;
+  int _client_fd{-1};
   std::atomic<bool> _stop{false};
   std::atomic<std::size_t> _request_count{0};
+  std::atomic<std::size_t> _get_count{0};
+  std::atomic<std::size_t> _head_count{0};
+  std::atomic<std::size_t> _max_page_entries{0};
   mutable std::mutex _observations_mutex;
   std::vector<observed_query> _observations;
   std::thread _thread;
 };
+
+scripted_list_server::page_source generated_listing(std::size_t count, std::string prefix)
+{
+  return [count,
+          prefix = std::move(prefix)](observed_query const& query) -> std::optional<scripted_page> {
+    scripted_page page;
+    page.request_token                      = query.continuation_token;
+    constexpr std::string_view token_prefix = "page /+=";
+    std::string_view token{query.continuation_token};
+    std::size_t offset = 0;
+    if (!token.empty()) {
+      if (!token.starts_with(token_prefix)) { return std::nullopt; }
+      token.remove_prefix(token_prefix.size());
+      auto const parsed = std::from_chars(token.data(), token.data() + token.size(), offset);
+      if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || offset > count) {
+        return std::nullopt;
+      }
+    }
+    std::size_t limit = 1000;
+    if (!query.max_keys.empty()) {
+      auto const* begin = query.max_keys.data();
+      auto const parsed = std::from_chars(begin, begin + query.max_keys.size(), limit);
+      if (parsed.ec != std::errc{} || parsed.ptr != begin + query.max_keys.size() || limit == 0) {
+        return std::nullopt;
+      }
+      limit = std::min(limit, std::size_t{1000});
+    }
+    page.objects.reserve(std::min(limit, count - offset));
+    while (offset < count && page.objects.size() < limit) {
+      auto key = prefix + std::to_string(offset);
+      if (key.starts_with(query.prefix)) {
+        page.objects.push_back({std::move(key), static_cast<std::uint64_t>(offset)});
+      }
+      ++offset;
+    }
+    while (offset < count && !(prefix + std::to_string(offset)).starts_with(query.prefix)) {
+      ++offset;
+    }
+    page.truncated = offset < count;
+    if (page.truncated) { page.next_token = std::string{token_prefix} + std::to_string(offset); }
+    return page;
+  };
+}
 
 class loopback_list_authorizer final : public request_authorizer {
  public:
@@ -344,7 +433,8 @@ class loopback_list_authorizer final : public request_authorizer {
   std::string _endpoint;
 };
 
-config listing_config(std::size_t list_max_matches = 100'000)
+config listing_config(std::size_t list_max_matches = 100'000,
+                      std::size_t list_max_scanned = 1'000'000)
 {
   config cfg{};
   cfg.request_timeout_s       = 5;
@@ -356,6 +446,7 @@ config listing_config(std::size_t list_max_matches = 100'000)
   cfg.retry_jitter            = 0ms;
   cfg.honor_retry_after       = false;
   cfg.list_max_matches        = list_max_matches;
+  cfg.list_max_scanned        = list_max_scanned;
   return cfg;
 }
 
@@ -409,12 +500,15 @@ object_store_lister make_direct_lister(std::shared_ptr<stub_page_fetch> fetch,
 }
 
 struct listing_fixture {
-  explicit listing_fixture(std::vector<scripted_page> pages, std::size_t list_max_matches = 100'000)
-    : server(std::move(pages)),
+  explicit listing_fixture(std::vector<scripted_page> pages,
+                           std::size_t list_max_matches             = 100'000,
+                           scripted_list_server::page_source source = {},
+                           std::size_t list_max_scanned             = 1'000'000)
+    : server(std::move(pages), std::move(source)),
       authorizer(std::make_shared<loopback_list_authorizer>(server.endpoint()))
   {
     auto context = std::make_shared<rest_reactor::reactor_context>(
-      listing_config(list_max_matches), authorizer, nullptr);
+      listing_config(list_max_matches, list_max_scanned), authorizer, nullptr);
     ioctx = std::make_shared<rest_ioctx>(1, std::move(context));
     ioctx->start();
   }
@@ -476,6 +570,35 @@ TEST_CASE("rest ioctx delegates paged listing to its composed lister", "[rest][l
     CHECK_THROWS_WITH(fixture.ioctx->list_objects("bucket", "prefix/", 2, 2),
                       Catch::Matchers::ContainsSubstring("rest_ioctx::list_objects:") &&
                         Catch::Matchers::ContainsSubstring("more than 2 objects"));
+  }
+
+  SECTION("generated pages remain bounded and round-trip opaque tokens")
+  {
+    listing_fixture generated({}, 100'000, generated_listing(1005, "generated/"));
+    std::size_t seen  = 0;
+    std::size_t pages = 0;
+    bool ordered      = true;
+    generated.ioctx->list_objects_paged(
+      "bucket", "generated/", 1000, [&](list_objects_v2_page const& page) {
+        ++pages;
+        CHECK(page.entries.size() <= 1000);
+        for (auto const& entry : page.entries) {
+          ordered =
+            ordered && entry.key == "generated/" + std::to_string(seen) && entry.size == seen;
+          ++seen;
+        }
+        return true;
+      });
+    CHECK(ordered);
+    CHECK(seen == 1005);
+    CHECK(pages == 2);
+    CHECK(generated.server.max_page_entries() == 1000);
+    CHECK(generated.server.request_count() == 2);
+    CHECK(generated.server.get_count() == 0);
+    CHECK(generated.server.head_count() == 0);
+    auto const queries = generated.server.observations();
+    REQUIRE(queries.size() == 2);
+    CHECK(queries[1].continuation_token == "page /+=1000");
   }
 }
 
