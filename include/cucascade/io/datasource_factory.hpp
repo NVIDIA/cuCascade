@@ -21,6 +21,7 @@
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/io_context.hpp>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -80,11 +81,47 @@ class io_context_registry {
    */
   void register_ioctx(io_context_type type, scheme_checker_type checker, factory_type factory);
 
+  /**
+   * @brief Replaces one backend registration before path routing begins.
+   *
+   * A URI scheme may have more than one backend implementation, but only one
+   * of them should claim that scheme explicitly. For example, the registry
+   * initially assigns `s3://` paths to @c io_context_type::restful; when
+   * S3-over-RDMA is selected, the caller replaces that registration with
+   * @c io_context_type::s3rdma.
+   *
+   * The checker and factory for @p new_type are installed and the @p old_type
+   * entry is removed while holding the registry's exclusive lock, so no lookup
+   * observes an intermediate routing state.
+   *
+   * This operation changes registration metadata only. It does not construct,
+   * shut down, or migrate any ioctx instance.
+   *
+   * @param old_type Registered backend to remove.
+   * @param new_type Backend type to register.
+   * @param checker  Predicate used to claim paths for @p new_type.
+   * @param factory  Factory used by @c make_ioctx for @p new_type.
+   *
+   * @throws std::invalid_argument if @p old_type is absent, @p new_type is
+   *         already registered, or @p checker or @p factory is empty.
+   * @throws std::logic_error if @c lookup_path has already been called.
+   *
+   * Provides the strong exception guarantee: the registry is unchanged if the
+   * replacement fails. Intended for single-threaded bootstrap.
+   */
+  void replace_ioctx(io_context_type old_type,
+                     io_context_type new_type,
+                     scheme_checker_type checker,
+                     factory_type factory);
+
   /// Resolve the backend for a full @p path (not a bare scheme — the checkers
   /// parse the URI / stat the filesystem themselves).  Explicit backends
   /// (uring / restful) take precedence over the kvikio catch-all, so `s3://`
   /// never resolves to kvikio and a local file routes to uring before the
-  /// universal fallback.  std::nullopt when nothing matches.
+  /// universal fallback.  When the registry was built with
+  /// `backend = io_backend::kvikio`, the uring local backend and the REST
+  /// backend are suppressed so local files and `s3://` objects fall through to
+  /// kvikio.  std::nullopt when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
@@ -103,8 +140,15 @@ class io_context_registry {
   };
   const config_type _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
+  /// Set when @c backend=kvikio: kvikIO then serves BOTH local files (instead
+  /// of uring) and @c s3:// objects (instead of rest) for reads.  LIST / glob
+  /// still goes to the REST backend, which callers obtain by type.
+  bool _prefer_kvikio{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
+  /// Set by the first @c lookup_path; @c replace_ioctx refuses afterwards
+  /// (bootstrap-only — see its contract).
+  mutable std::atomic<bool> _lookup_latched{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -120,8 +164,8 @@ class io_context_registry {
 // than thrown, matching @c io_context_registry::make_ioctx.
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
-/// @c config.local (bounce-slot size taken from the HOST-tier resource's block
-/// size) and @c config.uring_n_reactors.
+/// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
+/// HOST-tier resource block size; physical grouping is chosen by the worker.
 io_context_registry::factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);
 

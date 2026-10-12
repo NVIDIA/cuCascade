@@ -67,7 +67,7 @@ class disk_data_representation : public idata_representation {
    *
    * @throws cucascade::logic_error always.
    */
-  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) override;
 
   /**
    * @brief Access the underlying disk table allocation.

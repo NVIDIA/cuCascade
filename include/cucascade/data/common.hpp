@@ -17,9 +17,8 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
@@ -110,7 +109,7 @@ class idata_representation {
    * @param stream CUDA stream for memory operations
    * @return std::unique_ptr<idata_representation> A new data representation with copied data
    */
-  virtual std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) = 0;
+  virtual std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) = 0;
 
   /**
    * @brief Record a CUDA event marking completion of the most recent writes to this
@@ -122,7 +121,7 @@ class idata_representation {
    *
    * @param writer_stream The stream on which the most recent writes were enqueued.
    */
-  virtual void record_writer_event([[maybe_unused]] rmm::cuda_stream_view writer_stream) {}
+  virtual void record_writer_event([[maybe_unused]] ::cuda::stream_ref writer_stream) {}
 
   /**
    * @brief Get the writer event recorded by record_writer_event(), or nullptr if none.
@@ -146,7 +145,7 @@ class idata_representation {
    *
    * @param stream Stream used for future asynchronous deallocation of the data's buffers.
    */
-  virtual void rebind_stream([[maybe_unused]] rmm::cuda_stream_view stream) {}
+  virtual void rebind_stream([[maybe_unused]] ::cuda::stream_ref stream) {}
 
   /**
    * @brief Casts this interface to a specific derived type.

@@ -17,12 +17,9 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
+
 #include <cuda/memory_resource>
-#if __has_include(<cuda/stream>)
-#include <cuda/stream>
-#else
-#include <cuda/stream_ref>
-#endif
 
 #include <cstddef>
 

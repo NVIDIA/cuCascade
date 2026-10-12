@@ -19,7 +19,9 @@
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#ifdef CUCASCADE_HAS_KVIKIO
 #include <cucascade/io/kvikio/kvikio_context.hpp>
+#endif
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
@@ -78,19 +80,21 @@ std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
 
+#ifdef CUCASCADE_HAS_KVIKIO
 factory_type make_kvikio_ioctx_factory()
 {
   return [](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       // Applies config.kvikio to kvikIO's process-global defaults (see
       // kvikio_config): unset fields keep kvikIO's env-var-seeded values.
-      return std::make_shared<kvikio_context>(config.kvikio);
+      return std::make_shared<kvikio_context>(config.kvikio, config.object_store);
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
     }
   };
 }
+#endif
 
 factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
@@ -103,12 +107,8 @@ factory_type make_uring_ioctx_factory(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
-      // One reactor_context shared by the whole pool: it carries the per-reactor
-      // config (bounce-slot size taken from the staging resource's block size)
-      // and the pinned bounce-staging resource itself.
-      auto uring_cfg        = config.local;
-      uring_cfg.bounce_size = host_mr->get_block_size();
-      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(uring_cfg, host_mr);
+      // One reactor_context shares config and the pinned staging resource.
+      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
       return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
@@ -129,11 +129,8 @@ factory_type make_rest_ioctx_factory(
           "region missing); REST backend disabled");
         return nullptr;
       }
-      // Host staging is optional for REST — when absent, reactor-staged device
-      // reads are disabled (bounce_block_size 0), host reads still work.
-      auto* host_mr              = first_host_resource(reservation_manager);
-      auto rest_cfg              = config.rest;
-      rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
+      auto* host_mr = first_host_resource(reservation_manager);
+      auto rest_cfg = config.rest;
       // The object store owns the endpoint and its TLS trust; the reactor's
       // curl GETs must verify against the same CA bundle / policy the authorizer
       // presigns for, so source these from object_store rather than rest config.
@@ -155,16 +152,21 @@ factory_type make_rest_ioctx_factory(
 
 io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
-  : _config(std::move(config)), _reservation_manager(reservation_manager)
+  : _config(std::move(config)),
+    _reservation_manager(reservation_manager),
+    _prefer_kvikio(_config.backend == io_backend::kvikio)
 {
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  kvikio is the universal fallback —
   // it can open any local path — so it matches everything and lookup_path
-  // defers it behind the explicit backends.
+  // defers it behind the explicit backends.  Without kvikIO (a cudf-free
+  // build) there is no catch-all and unmatched paths resolve to nothing.
+#ifdef CUCASCADE_HAS_KVIKIO
   _entries.emplace(
     io_context_type::kvikio,
     entry{
       io_context_type::kvikio, [](std::string_view) { return true; }, make_kvikio_ioctx_factory()});
+#endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
@@ -185,10 +187,37 @@ void io_context_registry::register_ioctx(io_context_type type,
   _entries[type] = {type, std::move(checker), std::move(factory)};
 }
 
+void io_context_registry::replace_ioctx(io_context_type old_type,
+                                        io_context_type new_type,
+                                        scheme_checker_type checker,
+                                        factory_type factory)
+{
+  if (!checker) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: null scheme checker");
+  }
+  if (!factory) { throw std::invalid_argument("datasource_registry: replace_ioctx: null factory"); }
+  std::lock_guard lk{_mtx};
+  if (_lookup_latched.load(std::memory_order_acquire)) {
+    throw std::logic_error(
+      "datasource_registry: replace_ioctx after the first lookup_path (bootstrap-only)");
+  }
+  if (!_entries.contains(old_type)) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: old type not registered");
+  }
+  if (_entries.contains(new_type)) {
+    throw std::invalid_argument("datasource_registry: replace_ioctx: new type already registered");
+  }
+  // Strong guarantee: the emplace is the only throwing step and precedes the
+  // erase; erase by KEY, not by a pre-emplace iterator (emplace may rehash).
+  _entries.emplace(new_type, entry{new_type, std::move(checker), std::move(factory)});
+  _entries.erase(old_type);
+}
+
 std::optional<io_context_type> io_context_registry::lookup_path(
   std::string_view path) const noexcept
 {
   std::shared_lock lk{_mtx};
+  _lookup_latched.store(true, std::memory_order_release);
   // kvikio's checker matches everything; _entries iterates in unspecified order,
   // so defer the catch-all and let an explicit backend (uring/restful) win.
   std::optional<io_context_type> fallback;
@@ -196,6 +225,12 @@ std::optional<io_context_type> io_context_registry::lookup_path(
     if (!entry.checker(path)) continue;
     if (type == io_context_type::kvikio) {
       fallback = type;
+      continue;
+    }
+    // backend=kvikio takes over reads from BOTH explicit backends: local files
+    // from uring, s3:// objects from rest (kvikIO's RemoteHandle serves them).
+    // LIST still needs the rest ioctx, which callers fetch by type instead.
+    if (_prefer_kvikio && (type == io_context_type::uring || type == io_context_type::restful)) {
       continue;
     }
     return type;

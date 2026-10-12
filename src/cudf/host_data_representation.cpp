@@ -252,7 +252,7 @@ std::unique_ptr<host_data_representation> host_data_representation::slice(
 }
 
 std::unique_ptr<idata_representation> host_data_representation::clone(
-  [[maybe_unused]] rmm::cuda_stream_view stream)
+  [[maybe_unused]] ::cuda::stream_ref stream)
 {
   auto cloned = _host_table->clone(get_memory_space());
   return std::make_unique<host_data_representation>(std::move(cloned), &get_memory_space());
@@ -286,7 +286,7 @@ host_data_packed_representation::get_host_table() const
 }
 
 std::unique_ptr<idata_representation> host_data_packed_representation::clone(
-  [[maybe_unused]] rmm::cuda_stream_view stream)
+  [[maybe_unused]] ::cuda::stream_ref stream)
 {
   // Get the host memory resource from the memory space
   auto* host_mr = get_memory_space().get_memory_resource_of<memory::Tier::HOST>();

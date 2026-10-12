@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cucascade/cuda/stream.hpp>
 
 #include <cstddef>
 #include <filesystem>
@@ -59,7 +59,7 @@ class idisk_io_backend {
                      const void* dev_ptr,
                      std::size_t size,
                      std::size_t file_offset,
-                     rmm::cuda_stream_view stream) = 0;
+                     ::cuda::stream_ref stream) = 0;
 
   /**
    * @brief Read data from a disk file into device memory.
@@ -74,7 +74,7 @@ class idisk_io_backend {
                     void* dev_ptr,
                     std::size_t size,
                     std::size_t file_offset,
-                    rmm::cuda_stream_view stream) = 0;
+                    ::cuda::stream_ref stream) = 0;
 
   /**
    * @brief Write data from host memory to a disk file.
@@ -116,7 +116,7 @@ class idisk_io_backend {
    */
   virtual void write_batch(const std::filesystem::path& path,
                            const std::vector<io_batch_entry>& entries,
-                           rmm::cuda_stream_view stream)
+                           ::cuda::stream_ref stream)
   {
     for (const auto& entry : entries) {
       write(path, entry.ptr, entry.size, entry.file_offset, stream);
@@ -133,7 +133,7 @@ class idisk_io_backend {
    */
   virtual void read_batch(const std::filesystem::path& path,
                           const std::vector<io_batch_entry>& entries,
-                          rmm::cuda_stream_view stream)
+                          ::cuda::stream_ref stream)
   {
     for (const auto& entry : entries) {
       read(path, const_cast<void*>(entry.ptr), entry.size, entry.file_offset, stream);

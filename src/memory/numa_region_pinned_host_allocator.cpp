@@ -43,7 +43,7 @@ int numa_region_pinned_host_memory_resource::cuda_host_flags(int numa_node,
                          : static_cast<int>(cudaHostRegisterPortable | cudaHostRegisterMapped);
 }
 
-void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda::stream_ref stream,
                                                         std::size_t bytes,
                                                         [[maybe_unused]] std::size_t alignment)
 {
@@ -66,7 +66,7 @@ void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] cuda::s
 }
 
 void numa_region_pinned_host_memory_resource::deallocate(
-  [[maybe_unused]] cuda::stream_ref stream,
+  [[maybe_unused]] ::cuda::stream_ref stream,
   void* ptr,
   std::size_t bytes,
   [[maybe_unused]] std::size_t alignment) noexcept
@@ -83,13 +83,13 @@ void numa_region_pinned_host_memory_resource::deallocate(
 void* numa_region_pinned_host_memory_resource::allocate_sync(std::size_t bytes,
                                                              [[maybe_unused]] std::size_t alignment)
 {
-  return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+  return allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
 }
 
 void numa_region_pinned_host_memory_resource::deallocate_sync(
   void* ptr, std::size_t bytes, [[maybe_unused]] std::size_t alignment) noexcept
 {
-  deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+  deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
 }
 
 bool numa_region_pinned_host_memory_resource::operator==(

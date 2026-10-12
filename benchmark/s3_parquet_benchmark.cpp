@@ -101,9 +101,6 @@ static void usage(char const* prog)
     << "REST config overrides (rest only; key=value, any order after num_rows):\n"
     << "  n_reactors=<N>          REST reactor threads (same as positional)\n"
     << "  max_connections=<N>     max concurrent in-flight easy handles per reactor (def 16)\n"
-    << "  chunk_size=<bytes>      target max bytes per ranged GET (def 8388608)\n"
-    << "  max_n_chunks=<N>        max buffers fused into one scatter GET (def 16)\n"
-    << "  max_read_split=<N>      parallel GETs a contiguous host read splits into (def 16)\n"
     << "  request_timeout_s=<S>   whole-request timeout, 0 = no limit (def 30)\n"
     << "  max_retry_attempts=<N>  retry attempts (def 10)\n"
     << "\n"
@@ -131,12 +128,6 @@ static bool apply_rest_override(std::string const& key,
     n_reactors = ull();
   } else if (key == "max_connections") {
     cfg.max_connections = ull();
-  } else if (key == "chunk_size") {
-    cfg.chunk_size = ull();
-  } else if (key == "max_n_chunks") {
-    cfg.max_n_chunks = ull();
-  } else if (key == "max_read_split") {
-    cfg.max_read_split = ull();
   } else if (key == "request_timeout_s") {
     cfg.request_timeout_s = std::stol(val);
   } else if (key == "max_retry_attempts") {
@@ -276,7 +267,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
   [[nodiscard]] bool supports_device_read() const override { return true; }
 
-  size_t device_read(size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view) override
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref) override
   {
     size_t const n = clamp(offset, size);
     if (n == 0) { return 0; }
@@ -288,7 +279,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
-                                        rmm::cuda_stream_view) override
+                                        ::cuda::stream_ref) override
   {
     size_t const n = clamp(offset, size);
     return _handle.pread(dst, n, offset);
@@ -296,7 +287,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
   std::unique_ptr<buffer> device_read(size_t offset,
                                       size_t size,
-                                      rmm::cuda_stream_view stream) override
+                                      ::cuda::stream_ref stream) override
   {
     size_t const n = clamp(offset, size);
     rmm::device_buffer out(n, stream);
@@ -446,13 +437,8 @@ int main(int argc, char** argv)
 
   std::shared_ptr<cucascade::io::rest::rest_ioctx> io_ctx;  // rest path only
   if (source == DataSource::rest) {
-    rest_cfg.bounce_block_size = host_mr.get_block_size();
-
     std::cout << "REST   : n_reactors=" << n_reactors
-              << "  max_connections=" << rest_cfg.max_connections
-              << "  chunk_size=" << rest_cfg.chunk_size
-              << "  max_n_chunks=" << rest_cfg.max_n_chunks
-              << "  max_read_split=" << rest_cfg.max_read_split << "\n\n";
+              << "  max_connections=" << rest_cfg.max_connections << "\n\n";
 
     auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
     auto rest_ctx   = std::make_shared<cucascade::io::rest::rest_reactor::reactor_context>(
@@ -597,7 +583,7 @@ int main(int argc, char** argv)
         auto tbl = cudf::io::read_parquet(std::move(thread_sources[static_cast<size_t>(t)]),
                                           std::move(thread_metadata[static_cast<size_t>(t)]),
                                           opts,
-                                          streams[static_cast<size_t>(t)].view());
+                                          streams[static_cast<size_t>(t)]);
       });
     }
     for (auto& w : workers)

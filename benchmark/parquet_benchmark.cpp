@@ -303,7 +303,7 @@ int main(int argc, char** argv)
     auto sources = cudf::io::make_datasources(cudf::io::source_info{path_list});
     ms           = time_ms([&] {
       auto tbl =
-        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream);
     });
   } else {
     // Size the buffer pool to fit the working set, plus headroom.
@@ -323,8 +323,7 @@ int main(int argc, char** argv)
                                                                1);               // initial_pools
 
     auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-      cucascade::io::uring::uring_reactor::reactor_config_type{
-        .bounce_size = host_mr.get_block_size(), .use_odirect = use_odirect},
+      cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect = use_odirect},
       &host_mr);
     auto io_ctx =
       std::make_shared<cucascade::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
@@ -339,7 +338,7 @@ int main(int argc, char** argv)
 
     ms = time_ms([&] {
       auto tbl =
-        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream);
     });
   }
 

@@ -121,9 +121,6 @@ static void usage(char const* prog)
     << "REST config overrides (rest only; key=value, any order after num_rows):\n"
     << "  n_threads=<N>           reader threads / REST reactors\n"
     << "  max_connections=<N>     max concurrent in-flight easy handles per reactor (def 16)\n"
-    << "  chunk_size=<bytes>      target max bytes per ranged GET (def 8388608)\n"
-    << "  max_n_chunks=<N>        max buffers fused into one scatter GET (def 16)\n"
-    << "  max_read_split=<N>      parallel GETs a contiguous host read splits into (def 16)\n"
     << "\n"
     << "credentials/region/endpoint via the AWS environment: AWS_ACCESS_KEY_ID,\n"
     << "AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION, AWS_ENDPOINT_URL\n";
@@ -142,12 +139,6 @@ static bool apply_override(std::string const& key,
     n_threads = ull();
   } else if (key == "max_connections") {
     cfg.max_connections = ull();
-  } else if (key == "chunk_size") {
-    cfg.chunk_size = ull();
-  } else if (key == "max_n_chunks") {
-    cfg.max_n_chunks = ull();
-  } else if (key == "max_read_split") {
-    cfg.max_read_split = ull();
   } else {
     return false;
   }
@@ -283,7 +274,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
   [[nodiscard]] bool supports_device_read() const override { return true; }
 
-  size_t device_read(size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view) override
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref) override
   {
     size_t const n = clamp(offset, size);
     if (n == 0) { return 0; }
@@ -293,7 +284,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
-                                        rmm::cuda_stream_view) override
+                                        ::cuda::stream_ref) override
   {
     size_t const n = clamp(offset, size);
     return _handle.pread(dst, n, offset);
@@ -301,7 +292,7 @@ class kvikio_s3_datasource final : public cudf::io::datasource {
 
   std::unique_ptr<buffer> device_read(size_t offset,
                                       size_t size,
-                                      rmm::cuda_stream_view stream) override
+                                      ::cuda::stream_ref stream) override
   {
     size_t const n = clamp(offset, size);
     rmm::device_buffer out(n, stream);
@@ -459,12 +450,8 @@ int main(int argc, char** argv)
   std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
 
   if (backend == Backend::rest) {
-    rest_cfg.bounce_block_size = host_mr.get_block_size();
     std::cout << "REST   : n_reactors=" << n_threads
-              << "  max_connections=" << rest_cfg.max_connections
-              << "  chunk_size=" << rest_cfg.chunk_size
-              << "  max_n_chunks=" << rest_cfg.max_n_chunks
-              << "  max_read_split=" << rest_cfg.max_read_split << "\n";
+              << "  max_connections=" << rest_cfg.max_connections << "\n";
     auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
     auto rest_ctx   = std::make_shared<cucascade::io::rest::rest_reactor::reactor_context>(
       std::move(rest_cfg), std::move(authorizer), &host_mr);
@@ -585,7 +572,7 @@ int main(int argc, char** argv)
   } else {
     dev_bufs.reserve(ranges.size());
     for (size_t i = 0; i < ranges.size(); ++i) {
-      dev_bufs.emplace_back(ranges[i].size, alloc_stream.view());
+      dev_bufs.emplace_back(ranges[i].size, alloc_stream);
       dsts[i] = static_cast<uint8_t*>(dev_bufs[i].data());
     }
     alloc_stream.synchronize();
@@ -655,8 +642,8 @@ int main(int argc, char** argv)
           futs.reserve(hi - lo);
           for (size_t i = lo; i < hi; ++i) {
             auto const& r = ranges[i];
-            futs.push_back(io_ctx->device_read_async(
-              *io_objects[r.obj_idx], r.offset, r.size, dsts[i], stream.view()));
+            futs.push_back(
+              io_ctx->device_read_async(*io_objects[r.obj_idx], r.offset, r.size, dsts[i], stream));
           }
           for (auto& f : futs)
             std::move(f).get();
@@ -676,7 +663,7 @@ int main(int argc, char** argv)
           for (size_t i = lo; i < hi; ++i) {
             auto const& r = ranges[i];
             futs.push_back(
-              datasources[r.obj_idx]->device_read_async(r.offset, r.size, dsts[i], stream.view()));
+              datasources[r.obj_idx]->device_read_async(r.offset, r.size, dsts[i], stream));
           }
           for (auto& f : futs)
             f.get();

@@ -55,7 +55,7 @@ std::size_t disk_data_representation::get_uncompressed_data_size_in_bytes() cons
 }
 
 std::unique_ptr<idata_representation> disk_data_representation::clone(
-  [[maybe_unused]] rmm::cuda_stream_view stream)
+  [[maybe_unused]] ::cuda::stream_ref stream)
 {
   CUCASCADE_FAIL("disk_data_representation does not support clone");
 }

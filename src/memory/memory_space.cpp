@@ -15,7 +15,9 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/disk_io_backend.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -27,10 +29,10 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_pool.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -46,6 +48,12 @@ std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io    = f
 namespace memory {
 namespace {
 
+using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
+
+struct wait_reservation_message {
+  static constexpr char const* message{"wait:reservation"};
+};
+
 class fixed_size_host_resource_ref {
  public:
   explicit fixed_size_host_resource_ref(fixed_size_host_memory_resource& resource)
@@ -53,14 +61,14 @@ class fixed_size_host_resource_ref {
   {
   }
 
-  void* allocate(cuda::stream_ref stream,
+  void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t))
   {
     return resource_->allocate(stream, bytes, alignment);
   }
 
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept
@@ -257,6 +265,11 @@ std::unique_ptr<reservation> memory_space::make_reservation_upto(size_t size)
 std::unique_ptr<reservation> memory_space::make_reservation(size_t size)
 {
   std::unique_ptr<reservation> res = make_reservation_or_null(size);
+  if (res) { return res; }
+
+  auto const& message =
+    nvtx3::registered_string_in<libcucascade_domain>::get<wait_reservation_message>();
+  nvtx_range const wait_range{message, nvtx3::payload{static_cast<std::uint64_t>(size)}};
   while (!res) {
     auto status = _notification_channel->wait();
     if (status == notification_channel::wait_status::SHUTDOWN) { return nullptr; }
@@ -266,7 +279,7 @@ std::unique_ptr<reservation> memory_space::make_reservation(size_t size)
   return res;
 }
 
-rmm::cuda_stream_view memory_space::acquire_stream() const
+::cuda::stream_ref memory_space::acquire_stream() const
 {
   if (!_stream_pool) {
     throw std::runtime_error("Stream pool is not available for non-GPU memory spaces");
@@ -312,7 +325,7 @@ size_t memory_space::get_amount_to_downgrade() const
   return consumed - _stop_downgrading_memory_threshold;
 }
 
-size_t memory_space::get_available_memory(rmm::cuda_stream_view stream) const
+size_t memory_space::get_available_memory(::cuda::stream_ref stream) const
 {
   return std::visit(
     utils::overloaded{

@@ -49,14 +49,14 @@ borrowed_stream& borrowed_stream::operator=(borrowed_stream&& other) noexcept
   return *this;
 }
 
-borrowed_stream::operator rmm::cuda_stream_view() const { return _stream; }
+borrowed_stream::operator ::cuda::stream_ref() const { return _stream; }
 
 void borrowed_stream::reset() noexcept
 {
   if (_release_fn) { std::exchange(_release_fn, nullptr)(std::move(_stream)); }
 }
 
-rmm::cuda_stream_view borrowed_stream::get() const noexcept { return _stream; }
+::cuda::stream_ref borrowed_stream::get() const noexcept { return _stream; }
 const rmm::cuda_stream* borrowed_stream::operator->() const noexcept { return &_stream; }
 const rmm::cuda_stream* borrowed_stream::operator->() noexcept { return &_stream; }
 

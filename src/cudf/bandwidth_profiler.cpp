@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/cudf/bandwidth_profiler.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -28,7 +29,6 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <fcntl.h>
@@ -75,7 +75,7 @@ std::size_t probe_max_chunk_bytes(const memory::memory_space& space)
 /// through the provided GPU memory resource reference.
 std::unique_ptr<cudf::table> make_gpu_table_of_size(std::size_t size_bytes,
                                                     rmm::device_async_resource_ref gpu_mr,
-                                                    rmm::cuda_stream_view stream)
+                                                    ::cuda::stream_ref stream)
 {
   constexpr std::size_t bytes_per_row = sizeof(std::int32_t);
   auto num_rows                       = static_cast<cudf::size_type>(
@@ -108,7 +108,7 @@ std::unique_ptr<idata_representation> build_source_representation(
   auto table            = make_gpu_table_of_size(size_bytes, gpu_mr, bootstrap_stream);
   auto gpu_rep =
     std::make_unique<gpu_table_representation>(std::move(table), *bootstrap_gpu, bootstrap_stream);
-  bootstrap_stream.synchronize();
+  bootstrap_stream.sync();
 
   // Step 2: land the data in the requested src space via the registry. The converter is
   // responsible for switching device when moving data across GPUs.
@@ -119,7 +119,7 @@ std::unique_ptr<idata_representation> build_source_representation(
   // The converter may have enqueued async GPU reads from `gpu_rep`'s table on
   // `bootstrap_stream`. Sync before `gpu_rep` goes out of scope — otherwise its cuDF table's
   // RMM deallocation races with the in-flight copy and corrupts the converted output.
-  bootstrap_stream.synchronize();
+  bootstrap_stream.sync();
   return result;
 }
 
@@ -156,7 +156,7 @@ bandwidth_sample measure_single_size(idata_representation& source,
                                      std::type_index target_type,
                                      memory::memory_space* dst_space,
                                      const representation_converter_registry& registry,
-                                     rmm::cuda_stream_view stream,
+                                     ::cuda::stream_ref stream,
                                      std::size_t nominal_size_bytes,
                                      std::size_t warmup_iters,
                                      std::size_t timed_iters,
@@ -178,7 +178,7 @@ bandwidth_sample measure_single_size(idata_representation& source,
   // Warmup — discard results.
   for (std::size_t i = 0; i < warmup_iters; ++i) {
     auto dst_rep = registry.convert(source, target_type, dst_space, stream);
-    stream.synchronize();
+    stream.sync();
     dst_rep.reset();
     evict_if_needed();
   }
@@ -191,7 +191,7 @@ bandwidth_sample measure_single_size(idata_representation& source,
   for (std::size_t i = 0; i < timed_iters; ++i) {
     auto iter_t0 = clock::now();
     auto dst_rep = registry.convert(source, target_type, dst_space, stream);
-    stream.synchronize();
+    stream.sync();
     auto iter_t1 = clock::now();
     elapsed += (iter_t1 - iter_t0);
     dst_rep.reset();
@@ -326,7 +326,7 @@ bandwidth_profile measure_bandwidth(std::span<memory::memory_space* const> space
 
           // Ensure source construction is complete on the destination's stream (converters may
           // enqueue work on it during the warmup iterations).
-          stream.synchronize();
+          stream.sync();
           auto sample = measure_single_size(*source,
                                             target_type,
                                             dst,

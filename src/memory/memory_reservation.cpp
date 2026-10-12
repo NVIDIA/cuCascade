@@ -76,7 +76,7 @@ void reservation::shrink_to_fit() { return _arena->shrink_to_fit(); }
 ignore_reservation_limit_policy::ignore_reservation_limit_policy() = default;
 
 void ignore_reservation_limit_policy::handle_over_reservation(
-  [[maybe_unused]] rmm::cuda_stream_view stream,
+  [[maybe_unused]] ::cuda::stream_ref stream,
   [[maybe_unused]] std::size_t requested_bytes,
   [[maybe_unused]] std::size_t current_allocated,
   [[maybe_unused]] reserved_arena* reserved_bytes)
@@ -89,7 +89,7 @@ std::string ignore_reservation_limit_policy::get_policy_name() const { return "i
 fail_reservation_limit_policy::fail_reservation_limit_policy() = default;
 
 void fail_reservation_limit_policy::handle_over_reservation(
-  [[maybe_unused]] rmm::cuda_stream_view stream,
+  [[maybe_unused]] ::cuda::stream_ref stream,
   std::size_t requested_bytes,
   std::size_t current_allocated,
   reserved_arena* reserved_bytes)
@@ -113,7 +113,7 @@ increase_reservation_limit_policy::increase_reservation_limit_policy(double padd
 }
 
 void increase_reservation_limit_policy::handle_over_reservation(
-  [[maybe_unused]] rmm::cuda_stream_view stream,
+  [[maybe_unused]] ::cuda::stream_ref stream,
   std::size_t requested_bytes,
   std::size_t current_allocated,
   reserved_arena* reserved_bytes)

@@ -28,14 +28,14 @@ class shared_device_resource {
  public:
   explicit shared_device_resource(rmm::device_async_resource_ref upstream) : upstream_(upstream) {}
 
-  void* allocate(cuda::stream_ref stream,
+  void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t))
   {
     return upstream_.allocate(stream, bytes, alignment);
   }
 
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* p,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept
@@ -45,14 +45,14 @@ class shared_device_resource {
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    return allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
   }
 
   void deallocate_sync(void* p,
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, p, bytes, alignment);
+    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, p, bytes, alignment);
   }
 
   bool operator==(shared_device_resource const&) const noexcept { return false; }
