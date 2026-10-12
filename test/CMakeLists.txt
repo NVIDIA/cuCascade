@@ -81,6 +81,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     # Main test runner
     unittest.cpp)
 
+  target_sources(
+    cucascade_io_tests PRIVATE io/rest/test_rest_reactor.cpp
+                               io/rest/test_rest_ioctx_contracts.cpp)
+
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
   if(CUCASCADE_BUILD_CUDF)
     target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp)
@@ -119,8 +123,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # The datasource bridge and its cache-level tests exist only in an io build.
   if(CUCASCADE_BUILD_IO)
-    target_sources(cucascade_cudf_tests
-                   PRIVATE cudf/test_cache_object_identity.cpp)
+    target_sources(
+      cucascade_cudf_tests PRIVATE cudf/test_cache_object_identity.cpp
+                                   cudf/test_rest_datasource_contracts.cpp)
   endif()
 
   set_target_properties(cucascade_cudf_tests
