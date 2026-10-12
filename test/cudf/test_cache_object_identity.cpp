@@ -33,6 +33,7 @@
 // The same fixture also hosts the fs_cache summary snapshot test, which needs a
 // cache with live read counters but nothing about object identity.
 
+#include "cache_test_fixture.hpp"
 #include "io/rest/loopback_range_server.hpp"
 #include "io/rest/mock_authorizer.hpp"
 #include "utils/test_memory_resources.hpp"
@@ -82,6 +83,12 @@ using cucascade::io::object_changed_error;
 using cucascade::io::rest::rest_io_object;
 using cucascade::io::rest::rest_ioctx;
 using cucascade::io::rest::rest_reactor;
+using cucascade::test::advise;
+using cucascade::test::held_object;
+using cucascade::test::held_request;
+using cucascade::test::identity_cache_config;
+using cucascade::test::identity_memory;
+using held_context = cucascade::test::controlled_ioctx;
 using cucascade::test::key_response_script;
 using cucascade::test::list_capable_mock_authorizer;
 using cucascade::test::loopback_range_server;
@@ -91,39 +98,6 @@ using cucascade::test::scripted_response;
 constexpr std::size_t chunk_bytes  = 1U << 20;
 constexpr std::size_t object_bytes = 64U << 10;  // one chunk, only partly populated
 constexpr char const* object_uri   = "s3://bucket/object.bin";
-
-std::unique_ptr<cucascade::memory::memory_reservation_manager> identity_memory()
-{
-  cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(1)
-    .set_gpu_usage_limit(2ULL << 30)
-    .set_reservation_fraction_per_gpu(0.75)
-    .set_gpu_memory_resource_factory(cucascade::test::make_shared_current_device_resource)
-    .set_per_numa_region_capacity(256ULL << 20)
-    .use_gpu_id_as_host_id()
-    .set_reservation_fraction_per_numa_region(1.0);
-  return std::make_unique<cucascade::memory::memory_reservation_manager>(builder.build());
-}
-
-cucascade::io::cache::config identity_cache_config()
-{
-  cucascade::io::cache::config cfg;
-  cfg.mode                            = cucascade::io::cache::cache_mode::cucs;
-  cfg.eviction                        = cucascade::io::cache::eviction_policy::lru;
-  cfg.min_prefetching_budget_fraction = 0.5;
-  cfg.eviction_threshold_fraction     = 1.0;
-  cfg.apply_mode();
-  return cfg;
-}
-
-/// Hint [0, size) of @p ds and take staging buffers for it, as a scan does.
-void advise(datasource& ds, std::size_t size)
-{
-  std::vector<cudf::io::text::byte_range_info> ranges;
-  ranges.emplace_back(0, static_cast<std::int64_t>(size));
-  ds.fadvise(ranges, 0);
-  REQUIRE(ds.prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
-}
 
 std::vector<std::uint8_t> read_all(datasource& ds)
 {
@@ -244,131 +218,6 @@ struct rest_cache_fixture {
   std::unique_ptr<cucascade::memory::memory_reservation_manager> memory;
   std::shared_ptr<rest_ioctx> context;
 };
-
-// ---------------------------------------------------------------------------
-// A backend whose fills the test holds, completes and fails by hand.
-// ---------------------------------------------------------------------------
-
-struct held_config {
-  [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
-  [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
-
-  std::size_t n_max_concurrent_scans{1};
-};
-
-class held_backend {
- public:
-  using io_object_type                  = rest_io_object;
-  using reactor_config_type             = held_config;
-  static constexpr bool prefers_bulk_io = false;
-
-  [[nodiscard]] held_config const& get_config() const noexcept { return config; }
-  [[nodiscard]] std::size_t staging_block_size() const noexcept { return chunk_bytes; }
-  [[nodiscard]] std::size_t queued_bytes() const noexcept { return 0; }
-
-  void enqueue(std::unique_ptr<cucascade::io::grouped_io_request> request) noexcept
-  {
-    requests.push_back(std::move(request));
-  }
-
-  std::unique_ptr<cucascade::io::grouped_io_request> take()
-  {
-    if (requests.empty()) { return {}; }
-    auto result = std::move(requests.front());
-    requests.pop_front();
-    return result;
-  }
-
-  std::size_t host_read(rest_io_object const&, std::size_t, std::size_t, std::uint8_t*)
-  {
-    throw std::logic_error("held backend reads must use the request queue");
-  }
-
-  void start() {}
-  void interrupt() {}
-  void shutdown()
-  {
-    while (auto request = take()) {
-      request->cancel_remaining(std::make_exception_ptr(std::runtime_error("test shutdown")));
-    }
-  }
-
-  static std::unique_ptr<rest_io_object> create_io_object(std::string path)
-  {
-    return std::make_unique<rest_io_object>(
-      std::move(path), "bucket", "key", chunk_bytes, "\"one\"");
-  }
-  static bool supports(std::string_view) { return true; }
-  static std::vector<cucascade::io::byte_range> align_and_coalesce(
-    std::span<cucascade::io::byte_range const> ranges, std::optional<std::size_t>)
-  {
-    return {ranges.begin(), ranges.end()};
-  }
-
-  held_config config;
-  std::deque<std::unique_ptr<cucascade::io::grouped_io_request>> requests;
-};
-
-class held_context final : public cucascade::io::templated_ioctx<held_backend> {
- public:
-  held_context() : templated_ioctx(1, [] { return std::make_unique<held_backend>(); }) {}
-
-  [[nodiscard]] cucascade::io::io_context_type type() const noexcept override
-  {
-    return cucascade::io::io_context_type::restful;
-  }
-
-  held_backend& backend() { return *_reactors.front(); }
-};
-
-/// One request taken off the held backend; a request still held when the test
-/// ends is cancelled so no completion is left dangling.
-struct held_request {
-  held_request() = default;
-  ~held_request()
-  {
-    if (request) {
-      request->cancel_remaining(std::make_exception_ptr(std::runtime_error("test cleanup")));
-    }
-  }
-  held_request(held_request const&)            = delete;
-  held_request& operator=(held_request const&) = delete;
-
-  /// Fill every slice with @p value and complete it successfully.
-  void complete(std::uint8_t value)
-  {
-    REQUIRE(request != nullptr);
-    while (!request->empty()) {
-      auto slice = request->take_front();
-      if (slice.h_buffer.is_contiguous()) {
-        std::fill_n(std::get<std::uint8_t*>(slice.h_buffer.buffer), slice.size(), value);
-      } else {
-        for (auto* chunk : slice.h_buffer.fragments()) {
-          std::fill_n(chunk->data + slice.offset() - chunk->offset, slice.size(), value);
-        }
-      }
-      if (slice.on_complete) { (*slice.on_complete)(slice.h_buffer.fragments(), true); }
-      request->coordinator->on_complete();
-    }
-    request.reset();
-  }
-
-  /// Fail the whole request as a refused conditional GET would.
-  void fail(std::string const& path, std::string const& expected, std::string const& observed)
-  {
-    REQUIRE(request != nullptr);
-    request->cancel_remaining(
-      std::make_exception_ptr(object_changed_error(path, expected, observed)));
-    request.reset();
-  }
-
-  std::unique_ptr<cucascade::io::grouped_io_request> request;
-};
-
-std::shared_ptr<rest_io_object> held_object(std::string const& path, std::string const& tag)
-{
-  return std::make_shared<rest_io_object>(path, "controlled", "generation.bin", chunk_bytes, tag);
-}
 
 /// Holds back everything queued on a consumer stream until released: a host
 /// function parked on a producer stream spins, and the consumer waits on an event
