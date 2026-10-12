@@ -18,6 +18,7 @@
 
 #include "loopback_range_server.hpp"
 #include "mock_authorizer.hpp"
+#include "utils/child_test_runner.hpp"
 
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
@@ -274,68 +275,11 @@ struct fixture_child_result {
 
 fixture_child_result run_fixture_child(char const* test_name)
 {
-  constexpr char const* child_env     = "CUCASCADE_REST_FIXTURE_CHILD";
-  auto const* value                   = std::getenv(child_env);
-  std::optional<std::string> previous = value ? std::optional<std::string>{value} : std::nullopt;
-  std::unique_ptr<std::FILE, decltype(&std::fclose)> log{std::tmpfile(), &std::fclose};
-  REQUIRE(log != nullptr);
-  int const log_fd = ::fileno(log.get());
-  REQUIRE(::setenv(child_env, "1", 1) == 0);
-  pid_t const pid = ::fork();
-  if (pid == 0) {
-    if (::dup2(log_fd, STDOUT_FILENO) < 0 || ::dup2(log_fd, STDERR_FILENO) < 0) { ::_exit(126); }
-    ::execl("/proc/self/exe",
-            "cucascade_io_tests",
-            "--order",
-            "decl",
-            "--reporter",
-            "compact",
-            test_name,
-            static_cast<char*>(nullptr));
-    ::_exit(127);
-  }
-  if (previous) {
-    ::setenv(child_env, previous->c_str(), 1);
-  } else {
-    ::unsetenv(child_env);
-  }
-  REQUIRE(pid > 0);
-
-  struct child_guard {
-    pid_t pid;
-    ~child_guard()
-    {
-      if (pid <= 0) { return; }
-      ::kill(pid, SIGKILL);
-      while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
-    }
-  } child{pid};
-
-  int status          = 0;
-  bool timed_out      = true;
-  auto const deadline = std::chrono::steady_clock::now() + 30s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    auto const waited = ::waitpid(pid, &status, WNOHANG);
-    if (waited == pid) {
-      child.pid = -1;
-      timed_out = false;
-      break;
-    }
-    if (waited < 0 && errno != EINTR) { throw std::runtime_error("waitpid failed"); }
-    std::this_thread::sleep_for(10ms);
-  }
-  if (timed_out) {
-    ::kill(pid, SIGKILL);
-    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    child.pid = -1;
-  }
-  std::rewind(log.get());
-  std::string output;
-  std::array<char, 4096> bytes{};
-  while (auto const count = std::fread(bytes.data(), 1, bytes.size(), log.get())) {
-    output.append(bytes.data(), count);
-  }
-  return {timed_out, status, std::move(output)};
+  cucascade::test::child_test_runner child{test_name,
+                                           {{"CUCASCADE_REST_FIXTURE_CHILD", std::string{"1"}}}};
+  bool const completed = child.wait_for(30s);
+  if (!completed) { child.stop(); }
+  return {!completed, child.status(), child.output()};
 }
 
 }  // namespace
@@ -853,11 +797,30 @@ TEST_CASE("loopback range server releases held responses on stop", "[rest][fixtu
 {
   if (auto const* child = std::getenv("CUCASCADE_REST_FIXTURE_CHILD");
       child == nullptr || std::string_view{child} != "1") {
-    auto const result = run_fixture_child("loopback range server releases held responses on stop");
-    INFO(result.output);
-    REQUIRE_FALSE(result.timed_out);
-    REQUIRE(WIFEXITED(result.status));
-    CHECK(WEXITSTATUS(result.status) == 0);
+    for (bool initially_set : {false, true}) {
+      DYNAMIC_SECTION((initially_set ? "marker initially set" : "marker initially absent"))
+      {
+        auto const expected =
+          initially_set ? std::optional<std::string>{"parent-value"} : std::nullopt;
+        cucascade::test::scoped_test_environment initial{
+          {"CUCASCADE_REST_FIXTURE_CHILD", expected}};
+        initial.apply();
+        auto const result =
+          run_fixture_child("loopback range server releases held responses on stop");
+        auto const* restored = std::getenv("CUCASCADE_REST_FIXTURE_CHILD");
+        if (expected) {
+          REQUIRE(restored != nullptr);
+          CHECK(std::string_view{restored} == *expected);
+        } else {
+          CHECK(restored == nullptr);
+        }
+        initial.restore();
+        INFO(result.output);
+        REQUIRE_FALSE(result.timed_out);
+        REQUIRE(WIFEXITED(result.status));
+        CHECK(WEXITSTATUS(result.status) == 0);
+      }
+    }
     return;
   }
 
