@@ -154,7 +154,7 @@ void expect_column_buffers_bound_to(std::unique_ptr<cudf::column> col,
 {
   auto contents = col->release();
   if (contents.data && contents.data->size() > 0) {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 10)
     auto actual_stream = contents.data->stream().get();
 #else
     auto actual_stream = contents.data->stream().value();
@@ -164,7 +164,7 @@ void expect_column_buffers_bound_to(std::unique_ptr<cudf::column> col,
     ++buffers_checked;
   }
   if (contents.null_mask && contents.null_mask->size() > 0) {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 10)
     auto actual_stream = contents.null_mask->stream().get();
 #else
     auto actual_stream = contents.null_mask->stream().value();
