@@ -107,9 +107,14 @@ class local_io_object : public io_object {
  *
  * Owns one @c io_uring, one worker thread, a fixed pool of pinned staging
  * blocks, and a two-tier request queue (see @ref io_priority). The worker
- * always takes a high-priority request before a low one, and parks an active
- * low request at a slice boundary while high requests are waiting, so a demand
- * read never waits behind a whole-split readahead. Physical operations use
+ * takes a high-priority request before a low one, and parks an active low
+ * request at a slice boundary while high requests are waiting, so a demand
+ * read does not wait behind a whole-split readahead.  Priority is bounded,
+ * not strict: after @c config::low_service_interval high requests have
+ * started while low work waited, the low tier gets one turn of at least one
+ * quantum (@c config::slices_per_pass slices) even if high work is waiting, so
+ * a demand read blocked on an in-flight prefetch is not starved by a stream of
+ * other high requests (0 restores strict priority). Physical operations use
  * O_DIRECT only when the worker determines that the complete transfer is
  * compatible. Models the reactor concept consumed by @c templated_ioctx.
  */
@@ -233,6 +238,9 @@ class uring_reactor {
     std::uint64_t bytes_submitted{0};    ///< cumulative physical bytes submitted
     /// Cumulative times an active low request was parked for a high one.
     std::uint64_t preemptions{0};
+    /// Cumulative times the low tier was served ahead of waiting high work by
+    /// the bounded-service rule (see @c config::low_service_interval).
+    std::uint64_t low_service_grants{0};
     /// Queue delay (enqueue -> first slice expanded) of requests whose first slice
     /// was expanded since the previous take_gauges(), per priority tier:
     /// [0] = @c io_priority::high, [1] = @c io_priority::low.
@@ -299,6 +307,7 @@ class uring_reactor {
   std::atomic<std::uint64_t> _gauge_requests_started{0};
   std::atomic<std::uint64_t> _gauge_bytes_submitted{0};
   std::atomic<std::uint64_t> _gauge_preemptions{0};
+  std::atomic<std::uint64_t> _gauge_low_service_grants{0};
 
   /// Worker-side accumulators behind gauges::queue_delay; take_gauges() swaps them out.
   struct queue_delay_atomics {
@@ -314,6 +323,9 @@ class uring_reactor {
   /// config::slices_per_pass with 0 (no cap) mapped to SIZE_MAX; read once at
   /// construction.
   std::size_t _slices_per_pass{1};
+  /// Slices a low request granted service must expand before it can be parked
+  /// again: _slices_per_pass, capped at max_slices_per_pass.
+  std::size_t _low_service_quantum{1};
 };
 
 }  // namespace cucascade::io::uring

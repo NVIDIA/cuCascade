@@ -474,9 +474,10 @@ uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_v
   if (_ctx->host_memory_resource() == nullptr) {
     throw std::invalid_argument("uring_reactor: host memory resource must be non-null");
   }
-  _config           = _ctx->cfg();
-  _bounce_slot_size = _ctx->host_memory_resource()->get_block_size();
-  _slices_per_pass  = effective_slices_per_pass(_config.slices_per_pass);
+  _config              = _ctx->cfg();
+  _bounce_slot_size    = _ctx->host_memory_resource()->get_block_size();
+  _slices_per_pass     = effective_slices_per_pass(_config.slices_per_pass);
+  _low_service_quantum = std::min(_slices_per_pass, max_slices_per_pass);
 }
 
 uring_reactor::~uring_reactor() { shutdown(); }
@@ -497,6 +498,7 @@ uring_reactor::gauges uring_reactor::take_gauges() noexcept
   out.requests_started        = _gauge_requests_started.load(std::memory_order_relaxed);
   out.bytes_submitted         = _gauge_bytes_submitted.load(std::memory_order_relaxed);
   out.preemptions             = _gauge_preemptions.load(std::memory_order_relaxed);
+  out.low_service_grants      = _gauge_low_service_grants.load(std::memory_order_relaxed);
   for (std::size_t c = 0; c < 2; ++c) {
     auto& src  = _gauge_queue_delay[c];
     auto& dst  = out.queue_delay[c];
@@ -785,10 +787,18 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     // before any further low request is taken.
     std::unique_ptr<grouped_io_request> parked;
     std::size_t inflight = 0;
+    // Bounded low service (config::low_service_interval): high requests started
+    // while low work waited since the low tier was last served, and how many
+    // slices the active request -- when it was granted a turn -- may still
+    // expand before preempt_low can park it again.
+    std::size_t const low_service_interval = _config.low_service_interval;
+    std::size_t high_starts_over_low       = 0;
+    std::size_t granted_slices_left        = 0;
     // Gauge accumulators: worker-local, published by publish_gauges().
-    std::uint64_t requests_started = 0;
-    std::uint64_t bytes_submitted  = 0;
-    std::uint64_t preemptions      = 0;
+    std::uint64_t requests_started   = 0;
+    std::uint64_t bytes_submitted    = 0;
+    std::uint64_t preemptions        = 0;
+    std::uint64_t low_service_grants = 0;
 
     auto publish_gauges = [&]() noexcept {
       constexpr auto relaxed = std::memory_order_relaxed;
@@ -801,33 +811,79 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       _gauge_requests_started.store(requests_started, relaxed);
       _gauge_bytes_submitted.store(bytes_submitted, relaxed);
       _gauge_preemptions.store(preemptions, relaxed);
+      _gauge_low_service_grants.store(low_service_grants, relaxed);
     };
 
-    // Make the next request active without blocking: a waiting high request
-    // first, then the parked low one, then anything queued.
+    auto low_waiting = [&]() noexcept {
+      return parked != nullptr || _requests.size_approx(io_priority::low) != 0;
+    };
+
+    // Make @p next the active request and keep the bounded-service books: a
+    // low request becoming active means the low tier was served, a high one
+    // starting while low work waits counts towards the next grant.  Only a
+    // grant (see take_next) leaves the new request a protected quantum.
+    auto activate = [&](std::unique_ptr<grouped_io_request> next, bool fresh) {
+      granted_slices_left = 0;
+      if (next->priority == io_priority::low) {
+        high_starts_over_low = 0;
+      } else if (low_waiting()) {
+        ++high_starts_over_low;
+      }
+      active = std::move(next);
+      if (fresh) ++requests_started;
+    };
+
+    // Bounded service: once low_service_interval high requests have started
+    // while low work waited, give the low tier one turn even if high work is
+    // waiting -- the parked request if there is one, else the next queued low
+    // request -- and protect it from preempt_low for one quantum.
+    auto grant_low_service = [&]() -> bool {
+      if (low_service_interval == 0 || high_starts_over_low < low_service_interval) return false;
+      std::unique_ptr<grouped_io_request> next;
+      bool fresh = false;
+      if (parked != nullptr) {
+        next = std::move(parked);
+      } else if (_requests.try_dequeue_low(next) && next != nullptr) {
+        fresh = true;
+      } else {
+        // Nothing low is actually waiting any more: nothing to grant.
+        high_starts_over_low = 0;
+        return false;
+      }
+      activate(std::move(next), fresh);
+      granted_slices_left = _low_service_quantum;
+      ++low_service_grants;
+      return true;
+    };
+
+    // Make the next request active without blocking: a low-service grant when
+    // one is due, else a waiting high request, then the parked low one, then
+    // anything queued.
     auto take_next = [&]() -> bool {
+      if (grant_low_service()) return true;
       std::unique_ptr<grouped_io_request> next;
       if (parked != nullptr) {
         if (!_requests.try_dequeue_high(next) || next == nullptr) {
-          active = std::move(parked);
+          activate(std::move(parked), false);
           return true;
         }
       } else if (!_requests.try_dequeue(next) || next == nullptr) {
         return false;
       }
-      active = std::move(next);
-      ++requests_started;
+      activate(std::move(next), true);
       return true;
     };
 
-    // Park an active low request at this slice boundary when a high one waits.
+    // Park an active low request at this slice boundary when a high one waits,
+    // unless the request is still inside the quantum a low-service grant gave it.
     auto preempt_low = [&]() {
-      if (active == nullptr || parked != nullptr || active->priority != io_priority::low) return;
+      if (active == nullptr || parked != nullptr || active->priority != io_priority::low ||
+          granted_slices_left != 0)
+        return;
       std::unique_ptr<grouped_io_request> next;
       if (!_requests.try_dequeue_high(next) || next == nullptr) return;
       parked = std::move(active);
-      active = std::move(next);
-      ++requests_started;
+      activate(std::move(next), true);
       ++preemptions;
     };
 
@@ -1156,6 +1212,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
             auto const backlog =
               std::max(_queued_bytes.load(std::memory_order_relaxed), active->remaining_bytes());
             auto slice = active->take_front();
+            if (granted_slices_left != 0) --granted_slices_left;
             _queued_bytes.fetch_sub(slice.size(), std::memory_order_relaxed);
 
             try {
@@ -1216,8 +1273,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           std::unique_ptr<grouped_io_request> next;
           if (!_requests.wait_dequeue_timed(next, POLL_INTERVAL_US)) continue;
           if (next == nullptr) break;
-          active = std::move(next);
-          ++requests_started;
+          activate(std::move(next), true);
         }
       }
     } catch (...) {

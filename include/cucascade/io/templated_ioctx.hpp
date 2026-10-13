@@ -351,7 +351,7 @@ class templated_ioctx : public ioctx {
       // One call site issues one priority, so the first slice speaks for the
       // request; stamp the resolved value on every slice so each queue entry
       // built below carries it.
-      auto const priority = request_priority(slices, has_device_slice);
+      auto const priority = request_priority(slices);
       for (auto& slice : slices) {
         slice.priority = priority;
       }
@@ -451,17 +451,15 @@ class templated_ioctx : public ioctx {
 
  protected:
   /// Resolve the queue tier for a request whose slices are @p slices.  An
-  /// explicit priority on the first slice (a cache prefetch stamps @c low) wins.
-  /// @c automatic follows the call shape: a multi-range host read waits on the
-  /// low tier; a device read or a single host range is something the caller is
-  /// blocked on, so it goes high.
-  [[nodiscard]] static io_priority request_priority(std::vector<prepared_io_slice> const& slices,
-                                                    bool has_device_slice) noexcept
+  /// explicit priority on the first slice wins (a cache prefetch stamps
+  /// @c low).  @c automatic always resolves to @c high, whatever the call
+  /// shape: a caller that did not opt into the low tier is treated as demand
+  /// work it may block on (a multi-range host read from a native decoder is
+  /// exactly that), so only explicitly-stamped background work runs low.
+  [[nodiscard]] static io_priority request_priority(
+    std::vector<prepared_io_slice> const& slices) noexcept
   {
-    auto const& front = slices.front();
-    if (front.priority != io_priority::automatic) return front.priority;
-    if (has_device_slice || slices.size() == 1) return io_priority::high;
-    return io_priority::low;
+    return resolve_priority(slices.front().priority, io_priority::high);
   }
 
   /**

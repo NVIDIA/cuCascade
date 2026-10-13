@@ -178,6 +178,7 @@ TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
   REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) == prefetch_refusal::issued);
   prefetch.request = fixture.context->backend().wait_take(2s);
   REQUIRE(prefetch.request != nullptr);
+  CHECK(prefetch.request->priority == cucascade::io::io_priority::low);
   read_call           = std::async(std::launch::async, [&] {
     return fixture.datasource->host_read_async(
       2 * chunk_size, destination.size(), destination.data());
@@ -189,12 +190,45 @@ TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
   auto read      = read_call.get();
   demand.request = fixture.context->backend().wait_take(2s);
   REQUIRE(demand.request != nullptr);
+  CHECK(demand.request->priority == cucascade::io::io_priority::high);
   CHECK(demand.request->front().h_buffer.is_contiguous());
   demand.complete(0x2b);
   if (prefetch.request) { prefetch.complete(0x5a); }
   REQUIRE(read.wait_for(2s) == std::future_status::ready);
   CHECK(read.get() == destination.size());
   CHECK(std::ranges::all_of(destination, [](auto byte) { return byte == 0x2b; }));
+}
+
+TEST_CASE("a cached multi-range host read sends its backend work on the high tier",
+          "[cache][cache_handle][read-arbitration][priority]")
+{
+  if (run_arbitration_child(
+        "a cached multi-range host read sends its backend work on the high tier")) {
+    return;
+  }
+  // A native decoder's vectored host read is demand work: left at automatic,
+  // the part the cache cannot serve must not land on the low (prefetch) tier.
+  arbitration_fixture fixture;
+  fixture.advise(0);
+  std::array<std::uint8_t, 2 * read_size> destination{};
+  std::array<cucascade::io::slice, 2> const ranges{
+    cucascade::io::slice{2 * chunk_size, read_size, destination.data()},
+    cucascade::io::slice{3 * chunk_size, read_size, destination.data() + read_size}};
+  held_request first;
+  held_request second;
+  read_cleanup cleanup{*fixture.context, {&first, &second}};
+  auto read     = fixture.datasource->host_read_ranges_async(ranges);
+  first.request = fixture.context->backend().wait_take(2s);
+  REQUIRE(first.request != nullptr);
+  CHECK(first.request->priority == cucascade::io::io_priority::high);
+  // The two ranges may share one request or be split across two.
+  second.request = fixture.context->backend().wait_take(100ms);
+  if (second.request) { CHECK(second.request->priority == cucascade::io::io_priority::high); }
+  first.complete(0x3c);
+  if (second.request) { second.complete(0x3c); }
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == destination.size());
+  CHECK(std::ranges::all_of(destination, [](auto byte) { return byte == 0x3c; }));
 }
 
 TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
