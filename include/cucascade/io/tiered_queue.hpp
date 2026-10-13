@@ -36,9 +36,11 @@ namespace cucascade::io {
  * semaphore is signalled only after an item is visible in its queue, so a
  * consumer holding a permit always finds an item in one of the tiers.
  *
- * Ordering is FIFO within a tier (per producer, as moodycamel guarantees) and
- * strictly high-before-low across tiers: a low item is taken only when the
- * high tier is observed empty.
+ * Ordering is FIFO within a tier (per producer, as moodycamel guarantees).
+ * @ref try_dequeue and @ref wait_dequeue_timed are high-before-low: they take
+ * a low item only when the high tier is observed empty.  A consumer that wants
+ * to bound how long low items wait (the uring reactor's low-service grant) uses
+ * @ref try_dequeue_low to take one explicitly.
  */
 template <typename T>
 class tiered_blocking_queue {
@@ -69,6 +71,17 @@ class tiered_blocking_queue {
     if (_high.try_dequeue(item)) return true;
     // Another consumer won the high item; hand the permit back for whichever
     // item it now accounts for.
+    _items.signal();
+    return false;
+  }
+
+  /// Take the next item from the low tier only, without blocking; high items
+  /// are left in place.
+  bool try_dequeue_low(T& item)
+  {
+    if (_low.size_approx() == 0 || !_items.tryWait()) return false;
+    if (_low.try_dequeue(item)) return true;
+    // Another consumer won the low item; hand the permit back.
     _items.signal();
     return false;
   }

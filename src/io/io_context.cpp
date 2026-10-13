@@ -183,7 +183,7 @@ exec::semi_future<size_t> ioctx::host_readv_async_io(const io_object& obj,
 {
   if (slices.empty()) return exec::make_semi_future<size_t>(0);
   try {
-    auto const resolved = resolve_priority(priority, io_priority::low);
+    auto const resolved = resolve_priority(priority, io_priority::high);
     std::vector<prepared_io_slice> prepared_slices;
     prepared_slices.reserve(slices.size());
     for (auto const& current : slices) {

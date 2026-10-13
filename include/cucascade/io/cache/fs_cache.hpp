@@ -334,7 +334,8 @@ class fs_cache {
 
   // @p priority on the reads below is the reactor queue tier for whatever the
   // cache cannot serve itself (see @ref io_priority); @c automatic resolves to
-  // high for the single-range and device forms and low for host ranges.
+  // high for every form (these are demand reads).  Only the cache's own
+  // prefetch runs low.
 
   [[nodiscard]] std::size_t host_read(const io_object& obj,
                                       size_t offset,

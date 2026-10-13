@@ -61,6 +61,27 @@ TEST_CASE("tiered_blocking_queue::try_dequeue_high leaves low items queued", "[i
   CHECK(item == 1);
 }
 
+TEST_CASE("tiered_blocking_queue::try_dequeue_low takes a low item past waiting high ones",
+          "[io][tiered_queue]")
+{
+  tiered_blocking_queue<int> queue;
+  int item = 0;
+  CHECK(queue.enqueue(7, io_priority::high));
+  CHECK_FALSE(queue.try_dequeue_low(item));
+  CHECK(queue.enqueue(1, io_priority::low));
+  CHECK(queue.enqueue(2, io_priority::low));
+  CHECK(queue.try_dequeue_low(item));
+  CHECK(item == 1);
+  CHECK(queue.size_approx() == 2);
+  // The remaining permits still cover one high and one low item, high first.
+  CHECK(queue.try_dequeue(item));
+  CHECK(item == 7);
+  CHECK(queue.try_dequeue(item));
+  CHECK(item == 2);
+  CHECK_FALSE(queue.try_dequeue_low(item));
+  CHECK_FALSE(queue.wait_dequeue_timed(item, 1000));
+}
+
 TEST_CASE("tiered_blocking_queue wakes a blocked consumer and loses nothing under contention",
           "[io][tiered_queue]")
 {

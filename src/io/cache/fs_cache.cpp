@@ -798,6 +798,10 @@ void fs_cache::await_inflight_prefetch(const io_object& obj,
       return chunk->state.get_state() == chunk_state::loading;
     });
     if (has_loading_chunk && handle->is_prefetch_in_flight()) {
+      // The prefetch runs on the low tier.  This demand read now waits on it,
+      // but the reactor's bounded low service (uring::config::
+      // low_service_interval) keeps it progressing even while other high
+      // requests keep arriving, so the wait is bounded.
       auto const wait_start = std::chrono::steady_clock::now();
       std::ignore           = handle->wait_until_ready();
       auto const waited     = std::chrono::steady_clock::now() - wait_start;
@@ -948,7 +952,9 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
     bool const has_backend = !prepared.empty();
     exec::semi_future<std::size_t> result_future;
     if (has_backend) {
-      auto const resolved = resolve_priority(priority, io_priority::low);
+      // A cache read is demand work: the caller blocks on it, so @c automatic
+      // resolves high.  Only the prefetch path stamps @c low explicitly.
+      auto const resolved = resolve_priority(priority, io_priority::high);
       for (auto& io_slice : prepared) {
         io_slice.priority = resolved;
       }

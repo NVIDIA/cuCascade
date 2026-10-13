@@ -241,14 +241,18 @@ class prepared_io_completion final {
   callback_type _callback;
 };
 
-/// Which of a reactor's two queues a read waits in.  A reactor always takes the
-/// next request from its @c high queue before its @c low one, and parks an
-/// active @c low request at a slice boundary when a @c high one arrives, so a
-/// read the executor is blocked on never queues behind bulk readahead.
+/// Which of a reactor's two queues a read waits in.  A reactor prefers its
+/// @c high queue over its @c low one, and parks an active @c low request at a
+/// slice boundary when a @c high one arrives, so a read the executor is blocked
+/// on does not queue behind bulk readahead.  The preference is not strict: a
+/// tiered reactor (uring) grants the low tier bounded service, so waiting low
+/// work is never starved by a continuous stream of high requests (see
+/// @c uring::config::low_service_interval).
 ///
-/// @c automatic (the read APIs' default) resolves by call shape: device reads
-/// and single-range host reads go @c high; multi-range host reads (and cache
-/// prefetches) go @c low.  @c high / @c low override that.
+/// @c automatic (the read APIs' default) always resolves to @c high: anything
+/// a caller did not explicitly mark as background is demand work it may block
+/// on, whatever the call shape.  Only an explicit @c low (the cache prefetch
+/// stamps it) lands in the low tier.
 enum class io_priority : std::uint8_t { automatic, high, low };
 
 /// @p requested, or @p fallback when it is @c io_priority::automatic.
