@@ -1,3 +1,5 @@
+> Superseded measurement build: whole-archive core linking with `--exclude-libs,ALL` hid RMM's cross-DSO registry. This build is preserved only as diagnostic history; use the corrected direct-object build in `../followup-20261013/sirius-build-corrected/`.
+
 # Isolated Sirius allocator A/B consumer build
 
 Compilation and relinking completed without executing GPU code. Original Sirius and cuCascade sources and original build artifacts were read only. Outputs live exclusively in this directory.

@@ -1,6 +1,8 @@
 # cuCascade PR #185 reevaluation — 2026-10-12
 
-**Recommendation: retain the PR.** Current main still performs a pinned host allocation and free for every request larger than 8 KiB. The merged, hardened cache removes that repeated work and reduces the current Sirius hot TPC-H SF50 suite time by **1.60%** on this GB10. The original PR's **13.9%** application improvement was not reproduced under the current configuration.
+**Corrected recommendation: retain the cache for the tested raw-Parquet workloads.** With faithful consumer resource registration restored, the current SF50 suite takes **6.14% less time with Sirius input caching** and **3.37% less with input caching disabled**. All 1,936 corrected query executions match CPU results. These are repeated-query measurements; a uniformly cold system was not measured. See the [corrected follow-up](followup-20261013/REPORT.md).
+
+**The earlier 1.60% normal-consumer result is withdrawn.** The first isolated relink hid RMM's shared device-resource registry through whole-archive linkage with `--exclude-libs,ALL`, altering cuDF's default allocation behavior. Corrected links restore original direct-object placement, match normal ELF exports, and share registry addresses with libcudf. The original tables below are preserved as superseded artifact-regime evidence. Core allocator correctness and standalone evidence remain valid.
 
 Original PR: [NVIDIA/cuCascade #185](https://github.com/NVIDIA/cuCascade/pull/185), branch `fix/pinned-large-alloc-cache`, original head `5df1ea0e7ac78dea0713e3a580207cb0286b1740`. Fetched main: `bd4aeedbee1201df68bd042374fd9ab6afb5b46d`. Local merge commit: **`8b2d229`**, with both heads as parents. No remote publication was performed. The user explicitly authorized bypassing the repository's GSD workflow for this task.
 
@@ -23,7 +25,9 @@ Asynchronous allocation establishes GPU stream dependencies. A caller must synch
 
 The architect, developer, and reviewer completed their assigned repository and book readings before their work. Their reading lists and assessments are preserved in [ARCHITECTURE.md](ARCHITECTURE.md), [IMPLEMENTATION.md](IMPLEMENTATION.md), and [REVIEW.md](../../REVIEW.md).
 
-## Current Sirius application measurement
+## Superseded isolated Sirius application measurement
+
+The measurements and counts below record the original isolated artifacts. Their numerical values are reproducible within that private-registry regime; the deployment inference and original retain recommendation are withdrawn. Raw device allocation findings require rechecking against repaired resource registration.
 
 | Hot 22-query SF50 suite | Main allocator | Merged cache |
 |---|---:|---:|
@@ -32,7 +36,7 @@ The architect, developer, and reviewer completed their assigned repository and b
 
 The fixed schedule was three baseline noise processes followed by **B, C, C, B, C, B, B, C**. Each process ran every query four times, excluded the first iteration per query, and summed the 22 medians of the remaining three hot iterations. The reported figure is the median of four process totals per arm. Iterations are not treated as independent process repetitions.
 
-Baseline noise totals were 13.454758, 13.511138, and 13.525760 s: range **71.002 ms / 0.52551%**, MAD 14.622 ms. The four adjacent balanced pairs improved by **1.55%, 1.38%, 1.27%, and 2.16%**. Every candidate total was below every paired baseline total. This supports a modest application benefit on this snapshot; it is not an individual-query statistical significance claim or a general speedup guarantee.
+Baseline noise totals were 13.454758, 13.511138, and 13.525760 s: range **71.002 ms / 0.52551%**, MAD 14.622 ms. The four adjacent balanced pairs improved by **1.55%, 1.38%, 1.27%, and 2.16%**. Every candidate total was below every paired baseline total. This supports a modest difference between those isolated artifacts; it does not establish normal consumer performance or individual-query statistical significance.
 
 All **968 query executions** across the noise and comparison blocks matched CPU reference results; 704 were in the paired comparison, of which 528 hot iterations contributed to the figure and 176 first iterations were excluded. Every query retained one row count and result digest across all blocks. CPU fallback was disabled, and each process's fully flushed combined logs contained all 88 expected GPU starts, completions, and engine query entries without query errors. Result checking occurred after the timer stopped.
 
@@ -40,7 +44,7 @@ The current canonical Python harness rendered SF50 SQL over the existing unclust
 
 The consumer source snapshot is Sirius `45253bf5074eb9462bbe6ef0c1dc081a252adf03`. It uses cuCascade dependency `e1b67fe7d44229597af562d46bb8383828d77981`, whose unrelated reservation-accounting changes were retained identically in both arms. Its allocator and fixed upstream source bytes match fetched main. Only the allocator header/source were overlaid; its translation unit and the constructing SiriusContext owner were rebuilt for each arm. All other 333 consumer archive members and 21 resource archive members remained byte-identical between arms. Current wrapper glue was rebuilt against the same clean DuckDB engine archives. This is a controlled allocator comparison on source-equivalent frozen consumer objects, not a claim of a fresh full consumer/engine rebuild. [Build provenance](sirius-build/README.md) records commands, dependency checks, and hashes.
 
-The original PR omitted its exact historical configuration. This experiment establishes current value under the recorded configuration; it cannot certify a literal reproduction of the old 13.9% claim. Initial correctness smokes and an incomplete noise attempt were excluded. The latter exposed a shared harness date-result parsing bug; only the isolated validation adapter was corrected, then the complete prespecified schedule restarted. No engine or query implementation changed.
+The original PR omitted its exact historical configuration. This superseded experiment does not establish normal current-consumer value or reproduce the old 13.9% claim. Initial correctness smokes and an incomplete noise attempt were excluded. The latter exposed a shared harness date-result parsing bug; only the isolated validation adapter was corrected, then the complete prespecified schedule restarted. No engine or query implementation changed.
 
 See the [consumer contract](sirius-benchmark/CONTRACT.md), [manifest](sirius-benchmark/MANIFEST.json), [results](sirius-benchmark/RESULTS.json), and [raw evidence archive](sirius-benchmark/raw-evidence.tar.gz).
 

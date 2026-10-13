@@ -1,0 +1,440 @@
+{
+  "B": {
+    "provenance": "corrected direct-core-object link; sharedRMM registry independentlyverified",
+    "scope": "single hotQ18 sirius::query NVTX range; profiler stop itself ends collection and is notrecorded",
+    "query_start_ns": 17474960,
+    "query_end_ns": 810717840,
+    "profiled_query_ms": 793.24288,
+    "markers": [
+      [
+        4541072,
+        4544208,
+        "cuProfilerStart"
+      ]
+    ],
+    "runtime": {
+      "cudaMallocFromPoolAsync_v11020": {
+        "count": 2308,
+        "inclusive_ms": 11.45416,
+        "return_codes": {
+          "0": 2308
+        }
+      },
+      "cudaStreamWaitEvent_v3020": {
+        "count": 901,
+        "inclusive_ms": 1.76024,
+        "return_codes": {
+          "0": 901
+        }
+      },
+      "cudaStreamSynchronize_v3020": {
+        "count": 1955,
+        "inclusive_ms": 1467.48352,
+        "return_codes": {
+          "0": 1955
+        }
+      },
+      "cudaMemcpyAsync_v3020": {
+        "count": 251,
+        "inclusive_ms": 25.8292,
+        "return_codes": {
+          "0": 251
+        }
+      },
+      "cudaStreamGetDevice_v12080": {
+        "count": 798,
+        "inclusive_ms": 0.253152,
+        "return_codes": {
+          "0": 798
+        }
+      },
+      "cudaEventRecord_v3020": {
+        "count": 1054,
+        "inclusive_ms": 149.357424,
+        "return_codes": {
+          "0": 1054
+        }
+      },
+      "cudaMemsetAsync_v3020": {
+        "count": 296,
+        "inclusive_ms": 6.743744,
+        "return_codes": {
+          "0": 296
+        }
+      },
+      "cuKernelGetName": {
+        "count": 1607,
+        "inclusive_ms": 0.27992,
+        "return_codes": {
+          "0": 1607
+        }
+      },
+      "cudaLaunchKernel_v7000": {
+        "count": 1608,
+        "inclusive_ms": 276.20936,
+        "return_codes": {
+          "0": 1608
+        }
+      },
+      "cudaFreeAsync_v11020": {
+        "count": 2306,
+        "inclusive_ms": 6.27304,
+        "return_codes": {
+          "0": 2306
+        }
+      },
+      "cuStreamSynchronize": {
+        "count": 287,
+        "inclusive_ms": 1241.799488,
+        "return_codes": {
+          "0": 287
+        }
+      },
+      "cudaMemcpyBatchAsync_v13000": {
+        "count": 2130,
+        "inclusive_ms": 114.459232,
+        "return_codes": {
+          "0": 2130
+        }
+      },
+      "cudaStreamAddCallback_v5000": {
+        "count": 1250,
+        "inclusive_ms": 10.9816,
+        "return_codes": {
+          "0": 1250
+        }
+      },
+      "cudaEventQuery_v3020": {
+        "count": 252,
+        "inclusive_ms": 0.257216,
+        "return_codes": {
+          "600": 160,
+          "0": 92
+        }
+      },
+      "cudaEventSynchronize_v3020": {
+        "count": 6,
+        "inclusive_ms": 0.156512,
+        "return_codes": {
+          "0": 6
+        }
+      },
+      "cudaHostAlloc_v3020": {
+        "count": 186,
+        "inclusive_ms": 200.450368,
+        "return_codes": {
+          "0": 186
+        }
+      },
+      "cuCtxSetCurrent": {
+        "count": 50,
+        "inclusive_ms": 0.007696,
+        "return_codes": {
+          "0": 50
+        }
+      },
+      "cudaFreeHost_v3020": {
+        "count": 186,
+        "inclusive_ms": 296.642816,
+        "return_codes": {
+          "0": 186
+        }
+      },
+      "cudaEventCreateWithFlags_v3020": {
+        "count": 107,
+        "inclusive_ms": 62.137088,
+        "return_codes": {
+          "0": 107
+        }
+      },
+      "cudaOccupancyAvailableDynamicSMemPerBlock_v10200": {
+        "count": 15,
+        "inclusive_ms": 1.017344,
+        "return_codes": {
+          "0": 15
+        }
+      },
+      "cudaEventDestroy_v3020": {
+        "count": 107,
+        "inclusive_ms": 68.801072,
+        "return_codes": {
+          "0": 107
+        }
+      },
+      "cudaMalloc_v3020": {
+        "count": 0,
+        "inclusive_ms": 0,
+        "return_codes": {}
+      },
+      "cudaFree_v3020": {
+        "count": 0,
+        "inclusive_ms": 0,
+        "return_codes": {}
+      }
+    },
+    "kernels": 1608,
+    "copies": [
+      {
+        "direction": "Host-to-Device",
+        "source": "Pinned",
+        "destination": "Device",
+        "records": 1595,
+        "bytes": 1316896253
+      },
+      {
+        "direction": "Host-to-Device",
+        "source": "Pageable",
+        "destination": "Device",
+        "records": 44,
+        "bytes": 934
+      },
+      {
+        "direction": "Device-to-Host",
+        "source": "Device",
+        "destination": "Pinned",
+        "records": 325,
+        "bytes": 9217
+      },
+      {
+        "direction": "Host-to-Host",
+        "source": "Pinned",
+        "destination": "Pinned",
+        "records": 150,
+        "bytes": 48325056
+      },
+      {
+        "direction": "Device-to-Device",
+        "source": "Device",
+        "destination": "Device",
+        "records": 202,
+        "bytes": 1801246399
+      },
+      {
+        "direction": "Device-to-Host",
+        "source": "Device",
+        "destination": "Pageable",
+        "records": 65,
+        "bytes": 16916
+      }
+    ],
+    "copy_bytes": 3166494775,
+    "copy_records": 2381
+  },
+  "C": {
+    "provenance": "corrected direct-core-object link; sharedRMM registry independentlyverified",
+    "scope": "single hotQ18 sirius::query NVTX range; profiler stop itself ends collection and is notrecorded",
+    "query_start_ns": 17576064,
+    "query_end_ns": 775898240,
+    "profiled_query_ms": 758.322176,
+    "markers": [
+      [
+        4454272,
+        4457888,
+        "cuProfilerStart"
+      ]
+    ],
+    "runtime": {
+      "cudaMallocFromPoolAsync_v11020": {
+        "count": 2308,
+        "inclusive_ms": 11.3468,
+        "return_codes": {
+          "0": 2308
+        }
+      },
+      "cudaStreamWaitEvent_v3020": {
+        "count": 1087,
+        "inclusive_ms": 1.819872,
+        "return_codes": {
+          "0": 1087
+        }
+      },
+      "cudaStreamSynchronize_v3020": {
+        "count": 1955,
+        "inclusive_ms": 2055.555856,
+        "return_codes": {
+          "0": 1955
+        }
+      },
+      "cudaMemcpyAsync_v3020": {
+        "count": 251,
+        "inclusive_ms": 4.607984,
+        "return_codes": {
+          "0": 251
+        }
+      },
+      "cudaStreamGetDevice_v12080": {
+        "count": 984,
+        "inclusive_ms": 0.270016,
+        "return_codes": {
+          "0": 984
+        }
+      },
+      "cudaEventRecord_v3020": {
+        "count": 1240,
+        "inclusive_ms": 2.680576,
+        "return_codes": {
+          "0": 1240
+        }
+      },
+      "cudaMemsetAsync_v3020": {
+        "count": 296,
+        "inclusive_ms": 0.983008,
+        "return_codes": {
+          "0": 296
+        }
+      },
+      "cuKernelGetName": {
+        "count": 1607,
+        "inclusive_ms": 0.219984,
+        "return_codes": {
+          "0": 1607
+        }
+      },
+      "cudaLaunchKernel_v7000": {
+        "count": 1608,
+        "inclusive_ms": 12.776064,
+        "return_codes": {
+          "0": 1608
+        }
+      },
+      "cudaFreeAsync_v11020": {
+        "count": 2306,
+        "inclusive_ms": 4.327968,
+        "return_codes": {
+          "0": 2306
+        }
+      },
+      "cuStreamSynchronize": {
+        "count": 287,
+        "inclusive_ms": 1460.143184,
+        "return_codes": {
+          "0": 287
+        }
+      },
+      "cudaMemcpyBatchAsync_v13000": {
+        "count": 2130,
+        "inclusive_ms": 16.551072,
+        "return_codes": {
+          "0": 2130
+        }
+      },
+      "cudaStreamAddCallback_v5000": {
+        "count": 1250,
+        "inclusive_ms": 6.268592,
+        "return_codes": {
+          "0": 1250
+        }
+      },
+      "cudaEventQuery_v3020": {
+        "count": 350,
+        "inclusive_ms": 0.40328,
+        "return_codes": {
+          "600": 259,
+          "0": 91
+        }
+      },
+      "cudaEventSynchronize_v3020": {
+        "count": 7,
+        "inclusive_ms": 0.125792,
+        "return_codes": {
+          "0": 7
+        }
+      },
+      "cuCtxSetCurrent": {
+        "count": 50,
+        "inclusive_ms": 0.007216,
+        "return_codes": {
+          "0": 50
+        }
+      },
+      "cudaEventCreateWithFlags_v3020": {
+        "count": 107,
+        "inclusive_ms": 0.21304,
+        "return_codes": {
+          "0": 107
+        }
+      },
+      "cudaOccupancyAvailableDynamicSMemPerBlock_v10200": {
+        "count": 15,
+        "inclusive_ms": 0.032624,
+        "return_codes": {
+          "0": 15
+        }
+      },
+      "cudaEventDestroy_v3020": {
+        "count": 107,
+        "inclusive_ms": 0.548336,
+        "return_codes": {
+          "0": 107
+        }
+      },
+      "cudaHostAlloc_v3020": {
+        "count": 0,
+        "inclusive_ms": 0,
+        "return_codes": {}
+      },
+      "cudaFreeHost_v3020": {
+        "count": 0,
+        "inclusive_ms": 0,
+        "return_codes": {}
+      },
+      "cudaMalloc_v3020": {
+        "count": 0,
+        "inclusive_ms": 0,
+        "return_codes": {}
+      },
+      "cudaFree_v3020": {
+        "count": 0,
+        "inclusive_ms": 0,
+        "return_codes": {}
+      }
+    },
+    "kernels": 1608,
+    "copies": [
+      {
+        "direction": "Host-to-Device",
+        "source": "Pinned",
+        "destination": "Device",
+        "records": 1596,
+        "bytes": 1316896253
+      },
+      {
+        "direction": "Host-to-Device",
+        "source": "Pageable",
+        "destination": "Device",
+        "records": 44,
+        "bytes": 934
+      },
+      {
+        "direction": "Device-to-Host",
+        "source": "Device",
+        "destination": "Pinned",
+        "records": 325,
+        "bytes": 9217
+      },
+      {
+        "direction": "Host-to-Host",
+        "source": "Pinned",
+        "destination": "Pinned",
+        "records": 150,
+        "bytes": 48325056
+      },
+      {
+        "direction": "Device-to-Device",
+        "source": "Device",
+        "destination": "Device",
+        "records": 202,
+        "bytes": 1801246399
+      },
+      {
+        "direction": "Device-to-Host",
+        "source": "Device",
+        "destination": "Pageable",
+        "records": 65,
+        "bytes": 16916
+      }
+    ],
+    "copy_bytes": 3166494775,
+    "copy_records": 2382
+  }
+}

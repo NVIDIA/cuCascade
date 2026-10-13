@@ -1,3 +1,5 @@
+> The original application-equivalence assumption below was invalidated by the link-visibility artifact. Numerical records are preserved; normal-consumer inference is withdrawn. Corrected contracts/results are under `../followup-20261013/`.
+
 # Current Sirius consumer reevaluation of cuCascade PR185
 
 Motivation: the original PR claimed13.9% improvement across hot TPC-H SF50 queries on a GB10. Standalone cuDF read testing demonstrated correct cache execution but no measurable small-fixture gain, so validate the actual current consumer separately. This contract is fixed before consumer timings.

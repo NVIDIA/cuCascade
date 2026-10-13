@@ -1,3 +1,5 @@
+> Superseded application inference: the original consumer relink hid RMM's shared registry. Its 1.60% figure and raw-device-allocation attribution do not describe normal consumer resource registration. See [corrected follow-up](followup-20261013/REPORT.md). Core allocator findings remain valid.
+
 # Architecture assessment: pinned large allocation cache
 
 ## Reading record

@@ -1,0 +1,9 @@
+# Corrected consumer comparison: input-cache mode sirius
+
+Fixed before timings. Use faithful direct-core-object B/C links restoring normal exported GNU-unique RMM device resource registry; independent ELF/provenance gate precedes GPU smoke. Same production allocator B=main, C=merged8b2d229, same frozen consumer nonallocator objects/dependencies, and same SF50 data/query CPUreference. Only the allocator+constructing owner differ between arms. Original private-registry measurements are excluded from deployment inference and never pooled with these runs.
+
+FOM: sum22per-query medians of iterations1–3 of four grouped runs/query, then median of four process totals/arm. Independent processes; first iteration excluded. Fixed3baseline-noise blocks then B,C,C,B,C,B,B,C. Within-policy schedules are interleaved with the other policy after both noise series. Validate every88results againstCPUreference, disablefallback, require88GPUstarts/completions/engineentries and no errors. No optional extra sampling. First-per-query results are descriptive, not uniformly cold system timing.
+
+Fixed48GBGPU/24GBhost,8pipeline/4creator/6scan threads,512MiBbatches, no explicit pinning, no host→GPU memoryprefetcher, no Quent. Mode sirius retains undecoded input withLRU and permits derived backend readahead; mode none disables that policy and compatible reads remainO_DIRECT. CUDA/context/metadata/resource pools survive within eachprocess; initial filefadvise only. This tests input-cache policy sensitivity, not a claim of fully cold physical media or independently priced readahead.
+
+GPUjobs serialized through existinggpu-run.shlease. No profilers during timings and no concurrent expensive CPUanalysis/builds. All source/config/binary hashes frozen beforetiming. Stop on correctness/path failure; environmental contamination excludesaffectedattempt for stated non-result-drivenreason.

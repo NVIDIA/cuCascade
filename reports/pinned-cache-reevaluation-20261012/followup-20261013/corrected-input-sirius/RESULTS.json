@@ -1,0 +1,168 @@
+{
+  "FOM": "median of4process sums of22per-query hot medians",
+  "baseline_noise_ms": [
+    7588.987,
+    7578.3589999999995,
+    7584.259
+  ],
+  "baseline_noise_median_ms": 7584.259,
+  "baseline_noise_range_pct": 0.14013234516385334,
+  "process_FOM_ms": {
+    "B": [
+      7607.535,
+      7615.336,
+      7580.405,
+      7628.689
+    ],
+    "C": [
+      7151.456,
+      7151.448,
+      7124.776,
+      7136.871
+    ]
+  },
+  "median_FOM_ms": {
+    "B": 7611.4355,
+    "C": 7144.1595
+  },
+  "time_reduction_pct": 6.139131048275981,
+  "adjacent_block_pair_time_reduction_pct": [
+    5.995095651876725,
+    6.091497472993968,
+    6.010615527798313,
+    6.446953074112738
+  ],
+  "first_per_query_process_sums_ms": {
+    "B": [
+      8828.619,
+      8762.421,
+      8804.436,
+      8772.314
+    ],
+    "C": [
+      8299.856,
+      8266.79,
+      8359.23,
+      8335.524
+    ]
+  },
+  "first_per_query_median_sum_ms": {
+    "B": 8788.375,
+    "C": 8317.689999999999
+  },
+  "first_per_query_time_reduction_pct": 5.3557682734294065,
+  "first_per_query_scope": "shared process; not a uniformly cold system benchmark",
+  "checked_noise_and_timed_iterations": 968,
+  "per_query_medians": {
+    "1": {
+      "baseline_ms": 666.3855000000001,
+      "candidate_ms": 633.2945,
+      "time_reduction_pct": 4.965744302659669
+    },
+    "2": {
+      "baseline_ms": 115.16199999999999,
+      "candidate_ms": 107.332,
+      "time_reduction_pct": 6.7991177645403855
+    },
+    "3": {
+      "baseline_ms": 480.39549999999997,
+      "candidate_ms": 440.5215,
+      "time_reduction_pct": 8.300244277891855
+    },
+    "4": {
+      "baseline_ms": 205.3785,
+      "candidate_ms": 191.30599999999998,
+      "time_reduction_pct": 6.851983045937149
+    },
+    "5": {
+      "baseline_ms": 269.588,
+      "candidate_ms": 235.3425,
+      "time_reduction_pct": 12.70290220632967
+    },
+    "6": {
+      "baseline_ms": 184.25650000000002,
+      "candidate_ms": 168.03500000000003,
+      "time_reduction_pct": 8.803759975903148
+    },
+    "7": {
+      "baseline_ms": 358.47,
+      "candidate_ms": 329.1155,
+      "time_reduction_pct": 8.188830306580751
+    },
+    "8": {
+      "baseline_ms": 312.826,
+      "candidate_ms": 286.587,
+      "time_reduction_pct": 8.387729920147313
+    },
+    "9": {
+      "baseline_ms": 758.345,
+      "candidate_ms": 735.06,
+      "time_reduction_pct": 3.070502212053894
+    },
+    "10": {
+      "baseline_ms": 519.5050000000001,
+      "candidate_ms": 488.8165,
+      "time_reduction_pct": 5.90725787047287
+    },
+    "11": {
+      "baseline_ms": 111.276,
+      "candidate_ms": 105.29650000000001,
+      "time_reduction_pct": 5.373575613789128
+    },
+    "12": {
+      "baseline_ms": 329.337,
+      "candidate_ms": 306.2555,
+      "time_reduction_pct": 7.008474602003423
+    },
+    "13": {
+      "baseline_ms": 243.30849999999998,
+      "candidate_ms": 229.619,
+      "time_reduction_pct": 5.626396118507982
+    },
+    "14": {
+      "baseline_ms": 210.599,
+      "candidate_ms": 192.938,
+      "time_reduction_pct": 8.386079705981508
+    },
+    "15": {
+      "baseline_ms": 225.34,
+      "candidate_ms": 211.66400000000002,
+      "time_reduction_pct": 6.069051211502607
+    },
+    "16": {
+      "baseline_ms": 126.6995,
+      "candidate_ms": 122.51050000000001,
+      "time_reduction_pct": 3.306248248809185
+    },
+    "17": {
+      "baseline_ms": 250.71200000000002,
+      "candidate_ms": 239.4535,
+      "time_reduction_pct": 4.490610740610745
+    },
+    "18": {
+      "baseline_ms": 791.6685,
+      "candidate_ms": 763.3729999999999,
+      "time_reduction_pct": 3.574160144050198
+    },
+    "19": {
+      "baseline_ms": 445.09299999999996,
+      "candidate_ms": 426.6875,
+      "time_reduction_pct": 4.135203204723503
+    },
+    "20": {
+      "baseline_ms": 273.02049999999997,
+      "candidate_ms": 254.745,
+      "time_reduction_pct": 6.693819694858072
+    },
+    "21": {
+      "baseline_ms": 646.1925000000001,
+      "candidate_ms": 587.6875,
+      "time_reduction_pct": 9.053803626628298
+    },
+    "22": {
+      "baseline_ms": 93.8685,
+      "candidate_ms": 90.039,
+      "time_reduction_pct": 4.07964333082983
+    }
+  }
+}

@@ -1,11 +1,15 @@
 # Pinned large-allocation cache PR reevaluation
 
 **Verdict:** no unresolved blocking correctness or design findings in the integrated allocator.
-The cache remains worth retaining: it reduces the matched current Sirius TPC-H SF50 hot suite time
-by **1.60%** on this machine, exceeding its 0.526% baseline noise range with all four balanced comparisons
-improving. This is a current-configuration result, not reproduction of the historical 13.9% claim.
-Repeated pinned allocation diagnostics also improve substantially. The separate small Parquet-read
-workload shows no demonstrated speedup or regression.
+The cache has demonstrated current application value in the corrected matched Sirius SF50
+consumer: repeated-query suite time falls **6.14% with Sirius input caching** and **3.37% with that
+input-cache policy disabled**. Each policy's four balanced comparisons improves beyond its observed
+baseline noise range. The fixed configuration and this machine bound that verdict; neither test is
+a uniformly cold-system measurement. Repeated pinned allocation diagnostics improve substantially,
+while the separate small Parquet-read workload shows no demonstrated speedup or regression.
+**The earlier 1.60% normal-Sirius verdict remains withdrawn** because its isolated link localized
+RMM's registry. Those artifact-regime measurements are excluded from the corrected verdict.
+The historical 13.9% claim remains unverified.
 
 The original PR head was `5df1ea0`; the comparison baseline is fetched `origin/main` `bd4aeed`.
 Current main still allocates/frees every request above 8192 bytes directly, so the optimization is not
@@ -28,7 +32,9 @@ Read before allocator review:
   allocator tests, and installed cuDF host allocator synchronization behavior.
 - For the additional consumer audit: frozen Sirius `AGENTS.md`, the isolated build/benchmark
   contracts, allocating owner and NUMA facade/resource view, canonical timer/result parser, and
-  installed cuDF 26.08 host-vector/pinned-vector allocation dispatch.
+  installed cuDF 26.08 host-vector/pinned-vector allocation dispatch. Follow-up reads include the
+  full Sirius memory-management guide, task/completion ownership boundaries, canonical cache regimes,
+  installed RMM/cuDF per-device registry implementation and actual ELF/link visibility.
 
 Review covered ownership, asynchronous reuse, CPU access, device selection, metadata exceptions,
 OOM retry, teardown, cache cap/rounding, documentation, and test adequacy. GPU runs were executed by
@@ -134,10 +140,10 @@ Each diagnostic includes allocation-stream synchronization and minimal CPU touch
 content checks pass. The figures measure avoided allocation/registration work with a warm cache;
 they are not transfer throughput, large-buffer initialization throughput, or end-to-end query gains.
 
-## Matched current Sirius consumer assessment
+## Withdrawn normal-consumer inference from the original isolated Sirius build
 
 The original PR claimed a hot 22-query SF50 improvement. A separate prespecified full-consumer
-experiment addresses that scope directly; the earlier small Parquet workload cannot price it.
+experiment attempted to address that scope; the earlier small Parquet workload cannot price it.
 The current engine source is Sirius `45253bf`, with cuCascade consumer dependency `e1b67fe` and its
 unrelated reservation-accounting changes retained. The comparison substitutes only current-main
 versus final-candidate allocator headers/translation units. Both arms freshly compile the allocating
@@ -148,11 +154,53 @@ The remaining **333 Sirius archive members and 21 core resource archive members*
 byte. The owner depfiles each contain 2229 inputs, differing only by the copied owner source and
 overlaid allocator header; no build-generated owner header is substituted. The private NUMA facade
 is included only by the rebuilt owner. The exact same DuckDB `069cc9f` archives, common wrapper,
-support archives, and linker flags are used. Actual loaded extension hashes match the manifest:
+support archives, and linker flags are used between arms. Loaded extension hashes match the manifest:
 baseline `5e4582186ce64df86d58a570377ee23bbc0aee7e01915ccb8191ba708b5fe6b8` and candidate
 `00ed9a0b550907e7f2d49167e24bc127b921006b32cde8156b0c6e31dbc70ec5`.
-This is an isolated comparison using matched frozen current consumer objects, not a fresh full
-engine rebuild or replacement of its whole dependency with an ABI-incompatible latest library.
+This preserves input object bytes between arms, but **does not preserve their original dynamic
+symbol visibility**. The same flags do not establish equivalent behavior when direct object inputs
+are moved into an archive.
+
+Independent verification of the actual normal current extension finds GNU-unique dynamic symbols
+for RMM's `get_ref_map()::device_id_to_resource`, guard and `ref_map_lock` at `0x77ebc50`,
+`0x77ebc48` and `0x77ebc80`. The older normal extension exports them too. Both isolated timing arms
+have no dynamic exports for this registry; the candidate's map is a local `b` symbol at
+`0x5750de8`, whereas installed libcudf exports a separate GNU-unique map at `0x52946f8`.
+
+The original link command has 323 direct object inputs and `--exclude-libs,ALL`. The isolated build
+replaces those with a direct wrapper and whole-archive `libsirius_core.a`, retaining the archive
+exclusion flag. That flag now localizes registry symbols formerly emitted by direct objects. RMM's
+installed `per_device_resource.hpp:41–49` explicitly requires default visibility to share one
+registry across DSOs. Its getter initializes an unregistered device with `cuda_memory_resource`,
+which uses direct `cudaMalloc`/`cudaFree`; Sirius's inline setter operates on its extension registry.
+Thus library-side default allocations can use a different resource from the configured pool.
+ELF identity does not alone reveal live registry content or attribute every synchronous allocation,
+but the visibility divergence is a confirmed measurement-build defect.
+
+**Required remedy property:** preserve original direct-object link/export behavior while replacing
+only the allocator and allocating/deleting owner objects. The cheapest repair restores the current
+Sirius core members as direct object inputs and leaves archive flags/support inputs in their
+original roles. Verify registry export parity and input provenance before new GPU smoke tests and
+the fixed comparisons. Broadly removing archive visibility controls would change more than this
+property requires. Original measurements are retained as artifact-regime evidence, not deployment
+performance. The root has stopped the ongoing input-cache sensitivity run because it used the same
+invalid consumer-equivalence assumption.
+
+The corrected build now passes the independent pre-GPU gate. Every actual extracted member was
+checked: 334 direct core objects per arm preserve all 333 non-owner members, both distinct
+`type.pb.cc.o` members, and the CUDA device-link object; 21 non-allocator resource members remain
+unchanged. Link argv matches exactly the prior command with the Sirius whole-archive block expanded
+to the direct inventory and isolated output/resource/dependency-file paths. Both corrected
+extensions export the registry map, guard and lock as `OBJECT UNIQUE DEFAULT`, matching the normal
+extensions. With GPUs hidden, separate loader-only processes use `dlopen`/`dlsym` and resolve all
+three data symbols to exactly the same addresses in each corrected extension and libcudf; no
+resource, extension, device or query entry point is called. This confirms the repaired sharing
+property for the exercised libcudf-first load order, not application execution or performance.
+Corrected baseline SHA-256 is
+`5cc828e67b6e4d1007a257569c5383b301037dcadcf32b4ea2aee2b3cf18690a`; candidate is
+`2673bb70648cf4d1f749b44b3bf88813db0b947d87ed311c12e3b33e88dc20ad`.
+Commands, symbol addresses, provenance checks and limits are persisted in
+`sirius-build-corrected/INDEPENDENT-GATE.json`. Original consumer and production hashes remain unchanged.
 
 The existing unclustered SF50 dataset is 13.45 GB of raw Parquet. Configuration is fixed: one GPU,
 48 GB GPU/24 GB host limits, 512 MiB batches, pipeline/creator/scan threads 8/4/6, Sirius LRU cache,
@@ -165,12 +213,13 @@ Prices come from unprofiled `execute(...).fetchall()` wall time, with validation
 The fixed protocol uses three baseline-noise processes, then **B, C, C, B, C, B, B, C**.
 Independent recomputation of every CSV and validation record gives:
 
-| Current Sirius hot SF50 suite | Baseline | Candidate |
+| Original isolated artifact hot SF50 suite | Baseline | Candidate |
 |---|---:|---:|
 | Four process totals, ms | 13576.664; 13578.534; 13525.791; 13581.552 | 13366.717; 13391.483; 13353.822; 13287.594 |
 | Median total | 13.577599 s | 13.3602695 s |
 
-The reduction is **1.60065%**. Adjacent balanced comparisons improve by 1.546%, 1.378%, 1.271%, and
+The recorded artifact-regime reduction is **1.60065%**, with its normal-consumer inference withdrawn.
+Adjacent balanced comparisons improve by 1.546%, 1.378%, 1.271%, and
 2.164%. Baseline-noise totals are 13454.758, 13511.138, and 13525.760 ms: range 71.002 ms,
 **0.525507%**, MAD 14.622 ms. All 22 per-query point medians are lower, but no individual-query
 significance claim is made from the suite-level noise measurement.
@@ -189,7 +238,7 @@ or repository source. The TypeError and corrected date round trip were reproduce
 The entire aborted block is retained separately and excluded; all three valid noise blocks and the
 unchanged fixed paired schedule restart under the corrected adapter hash.
 
-Separate Nsight traces validate all 88 results in each diagnostic process and capture only Q18's
+Separate traces of these original artifacts validate all 88 results and capture only Q18's
 first hot iteration, chosen from baseline contributions. Independent SQLite queries clip to the
 profiler-start return and profiler-stop entry, enclosing exactly one `sirius::query` range:
 
@@ -221,9 +270,103 @@ The observer runs the same **22 queries × four iterations**, validates all 88 r
 88 GPU starts/completions. It observes **84,466 asynchronous allocations and 84,466 asynchronous
 deallocations, with zero synchronous calls of either kind**. Installed cuDF host allocators use
 asynchronous allocation followed by explicit stream synchronization before CPU initialization.
-Thus the stale external synchronous entry point is unused in the measured route and does not
-invalidate these results. It remains a limitation for other callers, not a resolved Sirius defect.
+Thus the stale external synchronous entry point is unused in the measured artifact route. It adds
+no further correctness objection to those executions, but cannot repair the link-visibility problem
+or establish normal-consumer reachability. It remains a limitation for other callers, not a resolved
+Sirius defect.
 Observer timings are excluded from all performance comparisons.
+
+## Corrected matched consumer result
+
+Independent ELF, exact-link-argv, member-byte and loader checks establish the repaired registry
+sharing property above. Four excluded full-query smokes cover both allocator arms under both
+input-cache policies: all 88 query results match the CPU reference, with matching GPU starts,
+completions and engine entries. Actual loaded paths resolve to the corrected artifact hashes.
+The same snapshot, 13.45 GB SF50 raw-Parquet data, rendered SQL, CPU reference, memory budgets,
+512 MiB batches, thread counts, disabled fallback/Quent and result adapter are retained.
+
+Both policies complete the prespecified three baseline-noise processes plus **B, C, C, B, C, B, B,
+C**. Noise series precede comparisons; the two policies' corresponding comparison blocks interleave.
+Independent recomputation uses each query's median of iterations 1–3, sums all 22 query medians per
+process, then takes the median of four process sums per arm. Individual iterations are not treated
+as independent experiments. No original artifact-regime measurements are pooled with these results.
+
+| Corrected SF50 repeated-query suite | Sirius input cache | Input-cache policy disabled |
+|---|---:|---:|
+| Baseline median | 7.6114355 s | 9.1284350 s |
+| Candidate median | 7.1441595 s | 8.8212210 s |
+| Time reduction | **6.13913%** | **3.36546%** |
+| Four adjacent balanced reductions | 5.9951%, 6.0915%, 6.0106%, 6.4470% | 3.5447%, 3.9204%, 3.2940%, 2.8379% |
+| Baseline-noise process sums, ms | 7588.987; 7578.359; 7584.259 | 9129.131; 9060.777; 9119.654 |
+| Observed noise range | 10.628 ms / **0.14013%** | 68.354 ms / **0.74952%** |
+| Noise median absolute deviation | 4.728 ms | 9.477 ms |
+
+Every policy's four paired reductions exceeds its observed baseline-noise range. That is repeatable
+evidence for a suite-level benefit under these configurations, not a formal confidence interval or
+a per-query significance claim. Under disabled input caching, Q2 and Q20 have slightly slower point
+medians; a positive aggregate does not establish improvement for every query. Changing the policy
+reduces the measured benefit, but does not remove it. This directly rejects the narrower explanation
+that the benefit exists only when Sirius retains raw inputs; it does not establish independence
+from batch size, scan concurrency or other untested settings.
+
+The two policy configurations differ only in `scan_manager.cache.mode`. Source semantics matter:
+`sirius` retains undecoded input with LRU and permits derived backend readahead; `none` disables
+both that cache and default readahead eligibility. Both intend compatible local reads through
+O_DIRECT. This is sensitivity to the whole input-cache policy, not a separately isolated price
+for retention versus readahead. The host-to-GPU memory prefetcher is independently disabled in both.
+
+The reviewer checks every accepted record against raw CSVs and per-iteration validation, not just
+the summary. All **1936 noise/timed iterations** validate against the CPU reference, including
+1408 paired iterations: 1056 hot iterations contribute to the figure of merit and 352 first
+iterations are excluded. Every query has one result digest and row count across all 22 processes;
+all rendered query-file hashes match across them. Each process records exactly 88 GPU starts,
+completions and engine entries with no specified fallback/query-error markers. The actual global
+run order matches the fixed interleave, and source/config/adapter/canonical/production/original-
+extension/corrected-artifact endpoint hashes remain unchanged. Reproducible independent audit and
+results are in `audit_corrected.py` and `CORRECTED-INDEPENDENT-RESULTS.json`.
+
+Initial dataset-file `posix_fadvise(DONTNEED)` occurs once per process. Canonical grouped execution
+uses one initialized connection, four executions of Q1 before Q2, and no inter-query or inter-
+iteration cache reset. Extension loading and Parquet view binding occur before query timers.
+Summing each query's first iteration gives descriptive median reductions of **5.35577%** with
+Sirius caching (8.788375 → 8.317690 s) and **3.13961%** with disabled input caching
+(9.4254695 → 9.1295465 s). Their baseline first-iteration noise ranges are separately 0.60374%
+and 1.12336%; the hot noise ranges must not be substituted for them. Earlier query groups may warm
+shared inputs, metadata, CUDA state and allocation caches. Advisory file eviction and O_DIRECT do
+not flush device/controller caches. These first-iteration numbers therefore do not establish fully
+cold application/storage value, and neither does turning off input caching alone.
+
+The original claim lacks its exact historical configuration. The corrected 6.14%/3.37% measurements
+reevaluate present value and do not reproduce or validate the historical 13.9% number. The absence
+of benefit in the standalone small Parquet fixture remains a separate valid result.
+
+Corrected Nsight attribution separately profiles Q18 iteration 1 inside the same full 22-query
+process; both diagnostic processes validate all 88 results. Collection now stops immediately at the
+stop callback, so only `cuProfilerStart` is recorded. The reviewer verifies exactly one complete
+`sirius::query` NVTX range per trace and selects only its contained records, with no runtime call
+crossing a query boundary. The old two-marker scope is not applied to these corrected exports.
+
+| Corrected Q18 hot attribution | Baseline | Candidate |
+|---|---:|---:|
+| Host allocation / free calls | 186 / 186 | 0 / 0 |
+| Raw `cudaMalloc` / `cudaFree` calls | 0 / 0 | 0 / 0 |
+| Pool allocation / free calls inside query | 2308 / 2306 | 2308 / 2306 |
+| Runtime stream synchronizations | 1955 | 1955 |
+| Driver stream synchronizations | 287 | 287 |
+| Stream-event waits | 901 | 1087 |
+| Event synchronizations | 6 | 7 |
+| GPU kernels | 1608 | 1608 |
+| Copy records / total bytes | 2381 / 3,166,494,775 | 2382 / 3,166,494,775 |
+
+Both traces transfer 1,316,896,253 bytes from pinned host memory to device and 1,801,246,399 bytes
+device-to-device. Pageable transfers total only 934 host-to-device bytes and 16,916 device-to-host
+bytes; the remaining categories and their byte totals also match. These counts confirm pooled
+device allocation after the registry repair and removal of repeated host allocation/free calls,
+with extra event dependencies protecting reuse and equivalent kernel/copy work. All selected API
+returns succeed except expected `cudaEventQuery` NotReady (600) polling. The trace hashes and
+independent SQL aggregate/capture/result checks are in `CORRECTED-INDEPENDENT-PROFILE.json`.
+Inclusive API durations overlap across threads, and profiling perturbs execution; neither their
+sum nor the single profiled wall times supplies the unprofiled suite performance price.
 
 ## Practical limits
 

@@ -1,0 +1,140 @@
+{
+  "B": {
+    "verdict": "PASS",
+    "query_ns": [
+      17474960,
+      810717840
+    ],
+    "start_marker_only_expected": true,
+    "no_crossing_runtime_calls": true,
+    "HostAlloc": 186,
+    "FreeHost": 186,
+    "rawMalloc": 0,
+    "rawFree": 0,
+    "poolAlloc": 2308,
+    "poolFree_in_query": 2306,
+    "streamWaitEvent": 901,
+    "runtimeStreamSync": 1955,
+    "driverStreamSync": 287,
+    "eventSync": 6,
+    "kernels": 1608,
+    "copy_records": 2381,
+    "copy_bytes": 3166494775,
+    "copy_groups": [
+      [
+        "Device-to-Device",
+        "Device",
+        "Device",
+        202,
+        1801246399
+      ],
+      [
+        "Device-to-Host",
+        "Device",
+        "Pageable",
+        65,
+        16916
+      ],
+      [
+        "Device-to-Host",
+        "Device",
+        "Pinned",
+        325,
+        9217
+      ],
+      [
+        "Host-to-Device",
+        "Pageable",
+        "Device",
+        44,
+        934
+      ],
+      [
+        "Host-to-Device",
+        "Pinned",
+        "Device",
+        1595,
+        1316896253
+      ],
+      [
+        "Host-to-Host",
+        "Pinned",
+        "Pinned",
+        150,
+        48325056
+      ]
+    ],
+    "88_CPUchecks_and_one_Q18_hot_capture": true,
+    "trace_sha256": "406a75601061dbbb4b0309b42fe2e13952b0cb29b0b2b850ac5bc53c03f9d60b",
+    "all_nonzero_returns": "cudaEventQuery NotReady600 only"
+  },
+  "C": {
+    "verdict": "PASS",
+    "query_ns": [
+      17576064,
+      775898240
+    ],
+    "start_marker_only_expected": true,
+    "no_crossing_runtime_calls": true,
+    "HostAlloc": 0,
+    "FreeHost": 0,
+    "rawMalloc": 0,
+    "rawFree": 0,
+    "poolAlloc": 2308,
+    "poolFree_in_query": 2306,
+    "streamWaitEvent": 1087,
+    "runtimeStreamSync": 1955,
+    "driverStreamSync": 287,
+    "eventSync": 7,
+    "kernels": 1608,
+    "copy_records": 2382,
+    "copy_bytes": 3166494775,
+    "copy_groups": [
+      [
+        "Device-to-Device",
+        "Device",
+        "Device",
+        202,
+        1801246399
+      ],
+      [
+        "Device-to-Host",
+        "Device",
+        "Pageable",
+        65,
+        16916
+      ],
+      [
+        "Device-to-Host",
+        "Device",
+        "Pinned",
+        325,
+        9217
+      ],
+      [
+        "Host-to-Device",
+        "Pageable",
+        "Device",
+        44,
+        934
+      ],
+      [
+        "Host-to-Device",
+        "Pinned",
+        "Device",
+        1596,
+        1316896253
+      ],
+      [
+        "Host-to-Host",
+        "Pinned",
+        "Pinned",
+        150,
+        48325056
+      ]
+    ],
+    "88_CPUchecks_and_one_Q18_hot_capture": true,
+    "trace_sha256": "7e5d4b9fd53715cce1a496c9a9e4a89f7c37a5aff9b60e58f41457c60a000111",
+    "all_nonzero_returns": "cudaEventQuery NotReady600 only"
+  }
+}
