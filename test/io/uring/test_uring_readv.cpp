@@ -148,16 +148,19 @@ class pattern_file {
 
 /**
  * A started reactor whose staging is 64 one-MiB slots (the slot cap), reading
- * with @p slices_per_pass.
+ * with @p slices_per_pass and @p low_service_interval.
  */
 class spp_reactor {
  public:
   static constexpr std::size_t block_size = 1UL << 20;
   static constexpr std::size_t capacity   = 128UL << 20;
 
-  explicit spp_reactor(std::size_t slices_per_pass)
+  explicit spp_reactor(
+    std::size_t slices_per_pass,
+    std::size_t low_service_interval = cucascade::io::uring::config{}.low_service_interval)
     : _mr{0, _upstream, capacity, capacity, block_size, 64, 0},
-      _reactor{std::make_shared<uring_reactor::reactor_context>(config_for(slices_per_pass), &_mr),
+      _reactor{std::make_shared<uring_reactor::reactor_context>(
+                 config_for(slices_per_pass, low_service_interval), &_mr),
                ""}
   {
     _reactor.start();
@@ -171,10 +174,12 @@ class spp_reactor {
   [[nodiscard]] uring_reactor& get() noexcept { return _reactor; }
 
  private:
-  [[nodiscard]] static cucascade::io::uring::config config_for(std::size_t slices_per_pass)
+  [[nodiscard]] static cucascade::io::uring::config config_for(std::size_t slices_per_pass,
+                                                               std::size_t low_service_interval)
   {
     cucascade::io::uring::config cfg{};
-    cfg.slices_per_pass = slices_per_pass;
+    cfg.slices_per_pass      = slices_per_pass;
+    cfg.low_service_interval = low_service_interval;
     return cfg;
   }
 
@@ -619,6 +624,190 @@ TEST_CASE("io_uring parks an active low request for a high one and resumes it",
   for (std::size_t i = ranges.back().offset; i < total; ++i) {
     REQUIRE(high_dst.get()[i] == pattern_byte(i));
   }
+}
+
+namespace {
+
+/// Outcome of one low request raced against a backlog of high ones.
+struct low_vs_high_outcome {
+  bool low_ok{false};
+  /// High requests that had completed when the low one completed.
+  std::size_t highs_before_low{0};
+  std::uint64_t grants{0};
+};
+
+/**
+ * Enqueue one @p n_low_slices-slice low request, then @p n_high high requests
+ * of @p high_slices slices each, all at once (so the high tier stays backed
+ * up), on a reactor expanding one slice per pass.  Report how many high
+ * requests finished before the low one.
+ */
+low_vs_high_outcome race_low_against_high_backlog(std::size_t low_service_interval,
+                                                  std::size_t n_low_slices,
+                                                  std::size_t n_high,
+                                                  std::size_t high_slices)
+{
+  using cucascade::io::io_priority;
+  constexpr std::size_t stride = 64UL << 10;
+  std::size_t const n_slices   = n_low_slices + high_slices;
+  pattern_file const file{n_slices * stride};
+  auto const all = slice_ranges(n_slices, stride, false);
+  std::vector<range> const low_ranges(all.begin(),
+                                      all.begin() + static_cast<std::ptrdiff_t>(n_low_slices));
+  std::vector<range> const high_ranges(all.begin() + static_cast<std::ptrdiff_t>(n_low_slices),
+                                       all.end());
+
+  spp_reactor reactor{1, low_service_interval};
+  aligned_bytes low_dst{n_slices * stride};
+  aligned_bytes high_dst{n_slices * stride};
+
+  struct shared_state {
+    std::atomic<std::size_t> highs_done{0};
+    std::atomic<std::size_t> highs_before_low{0};
+    std::atomic<bool> low_done{false};
+    std::atomic<bool> low_ok{false};
+    std::atomic<std::size_t> high_errors{0};
+  };
+  auto state = std::make_shared<shared_state>();
+
+  enqueue_ranges(reactor.get(), file.open(), low_ranges, low_dst.get(), io_priority::low)
+    .install_callback([state](cucascade::exec::try_t<std::size_t>&& result) {
+      state->highs_before_low.store(state->highs_done.load());
+      state->low_ok.store(result.has_value());
+      state->low_done.store(true);
+    });
+  for (std::size_t i = 0; i < n_high; ++i) {
+    enqueue_ranges(reactor.get(), file.open(), high_ranges, high_dst.get(), io_priority::high)
+      .install_callback([state](cucascade::exec::try_t<std::size_t>&& result) {
+        if (!result.has_value()) state->high_errors.fetch_add(1);
+        state->highs_done.fetch_add(1);
+      });
+  }
+
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!state->low_done.load() || state->highs_done.load() < n_high) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+  CHECK(state->high_errors.load() == 0);
+  for (auto const& r : low_ranges) {
+    for (std::size_t i = r.offset; i < r.end(); i += 509) {
+      REQUIRE(low_dst.get()[i] == pattern_byte(i));
+    }
+  }
+  return {state->low_ok.load(),
+          state->highs_before_low.load(),
+          reactor.get().take_gauges().low_service_grants};
+}
+
+}  // namespace
+
+TEST_CASE("io_uring low_service_interval defaults to bounded service", "[io][uring][priority]")
+{
+  CHECK(cucascade::io::uring::config{}.low_service_interval == 4);
+}
+
+TEST_CASE("io_uring grants a waiting low request bounded service under a high backlog",
+          "[io][uring][priority][low_service]")
+{
+  // One slice per pass, so each grant's quantum is one slice: the low request's
+  // n_low slices need at most n_low grants, one per `interval` high starts.
+  constexpr std::size_t interval = 4;
+  constexpr std::size_t n_low    = 4;
+  constexpr std::size_t n_high   = 64;
+  auto const outcome             = race_low_against_high_backlog(interval, n_low, n_high, 8);
+  CHECK(outcome.low_ok);
+  CHECK(outcome.grants >= 1);
+  // At most n_low * interval high starts precede the low request's last grant
+  // (plus the one that preempted it); allow a few more that were already in
+  // flight while its last slice completed.
+  CHECK(outcome.highs_before_low <= n_low * (interval + 1) + 4);
+  CHECK(outcome.highs_before_low < n_high);
+}
+
+TEST_CASE("io_uring low_service_interval = 0 keeps priority strict",
+          "[io][uring][priority][low_service]")
+{
+  constexpr std::size_t n_high = 64;
+  auto const outcome           = race_low_against_high_backlog(0, 4, n_high, 8);
+  CHECK(outcome.low_ok);
+  CHECK(outcome.grants == 0);
+  // The low request runs only once the high tier is empty, i.e. behind
+  // (nearly) the whole backlog.
+  CHECK(outcome.highs_before_low >= n_high / 2);
+}
+
+TEST_CASE("io_uring a read waiting on low work completes while high traffic continues",
+          "[io][uring][priority][low_service]")
+{
+  // The fs_cache shape: a demand read blocks on an in-flight prefetch (a low
+  // request) while other demand (high) reads keep arriving with no gap.  The
+  // high stream only stops once the low request is done, so under strict
+  // priority the wait would never end; bounded service must finish it.
+  using cucascade::io::io_priority;
+  constexpr std::size_t stride      = 64UL << 10;
+  constexpr std::size_t n_low       = 32;
+  constexpr std::size_t high_slices = 4;
+  constexpr std::size_t max_backlog = 32;
+  constexpr std::size_t n_slices    = n_low + high_slices;
+  pattern_file const file{n_slices * stride};
+  auto const all   = slice_ranges(n_slices, stride, false);
+  auto const split = all.begin() + static_cast<std::ptrdiff_t>(n_low);
+  std::vector<range> const low_ranges(all.begin(), split);
+  std::vector<range> const high_ranges(split, all.end());
+
+  spp_reactor reactor{1};
+  aligned_bytes low_dst{n_slices * stride};
+  aligned_bytes high_dst{n_slices * stride};
+
+  struct shared_state {
+    std::atomic<std::size_t> highs_issued{0};
+    std::atomic<std::size_t> highs_done{0};
+    std::atomic<std::size_t> high_errors{0};
+  };
+  auto state = std::make_shared<shared_state>();
+
+  auto prefetch =
+    enqueue_ranges(reactor.get(), file.open(), low_ranges, low_dst.get(), io_priority::low);
+  std::atomic<bool> stop{false};
+  std::thread high_traffic([&] {
+    while (!stop.load()) {
+      if (state->highs_issued.load() - state->highs_done.load() >= max_backlog) {
+        std::this_thread::yield();
+        continue;
+      }
+      state->highs_issued.fetch_add(1);
+      enqueue_ranges(reactor.get(), file.open(), high_ranges, high_dst.get(), io_priority::high)
+        .install_callback([state](cucascade::exec::try_t<std::size_t>&& result) {
+          if (!result.has_value()) state->high_errors.fetch_add(1);
+          state->highs_done.fetch_add(1);
+        });
+    }
+  });
+
+  // The "demand read": blocked on the prefetch.
+  std::size_t waited = 0;
+  bool wait_ok       = false;
+  try {
+    waited  = std::move(prefetch).get(std::chrono::seconds(30));
+    wait_ok = true;
+  } catch (...) {
+  }
+  auto const highs_while_waiting = state->highs_done.load();
+  stop.store(true);
+  high_traffic.join();
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (state->highs_done.load() < state->highs_issued.load()) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+
+  REQUIRE(wait_ok);
+  CHECK(waited == n_low * stride);
+  CHECK(state->high_errors.load() == 0);
+  // High traffic really did run alongside, and the low tier got its turns by grant.
+  CHECK(highs_while_waiting > 0);
+  CHECK(reactor.get().take_gauges().low_service_grants >= 1);
 }
 
 TEST_CASE("io_uring slices_per_pass never changes the bytes read", "[io][uring][slices_per_pass]")

@@ -67,6 +67,25 @@ struct config {
   /// than one that holds a reactor until its last slice.  0 disables the split.
   std::size_t range_batch_slices{8};
 
+  /// Bounded service for the low-priority tier.  Priority is otherwise strict
+  /// (a waiting high request is taken first and parks an active low one), so a
+  /// demand read that waits on in-flight low work (a cache prefetch it hit)
+  /// could starve behind a continuous stream of high requests.  After this many
+  /// high requests have started while low work was waiting (parked, or queued
+  /// on the low tier), the reactor grants the low tier one turn even though
+  /// high work is waiting: it resumes the parked request, or else takes the
+  /// next queued low one.  A granted request is not preempted again until it
+  /// has expanded one quantum of slices -- @ref slices_per_pass of them, or
+  /// @c max_slices_per_pass when that is 0 (uncapped) -- or completed.
+  ///
+  /// So with at least one low request waiting, the low tier gets at least one
+  /// quantum per @c low_service_interval high request starts: high work keeps
+  /// at least interval/(interval+1) of the request starts (80% at the default
+  /// 4) while a prefetch a demand read is blocked on still finishes in bounded
+  /// time.  0 restores strict priority (low work runs only when no high request
+  /// is waiting).
+  std::size_t low_service_interval{4};
+
   /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
   /// either way -- naming it lets the caller align once, up front, instead of
   /// every layer rediscovering it.  Reported even when @ref use_odirect is

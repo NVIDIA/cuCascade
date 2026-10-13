@@ -293,8 +293,8 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   // no prefetch reservation.  All async variants return @c exec::semi_future.
   //
   // @p priority picks the reactor queue tier (see @ref io_priority).  Left at
-  // @c automatic, device reads and single-range host reads go high and
-  // multi-range host reads go low.  A backend without tiered queues ignores it.
+  // @c automatic, every read goes high (demand); only an explicit @c low
+  // goes low.  A backend without tiered queues ignores it.
 
   size_t host_read(const io_object& obj,
                    size_t offset,

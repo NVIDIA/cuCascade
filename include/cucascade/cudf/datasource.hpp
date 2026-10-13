@@ -164,7 +164,8 @@ class datasource : public cudf::io::datasource {
                                                io_priority priority = io_priority::automatic);
 
   /// \brief Vectored host read.  \p priority as above; @c automatic resolves to
-  /// low, since a multi-range host read is treated as bulk.
+  /// high, since the caller (e.g. a native decoder) typically blocks on it.
+  /// Pass @c io_priority::low explicitly for background/readahead reads.
   std::future<size_t> host_read_ranges_async(std::span<const slice> slices,
                                              io_priority priority = io_priority::automatic);
 

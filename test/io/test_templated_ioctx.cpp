@@ -283,7 +283,7 @@ TEST_CASE("next_reactor sends a read to the two least-backlogged reactors",
   }
 }
 
-TEST_CASE("automatic priority resolves by call shape; an explicit priority wins",
+TEST_CASE("automatic priority always resolves high; only an explicit low is low",
           "[io][templated_ioctx][priority]")
 {
   using cucascade::io::io_priority;
@@ -296,7 +296,11 @@ TEST_CASE("automatic priority resolves by call shape; an explicit priority wins"
   static_cast<void>(pool.context->host_read_async_io(*pool.object, 0, 16, buffer));
   CHECK(requests.back()->priority == io_priority::high);
 
+  // A multi-range host read is demand work too (a native decoder blocks on it).
   static_cast<void>(pool.context->host_readv_async_io(*pool.object, ranges));
+  CHECK(requests.back()->priority == io_priority::high);
+
+  static_cast<void>(pool.context->host_readv_async_io(*pool.object, ranges, io_priority::low));
   CHECK(requests.back()->priority == io_priority::low);
 
   static_cast<void>(pool.context->host_readv_async_io(*pool.object, ranges, io_priority::high));
@@ -306,13 +310,16 @@ TEST_CASE("automatic priority resolves by call shape; an explicit priority wins"
     pool.context->host_read_async_io(*pool.object, 0, 16, buffer, io_priority::low));
   CHECK(requests.back()->priority == io_priority::low);
 
-  // Slices handed straight to mixed_readv_async_io resolve the same way.
+  // Slices handed straight to mixed_readv_async_io resolve the same way,
+  // whatever the call shape.
   static_cast<void>(pool.dispatch(1));
   CHECK(requests.back()->priority == io_priority::high);
   static_cast<void>(pool.dispatch(3));
-  CHECK(requests.back()->priority == io_priority::low);
-  // A cache prefetch stamps its single slice low, which beats the call shape.
+  CHECK(requests.back()->priority == io_priority::high);
+  // A cache prefetch stamps its slices low explicitly, and that wins.
   static_cast<void>(pool.dispatch(1, io_priority::low));
+  CHECK(requests.back()->priority == io_priority::low);
+  static_cast<void>(pool.dispatch(3, io_priority::low));
   CHECK(requests.back()->priority == io_priority::low);
 }
 
