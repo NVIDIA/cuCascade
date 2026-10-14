@@ -1,83 +1,157 @@
-# Suggested review comments and follow-ups for NVIDIA/cuCascade PR 185 (head 32dcbce7)
+# PR 185 notes after local fixes
 
-Source: SPEC.md section 7 (pinned-slab-pool). Comments are drafted for the user to post themselves;
-nothing has been posted. Ordered by importance for Sirius' multi-GPU use.
+Updated 2026-10-14 after the architect -> developer -> reviewer implementation cycle.
+This is a temporary handoff file: remove it before merging the PR.
 
-## 1. Add allocation counters (G2) -- `include/cucascade/memory/small_pinned_host_memory_resource.hpp`
-The cache is sized by one number, but the only thing a consumer can observe is
-`large_cache_bytes()`. That leaves no way to tell whether the limit fits the workload: a too-small
-limit only shows up as `cudaHostAlloc` / `cudaFreeHost` calls in a profiler.
+The original notes cited SPEC.md section 7 (pinned-slab-pool). That SPEC and its SF1000
+four-GPU evidence are unavailable on this machine. The claimed -8.6 s / -18% result remains
+unverified here; it must not be presented as a measured result of this port.
 
-Suggest a const snapshot API that is cheap to call at shutdown:
+## 1. Allocation statistics (G2): implemented
 
-```cpp
-struct statistics {
-  std::size_t cached_large_bytes;      // == large_cache_bytes()
-  std::size_t peak_cached_large_bytes;
-  std::size_t large_hits;              // served from the cache
-  std::size_t large_misses;            // cudaHostAlloc on a cacheable bucket
-  std::size_t large_uncacheable;       // bucket > limit (exact-size cudaHostAlloc)
-  std::size_t large_evictions;         // cudaFreeHost of a cached entry (FIFO or purge)
-};
-[[nodiscard]] statistics get_statistics() const;
-```
+`small_pinned_host_memory_resource::get_statistics()` returns a thread-safe value snapshot:
 
-Hits, misses and evictions are maintained under the existing mutex. The uncacheable counter is
-incremented on a lock-free path, so make it atomic. Sirius would log this per NUMA pool at shutdown.
+| Field | Meaning |
+| --- | --- |
+| `cached_large_bytes` | Retained cache-entry capacity, matching `large_cache_bytes()` at the same instant. |
+| `peak_cached_large_bytes` | Highest retained capacity; purge does not reset it. |
+| `large_requests` | Nonzero allocation calls above 8 KiB, including calls that later fail. |
+| `large_hits` | Successful cache takes after establishing reuse ordering. |
+| `large_misses` | Initial cache lookups that found no entry, once per cacheable request. |
+| `large_uncacheable` | Requests whose computed bucket exceeds the limit, once per call. |
+| `large_evictions` | Previously cached entries detached for cap eviction or allocation-failure purge. |
 
-## 2. Document what the limit means in practice (G1) -- class docs, lines 37-43
-The limit bounds only *free* cached buffers; live ones are uncounted. A new buffer is allocated only
-when its bucket has nothing cached, so the cache needs the **sum over buckets of each bucket's peak
-concurrency**.
+Hits and misses are lookup observations, not a partition of requests. Post-purge reuse records
+both an initial miss and a hit; a failed initial reuse wait records a request but neither a hit
+nor a miss. Two CUDA allocation attempts during recovery still count as one request. Evictions
+remain counted if subsequent synchronization fails and storage is quarantined; destructor
+release and buffers never inserted into the cache are excluded.
 
-When a query ends, everything is freed at once. If that sum is above the limit, FIFO eviction
-`cudaFreeHost`s the excess, and the next query pays the same number of `cudaHostAlloc` calls. The
-driver-lock serialisation the PR removes then comes back, once per excess buffer per query.
+Protected counters use the existing cache mutex. One independent atomic counts uncacheable
+requests without adding a mutex to that allocation path. The snapshot samples it once under the
+cache mutex and derives the total request count from that same sample. It does not imply that
+all observed requests have completed. Separate getter calls can differ during concurrent use.
 
-Suggest:
-- one sentence of sizing guidance in the class docs and the constructor `@param`;
-- a note that one resource may be shared by several GPUs, as Sirius does with one instance per NUMA
-  node; the PR's measurements were single-GPU.
+These counters do not measure actual CUDA allocation/free calls, successful physical frees,
+live pinned-memory demand, or per-bucket peaks. Consumer logging through Sirius' per-NUMA
+facade remains a separate integration step.
 
-## 3. NUMA placement of large buffers (G3, follow-up) -- `src/memory/small_pinned_host_memory_resource.cpp:149,168`
-Slabs come from the NUMA-bound `fixed_size_host_memory_resource`. Large buffers use plain
-`cudaHostAlloc(Portable|Mapped)`, so their pages follow the allocating thread's NUMA policy rather
-than the upstream pool's node.
+## 2. Cache limit and sizing (G1): documentation corrected
 
-Consider allocating cacheable buckets from `upstream_.get_upstream_resource()`, which is
-`numa_region_pinned_host_memory_resource`: it is NUMA-bound and keeps the `Portable|Mapped` flags.
-The upstream's extra `cudaHostRegister` cost is paid only on a miss.
+The cap bounds retained entries available for stream-ordered reuse, including entries with GPU
+work still pending. It excludes live allocations, slab storage, detached eviction/purge victims
+awaiting completion, and quarantined storage. It is not a bound on total pinned memory.
 
-Fine as a follow-up; on a single-socket host it changes nothing.
+For stable reuse without allocation failures, a conservative full-retention estimate is:
 
-## 4. Behaviour changes worth stating in the PR body
-- The constructor stays source-compatible, but **default-constructed instances now cache** up to
-  256 MiB of free large buffers and buckets up to 256 MiB.
-- When the bucket is above the limit, or no event can be recorded, the free path now **synchronizes
-  the freeing stream** before `cudaFreeHost`. Previously it called `cudaFreeHost` directly. This blocks
-  the freeing thread (`cudaFreeHost` already synchronized implicitly).
-- Requests above 8 KiB are rounded up to a power of two of at least 16 KiB, which can cost up to
-  2x the live bytes for large buffers.
-- `alignment` remains unused. The header already says so, which is fine.
+`sum(bucket capacity * peak outstanding allocation count in that bucket)`
 
-## 5. Merge hygiene and PR body (G5)
-- Commits 68440d1 and b2ded83 add about 13k lines under `reports/`, including about 6.5 MB of
-  `raw-evidence.tar.gz` / `diagnostic-evidence.tar.gz`. 32dcbce deletes them again. **Squash-merge
-  only**, or rewrite the branch, so those blobs never reach `main`. 8b2d229 is also a merge commit.
-- The PR body says "22 cases (10 new)", but the test file has 28 `TEST_CASE`s, including the
-  `[stream_ordering]` and `[multi_gpu]` cases. Update the body.
-- Mark it ready for review once the copy-pr-bot vetting has let CI run.
+Include allocation calls still in progress and all streams/devices sharing the resource. This
+is an estimate, not an exact minimum or a prediction of CUDA call counts. Returned-buffer order
+and overlapping lifetimes affect churn; query-end simultaneous freeing is not guaranteed.
+For example, alternating 16 KiB and 32 KiB allocation/free cycles under a 32 KiB cap produces
+two misses per cycle through mutual eviction.
 
-## 6. Offer multi-GPU evidence
-- The PR's report states that multi-GPU is untested; its one `[multi_gpu]` case was skipped on GB10.
-- From the 4x L40S box, post:
-  - `cucascade_tests "[small_pinned]"`, including `[multi_gpu]`;
-  - the Sirius A/B from SPEC section 7.4 (SF1000 4-GPU WARM/PINNED, warm-window
-    `cudaHostAlloc`/`cudaFreeHost` counts).
-- Sirius' campaign measured the same mechanism at -8.6 s (-18 %) on SF1000 4-GPU WARM. That is the
-  strongest motivation for the PR, so include it once the port's A/B confirms equivalence.
+`peak_cached_large_bytes` measures retained occupancy, which is itself capped; it does not
+measure the live-demand peaks needed by the estimate. Sirius currently owns one pool per NUMA
+node, potentially shared by several GPUs. Multi-GPU demand must be measured on the other box.
 
-## Not for this PR (Sirius-side, pre-existing)
-Sirius' `numa_small_pinned_mr::allocate_sync` does not synchronize, and its comment "pool ignores
-the stream arg" has been stale since event-ordered reuse. PR 185's own report flagged this. Track it
-as a Sirius issue, not a cuCascade comment.
+## 3. NUMA placement (G3): separate follow-up
+
+Slabs use the fixed-size upstream pool. Large buffers use
+`cudaHostAlloc(cudaHostAllocPortable | cudaHostAllocMapped)`, which does not enforce the
+upstream pool's NUMA placement. Portable controls recognition across CUDA contexts and Mapped
+controls device mapping; neither flag specifies a NUMA node. Do not claim a universal CUDA
+contract that pages follow the allocating thread's NUMA policy.
+
+`get_upstream_resource()` returns a type-erased resource reference; custom upstream resources
+are supported. The normal factory uses `numa_region_pinned_host_memory_resource`, but binding
+requires a known node, and its Portable/Mapped registration flags depend on `make_portable`
+(which defaults to false).
+
+A future upstream allocation route must preserve host/device access and the required flags,
+use matching upstream deallocation with the actual allocated bucket size on every eviction,
+purge, fallback, and destruction path, and preserve completion checks, quarantine, and upstream
+lifetime. Known-node registered storage needs unregistering plus `numa_free`, not `cudaFreeHost`.
+The existing registration-failure path also needs host-allocation rollback before adopting it.
+Allocation/registration/release behavior can change even on a single-socket host.
+
+## 4. Behavior and compatibility: corrected PR description
+
+- An upstream reference is required. Construction using the default cache limit enables a
+  256 MiB retained cache; this is not a zero-argument default constructor.
+- Existing one-argument construction is source-compatible. The constructor symbol and object
+  layout differ from main; consumers must be rebuilt and relinked. The statistics fields also
+  change the layout relative to the previously measured cache build.
+- Only cacheable requests above 8 KiB are rounded to a representable power of two of at least
+  16 KiB. Their allocation size is less than twice the request. Above-cap requests retain their
+  exact size; unrepresentable rounding also retains the exact size.
+- Noncacheable/no-event large-buffer release explicitly synchronizes the freeing stream before
+  unpinning; failed synchronization retains storage. Do not rely on undocumented implicit
+  synchronization from `cudaFreeHost`. Main already had the no-event slab fallback.
+- The alignment argument remains unused, as documented.
+
+CUDA references: [memory management](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-runtime-api/group__CUDART__MEMORY.html)
+and [synchronization behavior](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-runtime-api/api-sync-behavior.html).
+
+## 5. Local validation and merge hygiene (G5)
+
+The new local validation uses the existing Release/CUDA 13.2/cuDF 26.08 environment on one GB10:
+
+- Warnings-as-errors build passed.
+- Allocator suite: 29 cases (17 added relative to main's 12), 28 passed and one multi-GPU case
+  skipped; the recorded run passed 1,202 assertions. Nine cases cover statistics.
+- Exact allocator translation-unit fault harness: 21 cases passed, including request-once
+  retry/failure accounting, failed reuse waits, cap/purge detachments despite quarantine,
+  metadata fallback, and pending-DMA teardown.
+- ThreadSanitizer: eight workers x 1,000 mixed cached/bypass cycles plus concurrent snapshots;
+  no reports. The driver and exact allocator translation unit are instrumented; CUDA, RMM,
+  and the backing allocator libraries are not. The established process-local ASLR setting was
+  used to allow the sanitizer to start.
+
+Logs and supplemental harnesses are local and ignored under `build/pr185-followup/`.
+
+Commits `68440d1` and `b2ded83` added about 19.7k report lines and 6.456 MB of evidence archives;
+`32dcbce` deleted them from the final tree, but their blobs remain in ancestor commits.
+Squash-merge the final clean tree, or explicitly curate the history before merging. An ordinary
+merge or replay of the artifact commits retains the blobs in main's reachable history. Squash
+merging does not erase copies already published to the fork/server. Remove this notes file
+before the final merge; do not re-add investigation artifacts.
+
+Keep the PR draft while the remaining validation is being completed. The current status failure
+concerns missing category/breaking labels, and the current GitHub account has no upstream
+write/triage permission to apply them. Ask a maintainer for the applicable labels; `improvement`
+and `breaking` fit the performance feature and ABI change. The historical copy-pr-bot comment
+alone does not establish the current runner-vetting or CI state. CI still needs verification.
+
+## 6. Multi-GPU and application evidence: user handoff
+
+The existing allocator `[multi_gpu]` case tests a mismatch between the current device and the
+freeing stream's owner. It was skipped on GB10. It does not test producer GPU 0 -> reuse GPU 1,
+concurrent traffic from multiple GPUs through one shared pool, or four-GPU performance.
+
+On the multi-GPU box:
+
+- Rebuild dependent consumers and run `cucascade_tests "[small_pinned]"`, confirming the hardware
+  case actually executes.
+- Exercise cross-device reuse with pending producer work and simultaneous shared-pool traffic;
+  check data, stream dependencies, device restoration, and cache accounting.
+- Run a matched Sirius baseline/candidate A/B at the intended SF1000 four-GPU configuration,
+  recording warm and explicitly pinned modes separately, actual per-NUMA limits, source/build
+  identities, and GPU-vs-CPU correctness. Preserve normal linker behavior and shared RMM
+  resource registration across Sirius/cuDF.
+- Collect quiescent per-pool statistics and scoped warm-window `cudaHostAlloc`/`cudaFreeHost`
+  counts. Use unprofiled timings for performance; API duration sums are not removable wall time.
+
+Earlier corrected single-GB10 SF50 comparisons measured 6.14% less elapsed time with Sirius
+input caching and 3.37% less with it disabled, with 1,936 CPU-validated query executions. These
+were repeated-query measurements, not fully cold runs or explicit decoded-table pinning.
+They used the prior reviewed cache build; the new statistics addition has not been priced by a
+fresh Sirius A/B. Do not generalize those percentages to four GPUs or replace the unavailable
+SPEC evidence with them. The other box should establish the result for the final implementation.
+
+## Separate Sirius issue
+
+`numa_small_pinned_mr::allocate_sync` forwards to asynchronous allocation without waiting.
+Its comment that the pool ignores streams is stale. Correct the facade's synchronous CPU-readiness
+contract in Sirius; it predates this PR and is outside the cuCascade implementation changes.

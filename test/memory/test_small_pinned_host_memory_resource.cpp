@@ -27,13 +27,17 @@
 #include <catch2/catch_all.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <set>
+#include <stdexcept>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
@@ -93,16 +97,28 @@ class pending_stream_work {
   std::atomic<bool> released_{false};
 };
 
+void require_no_large_activity(small_pinned_host_memory_resource::statistics const& stats)
+{
+  REQUIRE(stats.cached_large_bytes == 0);
+  REQUIRE(stats.peak_cached_large_bytes == 0);
+  REQUIRE(stats.large_requests == 0);
+  REQUIRE(stats.large_hits == 0);
+  REQUIRE(stats.large_misses == 0);
+  REQUIRE(stats.large_uncacheable == 0);
+  REQUIRE(stats.large_evictions == 0);
+}
+
 }  // namespace
 
-TEST_CASE("Zero-byte allocation returns nullptr", "[small_pinned]")
+TEST_CASE("Zero-byte allocation returns nullptr", "[small_pinned][statistics]")
 {
   test_fixture f;
   auto* ptr = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 0);
   REQUIRE(ptr == nullptr);
+  require_no_large_activity(f.slab_mr.get_statistics());
 }
 
-TEST_CASE("Allocate and deallocate each slab size", "[small_pinned]")
+TEST_CASE("Allocate and deallocate each slab size", "[small_pinned][statistics]")
 {
   test_fixture f;
   constexpr std::array<std::size_t, 5> sizes{512, 1024, 2048, 4096, 8192};
@@ -115,6 +131,7 @@ TEST_CASE("Allocate and deallocate each slab size", "[small_pinned]")
       // Write to the memory to verify it is accessible
       std::memset(ptr, 0xAB, sz);
       f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, ptr, sz);
+      require_no_large_activity(f.slab_mr.get_statistics());
     }
   }
 }
@@ -349,24 +366,43 @@ TEST_CASE("large_allocation_size rounds only cacheable requests", "[small_pinned
   REQUIRE(tiny.large_allocation_size(100000) == 100000);
 }
 
-TEST_CASE("Large allocations are cached and reused", "[small_pinned]")
+TEST_CASE("Large allocations are cached and reused", "[small_pinned][statistics]")
 {
   test_fixture f;
   constexpr std::size_t big = 100000;  // rounds up to a 128 KB bucket
 
   auto* slab = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 512);
-  auto* p1   = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, big);
+  require_no_large_activity(f.slab_mr.get_statistics());
+  auto* p1 = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, big);
   REQUIRE(p1 != nullptr);
   REQUIRE(p1 != slab);
+  auto const cold = f.slab_mr.get_statistics();
+  REQUIRE(cold.large_requests == 1);
+  REQUIRE(cold.large_hits == 0);
+  REQUIRE(cold.large_misses == 1);
+  REQUIRE(cold.large_uncacheable == 0);
+  REQUIRE(cold.large_evictions == 0);
+  REQUIRE(cold.cached_large_bytes == 0);
+  REQUIRE(cold.peak_cached_large_bytes == 0);
   CUCASCADE_CUDA_TRY(::cudaStreamSynchronize(cudaStreamDefault));
   std::memset(p1, 0xEF, big);
   f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p1, big);
+  auto const retained = f.slab_mr.get_statistics();
+  REQUIRE(retained.cached_large_bytes == 128 * 1024);
+  REQUIRE(retained.peak_cached_large_bytes == retained.cached_large_bytes);
 
   // The freed buffer is cached, so an allocation of the same size gets it back.
   auto* p2 = f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, big);
   REQUIRE(p2 == p1);
+  auto const warm = f.slab_mr.get_statistics();
+  REQUIRE(warm.large_requests == 2);
+  REQUIRE(warm.large_hits == 1);
+  REQUIRE(warm.large_misses == 1);
+  REQUIRE(warm.cached_large_bytes == 0);
+  REQUIRE(warm.peak_cached_large_bytes == retained.peak_cached_large_bytes);
   f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p2, big);
   f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, slab, 512);
+  REQUIRE(f.slab_mr.get_statistics().cached_large_bytes == f.slab_mr.large_cache_bytes());
 }
 
 TEST_CASE("Large cache serves within a bucket but not across buckets", "[small_pinned]")
@@ -443,7 +479,7 @@ TEST_CASE("Large cache respects its cap and evicts oldest entries", "[small_pinn
   }
 }
 
-TEST_CASE("Buffers larger than the whole cap are freed, not cached", "[small_pinned]")
+TEST_CASE("Buffers larger than the whole cap are freed, not cached", "[small_pinned][statistics]")
 {
   test_fixture f;
   small_pinned_host_memory_resource mr{f.upstream, 64 * 1024};
@@ -459,9 +495,17 @@ TEST_CASE("Buffers larger than the whole cap are freed, not cached", "[small_pin
   REQUIRE(p != nullptr);
   mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p, huge);
   REQUIRE(mr.large_cache_bytes() == cached_before);
+  auto const stats = mr.get_statistics();
+  REQUIRE(stats.large_requests == 2);
+  REQUIRE(stats.large_hits == 0);
+  REQUIRE(stats.large_misses == 1);
+  REQUIRE(stats.large_uncacheable == 1);
+  REQUIRE(stats.large_evictions == 0);
+  REQUIRE(stats.peak_cached_large_bytes == cached_before);
 }
 
-TEST_CASE("Never-cacheable sizes round trip without polluting the cache", "[small_pinned]")
+TEST_CASE("Never-cacheable sizes round trip without polluting the cache",
+          "[small_pinned][statistics]")
 {
   // A non-power-of-two size whose bucket exceeds the whole cap is allocated at exactly the
   // requested size and freed on deallocate rather than cached.
@@ -478,6 +522,14 @@ TEST_CASE("Never-cacheable sizes round trip without polluting the cache", "[smal
   auto* q = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, bytes);
   REQUIRE(q != nullptr);
   mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, q, bytes);
+  auto const stats = mr.get_statistics();
+  REQUIRE(stats.large_requests == 2);
+  REQUIRE(stats.large_uncacheable == 2);
+  REQUIRE(stats.large_hits == 0);
+  REQUIRE(stats.large_misses == 0);
+  REQUIRE(stats.large_evictions == 0);
+  REQUIRE(stats.cached_large_bytes == 0);
+  REQUIRE(stats.peak_cached_large_bytes == 0);
 }
 
 TEST_CASE("Slab and large reuse work on a real stream", "[small_pinned]")
@@ -560,7 +612,8 @@ TEST_CASE("Bucket rounding handles the largest representable sizes", "[small_pin
           std::numeric_limits<std::size_t>::max());
 }
 
-TEST_CASE("Disabled large cache preserves host and device accessibility", "[small_pinned]")
+TEST_CASE("Disabled large cache preserves host and device accessibility",
+          "[small_pinned][statistics]")
 {
   test_fixture f;
   auto const limit =
@@ -581,9 +634,17 @@ TEST_CASE("Disabled large cache preserves host and device accessibility", "[smal
   REQUIRE(first_word == 0xDEADBEEF);
   mr.deallocate_sync(ptr, bytes);
   REQUIRE(mr.large_cache_bytes() == 0);
+  auto const stats = mr.get_statistics();
+  REQUIRE(stats.large_requests == 1);
+  REQUIRE(stats.large_uncacheable == 1);
+  REQUIRE(stats.large_hits == 0);
+  REQUIRE(stats.large_misses == 0);
+  REQUIRE(stats.large_evictions == 0);
+  REQUIRE(stats.cached_large_bytes == 0);
+  REQUIRE(stats.peak_cached_large_bytes == 0);
 }
 
-TEST_CASE("Large FIFO eviction orders entries across buckets", "[small_pinned]")
+TEST_CASE("Large FIFO eviction orders entries across buckets", "[small_pinned][statistics]")
 {
   test_fixture f;
   small_pinned_host_memory_resource mr{f.upstream, 64 * 1024};
@@ -596,16 +657,111 @@ TEST_CASE("Large FIFO eviction orders entries across buckets", "[small_pinned]")
   mr.deallocate_sync(retained_small, 9000);
   mr.deallocate_sync(retained_large, 20000);
   REQUIRE(mr.large_cache_bytes() == 48 * 1024);
+  auto const retained = mr.get_statistics();
+  REQUIRE(retained.large_requests == 4);
+  REQUIRE(retained.large_hits == 0);
+  REQUIRE(retained.large_misses == 4);
+  REQUIRE(retained.large_uncacheable == 0);
+  REQUIRE(retained.large_evictions == 2);
+  REQUIRE(retained.cached_large_bytes == 48 * 1024);
+  REQUIRE(retained.peak_cached_large_bytes == 64 * 1024);
   auto* small = mr.allocate_sync(9000);
   auto* large = mr.allocate_sync(20000);
   REQUIRE(small == retained_small);
   REQUIRE(large == retained_large);
   REQUIRE(mr.large_cache_bytes() == 0);
+  auto const reused = mr.get_statistics();
+  REQUIRE(reused.large_requests == 6);
+  REQUIRE(reused.large_hits == 2);
+  REQUIRE(reused.large_misses == 4);
+  REQUIRE(reused.large_evictions == 2);
+  REQUIRE(reused.peak_cached_large_bytes == retained.peak_cached_large_bytes);
   mr.deallocate_sync(small, 9000);
   mr.deallocate_sync(large, 20000);
 }
 
-TEST_CASE("Reuse orders pending DMA across allocation streams", "[small_pinned][stream_ordering]")
+TEST_CASE("Large allocation statistics remain consistent during mixed concurrent requests",
+          "[small_pinned][statistics][threading]")
+{
+  test_fixture f;
+  constexpr std::size_t cap                 = 64 * 1024;
+  constexpr std::size_t worker_count        = 4;
+  constexpr std::size_t cacheable_workers   = 2;
+  constexpr std::size_t requests_per_worker = 32;
+  small_pinned_host_memory_resource mr{f.upstream, cap};
+  auto const current_device = rmm::get_current_cuda_device();
+  std::atomic<bool> start{false};
+  std::atomic<std::size_t> finished{0};
+  std::array<std::exception_ptr, worker_count> worker_failures{};
+  std::array<std::jthread, worker_count> workers;
+
+  for (std::size_t index = 0; index < worker_count; ++index) {
+    workers[index] = std::jthread{[&, index](std::stop_token stop) {
+      try {
+        while (!start.load(std::memory_order_acquire)) {
+          // Thread construction or a main-thread assertion may fail before all workers start.
+          if (stop.stop_requested()) {
+            finished.fetch_add(1, std::memory_order_release);
+            return;
+          }
+          std::this_thread::yield();
+        }
+        rmm::cuda_set_device_raii device_guard{current_device};
+        rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+        auto const bytes = index < cacheable_workers ? std::size_t{9000} : cap + 1;
+        for (std::size_t request = 0; request < requests_per_worker; ++request) {
+          if (stop.stop_requested()) { break; }
+          void* ptr = mr.allocate(stream, bytes);
+          if (ptr == nullptr) { throw std::runtime_error{"nonzero allocation returned nullptr"}; }
+          mr.deallocate(stream, ptr, bytes);
+        }
+        stream.synchronize();
+      } catch (...) {
+        worker_failures[index] = std::current_exception();
+      }
+      finished.fetch_add(1, std::memory_order_release);
+    }};
+  }
+
+  auto previous = mr.get_statistics();
+  start.store(true, std::memory_order_release);
+  do {
+    auto const current = mr.get_statistics();
+    REQUIRE(current.large_requests >= previous.large_requests);
+    REQUIRE(current.large_hits >= previous.large_hits);
+    REQUIRE(current.large_misses >= previous.large_misses);
+    REQUIRE(current.large_uncacheable >= previous.large_uncacheable);
+    REQUIRE(current.large_evictions >= previous.large_evictions);
+    REQUIRE(current.peak_cached_large_bytes >= previous.peak_cached_large_bytes);
+    REQUIRE(current.cached_large_bytes <= current.peak_cached_large_bytes);
+    REQUIRE(current.peak_cached_large_bytes <= cap);
+    REQUIRE(current.large_requests ==
+            current.large_hits + current.large_misses + current.large_uncacheable);
+    previous = current;
+    std::this_thread::sleep_for(std::chrono::microseconds{25});
+  } while (finished.load(std::memory_order_acquire) != worker_count);
+
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  for (auto const& failure : worker_failures) {
+    if (failure) { std::rethrow_exception(failure); }
+  }
+  auto const final = mr.get_statistics();
+  REQUIRE(final.large_requests == static_cast<std::uint64_t>(worker_count * requests_per_worker));
+  REQUIRE(final.large_uncacheable ==
+          static_cast<std::uint64_t>((worker_count - cacheable_workers) * requests_per_worker));
+  REQUIRE(final.large_hits + final.large_misses ==
+          static_cast<std::uint64_t>(cacheable_workers * requests_per_worker));
+  REQUIRE(final.large_evictions == 0);
+  REQUIRE(final.cached_large_bytes == mr.large_cache_bytes());
+  REQUIRE(final.cached_large_bytes <= final.peak_cached_large_bytes);
+  REQUIRE(final.peak_cached_large_bytes >= small_pinned_host_memory_resource::MIN_LARGE_BUCKET);
+  REQUIRE(final.peak_cached_large_bytes <= cap);
+}
+
+TEST_CASE("Reuse orders pending DMA across allocation streams",
+          "[small_pinned][stream_ordering][statistics]")
 {
   auto const bytes = GENERATE(std::size_t{2048}, std::size_t{100000});
   test_fixture f;
@@ -621,6 +777,17 @@ TEST_CASE("Reuse orders pending DMA across allocation streams", "[small_pinned][
   auto* reused = f.slab_mr.allocate(consumer, bytes);
   REQUIRE(reused == original);
   REQUIRE(::cudaStreamQuery(consumer.value()) == cudaErrorNotReady);
+  auto const stats = f.slab_mr.get_statistics();
+  if (bytes > small_pinned_host_memory_resource::MAX_SLAB_SIZE) {
+    REQUIRE(stats.large_requests == 2);
+    REQUIRE(stats.large_hits == 1);
+    REQUIRE(stats.large_misses == 1);
+    REQUIRE(stats.cached_large_bytes == 0);
+    REQUIRE(stats.peak_cached_large_bytes ==
+            small_pinned_host_memory_resource::large_bucket_size_for(bytes));
+  } else {
+    require_no_large_activity(stats);
+  }
   gate.release();
   consumer.synchronize();
   std::memset(reused, 0xA7, bytes);

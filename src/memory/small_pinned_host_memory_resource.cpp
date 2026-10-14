@@ -19,6 +19,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <bit>
 #include <limits>
 #include <new>
@@ -143,7 +144,11 @@ void* small_pinned_host_memory_resource::allocate(::cuda::stream_ref stream,
     std::size_t const alloc_bytes = large_allocation_size(bytes);
     if (cacheable) {
       std::lock_guard lock(mutex_);
+      ++_large_cacheable_requests;
       if (void* cached = try_take_cached_large_locked(bucket, stream)) { return cached; }
+      ++_large_misses;
+    } else {
+      _large_uncacheable.fetch_add(1, std::memory_order_relaxed);
     }
     void* ptr   = nullptr;
     auto status = ::cudaHostAlloc(&ptr, alloc_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
@@ -221,6 +226,7 @@ void small_pinned_host_memory_resource::deallocate(::cuda::stream_ref stream,
               found->second.push_back({ptr, ready, large_cache_sequence_});
               ++large_cache_sequence_;
               large_cache_bytes_ += bucket;
+              _peak_cached_large_bytes = std::max(_peak_cached_large_bytes, large_cache_bytes_);
               return;
             } catch (...) {
               auto const found = large_cache_.find(bucket);
@@ -314,6 +320,20 @@ std::size_t small_pinned_host_memory_resource::large_cache_bytes() const
   return large_cache_bytes_;
 }
 
+small_pinned_host_memory_resource::statistics small_pinned_host_memory_resource::get_statistics()
+  const
+{
+  std::lock_guard lock(mutex_);
+  auto const uncacheable = _large_uncacheable.load(std::memory_order_relaxed);
+  return {large_cache_bytes_,
+          _peak_cached_large_bytes,
+          _large_cacheable_requests + uncacheable,
+          _large_hits,
+          _large_misses,
+          uncacheable,
+          _large_evictions};
+}
+
 void* small_pinned_host_memory_resource::try_take_cached_large_locked(std::size_t bucket,
                                                                       ::cuda::stream_ref stream)
 {
@@ -326,6 +346,7 @@ void* small_pinned_host_memory_resource::try_take_cached_large_locked(std::size_
   found->second.pop_front();
   if (found->second.empty()) { large_cache_.erase(found); }
   large_cache_bytes_ -= bucket;
+  ++_large_hits;
   release_event_locked(entry.ready);
   return entry.ptr;
 }
@@ -346,6 +367,7 @@ small_pinned_host_memory_resource::evict_oldest_large_locked() noexcept
   oldest->second.pop_front();
   if (oldest->second.empty()) { large_cache_.erase(oldest); }
   large_cache_bytes_ -= bucket;
+  ++_large_evictions;
   return entry;
 }
 
@@ -353,6 +375,10 @@ small_pinned_host_memory_resource::large_cache_type
 small_pinned_host_memory_resource::purge_large_cache_locked() noexcept
 {
   large_cache_type entries;
+  for (auto const& [bucket, cached] : large_cache_) {
+    (void)bucket;
+    _large_evictions += static_cast<std::uint64_t>(cached.size());
+  }
   entries.swap(large_cache_);
   large_cache_bytes_ = 0;
   return entries;

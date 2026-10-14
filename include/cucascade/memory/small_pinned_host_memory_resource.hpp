@@ -24,6 +24,7 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -38,9 +39,16 @@ namespace memory {
  * @brief Provides pooled pinned host memory for small and large allocations
  *
  * Requests up to `MAX_SLAB_SIZE` use slabs carved from `fixed_size_host_memory_resource`. Larger
- * requests whose power-of-two bucket fits the configured cache limit reuse released portable,
- * mapped pinned buffers; other requests allocate exactly the requested size. The cache limit bounds
- * retained large-buffer capacity, excluding live allocations and slab storage.
+ * requests are rounded to a power-of-two bucket only when that bucket is representable and fits the
+ * configured cache limit; other requests allocate exactly the requested size. Large buffers are
+ * portable and mapped. The limit bounds entries retained for stream-ordered reuse, which may still
+ * have GPU work pending; live allocations, slab storage, detached eviction or purge victims, and
+ * quarantined storage are excluded.
+ *
+ * For a stable workload without allocation failures, a conservative full-retention estimate sums
+ * each bucket's capacity times its observed peak outstanding allocation count, including allocation
+ * calls still in progress, across all devices and streams sharing this resource. This is not an
+ * exact minimum or a prediction of CUDA allocation counts.
  *
  * Allocation and deallocation are thread-safe and stream-ordered. The caller must order every prior
  * GPU access before the deallocation stream. Before accessing an asynchronous allocation on the
@@ -60,11 +68,31 @@ class small_pinned_host_memory_resource {
     512, 1024, 2048, 4096, 8192};  ///< Slab sizes.
 
   /**
+   * @brief Recorded activity for requests larger than `MAX_SLAB_SIZE`
+   *
+   * Counts include activity from allocation calls that later fail. Request classification and
+   * initial misses are counted once per call, regardless of retries. A successful cache take after
+   * a purge records both a miss and a hit; a failed initial reuse wait records a request but
+   * neither a hit nor a miss. Evictions remain counted if release fails; destructor drainage is
+   * excluded.
+   */
+  struct statistics {
+    std::size_t cached_large_bytes;       ///< Retained cache entry capacity.
+    std::size_t peak_cached_large_bytes;  ///< Highest retained capacity; purges do not reset it.
+    std::uint64_t large_requests;         ///< Nonzero requests larger than `MAX_SLAB_SIZE`.
+    std::uint64_t large_hits;         ///< Successful cache takes after establishing reuse order.
+    std::uint64_t large_misses;       ///< Initial cache lookups that found no entry.
+    std::uint64_t large_uncacheable;  ///< Requests whose computed bucket exceeds the limit.
+    std::uint64_t large_evictions;    ///< Cached entries detached for cap eviction or purge.
+  };
+
+  /**
    * @brief Constructs a pinned host memory resource
    *
    * @param upstream Block allocator backed by pinned host memory; must outlive this resource
-   * @param large_cache_limit_bytes Maximum retained large-buffer capacity; values below
-   * `MIN_LARGE_BUCKET` disable caching
+   * @param large_cache_limit_bytes Maximum retained cache entry capacity shared by all devices and
+   * streams using this resource; values below `MIN_LARGE_BUCKET` disable caching. Use the class's
+   * bucket-weighted demand estimate when sizing this limit.
    */
   explicit small_pinned_host_memory_resource(
     fixed_size_host_memory_resource& upstream,
@@ -135,6 +163,11 @@ class small_pinned_host_memory_resource {
    * @return Sum of cached bucket capacities
    */
   [[nodiscard]] std::size_t large_cache_bytes() const;
+
+  /**
+   * @brief Returns a consistent snapshot of recorded large-allocation activity
+   */
+  [[nodiscard]] statistics get_statistics() const;
 
   bool operator==(small_pinned_host_memory_resource const& other) const noexcept;
 
@@ -213,6 +246,12 @@ class small_pinned_host_memory_resource {
   std::size_t large_cache_bytes_{0};
   std::size_t const large_cache_limit_bytes_;
   std::uint64_t large_cache_sequence_{0};
+  std::size_t _peak_cached_large_bytes{0};
+  std::uint64_t _large_cacheable_requests{0};
+  std::uint64_t _large_hits{0};
+  std::uint64_t _large_misses{0};
+  std::atomic<std::uint64_t> _large_uncacheable{0};
+  std::uint64_t _large_evictions{0};
 };
 
 static_assert(::cuda::mr::resource_with<small_pinned_host_memory_resource,
