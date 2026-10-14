@@ -1,9 +1,0 @@
-name, utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
-NVIDIA GB10, 0 %, 43, 208 MHz
-pid, process_name, used_gpu_memory [MiB]
-GPU stable after 3 samples, UTC 2026-10-12T21:42:58Z
-Filters: [small_pinned]
-RNG seed: 997364381
-/home/kkristensen/Code/cuCascade/test/memory/test_small_pinned_host_memory_resource.cpp:678: skipped: 'requires two CUDA devices'
-test cases:  28 |  27 passed | 1 skipped
-assertions: 992 | 992 passed

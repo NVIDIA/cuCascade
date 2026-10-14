@@ -1,8 +1,0 @@
-name, utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
-NVIDIA GB10, 1 %, 44, 2398 MHz
-pid, process_name, used_gpu_memory [MiB]
-GPU stable after 3 samples, UTC 2026-10-12T21:42:28Z
-RNG seed: 2517932187
-/home/kkristensen/Code/cuCascade/test/cudf/test_release_table_stream.cpp:457: skipped: 'requires at least two CUDA devices'
-test cases:  188 |  187 passed | 1 skipped
-assertions: 2564 | 2564 passed

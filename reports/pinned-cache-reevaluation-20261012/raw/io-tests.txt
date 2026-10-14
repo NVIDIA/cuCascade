@@ -1,6 +1,0 @@
-name, utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
-NVIDIA GB10, 1 %, 45, 2405 MHz
-pid, process_name, used_gpu_memory [MiB]
-GPU stable after 3 samples, UTC 2026-10-12T21:42:41Z
-RNG seed: 4291319871
-All tests passed (1540 assertions in 139 test cases)

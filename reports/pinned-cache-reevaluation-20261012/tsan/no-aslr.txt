@@ -1,5 +1,0 @@
-name, utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
-NVIDIA GB10, 0 %, 42, 208 MHz
-pid, process_name, used_gpu_memory [MiB]
-GPU stable after 3 samples, UTC 2026-10-12T21:50:43Z
-PASS 8 threads x 1000 large-cache cycles; cap=524288 bytes, retained=114688 bytes
