@@ -23,9 +23,9 @@
  * [peer_route_working] - requires hardware whose direct peer route delivers correct bytes
  *
  * Two independent fake CUDA runtimes back these tests: `fake_operations` drives
- * detail::grant_pool_peer_access(), and `cache_operations` drives detail::probe_peer_dma_sequence()
- * and detail::count_broken_directions(). Both keep their state in file-scope globals, so every test
- * resets its own harness first and the cases in this file must not run concurrently.
+ * detail::grant_pool_peer_access(), and `cache_operations` drives detail::peer_dma_probe_cache.
+ * Both keep their state in file-scope globals, so every test resets its own harness first and the
+ * cases in this file must not run concurrently.
  */
 
 #include <cucascade/memory/common.hpp>
@@ -35,6 +35,7 @@
 #include <catch2/catch_all.hpp>
 #include <memory/pool_peer_access_detail.hpp>
 
+#include <array>
 #include <cstddef>
 #include <system_error>
 #include <utility>
@@ -43,6 +44,7 @@
 namespace {
 
 using cucascade::memory::pool_peer_access_status;
+using cucascade::memory::detail::peer_dma_probe_cache;
 using cucascade::memory::detail::peer_dma_probe_result;
 using cucascade::memory::detail::peer_dma_probe_status;
 
@@ -245,14 +247,15 @@ TEST_CASE("Transient peer probe errors leave a safe fallback and can be retried"
   cache_state             = fake_cache_state{};
   cache_state.first_probe = {peer_dma_probe_status::CUDA_ERROR, cudaErrorMemoryAllocation};
 
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 1);
+  auto const third  = cache.result(0, 1);
 
-  REQUIRE(results.size() == 3);
-  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
-  CHECK(results[0].error == cudaErrorMemoryAllocation);
-  CHECK(results[1].status == peer_dma_probe_status::SUPPORTED);
-  CHECK(results[2].status == peer_dma_probe_status::SUPPORTED);
+  CHECK(first.status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(first.error == cudaErrorMemoryAllocation);
+  CHECK(second.status == peer_dma_probe_status::SUPPORTED);
+  CHECK(third.status == peer_dma_probe_status::SUPPORTED);
   CHECK(cache_state.probe_calls[0][1] == 2);
   CHECK(cache_state.last_error == cudaSuccess);
   CHECK(cache_state.current_device == 0);
@@ -263,12 +266,12 @@ TEST_CASE("Converter lookups do not repeatedly probe a failed peer direction", "
   cache_state             = fake_cache_state{};
   cache_state.first_probe = {peer_dma_probe_status::CUDA_ERROR, cudaErrorMemoryAllocation};
 
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations, false);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1, false);
+  auto const second = cache.result(0, 1, false);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
-  CHECK(results[1].status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(first.status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(second.status == peer_dma_probe_status::CUDA_ERROR);
   CHECK(cache_state.probe_calls[0][1] == 1);
   CHECK(cache_state.last_error == cudaSuccess);
 }
@@ -277,13 +280,13 @@ TEST_CASE("Peer probe initialization errors are retried", "[pool_peer_access]")
 {
   cache_state             = fake_cache_state{};
   cache_state.count_error = cudaErrorInitializationError;
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 1);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
-  CHECK(results[0].error == cudaErrorInitializationError);
-  CHECK(results[1].status == peer_dma_probe_status::SUPPORTED);
+  CHECK(first.status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(first.error == cudaErrorInitializationError);
+  CHECK(second.status == peer_dma_probe_status::SUPPORTED);
   CHECK(cache_state.count_calls == 2);
   CHECK(cache_state.last_error == cudaSuccess);
 }
@@ -293,12 +296,12 @@ TEST_CASE("Converter lookups leave an initialization error for an explicit retry
 {
   cache_state             = fake_cache_state{};
   cache_state.count_error = cudaErrorInitializationError;
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations, false);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1, false);
+  auto const second = cache.result(0, 1, false);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].error == cudaErrorInitializationError);
-  CHECK(results[1].error == cudaErrorInitializationError);
+  CHECK(first.error == cudaErrorInitializationError);
+  CHECK(second.error == cudaErrorInitializationError);
   CHECK(cache_state.count_calls == 1);
   CHECK(cache_state.last_error == cudaSuccess);
 }
@@ -308,13 +311,13 @@ TEST_CASE("Probe CUDA error survives a device restoration failure", "[pool_peer_
   cache_state                      = fake_cache_state{};
   cache_state.first_probe          = {peer_dma_probe_status::CUDA_ERROR, cudaErrorMemoryAllocation};
   cache_state.fail_set_device_call = 1;
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 1);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
-  CHECK(results[0].error == cudaErrorMemoryAllocation);
-  CHECK(results[1].status == peer_dma_probe_status::SUPPORTED);
+  CHECK(first.status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(first.error == cudaErrorMemoryAllocation);
+  CHECK(second.status == peer_dma_probe_status::SUPPORTED);
   CHECK(cache_state.probe_calls[0][1] == 2);
   CHECK(cache_state.last_error == cudaSuccess);
   CHECK(cache_state.current_device == 0);
@@ -325,12 +328,12 @@ TEST_CASE("Caller device is restored after a probe CUDA error", "[pool_peer_acce
   cache_state                     = fake_cache_state{};
   cache_state.first_probe         = {peer_dma_probe_status::CUDA_ERROR, cudaErrorMemoryAllocation};
   cache_state.failing_probe_calls = 2;
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 1);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].error == cudaErrorMemoryAllocation);
-  CHECK(results[1].error == cudaErrorMemoryAllocation);
+  CHECK(first.error == cudaErrorMemoryAllocation);
+  CHECK(second.error == cudaErrorMemoryAllocation);
   // The failing 0 -> 1 probe leaves device 1 current. The restorations, in order, follow the first
   // 0 -> 1 attempt, the 1 -> 0 probe, the end of the initialization scan, and the retried 0 -> 1
   // attempt; each must select the caller's device 0.
@@ -344,13 +347,13 @@ TEST_CASE("Device restoration failure overrides a successful probe and is retrie
 {
   cache_state                      = fake_cache_state{};
   cache_state.fail_set_device_call = 1;
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 1);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
-  CHECK(results[0].error == cudaErrorInvalidDevice);
-  CHECK(results[1].status == peer_dma_probe_status::SUPPORTED);
+  CHECK(first.status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(first.error == cudaErrorInvalidDevice);
+  CHECK(second.status == peer_dma_probe_status::SUPPORTED);
   CHECK(cache_state.probe_calls[0][1] == 2);
   CHECK(cache_state.last_error == cudaSuccess);
   CHECK(cache_state.current_device == 0);
@@ -361,13 +364,13 @@ TEST_CASE("Device query failure skips the probe and is retried", "[pool_peer_acc
   cache_state = fake_cache_state{};
   // The first query saves the caller's device during initialization; the second precedes 0 -> 1.
   cache_state.fail_get_device_call = 2;
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 1);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
-  CHECK(results[0].error == cudaErrorNoDevice);
-  CHECK(results[1].status == peer_dma_probe_status::SUPPORTED);
+  CHECK(first.status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(first.error == cudaErrorNoDevice);
+  CHECK(second.status == peer_dma_probe_status::SUPPORTED);
   CHECK(cache_state.probe_calls[0][1] == 1);
   CHECK(cache_state.last_error == cudaSuccess);
   CHECK(cache_state.current_device == 0);
@@ -377,10 +380,9 @@ TEST_CASE("Verification failures are cached without a retry", "[pool_peer_access
 {
   cache_state             = fake_cache_state{};
   cache_state.first_probe = {peer_dma_probe_status::VERIFICATION_FAILED, cudaSuccess};
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const results = std::array{cache.result(0, 1), cache.result(0, 1)};
 
-  REQUIRE(results.size() == 2);
   for (auto const& result : results) {
     CHECK(result.status == peer_dma_probe_status::VERIFICATION_FAILED);
     CHECK(result.error == cudaSuccess);
@@ -403,13 +405,13 @@ TEST_CASE("Peer capability queries gate the probe", "[pool_peer_access]")
     cache_state.can_access_error = cudaErrorInvalidDevice;
     expected                     = {peer_dma_probe_status::CUDA_ERROR, cudaErrorInvalidDevice};
   }
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 0}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 0);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].status == expected.status);
-  CHECK(results[0].error == expected.error);
-  CHECK(results[1].status == peer_dma_probe_status::SUPPORTED);
+  CHECK(first.status == expected.status);
+  CHECK(first.error == expected.error);
+  CHECK(second.status == peer_dma_probe_status::SUPPORTED);
   CHECK(cache_state.probe_calls[0][1] == 0);
   CHECK(cache_state.probe_calls[0][0] == 0);
   CHECK(cache_state.last_error == cudaSuccess);
@@ -418,10 +420,9 @@ TEST_CASE("Peer capability queries gate the probe", "[pool_peer_access]")
 TEST_CASE("Out-of-range devices are rejected without probing", "[pool_peer_access]")
 {
   cache_state = fake_cache_state{};
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 2}, {-1, 0}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const results = std::array{cache.result(0, 2), cache.result(-1, 0)};
 
-  REQUIRE(results.size() == 2);
   for (auto const& result : results) {
     CHECK(result.status == peer_dma_probe_status::CUDA_ERROR);
     CHECK(result.error == cudaErrorInvalidDevice);
@@ -432,18 +433,19 @@ TEST_CASE("Final device restoration failure does not repeat the full probe scan"
           "[pool_peer_access]")
 {
   cache_state = fake_cache_state{};
-  (void)cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}}, cache_operations);
+  peer_dma_probe_cache successful_cache{cache_operations};
+  (void)successful_cache.result(0, 1);
   auto const final_restore_call = cache_state.set_device_calls;
 
   cache_state                      = fake_cache_state{};
   cache_state.fail_set_device_call = final_restore_call;
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 1);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
-  CHECK(results[0].error == cudaErrorInvalidDevice);
-  CHECK(results[1].status == peer_dma_probe_status::SUPPORTED);
+  CHECK(first.status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(first.error == cudaErrorInvalidDevice);
+  CHECK(second.status == peer_dma_probe_status::SUPPORTED);
   CHECK(cache_state.count_calls == 1);
   CHECK(cache_state.probe_calls[0][1] == 1);
 }
@@ -453,10 +455,9 @@ TEST_CASE("Probe callback exceptions become CUDA errors", "[pool_peer_access]")
   cache_state                           = fake_cache_state{};
   cache_state.throw_on_capability_query = true;
   // Without retries, the second request reports the stored initialization error.
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, cache_operations, false);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const results = std::array{cache.result(0, 1, false), cache.result(0, 1, false)};
 
-  REQUIRE(results.size() == 2);
   for (auto const& result : results) {
     CHECK(result.status == peer_dma_probe_status::CUDA_ERROR);
     CHECK(result.error == cudaErrorUnknown);
@@ -471,16 +472,18 @@ TEST_CASE("Broken-direction count includes only verification failures and retrie
   SECTION("verification failure")
   {
     cache_state.first_probe = {peer_dma_probe_status::VERIFICATION_FAILED, cudaSuccess};
-    CHECK(cucascade::memory::detail::count_broken_directions(cache_operations, 2) ==
-          std::vector<int>{1, 1});
+    peer_dma_probe_cache count_cache{cache_operations};
+    CHECK(count_cache.broken_direction_count() == 1);
+    CHECK(count_cache.broken_direction_count() == 1);
     CHECK(cache_state.probe_calls[0][1] == 1);
   }
   SECTION("CUDA error, then a verification failure on retry")
   {
     cache_state.first_probe = {peer_dma_probe_status::CUDA_ERROR, cudaErrorMemoryAllocation};
     cache_state.later_probe = {peer_dma_probe_status::VERIFICATION_FAILED, cudaSuccess};
-    CHECK(cucascade::memory::detail::count_broken_directions(cache_operations, 2) ==
-          std::vector<int>{0, 1});
+    peer_dma_probe_cache count_cache{cache_operations};
+    CHECK(count_cache.broken_direction_count() == 0);
+    CHECK(count_cache.broken_direction_count() == 1);
     CHECK(cache_state.probe_calls[0][1] == 2);
   }
   CHECK(cache_state.last_error == cudaSuccess);
@@ -492,14 +495,15 @@ TEST_CASE("Broken-direction count reports -1 when verification cannot run", "[po
   SECTION("device count query fails once")
   {
     cache_state.count_error = cudaErrorInitializationError;
-    CHECK(cucascade::memory::detail::count_broken_directions(cache_operations, 2) ==
-          std::vector<int>{-1, 0});
+    peer_dma_probe_cache count_cache{cache_operations};
+    CHECK(count_cache.broken_direction_count() == -1);
+    CHECK(count_cache.broken_direction_count() == 0);
   }
   SECTION("capability query throws")
   {
     cache_state.throw_on_capability_query = true;
-    CHECK(cucascade::memory::detail::count_broken_directions(cache_operations, 1) ==
-          std::vector<int>{-1});
+    peer_dma_probe_cache count_cache{cache_operations};
+    CHECK(count_cache.broken_direction_count() == -1);
   }
 }
 
@@ -509,8 +513,8 @@ TEST_CASE("Broken-direction count survives a failed final device restoration", "
   cache_state.first_probe = {peer_dma_probe_status::VERIFICATION_FAILED, cudaSuccess};
   // Restorations follow 0 -> 1, then 1 -> 0, then the end of the initialization scan.
   cache_state.fail_set_device_call = 3;
-  CHECK(cucascade::memory::detail::count_broken_directions(cache_operations, 1) ==
-        std::vector<int>{1});
+  peer_dma_probe_cache count_cache{cache_operations};
+  CHECK(count_cache.broken_direction_count() == 1);
   CHECK(cache_state.last_error == cudaSuccess);
 }
 
@@ -518,16 +522,15 @@ TEST_CASE("Zero visible devices verify as empty", "[pool_peer_access]")
 {
   cache_state              = fake_cache_state{};
   cache_state.device_count = 0;
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 0}, {0, 1}}, cache_operations);
+  peer_dma_probe_cache cache{cache_operations};
+  auto const results = std::array{cache.result(0, 0), cache.result(0, 1)};
 
-  REQUIRE(results.size() == 2);
   for (auto const& result : results) {
     CHECK(result.status == peer_dma_probe_status::CUDA_ERROR);
     CHECK(result.error == cudaErrorInvalidDevice);
   }
-  CHECK(cucascade::memory::detail::count_broken_directions(cache_operations, 1) ==
-        std::vector<int>{0});
+  peer_dma_probe_cache count_cache{cache_operations};
+  CHECK(count_cache.broken_direction_count() == 0);
   CHECK(cache_state.probe_calls[0][0] == 0);
   CHECK(cache_state.probe_calls[0][1] == 0);
 }

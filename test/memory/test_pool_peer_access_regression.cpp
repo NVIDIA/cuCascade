@@ -25,10 +25,10 @@
  * [peer_route_working]     - requires hardware whose direct peer route delivers correct bytes
  * [.peer_route_broken]     - hidden; only for hardware whose direct peer route corrupts bytes
  *
- * `fake_operations` drives detail::probe_peer_dma_sequence() with a fake CUDA runtime whose state
- * lives in file-scope globals, so each test resets that state first and the cases in this file must
- * not run concurrently. `hardware_operations` drives the same cache with the real CUDA runtime and
- * the real probe.
+ * `fake_operations` drives detail::peer_dma_probe_cache with a fake CUDA runtime whose state lives
+ * in file-scope globals, so each test resets that state first and the cases in this file must not
+ * run concurrently. `hardware_operations` drives the same cache with the real CUDA runtime and the
+ * real probe.
  */
 
 #include "test_gpu_kernels.cuh"
@@ -45,11 +45,11 @@
 #include <cstddef>
 #include <memory>
 #include <type_traits>
-#include <vector>
 
 namespace {
 
 using cucascade::memory::pool_peer_access_status;
+using cucascade::memory::detail::peer_dma_probe_cache;
 using cucascade::memory::detail::peer_dma_probe_operations;
 using cucascade::memory::detail::peer_dma_probe_result;
 using cucascade::memory::detail::peer_dma_probe_status;
@@ -231,11 +231,10 @@ struct ordinary_peer_state_guard {
 }
 
 /** @brief Run the real probe in both directions through a fresh cache and require a conclusion. */
-[[nodiscard]] std::vector<peer_dma_probe_result> probe_both_directions()
+[[nodiscard]] std::array<peer_dma_probe_result, 2> probe_both_directions()
 {
-  auto results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {1, 0}}, hardware_operations);
-  REQUIRE(results.size() == 2);
+  peer_dma_probe_cache cache{hardware_operations};
+  auto const results = std::array{cache.result(0, 1), cache.result(1, 0)};
   for (auto const& result : results) {
     INFO("probe CUDA error: " << cudaGetErrorName(result.error));
     REQUIRE(result.status != peer_dma_probe_status::CUDA_ERROR);
@@ -342,13 +341,13 @@ TEST_CASE("Retrying an inconclusive peer probe restores the caller device",
   fake_current_device = device;
   fake_probe_calls    = 0;
 
-  auto const results =
-    cucascade::memory::detail::probe_peer_dma_sequence({{0, 1}, {0, 1}}, fake_operations);
+  peer_dma_probe_cache cache{fake_operations};
+  auto const first  = cache.result(0, 1);
+  auto const second = cache.result(0, 1);
 
-  REQUIRE(results.size() == 2);
-  CHECK(results[0].status == peer_dma_probe_status::CUDA_ERROR);
-  CHECK(results[0].error == cudaErrorMemoryAllocation);
-  CHECK(results[1].status == peer_dma_probe_status::SUPPORTED);
+  CHECK(first.status == peer_dma_probe_status::CUDA_ERROR);
+  CHECK(first.error == cudaErrorMemoryAllocation);
+  CHECK(second.status == peer_dma_probe_status::SUPPORTED);
   CHECK(fake_probe_calls == 2);
   CHECK(fake_current_device == device);
 }
@@ -597,6 +596,32 @@ TEST_CASE("Pool grants leave ordinary peer access unchanged",
   }
 }
 
+TEST_CASE("Bidirectional peer queries preserve caller device and access",
+          "[pool_peer_access][peer_access_regression][gpu][.multi-device]")
+{
+  require_peer_devices();
+  auto const initial_bits = GENERATE(0, 1, 2, 3);
+  auto const owner        = GENERATE(0, 1);
+  ordinary_peer_state const initial{(initial_bits & 1) != 0, (initial_bits & 2) != 0};
+  CAPTURE(owner, initial[0], initial[1]);
+  int saved_device = 0;
+  REQUIRE(cudaGetDevice(&saved_device) == cudaSuccess);
+  current_device_guard restore_device{saved_device};
+  ordinary_peer_state_guard restore_access{};
+  require_ordinary_peer_state(initial);
+  pool_guard pool{create_device_pool(owner)};
+  auto const access_before = pool_access(pool.pool, 1 - owner);
+  REQUIRE(cudaSetDevice(owner) == cudaSuccess);
+
+  (void)cucascade::memory::peer_access_verified(owner, 1 - owner);
+
+  int device_after = -1;
+  REQUIRE(cudaGetDevice(&device_after) == cudaSuccess);
+  CHECK(device_after == owner);
+  CHECK(pool_access(pool.pool, 1 - owner) == access_before);
+  CHECK(read_ordinary_peer_state() == initial);
+}
+
 // Catch2 runs a hidden case whenever a positive filter matches any of its tags, so this case
 // carries only its own hidden tag. Select it with "[peer_route_broken]" on hardware whose direct
 // peer route is known to deliver wrong bytes, together with "~[peer_route_working]". The default
@@ -622,8 +647,10 @@ TEST_CASE("Broken pool peer route refuses grants without changing state", "[.pee
   CHECK(grant.error() == cudaSuccess);
   CHECK(pool_access(pool.pool, accessor) == access_before);
   CHECK(read_ordinary_peer_state() == restore_access.original);
-  CHECK_FALSE((cucascade::memory::probe_peer_dma_works(owner, accessor) &&
-               cucascade::memory::probe_peer_dma_works(accessor, owner)));
+  CHECK_FALSE(cucascade::memory::peer_access_verified(owner, accessor));
+  CHECK_FALSE(cucascade::memory::peer_access_verified(accessor, owner));
+  CHECK(pool_access(pool.pool, accessor) == access_before);
+  CHECK(read_ordinary_peer_state() == restore_access.original);
   CHECK(cucascade::memory::disable_peer_access_where_broken() > 0);
 }
 
@@ -640,4 +667,13 @@ TEST_CASE("Public peer verification reports a working route and no broken direct
   CHECK(cucascade::memory::probe_peer_dma_works(0, 1));
   CHECK(cucascade::memory::probe_peer_dma_works(1, 0));
   CHECK(cucascade::memory::probe_peer_dma_works(0, 0));
+  CHECK(cucascade::memory::peer_access_verified(0, 1));
+  CHECK(cucascade::memory::peer_access_verified(1, 0));
+  CHECK(cucascade::memory::peer_access_verified(0, 0));
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  CHECK_FALSE(cucascade::memory::peer_access_verified(-1, 0));
+  CHECK_FALSE(cucascade::memory::peer_access_verified(0, -1));
+  CHECK_FALSE(cucascade::memory::peer_access_verified(device_count, 0));
+  CHECK_FALSE(cucascade::memory::peer_access_verified(0, device_count));
 }

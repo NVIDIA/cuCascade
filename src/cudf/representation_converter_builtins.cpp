@@ -573,7 +573,7 @@ static int resolve_gpu_numa_node(int device_id) noexcept
  *
  * Routing is decided per direction by cucascade::memory::probe_peer_dma_works(), which verifies a
  * peer copy between two mutually granted private memory pools:
- *   - verified: cudaMemcpyPeerAsync (direct device-to-device copy over NVLink or supported PCIe)
+ *   - verified: cudaMemcpyPeerAsync (direct only when the pools are granted peer access)
  *   - wrong bytes or a CUDA error during verification: explicit host-staged copy
  *
  * The host-staged copy goes through the pre-pinned HOST memory_space pool (registered by

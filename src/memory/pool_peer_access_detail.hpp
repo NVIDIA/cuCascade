@@ -31,7 +31,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
-#include <utility>
+#include <mutex>
 #include <vector>
 
 namespace cucascade {
@@ -46,6 +46,7 @@ enum class peer_dma_probe_status {
   CUDA_ERROR            ///< A CUDA runtime operation failed; the result carries the first error
 };
 
+/** @brief Outcome of one directional probe; a default-constructed result fails closed. */
 struct peer_dma_probe_result {
   peer_dma_probe_status status{peer_dma_probe_status::CUDA_ERROR};
   cudaError_t error{cudaErrorUnknown};
@@ -54,8 +55,8 @@ struct peer_dma_probe_result {
 /**
  * @brief Operations used by the process-wide peer DMA probe cache
  *
- * Production code binds probe_peer_dma to probe_peer_dma_with_private_pools(); tests drive the
- * cache through probe_peer_dma_sequence() and count_broken_directions().
+ * Production code binds probe_peer_dma to probe_peer_dma_with_private_pools(); tests construct
+ * peer_dma_probe_cache with fake operations.
  */
 struct peer_dma_probe_operations {
   cudaError_t (*get_device_count)(int* count);
@@ -66,20 +67,49 @@ struct peer_dma_probe_operations {
   peer_dma_probe_result (*probe_peer_dma)(int source_device, int destination_device) noexcept;
 };
 
-/** @brief Run requests through a fresh probe cache with supplied CUDA operations. */
-[[nodiscard]] std::vector<peer_dma_probe_result> probe_peer_dma_sequence(
-  std::vector<std::pair<int, int>> const& requests,
-  peer_dma_probe_operations const& operations,
-  bool retry_errors = true);
-
 /**
- * @brief Call the broken-direction count behind disable_peer_access_where_broken() @p calls times
- * on one fresh probe cache with supplied CUDA operations
+ * @brief Thread-safe cache of peer DMA probe results
  *
- * @return The count returned by each call, in order
+ * Production code shares one instance; tests can construct independent instances with supplied
+ * operations.
  */
-[[nodiscard]] std::vector<int> count_broken_directions(peer_dma_probe_operations const& operations,
-                                                       std::size_t calls);
+class peer_dma_probe_cache {
+ public:
+  explicit peer_dma_probe_cache(peer_dma_probe_operations operations) noexcept;
+
+  /**
+   * @brief Return the cached result for one direction, running the full scan on first use.
+   *
+   * With @p retry_errors true, a direction cached as a CUDA error or a failed scan is probed again
+   * and a failed scan is retried. Without it (e.g., during converter lookups), a cached error or a
+   * failed scan's error is returned unchanged.
+   */
+  [[nodiscard]] peer_dma_probe_result result(int source_device,
+                                             int destination_device,
+                                             bool retry_errors = true) noexcept;
+
+  /**
+   * @brief Count verification failures, retrying cached CUDA errors and failed initialization
+   *
+   * @return The number of failed directions, or -1 if the count cannot be determined
+   */
+  [[nodiscard]] int broken_direction_count() noexcept;
+
+ private:
+  [[nodiscard]] peer_dma_probe_result& entry(int source_device, int destination_device) noexcept;
+  [[nodiscard]] cudaError_t initialize_locked();
+  [[nodiscard]] int count_broken_locked() const noexcept;
+  [[nodiscard]] peer_dma_probe_result probe_direction(int source_device, int destination_device);
+
+  peer_dma_probe_operations _operations;
+  std::mutex _mutex;
+  std::vector<peer_dma_probe_result> _results;
+  int _device_count{0};
+  bool _initialized{false};
+  bool _initialization_attempted{false};
+  // Every failure path assigns this, except an exception, which leaves this generic code.
+  cudaError_t _initialization_error{cudaErrorUnknown};
+};
 
 /**
  * @brief Operations used by grant_pool_peer_access()

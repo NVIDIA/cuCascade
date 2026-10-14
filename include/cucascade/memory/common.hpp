@@ -143,13 +143,13 @@ using DeviceMemoryResourceFactoryFn =
  *
  * Access is granted only after the byte verification described for probe_peer_dma_works() passes in
  * both directions. The first request that needs verification, through this function,
- * probe_peer_dma_works(), or disable_peer_access_where_broken(), verifies every ordered pair of
- * visible devices while holding a process-wide lock, so concurrent requests wait for it. Results
- * are cached for the process lifetime; directions that ended in a CUDA error are verified again on
- * a later grant request. If both directional probes fail, a CUDA error takes precedence over a
- * verification failure or an unsupported result. Verification temporarily changes the caller
- * thread's current device and restores it before return; a restoration failure is reported as
- * pool_peer_access_status::CUDA_ERROR.
+ * probe_peer_dma_works(), peer_access_verified(), or disable_peer_access_where_broken(), verifies
+ * every ordered pair of visible devices while holding a process-wide lock, so concurrent requests
+ * wait for it. Results are cached for the process lifetime; directions that ended in a CUDA error
+ * are verified again on a later grant request. If both directional probes fail, a CUDA error takes
+ * precedence over a verification failure or an unsupported result. Verification temporarily changes
+ * the caller thread's current device and restores it before return; a restoration failure is
+ * reported as pool_peer_access_status::CUDA_ERROR.
  *
  * The caller must supply a live non-null pool, valid visible CUDA device IDs, and the device that
  * actually owns the pool's allocations as owner_device. For distinct devices this is not checked,
@@ -189,9 +189,13 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
  * whether peer copies are used.
  *
  * A same-device request returns true. For distinct devices, verification copies 64 bytes with
- * `cudaMemcpyPeerAsync` between two private memory pools that are granted to each other, then
- * compares the bytes. Pool grants, not ordinary peer access, select the copy route for pool
- * allocations, so the result applies to pools created with the allocation properties of the pool
+ * `cudaMemcpyPeerAsync` issued on @p dst_device between two private memory pools that are granted
+ * to each other, then compares the bytes. A successful probe means @p dst_device can pull bytes
+ * from @p src_device; it does not verify the reverse direction. Use peer_access_verified() for the
+ * bidirectional check required before granting peer access.
+ *
+ * Pool grants, not ordinary peer access, select the copy route for pool allocations, so the result
+ * applies to pools created with the allocation properties of the pool
  * owned by `rmm::mr::cuda_async_memory_resource`; pools with other properties, including
  * managed-memory pools such as the one owned by `rmm::mr::cuda_async_managed_memory_resource`, are
  * not verified separately. Verification changes neither ordinary peer access nor the permissions of
@@ -208,11 +212,33 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
  * disable_peer_access_where_broken() retries it.
  *
  * @param src_device The device that owns the copied bytes
- * @param dst_device The device that receives the copied bytes
+ * @param dst_device The device that receives the bytes and issues the copy; true does not imply
+ *                   that the reverse direction (that @p src_device can access @p dst_device ) is
+ *                   verified.
  * @return True for a same-device request or a verified direction; false for unsupported directions,
- * failed verification, or CUDA errors
+ *         failed verification, or CUDA errors
  */
 [[nodiscard]] bool probe_peer_dma_works(int src_device, int dst_device);
+
+/**
+ * @brief Return whether peer byte-transfer verification succeeded in both directions
+ *
+ * Applies the bidirectional verification rule used by grant_pool_peer_access() without granting
+ * access to any caller pool or changing ordinary peer access. Applications can use this query to
+ * gate their own peer-access setup without interpreting the direction of a single copy probe.
+ * It uses the private-pool verification described by probe_peer_dma_works(); it does not separately
+ * verify the ordinary peer route for non-pool allocations.
+ *
+ * Results use the same process-wide cache as probe_peer_dma_works(). A cached CUDA error returns
+ * false without retrying; grant_pool_peer_access() or disable_peer_access_where_broken() retries
+ * it.
+ *
+ * @param owner_device The device that owns the memory to share
+ * @param accessing_device The device that needs access to that memory
+ * @return True for a same-device request or when both directions are verified; false if either
+ *         direction is unsupported, fails verification, or has a CUDA error
+ */
+[[nodiscard]] bool peer_access_verified(int owner_device, int accessing_device);
 
 /**
  * @brief Trigger cached peer verification and count the directions that failed it

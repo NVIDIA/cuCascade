@@ -89,6 +89,8 @@ __global__ void copy_peer_bytes_kernel(unsigned char* destination,
   }
 }
 
+// Use the intrinsic nanosecond timer (%globaltimer) for the timeout; clock64() varies across SMs as
+// it counts SM clock cycles.
 __device__ unsigned long long global_timer_ns()
 {
   unsigned long long time = 0;

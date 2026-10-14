@@ -207,8 +207,15 @@ prove the route of a later copy. A failed grant leaves existing pool permissions
 revocation must be coordinated by the application with other users of that pool. CUDA errors take
 precedence over non-error rejections when the two directional probes disagree. Verified peer
 results are cached process-wide. `grant_pool_peer_access()` and
-`disable_peer_access_where_broken()` retry cached CUDA errors; `probe_peer_dma_works()`, which gates
-the GPU-to-GPU converter path, reports false and the converter host-stages while an error is cached.
+`disable_peer_access_where_broken()` retry cached CUDA errors; `probe_peer_dma_works()` and
+`peer_access_verified()` report false without retrying. The GPU-to-GPU converter uses the
+directional probe and host-stages while an error is cached.
+
+`peer_access_verified(owner_device, accessing_device)` exposes the same bidirectional verification
+rule without granting access. It returns true for a same-device request or when both directional
+probes pass. Applications can use it to gate their own ordinary peer-access setup. A single
+`probe_peer_dma_works(src_device, dst_device)` result is directional: the copy is issued on
+`dst_device`, verifying that it can pull bytes from `src_device`, not the reverse direction.
 
 Verification copies 64 bytes in each direction between two private memory pools that are granted
 to each other and compares the bytes. Pool grants, not ordinary peer access
@@ -225,8 +232,8 @@ GPU-to-GPU conversions stage through pinned host memory instead of copying direc
 cuCascade never enables or disables ordinary peer access. Copies of memory that does not come from a
 pool, such as `cudaMalloc` allocations, follow the application's own `cudaDeviceEnablePeerAccess`
 setting; while it is disabled the CUDA driver uses an indirect route that is correct but may be
-slower. An application may enable ordinary peer access itself, but the verification above does not
-cover that route.
+slower. An application may enable ordinary peer access itself, but neither the directional probe
+nor `peer_access_verified()` separately verifies that non-pool route.
 
 The legacy `enable_pool_peer_access_for_all_visible_devices()` helper remains best effort. It
 visits every visible peer for both the supplied pool and the owner's currently selected pool,
