@@ -70,7 +70,7 @@ class s3rdma_ioctx : public ioctx {
   [[nodiscard]] bool supports_device_read() const noexcept override;
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override;
   [[nodiscard]] bool supports_vector_host_read() const noexcept override;
-  [[nodiscard]] cache::prefetching_stage preferred_prefetching_stage() const noexcept override;
+  [[nodiscard]] bool supports_device_range_read() const noexcept override;
 
   [[nodiscard]] std::vector<byte_range> align_and_coalesce(
     std::span<const byte_range> ranges,
@@ -78,27 +78,10 @@ class s3rdma_ioctx : public ioctx {
 
   size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) override;
 
-  exec::semi_future<size_t> host_read_async_io(const io_object& obj,
-                                               size_t offset,
-                                               size_t size,
-                                               uint8_t* dst) noexcept override;
-
-  exec::semi_future<size_t> device_read_async_io(const io_object& obj,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 uint8_t* dst,
-                                                 ::cuda::stream_ref stream) noexcept override;
-
-  exec::semi_future<size_t> host_to_device_read_async_io(
-    const io_object& obj,
-    std::span<io_object_segment> slices,
-    size_t offset,
-    size_t size,
-    uint8_t* dst,
-    ::cuda::stream_ref stream) noexcept override;
-
-  exec::semi_future<size_t> host_read_ranges_async_io(
-    const io_object& obj, std::span<io_object_segment> segments) noexcept override;
+  /// The sole asynchronous backend hook; every scalar / vector host / device
+  /// read is lowered to prepared slices and forwarded here.
+  exec::semi_future<size_t> mixed_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept override;
 
  protected:
   std::shared_ptr<io_object> create_io_object(std::string path) override;

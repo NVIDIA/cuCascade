@@ -121,9 +121,6 @@ static void usage(char const* prog)
     << "REST config overrides (rest only; key=value, any order after num_rows):\n"
     << "  n_threads=<N>           reader threads / REST reactors\n"
     << "  max_connections=<N>     max concurrent in-flight easy handles per reactor (def 16)\n"
-    << "  chunk_size=<bytes>      target max bytes per ranged GET (def 8388608)\n"
-    << "  max_n_chunks=<N>        max buffers fused into one scatter GET (def 16)\n"
-    << "  max_read_split=<N>      parallel GETs a contiguous host read splits into (def 16)\n"
     << "\n"
     << "credentials/region/endpoint via the AWS environment: AWS_ACCESS_KEY_ID,\n"
     << "AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION, AWS_ENDPOINT_URL\n";
@@ -142,12 +139,6 @@ static bool apply_override(std::string const& key,
     n_threads = ull();
   } else if (key == "max_connections") {
     cfg.max_connections = ull();
-  } else if (key == "chunk_size") {
-    cfg.chunk_size = ull();
-  } else if (key == "max_n_chunks") {
-    cfg.max_n_chunks = ull();
-  } else if (key == "max_read_split") {
-    cfg.max_read_split = ull();
   } else {
     return false;
   }
@@ -459,12 +450,8 @@ int main(int argc, char** argv)
   std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
 
   if (backend == Backend::rest) {
-    rest_cfg.bounce_block_size = host_mr.get_block_size();
     std::cout << "REST   : n_reactors=" << n_threads
-              << "  max_connections=" << rest_cfg.max_connections
-              << "  chunk_size=" << rest_cfg.chunk_size
-              << "  max_n_chunks=" << rest_cfg.max_n_chunks
-              << "  max_read_split=" << rest_cfg.max_read_split << "\n";
+              << "  max_connections=" << rest_cfg.max_connections << "\n";
     auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
     auto rest_ctx   = std::make_shared<cucascade::io::rest::rest_reactor::reactor_context>(
       std::move(rest_cfg), std::move(authorizer), &host_mr);

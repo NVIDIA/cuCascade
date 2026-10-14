@@ -87,7 +87,7 @@ factory_type make_kvikio_ioctx_factory()
     try {
       // Applies config.kvikio to kvikIO's process-global defaults (see
       // kvikio_config): unset fields keep kvikIO's env-var-seeded values.
-      return std::make_shared<kvikio_context>(config.kvikio);
+      return std::make_shared<kvikio_context>(config.kvikio, config.object_store);
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -107,12 +107,8 @@ factory_type make_uring_ioctx_factory(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
-      // One reactor_context shared by the whole pool: it carries the per-reactor
-      // config (bounce-slot size taken from the staging resource's block size)
-      // and the pinned bounce-staging resource itself.
-      auto uring_cfg        = config.local;
-      uring_cfg.bounce_size = host_mr->get_block_size();
-      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(uring_cfg, host_mr);
+      // One reactor_context shares config and the pinned staging resource.
+      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
       return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
@@ -133,11 +129,8 @@ factory_type make_rest_ioctx_factory(
           "region missing); REST backend disabled");
         return nullptr;
       }
-      // Host staging is optional for REST — when absent, reactor-staged device
-      // reads are disabled (bounce_block_size 0), host reads still work.
-      auto* host_mr              = first_host_resource(reservation_manager);
-      auto rest_cfg              = config.rest;
-      rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
+      auto* host_mr = first_host_resource(reservation_manager);
+      auto rest_cfg = config.rest;
       // The object store owns the endpoint and its TLS trust; the reactor's
       // curl GETs must verify against the same CA bundle / policy the authorizer
       // presigns for, so source these from object_store rather than rest config.
@@ -159,7 +152,9 @@ factory_type make_rest_ioctx_factory(
 
 io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
-  : _config(std::move(config)), _reservation_manager(reservation_manager)
+  : _config(std::move(config)),
+    _reservation_manager(reservation_manager),
+    _prefer_kvikio(_config.backend == io_backend::kvikio)
 {
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  kvikio is the universal fallback —
@@ -230,6 +225,12 @@ std::optional<io_context_type> io_context_registry::lookup_path(
     if (!entry.checker(path)) continue;
     if (type == io_context_type::kvikio) {
       fallback = type;
+      continue;
+    }
+    // backend=kvikio takes over reads from BOTH explicit backends: local files
+    // from uring, s3:// objects from rest (kvikIO's RemoteHandle serves them).
+    // LIST still needs the rest ioctx, which callers fetch by type instead.
+    if (_prefer_kvikio && (type == io_context_type::uring || type == io_context_type::restful)) {
       continue;
     }
     return type;

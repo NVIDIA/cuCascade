@@ -29,12 +29,12 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -210,55 +210,6 @@ class rest_io_object : public io_object {
 };
 
 // ---------------------------------------------------------------------------
-// rest_perf_snapshot
-// ---------------------------------------------------------------------------
-
-/// Plain-value perf counters read out of a reactor, or summed across the pool
-/// by @c rest_ioctx.  The ns totals/maxes and ttfb stay 0 unless the reactor's
-/// @c perf_instrumentation is on; retry / terminal / device-stream-sync and
-/// payload-bytes counts are populated regardless.  The layout is not
-/// ABI-stable: consumers build from the same source pin, and fields are
-/// appended, never reordered or removed.
-struct rest_perf_snapshot {
-  std::uint64_t chunk_get_ns_total{0};
-  std::uint64_t chunk_get_count{0};
-  std::uint64_t chunk_get_ns_max{0};
-  std::uint64_t queue_wait_ns_total{0};
-  std::uint64_t queue_wait_count{0};
-  // ttfb = span from GET submission to completion of the reactor's first
-  // completed GET (async chunk or footer probe) — not first byte on the wire.
-  std::uint64_t ttfb_ns{0};
-  // h2d_observed_* time the copy_h2d_async call itself — the host-side async
-  // launch cost, not the copy, which completes later on the stream.
-  std::uint64_t h2d_observed_ns_total{0};
-  std::uint64_t h2d_observed_count{0};
-  std::uint64_t h2d_observed_ns_max{0};
-  std::uint64_t retries_total{0};
-  std::uint64_t terminal_failures_total{0};
-  std::uint64_t device_stream_sync_total{0};
-  // Always-on: HTTP response *body* bytes received (sink.total_received), summed
-  // over every completed curl attempt incl. retries / partial / failed bodies.
-  // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
-  std::uint64_t payload_bytes_read_total{0};
-  // perf_instrumentation-gated. Blocking host GETs remain part of chunk_get_*
-  // and are also attributed to blocking_host_get_*. Stash hits issue no GET and
-  // increment neither.
-  std::uint64_t blocking_host_get_count{0};
-  std::uint64_t blocking_host_get_wall_ns_total{0};
-  std::uint64_t blocking_host_get_wall_ns_max{0};
-  // Ioctx-level (not summed across reactors): live / high-water bytes reserved
-  // from the footer-resolve stash budget.  0 when the batched footer API has
-  // never run on this ioctx.
-  std::uint64_t footer_stash_reserved_bytes{0};
-  std::uint64_t footer_stash_reserved_peak_bytes{0};
-};
-
-/// How @c prep_host_rx_request attributes the resulting GETs in the perf
-/// snapshot: a @c blocking read (synchronous host_read) is counted in
-/// blocking_host_get_* in addition to chunk_get_*.
-enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
-
-// ---------------------------------------------------------------------------
 // rest_reactor
 // ---------------------------------------------------------------------------
 
@@ -266,14 +217,20 @@ enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
  * @brief Single-threaded I/O reactor for RESTful object storage (s3://...).
  *
  * Owns one worker thread driving a libcurl multi handle over an epoll event
- * loop (curl_multi_socket_action), a pool of reusable easy handles, optional
- * pinned bounce slots for device staging, a timerfd + min-heap retry
+ * loop (curl_multi_socket_action), a pool of reusable easy handles, dynamic
+ * CuCascade staging for device reads, a timerfd + min-heap retry
  * scheduler, and an MPSC request queue.  Models the reactor concept consumed
  * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
  * @c s3_request_authorizer, re-issued on every attempt.
  */
 class rest_reactor {
  public:
+  /// Every read is an HTTP round trip, so what a request costs is dominated by
+  /// the fact that it IS a request.  Given the whole range set at once the
+  /// reactor can fuse adjacent ranges and keep every connection busy, which it
+  /// cannot do when ranges arrive one at a time as a reader walks the file.
+  static constexpr bool prefers_bulk_io = true;
+
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c rest_ioctx and shared (via shared_ptr) across every reactor in the
   /// pool, so it is the natural home for things that are shared rather than
@@ -308,8 +265,6 @@ class rest_reactor {
   };
 
   using io_object_type       = rest_io_object;
-  using request_type         = rest_rx_request;
-  using request_type_ptr     = std::unique_ptr<rest_rx_request>;
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
 
@@ -326,52 +281,65 @@ class rest_reactor {
   /// in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  // -- request preparation (static: build chunk descriptions) --------------
-
-  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
-                                               const io_object_type& file,
-                                               const io_object_segment& segment);
-  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
-                                               const io_object_type& file,
-                                               const io_object_segment& segment,
-                                               host_read_attribution attribution);
-
-  static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
-                                                const io_object_type& file,
-                                                std::span<io_object_segment> segments);
-
-  static request_type_ptr prep_device_rx_request(const reactor_config_type& cfg,
-                                                 const io_object_type& file,
-                                                 uint8_t* dst,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 ::cuda::stream_ref stream,
-                                                 int device_id);
-
-  static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
-                                                         const io_object_type& file,
-                                                         std::span<io_object_segment> bounce,
-                                                         uint8_t* dst,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         ::cuda::stream_ref stream,
-                                                         int device_id);
+  /// Staging block size, taken from the context's host resource (0 when the
+  /// context has none).  INVARIANT: when a prefetching cache is present this
+  /// MUST equal its chunk size — the worker plans a fragmented fill's extent as
+  /// @c cache::fill_span(fill, chunk->offset, this value), so a larger staging
+  /// block writes past the end of the pinned chunk and a smaller one marks a
+  /// chunk cached while only part of it was fetched.  Checked once in
+  /// @c ioctx::initialize_cache, which is the only place both sizes are known
+  /// (the reactor is built, and may already be started, before the cache
+  /// exists).
+  [[nodiscard]] std::size_t staging_block_size() const noexcept
+  {
+    return _ctx == nullptr || _ctx->host_memory_resource() == nullptr
+             ? std::size_t{0}
+             : _ctx->host_memory_resource()->get_block_size();
+  }
 
   // -- dispatch / lifecycle ------------------------------------------------
 
-  /// Allocate the pinned bounce slots and launch the worker thread.  Split out
-  /// of the constructor so a reactor can be built cheaply (it only copies its
-  /// config and creates its wakeup fd) and parked until it is actually needed —
-  /// see @c ioctx::start.  Idempotent: a second call (while the worker is
-  /// already running) is a no-op.
+  /// Launch the worker thread. Split out of the constructor so a reactor can be
+  /// built cheaply and parked until it is actually needed. Idempotent while
+  /// running; shutdown is terminal and a later start is ignored.
   void start();
 
-  void enqueue(request_type_ptr req);
+  void enqueue(std::unique_ptr<grouped_io_request> req) noexcept;
   void interrupt();
-  void shutdown();
+  void shutdown() noexcept;
+
+  /// Bytes of queued-but-not-yet-submitted work — the reactor's backlog, and the
+  /// signal @c rest_ioctx::next_reactor balances dispatch against.  Counts only
+  /// what is waiting: a chunk stops counting the moment a connection picks it up,
+  /// because in-flight work is already bounded by @c max_connections and is
+  /// therefore the same ceiling on every reactor, while the queue is where an
+  /// unevenly-loaded pool actually diverges.
+  ///
+  /// A hint, not a synchronization point: it is read without ordering against
+  /// the queue itself, so a concurrent enqueue or dequeue may not be reflected
+  /// yet.  Dispatch only needs to be right on average.
+  [[nodiscard]] std::size_t queued_bytes() const noexcept
+  {
+    return _queued_bytes.load(std::memory_order_relaxed);
+  }
 
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
+
+  /// Ask the worker to open its connection pool against @p bucket before any
+  /// read needs it.  Returns immediately: the worker does the HEADs on its own
+  /// thread at the top of its next pass, because the connection cache it fills
+  /// is thread-confined (see the @c curl_share warning) and is reachable from
+  /// nowhere else.  Coalescing is the caller's job -- a second call before the
+  /// first is serviced simply replaces the target.
+  ///
+  /// The request is a bucket-scoped @c ListObjectsV2 capped at zero keys, not a
+  /// HEAD: a HEAD is signed per object and @c sigv4_authorizer refuses an empty
+  /// key, whereas @c authorize_list already signs a bucket-only URI, so this
+  /// keeps warm-up traffic off the query's data files without touching the
+  /// signing path.  The response is discarded and never inspected -- the
+  /// handshake is what is being bought, so even a 403 is a success.
+  void warmup(std::string bucket);
 
   /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
   /// build an @c rest_io_object.  @p bucket / @p key identify the object.
@@ -415,16 +383,10 @@ class rest_reactor {
   /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
   /// request query (no auth params — authorization is added via
   /// @c authorize_list).  @p prefix is only for retry-log / error text.
-  /// Control-plane op: retries/terminals are counted (and retries WARN-logged)
-  /// like every retry loop here, but the XML body never touches the chunk-GET /
-  /// payload byte counters.
+  /// Control-plane op: transient failures are retried and WARN-logged.
   std::string list_page(std::string_view bucket,
                         std::string_view prefix,
                         std::string_view canonical_query);
-
-  /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
-  /// loads); safe to call while the reactor is running.
-  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
   // -- capabilities / factory ----------------------------------------------
 
@@ -435,13 +397,6 @@ class rest_reactor {
   /// @c rest_ioctx::create_io_object.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
-  static constexpr cache::prefetching_stage preferred_prefetching_stage() noexcept
-  {
-    // Network round-trips are high-latency; read ahead on demand rather than
-    // eagerly prefilling the whole working set.
-    return cache::prefetching_stage::just_in_time;
-  }
-
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
   /// bound) into a minimal sorted set — fewer ranges means fewer GETs.
@@ -451,50 +406,34 @@ class rest_reactor {
  private:
   void worker_loop(const std::stop_token& stop_token);
 
-  /// Enqueue a batch of chunks with a single wake notification.
-  void enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_request>> batch);
-
   // Shared services + tunables for the whole reactor pool; kept alive for this
   // reactor's lifetime (the authorizer is used on every request).
   std::shared_ptr<reactor_context> _ctx;
   config _config;  // copy of _ctx->cfg() for hot-path access
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
-  std::size_t _bounce_slot_size{0};
 
-  // Keeps the bounce-slot blocks alive for the reactor's lifetime; the
-  // allocation handle returns the blocks to the upstream resource when the
-  // reactor is destroyed.  Null when no host_memory_resource is set.
-  cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
+  // Set by warmup() on a caller thread, consumed by the worker at the top of a
+  // pass.  The bucket is guarded because a std::string is not atomically
+  // publishable; the flag is what the worker actually polls.
+  std::atomic<bool> _warm_requested{false};
+  std::mutex _warm_mtx;
+  std::string _warm_bucket;
 
-  // Cross-thread wakeup: written by enqueue()/interrupt() and the CUDA
-  // copy-completion callback to break the worker out of epoll_wait.
+  // Cross-thread wakeup: written by enqueue()/interrupt() to break the worker
+  // out of epoll_wait.
   file_descriptor _wakeup_fd;
 
   std::stop_source _stop_source;
-  blocking_concurrent_queue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+  blocking_concurrent_queue<std::unique_ptr<grouped_io_request>> _requests;
+  mutable std::mutex _enqueue_mutex;
+  bool _running{false};
+  bool _accepting{false};
+  bool _stopped{false};
 
-  // Instrumentation counters, owned by the reactor (not worker_loop locals) so
-  // rest_ioctx can read them cross-thread.  Gating: see rest_perf_snapshot.
-  struct perf_counters {
-    std::atomic<std::uint64_t> chunk_get_ns_total{0};
-    std::atomic<std::uint64_t> chunk_get_count{0};
-    std::atomic<std::uint64_t> chunk_get_ns_max{0};
-    std::atomic<std::uint64_t> queue_wait_ns_total{0};
-    std::atomic<std::uint64_t> queue_wait_count{0};
-    std::atomic<std::uint64_t> ttfb_ns{0};
-    std::atomic<std::uint64_t> h2d_observed_ns_total{0};
-    std::atomic<std::uint64_t> h2d_observed_count{0};
-    std::atomic<std::uint64_t> h2d_observed_ns_max{0};
-    std::atomic<std::uint64_t> retries_total{0};
-    std::atomic<std::uint64_t> terminal_failures_total{0};
-    std::atomic<std::uint64_t> device_stream_sync_total{0};
-    std::atomic<std::uint64_t> payload_bytes_read_total{0};
-    std::atomic<std::uint64_t> blocking_host_get_count{0};
-    std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
-    std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
-  };
-  perf_counters _perf;
+  // Logical bytes not yet assigned to a curl slot. Retries are already claimed
+  // work and therefore never get counted a second time.
+  std::atomic<std::size_t> _queued_bytes{0};
 
   std::jthread _worker;
 };

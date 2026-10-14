@@ -24,6 +24,7 @@
 #include <string>
 
 using cucascade::io::parse;
+using cucascade::io::strip_file_scheme;
 
 TEST_CASE("uri_parser parses bare absolute paths as file URIs", "[uri_parser]")
 {
@@ -144,4 +145,74 @@ TEST_CASE("uri_parser rejects malformed input", "[uri_parser]")
   CHECK_THROWS_AS(parse("file://relative/path"), std::invalid_argument);
   CHECK_THROWS_AS(parse("s3://bucket"), std::invalid_argument);
   CHECK_THROWS_AS(parse("s3://bucket/"), std::invalid_argument);
+}
+
+//===----------------------------------------------------------------------===//
+// strip_file_scheme
+//
+// Applied at ioctx::open_io_object, so it runs on EVERY open.  Iceberg manifests
+// written by the Apache implementations record fully-qualified URIs
+// (file:///abs/path.parquet) while the local reactors only open bare paths; an
+// un-stripped URI reaches create_io_object and throws "unsupported path", which
+// happens during execution and so takes a runtime fallback rather than declining
+// at plan time.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("strip_file_scheme handles every legal file URI form", "[uri_parser]")
+{
+  // The file URI scheme has three spellings; an unstripped one fails during execution.
+  CHECK(strip_file_scheme("file:/abs/path.parquet") == "/abs/path.parquet");
+  CHECK(strip_file_scheme("file:///abs/path.parquet") == "/abs/path.parquet");
+  CHECK(strip_file_scheme("file:///var/tmp/t/data/00000-0-abc.parquet") ==
+        "/var/tmp/t/data/00000-0-abc.parquet");
+  CHECK(strip_file_scheme("file://localhost/abs/path.parquet") == "/abs/path.parquet");
+  CHECK(strip_file_scheme("file://LocalHost/abs/path.parquet") == "/abs/path.parquet");
+}
+
+TEST_CASE("strip_file_scheme percent-decodes a file URI", "[uri_parser]")
+{
+  // Only what was stripped is a URI.  A bare path or object-store key keeps a literal `%`.
+  CHECK(strip_file_scheme("file:///abs/a%20b/data.parquet") == "/abs/a b/data.parquet");
+  CHECK(strip_file_scheme("file:///abs/100%25.parquet") == "/abs/100%.parquet");
+  // A malformed escape is not a reason to fail an open: keep the stripped bytes as they are.
+  CHECK(strip_file_scheme("file:///abs/a%2.parquet") == "/abs/a%2.parquet");
+}
+
+TEST_CASE("strip_file_scheme is case-insensitive", "[uri_parser]")
+{
+  // A missed match would pair a delete file with no data file, silently returning deleted rows.
+  CHECK(strip_file_scheme("FILE:///abs/path.parquet") == "/abs/path.parquet");
+  CHECK(strip_file_scheme("File:///abs/path.parquet") == "/abs/path.parquet");
+  CHECK(strip_file_scheme("fILe:///abs/path.parquet") == "/abs/path.parquet");
+}
+
+TEST_CASE("strip_file_scheme leaves everything else byte-identical", "[uri_parser]")
+{
+  // Safe to apply unconditionally at an I/O boundary: object-store URIs must reach their backend
+  // untouched, and s3 keys are taken literally (no percent-decoding).
+  CHECK(strip_file_scheme("/abs/bare/path.parquet") == "/abs/bare/path.parquet");
+  CHECK(strip_file_scheme("s3://bucket/key.parquet") == "s3://bucket/key.parquet");
+  CHECK(strip_file_scheme("s3://bucket/a%20b") == "s3://bucket/a%20b");
+  CHECK(strip_file_scheme("gs://bucket/key") == "gs://bucket/key");
+  CHECK(strip_file_scheme("relative/path.parquet") == "relative/path.parquet");
+  CHECK(strip_file_scheme("/abs/100%.parquet") == "/abs/100%.parquet");
+  CHECK(strip_file_scheme("") == "");
+}
+
+TEST_CASE("strip_file_scheme does not throw on input parse() rejects", "[uri_parser]")
+{
+  // Deliberately not implemented via parse(): it runs on every open and must be total.
+  CHECK_NOTHROW(strip_file_scheme(""));
+  CHECK_NOTHROW(strip_file_scheme("file:"));
+  CHECK_NOTHROW(strip_file_scheme("file://"));
+  CHECK_NOTHROW(strip_file_scheme("://"));
+  // The non-standard "double-slash path" form keeps the plain strip, as does a remote authority.
+  CHECK(strip_file_scheme("file://relative/path") == "relative/path");
+  CHECK(strip_file_scheme("file://remote-host/abs/path") == "remote-host/abs/path");
+  // `file:/` is the host-omitted spelling of the root path.  `file://` alone has no path and no
+  // localhost authority, so the original bytes come back.
+  CHECK(strip_file_scheme("file:/") == "/");
+  CHECK(strip_file_scheme("file://") == "file://");
+  // A shape this function does not understand is returned untouched rather than mangled.
+  CHECK(strip_file_scheme("file:relative") == "file:relative");
 }
