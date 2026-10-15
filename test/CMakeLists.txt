@@ -90,9 +90,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
             io/test_io_request.cpp)
 
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
+  # The cuFile reactor loads libcufile through kvikIO's shim, so it is gated the
+  # same way.
   if(CUCASCADE_BUILD_CUDF)
-    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp
-                                              io/kvikio/test_kvikio_remote.cpp)
+    target_sources(
+      cucascade_io_tests
+      PRIVATE io/cufile/test_cufile_reactor.cpp
+              io/kvikio/test_kvikio_config.cpp io/kvikio/test_kvikio_remote.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
