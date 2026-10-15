@@ -19,6 +19,7 @@
 
 #include <cucascade/io/cache/config.hpp>
 #ifdef CUCASCADE_HAS_KVIKIO
+#include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/kvikio/config.hpp>
 #endif
 #include <cucascade/io/object_store_config.hpp>
@@ -35,6 +36,12 @@ enum class io_backend {
   native,
   /// The kvikIO backend (drives @c kvikio::FileHandle directly).
   kvikio,
+  /// The cuFile / GPUDirect Storage reactor: local paths are served by
+  /// @c cufile_ioctx instead of uring (device destinations via
+  /// @c cuFileReadAsync, everything else via POSIX); @c s3:// URLs still go to
+  /// the REST backend.  Needs a build with kvikIO (@c CUCASCADE_HAS_KVIKIO);
+  /// without it this behaves like @ref native.
+  cufile,
 };
 
 /**
@@ -45,7 +52,8 @@ enum class io_backend {
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
  * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
  * routes both local paths and @c s3:// objects to @c kvikio_context (LIST still
- * goes to the REST backend).
+ * goes to the REST backend), and @ref io_backend::cufile routes local paths to
+ * @c cufile_ioctx (@c s3:// stays on REST).
  *
  * @c cache is the read path's whole caching configuration, and its only home;
  * @ref apply_cache_mode derives @c uring.use_odirect and @c cache.dispose_on_idle
@@ -57,6 +65,8 @@ enum class io_backend {
  *  - @c kvikio  — kvikIO fallback tunables (local-disk catch-all path); present
  *    only when the library is built with CUCASCADE_BUILD_CUDF, which is what
  *    supplies kvikIO.
+ *  - @c cufile  — cuFile / GDS reactor tunables (local-disk GDS path); present
+ *    under the same condition as @c kvikio.
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -86,6 +96,15 @@ struct io_config {
   /// own env-var-seeded defaults in place.  Note these are process-global once
   /// applied; see @ref kvikio_config.
   kvikio_config kvikio{};
+
+  /// Number of cuFile reactor worker threads for the GDS local-disk IO path.
+  /// Same rationale as @c uring_n_reactors: local NVMe saturates at modest queue
+  /// depth, so a handful of reactors is enough.
+  std::size_t cufile_n_reactors{4};
+
+  /// cuFile / GDS reactor configuration.  Only consulted when
+  /// @c backend == @ref io_backend::cufile.
+  cufile::config cufile{};
 #endif
 
   /// The read path's caching configuration: mode, eviction policy and the
