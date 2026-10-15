@@ -767,7 +767,7 @@ TEST_CASE("Reuse orders pending DMA across allocation streams",
   test_fixture f;
   rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
   rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
-  rmm::device_buffer device{bytes, producer.view()};
+  rmm::device_buffer device{bytes, ::cuda::stream_ref{producer.value()}};
   auto* original = f.slab_mr.allocate_sync(bytes);
   std::memset(original, 0x31, bytes);
   pending_stream_work gate{producer};
@@ -805,7 +805,7 @@ TEST_CASE("Synchronous allocation waits for pending DMA before host reuse",
   auto const bytes = GENERATE(std::size_t{2048}, std::size_t{100000});
   test_fixture f;
   rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
-  rmm::device_buffer device{bytes, producer.view()};
+  rmm::device_buffer device{bytes, ::cuda::stream_ref{producer.value()}};
   auto* original = f.slab_mr.allocate_sync(bytes);
   std::memset(original, 0x43, bytes);
   pending_stream_work gate{producer};
@@ -856,4 +856,136 @@ TEST_CASE("Event ownership follows the freeing stream's device", "[small_pinned]
   REQUIRE(reused == original);
   device_zero_stream.synchronize();
   f.slab_mr.deallocate(device_zero_stream, reused, bytes);
+}
+
+TEST_CASE("Large cache reuse on another GPU waits for pending producer DMA",
+          "[small_pinned][multi_gpu][stream_ordering]")
+{
+  int device_count = 0;
+  CUCASCADE_CUDA_TRY(::cudaGetDeviceCount(&device_count));
+  if (device_count < 2) { SKIP("requires two CUDA devices"); }
+  constexpr std::size_t bytes = 100000;
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{0}};
+  test_fixture f;
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  rmm::device_buffer producer_data{bytes, ::cuda::stream_ref{producer.value()}};
+  auto consumer = [] {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{1}};
+    return rmm::cuda_stream{rmm::cuda_stream::flags::non_blocking};
+  }();
+  auto consumer_data = [&] {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{1}};
+    return rmm::device_buffer{bytes, ::cuda::stream_ref{consumer.value()}};
+  }();
+  auto* original = f.slab_mr.allocate_sync(bytes);
+  std::memset(original, 0x31, bytes);
+  // Declared after both devices' buffers/streams so failed assertions release the gate first.
+  pending_stream_work gate{producer};
+  CUCASCADE_CUDA_TRY(::cudaMemcpyAsync(
+    producer_data.data(), original, bytes, cudaMemcpyHostToDevice, producer.value()));
+  f.slab_mr.deallocate(producer, original, bytes);
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{1}};
+    auto* reused = f.slab_mr.allocate(consumer, bytes);
+    REQUIRE(reused == original);
+    REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{1});
+    REQUIRE(::cudaStreamQuery(consumer.value()) == cudaErrorNotReady);
+    gate.release();
+    consumer.synchronize();
+    std::memset(reused, 0xA7, bytes);
+    CUCASCADE_CUDA_TRY(::cudaMemcpyAsync(
+      consumer_data.data(), reused, bytes, cudaMemcpyHostToDevice, consumer.value()));
+    f.slab_mr.deallocate(consumer, reused, bytes);
+    REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{1});
+    consumer.synchronize();
+    std::vector<std::byte> copied(bytes);
+    CUCASCADE_CUDA_TRY(
+      ::cudaMemcpy(copied.data(), consumer_data.data(), bytes, cudaMemcpyDeviceToHost));
+    REQUIRE(std::all_of(
+      copied.begin(), copied.end(), [](std::byte value) { return value == std::byte{0xA7}; }));
+  }
+  REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
+  std::vector<std::byte> copied(bytes);
+  CUCASCADE_CUDA_TRY(
+    ::cudaMemcpy(copied.data(), producer_data.data(), bytes, cudaMemcpyDeviceToHost));
+  REQUIRE(std::all_of(
+    copied.begin(), copied.end(), [](std::byte value) { return value == std::byte{0x31}; }));
+  auto const stats = f.slab_mr.get_statistics();
+  REQUIRE(stats.large_requests == 2);
+  REQUIRE(stats.large_hits == 1);
+  REQUIRE(stats.large_misses == 1);
+  REQUIRE(stats.cached_large_bytes ==
+          small_pinned_host_memory_resource::large_bucket_size_for(bytes));
+}
+
+TEST_CASE("Multiple GPUs concurrently reuse one large pinned cache",
+          "[small_pinned][multi_gpu][statistics]")
+{
+  int device_count = 0;
+  CUCASCADE_CUDA_TRY(::cudaGetDeviceCount(&device_count));
+  if (device_count < 2) { SKIP("requires two CUDA devices"); }
+  test_fixture f;
+  constexpr std::size_t cache_limit = 256 * 1024;
+  constexpr int iterations          = 100;
+  small_pinned_host_memory_resource pool{f.upstream, cache_limit};
+  auto const worker_count = static_cast<std::size_t>(std::min(device_count, 4) * 2);
+  std::vector<std::exception_ptr> errors(worker_count);
+  std::atomic<bool> start{false};
+  std::atomic<bool> valid{true};
+  std::vector<std::jthread> workers;
+  for (std::size_t worker = 0; worker < worker_count; ++worker) {
+    workers.emplace_back([&, worker] {
+      start.wait(false);
+      try {
+        auto const device = rmm::cuda_device_id{static_cast<int>(worker / 2)};
+        rmm::cuda_set_device_raii guard{device};
+        rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+        rmm::device_buffer data{64 * 1024, ::cuda::stream_ref{stream.value()}};
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+          auto const bytes = std::size_t{16 * 1024} << (static_cast<std::size_t>(iteration) % 3);
+          auto* host       = pool.allocate(stream, bytes);
+          try {
+            // Host writes require completion of any cross-device reuse dependency.
+            stream.synchronize();
+            auto const pattern =
+              static_cast<unsigned char>(worker * 17 + static_cast<std::size_t>(iteration));
+            std::memset(host, pattern, bytes);
+            CUCASCADE_CUDA_TRY(
+              ::cudaMemcpyAsync(data.data(), host, bytes, cudaMemcpyHostToDevice, stream.value()));
+            pool.deallocate(stream, host, bytes);
+            host = nullptr;
+            stream.synchronize();
+            std::vector<unsigned char> copied(bytes);
+            CUCASCADE_CUDA_TRY(
+              ::cudaMemcpy(copied.data(), data.data(), bytes, cudaMemcpyDeviceToHost));
+            if (!std::all_of(
+                  copied.begin(), copied.end(), [pattern](auto x) { return x == pattern; }) ||
+                rmm::get_current_cuda_device() != device ||
+                pool.get_statistics().cached_large_bytes > cache_limit) {
+              valid.store(false);
+            }
+          } catch (...) {
+            if (host != nullptr) { pool.deallocate(stream, host, bytes); }
+            throw;
+          }
+        }
+      } catch (...) {
+        errors[worker] = std::current_exception();
+      }
+    });
+  }
+  start.store(true);
+  start.notify_all();
+  workers.clear();
+  for (auto const& error : errors) {
+    if (error) { std::rethrow_exception(error); }
+  }
+  REQUIRE(valid.load());
+  auto const stats = pool.get_statistics();
+  REQUIRE(stats.large_requests == worker_count * iterations);
+  REQUIRE(stats.large_hits > 0);
+  REQUIRE(stats.large_hits + stats.large_misses == stats.large_requests);
+  REQUIRE(stats.large_uncacheable == 0);
+  REQUIRE(stats.cached_large_bytes <= cache_limit);
+  REQUIRE(stats.peak_cached_large_bytes <= cache_limit);
 }
