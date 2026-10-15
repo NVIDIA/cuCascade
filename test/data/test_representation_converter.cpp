@@ -51,7 +51,8 @@ class custom_test_representation : public idata_representation {
   std::size_t get_size_in_bytes() const override { return sizeof(_value); }
   std::size_t get_uncompressed_data_size_in_bytes() const override { return sizeof(_value); }
 
-  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone(
+    [[maybe_unused]] ::cuda::stream_ref stream) const override
   {
     return std::make_unique<custom_test_representation>(_value, get_memory_space());
   }
@@ -73,7 +74,8 @@ class another_test_representation : public idata_representation {
   std::size_t get_size_in_bytes() const override { return sizeof(_value); }
   std::size_t get_uncompressed_data_size_in_bytes() const override { return sizeof(_value); }
 
-  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone(
+    [[maybe_unused]] ::cuda::stream_ref stream) const override
   {
     return std::make_unique<another_test_representation>(_value, get_memory_space());
   }
@@ -98,7 +100,7 @@ TEST_CASE("representation_converter_registry register custom converter",
   {
     REQUIRE_NOTHROW(
       registry.register_converter<custom_test_representation, another_test_representation>(
-        [](idata_representation& source,
+        [](const idata_representation& source,
            const memory::memory_space* target_space,
            ::cuda::stream_ref /*stream*/,
            memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -112,7 +114,7 @@ TEST_CASE("representation_converter_registry register custom converter",
   {
     // Register the converter first
     registry.register_converter<custom_test_representation, another_test_representation>(
-      [](idata_representation& source,
+      [](const idata_representation& source,
          const memory::memory_space* target_space,
          ::cuda::stream_ref /*stream*/,
          memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -125,7 +127,7 @@ TEST_CASE("representation_converter_registry register custom converter",
     // Use a lambda to avoid comma issues with the macro
     auto duplicate_register = [&]() {
       registry.register_converter<custom_test_representation, another_test_representation>(
-        [](idata_representation&,
+        [](const idata_representation&,
            const memory::memory_space*,
            ::cuda::stream_ref,
            memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -150,7 +152,7 @@ TEST_CASE("representation_converter_registry has_converter", "[representation_co
   SECTION("Returns true after registration")
   {
     registry.register_converter<custom_test_representation, another_test_representation>(
-      [](idata_representation& source,
+      [](const idata_representation& source,
          const memory::memory_space* target_space,
          ::cuda::stream_ref /*stream*/,
          memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -165,7 +167,7 @@ TEST_CASE("representation_converter_registry has_converter", "[representation_co
   SECTION("Returns false for reverse direction if not registered")
   {
     registry.register_converter<custom_test_representation, another_test_representation>(
-      [](idata_representation& source,
+      [](const idata_representation& source,
          const memory::memory_space* target_space,
          ::cuda::stream_ref /*stream*/,
          memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -189,7 +191,7 @@ TEST_CASE("representation_converter_registry has_converter_for runtime lookup",
   auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   registry.register_converter<custom_test_representation, another_test_representation>(
-    [](idata_representation& source,
+    [](const idata_representation& source,
        const memory::memory_space* target_space,
        ::cuda::stream_ref /*stream*/,
        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -225,7 +227,7 @@ TEST_CASE("representation_converter_registry unregister_converter", "[representa
   SECTION("Unregister returns true and removes registered converter")
   {
     registry.register_converter<custom_test_representation, another_test_representation>(
-      [](idata_representation& source,
+      [](const idata_representation& source,
          const memory::memory_space* target_space,
          ::cuda::stream_ref /*stream*/,
          memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -244,7 +246,7 @@ TEST_CASE("representation_converter_registry unregister_converter", "[representa
   SECTION("After unregister, can register again")
   {
     registry.register_converter<custom_test_representation, another_test_representation>(
-      [](idata_representation&,
+      [](const idata_representation&,
          const memory::memory_space*,
          ::cuda::stream_ref,
          memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -256,7 +258,7 @@ TEST_CASE("representation_converter_registry unregister_converter", "[representa
     // Should not throw now
     REQUIRE_NOTHROW(
       registry.register_converter<custom_test_representation, another_test_representation>(
-        [](idata_representation&,
+        [](const idata_representation&,
            const memory::memory_space*,
            ::cuda::stream_ref,
            memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -283,7 +285,7 @@ TEST_CASE("representation_converter_registry convert with custom types",
 
   // Register a converter that doubles the value
   registry.register_converter<custom_test_representation, another_test_representation>(
-    [](idata_representation& source,
+    [](const idata_representation& source,
        const memory::memory_space* target_space,
        ::cuda::stream_ref /*stream*/,
        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -294,7 +296,7 @@ TEST_CASE("representation_converter_registry convert with custom types",
 
   SECTION("Conversion produces expected result")
   {
-    custom_test_representation source(21, *mock_space);
+    const custom_test_representation source(21, *mock_space);
     auto result = registry.convert<another_test_representation>(
       source, mock_space.get(), ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
@@ -319,7 +321,7 @@ TEST_CASE("representation_converter_registry convert with type_index", "[represe
   auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   registry.register_converter<custom_test_representation, another_test_representation>(
-    [](idata_representation& source,
+    [](const idata_representation& source,
        const memory::memory_space* target_space,
        ::cuda::stream_ref /*stream*/,
        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -328,7 +330,7 @@ TEST_CASE("representation_converter_registry convert with type_index", "[represe
         static_cast<double>(src.get_value()), *const_cast<memory::memory_space*>(target_space));
     });
 
-  custom_test_representation source(100, *mock_space);
+  const custom_test_representation source(100, *mock_space);
 
   SECTION("Runtime type_index conversion works")
   {
@@ -489,7 +491,7 @@ TEST_CASE("Converter preserves memory space properties", "[representation_conver
   auto target_space = make_mock_memory_space(memory::Tier::HOST, 1);
 
   registry.register_converter<custom_test_representation, another_test_representation>(
-    [](idata_representation& source,
+    [](const idata_representation& source,
        const memory::memory_space* target_space,
        ::cuda::stream_ref /*stream*/,
        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -514,7 +516,7 @@ TEST_CASE("Multiple independent converters can coexist", "[representation_conver
 
   // Register forward converter (custom -> another)
   registry.register_converter<custom_test_representation, another_test_representation>(
-    [](idata_representation& source,
+    [](const idata_representation& source,
        const memory::memory_space* target_space,
        ::cuda::stream_ref /*stream*/,
        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -525,7 +527,7 @@ TEST_CASE("Multiple independent converters can coexist", "[representation_conver
 
   // Register reverse converter (another -> custom)
   registry.register_converter<another_test_representation, custom_test_representation>(
-    [](idata_representation& source,
+    [](const idata_representation& source,
        const memory::memory_space* target_space,
        ::cuda::stream_ref /*stream*/,
        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -574,7 +576,7 @@ TEST_CASE("Duplicate registration error message includes type names", "[represen
   auto mock_space = make_mock_memory_space(memory::Tier::GPU, 0);
 
   registry.register_converter<custom_test_representation, another_test_representation>(
-    [](idata_representation&,
+    [](const idata_representation&,
        const memory::memory_space*,
        ::cuda::stream_ref,
        memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -583,7 +585,7 @@ TEST_CASE("Duplicate registration error message includes type names", "[represen
 
   try {
     registry.register_converter<custom_test_representation, another_test_representation>(
-      [](idata_representation&,
+      [](const idata_representation&,
          const memory::memory_space*,
          ::cuda::stream_ref,
          memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {

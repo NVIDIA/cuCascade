@@ -115,7 +115,8 @@ class mock_data_representation : private mock_memory_space_holder, public idata_
 
   std::size_t get_uncompressed_data_size_in_bytes() const override { return _size; }
 
-  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone(
+    [[maybe_unused]] ::cuda::stream_ref stream) const override
   {
     return std::make_unique<mock_data_representation>(get_current_tier(), _size, get_device_id());
   }

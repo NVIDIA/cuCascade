@@ -855,7 +855,8 @@ class observed_gpu_representation : private cucascade::test::mock_memory_space_h
   void const* data() const { return _buf.data(); }
   std::size_t get_size_in_bytes() const override { return _buf.size(); }
   std::size_t get_uncompressed_data_size_in_bytes() const override { return _buf.size(); }
-  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone(
+    [[maybe_unused]] ::cuda::stream_ref stream) const override
   {
     return nullptr;
   }
@@ -888,7 +889,7 @@ TEST_CASE("convert_to synchronizes stream before destroying GPU source", "[data_
   // source.
   representation_converter_registry registry;
   registry.register_converter<observed_gpu_representation, mock_data_representation>(
-    [&](idata_representation& source,
+    [&](const idata_representation& source,
         const memory::memory_space* /*target_space*/,
         ::cuda::stream_ref s,
         memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -954,7 +955,8 @@ class observed_host_representation : private cucascade::test::mock_memory_space_
   void const* data() const { return _pinned_ptr; }
   std::size_t get_size_in_bytes() const override { return _size; }
   std::size_t get_uncompressed_data_size_in_bytes() const override { return _size; }
-  std::unique_ptr<idata_representation> clone([[maybe_unused]] ::cuda::stream_ref stream) override
+  std::unique_ptr<idata_representation> clone(
+    [[maybe_unused]] ::cuda::stream_ref stream) const override
   {
     return nullptr;
   }
@@ -984,7 +986,7 @@ TEST_CASE("convert_to synchronizes stream before destroying HOST source when tar
   // destroying the source.
   representation_converter_registry registry;
   registry.register_converter<observed_host_representation, mock_data_representation>(
-    [&](idata_representation& source,
+    [&](const idata_representation& source,
         const memory::memory_space* /*target_space*/,
         ::cuda::stream_ref s,
         memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {
@@ -1107,7 +1109,7 @@ TEST_CASE("mutable_data_batch holds exclusive lock during convert_to stream sync
 
   representation_converter_registry registry;
   registry.register_converter<observed_gpu_representation, mock_data_representation>(
-    [&](idata_representation& source,
+    [&](const idata_representation& source,
         const memory::memory_space* /*target_space*/,
         ::cuda::stream_ref s,
         memory::reservation* /*reservation*/) -> std::unique_ptr<idata_representation> {

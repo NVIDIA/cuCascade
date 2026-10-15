@@ -125,7 +125,7 @@ class gpu_table_representation : public idata_representation {
    * @param stream CUDA stream for memory operations
    * @return std::unique_ptr<idata_representation> A new gpu_table_representation with copied data
    */
-  std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) override;
+  std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) const override;
 
   /**
    * @brief Get the underlying cuDF table view

@@ -136,7 +136,8 @@ void gpu_table_representation::rebind_stream(::cuda::stream_ref stream)
   table = std::make_unique<cudf::table>(std::move(columns));
 }
 
-std::unique_ptr<idata_representation> gpu_table_representation::clone(::cuda::stream_ref stream)
+std::unique_ptr<idata_representation> gpu_table_representation::clone(
+  ::cuda::stream_ref stream) const
 {
   // Create a deep copy of the cuDF table using the provided stream.
   // STREAM-LINEAGE: the clone has been written by `stream`; record an event on
