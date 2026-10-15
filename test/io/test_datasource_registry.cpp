@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -77,6 +78,41 @@ TEST_CASE("replace hands the s3 claimant to the new backend", "[io][registry]")
   CHECK(old_factory_calls == 0);
   CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::uring);
 }
+
+#ifdef CUCASCADE_HAS_KVIKIO
+namespace {
+
+/** The backend a registry configured for @p backend routes @p path to. */
+std::optional<io_context_type> route(cucascade::io::io_backend backend, std::string_view path)
+{
+  memory_reservation_manager manager{std::vector<memory_space_config>{
+    disk_memory_space_config{.disk_id = 0, .memory_capacity = 1UL << 20, .mount_paths = "/tmp"}}};
+  io_config config{};
+  config.backend = backend;
+  io_context_registry registry{config, manager};
+  return registry.lookup_path(path);
+}
+
+}  // namespace
+
+TEST_CASE("cufile backend takes local files from uring and leaves s3 to rest", "[io][registry]")
+{
+  using cucascade::io::io_backend;
+
+  CHECK(route(io_backend::cufile, "/proc/self/exe") == io_context_type::cufile);
+  CHECK(route(io_backend::cufile, "s3://bucket/key") == io_context_type::restful);
+}
+
+TEST_CASE("other backends never route a local file to cufile", "[io][registry]")
+{
+  using cucascade::io::io_backend;
+
+  // uring and cufile both claim a local file; only an explicit choice may select cufile.
+  CHECK(route(io_backend::native, "/proc/self/exe") == io_context_type::uring);
+  CHECK(route(io_backend::kvikio, "/proc/self/exe") == io_context_type::kvikio);
+  CHECK(route(io_backend::kvikio, "s3://bucket/key") == io_context_type::kvikio);
+}
+#endif
 
 TEST_CASE("replace rejects a missing old backend without changing routing", "[io][registry]")
 {
