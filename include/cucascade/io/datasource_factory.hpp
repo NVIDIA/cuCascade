@@ -121,7 +121,10 @@ class io_context_registry {
   /// universal fallback.  When the registry was built with
   /// `backend = io_backend::kvikio`, the uring local backend and the REST
   /// backend are suppressed so local files and `s3://` objects fall through to
-  /// kvikio.  std::nullopt when nothing matches.
+  /// kvikio.  Both uring and cufile claim local files, so the cufile backend
+  /// is skipped unless `backend = io_backend::cufile`, in which case it wins
+  /// local files over uring (`s3://` still resolves to REST).  std::nullopt
+  /// when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
@@ -144,6 +147,10 @@ class io_context_registry {
   /// of uring) and @c s3:// objects (instead of rest) for reads.  LIST / glob
   /// still goes to the REST backend, which callers obtain by type.
   bool _prefer_kvikio{false};
+  /// Set when @c backend=cufile: the cuFile / GDS reactor then serves local
+  /// files instead of uring.  @c s3:// objects still go to REST -- the cuFile
+  /// backend is local-disk only.
+  bool _prefer_cufile{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
   /// Set by the first @c lookup_path; @c replace_ioctx refuses afterwards
@@ -162,6 +169,15 @@ class io_context_registry {
 // The closures are @c noexcept-safe: a construction failure (missing resource,
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
+
+#ifdef CUCASCADE_HAS_KVIKIO
+/// cuFile / GPUDirect Storage local-disk backend.  Builds a
+/// @c cufile_reactor::reactor_context from @c config.cufile and
+/// @c config.cufile_n_reactors.  Takes no reservation manager: the reactor does
+/// not stage device reads through pinned host memory (cuFile DMAs direct to the
+/// device).  Declared only in a build with kvikIO, which supplies the cuFile shim.
+io_context_registry::factory_type make_cufile_ioctx_factory();
+#endif
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
 /// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the

@@ -35,8 +35,12 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
 
 # kvikIO reaches the environment only via libcudf's dependency closure, so the
-# fallback ioctx is built only alongside the cudf layer.
+# fallback ioctx -- and the cuFile / GDS reactor, which loads libcufile through
+# kvikIO's shim -- are built only alongside the cudf layer.
 if(CUCASCADE_BUILD_CUDF)
-  target_sources(cucascade_io_objects
-                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp)
+  target_sources(
+    cucascade_io_objects
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_ioctx.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_reactor.cpp)
 endif()
