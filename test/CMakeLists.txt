@@ -30,6 +30,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     cucascade_tests
     # Memory tests
     memory/test_memory_reservation_manager.cpp
+    memory/test_pool_peer_access.cpp
+    memory/test_pool_peer_access_regression.cpp
     memory/test_reservation_aware_resource_adaptor.cpp
     memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
@@ -46,8 +48,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   # Set include directories
   target_include_directories(
-    cucascade_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                            ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+    cucascade_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${PROJECT_SOURCE_DIR}/src)
 
   # Link dependencies
   target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2

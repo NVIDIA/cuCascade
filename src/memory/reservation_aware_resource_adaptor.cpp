@@ -273,6 +273,8 @@ rmm::device_async_resource_ref impl_type::get_upstream_resource() const noexcept
   return _upstream;
 }
 
+cudaMemPool_t impl_type::pool_handle() const noexcept { return _pool_handle; }
+
 std::size_t impl_type::get_available_memory() const noexcept
 {
   auto current_bytes = _total_allocated_bytes.load();
@@ -615,6 +617,11 @@ rmm::device_async_resource_ref reservation_aware_resource_adaptor::get_upstream_
   const noexcept
 {
   return get().get_upstream_resource();
+}
+
+cudaMemPool_t reservation_aware_resource_adaptor::pool_handle() const noexcept
+{
+  return get().pool_handle();
 }
 
 std::size_t reservation_aware_resource_adaptor::get_available_memory() const noexcept
