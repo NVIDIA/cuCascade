@@ -97,13 +97,15 @@ cuCascade/
 │   │   ├── representation_converter.hpp
 │   │   ├── cpu_data_representation.hpp
 │   │   └── gpu_data_representation.hpp
-│   ├── memory/                  # Memory module headers (17 files)
+│   ├── memory/                  # Memory module headers (23 files)
 │   │   ├── common.hpp           # Tier enum, memory_space_id
 │   │   ├── config.hpp           # Tier-specific config structs
 │   │   ├── memory_reservation_manager.hpp
 │   │   ├── memory_space.hpp
 │   │   ├── memory_reservation.hpp
 │   │   ├── reservation_aware_resource_adaptor.hpp
+│   │   ├── reservation_aware_memory_resource.hpp
+│   │   ├── reservation_aware_memory_resource_adaptor.hpp
 │   │   ├── fixed_size_host_memory_resource.hpp
 │   │   ├── disk_access_limiter.hpp
 │   │   ├── topology_discovery.hpp
@@ -121,11 +123,11 @@ cuCascade/
 │       └── overloaded.hpp       # Variant visitor helper
 ├── src/
 │   ├── data/                    # Data module implementation (6 .cpp files)
-│   └── memory/                  # Memory module implementation (15 .cpp files)
+│   └── memory/                  # Memory module implementation (18 .cpp files)
 ├── test/
 │   ├── unittest.cpp             # Test runner with GPU pool setup
 │   ├── data/                    # Data module tests (5 files)
-│   ├── memory/                  # Memory module tests (3 files + GPU kernels)
+│   ├── memory/                  # Memory module tests (7 files + GPU kernels)
 │   └── utils/                   # Test utilities (mocks, cuDF helpers)
 ├── benchmark/                   # Google Benchmark suite
 ├── docs/                        # Documentation (you are here)
@@ -233,6 +235,8 @@ All tests compile into a single executable `cucascade_tests`:
 | `test/data/test_data_representation.cpp` | Representation interface | Size, tier, clone operations |
 | `test/data/test_representation_converter.cpp` | Converter registry | Registration, lookup, conversion |
 | `test/memory/test_memory_reservation_manager.cpp` | Reservation system | Strategies, limits, multi-space |
+| `test/memory/test_reservation_aware_memory_resource.cpp` | Reservation-aware resource | Reserve variants, partial-split accounting, overflow and OOM policies, threading stress, GPU pool handles |
+| `test/memory/test_reservation_aware_memory_resource_adaptor.cpp` | Reservation-aware adaptor | Attach/detach, per-stream routing, `rmm::device_buffer` binding, attach/detach races |
 | `test/memory/test_topology_discovery.cpp` | Hardware detection | NVML integration |
 | `test/memory/test_gpu_kernels.cu` | GPU kernel tests | Device-side operations |
 

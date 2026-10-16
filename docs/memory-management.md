@@ -16,6 +16,7 @@ A deep dive into cuCascade's three-tier memory system, reservation model, and ti
   - [Per-Stream vs Per-Thread Tracking](#per-stream-vs-per-thread-tracking)
   - [Allocation Flow](#allocation-flow)
   - [OOM Handling](#oom-handling)
+  - [Reservation-aware memory resource (resource + adaptor)](#reservation-aware-memory-resource-resource--adaptor)
 - [Host Memory Management](#host-memory-management)
   - [Block-Based Allocation](#block-based-allocation)
   - [Pool Expansion](#pool-expansion)
@@ -243,6 +244,66 @@ The default `throw_on_oom_policy` simply rethrows the exception. Custom policies
 
 cuCascade also provides a custom exception `cucascade_out_of_memory` (extending `rmm::out_of_memory`) that includes `requested_bytes` and `global_usage` for diagnostics.
 
+### Reservation-aware memory resource (resource + adaptor)
+
+**Files**: `include/cucascade/memory/reservation_aware_memory_resource.hpp`, `include/cucascade/memory/reservation_aware_memory_resource_adaptor.hpp`
+
+These two classes split the job of `reservation_aware_resource_adaptor` into global accounting and a per-stream view. They are additive: `memory_space` still uses `reservation_aware_resource_adaptor`.
+
+| Type | Role |
+|------|------|
+| `reservation_aware_memory_resource` | Wraps an upstream `rmm::device_async_resource_ref` and owns the global accounting (committed bytes, peak, `memory_limit`, `capacity`, pool handle, default OOM and overflow policies). Creates reservations with `reserve` (throws `cucascade_out_of_memory` with `LIMIT_EXCEEDED`), `try_reserve` (returns an empty handle) and `reserve_upto` (clamps, possibly to 0). Allocates through an explicit `reservation&` or untracked. Non-copyable and non-movable, so it cannot be bound to `rmm::device_async_resource_ref`. |
+| `reservation_aware_memory_resource::reservation` | Move-only handle to committed bytes: `size()`, `allocated_bytes()`, `available_bytes()`, `grow_by()`, `shrink_to_fit()`, `release()`. Releases the bytes and posts its optional `event_notifier` on destruction. |
+| `reservation_aware_memory_resource_adaptor` | Copyable per-stream handle over the resource (copies share bindings). `attach(on_stream{s}, std::move(res), oom, overflow)` binds a reservation and optional per-binding policies to a stream; `detach(on_stream{s})` returns the reservation. Streams without a binding use the untracked path. Binds to `rmm::device_async_resource_ref`, so it can back an `rmm::device_buffer`. |
+
+```cpp
+rmm::mr::cuda_async_memory_resource upstream;
+reservation_aware_memory_resource mr{
+    rmm::device_async_resource_ref{upstream}, /*memory_limit=*/6ULL << 30, /*capacity=*/8ULL << 30};
+reservation_aware_memory_resource_adaptor adaptor{mr};
+
+rmm::cuda_stream owner;
+::cuda::stream_ref stream{owner.value()};
+
+auto res = mr.reserve(256ULL << 20);                // commits 256 MB now
+adaptor.attach(on_stream{stream}, std::move(res));  // optional: OOM policy, overflow policy
+
+void* p = adaptor.allocate(stream, 1ULL << 20);     // drawn from the stream's reservation
+adaptor.deallocate(stream, p, 1ULL << 20);
+
+auto back = adaptor.detach(on_stream{stream});      // dropping `back` releases the 256 MB
+```
+
+**Accounting model.** A reservation commits its size to the global counter when it is created (`commit_cap` defaults to `memory_limit`; explicit values are clamped to `capacity`). Allocations that fit in the reservation update only the reservation. When an allocation does not fit, the overflow policy (`overflow_policy`, an alias of `reservation_limit_policy`) decides: `fail` throws `rmm::out_of_memory` before anything is charged, `increase` grows the reservation first, `ignore` (the default) lets it proceed. Only the part above the reservation is charged to the global counter (bounded by `capacity`), and frees credit back the same part. Untracked allocations are charged in full. Every request is tracked as `align_up(bytes, 256)`. As a result, whenever no operation is in flight, the global counter equals the untracked bytes plus, for each live reservation, the larger of its allocated bytes and its size (`G = U + sum max(a_i, R_i)`), and it returns to 0 once every allocation is freed and every reservation released.
+
+**Thread safety and lifetime.**
+
+- All member functions of both classes are safe for concurrent use, including `attach`/`detach` racing with allocations on the same stream. Overflow policies run inside each reservation's short accounting critical section and must be short and non-blocking.
+- Usage guidance: a reservation shared by many threads serializes them on its per-reservation spinlock; prefer one reservation per stream (for example one adaptor binding per stream).
+- The upstream must outlive the resource, and the resource must outlive every allocate/deallocate call, including those made by an `rmm::device_buffer` that holds a copy of the adaptor.
+- Reservation handles may outlive the resource. They remain valid for `release`, `grow_by` and `shrink_to_fit` against the shared accounting core, but they can no longer allocate (allocation needs a live resource).
+- `detach` waits for in-flight calls on that stream; do not call it from an OOM or overflow policy.
+- Bindings are keyed by the raw stream handle: `detach` a stream before destroying it, otherwise a later stream that reuses the handle value inherits the stale binding.
+- Per-stream bookkeeping (about 128 bytes, two cache lines, per distinct stream ever attached) is freed only when the last adaptor copy is destroyed.
+
+Intentional differences from `reservation_aware_resource_adaptor`:
+
+| Behavior | `reservation_aware_resource_adaptor` | Resource + adaptor |
+|----------|--------------------------------------|--------------------|
+| Allocation after the `increase` policy grew the reservation | Excess computed against the old size; it is never credited back (leak) | Excess computed against the grown size; no leak |
+| `grow_by(x)` charge | Always `x`, double counting bytes already charged above the reservation | `x` minus the bytes already charged above the reservation |
+| Alignment | Ignored; upstream always gets 256 | Forwarded to upstream on allocate and deallocate |
+| Upstream exceptions | Any `std::exception` rewrapped as `cucascade_out_of_memory` | Only the `std::bad_alloc` family is rewrapped; others propagate unchanged |
+| Peaks | Raised before the upstream call, also by failed allocations | Raised only after a successful allocation |
+| Per-thread tracking | `AllocationTrackingScope::PER_THREAD` | Not provided; use `allocate(stream, bytes, alignment, reservation&)` |
+| Attach on a bound stream | `attach_reservation_to_tracker` returns `false` | `attach` throws `cucascade::logic_error`; the caller keeps the reservation |
+| Reservation does not fit | `reserve` returns a null arena | `reserve` throws; `try_reserve` returns an empty handle |
+| Binding attached without its own policies | Always gets fresh `ignore` / `rethrow` policies | Uses the resource's default overflow and OOM policies |
+| `operator==` | Equal when the upstream resources compare equal | Identity: the same resource, or adaptor copies sharing the same state |
+| `shrink_to_fit` | `get_total_reserved_bytes()` is not reduced (drifts) | `get_total_reserved_bytes()` stays consistent |
+| Request larger than `capacity` | Overflow policy, then `LIMIT_EXCEEDED` routed to the OOM policy | `LIMIT_EXCEEDED` thrown up front; neither policy is consulted |
+| OOM-policy retry of a reservation-backed allocation | Re-charges the first attempt's global charge while the reservation's allocated bytes stay raised | Rolls the allocated bytes back first, then the retry re-runs the full reservation accounting (without the overflow policy) |
+
 ---
 
 ## Host Memory Management
@@ -397,6 +458,8 @@ Default pool size: **16 streams** per memory space.
 | `include/cucascade/memory/memory_space.hpp` | Per-location memory container |
 | `include/cucascade/memory/memory_reservation.hpp` | `reservation`, `reserved_arena`, limit policies |
 | `include/cucascade/memory/reservation_aware_resource_adaptor.hpp` | GPU allocator with per-stream tracking |
+| `include/cucascade/memory/reservation_aware_memory_resource.hpp` | Reservation-aware device resource: global accounting, `reservation` handle, overflow and OOM policies (not yet used by `memory_space`) |
+| `include/cucascade/memory/reservation_aware_memory_resource_adaptor.hpp` | Copyable per-stream view over `reservation_aware_memory_resource` with `attach`/`detach` (not yet used by `memory_space`) |
 | `include/cucascade/memory/fixed_size_host_memory_resource.hpp` | Block-based pinned host allocator |
 | `include/cucascade/memory/disk_access_limiter.hpp` | Disk tier reservation tracker |
 | `include/cucascade/memory/notification_channel.hpp` | Cross-reservation signaling |

@@ -166,6 +166,8 @@ memory_space (GPU, device 0)
 └── downgrade_stop: 5.2 GB (65%)
 ```
 
+`reservation_aware_memory_resource` (global accounting and reservations) and `reservation_aware_memory_resource_adaptor` (per-stream attach/detach view) are additive and not yet wired into `memory_space`; see [memory-management.md](memory-management.md#reservation-aware-memory-resource-resource--adaptor).
+
 ### Reservation System
 
 **File**: `include/cucascade/memory/memory_reservation.hpp`
@@ -354,7 +356,7 @@ Key synchronization primitives:
 | **Builder** | `reservation_manager_configurator` for fluent system configuration |
 | **RAII** | `data_batch_processing_handle`, `borrowed_stream`, `multiple_blocks_allocation`, `notify_on_exit` |
 | **Factory** | `DeviceMemoryResourceFactoryFn` for tier-specific allocator creation |
-| **Adapter** | `reservation_aware_resource_adaptor` wraps RMM resources with tracking |
+| **Adapter** | `reservation_aware_resource_adaptor` wraps RMM resources with tracking; `reservation_aware_memory_resource_adaptor` gives a per-stream view over `reservation_aware_memory_resource` |
 | **3-Class System** | `data_batch` with read-only and mutable class variants which provide locking and accessors |
 | **Observer** | `notification_channel` / `event_notifier` for memory release signaling |
 | **Type-Indexed Registry** | `representation_converter_registry` keyed by `(source_type, target_type)` |
@@ -374,6 +376,8 @@ Key synchronization primitives:
 | `include/cucascade/memory/memory_space.hpp` | Per-location memory container |
 | `include/cucascade/memory/memory_reservation.hpp` | Reservation objects, arenas, and limit policies |
 | `include/cucascade/memory/reservation_aware_resource_adaptor.hpp` | GPU allocator with per-stream tracking |
+| `include/cucascade/memory/reservation_aware_memory_resource.hpp` | Reservation-aware device resource with global accounting and move-only reservation handles |
+| `include/cucascade/memory/reservation_aware_memory_resource_adaptor.hpp` | Copyable per-stream attach/detach view over `reservation_aware_memory_resource` |
 | `include/cucascade/memory/fixed_size_host_memory_resource.hpp` | Block-based pinned host allocator |
 | `include/cucascade/memory/disk_access_limiter.hpp` | Disk tier reservation tracker |
 | `include/cucascade/memory/topology_discovery.hpp` | NVML-based hardware topology detection |

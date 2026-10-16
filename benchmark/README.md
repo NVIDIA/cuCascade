@@ -66,6 +66,11 @@ Located in `benchmark_representation_converter.cpp`:
 All benchmarks measure different thread counts.
 The multi-threading is explicitly implemented instead of relying on googlebenchmark's built-in threading functionality,
 because that resulted in improper results.
+The benchmark below is the exception: its iterations are sub-microsecond and CPU-only, and Google Benchmark starts all threads behind a barrier, so the built-in threading gives valid results there.
+
+### Reservation-Aware Memory Resource Benchmarks
+
+`benchmark_reservation_aware_memory_resource.cpp` (`--benchmark_filter=ReservationAware`, manual only): accounting cost of one 4 KiB allocate+deallocate pair (CUDA-free fake upstream and streams, 1-16 Google Benchmark threads; `thread_ns` = per-thread latency) for the legacy `reservation_aware_resource_adaptor` vs the new `reservation_aware_memory_resource` / `reservation_aware_memory_resource_adaptor` (untracked, shared reservation, per-stream reservation, overflow).
 
 ## Adding New Benchmarks
 
