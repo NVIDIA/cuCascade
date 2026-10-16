@@ -238,11 +238,9 @@ by the first successful insertion and persists after draining; partition orderin
 immutable constructor declaration that defaults to unordered.
 
 ```cpp
-// Legacy unordered FIFO pop (returns nullptr if empty)
-auto batch = repository.pop_next_data_batch();
-
-// Position-aware FIFO pop: arrival order, with optional logical sequence metadata
-auto [positioned_batch, position] = repository.pop_next_data_batch_with_position();
+// FIFO pop: arrival order, with optional logical sequence metadata.
+// An empty partition returns {nullptr, std::nullopt}.
+auto [batch, position] = repository.pop_next_data_batch_with_position();
 ```
 
 The `data_repository_manager` coordinates multiple repositories across operators/pipelines and provides atomic batch ID generation.

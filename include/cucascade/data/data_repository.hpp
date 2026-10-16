@@ -142,80 +142,38 @@ class data_repository {
   }
 
   /**
-   * @brief Remove and return the next data batch from the repository.
-   *
-   * Returns the first batch in the partition regardless of its state.
-   * If the partition is empty, returns a null pointer.
-   *
-   * @param partition_idx Index of the partition to pop from (default: 0)
-   * @return The next data batch, or nullptr if the partition is empty.
-   *
-   * @note Thread-safe operation protected by internal mutex
+   * @brief Remove a batch without retaining its logical position.
+   * @return Payload, or nullptr if absent; valid in every ordering mode.
+   * @note Use pop_next_data_batch_with_position() when the consumer must preserve ordering.
    * @throws std::out_of_range if partition_idx is out of range
-   * @throws std::logic_error if batch mode is ORDERED; use pop_next_data_batch_with_position
    */
   virtual std::shared_ptr<data_batch> pop_next_data_batch(size_t partition_idx = 0)
   {
-    std::unique_lock<std::mutex> lock(_mutex);
-
-    require_partition(partition_idx);
-    require_unpositioned_access();
-    return pop_next_data_batch_unlocked(partition_idx).first;
+    return pop_next_data_batch_with_position(partition_idx).first;
   }
 
   /**
-   * @brief Remove and return a data batch by its batch ID.
-   *
-   * Searches for a batch with the specified batch_id within the given partition.
-   * Returns the batch if found, nullptr otherwise.
-   *
-   * @param batch_id The unique identifier of the batch to retrieve
-   * @param partition_idx Index of the partition to search (default: 0)
-   * @return The data batch with the matching batch_id, or nullptr if not found
-   *
-   * @note Thread-safe operation protected by internal mutex
+   * @brief Remove a batch without retaining its logical position.
+   * @return Payload, or nullptr if absent; valid in every ordering mode.
+   * @note Use pop_data_batch_by_id_with_position() when the consumer must preserve ordering.
    * @throws std::out_of_range if partition_idx is out of range
-   * @throws std::logic_error if batch mode is ORDERED; use pop_data_batch_by_id_with_position
    */
   virtual std::shared_ptr<data_batch> pop_data_batch_by_id(uint64_t batch_id,
                                                            size_t partition_idx = 0)
   {
-    std::unique_lock<std::mutex> lock(_mutex);
-
-    require_partition(partition_idx);
-    require_unpositioned_access();
-    return pop_data_batch_by_id_unlocked(batch_id, partition_idx).first;
+    return pop_data_batch_by_id_with_position(batch_id, partition_idx).first;
   }
 
   /**
-   * @brief Get a copy of a data batch by its batch ID (does not remove from repository).
-   *
-   * Searches for a batch with the specified batch_id within the given partition
-   * and returns a copy of the pointer.
-   *
-   * @param batch_id The unique identifier of the batch to retrieve
-   * @param partition_idx Index of the partition to search (default: 0)
-   * @return A copy of the data batch pointer with the matching batch_id, or nullptr
-   *
-   * @note Payload-only inspection is allowed in every mode for memory management. Use
-   * get_data_batch_by_id_with_position when consuming sequence metadata.
-   * @note Thread-safe operation protected by internal mutex
+   * @brief Inspect a batch without retaining its logical position.
+   * @return Payload, or nullptr if absent; valid in every ordering mode.
+   * @note Use get_data_batch_by_id_with_position() when the consumer must preserve ordering.
    * @throws std::out_of_range if partition_idx is out of range
    */
   virtual std::shared_ptr<data_batch> get_data_batch_by_id(uint64_t batch_id,
                                                            size_t partition_idx = 0) const
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-
-    if (partition_idx >= _data_batches.size()) {
-      throw std::out_of_range("partition_idx out of range");
-    }
-
-    for (const auto& entry : _data_batches[partition_idx]) {
-      if (entry.first->get_batch_id() == batch_id) { return entry.first; }
-    }
-
-    return nullptr;
+    return get_data_batch_by_id_with_position(batch_id, partition_idx).first;
   }
 
   /**
@@ -223,7 +181,6 @@ class data_repository {
    * @param partition_idx Partition to pop from (default: 0)
    * @return Payload and optional position, or {nullptr, nullopt} if empty
    * @throws std::out_of_range if partition_idx is out of range
-   * @note Transitional pair-returning API; the original name will return pairs after migration.
    */
   virtual positioned_data_batch pop_next_data_batch_with_position(size_t partition_idx = 0)
   {
@@ -238,7 +195,6 @@ class data_repository {
    * @param partition_idx Partition to search (default: 0)
    * @return Payload and optional position, or {nullptr, nullopt} on a miss
    * @throws std::out_of_range if partition_idx is out of range
-   * @note Transitional API; migrate payload-only destructive callers before publishing positions.
    */
   virtual positioned_data_batch pop_data_batch_by_id_with_position(uint64_t batch_id,
                                                                    size_t partition_idx = 0)
@@ -254,7 +210,6 @@ class data_repository {
    * @param partition_idx Partition to search (default: 0)
    * @return Payload and optional position, or {nullptr, nullopt} on a miss
    * @throws std::out_of_range if partition_idx is out of range
-   * @note Transitional pair-returning API; the original name will return pairs after migration.
    */
   virtual positioned_data_batch get_data_batch_by_id_with_position(uint64_t batch_id,
                                                                    size_t partition_idx = 0) const
@@ -318,10 +273,11 @@ class data_repository {
    * @return Positions in increasing order; gaps and empty partitions are allowed
    * @throws std::out_of_range if partition_idx is out of range
    * @throws std::logic_error if batch mode is UNKNOWN or UNORDERED
-   * @note Enumeration does not claim batches. Ordered traversal requires successful producer
-   * completion and one coordinated consumer; concurrent mutation may invalidate the snapshot.
+   * @warning This snapshot is only complete after all producer operators have finished.
+   * Enumeration does not claim batches; consumers must coordinate because concurrent mutation
+   * may invalidate the snapshot.
    */
-  virtual std::vector<size_t> get_batch_positions(size_t partition_idx = 0) const
+  virtual std::vector<size_t> get_positions(size_t partition_idx = 0) const
   {
     std::lock_guard<std::mutex> lock(_mutex);
     require_partition(partition_idx);
@@ -333,6 +289,11 @@ class data_repository {
     }
     std::sort(positions.begin(), positions.end());
     return positions;
+  }
+
+  virtual std::vector<size_t> get_batch_positions(size_t partition_idx = 0) const
+  {
+    return get_positions(partition_idx);
   }
 
   /**

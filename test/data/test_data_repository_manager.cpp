@@ -71,7 +71,7 @@ TEST_CASE("manager discovery retains positioned payloads and their coordinates",
   REQUIRE(repository.get_data_batch_by_id(batch->get_batch_id(), 2) == batch);
   REQUIRE(repository.get_data_batch_by_id_with_position(batch->get_batch_id(), 2) ==
           positioned_data_batch{batch, 42});
-  REQUIRE(repository.get_batch_positions(2) == std::vector<size_t>{42});
+  REQUIRE(repository.get_positions(2) == std::vector<size_t>{42});
   REQUIRE_THROWS_AS(manager.add_data_batch(batch, {{1, "output"}}), std::logic_error);
   REQUIRE(repository.total_size() == 1);
   REQUIRE(repository.pop_data_batch_by_position(42, 2) == batch);
