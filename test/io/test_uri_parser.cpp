@@ -22,6 +22,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 using cucascade::io::parse;
 using cucascade::io::strip_file_scheme;
@@ -88,6 +89,26 @@ TEST_CASE("uri_parser applies the literal S3 path to uppercase schemes", "[uri_p
   CHECK(parsed.host == "bkt");
   CHECK(parsed.path == "a%20b");
   CHECK(parsed.query.empty());
+}
+
+TEST_CASE("uri_parser keeps S3 keys byte for byte including encoded slashes and spaces",
+          "[uri_parser][s3]")
+{
+  for (auto const key : {std::string_view{"a%2Fb.p"},
+                         std::string_view{"a%20b.p"},
+                         std::string_view{"a#b.p"},
+                         std::string_view{"a?b.p"},
+                         std::string_view{"100%x.p"},
+                         std::string_view{"plain.parquet"},
+                         std::string_view{"year=2026/part 0.parquet"},
+                         std::string_view{"nested/path/file.parquet"}}) {
+    DYNAMIC_SECTION("key=" << key)
+    {
+      auto const parsed = parse("s3://bkt/" + std::string{key});
+      CHECK(parsed.host == "bkt");
+      CHECK(parsed.path == key);
+    }
+  }
 }
 
 TEST_CASE("uri_parser preserves S3 leading slashes in object key", "[uri_parser]")
