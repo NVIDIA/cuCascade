@@ -733,7 +733,7 @@ static cudf_compat::null_mask_buffer alloc_and_peer_copy_sync(
 {
   auto buf =
     cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, target_stream, target_mr);
-  auto const size = buf.size();
+  auto const size = cudf_compat::get_null_mask_size_bytes(buf);
   buf = peer_copy_into(std::move(buf), src_ptr, src_device, size, dst_device, target_stream);
   if (size == 0 || src_ptr == nullptr) { return buf; }
   target_stream.sync();
@@ -1024,7 +1024,7 @@ static cudf_compat::null_mask_buffer alloc_and_copy_h2d_sync(
     nvtx_scope alloc_range{"convert:host_to_gpu:device_alloc"};
     return cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream, mr);
   }();
-  auto const size = buf.size();
+  auto const size = cudf_compat::get_null_mask_size_bytes(buf);
   if (size == 0) { return buf; }
 
   const std::size_t block_size = alloc.block_size();
@@ -1730,16 +1730,16 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   rmm::device_async_resource_ref mr,
   idisk_io_backend& backend)
 {
-  // Null mask (shared by all type categories). create_null_mask(num_rows) allocates exactly
-  // cudf::bitmask_allocation_size_bytes(num_rows), which is what the writer recorded as
-  // meta.null_mask_size, so null_mask.size() is the correct on-disk extent to read.
+  // Null mask (shared by all type categories). The buffer size is measured in elements
+  // in newer cudf versions; disk extents and backend transfers are measured in bytes.
   auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   if (meta.has_null_mask) {
     null_mask = cudf::create_null_mask(meta.num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
-    if (null_mask.size() > 0) {
+    auto const mask_bytes = cudf_compat::get_null_mask_size_bytes(null_mask);
+    if (mask_bytes > 0) {
       backend.read(file_path,
                    null_mask.data(),
-                   std::min(null_mask.size(), meta.null_mask_size),
+                   std::min(mask_bytes, meta.null_mask_size),
                    meta.null_mask_offset,
                    stream);
     }

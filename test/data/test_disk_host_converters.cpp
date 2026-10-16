@@ -250,22 +250,25 @@ TEST_CASE("host_data disk round-trip no-null column", "[disk][converter][null]")
 
 TEST_CASE("host_data disk round-trip mixed-null column", "[disk][converter][null]")
 {
-  // Create a column with alternating nulls
+  // Exercise masks beyond the first quarter of the allocation, including a partial word.
+  auto const num_rows = GENERATE(100, 4097);
 
   auto col = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT32}, 100, cudf::mask_state::ALL_VALID, shared_stream());
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_VALID, shared_stream());
 
   // Set every other bit to null using cudf utilities
-  auto const num_rows = 100;
-  std::vector<uint8_t> host_mask(cudf::bitmask_allocation_size_bytes(num_rows), 0xFF);
+  std::vector<cudf::bitmask_type> host_mask(
+    cudf::bitmask_allocation_size_bytes(num_rows) / sizeof(cudf::bitmask_type),
+    ~cudf::bitmask_type{0});
   // Clear every other bit (set elements 0, 2, 4, ... to null)
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
   for (int i = 0; i < num_rows; i += 2) {
-    auto byte_idx = static_cast<std::size_t>(i / 8);
-    auto bit_idx  = static_cast<unsigned>(i % 8);
-    host_mask[byte_idx] &= static_cast<uint8_t>(~(1u << bit_idx));
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
   }
   auto dev_mask = test::make_null_mask_from_host(num_rows, host_mask, shared_stream());
-  col->set_null_mask(std::move(dev_mask), 50);  // 50 nulls out of 100
+  col->set_null_mask(std::move(dev_mask), (num_rows + 1) / 2);
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
@@ -373,9 +376,10 @@ TEST_CASE("host_data disk round-trip string column with nulls", "[disk][converte
 
   // Create null mask: elements 1 and 3 are null
   auto null_mask_size = cudf::bitmask_allocation_size_bytes(num_strings);
-  std::vector<uint8_t> host_mask(null_mask_size, 0xFF);
-  host_mask[0] &= static_cast<uint8_t>(~(1u << 1));  // null at index 1
-  host_mask[0] &= static_cast<uint8_t>(~(1u << 3));  // null at index 3
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  host_mask[0] &= ~(cudf::bitmask_type{1} << 1);  // null at index 1
+  host_mask[0] &= ~(cudf::bitmask_type{1} << 3);  // null at index 3
   auto dev_mask = test::make_null_mask_from_host(num_strings, host_mask, shared_stream());
   shared_stream().sync();
 
@@ -637,12 +641,14 @@ TEST_CASE("host_data disk round-trip struct with null mask", "[disk][converter][
 
   // Create struct-level null mask (every 3rd element is null)
   auto null_mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
-  std::vector<uint8_t> host_mask(null_mask_size, 0xFF);
-  cudf::size_type null_count = 0;
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  cudf::size_type null_count   = 0;
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
   for (int i = 0; i < num_rows; i += 3) {
-    auto byte_idx = static_cast<std::size_t>(i / 8);
-    auto bit_idx  = static_cast<unsigned>(i % 8);
-    host_mask[byte_idx] &= static_cast<uint8_t>(~(1u << bit_idx));
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
     null_count++;
   }
   auto dev_mask = test::make_null_mask_from_host(num_rows, host_mask, shared_stream());
@@ -735,10 +741,14 @@ TEST_CASE("host_data disk round-trip sliced column with nulls", "[disk][converte
 
   // Set some nulls
   auto null_mask_size = cudf::bitmask_allocation_size_bytes(total_rows);
-  std::vector<uint8_t> host_mask(null_mask_size, 0xFF);
-  cudf::size_type null_count = 0;
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  cudf::size_type null_count   = 0;
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
   for (int i = 0; i < total_rows; i += 5) {
-    host_mask[static_cast<std::size_t>(i / 8)] &= static_cast<uint8_t>(~(1u << (i % 8)));
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
     null_count++;
   }
   auto dev_mask = test::make_null_mask_from_host(total_rows, host_mask, shared_stream());

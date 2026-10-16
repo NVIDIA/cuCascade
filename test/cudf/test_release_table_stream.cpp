@@ -34,6 +34,7 @@
 #include <cudf/types.hpp>
 #include <cudf/version_config.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -41,6 +42,7 @@
 #include <rmm/mr/callback_memory_resource.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+#include <rmm/version_config.hpp>
 
 #include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
@@ -64,6 +66,9 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#define RMM_NEW_CALLBACK_MEMORY_RESOURCE \
+  (RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12))
 
 using namespace cucascade;
 
@@ -355,8 +360,9 @@ constexpr std::string_view injected_allocation_failure{"injected allocation fail
 class failing_allocation_scope {
  public:
   explicit failing_allocation_scope(int failing_allocation)
-    : _previous{rmm::mr::set_current_device_resource(rmm::mr::callback_memory_resource{
-        [this, failing_allocation](std::size_t bytes, ::cuda::stream_ref stream, void*) -> void* {
+    : _previous{rmm::mr::set_current_device_resource(memory_resource(
+        [this, failing_allocation](
+          ::cuda::stream_ref stream, std::size_t bytes, std::size_t, void*) -> void* {
           if (++_allocations == failing_allocation) {
             throw rmm::bad_alloc{std::string{injected_allocation_failure}};
           }
@@ -364,9 +370,9 @@ class failing_allocation_scope {
           CUCASCADE_CUDA_TRY(cudaMallocAsync(&ptr, bytes, stream.get()));
           return ptr;
         },
-        [](void* ptr, std::size_t, ::cuda::stream_ref stream, void*) {
+        [](::cuda::stream_ref stream, void* ptr, std::size_t, std::size_t, void*) {
           CUCASCADE_ASSERT_CUDA_SUCCESS(cudaFreeAsync(ptr, stream.get()));
-        }})}
+        }))}
   {
   }
 
@@ -378,6 +384,30 @@ class failing_allocation_scope {
  private:
   int _allocations{0};
   ::cuda::mr::any_resource<::cuda::mr::device_accessible> _previous;
+
+  /**
+   * @brief Helper function to create RMM callback memory resource.
+   *
+   * `rmm::mr::callback_memory_resource` changed its API in 26.12 to add an `alignment`
+   * argument. We don't need it, but we need to adapt to the new API.
+   *
+   * TODO: drop this once the minimum supported RMM version is 26.12.
+   */
+  template <typename AllocateF, typename DeallocateF>
+  rmm::mr::callback_memory_resource memory_resource(AllocateF allocate, DeallocateF deallocate)
+  {
+#if RMM_NEW_CALLBACK_MEMORY_RESOURCE
+    return rmm::mr::callback_memory_resource{allocate, deallocate};
+#else
+    return rmm::mr::callback_memory_resource{
+      [allocate](std::size_t bytes, ::cuda::stream_ref stream, void* data) -> void* {
+        return allocate(stream, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT, data);
+      },
+      [deallocate](void* ptr, std::size_t bytes, ::cuda::stream_ref stream, void* data) {
+        deallocate(stream, ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT, data);
+      }};
+#endif
+  }
 };
 
 /// Pinned so the D2H readback enqueues asynchronously instead of staging synchronously.
