@@ -16,6 +16,7 @@
  */
 
 #include "utils/mock_test_utils.hpp"
+#include "utils/repository_test_utils.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -35,6 +36,47 @@ using namespace cucascade;
 using cucascade::test::mock_data_representation;
 
 static_assert(std::is_same_v<shared_data_repository_manager, data_repository_manager>);
+
+TEST_CASE("manager discovery retains positioned payloads and their coordinates",
+          "[data_repository_manager][ordering]")
+{
+  data_repository_manager manager;
+  manager.add_new_repository(
+    1, "output", std::make_unique<data_repository>(data_repository_partition_ordering::ORDERED));
+  auto& repository = *manager.get_repository(1, "output");
+  auto batch       = cucascade::test::make_repository_test_batch(manager.get_next_data_batch_id());
+  repository.add_data_batch_at_position(batch, 42, 2);
+
+  size_t visited = 0;
+  manager.for_each_repository([&](data_repository* discovered) {
+    REQUIRE(discovered == &repository);
+    REQUIRE(discovered->get_partition_ordering() == data_repository_partition_ordering::ORDERED);
+    for (size_t partition_idx = 0; partition_idx < discovered->num_partitions(); ++partition_idx) {
+      for (auto id : discovered->get_batch_ids(partition_idx)) {
+        REQUIRE(partition_idx == 2);
+        REQUIRE(discovered->get_data_batch_by_id(id, partition_idx) == batch);
+        REQUIRE(discovered->get_data_batch_by_id_with_position(id, partition_idx) ==
+                positioned_data_batch{batch, 42});
+        ++visited;
+      }
+    }
+  });
+  REQUIRE(visited == 1);
+  REQUIRE(manager.get_repositories() == std::vector<data_repository*>{&repository});
+  {
+    // Memory management can replace a resident representation without removing its coordinates.
+    auto mutable_batch = batch->to_mutable();
+    mutable_batch.set_data(std::make_unique<cucascade::test::repository_test_representation>(512));
+  }
+  REQUIRE(repository.get_data_batch_by_id(batch->get_batch_id(), 2) == batch);
+  REQUIRE(repository.get_data_batch_by_id_with_position(batch->get_batch_id(), 2) ==
+          positioned_data_batch{batch, 42});
+  REQUIRE(repository.get_batch_positions(2) == std::vector<size_t>{42});
+  REQUIRE_THROWS_AS(manager.add_data_batch(batch, {{1, "output"}}), std::logic_error);
+  REQUIRE(repository.total_size() == 1);
+  REQUIRE(repository.pop_data_batch_by_position(42, 2) == batch);
+  REQUIRE(manager.clear_all_repositories().empty());
+}
 
 // =============================================================================
 // Tests for shared_ptr based repository manager

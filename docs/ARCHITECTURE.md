@@ -232,17 +232,26 @@ The `data_batch_processing_handle` uses RAII to ensure the processing count is a
 
 **File**: `include/cucascade/data/data_repository.hpp`
 
-A `data_repository` is a partitioned storage for data batches. It provides blocking `pop` operations that wait until a batch reaches the requested state.
+A `data_repository` stores shared batches and optional partition-local positions under a mutex.
+All retrieval is non-blocking and independent of batch state. Batch-positioning mode is established
+by the first successful insertion and persists after draining; partition ordering is an independent,
+immutable constructor declaration that defaults to unordered.
 
 ```cpp
-// Pop a batch that can transition to task_created (blocks if none ready)
-auto batch = repository.pop_data_batch(batch_state::task_created);
+// Legacy unordered FIFO pop (returns nullptr if empty)
+auto batch = repository.pop_next_data_batch();
 
-// Pop a specific batch by ID
-auto batch = repository.pop_data_batch_by_id(42, batch_state::in_transit);
+// Position-aware FIFO pop: arrival order, with optional logical sequence metadata
+auto [positioned_batch, position] = repository.pop_next_data_batch_with_position();
 ```
 
 The `data_repository_manager` coordinates multiple repositories across operators/pipelines and provides atomic batch ID generation.
+
+Legacy destructive reads reject positioned repositories to prevent metadata loss. Memory management
+can still enumerate IDs and inspect payloads without removing them. Sorted position snapshots and
+position lookup enable ordered consumption after successful producer completion, coordinated by the
+caller. The repository does not infer completion or sortedness. See
+[Data Repositories](data-management.md#data-repositories) for the contract and API migration.
 
 ### Representation Converter
 
@@ -393,7 +402,7 @@ Key synchronization primitives:
 |------|---------|
 | `include/cucascade/data/common.hpp` | `idata_representation` interface |
 | `include/cucascade/data/data_batch.hpp` | Batch lifecycle, read-only and mutable locking accessor classes|
-| `include/cucascade/data/data_repository.hpp` | Partitioned batch storage with blocking pops |
+| `include/cucascade/data/data_repository.hpp` | Partitioned batch storage with optional positions and non-blocking pops |
 | `include/cucascade/data/data_repository_manager.hpp` | Multi-pipeline repository coordination |
 | `include/cucascade/data/representation_converter.hpp` | Type-indexed converter registry |
 | `include/cucascade/data/gpu_data_representation.hpp` | GPU-resident cuDF table wrapper |

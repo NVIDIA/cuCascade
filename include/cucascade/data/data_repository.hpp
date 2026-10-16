@@ -19,7 +19,8 @@
 
 #include <cucascade/data/data_batch.hpp>
 
-#include <condition_variable>
+#include <algorithm>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,31 +31,44 @@
 
 namespace cucascade {
 
+/** @brief A payload and its optional logical position within a repository partition. */
+using positioned_data_batch = std::pair<std::shared_ptr<data_batch>, std::optional<size_t>>;
+
+/** @brief Uniform batch-positioning mode, established by the first successful insertion. */
+enum class data_repository_ordering { ORDERED, UNORDERED, UNKNOWN };
+
+/** @brief Whether increasing partition indices define logical sequence. */
+enum class data_repository_partition_ordering { ORDERED, UNORDERED };
+
 /**
- * @brief Abstract interface for managing collections of data_batch objects within a pipeline.
+ * @brief Thread-safe partitioned storage of shared batches and optional logical positions.
  *
- * data_repository defines the contract for storing, retrieving, and managing data batches
- * within a specific pipeline. Different implementations can provide various storage strategies,
- * such as:
- * - FIFO (First In, First Out) repositories for streaming data
- * - LRU (Least Recently Used) repositories for caching scenarios
- * - Priority-based repositories for workload-aware scheduling
+ * Batch positioning and partition ordering are independent. Positions are producer assertions
+ * scoped to a partition; the repository checks structure, not sortedness or SQL comparators.
+ * FIFO retrieval always follows arrival order, including for positioned batches.
  *
- * The repository is responsible for:
- * - Managing the lifecycle of data_batch objects through smart pointers
- * - Implementing eviction policies when memory pressure occurs
- * - Providing downgrade candidates for memory tier management
- * - Thread-safe access to shared data structures
+ * The first successful insertion establishes a uniform batch mode across all partitions.
+ * Draining never resets that mode. UNKNOWN means no insertion has established a mode;
+ * neither UNKNOWN nor emptiness indicates producer completion.
  *
- * @note Implementations must be thread-safe as multiple threads may access
- *       the repository concurrently during query execution.
+ * @note Ordered consumption requires successful producer completion and a coordinated consumer.
+ * Position enumeration is a snapshot, not an atomic claim or completion signal.
+ * @note Derived classes must preserve the mode and position invariants under _mutex. Protected
+ * storage contains positioned_data_batch pairs; subclasses accessing it must migrate explicitly.
  */
 class data_repository {
  public:
+  /** @brief Initialize one empty partition with unordered partition indices. */
+  data_repository() : data_repository(data_repository_partition_ordering::UNORDERED) {}
+
   /**
-   * @brief Default constructor - initializes with one empty partition.
+   * @brief Initialize one empty partition with an independent partition-order declaration.
+   * @param partition_ordering Whether partition indices define sequence; immutable after creation.
    */
-  data_repository() : _data_batches(1) {}
+  explicit data_repository(data_repository_partition_ordering partition_ordering)
+    : _data_batches(1), _partition_ordering(partition_ordering)
+  {
+  }
 
   /**
    * @brief Virtual destructor for proper cleanup of derived classes.
@@ -71,17 +85,60 @@ class data_repository {
    * @param partition_idx Index of the partition to add the batch to (default: 0)
    *
    * @note Thread-safe operation protected by internal mutex
+   * @throws std::logic_error if batch mode is ORDERED
+   * @throws std::out_of_range if partition_idx cannot be represented as a partition count
    */
   virtual void add_data_batch(std::shared_ptr<data_batch> batch, size_t partition_idx = 0)
   {
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
+    require_unpositioned_access();
+    insert_data_batch({std::move(batch), std::nullopt}, partition_idx);
+    _ordering = data_repository_ordering::UNORDERED;
+  }
 
-      if (static_cast<std::size_t>(partition_idx) >= _data_batches.size()) {
-        _data_batches.resize(partition_idx + 1);
-      }
-      _data_batches[partition_idx].push_back(std::move(batch));
+  /**
+   * @brief Add a batch at a logical position, establishing ORDERED mode on success.
+   *
+   * Positions may arrive in any order and may have gaps. Duplicate resident positions in one
+   * partition are rejected. Reuse after consumption is also invalid, but is not tracked.
+   * Failed insertion leaves contents, partition count, and batch mode unchanged.
+   *
+   * @param batch Shared payload to store
+   * @param position Logical position within the partition
+   * @param partition_idx Partition to grow or insert into (default: 0)
+   * @throws std::logic_error if batch mode is UNORDERED or the position is already resident
+   * @throws std::out_of_range if partition_idx cannot be represented as a partition count
+   */
+  virtual void add_data_batch_at_position(std::shared_ptr<data_batch> batch,
+                                          size_t position,
+                                          size_t partition_idx = 0)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_ordering == data_repository_ordering::UNORDERED) {
+      throw std::logic_error("positioned insertion requires an UNKNOWN or ORDERED repository");
     }
+    if (partition_idx < _data_batches.size()) {
+      for (const auto& entry : _data_batches[partition_idx]) {
+        if (entry.second == position) {
+          throw std::logic_error("duplicate resident batch position in partition");
+        }
+      }
+    }
+    insert_data_batch({std::move(batch), position}, partition_idx);
+    _ordering = data_repository_ordering::ORDERED;
+  }
+
+  /** @brief Get the synchronized batch-positioning mode, independent of partition ordering. */
+  [[nodiscard]] data_repository_ordering get_ordering() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _ordering;
+  }
+
+  /** @brief Get the immutable partition-order declaration, independent of batch positioning. */
+  [[nodiscard]] data_repository_partition_ordering get_partition_ordering() const
+  {
+    return _partition_ordering;
   }
 
   /**
@@ -95,20 +152,15 @@ class data_repository {
    *
    * @note Thread-safe operation protected by internal mutex
    * @throws std::out_of_range if partition_idx is out of range
+   * @throws std::logic_error if batch mode is ORDERED; use pop_next_data_batch_with_position
    */
   virtual std::shared_ptr<data_batch> pop_next_data_batch(size_t partition_idx = 0)
   {
     std::unique_lock<std::mutex> lock(_mutex);
 
-    if (partition_idx >= _data_batches.size()) {
-      throw std::out_of_range("partition_idx out of range");
-    }
-
-    if (_data_batches[partition_idx].empty()) { return {}; }
-
-    auto batch = std::move(_data_batches[partition_idx].front());
-    _data_batches[partition_idx].erase(_data_batches[partition_idx].begin());
-    return batch;
+    require_partition(partition_idx);
+    require_unpositioned_access();
+    return pop_next_data_batch_unlocked(partition_idx).first;
   }
 
   /**
@@ -123,26 +175,16 @@ class data_repository {
    *
    * @note Thread-safe operation protected by internal mutex
    * @throws std::out_of_range if partition_idx is out of range
+   * @throws std::logic_error if batch mode is ORDERED; use pop_data_batch_by_id_with_position
    */
   virtual std::shared_ptr<data_batch> pop_data_batch_by_id(uint64_t batch_id,
                                                            size_t partition_idx = 0)
   {
     std::unique_lock<std::mutex> lock(_mutex);
 
-    if (partition_idx >= _data_batches.size()) {
-      throw std::out_of_range("partition_idx out of range");
-    }
-
-    for (auto it = _data_batches[partition_idx].begin(); it != _data_batches[partition_idx].end();
-         ++it) {
-      if (it->get()->get_batch_id() == batch_id) {
-        auto batch = std::move(*it);
-        _data_batches[partition_idx].erase(it);
-        return batch;
-      }
-    }
-
-    return {};
+    require_partition(partition_idx);
+    require_unpositioned_access();
+    return pop_data_batch_by_id_unlocked(batch_id, partition_idx).first;
   }
 
   /**
@@ -155,6 +197,8 @@ class data_repository {
    * @param partition_idx Index of the partition to search (default: 0)
    * @return A copy of the data batch pointer with the matching batch_id, or nullptr
    *
+   * @note Payload-only inspection is allowed in every mode for memory management. Use
+   * get_data_batch_by_id_with_position when consuming sequence metadata.
    * @note Thread-safe operation protected by internal mutex
    * @throws std::out_of_range if partition_idx is out of range
    */
@@ -167,14 +211,128 @@ class data_repository {
       throw std::out_of_range("partition_idx out of range");
     }
 
-    for (const std::shared_ptr<data_batch>& batch : _data_batches[partition_idx]) {
-      if (batch->get_batch_id() == batch_id) {
-        std::shared_ptr<data_batch> copy = batch;
-        return copy;
-      }
+    for (const auto& entry : _data_batches[partition_idx]) {
+      if (entry.first->get_batch_id() == batch_id) { return entry.first; }
     }
 
     return nullptr;
+  }
+
+  /**
+   * @brief Remove the next batch and its position in arrival order, in any batch mode.
+   * @param partition_idx Partition to pop from (default: 0)
+   * @return Payload and optional position, or {nullptr, nullopt} if empty
+   * @throws std::out_of_range if partition_idx is out of range
+   * @note Transitional pair-returning API; the original name will return pairs after migration.
+   */
+  virtual positioned_data_batch pop_next_data_batch_with_position(size_t partition_idx = 0)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    require_partition(partition_idx);
+    return pop_next_data_batch_unlocked(partition_idx);
+  }
+
+  /**
+   * @brief Remove a batch by ID with its optional position, in any batch mode.
+   * @param batch_id ID to search for
+   * @param partition_idx Partition to search (default: 0)
+   * @return Payload and optional position, or {nullptr, nullopt} on a miss
+   * @throws std::out_of_range if partition_idx is out of range
+   * @note Transitional API; migrate payload-only destructive callers before publishing positions.
+   */
+  virtual positioned_data_batch pop_data_batch_by_id_with_position(uint64_t batch_id,
+                                                                   size_t partition_idx = 0)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    require_partition(partition_idx);
+    return pop_data_batch_by_id_unlocked(batch_id, partition_idx);
+  }
+
+  /**
+   * @brief Inspect a batch by ID with its optional position without removing it, in any mode.
+   * @param batch_id ID to search for
+   * @param partition_idx Partition to search (default: 0)
+   * @return Payload and optional position, or {nullptr, nullopt} on a miss
+   * @throws std::out_of_range if partition_idx is out of range
+   * @note Transitional pair-returning API; the original name will return pairs after migration.
+   */
+  virtual positioned_data_batch get_data_batch_by_id_with_position(uint64_t batch_id,
+                                                                   size_t partition_idx = 0) const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    require_partition(partition_idx);
+    for (const auto& entry : _data_batches[partition_idx]) {
+      if (entry.first->get_batch_id() == batch_id) { return entry; }
+    }
+    return {};
+  }
+
+  /**
+   * @brief Inspect a batch at a partition-local position without removing it.
+   * @param position Logical position to search for
+   * @param partition_idx Partition to search (default: 0)
+   * @return Payload, or nullptr if absent
+   * @throws std::out_of_range if partition_idx is out of range
+   * @throws std::logic_error if batch mode is UNKNOWN or UNORDERED
+   */
+  virtual std::shared_ptr<data_batch> get_data_batch_by_position(size_t position,
+                                                                 size_t partition_idx = 0) const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    require_partition(partition_idx);
+    require_positioned_access();
+    for (const auto& entry : _data_batches[partition_idx]) {
+      if (entry.second == position) { return entry.first; }
+    }
+    return nullptr;
+  }
+
+  /**
+   * @brief Remove a batch at a partition-local position.
+   * @param position Logical position to search for
+   * @param partition_idx Partition to search (default: 0)
+   * @return Payload, or nullptr if absent
+   * @throws std::out_of_range if partition_idx is out of range
+   * @throws std::logic_error if batch mode is UNKNOWN or UNORDERED
+   */
+  virtual std::shared_ptr<data_batch> pop_data_batch_by_position(size_t position,
+                                                                 size_t partition_idx = 0)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    require_partition(partition_idx);
+    require_positioned_access();
+    auto& partition = _data_batches[partition_idx];
+    for (auto it = partition.begin(); it != partition.end(); ++it) {
+      if (it->second == position) {
+        auto batch = std::move(it->first);
+        partition.erase(it);
+        return batch;
+      }
+    }
+    return nullptr;
+  }
+
+  /**
+   * @brief Get a sorted snapshot of resident positions in one partition.
+   * @param partition_idx Partition to enumerate (default: 0)
+   * @return Positions in increasing order; gaps and empty partitions are allowed
+   * @throws std::out_of_range if partition_idx is out of range
+   * @throws std::logic_error if batch mode is UNKNOWN or UNORDERED
+   * @note Enumeration does not claim batches. Ordered traversal requires successful producer
+   * completion and one coordinated consumer; concurrent mutation may invalidate the snapshot.
+   */
+  virtual std::vector<size_t> get_batch_positions(size_t partition_idx = 0) const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    require_partition(partition_idx);
+    require_positioned_access();
+    std::vector<size_t> positions;
+    positions.reserve(_data_batches[partition_idx].size());
+    for (const auto& entry : _data_batches[partition_idx]) {
+      positions.push_back(*entry.second);
+    }
+    std::sort(positions.begin(), positions.end());
+    return positions;
   }
 
   /**
@@ -197,8 +355,8 @@ class data_repository {
     std::vector<uint64_t> batch_ids;
     batch_ids.reserve(_data_batches[partition_idx].size());
 
-    for (const auto& batch : _data_batches[partition_idx]) {
-      batch_ids.push_back(batch->get_batch_id());
+    for (const auto& entry : _data_batches[partition_idx]) {
+      batch_ids.push_back(entry.first->get_batch_id());
     }
 
     return batch_ids;
@@ -312,8 +470,72 @@ class data_repository {
 
  protected:
   mutable std::mutex _mutex;  ///< Mutex for thread-safe access to repository operations
-  std::vector<std::vector<std::shared_ptr<data_batch>>>
-    _data_batches;  ///< Container for data batch pointers (partitioned)
+  std::vector<std::vector<positioned_data_batch>>
+    _data_batches;  ///< Partitioned arrival-order storage
+  data_repository_ordering _ordering = data_repository_ordering::UNKNOWN;  ///< Guarded by _mutex
+
+ private:
+  const data_repository_partition_ordering _partition_ordering;
+
+  // Helpers require the caller to hold _mutex.
+  void require_partition(size_t partition_idx) const
+  {
+    if (partition_idx >= _data_batches.size()) {
+      throw std::out_of_range("partition_idx out of range");
+    }
+  }
+
+  void require_unpositioned_access() const
+  {
+    if (_ordering == data_repository_ordering::ORDERED) {
+      throw std::logic_error("unpositioned access is not allowed on an ORDERED repository");
+    }
+  }
+
+  void require_positioned_access() const
+  {
+    if (_ordering != data_repository_ordering::ORDERED) {
+      throw std::logic_error("position access requires an ORDERED repository");
+    }
+  }
+
+  void insert_data_batch(positioned_data_batch entry, size_t partition_idx)
+  {
+    if (partition_idx < _data_batches.size()) {
+      _data_batches[partition_idx].push_back(std::move(entry));
+      return;
+    }
+    if (partition_idx == std::numeric_limits<size_t>::max()) {
+      throw std::out_of_range("partition_idx cannot be represented as a partition count");
+    }
+    // Prepare the inner allocation first. After resize succeeds, moving it cannot throw.
+    std::vector<positioned_data_batch> partition;
+    partition.push_back(std::move(entry));
+    _data_batches.resize(partition_idx + 1);
+    _data_batches[partition_idx] = std::move(partition);
+  }
+
+  positioned_data_batch pop_next_data_batch_unlocked(size_t partition_idx)
+  {
+    auto& partition = _data_batches[partition_idx];
+    if (partition.empty()) { return {}; }
+    auto entry = std::move(partition.front());
+    partition.erase(partition.begin());
+    return entry;
+  }
+
+  positioned_data_batch pop_data_batch_by_id_unlocked(uint64_t batch_id, size_t partition_idx)
+  {
+    auto& partition = _data_batches[partition_idx];
+    for (auto it = partition.begin(); it != partition.end(); ++it) {
+      if (it->first->get_batch_id() == batch_id) {
+        auto entry = std::move(*it);
+        partition.erase(it);
+        return entry;
+      }
+    }
+    return {};
+  }
 };
 
 using shared_data_repository = data_repository;
