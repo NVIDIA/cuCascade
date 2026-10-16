@@ -394,24 +394,25 @@ batch state. They do not acquire batch accessors — callers acquire the appropr
 // Add a batch (idle state)
 repository.add_data_batch(batch_ptr, partition_idx);
 
-// Pop the next batch from a partition (non-blocking; returns nullptr if empty)
-auto batch = repository.pop_next_data_batch(partition_idx);
+// Pop the next batch from a partition (non-blocking; returns {nullptr, nullopt} if empty)
+auto [batch, position] = repository.pop_next_data_batch_with_position(partition_idx);
 if (batch) {
     auto ro = batch->to_read_only();   // acquire shared lock
     process(ro.get_data());
 }
 
-// Pop a specific batch by ID (returns nullptr if not found)
-auto batch = repository.pop_data_batch_by_id(batch_id, partition_idx);
+// Pop a specific batch by ID (returns {nullptr, nullopt} if not found)
+auto [batch, position] = repository.pop_data_batch_by_id_with_position(batch_id, partition_idx);
 
 // Non-removing payload inspection is available in every ordering mode
-auto batch = repository.get_data_batch_by_id(batch_id, partition_idx);
+auto [batch, position] = repository.get_data_batch_by_id_with_position(batch_id, partition_idx);
 ```
 
-`pop_next_data_batch` is **non-blocking** — it returns `nullptr` immediately if the partition is
+`pop_next_data_batch_with_position` is **non-blocking** — it returns `{nullptr, std::nullopt}` immediately if the partition is
 empty. Emptiness describes current storage; producer completion must be established separately.
 All partition-specific reads throw `std::out_of_range` for an invalid partition index.
-Legacy destructive reads reject positioned repositories as described below.
+Plain retrieval methods return just the payload pointer (or `nullptr`); the `_with_position`
+variants return the pointer and optional position. Both work in every ordering mode.
 
 ### Partitioning
 
@@ -427,7 +428,7 @@ repository.add_data_batch(batch_a, 0);
 repository.add_data_batch(batch_b, 1);
 
 // Pop from partition 0 only
-auto batch = repository.pop_next_data_batch(0);
+auto [batch, position] = repository.pop_next_data_batch_with_position(0);
 ```
 
 Partition membership, sequence within a partition, and device placement are independent.
@@ -485,12 +486,12 @@ auto [removed, removed_position] =
     positioned.pop_data_batch_by_id_with_position(earlier_batch->get_batch_id());
 ```
 
-The three `*_with_position` retrieval methods work in every mode. They return `{nullptr, nullopt}`
+The three `_with_position` FIFO/ID retrieval methods work in every mode. They return `{nullptr, nullopt}`
 on a miss, and `{batch, nullopt}` for an unpositioned batch. FIFO and ID retrieval do not sort data.
 
 `get_data_batch_by_position(position, partition_idx)` and
 `pop_data_batch_by_position(position, partition_idx)` return the payload pointer or `nullptr`
-when absent. `get_batch_positions(partition_idx)` returns a copy of the resident positions in
+when absent. `get_positions(partition_idx)` returns a copy of the resident positions in
 increasing order. These three operations require `ORDERED` batch mode: `UNKNOWN` and `UNORDERED`
 throw `std::logic_error`, including on an empty partition. Invalid partition indices still throw
 `std::out_of_range`, checked before mode errors. Growing partitions never changes either ordering
@@ -513,7 +514,7 @@ After successful completion, one coordinated consumer can enumerate and retrieve
 ```cpp
 // Caller has already established successful producer completion and exclusive drain ownership.
 if (!repository.all_empty()) {
-    for (auto position : repository.get_batch_positions(partition_idx)) {
+    for (auto position : repository.get_positions(partition_idx)) {
         auto batch = repository.pop_data_batch_by_position(position, partition_idx);
         // Consume batch in this logical order.
     }
@@ -525,26 +526,23 @@ retrieval miss; ordered traversal therefore needs consumer coordination. Arrival
 and a mutex around final append do not establish logical execution order. Operators such as LIMIT
 must apply their state in logical input order at the execution boundary.
 
-### API Migration
+### Choosing a Retrieval API
 
-This is the additive phase of the positioned repository contract. Existing pointer-returning
-`pop_next_data_batch()` and `pop_data_batch_by_id()` continue to support `UNKNOWN` and `UNORDERED`
-repositories. On `ORDERED` repositories they throw `std::logic_error` before removing data,
-even for a missing ID or an empty partition, so a consumer cannot silently discard positions.
-The non-removing `get_data_batch_by_id()` remains a payload-only inspection path in every mode
-for memory management.
+Use `pop_next_data_batch()`, `pop_data_batch_by_id()`, or `get_data_batch_by_id()` when the
+position is not needed. These return a payload pointer (or `nullptr`) in every ordering mode.
+Plain pops intentionally discard the removed batch's position; they do not change the repository's
+ordering mode or rearrange remaining entries.
 
-Migrate consumers to `pop_next_data_batch_with_position()`,
-`pop_data_batch_by_id_with_position()`, and `get_data_batch_by_id_with_position()` before enabling
-positioned producers. These names are transitional: after dependent consumers migrate, a separate
-breaking change will make the original retrieval names return pairs and retain the temporary names
-as forwarding aliases for one migration interval, then remove them. This change does not activate
-ordered query behavior in downstream engines.
+Use the corresponding `_with_position()` variant when the consumer needs to preserve the
+position. These return `positioned_data_batch`, or `{nullptr, std::nullopt}` on a miss. FIFO
+retrieval follows arrival order with either API; it does not sort by position.
 
-Subclasses that access protected `_data_batches` must migrate from pointers to pairs and preserve
-the batch-mode invariants under `_mutex`. Subclasses overriding retrieval must review the new
-virtual APIs as well as the legacy APIs; public source compatibility does not preserve custom
-storage or dispatch behavior automatically.
+The plain virtual methods forward to the position-aware virtual methods and select `.first`.
+Subclasses implementing custom storage can override the position-aware methods to support both
+forms; instrumentation that only observes one form should override that form explicitly.
+
+`get_positions()` enumerates sorted positions; `get_batch_positions()` remains an alias.
+The snapshot is only complete after all producers finish, and consumers must coordinate removal.
 
 ### Shared Ownership
 
