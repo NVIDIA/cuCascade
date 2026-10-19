@@ -239,6 +239,20 @@ its old behaviour). The same two passes drop the path's entry in the ioctx's `me
 (new `metadata_store::invalidate(path)`): a parsed footer of the old bytes is as stale as the
 chunks. `flush` does not invalidate.
 
+Additions from the review (w1-review):
+- `open_io_object_for_write` with `create_or_truncate` or `create_new` invalidates the path too:
+  it changes (or replaces) the bytes as much as a write.
+- A footer parsed from the old bytes can finish after both passes. `metadata_store` therefore keeps
+  a per-path epoch (a fixed 256-slot table indexed by path hash, so it does not grow with spill
+  paths): `invalidate` advances it, `ioctx` stamps every object it opens with it, and
+  `register_metadata` drops a registration from an object stamped before the last invalidation.
+- Scope (documented on the write API): only the writing ioctx's cache and metadata store are
+  invalidated; paths are matched as given (no normalisation); a reader holding a cache handle
+  from before the write keeps its view of the old bytes.
+- `shutdown_cache()` / `pre_destroy()` wait for every asynchronous write in flight (each holds a
+  pending invalidation); calling them from a continuation on one of the ioctx's reactor threads
+  can deadlock.
+
 ### 3.8 Lifecycle
 Async writes need `start()`; before it or after `shutdown()` they resolve with
 `operation_canceled` (as reads). `host_write` / `flush` run on the caller thread and work without
@@ -407,9 +421,13 @@ guarantees to deliver and what the reactor must guarantee back.
   for a staged write starts `copy_to_host_async` on the slot's event (device) or memcpy's the host
   bytes (host bounce) and moves the slot to `staging` / straight to SQE preparation. A new
   `poll_staging()` moves finished copies to SQE preparation (existing `prepared` / `incomplete`
-  path). While staging is non-empty the CQE wait is capped at 200 us instead of 20 ms; with
-  nothing else to do the worker synchronizes the oldest staging event. Terminal path synchronizes
-  staging events before settling.
+  path). The worker never blocks on a copy event (they sit on callers' streams, which may be
+  stalled by unrelated GPU work; review finding MAJOR-1): while staging or H2D copies are
+  pending the CQE wait is capped at 100 us, and with nothing in the kernel it waits 100 us for a
+  new request (or backs off when only slot-blocked work remains) and polls the events on the next
+  pass. The same applies to the read path's H2D copies. Bytes of staged writes whose D2H is
+  pending count in `queued_bytes()`, so `next_reactor` sees that backlog. Only the terminal
+  path synchronizes staging events, before their blocks are released.
 - `prepare_sqe`: `write_fixed` (single registered staging block) / `write` / `writev` for writes,
   `fsync(DATASYNC)` for flush. Reap: writes complete at `bytes_done == io_rng.size`, 0 -> `EIO`,
   short -> resubmit (an O_DIRECT remainder that is no longer aligned falls back to buffered);
@@ -421,9 +439,11 @@ guarantees to deliver and what the reactor must guarantee back.
 ## 8. kvikIO context (trivial, implemented)
 
 `kvikio::FileHandle` already writes host and device pointers:
-- `create_io_object_for_write`: `open(2)` with the mode flags (create/trunc/excl, perms), close,
-  then `FileHandle{path, "r+", m644, compat_mode}`; `s3://` -> `not_supported`. `kvikio_io_object`
-  gets the atomic size and `writable`.
+- `create_io_object_for_write`: `open(2)` with the mode flags (create/trunc/excl, perms), a
+  best-effort `fallocate(KEEP_SIZE)` for `size_hint`, then `FileHandle{path, "r+", m644,
+  compat_mode}` while the first fd is still open; the handle must name the same inode, and a file
+  this call created is unlinked when the handle cannot be built. `s3://` -> `not_supported`.
+  `kvikio_io_object` gets the atomic size and `writable`.
 - `host_write_io`: `pwrite(src, size, offset).get()`, short -> `EIO`, `note_written`.
 - `mixed_writev_async_io`: eager like its reads (`make_semi_future_with`); device slices
   `cudaStreamSynchronize(stream)` first, then `pwrite(device_ptr, ...)` (kvikIO picks GDS/bounce).
