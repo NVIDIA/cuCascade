@@ -207,9 +207,9 @@ prove the route of a later copy. A failed grant leaves existing pool permissions
 revocation must be coordinated by the application with other users of that pool. CUDA errors take
 precedence over non-error rejections when the two directional probes disagree. Verified peer
 results are cached process-wide. `grant_pool_peer_access()` and
-`disable_peer_access_where_broken()` retry cached CUDA errors; `probe_peer_dma_works()` and
-`peer_access_verified()` report false without retrying. The GPU-to-GPU converter uses the
-directional probe and host-stages while an error is cached.
+the deprecated `disable_peer_access_where_broken()` retry cached CUDA errors;
+`probe_peer_dma_works()` and `peer_access_verified()` report false without retrying. The GPU-to-GPU
+converter uses the directional probe and host-stages while an error is cached.
 
 `peer_access_verified(owner_device, accessing_device)` exposes the same bidirectional verification
 rule without granting access. It returns true for a same-device request or when both directional
@@ -235,11 +235,19 @@ setting; while it is disabled the CUDA driver uses an indirect route that is cor
 slower. An application may enable ordinary peer access itself, but neither the directional probe
 nor `peer_access_verified()` separately verifies that non-pool route.
 
-The legacy `enable_pool_peer_access_for_all_visible_devices()` helper remains best effort. It
-visits every visible peer for both the supplied pool and the owner's currently selected pool,
-writes one stderr line per grant that fails with a CUDA error, and discards other outcomes.
-`disable_peer_access_where_broken()` keeps its name for compatibility but changes no state; it
-reports how many directions failed byte verification, or -1 when verification could not run.
+`enable_pool_peer_access_for_all_visible_devices()` is deprecated. It visits every visible peer for
+both the supplied pool and the owner's currently selected pool, writes one stderr line per grant
+that fails with a CUDA error, and discards other outcomes. Replace it with explicit
+`grant_pool_peer_access()` calls for each required pool and accessing device, and check each
+returned `pool_peer_access_result`. Only the pools explicitly passed to `grant_pool_peer_access()`
+are configured.
+
+`disable_peer_access_where_broken()` is deprecated. Despite its name, it changes neither ordinary
+peer access nor caller pool permissions; it reports how many directions failed byte verification, or
+-1 when verification could not run, and retries cached CUDA errors. Use `peer_access_verified()` for
+a boolean verification check; that query does not count failed directions or retry cached CUDA
+errors. Applications must coordinate any access revocation with other users and perform it through
+CUDA.
 
 ### Per-Stream vs Per-Thread Tracking
 

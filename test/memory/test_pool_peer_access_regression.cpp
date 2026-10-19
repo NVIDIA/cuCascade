@@ -55,6 +55,19 @@ using cucascade::memory::detail::peer_dma_probe_result;
 using cucascade::memory::detail::peer_dma_probe_status;
 using cucascade::test::first_mismatch;
 
+// Keep coverage of the deprecated count API without suppressing warnings in other tests.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+[[nodiscard]] int legacy_broken_direction_count()
+{
+  return cucascade::memory::disable_peer_access_where_broken();
+}
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 thread_local int fake_current_device{0};
 int fake_probe_calls{0};
 
@@ -651,7 +664,7 @@ TEST_CASE("Broken pool peer route refuses grants without changing state", "[.pee
   CHECK_FALSE(cucascade::memory::peer_access_verified(accessor, owner));
   CHECK(pool_access(pool.pool, accessor) == access_before);
   CHECK(read_ordinary_peer_state() == restore_access.original);
-  CHECK(cucascade::memory::disable_peer_access_where_broken() > 0);
+  CHECK(legacy_broken_direction_count() > 0);
 }
 
 TEST_CASE("Public peer verification reports a working route and no broken directions",
@@ -663,7 +676,7 @@ TEST_CASE("Public peer verification reports a working route and no broken direct
   current_device_guard restore_device{saved_device};
 
   // Runs first because it retries CUDA errors cached by earlier tests; the lookups below do not.
-  CHECK(cucascade::memory::disable_peer_access_where_broken() == 0);
+  CHECK(legacy_broken_direction_count() == 0);
   CHECK(cucascade::memory::probe_peer_dma_works(0, 1));
   CHECK(cucascade::memory::probe_peer_dma_works(1, 0));
   CHECK(cucascade::memory::probe_peer_dma_works(0, 0));
