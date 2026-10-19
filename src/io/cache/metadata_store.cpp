@@ -46,6 +46,16 @@ bool metadata_store::has_path(std::string_view object_path) const noexcept
   return _key_by_path.contains(object_path);
 }
 
+void metadata_store::invalidate(std::string_view object_path) noexcept
+{
+  if (!has_path(object_path)) return;
+  std::unique_lock lk(_mtx);
+  auto const it = _key_by_path.find(object_path);
+  if (it == _key_by_path.end()) return;
+  _by_key.erase(it->second);
+  _key_by_path.erase(it);
+}
+
 std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
 {
   return get_metadata(obj.raw_file_cache_id());
