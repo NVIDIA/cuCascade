@@ -81,6 +81,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
     io/uring/test_uring_readv.cpp
+    io/uring/test_uring_write.cpp
     # Main test runner
     unittest.cpp)
 
