@@ -38,9 +38,18 @@ namespace cucascade::io::cufile {
  * has finished and completes host-observed; with a real GDS stack cuFile DMAs
  * from NVMe straight into GPU memory with no host-side bounce of its own.
  *
- * Host-only reads and mixed host+device requests fall back to POSIX @c pread on
- * the buffered fd; the reactor exists for the device fast path and treats
- * everything else as a correctness-preserving fallback.
+ * Host-only reads go O_DIRECT (through the reactor's pinned scratch when not
+ * block-aligned); mixed host+device requests use POSIX @c pread on the buffered
+ * fd.
+ *
+ * @note Host-source writes whose aligned body is below 4 MiB or does not line up
+ *       with its source address (e.g. the DISK tier's pinned pool blocks) are
+ *       written through the page cache with writeback started at once
+ *       (@c sync_file_range), which measured faster than O_DIRECT from a
+ *       synchronous reactor.  Spilled host data can therefore transiently occupy
+ *       the page cache; the pages are clean, hence reclaimable, once written
+ *       back, and durability still needs a flush (@c fdatasync).  Larger
+ *       congruent bodies go O_DIRECT from the caller's buffer.
  *
  * Writes of device sources use @c cuFileWrite for their aligned body only when
  * cuFile reports a real GDS mode; on a compat-only platform every device write

@@ -142,9 +142,12 @@ class cufile_io_object final : public io_object {
  * with @c pwrite -- O_DIRECT for aligned pieces, buffered otherwise -- device
  * bytes being staged through the reactor's pinned scratch by D2H copies.  A
  * host source that lines up with the file goes O_DIRECT straight from the
- * caller; any other host source is written through the page cache with its
- * writeback started at once (@c sync_file_range), which overlaps the kernel's
- * copy with the device write and measured faster than staging it for O_DIRECT.
+ * caller when its body is at least 4 MiB; any other host source is written
+ * through the page cache with its writeback started at once
+ * (@c sync_file_range), which overlaps the kernel's copy with the device write
+ * and measured faster than staging it for O_DIRECT -- so spilled host data can
+ * transiently occupy the page cache (clean and reclaimable once written back;
+ * durability still needs a flush).
  * Host-only reads go O_DIRECT, through the scratch when not block-aligned.  A
  * flush is an @c fdatasync.  On a platform where cuFile
  * runs only in compatibility mode (@c probe_platform().compat_only) aligned
