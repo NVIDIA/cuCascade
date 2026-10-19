@@ -1944,15 +1944,18 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
     gpu_columns.push_back(assemble_disk_column(disk_columns[i], buffers[i], stream, mr));
   }
 
-  // No host-side stream.sync() is needed here. The read future resolves only after every byte is
-  // in device memory: the uring reactor settles a device slice only once cudaEventQuery reports
-  // the event it recorded on `stream` behind that slice's H2D copies as complete, and the cuFile
-  // reactor settles a cuFileReadAsync (and its POSIX fallback's H2D copy) only once the event it
-  // recorded on `stream` behind the submission has completed. Everything assemble_disk_column
-  // enqueues (offset casts) is ordered on `stream` after that, and make_written_on() records the
-  // table's writer event on `stream` behind it, which every reader waits on before touching the
-  // data. A backend whose future resolved before its data landed would break the ioctx read
-  // contract, not this converter.
+  // No host-side stream.sync() is needed here. It rests on the ioctx read contract, not on how a
+  // particular backend implements it:
+  //  1. The read future resolves only after every byte is in device memory, on whichever stream
+  //     the backend used (uring: its H2D copies on `stream`, settled once their event completes;
+  //     cuFile: a synchronous cuFileRead, or POSIX + H2D on its own copy stream, settled after the
+  //     copy events). So the buffers are complete when read_disk_file_device() returns.
+  //  2. A backend writes the destinations only after the work enqueued on `stream` before the read
+  //     (uring copies on `stream`; cuFile waits for `stream` before it writes from elsewhere). The
+  //     destinations are stream-ordered allocations on `stream`, so this ordering is required.
+  // Everything assemble_disk_column enqueues (offset casts) is ordered on `stream` after that, and
+  // make_written_on() records the table's writer event on `stream` behind it, which every reader
+  // waits on before touching the data.
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   return gpu_table_representation::make_written_on(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);

@@ -179,8 +179,7 @@ struct disk_io_context_options {
 ## 4. Reader / writer path (cudf layer, private `src/cudf/disk_io.{hpp,cpp}`)
 
 ```cpp
-/// The space's context, adopting default_disk_io_context() if none is set; throws
-/// std::logic_error if it does not support writes (e.g. a REST context).
+/// The space's context, adopting default_disk_io_context() if none is set.
 std::shared_ptr<io::ioctx> resolve_disk_io_context(memory::memory_space const& space);
 
 /// One file, one request: open_io_object_for_write(path, {open_existing, size_hint = file size}),
@@ -203,7 +202,9 @@ void read_disk_file_host(io::ioctx&, std::string const& path, std::span<io::slic
   `io_object` of any backend sees the data once the write future resolved.
 - Reads use the cache-unaware primitives and verify `bytes == sum(slice sizes)` (the ioctx clamps to
   EOF, so a truncated file shows up as a short count -> `std::runtime_error` naming the path).
-- Device paths additionally require `supports_device_write()` (checked, `std::logic_error`).
+- Capability checks live in the helpers and throw `std::logic_error`: the write helpers require
+  `supports_write()` (host) / `supports_device_write()` (device), the device read helper
+  `supports_device_read()` (e.g. a REST context fails there, not in `resolve_disk_io_context`).
 - Priority `automatic` (= high) both ways. Later option: spill writes `low` when sharing with scans.
 - The helpers build every slice **before** submitting and submit exactly once, so nothing can throw
   between submit and wait; the wait itself is the last statement that touches the request (see 10).
@@ -225,22 +226,25 @@ void read_disk_file_host(io::ioctx&, std::string const& path, std::span<io::slic
      (`cudf::create_null_mask(num_rows, UNINITIALIZED)`, read `min(size, meta.null_mask_size)`
      bytes) and data buffer (`rmm::device_buffer` on `stream`) into a buffer tree, appending one
      `io::slice` per non-empty buffer;
-  2. one `device_readv_async_io(obj, slices, stream)` and wait — the reactor's H2D copies (uring) or
-     `cuFileReadAsync` (cufile) are enqueued on `stream`, after the stream-ordered allocations;
+  2. one `device_readv_async_io(obj, slices, stream)` and wait — the backend writes the
+     destinations only after the work enqueued on `stream` (uring copies on `stream`; cuFile waits
+     for `stream`, then reads synchronously or copies on its own stream), so after the
+     stream-ordered allocations;
   3. `assemble_disk_column(meta, buffers, stream, mr)` — the existing type dispatch (STRING with the
      INT32 -> INT64 offsets cast, LIST keeping INT32 offsets, STRUCT, DICTIONARY32, fixed width /
      fixed point), moving the buffers in.
   Then `make_written_on(table, target, stream)` as today.
-- **The trailing `stream.sync()` of DISK -> GPU**: decided by the completion guarantee of the read
-  future, not by a test. uring settles a device op only after the `cudaEventQuery` of the event it
-  recorded on `stream` behind the op's H2D copies reports `cudaSuccess`; the cufile reactor settles a
-  `cuFileReadAsync` only after the event it recorded on `stream` behind the submission completes, and
-  its POSIX fallback after its H2D copy's event. So when the future resolves, every byte is in device
-  memory and all stream work up to those events is done; the casts of phase 3 are enqueued on
-  `stream` afterwards and `make_written_on` records the writer event behind them, which every reader
-  waits on. The host-side `stream.sync()` therefore adds nothing for correctness and is dropped; this
-  reasoning goes into a code comment, and a backend that resolved its future before the data landed
-  would violate the ioctx read contract, not this converter.
+- **The trailing `stream.sync()` of DISK -> GPU**: decided by the ioctx read contract, not by a
+  test or by one backend's mechanism. (1) The read future resolves only after every byte is in
+  device memory, on whichever stream the backend used: uring settles a device op once the event it
+  recorded behind its H2D copies on `stream` completes; cuFile settles after its synchronous
+  `cuFileRead`, or after the copy events of its POSIX + H2D path on its own copy stream. (2) A
+  backend writes the destinations only after the work enqueued on `stream` before the read (uring
+  copies on `stream`; cuFile gates on `stream` first); the destinations are stream-ordered
+  allocations on `stream`, so this ordering is required, not incidental. The casts of phase 3 are
+  enqueued on `stream` afterwards and `make_written_on` records the writer event behind them, which
+  every reader waits on. The host-side `stream.sync()` therefore adds nothing and is dropped; the
+  code comment states the same contract.
 
 ## 6. Backend selection
 
