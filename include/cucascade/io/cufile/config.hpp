@@ -78,11 +78,12 @@ struct config {
   ///       @c max_direct_io_size (16 MiB) anyway.
   std::size_t max_op_bytes{64UL << 20};
 
-  /// Physical operations below this size use POSIX pread on the buffered fd
-  /// instead of cuFile.  Matches kvikIO's @c gds_threshold (env
-  /// @c KVIKIO_GDS_THRESHOLD, default 1 MiB): small reads pay more in cuFile
-  /// bookkeeping than they save in DMA.
-  std::size_t gds_threshold{1UL << 20};
+  /// Device reads below this size use POSIX pread (through the reactor's pinned
+  /// scratch) instead of cuFile.  256 KiB follows gpuio's @c gds_min_bytes: it
+  /// sits above the <= 128 KiB small-I/O regression NVIDIA documents for real GDS
+  /// on kernels >= 6.11, and in compatibility mode a 256 KiB @c cuFileRead from
+  /// four threads already reached 4 GB/s here (docs/io/gpuio-gds-practices.md).
+  std::size_t gds_threshold{256UL << 10};
 
   /// Whether the reactor opens the O_DIRECT fd needed to register with cuFile.
   /// If false, cuFile registration is skipped and every read falls back to
