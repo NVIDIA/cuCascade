@@ -229,10 +229,15 @@ generation and go to the backend; a later prefetch builds a fresh generation.
 The write front wrappers call it twice: before dispatch, and when the write settled (success or
 failure), before the returned future resolves, so a prefetch that raced the write and cached
 pre-write bytes is dropped too. The second call runs from the completing thread through
-`install_callback` and must not touch a cache that `shutdown_cache()` already destroyed: it holds
-a `std::weak_ptr` to a small cache-owned liveness token (or an equivalent shared gate the cache
-closes, waiting out an in-progress call, before it dies). Sync `host_write` simply calls it
-before and after. `flush` does not invalidate.
+`install_callback` and must not touch a cache that `shutdown_cache()` already destroyed: it is a
+`fs_cache::pending_invalidation` from `fs_cache::invalidate_later(path)`, which holds one of the
+cache's in-flight-IO slots, so the cache destructor waits for it exactly as it waits for
+in-flight prefetch IO. Sync `host_write` simply calls `invalidate` before and after. An
+invalidated generation carries an `invalidated` flag and is never handed out again, even to a
+later request for the same key while an old reader keeps it alive (a superseded generation keeps
+its old behaviour). The same two passes drop the path's entry in the ioctx's `metadata_store`
+(new `metadata_store::invalidate(path)`): a parsed footer of the old bytes is as stale as the
+chunks. `flush` does not invalidate.
 
 ### 3.8 Lifecycle
 Async writes need `start()`; before it or after `shutdown()` they resolve with
@@ -395,6 +400,9 @@ guarantees to deliver and what the reactor must guarantee back.
   bodies): ops of `dynamic_io_target(...)` bytes (multiples of the 1 MiB staging block, up to
   16 MiB) cut at granule boundaries, `staging_blocks = ceil(bytes / block)`. Head/tail: one op each.
   Flush: one op, buffered fd, no staging.
+- Host bounce: a host body whose address is not congruent with its offset (the disk tier's 8 B
+  aligned pinned blocks) is memcpy'd into staging blocks on the reactor and written O_DIRECT,
+  rather than written buffered from the caller's buffer.
 - Worker: new slot state `staging` (D2H in flight). `dispatch_pending` assigns staging blocks, then
   for a staged write starts `copy_to_host_async` on the slot's event (device) or memcpy's the host
   bytes (host bounce) and moves the slot to `staging` / straight to SQE preparation. A new
@@ -462,9 +470,11 @@ one reactor as a single flush slice; `io_op_request::finish_success` raises `siz
 `test/io/kvikio/test_kvikio_write.cpp` (cudf build, as the other kvikIO tests): host/device round
 trip, past EOF, flush, read-only rejection.
 
-`test/io/cache/` (controlled_reactor fixtures, else one case in `test/cudf/`): a write retires the
-path's generations (`generation_count` drops, a pinned reader of the retired generation stays
-valid), a prefetch that completes during the write is invalidated by the completion pass.
+`test/cudf/test_write_cache_invalidation.cpp` (generations are only built through the cudf
+datasource's fadvise, so the controlled_reactor fixtures of `test/io/cache` cannot reach them): a
+write (sync and async) retires the path's generations and its metadata entry while an open reader
+keeps its retired generation valid; a generation built between the two passes is dropped by the
+pending invalidation; an invalidated generation is never handed out again.
 
 All added to `test/CMakeLists.txt` next to their read counterparts.
 
@@ -474,10 +484,18 @@ Changed: `include/cucascade/io/{types,io_request,io_context,templated_ioctx}.hpp
 `src/io/io_context.cpp`, `include/cucascade/io/uring/{uring_reactor,types}.hpp`,
 `src/io/uring/uring_reactor.cpp`, `include/cucascade/io/kvikio/kvikio_context.hpp`,
 `src/io/kvikio/kvikio_context.cpp`, tests above, `test/CMakeLists.txt`.
-`include/cucascade/io/cache/fs_cache.hpp`, `src/io/cache/fs_cache.cpp` (`invalidate`).
+`include/cucascade/io/cache/{fs_cache,metadata_store}.hpp`, `src/io/cache/{fs_cache,metadata_store}.cpp`
+(`invalidate`, `invalidate_later`), `test/cudf/test_write_cache_invalidation.cpp`.
 Not touched: read semantics, rest, s3rdma, cufile (W2), datasource/cudf layer.
 
-## 11. Decisions (lead review)
+## 11. Measured (this machine, /tmp = root NVMe ext4, 4 GiB per run, 4 reactors)
+
+Hidden test `cucascade_io_tests "[write_bench]"` (4 KiB-aligned 256 MiB segments in one vectored
+call): device -> file 5.1 GB/s, pinned host -> file 6.2 GB/s, pinned host + 8 B (host bounce)
+5.2 GB/s; `dd oflag=direct bs=16M` reaches 5.0 GB/s on the same file system. A test checks with
+`mincore` that aligned writes leave no page in the page cache.
+
+## 12. Decisions (lead review)
 
 - Q1. `flush_async` returns `exec::semi_future<void>`; every write API returns
   `semi_future<size_t>`.
