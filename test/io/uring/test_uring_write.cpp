@@ -31,8 +31,12 @@
 
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -333,6 +337,28 @@ class stream_gate {
 
   std::atomic<bool> _open{false};
 };
+
+/**
+ * Make io_uring_setup fail with EPERM for this thread and the threads it
+ * creates from now on, as a container's default seccomp profile does.
+ */
+void block_io_uring_setup()
+{
+  auto statement = [](std::uint32_t code, std::uint32_t k) {
+    return sock_filter{static_cast<std::uint16_t>(code), 0, 0, k};
+  };
+  std::array<sock_filter, 4> filter{
+    statement(BPF_LD | BPF_W | BPF_ABS, static_cast<std::uint32_t>(offsetof(seccomp_data, nr))),
+    sock_filter{static_cast<std::uint16_t>(BPF_JMP | BPF_JEQ | BPF_K),
+                0,
+                1,
+                static_cast<std::uint32_t>(__NR_io_uring_setup)},
+    statement(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+    statement(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+  sock_fprog program{static_cast<unsigned short>(filter.size()), filter.data()};
+  REQUIRE(::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+  REQUIRE(::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == 0);
+}
 
 /** An io_object of no backend at all. */
 class foreign_object final : public io_object {
@@ -1169,4 +1195,52 @@ TEST_CASE("uring writes and truncating opens invalidate the path's metadata", "[
   auto const after = ctx->open_io_object(path.str());
   store.register_metadata(*after, metadata);
   CHECK(store.has_path(path.str()));
+}
+
+TEST_CASE("uring a reactor that cannot set up io_uring fails start and every request with why",
+          "[io][uring][write]")
+{
+  // The seccomp filter is process state, so the body runs in a child process.
+  constexpr char const* marker_name = "CUCASCADE_URING_SETUP_FAILURE_CHILD";
+  if (auto const* marker = std::getenv(marker_name);
+      marker == nullptr || std::string_view{marker} != "1") {
+    cucascade::test::child_test_runner child{
+      "uring a reactor that cannot set up io_uring fails start and every request with why",
+      {{marker_name, std::string{"1"}}}};
+    bool const completed = child.wait_for(std::chrono::seconds(120));
+    if (!completed) child.stop();
+    INFO(child.output());
+    REQUIRE(completed);
+    REQUIRE(WIFEXITED(child.status()));
+    REQUIRE(WEXITSTATUS(child.status()) == 0);
+    return;
+  }
+
+  block_io_uring_setup();
+  write_context ctx{1, cucascade::io::uring::config{}, false};
+  scratch_path path;
+  path.fill(pattern(4096, 50));
+  try {
+    ctx->start();
+    FAIL("start() succeeded without io_uring");
+  } catch (std::system_error const& error) {
+    CHECK(error.code() == std::errc::operation_not_permitted);
+  }
+
+  // Asynchronous requests fail with the setup error, not operation_canceled.
+  auto reader = ctx->open_io_object(path.str());
+  std::vector<std::uint8_t> out(4096);
+  CHECK(error_of(failure_of(ctx->host_read_async_io(*reader, 0, out.size(), out.data()))) ==
+        std::errc::operation_not_permitted);
+  auto writer      = ctx->open_io_object_for_write(path.str(), {.mode = write_mode::open_existing});
+  auto const bytes = pattern(100, 51);
+  CHECK(error_of(failure_of(ctx->host_write_async(*writer, 0, bytes.size(), bytes.data()))) ==
+        std::errc::operation_not_permitted);
+  CHECK(error_of(flush_failure_of(ctx->flush_async(*writer))) ==
+        std::errc::operation_not_permitted);
+
+  // The synchronous paths run on the caller and need no ring.
+  CHECK(ctx->host_write(*writer, 0, bytes.size(), bytes.data()) == bytes.size());
+  CHECK(ctx->host_read_io(*reader, 0, out.size(), out.data()) == out.size());
+  CHECK(std::equal(bytes.begin(), bytes.end(), out.begin()));
 }

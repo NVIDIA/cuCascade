@@ -42,7 +42,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -114,6 +116,18 @@ static_assert(max_slices_per_pass == MAX_NUM_SLOTS,
 [[nodiscard]] std::error_code canceled_error() noexcept
 {
   return std::make_error_code(std::errc::operation_canceled);
+}
+
+/// The message of @p error, for logging.
+[[nodiscard, maybe_unused]] std::string describe(std::exception_ptr const& error)
+{
+  try {
+    std::rethrow_exception(error);
+  } catch (std::exception const& e) {
+    return e.what();
+  } catch (...) {
+  }
+  return "unknown error";
 }
 
 struct ring_deleter {
@@ -739,19 +753,37 @@ void uring_reactor::start()
     throw std::runtime_error("uring_reactor: failed to allocate all staging slots");
   }
 
-  std::lock_guard lock(_enqueue_mutex);
-  try {
-    _accepting.store(true, std::memory_order_release);
-    _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(stop_token); },
-                           _stop_source.get_token());
-  } catch (...) {
-    _accepting.store(false, std::memory_order_release);
-    _bounce_storage.reset();
-    throw;
+  std::promise<void> ready;
+  auto ring_ready = ready.get_future();
+  {
+    std::lock_guard lock(_enqueue_mutex);
+    try {
+      _rejection_error = nullptr;
+      _accepting.store(true, std::memory_order_release);
+      _worker =
+        std::jthread([this, ready = std::move(ready)](
+                       std::stop_token stop_token) mutable { worker_loop(stop_token, ready); },
+                     _stop_source.get_token());
+    } catch (...) {
+      _accepting.store(false, std::memory_order_release);
+      _bounce_storage.reset();
+      throw;
+    }
   }
   if (!_tname.empty()) {
     auto const name = _tname + "_worker";
     std::ignore     = cucascade::exec::thread_util::set_thread_name(_worker, name);
+  }
+
+  // Surface a ring that cannot be set up here rather than as a stream of
+  // cancelled requests.  The failed worker has already closed admission and
+  // recorded the error for later requests; it is exiting, so join it.
+  try {
+    ring_ready.get();
+  } catch (...) {
+    _worker.join();
+    _bounce_storage.reset();
+    throw;
   }
 }
 
@@ -789,7 +821,9 @@ void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcep
   grouped_coordinator::error_type error{canceled_error()};
   {
     std::lock_guard lock(_enqueue_mutex);
-    if (_accepting.load(std::memory_order_acquire)) {
+    if (!_accepting.load(std::memory_order_acquire) && _rejection_error != nullptr) {
+      error = _rejection_error;
+    } else if (_accepting.load(std::memory_order_acquire)) {
       _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
       try {
         auto const priority = request->priority;
@@ -1014,8 +1048,9 @@ std::vector<byte_range> uring_reactor::align_and_coalesce(
   }
 }
 
-void uring_reactor::worker_loop(std::stop_token const& stop_token)
+void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<void>& ready)
 {
+  bool ring_ready    = false;
   auto cancel_queued = [&](grouped_coordinator::error_type const& error) noexcept {
     std::unique_ptr<grouped_io_request> request;
     while (_requests.try_dequeue(request)) {
@@ -1044,6 +1079,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     for (std::size_t index = 0; index < slot_count; ++index) {
       slots.emplace_back(static_cast<int>(index), fixed_supported);
     }
+    ring_ready = true;
+    ready.set_value();
 
     std::array<io_uring_cqe*, MAX_NUM_SLOTS> cqes{};
     std::vector<int> incomplete;
@@ -1688,10 +1725,15 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
     // Close admission before draining the queue.  Taking the same mutex as
     // enqueue() ensures every request that observed _accepting=true has
-    // finished publishing its queue entry before cancel_queued() runs.
+    // finished publishing its queue entry before cancel_queued() runs.  After
+    // a fatal error, later requests are rejected with it.
     {
       std::lock_guard lock(_enqueue_mutex);
       _accepting.store(false, std::memory_order_release);
+      _rejection_error = fatal_error;
+    }
+    if (fatal_error != nullptr) {
+      CUCASCADE_LOG_ERROR("uring_reactor {}: worker failed: {}", _tname, describe(fatal_error));
     }
 
     auto const cancellation = canceled_error();
@@ -1799,11 +1841,17 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     }
   } catch (...) {
     auto const error = std::current_exception();
+    CUCASCADE_LOG_ERROR("uring_reactor {}: {}: {}",
+                        _tname,
+                        ring_ready ? "worker failed" : "cannot set up its io_uring",
+                        describe(error));
     {
       std::lock_guard lock(_enqueue_mutex);
       _accepting.store(false, std::memory_order_release);
+      _rejection_error = error;
     }
     cancel_queued(error);
+    if (!ring_ready) ready.set_exception(error);
   }
 }
 
