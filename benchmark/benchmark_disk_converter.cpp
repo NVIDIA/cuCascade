@@ -16,6 +16,7 @@
  */
 
 #include "cucascade/cudf/builtin_converters.hpp"
+#include "cucascade/cudf/disk_io_context.hpp"
 #include "cucascade/cudf/gpu_data_representation.hpp"
 #include "cucascade/cudf/host_data_representation.hpp"
 #include "cucascade/data/disk_data_representation.hpp"
@@ -24,6 +25,7 @@
 #include "cucascade/memory/memory_reservation_manager.hpp"
 
 #include <cucascade/error.hpp>
+#include <cucascade/io/io_context.hpp>
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -38,6 +40,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -120,6 +123,17 @@ std::unique_ptr<representation_converter_registry> make_benchmark_registry()
 // cudaHostRegister
 constexpr int hostDevId = -1;
 
+/// DISK memory space ids; every disk benchmark takes one as its last argument.
+constexpr int DEFAULT_DISK_ID = 0;  ///< default io context (uring on hosts without GDS)
+constexpr int CUFILE_DISK_ID  = 1;  ///< forced cuFile io context
+
+/// Directory the DISK spaces create their files in: $CUCASCADE_BENCH_DISK_DIR, else /tmp.
+std::string benchmark_disk_dir()
+{
+  char const* dir = std::getenv("CUCASCADE_BENCH_DISK_DIR");
+  return dir != nullptr && *dir != '\0' ? std::string{dir} : std::string{"/tmp"};
+}
+
 // Global shared memory manager - managed via setup/teardown functions
 static std::shared_ptr<memory_reservation_manager> g_shared_memory_manager;
 
@@ -149,11 +163,20 @@ std::vector<memory_space_config> create_benchmark_configs()
   host_config.initial_number_pools = 16;
   configs.emplace_back(host_config);
 
-  disk_memory_space_config disk_config;
-  disk_config.disk_id         = 0;
-  disk_config.memory_capacity = 32 * GiB;
-  disk_config.mount_paths     = "/tmp";
-  configs.emplace_back(disk_config);
+  // DISK 0: no io context -> adopts the process-shared default (cuFile with real GDS, else uring).
+  disk_memory_space_config default_disk;
+  default_disk.disk_id         = DEFAULT_DISK_ID;
+  default_disk.memory_capacity = 32 * GiB;
+  default_disk.mount_paths     = benchmark_disk_dir();
+  configs.emplace_back(default_disk);
+
+  // DISK 1: cuFile forced (GDS when available, cuFile compatibility mode otherwise).
+  disk_memory_space_config cufile_disk = default_disk;
+  cufile_disk.disk_id                  = CUFILE_DISK_ID;
+  disk_io_context_options cufile_options;
+  cufile_options.backend = disk_io_backend::cufile;
+  cufile_disk.io_context = make_disk_io_context(cufile_options);
+  configs.emplace_back(cufile_disk);
 
   return configs;
 }
@@ -174,6 +197,11 @@ void DoSetup([[maybe_unused]] const benchmark::State& state)
   if (!g_shared_memory_manager) {
     g_shared_memory_manager =
       std::make_shared<memory_reservation_manager>(create_benchmark_configs());
+    // Release the manager -- and with it the disk spaces' io contexts, their reactor threads and
+    // pinned staging -- at exit before the CUDA runtime and the cuFile driver, which were
+    // initialized above and so register their own teardown earlier (exit handlers run in
+    // reverse order). Left to the namespace-scope shared_ptr's destructor, it would run last.
+    std::atexit([] { g_shared_memory_manager.reset(); });
   }
 }
 
@@ -188,6 +216,27 @@ void DoSetup([[maybe_unused]] const benchmark::State& state)
 void DoTeardown([[maybe_unused]] const benchmark::State& state)
 {
   // no-op: manager persists across benchmark functions
+}
+
+/**
+ * @brief The DISK space named by the benchmark's third argument (state.range(2)), or null
+ *        (benchmark skipped) when its io context cannot write what the benchmark needs.
+ *
+ * @param device Whether the benchmark writes device memory (GPU -> DISK) or host memory.
+ */
+const memory_space* disk_space_for(benchmark::State& state, bool device)
+{
+  auto const disk_id = static_cast<int>(state.range(2));
+  auto* space        = get_shared_memory_manager()->get_memory_space(Tier::DISK, disk_id);
+  auto context       = space->get_io_context();
+  if (!context) { context = default_disk_io_context(); }
+  if (device ? !context->supports_device_write() : !context->supports_write()) {
+    state.SkipWithMessage("the io context of DISK " + std::to_string(disk_id) + " cannot write " +
+                          (device ? "device" : "host") + " memory");
+    return nullptr;
+  }
+  state.counters["disk"] = static_cast<double>(disk_id);
+  return space;
 }
 
 /**
@@ -424,7 +473,8 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
   auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, true);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -446,7 +496,6 @@ void BM_ConvertGpuToDisk(benchmark::State& state)
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
-    // No cache eviction needed — pipeline uses O_DIRECT
     auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
@@ -476,7 +525,8 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
   auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, true);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -491,7 +541,7 @@ void BM_ConvertDiskToGpu(benchmark::State& state)
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
-    // No cache eviction needed — pipeline uses O_DIRECT
+    drop_os_cache(disk_rep->get_disk_table().file_path);
     auto gpu_result = registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream);
     stream.synchronize();
   }
@@ -522,7 +572,8 @@ void BM_ConvertHostToDisk(benchmark::State& state)
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, false);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -537,7 +588,6 @@ void BM_ConvertHostToDisk(benchmark::State& state)
   size_t bytes_transferred = host_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
-    // No cache eviction needed — pipeline uses O_DIRECT
     auto disk_result = registry->convert<disk_data_representation>(*host_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
@@ -569,7 +619,8 @@ void BM_ConvertDiskToHost(benchmark::State& state)
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
   const memory_space* host_space = mgr->get_memory_space(Tier::HOST, hostDevId);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, false);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -587,7 +638,7 @@ void BM_ConvertDiskToHost(benchmark::State& state)
   size_t bytes_transferred = disk_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
-    // No cache eviction needed — pipeline uses O_DIRECT
+    drop_os_cache(disk_rep->get_disk_table().file_path);
     auto host_result = registry->convert<host_data_representation>(*disk_rep, host_space, stream);
     stream.synchronize();
   }
@@ -620,7 +671,8 @@ void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
   auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, true);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -631,7 +683,6 @@ void BM_ConvertGpuToDiskStringColumns(benchmark::State& state)
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
-    // No cache eviction needed — pipeline uses O_DIRECT
     auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
@@ -661,7 +712,8 @@ void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
   auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, true);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -672,7 +724,6 @@ void BM_ConvertGpuToDiskListColumns(benchmark::State& state)
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
-    // No cache eviction needed — pipeline uses O_DIRECT
     auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
@@ -702,7 +753,8 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
   auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, true);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -713,7 +765,6 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
   size_t bytes_transferred = gpu_rep->get_size_in_bytes();
 
   for ([[maybe_unused]] auto _ : state) {
-    // No cache eviction needed — pipeline uses O_DIRECT
     auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
     stream.synchronize();
     drop_os_cache(disk_result->get_disk_table().file_path);
@@ -735,20 +786,16 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 BENCHMARK(BM_ConvertGpuToDisk)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->Args({1 * MiB, 4})
-  ->Args({64 * MiB, 4})
-  ->Args({512 * MiB, 4})
-  ->Args({4 * GiB, 4})
+  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 BENCHMARK(BM_ConvertDiskToGpu)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->Args({1 * MiB, 4})
-  ->Args({64 * MiB, 4})
-  ->Args({512 * MiB, 4})
-  ->Args({4 * GiB, 4})
+  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
@@ -756,20 +803,16 @@ BENCHMARK(BM_ConvertDiskToGpu)
 BENCHMARK(BM_ConvertHostToDisk)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->Args({1 * MiB, 4})
-  ->Args({64 * MiB, 4})
-  ->Args({512 * MiB, 4})
-  ->Args({4 * GiB, 4})
+  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 BENCHMARK(BM_ConvertDiskToHost)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->Args({1 * MiB, 4})
-  ->Args({64 * MiB, 4})
-  ->Args({512 * MiB, 4})
-  ->Args({4 * GiB, 4})
+  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
@@ -777,86 +820,34 @@ BENCHMARK(BM_ConvertDiskToHost)
 BENCHMARK(BM_ConvertGpuToDiskStringColumns)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->Args({64 * MiB, 2})
-  ->Args({64 * MiB, 4})
-  ->Args({64 * MiB, 8})
+  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 BENCHMARK(BM_ConvertGpuToDiskListColumns)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->Args({64 * MiB, 2})
-  ->Args({64 * MiB, 4})
-  ->Args({64 * MiB, 8})
+  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 BENCHMARK(BM_ConvertGpuToDiskStructColumns)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->Args({64 * MiB, 2})
-  ->Args({64 * MiB, 4})
-  ->Args({64 * MiB, 8})
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
-
-// BENCH-03: Pipeline backend (double-buffered pinned host)
-void BM_ConvertGpuToDiskPipeline(benchmark::State& state)
-{
-  int64_t total_bytes = state.range(0);
-  if (skip_if_oom(state, total_bytes)) return;
-  int num_columns = static_cast<int>(state.range(1));
-
-  auto mgr = get_shared_memory_manager();
-
-  auto registry = std::make_unique<representation_converter_registry>();
-  register_builtin_converters(*registry);
-
-  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
-
-  rmm::cuda_stream stream;
-
-  auto table   = create_benchmark_table_from_bytes(total_bytes, num_columns);
-  auto gpu_rep = std::make_unique<gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), *const_cast<memory_space*>(gpu_space), stream);
-
-  size_t bytes_transferred = gpu_rep->get_size_in_bytes();
-
-  for ([[maybe_unused]] auto _ : state) {
-    // No cache eviction needed — pipeline uses O_DIRECT
-    auto disk_result = registry->convert<disk_data_representation>(*gpu_rep, disk_space, stream);
-    stream.synchronize();
-    drop_os_cache(disk_result->get_disk_table().file_path);
-  }
-
-  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
-                          static_cast<int64_t>(bytes_transferred));
-  state.counters["columns"]          = static_cast<double>(num_columns);
-  state.counters["bytes"]            = static_cast<double>(bytes_transferred);
-  state.counters["gdsio_write_GiBs"] = GDSIO_WRITE_GIBS;
-  state.counters["gdsio_read_GiBs"]  = GDSIO_READ_GIBS;
-  state.counters["backend"]          = 2;  // 2 = Pipeline
-}
-
-BENCHMARK(BM_ConvertGpuToDiskPipeline)
-  ->Setup(DoSetup)
-  ->Teardown(DoTeardown)
-  ->Args({1 * MiB, 4})
-  ->Args({64 * MiB, 4})
-  ->Args({512 * MiB, 4})
-  ->Args({4 * GiB, 4})
+  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
 
 // =============================================================================
-// BENCH-04: Read benchmark (Disk -> GPU) using Pipeline backend
+// BENCH-05 helpers
 // =============================================================================
 
 /**
- * @brief Helper: write a GPU table to disk using the pipeline backend,
- *        returning the disk representation for read benchmarks.
+ * @brief Helper: write a GPU table to a disk space, returning the disk representation for read
+ *        benchmarks.
  */
 std::unique_ptr<disk_data_representation> write_table_to_disk(cudf::table&& table,
                                                               const memory_space* gpu_space,
@@ -872,51 +863,6 @@ std::unique_ptr<disk_data_representation> write_table_to_disk(cudf::table&& tabl
   return disk_rep;
 }
 
-void BM_ConvertDiskToGpuPipeline(benchmark::State& state)
-{
-  int64_t total_bytes = state.range(0);
-  if (skip_if_oom(state, total_bytes)) return;
-  int num_columns = static_cast<int>(state.range(1));
-
-  auto mgr = get_shared_memory_manager();
-
-  const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
-
-  rmm::cuda_stream stream;
-
-  auto disk_rep = write_table_to_disk(
-    create_benchmark_table_from_bytes(total_bytes, num_columns), gpu_space, disk_space, stream);
-
-  auto registry = make_benchmark_registry();
-
-  size_t bytes_transferred = disk_rep->get_size_in_bytes();
-  const auto& disk_file    = disk_rep->get_disk_table().file_path;
-
-  for ([[maybe_unused]] auto _ : state) {
-    drop_os_cache(disk_file);
-    auto gpu_result = registry->convert<gpu_table_representation>(*disk_rep, gpu_space, stream);
-    stream.synchronize();
-  }
-
-  state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
-                          static_cast<int64_t>(bytes_transferred));
-  state.counters["columns"]          = static_cast<double>(num_columns);
-  state.counters["bytes"]            = static_cast<double>(bytes_transferred);
-  state.counters["gdsio_write_GiBs"] = GDSIO_WRITE_GIBS;
-  state.counters["gdsio_read_GiBs"]  = GDSIO_READ_GIBS;
-}
-
-BENCHMARK(BM_ConvertDiskToGpuPipeline)
-  ->Setup(DoSetup)
-  ->Teardown(DoTeardown)
-  ->Args({1 * MiB, 4})
-  ->Args({64 * MiB, 4})
-  ->Args({512 * MiB, 4})
-  ->Args({4 * GiB, 4})
-  ->Unit(benchmark::kMillisecond)
-  ->UseRealTime();
-
 // =============================================================================
 // BENCH-05: Column type sweep — write + read benchmarks (64 MiB)
 // =============================================================================
@@ -925,7 +871,7 @@ BENCHMARK(BM_ConvertDiskToGpuPipeline)
  * @brief Helper: write benchmark for a given table creation function.
  */
 template <typename TableFactory>
-void pipeline_write_benchmark(benchmark::State& state, TableFactory table_factory)
+void disk_write_benchmark(benchmark::State& state, TableFactory table_factory)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
@@ -936,7 +882,8 @@ void pipeline_write_benchmark(benchmark::State& state, TableFactory table_factor
   auto registry = make_benchmark_registry();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, true);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -964,7 +911,7 @@ void pipeline_write_benchmark(benchmark::State& state, TableFactory table_factor
  * @brief Helper: read benchmark for a given table creation function.
  */
 template <typename TableFactory>
-void pipeline_read_benchmark(benchmark::State& state, TableFactory table_factory)
+void disk_read_benchmark(benchmark::State& state, TableFactory table_factory)
 {
   int64_t total_bytes = state.range(0);
   if (skip_if_oom(state, total_bytes)) return;
@@ -973,7 +920,8 @@ void pipeline_read_benchmark(benchmark::State& state, TableFactory table_factory
   auto mgr = get_shared_memory_manager();
 
   const memory_space* gpu_space  = mgr->get_memory_space(Tier::GPU, 0);
-  const memory_space* disk_space = mgr->get_memory_space(Tier::DISK, 0);
+  const memory_space* disk_space = disk_space_for(state, true);
+  if (disk_space == nullptr) return;
 
   rmm::cuda_stream stream;
 
@@ -1000,65 +948,46 @@ void pipeline_read_benchmark(benchmark::State& state, TableFactory table_factory
 }
 
 // --- Numeric write/read ---
-void BM_WriteNumericPipeline(benchmark::State& s)
+void BM_WriteNumeric(benchmark::State& s)
 {
-  pipeline_write_benchmark(s, create_benchmark_table_from_bytes);
+  disk_write_benchmark(s, create_benchmark_table_from_bytes);
 }
-void BM_ReadNumericPipeline(benchmark::State& s)
+void BM_ReadNumeric(benchmark::State& s)
 {
-  pipeline_read_benchmark(s, create_benchmark_table_from_bytes);
+  disk_read_benchmark(s, create_benchmark_table_from_bytes);
 }
 
 // --- String write/read ---
-void BM_WriteStringPipeline(benchmark::State& s)
-{
-  pipeline_write_benchmark(s, create_string_benchmark_table);
-}
-void BM_ReadStringPipeline(benchmark::State& s)
-{
-  pipeline_read_benchmark(s, create_string_benchmark_table);
-}
+void BM_WriteString(benchmark::State& s) { disk_write_benchmark(s, create_string_benchmark_table); }
+void BM_ReadString(benchmark::State& s) { disk_read_benchmark(s, create_string_benchmark_table); }
 
 // --- List write/read ---
-void BM_WriteListPipeline(benchmark::State& s)
-{
-  pipeline_write_benchmark(s, create_list_benchmark_table);
-}
-void BM_ReadListPipeline(benchmark::State& s)
-{
-  pipeline_read_benchmark(s, create_list_benchmark_table);
-}
+void BM_WriteList(benchmark::State& s) { disk_write_benchmark(s, create_list_benchmark_table); }
+void BM_ReadList(benchmark::State& s) { disk_read_benchmark(s, create_list_benchmark_table); }
 
 // --- Struct write/read ---
-void BM_WriteStructPipeline(benchmark::State& s)
-{
-  pipeline_write_benchmark(s, create_struct_benchmark_table);
-}
-void BM_ReadStructPipeline(benchmark::State& s)
-{
-  pipeline_read_benchmark(s, create_struct_benchmark_table);
-}
+void BM_WriteStruct(benchmark::State& s) { disk_write_benchmark(s, create_struct_benchmark_table); }
+void BM_ReadStruct(benchmark::State& s) { disk_read_benchmark(s, create_struct_benchmark_table); }
 
 // Size sweep args for type comparison
-#define DISK_BACKEND_ARGS           \
-  ->Setup(DoSetup)                  \
-    ->Teardown(DoTeardown)          \
-    ->Args({64 * MiB, 4})           \
-    ->Args({512 * MiB, 4})          \
-    ->Args({4 * GiB, 4})            \
-    ->Unit(benchmark::kMillisecond) \
+#define DISK_BACKEND_ARGS                                                                   \
+  ->Setup(DoSetup)                                                                          \
+    ->Teardown(DoTeardown)                                                                  \
+    ->ArgsProduct({{64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}}) \
+    ->ArgNames({"bytes", "columns", "disk"})                                                \
+    ->Unit(benchmark::kMillisecond)                                                         \
     ->UseRealTime()
 
-BENCHMARK(BM_WriteNumericPipeline) DISK_BACKEND_ARGS;
-BENCHMARK(BM_ReadNumericPipeline) DISK_BACKEND_ARGS;
+BENCHMARK(BM_WriteNumeric) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadNumeric) DISK_BACKEND_ARGS;
 
-BENCHMARK(BM_WriteStringPipeline) DISK_BACKEND_ARGS;
-BENCHMARK(BM_ReadStringPipeline) DISK_BACKEND_ARGS;
+BENCHMARK(BM_WriteString) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadString) DISK_BACKEND_ARGS;
 
-BENCHMARK(BM_WriteListPipeline) DISK_BACKEND_ARGS;
-BENCHMARK(BM_ReadListPipeline) DISK_BACKEND_ARGS;
+BENCHMARK(BM_WriteList) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadList) DISK_BACKEND_ARGS;
 
-BENCHMARK(BM_WriteStructPipeline) DISK_BACKEND_ARGS;
-BENCHMARK(BM_ReadStructPipeline) DISK_BACKEND_ARGS;
+BENCHMARK(BM_WriteStruct) DISK_BACKEND_ARGS;
+BENCHMARK(BM_ReadStruct) DISK_BACKEND_ARGS;
 
 }  // namespace
