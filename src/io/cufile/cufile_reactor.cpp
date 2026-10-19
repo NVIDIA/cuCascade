@@ -126,29 +126,81 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
   }
 }
 
-/**
- * @brief The lock that serializes @c cuFileReadAsync submissions onto @p stream.
- *
- * libcufile keeps per-stream bookkeeping that assumes operations are registered in
- * the order they are queued on the stream.  Two threads calling @c cuFileReadAsync on
- * the same stream at once break that, and libcufile then aborts the process from an
- * assertion (@c cufile_async.h, @c CUfileStream_s::putStreamOp).  One multi-slice
- * device read hits exactly this: its slices share the caller's stream and
- * @c templated_ioctx fans them out across reactor threads.  Submissions to one stream
- * must therefore be serialized, across every reactor and ioctx in the process.
- *
- * A fixed table of mutexes indexed by stream handle keeps unrelated streams from
- * contending, and bounds the memory a per-stream map would grow without limit.  Two
- * streams that collide on a slot merely share a lock.
- */
-[[nodiscard]] std::mutex& stream_submit_mutex(cudaStream_t stream) noexcept
+/// Round @p value down to a multiple of @c IO_BLOCK_SIZE (a power of two).
+[[nodiscard]] constexpr std::size_t align_down_block(std::size_t value) noexcept
 {
-  constexpr std::size_t slots = 64;
-  static std::array<std::mutex, slots> mutexes;
-  // Stream handles are aligned pointers, so drop the always-zero low bits first.
-  auto const key = reinterpret_cast<std::uintptr_t>(stream) >> 4;
-  return mutexes[key % slots];
+  return value & ~(IO_BLOCK_SIZE - 1);
 }
+
+/**
+ * @brief Length of the next @c cuFileRead of a device slice.
+ *
+ * The piece starting at @p pos ends at @p end, or earlier: a piece longer than
+ * @p max_op stops at the last 4 KiB file boundary within it (so every piece after
+ * the first starts aligned), and a piece reaching an unaligned end of file stops
+ * at @c align_down(file_size) so the aligned body stays eligible for direct DMA
+ * and the sub-block tail is read on its own (the gpuio EOF rule).
+ *
+ * @pre pos < end <= file_size, max_op >= IO_BLOCK_SIZE.
+ */
+[[nodiscard]] std::size_t next_piece(std::size_t pos,
+                                     std::size_t end,
+                                     std::size_t file_size,
+                                     std::size_t max_op) noexcept
+{
+  auto stop = end;
+  if (stop - pos > max_op) {
+    auto const aligned = align_down_block(pos + max_op);
+    stop               = aligned > pos ? aligned : pos + max_op;
+  }
+  auto const tail_start = align_down_block(file_size);
+  if (stop == file_size && tail_start > pos && tail_start < stop) { stop = tail_start; }
+  return stop - pos;
+}
+
+/// Human-readable cause of a failed synchronous cuFile call: @c -1 carries the
+/// cause in @c errno (a POSIX errno or a cuFile code above 5000); a value below
+/// @c -1 is a negated @c CUfileOpError.
+[[nodiscard]] std::string describe_cufile_failure(ssize_t result, int saved_errno)
+{
+  auto const code = result == -1 ? saved_errno : static_cast<int>(-result);
+  if (code > CUFILEOP_BASE_ERR) {
+    return std::string{cufileop_status_error(static_cast<CUfileOpError>(code))} + " (" +
+           std::to_string(code) + ")";
+  }
+  return std::string{std::strerror(code)} + " (errno " + std::to_string(code) + ")";
+}
+
+/**
+ * @brief Block until the work queued on @p stream before this call has finished.
+ *
+ * A synchronous cuFile read is not ordered on any stream, so it must not start
+ * while earlier work on the caller's stream (a stream-ordered allocation, a
+ * kernel still reading the buffer) may touch the destination.  An idle stream
+ * costs one query; otherwise an event recorded now is waited on, which leaves
+ * work queued after this call free to run concurrently.
+ */
+[[nodiscard]] cudaError_t wait_for_queued_work(cudaStream_t stream) noexcept
+{
+  auto const state = cudaStreamQuery(stream);
+  if (state != cudaErrorNotReady) {
+    if (state != cudaSuccess) std::ignore = cudaGetLastError();
+    return state;
+  }
+  std::ignore    = cudaGetLastError();
+  cudaEvent_t ev = nullptr;
+  if (auto const status = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+      status != cudaSuccess) {
+    return status;
+  }
+  auto status = cudaEventRecord(ev, stream);
+  if (status == cudaSuccess) status = cudaEventSynchronize(ev);
+  std::ignore = cudaEventDestroy(ev);
+  return status;
+}
+
+/// Short reads tolerated in a row before a device slice is declared failed.
+constexpr int max_short_reads = 64;
 
 /// Open the process-wide cuFile driver once.  A failure is not fatal here: the
 /// handle registration that follows reports it, and in AUTO mode the reactor
@@ -309,10 +361,11 @@ cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string
   if (_config.max_inflight == 0) {
     throw std::invalid_argument("cufile_reactor: max_inflight must be non-zero");
   }
-  // Sized once so a record can always be appended after a cuFile submission is
-  // already on the stream: a throwing push_back there would free the argument
-  // block the stream still points at.
-  _inflight_cufile.reserve(_config.max_inflight);
+  if (_config.max_op_bytes < IO_BLOCK_SIZE) {
+    throw std::invalid_argument("cufile_reactor: max_op_bytes must be at least IO_BLOCK_SIZE");
+  }
+  // Sized once so a record can always be appended after a copy is already on the
+  // stream: a throwing push_back there would free the event the stream records.
   _inflight_copy.reserve(_config.max_inflight);
 }
 
@@ -547,8 +600,7 @@ void cufile_reactor::dispatch_slice(
     // cuFile's bookkeeping, of a file that registered with cuFile.
     bool const device_only = slice.has_device_request() && !slice.has_host_request();
     if (file->cufile_registered() && device_only && clamped >= _config.gds_threshold) {
-      auto const result = submit_cufile(*file, slice, request);
-      if (result != submit_result::fallback) return;
+      if (read_cufile(*file, slice, request)) return;
     }
     dispatch_posix(*file, slice, std::move(request));
   } catch (...) {
@@ -562,56 +614,56 @@ void cufile_reactor::dispatch_slice(
   }
 }
 
-cufile_reactor::submit_result cufile_reactor::submit_cufile(cufile_io_object const& file,
-                                                            prepared_io_slice const& slice,
-                                                            std::unique_ptr<io_op_request>& request)
+bool cufile_reactor::read_cufile(cufile_io_object const& file,
+                                 prepared_io_slice const& slice,
+                                 std::unique_ptr<io_op_request>& request)
 {
   auto& api = kvikio::cuFileAPI::instance();
-  // The stream API needs cuFile 1.5+; an older library leaves the symbol unset.
-  if (api.ReadAsync == nullptr) return submit_result::fallback;
+  if (api.Read == nullptr) return false;
 
   int device_id = slice.d_buffer.device_id;
   if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
 
-  auto args           = std::make_unique<cufile_stream_args>();
-  args->size          = request->io_rng.size;
-  args->file_offset   = static_cast<off_t>(request->io_rng.offset);
-  args->devPtr_offset = 0;  // The destination is unregistered, so cuFile requires 0.
-  args->bytes_done    = 0;
-
-  cucascade::cuda::cuda_event event{cudaEventDisableTiming};
-  auto const stream = slice.d_buffer.stream;
-
-  CUfileError_t status;
-  {
-    std::lock_guard lock(stream_submit_mutex(stream.get()));
-    status = api.ReadAsync(file.cufile_handle(),
-                           slice.d_buffer.data,
-                           &args->size,
-                           &args->file_offset,
-                           &args->devPtr_offset,
-                           &args->bytes_done,
-                           stream.get());
-  }
-  if (status.err != CU_FILE_SUCCESS) {
-    CUCASCADE_LOG_WARN("cufile_reactor: cuFileReadAsync submit failed (err={}); using POSIX",
-                       static_cast<int>(status.err));
-    return submit_result::fallback;
+  if (auto const status = wait_for_queued_work(slice.d_buffer.stream.get());
+      status != cudaSuccess) {
+    request->finish_error(status);
+    return true;
   }
 
-  // From here cuFile holds pointers into `args` on the stream.  The record must
-  // be kept (or the stream drained) before `args` is released.
-  if (auto const recorded = cudaEventRecord(event.get(), stream.get()); recorded != cudaSuccess) {
-    std::ignore = cudaStreamSynchronize(stream.get());
-    request->finish_error(recorded);
-    return submit_result::failed;
+  auto const offset = request->io_rng.offset;
+  auto const end    = offset + request->io_rng.size;
+  auto* const dst   = slice.d_buffer.data;
+  auto pos          = offset;
+  int short_reads   = 0;
+  while (pos < end) {
+    auto const want = next_piece(pos, end, file.size(), _config.max_op_bytes);
+    errno           = 0;
+    auto const got =
+      api.Read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
+    if (got < 0) {
+      auto const saved_errno = errno;
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true, std::memory_order_relaxed)) {
+        CUCASCADE_LOG_WARN(
+          "cufile_reactor: cuFileRead of '{}' failed: {}; serving such reads through POSIX "
+          "(logged once)",
+          file.object_path(),
+          describe_cufile_failure(got, saved_errno));
+      }
+      return false;
+    }
+    // The range was clamped to the size recorded at open, so nothing read here is
+    // a sign that the file shrank underneath us.
+    if (got == 0 || ++short_reads > max_short_reads) {
+      request->finish_error(std::make_error_code(std::errc::io_error));
+      return true;
+    }
+    if (static_cast<std::size_t>(got) == want) short_reads = 0;
+    pos += static_cast<std::size_t>(got);
   }
-
-  auto const expected = request->io_rng.size;
-  _inflight_cufile.push_back(
-    inflight_cufile{std::move(request), std::move(args), std::move(event), expected});
-  return submit_result::submitted;
+  request->finish_success();
+  return true;
 }
 
 void cufile_reactor::dispatch_posix(cufile_io_object const& file,
@@ -681,33 +733,6 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
 
 void cufile_reactor::poll_completions() noexcept
 {
-  // cuFile submissions.  The event was recorded on the stream right after the
-  // read, so once it fires cuFile's bytes_done out-pointer is final.
-  auto cufile_out = _inflight_cufile.begin();
-  for (auto it = _inflight_cufile.begin(); it != _inflight_cufile.end(); ++it) {
-    auto const status = cudaEventQuery(it->event.get());
-    if (status == cudaErrorNotReady) {
-      if (cufile_out != it) *cufile_out = std::move(*it);
-      ++cufile_out;
-      continue;
-    }
-    if (status != cudaSuccess) {
-      it->request->finish_error(status);
-    } else if (it->args->bytes_done < 0) {
-      CUCASCADE_LOG_ERROR("cufile_reactor: cuFileReadAsync reported bytes_done={}",
-                          static_cast<long long>(it->args->bytes_done));
-      it->request->finish_error(std::make_error_code(std::errc::io_error));
-    } else if (static_cast<std::size_t>(it->args->bytes_done) < it->expected_bytes) {
-      CUCASCADE_LOG_ERROR("cufile_reactor: short cuFile read: expected {} got {}",
-                          it->expected_bytes,
-                          static_cast<long long>(it->args->bytes_done));
-      it->request->finish_error(std::make_error_code(std::errc::io_error));
-    } else {
-      it->request->finish_success();
-    }
-  }
-  _inflight_cufile.erase(cufile_out, _inflight_cufile.end());
-
   // Host-to-device copies of POSIX-fallback reads.
   auto copy_out = _inflight_copy.begin();
   for (auto it = _inflight_copy.begin(); it != _inflight_copy.end(); ++it) {
@@ -728,13 +753,6 @@ void cufile_reactor::poll_completions() noexcept
 
 void cufile_reactor::drain_inflight(grouped_coordinator::error_type const& terminal_error) noexcept
 {
-  for (auto& record : _inflight_cufile) {
-    // Wait for the stream before releasing the argument block it points into.
-    std::ignore = record.event.synchronize_no_throw();
-    record.request->finish_error(terminal_error);
-  }
-  _inflight_cufile.clear();
-
   for (auto& record : _inflight_copy) {
     std::ignore = record.event.synchronize_no_throw();
     record.request->finish_error(terminal_error, /*host_data_valid=*/true);
@@ -781,8 +799,8 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
       }
       scheduler.preempt_low();
 
-      // One pass dispatches at most a quantum of slices.  A POSIX read completes
-      // inside dispatch_slice, so the in-flight window alone never ends the pass;
+      // One pass dispatches at most a quantum of slices.  A cuFile or POSIX read
+      // completes inside dispatch_slice, so the in-flight window alone never ends the pass;
       // without this cap a many-slice low request could not be parked for a high
       // one until its last slice.
       for (std::size_t dispatched = 0;
