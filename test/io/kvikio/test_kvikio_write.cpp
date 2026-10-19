@@ -167,3 +167,48 @@ TEST_CASE("kvikio_context rejects writes to read-only and object-store objects",
     CHECK(error.code() == std::errc::file_exists);
   }
 }
+
+TEST_CASE("kvikio_context device writes observe the work queued on their stream", "[kvikio][write]")
+{
+  kvikio_context ctx;
+  scratch_path path;
+  auto object = ctx.open_io_object_for_write(path.str());
+
+  constexpr std::size_t bytes = (8UL << 20) + 3;
+  void* device                = nullptr;
+  REQUIRE(cudaMalloc(&device, bytes) == cudaSuccess);
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+  // Queue the producer, then the write, without synchronizing in between.
+  REQUIRE(cudaMemsetAsync(device, 0x11, bytes, stream) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(device, 0xCD, bytes, stream) == cudaSuccess);
+  CHECK(ctx
+          .device_write_async(
+            *object, 0, bytes, static_cast<std::uint8_t const*>(device), ::cuda::stream_ref{stream})
+          .get() == bytes);
+
+  auto const contents = path.contents();
+  REQUIRE(contents.size() == bytes);
+  CHECK(std::all_of(contents.begin(), contents.end(), [](std::uint8_t b) { return b == 0xCD; }));
+  std::ignore = cudaStreamDestroy(stream);
+  std::ignore = cudaFree(device);
+}
+
+TEST_CASE("kvikio_context open honours size hints and reports open errors", "[kvikio][write]")
+{
+  kvikio_context ctx;
+  scratch_path path;
+  {
+    auto object = ctx.open_io_object_for_write(path.str(), {.size_hint = 1UL << 20});
+    CHECK(object->size() == 0);
+  }
+  CHECK(std::filesystem::file_size(path.str()) == 0);
+  try {
+    std::ignore =
+      ctx.open_io_object_for_write(path.str() + ".missing/x", {.mode = write_mode::create_new});
+    FAIL("created a file under a missing directory");
+  } catch (std::system_error const& error) {
+    CHECK(error.code() == std::errc::no_such_file_or_directory);
+  }
+  CHECK_FALSE(std::filesystem::exists(path.str() + ".missing"));
+}

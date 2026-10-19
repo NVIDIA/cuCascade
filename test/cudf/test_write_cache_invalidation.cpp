@@ -39,6 +39,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -170,7 +171,9 @@ TEST_CASE("a pending invalidation drops a generation built while the write ran",
 
   // What the write front end does: one pass before the write starts, and one
   // held until the write settles.  A prefetch that raced the write builds a
-  // generation in between; firing the pending pass drops it.
+  // generation in between; firing the pending pass drops it.  The race is
+  // simulated with the cache calls the front end makes, not with a real write
+  // racing a real prefetch.
   cache.invalidate(fixture.path);
   auto pending = cache.invalidate_later(fixture.path);
   REQUIRE(pending);
@@ -190,4 +193,25 @@ TEST_CASE("a pending invalidation drops a generation built while the write ran",
   racing.reset();
   CHECK(wait_for_cache([&] { return cache.generation_count(fixture.path) == 1; }, 5s));
   CHECK(cache.retired_generation_count() == 0);
+}
+
+TEST_CASE("shutting the cache down waits for a pending invalidation", "[cache][write][uring]")
+{
+  write_cache_fixture fixture;
+  auto pending = fixture.context->cache()->invalidate_later(fixture.path);
+  REQUIRE(pending);
+
+  // A pending invalidation stands for a write still in flight: the cache must
+  // outlive it, so its destructor waits until it fires.
+  std::atomic<bool> closed{false};
+  std::thread closer([&] {
+    fixture.context->shutdown_cache();
+    closed.store(true);
+  });
+  std::this_thread::sleep_for(200ms);
+  CHECK_FALSE(closed.load());
+  pending.fire();
+  closer.join();
+  CHECK(closed.load());
+  CHECK(fixture.context->cache() == nullptr);
 }
