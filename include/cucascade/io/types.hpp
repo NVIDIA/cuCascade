@@ -44,7 +44,12 @@
 
 namespace cucascade::io::cache {
 struct cached_chunk;
-}
+class metadata_store;
+}  // namespace cucascade::io::cache
+
+namespace cucascade::io {
+class ioctx;
+}  // namespace cucascade::io
 
 namespace cucascade::io {
 
@@ -140,6 +145,15 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// Called by @c io_op_request::finish_success for write operations; a no-op
   /// for read-only objects.
   virtual void note_written(std::size_t /*end*/) const noexcept {}
+
+ private:
+  friend class ioctx;
+  friend class cache::metadata_store;
+
+  /// The metadata store's invalidation epoch of this object's path when an
+  /// ioctx opened it (see @c cache::metadata_store::register_metadata): metadata
+  /// parsed through an object opened before a write of its path is dropped.
+  std::uint64_t _metadata_epoch{0};
 };
 
 /// Whether a backend opened an @c io_object for reading only or for reading and

@@ -18,6 +18,8 @@
 
 #include <cucascade/io/cache/metadata_store.hpp>
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string_view>
 #include <utility>
@@ -31,6 +33,9 @@ void metadata_store::register_metadata(io_object const& obj,
   auto const& key  = obj.raw_file_cache_id();
   auto const& path = obj.object_path();
   std::unique_lock lk(_mtx);
+  // Checked under the lock: invalidate() advances the epoch before it takes the
+  // lock to erase, so a registration either sees the new epoch or is erased.
+  if (obj._metadata_epoch != epoch_of(path).load(std::memory_order_acquire)) return;
   if (auto it = _key_by_path.find(path); it != _key_by_path.end() && it->second != key) {
     _by_key.erase(it->second);
     it->second = key;
@@ -46,8 +51,19 @@ bool metadata_store::has_path(std::string_view object_path) const noexcept
   return _key_by_path.contains(object_path);
 }
 
+std::atomic<std::uint64_t>& metadata_store::epoch_of(std::string_view object_path) const noexcept
+{
+  return _epochs[detail::string_hash{}(object_path) % epoch_slots];
+}
+
+void metadata_store::stamp(io_object& obj) const noexcept
+{
+  obj._metadata_epoch = epoch_of(obj.object_path()).load(std::memory_order_acquire);
+}
+
 void metadata_store::invalidate(std::string_view object_path) noexcept
 {
+  epoch_of(object_path).fetch_add(1, std::memory_order_acq_rel);
   if (!has_path(object_path)) return;
   std::unique_lock lk(_mtx);
   auto const it = _key_by_path.find(object_path);

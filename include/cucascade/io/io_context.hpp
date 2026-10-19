@@ -107,14 +107,14 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// a clean decline.
   [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path)
   {
-    return create_io_object(strip_file_scheme(path));
+    return stamped(create_io_object(strip_file_scheme(path)));
   }
 
   /// As above, forwarding @p hint to the backend's io_object resolution so it
   /// can, e.g., prefetch a parquet footer in the same round-trip as the size.
   [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path, open_hint hint)
   {
-    return create_io_object(strip_file_scheme(path), hint);
+    return stamped(create_io_object(strip_file_scheme(path), hint));
   }
 
   /// As above, with the object's size already known (e.g. from an S3
@@ -123,7 +123,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path,
                                                           std::uint64_t known_size)
   {
-    return create_io_object(strip_file_scheme(path), known_size);
+    return stamped(create_io_object(strip_file_scheme(path), known_size));
   }
 
   /**
@@ -131,18 +131,18 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
    *
    * The returned object is accepted by the write API below and may also be
    * read through this ioctx (reads clamp to its growing @c size()).  A leading
-   * @c file: scheme is stripped, as for @ref open_io_object.
+   * @c file: scheme is stripped, as for @ref open_io_object.  Opening with
+   * @c write_mode::create_or_truncate or @c write_mode::create_new changes (or
+   * replaces) the file's bytes, so it invalidates the path in this ioctx's
+   * cache and metadata store like a write does.
    *
    * @throws std::system_error with @c std::errc::not_supported when the backend
    *         cannot write; @c std::system_error with the @c errno of the failed
    *         open otherwise (e.g. @c ENOENT for @c write_mode::open_existing on a
    *         missing file, @c EEXIST for @c write_mode::create_new).
    */
-  [[nodiscard]] std::shared_ptr<io_object> open_io_object_for_write(std::string path,
-                                                                    write_open_options options = {})
-  {
-    return create_io_object_for_write(strip_file_scheme(path), options);
-  }
+  [[nodiscard]] std::shared_ptr<io_object> open_io_object_for_write(
+    std::string path, write_open_options options = {});
 
   /// Open the backend's connections to whatever serves @p bucket_url, ahead of
   /// the first read, so a query does not pay connection setup on its hot path.
@@ -267,6 +267,14 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// manager) calls this BEFORE releasing the @c buffer_pool the cache
   /// was constructed with — otherwise workers may issue final IO
   /// against a destroyed pool.
+  ///
+  /// It also waits for every asynchronous write still in flight on this ioctx:
+  /// each holds a pending cache invalidation (see the write API) that must run
+  /// before the cache goes.  A write gated on a busy caller stream therefore
+  /// delays this call until the stream reaches it, and calling it from a
+  /// continuation running on one of this ioctx's reactor threads can deadlock
+  /// on writes that reactor still has to finish.  The same holds for
+  /// @ref pre_destroy.
   void shutdown_cache() noexcept;
 
   /// Every concrete derived class MUST call this as the very first
@@ -354,6 +362,17 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   // (again once the write settled, before the future resolves, so a prefetch
   // that raced the write is dropped too), and forward to the backend hooks
   // below.
+  //
+  // Invalidation scope:
+  //  - It covers THIS ioctx's cache and metadata store only.  Another ioctx
+  //    caching the same path stays stale: read written files through the
+  //    writing ioctx (or one without a cache).
+  //  - It matches the path string as given (@c object_path()); no
+  //    normalisation, so "/a//b", "/a/./b" or a symlink to it are other paths.
+  //  - A reader holding a cache handle taken before the write keeps its view
+  //    of the old bytes; readers that start afterwards see the new ones.
+  //  - It reads the cache pointer unsynchronised, like the read wrappers: do
+  //    not race writes with initialize_cache() / shutdown_cache().
   //
   // Semantics shared by every form:
   //  - @p obj must come from @ref open_io_object_for_write (otherwise
@@ -495,7 +514,10 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// builds write slices (@c make_host_write_slice / @c make_device_write_slice)
   /// and forwards here.  An implementation validates them with
   /// @c validate_write_slices.  The default resolves with
-  /// @c std::errc::not_supported.
+  /// @c std::errc::not_supported.  Contract: the returned future must resolve
+  /// before this ioctx is destroyed (the front end's completion pass touches
+  /// its metadata store) -- reactor-backed contexts join their reactors in
+  /// their destructor, eager ones resolve before returning.
   virtual exec::semi_future<std::size_t> mixed_writev_async_io(
     const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept;
 
@@ -561,6 +583,13 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Drop what the prefetching cache (when attached) and the metadata store
   /// hold for @p object_path.
   void invalidate_cached(std::string_view object_path) noexcept;
+
+  /// Stamp a freshly opened object with its path's metadata epoch.
+  std::shared_ptr<io_object> stamped(std::shared_ptr<io_object> object) noexcept
+  {
+    if (object != nullptr) _metadata_store.stamp(*object);
+    return object;
+  }
 };
 
 }  // namespace cucascade::io
