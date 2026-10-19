@@ -111,7 +111,8 @@ std::shared_ptr<io::ioctx> io_context = nullptr)` forwards it into the config.
 enum class disk_io_backend : std::uint8_t { automatic, uring, cufile, kvikio };
 
 struct disk_io_context_options {
-  /// automatic: cufile when io::cufile::gds_available(), else uring.
+  /// automatic: cufile when io::cufile::gds_available(), else uring when io_uring is allowed in
+  /// this process, else kvikio.
   disk_io_backend backend{disk_io_backend::automatic};
   /// The io stack's own static configuration: uring_n_reactors / uring, cufile_n_reactors /
   /// cufile, kvikio. backend and cache are ignored (the disk tier never arms an fs_cache).
@@ -130,8 +131,10 @@ struct disk_io_context_options {
 [[nodiscard]] std::shared_ptr<io::ioctx> default_disk_io_context();
 ```
 
-- The default serves BOTH host and device paths of a space. On a GDS host, HOST <-> DISK therefore
-  goes through the cufile reactor's POSIX path — accepted; follow-up in section 6.
+- The default serves BOTH host and device paths. On a GDS host HOST <-> DISK therefore goes
+  through the cufile reactor's host path, which runs at uring speed since 6ec77f9 (section 6).
+  Without GDS, automatic picks uring when this process may use io_uring and kvikIO otherwise
+  (forced uring fails fast with the errno instead).
 - uring staging ownership uses the hook the reactor already provides: a private subclass of
   `uring_reactor::reactor_context` owns the upstream pinned resource and the
   `fixed_size_host_memory_resource` (base-from-member); every reactor's shared `_ctx` keeps it
@@ -268,10 +271,33 @@ its own per-call buffers (gds-reactor-recommendations.md R0), while uring's pinn
 measured fast path; on this host automatic therefore resolves to uring, and cuFile is exercised
 explicitly in tests and the benchmark.
 
-Follow-up (not in this change): on GDS hosts HOST <-> DISK goes through the cufile reactor's POSIX
-path (one synchronous `pread`/`pwrite` per op on the reactor thread, buffered fd). If that turns out
-slow, either improve that path in the reactor (O_DIRECT for congruent host buffers) or let
-`make_disk_io_context` build a composite that routes host-only requests to uring.
+On GDS hosts the automatic default (cuFile) also serves HOST <-> DISK. That path used to be the
+cufile reactor's buffered POSIX fallback (one synchronous `pread`/`pwrite` per op); the W3 review
+measured it against uring, and gds rewrote it in 6ec77f9 (`perf(cufile): serve the DISK tier's host
+transfers at uring speed`: O_DIRECT host bodies through pinned staging, as uring does). Measured with
+a forced cuFile context (the same code path as on a GDS host), `benchmark_disk_converter`, 4 columns,
+single-benchmark processes alternated, GiB/s:
+
+| Path | cuFile before 6ec77f9 | cuFile after | uring |
+|---|---|---|---|
+| HOST -> DISK, 512 MiB | 2.57-2.88 | 4.13-4.22 | 4.26-4.40 |
+| HOST -> DISK, 64 MiB | 2.20-2.47 | 3.00-3.05 | 3.31-3.39 |
+| DISK -> HOST cold, 512 MiB | 1.47-1.82 | 6.35-6.39 | 6.22-6.29 |
+| DISK -> HOST cold, 64 MiB | 1.49-1.73 | 5.52-5.67 | 5.22-5.59 |
+
+The W3 review's first figure for cuFile HOST -> DISK (1.40-1.46) was taken with the drive past its
+SLC cache; on a recovered drive the pre-fix figure is 2.68-2.81. After the fix the cuFile host path
+is 0.88-0.96x uring for writes and at least 1.05x for cold reads (W3 review, verification round 3),
+so a single cuFile context per space no longer costs the HOST <-> DISK chain. GPU <-> DISK is
+unchanged by the fix. Full table: `docs/io/gpuio-gds-practices.md` section 8.
+
+`cufile.log`: resolving `automatic` opens the cuFile driver once per process (to ask
+`gds_available()`), and cuFile writes `cufile.log` into the working directory. There is no clean way
+to redirect it from the library: gds found that libcufile accepts the log-dir parameter setters but
+ignores them, and the only working controls are `CUFILE_LOGFILE_PATH` set before the first cuFile
+call or a `cufile.json` — both belong to the user, and a library `setenv` would be process-global
+and racy. Resolution (agreed with gds and the lead): documented on `make_disk_io_context()`; users
+set `CUFILE_LOGFILE_PATH` or `cufile.json` to move it.
 
 ## 7. Removal — every affected public symbol and test
 
@@ -415,6 +441,9 @@ cudf (`cucascade_cudf_tests`, links io):
   force uring / cufile / kvikio per space.
 - Q3. Process-shared, lazily built defaults with the io_config defaults (weak_ptr cache).
 - Q4. Remove the old API outright, no deprecation. `AGENTS.md` is left to the lead.
+- W3 review MAJOR-2: automatic stays cuFile on real-GDS hosts; the cufile reactor's host path was
+  brought to uring speed instead (6ec77f9, section 6). MAJOR-1: the DISK tier probes io_uring once;
+  forced uring fails fast, automatic falls back. MINOR-2 (`cufile.log`): documented (section 6).
 - Q5. Update `docs/bandwidth-profiler.md`.
 - DISK -> GPU's trailing `stream.sync()` is decided from the read future's completion guarantee and
   documented in a code comment (section 5).
@@ -428,7 +457,7 @@ ext4), 4 columns, 512 MiB tables, page cache dropped before every read on both s
 pipeline backend is a19cf0a rebuilt from a `git archive` snapshot with the same cold-read change.
 Throughput in GiB/s; new = the default context (uring here, since `gds_available()` is false).
 
-| Path | Old pipeline | New (uring) | cuFile (compat mode) |
+| Path | Old pipeline | New (uring) | cuFile (compat mode), before 6ec77f9 |
 |---|---|---|---|
 | DISK -> GPU | 1.3-1.9 | 5.1 | 5.0-5.4 |
 | DISK -> HOST | 0.6-1.2 | 4.5-4.6 | 1.3-1.4 |
@@ -436,6 +465,9 @@ Throughput in GiB/s; new = the default context (uring here, since `gds_available
 | GPU -> DISK | 2.3-2.5 | 4.3-4.8 | 1.5-3.7 |
 | HOST -> DISK | 2.55-2.62 | 4.1-4.6 | 1.3-1.5 |
 | GPU -> DISK, strings | 2.3-2.5 | 4.55-4.9 | 1.3-2.6 |
+
+The cuFile column predates gds's host-path fix (6ec77f9) and partly ran with the drive past its SLC
+cache; section 6 has the cuFile HOST <-> DISK numbers after the fix (within ~5-12% of uring).
 
 Read rows: two back-to-back runs of the whole sweep in a quiet-disk window. Write rows: old and new
 alternated as single-benchmark processes, three rounds. Raw data and scripts:
