@@ -35,9 +35,11 @@ namespace cucascade::io::cufile {
  * @brief cuFile / GPUDirect Storage local-disk ioctx.  Thin specialisation of
  *        @c templated_ioctx<cufile_reactor>.
  *
- * A pool of @c cufile_reactor s serves device destinations via
- * @c cuFileReadAsync and everything else via POSIX @c pread; the pool shares one
- * @c reactor_context (config only -- no pinned staging).  Selected by
+ * A pool of @c cufile_reactor s serves device reads and writes with synchronous
+ * @c cuFileRead / @c cuFileWrite (or, when cuFile cannot or should not serve
+ * them, POSIX I/O staged through each reactor's pinned scratch) and host I/O with
+ * POSIX @c pread / @c pwrite; the pool shares one @c reactor_context (config
+ * only).  Selected by
  * @c io_backend::cufile and registered from the datasource factory like the
  * uring / kvikio / rest backends.
  */
