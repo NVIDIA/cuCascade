@@ -27,11 +27,12 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <liburing.h>
+
 #include <array>
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <system_error>
 
 namespace cucascade {
 namespace test {
@@ -54,20 +55,30 @@ inline constexpr std::array<disk_io_backend, 4> disk_test_backends{disk_io_backe
   return "unknown";
 }
 
+/// Whether this process may set up io_uring rings (container seccomp profiles, gVisor and
+/// kernel.io_uring_disabled can forbid it). Probed once.
+[[nodiscard]] inline bool io_uring_usable()
+{
+  static bool const usable = [] {
+    io_uring ring{};
+    if (io_uring_queue_init(1, &ring, 0) != 0) { return false; }
+    io_uring_queue_exit(&ring);
+    return true;
+  }();
+  return usable;
+}
+
 /**
  * @brief make_disk_io_context() for @p backend, or null when that backend cannot run in this
- *        process (e.g. uring where io_uring is forbidden: make_disk_io_context throws
- *        std::system_error).
+ *        process: only uring where io_uring is forbidden. Any other failure propagates, so a
+ *        backend regression fails the test instead of skipping it.
  */
 [[nodiscard]] inline std::shared_ptr<io::ioctx> try_make_disk_io_context(disk_io_backend backend)
 {
+  if (backend == disk_io_backend::uring && !io_uring_usable()) { return nullptr; }
   disk_io_context_options options;
   options.backend = backend;
-  try {
-    return make_disk_io_context(options);
-  } catch (std::system_error const&) {
-    return nullptr;
-  }
+  return make_disk_io_context(options);
 }
 
 /**
