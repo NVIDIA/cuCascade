@@ -31,11 +31,12 @@ namespace cucascade::io::cufile {
 /**
  * @brief Tunables for the cuFile / GPUDirect Storage local-file reactor.
  *
- * This backend uses the same mechanism kvikIO uses internally
- * (@c cuFileHandleRegister / @c cuFileReadAsync) but drives it directly from a
- * cuCascade reactor rather than through @c kvikio::FileHandle.  The pure-device
- * path is stream-ordered against the caller's CUDA stream: cuFile DMAs from NVMe
- * straight into GPU memory with no host-side bounce of its own.
+ * This backend registers each file with @c cuFileHandleRegister and serves
+ * device destinations with synchronous @c cuFileRead calls issued from the
+ * reactor's worker thread, rather than going through @c kvikio::FileHandle.  A
+ * device read starts once the work already queued on the caller's CUDA stream
+ * has finished and completes host-observed; with a real GDS stack cuFile DMAs
+ * from NVMe straight into GPU memory with no host-side bounce of its own.
  *
  * Host-only reads and mixed host+device requests fall back to POSIX @c pread on
  * the buffered fd; the reactor exists for the device fast path and treats
@@ -59,10 +60,23 @@ struct config {
   /// pipeline width) can override the latter but not the former.
   bool n_max_concurrent_scans_explicit{false};
 
-  /// Maximum physical operations (cuFile submissions plus fallback host-to-device
-  /// copies) in flight per reactor.  The reactor stops dispatching new slices
-  /// once this many are awaiting their CUDA event.
+  /// Maximum fallback host-to-device copies in flight per reactor.  cuFile reads
+  /// are synchronous on the worker and never count; the reactor stops dispatching
+  /// new slices once this many copies are awaiting their CUDA event.
   std::size_t max_inflight{32};
+
+  /// Largest single @c cuFileRead the reactor issues; a larger device slice is
+  /// read in pieces of at most this size whose boundaries fall on 4 KiB file
+  /// offsets.  One call this large lets cuFile split it internally across its
+  /// own threads, which is what saturates a local NVMe from one reactor.  Must be
+  /// at least @c io::IO_BLOCK_SIZE.
+  ///
+  /// @note 64 MiB was measured in cuFile compatibility mode (no nvidia-fs; one
+  ///       thread reached 6.83 GB/s at 64 MiB vs 6.00 at 16 MiB against a
+  ///       7.1 GB/s device; docs/io/gpuio-gds-practices.md).  Re-sweep it on a
+  ///       host with a real GDS stack, where cuFile chunks by its own
+  ///       @c max_direct_io_size (16 MiB) anyway.
+  std::size_t max_op_bytes{64UL << 20};
 
   /// Physical operations below this size use POSIX pread on the buffered fd
   /// instead of cuFile.  Matches kvikIO's @c gds_threshold (env
@@ -84,9 +98,9 @@ struct config {
   /// @c KVIKIO_COMPAT_MODE).
   std::optional<kvikio::CompatMode> compat_mode;
 
-  /// How long the worker sleeps between completion polls while operations are
-  /// in flight and it has nothing to submit.  A completion is only noticed at a
-  /// poll, so this bounds the latency a finished read adds; it is not a wait the
+  /// How long the worker sleeps between completion polls while fallback copies
+  /// are in flight and it has nothing to submit.  A completion is only noticed at
+  /// a poll, so this bounds the latency a finished copy adds; it is not a wait the
   /// reactor takes when it has work to dispatch.
   std::size_t poll_interval_us{200};
 

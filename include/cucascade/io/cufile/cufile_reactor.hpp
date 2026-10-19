@@ -20,7 +20,6 @@
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/io/cufile/config.hpp>
-#include <cucascade/io/cufile/types.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 #include <cucascade/io/tiered_queue.hpp>
@@ -86,7 +85,7 @@ class cufile_io_object final : public io_object {
   /// The reactor never reads through it directly -- cuFile does.
   [[nodiscard]] int direct_fd() const noexcept { return _direct_fd.get(); }
 
-  /// The handle to pass to @c cuFileReadAsync; null when the GDS fast path is
+  /// The handle to pass to @c cuFileRead; null when the GDS fast path is
   /// unavailable for this file.
   [[nodiscard]] CUfileHandle_t cufile_handle() const noexcept { return _cufile_handle; }
 
@@ -109,11 +108,21 @@ class cufile_io_object final : public io_object {
  *
  * Owns one worker thread and a two-tier request queue (see @ref io_priority).
  * A contiguous device destination of at least @ref config::gds_threshold bytes
- * is served by @c cuFileReadAsync, stream-ordered against the caller's stream;
- * everything else (host reads, small reads, dual host+device requests) falls
- * back to POSIX @c pread on the buffered fd, with a host-to-device copy when a
- * device destination was also requested.  A cuFile submission that cuFile
- * itself rejects degrades to the same fallback instead of failing the read.
+ * is served by synchronous @c cuFileRead calls of at most
+ * @ref config::max_op_bytes each, issued on the worker once the work already
+ * queued on the caller's stream has finished (so a stream-ordered allocation or
+ * a kernel still using the buffer is never overwritten); the read completes
+ * host-observed, like every other backend.  Everything else (host reads, small
+ * reads, dual host+device requests) falls back to POSIX @c pread on the
+ * buffered fd, with a host-to-device copy when a device destination was also
+ * requested.  A cuFile read that fails degrades to the same fallback instead of
+ * failing the read.
+ *
+ * The synchronous API is deliberate (it is what NVIDIA's own consumers use):
+ * @c cuFileReadAsync serialises a stream's operations, runs synchronously in
+ * the submitting thread in compatibility mode, and keeps per-stream state keyed
+ * by caller stream handles the reactor neither registers nor deregisters.  See
+ * docs/io/gpuio-gds-practices.md (G1).
  *
  * The worker takes a high-priority request before a low one and parks an active
  * low request at a slice boundary while high requests wait.  Priority is bounded
@@ -124,17 +133,17 @@ class cufile_io_object final : public io_object {
  * (@c reactor_traits::supports_vector_host_read is false).
  *
  * @note The reactor does not register device buffers with cuFile.  Per cuFile,
- *       an unregistered buffer is bounced through cuFile's own pinned buffers
- *       rather than DMA'd peer to peer, so GPUs whose BAR1 allows it can
- *       increase throughput by registering large destinations per transfer.
+ *       an unregistered buffer is bounced through cuFile's own GPU buffers
+ *       rather than DMA'd peer to peer; NVIDIA advises against registering a
+ *       one-shot destination, and in compatibility mode registration buys
+ *       nothing measurable (docs/io/gpuio-gds-practices.md, G8).
  *
  * Models the reactor concept consumed by @c templated_ioctx.
  */
 class cufile_reactor {
  public:
-  /// A read here is a syscall against NVMe (POSIX fallback) or a stream-ordered
-  /// cuFile submission (GDS fast path); both are cheap enough that batching buys
-  /// little.
+  /// A read here is a syscall against NVMe (POSIX fallback) or a synchronous
+  /// cuFile call (GDS fast path); batching either buys little.
   static constexpr bool prefers_bulk_io = false;
 
   /// Shared, immutable config for a pool of reactors.  A dedicated type so a
@@ -228,16 +237,6 @@ class cufile_reactor {
     std::optional<std::size_t> alignment = std::nullopt) noexcept;
 
  private:
-  /// One record per in-flight cuFile submission, kept until its CUDA event fires.
-  struct inflight_cufile {
-    std::unique_ptr<io_op_request> request;
-    /// cuFile writes @c bytes_done and reads the size/offsets through pointers
-    /// into this block from the stream, so it must outlive the event.
-    std::unique_ptr<cufile_stream_args> args;
-    cucascade::cuda::cuda_event event;
-    std::size_t expected_bytes{0};
-  };
-
   /// One record per in-flight H2D copy issued for a read that took the POSIX
   /// fallback and also had a device destination.
   struct inflight_copy {
@@ -246,25 +245,22 @@ class cufile_reactor {
     std::size_t bytes{0};
   };
 
-  /// What @c submit_cufile did with a slice.
-  enum class submit_result {
-    submitted,  ///< Queued on the caller's stream; completion is polled.
-    fallback,   ///< cuFile refused it; the caller must take the POSIX path.
-    failed      ///< Already settled with an error.
-  };
-
   void worker_loop(std::stop_token const& stop_token);
 
-  /// Turn one slice into a cuFile submission or a POSIX pread.  Never throws --
+  /// Turn one slice into cuFile reads or a POSIX pread.  Never throws --
   /// errors are reported through the slice's completion and coordinator.
   void dispatch_slice(std::shared_ptr<const io_object> const& obj,
                       prepared_io_slice slice,
                       std::shared_ptr<grouped_coordinator> const& coordinator) noexcept;
 
-  /// Submit @p request's range to @c cuFileReadAsync on the slice's stream.
-  [[nodiscard]] submit_result submit_cufile(cufile_io_object const& file,
-                                            prepared_io_slice const& slice,
-                                            std::unique_ptr<io_op_request>& request);
+  /// Read @p request's range into the slice's device buffer with synchronous
+  /// @c cuFileRead calls, after the slice's stream has drained the work queued
+  /// before this call.  Returns true when @p request was settled (success or a
+  /// definite error), false when cuFile failed and the caller must take the
+  /// POSIX path for the whole range.
+  [[nodiscard]] bool read_cufile(cufile_io_object const& file,
+                                 prepared_io_slice const& slice,
+                                 std::unique_ptr<io_op_request>& request);
 
   /// POSIX pread into the slice's host buffer (or a scratch pinned buffer for a
   /// device-only slice), then the H2D copy when a device destination was asked for.
@@ -272,17 +268,14 @@ class cufile_reactor {
                       prepared_io_slice const& slice,
                       std::unique_ptr<io_op_request> request);
 
-  /// Settle every in-flight operation whose CUDA event has completed.
+  /// Settle every in-flight H2D copy whose CUDA event has completed.
   void poll_completions() noexcept;
 
-  /// Synchronize and settle every outstanding operation with @p terminal_error,
-  /// so no coordinator promise is stranded at shutdown.
+  /// Synchronize and settle every outstanding copy with @p terminal_error, so no
+  /// coordinator promise is stranded at shutdown.
   void drain_inflight(grouped_coordinator::error_type const& terminal_error) noexcept;
 
-  [[nodiscard]] std::size_t inflight_count() const noexcept
-  {
-    return _inflight_cufile.size() + _inflight_copy.size();
-  }
+  [[nodiscard]] std::size_t inflight_count() const noexcept { return _inflight_copy.size(); }
 
   std::shared_ptr<reactor_context> _ctx;
   reactor_config_type _config;
@@ -296,7 +289,6 @@ class cufile_reactor {
   std::atomic<bool> _accepting{false};
 
   // Worker-only state; touched exclusively from the reactor thread.
-  std::vector<inflight_cufile> _inflight_cufile;
   std::vector<inflight_copy> _inflight_copy;
 };
 
@@ -305,7 +297,7 @@ class cufile_reactor {
 namespace cucascade::io {
 
 /// The reactor serves contiguous host destinations (POSIX pread), contiguous
-/// device destinations (cuFileReadAsync) and a caller-supplied contiguous
+/// device destinations (cuFileRead) and a caller-supplied contiguous
 /// host+device pair (POSIX + H2D copy).  It cannot fill fragmented cache chunks.
 ///
 /// @c supports_host_to_device_read is deliberately false even though the

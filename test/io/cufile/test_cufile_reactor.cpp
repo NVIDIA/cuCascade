@@ -416,6 +416,64 @@ TEST_CASE("cufile ioctx reads device destinations", "[io][cufile][gpu]")
   }
 }
 
+TEST_CASE("cufile ioctx reads a large device slice in aligned pieces up to the end of the file",
+          "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  // An unaligned file size makes the last block a sub-block tail; a 64 KiB piece
+  // size makes every read below span many cuFileRead calls.
+  static constexpr std::size_t file_bytes = (1UL << 20) + 1234;
+  pattern_file const file{file_bytes};
+  config cfg{};
+  cfg.gds_threshold = 1;
+  cfg.max_op_bytes  = 64UL << 10;
+  started_ioctx ioctx{cfg};
+  auto object = ioctx.get().open_io_object(file.path());
+  rmm::cuda_stream stream;
+
+  auto const [offset, size] = GENERATE(std::pair<std::size_t, std::size_t>{0, file_bytes},
+                                       std::pair<std::size_t, std::size_t>{4097, file_bytes},
+                                       std::pair<std::size_t, std::size_t>{65'535, 300'001},
+                                       std::pair<std::size_t, std::size_t>{file_bytes - 1000, 1000},
+                                       std::pair<std::size_t, std::size_t>{1UL << 20, 1UL << 20});
+  auto const expected       = std::min(size, file_bytes - offset);
+  CAPTURE(offset, size);
+  rmm::device_buffer dst(size, stream);
+  REQUIRE(
+    ioctx.get()
+      .device_read_async_io(*object, offset, size, static_cast<std::uint8_t*>(dst.data()), stream)
+      .get(30s) == expected);
+  CHECK(matches_file(device_bytes(dst, expected, stream), offset, expected));
+}
+
+TEST_CASE("cufile ioctx device read starts after work already queued on its stream",
+          "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t size = 2UL << 20;
+  pattern_file const file{size};
+  config cfg{};
+  cfg.gds_threshold = 1;
+  started_ioctx ioctx{cfg};
+  auto object = ioctx.get().open_io_object(file.path());
+  rmm::cuda_stream stream;
+  rmm::device_buffer dst(size, stream);
+
+  // Hold the stream on the host, then queue a memset of the destination behind it.
+  // A read that did not wait for that memset would land first and be overwritten.
+  REQUIRE(cudaLaunchHostFunc(
+            stream.value(),
+            [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds{200}); },
+            nullptr) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(dst.data(), 0xAB, size, stream.value()) == cudaSuccess);
+  REQUIRE(ioctx.get()
+            .device_read_async_io(*object, 0, size, static_cast<std::uint8_t*>(dst.data()), stream)
+            .get(30s) == size);
+  CHECK(matches_file(device_bytes(dst, size, stream), 0, size));
+}
+
 TEST_CASE("cufile ioctx cancels reads submitted after shutdown", "[io][cufile]")
 {
   pattern_file const file{64 * 1024};
@@ -447,6 +505,14 @@ TEST_CASE("cufile reactor rejects a zero in-flight window", "[io][cufile]")
   CHECK_THROWS_AS(cufile_reactor(std::make_shared<cufile_reactor::reactor_context>(cfg)),
                   std::invalid_argument);
   CHECK_THROWS_AS(cufile_reactor(nullptr), std::invalid_argument);
+}
+
+TEST_CASE("cufile reactor rejects a cuFile piece smaller than a block", "[io][cufile]")
+{
+  config cfg{};
+  cfg.max_op_bytes = cucascade::io::IO_BLOCK_SIZE - 1;
+  CHECK_THROWS_AS(cufile_reactor(std::make_shared<cufile_reactor::reactor_context>(cfg)),
+                  std::invalid_argument);
 }
 
 TEST_CASE("cufile reactor drops a slice from the wrong backend's object cleanly", "[io][cufile]")
@@ -697,67 +763,67 @@ void run_probe(std::string const& label,
   std::vector<rmm::cuda_stream> streams(n_stream);
   auto const bytes = file_bytes / window * window;
 
-  auto report = [&](std::string const& scenario, double gbps) {
-    std::printf("%-8s %-28s %7.2f GB/s\n", label.c_str(), scenario.c_str(), gbps);
+  // CUCASCADE_IO_BENCH_ONLY=<substring> runs only the scenarios whose name holds it.
+  char const* only_env   = std::getenv("CUCASCADE_IO_BENCH_ONLY");
+  std::string const only = only_env != nullptr ? only_env : "";
+  auto scenario          = [&](std::string const& name, std::size_t total, auto&& run) {
+    if (!only.empty() && name.find(only) == std::string::npos) return;
+    auto const gbps = measure(path, total, rounds, run);
+    std::printf("%-8s %-28s %7.2f GB/s\n", label.c_str(), name.c_str(), gbps);
     std::fflush(stdout);
   };
 
   for (std::size_t const piece : {256UL << 20, 1UL << 30}) {
-    report("dev 1 slice x " + std::to_string(piece >> 20) + " MiB, QD1",
-           measure(path, bytes, rounds, [&] {
-             for (std::size_t off = 0; off < bytes; off += piece) {
-               REQUIRE(ctx.device_read_async_io(*object, off, piece, base, streams[0]).get(120s) ==
-                       piece);
-             }
-           }));
+    scenario("dev 1 slice x " + std::to_string(piece >> 20) + " MiB, QD1", bytes, [&] {
+      for (std::size_t off = 0; off < bytes; off += piece) {
+        REQUIRE(ctx.device_read_async_io(*object, off, piece, base, streams[0]).get(120s) == piece);
+      }
+    });
   }
 
   for (std::size_t const piece : {4UL << 20, 16UL << 20}) {
-    report("dev readv " + std::to_string(piece >> 20) + " MiB, 1 stream",
-           measure(path, bytes, rounds, [&] {
-             for (std::size_t off = 0; off < bytes; off += window) {
-               std::vector<cucascade::io::slice> slices;
-               for (std::size_t p = 0; p < window; p += piece) {
-                 slices.emplace_back(off + p, piece, base + p);
-               }
-               REQUIRE(ctx.device_readv_async_io(*object, slices, streams[0]).get(120s) == window);
-             }
-           }));
+    scenario("dev readv " + std::to_string(piece >> 20) + " MiB, 1 stream", bytes, [&] {
+      for (std::size_t off = 0; off < bytes; off += window) {
+        std::vector<cucascade::io::slice> slices;
+        for (std::size_t p = 0; p < window; p += piece) {
+          slices.emplace_back(off + p, piece, base + p);
+        }
+        REQUIRE(ctx.device_readv_async_io(*object, slices, streams[0]).get(120s) == window);
+      }
+    });
   }
 
-  for (std::size_t const piece : {256UL << 10, 1UL << 20, 8UL << 20}) {
+  for (std::size_t const piece : {64UL << 10, 256UL << 10, 1UL << 20, 8UL << 20}) {
     auto const total = piece < (1UL << 20) ? std::min(bytes, std::size_t{1} << 30) : bytes;
-    report(
-      "dev " + std::to_string(piece >> 10) + " KiB x 8 streams", measure(path, total, rounds, [&] {
-        for (std::size_t off = 0; off < total; off += window) {
-          std::vector<cucascade::exec::semi_future<std::size_t>> futures;
-          std::size_t i = 0;
-          for (std::size_t p = 0; p < window; p += piece, ++i) {
-            futures.push_back(
-              ctx.device_read_async_io(*object, off + p, piece, base + p, streams[i % n_stream]));
-          }
-          for (auto& future : futures) {
-            REQUIRE(std::move(future).get(120s) == piece);
-          }
+    scenario("dev " + std::to_string(piece >> 10) + " KiB x 8 streams", total, [&] {
+      for (std::size_t off = 0; off < total; off += window) {
+        std::vector<cucascade::exec::semi_future<std::size_t>> futures;
+        std::size_t i = 0;
+        for (std::size_t p = 0; p < window; p += piece, ++i) {
+          futures.push_back(
+            ctx.device_read_async_io(*object, off + p, piece, base + p, streams[i % n_stream]));
         }
-      }));
+        for (auto& future : futures) {
+          REQUIRE(std::move(future).get(120s) == piece);
+        }
+      }
+    });
   }
 
   {
     constexpr std::size_t piece = 4UL << 20;
     std::vector<std::uint8_t> host(window);
-    report(
-      "host 4 MiB, all queued", measure(path, bytes, rounds, [&] {
-        for (std::size_t off = 0; off < bytes; off += window) {
-          std::vector<cucascade::exec::semi_future<std::size_t>> futures;
-          for (std::size_t p = 0; p < window; p += piece) {
-            futures.push_back(ctx.host_read_async_io(*object, off + p, piece, host.data() + p));
-          }
-          for (auto& future : futures) {
-            REQUIRE(std::move(future).get(120s) == piece);
-          }
+    scenario("host 4 MiB, all queued", bytes, [&] {
+      for (std::size_t off = 0; off < bytes; off += window) {
+        std::vector<cucascade::exec::semi_future<std::size_t>> futures;
+        for (std::size_t p = 0; p < window; p += piece) {
+          futures.push_back(ctx.host_read_async_io(*object, off + p, piece, host.data() + p));
         }
-      }));
+        for (auto& future : futures) {
+          REQUIRE(std::move(future).get(120s) == piece);
+        }
+      }
+    });
   }
 }
 
