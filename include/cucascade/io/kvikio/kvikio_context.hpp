@@ -26,6 +26,7 @@
 #include <kvikio/file_handle.hpp>
 #include <kvikio/remote_handle.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -73,14 +74,28 @@ class kvikio_object : public io_object {
  */
 class kvikio_io_object final : public kvikio_object {
  public:
-  kvikio_io_object(std::string path, kvikio::FileHandle handle, size_t file_size)
-    : _path(std::move(path)), _handle(std::move(handle)), _file_size(file_size)
+  kvikio_io_object(std::string path,
+                   kvikio::FileHandle handle,
+                   size_t file_size,
+                   io_access access = io_access::read_only)
+    : _path(std::move(path)), _handle(std::move(handle)), _file_size(file_size), _access(access)
   {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept final { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept final { return _path; }
-  [[nodiscard]] size_t size() const noexcept final { return _file_size; }
+  [[nodiscard]] size_t size() const noexcept final
+  {
+    return _file_size.load(std::memory_order_acquire);
+  }
+
+  /// True for objects opened by @c kvikio_context::open_io_object_for_write.
+  [[nodiscard]] bool writable() const noexcept final { return _access == io_access::read_write; }
+
+  void note_written(std::size_t end) const noexcept final
+  {
+    if (writable()) atomic_store_max(_file_size, end);
+  }
 
   /// Mutable: kvikIO's read entry points are non-const, and the reads issued
   /// through them do not mutate observable file state.
@@ -91,7 +106,8 @@ class kvikio_io_object final : public kvikio_object {
  private:
   std::string _path;
   mutable kvikio::FileHandle _handle;
-  size_t _file_size{0};
+  mutable std::atomic<size_t> _file_size{0};
+  io_access _access{io_access::read_only};
 };
 
 // ---------------------------------------------------------------------------
@@ -196,6 +212,11 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
 
+  /// Local files only (@c kvikio::FileHandle::pwrite, host or device sources);
+  /// @c s3:// objects cannot be opened for writing.
+  [[nodiscard]] bool supports_write() const noexcept override { return true; }
+  [[nodiscard]] bool supports_device_write() const noexcept override { return true; }
+
   /// Always false: kvikIO is a local-file path, and its whole point is streaming
   /// straight to device per read rather than assembling a batch first.
   [[nodiscard]] bool prefers_bulk_io() const noexcept override { return false; }
@@ -220,6 +241,24 @@ class kvikio_context final : public ioctx {
   exec::semi_future<size_t> mixed_readv_async_io(
     const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept final;
 
+  /// Blocking @c pwrite through the object's kvikIO handle.
+  std::size_t host_write_io(const io_object& obj,
+                            std::size_t offset,
+                            std::size_t size,
+                            const std::uint8_t* src) final;
+
+  /// Writes eagerly on the calling thread, like the reads: host slices with
+  /// @c pwrite, device slices after synchronizing their stream (kvikIO then
+  /// picks GDS or its bounce buffers).  The future is ready on return.
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept final;
+
+  /// @c fdatasync of the object's file.
+  void flush_io(const io_object& obj) final;
+
+  /// @ref flush_io, eagerly.
+  exec::semi_future<void> flush_async_io(const io_object& obj, io_priority priority) noexcept final;
+
   /// The config this context was built with (default-constructed when none was
   /// supplied).  Only @c compat_mode is still consulted after construction; the
   /// rest already went into kvikIO's globals.
@@ -236,6 +275,12 @@ class kvikio_context final : public ioctx {
   /// @c config().compat_mode when set.  Throws when the object cannot be
   /// opened.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
+
+  /// Open @p path per @p options with @c open(2) (creating / truncating /
+  /// exclusive as asked), then a read-write @c kvikio::FileHandle on it.
+  /// @c s3:// URIs report @c std::errc::not_supported.
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) override;
 
  private:
   kvikio_config _config;
