@@ -35,7 +35,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -225,10 +224,23 @@ std::shared_ptr<io_object> kvikio_context::create_io_object_for_write(std::strin
     case write_mode::open_existing: break;
     case write_mode::create_new: flags |= O_CREAT | O_EXCL; break;
   }
-  std::error_code exists_error;
-  bool const existed =
-    options.mode != write_mode::create_new && std::filesystem::exists(path, exists_error);
-  file_descriptor fd{::open(path.c_str(), flags, options.permissions)};
+  // Whether this call created the file decides whether a failure below may
+  // remove it, so learn it from the kernel: try an exclusive create first and
+  // fall back to the requested flags when the file already exists.  (A file
+  // removed between the two opens is recreated but not counted as ours, which
+  // can only leave debris, never remove someone else's file.)
+  bool created = false;
+  file_descriptor fd;
+  if (options.mode != write_mode::open_existing) {
+    fd = file_descriptor{
+      ::open(path.c_str(), O_RDWR | O_CLOEXEC | O_CREAT | O_EXCL, options.permissions)};
+    created = static_cast<bool>(fd);
+    if (!fd && (errno != EEXIST || options.mode == write_mode::create_new)) {
+      throw std::system_error(
+        errno, std::generic_category(), "kvikio_context: open '" + path + "' for writing");
+    }
+  }
+  if (!fd) { fd = file_descriptor{::open(path.c_str(), flags, options.permissions)}; }
   if (!fd) {
     throw std::system_error(
       errno, std::generic_category(), "kvikio_context: open '" + path + "' for writing");
@@ -237,7 +249,6 @@ std::shared_ptr<io_object> kvikio_context::create_io_object_for_write(std::strin
   if (::fstat(fd.get(), &opened) != 0) {
     throw std::system_error(errno, std::generic_category(), "kvikio_context: fstat '" + path + "'");
   }
-  bool const created        = options.mode != write_mode::open_existing && !existed;
   constexpr auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
   if (options.size_hint != 0 && options.size_hint <= max_offset) {
     // Best effort, as in the uring backend: never changes the size.
