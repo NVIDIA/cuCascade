@@ -126,6 +126,24 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     return create_io_object(strip_file_scheme(path), known_size);
   }
 
+  /**
+   * @brief Open (and, depending on @p options, create) @p path for writing.
+   *
+   * The returned object is accepted by the write API below and may also be
+   * read through this ioctx (reads clamp to its growing @c size()).  A leading
+   * @c file: scheme is stripped, as for @ref open_io_object.
+   *
+   * @throws std::system_error with @c std::errc::not_supported when the backend
+   *         cannot write; @c std::system_error with the @c errno of the failed
+   *         open otherwise (e.g. @c ENOENT for @c write_mode::open_existing on a
+   *         missing file, @c EEXIST for @c write_mode::create_new).
+   */
+  [[nodiscard]] std::shared_ptr<io_object> open_io_object_for_write(std::string path,
+                                                                    write_open_options options = {})
+  {
+    return create_io_object_for_write(strip_file_scheme(path), options);
+  }
+
   /// Open the backend's connections to whatever serves @p bucket_url, ahead of
   /// the first read, so a query does not pay connection setup on its hot path.
   ///
@@ -169,6 +187,15 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Whether the backend can efficiently serve a batch of device reads.
   /// Backends may still process mixed slices serially when this is false.
   [[nodiscard]] virtual bool supports_device_range_read() const noexcept = 0;
+
+  /// Whether the backend implements the write API (@ref open_io_object_for_write,
+  /// @ref host_write, ..., @ref flush).  Conservatively false.
+  [[nodiscard]] virtual bool supports_write() const noexcept { return false; }
+
+  /// Whether the backend accepts device-memory write sources
+  /// (@ref device_write_async and the device segments of the vector forms).
+  /// Conservatively false; implies @ref supports_write.
+  [[nodiscard]] virtual bool supports_device_write() const noexcept { return false; }
 
   /// Whether this backend would rather be handed one batched request covering
   /// everything a reader needs than a stream of small reads as the reader walks
@@ -320,6 +347,101 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     cache::cache_handle* handle = nullptr,
     io_priority priority        = io_priority::automatic);
 
+  // -- Writes -------------------------------------------------------------------
+  //
+  // The write entry points callers should use.  They validate, drop everything
+  // the prefetching cache and the metadata store hold for the object's path
+  // (again once the write settled, before the future resolves, so a prefetch
+  // that raced the write is dropped too), and forward to the backend hooks
+  // below.
+  //
+  // Semantics shared by every form:
+  //  - @p obj must come from @ref open_io_object_for_write (otherwise
+  //    @c std::errc::bad_file_descriptor); a backend without writes reports
+  //    @c std::errc::not_supported.
+  //  - Writes are never clamped: one at or past EOF extends the file (a gap
+  //    reads back as zeros) and @c obj.size() grows to cover every completed
+  //    write before its future resolves.  A new io_object opened afterwards,
+  //    through any backend, sees the bytes; @ref flush is for durability only.
+  //  - Any alignment is accepted.  4 KiB-aligned offsets and sizes let the
+  //    backend bypass the page cache entirely (O_DIRECT); unaligned heads and
+  //    tails go through it.
+  //  - A future resolves with the total bytes requested once every byte was
+  //    written.  On error it fails with the first error, but only after every
+  //    operation of the request has stopped touching the source and the file;
+  //    bytes already written stay written.
+  //  - SOURCE LIFETIME: a source buffer must stay valid and unmodified until
+  //    the future resolves.  A device source is copied on @p stream when the
+  //    backend starts the write, so the write observes all work enqueued on
+  //    @p stream before the call (and possibly work enqueued after it); in
+  //    particular do not release the source with a stream-ordered free before
+  //    the future resolved.  No buffer registration is required.
+  //  - Concurrent writes to disjoint ranges are safe, also when they share a
+  //    block or page.  Overlapping writes in flight together, or reads of a
+  //    range being written, give unspecified bytes; the segments of one vector
+  //    call must not overlap (@c std::invalid_argument).
+  //  - @p priority picks the reactor queue tier as for reads (@c automatic ->
+  //    high).  Asynchronous forms never throw: every error, including invalid
+  //    arguments, arrives through the future.
+  //  - Zero-size writes return 0 without I/O; zero-size segments are dropped.
+
+  /// Synchronously write @p size bytes of host memory @p src at @p offset on
+  /// the calling thread.  @return @p size.  @throws on any error.
+  std::size_t host_write(const io_object& obj,
+                         std::size_t offset,
+                         std::size_t size,
+                         const std::uint8_t* src);
+
+  [[nodiscard]] exec::semi_future<std::size_t> host_write_async(
+    const io_object& obj,
+    std::size_t offset,
+    std::size_t size,
+    const std::uint8_t* src,
+    io_priority priority = io_priority::automatic) noexcept;
+
+  /// Write @p size bytes of device memory @p src (stream-ordered on @p stream,
+  /// see SOURCE LIFETIME above) at @p offset.
+  [[nodiscard]] exec::semi_future<std::size_t> device_write_async(
+    const io_object& obj,
+    std::size_t offset,
+    std::size_t size,
+    const std::uint8_t* src,
+    ::cuda::stream_ref stream,
+    io_priority priority = io_priority::automatic) noexcept;
+
+  /// Vectored host write: every segment's @c src is host memory.
+  [[nodiscard]] exec::semi_future<std::size_t> host_writev_async(
+    const io_object& obj,
+    std::span<const write_slice> slices,
+    io_priority priority = io_priority::automatic) noexcept;
+
+  /// Vectored device write: every segment's @c src is device memory, read in
+  /// stream order on @p stream.
+  [[nodiscard]] exec::semi_future<std::size_t> device_writev_async(
+    const io_object& obj,
+    std::span<const write_slice> slices,
+    ::cuda::stream_ref stream,
+    io_priority priority = io_priority::automatic) noexcept;
+
+  /// Host and device segments in one request (one future); the device
+  /// segments are read in stream order on @p stream.  No segment may overlap
+  /// another, host or device.
+  [[nodiscard]] exec::semi_future<std::size_t> mixed_writev_async(
+    const io_object& obj,
+    std::span<const write_slice> host_slices,
+    std::span<const write_slice> device_slices,
+    ::cuda::stream_ref stream,
+    io_priority priority = io_priority::automatic) noexcept;
+
+  /// Make every write whose future resolved before this call durable
+  /// (@c fdatasync for local files), on the calling thread.  Writes still in
+  /// flight are not covered.  @throws on any error.
+  void flush(const io_object& obj);
+
+  /// Asynchronous @ref flush, executed by a reactor.
+  [[nodiscard]] exec::semi_future<void> flush_async(
+    const io_object& obj, io_priority priority = io_priority::automatic) noexcept;
+
   // -- Backend primitives (cache-unaware) ----------------------------------------
 
   virtual size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
@@ -362,6 +484,30 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     return mixed_readv_async_io(obj, std::move(slices));
   }
 
+  /// Backend hook behind @ref host_write.  The default throws
+  /// @c std::system_error(std::errc::not_supported).
+  virtual std::size_t host_write_io(const io_object& obj,
+                                    std::size_t offset,
+                                    std::size_t size,
+                                    const std::uint8_t* src);
+
+  /// The sole asynchronous backend write hook: every asynchronous write form
+  /// builds write slices (@c make_host_write_slice / @c make_device_write_slice)
+  /// and forwards here.  An implementation validates them with
+  /// @c validate_write_slices.  The default resolves with
+  /// @c std::errc::not_supported.
+  virtual exec::semi_future<std::size_t> mixed_writev_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept;
+
+  /// Backend hook behind @ref flush.  The default throws
+  /// @c std::system_error(std::errc::not_supported).
+  virtual void flush_io(const io_object& obj);
+
+  /// Backend hook behind @ref flush_async.  The default resolves with
+  /// @c std::errc::not_supported.
+  virtual exec::semi_future<void> flush_async_io(const io_object& obj,
+                                                 io_priority priority) noexcept;
+
   bool can_use_fs_cache() const noexcept
   {
     return supports_vector_host_read() || supports_host_to_device_read();
@@ -388,6 +534,11 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// variant above.
   virtual std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size);
 
+  /// Backend hook behind @ref open_io_object_for_write (scheme already
+  /// stripped).  The default throws @c std::system_error(std::errc::not_supported).
+  virtual std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                                write_open_options options);
+
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
   /// though callers are expected to drive the lifecycle explicitly so
@@ -396,6 +547,20 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
 
   /// Independent of the prefetching machinery — exposed via @c metadata_store().
   cache::metadata_store _metadata_store;
+
+ private:
+  /// Shared body of the asynchronous write forms: validate, build the write
+  /// slices, invalidate the object's path, dispatch to @ref mixed_writev_async_io
+  /// and invalidate again once the write settled.
+  exec::semi_future<std::size_t> submit_write(const io_object& obj,
+                                              std::span<const write_slice> host_slices,
+                                              std::span<const write_slice> device_slices,
+                                              ::cuda::stream_ref stream,
+                                              io_priority priority) noexcept;
+
+  /// Drop what the prefetching cache (when attached) and the metadata store
+  /// hold for @p object_path.
+  void invalidate_cached(std::string_view object_path) noexcept;
 };
 
 }  // namespace cucascade::io
