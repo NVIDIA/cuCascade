@@ -819,11 +819,24 @@ void run_probe(std::string const& label,
   std::vector<rmm::cuda_stream> streams(n_stream);
   auto const bytes = file_bytes / window * window;
 
-  // CUCASCADE_IO_BENCH_ONLY=<substring> runs only the scenarios whose name holds it.
-  char const* only_env   = std::getenv("CUCASCADE_IO_BENCH_ONLY");
-  std::string const only = only_env != nullptr ? only_env : "";
-  auto scenario          = [&](std::string const& name, std::size_t total, auto&& run) {
-    if (!only.empty() && name.find(only) == std::string::npos) return;
+  // CUCASCADE_IO_BENCH_ONLY=<substring>[,<substring>...] runs only the scenarios whose
+  // name holds one of them.
+  std::vector<std::string> only;
+  if (char const* only_env = std::getenv("CUCASCADE_IO_BENCH_ONLY"); only_env != nullptr) {
+    std::string list{only_env};
+    for (std::size_t start = 0; start <= list.size();) {
+      auto const comma = std::min(list.find(',', start), list.size());
+      if (comma > start) only.push_back(list.substr(start, comma - start));
+      start = comma + 1;
+    }
+  }
+  auto selected = [&](std::string const& name) {
+    return only.empty() || std::any_of(only.begin(), only.end(), [&](std::string const& part) {
+             return name.find(part) != std::string::npos;
+           });
+  };
+  auto scenario = [&](std::string const& name, std::size_t total, auto&& run) {
+    if (!selected(name)) return;
     auto const gbps = measure(path, total, rounds, run);
     std::printf("%-8s %-28s %7.2f GB/s\n", label.c_str(), name.c_str(), gbps);
     std::fflush(stdout);
