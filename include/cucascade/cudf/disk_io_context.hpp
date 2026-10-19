@@ -70,6 +70,14 @@ struct disk_io_context_options {
  * @param options Backend selection and its static configuration.
  * @return The started context; reactors are shut down and joined when the last owner releases it.
  * @throws std::runtime_error (or the backend's exception) if the context cannot be built.
+ *
+ * @note Release every context (and every memory space or reservation manager holding one) before
+ *       the process tears down the CUDA runtime and the cuFile driver: shutting a context down
+ *       synchronizes CUDA events, frees pinned staging and closes cuFile handles. Objects with
+ *       static storage duration that were constructed before CUDA was first used (e.g. a
+ *       namespace-scope `std::shared_ptr<memory_reservation_manager>`) are destroyed after that
+ *       teardown; reset them explicitly (or from an `std::atexit` handler registered after the
+ *       context was built) instead.
  */
 [[nodiscard]] std::shared_ptr<io::ioctx> make_disk_io_context(
   disk_io_context_options const& options = {});
@@ -81,7 +89,7 @@ struct disk_io_context_options {
  * cuFile when GPUDirect Storage is available, otherwise uring), serving both the host and the
  * device paths. It is cached through a weak reference, so every space that adopts it shares one
  * reactor set; it is shut down when the last space holding it is destroyed and rebuilt on a later
- * use.
+ * use. The same teardown-order note as for make_disk_io_context() applies to the spaces holding it.
  *
  * @return The shared default context (started).
  */
