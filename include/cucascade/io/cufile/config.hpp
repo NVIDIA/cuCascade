@@ -42,6 +42,11 @@ namespace cucascade::io::cufile {
  * the buffered fd; the reactor exists for the device fast path and treats
  * everything else as a correctness-preserving fallback.
  *
+ * Writes of device sources use @c cuFileWrite for their aligned body only when
+ * cuFile reports a real GDS mode; on a compat-only platform every device write
+ * is staged through pinned host memory and @c pwrite, which measured faster
+ * there (see @c cufile_reactor).  No setting changes that.
+ *
  * @note This backend is available only in a build with kvikIO
  *       (@c CUCASCADE_HAS_KVIKIO, i.e. @c CUCASCADE_BUILD_CUDF), because it
  *       reaches libcufile through kvikIO's lazily-loading @c cuFileAPI shim.

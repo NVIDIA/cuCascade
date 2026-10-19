@@ -19,6 +19,7 @@
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
+#include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
@@ -237,10 +238,29 @@ class write_context {
   std::shared_ptr<cufile_ioctx> _ctx;
 };
 
+/**
+ * Lets aligned device-write bodies reach cuFileWrite on a compat-only platform
+ * (where the reactor would stage them) for the guard's lifetime.
+ */
+class force_cufile_writes {
+ public:
+  explicit force_cufile_writes(bool enabled = true)
+  {
+    cucascade::io::cufile::detail::set_cufile_writes_in_compat_for_testing(enabled);
+  }
+  ~force_cufile_writes()
+  {
+    cucascade::io::cufile::detail::set_cufile_writes_in_compat_for_testing(false);
+  }
+  force_cufile_writes(force_cufile_writes const&)            = delete;
+  force_cufile_writes& operator=(force_cufile_writes const&) = delete;
+};
+
 /** The ways a device write can be served: cuFile for the body, or staged. */
 struct write_path {
   std::string label;
   config cfg;
+  bool force_cufile{false};  ///< cuFileWrite even on a compat-only platform
 };
 
 [[nodiscard]] std::vector<write_path> write_paths()
@@ -256,7 +276,8 @@ struct write_path {
   buffered.use_odirect   = false;  // POSIX through the page cache only
   buffered.compat_mode   = kvikio::CompatMode::ON;
   buffered.gds_threshold = IO_BLOCK_SIZE;
-  return {{"cuFile body", cufile_body},
+  return {{"cuFile body", cufile_body, true},
+          {"default policy", cufile_body, false},
           {"staged", staged},
           {"unregistered file", unregistered},
           {"buffered only", buffered}};
@@ -385,9 +406,10 @@ TEST_CASE("cufile open_io_object_for_write honours the open modes", "[io][cufile
 
 TEST_CASE("cufile host writes round-trip aligned and unaligned ranges", "[io][cufile][write]")
 {
-  auto const [label, cfg] = GENERATE(from_range(write_paths()));
+  auto const [label, cfg, force_cufile] = GENERATE(from_range(write_paths()));
   DYNAMIC_SECTION(label)
   {
+    force_cufile_writes const force{force_cufile};
     write_context ctx{cfg};
     scratch_path path;
     auto object = ctx->open_io_object_for_write(path.str());
@@ -416,9 +438,10 @@ TEST_CASE("cufile host writes round-trip aligned and unaligned ranges", "[io][cu
 TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
-  auto const [label, cfg] = GENERATE(from_range(write_paths()));
+  auto const [label, cfg, force_cufile] = GENERATE(from_range(write_paths()));
   DYNAMIC_SECTION(label)
   {
+    force_cufile_writes const force{force_cufile};
     write_context ctx{cfg};
     scratch_path path;
     auto object = ctx->open_io_object_for_write(path.str());
@@ -452,9 +475,10 @@ TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][
 TEST_CASE("cufile device write observes the work queued on its stream", "[io][cufile][write][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
-  auto const [label, cfg] = GENERATE(from_range(write_paths()));
+  auto const [label, cfg, force_cufile] = GENERATE(from_range(write_paths()));
   DYNAMIC_SECTION(label)
   {
+    force_cufile_writes const force{force_cufile};
     write_context ctx{cfg};
     scratch_path path;
     auto object             = ctx->open_io_object_for_write(path.str());
@@ -480,6 +504,7 @@ TEST_CASE("cufile device write observes the work queued on its stream", "[io][cu
 TEST_CASE("cufile vectored writes place every segment", "[io][cufile][write][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  force_cufile_writes const force;
   config cfg{};
   cfg.gds_threshold     = IO_BLOCK_SIZE;
   cfg.write_split_bytes = 4 * MiB;  // also exercises templated_ioctx's cut
@@ -540,6 +565,7 @@ TEST_CASE("cufile vectored writes place every segment", "[io][cufile][write][gpu
 TEST_CASE("cufile writes past EOF extend the file and reads see it", "[io][cufile][write][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  force_cufile_writes const force;
   config cfg{};
   cfg.gds_threshold = IO_BLOCK_SIZE;
   write_context ctx{cfg};
@@ -594,6 +620,7 @@ TEST_CASE("cufile write errors reach the caller", "[io][cufile][write]")
 TEST_CASE("cufile concurrent writers of disjoint ranges sharing blocks", "[io][cufile][write][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  force_cufile_writes const force;
   config cfg{};
   cfg.gds_threshold = IO_BLOCK_SIZE;
   write_context ctx{cfg, 4};
@@ -685,6 +712,7 @@ TEST_CASE("cufile writes before start are cancelled", "[io][cufile][write]")
 TEST_CASE("cufile registers large aligned transfers when asked", "[io][cufile][write][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  force_cufile_writes const force;
   config cfg{};
   cfg.gds_threshold      = IO_BLOCK_SIZE;
   cfg.max_op_bytes       = 1 * MiB;  // several cuFile calls address one registration
@@ -717,6 +745,44 @@ TEST_CASE("cufile registers large aligned transfers when asked", "[io][cufile][w
     REQUIRE(cudaMemcpy(got.data(), dst.get(), size, cudaMemcpyDeviceToHost) == cudaSuccess);
     check_same(got, bytes);
   }
+  check_same(read_back(ctx.get(), path.str()), shadow.bytes());
+}
+
+TEST_CASE("cufile stages aligned device writes on a compat-only platform",
+          "[io][cufile][write][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  config cfg{};
+  cfg.gds_threshold = IO_BLOCK_SIZE;
+  write_context ctx{cfg};
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+  if (!dynamic_cast<cufile_io_object const&>(*object).cufile_registered()) {
+    SKIP("the file did not register with cuFile here");
+  }
+  cuda_stream stream;
+  auto const bytes = pattern(4 * MiB, 700);
+  device_bytes const src{bytes};
+
+  auto calls_for_one_write = [&](std::size_t offset) {
+    auto const before = cucascade::io::cufile::detail::cufile_write_calls_for_testing();
+    REQUIRE(
+      ctx->device_write_async(*object, offset, bytes.size(), src.get(), stream.ref()).get(60s) ==
+      bytes.size());
+    return cucascade::io::cufile::detail::cufile_write_calls_for_testing() - before;
+  };
+
+  bool const compat_only = cucascade::io::cufile::probe_platform().compat_only;
+  CAPTURE(compat_only);
+  // The default policy: cuFileWrite only with a real GDS mode.
+  CHECK((calls_for_one_write(0) != 0) == !compat_only);
+  {
+    force_cufile_writes const force;
+    CHECK(calls_for_one_write(4 * MiB) != 0);
+  }
+  shadow_file shadow;
+  shadow.write(0, bytes);
+  shadow.write(4 * MiB, bytes);
   check_same(read_back(ctx.get(), path.str()), shadow.bytes());
 }
 

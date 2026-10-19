@@ -391,6 +391,10 @@ class transfer_registration {
   void const* _base{nullptr};
 };
 
+/// Test seams of the write policy (see detail:: in the header).
+std::atomic<bool> cufile_writes_in_compat{false};
+std::atomic<std::size_t> cufile_write_calls{0};
+
 /// Short reads tolerated in a row before a device slice is declared failed.
 constexpr int max_short_reads = 64;
 
@@ -1111,8 +1115,12 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
   // head and tail, and a body cuFile cannot or should not take, are staged.
   auto const& body = pieces[1];
   std::array<range, 3> staged{pieces[0], range{}, pieces[2]};
+  // In compatibility mode cuFile bounces through host memory anyway, and staging
+  // measured faster for extending writes: keep cuFileWrite for real GDS.
+  bool const compat_only =
+    probe_platform().compat_only && !cufile_writes_in_compat.load(std::memory_order_relaxed);
   bool const try_cufile =
-    file.cufile_registered() && !body.empty() && body.size >= _config.gds_threshold;
+    file.cufile_registered() && !compat_only && !body.empty() && body.size >= _config.gds_threshold;
   if (try_cufile) {
     // cuFileWrite is ordered on no stream: wait for the work queued on the
     // source's stream before cuFile reads the source.
@@ -1146,6 +1154,7 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
   while (done < piece.size) {
     auto const want = std::min(max_op, piece.size - done);
     errno           = 0;
+    cufile_write_calls.fetch_add(1, std::memory_order_relaxed);
     auto const got =
       registration.registered()
         ? api.Write(file.cufile_handle(),
@@ -1461,5 +1470,19 @@ bool gds_available() noexcept
   auto const& info = probe_platform();
   return info.driver_opened && !info.compat_only && !info.forced_compat;
 }
+
+namespace detail {
+
+void set_cufile_writes_in_compat_for_testing(bool enabled) noexcept
+{
+  cufile_writes_in_compat.store(enabled, std::memory_order_relaxed);
+}
+
+std::size_t cufile_write_calls_for_testing() noexcept
+{
+  return cufile_write_calls.load(std::memory_order_relaxed);
+}
+
+}  // namespace detail
 
 }  // namespace cucascade::io::cufile
