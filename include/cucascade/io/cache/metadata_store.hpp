@@ -80,6 +80,11 @@ class metadata_store {
   /// source of metadata: only an exact-key lookup is.
   [[nodiscard]] bool has_path(std::string_view object_path) const noexcept;
 
+  /// Drop the metadata registered for any generation of @p object_path, because
+  /// the object was written and the parsed metadata may no longer describe it.
+  /// A no-op when nothing is registered for the path.
+  void invalidate(std::string_view object_path) noexcept;
+
   /// Look up the metadata for @p obj's cache key.  Returns nullptr on
   /// miss.
   [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(io_object const& obj) const;
