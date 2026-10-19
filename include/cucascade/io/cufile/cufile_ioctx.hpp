@@ -53,6 +53,10 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the
   /// static @c cufile_reactor::create_io_object(path) cannot see.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
+
+  /// Opens @p path for writing with this ioctx's @c use_odirect / @c compat_mode.
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) override;
 };
 
 }  // namespace cucascade::io::cufile
