@@ -52,7 +52,7 @@ namespace cucascade {
  *       ignore it.
  */
 using representation_converter_fn = std::function<std::unique_ptr<idata_representation>(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   memory::reservation* reservation)>;
@@ -124,7 +124,7 @@ class representation_converter_registry {
    *
    * @code
    * registry.register_converter<SourceType, TargetType>(
-   *   [](idata_representation& source,
+   *   [](const idata_representation& source,
    *      const memory::memory_space* target_memory_space,
    *      ::cuda::stream_ref stream,
    *      memory::reservation* reservation) -> std::unique_ptr<idata_representation> {
@@ -193,7 +193,7 @@ class representation_converter_registry {
    * auto result = registry.convert<my_target_representation>(source, space);
    */
   template <typename TargetType>
-  std::unique_ptr<TargetType> convert(idata_representation& source,
+  std::unique_ptr<TargetType> convert(const idata_representation& source,
                                       const memory::memory_space* target_memory_space,
                                       ::cuda::stream_ref stream = ::cuda::stream_ref{
                                         cudaStream_t{cudaStreamDefault}}) const
@@ -219,7 +219,7 @@ class representation_converter_registry {
    * @throws std::runtime_error if no converter is registered for the type pair
    */
   template <typename TargetType>
-  std::unique_ptr<TargetType> convert(idata_representation& source,
+  std::unique_ptr<TargetType> convert(const idata_representation& source,
                                       memory::reservation& reservation,
                                       ::cuda::stream_ref stream = ::cuda::stream_ref{
                                         cudaStream_t{cudaStreamDefault}}) const
@@ -244,7 +244,7 @@ class representation_converter_registry {
    * @note This runtime-typed overload always allocates without a reservation. Callers that hold a
    *       reservation should use the templated convert<TargetType>(source, reservation, stream).
    */
-  std::unique_ptr<idata_representation> convert(idata_representation& source,
+  std::unique_ptr<idata_representation> convert(const idata_representation& source,
                                                 std::type_index target_type,
                                                 const memory::memory_space* target_memory_space,
                                                 ::cuda::stream_ref stream = ::cuda::stream_ref{
@@ -276,7 +276,7 @@ class representation_converter_registry {
   bool has_converter_impl(const converter_key& key) const;
   std::unique_ptr<idata_representation> convert_impl(
     const converter_key& key,
-    idata_representation& source,
+    const idata_representation& source,
     const memory::memory_space* target_memory_space,
     ::cuda::stream_ref stream,
     memory::reservation* reservation) const;

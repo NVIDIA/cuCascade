@@ -152,7 +152,7 @@ void evict_page_cache(const std::string& path)
 }
 
 /// Core per-pair probe — warmup + timed loop around `registry.convert(...)`.
-bandwidth_sample measure_single_size(idata_representation& source,
+bandwidth_sample measure_single_size(const idata_representation& source,
                                      std::type_index target_type,
                                      memory::memory_space* dst_space,
                                      const representation_converter_registry& registry,

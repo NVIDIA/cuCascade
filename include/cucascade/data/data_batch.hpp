@@ -356,14 +356,8 @@ class read_only_data_batch {
   /**
    * @brief Get the writer event from the underlying representation, or nullptr.
    *
-   * Delegates polymorphically to idata_representation::get_writer_event().
-   * Returns nullptr when there is no underlying representation, when the representation's
-   * tier records no writer event (the base-class default, e.g. host or disk tier), or when
-   * no writer event has been recorded yet.
-   *
-   * STREAM-LINEAGE: callers that cross stream / device boundaries should call
-   * cudaStreamWaitEvent on the returned event (when non-null) before reading the
-   * underlying memory of this batch.
+   * Delegates to idata_representation::get_writer_event(), which documents how readers must handle
+   * both a non-null event and nullptr, and returns nullptr when the batch holds no representation.
    *
    * @return cudaEvent_t The writer event, or nullptr if none is available.
    */
@@ -439,7 +433,7 @@ class read_only_data_batch {
    */
   template <typename TargetRepresentation>
   [[nodiscard]] std::shared_ptr<data_batch> clone_to(
-    representation_converter_registry& registry,
+    const representation_converter_registry& registry,
     uint64_t new_batch_id,
     const memory::memory_space* target_memory_space,
     ::cuda::stream_ref stream,
@@ -461,7 +455,7 @@ class read_only_data_batch {
    */
   template <typename TargetRepresentation>
   [[nodiscard]] std::shared_ptr<data_batch> clone_to(
-    representation_converter_registry& registry,
+    const representation_converter_registry& registry,
     uint64_t new_batch_id,
     memory::reservation& reservation,
     ::cuda::stream_ref stream,
@@ -544,7 +538,7 @@ class mutable_data_batch {
    * @param stream              CUDA stream for memory operations.
    */
   template <typename TargetRepresentation>
-  void convert_to(representation_converter_registry& registry,
+  void convert_to(const representation_converter_registry& registry,
                   const memory::memory_space* target_memory_space,
                   ::cuda::stream_ref stream);
 
@@ -563,7 +557,7 @@ class mutable_data_batch {
    * @param stream      CUDA stream for memory operations.
    */
   template <typename TargetRepresentation>
-  void convert_to(representation_converter_registry& registry,
+  void convert_to(const representation_converter_registry& registry,
                   memory::reservation& reservation,
                   ::cuda::stream_ref stream);
 
@@ -619,7 +613,7 @@ class mutable_data_batch {
    */
   template <typename TargetRepresentation>
   [[nodiscard]] std::shared_ptr<data_batch> clone_to(
-    representation_converter_registry& registry,
+    const representation_converter_registry& registry,
     uint64_t new_batch_id,
     const memory::memory_space* target_memory_space,
     ::cuda::stream_ref stream,
@@ -641,7 +635,7 @@ class mutable_data_batch {
    */
   template <typename TargetRepresentation>
   [[nodiscard]] std::shared_ptr<data_batch> clone_to(
-    representation_converter_registry& registry,
+    const representation_converter_registry& registry,
     uint64_t new_batch_id,
     memory::reservation& reservation,
     ::cuda::stream_ref stream,
@@ -732,7 +726,7 @@ class idata_batch_probe {
 
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> read_only_data_batch::clone_to(
-  representation_converter_registry& registry,
+  const representation_converter_registry& registry,
   uint64_t new_batch_id,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
@@ -745,7 +739,7 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
 
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> read_only_data_batch::clone_to(
-  representation_converter_registry& registry,
+  const representation_converter_registry& registry,
   uint64_t new_batch_id,
   memory::reservation& reservation,
   ::cuda::stream_ref stream,
@@ -759,7 +753,7 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
 // -- mutable_data_batch::convert_to (in-place conversion) --
 
 template <typename TargetRepresentation>
-void mutable_data_batch::convert_to(representation_converter_registry& registry,
+void mutable_data_batch::convert_to(const representation_converter_registry& registry,
                                     const memory::memory_space* target_memory_space,
                                     ::cuda::stream_ref stream)
 {
@@ -786,7 +780,7 @@ void mutable_data_batch::convert_to(representation_converter_registry& registry,
 }
 
 template <typename TargetRepresentation>
-void mutable_data_batch::convert_to(representation_converter_registry& registry,
+void mutable_data_batch::convert_to(const representation_converter_registry& registry,
                                     memory::reservation& reservation,
                                     ::cuda::stream_ref stream)
 {
@@ -814,7 +808,7 @@ void mutable_data_batch::convert_to(representation_converter_registry& registry,
 
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> mutable_data_batch::clone_to(
-  representation_converter_registry& registry,
+  const representation_converter_registry& registry,
   uint64_t new_batch_id,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
@@ -827,7 +821,7 @@ std::shared_ptr<data_batch> mutable_data_batch::clone_to(
 
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> mutable_data_batch::clone_to(
-  representation_converter_registry& registry,
+  const representation_converter_registry& registry,
   uint64_t new_batch_id,
   memory::reservation& reservation,
   ::cuda::stream_ref stream,
