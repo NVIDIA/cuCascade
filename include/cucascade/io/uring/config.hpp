@@ -67,6 +67,13 @@ struct config {
   /// than one that holds a reactor until its last slice.  0 disables the split.
   std::size_t range_batch_slices{8};
 
+  /// Largest write slice queued as one entry: a larger one (a whole spilled
+  /// column) is cut at multiples of this size so its pieces spread over the
+  /// reactors a write is dispatched to and their staging copies and writes
+  /// pipeline (see templated_ioctx::mixed_writev_async_io).  Rounded down to the
+  /// write granule; 0 disables the cut.
+  std::size_t write_split_bytes{32UL << 20};
+
   /// Bounded service for the low-priority tier.  Priority is otherwise strict
   /// (a waiting high request is taken first and parks an active low one), so a
   /// demand read that waits on in-flight low work (a cache prefetch it hit)

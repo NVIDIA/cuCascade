@@ -56,9 +56,12 @@ namespace cucascade::io::uring {
 /**
  * @brief Concrete @c io_object backed by a filesystem path.
  *
- * Passive bag of native handles. The buffered @c O_RDONLY fd and, when the
- * filesystem supports it, an optional @c O_DIRECT fd are produced by
- * @c uring_reactor::create_io_object. This class does no I/O of its own.
+ * Passive bag of native handles. The buffered fd and, when the filesystem
+ * supports it, an optional @c O_DIRECT fd are produced by
+ * @c uring_reactor::create_io_object (read-only, @c O_RDONLY) or
+ * @c uring_reactor::create_io_object_for_write (@c O_RDWR). This class does no
+ * I/O of its own.  A writable object's size grows as writes complete (see
+ * @c io_object::note_written).
  */
 class local_io_object : public io_object {
  public:
@@ -79,9 +82,31 @@ class local_io_object : public io_object {
     }
   }
 
+  /// As above with an explicit @p access: @c io_access::read_write makes the
+  /// object accept writes (its fds must then be open for writing).
+  local_io_object(std::string path,
+                  file_descriptor fd,
+                  file_descriptor fd_direct,
+                  size_t file_size,
+                  io_access access)
+    : local_io_object(std::move(path), std::move(fd), std::move(fd_direct), file_size)
+  {
+    _access = access;
+  }
+
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
-  [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] size_t size() const noexcept override
+  {
+    return _file_size.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] bool writable() const noexcept override { return _access == io_access::read_write; }
+
+  void note_written(std::size_t end) const noexcept override
+  {
+    if (writable()) atomic_store_max(_file_size, end);
+  }
 
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
   [[nodiscard]] int fd_direct() const noexcept { return _fd_direct.get(); }
@@ -95,7 +120,8 @@ class local_io_object : public io_object {
   std::string _hash;
   file_descriptor _fd;
   file_descriptor _fd_direct;
-  size_t _file_size{0};
+  mutable std::atomic<size_t> _file_size{0};
+  io_access _access{io_access::read_only};
 };
 
 // ---------------------------------------------------------------------------
@@ -117,6 +143,14 @@ class local_io_object : public io_object {
  * other high requests (0 restores strict priority). Physical operations use
  * O_DIRECT only when the worker determines that the complete transfer is
  * compatible. Models the reactor concept consumed by @c templated_ioctx.
+ *
+ * Writes (@c io_write_reactor_c): each write slice is split at the write
+ * granule into an unaligned head, an aligned body and an unaligned tail.  The
+ * body goes O_DIRECT -- straight from a host source whose address is congruent
+ * with its file offset, otherwise through the pinned staging blocks (a D2H
+ * copy on the caller's stream for device sources, a memcpy for host ones);
+ * head and tail are written through the page cache.  Short writes are
+ * resubmitted; a flush is an @c IORING_OP_FSYNC with @c IORING_FSYNC_DATASYNC.
  */
 class uring_reactor {
  public:
@@ -202,6 +236,20 @@ class uring_reactor {
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
+  /// Synchronous write of @p size bytes of host memory @p src at @p offset on
+  /// the calling thread, with the same head / body / tail placement as the
+  /// asynchronous path (the body O_DIRECT only when @p src is congruent; no
+  /// staging).  Raises @p file's size.  @return @p size.
+  /// @throws std::system_error (@c EBADF for a read-only object, or the errno of
+  ///         a failed write) or std::invalid_argument for a null @p src.
+  std::size_t host_write(const io_object_type& file,
+                         std::size_t offset,
+                         std::size_t size,
+                         std::uint8_t const* src);
+
+  /// @c fdatasync the file on the calling thread.  @throws std::system_error.
+  static void flush(const io_object_type& file);
+
   void enqueue(std::unique_ptr<grouped_io_request> request) noexcept;
 
   /// Approximate bytes not yet converted from logical slices to physical ops.
@@ -258,6 +306,14 @@ class uring_reactor {
   /// @p path. The buffered handle is always required; an unsupported direct
   /// handle simply makes worker-planned operations use buffered I/O.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
+
+  /// Open (per @p options.mode, creating with @p options.permissions) a buffered
+  /// @c O_RDWR fd and opportunistically an @c O_RDWR | @c O_DIRECT fd for
+  /// @p path, preallocate @p options.size_hint bytes best-effort, and return a
+  /// writable object sized at its current length.
+  /// @throws std::system_error with the errno of the failed open.
+  static std::unique_ptr<io_object_type> create_io_object_for_write(std::string path,
+                                                                    write_open_options options);
 
   /// fstat the open fd to get the file's current size.
   static size_t size(int native_handle);
