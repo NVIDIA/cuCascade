@@ -682,6 +682,44 @@ TEST_CASE("cufile writes before start are cancelled", "[io][cufile][write]")
   REQUIRE_NOTHROW(ctx->flush(*object));
 }
 
+TEST_CASE("cufile registers large aligned transfers when asked", "[io][cufile][write][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  config cfg{};
+  cfg.gds_threshold      = IO_BLOCK_SIZE;
+  cfg.max_op_bytes       = 1 * MiB;  // several cuFile calls address one registration
+  cfg.register_min_bytes = 2 * MiB;
+  write_context ctx{cfg};
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+  cuda_stream stream;
+  shadow_file shadow;
+
+  // Registered (aligned, large), not registered (misaligned source; too small).
+  struct shape {
+    std::size_t offset;
+    std::size_t size;
+    std::size_t misalignment;
+  };
+  std::size_t seed = 600;
+  for (auto const& [offset, size, misalignment] :
+       {shape{0, 8 * MiB, 0}, shape{8 * MiB, 4 * MiB, 512}, shape{12 * MiB, 1 * MiB, 0}}) {
+    auto const bytes = pattern(size, ++seed);
+    device_bytes const src{bytes, misalignment};
+    REQUIRE(ctx->device_write_async(*object, offset, size, src.get(), stream.ref()).get(60s) ==
+            size);
+    shadow.write(offset, bytes);
+
+    device_bytes const dst{std::vector<std::uint8_t>(size), misalignment};
+    REQUIRE(ctx->device_read_async_io(*object, offset, size, dst.get(), stream.ref()).get(60s) ==
+            size);
+    std::vector<std::uint8_t> got(size);
+    REQUIRE(cudaMemcpy(got.data(), dst.get(), size, cudaMemcpyDeviceToHost) == cudaSuccess);
+    check_same(got, bytes);
+  }
+  check_same(read_back(ctx.get(), path.str()), shadow.bytes());
+}
+
 // ---------------------------------------------------------------------------
 // Write throughput probe (hidden; run explicitly with "[.cufile-write-bench]")
 // ---------------------------------------------------------------------------

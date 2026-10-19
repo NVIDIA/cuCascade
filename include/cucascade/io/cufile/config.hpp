@@ -78,6 +78,20 @@ struct config {
   ///       @c max_direct_io_size (16 MiB) anyway.
   std::size_t max_op_bytes{64UL << 20};
 
+  /// Register device buffers with @c cuFileBufRegister for the duration of one
+  /// transfer when the transfer is at least this many bytes and the buffer (and,
+  /// for a read, the file offset) is 4 KiB-aligned; 0 (the default) never
+  /// registers.  The registration is dropped before the transfer's future
+  /// resolves.
+  ///
+  /// @note Off by default on purpose: NVIDIA advises against registering a
+  ///       one-shot destination (the cost is not amortised and BAR1 space is
+  ///       shared), and in compatibility mode it measured no gain here
+  ///       (docs/io/gpuio-gds-practices.md, G8).  It exists to A/B on a host with
+  ///       a real GDS stack, where an aligned registered buffer is DMA'd directly
+  ///       instead of through cuFile's GPU bounce buffers.
+  std::size_t register_min_bytes{0};
+
   /// Write slices larger than this are cut by @c templated_ioctx into pieces of
   /// this size (rounded down to the write granule) and spread over the selected
   /// reactors; 0 = never cut.  cuFile prefers large submissions (one call splits
