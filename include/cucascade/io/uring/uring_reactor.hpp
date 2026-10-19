@@ -252,7 +252,9 @@ class uring_reactor {
 
   void enqueue(std::unique_ptr<grouped_io_request> request) noexcept;
 
-  /// Approximate bytes not yet converted from logical slices to physical ops.
+  /// Approximate bytes not yet converted from logical slices to physical ops,
+  /// plus the bytes of staged writes whose device-to-host copy is still pending
+  /// on the caller's stream (they hold staging blocks without any I/O in flight).
   [[nodiscard]] std::size_t queued_bytes() const noexcept
   {
     return _queued_bytes.load(std::memory_order_relaxed);
