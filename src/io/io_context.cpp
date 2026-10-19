@@ -257,6 +257,18 @@ exec::semi_future<size_t> ioctx::device_readv_async_io(const io_object& obj,
 // Writes
 // ---------------------------------------------------------------------------
 
+std::shared_ptr<io_object> ioctx::open_io_object_for_write(std::string path,
+                                                           write_open_options options)
+{
+  auto object = create_io_object_for_write(strip_file_scheme(path), options);
+  if (object == nullptr) return object;
+  // Truncating (or replacing) the file changes its bytes as much as a write.
+  if (options.mode == write_mode::create_or_truncate || options.mode == write_mode::create_new) {
+    invalidate_cached(object->object_path());
+  }
+  return stamped(std::move(object));
+}
+
 void ioctx::invalidate_cached(std::string_view object_path) noexcept
 {
   if (_cache) { _cache->invalidate(object_path); }

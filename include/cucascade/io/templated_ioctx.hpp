@@ -461,12 +461,13 @@ class templated_ioctx : public ioctx {
 
   // -- Writes (only for reactors modelling io_write_reactor_c) -----------------
 
-  [[nodiscard]] bool supports_write() const noexcept final
+  /// Overridable so a derived context can gate writes at run time.
+  [[nodiscard]] bool supports_write() const noexcept override
   {
     return reactor_write_traits_t::supports_write;
   }
 
-  [[nodiscard]] bool supports_device_write() const noexcept final
+  [[nodiscard]] bool supports_device_write() const noexcept override
   {
     return reactor_write_traits_t::supports_device_write;
   }

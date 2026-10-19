@@ -20,7 +20,10 @@
 
 #include <cucascade/io/types.hpp>
 
+#include <array>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -73,6 +76,11 @@ class metadata_store {
   /// of the same path.  A null @p metadata is silently ignored — symmetric with
   /// the older @c fs_cache::register_metadata contract so callers that
   /// pass through pre-parsed metadata don't have to null-check.
+  ///
+  /// Also ignored when @p obj was opened before the last @ref invalidate of its
+  /// path (see @ref stamp): its bytes, and so the parse, may predate a write.
+  /// That covers a parse that raced the write and finishes after both of the
+  /// write's invalidation passes.
   void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
 
   /// True when some generation of @p object_path is registered.  A hint for
@@ -81,9 +89,15 @@ class metadata_store {
   [[nodiscard]] bool has_path(std::string_view object_path) const noexcept;
 
   /// Drop the metadata registered for any generation of @p object_path, because
-  /// the object was written and the parsed metadata may no longer describe it.
-  /// A no-op when nothing is registered for the path.
+  /// the object was written and the parsed metadata may no longer describe it,
+  /// and advance the path's epoch so objects opened before now can no longer
+  /// register any.
   void invalidate(std::string_view object_path) noexcept;
+
+  /// Record @p obj's path epoch on it.  @c ioctx calls this for every object it
+  /// opens; an object never stamped carries epoch 0, which matches only a path
+  /// that was never invalidated.
+  void stamp(io_object& obj) const noexcept;
 
   /// Look up the metadata for @p obj's cache key.  Returns nullptr on
   /// miss.
@@ -98,9 +112,17 @@ class metadata_store {
   template <typename V>
   using string_map = std::unordered_map<std::string, V, detail::string_hash, std::equal_to<>>;
 
+  /// Epochs live in a fixed table indexed by path hash, so the store does not
+  /// grow with every written (spill) path.  Paths sharing a slot share an
+  /// epoch: a write of one only makes the other drop a registration, never
+  /// accept a stale one.
+  static constexpr std::size_t epoch_slots = 256;
+  [[nodiscard]] std::atomic<std::uint64_t>& epoch_of(std::string_view object_path) const noexcept;
+
   mutable std::shared_mutex _mtx;
   string_map<std::shared_ptr<io_object_metadata>> _by_key;
   string_map<std::string> _key_by_path;
+  mutable std::array<std::atomic<std::uint64_t>, epoch_slots> _epochs{};
 };
 
 }  // namespace cucascade::io::cache
