@@ -474,6 +474,45 @@ TEST_CASE("cufile ioctx device read starts after work already queued on its stre
   CHECK(matches_file(device_bytes(dst, size, stream), 0, size));
 }
 
+TEST_CASE("cufile ioctx stages a large device read through POSIX when cuFile is not used",
+          "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  // Larger than the two 8 MiB scratch slots together, so the slots are reused.
+  static constexpr std::size_t file_bytes = (20UL << 20) + 123;
+  pattern_file const file{file_bytes};
+
+  auto const [label, cfg] = GENERATE(std::pair<std::string, config>{"below the threshold",
+                                                                    [] {
+                                                                      config c{};
+                                                                      c.gds_threshold = 1UL << 40;
+                                                                      return c;
+                                                                    }()},
+                                     std::pair<std::string, config>{"file not registered", [] {
+                                                                      config c{};
+                                                                      c.compat_mode =
+                                                                        kvikio::CompatMode::ON;
+                                                                      return c;
+                                                                    }()});
+  DYNAMIC_SECTION(label)
+  {
+    started_ioctx ioctx{cfg};
+    auto object = ioctx.get().open_io_object(file.path());
+    rmm::cuda_stream stream;
+    constexpr std::size_t offset = 12'345;
+    constexpr std::size_t size   = file_bytes - offset;
+    rmm::device_buffer dst(size, stream);
+    // The staged copies run on the caller's stream, after work already queued there.
+    REQUIRE(cudaMemsetAsync(dst.data(), 0xAB, size, stream.value()) == cudaSuccess);
+    REQUIRE(
+      ioctx.get()
+        .device_read_async_io(*object, offset, size, static_cast<std::uint8_t*>(dst.data()), stream)
+        .get(30s) == size);
+    CHECK(matches_file(device_bytes(dst, size, stream), offset, size));
+  }
+}
+
 TEST_CASE("cufile ioctx cancels reads submitted after shutdown", "[io][cufile]")
 {
   pattern_file const file{64 * 1024};

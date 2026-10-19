@@ -677,29 +677,25 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     return;
   }
 
-  auto const wanted = request->io_rng.size;
-  std::size_t bytes_read{0};
-  if (slice.is_contiguous()) {
-    auto* base = std::get<std::uint8_t*>(slice.h_buffer.buffer);
-    if (base == nullptr) {
-      request->finish_error(std::make_error_code(std::errc::invalid_argument));
-      return;
-    }
-    bytes_read = pread_all(file.buffered_fd(), base, wanted, request->io_rng.offset);
-    request->iovecs.push_back(iovec{base, bytes_read});
-  } else if (slice.has_device_request()) {
-    // Device-only but off the cuFile path: read into a pinned scratch buffer that
-    // the op keeps alive until its H2D copy has completed.
-    void* scratch = nullptr;
-    CUCASCADE_CUDA_TRY(cudaMallocHost(&scratch, wanted));
-    request->staging_owner =
-      std::shared_ptr<void>(scratch, [](void* pointer) noexcept { cudaFreeHost(pointer); });
-    bytes_read = pread_all(file.buffered_fd(), scratch, wanted, request->io_rng.offset);
-    request->iovecs.push_back(iovec{scratch, bytes_read});
-  } else {
+  // Device-only but off the cuFile path: stage through the reactor's reusable
+  // pinned scratch.
+  if (!slice.is_contiguous() && slice.has_device_request()) {
+    read_device_staged(file, slice, *request);
+    return;
+  }
+  if (!slice.is_contiguous()) {
     request->finish_error(std::make_error_code(std::errc::invalid_argument));
     return;
   }
+
+  auto const wanted = request->io_rng.size;
+  auto* base        = std::get<std::uint8_t*>(slice.h_buffer.buffer);
+  if (base == nullptr) {
+    request->finish_error(std::make_error_code(std::errc::invalid_argument));
+    return;
+  }
+  auto const bytes_read = pread_all(file.buffered_fd(), base, wanted, request->io_rng.offset);
+  request->iovecs.push_back(iovec{base, bytes_read});
 
   // The range was clamped to the size recorded at open, so a short read means the
   // file shrank underneath us.  Report it rather than hand back a partly-filled buffer.
@@ -713,6 +709,7 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     return;
   }
 
+  // A caller-supplied host+device pair: copy the host bytes it already holds.
   int device_id = slice.d_buffer.device_id;
   if (device_id < 0) {
     if (auto const status = cudaGetDevice(&device_id); status != cudaSuccess) {
@@ -729,6 +726,87 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     return;
   }
   _inflight_copy.push_back(inflight_copy{std::move(request), std::move(event), bytes_read});
+}
+
+void cufile_reactor::read_device_staged(cufile_io_object const& file,
+                                        prepared_io_slice const& slice,
+                                        io_op_request& request)
+{
+  int device_id = slice.d_buffer.device_id;
+  if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+
+  if (_scratch == nullptr) {
+    void* memory = nullptr;
+    CUCASCADE_CUDA_TRY(
+      cudaHostAlloc(&memory, scratch_slots * scratch_slot_bytes, cudaHostAllocPortable));
+    _scratch = pinned_scratch{static_cast<std::uint8_t*>(memory)};
+  }
+
+  // Double-buffered: the read of piece k+1 overlaps the H2D copy of piece k, both
+  // copies run on the caller's stream (so they also follow its queued work), and
+  // a slot is reused only after its previous copy has completed.
+  static_assert(scratch_slots == 2, "one event per scratch slot below");
+  std::array<cucascade::cuda::cuda_event, scratch_slots> copied{
+    cucascade::cuda::cuda_event{cudaEventDisableTiming},
+    cucascade::cuda::cuda_event{cudaEventDisableTiming}};
+  std::array<bool, scratch_slots> pending{};
+  auto const stream = slice.d_buffer.stream.get();
+  auto drain        = [&]() noexcept {
+    auto status = cudaSuccess;
+    for (std::size_t slot = 0; slot < scratch_slots; ++slot) {
+      if (!pending[slot]) continue;
+      pending[slot] = false;
+      if (auto const s = copied[slot].synchronize_no_throw(); s != cudaSuccess) status = s;
+    }
+    return status;
+  };
+
+  auto const offset = request.io_rng.offset;
+  auto const size   = request.io_rng.size;
+  std::size_t done  = 0;
+  for (std::size_t piece = 0; done < size; ++piece) {
+    auto const slot = piece % scratch_slots;
+    if (pending[slot]) {
+      pending[slot] = false;
+      if (auto const status = copied[slot].synchronize_no_throw(); status != cudaSuccess) {
+        std::ignore = drain();
+        request.finish_error(status);
+        return;
+      }
+    }
+    auto* const buffer = _scratch.get() + slot * scratch_slot_bytes;
+    auto const want    = std::min(scratch_slot_bytes, size - done);
+    std::size_t got{0};
+    try {
+      got = pread_all(file.buffered_fd(), buffer, want, offset + done);
+    } catch (...) {
+      std::ignore = drain();
+      throw;
+    }
+    // The range was clamped to the size recorded at open: a short read means the
+    // file shrank underneath us.
+    if (got != want) {
+      std::ignore = drain();
+      request.finish_error(std::make_error_code(std::errc::io_error));
+      return;
+    }
+    auto status =
+      cudaMemcpyAsync(slice.d_buffer.data + done, buffer, want, cudaMemcpyHostToDevice, stream);
+    if (status == cudaSuccess) status = cudaEventRecord(copied[slot].get(), stream);
+    if (status != cudaSuccess) {
+      std::ignore = drain();
+      request.finish_error(status);
+      return;
+    }
+    pending[slot] = true;
+    done += want;
+  }
+  if (auto const status = drain(); status != cudaSuccess) {
+    request.finish_error(status);
+    return;
+  }
+  request.finish_success();
 }
 
 void cufile_reactor::poll_completions() noexcept

@@ -41,6 +41,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace cucascade::io::cufile {
@@ -262,11 +263,19 @@ class cufile_reactor {
                                  prepared_io_slice const& slice,
                                  std::unique_ptr<io_op_request>& request);
 
-  /// POSIX pread into the slice's host buffer (or a scratch pinned buffer for a
-  /// device-only slice), then the H2D copy when a device destination was asked for.
+  /// POSIX pread into the slice's host buffer, then the H2D copy when a device
+  /// destination was asked for too; a device-only slice goes to
+  /// @ref read_device_staged.
   void dispatch_posix(cufile_io_object const& file,
                       prepared_io_slice const& slice,
                       std::unique_ptr<io_op_request> request);
+
+  /// POSIX pread of a device-only slice through the reactor's reusable pinned
+  /// scratch, in pieces of @ref scratch_slot_bytes whose H2D copies (on the
+  /// slice's stream) overlap the next read.  Settles @p request before returning.
+  void read_device_staged(cufile_io_object const& file,
+                          prepared_io_slice const& slice,
+                          io_op_request& request);
 
   /// Settle every in-flight H2D copy whose CUDA event has completed.
   void poll_completions() noexcept;
@@ -288,8 +297,22 @@ class cufile_reactor {
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
 
+  /// Frees the pinned scratch.
+  struct pinned_deleter {
+    void operator()(std::uint8_t* memory) const noexcept { std::ignore = cudaFreeHost(memory); }
+  };
+  using pinned_scratch = std::unique_ptr<std::uint8_t, pinned_deleter>;
+
+  /// Slots of the device-fallback scratch: two, so a read overlaps a copy.
+  static constexpr std::size_t scratch_slots = 2;
+  /// Bytes per scratch slot (the fallback's piece size).
+  static constexpr std::size_t scratch_slot_bytes = 8UL << 20;
+
   // Worker-only state; touched exclusively from the reactor thread.
   std::vector<inflight_copy> _inflight_copy;
+  /// Pinned (portable) staging for device-only POSIX reads, allocated on first use
+  /// so a reactor that never takes that path holds no pinned memory.
+  pinned_scratch _scratch;
 };
 
 }  // namespace cucascade::io::cufile
