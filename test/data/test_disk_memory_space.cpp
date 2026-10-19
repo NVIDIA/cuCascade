@@ -24,10 +24,13 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace cucascade;
 
@@ -42,6 +45,18 @@ constexpr std::size_t disk_capacity = 1024UL * 1024 * 1024;
   config.memory_capacity = disk_capacity;
   config.mount_paths     = std::filesystem::temp_directory_path().string();
   return config;
+}
+
+/**
+ * @brief A non-null io context handle the core library can store but never dereferences.
+ *
+ * cucascade::io::ioctx is incomplete here; the core only copies and destroys the shared_ptr, so an
+ * aliasing pointer to some unrelated owned object stands in for a real context.
+ */
+[[nodiscard]] std::shared_ptr<io::ioctx> make_placeholder_context()
+{
+  auto owner = std::make_shared<int>(0);
+  return std::shared_ptr<io::ioctx>(owner, reinterpret_cast<io::ioctx*>(owner.get()));
 }
 
 }  // namespace
@@ -116,6 +131,57 @@ TEST_CASE("disk memory_space installs nothing when the default factory fails",
   }),
                     std::runtime_error);
   REQUIRE(space.get_io_context() == nullptr);
+}
+
+TEST_CASE("disk memory_space stores the configured io context and replaces it",
+          "[disk][io][memory_space]")
+{
+  auto configured   = make_placeholder_context();
+  auto config       = make_disk_config();
+  config.io_context = configured;
+  memory::memory_space space(config);
+  REQUIRE(space.get_io_context() == configured);
+
+  int calls    = 0;
+  auto adopted = space.get_or_init_io_context([&calls] {
+    ++calls;
+    return make_placeholder_context();
+  });
+  REQUIRE(adopted == configured);  // a configured context is never replaced by the default
+  REQUIRE(calls == 0);
+
+  auto replacement = make_placeholder_context();
+  space.set_io_context(replacement);
+  REQUIRE(space.get_io_context() == replacement);
+}
+
+TEST_CASE("concurrent first uses of a fresh disk memory_space adopt one default",
+          "[disk][io][memory_space][concurrency]")
+{
+  memory::memory_space space(make_disk_config());
+  constexpr std::size_t n_threads = 16;
+  std::atomic<int> factory_calls{0};
+  std::atomic<bool> go{false};
+  std::vector<std::shared_ptr<io::ioctx>> seen(n_threads);
+  {
+    std::vector<std::jthread> threads;
+    for (std::size_t i = 0; i < n_threads; ++i) {
+      threads.emplace_back([&, i] {
+        while (!go.load(std::memory_order_acquire)) {}
+        seen[i] = space.get_or_init_io_context([&factory_calls] {
+          factory_calls.fetch_add(1, std::memory_order_relaxed);
+          return make_placeholder_context();
+        });
+      });
+    }
+    go.store(true, std::memory_order_release);
+  }
+  REQUIRE(factory_calls.load() == 1);
+  REQUIRE(seen.front() != nullptr);
+  for (auto const& context : seen) {
+    REQUIRE(context == seen.front());
+  }
+  REQUIRE(space.get_io_context() == seen.front());
 }
 
 TEST_CASE("io context accessors reject non-DISK memory spaces", "[disk][io][memory_space]")
