@@ -203,6 +203,20 @@ TEST_CASE("kvikio_context open honours size hints and reports open errors", "[kv
     CHECK(object->size() == 0);
   }
   CHECK(std::filesystem::file_size(path.str()) == 0);
+
+  // An existing file: create_or_open keeps it, create_or_truncate empties it.
+  {
+    std::ofstream out(path.str(), std::ios::binary);
+    out << "0123456789";
+  }
+  CHECK(ctx.open_io_object_for_write(path.str(), {.mode = write_mode::create_or_open})->size() ==
+        10);
+  CHECK(std::filesystem::file_size(path.str()) == 10);
+  CHECK(
+    ctx.open_io_object_for_write(path.str(), {.mode = write_mode::create_or_truncate})->size() ==
+    0);
+  CHECK(std::filesystem::file_size(path.str()) == 0);
+
   try {
     std::ignore =
       ctx.open_io_object_for_write(path.str() + ".missing/x", {.mode = write_mode::create_new});
