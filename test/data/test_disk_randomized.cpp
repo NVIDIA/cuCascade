@@ -276,7 +276,12 @@ TEST_CASE("random mixed tables round-trip through every disk backend and path",
 
   for (auto const backend : test::disk_test_backends) {
     CAPTURE(test::to_string(backend));
-    auto& disk = test::shared_disk_space_for(backend);
+    auto* disk_space = test::shared_disk_space_for(backend);
+    if (disk_space == nullptr) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: unavailable here");
+      continue;
+    }
+    auto& disk = *disk_space;
 
     // Written by the device path ...
     auto const from_gpu = registry().convert<disk_data_representation>(*gpu, &disk, stream);
@@ -312,7 +317,12 @@ TEST_CASE("a zero-column table round-trips through every disk backend", "[disk][
     make_gpu_rep(std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{}));
   for (auto const backend : test::disk_test_backends) {
     CAPTURE(test::to_string(backend));
-    auto& disk    = test::shared_disk_space_for(backend);
+    auto* disk_space = test::shared_disk_space_for(backend);
+    if (disk_space == nullptr) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: unavailable here");
+      continue;
+    }
+    auto& disk    = *disk_space;
     auto from_gpu = registry().convert<disk_data_representation>(*gpu, &disk, shared_stream());
     auto back     = registry().convert<gpu_table_representation>(
       *from_gpu, shared_gpu_space().get(), shared_stream());

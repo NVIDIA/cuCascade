@@ -85,8 +85,12 @@ void round_trip_test(std::unique_ptr<cudf::table> original_table)
     registry.convert<host_data_representation>(*gpu_rep, host_space.get(), shared_stream());
 
   for (auto const backend : test::disk_test_backends) {
-    auto& disk_space = test::shared_disk_space_for(backend);
-    if (!test::disk_space_can_write(disk_space, /*device=*/false)) {
+    auto* disk_space = test::shared_disk_space_for(backend);
+    if (disk_space == nullptr) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: unavailable here");
+      continue;
+    }
+    if (!test::disk_space_can_write(*disk_space, /*device=*/false)) {
       WARN("skipping the " << test::to_string(backend) << " disk backend: no host writes");
       continue;
     }
@@ -94,7 +98,7 @@ void round_trip_test(std::unique_ptr<cudf::table> original_table)
 
     // host_data -> disk (one batched host write)
     auto disk_rep =
-      registry.convert<disk_data_representation>(*host_rep, &disk_space, shared_stream());
+      registry.convert<disk_data_representation>(*host_rep, disk_space, shared_stream());
 
     // disk -> host_data (one batched host read)
     auto host_rep2 =
