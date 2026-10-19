@@ -40,4 +40,11 @@ std::shared_ptr<io_object> cufile_ioctx::create_io_object(std::string path)
     cufile_reactor::create_io_object(std::move(path), _config.use_odirect, _config.compat_mode));
 }
 
+std::shared_ptr<io_object> cufile_ioctx::create_io_object_for_write(std::string path,
+                                                                    write_open_options options)
+{
+  return std::shared_ptr<io_object>(cufile_reactor::create_io_object_for_write(
+    std::move(path), options, _config.use_odirect, _config.compat_mode));
+}
+
 }  // namespace cucascade::io::cufile

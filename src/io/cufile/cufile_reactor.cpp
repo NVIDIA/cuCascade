@@ -24,6 +24,7 @@
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/log/logging.hpp>
 
@@ -49,6 +50,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -202,6 +204,136 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
   return status;
 }
 
+/**
+ * @brief Finish opening a cuFile object: open the O_DIRECT fd (@p direct_flags)
+ *        when @p use_odirect and the compat mode allow it, register it with
+ *        cuFile, and wrap both fds.
+ *
+ * @p mode decides what a file that cannot use cuFile means: @c ON never
+ * registers, @c AUTO falls back to POSIX for that file, @c OFF throws.
+ */
+[[nodiscard]] std::unique_ptr<cufile_io_object> open_with_cufile(std::string path,
+                                                                 file_descriptor buffered,
+                                                                 int direct_flags,
+                                                                 bool use_odirect,
+                                                                 kvikio::CompatMode mode,
+                                                                 io_access access,
+                                                                 std::string const& what)
+{
+  file_descriptor direct;
+  if (use_odirect && mode != kvikio::CompatMode::ON) {
+    direct = file_descriptor{::open(path.c_str(), direct_flags)};
+    if (!direct) {
+      if (mode == kvikio::CompatMode::OFF) {
+        throw std::system_error(
+          errno,
+          std::generic_category(),
+          what + ": O_DIRECT open of '" + path + "' (compat mode OFF enforces cuFile)");
+      }
+      CUCASCADE_LOG_WARN(
+        "cufile_reactor: O_DIRECT unavailable for '{}': {}; GDS fast path disabled for this file",
+        path,
+        strerror(errno));
+    }
+  }
+
+  struct stat stat_buffer{};
+  if (::fstat(buffered.get(), &stat_buffer) != 0) {
+    throw std::system_error(errno, std::generic_category(), what + ": fstat");
+  }
+  auto const file_size = static_cast<std::size_t>(stat_buffer.st_size);
+
+  // AUTO asks kvikIO whether cuFile can work here at all, so a host with no GDS
+  // goes straight to POSIX instead of failing a registration per file.
+  CUfileHandle_t handle{nullptr};
+  bool const try_register =
+    direct && (mode == kvikio::CompatMode::OFF || kvikio::is_cufile_available());
+  if (try_register) {
+    std::string failure;
+    try {
+      CUfileDescr_t descriptor{};
+      descriptor.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
+      descriptor.handle.fd = direct.get();
+      auto const status    = kvikio::cuFileAPI::instance().HandleRegister(&handle, &descriptor);
+      if (status.err != CU_FILE_SUCCESS) {
+        failure =
+          "cuFileHandleRegister failed (err=" + std::to_string(static_cast<int>(status.err)) + ")";
+      }
+    } catch (std::exception const& e) {
+      failure = e.what();
+    } catch (...) {
+      failure = "unknown error";
+    }
+    if (!failure.empty()) {
+      handle = nullptr;
+      if (mode == kvikio::CompatMode::OFF) {
+        throw std::runtime_error(what + ": cannot register '" + path + "' with cuFile: " + failure);
+      }
+      CUCASCADE_LOG_WARN(
+        "cufile_reactor: cannot register '{}' with cuFile: {}; using POSIX", path, failure);
+    }
+  }
+
+  return std::make_unique<cufile_io_object>(
+    std::move(path), std::move(buffered), std::move(direct), handle, file_size, access);
+}
+
+/// Full-range pwrite that retries EINTR and short writes; a 0-byte write is EIO.
+void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size_t offset)
+{
+  std::size_t completed = 0;
+  while (completed < bytes) {
+    auto const result =
+      ::pwrite(fd, source + completed, bytes - completed, static_cast<off_t>(offset + completed));
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      throw std::system_error(errno, std::generic_category(), "cufile_reactor: pwrite");
+    }
+    if (result == 0) {
+      throw std::system_error(std::make_error_code(std::errc::io_error),
+                              "cufile_reactor: pwrite wrote nothing");
+    }
+    completed += static_cast<std::size_t>(result);
+  }
+}
+
+/// Whether @p piece starts and ends on a multiple of @p granule.
+[[nodiscard]] bool is_granule_aligned(range piece, std::size_t granule) noexcept
+{
+  return piece.offset % granule == 0 && piece.size % granule == 0;
+}
+
+[[nodiscard]] bool is_block_aligned(void const* pointer) noexcept
+{
+  return reinterpret_cast<std::uintptr_t>(pointer) % IO_BLOCK_SIZE == 0;
+}
+
+/**
+ * @brief Write @p piece from host memory @p source to @p file.
+ *
+ * Through the O_DIRECT fd when @p direct is set (the caller checked the piece is
+ * granule-aligned and the source block-aligned), falling back to the buffered fd
+ * when the filesystem refuses O_DIRECT at run time; through the buffered fd
+ * otherwise.
+ */
+void write_host_piece(cufile_io_object const& file,
+                      bool direct,
+                      std::uint8_t const* source,
+                      range piece)
+{
+  if (!direct) {
+    pwrite_all(file.buffered_fd(), source, piece.size, piece.offset);
+    return;
+  }
+  try {
+    pwrite_all(file.direct_fd(), source, piece.size, piece.offset);
+  } catch (std::system_error const& error) {
+    if (!uring::detail::is_odirect_runtime_error(error.code().value())) throw;
+    pwrite_all(file.buffered_fd(), source, piece.size, piece.offset);
+  }
+}
+
 /// Short reads tolerated in a row before a device slice is declared failed.
 constexpr int max_short_reads = 64;
 
@@ -335,12 +467,14 @@ cufile_io_object::cufile_io_object(std::string path,
                                    file_descriptor buffered_fd,
                                    file_descriptor direct_fd,
                                    CUfileHandle_t cufile_handle,
-                                   std::size_t file_size)
+                                   std::size_t file_size,
+                                   io_access access)
   : _path(std::move(path)),
     _buffered_fd(std::move(buffered_fd)),
     _direct_fd(std::move(direct_fd)),
     _cufile_handle(cufile_handle),
-    _file_size(file_size)
+    _file_size(file_size),
+    _access(access)
 {
 }
 
@@ -483,66 +617,62 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object(
     throw std::system_error(
       errno, std::generic_category(), "cufile_reactor::create_io_object: buffered open");
   }
+  return open_with_cufile(std::move(path),
+                          std::move(buffered),
+                          O_RDONLY | O_DIRECT,
+                          use_odirect,
+                          mode,
+                          io_access::read_only,
+                          "cufile_reactor::create_io_object");
+}
 
-  file_descriptor direct;
-  if (use_odirect && mode != kvikio::CompatMode::ON) {
-    direct = file_descriptor{::open(path.c_str(), O_RDONLY | O_DIRECT)};
-    if (!direct) {
-      if (mode == kvikio::CompatMode::OFF) {
-        throw std::system_error(errno,
-                                std::generic_category(),
-                                "cufile_reactor::create_io_object: O_DIRECT open of '" + path +
-                                  "' (compat mode OFF enforces cuFile)");
-      }
-      CUCASCADE_LOG_WARN(
-        "cufile_reactor: O_DIRECT unavailable for '{}': {}; GDS fast path disabled for this file",
-        path,
-        strerror(errno));
-    }
+std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
+  std::string path, write_open_options options)
+{
+  return create_io_object_for_write(
+    std::move(path), options, /*use_odirect=*/true, /*compat_mode=*/std::nullopt);
+}
+
+std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
+  std::string path,
+  write_open_options options,
+  bool use_odirect,
+  std::optional<kvikio::CompatMode> compat_mode)
+{
+  auto const mode = resolve_compat_mode(compat_mode);
+  if (mode == kvikio::CompatMode::OFF && !use_odirect) {
+    throw std::invalid_argument(
+      "cufile_reactor::create_io_object_for_write: compat mode OFF enforces cuFile, which needs "
+      "O_DIRECT, but use_odirect is false");
   }
 
-  struct stat stat_buffer{};
-  if (::fstat(buffered.get(), &stat_buffer) != 0) {
-    throw std::system_error(
-      errno, std::generic_category(), "cufile_reactor::create_io_object: fstat");
+  int flags = O_RDWR | O_CLOEXEC;
+  switch (options.mode) {
+    case write_mode::create_or_truncate: flags |= O_CREAT | O_TRUNC; break;
+    case write_mode::create_or_open: flags |= O_CREAT; break;
+    case write_mode::open_existing: break;
+    case write_mode::create_new: flags |= O_CREAT | O_EXCL; break;
   }
-  auto const file_size = static_cast<std::size_t>(stat_buffer.st_size);
-
-  // AUTO asks kvikIO whether cuFile can work here at all, so a host with no GDS
-  // goes straight to POSIX instead of failing a registration per file.
-  CUfileHandle_t handle{nullptr};
-  bool const try_register =
-    direct && (mode == kvikio::CompatMode::OFF || kvikio::is_cufile_available());
-  if (try_register) {
-    std::string failure;
-    try {
-      CUfileDescr_t descriptor{};
-      descriptor.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
-      descriptor.handle.fd = direct.get();
-      auto const status    = kvikio::cuFileAPI::instance().HandleRegister(&handle, &descriptor);
-      if (status.err != CU_FILE_SUCCESS) {
-        failure =
-          "cuFileHandleRegister failed (err=" + std::to_string(static_cast<int>(status.err)) + ")";
-      }
-    } catch (std::exception const& e) {
-      failure = e.what();
-    } catch (...) {
-      failure = "unknown error";
-    }
-    if (!failure.empty()) {
-      handle = nullptr;
-      if (mode == kvikio::CompatMode::OFF) {
-        throw std::runtime_error("cufile_reactor::create_io_object: cannot register '" + path +
-                                 "' with cuFile: " + failure);
-      }
-      CUCASCADE_LOG_WARN(
-        "cufile_reactor: cannot register '{}' with cuFile: {}; using POSIX", path, failure);
-    }
+  file_descriptor buffered{::open(path.c_str(), flags, options.permissions)};
+  if (!buffered) {
+    throw std::system_error(errno,
+                            std::generic_category(),
+                            "cufile_reactor::create_io_object_for_write: open '" + path + "'");
   }
-
-  return std::make_unique<cufile_io_object>(
-    std::move(path), std::move(buffered), std::move(direct), handle, file_size);
+  constexpr auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+  if (options.size_hint != 0 && options.size_hint <= max_offset) {
+    // Best effort: a filesystem without preallocation simply grows as it is written.
+    std::ignore =
+      ::fallocate(buffered.get(), FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(options.size_hint));
+  }
+  // The file exists now; the direct fd only adds O_DIRECT (no create / truncate).
+  return open_with_cufile(std::move(path),
+                          std::move(buffered),
+                          O_RDWR | O_DIRECT | O_CLOEXEC,
+                          use_odirect,
+                          mode,
+                          io_access::read_write,
+                          "cufile_reactor::create_io_object_for_write");
 }
 
 std::vector<byte_range> cufile_reactor::align_and_coalesce(
@@ -590,6 +720,22 @@ void cufile_reactor::dispatch_slice(
       request->device_copy->req_rng   = slice.rng;
       request->device_copy->d_buffer  = slice.d_buffer;
       request->device_copy->device_id = slice.d_buffer.device_id;
+    }
+
+    if (slice.is_write() || slice.is_flush()) {
+      if (!file->writable()) {
+        throw std::system_error(
+          std::make_error_code(std::errc::bad_file_descriptor),
+          "cufile_reactor: '" + file->object_path() + "' was not opened for writing");
+      }
+      if (slice.is_flush()) {
+        request->kind = io_op_kind::flush;
+        flush(*file);
+        request->finish_success();
+      } else {
+        dispatch_write(*file, slice, *request);
+      }
+      return;
     }
 
     // Clamp to EOF up front so the terminal paths can trust request->io_rng.
@@ -740,12 +886,7 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
   if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
 
-  if (_scratch == nullptr) {
-    void* memory = nullptr;
-    CUCASCADE_CUDA_TRY(
-      cudaHostAlloc(&memory, scratch_slots * scratch_slot_bytes, cudaHostAllocPortable));
-    _scratch = pinned_scratch{static_cast<std::uint8_t*>(memory)};
-  }
+  auto* const scratch_base = scratch();
 
   // Double-buffered: the read of piece k+1 overlaps the H2D copy of piece k, both
   // copies run on the caller's stream (so they also follow its queued work), and
@@ -779,7 +920,7 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
         return;
       }
     }
-    auto* const buffer = _scratch.get() + slot * scratch_slot_bytes;
+    auto* const buffer = scratch_base + slot * scratch_slot_bytes;
     auto const want    = std::min(scratch_slot_bytes, size - done);
     std::size_t got{0};
     try {
@@ -811,6 +952,216 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
     return;
   }
   request.finish_success();
+}
+
+std::uint8_t* cufile_reactor::scratch()
+{
+  if (_scratch == nullptr) {
+    void* memory = nullptr;
+    CUCASCADE_CUDA_TRY(
+      cudaHostAlloc(&memory, scratch_slots * scratch_slot_bytes, cudaHostAllocPortable));
+    _scratch = pinned_scratch{static_cast<std::uint8_t*>(memory)};
+  }
+  return _scratch.get();
+}
+
+// ---------------------------------------------------------------------------
+// cufile_reactor: writes
+// ---------------------------------------------------------------------------
+
+std::size_t cufile_reactor::host_write(cufile_io_object const& file,
+                                       std::size_t offset,
+                                       std::size_t size,
+                                       std::uint8_t const* source)
+{
+  if (!file.writable()) {
+    throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
+                            "cufile_reactor::host_write: object was not opened for writing");
+  }
+  if (size == 0) return 0;
+  if (source == nullptr) throw std::invalid_argument("cufile_reactor::host_write: null source");
+
+  bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+  auto const granule   = write_granule();
+  for (auto const& piece : uring::detail::split_write_range(range{offset, size}, granule)) {
+    if (piece.empty()) continue;
+    auto const* src = source + (piece.offset - offset);
+    write_host_piece(
+      file, direct_fd && is_granule_aligned(piece, granule) && is_block_aligned(src), src, piece);
+  }
+  file.note_written(offset + size);
+  return size;
+}
+
+void cufile_reactor::flush(cufile_io_object const& file)
+{
+  if (!file.writable()) {
+    throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
+                            "cufile_reactor::flush: object was not opened for writing");
+  }
+  while (::fdatasync(file.buffered_fd()) != 0) {
+    if (errno == EINTR) continue;
+    throw std::system_error(errno, std::generic_category(), "cufile_reactor::flush: fdatasync");
+  }
+}
+
+void cufile_reactor::dispatch_write(cufile_io_object const& file,
+                                    prepared_io_slice const& slice,
+                                    io_op_request& request)
+{
+  request.kind       = io_op_kind::write;
+  request.io_rng     = slice.rng;  // writes are never clamped: they may extend the file
+  auto const granule = write_granule();
+  auto const pieces  = uring::detail::split_write_range(slice.rng, granule);
+
+  if (!slice.has_device_request()) {
+    auto* const source = std::get<std::uint8_t*>(slice.h_buffer.buffer);
+    if (source == nullptr) throw std::invalid_argument("cufile_reactor: null write source");
+    bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+    for (auto const& piece : pieces) {
+      if (piece.empty()) continue;
+      auto const* src = source + (piece.offset - slice.rng.offset);
+      write_host_piece(
+        file, direct_fd && is_granule_aligned(piece, granule) && is_block_aligned(src), src, piece);
+    }
+    request.finish_success();
+    return;
+  }
+
+  int device_id = slice.d_buffer.device_id;
+  if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+
+  // The granule-aligned body goes to cuFile (whatever the source pointer's
+  // alignment: cuFile bounces an unaligned one inside the GPU); the sub-granule
+  // head and tail, and a body cuFile cannot or should not take, are staged.
+  auto const& body = pieces[1];
+  std::array<range, 3> staged{pieces[0], range{}, pieces[2]};
+  bool const try_cufile =
+    file.cufile_registered() && !body.empty() && body.size >= _config.gds_threshold;
+  if (try_cufile) {
+    // cuFileWrite is ordered on no stream: wait for the work queued on the
+    // source's stream before cuFile reads the source.
+    if (auto const status = wait_for_queued_work(slice.d_buffer.stream.get());
+        status != cudaSuccess) {
+      request.finish_error(status);
+      return;
+    }
+    if (!write_cufile(file, slice.d_buffer.data + (body.offset - slice.rng.offset), body)) {
+      staged[1] = body;
+    }
+  } else {
+    staged[1] = body;
+  }
+  write_device_staged(file, slice, staged);
+  request.finish_success();
+}
+
+bool cufile_reactor::write_cufile(cufile_io_object const& file,
+                                  std::uint8_t const* source,
+                                  range piece)
+{
+  auto& api = kvikio::cuFileAPI::instance();
+  if (api.Write == nullptr) return false;
+
+  auto const max_op = _config.max_op_bytes - _config.max_op_bytes % IO_BLOCK_SIZE;
+  std::size_t done  = 0;
+  int short_writes  = 0;
+  while (done < piece.size) {
+    auto const want = std::min(max_op, piece.size - done);
+    errno           = 0;
+    auto const got  = api.Write(
+      file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
+    if (got < 0) {
+      auto const saved_errno = errno;
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true, std::memory_order_relaxed)) {
+        CUCASCADE_LOG_WARN(
+          "cufile_reactor: cuFileWrite of '{}' failed: {}; staging such writes through POSIX "
+          "(logged once)",
+          file.object_path(),
+          describe_cufile_failure(got, saved_errno));
+      }
+      return false;
+    }
+    if (got == 0 || ++short_writes > max_short_reads) {
+      throw std::system_error(std::make_error_code(std::errc::io_error),
+                              "cufile_reactor: cuFileWrite wrote nothing");
+    }
+    if (static_cast<std::size_t>(got) == want) short_writes = 0;
+    done += static_cast<std::size_t>(got);
+  }
+  return true;
+}
+
+void cufile_reactor::write_device_staged(cufile_io_object const& file,
+                                         prepared_io_slice const& slice,
+                                         std::span<range const> pieces)
+{
+  // Chunks of at most one scratch slot, never crossing a piece boundary, so a
+  // granule-aligned piece yields granule-aligned chunks (slot size is a multiple
+  // of every granule) that can go O_DIRECT.
+  std::vector<range> chunks;
+  for (auto const& piece : pieces) {
+    for (std::size_t done = 0; done < piece.size; done += scratch_slot_bytes) {
+      chunks.push_back(range{piece.offset + done, std::min(scratch_slot_bytes, piece.size - done)});
+    }
+  }
+  if (chunks.empty()) return;
+
+  auto* const scratch_base = scratch();
+  auto const stream        = slice.d_buffer.stream.get();
+  auto const granule       = write_granule();
+  bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+  static_assert(scratch_slots == 2, "one event per scratch slot below");
+  std::array<cucascade::cuda::cuda_event, scratch_slots> copied{
+    cucascade::cuda::cuda_event{cudaEventDisableTiming},
+    cucascade::cuda::cuda_event{cudaEventDisableTiming}};
+  std::array<bool, scratch_slots> pending{};
+  auto drain = [&]() noexcept {
+    for (std::size_t slot = 0; slot < scratch_slots; ++slot) {
+      if (pending[slot]) std::ignore = copied[slot].synchronize_no_throw();
+      pending[slot] = false;
+    }
+  };
+  // D2H of chunk k into its slot, on the source's stream (so it follows the work
+  // queued there before the call).  The slot's previous chunk was written already.
+  auto stage = [&](std::size_t k) {
+    auto const slot = k % scratch_slots;
+    auto status     = cudaMemcpyAsync(scratch_base + slot * scratch_slot_bytes,
+                                  slice.d_buffer.data + (chunks[k].offset - slice.rng.offset),
+                                  chunks[k].size,
+                                  cudaMemcpyDeviceToHost,
+                                  stream);
+    if (status == cudaSuccess) status = cudaEventRecord(copied[slot].get(), stream);
+    if (status != cudaSuccess) {
+      drain();
+      throw cucascade::cuda_error(std::string{"cufile_reactor: staging copy failed: "} +
+                                  cudaGetErrorString(status));
+    }
+    pending[slot] = true;
+  };
+
+  try {
+    stage(0);
+    for (std::size_t k = 0; k < chunks.size(); ++k) {
+      if (k + 1 < chunks.size()) stage(k + 1);  // overlaps the write of chunk k
+      auto const slot = k % scratch_slots;
+      pending[slot]   = false;
+      if (auto const status = copied[slot].synchronize_no_throw(); status != cudaSuccess) {
+        throw cucascade::cuda_error(std::string{"cufile_reactor: staging copy failed: "} +
+                                    cudaGetErrorString(status));
+      }
+      write_host_piece(file,
+                       direct_fd && is_granule_aligned(chunks[k], granule),
+                       scratch_base + slot * scratch_slot_bytes,
+                       chunks[k]);
+    }
+  } catch (...) {
+    // Never release the scratch to the next op while a copy may still fill it.
+    drain();
+    throw;
+  }
 }
 
 void cufile_reactor::poll_completions() noexcept

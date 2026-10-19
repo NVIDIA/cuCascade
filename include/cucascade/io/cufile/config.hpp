@@ -78,6 +78,12 @@ struct config {
   ///       @c max_direct_io_size (16 MiB) anyway.
   std::size_t max_op_bytes{64UL << 20};
 
+  /// Write slices larger than this are cut by @c templated_ioctx into pieces of
+  /// this size (rounded down to the write granule) and spread over the selected
+  /// reactors; 0 = never cut.  cuFile prefers large submissions (one call splits
+  /// internally across cuFile's own threads), so the default is no split.
+  std::size_t write_split_bytes{0};
+
   /// Device reads below this size use POSIX pread (through the reactor's pinned
   /// scratch) instead of cuFile.  256 KiB follows gpuio's @c gds_min_bytes: it
   /// sits above the <= 128 KiB small-I/O regression NVIDIA documents for real GDS

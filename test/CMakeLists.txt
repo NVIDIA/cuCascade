@@ -97,6 +97,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     target_sources(
       cucascade_io_tests
       PRIVATE io/cufile/test_cufile_reactor.cpp
+              io/cufile/test_cufile_write.cpp
               io/kvikio/test_kvikio_config.cpp io/kvikio/test_kvikio_remote.cpp
               io/kvikio/test_kvikio_write.cpp)
   endif()

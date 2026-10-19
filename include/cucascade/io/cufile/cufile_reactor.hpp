@@ -53,22 +53,25 @@ namespace cucascade::io::cufile {
 /**
  * @brief @c io_object backed by a local filesystem path and a cuFile handle.
  *
- * Owns two @c file_descriptor s -- a buffered O_RDONLY fd for POSIX fallback
- * reads and, when O_DIRECT is enabled and supported, an O_DIRECT fd registered
- * with cuFile via @c cuFileHandleRegister for GDS DMA.  The registered handle
- * lives for the object's lifetime; the destructor deregisters it before the fds
- * close.  All I/O is performed by the reactor -- this class is a passive bag of
- * native handles.
+ * Owns two @c file_descriptor s -- a buffered fd for POSIX I/O and, when
+ * O_DIRECT is enabled and supported, an O_DIRECT fd registered with cuFile via
+ * @c cuFileHandleRegister for GDS DMA.  Both are @c O_RDONLY for an object opened
+ * for reading and @c O_RDWR for one opened for writing (@ref writable).  The
+ * registered handle lives for the object's lifetime; the destructor deregisters
+ * it before the fds close.  All I/O is performed by the reactor -- this class is
+ * a passive bag of native handles plus the file size, which writes through a
+ * writable object raise (@ref note_written).
  */
 class cufile_io_object final : public io_object {
  public:
   /// @p cufile_handle is null when the file was not registered with cuFile; the
-  /// reactor then serves every read of it through the POSIX fallback.
+  /// reactor then serves every read and write of it through POSIX.
   cufile_io_object(std::string path,
                    file_descriptor buffered_fd,
                    file_descriptor direct_fd,
                    CUfileHandle_t cufile_handle,
-                   std::size_t file_size);
+                   std::size_t file_size,
+                   io_access access = io_access::read_only);
 
   ~cufile_io_object() override;
 
@@ -77,7 +80,17 @@ class cufile_io_object final : public io_object {
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
-  [[nodiscard]] std::size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] std::size_t size() const noexcept override
+  {
+    return _file_size.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] bool writable() const noexcept override { return _access == io_access::read_write; }
+
+  void note_written(std::size_t end) const noexcept override
+  {
+    if (writable()) atomic_store_max(_file_size, end);
+  }
 
   /// The buffered fd (page cache).  Always valid.
   [[nodiscard]] int buffered_fd() const noexcept { return _buffered_fd.get(); }
@@ -97,7 +110,8 @@ class cufile_io_object final : public io_object {
   file_descriptor _buffered_fd;
   file_descriptor _direct_fd;
   CUfileHandle_t _cufile_handle{nullptr};
-  std::size_t _file_size{0};
+  mutable std::atomic<std::size_t> _file_size{0};
+  io_access _access{io_access::read_only};
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +132,15 @@ class cufile_io_object final : public io_object {
  * buffered fd, with a host-to-device copy when a device destination was also
  * requested.  A cuFile read that fails degrades to the same fallback instead of
  * failing the read.
+ *
+ * Writes (on objects from @ref create_io_object_for_write) are split at the
+ * write granule like the uring reactor's: the granule-aligned body of a device
+ * source of at least @ref config::gds_threshold bytes goes to synchronous
+ * @c cuFileWrite calls (after the work queued on the source's stream), while
+ * the sub-granule head and tail, smaller bodies and host sources are written
+ * with @c pwrite -- O_DIRECT for aligned pieces, buffered otherwise -- device
+ * bytes being staged through the reactor's pinned scratch by D2H copies on the
+ * source's stream.  A flush is an @c fdatasync.
  *
  * The synchronous API is deliberate (it is what NVIDIA's own consumers use):
  * @c cuFileReadAsync serialises a stream's operations, runs synchronously in
@@ -230,6 +253,39 @@ class cufile_reactor {
   static std::unique_ptr<cufile_io_object> create_io_object(
     std::string path, bool use_odirect, std::optional<kvikio::CompatMode> compat_mode);
 
+  // -- Writes (docs/io/write-api-design.md section 6) ------------------------
+
+  /// Open @p path for writing with default options (O_DIRECT, kvikIO's default
+  /// compat mode).  See the four-argument overload.
+  static std::unique_ptr<cufile_io_object> create_io_object_for_write(std::string path,
+                                                                      write_open_options options);
+
+  /**
+   * @brief Open @p path read+write per @p options and register its O_DIRECT fd
+   *        with cuFile, with the same @p use_odirect / @p compat_mode rules as
+   *        @ref create_io_object.
+   *
+   * @throws std::system_error for open failures (@c ENOENT, @c EEXIST, ...);
+   *         std::invalid_argument / std::runtime_error as @ref create_io_object.
+   */
+  static std::unique_ptr<cufile_io_object> create_io_object_for_write(
+    std::string path,
+    write_open_options options,
+    bool use_odirect,
+    std::optional<kvikio::CompatMode> compat_mode);
+
+  /// Synchronous host write on the calling thread: the write-granule-aligned
+  /// body goes O_DIRECT when the source is block-aligned, head and tail through
+  /// the page cache.  Raises the object's size; returns @p size.
+  /// @throws std::system_error (@c EBADF for an object not opened for writing).
+  std::size_t host_write(cufile_io_object const& file,
+                         std::size_t offset,
+                         std::size_t size,
+                         std::uint8_t const* source);
+
+  /// @c fdatasync the file on the calling thread.  @throws std::system_error.
+  static void flush(cufile_io_object const& file);
+
   /// Same alignment / coalescing policy as the uring reactor: outward to page
   /// boundaries, then merge overlapping / adjacent ranges.  @p alignment smaller
   /// than @c IO_BLOCK_SIZE is ignored in favour of @c IO_BLOCK_SIZE.
@@ -262,6 +318,27 @@ class cufile_reactor {
   [[nodiscard]] bool read_cufile(cufile_io_object const& file,
                                  prepared_io_slice const& slice,
                                  std::unique_ptr<io_op_request>& request);
+
+  /// Serve a write slice: host sources by @c pwrite, device sources by
+  /// @c cuFileWrite for the aligned body and staged @c pwrite for the rest.
+  void dispatch_write(cufile_io_object const& file,
+                      prepared_io_slice const& slice,
+                      io_op_request& request);
+
+  /// Write the device-source pieces @p pieces of @p slice by D2H copies (on the
+  /// slice's stream) into the pinned scratch and @c pwrite, double-buffered.
+  void write_device_staged(cufile_io_object const& file,
+                           prepared_io_slice const& slice,
+                           std::span<range const> pieces);
+
+  /// Write @p piece from device memory @p source with @c cuFileWrite.  Returns
+  /// false when cuFile failed and the caller must stage the piece instead.
+  [[nodiscard]] bool write_cufile(cufile_io_object const& file,
+                                  std::uint8_t const* source,
+                                  range piece);
+
+  /// The scratch, allocated on first use.
+  [[nodiscard]] std::uint8_t* scratch();
 
   /// POSIX pread into the slice's host buffer, then the H2D copy when a device
   /// destination was asked for too; a device-only slice goes to
