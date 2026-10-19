@@ -73,8 +73,12 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
     std::move(original_table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   for (auto const backend : test::disk_test_backends) {
-    auto& disk_space = test::shared_disk_space_for(backend);
-    if (!test::disk_space_can_write(disk_space, /*device=*/true)) {
+    auto* disk_space = test::shared_disk_space_for(backend);
+    if (disk_space == nullptr) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: unavailable here");
+      continue;
+    }
+    if (!test::disk_space_can_write(*disk_space, /*device=*/true)) {
       WARN("skipping the " << test::to_string(backend) << " disk backend: no device writes");
       continue;
     }
@@ -82,7 +86,7 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
 
     // GPU -> disk (one batched device write)
     auto disk_rep =
-      registry.convert<disk_data_representation>(*gpu_rep, &disk_space, shared_stream());
+      registry.convert<disk_data_representation>(*gpu_rep, disk_space, shared_stream());
 
     // disk -> GPU (one batched device read)
     auto gpu_rep2 =
@@ -762,7 +766,11 @@ TEST_CASE("gpu disk round-trip with an explicit io context of each backend",
   CAPTURE(test::to_string(backend));
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
   auto disk_space = test::make_disk_space(backend);
-  auto context    = disk_space->get_io_context();
+  if (disk_space == nullptr) {
+    WARN("the " << test::to_string(backend) << " backend cannot run in this process");
+    return;
+  }
+  auto context = disk_space->get_io_context();
   REQUIRE(context != nullptr);
   if (!context->supports_device_write()) {
     WARN("the " << test::to_string(backend) << " context cannot write device memory yet");

@@ -260,10 +260,11 @@ TEST_CASE("make_disk_io_context builds a context of the requested backend", "[di
              std::pair{disk_io_backend::kvikio, io_context_type::kvikio});
   CAPTURE(test::to_string(backend));
 
-  disk_io_context_options options;
-  options.backend = backend;
-  auto context    = make_disk_io_context(options);
-  REQUIRE(context != nullptr);
+  auto context = test::try_make_disk_io_context(backend);
+  if (context == nullptr) {
+    WARN("the " << test::to_string(backend) << " backend cannot run in this process");
+    return;
+  }
   REQUIRE(context->type() == expected);
 }
 
@@ -366,10 +367,12 @@ TEST_CASE("disk spaces without a context adopt the shared default on first conve
 TEST_CASE("set_io_context switches the context of later conversions", "[disk][io][context]")
 {
   scratch_dir dir;
-  disk_io_context_options options;
-  options.backend = disk_io_backend::uring;
-  auto first      = make_disk_io_context(options);
-  auto second     = make_disk_io_context(options);
+  auto first  = test::try_make_disk_io_context(disk_io_backend::uring);
+  auto second = test::try_make_disk_io_context(disk_io_backend::uring);
+  if (first == nullptr || second == nullptr) {
+    WARN("the uring backend cannot run in this process");
+    return;
+  }
   if (!first->supports_device_write()) {
     WARN("the uring context cannot write device memory yet");
     return;
@@ -406,12 +409,16 @@ TEST_CASE("large multi-column tables round-trip through every disk backend", "[d
   auto gpu_rep = make_gpu_rep(make_sequence_table(4'500'007, 3, shared_stream()));
 
   for (auto const backend : test::disk_test_backends) {
-    auto& disk_space = test::shared_disk_space_for(backend);
+    auto* disk_space = test::shared_disk_space_for(backend);
     CAPTURE(test::to_string(backend));
+    if (disk_space == nullptr) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: unavailable here");
+      continue;
+    }
 
-    if (test::disk_space_can_write(disk_space, /*device=*/true)) {
+    if (test::disk_space_can_write(*disk_space, /*device=*/true)) {
       auto disk_rep =
-        registry().convert<disk_data_representation>(*gpu_rep, &disk_space, shared_stream());
+        registry().convert<disk_data_representation>(*gpu_rep, disk_space, shared_stream());
       auto back = registry().convert<gpu_table_representation>(
         *disk_rep, shared_gpu_space().get(), shared_stream());
       test::expect_cudf_tables_equal_on_stream(
@@ -420,11 +427,11 @@ TEST_CASE("large multi-column tables round-trip through every disk backend", "[d
       WARN("skipping GPU <-> DISK for " << test::to_string(backend) << ": no device writes");
     }
 
-    if (test::disk_space_can_write(disk_space, /*device=*/false)) {
+    if (test::disk_space_can_write(*disk_space, /*device=*/false)) {
       auto host_rep = registry().convert<host_data_representation>(
         *gpu_rep, shared_host_space().get(), shared_stream());
       auto disk_rep =
-        registry().convert<disk_data_representation>(*host_rep, &disk_space, shared_stream());
+        registry().convert<disk_data_representation>(*host_rep, disk_space, shared_stream());
       auto host_back = registry().convert<host_data_representation>(
         *disk_rep, shared_host_space().get(), shared_stream());
       auto back = registry().convert<gpu_table_representation>(
@@ -443,7 +450,7 @@ TEST_CASE("large multi-column tables round-trip through every disk backend", "[d
 
 TEST_CASE("concurrent conversions on one disk space", "[disk][io][concurrency]")
 {
-  auto& disk_space = test::shared_disk_space_for(disk_io_backend::automatic);
+  auto& disk_space = *test::shared_disk_space_for(disk_io_backend::automatic);
   if (!test::disk_space_can_write(disk_space, /*device=*/true)) {
     WARN("the default disk context cannot write device memory yet");
     return;
@@ -563,6 +570,10 @@ TEST_CASE("a disk write failing after submit throws and leaves no batch file",
     CAPTURE(test::to_string(backend));
     scratch_dir dir;
     auto space = test::make_disk_space(backend, 30 + static_cast<int>(i), dir.string());
+    if (space == nullptr) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: unavailable here");
+      continue;
+    }
 
     rlimit previous{};
     REQUIRE(::getrlimit(RLIMIT_FSIZE, &previous) == 0);

@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <system_error>
 
 namespace cucascade {
 namespace test {
@@ -54,7 +55,24 @@ inline constexpr std::array<disk_io_backend, 4> disk_test_backends{disk_io_backe
 }
 
 /**
- * @brief A DISK memory space under @p mount_path served by @p backend.
+ * @brief make_disk_io_context() for @p backend, or null when that backend cannot run in this
+ *        process (e.g. uring where io_uring is forbidden: make_disk_io_context throws
+ *        std::system_error).
+ */
+[[nodiscard]] inline std::shared_ptr<io::ioctx> try_make_disk_io_context(disk_io_backend backend)
+{
+  disk_io_context_options options;
+  options.backend = backend;
+  try {
+    return make_disk_io_context(options);
+  } catch (std::system_error const&) {
+    return nullptr;
+  }
+}
+
+/**
+ * @brief A DISK memory space under @p mount_path served by @p backend, or null when that backend
+ *        cannot run in this process (see try_make_disk_io_context).
  *
  * automatic leaves the space without a context, so the converters adopt the process-shared
  * default; every other backend gets its own context from make_disk_io_context().
@@ -69,16 +87,16 @@ inline constexpr std::array<disk_io_backend, 4> disk_test_backends{disk_io_backe
   config.memory_capacity = 1024UL * 1024 * 1024;
   config.mount_paths     = std::move(mount_path);
   if (backend != disk_io_backend::automatic) {
-    disk_io_context_options options;
-    options.backend   = backend;
-    config.io_context = make_disk_io_context(options);
+    config.io_context = try_make_disk_io_context(backend);
+    if (!config.io_context) { return nullptr; }
   }
   return std::make_shared<memory::memory_space>(config);
 }
 
 /// Process-lifetime DISK spaces, one per backend in disk_test_backends (shared by all tests to
-/// avoid rebuilding reactor pools and pinned staging per test).
-[[nodiscard]] inline memory::memory_space& shared_disk_space_for(disk_io_backend backend)
+/// avoid rebuilding reactor pools and pinned staging per test). Null for a backend that cannot run
+/// in this process.
+[[nodiscard]] inline memory::memory_space* shared_disk_space_for(disk_io_backend backend)
 {
   static auto const spaces = [] {
     std::array<std::shared_ptr<memory::memory_space>, disk_test_backends.size()> result;
@@ -88,9 +106,9 @@ inline constexpr std::array<disk_io_backend, 4> disk_test_backends{disk_io_backe
     return result;
   }();
   for (std::size_t i = 0; i < disk_test_backends.size(); ++i) {
-    if (disk_test_backends[i] == backend) { return *spaces[i]; }
+    if (disk_test_backends[i] == backend) { return spaces[i].get(); }
   }
-  return *spaces.front();
+  return nullptr;
 }
 
 /**
