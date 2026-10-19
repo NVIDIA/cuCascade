@@ -37,6 +37,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -228,6 +230,13 @@ class uring_reactor {
   /// of the constructor so a reactor can be built cheaply (it only copies its
   /// config) and parked until it is actually needed — see @c ioctx::start.
   /// Idempotent: a second call (while the worker is already running) is a no-op.
+  ///
+  /// Waits until the worker has set up its io_uring.  When that fails (e.g.
+  /// @c EPERM where a seccomp profile blocks io_uring: Docker's default since
+  /// 25, gVisor, @c kernel.io_uring_disabled), the worker exits, the error is
+  /// logged, and start() rethrows it (a @c std::system_error with the errno).
+  /// Requests enqueued before or after the failure fail with that same error,
+  /// not with @c operation_canceled.  start() may be called again to retry.
   void start();
 
   void interrupt();
@@ -336,7 +345,8 @@ class uring_reactor {
     std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
-  void worker_loop(const std::stop_token& stop_token);
+  /// @p ready is fulfilled once the ring is set up, or failed with the setup error.
+  void worker_loop(const std::stop_token& stop_token, std::promise<void>& ready);
 
   // Shared services + tunables for the whole reactor pool, kept alive for this
   // reactor's lifetime (so the bounce-staging resource outlives _bounce_storage).
@@ -356,6 +366,11 @@ class uring_reactor {
   mutable std::mutex _enqueue_mutex;
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
+  /// Why the reactor stopped accepting work after its worker failed (ring setup
+  /// or a fatal worker error); rejected requests fail with it.  Null after a
+  /// clean shutdown, which rejects with @c operation_canceled.  Guarded by
+  /// @c _enqueue_mutex.
+  std::exception_ptr _rejection_error;
 
   // Gauges (see @ref gauges): written only by the worker, read by take_gauges().
   std::atomic<std::uint32_t> _gauge_inflight{0};
