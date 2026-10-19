@@ -114,3 +114,21 @@ Not adopted (and why): gpuio's batch engine (2-10% below sync on real GB200 hard
 task-4 (read): G1 + G2 + G3 (one change), then G4, then G5; re-run `[.cufile-bench]` and the existing `[cufile]` tests after each. task-5 (write): G6 on io-write's contract, plus G8 as an off-by-default knob (`register_min_bytes = 0`; when set, only 4 KiB-aligned contiguous device slices of at least that size are registered before the first chunk and deregistered before the slice settles, on every path).
 
 **Follow-ups for a GDS-capable host** (lead decision, 2026-10-19): G7 (cuFile parameters, starting with `max_direct_io_size_kb = 16384`), G9 (per-reactor counters), re-sweeping `max_op_bytes` and `gds_threshold` in real GDS mode, and the G8 registered-vs-unregistered A/B with 4 KiB-aligned destinations.
+
+## 5. Results of task-4 (read path, compat mode)
+
+Applied: G1 + G2 + G3 (`0819aec`), G4 (`184686d`), G5 (`ac082ad`). `[.cufile-bench]`, 4 reactors, 4 GiB file on the root NVMe, median of 3 rounds per pass, page cache dropped per round; base = `3714b26`; "pass 1 / pass 2" are interleaved A/B runs on a machine shared with other builds, so differences below ~10% are noise.
+
+| scenario | base | after G1 | after G1-G5 |
+|---|---|---|---|
+| 1 device slice 256 MiB at a time | 1.84 / 1.90 | 6.25 / 6.14 | 6.49 / 6.27 |
+| 1 device slice 1 GiB at a time | 1.90 / 1.97 | 6.37 / 6.21 | 6.60 / 6.26 |
+| `device_readv` 4 MiB slices, one stream | 2.00 / 1.83 | 5.79 / 5.35 | 5.69 / 5.56 |
+| `device_readv` 16 MiB slices, one stream | 1.98 / 2.04 | 6.34 / 6.21 | 6.39 / 6.49 |
+| 64 KiB device reads, 8 streams (POSIX via pinned scratch) | n/a | n/a | 1.22 / 1.30 |
+| 256 KiB device reads, 8 streams | 1.29 / 1.35 | 2.35 / 2.22 | 3.24 / 4.04 |
+| 1 MiB device reads, 8 streams | 6.89 / 6.85 | 6.26 / 6.17 | 5.99 / 5.48 (isolated runs 6.62-6.96) |
+| 8 MiB device reads, 8 streams | 6.82 / 6.80 | 6.69 / 6.61 | 6.66 / 6.63 |
+| 4 MiB host reads (buffered `pread`) | 2.78 / 2.96 | 2.78 / 2.66 | 2.96 / 2.84 |
+
+Device ceiling 7.1-7.2 GB/s; the uring reactor measured 6.6-7.2 GB/s on the device scenarios in the same session. The 1 MiB x 8 streams row was the one scenario where the old path already saturated the device; its spread after the change (5.5-7.0 across runs, 6.6-7.0 when run alone) is within the noise of this shared host and was not traced to a specific cost.
