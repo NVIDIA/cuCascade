@@ -41,11 +41,18 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -154,6 +161,42 @@ std::unique_ptr<cudf::table> make_sequence_table(cudf::size_type rows,
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
+/**
+ * @brief Run the test case @p name in a child process unless this already is that child.
+ *
+ * The child is this test executable re-run on the single test case with @p marker set to "1"; it
+ * must exit with status 0. Returns true in the parent (the caller returns), false in the child
+ * (the caller runs the test body).
+ */
+bool run_in_child_process(char const* name, char const* marker)
+{
+  auto const* value = std::getenv(marker);
+  if (value != nullptr && std::string_view{value} == "1") { return false; }
+  test::child_test_runner child{name, {{marker, std::string{"1"}}}};
+  bool const finished = child.wait_for(std::chrono::seconds{300});
+  if (!finished) { child.stop(); }
+  INFO(child.output());
+  REQUIRE(finished);
+  REQUIRE(WIFEXITED(child.status()));
+  REQUIRE(WEXITSTATUS(child.status()) == 0);
+  return true;
+}
+
+/// Make io_uring_setup fail with EPERM in this thread and every thread it creates from now on, as
+/// container seccomp profiles (Docker 25+), gVisor and kernel.io_uring_disabled do.
+void forbid_io_uring()
+{
+  sock_filter filter[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, static_cast<std::uint32_t>(offsetof(seccomp_data, nr))),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<std::uint32_t>(__NR_io_uring_setup), 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  sock_fprog program{static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])), filter};
+  REQUIRE(::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+  REQUIRE(::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == 0);
+}
+
 std::unique_ptr<gpu_table_representation> make_gpu_rep(std::unique_ptr<cudf::table> table)
 {
   return std::make_unique<gpu_table_representation>(
@@ -224,12 +267,68 @@ TEST_CASE("make_disk_io_context builds a context of the requested backend", "[di
   REQUIRE(context->type() == expected);
 }
 
-TEST_CASE("make_disk_io_context resolves automatic to cufile or uring", "[disk][io][context]")
+TEST_CASE("make_disk_io_context resolves automatic to a concrete backend", "[disk][io][context]")
 {
   auto context = make_disk_io_context();
   REQUIRE(context != nullptr);
   auto const type = context->type();
-  REQUIRE((type == io::io_context_type::uring || type == io::io_context_type::cufile));
+  REQUIRE((type == io::io_context_type::uring || type == io::io_context_type::cufile ||
+           type == io::io_context_type::kvikio));
+}
+
+TEST_CASE("make_disk_io_context rejects a backend without reactors", "[disk][io][context]")
+{
+  disk_io_context_options options;
+  options.backend             = disk_io_backend::uring;
+  options.io.uring_n_reactors = 0;
+  REQUIRE_THROWS_AS(make_disk_io_context(options), std::invalid_argument);
+
+  options.backend              = disk_io_backend::cufile;
+  options.io.cufile_n_reactors = 0;
+  REQUIRE_THROWS_AS(make_disk_io_context(options), std::invalid_argument);
+}
+
+TEST_CASE("without io_uring the DISK tier fails fast or falls back", "[disk][io][no_uring]")
+{
+  if (run_in_child_process("without io_uring the DISK tier fails fast or falls back",
+                           "CUCASCADE_DISK_NO_URING_CHILD")) {
+    return;
+  }
+  // Child: io_uring is forbidden from here on, before anything set up a ring.
+  forbid_io_uring();
+
+  // A forced uring context fails at construction with the real cause ...
+  disk_io_context_options forced;
+  forced.backend = disk_io_backend::uring;
+  try {
+    [[maybe_unused]] auto context = make_disk_io_context(forced);
+    FAIL("make_disk_io_context built a uring context although io_uring is forbidden");
+  } catch (std::system_error const& error) {
+    REQUIRE(error.code().value() == EPERM);
+  }
+
+  // ... while automatic, and so a DISK space without a context, picks a backend that works.
+  REQUIRE(make_disk_io_context()->type() != io::io_context_type::uring);
+  scratch_dir dir;
+  auto space   = test::make_disk_space(disk_io_backend::automatic, 16, dir.string());
+  auto gpu_rep = make_gpu_rep(make_sequence_table(300'000, 2, shared_stream()));
+  auto from_gpu =
+    registry().convert<disk_data_representation>(*gpu_rep, space.get(), shared_stream());
+  REQUIRE(space->get_io_context()->type() != io::io_context_type::uring);
+  auto back = registry().convert<gpu_table_representation>(
+    *from_gpu, shared_gpu_space().get(), shared_stream());
+  test::expect_cudf_tables_equal_on_stream(
+    gpu_rep->get_table_view(), back->get_table_view(), shared_stream());
+  auto host_rep = registry().convert<host_data_representation>(
+    *gpu_rep, shared_host_space().get(), shared_stream());
+  auto from_cpu =
+    registry().convert<disk_data_representation>(*host_rep, space.get(), shared_stream());
+  auto host_back = registry().convert<host_data_representation>(
+    *from_cpu, shared_host_space().get(), shared_stream());
+  auto back_from_host = registry().convert<gpu_table_representation>(
+    *host_back, shared_gpu_space().get(), shared_stream());
+  test::expect_cudf_tables_equal_on_stream(
+    gpu_rep->get_table_view(), back_from_host->get_table_view(), shared_stream());
 }
 
 TEST_CASE("default_disk_io_context is shared by every caller", "[disk][io][context]")
@@ -444,6 +543,50 @@ TEST_CASE("a truncated or missing batch file fails the read", "[disk][io][error]
   }
 }
 
+TEST_CASE("a disk write failing after submit throws and leaves no batch file",
+          "[disk][io][error][efbig]")
+{
+  if (run_in_child_process("a disk write failing after submit throws and leaves no batch file",
+                           "CUCASCADE_DISK_EFBIG_CHILD")) {
+    return;
+  }
+  // Child: 3 x 4M INT64 columns (~96 MiB per file) against an 8 MiB file-size limit, so the
+  // request's first ops land and later ones fail with EFBIG while siblings are in flight.
+  auto gpu_rep  = make_gpu_rep(make_sequence_table(4'000'003, 3, shared_stream()));
+  auto host_rep = registry().convert<host_data_representation>(
+    *gpu_rep, shared_host_space().get(), shared_stream());
+  shared_stream().sync();
+  std::signal(SIGXFSZ, SIG_IGN);  // EFBIG instead of the default SIGXFSZ termination
+
+  for (std::size_t i = 0; i < test::disk_test_backends.size(); ++i) {
+    auto const backend = test::disk_test_backends[i];
+    CAPTURE(test::to_string(backend));
+    scratch_dir dir;
+    auto space = test::make_disk_space(backend, 30 + static_cast<int>(i), dir.string());
+
+    rlimit previous{};
+    REQUIRE(::getrlimit(RLIMIT_FSIZE, &previous) == 0);
+    rlimit limited   = previous;
+    limited.rlim_cur = 8UL << 20;
+    REQUIRE(::setrlimit(RLIMIT_FSIZE, &limited) == 0);
+    REQUIRE_THROWS(
+      registry().convert<disk_data_representation>(*gpu_rep, space.get(), shared_stream()));
+    REQUIRE(dir.file_count() == 0);
+    REQUIRE_THROWS(
+      registry().convert<disk_data_representation>(*host_rep, space.get(), shared_stream()));
+    REQUIRE(dir.file_count() == 0);
+    REQUIRE(::setrlimit(RLIMIT_FSIZE, &previous) == 0);
+
+    // The space keeps working once the limit is gone.
+    auto disk_rep =
+      registry().convert<disk_data_representation>(*gpu_rep, space.get(), shared_stream());
+    auto back = registry().convert<gpu_table_representation>(
+      *disk_rep, shared_gpu_space().get(), shared_stream());
+    test::expect_cudf_tables_equal_on_stream(
+      gpu_rep->get_table_view(), back->get_table_view(), shared_stream());
+  }
+}
+
 TEST_CASE("disk_data_representation deletes its batch file", "[disk][io][lifetime]")
 {
   scratch_dir dir;
@@ -476,18 +619,8 @@ TEST_CASE("disk spaces kept in globals survive process exit", "[disk][io][lifeti
   // same holds for HOST memory spaces kept in a global.
   SKIP("debug builds assert on CUDA calls made after the CUDA runtime was torn down");
 #endif
-  constexpr char const* child_marker = "CUCASCADE_DISK_EXIT_CHILD";
-  auto const* marker                 = std::getenv(child_marker);
-  if (marker == nullptr || std::string_view{marker} != "1") {
-    // Parent: run this test case in a child process and require a clean exit.
-    test::child_test_runner child{"disk spaces kept in globals survive process exit",
-                                  {{child_marker, std::string{"1"}}}};
-    bool const finished = child.wait_for(std::chrono::seconds{120});
-    if (!finished) { child.stop(); }
-    INFO(child.output());
-    REQUIRE(finished);
-    REQUIRE(WIFEXITED(child.status()));
-    REQUIRE(WEXITSTATUS(child.status()) == 0);
+  if (run_in_child_process("disk spaces kept in globals survive process exit",
+                           "CUCASCADE_DISK_EXIT_CHILD")) {
     return;
   }
 

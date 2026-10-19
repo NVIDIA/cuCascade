@@ -144,6 +144,10 @@ void read_disk_file_device(io::ioctx& ctx,
                            std::span<io::slice const> slices,
                            ::cuda::stream_ref stream)
 {
+  if (!ctx.supports_device_read()) {
+    throw std::logic_error(
+      "disk tier: the io context of the DISK memory space cannot read into device memory");
+  }
   if (slices.empty()) { return; }
   auto const expected = total_bytes(slices);
   auto const object   = ctx.open_io_object(path);

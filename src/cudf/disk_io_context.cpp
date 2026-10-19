@@ -23,14 +23,19 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
-#include <algorithm>
+#include <liburing.h>
+
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <system_error>
 #include <utility>
 
 namespace cucascade {
@@ -53,10 +58,12 @@ class owned_uring_staging {
  protected:
   owned_uring_staging(std::size_t n_reactors, int numa_node)
     : _upstream(numa_node, /*make_portable=*/true),
+      // The first argument only tags the resource's HOST memory_space_id (a HOST space's id is
+      // its NUMA node); this resource belongs to no memory space.
       _staging(numa_node,
                _upstream,
-               std::max<std::size_t>(n_reactors, 1) * uring_staging_bytes_per_reactor,
-               std::max<std::size_t>(n_reactors, 1) * uring_staging_bytes_per_reactor,
+               n_reactors * uring_staging_bytes_per_reactor,
+               n_reactors * uring_staging_bytes_per_reactor,
                uring_staging_block_size,
                uring_staging_bytes_per_reactor / uring_staging_block_size,
                /*initial_pools=*/0)
@@ -83,16 +90,64 @@ class owning_uring_reactor_context final : private owned_uring_staging,
   }
 };
 
-[[nodiscard]] disk_io_backend resolve_backend(disk_io_backend requested) noexcept
+/**
+ * @brief 0 when this process can set up io_uring rings, otherwise the (positive) errno of the
+ *        failed setup. Probed once with a one-entry ring.
+ *
+ * io_uring can be forbidden even on a kernel that has it: container seccomp profiles (Docker 25+),
+ * gVisor and kernel.io_uring_disabled make io_uring_setup fail with EPERM / ENOSYS. A uring
+ * reactor whose ring cannot be set up dies in its worker and fails every request, so the DISK tier
+ * checks up front instead.
+ */
+[[nodiscard]] int uring_setup_errno() noexcept
+{
+  static int const error = [] {
+    io_uring ring{};
+    int const rc = io_uring_queue_init(1, &ring, 0);
+    if (rc == 0) {
+      io_uring_queue_exit(&ring);
+      return 0;
+    }
+    return -rc;
+  }();
+  return error;
+}
+
+[[nodiscard]] disk_io_backend resolve_backend(disk_io_backend requested)
 {
   if (requested != disk_io_backend::automatic) { return requested; }
-  return detail::gds_is_available() ? disk_io_backend::cufile : disk_io_backend::uring;
+  if (detail::gds_is_available()) { return disk_io_backend::cufile; }
+  if (uring_setup_errno() == 0) { return disk_io_backend::uring; }
+  CUCASCADE_LOG_WARN(
+    "disk tier: io_uring is unavailable in this process ({}); DISK spaces without an explicit io "
+    "context use kvikIO",
+    std::strerror(uring_setup_errno()));
+  return disk_io_backend::kvikio;
+}
+
+void validate(disk_io_context_options const& options, disk_io_backend backend)
+{
+  auto const& cfg = options.io;
+  if (backend == disk_io_backend::uring && cfg.uring_n_reactors == 0) {
+    throw std::invalid_argument("make_disk_io_context: io.uring_n_reactors must be at least 1");
+  }
+  if (backend == disk_io_backend::cufile && cfg.cufile_n_reactors == 0) {
+    throw std::invalid_argument("make_disk_io_context: io.cufile_n_reactors must be at least 1");
+  }
+  if (backend == disk_io_backend::uring && uring_setup_errno() != 0) {
+    throw std::system_error(uring_setup_errno(),
+                            std::generic_category(),
+                            "make_disk_io_context: io_uring is unavailable in this process "
+                            "(io_uring_queue_init)");
+  }
 }
 
 [[nodiscard]] std::shared_ptr<io::ioctx> build_context(disk_io_context_options const& options)
 {
-  auto const& cfg = options.io;
-  switch (resolve_backend(options.backend)) {
+  auto const& cfg    = options.io;
+  auto const backend = resolve_backend(options.backend);
+  validate(options, backend);
+  switch (backend) {
     case disk_io_backend::cufile: {
       auto reactor_ctx = std::make_shared<io::cufile::cufile_reactor::reactor_context>(cfg.cufile);
       return std::make_shared<io::cufile::cufile_ioctx>(cfg.cufile_n_reactors,
