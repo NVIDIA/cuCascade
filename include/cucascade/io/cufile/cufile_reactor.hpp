@@ -140,7 +140,11 @@ class cufile_io_object final : public io_object {
  * the sub-granule head and tail, smaller bodies and host sources are written
  * with @c pwrite -- O_DIRECT for aligned pieces, buffered otherwise -- device
  * bytes being staged through the reactor's pinned scratch by D2H copies on the
- * source's stream.  A flush is an @c fdatasync.
+ * source's stream.  A flush is an @c fdatasync.  On a platform where cuFile
+ * runs only in compatibility mode (@c probe_platform().compat_only) aligned
+ * device bodies are staged too: cuFile then bounces through host memory itself,
+ * and its 1 MiB writes measured about half as fast as the staged path when they
+ * extend a file (docs/io/gpuio-gds-practices.md, section 6).
  *
  * The synchronous API is deliberate (it is what NVIDIA's own consumers use):
  * @c cuFileReadAsync serialises a stream's operations, runs synchronously in
@@ -391,6 +395,17 @@ class cufile_reactor {
   /// so a reactor that never takes that path holds no pinned memory.
   pinned_scratch _scratch;
 };
+
+namespace detail {
+
+/// Tests only: let aligned device-write bodies use @c cuFileWrite even on a
+/// compat-only platform, so hosts without GDS still cover that path.  Process-wide.
+void set_cufile_writes_in_compat_for_testing(bool enabled) noexcept;
+
+/// Tests only: @c cuFileWrite calls issued by every cuFile reactor so far.
+[[nodiscard]] std::size_t cufile_write_calls_for_testing() noexcept;
+
+}  // namespace detail
 
 }  // namespace cucascade::io::cufile
 
