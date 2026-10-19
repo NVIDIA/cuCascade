@@ -96,10 +96,16 @@ void write_disk_file_host(io::ioctx& ctx,
 /**
  * @brief Read ranges of a batch file into device buffers and wait.
  *
- * One device_readv_async_io on @p stream. When it returns, every byte is in device memory: the
- * read future resolves only after the backend's copies / cuFile reads enqueued on @p stream have
- * completed. Must be called with the destination device current.
+ * One device_readv_async_io on @p stream. It relies on the ioctx read contract:
+ *  - the request's future resolves only after every byte is in device memory, whichever stream
+ *    the backend used to put it there, so the data is complete when this function returns;
+ *  - a backend writes the destinations only after the work enqueued on @p stream before the call
+ *    (it copies on @p stream, or waits for @p stream before writing from another stream or the
+ *    host). The destinations may be stream-ordered allocations on @p stream; that ordering is
+ *    what makes writing them safe.
+ * Must be called with the destination device current.
  *
+ * @throws std::logic_error if @p ctx cannot read into device memory.
  * @throws std::system_error / std::runtime_error on any I/O, CUDA or short-read failure (a short
  *         read means the file is truncated).
  */
