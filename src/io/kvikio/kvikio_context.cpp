@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -34,12 +35,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -212,7 +216,8 @@ std::shared_ptr<io_object> kvikio_context::create_io_object_for_write(std::strin
   }
   // kvikIO's fopen-style flags have no "create without truncating" or
   // "exclusive" mode, so the create / truncate / exclusive semantics come from
-  // open(2) and the handle then opens the existing file read-write ("r+").
+  // open(2) and the handle then opens the same file read-write ("r+").  The
+  // first fd stays open until the handle is checked to name the same inode.
   int flags = O_RDWR | O_CLOEXEC;
   switch (options.mode) {
     case write_mode::create_or_truncate: flags |= O_CREAT | O_TRUNC; break;
@@ -220,20 +225,50 @@ std::shared_ptr<io_object> kvikio_context::create_io_object_for_write(std::strin
     case write_mode::open_existing: break;
     case write_mode::create_new: flags |= O_CREAT | O_EXCL; break;
   }
-  auto const fd = ::open(path.c_str(), flags, options.permissions);
-  if (fd < 0) {
+  std::error_code exists_error;
+  bool const existed =
+    options.mode != write_mode::create_new && std::filesystem::exists(path, exists_error);
+  file_descriptor fd{::open(path.c_str(), flags, options.permissions)};
+  if (!fd) {
     throw std::system_error(
       errno, std::generic_category(), "kvikio_context: open '" + path + "' for writing");
   }
-  ::close(fd);
+  struct stat opened{};
+  if (::fstat(fd.get(), &opened) != 0) {
+    throw std::system_error(errno, std::generic_category(), "kvikio_context: fstat '" + path + "'");
+  }
+  bool const created        = options.mode != write_mode::open_existing && !existed;
+  constexpr auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+  if (options.size_hint != 0 && options.size_hint <= max_offset) {
+    // Best effort, as in the uring backend: never changes the size.
+    std::ignore =
+      ::fallocate(fd.get(), FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(options.size_hint));
+  }
 
-  kvikio::FileHandle handle =
-    _config.compat_mode
-      ? kvikio::FileHandle{path, "r+", kvikio::FileHandle::m644, *_config.compat_mode}
-      : kvikio::FileHandle{path, "r+"};
-  auto const file_size = handle.nbytes();
-  return std::make_shared<kvikio_io_object>(
-    std::move(path), std::move(handle), file_size, io_access::read_write);
+  try {
+    kvikio::FileHandle handle =
+      _config.compat_mode
+        ? kvikio::FileHandle{path, "r+", kvikio::FileHandle::m644, *_config.compat_mode}
+        : kvikio::FileHandle{path, "r+"};
+    struct stat reopened{};
+    if (::fstat(handle.fd(), &reopened) != 0 || reopened.st_dev != opened.st_dev ||
+        reopened.st_ino != opened.st_ino) {
+      throw std::runtime_error("kvikio_context: '" + path +
+                               "' was replaced while it was being opened for writing");
+    }
+    auto const file_size = handle.nbytes();
+    return std::make_shared<kvikio_io_object>(
+      std::move(path), std::move(handle), file_size, io_access::read_write);
+  } catch (...) {
+    // Leave no debris behind a failed open: remove the file if this call
+    // created it and the path still names it.
+    struct stat current{};
+    if (created && ::stat(path.c_str(), &current) == 0 && current.st_dev == opened.st_dev &&
+        current.st_ino == opened.st_ino) {
+      ::unlink(path.c_str());
+    }
+    throw;
+  }
 }
 
 size_t kvikio_context::host_write_io(const io_object& obj,
