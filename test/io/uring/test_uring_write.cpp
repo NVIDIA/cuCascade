@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "utils/child_test_runner.hpp"
+
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
@@ -30,12 +32,15 @@
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -48,6 +53,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <tuple>
@@ -298,6 +304,35 @@ template <class Future>
   }
   return false;
 }
+
+/** Holds a CUDA stream at a host function until released (or for 10 s at most). */
+class stream_gate {
+ public:
+  stream_gate()                              = default;
+  stream_gate(stream_gate const&)            = delete;
+  stream_gate& operator=(stream_gate const&) = delete;
+  ~stream_gate() { release(); }
+
+  void block(cudaStream_t stream)
+  {
+    REQUIRE(cudaLaunchHostFunc(stream, &stream_gate::wait, this) == cudaSuccess);
+  }
+
+  void release() noexcept { _open.store(true, std::memory_order_release); }
+
+ private:
+  static void CUDART_CB wait(void* self)
+  {
+    auto const* gate    = static_cast<stream_gate const*>(self);
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!gate->_open.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+  std::atomic<bool> _open{false};
+};
 
 /** An io_object of no backend at all. */
 class foreign_object final : public io_object {
@@ -970,4 +1005,168 @@ TEST_CASE("uring write throughput probe", "[.][io][uring][write_bench]")
 
   std::ignore = cudaFreeHost(pinned);
   std::ignore = cudaFree(device);
+}
+
+TEST_CASE("uring a request stalled on its caller's stream does not hold up other requests",
+          "[io][uring][write]")
+{
+  // One reactor, so the stalled request and the probes share it.
+  write_context ctx{1};
+  scratch_path read_path;
+  read_path.fill(pattern(MiB, 30));
+  scratch_path write_path;
+  auto reader = ctx->open_io_object(read_path.str());
+  auto writer = ctx->open_io_object_for_write(write_path.str());
+  cuda_stream stream;
+  auto const device_data = pattern(4 * MiB, 31);
+  device_bytes device{device_data};
+  stream_gate gate;
+  gate.block(stream.get());
+
+  cucascade::exec::semi_future<std::size_t> stalled;
+  std::size_t stalled_bytes = 0;
+  SECTION("a staged device write")
+  {
+    stalled_bytes = 4 * MiB;
+    stalled       = ctx->device_write_async(*writer, 0, stalled_bytes, device.get(), stream.ref());
+  }
+  SECTION("a device read's host-to-device copy")
+  {
+    stalled_bytes = MiB;
+    stalled = ctx->device_read_async_io(*reader, 0, stalled_bytes, device.get(), stream.ref());
+  }
+  // Let the reactor reach the stalled request's copy.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto const start = std::chrono::steady_clock::now();
+  std::vector<std::uint8_t> read_back_bytes(4096);
+  CHECK(
+    ctx->host_read_async_io(*reader, 4096, read_back_bytes.size(), read_back_bytes.data()).get() ==
+    read_back_bytes.size());
+  auto const other = pattern(8192, 32);
+  CHECK(ctx->host_write_async(*writer, 8 * MiB, other.size(), other.data()).get() == other.size());
+  auto const elapsed = std::chrono::steady_clock::now() - start;
+  CHECK(elapsed < std::chrono::seconds(1));
+  CHECK_FALSE(stalled.is_ready());
+
+  gate.release();
+  CHECK(std::move(stalled).get() == stalled_bytes);
+  CHECK(
+    std::equal(read_back_bytes.begin(), read_back_bytes.end(), pattern(MiB, 30).begin() + 4096));
+}
+
+TEST_CASE("uring short writes are resubmitted and a file size limit fails cleanly",
+          "[io][uring][write]")
+{
+  // RLIMIT_FSIZE is process-wide, so the body runs in a child process.
+  constexpr char const* marker_name = "CUCASCADE_URING_WRITE_FSIZE_CHILD";
+  if (auto const* marker = std::getenv(marker_name);
+      marker == nullptr || std::string_view{marker} != "1") {
+    cucascade::test::child_test_runner child{
+      "uring short writes are resubmitted and a file size limit fails cleanly",
+      {{marker_name, std::string{"1"}}}};
+    bool const completed = child.wait_for(std::chrono::seconds(120));
+    if (!completed) child.stop();
+    INFO(child.output());
+    REQUIRE(completed);
+    REQUIRE(WIFEXITED(child.status()));
+    REQUIRE(WEXITSTATUS(child.status()) == 0);
+    return;
+  }
+
+  // Past the limit a write fails with EFBIG instead of raising SIGXFSZ.  A
+  // write crossing it is cut short at the limit first: the reactor resubmits the
+  // remainder (falling back from O_DIRECT, whose shortened length is no longer
+  // aligned) and only then reports EFBIG.
+  std::signal(SIGXFSZ, SIG_IGN);
+  constexpr std::size_t limit = MiB + 1000;
+  rlimit fsize{};
+  REQUIRE(::getrlimit(RLIMIT_FSIZE, &fsize) == 0);
+  fsize.rlim_cur = limit;
+  REQUIRE(::setrlimit(RLIMIT_FSIZE, &fsize) == 0);
+
+  for (bool const use_odirect : {true, false}) {
+    INFO("use_odirect=" << use_odirect);
+    cucascade::io::uring::config cfg{};
+    cfg.use_odirect = use_odirect;
+    write_context ctx{1, cfg};
+    cuda_stream stream;
+    scratch_path path;
+    auto object      = ctx->open_io_object_for_write(path.str());
+    auto const bytes = pattern(4 * MiB, 33);
+    host_bytes host{bytes, 0};
+    device_bytes device{bytes};
+
+    CHECK(error_of(failure_of(ctx->host_write_async(*object, 0, bytes.size(), host.get()))) ==
+          std::errc::file_too_large);
+    CHECK(object->size() == 0);
+    try {
+      std::ignore = ctx->host_write(*object, 0, bytes.size(), host.get());
+      FAIL("wrote past RLIMIT_FSIZE");
+    } catch (std::system_error const& error) {
+      CHECK(error.code() == std::errc::file_too_large);
+    }
+    CHECK(error_of(failure_of(ctx->device_write_async(
+            *object, 0, bytes.size(), device.get(), stream.ref()))) == std::errc::file_too_large);
+    CHECK(object->size() <= limit);
+    CHECK(std::filesystem::file_size(path.str()) <= limit);
+
+    // The reactor is still usable, and a write below the limit succeeds.
+    CHECK(ctx->host_write_async(*object, 0, 1000, host.get()).get() == 1000);
+    CHECK(object->size() >= 1000);
+  }
+}
+
+TEST_CASE("uring the first error of many sibling operations fails the write once",
+          "[io][uring][write]")
+{
+  if (!std::filesystem::exists("/dev/full")) { SKIP("no /dev/full"); }
+  cucascade::io::uring::config cfg{};
+  cfg.write_split_bytes = 64UL << 10;  // hundreds of slices over both reactors
+  write_context ctx{2, cfg};
+  cuda_stream stream;
+  auto object = ctx->open_io_object_for_write("/dev/full", {.mode = write_mode::open_existing});
+  auto const bytes = pattern(32 * MiB, 34);
+  device_bytes device{bytes};
+  for (int round = 0; round < 5; ++round) {
+    CHECK(error_of(failure_of(
+            ctx->device_write_async(*object, 0, bytes.size(), device.get(), stream.ref()))) ==
+          std::errc::no_space_on_device);
+    CHECK(error_of(failure_of(ctx->host_write_async(*object, 3, bytes.size() - 3, bytes.data()))) ==
+          std::errc::no_space_on_device);
+  }
+}
+
+TEST_CASE("uring writes and truncating opens invalidate the path's metadata", "[io][uring][write]")
+{
+  write_context ctx;
+  scratch_path path;
+  path.fill(pattern(8192, 40));
+  auto& store         = ctx->metadata_store();
+  auto const metadata = std::make_shared<cucascade::io::io_object_metadata>();
+  auto const before   = ctx->open_io_object(path.str());
+  store.register_metadata(*before, metadata);
+  REQUIRE(store.has_path(path.str()));
+
+  SECTION("a write")
+  {
+    auto writer = ctx->open_io_object_for_write(path.str(), {.mode = write_mode::open_existing});
+    CHECK(store.has_path(path.str()));
+    auto const bytes = pattern(100, 41);
+    CHECK(ctx->host_write_async(*writer, 0, bytes.size(), bytes.data()).get() == bytes.size());
+    CHECK_FALSE(store.has_path(path.str()));
+  }
+  SECTION("a truncating open")
+  {
+    auto writer = ctx->open_io_object_for_write(path.str());
+    CHECK_FALSE(store.has_path(path.str()));
+  }
+
+  // Metadata parsed through an object opened before the change is refused; an
+  // object opened afterwards registers again.
+  store.register_metadata(*before, metadata);
+  CHECK_FALSE(store.has_path(path.str()));
+  auto const after = ctx->open_io_object(path.str());
+  store.register_metadata(*after, metadata);
+  CHECK(store.has_path(path.str()));
 }
