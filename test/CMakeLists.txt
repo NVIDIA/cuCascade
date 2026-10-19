@@ -124,6 +124,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_data_representation.cpp
     data/test_disk_host_converters.cpp
     data/test_disk_io_context.cpp
+    data/test_disk_randomized.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
     cudf/test_release_table_stream.cpp
