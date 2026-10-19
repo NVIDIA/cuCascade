@@ -66,11 +66,14 @@ constexpr std::size_t STAGING_BUDGET_BYTES = 64UL << 20;
 constexpr std::size_t MAX_NUM_SLOTS        = 64;
 constexpr std::size_t MAX_PLAIN_READ_SIZE  = 1UL << 30;
 constexpr std::chrono::milliseconds POLL_INTERVAL{20};
-// Completion wait while staged writes have D2H copies in flight: a finished copy
-// gates its write SQE, so it must be noticed well before POLL_INTERVAL.
-constexpr std::chrono::microseconds STAGING_POLL_INTERVAL{100};
+// How often the worker polls device copies on callers' streams (a staged write's
+// D2H, a read's H2D).  It never blocks on such a copy: the stream belongs to the
+// caller and may sit behind arbitrary GPU work, so the worker keeps serving
+// other requests and checks the copies' events at this interval instead.
+constexpr std::chrono::microseconds COPY_POLL_INTERVAL{100};
 constexpr auto POLL_INTERVAL_US =
   std::chrono::duration_cast<std::chrono::microseconds>(POLL_INTERVAL).count();
+constexpr auto COPY_POLL_INTERVAL_US = COPY_POLL_INTERVAL.count();
 
 [[nodiscard]] constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
 {
@@ -1377,6 +1380,13 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     // Staged writes: a slot whose blocks are being filled by a D2H copy sits in
     // `staging` until its event fires, then its write SQE is prepared like any
     // other operation.
+    // A staged write's bytes count towards queued_bytes() while its D2H copy is
+    // pending, so next_reactor sees the backlog of a reactor whose staging is
+    // held by a stalled caller stream.
+    auto leave_staging = [&](io_slot& slot) noexcept {
+      _queued_bytes.fetch_sub(slot.op->request.io_rng.size, std::memory_order_relaxed);
+    };
+
     auto prepare_staged_write = [&](io_slot& slot) noexcept {
       if (!slot.op->request.coordinator->should_continue()) {
         settle_slot_error(slot, canceled_error());
@@ -1425,6 +1435,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         }
         slot.state = slot_state::staging;
         staging.push_back(slot.index);
+        _queued_bytes.fetch_add(slot.op->request.io_rng.size, std::memory_order_relaxed);
       } catch (...) {
         std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
         settle_slot_error(slot, std::current_exception());
@@ -1442,6 +1453,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           *output++ = *it;
           continue;
         }
+        leave_staging(slot);
         if (status == cudaSuccess) {
           prepare_staged_write(slot);
         } else {
@@ -1638,32 +1650,31 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         if (active == nullptr && pending.empty() && take_next()) continue;
 
         publish_gauges();
+        bool const copies_pending = !staging.empty() || !copying.empty();
         if (inflight != 0) {
-          auto const timeout = staging.empty() ? std::chrono::microseconds{POLL_INTERVAL}
-                                               : std::chrono::microseconds{STAGING_POLL_INTERVAL};
+          auto const timeout =
+            copies_pending ? COPY_POLL_INTERVAL : std::chrono::microseconds{POLL_INTERVAL};
           if (auto const error = ring.wait_for(timeout); error != 0) {
             throw std::system_error(std::error_code{error, std::generic_category()},
                                     "uring_reactor: io_uring_wait_cqe_timeout");
           }
           reap_completions();
-        } else if (!staging.empty() && (active == nullptr || !pending.empty())) {
-          // Nothing in the kernel and nothing left to expand: the oldest staging
-          // copy is what the next write waits for.
-          auto& slot  = slots[static_cast<std::size_t>(staging.front())];
-          std::ignore = slot.copy_event->synchronize_no_throw();
-          poll_staging();
-        } else if (!copying.empty() && pending.empty() && active == nullptr) {
-          auto const index = copying.back();
-          copying.pop_back();
-          auto& slot        = slots[static_cast<std::size_t>(index)];
-          auto const status = slot.copy_event->synchronize_no_throw();
-          if (status == cudaSuccess) {
-            slot.op->request.finish_success();
-            reset_slot(slot);
-          } else {
-            settle_slot_error(slot, status, true);
+        } else if (copies_pending) {
+          // Nothing in the kernel; device copies on callers' streams are what
+          // remains.  Never block on them (a stalled caller stream would stall
+          // every request of this reactor): wait for a new request for one poll
+          // interval instead, and let the next pass poll the copies.  Work that
+          // waits for a slot backs off for the interval; an active request that
+          // can still expand goes straight to the next pass.
+          if (pending.empty() && active == nullptr) {
+            std::unique_ptr<grouped_io_request> next;
+            if (_requests.wait_dequeue_timed(next, COPY_POLL_INTERVAL_US)) {
+              if (next == nullptr) break;
+              activate(std::move(next), true);
+            }
+          } else if (!pending.empty() || available_slots.approx_free() == 0) {
+            std::this_thread::sleep_for(COPY_POLL_INTERVAL);
           }
-          poll_copy_completions();
         } else if (pending.empty() && active == nullptr) {
           std::unique_ptr<grouped_io_request> next;
           if (!_requests.wait_dequeue_timed(next, POLL_INTERVAL_US)) continue;
@@ -1766,6 +1777,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     for (auto const index : staging) {
       auto& slot  = slots[static_cast<std::size_t>(index)];
       std::ignore = slot.copy_event->synchronize_no_throw();
+      leave_staging(slot);
       settle_slot_error(slot, terminal_error);
     }
     staging.clear();
