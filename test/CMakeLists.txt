@@ -37,8 +37,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # Data tests
     data/test_data_repository.cpp
     data/test_data_repository_manager.cpp
-    data/test_disk_io_backend.cpp
-    data/test_io_worker.cpp
+    data/test_disk_memory_space.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
@@ -124,6 +123,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_data_batch.cpp
     data/test_data_representation.cpp
     data/test_disk_host_converters.cpp
+    data/test_disk_io_context.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
     cudf/test_release_table_stream.cpp

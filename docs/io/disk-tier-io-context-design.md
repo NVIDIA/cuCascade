@@ -137,12 +137,13 @@ struct disk_io_context_options {
   `fixed_size_host_memory_resource` (base-from-member); every reactor's shared `_ctx` keeps it
   alive and each reactor's `_bounce_storage` is released before it. No custom deleter, so the
   context is a plain `make_shared` (its `enable_shared_from_this` stays valid).
-- GDS probe: owned by W2 (agreed with `gds`, lands with task-4):
+- GDS probe: owned by W2 (agreed with `gds`, landed in ac082ad):
   `cucascade::io::cufile::gds_available()` in `include/cucascade/io/cufile/platform.hpp` —
   process-wide, computed once, never throws; true iff libcufile loads, the driver opened, it reports
   a real GDS mode (`nvfs.dstatusflags != 0`) and `KVIKIO_COMPAT_MODE` / `CUFILE_FORCE_COMPAT_MODE` do
-  not force compat. The header does not include kvikIO. Until it lands, the call sits behind one
-  private helper (`detail::gds_is_available()`) that returns false. False on this host (no
+  not force compat. The header does not include kvikIO. The disk tier asks it through one private
+  helper (`detail::gds_is_available()`); the first call opens the cuFile driver (~0.3 s), which only
+  happens when an automatic context is built. False on this host (no
   nvidia-fs), so the tests drive both backends through `disk_io_context_options::backend`. A file on a
   filesystem cuFile cannot register (btrfs, tmpfs) still takes the cufile reactor's POSIX path per
   file — correct, just slower; `automatic` does not try to detect that.
@@ -392,7 +393,8 @@ cudf (`cucascade_cudf_tests`, links io):
    accessors, configurator; remove the old interface, registry, pipeline backend, `io_worker` and
    their tests.
 2. cudf: `disk_io_context.{hpp,cpp}` (options, factory with owning uring staging, shared default,
-   `detail::gds_is_available()` stub until W2's `platform.hpp` lands) and `disk_io.{hpp,cpp}`.
+   `detail::gds_is_available()` forwarding to W2's `io::cufile::gds_available()`) and
+   `disk_io.{hpp,cpp}`.
 3. Read converters first (DISK -> GPU in three phases, DISK -> HOST) — they use the existing read API.
 4. Write converters (GPU -> DISK, HOST -> DISK) once io-write completes task-3.
 5. Tests (core + cudf), the benchmark, `docs/bandwidth-profiler.md`, header comments.
