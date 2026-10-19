@@ -20,6 +20,7 @@
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
+#include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
@@ -511,6 +512,22 @@ TEST_CASE("cufile ioctx stages a large device read through POSIX when cuFile is 
         .get(30s) == size);
     CHECK(matches_file(device_bytes(dst, size, stream), offset, size));
   }
+}
+
+TEST_CASE("cufile platform probe is cached and self-consistent", "[io][cufile]")
+{
+  auto const& first  = cucascade::io::cufile::probe_platform();
+  auto const& second = cucascade::io::cufile::probe_platform();
+  CHECK(&first == &second);
+  CHECK(cucascade::io::cufile::gds_available() ==
+        (first.driver_opened && !first.compat_only && !first.forced_compat));
+  if (!first.driver_opened) return;
+  CHECK(first.library_available);
+  CHECK(first.compat_only == (first.dstatusflags == 0));
+  CHECK(first.max_direct_io_size_kb > 0);
+  INFO("cuFile " << first.version << ", dstatusflags " << first.dstatusflags
+                 << (first.compat_only ? " (compatibility mode)" : " (GDS)"));
+  CHECK(first.version > 0);
 }
 
 TEST_CASE("cufile ioctx cancels reads submitted after shutdown", "[io][cufile]")

@@ -20,6 +20,7 @@
 #include <cucascade/error.hpp>
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
+#include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
@@ -44,6 +45,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -53,6 +55,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <tuple>
@@ -375,7 +378,8 @@ void cufile_reactor::start()
 {
   if (_worker.joinable()) return;
 
-  open_cufile_driver_once();
+  // Opens the process-wide cuFile driver (once) and logs the effective mode once.
+  std::ignore = probe_platform();
 
   std::lock_guard lock(_enqueue_mutex);
   try {
@@ -945,6 +949,83 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
   if (inflight_count() != 0) { drain_inflight(terminal_error); }
 
   cancel_queued(terminal_error);
+}
+
+}  // namespace cucascade::io::cufile
+
+// ---------------------------------------------------------------------------
+// platform probe
+// ---------------------------------------------------------------------------
+
+namespace cucascade::io::cufile {
+
+namespace {
+
+/// Whether @p name is set to a value cuFile / kvikIO read as "on".
+[[nodiscard]] bool env_flag_on(char const* name) noexcept
+{
+  char const* value = std::getenv(name);
+  if (value == nullptr) return false;
+  std::string_view const text{value};
+  return text == "1" || text == "ON" || text == "on" || text == "On" || text == "TRUE" ||
+         text == "true" || text == "True" || text == "YES" || text == "yes";
+}
+
+[[nodiscard]] platform_info compute_platform() noexcept
+{
+  platform_info info{};
+  info.forced_compat = env_flag_on("CUFILE_FORCE_COMPAT_MODE");
+  try {
+    if (kvikio::defaults::compat_mode() == kvikio::CompatMode::ON) info.forced_compat = true;
+    info.library_available = kvikio::is_cufile_library_available();
+    if (!info.library_available) return info;
+    info.version = kvikio::cufile_version();
+    open_cufile_driver_once();
+    auto& api = kvikio::cuFileAPI::instance();
+    if (api.DriverGetProperties == nullptr) return info;
+    CUfileDrvProps_t props{};
+    if (api.DriverGetProperties(&props).err != CU_FILE_SUCCESS) return info;
+    info.driver_opened         = true;
+    info.dstatusflags          = props.nvfs.dstatusflags;
+    info.compat_only           = info.dstatusflags == 0;
+    info.max_direct_io_size_kb = props.nvfs.max_direct_io_size;
+  } catch (std::exception const& e) {
+    CUCASCADE_LOG_WARN("cufile: probing the cuFile library failed: {}", e.what());
+  } catch (...) {
+    CUCASCADE_LOG_WARN("cufile: probing the cuFile library failed with an unknown error");
+  }
+  return info;
+}
+
+}  // namespace
+
+platform_info const& probe_platform() noexcept
+{
+  static platform_info const info = [] {
+    auto result = compute_platform();
+    if (!result.driver_opened) {
+      CUCASCADE_LOG_INFO("cufile: cuFile unavailable (library {}, driver not opened)",
+                         result.library_available ? "loaded" : "missing");
+    } else if (result.compat_only || result.forced_compat) {
+      CUCASCADE_LOG_INFO(
+        "cufile: cuFile {} runs in COMPATIBILITY mode ({}): reads and writes bounce through "
+        "host memory inside cuFile",
+        result.version,
+        result.forced_compat ? "forced by the environment" : "no storage class reports GDS");
+    } else {
+      CUCASCADE_LOG_INFO("cufile: cuFile {} reports GPUDirect Storage (dstatusflags {:#x})",
+                         result.version,
+                         result.dstatusflags);
+    }
+    return result;
+  }();
+  return info;
+}
+
+bool gds_available() noexcept
+{
+  auto const& info = probe_platform();
+  return info.driver_opened && !info.compat_only && !info.forced_compat;
 }
 
 }  // namespace cucascade::io::cufile
