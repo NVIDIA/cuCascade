@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "utils/child_test_runner.hpp"
 #include "utils/cudf_test_utils.hpp"
 #include "utils/disk_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
@@ -40,11 +41,14 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -60,6 +64,13 @@
 using namespace cucascade;
 
 namespace {
+
+/// DISK spaces kept alive until static destruction by the exit test's child: they are
+/// namespace-scope, so they are constructed before CUDA is first used and destroyed after the CUDA
+/// runtime and the cuFile driver have been torn down -- as with a reservation manager a user keeps
+/// in a global.
+std::shared_ptr<memory::memory_space> g_exit_default_disk;
+std::shared_ptr<memory::memory_space> g_exit_cufile_disk;
 
 auto& shared_gpu_space()
 {
@@ -451,4 +462,58 @@ TEST_CASE("disk_data_representation deletes its batch file", "[disk][io][lifetim
   disk_rep.reset();
   REQUIRE_FALSE(std::filesystem::exists(path));
   REQUIRE(dir.file_count() == 0);
+}
+
+// =============================================================================
+// Process exit
+// =============================================================================
+
+TEST_CASE("disk spaces kept in globals survive process exit", "[disk][io][lifetime][exit]")
+{
+#ifndef NDEBUG
+  // Debug builds assert on every CUDA call that fails after the runtime was torn down
+  // (CUCASCADE_ASSERT_CUDA_SUCCESS), which pinned memory freed from a global always does -- the
+  // same holds for HOST memory spaces kept in a global.
+  SKIP("debug builds assert on CUDA calls made after the CUDA runtime was torn down");
+#endif
+  constexpr char const* child_marker = "CUCASCADE_DISK_EXIT_CHILD";
+  auto const* marker                 = std::getenv(child_marker);
+  if (marker == nullptr || std::string_view{marker} != "1") {
+    // Parent: run this test case in a child process and require a clean exit.
+    test::child_test_runner child{"disk spaces kept in globals survive process exit",
+                                  {{child_marker, std::string{"1"}}}};
+    bool const finished = child.wait_for(std::chrono::seconds{120});
+    if (!finished) { child.stop(); }
+    INFO(child.output());
+    REQUIRE(finished);
+    REQUIRE(WIFEXITED(child.status()));
+    REQUIRE(WEXITSTATUS(child.status()) == 0);
+    return;
+  }
+
+  // Child: bring up both kinds of context (the shared default and a forced cuFile one), run every
+  // conversion through them, and leave the spaces -- and so the contexts, their reactor threads and
+  // pinned staging -- to static destruction.
+  g_exit_default_disk = test::make_disk_space(disk_io_backend::automatic, 20);
+  g_exit_cufile_disk  = test::make_disk_space(disk_io_backend::cufile, 21);
+  auto gpu_rep        = make_gpu_rep(make_sequence_table(300'000, 2, shared_stream()));
+  for (auto* space : {g_exit_default_disk.get(), g_exit_cufile_disk.get()}) {
+    if (test::disk_space_can_write(*space, /*device=*/true)) {
+      auto disk_rep =
+        registry().convert<disk_data_representation>(*gpu_rep, space, shared_stream());
+      auto back = registry().convert<gpu_table_representation>(
+        *disk_rep, shared_gpu_space().get(), shared_stream());
+      shared_stream().sync();
+    }
+    if (test::disk_space_can_write(*space, /*device=*/false)) {
+      auto host_rep = registry().convert<host_data_representation>(
+        *gpu_rep, shared_host_space().get(), shared_stream());
+      auto disk_rep =
+        registry().convert<disk_data_representation>(*host_rep, space, shared_stream());
+      auto back = registry().convert<host_data_representation>(
+        *disk_rep, shared_host_space().get(), shared_stream());
+    }
+  }
+  REQUIRE(g_exit_default_disk->get_io_context() != nullptr);
+  REQUIRE(g_exit_cufile_disk->get_io_context() != nullptr);
 }
