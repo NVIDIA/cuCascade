@@ -544,6 +544,19 @@ class scratch_pool {
   std::vector<std::uint8_t*> _free;
 };
 
+/// Smallest host-write body worth an O_DIRECT write from the caller's buffer:
+/// below it, a synchronous O_DIRECT write per slice leaves the device idle
+/// between slices, and the page cache with early writeback is faster.
+constexpr std::size_t min_direct_host_write = 4UL << 20;
+
+/// Start writeback of @p rng (written through the page cache) without waiting
+/// for it.  Best effort: a failure only means the data is written back later.
+void start_writeback(int fd, range rng) noexcept
+{
+  std::ignore = ::sync_file_range(
+    fd, static_cast<off_t>(rng.offset), static_cast<off_t>(rng.size), SYNC_FILE_RANGE_WRITE);
+}
+
 /// Short reads tolerated in a row before a device slice is declared failed.
 constexpr int max_short_reads = 64;
 
@@ -1104,7 +1117,14 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     request->finish_error(std::make_error_code(std::errc::invalid_argument));
     return;
   }
-  auto const bytes_read = pread_all(file.buffered_fd(), base, wanted, request->io_rng.offset);
+  // A host-only read goes O_DIRECT (staged through the scratch when it is not
+  // block-aligned), like the uring reactor's; a host+device pair, or a file
+  // without an O_DIRECT fd, reads through the page cache.
+  bool const direct = !slice.has_device_request() &&
+                      uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+  auto const bytes_read = direct
+                            ? read_host_direct(file, base, request->io_rng)
+                            : pread_all(file.buffered_fd(), base, wanted, request->io_rng.offset);
   request->iovecs.push_back(iovec{base, bytes_read});
 
   // The range was clamped to the size recorded at open, so a short read means the
@@ -1136,6 +1156,41 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     return;
   }
   _inflight_copy.push_back(inflight_copy{std::move(request), std::move(event), bytes_read});
+}
+
+std::size_t cufile_reactor::read_host_direct(cufile_io_object const& file,
+                                             std::uint8_t* destination,
+                                             range rng)
+{
+  auto const end = rng.end();
+  try {
+    if (rng.offset % IO_BLOCK_SIZE == 0 && rng.size % IO_BLOCK_SIZE == 0 &&
+        is_block_aligned(destination)) {
+      return pread_all(file.direct_fd(), destination, rng.size, rng.offset);
+    }
+    // Read whole blocks covering the range through the scratch, a slot at a time,
+    // and copy out the wanted bytes.  A read reaching EOF returns short there.
+    auto* const buffer = scratch();
+    std::size_t copied = 0;
+    for (auto block = align_down_block(rng.offset); block < end;) {
+      if (_stop_source.stop_requested()) throw std::system_error(canceled_error());
+      auto const want =
+        std::min(scratch_slot_bytes, align_down_block(end - 1) + IO_BLOCK_SIZE - block);
+      auto const got  = pread_all(file.direct_fd(), buffer, want, block);
+      auto const from = std::max(block, rng.offset);
+      auto const to   = std::min(block + got, end);
+      if (to <= from) break;
+      std::memcpy(destination + (from - rng.offset), buffer + (from - block), to - from);
+      copied += to - from;
+      if (got < want) break;  // end of file
+      block += want;
+    }
+    return copied;
+  } catch (std::system_error const& error) {
+    // The filesystem refused O_DIRECT at run time: read through the page cache.
+    if (!uring::detail::is_odirect_runtime_error(error.code().value())) throw;
+    return pread_all(file.buffered_fd(), destination, rng.size, rng.offset);
+  }
 }
 
 void cufile_reactor::read_device_staged(cufile_io_object const& file,
@@ -1330,11 +1385,25 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
     auto* const source = std::get<std::uint8_t*>(slice.h_buffer.buffer);
     if (source == nullptr) throw std::invalid_argument("cufile_reactor: null write source");
     bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
-    for (auto const& piece : pieces) {
-      if (piece.empty()) continue;
-      auto const* src = source + (piece.offset - slice.rng.offset);
-      write_host_piece(
-        file, direct_fd && is_granule_aligned(piece, granule) && is_block_aligned(src), src, piece);
+    bool const congruent = is_block_aligned(source + (pieces[1].offset - slice.rng.offset));
+    if (direct_fd && congruent && pieces[1].size >= min_direct_host_write) {
+      // A large body that lines up with its source goes O_DIRECT straight from it,
+      // head and tail through the page cache.
+      for (auto const& piece : pieces) {
+        if (piece.empty()) continue;
+        auto const* src = source + (piece.offset - slice.rng.offset);
+        write_host_piece(file, is_granule_aligned(piece, granule), src, piece);
+      }
+    } else {
+      // Otherwise (e.g. 1 MiB pinned pool blocks, 8 B-aligned or not) the whole
+      // slice goes through the page cache and its writeback starts at once: the
+      // kernel's copy then overlaps the device write of earlier slices, where a
+      // synchronous O_DIRECT write leaves the device idle between slices (and an
+      // unaligned source would first need a staging copy).  Measured, one writer
+      // of 1 MiB slices into a fresh file: about 5.3 GB/s this way against
+      // 3.0-4.3 GB/s O_DIRECT (docs/io/gpuio-gds-practices.md section 8).
+      write_host_piece(file, /*direct=*/false, source, slice.rng);
+      start_writeback(file.buffered_fd(), slice.rng);
     }
     request.finish_success();
     return;

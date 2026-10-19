@@ -19,10 +19,12 @@
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io::cufile {
 
@@ -45,6 +47,41 @@ std::shared_ptr<io_object> cufile_ioctx::create_io_object_for_write(std::string 
 {
   return std::shared_ptr<io_object>(cufile_reactor::create_io_object_for_write(
     std::move(path), options, _config.use_odirect, _config.compat_mode));
+}
+
+std::vector<cufile_reactor*> cufile_ioctx::next_reactor(cufile_io_object const& object,
+                                                        std::size_t n_slices,
+                                                        io_op_type type,
+                                                        int device_id)
+{
+  auto const count = _reactors.size();
+  if (type == io_op_type::write_vector_async && device_id < 0 && count > 1) {
+    // A host-only vectored write (device_id stays unresolved without device
+    // slices) goes to one reactor: its page-cache writes with early writeback
+    // already keep the device busy, and interleaving writers of one file only
+    // contends on its inode.
+    auto selected =
+      templated_ioctx<cufile_reactor>::next_reactor(object, n_slices, type, device_id);
+    if (selected.size() > 1) selected.resize(1);
+    return selected;
+  }
+  if (type != io_op_type::host_vector_async || n_slices <= 2 || count <= 2) {
+    return templated_ioctx<cufile_reactor>::next_reactor(object, n_slices, type, device_id);
+  }
+  // A vectored read: every reactor, least backlogged first.
+  auto const start = _next.fetch_add(1, std::memory_order_relaxed) % count;
+  std::vector<std::pair<std::size_t, std::size_t>> ranked;
+  ranked.reserve(count);
+  for (std::size_t distance = 0; distance < count; ++distance) {
+    ranked.emplace_back(_reactors[(start + distance) % count]->queued_bytes(), distance);
+  }
+  std::sort(ranked.begin(), ranked.end());
+  std::vector<cufile_reactor*> result;
+  result.reserve(count);
+  for (auto const& [bytes, distance] : ranked) {
+    result.push_back(_reactors[(start + distance) % count].get());
+  }
+  return result;
 }
 
 }  // namespace cucascade::io::cufile

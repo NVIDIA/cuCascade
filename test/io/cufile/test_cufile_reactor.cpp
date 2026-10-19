@@ -356,6 +356,42 @@ TEST_CASE("cufile ioctx reads host destinations", "[io][cufile]")
   }
 }
 
+TEST_CASE("cufile ioctx host reads land in place on every alignment", "[io][cufile]")
+{
+  // Host-only reads go O_DIRECT: straight into a block-aligned destination for a
+  // block-aligned range, else whole blocks through the scratch (8 MiB slots).
+  static constexpr std::size_t file_bytes = (24UL << 20) + 5;
+  pattern_file const file{file_bytes};
+  started_ioctx ioctx{config{}};
+  auto object = ioctx.get().open_io_object(file.path());
+
+  struct read_case {
+    std::string label;
+    std::size_t offset;
+    std::size_t size;
+    std::size_t misalignment;
+  };
+  auto const [label, offset, size, misalignment] =
+    GENERATE(read_case{"aligned, direct", 4096, 8UL << 20, 0},
+             read_case{"aligned range, misaligned buffer", 4096, 8UL << 20, 8},
+             read_case{"unaligned, several slots", 4097, (20UL << 20) + 123, 8},
+             read_case{"to the unaligned end of file", 3UL << 20, file_bytes - (3UL << 20), 0},
+             read_case{"inside one block", 10, 100, 3});
+  DYNAMIC_SECTION(label)
+  {
+    std::vector<std::uint8_t> storage(size + misalignment + 4096);
+    auto* const base =
+      storage.data() + (4096 - reinterpret_cast<std::uintptr_t>(storage.data()) % 4096) % 4096;
+    auto* const dst = base + misalignment;
+    REQUIRE(ioctx.get().host_read_async_io(*object, offset, size, dst).get(30s) == size);
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < size; ++i) {
+      if (dst[i] != pattern_byte(offset + i)) ++bad;
+    }
+    CHECK(bad == 0);
+  }
+}
+
 TEST_CASE("cufile ioctx clamps a read that crosses the end of the file", "[io][cufile]")
 {
   pattern_file const file{100'000};

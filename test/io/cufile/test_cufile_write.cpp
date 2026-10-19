@@ -442,6 +442,57 @@ TEST_CASE("cufile host writes round-trip aligned and unaligned ranges", "[io][cu
   }
 }
 
+TEST_CASE("cufile host writes from 8 B-aligned blocks land in place", "[io][cufile][write]")
+{
+  // The DISK tier's HOST -> DISK layout: 1 MiB pinned-pool blocks holding 8 B
+  // aligned column buffers, written as one vectored request whose segments start
+  // at file offsets that are not congruent with their source addresses (the
+  // granule-aligned bodies are then staged through the scratch and written
+  // O_DIRECT), across several columns at 4 KiB-aligned file offsets.
+  auto const [label, cfg, force_cufile] = GENERATE(from_range(write_paths()));
+  DYNAMIC_SECTION(label)
+  {
+    std::ignore = force_cufile;
+    write_context ctx{cfg};
+    scratch_path path;
+    auto object = ctx->open_io_object_for_write(path.str());
+    shadow_file shadow;
+
+    constexpr std::size_t block = 1 * MiB;
+    struct column {
+      std::size_t host_offset;  // inside the block allocation, 8 B aligned
+      std::size_t size;
+      std::size_t file_offset;  // 4 KiB aligned
+    };
+    std::vector<column> const columns{{8, 3 * MiB + 77, 0},
+                                      {3 * MiB + 88, 2 * MiB + 5, 8 * MiB},
+                                      {5 * MiB + 96, 100'000, 12 * MiB},
+                                      {5 * MiB + 100'104, 1 * MiB, 16 * MiB}};
+    std::size_t const allocation = 8 * MiB;
+    auto const host_data         = pattern(allocation, 1000);
+    host_bytes const blocks{host_data, 0};  // block-aligned base, like the pool
+
+    std::vector<write_slice> slices;
+    for (auto const& col : columns) {
+      for (std::size_t written = 0; written < col.size;) {
+        auto const at    = col.host_offset + written;
+        auto const chunk = std::min(col.size - written, block - at % block);
+        slices.emplace_back(col.file_offset + written, chunk, blocks.get() + at);
+        shadow.write(col.file_offset + written,
+                     std::span<std::uint8_t const>(host_data.data() + at, chunk));
+        written += chunk;
+      }
+    }
+    std::size_t total = 0;
+    for (auto const& sl : slices) {
+      total += sl.size();
+    }
+    REQUIRE(ctx->host_writev_async(*object, slices).get(60s) == total);
+    CHECK(object->size() == shadow.bytes().size());
+    check_same(read_back(ctx.get(), path.str()), shadow.bytes());
+  }
+}
+
 TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
@@ -995,6 +1046,22 @@ void run_write_probe(std::string const& label,
       REQUIRE(std::move(future).get(300s) == piece);
     }
   });
+  scenario("host writev 1 MiB, 8 B aligned", [&](auto& object) {
+    // The DISK tier's HOST -> DISK shape: 1 MiB pool blocks whose bytes start 8 B
+    // past a block boundary, so file offsets and sources are never congruent.
+    constexpr std::size_t piece = 1UL << 20;
+    for (std::size_t off = 0; off < bytes; off += window) {
+      // Block 0 holds the first piece - 8 bytes at +8; every later block starts a
+      // segment at a file offset 8 bytes short of a 4 KiB boundary.
+      std::vector<write_slice> slices;
+      slices.emplace_back(off, piece - 8, host_src.get() + 8);
+      for (std::size_t p = piece; p < window; p += piece) {
+        slices.emplace_back(off + p - 8, piece, host_src.get() + p);
+      }
+      slices.emplace_back(off + window - 8, 8, host_src.get());
+      REQUIRE(ctx.host_writev_async(object, slices).get(300s) == window);
+    }
+  });
   scenario("host 4 MiB, all queued", [&](auto& object) {
     constexpr std::size_t piece = 4UL << 20;
     std::vector<cucascade::exec::semi_future<std::size_t>> futures;
@@ -1033,6 +1100,13 @@ TEST_CASE("cufile write throughput probe", "[.cufile-write-bench]")
     cfg.write_split_bytes = env_size("CUCASCADE_IO_BENCH_SPLIT", 64UL << 20);
     write_context ctx{cfg, reactors};
     run_write_probe("cufile-split", ctx.get(), dir, total, rounds);
+  }
+  if (which == "all" || which == "cufile-buffered") {
+    config cfg{};
+    cfg.use_odirect = false;
+    cfg.compat_mode = kvikio::CompatMode::ON;
+    write_context ctx{cfg, reactors};
+    run_write_probe("cufile-buffer", ctx.get(), dir, total, rounds);
   }
   if (which == "all" || which == "cufile-staged") {
     config cfg{};
