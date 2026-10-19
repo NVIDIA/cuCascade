@@ -16,11 +16,16 @@
  * limitations under the License.
  */
 
+#include <cucascade/error.hpp>
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
+#include <cucascade/io/uring/uring_reactor.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <kvikio/compat_mode.hpp>
 #include <kvikio/shim/cufile.hpp>
@@ -31,6 +36,7 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -39,6 +45,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -50,6 +58,8 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -612,4 +622,413 @@ TEST_CASE("cufile reactor grants a waiting low request bounded service under a h
   CHECK(order[3] == "H1_0");
   CHECK(order[4] == "L2");
   CHECK(order[5] == "L3");
+}
+
+// ---------------------------------------------------------------------------
+// Throughput probe (hidden; run explicitly with "[.cufile-bench]")
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Write @p bytes of a cheap pattern to @p path unless it already holds that many.
+void ensure_bench_file(std::string const& path, std::size_t bytes)
+{
+  std::error_code ec;
+  if (std::filesystem::file_size(path, ec) >= bytes && !ec) return;
+  constexpr std::size_t block = 64UL << 20;
+  std::vector<char> data(block);
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  for (std::size_t done = 0; done < bytes; done += block) {
+    for (std::size_t i = 0; i < block; i += 4096) {
+      data[i] = static_cast<char>(pattern_byte(done + i));
+    }
+    out.write(data.data(), static_cast<std::streamsize>(std::min(block, bytes - done)));
+  }
+  out.close();
+  REQUIRE(out);
+}
+
+/// Evict @p path from the page cache (no root needed for clean pages).
+void drop_file_cache(std::string const& path)
+{
+  file_descriptor fd{::open(path.c_str(), O_RDONLY)};
+  if (!fd) return;
+  std::ignore = ::fdatasync(fd.get());
+  std::ignore = ::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_DONTNEED);
+}
+
+[[nodiscard]] std::size_t env_size(char const* name, std::size_t fallback)
+{
+  char const* value = std::getenv(name);
+  return value != nullptr && *value != '\0' ? std::stoull(value) : fallback;
+}
+
+/// GB/s of @p run over @p bytes, median of @p rounds, each after a page-cache drop.
+template <class Run>
+[[nodiscard]] double measure(std::string const& path, std::size_t bytes, int rounds, Run&& run)
+{
+  std::vector<double> rates;
+  for (int r = 0; r < rounds; ++r) {
+    drop_file_cache(path);
+    auto const start = std::chrono::steady_clock::now();
+    run();
+    auto const secs =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    rates.push_back(static_cast<double>(bytes) / secs / 1e9);
+  }
+  std::sort(rates.begin(), rates.end());
+  return rates[rates.size() / 2];
+}
+
+/// Run every probe scenario against @p ctx and print one line per scenario.
+void run_probe(std::string const& label,
+               cucascade::io::ioctx& ctx,
+               std::string const& path,
+               std::size_t file_bytes,
+               int rounds)
+{
+  auto object                    = ctx.open_io_object(path);
+  constexpr std::size_t window   = 1UL << 30;
+  constexpr std::size_t n_stream = 8;
+  rmm::cuda_stream alloc_stream;
+  rmm::device_buffer dst(window, alloc_stream);
+  alloc_stream.synchronize();
+  auto* const base = static_cast<std::uint8_t*>(dst.data());
+  std::vector<rmm::cuda_stream> streams(n_stream);
+  auto const bytes = file_bytes / window * window;
+
+  auto report = [&](std::string const& scenario, double gbps) {
+    std::printf("%-8s %-28s %7.2f GB/s\n", label.c_str(), scenario.c_str(), gbps);
+    std::fflush(stdout);
+  };
+
+  for (std::size_t const piece : {256UL << 20, 1UL << 30}) {
+    report("dev 1 slice x " + std::to_string(piece >> 20) + " MiB, QD1",
+           measure(path, bytes, rounds, [&] {
+             for (std::size_t off = 0; off < bytes; off += piece) {
+               REQUIRE(ctx.device_read_async_io(*object, off, piece, base, streams[0]).get(120s) ==
+                       piece);
+             }
+           }));
+  }
+
+  for (std::size_t const piece : {4UL << 20, 16UL << 20}) {
+    report("dev readv " + std::to_string(piece >> 20) + " MiB, 1 stream",
+           measure(path, bytes, rounds, [&] {
+             for (std::size_t off = 0; off < bytes; off += window) {
+               std::vector<cucascade::io::slice> slices;
+               for (std::size_t p = 0; p < window; p += piece) {
+                 slices.emplace_back(off + p, piece, base + p);
+               }
+               REQUIRE(ctx.device_readv_async_io(*object, slices, streams[0]).get(120s) == window);
+             }
+           }));
+  }
+
+  for (std::size_t const piece : {256UL << 10, 1UL << 20, 8UL << 20}) {
+    auto const total = piece < (1UL << 20) ? std::min(bytes, std::size_t{1} << 30) : bytes;
+    report(
+      "dev " + std::to_string(piece >> 10) + " KiB x 8 streams", measure(path, total, rounds, [&] {
+        for (std::size_t off = 0; off < total; off += window) {
+          std::vector<cucascade::exec::semi_future<std::size_t>> futures;
+          std::size_t i = 0;
+          for (std::size_t p = 0; p < window; p += piece, ++i) {
+            futures.push_back(
+              ctx.device_read_async_io(*object, off + p, piece, base + p, streams[i % n_stream]));
+          }
+          for (auto& future : futures) {
+            REQUIRE(std::move(future).get(120s) == piece);
+          }
+        }
+      }));
+  }
+
+  {
+    constexpr std::size_t piece = 4UL << 20;
+    std::vector<std::uint8_t> host(window);
+    report(
+      "host 4 MiB, all queued", measure(path, bytes, rounds, [&] {
+        for (std::size_t off = 0; off < bytes; off += window) {
+          std::vector<cucascade::exec::semi_future<std::size_t>> futures;
+          for (std::size_t p = 0; p < window; p += piece) {
+            futures.push_back(ctx.host_read_async_io(*object, off + p, piece, host.data() + p));
+          }
+          for (auto& future : futures) {
+            REQUIRE(std::move(future).get(120s) == piece);
+          }
+        }
+      }));
+  }
+}
+
+}  // namespace
+
+TEST_CASE("cufile throughput probe", "[.cufile-bench]")
+{
+  char const* path_env = std::getenv("CUCASCADE_IO_BENCH_FILE");
+  if (path_env == nullptr || !has_cuda_device()) {
+    SKIP("set CUCASCADE_IO_BENCH_FILE (and have a GPU) to run the probe");
+  }
+  std::string const path  = path_env;
+  auto const file_bytes   = env_size("CUCASCADE_IO_BENCH_BYTES", 4UL << 30);
+  auto const rounds       = static_cast<int>(env_size("CUCASCADE_IO_BENCH_ROUNDS", 3));
+  auto const reactors     = env_size("CUCASCADE_IO_BENCH_REACTORS", 4);
+  char const* backend     = std::getenv("CUCASCADE_IO_BENCH_BACKEND");
+  std::string const which = backend != nullptr ? backend : "both";
+  ensure_bench_file(path, file_bytes);
+
+  if (which == "both" || which == "cufile") {
+    config cfg{};
+    cfg.gds_threshold = env_size("CUCASCADE_IO_BENCH_GDS_THRESHOLD", cfg.gds_threshold);
+    started_ioctx ioctx{cfg, reactors};
+    run_probe("cufile", ioctx.get(), path, file_bytes, rounds);
+  }
+  if (which == "both" || which == "uring") {
+    cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+    cucascade::memory::fixed_size_host_memory_resource mr{
+      0, upstream, 2UL << 30, 2UL << 30, 1UL << 20, 128, 8};
+    cucascade::io::uring::uring_ioctx ioctx{
+      reactors,
+      std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+        cucascade::io::uring::config{}, &mr)};
+    ioctx.start();
+    run_probe("uring", ioctx, path, file_bytes, rounds);
+    ioctx.shutdown();
+  }
+}
+
+namespace {
+
+struct cufile_stream_args_probe {
+  std::size_t size{0};
+  off_t file_offset{0};
+  off_t devPtr_offset{0};
+  ssize_t bytes_done{0};
+};
+
+/// Raw cuFile submission-mode experiment: sync cuFileRead from T threads vs cuFileReadAsync on K
+/// lane streams from one thread, op size swept, registered vs unregistered destination.
+void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int rounds)
+{
+  auto object = cufile_reactor::create_io_object(path);
+  if (!object->cufile_registered()) {
+    std::printf("raw: file not registered with cuFile; skipping\n");
+    return;
+  }
+  auto& api                    = kvikio::cuFileAPI::instance();
+  constexpr std::size_t window = 1UL << 30;
+  rmm::cuda_stream alloc_stream;
+  rmm::device_buffer dst(window, alloc_stream);
+  alloc_stream.synchronize();
+  auto* const base = static_cast<std::uint8_t*>(dst.data());
+  auto const bytes = file_bytes / window * window;
+  // cuFile keeps per-stream state keyed by the handle: lanes live for the whole probe and are
+  // deregistered before they are destroyed (a destroyed-then-reused handle breaks cuFile).
+  std::vector<rmm::cuda_stream> lane(16);
+  auto report = [](std::string const& what, double gbps) {
+    std::printf("raw      %-40s %7.2f GB/s\n", what.c_str(), gbps);
+    std::fflush(stdout);
+  };
+
+  for (bool const registered : {false, true}) {
+    if (registered) {
+      auto const t0 = std::chrono::steady_clock::now();
+      auto const st = api.BufRegister(base, window, 0);
+      auto const reg =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0);
+      std::printf("raw      cuFileBufRegister 1 GiB: err=%d in %.1f ms\n",
+                  static_cast<int>(st.err),
+                  reg.count());
+      if (st.err != CU_FILE_SUCCESS) return;
+    }
+    std::string const tag = registered ? " [reg]" : "";
+    bool const with_async = env_size("CUCASCADE_IO_BENCH_ASYNC", 1) != 0;
+    for (std::size_t const op : {256UL << 10, 1UL << 20, 4UL << 20, 16UL << 20, 64UL << 20}) {
+      for (std::size_t const threads : {1UL, 4UL, 8UL}) {
+        report(
+          "sync " + std::to_string(op >> 10) + " KiB x " + std::to_string(threads) + " thr" + tag,
+          measure(path, op < (4UL << 20) ? window : bytes, rounds, [&] {
+            auto const bytes_here = op < (4UL << 20) ? window : bytes;
+            std::atomic<std::size_t> next{0};
+            auto worker = [&] {
+              CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+              for (;;) {
+                auto const off = next.fetch_add(op);
+                if (off >= bytes_here) break;
+                auto const in_window = off % window;
+                ssize_t got =
+                  registered
+                    ? api.Read(object->cufile_handle(),
+                               base,
+                               op,
+                               static_cast<off_t>(off),
+                               static_cast<off_t>(in_window))
+                    : api.Read(
+                        object->cufile_handle(), base + in_window, op, static_cast<off_t>(off), 0);
+                REQUIRE(got == static_cast<ssize_t>(op));
+              }
+            };
+            std::vector<std::thread> pool;
+            for (std::size_t t = 0; t < threads; ++t)
+              pool.emplace_back(worker);
+            for (auto& t : pool)
+              t.join();
+          }));
+      }
+      for (std::size_t const lanes : {1UL, 4UL, 8UL, 16UL}) {
+        if (!with_async) break;
+        report(
+          "async " + std::to_string(op >> 20) + " MiB x " + std::to_string(lanes) + " lanes" + tag,
+          measure(path, bytes, rounds, [&] {
+            std::vector<cufile_stream_args_probe> args(bytes / op);
+            for (std::size_t i = 0, off = 0; off < bytes; off += op, ++i) {
+              auto& a         = args[i];
+              a.size          = op;
+              a.file_offset   = static_cast<off_t>(off);
+              a.devPtr_offset = registered ? static_cast<off_t>(off % window) : 0;
+              a.bytes_done    = 0;
+              void* ptr       = registered ? base : base + off % window;
+              auto const st   = api.ReadAsync(object->cufile_handle(),
+                                            ptr,
+                                            &a.size,
+                                            &a.file_offset,
+                                            &a.devPtr_offset,
+                                            &a.bytes_done,
+                                            lane[i % lanes].value());
+              REQUIRE(st.err == CU_FILE_SUCCESS);
+              // Bound the outstanding ops to 2 per lane, as a reactor's window would.
+              if (i >= 2 * lanes) { lane[(i - 2 * lanes) % lanes].synchronize(); }
+            }
+            for (std::size_t l = 0; l < lanes; ++l)
+              lane[l].synchronize();
+            for (auto& a : args)
+              REQUIRE(a.bytes_done == static_cast<ssize_t>(op));
+          }));
+      }
+    }
+    if (registered) { std::ignore = api.BufDeregister(base); }
+  }
+  for (auto& l : lane)
+    std::ignore = api.StreamDeregister(l.value());
+}
+
+}  // namespace
+
+TEST_CASE("cufile raw submission-mode probe", "[.cufile-probe-api]")
+{
+  char const* path_env = std::getenv("CUCASCADE_IO_BENCH_FILE");
+  if (path_env == nullptr || !has_cuda_device()) { SKIP("set CUCASCADE_IO_BENCH_FILE"); }
+  auto const file_bytes = env_size("CUCASCADE_IO_BENCH_BYTES", 4UL << 30);
+  ensure_bench_file(path_env, file_bytes);
+  kvikio::cuFileAPI::instance().driver_open();
+  raw_cufile_probe(
+    path_env, file_bytes, static_cast<int>(env_size("CUCASCADE_IO_BENCH_ROUNDS", 1)));
+}
+
+TEST_CASE("cufile async submit timing probe", "[.cufile-probe-submit]")
+{
+  char const* path_env = std::getenv("CUCASCADE_IO_BENCH_FILE");
+  if (path_env == nullptr || !has_cuda_device()) { SKIP("set CUCASCADE_IO_BENCH_FILE"); }
+  auto const op    = env_size("CUCASCADE_IO_BENCH_OP", 16UL << 20);
+  auto const count = env_size("CUCASCADE_IO_BENCH_COUNT", 64);
+  auto object      = cufile_reactor::create_io_object(path_env);
+  REQUIRE(object->cufile_registered());
+  auto& api = kvikio::cuFileAPI::instance();
+  rmm::cuda_stream stream;
+  rmm::device_buffer dst(op * count, stream);
+  stream.synchronize();
+  std::vector<cufile_stream_args_probe> args(count);
+  double submit_ms = 0;
+  auto const t0    = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < count; ++i) {
+    auto& a       = args[i];
+    a.size        = op;
+    a.file_offset = static_cast<off_t>(i * op);
+    auto const s0 = std::chrono::steady_clock::now();
+    auto const st = api.ReadAsync(object->cufile_handle(),
+                                  static_cast<std::uint8_t*>(dst.data()) + i * op,
+                                  &a.size,
+                                  &a.file_offset,
+                                  &a.devPtr_offset,
+                                  &a.bytes_done,
+                                  stream.value());
+    submit_ms +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+    REQUIRE(st.err == CU_FILE_SUCCESS);
+  }
+  auto const t1 = std::chrono::steady_clock::now();
+  stream.synchronize();
+  auto const t2   = std::chrono::steady_clock::now();
+  std::size_t bad = 0;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (args[i].bytes_done != static_cast<ssize_t>(op)) {
+      if (bad++ < 3) std::printf("op %zu bytes_done %zd\n", i, args[i].bytes_done);
+    }
+  }
+  std::printf(
+    "op %zu MiB x %zu: submit total %.1f ms (%.2f ms/op), wait %.1f ms, %.2f GB/s, bad %zu\n",
+    op >> 20,
+    count,
+    submit_ms,
+    submit_ms / static_cast<double>(count),
+    std::chrono::duration<double, std::milli>(t2 - t1).count(),
+    static_cast<double>(op * count) / std::chrono::duration<double>(t2 - t0).count() / 1e9,
+    bad);
+  std::ignore = api.StreamDeregister(stream.value());
+}
+
+TEST_CASE("cufile raw write probe", "[.cufile-probe-write]")
+{
+  char const* path_env = std::getenv("CUCASCADE_IO_BENCH_WFILE");
+  if (path_env == nullptr || !has_cuda_device()) { SKIP("set CUCASCADE_IO_BENCH_WFILE"); }
+  std::string const path = path_env;
+  auto const bytes       = env_size("CUCASCADE_IO_BENCH_BYTES", 4UL << 30);
+  auto& api              = kvikio::cuFileAPI::instance();
+  api.driver_open();
+  constexpr std::size_t window = 1UL << 30;
+  rmm::cuda_stream alloc_stream;
+  rmm::device_buffer src(window, alloc_stream);
+  REQUIRE(cudaMemsetAsync(src.data(), 0x5A, window, alloc_stream.value()) == cudaSuccess);
+  alloc_stream.synchronize();
+  auto* const base = static_cast<std::uint8_t*>(src.data());
+  for (std::size_t const op : {1UL << 20, 4UL << 20, 16UL << 20, 64UL << 20}) {
+    for (std::size_t const threads : {1UL, 4UL, 8UL}) {
+      std::filesystem::remove(path);
+      file_descriptor fd{::open(path.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0644)};
+      REQUIRE(fd);
+      CUfileDescr_t descr{};
+      descr.type      = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+      descr.handle.fd = fd.get();
+      CUfileHandle_t handle{};
+      REQUIRE(api.HandleRegister(&handle, &descr).err == CU_FILE_SUCCESS);
+      std::atomic<std::size_t> next{0};
+      auto const t0 = std::chrono::steady_clock::now();
+      std::vector<std::thread> pool;
+      for (std::size_t t = 0; t < threads; ++t) {
+        pool.emplace_back([&] {
+          CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+          for (;;) {
+            auto const off = next.fetch_add(op);
+            if (off >= bytes) break;
+            REQUIRE(api.Write(handle, base + off % window, op, static_cast<off_t>(off), 0) ==
+                    static_cast<ssize_t>(op));
+          }
+        });
+      }
+      for (auto& t : pool)
+        t.join();
+      auto const t1 = std::chrono::steady_clock::now();
+      REQUIRE(::fdatasync(fd.get()) == 0);
+      auto const t2 = std::chrono::steady_clock::now();
+      api.HandleDeregister(handle);
+      std::printf(
+        "raw      write %5zu KiB x %zu thr: %.2f GB/s (%.2f GB/s incl. fdatasync)\n",
+        op >> 10,
+        threads,
+        static_cast<double>(bytes) / std::chrono::duration<double>(t1 - t0).count() / 1e9,
+        static_cast<double>(bytes) / std::chrono::duration<double>(t2 - t0).count() / 1e9);
+      std::fflush(stdout);
+    }
+  }
+  std::filesystem::remove(path);
 }
