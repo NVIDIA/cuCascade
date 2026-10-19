@@ -140,8 +140,13 @@ class cufile_io_object final : public io_object {
  * @c cuFileWrite calls (after the work queued on the source's stream), while
  * the sub-granule head and tail, smaller bodies and host sources are written
  * with @c pwrite -- O_DIRECT for aligned pieces, buffered otherwise -- device
- * bytes being staged through the reactor's pinned scratch by D2H copies on the
- * source's stream.  A flush is an @c fdatasync.  On a platform where cuFile
+ * bytes being staged through the reactor's pinned scratch by D2H copies.  A
+ * host source that lines up with the file goes O_DIRECT straight from the
+ * caller; any other host source is written through the page cache with its
+ * writeback started at once (@c sync_file_range), which overlaps the kernel's
+ * copy with the device write and measured faster than staging it for O_DIRECT.
+ * Host-only reads go O_DIRECT, through the scratch when not block-aligned.  A
+ * flush is an @c fdatasync.  On a platform where cuFile
  * runs only in compatibility mode (@c probe_platform().compat_only) aligned
  * device bodies are staged too: cuFile then bounces through host memory itself,
  * and its 1 MiB writes measured about half as fast as the staged path when they
@@ -404,6 +409,13 @@ class cufile_reactor {
   void dispatch_posix(cufile_io_object const& file,
                       prepared_io_slice const& slice,
                       std::unique_ptr<io_op_request> request);
+
+  /// O_DIRECT read of @p rng into host memory @p destination: straight into it
+  /// when the range and the pointer are block-aligned, else whole blocks through
+  /// the scratch, copied out.  Returns the bytes read (short only at EOF).
+  [[nodiscard]] std::size_t read_host_direct(cufile_io_object const& file,
+                                             std::uint8_t* destination,
+                                             range rng);
 
   /// POSIX pread of a device-only slice through the reactor's reusable pinned
   /// scratch, in pieces of @ref scratch_slot_bytes whose H2D copies (on the

@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace cucascade::io::cufile {
 
@@ -50,6 +51,23 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   cufile_ioctx(std::size_t n_reactors, std::shared_ptr<cufile_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::cufile; }
+
+  /**
+   * @brief Reactor selection tuned to synchronous reactors.
+   *
+   * A cuFile reactor serves one transfer at a time (synchronous cuFile and POSIX
+   * calls), so a request's queue depth is the number of reactors it is spread
+   * over.  A vectored read with more slices than the base's two gets every
+   * reactor, least backlogged first.  A host-only vectored write goes to one
+   * reactor: its page-cache writes with early writeback keep the device busy,
+   * and interleaving writers of one file only contends on its inode
+   * (docs/io/gpuio-gds-practices.md section 8).
+   * Other operations keep the base selection.
+   */
+  std::vector<cufile_reactor*> next_reactor(cufile_io_object const& object,
+                                            std::size_t n_slices,
+                                            io_op_type type,
+                                            int device_id = -1) override;
 
  protected:
   /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the

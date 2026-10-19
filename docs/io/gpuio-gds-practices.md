@@ -172,3 +172,26 @@ The W2 review (`w2-review`) found that G2 as implemented blocked the worker on t
 Re-measured after the fixes (compat, same host and method, one run, GB/s): read 1 slice 1 GiB 6.24, `device_readv` 16 MiB 6.16, 256 KiB x 8 streams 3.52, 64 KiB x 8 streams 1.17; write fresh 1 slice 1 GiB 5.35 (256 MiB 5.24, 8 MiB x 8 streams 5.02), overwrite 1 slice 1 GiB 5.66. No regression against sections 5 and 6.
 
 **Known gap (MINOR-4).** Device reads below `gds_threshold` (and every device read of a file without a cuFile handle) take the staged POSIX path, which is synchronous per reactor: one `pread` of the slice, its H2D copy, then the next slice. With 4 reactors that is a queue depth of 4, so 64 KiB reads reach about 1.2-1.3 GB/s where the uring reactor, which keeps up to 64 operations in flight per reactor, reaches about 6 GB/s. Closing it needs asynchronous POSIX reads inside the cuFile reactor (io_uring-style), which is a redesign; callers with many small device reads should prefer the uring backend, and the DISK tier only routes to cuFile on real-GDS hosts.
+
+## 8. Host transfers of the DISK tier (W3 review MAJOR-2)
+
+On a GDS host the DISK tier's automatic context is the cuFile one, and it also serves HOST <-> DISK: one vectored request per table, with segments of up to 1 MiB (the pinned pool's blocks; column buffers start 8 B-aligned inside them, so file offsets and sources are rarely congruent). The cuFile reactor served those with buffered `pread` / `pwrite`, one segment at a time on each of the two reactors a request reached.
+
+What limits a synchronous writer here (Python probe on the root NVMe, 512 MiB, fresh file preallocated like the DISK tier's, GB/s): O_DIRECT 1 MiB writes 4.34 from one thread but about 3.0 from 2-4 threads (extending writes serialize on the inode); a small buffered write next to each 1 MiB O_DIRECT write drops that to 1.6-2.2; buffered 1 MiB writes alone 3.2-3.3, but 5.3-5.4 with `sync_file_range(SYNC_FILE_RANGE_WRITE)` after each, which starts writeback at once so the kernel's copy of the next segment overlaps the device write of the previous ones.
+
+Changes (cufile reactor and `cufile_ioctx` only):
+- **Host-only reads go O_DIRECT**: straight into the destination for a block-aligned range and pointer, else whole blocks through the pinned scratch (8 MiB slots), copied out; a runtime O_DIRECT refusal falls back to the page cache. A vectored read with more than two slices is spread over every reactor (each reactor serves one transfer at a time).
+- **Host writes**: a body of at least 4 MiB whose source lines up with the file still goes O_DIRECT from the caller (head and tail buffered); everything else is written through the page cache with its writeback started immediately (`sync_file_range`). A host-only vectored write goes to one reactor. Durability is unchanged (`flush` is `fdatasync`); written pages are clean soon after and reclaimable, but unlike the uring reactor's O_DIRECT writes they do pass through the page cache.
+
+`benchmark_disk_converter`, 4 columns, single-benchmark processes alternated (base = `9e7ad25` via `LD_PRELOAD`, new = this change, uring = disk 0), `CUCASCADE_BENCH_DISK_DIR=/tmp`, GiB/s:
+
+| row | cufile base | cufile new | uring |
+|---|---|---|---|
+| HOST -> DISK 512 MiB | 2.57-2.88 | 4.13-4.22 | 4.26-4.40 |
+| HOST -> DISK 64 MiB | 2.20-2.47 | 3.00-3.05 | 3.31-3.39 |
+| DISK -> HOST 512 MiB (cold) | 1.47-1.82 | 6.35-6.39 | 6.22-6.29 |
+| DISK -> HOST 64 MiB (cold) | 1.49-1.73 | 5.52-5.67 | 5.22-5.59 |
+| GPU -> DISK 512 MiB | 4.70-4.88 | 4.63 | 4.53-4.80 |
+| DISK -> GPU 512 MiB | 6.43-6.44 | 6.37-6.47 | 6.32-6.45 |
+
+The review's 1.40-1.46 GiB/s for cuFile HOST -> DISK was taken while the SSD's write cache was exhausted (every writer drops to about 1.4 then); the base figures above are from a recovered drive. cuFile HOST <-> DISK is now within 10 % of uring (HOST -> DISK 64 MiB at 91 %, the rest at 95 % or above); the device rows are unchanged.
