@@ -416,3 +416,35 @@ cudf (`cucascade_cudf_tests`, links io):
   documented in a code comment (section 5).
 - Every converter awaits its future before any owning scope can unwind, also on exception paths
   (section 10).
+
+## 15. Results (implementation: 2337673, 8f79ac9, e474ef7, d02fa3d, e5fdce6)
+
+Measured with `benchmark_disk_converter` on `/tmp` (Samsung 990 PRO 2 TB behind LUKS/dm-crypt,
+ext4), 4 columns, 512 MiB tables, page cache dropped before every read on both sides. The old
+pipeline backend is a19cf0a rebuilt from a `git archive` snapshot with the same cold-read change.
+Throughput in GiB/s; new = the default context (uring here, since `gds_available()` is false).
+
+| Path | Old pipeline | New (uring) | cuFile (compat mode) |
+|---|---|---|---|
+| DISK -> GPU | 1.3-1.9 | 5.1 | 5.0-5.4 |
+| DISK -> HOST | 0.6-1.2 | 4.5-4.6 | 1.3-1.4 |
+| DISK -> GPU, strings | 1.2 | 4.8-6.3 | 2.8-4.3 |
+| GPU -> DISK | 2.3-2.5 | 4.3-4.8 | 1.5-3.7 |
+| HOST -> DISK | 2.55-2.62 | 4.1-4.6 | 1.3-1.5 |
+| GPU -> DISK, strings | 2.3-2.5 | 4.55-4.9 | 1.3-2.6 |
+
+Read rows: two back-to-back runs of the whole sweep in a quiet-disk window. Write rows: old and new
+alternated as single-benchmark processes, three rounds. Raw data and scripts:
+`/home/aaramoon/workspace/tmp-io/disk-tier/` (`compare-123620/`, `alternating_writes.txt`).
+
+Caveat — sustained writes: after ~20 GB of back-to-back writes in one process, every write path
+(uring included) drops to ~1.3-1.4 GiB/s. That matches the 990 PRO running out of its SLC cache
+(TLC sustained ~1.4-1.6 GB/s); short runs and the old path, which writes about half as fast, rarely
+get there. Compare write numbers only from runs that start with the drive's cache drained.
+
+Exit-time behaviour: a release build tolerates DISK spaces (and so their contexts) destroyed after
+the CUDA runtime and the cuFile driver were torn down — the context teardown only makes CUDA
+runtime calls whose errors are discarded and no cuFile calls (no io_object or registered buffer
+outlives a conversion); `test(disk): exit a process with live disk io contexts held in globals`
+checks it. Debug builds assert on those post-teardown CUDA errors, as they already do for HOST
+memory spaces kept in a global; hence the note on `make_disk_io_context()`.
