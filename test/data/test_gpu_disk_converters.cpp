@@ -16,6 +16,7 @@
  */
 
 #include "utils/cudf_test_utils.hpp"
+#include "utils/disk_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
 #include <cucascade/cudf/builtin_converters.hpp>
@@ -52,23 +53,17 @@ auto& shared_gpu_space()
   static auto s = test::make_mock_memory_space(memory::Tier::GPU, 0);
   return s;
 }
-auto& shared_disk_space()
-{
-  static auto s = test::make_mock_memory_space(memory::Tier::DISK, 0);
-  return s;
-}
 ::cuda::stream_ref shared_stream()
 {
   static rmm::cuda_stream s;
   return s;
 }
 
-/// Round-trip test helper: GPU -> disk -> GPU (direct 3-step), compare tables.
+/// Round-trip test helper: GPU -> disk -> GPU (direct 3-step), compare tables. Runs once per
+/// disk io stack (the adopted default and every forced backend that can write device memory).
 void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
 {
-  auto stream      = shared_stream();
-  auto& gpu_space  = shared_gpu_space();
-  auto& disk_space = shared_disk_space();
+  auto& gpu_space = shared_gpu_space();
 
   representation_converter_registry registry;
   register_builtin_converters(registry);
@@ -77,17 +72,26 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
   auto gpu_rep = std::make_unique<gpu_table_representation>(
     std::move(original_table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
-  // GPU -> disk (direct via write/write_batch)
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
+  for (auto const backend : test::disk_test_backends) {
+    auto& disk_space = test::shared_disk_space_for(backend);
+    if (!test::disk_space_can_write(disk_space, /*device=*/true)) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: no device writes");
+      continue;
+    }
+    CAPTURE(test::to_string(backend));
 
-  // disk -> GPU (direct via read)
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
+    // GPU -> disk (one batched device write)
+    auto disk_rep =
+      registry.convert<disk_data_representation>(*gpu_rep, &disk_space, shared_stream());
 
-  // Compare original (from gpu_rep) with round-tripped
-  test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
+    // disk -> GPU (one batched device read)
+    auto gpu_rep2 =
+      registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
+
+    // Compare original (from gpu_rep) with round-tripped
+    test::expect_cudf_tables_equal_on_stream(
+      gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
+  }
 }
 
 /// Create a simple column of the given type with uninitialized data.
@@ -747,37 +751,22 @@ TEST_CASE("gpu disk round-trip sliced column with nulls", "[disk][gpu-converter]
 }
 
 // =============================================================================
-// I/O backend selection tests (TEST-10)
+// io context selection tests
 // =============================================================================
 
-TEST_CASE("gpu disk round-trip with explicit pipeline backend",
-          "[disk][gpu-converter][backend][pipeline]")
+TEST_CASE("gpu disk round-trip with an explicit io context of each backend",
+          "[disk][gpu-converter][backend]")
 {
+  auto const backend = GENERATE(disk_io_backend::uring, disk_io_backend::cufile);
+  CAPTURE(test::to_string(backend));
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
-  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
-
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
-  // Simple INT32 column, 100 rows
-  auto table   = make_typed_table(cudf::type_id::INT32, 100);
-  auto gpu_rep = std::make_unique<gpu_table_representation>(
-    std::move(table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
-
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
-
-  test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
-}
-
-TEST_CASE("gpu disk round-trip pipeline with multiple types",
-          "[disk][gpu-converter][backend][pipeline]")
-{
-  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
-  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+  auto disk_space = test::make_disk_space(backend);
+  auto context    = disk_space->get_io_context();
+  REQUIRE(context != nullptr);
+  if (!context->supports_device_write()) {
+    WARN("the " << test::to_string(backend) << " context cannot write device memory yet");
+    return;
+  }
 
   representation_converter_registry registry;
   register_builtin_converters(registry);
@@ -793,6 +782,8 @@ TEST_CASE("gpu disk round-trip pipeline with multiple types",
 
   REQUIRE(disk_rep->get_size_in_bytes() > 0);
   REQUIRE(disk_rep->get_uncompressed_data_size_in_bytes() == disk_rep->get_size_in_bytes());
+  // The space kept the context it was configured with.
+  REQUIRE(disk_space->get_io_context() == context);
 
   auto gpu_rep2 =
     registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());

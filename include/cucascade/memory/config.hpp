@@ -19,9 +19,16 @@
 
 #include <cucascade/memory/common.hpp>
 
+#include <cstddef>
+#include <memory>
+#include <string>
 #include <variant>
 
 namespace cucascade {
+namespace io {
+class ioctx;
+}  // namespace io
+
 namespace memory {
 
 static constexpr std::size_t default_block_size = 1 << 20;  ///< Default block size (1MB)
@@ -95,6 +102,10 @@ struct disk_memory_space_config {
   int disk_id{-1};
   std::size_t memory_capacity{0};
   std::string mount_paths;
+  /// I/O context that reads and writes this space's files (uring, cuFile, kvikIO, ...). It must be
+  /// started and support writes. Null: the DISK converters of the cucascade-cudf layer adopt the
+  /// process-shared default context on first use (see cucascade/cudf/disk_io_context.hpp).
+  std::shared_ptr<io::ioctx> io_context{};
 
   [[nodiscard]] Tier tier() const { return Tier::DISK; }
 
