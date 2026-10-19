@@ -65,9 +65,10 @@ struct config {
   /// pipeline width) can override the latter but not the former.
   bool n_max_concurrent_scans_explicit{false};
 
-  /// Maximum fallback host-to-device copies in flight per reactor.  cuFile reads
-  /// are synchronous on the worker and never count; the reactor stops dispatching
-  /// new slices once this many copies are awaiting their CUDA event.
+  /// Maximum asynchronous items per reactor: device slices parked until their
+  /// stream is ready plus fallback host-to-device copies in flight.  cuFile and
+  /// staged transfers are synchronous on the worker and never count; the reactor
+  /// stops dispatching new slices once this many items await their CUDA event.
   std::size_t max_inflight{32};
 
   /// Largest single @c cuFileRead the reactor issues; a larger device slice is
@@ -88,6 +89,13 @@ struct config {
   /// for a read, the file offset) is 4 KiB-aligned; 0 (the default) never
   /// registers.  The registration is dropped before the transfer's future
   /// resolves.
+  ///
+  /// Registrations are shared through a process-wide table keyed by base
+  /// address: a transfer whose buffer starts at a live registration's base and
+  /// fits inside it reuses that registration (the last user deregisters); one
+  /// whose buffer otherwise overlaps a live registration takes the staged POSIX
+  /// path, so no cuFile call ever addresses memory a concurrent transfer may
+  /// deregister.
   ///
   /// @note Off by default on purpose: NVIDIA advises against registering a
   ///       one-shot destination (the cost is not amortised and BAR1 space is
@@ -110,11 +118,12 @@ struct config {
   /// four threads already reached 4 GB/s here (docs/io/gpuio-gds-practices.md).
   std::size_t gds_threshold{256UL << 10};
 
-  /// Whether the reactor opens the O_DIRECT fd needed to register with cuFile.
-  /// If false, cuFile registration is skipped and every read falls back to
-  /// POSIX -- effectively disabling the reactor's fast path.  Kept as a knob so
-  /// a filesystem that rejects O_DIRECT can still exercise the reactor
-  /// end-to-end via the fallback.
+  /// Whether the reactor opens the O_DIRECT fd needed to register with cuFile
+  /// (and used for aligned POSIX writes).  If false, cuFile registration is
+  /// skipped and every read and write goes through POSIX and the page cache --
+  /// effectively disabling the reactor's fast path.  Kept as a knob so a
+  /// filesystem that rejects O_DIRECT can still exercise the reactor end-to-end
+  /// via the fallback.
   bool use_odirect{true};
 
   /// Per-file cuFile compat mode.  @c OFF enforces cuFile/GDS (opening a file

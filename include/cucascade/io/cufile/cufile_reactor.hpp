@@ -96,7 +96,8 @@ class cufile_io_object final : public io_object {
   [[nodiscard]] int buffered_fd() const noexcept { return _buffered_fd.get(); }
 
   /// The O_DIRECT fd cuFile was registered against, or -1 when none was opened.
-  /// The reactor never reads through it directly -- cuFile does.
+  /// Reads through it are cuFile's; the reactor @c pwrite s aligned write
+  /// pieces through it.
   [[nodiscard]] int direct_fd() const noexcept { return _direct_fd.get(); }
 
   /// The handle to pass to @c cuFileRead; null when the GDS fast path is
@@ -156,15 +157,26 @@ class cufile_io_object final : public io_object {
  * low request at a slice boundary while high requests wait.  Priority is bounded
  * (see @ref config::low_service_interval) so waiting low work is never starved.
  *
- * Fragmented (cache-chunk) destinations are not served: the reactor stages
- * nothing through pinned host memory, so it opts out of the prefetching cache
- * (@c reactor_traits::supports_vector_host_read is false).
+ * A device slice never blocks the worker on its caller's stream: when work is
+ * still queued there, the slice is parked behind an event recorded at dispatch
+ * and served once that event completed, while the worker keeps serving other
+ * requests.  Staging copies then run on a reactor-owned stream per device.
  *
- * @note The reactor does not register device buffers with cuFile.  Per cuFile,
- *       an unregistered buffer is bounced through cuFile's own GPU buffers
- *       rather than DMA'd peer to peer; NVIDIA advises against registering a
- *       one-shot destination, and in compatibility mode registration buys
- *       nothing measurable (docs/io/gpuio-gds-practices.md, G8).
+ * Fragmented (cache-chunk) destinations are not served: the reactor's pinned
+ * scratch is not shaped like cache chunks, so it opts out of the prefetching
+ * cache (@c reactor_traits::supports_vector_host_read is false).
+ *
+ * @note By default the reactor does not register device buffers with cuFile
+ *       (see @ref config::register_min_bytes).  Per cuFile, an unregistered
+ *       buffer is bounced through cuFile's own GPU buffers rather than DMA'd
+ *       peer to peer; NVIDIA advises against registering a one-shot destination,
+ *       and in compatibility mode registration buys nothing measurable
+ *       (docs/io/gpuio-gds-practices.md, G8).
+ *
+ * @note Known gap: a device read below @ref config::gds_threshold, or of a file
+ *       without a cuFile handle, is a synchronous @c pread plus H2D copy, so a
+ *       reactor serves one at a time (64 KiB reads: about 1.3 GB/s from four
+ *       reactors against about 6 GB/s for the uring reactor, compat mode).
  *
  * Models the reactor concept consumed by @c templated_ioctx.
  */
@@ -202,9 +214,10 @@ class cufile_reactor {
 
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  /// Zero: this reactor stages nothing through pinned host memory (the GDS fast
-  /// path DMAs direct to device), so there is no chunk size for a cache to match.
-  /// @c ioctx::initialize_cache accepts 0 as "backend does not stage".
+  /// Zero: the reactor's pinned scratch is not a cache-chunk staging area (it
+  /// does not serve the prefetching cache), so there is no chunk size for a
+  /// cache to match.  @c ioctx::initialize_cache accepts 0 as "backend does not
+  /// stage".
   [[nodiscard]] std::size_t staging_block_size() const noexcept { return 0; }
 
   /// Open the process-wide cuFile driver (once) and launch the worker thread.
@@ -298,6 +311,28 @@ class cufile_reactor {
     std::optional<std::size_t> alignment = std::nullopt) noexcept;
 
  private:
+  /// A device-only slice parked until the work queued on its stream before
+  /// dispatch has finished (@c event fires).
+  struct waiting_slice {
+    std::shared_ptr<const io_object> obj;
+    prepared_io_slice slice;
+    std::shared_ptr<grouped_coordinator> coordinator;
+    cucascade::cuda::cuda_event event;
+  };
+
+  /// A non-blocking stream owned by the reactor, destroyed with it.
+  struct owned_stream {
+    owned_stream() noexcept = default;
+    owned_stream(owned_stream&& other) noexcept;
+    owned_stream& operator=(owned_stream&& other) noexcept;
+    owned_stream(owned_stream const&)            = delete;
+    owned_stream& operator=(owned_stream const&) = delete;
+    ~owned_stream();
+
+    cudaStream_t stream{nullptr};
+    int device_id{-1};
+  };
+
   /// One record per in-flight H2D copy issued for a read that took the POSIX
   /// fallback and also had a device destination.
   struct inflight_copy {
@@ -309,10 +344,24 @@ class cufile_reactor {
   void worker_loop(std::stop_token const& stop_token);
 
   /// Turn one slice into cuFile reads or a POSIX pread.  Never throws --
-  /// errors are reported through the slice's completion and coordinator.
+  /// errors are reported through the slice's completion and coordinator.  A
+  /// device-only slice whose stream still has queued work is parked (see
+  /// @ref park_if_stream_busy) unless @p stream_ready says its gate passed.
   void dispatch_slice(std::shared_ptr<const io_object> const& obj,
                       prepared_io_slice slice,
-                      std::shared_ptr<grouped_coordinator> const& coordinator) noexcept;
+                      std::shared_ptr<grouped_coordinator> const& coordinator,
+                      bool stream_ready = false) noexcept;
+
+  /// When the slice's stream still has queued work, record an event on it and
+  /// park the slice in @ref _waiting; returns whether it was parked.
+  /// @throws cucascade::cuda_error when the stream cannot be queried / recorded.
+  [[nodiscard]] bool park_if_stream_busy(std::shared_ptr<const io_object> const& obj,
+                                         prepared_io_slice& slice,
+                                         std::shared_ptr<grouped_coordinator> const& coordinator);
+
+  /// The reactor-owned stream of @p device_id for staging copies, created on
+  /// first use.  The calling thread's current device must be @p device_id.
+  [[nodiscard]] cudaStream_t copy_stream(int device_id);
 
   /// Read @p request's range into the slice's device buffer with synchronous
   /// @c cuFileRead calls, after the slice's stream has drained the work queued
@@ -330,7 +379,7 @@ class cufile_reactor {
                       io_op_request& request);
 
   /// Write the device-source pieces @p pieces of @p slice by D2H copies (on the
-  /// slice's stream) into the pinned scratch and @c pwrite, double-buffered.
+  /// reactor's copy stream) into the pinned scratch and @c pwrite, double-buffered.
   void write_device_staged(cufile_io_object const& file,
                            prepared_io_slice const& slice,
                            std::span<range const> pieces);
@@ -353,19 +402,27 @@ class cufile_reactor {
 
   /// POSIX pread of a device-only slice through the reactor's reusable pinned
   /// scratch, in pieces of @ref scratch_slot_bytes whose H2D copies (on the
-  /// slice's stream) overlap the next read.  Settles @p request before returning.
+  /// reactor's copy stream) overlap the next read.  Settles @p request before
+  /// returning.
   void read_device_staged(cufile_io_object const& file,
                           prepared_io_slice const& slice,
                           io_op_request& request);
 
-  /// Settle every in-flight H2D copy whose CUDA event has completed.
+  /// Dispatch every parked slice whose stream gate opened, then settle every
+  /// in-flight H2D copy whose CUDA event has completed.
   void poll_completions() noexcept;
 
   /// Synchronize and settle every outstanding copy with @p terminal_error, so no
   /// coordinator promise is stranded at shutdown.
   void drain_inflight(grouped_coordinator::error_type const& terminal_error) noexcept;
 
-  [[nodiscard]] std::size_t inflight_count() const noexcept { return _inflight_copy.size(); }
+  /// Settle every parked slice with @p error; nothing was issued for them.
+  void cancel_waiting(grouped_coordinator::error_type const& error) noexcept;
+
+  [[nodiscard]] std::size_t inflight_count() const noexcept
+  {
+    return _inflight_copy.size() + _waiting.size();
+  }
 
   std::shared_ptr<reactor_context> _ctx;
   reactor_config_type _config;
@@ -389,23 +446,16 @@ class cufile_reactor {
   /// Bytes per scratch slot (the fallback's piece size).
   static constexpr std::size_t scratch_slot_bytes = 8UL << 20;
 
-  // Worker-only state; touched exclusively from the reactor thread.
+  // Worker-only state; touched exclusively from the reactor thread (and by
+  // shutdown() once the worker has been joined).
   std::vector<inflight_copy> _inflight_copy;
+  std::vector<waiting_slice> _waiting;
+  /// Staging-copy streams, indexed by device id.
+  std::vector<owned_stream> _copy_streams;
   /// Pinned (portable) staging for device-only POSIX reads, allocated on first use
   /// so a reactor that never takes that path holds no pinned memory.
   pinned_scratch _scratch;
 };
-
-namespace detail {
-
-/// Tests only: let aligned device-write bodies use @c cuFileWrite even on a
-/// compat-only platform, so hosts without GDS still cover that path.  Process-wide.
-void set_cufile_writes_in_compat_for_testing(bool enabled) noexcept;
-
-/// Tests only: @c cuFileWrite calls issued by every cuFile reactor so far.
-[[nodiscard]] std::size_t cufile_write_calls_for_testing() noexcept;
-
-}  // namespace detail
 
 }  // namespace cucascade::io::cufile
 

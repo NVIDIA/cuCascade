@@ -20,6 +20,7 @@
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
+#include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
@@ -82,9 +83,14 @@ namespace {
 
 using namespace std::chrono_literals;
 
+/// splitmix64 of @p offset: never periodic, so bytes landing a whole number of
+/// pieces / scratch slots away from their place cannot compare equal.
 [[nodiscard]] std::uint8_t pattern_byte(std::size_t offset) noexcept
 {
-  return static_cast<std::uint8_t>((offset * 2654435761ULL) >> 11);
+  std::uint64_t z = offset + 0x9E3779B97F4A7C15ULL;
+  z               = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z               = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return static_cast<std::uint8_t>(z ^ (z >> 31));
 }
 
 /** A temporary file of @p bytes filled with @ref pattern_byte, removed on scope exit. */
@@ -154,6 +160,52 @@ class pattern_file {
   REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
   return out;
 }
+
+/**
+ * Copy @p bytes of @p device back on a NEW non-blocking stream, without
+ * synchronizing the stream the read was issued on: a read is complete when its
+ * future resolves, so the bytes must already be in place.
+ */
+[[nodiscard]] std::vector<std::uint8_t> device_bytes_elsewhere(void const* device,
+                                                               std::size_t bytes)
+{
+  cudaStream_t other{};
+  REQUIRE(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking) == cudaSuccess);
+  std::vector<std::uint8_t> out(bytes);
+  REQUIRE(cudaMemcpyAsync(out.data(), device, bytes, cudaMemcpyDeviceToHost, other) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(other) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(other) == cudaSuccess);
+  return out;
+}
+
+/// Hold @p stream on the host for @p duration (a host function that sleeps).
+void hold_stream(cudaStream_t stream, std::chrono::milliseconds duration)
+{
+  auto* const heap = new std::chrono::milliseconds{duration};
+  REQUIRE(cudaLaunchHostFunc(
+            stream,
+            [](void* arg) {
+              std::unique_ptr<std::chrono::milliseconds> const time{
+                static_cast<std::chrono::milliseconds*>(arg)};
+              std::this_thread::sleep_for(*time);
+            },
+            heap) == cudaSuccess);
+}
+
+/** Delays every staging copy of the cuFile reactors for the guard's lifetime. */
+class staging_copy_delay {
+ public:
+  explicit staging_copy_delay(std::chrono::microseconds delay)
+  {
+    cucascade::io::cufile::detail::set_staging_copy_delay_for_testing(delay);
+  }
+  ~staging_copy_delay()
+  {
+    cucascade::io::cufile::detail::set_staging_copy_delay_for_testing(std::chrono::microseconds{0});
+  }
+  staging_copy_delay(staging_copy_delay const&)            = delete;
+  staging_copy_delay& operator=(staging_copy_delay const&) = delete;
+};
 
 /** Consume @p future and report whether it carries the reactor's cancellation error. */
 [[nodiscard]] bool canceled(cucascade::exec::semi_future<std::size_t>&& future) noexcept
@@ -528,6 +580,136 @@ TEST_CASE("cufile platform probe is cached and self-consistent", "[io][cufile]")
   INFO("cuFile " << first.version << ", dstatusflags " << first.dstatusflags
                  << (first.compat_only ? " (compatibility mode)" : " (GDS)"));
   CHECK(first.version > 0);
+}
+
+TEST_CASE("cufile ioctx device reads are complete when their future resolves", "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  // The destination's stream is held, so the read must wait for it; the bytes
+  // are then checked on another stream.  Sizes above and below the two 8 MiB
+  // scratch slots exercise slot reuse and the final drain of the staged path.
+  struct read_case {
+    std::string label;
+    std::size_t threshold;
+    std::size_t size;
+  };
+  auto const [label, threshold, size] =
+    GENERATE(read_case{"staged, slots reused", 1UL << 40, (20UL << 20) + 123},
+             read_case{"staged, within two slots", 1UL << 40, 12UL << 20},
+             read_case{"cuFile", 1, (20UL << 20) + 123});
+  DYNAMIC_SECTION(label)
+  {
+    pattern_file const file{size};
+    config cfg{};
+    cfg.gds_threshold = threshold;
+    started_ioctx ioctx{cfg, 1};
+    auto object = ioctx.get().open_io_object(file.path());
+    rmm::cuda_stream stream;
+    rmm::device_buffer dst(size, stream);
+    stream.synchronize();
+    hold_stream(stream.value(), std::chrono::milliseconds{300});
+    // Slow every staging copy down, so a slot reused or a request settled before
+    // its copy landed shows up as wrong bytes.
+    staging_copy_delay const slow{std::chrono::milliseconds{50}};
+    REQUIRE(
+      ioctx.get()
+        .device_read_async_io(*object, 0, size, static_cast<std::uint8_t*>(dst.data()), stream)
+        .get(30s) == size);
+    auto const got  = device_bytes_elsewhere(dst.data(), size);
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < size; ++i) {
+      if (got[i] != pattern_byte(i)) ++bad;
+    }
+    CHECK(bad == 0);
+  }
+}
+
+TEST_CASE("cufile reactor serves other requests while a device slice waits for its stream",
+          "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+  auto const threshold = GENERATE(std::size_t{1}, std::size_t{1} << 40);
+  CAPTURE(threshold);
+  config cfg{};
+  cfg.gds_threshold = threshold;
+  started_ioctx ioctx{cfg, 1};  // one reactor: everything below shares its worker
+  auto object = ioctx.get().open_io_object(file.path());
+
+  rmm::cuda_stream held;
+  rmm::cuda_stream idle;
+  rmm::device_buffer held_dst(size, held);
+  rmm::device_buffer idle_dst(size, idle);
+  held.synchronize();
+  idle.synchronize();
+  hold_stream(held.value(), std::chrono::milliseconds{2000});
+
+  auto waiting = ioctx.get().device_read_async_io(
+    *object, 0, size, static_cast<std::uint8_t*>(held_dst.data()), held);
+  auto served = ioctx.get().device_read_async_io(
+    *object, 0, size, static_cast<std::uint8_t*>(idle_dst.data()), idle);
+  std::vector<std::uint8_t> host(64UL << 10);
+  auto host_read = ioctx.get().host_read_async_io(*object, 4096, host.size(), host.data());
+
+  // Both later requests complete while the first still waits for its stream.
+  REQUIRE(std::move(served).get(1500ms) == size);
+  REQUIRE(std::move(host_read).get(1500ms) == host.size());
+  CHECK_FALSE(waiting.is_ready());
+  REQUIRE(std::move(waiting).get(30s) == size);
+  CHECK(matches_file(device_bytes_elsewhere(held_dst.data(), size), 0, size));
+  CHECK(matches_file(device_bytes_elsewhere(idle_dst.data(), size), 0, size));
+}
+
+TEST_CASE("cufile shutdown cancels a device read still waiting for its stream", "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t size = 1UL << 20;
+  pattern_file const file{size};
+  config cfg{};
+  cfg.gds_threshold = 1;
+  cufile_ioctx ioctx{1, std::make_shared<cufile_reactor::reactor_context>(cfg)};
+  ioctx.start();
+  auto object = ioctx.open_io_object(file.path());
+  rmm::cuda_stream held;
+  rmm::device_buffer dst(size, held);
+  held.synchronize();
+  hold_stream(held.value(), std::chrono::milliseconds{3000});
+  auto future =
+    ioctx.device_read_async_io(*object, 0, size, static_cast<std::uint8_t*>(dst.data()), held);
+  std::this_thread::sleep_for(50ms);  // let the worker park it
+
+  auto const start = std::chrono::steady_clock::now();
+  ioctx.shutdown();
+  CHECK(canceled(std::move(future)));
+  CHECK(std::chrono::steady_clock::now() - start < 1500ms);
+  held.synchronize();
+}
+
+TEST_CASE("cufile next_piece keeps cuFile reads aligned and splits the EOF tail", "[io][cufile]")
+{
+  using cucascade::io::cufile::detail::next_piece;
+  constexpr std::size_t KiB = 1024;
+  constexpr std::size_t MiB = 1024 * KiB;
+  // Short ranges are read whole.
+  CHECK(next_piece(0, 1 * MiB, 10 * MiB, 64 * MiB) == 1 * MiB);
+  // A long range stops at max_op; an unaligned start stops at the last 4 KiB
+  // boundary inside max_op, so the next piece starts aligned.
+  CHECK(next_piece(0, 100 * MiB, 200 * MiB, 64 * MiB) == 64 * MiB);
+  CHECK(next_piece(123, 100 * MiB, 200 * MiB, 64 * MiB) == 64 * MiB - 123);
+  CHECK((123 + next_piece(123, 100 * MiB, 200 * MiB, 64 * MiB)) % (4 * KiB) == 0);
+  // A piece reaching an unaligned end of file stops at align_down(file_size) ...
+  constexpr std::size_t file_size = 10 * MiB + 1234;
+  CHECK(next_piece(0, file_size, file_size, 64 * MiB) == 10 * MiB);
+  // ... and the sub-block tail is its own piece.
+  CHECK(next_piece(10 * MiB, file_size, file_size, 64 * MiB) == 1234);
+  // A range that ends before EOF is not split there.
+  CHECK(next_piece(0, 10 * MiB + 1000, file_size, 64 * MiB) == 10 * MiB + 1000);
+  // A range wholly inside the last block is read whole.
+  CHECK(next_piece(10 * MiB + 100, file_size, file_size, 64 * MiB) == 1134);
 }
 
 TEST_CASE("cufile ioctx cancels reads submitted after shutdown", "[io][cufile]")
@@ -985,8 +1167,12 @@ void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int round
           measure(path, op < (4UL << 20) ? window : bytes, rounds, [&] {
             auto const bytes_here = op < (4UL << 20) ? window : bytes;
             std::atomic<std::size_t> next{0};
+            std::atomic<int> failures{0};
             auto worker = [&] {
-              CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+              if (cudaSetDevice(0) != cudaSuccess) {
+                ++failures;
+                return;
+              }
               for (;;) {
                 auto const off = next.fetch_add(op);
                 if (off >= bytes_here) break;
@@ -1000,7 +1186,7 @@ void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int round
                                static_cast<off_t>(in_window))
                     : api.Read(
                         object->cufile_handle(), base + in_window, op, static_cast<off_t>(off), 0);
-                REQUIRE(got == static_cast<ssize_t>(op));
+                if (got != static_cast<ssize_t>(op)) ++failures;
               }
             };
             std::vector<std::thread> pool;
@@ -1008,6 +1194,7 @@ void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int round
               pool.emplace_back(worker);
             for (auto& t : pool)
               t.join();
+            REQUIRE(failures == 0);
           }));
       }
       for (std::size_t const lanes : {1UL, 4UL, 8UL, 16UL}) {
@@ -1137,21 +1324,28 @@ TEST_CASE("cufile raw write probe", "[.cufile-probe-write]")
       CUfileHandle_t handle{};
       REQUIRE(api.HandleRegister(&handle, &descr).err == CU_FILE_SUCCESS);
       std::atomic<std::size_t> next{0};
+      std::atomic<int> failures{0};
       auto const t0 = std::chrono::steady_clock::now();
       std::vector<std::thread> pool;
       for (std::size_t t = 0; t < threads; ++t) {
         pool.emplace_back([&] {
-          CUCASCADE_CUDA_TRY(cudaSetDevice(0));
+          if (cudaSetDevice(0) != cudaSuccess) {
+            ++failures;
+            return;
+          }
           for (;;) {
             auto const off = next.fetch_add(op);
             if (off >= bytes) break;
-            REQUIRE(api.Write(handle, base + off % window, op, static_cast<off_t>(off), 0) ==
-                    static_cast<ssize_t>(op));
+            if (api.Write(handle, base + off % window, op, static_cast<off_t>(off), 0) !=
+                static_cast<ssize_t>(op)) {
+              ++failures;
+            }
           }
         });
       }
       for (auto& t : pool)
         t.join();
+      REQUIRE(failures == 0);
       auto const t1 = std::chrono::steady_clock::now();
       REQUIRE(::fdatasync(fd.get()) == 0);
       auto const t2 = std::chrono::steady_clock::now();
