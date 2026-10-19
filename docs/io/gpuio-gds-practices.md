@@ -132,3 +132,24 @@ Applied: G1 + G2 + G3 (`0819aec`), G4 (`184686d`), G5 (`ac082ad`). `[.cufile-ben
 | 4 MiB host reads (buffered `pread`) | 2.78 / 2.96 | 2.78 / 2.66 | 2.96 / 2.84 |
 
 Device ceiling 7.1-7.2 GB/s; the uring reactor measured 6.6-7.2 GB/s on the device scenarios in the same session. The 1 MiB x 8 streams row was the one scenario where the old path already saturated the device; its spread after the change (5.5-7.0 across runs, 6.6-7.0 when run alone) is within the noise of this shared host and was not traced to a specific cost.
+
+## 6. Results of task-5 (write path, compat mode)
+
+Applied: G6 (`849d4b3`) and G8 as the off-by-default `register_min_bytes` knob (`b82d802`). `[.cufile-write-bench]` (`test/io/cufile/test_cufile_write.cpp`), 4 reactors, 1 GiB per scenario into a file on the root NVMe, timed including the final `fdatasync`, median of 3 rounds, two interleaved passes with 45 s idle between runs (the 990 PRO's SLC cache otherwise skews later runs), GB/s. "overwrite" rewrites an existing file, "fresh" truncates it every round (every write extends it). `cufile-staged` forces the D2H + `pwrite` path (`gds_threshold` = 1 TiB); `cufile-split` sets `write_split_bytes` = 64 MiB.
+
+| scenario | cufile | cufile-staged | cufile-split | uring |
+|---|---|---|---|---|
+| overwrite: 1 device slice 256 MiB | 6.17 / 6.24 | 5.55 / 5.50 | 6.43 / - | 5.97 / 5.96 |
+| overwrite: 1 device slice 1 GiB | 6.39 / 6.43 | 5.48 / 5.57 | 6.57 / 6.57 | 6.29 / 6.32 |
+| overwrite: `device_writev` 4 MiB, one stream | 5.97 / 5.90 | 6.44 / 6.50 | 5.89 / 5.80 | 6.35 / 6.33 |
+| overwrite: 8 MiB device writes, 8 streams | 6.56 / 6.55 | 6.51 / 6.48 | 6.58 / 6.54 | 6.25 / 6.05 |
+| overwrite: 4 MiB host writes | 6.61 / 6.59 | 6.65 / 6.66 | 6.57 / 6.60 | 6.21 / 6.14 |
+| fresh: 1 device slice 256 MiB | 2.63 / 2.24 | 4.62 / 5.28 | 0.62 / 2.24 | 4.23 / 4.78 |
+| fresh: 1 device slice 1 GiB | 2.97 / 2.63 | 5.48 / 5.45 | 0.87 / 2.17 | 1.07 / 4.88 |
+| fresh: `device_writev` 4 MiB, one stream | 2.42 / 2.23 | 4.35 / 4.64 | 1.05 / 2.44 | 0.72 / 4.94 |
+| fresh: 8 MiB device writes, 8 streams | 2.07 / 2.24 | 3.41 / 5.09 | 0.90 / 2.28 | 1.26 / 5.57 |
+| fresh: 4 MiB host writes | 4.49 / 4.91 | 3.00 / 4.82 | 0.77 / 4.54 | 1.39 / 5.93 |
+
+Baselines, same session: `dd if=/dev/zero bs=8M oflag=direct` 1 GiB 4.6 GB/s fresh and 4.5 GB/s overwrite (QD1); raw `cuFileWrite` (`[.cufile-probe-write]`, 4 GiB fresh file) 2.1-2.65 GB/s whatever the thread count (1-8) and op size (1-64 MiB).
+
+Reading: overwriting, every path saturates the device (5.5-6.7 GB/s) and the cuFile body path is on par with uring. Extending a fresh file, compat-mode `cuFileWrite` is capped near 2.2-3.0 GB/s: `strace` shows libcufile issuing 1 MiB `O_DIRECT` `pwrite`s from its own bounce pool, each extending the file, where the staged path writes 8 MiB chunks. That is a property of cuFile's compatibility mode, which the DISK tier never uses (it selects cuFile only when `cufile::gds_available()`, i.e. a real GDS stack, and io_uring otherwise), so the reactor keeps `cuFileWrite` for aligned device bodies; on a GDS host those bytes are DMA'd from GPU memory without a host bounce. The fresh-file rows of pass 1 for uring and `cufile-split` were taken while the SSD's write cache was recovering and are not representative; `write_split_bytes` stays 0 (no consistent gain overwriting, worse when extending).
