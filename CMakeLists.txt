@@ -105,6 +105,17 @@ if(CUCASCADE_BUILD_IO AND CUCASCADE_TOPOLOGY_ONLY)
       CACHE BOOL "Build the cucascade-io library" FORCE)
 endif()
 
+# The cudf layer's DISK-tier converters read and write spill files through the
+# io library's io_context, so a cudf build needs the io library.
+if(CUCASCADE_BUILD_CUDF
+   AND NOT CUCASCADE_TOPOLOGY_ONLY
+   AND NOT CUCASCADE_BUILD_IO)
+  message(
+    FATAL_ERROR
+      "CUCASCADE_BUILD_CUDF=ON requires CUCASCADE_BUILD_IO=ON: the DISK-tier converters in cucascade-cudf perform their I/O through cucascade-io. Enable CUCASCADE_BUILD_IO or disable CUCASCADE_BUILD_CUDF."
+  )
+endif()
+
 # The S3 benchmark needs the io library (rest backend) and the benchmark tree.
 # Checked after the io gating above so a force-disabled io also disables it.
 if(CUCASCADE_BUILD_S3_BENCHMARK
