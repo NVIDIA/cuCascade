@@ -314,7 +314,9 @@ class registration_table {
   }
 
   /// Decide for a transfer of [@p base, @p base + @p bytes); register it when
-  /// @p want_registration and nothing overlaps.
+  /// @p want_registration and nothing overlaps.  An unregistered grant is
+  /// recorded too (release it with @ref release_unregistered), so a later
+  /// registration never covers memory an unregistered transfer is using.
   grant acquire(void const* base, std::size_t bytes, bool want_registration)
   {
     auto const begin = reinterpret_cast<std::uintptr_t>(base);
@@ -326,7 +328,10 @@ class registration_table {
       return grant::registered;
     }
     if (overlaps(begin, end)) return grant::conflict;
-    if (!want_registration) return grant::unregistered;
+    if (!want_registration || overlaps_unregistered(begin, end)) {
+      _unregistered.emplace(begin, bytes);
+      return grant::unregistered;
+    }
     auto& api = kvikio::cuFileAPI::instance();
     if (api.BufRegister == nullptr || api.BufDeregister == nullptr) return grant::unregistered;
     auto const status = api.BufRegister(base, bytes, 0);
@@ -341,8 +346,9 @@ class registration_table {
       }
       // Registered by someone outside the table: its owner may deregister it at
       // any time, so keep cuFile away from it.
-      return status.err == CU_FILE_MEMORY_ALREADY_REGISTERED ? grant::conflict
-                                                             : grant::unregistered;
+      if (status.err == CU_FILE_MEMORY_ALREADY_REGISTERED) return grant::conflict;
+      _unregistered.emplace(begin, bytes);
+      return grant::unregistered;
     }
     _live.emplace(begin, entry{bytes, 1});
     return grant::registered;
@@ -359,6 +365,19 @@ class registration_table {
       std::ignore = kvikio::cuFileAPI::instance().BufDeregister(base);
     } catch (...) {
       CUCASCADE_LOG_WARN("cufile_reactor: cuFileBufDeregister failed");
+    }
+  }
+
+  /// End an unregistered transfer of [@p base, @p base + @p bytes).
+  void release_unregistered(void const* base, std::size_t bytes) noexcept
+  {
+    std::lock_guard lock(_mutex);
+    auto const range = _unregistered.equal_range(reinterpret_cast<std::uintptr_t>(base));
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second == bytes) {
+        _unregistered.erase(it);
+        return;
+      }
     }
   }
 
@@ -384,8 +403,18 @@ class registration_table {
     return it->first + it->second.bytes > begin;
   }
 
+  /// Whether [begin, end) overlaps an unregistered transfer in flight (caller
+  /// holds the lock).  Few transfers are in flight at once: a scan is enough.
+  [[nodiscard]] bool overlaps_unregistered(std::uintptr_t begin, std::uintptr_t end) const
+  {
+    return std::any_of(_unregistered.begin(), _unregistered.end(), [&](auto const& transfer) {
+      return transfer.first < end && transfer.first + transfer.second > begin;
+    });
+  }
+
   mutable std::mutex _mutex;
   std::map<std::uintptr_t, entry> _live;
+  std::multimap<std::uintptr_t, std::size_t> _unregistered;
 };
 
 /**
@@ -414,18 +443,29 @@ class transfer_registration {
     } catch (...) {
       _grant = registration_table::grant::conflict;
     }
-    if (_grant == registration_table::grant::registered) _base = base;
+    if (_grant != registration_table::grant::conflict) {
+      _base  = base;
+      _bytes = bytes;
+    }
   }
 
   ~transfer_registration()
   {
-    if (_base != nullptr) registration_table::instance().release(_base);
+    if (_base == nullptr) return;
+    if (registered()) {
+      registration_table::instance().release(_base);
+    } else {
+      registration_table::instance().release_unregistered(_base, _bytes);
+    }
   }
 
   transfer_registration(transfer_registration const&)            = delete;
   transfer_registration& operator=(transfer_registration const&) = delete;
 
-  [[nodiscard]] bool registered() const noexcept { return _base != nullptr; }
+  [[nodiscard]] bool registered() const noexcept
+  {
+    return _grant == registration_table::grant::registered;
+  }
   [[nodiscard]] bool conflict() const noexcept
   {
     return _grant == registration_table::grant::conflict;
@@ -433,7 +473,8 @@ class transfer_registration {
 
  private:
   registration_table::grant _grant{registration_table::grant::unregistered};
-  void const* _base{nullptr};
+  void const* _base{nullptr};  ///< set when the table recorded this transfer
+  std::size_t _bytes{0};
 };
 
 /// Test seams (see cufile/detail.hpp).
@@ -456,6 +497,52 @@ std::atomic<std::int64_t> staging_copy_delay_us{0};
     },
     reinterpret_cast<void*>(static_cast<std::intptr_t>(delay)));
 }
+
+/**
+ * @brief Process-wide free list of reactor scratch buffers.
+ *
+ * @c cudaFreeHost synchronizes the whole device, so a reactor that freed its
+ * scratch at shutdown would wait for other callers' GPU work.  Scratches go back
+ * here instead and are reused by later reactors; the pool is never destroyed
+ * (process exit reclaims the memory).
+ */
+class scratch_pool {
+ public:
+  static scratch_pool& instance()
+  {
+    static auto* const pool = new scratch_pool;  // intentionally never destroyed
+    return *pool;
+  }
+
+  [[nodiscard]] std::uint8_t* acquire(std::size_t bytes)
+  {
+    {
+      std::lock_guard lock(_mutex);
+      if (!_free.empty()) {
+        auto* const memory = _free.back();
+        _free.pop_back();
+        return memory;
+      }
+    }
+    void* memory = nullptr;
+    CUCASCADE_CUDA_TRY(cudaHostAlloc(&memory, bytes, cudaHostAllocPortable));
+    return static_cast<std::uint8_t*>(memory);
+  }
+
+  void release(std::uint8_t* memory) noexcept
+  {
+    std::lock_guard lock(_mutex);
+    try {
+      _free.push_back(memory);
+    } catch (...) {
+      // Cannot keep it: leak it rather than synchronize the device.
+    }
+  }
+
+ private:
+  std::mutex _mutex;
+  std::vector<std::uint8_t*> _free;
+};
 
 /// Short reads tolerated in a row before a device slice is declared failed.
 constexpr int max_short_reads = 64;
@@ -1139,16 +1226,21 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
 std::uint8_t* cufile_reactor::scratch()
 {
   if (_scratch == nullptr) {
-    void* memory = nullptr;
-    CUCASCADE_CUDA_TRY(
-      cudaHostAlloc(&memory, scratch_slots * scratch_slot_bytes, cudaHostAllocPortable));
-    _scratch = pinned_scratch{static_cast<std::uint8_t*>(memory)};
+    _scratch = pinned_scratch{scratch_pool::instance().acquire(scratch_slots * scratch_slot_bytes)};
   }
   return _scratch.get();
 }
 
+void cufile_reactor::pinned_deleter::operator()(std::uint8_t* memory) const noexcept
+{
+  scratch_pool::instance().release(memory);
+}
+
 cudaStream_t cufile_reactor::copy_stream(int device_id)
 {
+  if (device_id < 0) {
+    throw std::invalid_argument("cufile_reactor: copy stream of an unresolved device");
+  }
   auto const index = static_cast<std::size_t>(device_id);
   if (_copy_streams.size() <= index) _copy_streams.resize(index + 1);
   auto& owned = _copy_streams[index];
@@ -1273,7 +1365,7 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
   } else {
     staged[1] = body;
   }
-  write_device_staged(file, slice, staged);
+  write_device_staged(file, slice, staged, device_id);
   request.finish_success();
 }
 
@@ -1331,7 +1423,8 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
 
 void cufile_reactor::write_device_staged(cufile_io_object const& file,
                                          prepared_io_slice const& slice,
-                                         std::span<range const> pieces)
+                                         std::span<range const> pieces,
+                                         int device_id)
 {
   // Chunks of at most one scratch slot, never crossing a piece boundary, so a
   // granule-aligned piece yields granule-aligned chunks (slot size is a multiple
@@ -1348,7 +1441,7 @@ void cufile_reactor::write_device_staged(cufile_io_object const& file,
   // The slice passed its stream gate (dispatch_slice), so the source's earlier
   // work is done: the copies run on the reactor's own stream, where later work
   // of the caller cannot hold the worker.
-  auto const stream    = copy_stream(slice.d_buffer.device_id);
+  auto const stream    = copy_stream(device_id);
   auto const granule   = write_granule();
   bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
   static_assert(scratch_slots == 2, "one event per scratch slot below");
@@ -1434,9 +1527,17 @@ void cufile_reactor::poll_completions() noexcept
       }
     }
     _waiting.erase(wait_out, _waiting.end());
+    // Serve about max_op_bytes of ready slices per call, like a worker pass; the
+    // rest stay parked (their events have fired) for the next call.
+    std::size_t served_bytes = 0;
     for (auto& [waiting, status] : ready) {
       grouped_coordinator::error_type error{canceled_error()};
       if (status == cudaSuccess && waiting.coordinator->should_continue()) {
+        if (served_bytes >= _config.max_op_bytes) {
+          _waiting.push_back(std::move(waiting));  // capacity reserved: cannot throw
+          continue;
+        }
+        served_bytes += waiting.slice.size();
         dispatch_slice(waiting.obj, std::move(waiting.slice), waiting.coordinator, true);
         continue;
       }

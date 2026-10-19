@@ -669,14 +669,21 @@ TEST_CASE("cufile shutdown cancels a device read still waiting for its stream", 
 
   constexpr std::size_t size = 1UL << 20;
   pattern_file const file{size};
+  // cuFile path, and the staged path after a first read gave the reactor its
+  // pinned scratch (which shutdown must hand back without synchronizing the
+  // device behind the held stream).
+  auto const threshold = GENERATE(std::size_t{1}, std::size_t{1} << 40);
+  CAPTURE(threshold);
   config cfg{};
-  cfg.gds_threshold = 1;
+  cfg.gds_threshold = threshold;
   cufile_ioctx ioctx{1, std::make_shared<cufile_reactor::reactor_context>(cfg)};
   ioctx.start();
   auto object = ioctx.open_io_object(file.path());
   rmm::cuda_stream held;
   rmm::device_buffer dst(size, held);
   held.synchronize();
+  REQUIRE(ioctx.device_read_async_io(*object, 0, size, static_cast<std::uint8_t*>(dst.data()), held)
+            .get(30s) == size);
   hold_stream(held.value(), std::chrono::milliseconds{3000});
   auto future =
     ioctx.device_read_async_io(*object, 0, size, static_cast<std::uint8_t*>(dst.data()), held);

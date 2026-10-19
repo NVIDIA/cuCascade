@@ -228,7 +228,11 @@ class cufile_reactor {
   void interrupt() noexcept;
 
   /// Close admission, request stop, join the worker, and cancel anything that
-  /// never made it out of the queue.  Idempotent.
+  /// never made it out of the queue.  Slices parked behind a busy stream are
+  /// cancelled at once; a transfer already running finishes its current piece.
+  /// The pinned scratch goes back to a process-wide pool rather than to
+  /// @c cudaFreeHost, which would synchronize the device and make shutdown wait
+  /// for other callers' GPU work.  Idempotent.
   void shutdown();
 
   /// Synchronous buffered host read (pread on the buffered fd).  Blocks the
@@ -382,7 +386,8 @@ class cufile_reactor {
   /// reactor's copy stream) into the pinned scratch and @c pwrite, double-buffered.
   void write_device_staged(cufile_io_object const& file,
                            prepared_io_slice const& slice,
-                           std::span<range const> pieces);
+                           std::span<range const> pieces,
+                           int device_id);
 
   /// Write @p piece from device memory @p source with @c cuFileWrite.  Returns
   /// false when cuFile failed and the caller must stage the piece instead.
@@ -435,9 +440,11 @@ class cufile_reactor {
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
 
-  /// Frees the pinned scratch.
+  /// Returns the pinned scratch to a process-wide pool instead of freeing it:
+  /// @c cudaFreeHost synchronizes the whole device, so freeing it would make a
+  /// reactor's shutdown wait for other callers' GPU work.
   struct pinned_deleter {
-    void operator()(std::uint8_t* memory) const noexcept { std::ignore = cudaFreeHost(memory); }
+    void operator()(std::uint8_t* memory) const noexcept;
   };
   using pinned_scratch = std::unique_ptr<std::uint8_t, pinned_deleter>;
 
@@ -452,8 +459,9 @@ class cufile_reactor {
   std::vector<waiting_slice> _waiting;
   /// Staging-copy streams, indexed by device id.
   std::vector<owned_stream> _copy_streams;
-  /// Pinned (portable) staging for device-only POSIX reads, allocated on first use
-  /// so a reactor that never takes that path holds no pinned memory.
+  /// Pinned (portable) staging for device-only POSIX reads and writes, taken from
+  /// a process-wide pool on first use (so a reactor that never stages holds no
+  /// pinned memory) and given back at shutdown.
   pinned_scratch _scratch;
 };
 

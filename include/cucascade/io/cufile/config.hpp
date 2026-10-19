@@ -68,7 +68,9 @@ struct config {
   /// Maximum asynchronous items per reactor: device slices parked until their
   /// stream is ready plus fallback host-to-device copies in flight.  cuFile and
   /// staged transfers are synchronous on the worker and never count; the reactor
-  /// stops dispatching new slices once this many items await their CUDA event.
+  /// stops dispatching new slices once this many items await their CUDA event,
+  /// so slices parked behind busy streams can fill the window; parked slices that
+  /// became ready are served (in about @ref max_op_bytes portions) before new ones.
   std::size_t max_inflight{32};
 
   /// Largest single @c cuFileRead the reactor issues; a larger device slice is
@@ -94,8 +96,9 @@ struct config {
   /// address: a transfer whose buffer starts at a live registration's base and
   /// fits inside it reuses that registration (the last user deregisters); one
   /// whose buffer otherwise overlaps a live registration takes the staged POSIX
-  /// path, so no cuFile call ever addresses memory a concurrent transfer may
-  /// deregister.
+  /// path, and a range an unregistered cuFile transfer is using is not registered
+  /// until it completes, so no cuFile call ever addresses memory a concurrent
+  /// transfer may deregister.
   ///
   /// @note Off by default on purpose: NVIDIA advises against registering a
   ///       one-shot destination (the cost is not amortised and BAR1 space is
