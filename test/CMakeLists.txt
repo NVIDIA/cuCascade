@@ -94,7 +94,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     target_sources(
       cucascade_io_tests
       PRIVATE io/cufile/test_cufile_reactor.cpp
-              io/kvikio/test_kvikio_config.cpp io/kvikio/test_kvikio_remote.cpp)
+              io/kvikio/test_kvikio_config.cpp io/kvikio/test_kvikio_remote.cpp
+              io/kvikio/test_kvikio_write.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

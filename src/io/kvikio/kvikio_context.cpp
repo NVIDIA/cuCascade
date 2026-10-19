@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/io/io_request.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 
 #include <kvikio/defaults.hpp>
@@ -25,7 +26,11 @@
 
 #include <cuda_runtime.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -34,7 +39,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io {
 
@@ -65,6 +72,32 @@ const kvikio_object& as_kvikio(const io_object& obj)
 [[nodiscard]] size_t clamp_to_object(const io_object& obj, size_t offset, size_t size) noexcept
 {
   return obj.size() > offset ? std::min(size, obj.size() - offset) : 0;
+}
+
+/// The local kvikIO object behind @p obj, which must be writable.
+kvikio_io_object const& as_writable_local(const io_object& obj)
+{
+  auto const* local = dynamic_cast<kvikio_io_object const*>(&as_kvikio(obj));
+  if (local == nullptr || !local->writable()) {
+    throw std::system_error(
+      std::make_error_code(std::errc::bad_file_descriptor),
+      "kvikio_context: '" + obj.object_path() + "' was not opened for writing");
+  }
+  return *local;
+}
+
+/// Write all @p size bytes of @p src (host or device memory) at @p offset.
+void write_all(kvikio_io_object const& object,
+               void const* src,
+               std::size_t size,
+               std::size_t offset)
+{
+  auto const written = object.handle().pwrite(src, size, offset).get();
+  if (written != size) {
+    throw std::system_error(std::make_error_code(std::errc::io_error),
+                            "kvikio_context: short write");
+  }
+  object.note_written(offset + size);
 }
 
 /// kvikIO falls back to the AWS_* environment when an argument is nullopt, so
@@ -168,6 +201,97 @@ std::shared_ptr<io_object> kvikio_context::create_io_object(std::string path)
       : kvikio::FileHandle{path, "r"};
   auto const file_size = handle.nbytes();
   return std::make_shared<kvikio_io_object>(std::move(path), std::move(handle), file_size);
+}
+
+std::shared_ptr<io_object> kvikio_context::create_io_object_for_write(std::string path,
+                                                                      write_open_options options)
+{
+  if (is_s3_uri(path)) {
+    throw std::system_error(std::make_error_code(std::errc::not_supported),
+                            "kvikio_context: cannot write object-store URI '" + path + "'");
+  }
+  // kvikIO's fopen-style flags have no "create without truncating" or
+  // "exclusive" mode, so the create / truncate / exclusive semantics come from
+  // open(2) and the handle then opens the existing file read-write ("r+").
+  int flags = O_RDWR | O_CLOEXEC;
+  switch (options.mode) {
+    case write_mode::create_or_truncate: flags |= O_CREAT | O_TRUNC; break;
+    case write_mode::create_or_open: flags |= O_CREAT; break;
+    case write_mode::open_existing: break;
+    case write_mode::create_new: flags |= O_CREAT | O_EXCL; break;
+  }
+  auto const fd = ::open(path.c_str(), flags, options.permissions);
+  if (fd < 0) {
+    throw std::system_error(
+      errno, std::generic_category(), "kvikio_context: open '" + path + "' for writing");
+  }
+  ::close(fd);
+
+  kvikio::FileHandle handle =
+    _config.compat_mode
+      ? kvikio::FileHandle{path, "r+", kvikio::FileHandle::m644, *_config.compat_mode}
+      : kvikio::FileHandle{path, "r+"};
+  auto const file_size = handle.nbytes();
+  return std::make_shared<kvikio_io_object>(
+    std::move(path), std::move(handle), file_size, io_access::read_write);
+}
+
+size_t kvikio_context::host_write_io(const io_object& obj,
+                                     size_t offset,
+                                     size_t size,
+                                     const uint8_t* src)
+{
+  auto const& object = as_writable_local(obj);
+  if (size == 0) return 0;
+  write_all(object, src, size, offset);
+  return size;
+}
+
+exec::semi_future<std::size_t> kvikio_context::mixed_writev_async_io(
+  const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept
+{
+  // Eager, like the reads: the future is ready when this returns.
+  return exec::make_semi_future_with([&obj, slices = std::move(slices)]() mutable -> size_t {
+    auto const& object = as_writable_local(obj);
+    std::erase_if(slices, [](prepared_io_slice const& slice) { return slice.rng.size == 0; });
+    auto const total = validate_write_slices(slices);
+    for (auto const& slice : slices) {
+      if (slice.has_device_request()) {
+        int device_id = slice.d_buffer.device_id;
+        if (device_id < 0) {
+          auto const status = cudaGetDevice(&device_id);
+          if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+        }
+        rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+        // kvikIO reads the source on its own streams / threads: let the
+        // caller's stream finish producing it first.
+        auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
+        if (sync_status != cudaSuccess) {
+          throw std::runtime_error(cudaGetErrorString(sync_status));
+        }
+        write_all(object, slice.d_buffer.data, slice.size(), slice.offset());
+      } else {
+        write_all(
+          object, std::get<std::uint8_t*>(slice.h_buffer.buffer), slice.size(), slice.offset());
+      }
+    }
+    return total;
+  });
+}
+
+void kvikio_context::flush_io(const io_object& obj)
+{
+  auto const& object = as_writable_local(obj);
+  while (::fdatasync(object.handle().fd()) != 0) {
+    if (errno == EINTR) continue;
+    throw std::system_error(errno, std::generic_category(), "kvikio_context: fdatasync");
+  }
+}
+
+exec::semi_future<void> kvikio_context::flush_async_io(const io_object& obj,
+                                                       io_priority /*priority*/) noexcept
+{
+  return exec::make_semi_future_with([this, &obj]() { flush_io(obj); });
 }
 
 bool kvikio_context::supports(std::string_view /*path*/) const noexcept
