@@ -334,6 +334,63 @@ void write_host_piece(cufile_io_object const& file,
   }
 }
 
+/**
+ * @brief Temporary @c cuFileBufRegister of a device range for one transfer.
+ *
+ * Registered on construction when @p bytes is at least @p min_bytes (0 = never)
+ * and @p base is 4 KiB-aligned, deregistered on destruction -- before the
+ * transfer's request settles, so the caller may free the buffer as soon as its
+ * future resolves.  A failed registration is not an error: the transfer runs
+ * unregistered (cuFile bounces it), and the failure is logged once.
+ */
+class transfer_registration {
+ public:
+  transfer_registration(void const* base, std::size_t bytes, std::size_t min_bytes) noexcept
+  {
+    if (min_bytes == 0 || bytes < min_bytes || bytes == 0 ||
+        reinterpret_cast<std::uintptr_t>(base) % IO_BLOCK_SIZE != 0) {
+      return;
+    }
+    try {
+      auto& api = kvikio::cuFileAPI::instance();
+      if (api.BufRegister == nullptr || api.BufDeregister == nullptr) return;
+      auto const status = api.BufRegister(base, bytes, 0);
+      if (status.err == CU_FILE_SUCCESS) {
+        _base = base;
+        return;
+      }
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true, std::memory_order_relaxed)) {
+        CUCASCADE_LOG_WARN(
+          "cufile_reactor: cuFileBufRegister of {} bytes failed (err={}); transferring "
+          "unregistered (logged once)",
+          bytes,
+          static_cast<int>(status.err));
+      }
+    } catch (...) {
+      _base = nullptr;
+    }
+  }
+
+  ~transfer_registration()
+  {
+    if (_base == nullptr) return;
+    try {
+      std::ignore = kvikio::cuFileAPI::instance().BufDeregister(_base);
+    } catch (...) {
+      CUCASCADE_LOG_WARN("cufile_reactor: cuFileBufDeregister failed");
+    }
+  }
+
+  transfer_registration(transfer_registration const&)            = delete;
+  transfer_registration& operator=(transfer_registration const&) = delete;
+
+  [[nodiscard]] bool registered() const noexcept { return _base != nullptr; }
+
+ private:
+  void const* _base{nullptr};
+};
+
 /// Short reads tolerated in a row before a device slice is declared failed.
 constexpr int max_short_reads = 64;
 
@@ -784,35 +841,52 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
   auto const offset = request->io_rng.offset;
   auto const end    = offset + request->io_rng.size;
   auto* const dst   = slice.d_buffer.data;
-  auto pos          = offset;
-  int short_reads   = 0;
-  while (pos < end) {
-    auto const want = next_piece(pos, end, file.size(), _config.max_op_bytes);
-    errno           = 0;
-    auto const got =
-      api.Read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
-    if (got < 0) {
-      auto const saved_errno = errno;
-      static std::atomic<bool> logged{false};
-      if (!logged.exchange(true, std::memory_order_relaxed)) {
-        CUCASCADE_LOG_WARN(
-          "cufile_reactor: cuFileRead of '{}' failed: {}; serving such reads through POSIX "
-          "(logged once)",
-          file.object_path(),
-          describe_cufile_failure(got, saved_errno));
+  bool failed       = false;
+  {
+    // A registered range is addressed by its base plus an offset (cuFile requires
+    // the registered base); an unregistered one by the exact pointer.
+    transfer_registration const registration{
+      dst, offset % IO_BLOCK_SIZE == 0 ? request->io_rng.size : 0, _config.register_min_bytes};
+    auto pos        = offset;
+    int short_reads = 0;
+    while (pos < end) {
+      auto const want = next_piece(pos, end, file.size(), _config.max_op_bytes);
+      errno           = 0;
+      auto const got =
+        registration.registered()
+          ? api.Read(file.cufile_handle(),
+                     dst,
+                     want,
+                     static_cast<off_t>(pos),
+                     static_cast<off_t>(pos - offset))
+          : api.Read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
+      if (got < 0) {
+        auto const saved_errno = errno;
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+          CUCASCADE_LOG_WARN(
+            "cufile_reactor: cuFileRead of '{}' failed: {}; serving such reads through POSIX "
+            "(logged once)",
+            file.object_path(),
+            describe_cufile_failure(got, saved_errno));
+        }
+        return false;
       }
-      return false;
+      // The range was clamped to the size recorded at open, so nothing read here
+      // is a sign that the file shrank underneath us.
+      if (got == 0 || ++short_reads > max_short_reads) {
+        failed = true;
+        break;
+      }
+      if (static_cast<std::size_t>(got) == want) short_reads = 0;
+      pos += static_cast<std::size_t>(got);
     }
-    // The range was clamped to the size recorded at open, so nothing read here is
-    // a sign that the file shrank underneath us.
-    if (got == 0 || ++short_reads > max_short_reads) {
-      request->finish_error(std::make_error_code(std::errc::io_error));
-      return true;
-    }
-    if (static_cast<std::size_t>(got) == want) short_reads = 0;
-    pos += static_cast<std::size_t>(got);
+  }  // deregistered before the request settles
+  if (failed) {
+    request->finish_error(std::make_error_code(std::errc::io_error));
+  } else {
+    request->finish_success();
   }
-  request->finish_success();
   return true;
 }
 
@@ -1065,13 +1139,22 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
   if (api.Write == nullptr) return false;
 
   auto const max_op = _config.max_op_bytes - _config.max_op_bytes % IO_BLOCK_SIZE;
-  std::size_t done  = 0;
-  int short_writes  = 0;
+  // Deregistered when this function returns or throws, before the request settles.
+  transfer_registration const registration{source, piece.size, _config.register_min_bytes};
+  std::size_t done = 0;
+  int short_writes = 0;
   while (done < piece.size) {
     auto const want = std::min(max_op, piece.size - done);
     errno           = 0;
-    auto const got  = api.Write(
-      file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
+    auto const got =
+      registration.registered()
+        ? api.Write(file.cufile_handle(),
+                    source,
+                    want,
+                    static_cast<off_t>(piece.offset + done),
+                    static_cast<off_t>(done))
+        : api.Write(
+            file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
     if (got < 0) {
       auto const saved_errno = errno;
       static std::atomic<bool> logged{false};
