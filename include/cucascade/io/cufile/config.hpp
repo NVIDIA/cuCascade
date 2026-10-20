@@ -21,19 +21,27 @@
 #include <cucascade/exec/config.hpp>
 #include <cucascade/io/types.hpp>
 
-#include <kvikio/compat_mode.hpp>
-
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 
 namespace cucascade::io::cufile {
+
+/**
+ * @brief Per-file policy for using cuFile.
+ */
+enum class compat : std::uint8_t {
+  automatic,  ///< try cuFile; a file that cannot be registered falls back to POSIX I/O
+  on,         ///< never use cuFile: every transfer of the file goes through POSIX I/O
+  off,        ///< enforce cuFile: opening a file that cannot be registered throws
+};
 
 /**
  * @brief Tunables for the cuFile / GPUDirect Storage local-file reactor.
  *
  * This backend registers each file with @c cuFileHandleRegister and serves
  * device destinations with synchronous @c cuFileRead calls issued from the
- * reactor's worker thread, rather than going through @c kvikio::FileHandle.  A
+ * reactor's worker thread.  A
  * device read starts once the work already queued on the caller's CUDA stream
  * has finished and completes host-observed; with a real GDS stack cuFile DMAs
  * from NVMe straight into GPU memory with no host-side bounce of its own.
@@ -56,9 +64,9 @@ namespace cucascade::io::cufile {
  * is staged through pinned host memory and @c pwrite, which measured faster
  * there (see @c cufile_reactor).  No setting changes that.
  *
- * @note This backend is available only in a build with kvikIO
- *       (@c CUCASCADE_HAS_KVIKIO, i.e. @c CUCASCADE_BUILD_CUDF), because it
- *       reaches libcufile through kvikIO's lazily-loading @c cuFileAPI shim.
+ * @note libcufile is loaded at run time (@c cufile_api); a host without it runs
+ *       every transfer through POSIX I/O.  The backend is built when @c cufile.h is
+ *       found at configure time (@c CUCASCADE_HAS_CUFILE).
  */
 struct config {
   /// How many scan tasks the readahead manager may keep in flight against this
@@ -138,12 +146,10 @@ struct config {
   /// via the fallback.
   bool use_odirect{true};
 
-  /// Per-file cuFile compat mode.  @c OFF enforces cuFile/GDS (opening a file
-  /// whose handle cannot be registered throws), @c ON forces POSIX at handle
-  /// level, @c AUTO tries cuFile and falls back to POSIX at registration time.
-  /// Unset leaves it at kvikIO's @c defaults::compat_mode() (which honours
-  /// @c KVIKIO_COMPAT_MODE).
-  std::optional<kvikio::CompatMode> compat_mode;
+  /// Per-file cuFile policy (see @ref compat).  Unset means @c compat::automatic.
+  /// Independently, @c CUFILE_FORCE_COMPAT_MODE=true in the environment makes
+  /// cuFile itself run in compatibility mode (see @c probe_platform()).
+  std::optional<compat> compat_mode;
 
   /// How long the worker sleeps between completion polls while fallback copies
   /// are in flight and it has nothing to submit.  A completion is only noticed at

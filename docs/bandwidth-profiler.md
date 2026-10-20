@@ -25,7 +25,7 @@ Use `representation_converter_registry::convert<T>()` for every transfer. The re
 **Why:** Engines route based on what converters will actually do at runtime. Raw `cudaMemcpyAsync` / `cuFileRead` numbers would diverge from production overhead (packing, metadata handling, backend selection).
 
 ### D-02. Disk backend selection
-The profiler takes no backend parameter: every DISK `memory_space` carries the `io::ioctx` that serves its files (uring, cuFile/GDS, kvikIO, or the process-shared default adopted on first use — see `include/cucascade/cudf/disk_io_context.hpp`). Profiler results are scoped to those contexts — a uring profile is not interchangeable with a GDS profile. Callers wanting both profile twice with differently configured disk spaces.
+The profiler takes no backend parameter: every DISK `memory_space` carries the `io::ioctx` that serves its files (uring, cuFile/GDS, or the process-shared default adopted on first use — see `include/cucascade/cudf/disk_io_context.hpp`). Profiler results are scoped to those contexts — a uring profile is not interchangeable with a GDS profile. Callers wanting both profile twice with differently configured disk spaces.
 
 ### D-03. Chunked-allocator detection — `chunked_resource_info` mixin
 New interface lives at `include/cucascade/memory/chunked_resource_info.hpp`:

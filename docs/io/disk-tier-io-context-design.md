@@ -37,7 +37,7 @@ GPU->DISK 2.36 GiB/s (incl. `fdatasync`), HOST->DISK 2.45, DISK->GPU cold 1.92 /
 ```
 cucascade (core)    memory_space, disk_data_representation, disk_table_allocation, disk config
    ^                holds std::shared_ptr<io::ioctx> -- forward-declared, never dereferenced
-cucascade_io        ioctx, uring / cufile / kvikio contexts, write API (W1, W2)
+cucascade_io        ioctx, uring / cufile contexts, write API (W1, W2)
    ^
 cucascade_cudf      disk converters, disk I/O helpers, disk io-context factory + defaults
 ```
@@ -77,7 +77,7 @@ struct disk_memory_space_config {
   int disk_id{-1};
   std::size_t memory_capacity{0};
   std::string mount_paths;
-  /// Context that serves this space's files (uring, cufile, kvikio, ...); must be started and
+  /// Context that serves this space's files (uring, cufile, ...); must be started and
   /// support writes. Null: the disk converters adopt the process-shared default on first use.
   std::shared_ptr<io::ioctx> io_context{};
 };
@@ -108,14 +108,14 @@ std::shared_ptr<io::ioctx> io_context = nullptr)` forwards it into the config.
 ### 3.2 cudf layer (`include/cucascade/cudf/disk_io_context.hpp`, new public header)
 
 ```cpp
-enum class disk_io_backend : std::uint8_t { automatic, uring, cufile, kvikio };
+enum class disk_io_backend : std::uint8_t { automatic, uring, cufile };
 
 struct disk_io_context_options {
   /// automatic: cufile when io::cufile::gds_available(), else uring when io_uring is allowed in
-  /// this process, else kvikio.
+  /// this process, else cufile (its POSIX path).
   disk_io_backend backend{disk_io_backend::automatic};
   /// The io stack's own static configuration: uring_n_reactors / uring, cufile_n_reactors /
-  /// cufile, kvikio. backend and cache are ignored (the disk tier never arms an fs_cache).
+  /// cufile. backend and cache are ignored (the disk tier never arms an fs_cache).
   io::io_config io{};
   /// NUMA node of the uring context's private pinned staging (-1: unbound, portable).
   int staging_numa_node{-1};
@@ -133,8 +133,9 @@ struct disk_io_context_options {
 
 - The default serves BOTH host and device paths. On a GDS host HOST <-> DISK therefore goes
   through the cufile reactor's host path, which runs at uring speed since 6ec77f9 (section 6).
-  Without GDS, automatic picks uring when this process may use io_uring and kvikIO otherwise
-  (forced uring fails fast with the errno instead).
+  Without GDS, automatic picks uring when this process may use io_uring and the cuFile reactor's
+  POSIX path otherwise (forced uring fails fast with the errno instead). kvikIO was removed
+  (2026-10-19): the cuFile reactor loads libcufile itself (`io::cufile::cufile_api`).
 - uring staging ownership uses the hook the reactor already provides: a private subclass of
   `uring_reactor::reactor_context` owns the upstream pinned resource and the
   `fixed_size_host_memory_resource` (base-from-member); every reactor's shared `_ctx` keeps it
@@ -143,8 +144,8 @@ struct disk_io_context_options {
 - GDS probe: owned by W2 (agreed with `gds`, landed in ac082ad):
   `cucascade::io::cufile::gds_available()` in `include/cucascade/io/cufile/platform.hpp` —
   process-wide, computed once, never throws; true iff libcufile loads, the driver opened, it reports
-  a real GDS mode (`nvfs.dstatusflags != 0`) and `KVIKIO_COMPAT_MODE` / `CUFILE_FORCE_COMPAT_MODE` do
-  not force compat. The header does not include kvikIO. The disk tier asks it through one private
+  a real GDS mode (`nvfs.dstatusflags != 0`) and `CUFILE_FORCE_COMPAT_MODE` does not force compat
+  (`KVIKIO_COMPAT_MODE` is no longer read). The disk tier asks it through one private
   helper (`detail::gds_is_available()`); the first call opens the cuFile driver (~0.3 s), which only
   happens when an automatic context is built. False on this host (no
   nvidia-fs), so the tests drive both backends through `disk_io_context_options::backend`. A file on a
@@ -255,16 +256,15 @@ void read_disk_file_host(io::ioctx&, std::string const& path, std::span<io::slic
 |---|---|---|---|
 | uring | staged through the reactor's pinned blocks, D2H/H2D on the caller's stream; aligned bodies O_DIRECT, sub-4 KiB heads/tails buffered (W1 3.3) | direct; O_DIRECT when address-congruent, else staged memcpy + O_DIRECT | default without GDS |
 | cufile | `cuFileWrite/ReadAsync` above `gds_threshold` (W2), POSIX below | POSIX | default when `gds_available()` |
-| kvikio | `kvikio::FileHandle` (GDS or its own bounce) | pwrite/pread | explicit opt-in only |
 
 How a user configures it:
 1. Nothing: the space adopts `default_disk_io_context()` — cuFile on GDS hosts, uring elsewhere.
 2. Per space: `config.io_context = make_disk_io_context({.backend = disk_io_backend::cufile})` (forces
-   cuFile even in compatibility mode, e.g. for testing), `uring` or `kvikio`; or
+   cuFile even in compatibility mode, e.g. for testing) or `uring`; or
    `space.set_io_context(ctx)` after construction; or any started, write-capable `ioctx` (e.g. one
    shared with the scan path).
 3. Process-wide knobs inside the contexts stay where they are (`io::io_config` fields passed through
-   `disk_io_context_options::io`, `KVIKIO_*` / `cufile.json`).
+   `disk_io_context_options::io`, `cufile.json`).
 
 Rationale for "automatic = cuFile only with real GDS": cuFile in compatibility mode bounces through
 its own per-call buffers (gds-reactor-recommendations.md R0), while uring's pinned staging is the
@@ -399,7 +399,7 @@ Core (`cucascade_tests`), `test_disk_memory_space.cpp`: `get_io_context()` null 
 cudf (`cucascade_cudf_tests`, links io):
 - The existing round trips in `test_gpu_disk_converters.cpp` / `test_disk_host_converters.cpp` run
   for the default and for each forced backend (`GENERATE(uring, cufile)`, cuFile in compat mode
-  here; kvikio when its writes land) by building disk spaces with `make_disk_io_context(...)`.
+  here) by building disk spaces with `make_disk_io_context(...)`.
 - New: multi-MiB tables (> a staging slot, > `gds_threshold`, > the write split); 8 threads converting
   concurrently on one space; default adoption (two spaces without a context share one default, an
   explicit context is honoured, `set_io_context` swaps); errors leave no file behind (unwritable
@@ -438,7 +438,7 @@ cudf (`cucascade_cudf_tests`, links io):
   `get_io_context` / `set_io_context` / `get_or_init_io_context`, one defaulted configurator
   parameter. Default = shared cuFile context when `io::cufile::gds_available()`, else the shared uring
   context, for both host and device paths. `disk_io_context_options::backend` lets users and tests
-  force uring / cufile / kvikio per space.
+  force uring / cufile per space.
 - Q3. Process-shared, lazily built defaults with the io_config defaults (weak_ptr cache).
 - Q4. Remove the old API outright, no deprecation. `AGENTS.md` is left to the lead.
 - W3 review MAJOR-2: automatic stays cuFile on real-GDS hosts; the cufile reactor's host path was

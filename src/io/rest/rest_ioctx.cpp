@@ -16,6 +16,9 @@
  * limitations under the License.
  */
 
+#include "io/rest/s3/multipart.hpp"
+#include "io/rest/worker/upload.hpp"
+
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uri_parser.hpp>
 #include <cucascade/log/logging.hpp>
@@ -26,6 +29,7 @@
 #include <cstdint>
 #include <exception>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -34,6 +38,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace cucascade::io::rest {
@@ -313,6 +318,93 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, std::u
                                                            static_cast<size_t>(known_size)));
 }
 
+std::shared_ptr<io_object> rest_ioctx::create_io_object_for_write(std::string path,
+                                                                  write_open_options options)
+{
+  auto parsed = cucascade::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object_for_write: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  if (_reactors.empty()) {
+    throw std::runtime_error("rest_ioctx::create_io_object_for_write: no reactors");
+  }
+  if (options.mode == write_mode::create_or_open || options.mode == write_mode::open_existing) {
+    throw std::system_error(std::make_error_code(std::errc::not_supported),
+                            "rest_ioctx: an S3 object cannot be modified in place ('" + path +
+                              "' opened in a mode that keeps its content)");
+  }
+  // The part size is the write split (templated_ioctx cuts every write slice at its multiples,
+  // so one write operation never spans two parts), or a multiple of it when size_hint needs
+  // more than 10000 parts.
+  auto const granule = write_granule();
+  auto const split =
+    std::max(granule, _config.write_split_bytes - _config.write_split_bytes % granule);
+  s3::upload_state::options opts;
+  opts.part_size  = s3::choose_part_size(split, options.size_hint, split);
+  opts.create_new = options.mode == write_mode::create_new;
+  auto upload     = std::make_shared<detail::upload_session>(
+    object_ref{parsed.host, parsed.path}, path, opts, _reactors.front()->write_inbox());
+  return std::make_shared<rest_write_object>(
+    std::move(path), std::move(parsed.host), std::move(parsed.path), std::move(upload));
+}
+
+void rest_ioctx::flush_io(io_object const& object)
+{
+  auto const* typed = dynamic_cast<rest_write_object const*>(&object);
+  if (typed == nullptr) {
+    throw std::system_error(
+      std::make_error_code(std::errc::bad_file_descriptor),
+      "rest_ioctx::flush: '" + object.object_path() + "' was not opened for writing");
+  }
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::flush: no reactors"); }
+  _reactors.front()->commit(*typed);
+}
+
+exec::semi_future<std::size_t> rest_ioctx::mixed_writev_async_io(
+  io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept
+{
+  // The base cuts only slices larger than the split, at its multiples; a smaller one may still
+  // straddle a multiple. Part sizes are multiples of the split (create_io_object_for_write), so
+  // cutting at every multiple keeps each write operation inside one part. A slice whose range or
+  // source is invalid is left alone: the base's validation rejects it.
+  try {
+    auto const granule = write_granule();
+    auto const piece =
+      std::max(granule, _config.write_split_bytes - _config.write_split_bytes % granule);
+    std::vector<prepared_io_slice> cut;
+    cut.reserve(slices.size() + 1);
+    for (auto& slice : slices) {
+      auto const begin     = slice.offset();
+      auto const size      = slice.size();
+      auto* const host     = std::get_if<std::uint8_t*>(&slice.h_buffer.buffer);
+      bool const source    = slice.has_device_request() || (host != nullptr && *host != nullptr);
+      bool const straddles = slice.is_write() && source && size > 1 && size <= piece &&
+                             size - 1 <= std::numeric_limits<std::size_t>::max() - begin &&
+                             begin / piece != (begin + size - 1) / piece;
+      if (!straddles) {
+        cut.push_back(std::move(slice));
+        continue;
+      }
+      auto const boundary = begin - begin % piece + piece;
+      auto tail           = slice;
+      slice.rng           = range{begin, boundary - begin};
+      tail.rng            = range{boundary, begin + size - boundary};
+      if (tail.has_device_request()) {
+        tail.d_buffer.data += boundary - begin;
+      } else {
+        tail.h_buffer.buffer = *host + (boundary - begin);
+      }
+      cut.push_back(std::move(slice));
+      cut.push_back(std::move(tail));
+    }
+    slices = std::move(cut);
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+  return templated_ioctx<rest_reactor>::mixed_writev_async_io(object, std::move(slices));
+}
+
 namespace {
 
 /// The bucket out of an @c s3:// URL, whether or not it names an object.
@@ -349,8 +441,9 @@ void rest_ioctx::warmup(std::string_view bucket_url) noexcept
     {
       std::lock_guard lk{_warm_mtx};
       auto const now = std::chrono::steady_clock::now();
-      // conn_max_age of 0 means "no cap" to libcurl, which leaves us no honest
-      // staleness horizon; fall back to a minute rather than re-warm forever.
+      // A pooled connection idle for longer than conn_max_age is closed rather
+      // than reused, so a warm-up older than that is stale; 0 (the 4 s
+      // default) has no honest horizon of its own: fall back to a minute.
       auto const stale_after =
         _config.conn_max_age.count() > 0
           ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(_config.conn_max_age)

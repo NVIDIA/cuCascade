@@ -38,8 +38,8 @@ struct platform_info {
   /// rule gpuio validated (it never calls @c cuFileDriverGetP2PFlags, which resets
   /// cuFile's running parameters in libcufile 1.19).
   bool compat_only{true};
-  /// Compatibility mode is forced by the environment (@c KVIKIO_COMPAT_MODE=ON or
-  /// @c CUFILE_FORCE_COMPAT_MODE=true) whatever the driver reports.
+  /// Compatibility mode is forced by the environment (@c CUFILE_FORCE_COMPAT_MODE=true)
+  /// whatever the driver reports.
   bool forced_compat{false};
   int version{0};                        ///< @c cuFileGetVersion, e.g. 1170; 0 when unknown.
   unsigned dstatusflags{0};              ///< Bit per storage class with a real GDS mode.

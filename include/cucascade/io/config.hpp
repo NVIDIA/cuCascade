@@ -18,9 +18,8 @@
 #pragma once
 
 #include <cucascade/io/cache/config.hpp>
-#ifdef CUCASCADE_HAS_KVIKIO
+#ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/config.hpp>
-#include <cucascade/io/kvikio/config.hpp>
 #endif
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/config.hpp>
@@ -34,13 +33,11 @@ namespace cucascade::io {
 enum class io_backend {
   /// cuCascade's own IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
-  /// The kvikIO backend (drives @c kvikio::FileHandle directly).
-  kvikio,
   /// The cuFile / GPUDirect Storage reactor: local paths are served by
   /// @c cufile_ioctx instead of uring (device destinations via
-  /// @c cuFileReadAsync, everything else via POSIX); @c s3:// URLs still go to
-  /// the REST backend.  Needs a build with kvikIO (@c CUCASCADE_HAS_KVIKIO);
-  /// without it this behaves like @ref native.
+  /// @c cuFileRead / @c cuFileWrite, everything else via POSIX); @c s3:// URLs
+  /// still go to the REST backend.  Needs a build that found @c cufile.h
+  /// (@c CUCASCADE_HAS_CUFILE); without it this behaves like @ref native.
   cufile,
 };
 
@@ -50,10 +47,9 @@ enum class io_backend {
  * Consumed by @c io_context_registry and the per-backend ioctx factories.
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
- * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
- * routes both local paths and @c s3:// objects to @c kvikio_context (LIST still
- * goes to the REST backend), and @ref io_backend::cufile routes local paths to
- * @c cufile_ioctx (@c s3:// stays on REST).
+ * to @c uring_ioctx and @c s3:// URLs to the REST backend, and
+ * @ref io_backend::cufile routes local paths to @c cufile_ioctx (@c s3:// stays
+ * on REST).
  *
  * @c cache is the read path's whole caching configuration, and its only home;
  * @ref apply_cache_mode derives @c uring.use_odirect and @c cache.dispose_on_idle
@@ -62,11 +58,8 @@ enum class io_backend {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c kvikio  — kvikIO fallback tunables (local-disk catch-all path); present
- *    only when the library is built with CUCASCADE_BUILD_CUDF, which is what
- *    supplies kvikIO.
  *  - @c cufile  — cuFile / GDS reactor tunables (local-disk GDS path); present
- *    under the same condition as @c kvikio.
+ *    only when the library is built with @c cufile.h (@c CUCASCADE_HAS_CUFILE).
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -78,7 +71,7 @@ struct io_config {
   std::size_t uring_n_reactors{4};
 
   /// Number of REST reactor worker threads for the S3/object-store IO path
-  /// (each its own libcurl event loop + connection pool).
+  /// (each its own io_uring ring + connection pools).
   std::size_t rest_n_reactors{2};
 
   /// Local (uring) reactor configuration.  @c use_odirect is derived from
@@ -90,13 +83,7 @@ struct io_config {
   /// worker-owned.
   rest::config rest{};
 
-#ifdef CUCASCADE_HAS_KVIKIO
-  /// kvikIO fallback configuration — thread-pool size, task/bounce sizing,
-  /// O_DIRECT, compat mode.  All fields default to "unset", leaving kvikIO's
-  /// own env-var-seeded defaults in place.  Note these are process-global once
-  /// applied; see @ref kvikio_config.
-  kvikio_config kvikio{};
-
+#ifdef CUCASCADE_HAS_CUFILE
   /// Number of cuFile reactor worker threads for the GDS local-disk IO path.
   /// Same rationale as @c uring_n_reactors: local NVMe saturates at modest queue
   /// depth, so a handful of reactors is enough.

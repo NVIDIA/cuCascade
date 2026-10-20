@@ -124,7 +124,7 @@ if(CUCASCADE_BUILD_S3_BENCHMARK
         OR NOT CUCASCADE_BUILD_CUDF))
   message(
     STATUS
-      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf and kvikIO)"
+      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf)"
   )
   set(CUCASCADE_BUILD_S3_BENCHMARK
       OFF
@@ -167,17 +167,23 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   if(CUCASCADE_BUILD_IO)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+    # OpenSSL: TLS for the REST transport (handshakes, the user-space record
+    # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
     find_package(OpenSSL REQUIRED)
 
-    # kvikIO — backs the local-file fallback ioctx (kvikio_context). It reaches
-    # the environment only through libcudf's dependency closure (libkvikio is
-    # not a direct dependency), so it is tied to CUCASCADE_BUILD_CUDF: a
-    # cudf-free build drops kvikio_context and its catch-all registry entry,
-    # leaving uring/restful to claim paths. Consumers see the difference via the
-    # CUCASCADE_HAS_KVIKIO definition propagated by cucascade_io_thirdparty.
-    if(CUCASCADE_BUILD_CUDF)
-      find_package(kvikio REQUIRED CONFIG)
+    # cuFile / GPUDirect Storage — the cufile reactor dlopen()s libcufile at run
+    # time and needs only cufile.h to build (it ships with the CUDA toolkit;
+    # libcufile-dev in conda). Without the header the cufile backend is left out
+    # and CUCASCADE_HAS_CUFILE stays undefined.
+    find_path(CUCASCADE_CUFILE_INCLUDE_DIR cufile.h
+              HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    if(CUCASCADE_CUFILE_INCLUDE_DIR)
+      message(
+        STATUS
+          "cufile.h found in ${CUCASCADE_CUFILE_INCLUDE_DIR}: cufile io backend enabled"
+      )
+    else()
+      message(STATUS "cufile.h not found: cufile io backend disabled")
     endif()
 
     # cucascade_io_thirdparty carries the swappable moodycamel + invocable
@@ -257,13 +263,16 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
                                  INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
     endif()
 
-    # Gates the kvikIO fallback ioctx in io_config and the datasource registry.
-    # Carried on the same INTERFACE target as the definitions above so the io
-    # object library, its installable variants, and installed consumers all
-    # agree on the layout of io_config.
-    if(CUCASCADE_BUILD_CUDF)
+    # Gates the cufile backend in io_config, the datasource registry and the
+    # DISK tier. Carried on the same INTERFACE target as the definitions above
+    # so the io object library, its installable variants, and installed
+    # consumers all agree on the layout of io_config.
+    if(CUCASCADE_CUFILE_INCLUDE_DIR)
       target_compile_definitions(cucascade_io_thirdparty
-                                 INTERFACE CUCASCADE_HAS_KVIKIO)
+                                 INTERFACE CUCASCADE_HAS_CUFILE)
+      target_include_directories(
+        cucascade_io_thirdparty
+        INTERFACE $<BUILD_INTERFACE:${CUCASCADE_CUFILE_INCLUDE_DIR}>)
     endif()
   endif()
 
@@ -408,7 +417,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # The datasource bridge (src/cudf/datasource.cpp) compiles against the io
   # core's headers, which need the io usage requirements (concurrentqueue
-  # include dir, curl/uring types, ...).
+  # include dir, uring types, ...).
   if(CUCASCADE_BUILD_IO)
     target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_io_objects)
   endif()
@@ -419,11 +428,8 @@ if(CUCASCADE_BUILD_IO)
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
   # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
   # approach.
-  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
-                             OpenSSL::Crypto)
-  if(CUCASCADE_BUILD_CUDF)
-    list(APPEND CUCASCADE_IO_LINK_LIBS kvikio::kvikio)
-  endif()
+  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING OpenSSL::SSL OpenSSL::Crypto
+                             ${CMAKE_DL_LIBS})
 
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}

@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <concepts>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -250,10 +251,25 @@ inline void futex_wake_all(std::atomic<std::uint32_t>& atom)
 #endif
 }
 
+// One iteration of a spin-wait loop: a pause hint, so a spinning consumer does not starve its
+// sibling hyper-thread or flood the memory system.
+inline void cpu_relax() noexcept
+{
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield" ::: "memory");
+#endif
+}
+
+// How long a consumer spins before it parks on the futex: folly Baton's default (a futex wait +
+// wake costs ~7 us, one spin iteration ~7 ns).  Only consumers spin, never the completing thread.
+inline constexpr std::chrono::nanoseconds future_wait_spin{2000};
+
 // ---------------------------------------------------------------------------
 // core: the shared slot between promise and semi_future/future.
 //
-// Lock-free FSM with four states, one-shot:
+// Lock-free FSM with four states, one-shot; the state word is also the futex word:
 //
 //                     set_try()        set_callback()
 //     empty ─────────────────► has_result ────────────────► done
@@ -261,9 +277,10 @@ inline void futex_wake_all(std::atomic<std::uint32_t>& atom)
 //        │                                                     │
 //        └──────── set_callback() ──► has_callback ── set_try()──┘
 //
-// Whichever of set_try() / set_callback() arrives second is the one that fires
-// the callback (on its executor or inline). Pull-mode waiters spin on
-// std::atomic<uint32_t>::wait, which compiles to a futex on Linux.
+// plus a waiter bit that a pull-mode consumer sets before it parks.  The producer completes with
+// one atomic exchange; the value it replaces says whether a callback is installed (run it) or a
+// consumer is parked (issue the only FUTEX_WAKE).  Without a parked consumer a completion makes
+// no syscall.  Whichever of set_try() / set_callback() arrives second fires the callback.
 //
 // Single-consumer model: either pull (wait+steal) OR push (set_callback), not
 // both, per core instance.
@@ -279,55 +296,48 @@ class core {
 
   [[nodiscard]] bool ready() const noexcept
   {
-    auto s = _state.load(std::memory_order_acquire);
-    return s == has_result || s == done;
+    return is_ready(_state.load(std::memory_order_acquire));
   }
 
-  // Producer side: deposit the result. Fires the callback if one is waiting.
+  // Producer side: deposit the result. Fires the callback if one is waiting, wakes a parked
+  // consumer if there is one.
   void set_try(try_t<value_t>&& t)
   {
-    _try                   = std::move(t);
-    std::uint32_t expected = empty;
-    if (_state.compare_exchange_strong(
-          expected, has_result, std::memory_order_acq_rel, std::memory_order_acquire)) {
-      // Pull-mode consumer (if any) is woken; push-mode set_callback (if it
-      // arrives later) will fire inline.
-      detail::futex_wake_all(_state);
+    _try                     = std::move(t);
+    std::uint32_t const prev = _state.exchange(has_result, std::memory_order_acq_rel);
+    assert((prev & state_mask) == empty || (prev & state_mask) == has_callback);
+    if ((prev & state_mask) == has_callback) {
+      // A callback was already installed (published by its CAS, acquired by the exchange).
+      run_and_complete();
       return;
     }
-    // The only other valid prior state is has_callback: a callback was
-    // already installed and is waiting for us to deliver the value.
-    assert(expected == has_callback);
-    run_and_complete();
+    if ((prev & waiter_bit) != 0) { detail::futex_wake_all(_state); }
   }
 
   // Consumer side (push mode): install a callback to fire when ready.
   void set_callback(callback cb)
   {
-    _callback              = std::move(cb);
-    std::uint32_t expected = empty;
-    if (_state.compare_exchange_strong(
-          expected, has_callback, std::memory_order_acq_rel, std::memory_order_acquire)) {
-      // Producer hasn't fired yet; they'll do it when set_try() runs.
-      return;
+    _callback       = std::move(cb);
+    std::uint32_t s = _state.load(std::memory_order_acquire);
+    while ((s & state_mask) != has_result) {
+      assert((s & state_mask) == empty);
+      if (_state.compare_exchange_weak(s,
+                                       (s & waiter_bit) | has_callback,
+                                       std::memory_order_acq_rel,
+                                       std::memory_order_acquire)) {
+        // Producer hasn't fired yet; it runs the callback in set_try().
+        return;
+      }
     }
     // Result was already deposited; fire now.
-    assert(expected == has_result);
     run_and_complete();
   }
 
-  // Pull-mode block until ready. Idempotent. Parks via the same raw-futex
-  // mechanism as wait_until so a single futex_wake_all reaches every waiter
-  // (see the futex_wake_all comment for why std::atomic::wait must not be
-  // mixed in here).
-  void wait()
-  {
-    while (true) {
-      auto s = _state.load(std::memory_order_acquire);
-      if (s == has_result || s == done) { return; }
-      detail::futex_wait(_state, s);
-    }
-  }
+  // Pull-mode block until ready. Idempotent. Spins briefly, then parks on the futex after setting
+  // the waiter bit (the producer wakes only when it sees it).  Parks through the raw-futex helpers
+  // so the producer's single futex_wake_all reaches it (see the futex_wake_all comment for why
+  // std::atomic::wait must not be mixed in here).
+  void wait() { (void)wait_impl(nullptr); }
 
   template <class rep, class period>
   bool wait_for(std::chrono::duration<rep, period> const& dur)
@@ -335,16 +345,7 @@ class core {
     return wait_until(std::chrono::steady_clock::now() + dur);
   }
 
-  bool wait_until(std::chrono::steady_clock::time_point deadline)
-  {
-    while (true) {
-      auto s = _state.load(std::memory_order_acquire);
-      if (s == has_result || s == done) { return true; }
-      if (std::chrono::steady_clock::now() >= deadline) { return false; }
-      // Blocks until _state != s or deadline passes; no busy spinning.
-      if (!detail::futex_wait_until(_state, s, deadline)) { return false; }
-    }
-  }
+  bool wait_until(std::chrono::steady_clock::time_point deadline) { return wait_impl(&deadline); }
 
   // Caller must have observed ready() == true. Single-shot; mutually
   // exclusive with set_callback().
@@ -358,15 +359,58 @@ class core {
   static constexpr std::uint32_t has_result   = 1;
   static constexpr std::uint32_t has_callback = 2;
   static constexpr std::uint32_t done         = 3;
+  static constexpr std::uint32_t state_mask   = 3;
+  static constexpr std::uint32_t waiter_bit   = 4;
+
+  [[nodiscard]] static bool is_ready(std::uint32_t s) noexcept
+  {
+    return (s & state_mask) == has_result || (s & state_mask) == done;
+  }
+
+  bool wait_impl(std::chrono::steady_clock::time_point const* deadline)
+  {
+    using clock     = std::chrono::steady_clock;
+    std::uint32_t s = _state.load(std::memory_order_acquire);
+    if (is_ready(s)) { return true; }
+    auto const now = clock::now();
+    if (deadline != nullptr && now >= *deadline) { return false; }
+    auto spin_end = now + future_wait_spin;
+    if (deadline != nullptr && *deadline < spin_end) { spin_end = *deadline; }
+    for (unsigned i = 1;; ++i) {
+      cpu_relax();
+      s = _state.load(std::memory_order_acquire);
+      if (is_ready(s)) { return true; }
+      if ((i & 7U) == 0 && clock::now() >= spin_end) { break; }
+    }
+    while (!is_ready(s)) {
+      if ((s & waiter_bit) == 0) {
+        if (!_state.compare_exchange_weak(
+              s, s | waiter_bit, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          continue;
+        }
+        s |= waiter_bit;
+      }
+      if (deadline == nullptr) {
+        detail::futex_wait(_state, s);
+      } else if (!detail::futex_wait_until(_state, s, *deadline)) {
+        return is_ready(_state.load(std::memory_order_acquire));
+      }
+      s = _state.load(std::memory_order_acquire);
+    }
+    return true;
+  }
 
   void run_and_complete()
   {
     // Both _try and _callback are set. The callback owns any executor dispatch
     // logic (captured at future<T,exec_t>::then_try time), so call it directly.
-    auto cb = std::move(_callback);
-    std::move(cb)(std::move(_try));
-    _state.store(done, std::memory_order_release);
-    detail::futex_wake_all(_state);
+    // The slot is completed before the callback runs: a callback that throws leaves a
+    // consistent, finished core behind (the exception propagates to the caller).
+    auto cb                  = std::move(_callback);
+    auto t                   = std::move(_try);
+    std::uint32_t const prev = _state.exchange(done, std::memory_order_acq_rel);
+    if ((prev & waiter_bit) != 0) { detail::futex_wake_all(_state); }
+    std::move(cb)(std::move(t));
   }
 
   std::atomic<std::uint32_t> _state{empty};
@@ -391,37 +435,76 @@ template <class value_t>
 struct state {
   using callback = invocable<void(try_t<value_t>&&)>;
 
-  virtual ~state()                                                         = default;
   virtual void await()                                                     = 0;
   virtual bool await_until(std::chrono::steady_clock::time_point deadline) = 0;
   [[nodiscard]] virtual bool peek_ready() const noexcept                   = 0;
   virtual try_t<value_t> consume()                                         = 0;
   virtual void set_callback(callback cb)                                   = 0;
+
+  // Ends the chain's ownership of this link (see state_deleter): a link owned by its chain alone
+  // is deleted; the promise-shared leaf drops its consumer reference instead.
+  virtual void destroy() noexcept { delete this; }
+
+ protected:
+  // Never deleted through a base pointer by anything but destroy().
+  virtual ~state() = default;
 };
 
-// Leaf state: backed by a core shared with a promise.
+// Deleter of a chain's link: destroy() instead of delete.  Converts from the default deleter of a
+// concrete link type, so std::make_unique<some_state>(...) feeds a state_ptr directly.
 template <class value_t>
-class leaf_state final : public state<value_t> {
+struct state_deleter {
+  state_deleter() noexcept = default;
+  template <class link_t>
+    requires std::derived_from<link_t, state<value_t>>
+  state_deleter(
+    std::default_delete<link_t> const&) noexcept /* NOLINT(google-explicit-constructor) */
+  {
+  }
+  void operator()(state<value_t>* link) const noexcept { link->destroy(); }
+};
+
+template <class value_t>
+using state_ptr = std::unique_ptr<state<value_t>, state_deleter<value_t>>;
+
+// Leaf state backed by a promise: the core and the chain's leaf in one allocation, shared by the
+// promise (producer reference) and the future's chain (consumer reference).  The last of the two
+// to let go deletes it.
+template <class value_t>
+class promise_state final : public state<value_t> {
  public:
   using callback = typename state<value_t>::callback;
 
-  explicit leaf_state(std::shared_ptr<core<value_t>> core) noexcept : _core(std::move(core)) {}
+  promise_state() = default;
 
-  void await() override { _core->wait(); }
+  void await() override { _core.wait(); }
   bool await_until(std::chrono::steady_clock::time_point deadline) override
   {
-    return _core->wait_until(deadline);
+    return _core.wait_until(deadline);
   }
-  [[nodiscard]] bool peek_ready() const noexcept override { return _core->ready(); }
+  [[nodiscard]] bool peek_ready() const noexcept override { return _core.ready(); }
   try_t<value_t> consume() override
   {
-    _core->wait();
-    return _core->steal();
+    _core.wait();
+    return _core.steal();
   }
-  void set_callback(callback cb) override { _core->set_callback(std::move(cb)); }
+  void set_callback(callback cb) override { _core.set_callback(std::move(cb)); }
+  void destroy() noexcept override { release(1); }
+
+  // Producer side.
+  [[nodiscard]] core<value_t>& slot() noexcept { return _core; }
+
+  // Drops @p n references (2 when one owner holds both); the last one deletes the state.
+  void release(std::uint32_t n) noexcept
+  {
+    if (_refs.fetch_sub(n, std::memory_order_acq_rel) == n) { delete this; }
+  }
 
  private:
-  std::shared_ptr<core<value_t>> _core;
+  ~promise_state() override = default;
+
+  core<value_t> _core;
+  std::atomic<std::uint32_t> _refs{2};  // producer + consumer
 };
 
 // Ready state: already-completed value, no synchronization needed.
@@ -453,7 +536,7 @@ class deferred_state final : public state<value_t> {
  public:
   using callback = typename state<value_t>::callback;
 
-  deferred_state(std::unique_ptr<state<upstream_t>> upstream, fn_t&& fn)
+  deferred_state(state_ptr<upstream_t> upstream, fn_t&& fn)
     : _upstream(std::move(upstream)), _fn(std::move(fn))
   {
   }
@@ -488,7 +571,7 @@ class deferred_state final : public state<value_t> {
   }
 
  private:
-  std::unique_ptr<state<upstream_t>> _upstream;
+  state_ptr<upstream_t> _upstream;
   fn_t _fn;
 };
 
@@ -499,7 +582,7 @@ class flat_map_state final : public state<value_t> {
  public:
   using callback = typename state<value_t>::callback;
 
-  flat_map_state(std::unique_ptr<state<upstream_t>> upstream, fn_t&& fn)
+  flat_map_state(state_ptr<upstream_t> upstream, fn_t&& fn)
     : _upstream(std::move(upstream)), _fn(std::move(fn))
   {
   }
@@ -538,7 +621,7 @@ class flat_map_state final : public state<value_t> {
   void set_callback(callback cb) override;  // defined below
 
  private:
-  std::unique_ptr<state<upstream_t>> _upstream;
+  state_ptr<upstream_t> _upstream;
   fn_t _fn;
   std::optional<try_t<value_t>> _cached;
 };
@@ -803,7 +886,7 @@ class semi_future {
 
   // Internal: construct from a pre-built state. Users should not call this
   // directly; the state type lives in the detail namespace.
-  explicit semi_future(std::unique_ptr<detail::state<value_t>> s) noexcept : _state(std::move(s)) {}
+  explicit semi_future(detail::state_ptr<value_t> s) noexcept : _state(std::move(s)) {}
 
  private:
   template <class>
@@ -822,7 +905,7 @@ class semi_future {
     return _state->await_until(std::chrono::steady_clock::now() + dur);
   }
 
-  std::unique_ptr<detail::state<value_t>> _state;
+  detail::state_ptr<value_t> _state;
 };
 
 // ---------------------------------------------------------------------------
@@ -831,28 +914,37 @@ class semi_future {
 template <class value_t>
 class promise {
  public:
-  promise() : _core(std::make_shared<detail::core<value_t>>()) {}
+  // One allocation: the slot the promise and its future share (detail::promise_state).
+  promise() : _state(new detail::promise_state<value_t>()) {}
 
-  promise(promise&&) noexcept            = default;
-  promise& operator=(promise&&) noexcept = default;
-  promise(promise const&)                = delete;
-  promise& operator=(promise const&)     = delete;
-
-  ~promise()
+  promise(promise&& other) noexcept
+    : _state(std::exchange(other._state, nullptr)),
+      _retrieved(std::exchange(other._retrieved, false))
   {
-    // If the producer dropped the promise without satisfying it, surface a
-    // broken_promise_error to the consumer.
-    if (_core && !_core->ready()) {
-      _core->set_try(try_t<value_t>(std::make_exception_ptr(broken_promise_error())));
-    }
   }
+  promise& operator=(promise&& other) noexcept
+  {
+    if (this != &other) {
+      abandon();
+      _state     = std::exchange(other._state, nullptr);
+      _retrieved = std::exchange(other._retrieved, false);
+    }
+    return *this;
+  }
+  promise(promise const&)            = delete;
+  promise& operator=(promise const&) = delete;
+
+  // If the producer dropped the promise without satisfying it, surface a
+  // broken_promise_error to the consumer.
+  ~promise() { abandon(); }
 
   semi_future<value_t> get_semi_future()
   {
     if (_retrieved) { throw future_already_retrieved_error(); }
-    if (!_core) { throw promise_already_satisfied_error(); }
+    if (!_state) { throw promise_already_satisfied_error(); }
     _retrieved = true;
-    return semi_future<value_t>(std::make_unique<detail::leaf_state<value_t>>(_core));
+    // The future's chain takes the consumer reference.
+    return semi_future<value_t>(detail::state_ptr<value_t>(_state));
   }
 
   // Convenience: get a future<value_t, exec_t> directly, bound to `exe`.
@@ -864,23 +956,20 @@ class promise {
   void set_value(upstream_t&& v)
   {
     check_settable();
-    _core->set_try(try_t<value_t>(std::forward<upstream_t>(v)));
-    _core.reset();
+    fulfil(try_t<value_t>(std::forward<upstream_t>(v)));
   }
 
   template <class upstream_t = value_t, std::enable_if_t<std::is_void_v<upstream_t>, int> = 0>
   void set_value()
   {
     check_settable();
-    _core->set_try(try_t<void>::make_value());
-    _core.reset();
+    fulfil(try_t<void>::make_value());
   }
 
   void set_exception(std::exception_ptr e)
   {
     check_settable();
-    _core->set_try(try_t<value_t>(std::move(e)));
-    _core.reset();
+    fulfil(try_t<value_t>(std::move(e)));
   }
 
   template <class exc_t>
@@ -892,8 +981,7 @@ class promise {
   void set_try(try_t<value_t>&& t)
   {
     check_settable();
-    _core->set_try(std::move(t));
-    _core.reset();
+    fulfil(std::move(t));
   }
 
   // Invoke f and capture value-or-exception in this promise.
@@ -901,19 +989,37 @@ class promise {
   void set_with(fn_t&& f)
   {
     check_settable();
-    _core->set_try(make_try_with(std::forward<fn_t>(f)));
-    _core.reset();
+    fulfil(make_try_with(std::forward<fn_t>(f)));
   }
 
-  [[nodiscard]] bool valid() const noexcept { return static_cast<bool>(_core); }
+  [[nodiscard]] bool valid() const noexcept { return _state != nullptr; }
 
  private:
   void check_settable()
   {
-    if (!_core) { throw promise_already_satisfied_error(); }
+    if (!_state) { throw promise_already_satisfied_error(); }
   }
 
-  std::shared_ptr<detail::core<value_t>> _core;
+  // Deposits @p t and lets go of the slot: the producer reference, and the consumer one too
+  // while no future was retrieved.  The references are dropped even when a callback run here
+  // throws (the exception propagates).
+  void fulfil(try_t<value_t>&& t)
+  {
+    struct releaser {
+      detail::promise_state<value_t>* state;
+      std::uint32_t refs;
+      ~releaser() { state->release(refs); }
+    } const done{std::exchange(_state, nullptr), _retrieved ? 1U : 2U};
+    done.state->slot().set_try(std::move(t));
+  }
+
+  void abandon()
+  {
+    if (_state == nullptr) { return; }
+    fulfil(try_t<value_t>(std::make_exception_ptr(broken_promise_error())));
+  }
+
+  detail::promise_state<value_t>* _state{nullptr};
   bool _retrieved = false;
 };
 
@@ -1092,10 +1198,7 @@ class future {
 
   // Internal constructor — users go through semi_future::via or
   // promise::get_future.
-  future(std::unique_ptr<detail::state<value_t>> s, exec_t* e) noexcept
-    : _state(std::move(s)), _executor(e)
-  {
-  }
+  future(detail::state_ptr<value_t> s, exec_t* e) noexcept : _state(std::move(s)), _executor(e) {}
 
  private:
   void throw_if_invalid() const
@@ -1103,7 +1206,7 @@ class future {
     if (!_state) { throw future_invalid_error(); }
   }
 
-  std::unique_ptr<detail::state<value_t>> _state;
+  detail::state_ptr<value_t> _state;
   exec_t* _executor = nullptr;
 };
 

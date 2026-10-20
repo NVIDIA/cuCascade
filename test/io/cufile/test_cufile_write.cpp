@@ -17,6 +17,7 @@
  */
 
 #include <cucascade/io/cufile/config.hpp>
+#include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
@@ -26,9 +27,6 @@
 #include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
-
-#include <kvikio/compat_mode.hpp>
-#include <kvikio/shim/cufile.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -278,10 +276,10 @@ struct write_path {
   config staged{};
   staged.gds_threshold = 1UL << 40;  // nothing goes to cuFile
   config unregistered{};
-  unregistered.compat_mode = kvikio::CompatMode::ON;  // no cuFile handle at all
+  unregistered.compat_mode = cucascade::io::cufile::compat::on;  // no cuFile handle at all
   config buffered{};
   buffered.use_odirect   = false;  // POSIX through the page cache only
-  buffered.compat_mode   = kvikio::CompatMode::ON;
+  buffered.compat_mode   = cucascade::io::cufile::compat::on;
   buffered.gds_threshold = IO_BLOCK_SIZE;
   return {{"cuFile body", cufile_body, true},
           {"default policy", cufile_body, false},
@@ -393,9 +391,9 @@ TEST_CASE("cufile open_io_object_for_write honours the open modes", "[io][cufile
 
   SECTION("compat mode OFF cannot be combined with use_odirect=false")
   {
-    CHECK_THROWS_AS(
-      cufile_reactor::create_io_object_for_write(path.str(), {}, false, kvikio::CompatMode::OFF),
-      std::invalid_argument);
+    CHECK_THROWS_AS(cufile_reactor::create_io_object_for_write(
+                      path.str(), {}, false, cucascade::io::cufile::compat::off),
+                    std::invalid_argument);
   }
 
   SECTION("the write object registers with cuFile like a read object would")
@@ -830,9 +828,10 @@ TEST_CASE("cufile registers large aligned transfers when asked", "[io][cufile][w
     CHECK(cucascade::io::cufile::detail::live_registrations_for_testing() == 0);
     for (void const* base :
          {static_cast<void const*>(src.get()), static_cast<void const*>(dst.get())}) {
-      auto& api = kvikio::cuFileAPI::instance();
-      REQUIRE(api.BufRegister(base, size, 0).err == CU_FILE_SUCCESS);
-      REQUIRE(api.BufDeregister(base).err == CU_FILE_SUCCESS);
+      REQUIRE(cucascade::io::cufile::cufile_api::get() != nullptr);
+      auto const& api = *cucascade::io::cufile::cufile_api::get();
+      REQUIRE(api.buf_register(base, size, 0).err == CU_FILE_SUCCESS);
+      REQUIRE(api.buf_deregister(base).err == CU_FILE_SUCCESS);
     }
   }
   check_same(read_back(ctx.get(), path.str()), shadow.bytes());
@@ -874,9 +873,10 @@ TEST_CASE("cufile shares one registration between transfers of the same buffer",
     REQUIRE(std::move(future).get(60s) > 0);
   }
   CHECK(cucascade::io::cufile::detail::live_registrations_for_testing() == 0);
-  auto& api = kvikio::cuFileAPI::instance();
-  REQUIRE(api.BufRegister(src.get(), bytes.size(), 0).err == CU_FILE_SUCCESS);
-  REQUIRE(api.BufDeregister(src.get()).err == CU_FILE_SUCCESS);
+  REQUIRE(cucascade::io::cufile::cufile_api::get() != nullptr);
+  auto const& api = *cucascade::io::cufile::cufile_api::get();
+  REQUIRE(api.buf_register(src.get(), bytes.size(), 0).err == CU_FILE_SUCCESS);
+  REQUIRE(api.buf_deregister(src.get()).err == CU_FILE_SUCCESS);
   for (std::size_t i = 0; i < copies; ++i) {
     auto const back = read_back(ctx.get(), paths[i]->str());
     REQUIRE(back.size() >= bytes.size());
@@ -1104,7 +1104,7 @@ TEST_CASE("cufile write throughput probe", "[.cufile-write-bench]")
   if (which == "all" || which == "cufile-buffered") {
     config cfg{};
     cfg.use_odirect = false;
-    cfg.compat_mode = kvikio::CompatMode::ON;
+    cfg.compat_mode = cucascade::io::cufile::compat::on;
     write_context ctx{cfg, reactors};
     run_write_probe("cufile-buffer", ctx.get(), dir, total, rounds);
   }

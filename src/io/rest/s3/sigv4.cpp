@@ -18,6 +18,7 @@
 
 #include <cucascade/io/rest/s3/sigv4.hpp>
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
@@ -92,6 +93,60 @@ std::string to_lower(std::string_view s)
   return out;
 }
 
+/**
+ * @brief The SigV4 signing key HMAC(HMAC(HMAC(HMAC("AWS4" + secret, date), region), service),
+ *        "aws4_request"), cached per thread (gpuio S3).
+ *
+ * The key changes only with the UTC day, the region, the service and the credentials, so a
+ * signature then costs the canonical-request SHA-256 plus ONE HMAC instead of five. The cache
+ * keys on the access key id and a SHA-256 of the secret (the secret itself is not copied), and
+ * holds one entry per thread: alternating credentials only recompute.
+ */
+std::array<unsigned char, 32> signing_key(sigv4_signer_config const& creds,
+                                          std::string_view date_stamp)
+{
+  struct cache_entry {
+    std::string date;
+    std::string region;
+    std::string service;
+    std::string access_key;
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> secret_digest{};
+    std::array<unsigned char, 32> key{};
+    bool valid{false};
+  };
+  thread_local cache_entry cache;
+
+  std::array<unsigned char, SHA256_DIGEST_LENGTH> secret_digest{};
+  SHA256(reinterpret_cast<unsigned char const*>(creds.secret_key.data()),
+         creds.secret_key.size(),
+         secret_digest.data());
+  if (cache.valid && cache.date == date_stamp && cache.region == creds.region &&
+      cache.service == creds.service && cache.access_key == creds.access_key &&
+      cache.secret_digest == secret_digest) {
+    return cache.key;
+  }
+  std::string k_secret = "AWS4" + creds.secret_key;
+  auto k_date          = hmac_sha256(k_secret, date_stamp);
+  OPENSSL_cleanse(k_secret.data(), k_secret.size());
+  auto k_region = hmac_sha256(
+    std::string_view(reinterpret_cast<char const*>(k_date.data()), k_date.size()), creds.region);
+  auto k_service =
+    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_region.data()), k_region.size()),
+                creds.service);
+  auto const k_signing =
+    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_service.data()), k_service.size()),
+                "aws4_request");
+  cache.valid         = false;  // stays invalid if an assignment below throws
+  cache.date          = std::string{date_stamp};
+  cache.region        = creds.region;
+  cache.service       = creds.service;
+  cache.access_key    = creds.access_key;
+  cache.secret_digest = secret_digest;
+  cache.key           = k_signing;
+  cache.valid         = true;
+  return k_signing;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -121,6 +176,37 @@ std::string uri_encode(std::string_view s, bool encode_slash)
       out.push_back(kHexUpper[(c >> 4) & 0xF]);
       out.push_back(kHexUpper[c & 0xF]);
     }
+  }
+  return out;
+}
+
+std::string canonical_query_string(std::string_view pre_encoded_query)
+{
+  std::vector<std::pair<std::string_view, std::string_view>> pairs;
+  for (std::size_t b = 0; b <= pre_encoded_query.size();) {
+    auto const amp = pre_encoded_query.find('&', b);
+    auto const pair =
+      pre_encoded_query.substr(b, amp == std::string_view::npos ? std::string_view::npos : amp - b);
+    if (!pair.empty()) {
+      auto const eq = pair.find('=');
+      if (eq == std::string_view::npos) {
+        pairs.emplace_back(pair, std::string_view{});
+      } else {
+        pairs.emplace_back(pair.substr(0, eq), pair.substr(eq + 1));
+      }
+    }
+    if (amp == std::string_view::npos) { break; }
+    b = amp + 1;
+  }
+  // SigV4: sort by encoded key, then by encoded value (byte order).
+  std::sort(pairs.begin(), pairs.end());
+  std::string out;
+  out.reserve(pre_encoded_query.size() + pairs.size());
+  for (std::size_t i = 0; i < pairs.size(); ++i) {
+    if (i != 0) { out += '&'; }
+    out += pairs[i].first;
+    out += '=';
+    out += pairs[i].second;
   }
   return out;
 }
@@ -215,17 +301,8 @@ sigv4_signed_request sign_request(
   string_to_sign += '\n';
   string_to_sign += sha256_hex(canonical_request);
 
-  // ---- 6. Signing key chain. ----
-  std::string k_secret = "AWS4" + creds.secret_key;
-  auto k_date          = hmac_sha256(k_secret, date_stamp);
-  auto k_region        = hmac_sha256(
-    std::string_view(reinterpret_cast<char const*>(k_date.data()), k_date.size()), creds.region);
-  auto k_service =
-    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_region.data()), k_region.size()),
-                creds.service);
-  auto k_signing =
-    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_service.data()), k_service.size()),
-                "aws4_request");
+  // ---- 6. Signing key chain (cached per thread for the day / region / service / key). ----
+  auto const k_signing = signing_key(creds, date_stamp);
   auto sig =
     hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_signing.data()), k_signing.size()),
                 string_to_sign);
@@ -387,16 +464,7 @@ std::string presign_url(std::string_view method,
   string_to_sign += sha256_hex(canonical_request);
 
   // ---- 7. Signing key chain (identical to sign_request). ----
-  std::string k_secret = "AWS4" + creds.secret_key;
-  auto k_date          = hmac_sha256(k_secret, date_stamp);
-  auto k_region        = hmac_sha256(
-    std::string_view(reinterpret_cast<char const*>(k_date.data()), k_date.size()), creds.region);
-  auto k_service =
-    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_region.data()), k_region.size()),
-                creds.service);
-  auto k_signing =
-    hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_service.data()), k_service.size()),
-                "aws4_request");
+  auto const k_signing = signing_key(creds, date_stamp);
   auto sig =
     hmac_sha256(std::string_view(reinterpret_cast<char const*>(k_signing.data()), k_signing.size()),
                 string_to_sign);

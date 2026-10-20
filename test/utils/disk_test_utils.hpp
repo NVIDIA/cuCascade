@@ -39,10 +39,8 @@ namespace test {
 
 /// The io stacks every DISK round-trip test runs on: the default a space adopts when it has no
 /// context, and each backend forced explicitly.
-inline constexpr std::array<disk_io_backend, 4> disk_test_backends{disk_io_backend::automatic,
-                                                                   disk_io_backend::uring,
-                                                                   disk_io_backend::cufile,
-                                                                   disk_io_backend::kvikio};
+inline constexpr std::array<disk_io_backend, 3> disk_test_backends{
+  disk_io_backend::automatic, disk_io_backend::uring, disk_io_backend::cufile};
 
 [[nodiscard]] inline char const* to_string(disk_io_backend backend) noexcept
 {
@@ -50,7 +48,6 @@ inline constexpr std::array<disk_io_backend, 4> disk_test_backends{disk_io_backe
     case disk_io_backend::automatic: return "default";
     case disk_io_backend::uring: return "uring";
     case disk_io_backend::cufile: return "cufile";
-    case disk_io_backend::kvikio: return "kvikio";
   }
   return "unknown";
 }
