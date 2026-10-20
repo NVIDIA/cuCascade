@@ -42,10 +42,10 @@ namespace cucascade::io {
  * @brief Thread-safe registry of @c ioctx backends, resolved by full path.
  *
  * The engine constructs a registry at startup and registers one entry per
- * backend (kvikio / uring / restful), each carrying a path-capability checker.
+ * backend (uring / restful / cufile), each carrying a path-capability checker.
  * At datasource-creation time @c lookup_path runs the checkers against a full
  * path (the checkers parse the URI / stat the filesystem themselves) and picks
- * the backend, preferring an explicit backend over the kvikio catch-all.
+ * the backend.
  *
  * All operations are safe under concurrent reads; mutations take an exclusive
  * lock but are expected only at engine bootstrap / shutdown.
@@ -75,7 +75,7 @@ class io_context_registry {
    * @brief Register an ioctx backend. Replaces any prior registration for the
    *        same type.
    *
-   * @param type    Backend identifier (uring / restful / kvikio).
+   * @param type    Backend identifier (uring / restful / cufile / s3rdma).
    * @param checker Decides whether this backend claims a given path.
    * @param factory Constructs the backend's ioctx; invoked by @c make_ioctx.
    */
@@ -115,13 +115,8 @@ class io_context_registry {
                      factory_type factory);
 
   /// Resolve the backend for a full @p path (not a bare scheme — the checkers
-  /// parse the URI / stat the filesystem themselves).  Explicit backends
-  /// (uring / restful) take precedence over the kvikio catch-all, so `s3://`
-  /// never resolves to kvikio and a local file routes to uring before the
-  /// universal fallback.  When the registry was built with
-  /// `backend = io_backend::kvikio`, the uring local backend and the REST
-  /// backend are suppressed so local files and `s3://` objects fall through to
-  /// kvikio.  Both uring and cufile claim local files, so the cufile backend
+  /// parse the URI / stat the filesystem themselves).  Both uring and cufile
+  /// claim local files, so the cufile backend
   /// is skipped unless `backend = io_backend::cufile`, in which case it wins
   /// local files over uring (`s3://` still resolves to REST).  std::nullopt
   /// when nothing matches.
@@ -143,10 +138,6 @@ class io_context_registry {
   };
   const config_type _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
-  /// Set when @c backend=kvikio: kvikIO then serves BOTH local files (instead
-  /// of uring) and @c s3:// objects (instead of rest) for reads.  LIST / glob
-  /// still goes to the REST backend, which callers obtain by type.
-  bool _prefer_kvikio{false};
   /// Set when @c backend=cufile: the cuFile / GDS reactor then serves local
   /// files instead of uring.  @c s3:// objects still go to REST -- the cuFile
   /// backend is local-disk only.
@@ -170,12 +161,12 @@ class io_context_registry {
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
 
-#ifdef CUCASCADE_HAS_KVIKIO
+#ifdef CUCASCADE_HAS_CUFILE
 /// cuFile / GPUDirect Storage local-disk backend.  Builds a
 /// @c cufile_reactor::reactor_context from @c config.cufile and
 /// @c config.cufile_n_reactors.  Takes no reservation manager: the reactor does
 /// not stage device reads through pinned host memory (cuFile DMAs direct to the
-/// device).  Declared only in a build with kvikIO, which supplies the cuFile shim.
+/// device).  Declared only in a build that found cufile.h.
 io_context_registry::factory_type make_cufile_ioctx_factory();
 #endif
 

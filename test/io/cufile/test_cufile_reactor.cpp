@@ -18,6 +18,7 @@
 
 #include <cucascade/error.hpp>
 #include <cucascade/io/cufile/config.hpp>
+#include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
@@ -28,9 +29,6 @@
 #include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
-
-#include <kvikio/compat_mode.hpp>
-#include <kvikio/shim/cufile.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -276,7 +274,8 @@ TEST_CASE("cufile create_io_object honours the compat mode", "[io][cufile]")
 
   SECTION("ON never registers with cuFile and opens no O_DIRECT fd")
   {
-    auto object = cufile_reactor::create_io_object(file.path(), true, kvikio::CompatMode::ON);
+    auto object =
+      cufile_reactor::create_io_object(file.path(), true, cucascade::io::cufile::compat::on);
     CHECK(object->size() == file.size());
     CHECK_FALSE(object->cufile_registered());
     CHECK(object->direct_fd() == -1);
@@ -285,22 +284,25 @@ TEST_CASE("cufile create_io_object honours the compat mode", "[io][cufile]")
 
   SECTION("without O_DIRECT nothing can be registered")
   {
-    auto object = cufile_reactor::create_io_object(file.path(), false, kvikio::CompatMode::AUTO);
+    auto object = cufile_reactor::create_io_object(
+      file.path(), false, cucascade::io::cufile::compat::automatic);
     CHECK_FALSE(object->cufile_registered());
     CHECK(object->direct_fd() == -1);
   }
 
   SECTION("OFF enforces cuFile, so it cannot be combined with use_odirect=false")
   {
-    CHECK_THROWS_AS(cufile_reactor::create_io_object(file.path(), false, kvikio::CompatMode::OFF),
-                    std::invalid_argument);
+    CHECK_THROWS_AS(
+      cufile_reactor::create_io_object(file.path(), false, cucascade::io::cufile::compat::off),
+      std::invalid_argument);
   }
 
   SECTION("OFF either registers the file or refuses it, and never silently degrades")
   {
     std::unique_ptr<cufile_io_object> object;
     try {
-      object = cufile_reactor::create_io_object(file.path(), true, kvikio::CompatMode::OFF);
+      object =
+        cufile_reactor::create_io_object(file.path(), true, cucascade::io::cufile::compat::off);
     } catch (std::exception const&) {
       return;  // cuFile cannot serve this host or filesystem: refusing is the contract
     }
@@ -572,18 +574,18 @@ TEST_CASE("cufile ioctx stages a large device read through POSIX when cuFile is 
   static constexpr std::size_t file_bytes = (20UL << 20) + 123;
   pattern_file const file{file_bytes};
 
-  auto const [label, cfg] = GENERATE(std::pair<std::string, config>{"below the threshold",
-                                                                    [] {
-                                                                      config c{};
-                                                                      c.gds_threshold = 1UL << 40;
-                                                                      return c;
-                                                                    }()},
-                                     std::pair<std::string, config>{"file not registered", [] {
-                                                                      config c{};
-                                                                      c.compat_mode =
-                                                                        kvikio::CompatMode::ON;
-                                                                      return c;
-                                                                    }()});
+  auto const [label, cfg] =
+    GENERATE(std::pair<std::string, config>{"below the threshold",
+                                            [] {
+                                              config c{};
+                                              c.gds_threshold = 1UL << 40;
+                                              return c;
+                                            }()},
+             std::pair<std::string, config>{"file not registered", [] {
+                                              config c{};
+                                              c.compat_mode = cucascade::io::cufile::compat::on;
+                                              return c;
+                                            }()});
   DYNAMIC_SECTION(label)
   {
     started_ioctx ioctx{cfg};
@@ -1175,7 +1177,8 @@ void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int round
     std::printf("raw: file not registered with cuFile; skipping\n");
     return;
   }
-  auto& api                    = kvikio::cuFileAPI::instance();
+  REQUIRE(cucascade::io::cufile::cufile_api::get() != nullptr);
+  auto const& api              = *cucascade::io::cufile::cufile_api::get();
   constexpr std::size_t window = 1UL << 30;
   rmm::cuda_stream alloc_stream;
   rmm::device_buffer dst(window, alloc_stream);
@@ -1193,7 +1196,7 @@ void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int round
   for (bool const registered : {false, true}) {
     if (registered) {
       auto const t0 = std::chrono::steady_clock::now();
-      auto const st = api.BufRegister(base, window, 0);
+      auto const st = api.buf_register(base, window, 0);
       auto const reg =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0);
       std::printf("raw      cuFileBufRegister 1 GiB: err=%d in %.1f ms\n",
@@ -1222,12 +1225,12 @@ void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int round
                 auto const in_window = off % window;
                 ssize_t got =
                   registered
-                    ? api.Read(object->cufile_handle(),
+                    ? api.read(object->cufile_handle(),
                                base,
                                op,
                                static_cast<off_t>(off),
                                static_cast<off_t>(in_window))
-                    : api.Read(
+                    : api.read(
                         object->cufile_handle(), base + in_window, op, static_cast<off_t>(off), 0);
                 if (got != static_cast<ssize_t>(op)) ++failures;
               }
@@ -1253,13 +1256,13 @@ void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int round
               a.devPtr_offset = registered ? static_cast<off_t>(off % window) : 0;
               a.bytes_done    = 0;
               void* ptr       = registered ? base : base + off % window;
-              auto const st   = api.ReadAsync(object->cufile_handle(),
-                                            ptr,
-                                            &a.size,
-                                            &a.file_offset,
-                                            &a.devPtr_offset,
-                                            &a.bytes_done,
-                                            lane[i % lanes].value());
+              auto const st   = api.read_async(object->cufile_handle(),
+                                             ptr,
+                                             &a.size,
+                                             &a.file_offset,
+                                             &a.devPtr_offset,
+                                             &a.bytes_done,
+                                             lane[i % lanes].value());
               REQUIRE(st.err == CU_FILE_SUCCESS);
               // Bound the outstanding ops to 2 per lane, as a reactor's window would.
               if (i >= 2 * lanes) { lane[(i - 2 * lanes) % lanes].synchronize(); }
@@ -1271,10 +1274,10 @@ void raw_cufile_probe(std::string const& path, std::size_t file_bytes, int round
           }));
       }
     }
-    if (registered) { std::ignore = api.BufDeregister(base); }
+    if (registered) { std::ignore = api.buf_deregister(base); }
   }
   for (auto& l : lane)
-    std::ignore = api.StreamDeregister(l.value());
+    std::ignore = api.stream_deregister(l.value());
 }
 
 }  // namespace
@@ -1285,7 +1288,7 @@ TEST_CASE("cufile raw submission-mode probe", "[.cufile-probe-api]")
   if (path_env == nullptr || !has_cuda_device()) { SKIP("set CUCASCADE_IO_BENCH_FILE"); }
   auto const file_bytes = env_size("CUCASCADE_IO_BENCH_BYTES", 4UL << 30);
   ensure_bench_file(path_env, file_bytes);
-  kvikio::cuFileAPI::instance().driver_open();
+  REQUIRE(cucascade::io::cufile::cufile_api::open_driver());
   raw_cufile_probe(
     path_env, file_bytes, static_cast<int>(env_size("CUCASCADE_IO_BENCH_ROUNDS", 1)));
 }
@@ -1298,7 +1301,8 @@ TEST_CASE("cufile async submit timing probe", "[.cufile-probe-submit]")
   auto const count = env_size("CUCASCADE_IO_BENCH_COUNT", 64);
   auto object      = cufile_reactor::create_io_object(path_env);
   REQUIRE(object->cufile_registered());
-  auto& api = kvikio::cuFileAPI::instance();
+  REQUIRE(cucascade::io::cufile::cufile_api::get() != nullptr);
+  auto const& api = *cucascade::io::cufile::cufile_api::get();
   rmm::cuda_stream stream;
   rmm::device_buffer dst(op * count, stream);
   stream.synchronize();
@@ -1310,13 +1314,13 @@ TEST_CASE("cufile async submit timing probe", "[.cufile-probe-submit]")
     a.size        = op;
     a.file_offset = static_cast<off_t>(i * op);
     auto const s0 = std::chrono::steady_clock::now();
-    auto const st = api.ReadAsync(object->cufile_handle(),
-                                  static_cast<std::uint8_t*>(dst.data()) + i * op,
-                                  &a.size,
-                                  &a.file_offset,
-                                  &a.devPtr_offset,
-                                  &a.bytes_done,
-                                  stream.value());
+    auto const st = api.read_async(object->cufile_handle(),
+                                   static_cast<std::uint8_t*>(dst.data()) + i * op,
+                                   &a.size,
+                                   &a.file_offset,
+                                   &a.devPtr_offset,
+                                   &a.bytes_done,
+                                   stream.value());
     submit_ms +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
     REQUIRE(st.err == CU_FILE_SUCCESS);
@@ -1339,7 +1343,7 @@ TEST_CASE("cufile async submit timing probe", "[.cufile-probe-submit]")
     std::chrono::duration<double, std::milli>(t2 - t1).count(),
     static_cast<double>(op * count) / std::chrono::duration<double>(t2 - t0).count() / 1e9,
     bad);
-  std::ignore = api.StreamDeregister(stream.value());
+  std::ignore = api.stream_deregister(stream.value());
 }
 
 TEST_CASE("cufile raw write probe", "[.cufile-probe-write]")
@@ -1348,8 +1352,9 @@ TEST_CASE("cufile raw write probe", "[.cufile-probe-write]")
   if (path_env == nullptr || !has_cuda_device()) { SKIP("set CUCASCADE_IO_BENCH_WFILE"); }
   std::string const path = path_env;
   auto const bytes       = env_size("CUCASCADE_IO_BENCH_BYTES", 4UL << 30);
-  auto& api              = kvikio::cuFileAPI::instance();
-  api.driver_open();
+  REQUIRE(cucascade::io::cufile::cufile_api::open_driver());
+  REQUIRE(cucascade::io::cufile::cufile_api::get() != nullptr);
+  auto const& api              = *cucascade::io::cufile::cufile_api::get();
   constexpr std::size_t window = 1UL << 30;
   rmm::cuda_stream alloc_stream;
   rmm::device_buffer src(window, alloc_stream);
@@ -1365,7 +1370,7 @@ TEST_CASE("cufile raw write probe", "[.cufile-probe-write]")
       descr.type      = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
       descr.handle.fd = fd.get();
       CUfileHandle_t handle{};
-      REQUIRE(api.HandleRegister(&handle, &descr).err == CU_FILE_SUCCESS);
+      REQUIRE(api.handle_register(&handle, &descr).err == CU_FILE_SUCCESS);
       std::atomic<std::size_t> next{0};
       std::atomic<int> failures{0};
       auto const t0 = std::chrono::steady_clock::now();
@@ -1379,7 +1384,7 @@ TEST_CASE("cufile raw write probe", "[.cufile-probe-write]")
           for (;;) {
             auto const off = next.fetch_add(op);
             if (off >= bytes) break;
-            if (api.Write(handle, base + off % window, op, static_cast<off_t>(off), 0) !=
+            if (api.write(handle, base + off % window, op, static_cast<off_t>(off), 0) !=
                 static_cast<ssize_t>(op)) {
               ++failures;
             }
@@ -1392,7 +1397,7 @@ TEST_CASE("cufile raw write probe", "[.cufile-probe-write]")
       auto const t1 = std::chrono::steady_clock::now();
       REQUIRE(::fdatasync(fd.get()) == 0);
       auto const t2 = std::chrono::steady_clock::now();
-      api.HandleDeregister(handle);
+      api.handle_deregister(handle);
       std::printf(
         "raw      write %5zu KiB x %zu thr: %.2f GB/s (%.2f GB/s incl. fdatasync)\n",
         op >> 10,

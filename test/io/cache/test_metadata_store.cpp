@@ -263,8 +263,8 @@ TEST_CASE("metadata_store path-keyed objects are unaffected by generation handli
           "[cache][metadata_store][cache_identity]")
 {
   metadata_store store;
-  // raw_file_cache_id() == object_path(): the pre-existing keying, as local and
-  // kvikIO objects use.
+  // raw_file_cache_id() == object_path(): the pre-existing keying, as local
+  // objects use.
   fake_io_object const a{"/data/a.parquet"};
   fake_io_object const b{"/data/b.parquet"};
   store.register_metadata(a, std::make_shared<tagged_metadata>(1));

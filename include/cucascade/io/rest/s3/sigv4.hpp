@@ -95,8 +95,9 @@ sigv4_signed_request sign_request(
  * or other unsigned headers to the resulting GET / HEAD without breaking the
  * signature.
  *
- * @param method        HTTP method (@c "GET" / @c "HEAD" — the only methods
- *                      cuCascade uses for read-only S3).
+ * @param method        HTTP method (@c "GET" / @c "HEAD" for reads; @c "PUT" /
+ *                      @c "POST" / @c "DELETE" for the S3 write path — the method
+ *                      is part of the canonical request either way).
  * @param scheme        URL scheme (@c "http" / @c "https"), already lowercase.
  * @param host          Host[:port], already lowercase.
  * @param canonical_uri URI path, already RFC3986-encoded
@@ -111,7 +112,10 @@ sigv4_signed_request sign_request(
  *                      RFC3986-encoded, `&`-joined, and in SigV4 canonical
  *                      (byte-sorted) order (e.g.
  *                      @c "list-type=2&max-keys=1000&prefix=p%2F" for a
- *                      ListObjectsV2 request). Empty for plain object GET/HEAD.
+ *                      ListObjectsV2 request, or @c "partNumber=1&uploadId=abc"
+ *                      for an UploadPart). A parameter without a value
+ *                      (@c "uploads") is signed as @c "uploads=". Empty for
+ *                      plain object GET/HEAD.
  *                      These are merged with the @c X-Amz-* parameters and the
  *                      whole set is re-sorted before signing, so they
  *                      participate in the signature (required for S3 to accept
@@ -129,6 +133,19 @@ std::string presign_url(std::string_view method,
                         std::time_t timestamp_utc,
                         std::chrono::seconds ttl,
                         std::string_view extra_canonical_query = {});
+
+/**
+ * @brief SigV4 canonical form of a pre-encoded request query.
+ *
+ * Splits @p pre_encoded_query on @c '&' (empty pairs dropped), writes a parameter
+ * without a value as @c "key=" and sorts the pairs by encoded key, then by
+ * encoded value (byte order). The components are taken verbatim: pass them
+ * already RFC3986-encoded. A leading @c '?' is not allowed.
+ *
+ * Examples: @c "uploads" → @c "uploads="; @c "uploadId=u&partNumber=2" →
+ * @c "partNumber=2&uploadId=u".
+ */
+std::string canonical_query_string(std::string_view pre_encoded_query);
 
 /// Hex-encoded SHA256 digest of @p data. Thin wrapper around OpenSSL SHA256.
 std::string sha256_hex(std::string_view data);

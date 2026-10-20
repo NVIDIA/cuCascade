@@ -98,10 +98,11 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// Resolve many objects' footers concurrently.  Per-entry semantics are
   /// IDENTICAL to @c open_io_object(path, parquet_footer_probe): one verified
   /// suffix GET; 200/416/unverifiable-206 fall back to a HEAD supplying
-  /// size+tag; the same retry policy per entry, never stalling siblings.  The
-  /// caller's thread drives one curl multi with connection reuse across
-  /// entries, and @p on_result is invoked ON THE CALLER'S THREAD, SERIALLY,
-  /// as each entry lands — completion order, no all-entries barrier.
+  /// size+tag; the same retry policy per entry, never stalling siblings.  One
+  /// private ring and connection pool (reused across entries) runs the batch
+  /// on a short-lived helper thread, and @p on_result is invoked ON THE
+  /// CALLER'S THREAD, SERIALLY, as each entry lands — completion order, no
+  /// all-entries barrier; the batch waits for each callback to return.
   ///
   /// Every input occurrence is delivered exactly once (duplicates delivered
   /// per occurrence, disambiguated by index); no callback runs after the
@@ -116,9 +117,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @c config::footer_resolve_max_inflight == 0, or an explicit
   /// @c footer_resolve_stash_budget smaller than @c footer_probe_bytes.  An
   /// unparsable or non-s3 path is a per-entry error, not a batch error.
-  /// Should the transfer driver itself fail mid-batch (a curl multi error),
-  /// every undelivered entry is delivered as canceled before that failure
-  /// is rethrown — exactly-once holds on every exit path.  This ioctx must
+  /// Should the transfer driver itself fail (its ring cannot be set up, or it
+  /// fails mid-batch), every undelivered entry is delivered as canceled before
+  /// that failure is rethrown — exactly-once holds on every exit path.  This ioctx must
   /// outlive the call.
   void resolve_footer_objects(std::span<std::string const> paths,
                               std::function<void(footer_resolve_result)> const& on_result,
@@ -138,7 +139,7 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   ///
   /// Rate-limited rather than run once, because what goes stale is the
   /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
-  /// pooled connection (@c CURLOPT_MAXAGE_CONN), so a pool warmed before an idle
+  /// pooled connection, so a pool warmed before an idle
   /// gap longer than that is cold again by the next query -- a warm-once flag
   /// would serve the first query and no other.  Re-warms when the endpoint
   /// changes or the last warm-up is at least @c conn_max_age old, which is free
@@ -160,6 +161,23 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// ListObjectsV2 response), so the io_object is built with ZERO network — no
   /// HEAD, no probe.
   std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size) override;
+
+  /// Open @p path (s3://bucket/key) for writing: a @c rest_write_object whose
+  /// writes become an S3 upload, committed by @c flush (docs/io/rest-uring-design.md
+  /// section 5).  No request is sent here.  @c write_mode::create_or_truncate and
+  /// @c create_new are supported (the latter commits with `If-None-Match: *`);
+  /// the modes that keep existing content fail with @c not_supported (an S3
+  /// object cannot be modified in place).
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) override;
+
+  /// Commit @p object: upload what is left and complete the upload (blocking).
+  void flush_io(io_object const& object) override;
+
+  /// Cut every write slice that straddles a part boundary at it (one write operation is never
+  /// spread over two S3 parts), then dispatch as the base does.
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept override;
 
  private:
   /// Resolve @p path with a single suffix-range GET: it discovers the size and

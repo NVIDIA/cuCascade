@@ -33,10 +33,10 @@ class ioctx;
  */
 enum class disk_io_backend : std::uint8_t {
   automatic,  ///< cufile when GPUDirect Storage is really available (not compat mode), else uring
-              ///< when this process may use io_uring, else kvikio
+              ///< when this process may use io_uring, else cufile (its POSIX path)
   uring,      ///< io_uring reactors; device data is staged through private pinned host memory
   cufile,     ///< cuFile reactors (GDS); forced even when cuFile only runs in compatibility mode
-  kvikio,     ///< kvikIO's FileHandle (GDS or its own bounce buffers)
+              ///< or libcufile is absent (every transfer then takes the POSIX path)
 };
 
 /**
@@ -50,8 +50,8 @@ struct disk_io_context_options {
   disk_io_backend backend{disk_io_backend::automatic};
 
   /// The io stack's own static configuration. Used: uring_n_reactors / uring for uring,
-  /// cufile_n_reactors / cufile for cufile, kvikio / object_store for kvikio. Ignored: backend
-  /// (see @ref backend) and cache (the DISK tier never arms a prefetching cache).
+  /// cufile_n_reactors / cufile for cufile. Ignored: backend (see @ref backend) and cache (the
+  /// DISK tier never arms a prefetching cache).
   io::io_config io{};
 
   /// NUMA node the uring context's private pinned staging is bound to; -1 leaves it unbound.

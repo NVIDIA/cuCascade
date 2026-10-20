@@ -42,7 +42,7 @@ namespace cucascade::io::cufile {
  * POSIX @c pread / @c pwrite; the pool shares one @c reactor_context (config
  * only).  Selected by
  * @c io_backend::cufile and registered from the datasource factory like the
- * uring / kvikio / rest backends.
+ * uring / rest backends.
  */
 class cufile_ioctx : public templated_ioctx<cufile_reactor> {
  public:

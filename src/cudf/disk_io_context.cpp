@@ -18,10 +18,11 @@
 #include "disk_io.hpp"
 
 #include <cucascade/cudf/disk_io_context.hpp>
+#ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/platform.hpp>
+#endif
 #include <cucascade/io/io_context.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -118,11 +119,20 @@ class owning_uring_reactor_context final : private owned_uring_staging,
   if (requested != disk_io_backend::automatic) { return requested; }
   if (detail::gds_is_available()) { return disk_io_backend::cufile; }
   if (uring_setup_errno() == 0) { return disk_io_backend::uring; }
+#ifdef CUCASCADE_HAS_CUFILE
+  // The cuFile reactor needs no io_uring ring: without GDS it serves every transfer with POSIX
+  // I/O (staged through its own pinned scratch for device data).
   CUCASCADE_LOG_WARN(
     "disk tier: io_uring is unavailable in this process ({}); DISK spaces without an explicit io "
-    "context use kvikIO",
+    "context use the cuFile reactor's POSIX path",
     std::strerror(uring_setup_errno()));
-  return disk_io_backend::kvikio;
+  return disk_io_backend::cufile;
+#else
+  throw std::system_error(uring_setup_errno(),
+                          std::generic_category(),
+                          "make_disk_io_context: io_uring is unavailable in this process and "
+                          "this build has no cuFile backend to fall back to");
+#endif
 }
 
 void validate(disk_io_context_options const& options, disk_io_backend backend)
@@ -131,9 +141,11 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   if (backend == disk_io_backend::uring && cfg.uring_n_reactors == 0) {
     throw std::invalid_argument("make_disk_io_context: io.uring_n_reactors must be at least 1");
   }
+#ifdef CUCASCADE_HAS_CUFILE
   if (backend == disk_io_backend::cufile && cfg.cufile_n_reactors == 0) {
     throw std::invalid_argument("make_disk_io_context: io.cufile_n_reactors must be at least 1");
   }
+#endif
   if (backend == disk_io_backend::uring && uring_setup_errno() != 0) {
     throw std::system_error(uring_setup_errno(),
                             std::generic_category(),
@@ -149,12 +161,15 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   validate(options, backend);
   switch (backend) {
     case disk_io_backend::cufile: {
+#ifdef CUCASCADE_HAS_CUFILE
       auto reactor_ctx = std::make_shared<io::cufile::cufile_reactor::reactor_context>(cfg.cufile);
       return std::make_shared<io::cufile::cufile_ioctx>(cfg.cufile_n_reactors,
                                                         std::move(reactor_ctx));
+#else
+      throw std::invalid_argument(
+        "make_disk_io_context: the cufile backend was requested but this build has no cufile.h");
+#endif
     }
-    case disk_io_backend::kvikio:
-      return std::make_shared<io::kvikio_context>(cfg.kvikio, cfg.object_store);
     case disk_io_backend::uring:
     case disk_io_backend::automatic: break;
   }
@@ -169,9 +184,13 @@ namespace detail {
 
 bool gds_is_available() noexcept
 {
+#ifdef CUCASCADE_HAS_CUFILE
   // Cached process-wide by the cuFile layer; the first call opens the cuFile driver once, which
   // only happens when an automatic context is built (the shared default, or an explicit request).
   return io::cufile::gds_available();
+#else
+  return false;
+#endif
 }
 
 }  // namespace detail

@@ -1,7 +1,8 @@
 # io_context write API: design (W1)
 
 Status: approved by the lead (decisions recorded in section 11). Scope: `include/cucascade/io/{io_context,templated_ioctx,io_request,types}.hpp`,
-`src/io/io_context.cpp`, the uring reactor, the kvikIO context, tests in `test/io/`.
+`src/io/io_context.cpp`, the uring reactor, the kvikIO context (removed since, section 8), tests in
+`test/io/`.
 The cuFile reactor's writes (W2, teammate `gds`) build on the reactor contract in section 6.
 
 Guiding rule: the read side's shape, reused. One reactor per thread, configuration static at the
@@ -169,8 +170,8 @@ Overlap between segments of one call and slice-level invariants are validated on
   same object, same or other thread) sees the extended size and clamps to it.
 - Not observed: writes through other io_objects or processes, truncation by others (re-open).
   After a failed write `size()` may under-report bytes that did reach the file.
-- A new `io_object` opened after the future resolved (any backend, buffered or O_DIRECT, uring,
-  cuFile, kvikIO) sees the data: O_DIRECT reads flush dirty page-cache pages of their range first,
+- A new `io_object` opened after the future resolved (any local-file backend, buffered or
+  O_DIRECT, uring, cuFile) sees the data: O_DIRECT reads flush dirty page-cache pages of their range first,
   buffered reads read the page cache. No `flush` needed for visibility; `flush` is for durability.
 
 ### 3.3 Alignment and O_DIRECT placement (uring; cuFile may refine for its device path)
@@ -436,7 +437,12 @@ guarantees to deliver and what the reactor must guarantee back.
   writes too. Expected pipeline for a 1 GiB device column: 32 sub-slices over 2 reactors, each up to 64 MiB of staging in flight (D2H of op k+1
   overlapping the write of op k).
 
-## 8. kvikIO context (trivial, implemented)
+## 8. kvikIO context (removed)
+
+The kvikIO context below was implemented with W1 and removed on 2026-10-19 together with every
+other kvikIO use (the cuFile reactor now loads libcufile itself, `io::cufile::cufile_api`). The
+section is kept as a record of what it did.
+
 
 `kvikio::FileHandle` already writes host and device pointers:
 - `create_io_object_for_write`: `open(2)` with the mode flags (create/trunc/excl, perms), a
@@ -450,7 +456,9 @@ guarantees to deliver and what the reactor must guarantee back.
 - `flush_io` / `flush_async_io`: `fdatasync(handle.fd())` (eager).
 - `supports_write() == supports_device_write() == true`. Remote objects are not writable.
 
-`rest`, `s3rdma`: no change (defaults: `not_supported`).
+`rest`: S3 writes since the io_uring REST transport (multipart uploads; bytes visible at `flush`,
+the commit): docs/io/rest-uring-design.md section 5. `s3rdma`: no change (defaults:
+`not_supported`).
 
 ## 9. Tests (Catch2, `cucascade_io_tests`)
 
@@ -488,7 +496,7 @@ unclamped past EOF, device ids resolved, large slices split, partitions balanced
 one reactor as a single flush slice; `io_op_request::finish_success` raises `size()` for writes only.
 
 `test/io/kvikio/test_kvikio_write.cpp` (cudf build, as the other kvikIO tests): host/device round
-trip, past EOF, flush, read-only rejection.
+trip, past EOF, flush, read-only rejection. Removed with kvikIO.
 
 `test/cudf/test_write_cache_invalidation.cpp` (generations are only built through the cudf
 datasource's fadvise, so the controlled_reactor fixtures of `test/io/cache` cannot reach them): a
@@ -502,8 +510,8 @@ All added to `test/CMakeLists.txt` next to their read counterparts.
 
 Changed: `include/cucascade/io/{types,io_request,io_context,templated_ioctx}.hpp`,
 `src/io/io_context.cpp`, `include/cucascade/io/uring/{uring_reactor,types}.hpp`,
-`src/io/uring/uring_reactor.cpp`, `include/cucascade/io/kvikio/kvikio_context.hpp`,
-`src/io/kvikio/kvikio_context.cpp`, tests above, `test/CMakeLists.txt`.
+`src/io/uring/uring_reactor.cpp`, `include/cucascade/io/kvikio/kvikio_context.hpp` and
+`src/io/kvikio/kvikio_context.cpp` (both removed since), tests above, `test/CMakeLists.txt`.
 `include/cucascade/io/cache/{fs_cache,metadata_store}.hpp`, `src/io/cache/{fs_cache,metadata_store}.cpp`
 (`invalidate`, `invalidate_later`), `test/cudf/test_write_cache_invalidation.cpp`.
 Not touched: read semantics, rest, s3rdma, cufile (W2), datasource/cudf layer.

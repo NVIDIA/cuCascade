@@ -20,7 +20,6 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uri_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
@@ -34,13 +33,28 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
 
-# kvikIO reaches the environment only via libcudf's dependency closure, so the
-# fallback ioctx -- and the cuFile / GDS reactor, which loads libcufile through
-# kvikIO's shim -- are built only alongside the cudf layer.
-if(CUCASCADE_BUILD_CUDF)
+# Modules of the io_uring REST transport (docs/io/rest-uring-design.md).  Each
+# fragment adds its own sources to cucascade_io_objects.
+target_sources(cucascade_io_objects
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rest/errc.cpp)
+include(${CMAKE_CURRENT_SOURCE_DIR}/tls/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/http/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/planner/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/net/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/cloud/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/worker/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sources.cmake)
+
+# The io_uring REST modules include each other's private headers from src/.
+target_include_directories(cucascade_io_objects
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+# The cuFile / GDS reactor loads libcufile at run time; building it needs only
+# cufile.h (see CUCASCADE_CUFILE_INCLUDE_DIR in the top-level CMakeLists.txt).
+if(CUCASCADE_CUFILE_INCLUDE_DIR)
   target_sources(
     cucascade_io_objects
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_api.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_ioctx.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_reactor.cpp)
 endif()

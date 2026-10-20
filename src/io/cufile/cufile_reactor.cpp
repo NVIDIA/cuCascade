@@ -19,6 +19,7 @@
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/exec/thread_util.hpp>
+#include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/platform.hpp>
@@ -28,9 +29,6 @@
 #include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/log/logging.hpp>
-
-#include <kvikio/defaults.hpp>
-#include <kvikio/shim/cufile.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -114,23 +112,18 @@ constexpr std::int64_t idle_wait_us = 2000;
   return completed;
 }
 
-/// The compat mode a caller left unset resolves through kvikIO's own default,
-/// which honours @c KVIKIO_COMPAT_MODE exactly as @c kvikio::FileHandle does.
-[[nodiscard]] kvikio::CompatMode resolve_compat_mode(
-  std::optional<kvikio::CompatMode> const& configured)
+/// A compat mode the caller left unset means @c compat::automatic.
+[[nodiscard]] compat resolve_compat_mode(std::optional<compat> const& configured) noexcept
 {
-  return configured.value_or(kvikio::defaults::compat_mode());
+  return configured.value_or(compat::automatic);
 }
 
 /// Drop cuFile registration for @p handle.  Best-effort: used from a destructor.
 void deregister_cufile(CUfileHandle_t handle) noexcept
 {
   if (handle == nullptr) return;
-  try {
-    kvikio::cuFileAPI::instance().HandleDeregister(handle);
-  } catch (...) {
-    CUCASCADE_LOG_WARN("cufile_reactor: cuFileHandleDeregister failed");
-  }
+  // A registered handle implies the library loaded, so the table is present.
+  if (auto const* api = cufile_api::get(); api != nullptr) { api->handle_deregister(handle); }
 }
 
 /// Round @p value down to a multiple of @c IO_BLOCK_SIZE (a power of two).
@@ -158,22 +151,22 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
  *        when @p use_odirect and the compat mode allow it, register it with
  *        cuFile, and wrap both fds.
  *
- * @p mode decides what a file that cannot use cuFile means: @c ON never
- * registers, @c AUTO falls back to POSIX for that file, @c OFF throws.
+ * @p mode decides what a file that cannot use cuFile means: @c on never
+ * registers, @c automatic falls back to POSIX for that file, @c off throws.
  */
 [[nodiscard]] std::unique_ptr<cufile_io_object> open_with_cufile(std::string path,
                                                                  file_descriptor buffered,
                                                                  int direct_flags,
                                                                  bool use_odirect,
-                                                                 kvikio::CompatMode mode,
+                                                                 compat mode,
                                                                  io_access access,
                                                                  std::string const& what)
 {
   file_descriptor direct;
-  if (use_odirect && mode != kvikio::CompatMode::ON) {
+  if (use_odirect && mode != compat::on) {
     direct = file_descriptor{::open(path.c_str(), direct_flags)};
     if (!direct) {
-      if (mode == kvikio::CompatMode::OFF) {
+      if (mode == compat::off) {
         throw std::system_error(
           errno,
           std::generic_category(),
@@ -192,22 +185,28 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
   }
   auto const file_size = static_cast<std::size_t>(stat_buffer.st_size);
 
-  // AUTO asks kvikIO whether cuFile can work here at all, so a host with no GDS
-  // goes straight to POSIX instead of failing a registration per file.
+  // Automatic mode registers only when the cuFile driver opened, so a host without
+  // libcufile goes straight to POSIX instead of failing a registration per file.
   CUfileHandle_t handle{nullptr};
-  bool const try_register =
-    direct && (mode == kvikio::CompatMode::OFF || kvikio::is_cufile_available());
+  bool const driver_open  = direct && mode != compat::on && cufile_api::open_driver();
+  bool const try_register = direct && (mode == compat::off || driver_open);
   if (try_register) {
     std::string failure;
     try {
-      CUfileDescr_t descriptor{};
-      descriptor.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
-      descriptor.handle.fd = direct.get();
-      auto const status    = kvikio::cuFileAPI::instance().HandleRegister(&handle, &descriptor);
-      if (status.err != CU_FILE_SUCCESS) {
-        failure =
-          "cuFileHandleRegister failed (err=" + std::to_string(static_cast<int>(status.err)) + ")";
+      auto const* api = cufile_api::get();
+      if (!driver_open || api == nullptr) {
+        failure = "libcufile is unavailable or its driver did not open";
+      } else {
+        CUfileDescr_t descriptor{};
+        descriptor.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
+        descriptor.handle.fd = direct.get();
+        auto const status    = api->handle_register(&handle, &descriptor);
+        if (status.err != CU_FILE_SUCCESS) {
+          failure =
+            "cuFileHandleRegister failed (err=" + std::to_string(static_cast<int>(status.err)) +
+            ")";
+        }
       }
     } catch (std::exception const& e) {
       failure = e.what();
@@ -216,7 +215,7 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
     }
     if (!failure.empty()) {
       handle = nullptr;
-      if (mode == kvikio::CompatMode::OFF) {
+      if (mode == compat::off) {
         throw std::runtime_error(what + ": cannot register '" + path + "' with cuFile: " + failure);
       }
       CUCASCADE_LOG_WARN(
@@ -332,9 +331,9 @@ class registration_table {
       _unregistered.emplace(begin, bytes);
       return grant::unregistered;
     }
-    auto& api = kvikio::cuFileAPI::instance();
-    if (api.BufRegister == nullptr || api.BufDeregister == nullptr) return grant::unregistered;
-    auto const status = api.BufRegister(base, bytes, 0);
+    auto const* api = cufile_api::get();
+    if (api == nullptr) return grant::unregistered;
+    auto const status = api->buf_register(base, bytes, 0);
     if (status.err != CU_FILE_SUCCESS) {
       static std::atomic<bool> logged{false};
       if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -361,10 +360,9 @@ class registration_table {
     auto it = _live.find(reinterpret_cast<std::uintptr_t>(base));
     if (it == _live.end() || --it->second.users != 0) return;
     _live.erase(it);
-    try {
-      std::ignore = kvikio::cuFileAPI::instance().BufDeregister(base);
-    } catch (...) {
-      CUCASCADE_LOG_WARN("cufile_reactor: cuFileBufDeregister failed");
+    // A live registration implies the library loaded, so the table is present.
+    if (auto const* api = cufile_api::get(); api != nullptr) {
+      std::ignore = api->buf_deregister(base);
     }
   }
 
@@ -559,24 +557,6 @@ void start_writeback(int fd, range rng) noexcept
 
 /// Short reads tolerated in a row before a device slice is declared failed.
 constexpr int max_short_reads = 64;
-
-/// Open the process-wide cuFile driver once.  A failure is not fatal here: the
-/// handle registration that follows reports it, and in AUTO mode the reactor
-/// degrades to POSIX.
-void open_cufile_driver_once() noexcept
-{
-  static std::once_flag once;
-  std::call_once(once, [] {
-    try {
-      kvikio::cuFileAPI::instance().driver_open();
-    } catch (std::exception const& e) {
-      CUCASCADE_LOG_WARN("cufile_reactor: cuFile driver_open failed: {} (GDS fast path disabled)",
-                         e.what());
-    } catch (...) {
-      CUCASCADE_LOG_WARN("cufile_reactor: cuFile driver_open failed with an unknown error");
-    }
-  });
-}
 
 /**
  * @brief Request selection for the worker: strict priority with bounded low service.
@@ -827,14 +807,14 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object(std::string p
 }
 
 std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object(
-  std::string path, bool use_odirect, std::optional<kvikio::CompatMode> compat_mode)
+  std::string path, bool use_odirect, std::optional<compat> compat_mode)
 {
   if (!supports(path)) {
     throw std::runtime_error("cufile_reactor::create_io_object: unsupported path: " + path);
   }
 
   auto const mode = resolve_compat_mode(compat_mode);
-  if (mode == kvikio::CompatMode::OFF && !use_odirect) {
+  if (mode == compat::off && !use_odirect) {
     throw std::invalid_argument(
       "cufile_reactor::create_io_object: compat mode OFF enforces cuFile, which needs O_DIRECT, "
       "but use_odirect is false");
@@ -862,13 +842,10 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
 }
 
 std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
-  std::string path,
-  write_open_options options,
-  bool use_odirect,
-  std::optional<kvikio::CompatMode> compat_mode)
+  std::string path, write_open_options options, bool use_odirect, std::optional<compat> compat_mode)
 {
   auto const mode = resolve_compat_mode(compat_mode);
-  if (mode == kvikio::CompatMode::OFF && !use_odirect) {
+  if (mode == compat::off && !use_odirect) {
     throw std::invalid_argument(
       "cufile_reactor::create_io_object_for_write: compat mode OFF enforces cuFile, which needs "
       "O_DIRECT, but use_odirect is false");
@@ -1025,8 +1002,8 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
                                  prepared_io_slice const& slice,
                                  std::unique_ptr<io_op_request>& request)
 {
-  auto& api = kvikio::cuFileAPI::instance();
-  if (api.Read == nullptr) return false;
+  auto const* api = cufile_api::get();
+  if (api == nullptr) return false;
 
   int device_id = slice.d_buffer.device_id;
   if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
@@ -1053,12 +1030,12 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
       errno           = 0;
       auto const got =
         registration.registered()
-          ? api.Read(file.cufile_handle(),
-                     dst,
-                     want,
-                     static_cast<off_t>(pos),
-                     static_cast<off_t>(pos - offset))
-          : api.Read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
+          ? api->read(file.cufile_handle(),
+                      dst,
+                      want,
+                      static_cast<off_t>(pos),
+                      static_cast<off_t>(pos - offset))
+          : api->read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
       if (got < 0) {
         auto const saved_errno = errno;
         static std::atomic<bool> logged{false};
@@ -1442,8 +1419,8 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
                                   std::uint8_t const* source,
                                   range piece)
 {
-  auto& api = kvikio::cuFileAPI::instance();
-  if (api.Write == nullptr) return false;
+  auto const* api = cufile_api::get();
+  if (api == nullptr) return false;
 
   auto const max_op = _config.max_op_bytes - _config.max_op_bytes % IO_BLOCK_SIZE;
   // Deregistered when this function returns or throws, before the request settles.
@@ -1461,12 +1438,12 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
     cufile_write_calls.fetch_add(1, std::memory_order_relaxed);
     auto const got =
       registration.registered()
-        ? api.Write(file.cufile_handle(),
-                    source,
-                    want,
-                    static_cast<off_t>(piece.offset + done),
-                    static_cast<off_t>(done))
-        : api.Write(
+        ? api->write(file.cufile_handle(),
+                     source,
+                     want,
+                     static_cast<off_t>(piece.offset + done),
+                     static_cast<off_t>(done))
+        : api->write(
             file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
     if (got < 0) {
       auto const saved_errno = errno;
@@ -1782,7 +1759,7 @@ namespace cucascade::io::cufile {
 
 namespace {
 
-/// Whether @p name is set to a value cuFile / kvikIO read as "on".
+/// Whether @p name is set to a value cuFile reads as "on".
 [[nodiscard]] bool env_flag_on(char const* name) noexcept
 {
   char const* value = std::getenv(name);
@@ -1797,15 +1774,13 @@ namespace {
   platform_info info{};
   info.forced_compat = env_flag_on("CUFILE_FORCE_COMPAT_MODE");
   try {
-    if (kvikio::defaults::compat_mode() == kvikio::CompatMode::ON) info.forced_compat = true;
-    info.library_available = kvikio::is_cufile_library_available();
+    auto const* api        = cufile_api::get();
+    info.library_available = api != nullptr;
     if (!info.library_available) return info;
-    info.version = kvikio::cufile_version();
-    open_cufile_driver_once();
-    auto& api = kvikio::cuFileAPI::instance();
-    if (api.DriverGetProperties == nullptr) return info;
+    info.version = cufile_api::version();
+    if (!cufile_api::open_driver()) return info;
     CUfileDrvProps_t props{};
-    if (api.DriverGetProperties(&props).err != CU_FILE_SUCCESS) return info;
+    if (api->driver_get_properties(&props).err != CU_FILE_SUCCESS) return info;
     info.driver_opened         = true;
     info.dstatusflags          = props.nvfs.dstatusflags;
     info.compat_only           = info.dstatusflags == 0;

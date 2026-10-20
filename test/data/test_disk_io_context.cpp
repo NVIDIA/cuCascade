@@ -256,8 +256,7 @@ TEST_CASE("make_disk_io_context builds a context of the requested backend", "[di
   using io::io_context_type;
   auto const [backend, expected] =
     GENERATE(std::pair{disk_io_backend::uring, io_context_type::uring},
-             std::pair{disk_io_backend::cufile, io_context_type::cufile},
-             std::pair{disk_io_backend::kvikio, io_context_type::kvikio});
+             std::pair{disk_io_backend::cufile, io_context_type::cufile});
   CAPTURE(test::to_string(backend));
 
   auto context = test::try_make_disk_io_context(backend);
@@ -273,8 +272,7 @@ TEST_CASE("make_disk_io_context resolves automatic to a concrete backend", "[dis
   auto context = make_disk_io_context();
   REQUIRE(context != nullptr);
   auto const type = context->type();
-  REQUIRE((type == io::io_context_type::uring || type == io::io_context_type::cufile ||
-           type == io::io_context_type::kvikio));
+  REQUIRE((type == io::io_context_type::uring || type == io::io_context_type::cufile));
 }
 
 TEST_CASE("make_disk_io_context rejects a backend without reactors", "[disk][io][context]")

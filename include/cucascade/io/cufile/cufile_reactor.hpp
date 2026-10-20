@@ -25,10 +25,9 @@
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 
-#include <kvikio/compat_mode.hpp>
-#include <kvikio/shim/cufile_h_wrapper.hpp>
-
 #include <cuda_runtime.h>
+
+#include <cufile.h>
 
 #include <atomic>
 #include <cstddef>
@@ -263,7 +262,7 @@ class cufile_reactor {
   /// reactor (both claim local files) is decided by @c io_context_registry.
   [[nodiscard]] static bool supports(std::string_view path);
 
-  /// Open @p path with default options (O_DIRECT, kvikIO's default compat mode).
+  /// Open @p path with default options (O_DIRECT, @c compat::automatic).
   /// See the three-argument overload.
   static std::unique_ptr<cufile_io_object> create_io_object(std::string path);
 
@@ -271,21 +270,22 @@ class cufile_reactor {
    * @brief Open the buffered fd and, when @p use_odirect, an O_DIRECT fd, and
    *        register the latter with cuFile.
    *
-   * @p compat_mode (default: kvikIO's @c defaults::compat_mode()) selects what a
-   * file that cannot be registered means: @c ON never registers, @c AUTO falls
-   * back to POSIX for that file, @c OFF treats it as an error.
+   * @p compat_mode (default @c compat::automatic) selects what a file that cannot
+   * be registered means: @c on never registers, @c automatic falls back to POSIX
+   * for that file, @c off treats it as an error.
    *
    * @throws std::runtime_error / std::system_error when the file cannot be
-   *         opened or stat'ed, or when @p compat_mode is @c OFF and cuFile
+   *         opened or stat'ed, or when @p compat_mode is @c off and cuFile
    *         registration fails.
    */
-  static std::unique_ptr<cufile_io_object> create_io_object(
-    std::string path, bool use_odirect, std::optional<kvikio::CompatMode> compat_mode);
+  static std::unique_ptr<cufile_io_object> create_io_object(std::string path,
+                                                            bool use_odirect,
+                                                            std::optional<compat> compat_mode);
 
   // -- Writes (docs/io/write-api-design.md section 6) ------------------------
 
-  /// Open @p path for writing with default options (O_DIRECT, kvikIO's default
-  /// compat mode).  See the four-argument overload.
+  /// Open @p path for writing with default options (O_DIRECT,
+  /// @c compat::automatic).  See the four-argument overload.
   static std::unique_ptr<cufile_io_object> create_io_object_for_write(std::string path,
                                                                       write_open_options options);
 
@@ -301,7 +301,7 @@ class cufile_reactor {
     std::string path,
     write_open_options options,
     bool use_odirect,
-    std::optional<kvikio::CompatMode> compat_mode);
+    std::optional<compat> compat_mode);
 
   /// Synchronous host write on the calling thread: the write-granule-aligned
   /// body goes O_DIRECT when the source is block-aligned, head and tail through

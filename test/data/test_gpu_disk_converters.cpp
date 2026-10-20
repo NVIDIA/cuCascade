@@ -751,8 +751,7 @@ TEST_CASE("gpu disk round-trip sliced column with nulls", "[disk][gpu-converter]
 TEST_CASE("gpu disk round-trip with an explicit io context of each backend",
           "[disk][gpu-converter][backend]")
 {
-  auto const backend =
-    GENERATE(disk_io_backend::uring, disk_io_backend::cufile, disk_io_backend::kvikio);
+  auto const backend = GENERATE(disk_io_backend::uring, disk_io_backend::cufile);
   CAPTURE(test::to_string(backend));
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
   auto disk_space = test::make_disk_space(backend);

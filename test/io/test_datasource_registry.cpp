@@ -79,7 +79,7 @@ TEST_CASE("replace hands the s3 claimant to the new backend", "[io][registry]")
   CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::uring);
 }
 
-#ifdef CUCASCADE_HAS_KVIKIO
+#ifdef CUCASCADE_HAS_CUFILE
 namespace {
 
 /** The backend a registry configured for @p backend routes @p path to. */
@@ -109,8 +109,7 @@ TEST_CASE("other backends never route a local file to cufile", "[io][registry]")
 
   // uring and cufile both claim a local file; only an explicit choice may select cufile.
   CHECK(route(io_backend::native, "/proc/self/exe") == io_context_type::uring);
-  CHECK(route(io_backend::kvikio, "/proc/self/exe") == io_context_type::kvikio);
-  CHECK(route(io_backend::kvikio, "s3://bucket/key") == io_context_type::kvikio);
+  CHECK(route(io_backend::native, "s3://bucket/key") == io_context_type::restful);
 }
 #endif
 
@@ -129,7 +128,7 @@ TEST_CASE("replace rejects an already registered new backend", "[io][registry]")
   registry_fixture fixture;
 
   CHECK_THROWS_AS(fixture.registry.replace_ioctx(
-                    io_context_type::restful, io_context_type::kvikio, &s3_checker, &null_factory),
+                    io_context_type::restful, io_context_type::uring, &s3_checker, &null_factory),
                   std::invalid_argument);
   CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::restful);
 }
@@ -162,7 +161,8 @@ TEST_CASE("replace is forbidden after the first path lookup", "[io][registry]")
 {
   registry_fixture fixture;
 
-  REQUIRE(fixture.registry.lookup_path("unmatched-before-bootstrap") == io_context_type::kvikio);
+  // No backend claims this path (there is no catch-all); the lookup still latches.
+  REQUIRE_FALSE(fixture.registry.lookup_path("unmatched-before-bootstrap").has_value());
   CHECK_THROWS_AS(fixture.registry.replace_ioctx(
                     io_context_type::restful, io_context_type::s3rdma, &s3_checker, &null_factory),
                   std::logic_error);

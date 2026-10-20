@@ -56,8 +56,10 @@ using invocable = absl::AnyInvocable<Signature>;
 
 #include <concepts>
 #include <cstddef>
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <new>
 #include <type_traits>
 #include <utility>
 
@@ -74,47 +76,154 @@ namespace cucascade::exec {
  * layers rely on: `R(Args...)`, `R(Args...) noexcept`, `R(Args...) &&` and
  * `R(Args...) && noexcept`.  A `noexcept` signature only accepts targets that
  * are nothrow-invocable; an `&&` signature may only be invoked on an rvalue.
+ *
+ * A target of at most 48 bytes (alignment 16) whose move cannot throw is stored
+ * in place, without allocating, as `absl::AnyInvocable` and folly::Function do;
+ * a larger one is allocated once.  A null function pointer is no target.
  */
 template <typename Signature>
 class invocable;
 
 namespace detail {
 
+/// In-place buffer of `invocable` (folly::Function's size and alignment): a continuation that
+/// captures a pointer or two and a small result is stored without allocating.
+inline constexpr std::size_t invocable_inline_bytes = 48;
+inline constexpr std::size_t invocable_inline_align = 16;
+
+/// True when a target of type @p F is stored in place: it fits, and moving it cannot throw.
+template <typename F>
+inline constexpr bool invocable_stores_inline =
+  sizeof(F) <= invocable_inline_bytes && alignof(F) <= invocable_inline_align &&
+  std::is_nothrow_move_constructible_v<F>;
+
 /// Type-erased move-only storage shared by every `invocable` flavour.
+///
+/// A target that fits (`invocable_stores_inline`) lives in the object (no allocation); anything
+/// else is allocated once.  A call is one indirect call through a function pointer; a move is a
+/// 48-byte copy for a trivially copyable target, else one indirect call.
 template <bool NoExcept, typename R, typename... Args>
 class invocable_storage {
  public:
   invocable_storage() noexcept = default;
 
   template <typename F>
-  explicit invocable_storage(F&& f)
-    : _impl(std::make_unique<model<std::decay_t<F>>>(std::forward<F>(f)))
+  explicit invocable_storage(F&& f) noexcept(invocable_stores_inline<std::decay_t<F>> &&
+                                             std::is_nothrow_constructible_v<std::decay_t<F>, F>)
   {
+    using target_t = std::decay_t<F>;
+    if constexpr (std::is_pointer_v<target_t> || std::is_member_pointer_v<target_t>) {
+      if (f == nullptr) { return; }  // a null function pointer is no target
+    }
+    if constexpr (invocable_stores_inline<target_t>) {
+      if constexpr (std::is_trivially_copyable_v<target_t> &&
+                    sizeof(target_t) < invocable_inline_bytes) {
+        // Relocated by a whole-buffer copy: give the bytes the target does not use a value.
+        std::memset(_buf, 0, invocable_inline_bytes);
+      }
+      ::new (static_cast<void*>(_buf)) target_t(std::forward<F>(f));
+      _invoke = &invoke_inline<target_t>;
+      if constexpr (!std::is_trivially_copyable_v<target_t>) { _manage = &manage_inline<target_t>; }
+    } else {
+      auto* target = new target_t(std::forward<F>(f));
+      ::new (static_cast<void*>(_buf)) target_t*(target);
+      _invoke = &invoke_heap<target_t>;
+      _manage = &manage_heap<target_t>;
+    }
   }
 
-  [[nodiscard]] bool has_target() const noexcept { return _impl != nullptr; }
+  invocable_storage(invocable_storage&& other) noexcept { take(other); }
 
-  void reset() noexcept { _impl.reset(); }
+  invocable_storage& operator=(invocable_storage&& other) noexcept
+  {
+    if (this != &other) {
+      reset();
+      take(other);
+    }
+    return *this;
+  }
 
-  R call(Args&&... args) noexcept(NoExcept) { return _impl->invoke(std::forward<Args>(args)...); }
+  invocable_storage(invocable_storage const&)            = delete;
+  invocable_storage& operator=(invocable_storage const&) = delete;
+
+  ~invocable_storage() { reset(); }
+
+  [[nodiscard]] bool has_target() const noexcept { return _invoke != nullptr; }
+
+  void reset() noexcept
+  {
+    if (_manage != nullptr) { _manage(manage_op::destroy, _buf, nullptr); }
+    _invoke = nullptr;
+    _manage = nullptr;
+  }
+
+  R call(Args&&... args) noexcept(NoExcept)
+  {
+    return _invoke(static_cast<void*>(_buf), std::forward<Args>(args)...);
+  }
 
  private:
-  struct concept_t {
-    virtual ~concept_t()                                = default;
-    virtual R invoke(Args&&... args) noexcept(NoExcept) = 0;
-  };
+  enum class manage_op : unsigned char { relocate, destroy };
+  using invoke_fn = R (*)(void*, Args&&...) noexcept(NoExcept);
+  /// Null for a trivially copyable in-place target (moved by copying the buffer).
+  using manage_fn = void (*)(manage_op, void* src, void* dst) noexcept;
 
-  template <typename F>
-  struct model final : concept_t {
-    explicit model(F f) : fn(std::move(f)) {}
-    R invoke(Args&&... args) noexcept(NoExcept) override
-    {
-      return std::invoke(fn, std::forward<Args>(args)...);
+  void take(invocable_storage& other) noexcept
+  {
+    if (other._invoke == nullptr) { return; }
+    if (other._manage != nullptr) {
+      other._manage(manage_op::relocate, other._buf, _buf);
+    } else {
+      std::memcpy(_buf, other._buf, invocable_inline_bytes);
     }
-    F fn;
-  };
+    _invoke = std::exchange(other._invoke, nullptr);
+    _manage = std::exchange(other._manage, nullptr);
+  }
 
-  std::unique_ptr<concept_t> _impl;
+  template <typename T>
+  static R invoke_target(T& target, Args&&... args) noexcept(NoExcept)
+  {
+    if constexpr (std::is_void_v<R>) {
+      std::invoke(target, std::forward<Args>(args)...);
+    } else {
+      return std::invoke(target, std::forward<Args>(args)...);
+    }
+  }
+
+  template <typename T>
+  static R invoke_inline(void* buf, Args&&... args) noexcept(NoExcept)
+  {
+    return invoke_target(*std::launder(static_cast<T*>(buf)), std::forward<Args>(args)...);
+  }
+
+  template <typename T>
+  static R invoke_heap(void* buf, Args&&... args) noexcept(NoExcept)
+  {
+    return invoke_target(**std::launder(static_cast<T**>(buf)), std::forward<Args>(args)...);
+  }
+
+  template <typename T>
+  static void manage_inline(manage_op op, void* src, void* dst) noexcept
+  {
+    T* target = std::launder(static_cast<T*>(src));
+    if (op == manage_op::relocate) { ::new (dst) T(std::move(*target)); }
+    target->~T();
+  }
+
+  template <typename T>
+  static void manage_heap(manage_op op, void* src, void* dst) noexcept
+  {
+    T** target = std::launder(static_cast<T**>(src));
+    if (op == manage_op::relocate) {
+      ::new (dst) T*(*target);
+    } else {
+      delete *target;
+    }
+  }
+
+  alignas(invocable_inline_align) unsigned char _buf[invocable_inline_bytes];
+  invoke_fn _invoke{nullptr};
+  manage_fn _manage{nullptr};
 };
 
 /// A target is accepted when it is invocable as an lvalue, and additionally

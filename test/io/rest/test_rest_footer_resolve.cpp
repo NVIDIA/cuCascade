@@ -17,12 +17,18 @@
  */
 
 #include "loopback_range_server.hpp"
+#include "utils/child_test_runner.hpp"
 
 #include <cucascade/exec/scoped_dispatcher.hpp>
 #include <cucascade/exec/thread_pool.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 
 #include <catch2/catch_all.hpp>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 
 #include <algorithm>
 #include <array>
@@ -31,6 +37,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <future>
 #include <memory>
@@ -154,6 +161,26 @@ void require_span_equal(shared_byte_span const& lhs, shared_byte_span const& rhs
   if (!lhs) { return; }
   REQUIRE(lhs->size() == rhs->size());
   CHECK(std::equal(lhs->begin(), lhs->end(), rhs->begin(), rhs->end()));
+}
+
+/// Make io_uring_setup fail with EPERM for this thread and the threads it creates from now on,
+/// as a container's default seccomp profile does.
+void block_io_uring_setup()
+{
+  auto statement = [](std::uint32_t code, std::uint32_t k) {
+    return sock_filter{static_cast<std::uint16_t>(code), 0, 0, k};
+  };
+  std::array<sock_filter, 4> filter{
+    statement(BPF_LD | BPF_W | BPF_ABS, static_cast<std::uint32_t>(offsetof(seccomp_data, nr))),
+    sock_filter{static_cast<std::uint16_t>(BPF_JMP | BPF_JEQ | BPF_K),
+                0,
+                1,
+                static_cast<std::uint32_t>(__NR_io_uring_setup)},
+    statement(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+    statement(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+  sock_fprog program{static_cast<unsigned short>(filter.size()), filter.data()};
+  REQUIRE(::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+  REQUIRE(::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == 0);
 }
 
 bool is_operation_canceled(std::exception_ptr const& error)
@@ -525,8 +552,10 @@ TEST_CASE("batched footer resolve streams fast siblings while another entry dela
           "[rest][footer_resolve]")
 {
   std::unordered_map<std::string, key_response_script> scripts;
-  scripts["slow.parquet"].gets  = {scripted_response{.delay = 300ms}};
-  scripts["retry.parquet"].gets = {scripted_response{.status = 503}, scripted_response{}};
+  scripts["slow.parquet"].gets = {scripted_response{.delay = 300ms}};
+  // 500 (transient, ~retry_backoff_base) rather than 503: a throttle backs off 20x longer and
+  // could retry after the 300 ms slow sibling, making the delivery order a race.
+  scripts["retry.parquet"].gets = {scripted_response{.status = 500}, scripted_response{}};
   loopback_range_server server(test_payload(), {}, {}, std::move(scripts));
   auto fixture = make_ioctx(server, test_config(3));
   std::vector<std::string> paths{
@@ -758,6 +787,53 @@ TEST_CASE(
   std::this_thread::sleep_for(25ms);
   std::scoped_lock lock{state->mutex};
   CHECK(state->successful + state->canceled == callbacks_at_return);
+}
+
+TEST_CASE("batched footer resolve delivers every input as canceled when its ring cannot start",
+          "[rest][footer_resolve]")
+{
+  // The seccomp filter is process state, so the body runs in a child process.
+  constexpr char const* marker_name = "CUCASCADE_FOOTER_RING_FAILURE_CHILD";
+  if (auto const* marker = std::getenv(marker_name);
+      marker == nullptr || std::string_view{marker} != "1") {
+    cucascade::test::child_test_runner child{
+      "batched footer resolve delivers every input as canceled when its ring cannot start",
+      {{marker_name, std::string{"1"}}}};
+    bool const completed = child.wait_for(std::chrono::seconds(120));
+    if (!completed) child.stop();
+    INFO(child.output());
+    REQUIRE(completed);
+    REQUIRE(WIFEXITED(child.status()));
+    REQUIRE(WEXITSTATUS(child.status()) == 0);
+    return;
+  }
+
+  loopback_range_server server(test_payload());
+  block_io_uring_setup();
+  auto fixture = make_ioctx(server, test_config());
+  std::vector<std::string> const paths{object_uri("a.parquet"), object_uri("b.parquet")};
+  auto const caller = std::this_thread::get_id();
+  bool on_caller    = true;
+  std::vector<footer_resolve_result> results;
+
+  try {
+    fixture.ioctx->resolve_footer_objects(paths, [&](footer_resolve_result result) {
+      on_caller &= std::this_thread::get_id() == caller;
+      results.push_back(std::move(result));
+    });
+    FAIL("resolve_footer_objects succeeded without io_uring");
+  } catch (std::system_error const& error) {
+    CHECK(error.code() == std::errc::operation_not_permitted);
+  }
+
+  REQUIRE(results.size() == paths.size());
+  CHECK(std::all_of(results.begin(), results.end(), [](auto const& result) {
+    return is_operation_canceled(result.error);
+  }));
+  CHECK(result_at(results, 0).index == 0);
+  CHECK(result_at(results, 1).index == 1);
+  CHECK(on_caller);
+  CHECK(server.get_count() == 0);
 }
 
 TEST_CASE("batched footer resolve cancels concurrent completions after the first callback error",

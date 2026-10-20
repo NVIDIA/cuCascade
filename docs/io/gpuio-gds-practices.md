@@ -88,7 +88,7 @@ Not adopted (and why): gpuio's batch engine (2-10% below sync on real GB200 hard
 ### G5. Effective-mode probe
 
 - **gpuio evidence.** `read_platform`, `src/gds/gds_context.cpp:1079-1093`: `compat_only = (dstatusflags == 0)` from `cuFileDriverGetProperties`; `cuFileDriverGetP2PFlags` is deliberately never called (it resets running parameters in 1.19.1; `decision-gds-engines-and-arena.md` Decision 2); one summary line logged at open (`:840-860`).
-- **cuCascade.** New `include/cucascade/io/cufile/platform.hpp` (no kvikIO types): `struct platform_info { library_available, driver_opened, compat_only, version, dstatusflags, max_direct_io_size_kb }`, `probe_platform() noexcept` (computed once, shares the reactor's driver-open once-flag) and `gds_available() noexcept` (= driver opened and not compat-only and not forced compat by `KVIKIO_COMPAT_MODE=ON` / `CUFILE_FORCE_COMPAT_MODE`). The reactor logs the mode once at `start()`. The disk tier (W3) uses `gds_available()` to pick cuFile vs uring (agreed with `disk-tier`).
+- **cuCascade.** New `include/cucascade/io/cufile/platform.hpp` (no kvikIO types): `struct platform_info { library_available, driver_opened, compat_only, version, dstatusflags, max_direct_io_size_kb }`, `probe_platform() noexcept` (computed once, shares the reactor's driver-open once-flag) and `gds_available() noexcept` (= driver opened and not compat-only and not forced compat by `CUFILE_FORCE_COMPAT_MODE`; `KVIKIO_COMPAT_MODE` was honoured until kvikIO was removed on 2026-10-19). The reactor logs the mode once at `start()`. The disk tier (W3) uses `gds_available()` to pick cuFile vs uring (agreed with `disk-tier`).
 
 ### G6. Write practices (for task-5, on io-write's reactor contract)
 
@@ -98,7 +98,7 @@ Not adopted (and why): gpuio's batch engine (2-10% below sync on real GB200 hard
 ### G7. cuFile parameters (deferred)
 
 - **gpuio evidence.** `apply_params_locked`, `src/gds/gds_context.cpp:965-1050`, only when `cuFileUseCount() <= 0` (`:786-799`: parameters act only before the first open in the process); default `max_direct_io_size_kb = 16384` (`include/gpuio/gds.hpp:118`); the stdin guard around the open (`:746`).
-- **Why deferred.** kvikIO's shim exposes no `cuFileSetParameter*`, so this needs `dlsym(RTLD_NOLOAD)` plumbing; the only measured change on this box made large reads slower; the real-mode value of 16384 is a GDS-host experiment (E7).
+- **Why deferred.** kvikIO's shim exposed no `cuFileSetParameter*` (kvikIO has since been replaced by cuCascade's own loader, `io::cufile::cufile_api`, which can resolve them as optional members); the only measured change on this box made large reads slower; the real-mode value of 16384 is a GDS-host experiment (E7).
 
 ### G8. Buffer registration (not by default)
 

@@ -84,18 +84,31 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   target_sources(
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
-            io/test_io_request.cpp)
+            io/rest/test_rest_write.cpp io/test_io_request.cpp)
+  # The exec layer's futures and type-erased callables.
+  target_sources(cucascade_io_tests PRIVATE exec/test_invocable.cpp
+                                            exec/test_semi_future.cpp)
+  # End-to-end read path over the io_uring transport: HTTPS and plain-HTTP
+  # robustness.
+  target_sources(
+    cucascade_io_tests PRIVATE io/rest/test_rest_https.cpp
+                               io/rest/test_rest_read_robustness.cpp)
 
-  # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
-  # The cuFile reactor loads libcufile through kvikIO's shim, so it is gated the
-  # same way.
-  if(CUCASCADE_BUILD_CUDF)
-    target_sources(
-      cucascade_io_tests
-      PRIVATE io/cufile/test_cufile_reactor.cpp
-              io/cufile/test_cufile_write.cpp
-              io/kvikio/test_kvikio_config.cpp io/kvikio/test_kvikio_remote.cpp
-              io/kvikio/test_kvikio_write.cpp)
+  # Tests of the io_uring REST transport modules (docs/io/rest-uring-design.md);
+  # they include the modules' private headers from src/.
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/planner/tests.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/net/tests.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/s3/tests.cmake)
+  target_include_directories(cucascade_io_tests
+                             PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+  # The cuFile reactor is built when cufile.h was found; see
+  # src/io/CMakeLists.txt.
+  if(CUCASCADE_CUFILE_INCLUDE_DIR)
+    target_sources(cucascade_io_tests PRIVATE io/cufile/test_cufile_reactor.cpp
+                                              io/cufile/test_cufile_write.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
