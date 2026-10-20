@@ -22,6 +22,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
@@ -64,13 +65,13 @@ struct test_fixture {
 // an assertion aborts the test, so stream destruction cannot leave it blocked.
 class pending_stream_work {
  public:
-  explicit pending_stream_work(rmm::cuda_stream const& stream) : stream_(stream)
+  explicit pending_stream_work(rmm::cuda_stream const& stream) : _stream(stream)
   {
     CUCASCADE_CUDA_TRY(::cudaLaunchHostFunc(
-      stream_.value(),
+      _stream.value(),
       [](void* context) {
         auto& gate = *static_cast<pending_stream_work*>(context);
-        gate.released_.wait(false);
+        gate._released.wait(false);
       },
       this));
   }
@@ -83,18 +84,18 @@ class pending_stream_work {
   ~pending_stream_work()
   {
     release();
-    stream_.synchronize_no_throw();
+    _stream.synchronize_no_throw();
   }
 
   void release() noexcept
   {
-    released_.store(true);
-    released_.notify_all();
+    _released.store(true);
+    _released.notify_all();
   }
 
  private:
-  rmm::cuda_stream const& stream_;
-  std::atomic<bool> released_{false};
+  rmm::cuda_stream const& _stream;
+  std::atomic<bool> _released{false};
 };
 
 void require_no_large_activity(small_pinned_host_memory_resource::statistics const& stats)
@@ -678,6 +679,84 @@ TEST_CASE("Large FIFO eviction orders entries across buckets", "[small_pinned][s
   REQUIRE(reused.peak_cached_large_bytes == retained.peak_cached_large_bytes);
   mr.deallocate_sync(small, 9000);
   mr.deallocate_sync(large, 20000);
+}
+
+TEST_CASE("Failed large allocation purges the cache and throws out_of_memory",
+          "[small_pinned][statistics]")
+{
+  // No host can pin 1 PiB, so both cudaHostAlloc attempts fail with cudaErrorMemoryAllocation.
+  constexpr std::size_t impossible = std::size_t{1} << 50;
+  constexpr std::size_t seed_bytes = 100000;  // 128 KiB bucket
+  bool const cacheable             = GENERATE(false, true);
+  test_fixture f;
+  // The default limit makes the impossible request uncacheable; an unbounded limit makes it
+  // cacheable, so it also takes the cache-lookup and post-purge retry path.
+  small_pinned_host_memory_resource mr{
+    f.upstream,
+    cacheable ? std::numeric_limits<std::size_t>::max()
+              : small_pinned_host_memory_resource::DEFAULT_LARGE_CACHE_LIMIT};
+  mr.deallocate_sync(mr.allocate_sync(seed_bytes), seed_bytes);
+  REQUIRE(mr.large_cache_bytes() == 128 * 1024);
+
+  REQUIRE_THROWS_AS(mr.allocate_sync(impossible), rmm::out_of_memory);
+  REQUIRE(::cudaGetLastError() == cudaSuccess);
+  auto const stats = mr.get_statistics();
+  REQUIRE(stats.cached_large_bytes == 0);
+  REQUIRE(stats.peak_cached_large_bytes == 128 * 1024);
+  REQUIRE(stats.large_requests == 2);
+  REQUIRE(stats.large_hits == 0);
+  REQUIRE(stats.large_misses == (cacheable ? 2 : 1));
+  REQUIRE(stats.large_uncacheable == (cacheable ? 0 : 1));
+  REQUIRE(stats.large_evictions == 1);
+
+  // The resource remains usable after the failure.
+  auto* ptr = mr.allocate_sync(seed_bytes);
+  REQUIRE(ptr != nullptr);
+  std::memset(ptr, 0x5A, seed_bytes);
+  mr.deallocate_sync(ptr, seed_bytes);
+  REQUIRE(mr.large_cache_bytes() == 128 * 1024);
+}
+
+TEST_CASE("Slab pool rejects an upstream block smaller than the slab", "[small_pinned]")
+{
+  constexpr std::size_t block_size = 4096;
+  rmm::mr::pinned_host_memory_resource pinned_mr;
+  fixed_size_host_memory_resource upstream{
+    0, pinned_mr, 16 * block_size, 16 * block_size, block_size, 1, 1};
+  small_pinned_host_memory_resource mr{upstream};
+
+  REQUIRE_THROWS_AS(mr.allocate_sync(8192), std::invalid_argument);
+
+  // Slabs that fit the block are still served.
+  auto* ptr = mr.allocate_sync(block_size);
+  REQUIRE(ptr != nullptr);
+  mr.deallocate_sync(ptr, block_size);
+}
+
+TEST_CASE("Slab pool propagates upstream exhaustion as out_of_memory", "[small_pinned]")
+{
+  // The upstream can supply exactly one block, which holds eight 8 KiB slabs.
+  constexpr std::size_t block_size = 64 * 1024;
+  constexpr std::size_t slab_bytes = small_pinned_host_memory_resource::MAX_SLAB_SIZE;
+  constexpr std::size_t num_slabs  = block_size / slab_bytes;
+  rmm::mr::pinned_host_memory_resource pinned_mr;
+  fixed_size_host_memory_resource upstream{0, pinned_mr, block_size, block_size, block_size, 1, 1};
+  small_pinned_host_memory_resource mr{upstream};
+
+  std::vector<void*> slabs;
+  for (std::size_t i = 0; i < num_slabs; ++i) {
+    slabs.push_back(mr.allocate_sync(slab_bytes));
+  }
+  REQUIRE_THROWS_AS(mr.allocate_sync(slab_bytes), rmm::out_of_memory);
+
+  // A freed slab is reused after the failed expansion.
+  mr.deallocate_sync(slabs.back(), slab_bytes);
+  auto* reused = mr.allocate_sync(slab_bytes);
+  REQUIRE(reused == slabs.back());
+  slabs.back() = reused;
+  for (auto* slab : slabs) {
+    mr.deallocate_sync(slab, slab_bytes);
+  }
 }
 
 TEST_CASE("Large allocation statistics remain consistent during mixed concurrent requests",

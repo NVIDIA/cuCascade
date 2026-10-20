@@ -188,11 +188,15 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
+    // The table is built on the legacy default stream. Passing `cudaStreamDefault` would mean
+    // "no writer", so name `cudaStreamLegacy` explicitly. The GPU->HOST converters do not wait on
+    // the writer event; `streams` are blocking streams, which implicitly wait for the default
+    // stream.
     auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
     thread_gpu_reprs.push_back(std::make_unique<gpu_table_representation>(
       std::make_unique<cudf::table>(std::move(table)),
       *const_cast<memory_space*>(gpu_space),
-      ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}));
+      ::cuda::stream_ref{cudaStream_t{cudaStreamLegacy}}));
   }
 
   // Warm-up
@@ -340,11 +344,15 @@ void BM_ConvertGpuToHostFast(benchmark::State& state)
   std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
+    // The table is built on the legacy default stream. Passing `cudaStreamDefault` would mean
+    // "no writer", so name `cudaStreamLegacy` explicitly. The GPU->HOST converters do not wait on
+    // the writer event; `streams` are blocking streams, which implicitly wait for the default
+    // stream.
     auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
     thread_gpu_reprs.push_back(std::make_unique<gpu_table_representation>(
       std::make_unique<cudf::table>(std::move(table)),
       *const_cast<memory_space*>(gpu_space),
-      ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}));
+      ::cuda::stream_ref{cudaStream_t{cudaStreamLegacy}}));
   }
 
   // Warm-up: small transfer to prime CUDA driver
