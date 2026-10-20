@@ -44,6 +44,11 @@ enum class eviction_policy {
   /// Keep idle chunks for reuse and evict least-recently-used ones once the pool
   /// fills past @c eviction_threshold_fraction.
   lru,
+  /// Like @ref idle -- a chunk is dropped as soon as its request's consumer is disposed -- and a
+  /// declaration to the embedding readahead that the cache is staging for a device-tier prefetch:
+  /// once a split's bytes are device-resident the readahead disposes that split's request at once,
+  /// so its chunks are reclaimed on the evictor's next round instead of at the split's disposal.
+  prefetch,
 };
 
 /// Parse a @ref cache_mode from its lowercase YAML spelling.
@@ -77,6 +82,7 @@ inline bool string_to_enum(std::string_view sv, eviction_policy& out)
   static const std::unordered_map<std::string_view, eviction_policy> map = {
     {"idle", eviction_policy::idle},
     {"lru", eviction_policy::lru},
+    {"prefetch", eviction_policy::prefetch},
   };
   auto it = map.find(sv);
   if (it == map.end()) { return false; }
@@ -90,6 +96,7 @@ inline bool enum_to_string(eviction_policy policy, std::string& out)
   switch (policy) {
     case eviction_policy::idle: out = "idle"; return true;
     case eviction_policy::lru: out = "lru"; return true;
+    case eviction_policy::prefetch: out = "prefetch"; return true;
   }
   return false;
 }
@@ -99,9 +106,10 @@ inline bool enum_to_string(eviction_policy policy, std::string& out)
  *
  * @c mode and @c eviction are the two knobs; everything the read path derives
  * from caching (O_DIRECT vs buffered reads, whether the prefetching cache is
- * armed, whether idle chunks are dropped) follows from them, so those derived
- * settings are not separately configurable. The remaining fields size the
- * prefetching cache and only matter under @ref cache_mode::cucs.
+ * armed, whether idle chunks are dropped, which both @c idle and @c prefetch
+ * do) follows from them, so those derived settings are not separately
+ * configurable. The remaining fields size the prefetching cache and only matter
+ * under @ref cache_mode::cucs.
  */
 struct config {
   /// Which cache the read path goes through.
@@ -116,7 +124,8 @@ struct config {
   /// Start evicting once the pool fills to this fraction of its capacity.
   double eviction_threshold_fraction{0.8};
 
-  /// Derived from @ref eviction by @ref apply_mode; not settable on its own.
+  /// Derived from @ref eviction by @ref apply_mode (true under @c idle and @c prefetch);
+  /// not settable on its own.
   bool dispose_on_idle{false};
 
   /// Any caching at all — false only for @ref cache_mode::none. Reads that are
@@ -132,7 +141,10 @@ struct config {
   [[nodiscard]] bool use_odirect() const noexcept { return mode != cache_mode::os; }
 
   /// Refresh the knobs derived from @ref mode / @ref eviction.
-  void apply_mode() noexcept { dispose_on_idle = eviction == eviction_policy::idle; }
+  void apply_mode() noexcept
+  {
+    dispose_on_idle = eviction == eviction_policy::idle || eviction == eviction_policy::prefetch;
+  }
 };
 
 }  // namespace cucascade::io::cache
