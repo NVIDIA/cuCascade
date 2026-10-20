@@ -247,12 +247,11 @@ std::unique_ptr<host_data_representation> host_data_representation::slice(
   std::span<const std::size_t> col_indices) const
 {
   auto sliced = _host_table->slice(col_indices);
-  return std::make_unique<host_data_representation>(
-    std::move(sliced), &const_cast<memory::memory_space&>(get_memory_space()));
+  return std::make_unique<host_data_representation>(std::move(sliced), &get_memory_space());
 }
 
 std::unique_ptr<idata_representation> host_data_representation::clone(
-  [[maybe_unused]] ::cuda::stream_ref stream)
+  [[maybe_unused]] ::cuda::stream_ref stream) const
 {
   auto cloned = _host_table->clone(get_memory_space());
   return std::make_unique<host_data_representation>(std::move(cloned), &get_memory_space());
@@ -286,7 +285,7 @@ host_data_packed_representation::get_host_table() const
 }
 
 std::unique_ptr<idata_representation> host_data_packed_representation::clone(
-  [[maybe_unused]] ::cuda::stream_ref stream)
+  [[maybe_unused]] ::cuda::stream_ref stream) const
 {
   // Get the host memory resource from the memory space
   auto* host_mr = get_memory_space().get_memory_resource_of<memory::Tier::HOST>();

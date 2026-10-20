@@ -93,7 +93,7 @@ inline cudf::type_id as_cudf_type_id(int32_t type_id)
 // scratch allocator races with the cucascade resource ref under multi-GPU and
 // produces uninitialized dst_buf_info reads inside compute_splits).
 std::unique_ptr<idata_representation> convert_gpu_to_gpu(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation);
@@ -102,7 +102,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
  * @brief Convert gpu_table_representation to host_data_packed_representation
  */
 std::unique_ptr<idata_representation> convert_gpu_to_host(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   memory::reservation* reservation)
@@ -112,6 +112,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
   stream.sync();
 
   auto& gpu_source = source.cast<gpu_table_representation>();
+  gpu_source.wait_for_writer(stream);
   auto packed_data = cudf::pack(gpu_source.get_table_view(), stream);
 
   auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
@@ -150,7 +151,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_host(
  * @brief Convert host_data_packed_representation to gpu_table_representation
  */
 std::unique_ptr<idata_representation> convert_host_to_gpu(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
@@ -194,10 +195,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
   auto new_table = std::make_unique<cudf::table>(new_table_view, stream, mr);
   stream.sync();
 
-  // STREAM-LINEAGE: the resulting representation was written by `stream`;
-  // record an event on it so cross-stream/cross-device readers honor producer
-  // ordering.
-  return std::make_unique<gpu_table_representation>(
+  return gpu_table_representation::make_written_on(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
 }
 
@@ -206,7 +204,7 @@ std::unique_ptr<idata_representation> convert_host_to_gpu(
  * copy)
  */
 std::unique_ptr<idata_representation> convert_host_to_host(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref /*stream*/,
   memory::reservation* reservation)
@@ -498,13 +496,15 @@ static void collect_column_d2h_ops(
  * intermediate GPU-side contiguous buffer that cudf::pack allocates.
  */
 std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:gpu_to_host"};
-  auto& gpu_source            = source.cast<gpu_table_representation>();
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  // Planning reads string offsets on the device, so it must already be ordered after the writer.
+  gpu_source.wait_for_writer(stream);
   const cudf::table_view view = gpu_source.get_table_view();
 
   // --- Pass 1: plan the allocation layout ---
@@ -733,7 +733,7 @@ static cudf_compat::null_mask_buffer alloc_and_peer_copy_sync(
 {
   auto buf =
     cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, target_stream, target_mr);
-  auto const size = buf.size();
+  auto const size = cudf_compat::get_null_mask_size_bytes(buf);
   buf = peer_copy_into(std::move(buf), src_ptr, src_device, size, dst_device, target_stream);
   if (size == 0 || src_ptr == nullptr) { return buf; }
   target_stream.sync();
@@ -891,7 +891,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_v
  * allocate target-side buffers, and peer-copy each leaf buffer directly.
  */
 std::unique_ptr<idata_representation> convert_gpu_to_gpu(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
@@ -906,6 +906,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   // Same-device case: clone via source's own clone() method.
   if (source.get_device_id() == target_memory_space->get_device_id()) {
+    // A null stream handle represents the default stream of the current device: ensure it's the
+    // device attached to the representation, or clone() will throw.
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
     return source.clone(stream);
   }
 
@@ -916,25 +919,6 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
                                : "convert:gpu_to_gpu:host_staging";
   nvtx_scope copy_path_range{copy_path};
 
-  // STREAM-LINEAGE INVARIANT: cross-device peer copies of cudaMallocAsync
-  // allocations require explicit event-ordered synchronization with the
-  // writer stream. A source-device-wide cudaDeviceSynchronize() does NOT
-  // establish the cross-mempool visibility the driver needs — under
-  // compute-sanitizer this site emits hundreds of stream-ordered-race errors
-  // even with a brute-force device sync. Producer-consumer pairing:
-  //   producer = the stream that wrote gpu_source (recorded via
-  //              gpu_table_representation::record_writer_event)
-  //   consumer = target_stream (acquired from target memory space below)
-  // We resolve this in two passes:
-  //   1) Wait on the writer event (if recorded) on the *target* stream so the
-  //      reader sees the writer's allocation/copy ordering. This is the precise
-  //      primitive the sanitizer recognizes as closing the race.
-  //   2) Keep the source-device cudaDeviceSynchronize() as defense-in-depth for
-  //      callers that have not yet been migrated to record writer events
-  //      (get_writer_event() == nullptr). When the writer event is set the
-  //      cudaDeviceSynchronize is technically redundant but harmless.
-  cudaEvent_t const writer_event = gpu_source.get_writer_event();
-
   rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
 
   // Target-bound stream from the target memory_space's stream pool. All peer copies
@@ -943,20 +927,11 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto target_stream = target_memory_space->acquire_stream();
   auto mr            = target_memory_space->get_default_allocator();
 
-  if (writer_event != nullptr) {
-    // STREAM-LINEAGE pass 1: tie the reader stream's timeline to the writer's
-    // recorded event. After this point the target_stream observes all
-    // writer-side cudaMallocAsync allocations and writes in proper order.
-    cucascade::cuda::cuda_event_view{writer_event}.wait(target_stream);
-  } else {
-    // STREAM-LINEAGE pass 2 (fallback): no writer event recorded — fall back to
-    // a coarser source-device sync. This path is documented as insufficient for
-    // cross-mempool cudaMallocAsync allocations but is preserved for
-    // representations produced by code paths that have not yet been migrated to
-    // record_writer_event().
-    rmm::cuda_set_device_raii src_sync_guard{rmm::cuda_device_id{src_device_id}};
-    CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
-  }
+  // Order the peer copies below after the most recent writer of gpu_source. With an unknown writer
+  // this synchronizes the whole source device, which is correct but invisible to compute-sanitizer:
+  // its stream-ordered race tracking ignores host-side synchronization, so it may report races here
+  // that a recorded writer event avoids.
+  gpu_source.wait_for_writer(target_stream);
 
   cudf::table_view const src_view = gpu_source.get_table_view();
 
@@ -1049,7 +1024,7 @@ static cudf_compat::null_mask_buffer alloc_and_copy_h2d_sync(
     nvtx_scope alloc_range{"convert:host_to_gpu:device_alloc"};
     return cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream, mr);
   }();
-  auto const size = buf.size();
+  auto const size = cudf_compat::get_null_mask_size_bytes(buf);
   if (size == 0) { return buf; }
 
   const std::size_t block_size = alloc.block_size();
@@ -1209,7 +1184,7 @@ static std::unique_ptr<cudf::column> reconstruct_column(
  * buffers from pinned host blocks directly to device allocations.
  */
 std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
@@ -1276,7 +1251,7 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
  * @brief Convert host_data_representation to host_data_representation (cross-host copy)
  */
 std::unique_ptr<idata_representation> convert_host_fast_to_host_fast(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref /*stream*/,
   memory::reservation* reservation)
@@ -1553,7 +1528,7 @@ static void read_column_buffers(
  * An RAII file guard ensures partial files are cleaned up on exception.
  */
 static std::unique_ptr<idata_representation> convert_host_data_to_disk(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   [[maybe_unused]] ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
@@ -1600,7 +1575,7 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
  * allocates host blocks, and reads data buffers from the disk file.
  */
 static std::unique_ptr<idata_representation> convert_disk_to_host_data(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   [[maybe_unused]] ::cuda::stream_ref stream,
   memory::reservation* reservation)
@@ -1675,14 +1650,16 @@ static void collect_gpu_column_io_entries(const cudf::column_view& col,
  * File contains only 4KB-aligned column data — metadata stays in memory.
  */
 static std::unique_ptr<idata_representation> convert_gpu_to_disk(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:gpu_to_disk"};
-  auto& backend       = target_memory_space->get_io_backend();
-  auto& gpu_source    = source.cast<gpu_table_representation>();
+  auto& backend    = target_memory_space->get_io_backend();
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  // Planning reads string offsets on the device, and the backend orders its reads after `stream`.
+  gpu_source.wait_for_writer(stream);
   cudf::table_view tv = gpu_source.get_table_view();
 
   // Generate unique file path under the disk memory space's mount directory
@@ -1753,16 +1730,16 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
   rmm::device_async_resource_ref mr,
   idisk_io_backend& backend)
 {
-  // Null mask (shared by all type categories). create_null_mask(num_rows) allocates exactly
-  // cudf::bitmask_allocation_size_bytes(num_rows), which is what the writer recorded as
-  // meta.null_mask_size, so null_mask.size() is the correct on-disk extent to read.
+  // Null mask (shared by all type categories). The buffer size is measured in elements
+  // in newer cudf versions; disk extents and backend transfers are measured in bytes.
   auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   if (meta.has_null_mask) {
     null_mask = cudf::create_null_mask(meta.num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
-    if (null_mask.size() > 0) {
+    auto const mask_bytes = cudf_compat::get_null_mask_size_bytes(null_mask);
+    if (mask_bytes > 0) {
       backend.read(file_path,
                    null_mask.data(),
-                   std::min(null_mask.size(), meta.null_mask_size),
+                   std::min(mask_bytes, meta.null_mask_size),
                    meta.null_mask_offset,
                    stream);
     }
@@ -1870,7 +1847,7 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
  * Column metadata comes from the in-memory disk_table_allocation.
  */
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] memory::reservation* reservation)
@@ -1899,9 +1876,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   stream.sync();
 
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
-  // STREAM-LINEAGE: writes happened on `stream`; record event so cross-stream
-  // readers observe ordering.
-  return std::make_unique<gpu_table_representation>(
+  return gpu_table_representation::make_written_on(
     std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
 }
 
