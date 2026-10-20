@@ -73,14 +73,17 @@ exclusive_stream_pool::exclusive_stream_pool(rmm::cuda_device_id device_id,
   }
 }
 
-borrowed_stream exclusive_stream_pool::acquire_stream(stream_acquire_policy policy) noexcept
+borrowed_stream exclusive_stream_pool::acquire_stream(stream_acquire_policy policy)
 {
+  // Build the return callback before taking a stream out of the pool. Failure must
+  // leave the available streams intact, including their deferred deallocation work.
+  std::function<void(rmm::cuda_stream&&)> release_fn =
+    std::bind_front(&exclusive_stream_pool::release_stream, this);
   std::unique_lock lock(_mutex);
   if (_streams.empty()) {
     if (policy == stream_acquire_policy::GROW) {
       rmm::cuda_set_device_raii set_device{_device_id};
-      return borrowed_stream(rmm::cuda_stream(_flags),
-                             std::bind_front(&exclusive_stream_pool::release_stream, this));
+      return borrowed_stream(rmm::cuda_stream(_flags), std::move(release_fn));
     } else {
       _cv.wait(lock, [this]() { return !_streams.empty(); });
     }
@@ -90,8 +93,7 @@ borrowed_stream exclusive_stream_pool::acquire_stream(stream_acquire_policy poli
   // it is handed out again, instead of hammering the most-recently-returned stream.
   auto stream = std::move(_streams.front());
   _streams.pop_front();
-  return borrowed_stream(std::move(stream),
-                         std::bind_front(&exclusive_stream_pool::release_stream, this));
+  return borrowed_stream(std::move(stream), std::move(release_fn));
 }
 
 std::size_t exclusive_stream_pool::size() const noexcept
