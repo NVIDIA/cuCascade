@@ -61,7 +61,7 @@ namespace {
 /// Installed only after the read was submitted, so the install must not allocate: the future's
 /// exact callback type is moved in, where any other type gets a heap-allocated adapter.
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&)>;
-static_assert(std::is_same_v<size_terminal, exec::detail::state<std::size_t>::callback>);
+static_assert(std::is_same_v<size_terminal, exec::semi_future<std::size_t>::callback_type>);
 
 std::size_t reclaim_chunk_buffers(cache_generation& generation,
                                   buffer_pool& pool,

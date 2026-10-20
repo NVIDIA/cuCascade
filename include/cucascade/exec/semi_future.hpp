@@ -650,6 +650,10 @@ class semi_future {
 
  public:
   using value_type = value_t;
+  /// The callback type the shared state stores.  A callable of exactly this type is moved into
+  /// the state by install_callback(); any other callable is wrapped in a heap-allocated adapter,
+  /// so callers that must not allocate at install time build their callback as this type.
+  using callback_type = typename detail::state<value_t>::callback;
 
   semi_future() noexcept = default;
 
