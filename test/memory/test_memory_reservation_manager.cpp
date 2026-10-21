@@ -38,14 +38,18 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
 
 #include <cstdlib>
 #include <memory>
+#include <utility>
 #include <vector>
 
 using namespace cucascade::memory;
@@ -606,4 +610,84 @@ SCENARIO("Host Reservation", "[memory_space][host_reservation]")
       }
     }
   }
+}
+
+TEST_CASE("Host allocation outliving its reservation ignores a reservation at the same address",
+          "[memory_space][host_reservation]")
+{
+  auto manager                 = createSingleDeviceMemoryManager();
+  std::size_t reservation_size = 2UL << 20;
+  std::size_t small_allocation = 1UL << 20;
+
+  auto* host_space = manager->get_memory_space(Tier::HOST, 0);
+  REQUIRE(host_space != nullptr);
+  auto* mr = host_space->get_memory_resource_as<fixed_size_host_memory_resource>();
+  REQUIRE(mr != nullptr);
+
+  // Reserve through the resource directly so the test can observe the arena's address.
+  auto make_reservation = [&]() {
+    auto arena = mr->reserve(reservation_size, nullptr);
+    REQUIRE(arena != nullptr);
+    auto const* address = arena.get();
+    return std::pair{reservation::create(*host_space, std::move(arena)), address};
+  };
+
+  auto [first, first_address] = make_reservation();
+  auto stale_blocks           = mr->allocate_multiple_blocks(small_allocation, first.get());
+  first.reset();
+  // The released reservation's bytes return to the pool; the live blocks stay charged.
+  REQUIRE(mr->get_total_reserved_bytes() == 0);
+  REQUIRE(mr->get_total_allocated_bytes() == small_allocation);
+
+  // Reserve until the allocator hands out the released arena's address again. Misses are held so
+  // each attempt gets a fresh address.
+  std::unique_ptr<reservation> second;
+  std::vector<std::unique_ptr<reservation>> misses;
+  for (int attempt = 0; attempt < 64 && second == nullptr; ++attempt) {
+    auto [candidate, address] = make_reservation();
+    if (address == first_address) {
+      second = std::move(candidate);
+    } else {
+      misses.push_back(std::move(candidate));
+    }
+  }
+  misses.clear();
+  if (second == nullptr) { SKIP("the allocator did not reuse the released arena's address"); }
+  REQUIRE(mr->get_total_reserved_bytes() == reservation_size);
+  REQUIRE(mr->get_total_allocated_bytes() == reservation_size + small_allocation);
+
+  // A stale allocation must not grow against the new reservation.
+  REQUIRE_FALSE(stale_blocks->grow_by(small_allocation));
+
+  // Returning the stale blocks releases their bytes and leaves the new reservation untouched.
+  stale_blocks.reset();
+  REQUIRE(mr->get_total_reserved_bytes() == reservation_size);
+  REQUIRE(mr->get_total_allocated_bytes() == reservation_size);
+
+  // The new reservation's own accounting is intact: a full-size allocation fits inside it.
+  auto blocks = mr->allocate_multiple_blocks(reservation_size, second.get());
+  REQUIRE(mr->get_total_allocated_bytes() == reservation_size);
+  blocks.reset();
+  REQUIRE(mr->get_total_allocated_bytes() == reservation_size);
+
+  second.reset();
+  REQUIRE(mr->get_total_reserved_bytes() == 0);
+  REQUIRE(mr->get_total_allocated_bytes() == 0);
+}
+
+TEST_CASE("Destroying GPU memory spaces preserves the current device",
+          "[memory_space][.multi-device]")
+{
+  if (rmm::get_num_cuda_devices() < 2) { SKIP("requires at least two GPUs"); }
+
+  rmm::cuda_set_device_raii const restore{rmm::get_current_cuda_device()};
+  auto manager = createDualGpuMemoryManager();
+  REQUIRE(manager->get_memory_space(Tier::GPU, 0) != nullptr);
+  REQUIRE(manager->get_memory_space(Tier::GPU, 1) != nullptr);
+
+  // Tear down while device 1 is current, so GPU 0's stream pool is destroyed off its device.
+  REQUIRE(cudaSetDevice(1) == cudaSuccess);
+  manager.reset();
+  REQUIRE(rmm::get_current_cuda_device().value() == 1);
+  REQUIRE(cudaGetLastError() == cudaSuccess);
 }

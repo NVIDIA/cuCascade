@@ -122,12 +122,13 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
       throw std::runtime_error("cannot make allocation with other reservation type");
     }
   }
-  auto buffers = allocate_multiple_blocks_internal(total_bytes, h_reservation_slot);
+  auto buffers = allocate_multiple_blocks_internal(
+    total_bytes, h_reservation_slot, h_reservation_slot ? h_reservation_slot->uuid() : 0);
   return multiple_blocks_allocation::create(std::move(buffers), *this, res);
 }
 
 std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_blocks_internal(
-  std::size_t total_bytes, chunked_reserved_area* h_reservation_slot)
+  std::size_t total_bytes, chunked_reserved_area* h_reservation_slot, std::size_t reservation_uuid)
 {
   CUCASCADE_FUNC_RANGE();
 
@@ -140,7 +141,7 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
   std::lock_guard<std::mutex> lock(_mutex);
   if (h_reservation_slot) {
     auto iter = _active_reservations.find(h_reservation_slot);
-    if (iter == _active_reservations.end()) {
+    if (iter == _active_reservations.end() || iter->second.uuid != reservation_uuid) {
       throw std::runtime_error("reservation has been freed already");
     }
     tracker               = std::addressof(iter->second);
@@ -328,12 +329,17 @@ void fixed_size_host_memory_resource::release_reservation(chunked_reserved_area*
 }
 
 void fixed_size_host_memory_resource::return_allocated_chunks(std::vector<std::byte*> chunks,
-                                                              chunked_reserved_area* arena)
+                                                              chunked_reserved_area* arena,
+                                                              std::size_t reservation_uuid)
 {
   size_t reclaimed_bytes = chunks.size() * _block_size;
   std::lock_guard lock(_mutex);
-  if (arena != nullptr && _active_reservations.contains(arena)) {
-    auto& tracker         = _active_reservations.at(arena);
+  auto iter = _active_reservations.find(arena);
+  // A later reservation can reuse a released arena's address while older allocations still
+  // retain it. Compare its generation before reading or charging the current arena.
+  if (arena != nullptr && iter != _active_reservations.end() &&
+      iter->second.uuid == reservation_uuid) {
+    auto& tracker         = iter->second;
     auto reservation_size = static_cast<int64_t>(arena->size());
     int64_t pre_reclaimation_size =
       tracker.allocated_bytes.fetch_sub(static_cast<int64_t>(reclaimed_bytes));

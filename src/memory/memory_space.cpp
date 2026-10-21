@@ -184,6 +184,14 @@ memory_space::memory_space(const disk_memory_space_config& config)
 
 memory_space::~memory_space()
 {
+  // The pool's streams were created on this space's device and must be destroyed with that
+  // device current, but a GPU space can be destroyed while another device is current (e.g.
+  // multi-GPU teardown).
+  if (_id.tier == Tier::GPU && _stream_pool) {
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{_id.device_id}};
+    _stream_pool.reset();
+  }
+
   // Unregister this memory_space's HOST pool from the cross-tier registry.
   // No-op for non-HOST tiers and for any partially-constructed instance whose
   // _reservation_allocator never received a fixed_size_host_memory_resource.
