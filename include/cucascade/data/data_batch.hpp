@@ -494,7 +494,7 @@ class read_only_data_batch {
  *
  * Holds an exclusive lock on the parent data_batch's mutex, permitting a single
  * writer with no concurrent readers. Provides all read methods plus write methods
- * (set_data, convert_to) and clone operations (clone, clone_to).
+ * (set_data, convert_to, relocate_to) and clone operations (clone, clone_to).
  *
  * Move-only. The exclusive lock is released when this object is destroyed or moved-from.
  */
@@ -524,6 +524,32 @@ class mutable_data_batch {
    * @param data New data representation (takes ownership).
    */
   void set_data(std::unique_ptr<idata_representation> data) { _batch->set_data(std::move(data)); }
+
+  /**
+   * @brief Move the batch's encoded representation to another memory space.
+   *
+   * Preserves payload bytes, encoding, metadata, and batch identity. Returns after the copy
+   * completes, then releases the old storage. A failure leaves the original representation in
+   * the batch. The exclusive accessor prevents concurrent readers during relocation; pending
+   * registered GPU readers have already completed before this accessor is acquired.
+   *
+   * Relocation to the current memory space is a no-op. Other moves require a representation
+   * implementing idata_representation::relocate().
+   *
+   * @param target_memory_space Destination memory space; must not be null.
+   * @param stream Stream on the participating GPU (the target for cross-GPU copies).
+   */
+  void relocate_to(const memory::memory_space* target_memory_space, ::cuda::stream_ref stream);
+
+  /**
+   * @brief Relocate using a caller-owned HOST or DISK destination reservation.
+   *
+   * The reservation must cover the destination allocation, including host block rounding, and
+   * follow the allocator's existing reservation lifetime rules. For a GPU destination, attach
+   * the reservation to the GPU allocator's stream tracker, then use the memory-space overload;
+   * attaching consumes the reservation, so a caller-owned GPU reservation cannot be passed here.
+   */
+  void relocate_to(memory::reservation& reservation, ::cuda::stream_ref stream);
 
   /**
    * @brief Convert the data representation in-place.
@@ -659,6 +685,10 @@ class mutable_data_batch {
    */
   mutable_data_batch(std::shared_ptr<data_batch> parent, std::unique_lock<std::shared_mutex> lock);
 
+  void relocate_impl(const memory::memory_space* target_memory_space,
+                     ::cuda::stream_ref stream,
+                     memory::reservation* reservation);
+
   /**
    * @brief Swap in a freshly converted representation, synchronizing @p stream first when the
    * conversion touched the GPU tier.
@@ -715,6 +745,15 @@ class idata_batch_probe {
   }
   virtual void conversion_completed([[maybe_unused]] const idata_representation& data,
                                     [[maybe_unused]] const bool success) noexcept
+  {
+  }
+  virtual void relocation_started(
+    [[maybe_unused]] const idata_representation& current_data,
+    [[maybe_unused]] const memory::memory_space* target_memory_space) noexcept
+  {
+  }
+  virtual void relocation_completed([[maybe_unused]] const idata_representation& data,
+                                    [[maybe_unused]] bool success) noexcept
   {
   }
   virtual void data_replaced([[maybe_unused]] const idata_representation& new_data) noexcept {}

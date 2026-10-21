@@ -432,6 +432,43 @@ void mutable_data_batch::rebind_stream(::cuda::stream_ref stream)
   if (auto* repr = _batch->get_data()) { repr->rebind_stream(stream); }
 }
 
+void mutable_data_batch::relocate_to(const memory::memory_space* target_memory_space,
+                                     ::cuda::stream_ref stream)
+{
+  relocate_impl(target_memory_space, stream, nullptr);
+}
+
+void mutable_data_batch::relocate_to(memory::reservation& reservation, ::cuda::stream_ref stream)
+{
+  relocate_impl(&reservation.get_memory_space(), stream, &reservation);
+}
+
+void mutable_data_batch::relocate_impl(const memory::memory_space* target_memory_space,
+                                       ::cuda::stream_ref stream,
+                                       memory::reservation* reservation)
+{
+  CUCASCADE_FUNC_RANGE();
+  if (target_memory_space == nullptr) {
+    throw std::invalid_argument("Relocation target memory space must not be null");
+  }
+  if (target_memory_space == &_batch->_data->get_memory_space()) { return; }
+
+  _batch->_probe->relocation_started(*_batch->_data, target_memory_space);
+  try {
+    // relocate() completes all transfers before returning. Keep the original representation
+    // installed until that succeeds so allocation and I/O failures leave the batch intact.
+    auto relocated = _batch->_data->relocate(target_memory_space, stream, reservation);
+    if (relocated == nullptr || &relocated->get_memory_space() != target_memory_space) {
+      throw std::logic_error("Relocation returned an invalid destination representation");
+    }
+    _batch->set_data(std::move(relocated));
+  } catch (...) {
+    _batch->_probe->relocation_completed(*_batch->_data, false);
+    throw;
+  }
+  _batch->_probe->relocation_completed(*_batch->_data, true);
+}
+
 std::shared_ptr<data_batch> mutable_data_batch::clone(
   uint64_t new_batch_id, ::cuda::stream_ref stream, std::unique_ptr<idata_batch_probe> probe) const
 {
