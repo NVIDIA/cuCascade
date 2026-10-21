@@ -25,9 +25,14 @@
 #include <rmm/error.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace cucascade {
 namespace memory {
@@ -51,9 +56,7 @@ fixed_size_host_memory_resource::fixed_size_host_memory_resource(
     _pool_size(pool_size),
     _upstream_mr(upstream_mr)
 {
-  for (std::size_t i = 0; i < initial_pools; ++i) {
-    expand_pool();
-  }
+  expand_pools_parallel(initial_pools);
 }
 #pragma GCC diagnostic pop
 
@@ -294,6 +297,63 @@ void fixed_size_host_memory_resource::expand_pool()
     ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, total_size, alignof(std::max_align_t));
 #pragma GCC diagnostic pop
 
+  add_pool(large_allocation);
+}
+
+void fixed_size_host_memory_resource::expand_pools_parallel(std::size_t n_pools)
+{
+  if (n_pools == 0) { return; }
+  const std::size_t total_size = _block_size * _pool_size;
+  // Concurrent page faulting stops scaling at about 16 threads.
+  const std::size_t n_threads = std::min<std::size_t>(
+    {n_pools, 16, static_cast<std::size_t>(std::max(1u, std::thread::hardware_concurrency()))});
+
+  int device = 0;
+  CUCASCADE_CUDA_TRY(cudaGetDevice(&device));
+  std::vector<void*> allocations(n_pools, nullptr);
+  std::atomic<std::size_t> next{0};
+  std::exception_ptr error;
+  std::mutex error_mutex;
+  std::vector<std::thread> threads;
+  threads.reserve(n_threads);
+  for (std::size_t t = 0; t < n_threads; ++t) {
+    threads.emplace_back([&] {
+      try {
+        CUCASCADE_CUDA_TRY(cudaSetDevice(device));
+        for (std::size_t i; (i = next.fetch_add(1)) < n_pools;) {
+          allocations[i] =
+            _upstream_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                                  total_size,
+                                  alignof(std::max_align_t));
+        }
+      } catch (...) {
+        next.store(n_pools);  // stop the other threads
+        std::lock_guard lock(error_mutex);
+        if (!error) { error = std::current_exception(); }
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  if (error) {
+    for (void* p : allocations) {
+      if (p != nullptr) {
+        _upstream_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                                p,
+                                total_size,
+                                alignof(std::max_align_t));
+      }
+    }
+    std::rethrow_exception(error);
+  }
+  for (void* p : allocations) {
+    add_pool(p);
+  }
+}
+
+void fixed_size_host_memory_resource::add_pool(void* large_allocation)
+{
   _allocated_blocks.push_back(large_allocation);
 
   for (std::size_t i = 0; i < _pool_size; ++i) {

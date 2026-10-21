@@ -389,6 +389,17 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
   void expand_pool();
 
   /**
+   * @brief Allocate @p n_pools pools from upstream concurrently, for the constructor.
+   *
+   * Pinning is dominated by faulting in and zeroing pages, which the upstream does in the
+   * calling thread; spreading the pools over threads overlaps that work.
+   */
+  void expand_pools_parallel(std::size_t n_pools);
+
+  /// Add one upstream allocation of @c _block_size * @c _pool_size bytes to the free list.
+  void add_pool(void* large_allocation);
+
+  /**
    * @brief registers reservation with the memory resource
    * @param res reserved bytes that is registered with the memory resource
    */

@@ -19,8 +19,11 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <numa.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <cstring>
+#include <tuple>
 
 namespace cucascade {
 namespace memory {
@@ -59,6 +62,16 @@ void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda:
   } else {
     void* ptr = numa_alloc_onnode(bytes, _numa_node);
     if (ptr == nullptr) { throw rmm::bad_alloc(std::strerror(errno)); }
+    // cudaHostRegister faults in the pages itself, but under a driver lock that serializes
+    // concurrent callers. Faulting them in here (with transparent huge pages where allowed)
+    // does the zeroing in the calling thread, so concurrent allocations overlap it and the
+    // register only pins resident pages.
+    std::ignore     = madvise(ptr, bytes, MADV_HUGEPAGE);
+    auto* const p   = static_cast<volatile char*>(ptr);
+    auto const page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    for (std::size_t off = 0; off < bytes; off += page) {
+      p[off] = 0;
+    }
     CUCASCADE_CUDA_TRY_ALLOC(
       cudaHostRegister(ptr, bytes, static_cast<unsigned int>(_cuda_host_flags)), bytes);
     return ptr;
