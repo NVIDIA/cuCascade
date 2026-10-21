@@ -74,6 +74,19 @@ target_link_libraries(
   cucascade_benchmarks PRIVATE cucascade_cudf benchmark::benchmark
                                benchmark::benchmark_main CUDA::cudart_static)
 
+# Encoded relocation across the HOST, GPU, and DISK tiers against raw copies.
+add_executable(cucascade_relocation_benchmarks
+               ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_encoded_relocation.cpp)
+target_compile_options(
+  cucascade_relocation_benchmarks
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
+    ${CUCASCADE_CUDA_WARNING_FLAGS})
+target_link_libraries(
+  cucascade_relocation_benchmarks
+  PRIVATE cucascade_cudf benchmark::benchmark benchmark::benchmark_main
+          CUDA::cudart_static)
+
 # Add custom target to run benchmarks
 add_custom_target(
   run_benchmarks

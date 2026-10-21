@@ -221,9 +221,12 @@ struct release_gate {
 TEST_CASE("data batch relocates compressed bytes and decodes only on explicit conversion",
           "[data_batch][relocation][encoded]")
 {
+  temporary_directory directory;
   memory::memory_space host{make_host_config(-1)};
   memory::memory_space other_host{make_host_config(-2)};
   memory::memory_space gpu{make_gpu_config()};
+  memory::memory_space disk{
+    memory::disk_memory_space_config{0, 1ull << 24, directory.path.string()}};
   rmm::cuda_stream stream;
   std::vector<std::byte> plain(8193, std::byte{0xAA});
   std::fill(plain.begin() + 4096, plain.end(), std::byte{0x3D});
@@ -252,7 +255,8 @@ TEST_CASE("data batch relocates compressed bytes and decodes only on explicit co
 
   {
     auto mutable_batch = batch->to_mutable();
-    for (auto* target : std::array{&gpu, &other_host, &gpu, &host}) {
+    std::filesystem::path disk_path;
+    for (auto* target : std::array{&disk, &gpu, &other_host, &gpu, &disk, &host}) {
       mutable_batch.relocate_to(target, stream);
       const auto& encoded = mutable_batch.get_data()->cast<encoded_data_representation>();
       REQUIRE(&encoded.get_memory_space() == target);
@@ -260,8 +264,17 @@ TEST_CASE("data batch relocates compressed bytes and decodes only on explicit co
       REQUIRE(encoded.get_payload_size() == compressed.size());
       REQUIRE(mutable_batch.get_batch_id() == 777);
       REQUIRE(decoder_calls == 0);
-      if (target != &gpu) { REQUIRE(host_bytes(encoded) == compressed); }
+      if (target == &disk) {
+        // Leaving DISK removed the previous copy's file.
+        if (!disk_path.empty()) { REQUIRE_FALSE(std::filesystem::exists(disk_path)); }
+        disk_path = encoded.get_file_path();
+        REQUIRE(std::filesystem::file_size(disk_path) == compressed.size());
+      } else if (target != &gpu) {
+        REQUIRE(host_bytes(encoded) == compressed);
+      }
     }
+    REQUIRE_FALSE(std::filesystem::exists(disk_path));
+    REQUIRE(disk.get_total_reserved_memory() == 0);
     REQUIRE(gpu.get_memory_resource_of<memory::Tier::GPU>()->get_total_allocated_bytes() == 0);
     REQUIRE(other_host.get_memory_resource_of<memory::Tier::HOST>()->get_total_allocated_bytes() ==
             0);
@@ -304,43 +317,44 @@ TEST_CASE("data batch preserves source and reports relocation failures",
   REQUIRE(host.get_memory_resource_of<memory::Tier::HOST>()->get_total_allocated_bytes() == 0);
 }
 
-TEST_CASE("data batch relocation to or from DISK fails and keeps the batch intact",
-          "[data_batch][relocation][disk]")
+TEST_CASE("data batch keeps its DISK source when disk I/O fails",
+          "[data_batch][relocation][disk][failure]")
 {
   temporary_directory directory;
   memory::memory_space host{make_host_config(-1)};
   memory::memory_space disk{
     memory::disk_memory_space_config{0, 1ull << 24, directory.path.string()}};
   rmm::cuda_stream stream;
-  const std::vector<std::byte> bytes(4097, std::byte{0x5C});
-  relocation_observer observer;
-  auto batch =
-    data_batch::make(1,
-                     encoded_data_representation::from_host(bytes, {"opaque", 1, 999999, {}}, host),
-                     std::make_unique<relocation_probe>(observer));
-  {
-    auto mutable_batch   = batch->to_mutable();
-    const auto* original = mutable_batch.get_data();
-    REQUIRE_THROWS_AS(mutable_batch.relocate_to(&disk, stream), std::logic_error);
-    REQUIRE(mutable_batch.get_data() == original);
-    REQUIRE(host_bytes(original->cast<encoded_data_representation>()) == bytes);
-    REQUIRE(observer.completed == 1);
-    REQUIRE_FALSE(observer.success);
-  }
-  REQUIRE(disk.get_total_reserved_memory() == 0);
-
   const auto path = directory.path / "compressed.bin";
+  const std::vector<std::byte> bytes(4097, std::byte{0xB5});
   write_file(path, bytes);
-  auto disk_batch = data_batch::make(
-    2,
-    encoded_data_representation::from_disk(path, 0, bytes.size(), {"opaque", 1, 999999, {}}, disk));
-  auto mutable_batch   = disk_batch->to_mutable();
-  const auto* original = mutable_batch.get_data();
-  REQUIRE_THROWS_AS(mutable_batch.relocate_to(&host, stream), std::logic_error);
+  auto source =
+    encoded_data_representation::from_disk(path, 0, bytes.size(), {"opaque", 1, 999999, {}}, disk);
+  auto* original = source.get();
+  relocation_observer observer;
+  auto batch = data_batch::make(1, std::move(source), std::make_unique<relocation_probe>(observer));
+  // A truncated file makes the read short.
+  std::filesystem::resize_file(path, 3);
+  auto mutable_batch = batch->to_mutable();
+  REQUIRE_THROWS(mutable_batch.relocate_to(&host, stream));
   REQUIRE(mutable_batch.get_data() == original);
   REQUIRE(std::filesystem::exists(path));
-  REQUIRE(host.get_memory_resource_of<memory::Tier::HOST>()->get_total_allocated_bytes() ==
-          ((bytes.size() + 4095) / 4096) * 4096);
+  REQUIRE(host.get_memory_resource_of<memory::Tier::HOST>()->get_total_allocated_bytes() == 0);
+  REQUIRE(observer.started == 1);
+  REQUIRE(observer.completed == 1);
+  REQUIRE_FALSE(observer.success);
+  REQUIRE(observer.completed_data == original);
+  REQUIRE(observer.replaced == 0);
+  write_file(path, bytes);
+  mutable_batch.relocate_to(&host, stream);
+  REQUIRE(host_bytes(mutable_batch.get_data()->cast<encoded_data_representation>()) == bytes);
+  REQUIRE(observer.started == 2);
+  REQUIRE(observer.completed == 2);
+  REQUIRE(observer.success);
+  REQUIRE(observer.replaced == 1);
+  // The borrowed file stays; only the import's reservation is released.
+  REQUIRE(std::filesystem::exists(path));
+  REQUIRE(disk.get_total_reserved_memory() == 0);
 }
 
 TEST_CASE("data batch relocation rejects null and unsupported targets and skips same space",

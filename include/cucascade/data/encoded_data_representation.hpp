@@ -54,13 +54,14 @@ enum class encoded_file_ownership { borrowed, owned };
  * representation converter registry using get_metadata() and the tier-specific storage accessor.
  *
  * The class is built into the cucascade-cudf library, but its interface has no cuDF dependency.
- * Relocation between HOST and GPU spaces, and between GPU spaces, is supported. Relocation to or
- * from a DISK space is not supported yet and throws std::logic_error before touching either side;
- * from_disk() adopts a file range without any I/O.
+ * Relocation works between any two of the HOST, GPU, and DISK tiers, including between two GPUs.
+ * DISK transfers go through the io context of the DISK memory space (the process-shared default
+ * when the space has none); from_disk() adopts a file range without any I/O.
  *
  * Memory spaces must outlive their representations. For a disk range adopted with owned ownership,
  * destruction removes the entire file, including bytes outside the adopted range. Borrowed files
- * are never removed.
+ * are never removed. Relocated disk copies are new files under the target space's mount path,
+ * hold the payload at offset 0, and are always owned.
  *
  * Direct use requires external synchronization, as with other data representations. When exposing
  * device bytes to an asynchronous writer, record_writer_event() after enqueueing its writes. A
@@ -113,10 +114,9 @@ class encoded_data_representation : public idata_representation {
    *        bytes there: the payload rounded up to whole host blocks for HOST, the payload itself
    *        for GPU and DISK.
    *
-   * relocate() rejects a HOST reservation smaller than this. relocate() never accepts a GPU
-   * reservation pointer, so the GPU value is for sizing a reservation that the caller attaches to
-   * the target allocator's tracker before relocating. The DISK value describes the footprint of a
-   * DISK copy; relocation to or from DISK is not supported yet.
+   * relocate() rejects a HOST or DISK reservation smaller than this. relocate() never accepts a
+   * GPU reservation pointer, so the GPU value is for sizing a reservation that the caller attaches
+   * to the target allocator's tracker before relocating.
    *
    * @throws std::invalid_argument if a HOST space's block size is not a power of two.
    * @throws std::overflow_error if rounding up to whole blocks overflows.
@@ -147,17 +147,26 @@ class encoded_data_representation : public idata_representation {
    * @brief Make a complete byte-preserving copy in a target space, leaving the source untouched.
    *
    * For transfers to GPU, @p stream belongs to the destination device. For transfers from GPU to
-   * HOST, it belongs to the source device. HOST-only transfers do not use the stream. DISK sources
-   * and targets are not supported yet.
+   * HOST or DISK, it belongs to the source device. Transfers between HOST and DISK spaces do not
+   * use the stream.
    * An optional reservation must belong to the target space and cover
-   * relocation_reservation_bytes(). HOST allocations draw from that reservation. GPU allocations
-   * follow the target allocator's existing reservation tracker; pass no reservation pointer and
-   * attach owned GPU reservations to the tracker before calling. A non-null GPU reservation
-   * pointer is rejected.
+   * relocation_reservation_bytes(). HOST allocations draw from that reservation. A DISK
+   * reservation is caller-owned and must outlive the copy's file; without one, the copy owns a
+   * reservation for its payload. GPU allocations follow the target allocator's existing
+   * reservation tracker; pass no reservation pointer and attach owned GPU reservations to the
+   * tracker before calling. A non-null GPU reservation pointer is rejected.
    *
-   * @throws std::logic_error if the source or the target is a DISK space (not supported yet).
+   * A GPU source is written to DISK directly from device memory when the target space's io context
+   * can write device memory, and through bounded pageable host staging otherwise. A failed copy
+   * removes its partially written file before the exception propagates.
+   *
    * @throws std::invalid_argument on a null target, a stream on the wrong device, or a reservation
    *         that belongs to another space, is too small, or is a GPU reservation.
+   * @throws rmm::out_of_memory if no reservation is passed and a DISK target has no room left.
+   * @throws std::logic_error if a DISK source's io context cannot read into device memory for a
+   *         GPU target, or a DISK target's io context cannot write.
+   * @throws std::system_error / std::runtime_error on an I/O failure, including a DISK source
+   *         whose file is shorter than its range.
    */
   [[nodiscard]] std::unique_ptr<idata_representation> relocate(
     const memory::memory_space* target,
@@ -182,6 +191,8 @@ class encoded_data_representation : public idata_representation {
                                                                ::cuda::stream_ref stream,
                                                                memory::reservation* reservation);
   void wait_for_writer() const;
+  /// Copy the payload into @p result when either side is a DISK space (see relocate()).
+  void relocate_disk(encoded_data_representation& result, ::cuda::stream_ref stream) const;
   [[nodiscard]] void* device_data();
 
   std::size_t _payload_size;
