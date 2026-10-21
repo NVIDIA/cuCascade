@@ -23,10 +23,14 @@ extern "C" CUresult CUDAAPI cuDeviceGetAttribute(int* value,
                                                  CUdevice_attribute attribute,
                                                  CUdevice device)
 {
-  if (value == nullptr || attribute != CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK ||
-      device != 7) {
-    return CUDA_ERROR_INVALID_VALUE;
+  if (value == nullptr || device != 7) { return CUDA_ERROR_INVALID_VALUE; }
+  switch (attribute) {
+    // The fake GPU has a decompression engine and a coherent C2C host link.
+    case CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK:
+    case CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED:
+    case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES:
+      *value = 1;
+      return CUDA_SUCCESS;
+    default: return CUDA_ERROR_INVALID_VALUE;
   }
-  *value = 1;
-  return CUDA_SUCCESS;
 }

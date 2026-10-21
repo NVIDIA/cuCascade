@@ -225,8 +225,9 @@ set_target_properties(
              "${CMAKE_CURRENT_BINARY_DIR}/fake_cuda_driver/incomplete")
 
 add_executable(cucascade_cuda_driver_loading_test cuda_driver_loading_test.cpp)
-target_link_libraries(cucascade_cuda_driver_loading_test
-                      PRIVATE cucascade_topology_discovery ${CMAKE_DL_LIBS})
+target_link_libraries(
+  cucascade_cuda_driver_loading_test PRIVATE cucascade_topology_discovery
+                                             CUDA::nvml_static ${CMAKE_DL_LIBS})
 # The test interposes dlopen to attribute CUDA driver loads to their caller.
 # Export it so every module resolves to the interposer, and compile as PIE so
 # the address of a shared-library function is its real definition rather than a
