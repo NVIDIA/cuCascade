@@ -665,17 +665,19 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
 
 }  // namespace
 
-uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx)), _tname(tname)
+uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx,
+                             std::string_view tname,
+                             reactor_placement placement)
+  : _ctx(std::move(ctx)), _tname(tname), _placement(std::move(placement))
 {
   if (_ctx == nullptr) {
     throw std::invalid_argument("uring_reactor: reactor_context must be non-null");
   }
-  if (_ctx->host_memory_resource() == nullptr) {
+  if (staging_resource() == nullptr) {
     throw std::invalid_argument("uring_reactor: host memory resource must be non-null");
   }
   _config              = _ctx->cfg();
-  _bounce_slot_size    = _ctx->host_memory_resource()->get_block_size();
+  _bounce_slot_size    = staging_resource()->get_block_size();
   _slices_per_pass     = effective_slices_per_pass(_config.slices_per_pass);
   _low_service_quantum = std::min(_slices_per_pass, max_slices_per_pass);
 }
@@ -742,7 +744,7 @@ void uring_reactor::start()
     std::clamp(STAGING_BUDGET_BYTES / _bounce_slot_size, std::size_t{1}, MAX_NUM_SLOTS);
   auto const staging_bytes = slot_count * _bounce_slot_size;
   try {
-    _bounce_storage = _ctx->host_memory_resource()->allocate_multiple_blocks(staging_bytes);
+    _bounce_storage = staging_resource()->allocate_multiple_blocks(staging_bytes);
   } catch (rmm::out_of_memory const& e) {
     throw std::runtime_error("uring_reactor: cannot reserve " + std::to_string(staging_bytes) +
                              " bytes of pinned staging (" + std::to_string(slot_count) + " x " +
@@ -760,10 +762,12 @@ void uring_reactor::start()
     try {
       _rejection_error = nullptr;
       _accepting.store(true, std::memory_order_release);
-      _worker =
-        std::jthread([this, ready = std::move(ready)](
-                       std::stop_token stop_token) mutable { worker_loop(stop_token, ready); },
-                     _stop_source.get_token());
+      _worker = std::jthread(
+        [this, ready = std::move(ready)](std::stop_token stop_token) mutable {
+          pin_reactor_thread(_placement, _tname);
+          worker_loop(stop_token, ready);
+        },
+        _stop_source.get_token());
     } catch (...) {
       _accepting.store(false, std::memory_order_release);
       _bounce_storage.reset();

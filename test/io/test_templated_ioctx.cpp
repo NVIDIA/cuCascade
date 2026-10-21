@@ -286,6 +286,127 @@ TEST_CASE("next_reactor sends a read to the two least-backlogged reactors",
   }
 }
 
+namespace {
+
+constexpr std::size_t MiB = 1UL << 20;
+
+/// Four reactors: 0 and 1 homed on GPU 0 (NUMA 0), 2 and 3 on GPU 1 (NUMA 1).
+struct placed_pool {
+  explicit placed_pool(std::initializer_list<std::size_t> backlogs,
+                       std::initializer_list<int> numa_nodes = {0, 0, 1, 1})
+  {
+    cucascade::io::reactor_layout layout;
+    std::vector<std::unique_ptr<fake_reactor>> reactors;
+    auto numa = numa_nodes.begin();
+    for (auto const backlog : backlogs) {
+      reactors.push_back(std::make_unique<fake_reactor>(backlog));
+      raw.push_back(reactors.back().get());
+      cucascade::io::reactor_placement placement;
+      placement.gpu_id    = static_cast<int>(layout.placements.size() / 2);
+      placement.numa_node = *numa++;
+      layout.placements.push_back(placement);
+    }
+    context = std::make_unique<fake_context>(std::move(reactors), layout);
+  }
+
+  /// Indices of the reactors next_reactor picks for a request on @p device_id.
+  std::vector<std::size_t> pick(int device_id)
+  {
+    std::vector<std::size_t> picked;
+    for (auto* reactor :
+         context->next_reactor(*object, 3, fake_context::io_op_type::device_async, device_id)) {
+      picked.push_back(
+        static_cast<std::size_t>(std::find(raw.begin(), raw.end(), reactor) - raw.begin()));
+    }
+    return picked;
+  }
+
+  std::vector<fake_reactor*> raw;
+  std::unique_ptr<fake_context> context;
+  std::shared_ptr<fake_object> object = std::make_shared<fake_object>("fake", 4096);
+};
+
+}  // namespace
+
+TEST_CASE("next_reactor keeps a device request on its GPU's NUMA node",
+          "[io][templated_ioctx][next_reactor][numa]")
+{
+  placed_pool pool{{1000, 10, 0, 5}};
+  // The idle remote reactors do not draw a request away from a local node that keeps up.
+  CHECK(pool.pick(0) == std::vector<std::size_t>{1, 0});
+  CHECK(pool.pick(1) == std::vector<std::size_t>{2, 3});
+}
+
+TEST_CASE("next_reactor uses the whole pool for host-only requests and unknown GPUs",
+          "[io][templated_ioctx][next_reactor][numa]")
+{
+  placed_pool pool{{1000, 10, 20, 500}};
+  CHECK(pool.pick(-1) == std::vector<std::size_t>{1, 2});
+  CHECK(pool.pick(7) == std::vector<std::size_t>{1, 2});
+}
+
+TEST_CASE("next_reactor spills a device request once its NUMA node is much busier",
+          "[io][templated_ioctx][next_reactor][numa]")
+{
+  SECTION("over the floor and over the ratio: spill to the least backlogged of the pool")
+  {
+    placed_pool pool{{200 * MiB, 100 * MiB, 1 * MiB, 0}};
+    CHECK(pool.pick(0) == std::vector<std::size_t>{3, 2});
+  }
+  SECTION("over the floor but within the ratio: stay local")
+  {
+    placed_pool pool{{100 * MiB, 100 * MiB, 60 * MiB, 60 * MiB}};
+    CHECK(pool.pick(0) == std::vector<std::size_t>{0, 1});
+  }
+  SECTION("under the floor: stay local however idle the rest is")
+  {
+    placed_pool pool{{64 * MiB, 64 * MiB, 0, 0}};
+    CHECK(pool.pick(0) == std::vector<std::size_t>{0, 1});
+  }
+}
+
+TEST_CASE("next_reactor falls back to the GPU's own reactors when its NUMA node is unknown",
+          "[io][templated_ioctx][next_reactor][numa]")
+{
+  placed_pool pool{{0, 0, 0, 0}, {-1, -1, -1, -1}};
+  for (int round = 0; round < 4; ++round) {
+    auto picked = pool.pick(1);
+    std::ranges::sort(picked);
+    CHECK(picked == std::vector<std::size_t>{2, 3});
+  }
+}
+
+TEST_CASE("a device read is routed by the GPU of its first device slice",
+          "[io][templated_ioctx][next_reactor][numa]")
+{
+  placed_pool pool{{0, 0, 0, 0}};
+  std::uint8_t byte{};
+  std::vector<cucascade::io::prepared_io_slice> slices;
+  slices.emplace_back(cucascade::io::range{0, 40}, cucascade::io::host_buffer{&byte});
+  slices.emplace_back(
+    cucascade::io::range{100, 40},
+    cucascade::io::device_buffer{&byte, ::cuda::stream_ref{cudaStream_t{nullptr}}, 1});
+  static_cast<void>(pool.context->mixed_readv_async_io(*pool.object, std::move(slices)));
+
+  CHECK(pool.raw[0]->requests.empty());
+  CHECK(pool.raw[1]->requests.empty());
+  CHECK(pool.raw[2]->requests.size() + pool.raw[3]->requests.size() == 2);
+  for (auto* reactor : pool.raw) {
+    for (auto& request : reactor->requests) {
+      complete_request(*request);
+    }
+  }
+}
+
+TEST_CASE("a layout must place every reactor", "[io][templated_ioctx][numa]")
+{
+  std::vector<std::unique_ptr<fake_reactor>> reactors;
+  reactors.push_back(std::make_unique<fake_reactor>());
+  reactors.push_back(std::make_unique<fake_reactor>());
+  auto const layout = cucascade::io::reactor_layout::unplaced(1);
+  CHECK_THROWS_AS(fake_context(std::move(reactors), layout), std::invalid_argument);
+}
+
 TEST_CASE("automatic priority always resolves high; only an explicit low is low",
           "[io][templated_ioctx][priority]")
 {

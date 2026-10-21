@@ -691,8 +691,10 @@ cufile_io_object::~cufile_io_object()
 // cufile_reactor: lifecycle
 // ---------------------------------------------------------------------------
 
-cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx)), _tname(tname)
+cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx,
+                               std::string_view tname,
+                               reactor_placement placement)
+  : _ctx(std::move(ctx)), _tname(tname), _placement(std::move(placement))
 {
   if (_ctx == nullptr) {
     throw std::invalid_argument("cufile_reactor: reactor_context must be non-null");
@@ -722,8 +724,12 @@ void cufile_reactor::start()
   std::lock_guard lock(_enqueue_mutex);
   try {
     _accepting.store(true, std::memory_order_release);
-    _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(stop_token); },
-                           _stop_source.get_token());
+    _worker = std::jthread(
+      [this](std::stop_token stop_token) {
+        pin_reactor_thread(_placement, _tname);
+        worker_loop(stop_token);
+      },
+      _stop_source.get_token());
   } catch (...) {
     _accepting.store(false, std::memory_order_release);
     throw;

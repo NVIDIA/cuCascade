@@ -32,6 +32,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/topology_index.hpp>
 
 #include <cctype>
 #include <exception>
@@ -76,18 +77,34 @@ std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_
   return nullptr;
 }
 
+/// Placements of @p reactors_per_gpu reactors per GPU of @p topology (see
+/// make_reactor_placements) with the config's spill policy.
+reactor_layout make_layout(std::size_t reactors_per_gpu,
+                           const io_config& config,
+                           const cucascade::memory::topology_index* topology,
+                           cucascade::memory::memory_reservation_manager* rm)
+{
+  return reactor_layout{
+    make_reactor_placements(reactors_per_gpu, topology, rm, config.pin_reactor_threads),
+    config.reactor_spill};
+}
+
 }  // namespace
 
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
 
 #ifdef CUCASCADE_HAS_CUFILE
-factory_type make_cufile_ioctx_factory()
+factory_type make_cufile_ioctx_factory(
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
 {
-  return [](const io_config& config) -> std::shared_ptr<ioctx> {
+  return [topology_index =
+            std::move(topology_index)](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile);
-      return std::make_shared<cufile::cufile_ioctx>(config.cufile_n_reactors, std::move(ctx));
+      return std::make_shared<cufile::cufile_ioctx>(
+        make_layout(config.cufile_reactors_per_gpu, config, topology_index.get(), nullptr),
+        std::move(ctx));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -97,9 +114,11 @@ factory_type make_cufile_ioctx_factory()
 #endif
 
 factory_type make_uring_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager)
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
 {
-  return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
+  return [&reservation_manager, topology_index = std::move(topology_index)](
+           const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto* host_mr = first_host_resource(reservation_manager);
       if (host_mr == nullptr) {
@@ -107,9 +126,13 @@ factory_type make_uring_ioctx_factory(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
-      // One reactor_context shares config and the pinned staging resource.
+      // One reactor_context shares config and the fallback pinned staging
+      // resource; each placed reactor stages from its own NUMA node's.
       auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
-      return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
+      return std::make_shared<uring::uring_ioctx>(
+        make_layout(
+          config.uring_reactors_per_gpu, config, topology_index.get(), &reservation_manager),
+        std::move(ctx));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -118,9 +141,11 @@ factory_type make_uring_ioctx_factory(
 }
 
 factory_type make_rest_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager)
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
 {
-  return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
+  return [&reservation_manager, topology_index = std::move(topology_index)](
+           const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto authorizer = make_s3_authorizer(config.object_store);
       if (!authorizer) {
@@ -139,7 +164,13 @@ factory_type make_rest_ioctx_factory(
       rest_cfg.tls_verify     = config.object_store.tls_verify;
       auto ctx                = std::make_shared<rest::rest_reactor::reactor_context>(
         std::move(rest_cfg), std::move(authorizer), host_mr);
-      return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
+      // Without a HOST space there is no staging to place either.
+      return std::make_shared<rest::rest_ioctx>(
+        make_layout(config.rest_reactors_per_gpu,
+                    config,
+                    topology_index.get(),
+                    host_mr == nullptr ? nullptr : &reservation_manager),
+        std::move(ctx));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -152,9 +183,12 @@ factory_type make_rest_ioctx_factory(
 // ---------------------------------------------------------------------------
 
 io_context_registry::io_context_registry(
-  config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
+  config_type config,
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
+    _topology_index(std::move(topology_index)),
     _prefer_cufile(_config.backend == io_backend::cufile)
 {
   // uring / rest / cufile claim paths via their reactor's static supports()
@@ -162,18 +196,19 @@ io_context_registry::io_context_registry(
   // catch-all: a path no backend claims resolves to nothing.  Without cufile.h
   // there is no cufile backend and backend=cufile behaves like backend=native.
 #ifdef CUCASCADE_HAS_CUFILE
-  _entries.emplace(
-    io_context_type::cufile,
-    entry{io_context_type::cufile, &cufile::cufile_reactor::supports, make_cufile_ioctx_factory()});
+  _entries.emplace(io_context_type::cufile,
+                   entry{io_context_type::cufile,
+                         &cufile::cufile_reactor::supports,
+                         make_cufile_ioctx_factory(_topology_index)});
 #endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
-                         make_uring_ioctx_factory(_reservation_manager)});
+                         make_uring_ioctx_factory(_reservation_manager, _topology_index)});
   _entries.emplace(io_context_type::restful,
                    entry{io_context_type::restful,
                          &rest::rest_reactor::supports,
-                         make_rest_ioctx_factory(_reservation_manager)});
+                         make_rest_ioctx_factory(_reservation_manager, _topology_index)});
 }
 
 void io_context_registry::register_ioctx(io_context_type type,

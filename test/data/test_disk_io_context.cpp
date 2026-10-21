@@ -278,12 +278,12 @@ TEST_CASE("make_disk_io_context resolves automatic to a concrete backend", "[dis
 TEST_CASE("make_disk_io_context rejects a backend without reactors", "[disk][io][context]")
 {
   disk_io_context_options options;
-  options.backend             = disk_io_backend::uring;
-  options.io.uring_n_reactors = 0;
+  options.backend                   = disk_io_backend::uring;
+  options.io.uring_reactors_per_gpu = 0;
   REQUIRE_THROWS_AS(make_disk_io_context(options), std::invalid_argument);
 
-  options.backend              = disk_io_backend::cufile;
-  options.io.cufile_n_reactors = 0;
+  options.backend                    = disk_io_backend::cufile;
+  options.io.cufile_reactors_per_gpu = 0;
   REQUIRE_THROWS_AS(make_disk_io_context(options), std::invalid_argument);
 }
 

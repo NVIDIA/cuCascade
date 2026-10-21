@@ -30,9 +30,16 @@ namespace cucascade::io::cufile {
 
 cufile_ioctx::cufile_ioctx(std::size_t n_reactors,
                            std::shared_ptr<cufile_reactor::reactor_context> ctx)
-  : templated_ioctx<cufile_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
-      return std::make_unique<cufile_reactor>(ctx, "cufile-" + std::to_string(i++));
-    })
+  : cufile_ioctx(reactor_layout::unplaced(n_reactors), std::move(ctx))
+{
+}
+
+cufile_ioctx::cufile_ioctx(reactor_layout const& layout,
+                           std::shared_ptr<cufile_reactor::reactor_context> ctx)
+  : templated_ioctx<cufile_reactor>(
+      layout, [ctx = std::move(ctx), i = 0](reactor_placement const& placement) mutable {
+        return std::make_unique<cufile_reactor>(ctx, "cufile-" + std::to_string(i++), placement);
+      })
 {
 }
 
@@ -54,8 +61,7 @@ std::vector<cufile_reactor*> cufile_ioctx::next_reactor(cufile_io_object const& 
                                                         io_op_type type,
                                                         int device_id)
 {
-  auto const count = _reactors.size();
-  if (type == io_op_type::write_vector_async && device_id < 0 && count > 1) {
+  if (type == io_op_type::write_vector_async && device_id < 0 && _reactors.size() > 1) {
     // A host-only vectored write (device_id stays unresolved without device
     // slices) goes to one reactor: its page-cache writes with early writeback
     // already keep the device busy, and interleaving writers of one file only
@@ -65,23 +71,12 @@ std::vector<cufile_reactor*> cufile_ioctx::next_reactor(cufile_io_object const& 
     if (selected.size() > 1) selected.resize(1);
     return selected;
   }
-  if (type != io_op_type::host_vector_async || n_slices <= 2 || count <= 2) {
+  auto const candidates = routable_reactors(device_id);
+  if (type != io_op_type::host_vector_async || n_slices <= 2 || candidates.size() <= 2) {
     return templated_ioctx<cufile_reactor>::next_reactor(object, n_slices, type, device_id);
   }
-  // A vectored read: every reactor, least backlogged first.
-  auto const start = _next.fetch_add(1, std::memory_order_relaxed) % count;
-  std::vector<std::pair<std::size_t, std::size_t>> ranked;
-  ranked.reserve(count);
-  for (std::size_t distance = 0; distance < count; ++distance) {
-    ranked.emplace_back(_reactors[(start + distance) % count]->queued_bytes(), distance);
-  }
-  std::sort(ranked.begin(), ranked.end());
-  std::vector<cufile_reactor*> result;
-  result.reserve(count);
-  for (auto const& [bytes, distance] : ranked) {
-    result.push_back(_reactors[(start + distance) % count].get());
-  }
-  return result;
+  // A vectored read: every reactor it may use, least backlogged first.
+  return least_backlogged(candidates, candidates.size());
 }
 
 }  // namespace cucascade::io::cufile
