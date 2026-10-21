@@ -15,16 +15,21 @@
  * limitations under the License.
  */
 
+#include "utils/disk_test_utils.hpp"
 #include "utils/test_memory_resources.hpp"
 
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/data/encoded_data_representation.hpp>
 #include <cucascade/error.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
@@ -32,15 +37,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace cucascade;
@@ -113,6 +125,140 @@ void write_file(const std::filesystem::path& path,
   ::close(fd);
 }
 
+/// Read @p size bytes at @p offset of @p path with POSIX pread.
+std::vector<std::byte> read_file(const std::filesystem::path& path,
+                                 std::size_t offset,
+                                 std::size_t size)
+{
+  std::vector<std::byte> bytes(size);
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) { throw std::system_error(errno, std::generic_category(), "open"); }
+  std::size_t done = 0;
+  while (done < size) {
+    const auto count =
+      ::pread(fd, bytes.data() + done, size - done, static_cast<off_t>(offset + done));
+    if (count <= 0) {
+      const int error = count < 0 ? errno : EIO;
+      ::close(fd);
+      throw std::system_error(error, std::generic_category(), "pread");
+    }
+    done += static_cast<std::size_t>(count);
+  }
+  ::close(fd);
+  return bytes;
+}
+
+std::size_t file_count(const std::filesystem::path& directory)
+{
+  return static_cast<std::size_t>(std::distance(std::filesystem::directory_iterator{directory},
+                                                std::filesystem::directory_iterator{}));
+}
+
+/// A DISK memory space under @p directory without an io context (the converters adopt the
+/// process-shared default).
+std::unique_ptr<memory::memory_space> make_disk(const std::filesystem::path& directory,
+                                                std::size_t capacity = 1ull << 24,
+                                                int id               = 0)
+{
+  return std::make_unique<memory::memory_space>(
+    memory::disk_memory_space_config{id, capacity, directory.string()});
+}
+
+/**
+ * @brief An io context that forwards to a real one, with switches to fail requests or to hide
+ *        device writes, and counters of what reached the real context.
+ */
+class scripted_ioctx final : public io::ioctx {
+ public:
+  explicit scripted_ioctx(std::shared_ptr<io::ioctx> inner) : _inner(std::move(inner)) {}
+
+  [[nodiscard]] io::io_context_type type() const noexcept override { return _inner->type(); }
+  void shutdown() noexcept override {}
+  [[nodiscard]] bool supports(std::string_view path) const noexcept override
+  {
+    return _inner->supports(path);
+  }
+  [[nodiscard]] bool supports_device_read() const noexcept override
+  {
+    return _inner->supports_device_read();
+  }
+  [[nodiscard]] bool supports_host_to_device_read() const noexcept override
+  {
+    return _inner->supports_host_to_device_read();
+  }
+  [[nodiscard]] bool supports_vector_host_read() const noexcept override
+  {
+    return _inner->supports_vector_host_read();
+  }
+  [[nodiscard]] bool supports_device_range_read() const noexcept override
+  {
+    return _inner->supports_device_range_read();
+  }
+  [[nodiscard]] bool supports_write() const noexcept override { return _inner->supports_write(); }
+  [[nodiscard]] bool supports_device_write() const noexcept override
+  {
+    return device_write && _inner->supports_device_write();
+  }
+  [[nodiscard]] std::vector<io::byte_range> align_and_coalesce(
+    std::span<const io::byte_range> ranges, std::optional<size_t> alignment) const noexcept override
+  {
+    return _inner->align_and_coalesce(ranges, alignment);
+  }
+  size_t host_read_io(const io::io_object& object,
+                      size_t offset,
+                      size_t size,
+                      uint8_t* destination) override
+  {
+    return _inner->host_read_io(object, offset, size, destination);
+  }
+  exec::semi_future<size_t> mixed_readv_async_io(
+    const io::io_object& object, std::vector<io::prepared_io_slice>&& slices) noexcept override
+  {
+    if (fail_read) { return failure("injected read failure"); }
+    return _inner->mixed_readv_async_io(object, std::move(slices));
+  }
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    const io::io_object& object, std::vector<io::prepared_io_slice>&& slices) noexcept override
+  {
+    for (const auto& slice : slices) {
+      if (slice.has_device_request()) { device_write_slices.fetch_add(1); }
+    }
+    auto written = _inner->mixed_writev_async_io(object, std::move(slices));
+    if (!fail_write) { return written; }
+    // Let the bytes land first, so the failed copy leaves a written file behind to clean up.
+    try {
+      (void)std::move(written).get();
+    } catch (...) {
+      return exec::make_semi_future<std::size_t>(std::current_exception());
+    }
+    return failure("injected write failure");
+  }
+
+  std::atomic<bool> fail_read{false};
+  std::atomic<bool> fail_write{false};
+  std::atomic<bool> device_write{true};
+  std::atomic<std::size_t> device_write_slices{0};
+
+ protected:
+  std::shared_ptr<io::io_object> create_io_object(std::string path) override
+  {
+    return _inner->open_io_object(std::move(path));
+  }
+  std::shared_ptr<io::io_object> create_io_object_for_write(std::string path,
+                                                            io::write_open_options options) override
+  {
+    return _inner->open_io_object_for_write(std::move(path), options);
+  }
+
+ private:
+  static exec::semi_future<std::size_t> failure(const char* what)
+  {
+    return exec::make_semi_future<std::size_t>(std::make_exception_ptr(std::runtime_error(what)));
+  }
+
+  std::shared_ptr<io::ioctx> _inner;
+};
+
 encoded_data_metadata make_metadata()
 {
   return {"test/opaque-rle", 17, 999999, {std::byte{0}, std::byte{255}, std::byte{42}}};
@@ -127,7 +273,7 @@ std::vector<std::byte> payload(std::size_t size)
   return bytes;
 }
 
-/// The payload of a HOST or GPU representation.
+/// The payload of a representation; a DISK payload is read with POSIX pread.
 std::vector<std::byte> read_bytes(const encoded_data_representation& representation)
 {
   std::vector<std::byte> result(representation.get_payload_size());
@@ -141,6 +287,9 @@ std::vector<std::byte> read_bytes(const encoded_data_representation& representat
       std::memcpy(result.data() + offset, block.data(), count);
       offset += count;
     }
+  } else if (representation.get_current_tier() == memory::Tier::DISK) {
+    result =
+      read_file(representation.get_file_path(), representation.get_file_offset(), result.size());
   } else {
     REQUIRE(representation.get_current_tier() == memory::Tier::GPU);
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{representation.get_device_id()}};
@@ -154,15 +303,20 @@ std::vector<std::byte> read_bytes(const encoded_data_representation& representat
 
 }  // namespace
 
-TEST_CASE("encoded payload preserves every byte across HOST and GPU tier pairs",
-          "[encoded][relocation]")
+TEST_CASE("encoded payload preserves every byte across all tier pairs", "[encoded][relocation]")
 {
+  const auto backend = GENERATE(from_range(test::disk_test_backends));
+  CAPTURE(test::to_string(backend));
+  temp_directory directory;
+  auto disk = test::make_disk_space(backend, 0, directory.path.string());
+  if (disk == nullptr) { SKIP("the " << test::to_string(backend) << " backend cannot run here"); }
   memory::memory_space host{host_config()};
   memory::memory_space gpu{gpu_config()};
-  std::array<memory::memory_space*, 2> spaces{&host, &gpu};
+  std::array<memory::memory_space*, 3> spaces{&host, &gpu, disk.get()};
   rmm::cuda_stream stream;
   const auto metadata = make_metadata();
 
+  // Below, at, and just past one I/O block, and an unaligned multi-block payload.
   for (const auto size : {0u, 1u, 4095u, 4096u, 4097u, 12305u}) {
     const auto bytes = payload(size);
     auto seed        = encoded_data_representation::from_host(bytes, metadata, host);
@@ -181,35 +335,51 @@ TEST_CASE("encoded payload preserves every byte across HOST and GPU tier pairs",
         REQUIRE(read_bytes(source->cast<encoded_data_representation>()) == bytes);
         if (target_space == &host) {
           REQUIRE(encoded.get_size_in_bytes() == ((bytes.size() + 4095) / 4096) * 4096);
-        } else {
+        } else if (target_space == &gpu) {
           REQUIRE(encoded.get_size_in_bytes() == bytes.size());
           REQUIRE(encoded.get_writer_event() != nullptr);
+        } else {
+          REQUIRE(encoded.get_size_in_bytes() == bytes.size());
+          REQUIRE(encoded.get_file_offset() == 0);
+          REQUIRE(encoded.get_file_path().parent_path() == directory.path);
+          REQUIRE(std::filesystem::file_size(encoded.get_file_path()) == bytes.size());
         }
       }
     }
   }
+  // Every DISK copy removed its file and released its reservation.
+  REQUIRE(disk->get_total_reserved_memory() == 0);
+  REQUIRE(std::filesystem::is_empty(directory.path));
 }
 
 TEST_CASE("encoded clones own independent storage", "[encoded][relocation][ownership]")
 {
+  temp_directory directory;
   memory::memory_space host{host_config()};
   memory::memory_space gpu{gpu_config()};
+  auto disk = make_disk(directory.path);
   rmm::cuda_stream stream;
   const auto bytes = payload(4097);
   auto seed        = encoded_data_representation::from_host(bytes, make_metadata(), host);
-  for (auto* space : std::array{&host, &gpu}) {
+  for (auto* space : std::array{&host, &gpu, disk.get()}) {
     auto original = seed->relocate(space, stream);
     auto clone    = original->clone(stream);
     auto& source  = original->cast<encoded_data_representation>();
     auto& copy    = clone->cast<encoded_data_representation>();
     REQUIRE(&copy.get_memory_space() == space);
-    if (space == &gpu) {
+    if (space == disk.get()) {
+      REQUIRE(source.get_file_path() != copy.get_file_path());
+      REQUIRE(std::filesystem::exists(copy.get_file_path()));
+    } else if (space == &gpu) {
       REQUIRE(source.get_device_buffer().data() != copy.get_device_buffer().data());
     } else {
       REQUIRE(source.get_host_buffer()->at(0).data() != copy.get_host_buffer()->at(0).data());
     }
     original.reset();
     REQUIRE(read_bytes(copy) == bytes);
+    const auto path = space == disk.get() ? copy.get_file_path() : std::filesystem::path{};
+    clone.reset();
+    if (!path.empty()) { REQUIRE_FALSE(std::filesystem::exists(path)); }
   }
 }
 
@@ -252,45 +422,175 @@ TEST_CASE("encoded relocation reservation bytes match the destination footprint"
   auto result      = source->relocate(&target, stream, reservation.get());
   REQUIRE(result->get_size_in_bytes() == need);
   REQUIRE(read_bytes(result->cast<encoded>()) == bytes);
+
+  const auto disk_need = encoded::relocation_reservation_bytes(disk, bytes.size());
+  {
+    auto short_reservation = disk.make_reservation(disk_need - 1);
+    REQUIRE_THROWS_AS(source->relocate(&disk, stream, short_reservation.get()),
+                      std::invalid_argument);
+  }
+  auto disk_reservation = disk.make_reservation(disk_need);
+  auto on_disk          = source->relocate(&disk, stream, disk_reservation.get());
+  REQUIRE(read_bytes(on_disk->cast<encoded>()) == bytes);
 }
 
-TEST_CASE("encoded relocation to or from DISK is rejected before touching either side",
-          "[encoded][relocation][disk]")
+TEST_CASE("encoded DISK legs serve aligned and unaligned ranges through each io context",
+          "[encoded][relocation][disk][backend]")
+{
+  const auto backend = GENERATE(disk_io_backend::uring, disk_io_backend::cufile);
+  CAPTURE(test::to_string(backend));
+  auto context = test::try_make_disk_io_context(backend);
+  if (context == nullptr) {
+    SKIP("the " << test::to_string(backend) << " backend cannot run here");
+  }
+  temp_directory directory;
+  auto disk = make_disk(directory.path);
+  disk->set_io_context(context);
+  memory::memory_space gpu{gpu_config()};
+  memory::memory_space host{host_config(-1, 4ull << 20)};
+  rmm::cuda_stream stream;
+  // Whole I/O blocks and partial tails, at aligned and unaligned file offsets of imported ranges.
+  for (const std::size_t size :
+       {std::size_t{4096}, std::size_t{4097}, (std::size_t{1} << 20) + 4095}) {
+    for (const std::size_t offset : {std::size_t{0}, std::size_t{37}, std::size_t{4096}}) {
+      INFO("size=" << size << " offset=" << offset);
+      const auto bytes = payload(size);
+      const auto path  = directory.path / "imported.bin";
+      write_file(path, payload(offset));
+      write_file(path, bytes, offset);
+      auto imported =
+        encoded_data_representation::from_disk(path, offset, bytes.size(), make_metadata(), *disk);
+      auto device = imported->relocate(&gpu, stream);
+      REQUIRE(read_bytes(device->cast<encoded_data_representation>()) == bytes);
+      auto written = device->relocate(disk.get(), stream);
+      REQUIRE(read_bytes(written->cast<encoded_data_representation>()) == bytes);
+      REQUIRE(std::filesystem::file_size(
+                written->cast<encoded_data_representation>().get_file_path()) == bytes.size());
+      auto copied = imported->relocate(disk.get(), stream);
+      REQUIRE(read_bytes(copied->cast<encoded_data_representation>()) == bytes);
+      auto restored = copied->relocate(&host, stream);
+      REQUIRE(read_bytes(restored->cast<encoded_data_representation>()) == bytes);
+      auto stored = restored->relocate(disk.get(), stream);
+      REQUIRE(read_bytes(stored->cast<encoded_data_representation>()) == bytes);
+      REQUIRE(disk->get_io_context() == context);
+      imported.reset();
+      std::filesystem::remove(path);
+    }
+  }
+}
+
+TEST_CASE("encoded GPU to DISK relocation stages through host memory without device writes",
+          "[encoded][relocation][disk][gpu]")
 {
   temp_directory directory;
+  auto context = std::make_shared<scripted_ioctx>(make_disk_io_context());
+  auto disk    = make_disk(directory.path, 64ull << 20);
+  disk->set_io_context(context);
+  auto config      = host_config(-1, 32ull << 20);
+  config.pool_size = 256;
+  memory::memory_space host{config};
+  memory::memory_space gpu{gpu_config()};
+  rmm::cuda_stream stream;
+  // More than one staging chunk, and not a multiple of it.
+  const auto bytes = payload((8ull << 20) + 4097);
+  auto device =
+    encoded_data_representation::from_host(bytes, make_metadata(), host)->relocate(&gpu, stream);
+
+  context->device_write = false;
+  auto staged           = device->relocate(disk.get(), stream);
+  REQUIRE(context->device_write_slices == 0);
+  REQUIRE(read_bytes(staged->cast<encoded_data_representation>()) == bytes);
+
+  context->device_write = true;
+  auto direct           = device->relocate(disk.get(), stream);
+  REQUIRE(context->device_write_slices > 0);
+  REQUIRE(read_bytes(direct->cast<encoded_data_representation>()) == bytes);
+}
+
+TEST_CASE("encoded relocation removes a failed DISK copy and keeps its source",
+          "[encoded][relocation][disk][failure]")
+{
+  temp_directory directory;
+  auto context = std::make_shared<scripted_ioctx>(make_disk_io_context());
+  auto disk    = make_disk(directory.path);
+  disk->set_io_context(context);
   memory::memory_space host{host_config()};
   memory::memory_space gpu{gpu_config()};
-  memory::memory_space disk{
-    memory::disk_memory_space_config{0, 1ull << 24, directory.path.string()}};
   rmm::cuda_stream stream;
-  const auto bytes     = payload(4097);
-  auto* host_allocator = host.get_memory_resource_of<memory::Tier::HOST>();
-  auto* gpu_allocator  = gpu.get_memory_resource_of<memory::Tier::GPU>();
-
-  auto host_source = encoded_data_representation::from_host(bytes, make_metadata(), host);
-  auto gpu_source  = host_source->relocate(&gpu, stream);
-  for (idata_representation* source :
-       std::array<idata_representation*, 2>{host_source.get(), gpu_source.get()}) {
-    REQUIRE_THROWS_AS(source->relocate(&disk, stream), std::logic_error);
-    REQUIRE(read_bytes(source->cast<encoded_data_representation>()) == bytes);
-  }
-  REQUIRE(disk.get_total_reserved_memory() == 0);
-  REQUIRE(std::filesystem::is_empty(directory.path));
-
-  const auto path = directory.path / "input.bin";
-  write_file(path, bytes);
-  auto disk_source =
-    encoded_data_representation::from_disk(path, 0, bytes.size(), make_metadata(), disk);
+  const auto bytes       = payload(8193);
+  auto host_source       = encoded_data_representation::from_host(bytes, make_metadata(), host);
+  auto gpu_source        = host_source->relocate(&gpu, stream);
+  auto disk_source       = host_source->relocate(disk.get(), stream);
+  const auto disk_path   = disk_source->cast<encoded_data_representation>().get_file_path();
+  auto* host_allocator   = host.get_memory_resource_of<memory::Tier::HOST>();
+  auto* gpu_allocator    = gpu.get_memory_resource_of<memory::Tier::GPU>();
   const auto host_before = host_allocator->get_total_allocated_bytes();
   const auto gpu_before  = gpu_allocator->get_total_allocated_bytes();
-  REQUIRE_THROWS_AS(disk_source->relocate(&host, stream), std::logic_error);
-  REQUIRE_THROWS_AS(disk_source->relocate(&gpu, stream), std::logic_error);
-  REQUIRE_THROWS_AS(disk_source->clone(stream), std::logic_error);
+
+  // Writes: the bytes land, then the request fails; the new file must be gone afterwards.
+  context->fail_write = true;
+  for (const bool device_write : {true, false}) {
+    context->device_write = device_write;
+    for (idata_representation* source : std::array<idata_representation*, 3>{
+           host_source.get(), gpu_source.get(), disk_source.get()}) {
+      INFO("source tier=" << static_cast<int>(source->get_current_tier())
+                          << " device_write=" << device_write);
+      REQUIRE_THROWS_WITH(source->relocate(disk.get(), stream), "injected write failure");
+      REQUIRE(read_bytes(source->cast<encoded_data_representation>()) == bytes);
+      REQUIRE(file_count(directory.path) == 1);
+      REQUIRE(disk->get_total_reserved_memory() == bytes.size());
+    }
+  }
+  context->fail_write   = false;
+  context->device_write = true;
+
+  // Reads: no destination allocation survives the failure.
+  context->fail_read = true;
+  REQUIRE_THROWS_WITH(disk_source->relocate(&host, stream), "injected read failure");
+  REQUIRE_THROWS_WITH(disk_source->relocate(&gpu, stream), "injected read failure");
+  REQUIRE_THROWS_WITH(disk_source->clone(stream), "injected read failure");
   REQUIRE(host_allocator->get_total_allocated_bytes() == host_before);
   REQUIRE(gpu_allocator->get_total_allocated_bytes() == gpu_before);
-  REQUIRE(disk.get_total_reserved_memory() == bytes.size());
-  REQUIRE(disk_source->get_file_path() == std::filesystem::absolute(path));
-  REQUIRE(std::filesystem::file_size(path) == bytes.size());
+  REQUIRE(file_count(directory.path) == 1);
+  REQUIRE(disk->get_total_reserved_memory() == bytes.size());
+  context->fail_read = false;
+
+  REQUIRE(read_bytes(disk_source->cast<encoded_data_representation>()) == bytes);
+  disk_source.reset();
+  REQUIRE_FALSE(std::filesystem::exists(disk_path));
+  REQUIRE(disk->get_total_reserved_memory() == 0);
+}
+
+TEST_CASE("encoded relocation from a truncated DISK range fails without a destination",
+          "[encoded][relocation][disk][failure]")
+{
+  temp_directory directory;
+  auto disk = make_disk(directory.path);
+  memory::memory_space host{host_config()};
+  memory::memory_space gpu{gpu_config()};
+  rmm::cuda_stream stream;
+  const auto bytes = payload(8193);
+  const auto path  = directory.path / "input.bin";
+  write_file(path, bytes);
+  auto source =
+    encoded_data_representation::from_disk(path, 0, bytes.size(), make_metadata(), *disk);
+  std::filesystem::resize_file(path, 3);
+  auto* host_allocator   = host.get_memory_resource_of<memory::Tier::HOST>();
+  auto* gpu_allocator    = gpu.get_memory_resource_of<memory::Tier::GPU>();
+  const auto host_before = host_allocator->get_total_allocated_bytes();
+  const auto gpu_before  = gpu_allocator->get_total_allocated_bytes();
+  for (auto* target : std::array<memory::memory_space*, 3>{&host, &gpu, disk.get()}) {
+    INFO("target tier=" << static_cast<int>(target->get_tier()));
+    REQUIRE_THROWS(source->relocate(target, stream));
+  }
+  REQUIRE(host_allocator->get_total_allocated_bytes() == host_before);
+  REQUIRE(gpu_allocator->get_total_allocated_bytes() == gpu_before);
+  REQUIRE(disk->get_total_reserved_memory() == bytes.size());
+  REQUIRE(file_count(directory.path) == 1);
+
+  write_file(path, bytes);
+  auto restored = source->relocate(&host, stream);
+  REQUIRE(read_bytes(restored->cast<encoded_data_representation>()) == bytes);
 }
 
 TEST_CASE("encoded disk ranges preserve borrowed files and remove owned files",
@@ -438,8 +738,10 @@ TEST_CASE("encoded relocation waits for a pending GPU writer for every target",
 {
   int count = 0;
   CUCASCADE_CUDA_TRY(cudaGetDeviceCount(&count));
+  temp_directory directory;
   memory::memory_space host{host_config()};
   memory::memory_space gpu{gpu_config()};
+  auto disk = make_disk(directory.path);
   std::unique_ptr<memory::memory_space> other_gpu;
   if (count >= 2) {
     memory::gpu_memory_space_config config;
@@ -454,7 +756,7 @@ TEST_CASE("encoded relocation waits for a pending GPU writer for every target",
   const std::vector<std::byte> written(bytes.size(), std::byte{0xC3});
   auto seed = encoded_data_representation::from_host(bytes, make_metadata(), host);
 
-  std::vector<memory::memory_space*> targets{&gpu, &host};
+  std::vector<memory::memory_space*> targets{&gpu, &host, disk.get()};
   if (other_gpu) { targets.push_back(other_gpu.get()); }
   for (auto* target : targets) {
     INFO("target tier=" << static_cast<int>(target->get_tier())
@@ -538,6 +840,50 @@ TEST_CASE("encoded disk imports reserve their payload bytes", "[encoded][disk][r
   REQUIRE(disk.get_total_reserved_memory() == 0);
 }
 
+TEST_CASE("encoded DISK copies reserve their payload or use the caller's reservation",
+          "[encoded][relocation][disk][reservation]")
+{
+  temp_directory directory;
+  const auto bytes = payload(4097);
+  auto disk        = make_disk(directory.path, bytes.size() * 2);
+  memory::memory_space host{host_config()};
+  rmm::cuda_stream stream;
+  const auto path = directory.path / "imported.bin";
+  write_file(path, bytes);
+  auto imported =
+    encoded_data_representation::from_disk(path, 0, bytes.size(), make_metadata(), *disk);
+  auto clone = imported->clone(stream);
+  REQUIRE(disk->get_total_reserved_memory() == bytes.size() * 2);
+  // The space is full: the copy fails before creating a file.
+  REQUIRE_THROWS_AS(imported->clone(stream), rmm::out_of_memory);
+  REQUIRE(file_count(directory.path) == 2);
+  REQUIRE(read_bytes(*imported) == bytes);
+  imported.reset();
+  REQUIRE(disk->get_total_reserved_memory() == bytes.size());
+  REQUIRE(std::filesystem::exists(path));
+  clone.reset();
+  REQUIRE(disk->get_total_reserved_memory() == 0);
+  REQUIRE(file_count(directory.path) == 1);
+
+  // A caller-owned reservation backs the copy and outlives its file.
+  auto source      = encoded_data_representation::from_host(bytes, make_metadata(), host);
+  auto reservation = disk->make_reservation(bytes.size());
+  auto relocated   = source->relocate(disk.get(), stream, reservation.get());
+  REQUIRE(disk->get_total_reserved_memory() == bytes.size());
+  REQUIRE(read_bytes(relocated->cast<encoded_data_representation>()) == bytes);
+  const auto relocated_path = relocated->cast<encoded_data_representation>().get_file_path();
+  relocated.reset();
+  REQUIRE_FALSE(std::filesystem::exists(relocated_path));
+  REQUIRE(disk->get_total_reserved_memory() == bytes.size());
+  reservation.reset();
+  REQUIRE(disk->get_total_reserved_memory() == 0);
+
+  auto other_disk = make_disk(directory.path, bytes.size(), 1);
+  auto foreign    = other_disk->make_reservation(bytes.size());
+  REQUIRE_THROWS_AS(source->relocate(disk.get(), stream, foreign.get()), std::invalid_argument);
+  REQUIRE(file_count(directory.path) == 1);
+}
+
 TEST_CASE("encoded GPU relocation supports another device", "[encoded][gpu][multigpu]")
 {
   int count = 0;
@@ -549,6 +895,8 @@ TEST_CASE("encoded GPU relocation supports another device", "[encoded][gpu][mult
   other_config.device_id       = 1;
   other_config.memory_capacity = 32ull << 20;
   memory::memory_space gpu1{other_config};
+  temp_directory directory;
+  auto disk = make_disk(directory.path);
   // Larger than one staging chunk, and not a multiple of it.
   const auto bytes = payload((3ull << 20) + 65537);
   auto source      = encoded_data_representation::from_host(bytes, make_metadata(), host);
@@ -572,12 +920,22 @@ TEST_CASE("encoded GPU relocation supports another device", "[encoded][gpu][mult
     auto back = second->relocate(&gpu0, first_stream);
     REQUIRE(read_bytes(back->cast<encoded_data_representation>()) == bytes);
     REQUIRE(back->get_device_id() == 0);
+    // DISK legs use a stream of the GPU taking part.
+    REQUIRE_THROWS(second->relocate(disk.get(), first_stream));
+    auto on_disk = second->relocate(disk.get(), stream);
+    REQUIRE(read_bytes(on_disk->cast<encoded_data_representation>()) == bytes);
+    REQUIRE_THROWS(on_disk->relocate(&gpu1, first_stream));
+    auto from_disk = on_disk->relocate(&gpu1, stream);
+    REQUIRE(read_bytes(from_disk->cast<encoded_data_representation>()) == bytes);
+    REQUIRE(from_disk->get_device_id() == 1);
   }
   first.reset();
 }
 
-TEST_CASE("encoded relocation spans different host block sizes", "[encoded][relocation][boundary]")
+TEST_CASE("encoded relocation spans staging chunks and different host block sizes",
+          "[encoded][relocation][boundary]")
 {
+  temp_directory directory;
   auto source_config       = host_config(-1, 32ull << 20);
   auto target_config       = host_config(-2, 32ull << 20);
   source_config.block_size = 2048;
@@ -586,6 +944,7 @@ TEST_CASE("encoded relocation spans different host block sizes", "[encoded][relo
   memory::memory_space source_host{source_config};
   memory::memory_space target_host{target_config};
   memory::memory_space gpu{gpu_config()};
+  auto disk = make_disk(directory.path, 64ull << 20);
   rmm::cuda_stream stream;
   const auto bytes = payload((8ull << 20) + 33);
   auto original    = encoded_data_representation::from_host(bytes, make_metadata(), source_host);
@@ -597,6 +956,16 @@ TEST_CASE("encoded relocation spans different host block sizes", "[encoded][relo
   REQUIRE(read_bytes(host_again->cast<encoded_data_representation>()) == bytes);
   auto host_back = host_again->relocate(&target_host, stream);
   REQUIRE(read_bytes(host_back->cast<encoded_data_representation>()) == bytes);
+  // DISK legs, including a file-to-file copy larger than one staging chunk.
+  auto disk_copy = host_copy->relocate(disk.get(), stream);
+  REQUIRE(read_bytes(disk_copy->cast<encoded_data_representation>()) == bytes);
+  auto disk_clone = disk_copy->clone(stream);
+  REQUIRE(read_bytes(disk_clone->cast<encoded_data_representation>()) == bytes);
+  auto device_again = disk_clone->relocate(&gpu, stream);
+  REQUIRE(read_bytes(device_again->cast<encoded_data_representation>()) == bytes);
+  auto disk_again = device_again->relocate(disk.get(), stream);
+  auto host_last  = disk_again->relocate(&source_host, stream);
+  REQUIRE(read_bytes(host_last->cast<encoded_data_representation>()) == bytes);
 }
 
 TEST_CASE("encoded host allocation rejects unsupported block alignment",
