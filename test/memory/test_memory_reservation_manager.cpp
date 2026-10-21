@@ -612,17 +612,47 @@ SCENARIO("Host Reservation", "[memory_space][host_reservation]")
   }
 }
 
-TEST_CASE("Host allocation outliving its reservation ignores a reservation at the same address",
+TEST_CASE("Host allocation outliving its reservation is returned to the pool",
           "[memory_space][host_reservation]")
 {
-  auto manager                 = createSingleDeviceMemoryManager();
-  std::size_t reservation_size = 2UL << 20;
-  std::size_t small_allocation = 1UL << 20;
+  auto manager = createSingleDeviceMemoryManager();
 
   auto* host_space = manager->get_memory_space(Tier::HOST, 0);
   REQUIRE(host_space != nullptr);
   auto* mr = host_space->get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(mr != nullptr);
+  std::size_t const block_size = mr->get_block_size();
+
+  auto res          = host_space->make_reservation_or_null(4 * block_size);
+  auto stale_blocks = mr->allocate_multiple_blocks(2 * block_size, res.get());
+  res.reset();
+  REQUIRE(mr->get_total_reserved_bytes() == 0);
+  REQUIRE(mr->get_total_allocated_bytes() == 2 * block_size);
+
+  REQUIRE_FALSE(stale_blocks->grow_by(block_size));
+  REQUIRE(stale_blocks->size() == 2);
+
+  stale_blocks->trim_to(block_size);
+  REQUIRE(stale_blocks->size() == 1);
+  REQUIRE(mr->get_total_allocated_bytes() == block_size);
+
+  stale_blocks.reset();
+  REQUIRE(mr->get_total_reserved_bytes() == 0);
+  REQUIRE(mr->get_total_allocated_bytes() == 0);
+}
+
+TEST_CASE("Host allocation outliving its reservation ignores a reservation at the same address",
+          "[memory_space][host_reservation]")
+{
+  auto manager = createSingleDeviceMemoryManager();
+
+  auto* host_space = manager->get_memory_space(Tier::HOST, 0);
+  REQUIRE(host_space != nullptr);
+  auto* mr = host_space->get_memory_resource_as<fixed_size_host_memory_resource>();
+  REQUIRE(mr != nullptr);
+  std::size_t const block_size       = mr->get_block_size();
+  std::size_t const reservation_size = 4 * block_size;
+  std::size_t const stale_allocation = 2 * block_size;
 
   // Reserve through the resource directly so the test can observe the arena's address.
   auto make_reservation = [&]() {
@@ -633,14 +663,15 @@ TEST_CASE("Host allocation outliving its reservation ignores a reservation at th
   };
 
   auto [first, first_address] = make_reservation();
-  auto stale_blocks           = mr->allocate_multiple_blocks(small_allocation, first.get());
+  auto stale_blocks           = mr->allocate_multiple_blocks(stale_allocation, first.get());
   first.reset();
   // The released reservation's bytes return to the pool; the live blocks stay charged.
   REQUIRE(mr->get_total_reserved_bytes() == 0);
-  REQUIRE(mr->get_total_allocated_bytes() == small_allocation);
+  REQUIRE(mr->get_total_allocated_bytes() == stale_allocation);
 
   // Reserve until the allocator hands out the released arena's address again. Misses are held so
-  // each attempt gets a fresh address.
+  // each attempt gets a fresh address. Reuse depends on the heap allocator; a SKIP means this case
+  // tested nothing.
   std::unique_ptr<reservation> second;
   std::vector<std::unique_ptr<reservation>> misses;
   for (int attempt = 0; attempt < 64 && second == nullptr; ++attempt) {
@@ -654,12 +685,16 @@ TEST_CASE("Host allocation outliving its reservation ignores a reservation at th
   misses.clear();
   if (second == nullptr) { SKIP("the allocator did not reuse the released arena's address"); }
   REQUIRE(mr->get_total_reserved_bytes() == reservation_size);
-  REQUIRE(mr->get_total_allocated_bytes() == reservation_size + small_allocation);
+  REQUIRE(mr->get_total_allocated_bytes() == reservation_size + stale_allocation);
 
   // A stale allocation must not grow against the new reservation.
-  REQUIRE_FALSE(stale_blocks->grow_by(small_allocation));
+  REQUIRE_FALSE(stale_blocks->grow_by(block_size));
 
-  // Returning the stale blocks releases their bytes and leaves the new reservation untouched.
+  // Trimming or returning the stale blocks releases their bytes and leaves the new reservation
+  // untouched.
+  stale_blocks->trim_to(block_size);
+  REQUIRE(mr->get_total_reserved_bytes() == reservation_size);
+  REQUIRE(mr->get_total_allocated_bytes() == reservation_size + block_size);
   stale_blocks.reset();
   REQUIRE(mr->get_total_reserved_bytes() == reservation_size);
   REQUIRE(mr->get_total_allocated_bytes() == reservation_size);
@@ -675,8 +710,10 @@ TEST_CASE("Host allocation outliving its reservation ignores a reservation at th
   REQUIRE(mr->get_total_allocated_bytes() == 0);
 }
 
+// CUDA can destroy a stream from another device, so this checks clean teardown and the restored
+// device, not the device switch itself.
 TEST_CASE("Destroying GPU memory spaces preserves the current device",
-          "[memory_space][.multi-device]")
+          "[memory_space][multi-device]")
 {
   if (rmm::get_num_cuda_devices() < 2) { SKIP("requires at least two GPUs"); }
 
