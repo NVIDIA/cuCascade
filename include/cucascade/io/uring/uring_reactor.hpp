@@ -22,6 +22,7 @@
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
@@ -190,14 +191,17 @@ class uring_reactor {
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
 
-  /// Bounce slots are allocated by @c start() from the context's
-  /// host_memory_resource (which must be non-null); their size is taken from its
+  /// Bounce slots are allocated by @c start() from @p placement's staging
+  /// resource, or the context's host_memory_resource when it has none (one of
+  /// the two must be non-null); their size is taken from its
   /// @c get_block_size() and their count from a fixed 64 MiB staging budget.  The
   /// reactor keeps the @c multiple_blocks_allocation alive until it is destroyed —
   /// blocks return to the resource then — and holds the shared @p ctx so it (and
-  /// the resource) outlive the reactor.
+  /// the resource) outlive the reactor.  The worker pins itself to
+  /// @p placement's CPUs before it sets up its ring.
   explicit uring_reactor(std::shared_ptr<reactor_context> ctx,
-                         std::string_view tname = "uring_reactor");
+                         std::string_view tname      = "uring_reactor",
+                         reactor_placement placement = {});
 
   ~uring_reactor();
 
@@ -209,9 +213,9 @@ class uring_reactor {
   /// place — the context — rather than being passed in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  /// Bounce-slot size, read from the context's host resource (0 when the
-  /// context has none) rather than from @c _bounce_slot_size, which start()
-  /// derives from the same resource: the default ioctx initializes its cache
+  /// Bounce-slot size, read from the staging resource (0 when there is none)
+  /// rather than from @c _bounce_slot_size, which start() derives from the same
+  /// resource: the default ioctx initializes its cache
   /// before it starts its reactors, so the check below must not depend on
   /// start() having run.  INVARIANT: when a prefetching cache is present this
   /// MUST equal its chunk size — a fragmented fill's extent is computed as
@@ -221,10 +225,12 @@ class uring_reactor {
   /// @c ioctx::initialize_cache, which is the only place both sizes are known.
   [[nodiscard]] std::size_t staging_block_size() const noexcept
   {
-    return _ctx == nullptr || _ctx->host_memory_resource() == nullptr
-             ? std::size_t{0}
-             : _ctx->host_memory_resource()->get_block_size();
+    auto const* resource = staging_resource();
+    return resource == nullptr ? std::size_t{0} : resource->get_block_size();
   }
+
+  /// Where this reactor lives (home GPU, NUMA node, staging, worker CPUs).
+  [[nodiscard]] reactor_placement const& placement() const noexcept { return _placement; }
 
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out
   /// of the constructor so a reactor can be built cheaply (it only copies its
@@ -348,6 +354,14 @@ class uring_reactor {
   /// @p ready is fulfilled once the ring is set up, or failed with the setup error.
   void worker_loop(const std::stop_token& stop_token, std::promise<void>& ready);
 
+  /// The placement's staging resource, else the context's (null when neither).
+  [[nodiscard]] cucascade::memory::fixed_size_host_memory_resource* staging_resource()
+    const noexcept
+  {
+    if (_placement.staging_mr != nullptr) return _placement.staging_mr;
+    return _ctx == nullptr ? nullptr : _ctx->host_memory_resource();
+  }
+
   // Shared services + tunables for the whole reactor pool, kept alive for this
   // reactor's lifetime (so the bounce-staging resource outlives _bounce_storage).
   std::shared_ptr<reactor_context> _ctx;
@@ -355,6 +369,8 @@ class uring_reactor {
   reactor_config_type _config;
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
+  // Home GPU / NUMA node, staging override and worker CPUs.
+  reactor_placement _placement;
   // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
   // multiple_blocks_allocation destructor returns the blocks to the upstream
   // resource when the reactor is destroyed.

@@ -49,9 +49,10 @@ struct disk_io_context_options {
   /// Which backend to build (see disk_io_backend::automatic for how automatic resolves).
   disk_io_backend backend{disk_io_backend::automatic};
 
-  /// The io stack's own static configuration. Used: uring_n_reactors / uring for uring,
-  /// cufile_n_reactors / cufile for cufile. Ignored: backend (see @ref backend) and cache (the
-  /// DISK tier never arms a prefetching cache).
+  /// The io stack's own static configuration. Used: uring_reactors_per_gpu / uring for uring,
+  /// cufile_reactors_per_gpu / cufile for cufile -- the context has no topology index, so it runs
+  /// one GPU's worth of unplaced reactors. Ignored: backend (see @ref backend), cache (the DISK
+  /// tier never arms a prefetching cache), pin_reactor_threads and reactor_spill.
   io::io_config io{};
 
   /// NUMA node the uring context's private pinned staging is bound to; -1 leaves it unbound.
@@ -63,8 +64,8 @@ struct disk_io_context_options {
  * @brief Build and start an io context suitable for DISK memory spaces.
  *
  * The returned context owns everything it needs and is already started: the uring backend owns a
- * private pinned staging resource (uring_n_reactors x 64 MiB) that lives exactly as long as its
- * reactors. Pass it to a disk space through disk_memory_space_config::io_context,
+ * private pinned staging resource (uring_reactors_per_gpu x 64 MiB) that lives exactly as long as
+ * its reactors. Pass it to a disk space through disk_memory_space_config::io_context,
  * reservation_manager_configurator::set_disk_mounting_point() or memory_space::set_io_context().
  * One context may serve any number of disk spaces.
  *

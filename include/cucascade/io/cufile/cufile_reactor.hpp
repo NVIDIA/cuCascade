@@ -21,6 +21,7 @@
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
@@ -211,8 +212,12 @@ class cufile_reactor {
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
 
+  /// The worker pins itself to @p placement's CPUs when it starts.  The
+  /// placement's staging resource is unused: the reactor's pinned scratch comes
+  /// from a process-wide pool.
   explicit cufile_reactor(std::shared_ptr<reactor_context> ctx,
-                          std::string_view tname = "cufile_reactor");
+                          std::string_view tname      = "cufile_reactor",
+                          reactor_placement placement = {});
 
   ~cufile_reactor();
 
@@ -447,6 +452,8 @@ class cufile_reactor {
   std::shared_ptr<reactor_context> _ctx;
   reactor_config_type _config;
   std::string _tname;
+  // Home GPU / NUMA node and worker CPUs.
+  reactor_placement _placement;
 
   std::stop_source _stop_source;
   std::jthread _worker;

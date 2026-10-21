@@ -30,7 +30,8 @@
 
 namespace cucascade::memory {
 class memory_reservation_manager;
-}
+class topology_index;
+}  // namespace cucascade::memory
 
 namespace cucascade::io {
 
@@ -61,8 +62,15 @@ class io_context_registry {
   ///                            resource for the uring / rest reactors).  Must
   ///                            outlive the registry — the factory closures hold
   ///                            it by reference.
-  io_context_registry(config_type config,
-                      cucascade::memory::memory_reservation_manager& reservation_manager);
+  /// @param topology_index      GPUs the backends serve and their NUMA nodes.
+  ///                            Each backend runs its @c *_reactors_per_gpu
+  ///                            reactors for every GPU of the index, staged
+  ///                            from and pinned to that GPU's NUMA node; null
+  ///                            builds one GPU's worth of unplaced reactors.
+  io_context_registry(
+    config_type config,
+    cucascade::memory::memory_reservation_manager& reservation_manager,
+    std::shared_ptr<const cucascade::memory::topology_index> topology_index = nullptr);
   ~io_context_registry() = default;
 
   io_context_registry(io_context_registry const&)            = delete;
@@ -138,6 +146,7 @@ class io_context_registry {
   };
   const config_type _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
+  std::shared_ptr<const cucascade::memory::topology_index> _topology_index;
   /// Set when @c backend=cufile: the cuFile / GDS reactor then serves local
   /// files instead of uring.  @c s3:// objects still go to REST -- the cuFile
   /// backend is local-disk only.
@@ -157,6 +166,11 @@ class io_context_registry {
 // @c io_config.  The closure captures @p reservation_manager by
 // reference (it sources the HOST-tier staging resource the reactors need), so
 // @p reservation_manager must outlive every ioctx the returned factory creates.
+// With a @p topology_index the pool has @c *_reactors_per_gpu reactors per GPU
+// of the index, each staging from the HOST space of its GPU's NUMA node (the
+// first HOST space when that node has none) and, with
+// @c io_config::pin_reactor_threads, pinned to the GPU's local CPUs; without one
+// it has @c *_reactors_per_gpu unplaced reactors on the first HOST space.
 // The closures are @c noexcept-safe: a construction failure (missing resource,
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
@@ -164,23 +178,26 @@ class io_context_registry {
 #ifdef CUCASCADE_HAS_CUFILE
 /// cuFile / GPUDirect Storage local-disk backend.  Builds a
 /// @c cufile_reactor::reactor_context from @c config.cufile and
-/// @c config.cufile_n_reactors.  Takes no reservation manager: the reactor does
-/// not stage device reads through pinned host memory (cuFile DMAs direct to the
-/// device).  Declared only in a build that found cufile.h.
-io_context_registry::factory_type make_cufile_ioctx_factory();
+/// @c config.cufile_reactors_per_gpu.  Takes no reservation manager: the reactor
+/// does not stage device reads through pinned host memory (cuFile DMAs direct to
+/// the device).  Declared only in a build that found cufile.h.
+io_context_registry::factory_type make_cufile_ioctx_factory(
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index = nullptr);
 #endif
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
-/// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
+/// @c config.uring and @c config.uring_reactors_per_gpu. Pinned staging uses the
 /// HOST-tier resource block size; physical grouping is chosen by the worker.
 io_context_registry::factory_type make_uring_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager);
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index = nullptr);
 
 /// RESTful object-store (s3://) backend.  Builds a SigV4 authorizer from
 /// @c config.object_store and a @c rest_reactor::reactor_context from
 /// @c config.rest.  Returns a null ioctx when the object store is not
 /// configured (empty endpoint / credentials / region).
 io_context_registry::factory_type make_rest_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager);
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index = nullptr);
 
 }  // namespace cucascade::io

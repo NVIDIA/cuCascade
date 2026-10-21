@@ -105,8 +105,11 @@ std::optional<size_t> content_range_total(std::string_view cr)
  */
 class rest_reactor::worker {
  public:
-  worker(std::shared_ptr<reactor_context> ctx, std::string name, std::atomic<std::size_t>& queued)
-    : _ctx(std::move(ctx)), _name(std::move(name)), _queued(queued)
+  worker(std::shared_ptr<reactor_context> ctx,
+         std::string name,
+         std::atomic<std::size_t>& queued,
+         reactor_placement const& placement)
+    : _ctx(std::move(ctx)), _name(std::move(name)), _queued(queued), _placement(placement)
   {
     _inbox = std::make_shared<detail::mailbox>([this] { notify(); });
   }
@@ -221,7 +224,8 @@ class rest_reactor::worker {
     std::unique_ptr<detail::engine> e;
     std::exception_ptr failure;
     try {
-      e = std::make_unique<detail::engine>(_ctx, _name, &_queued);
+      pin_reactor_thread(_placement, _name);
+      e = std::make_unique<detail::engine>(_ctx, _name, &_queued, 0U, _placement.staging_mr);
       e->set_mailbox(_inbox);
       e->start();
       _ctx->services().reactor_started();
@@ -331,6 +335,7 @@ class rest_reactor::worker {
   std::shared_ptr<reactor_context> _ctx;
   std::string _name;
   std::atomic<std::size_t>& _queued;
+  reactor_placement const& _placement;  ///< the owning reactor's; outlives this worker
   std::shared_ptr<detail::mailbox> _inbox;
 
   std::mutex _mutex;
@@ -353,8 +358,10 @@ class rest_reactor::worker {
 // construction / lifecycle
 // =================================================================================================
 
-rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx)), _tname(tname)
+rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx,
+                           std::string_view tname,
+                           reactor_placement placement)
+  : _ctx(std::move(ctx)), _tname(tname), _placement(std::move(placement))
 {
   if (!_ctx) { throw std::invalid_argument("rest_reactor: reactor_context must be non-null"); }
   _config = _ctx->cfg();
@@ -366,8 +373,8 @@ rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_vie
   }
   if (_config.max_retry_attempts == 0) { _config.max_retry_attempts = 1; }
   // No thread, ring or connection until start(): a reactor can be built cheaply and parked.
-  _worker =
-    std::make_unique<worker>(_ctx, _tname.empty() ? std::string{"rest"} : _tname, _queued_bytes);
+  _worker = std::make_unique<worker>(
+    _ctx, _tname.empty() ? std::string{"rest"} : _tname, _queued_bytes, _placement);
 }
 
 rest_reactor::~rest_reactor() { shutdown(); }
