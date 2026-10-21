@@ -184,12 +184,19 @@ memory_space::memory_space(const disk_memory_space_config& config)
 
 memory_space::~memory_space()
 {
-  // The pool's streams were created on this space's device and must be destroyed with that
-  // device current, but a GPU space can be destroyed while another device is current (e.g.
-  // multi-GPU teardown).
-  if (_id.tier == Tier::GPU && _stream_pool) {
+  // The stream pool and the device allocator were created on this space's device and must be
+  // destroyed with that device current, but a GPU space can be destroyed while another device is
+  // current (e.g. multi-GPU teardown). Release them here in reverse declaration order, as the
+  // implicit member destruction would, while the guard holds this space's device.
+  if (_id.tier == Tier::GPU) {
     rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{_id.device_id}};
     _stream_pool.reset();
+    _reservation_allocator_resource.reset();
+    if (auto* gpu_alloc = std::get_if<std::unique_ptr<reservation_aware_resource_adaptor>>(
+          &_reservation_allocator)) {
+      gpu_alloc->reset();
+    }
+    _allocator = null_device_memory_resource{};
   }
 
   // Unregister this memory_space's HOST pool from the cross-tier registry.

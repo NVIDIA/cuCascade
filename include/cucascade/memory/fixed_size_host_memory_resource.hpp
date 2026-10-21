@@ -158,15 +158,12 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     bool grow_by(std::size_t additional_bytes) noexcept
     {
       try {
-        if (_mr == nullptr) { return false; }
+        if (_mr == nullptr || _block_size == 0) { return false; }
+        // Make room before taking blocks from the pool so appending them cannot throw and leak.
+        _blocks.reserve(_blocks.size() + (additional_bytes + _block_size - 1) / _block_size);
         auto blocks = _mr->allocate_multiple_blocks_internal(
           additional_bytes, _reseved_memory, _reservation_uuid);
-        try {
-          _blocks.insert(_blocks.end(), blocks.begin(), blocks.end());
-        } catch (...) {
-          _mr->return_allocated_chunks(std::move(blocks), _reseved_memory, _reservation_uuid);
-          throw;
-        }
+        _blocks.insert(_blocks.end(), blocks.begin(), blocks.end());
         return true;
       } catch (const std::exception& e) {
         return false;
