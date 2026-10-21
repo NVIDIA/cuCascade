@@ -40,6 +40,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -420,19 +422,29 @@ TEST_CASE("Runtime attributes report each GPU's C2C link", "[hw_topology][c2c]")
     }
     auto const& gpus = discovery.get_topology().gpus;
     if (gpus.empty()) { _exit(77); }
-    if (nvmlInit_v2() != NVML_SUCCESS) { _exit(2); }
+    if (nvmlInit_v2() != NVML_SUCCESS) {
+      std::fprintf(stderr, "nvmlInit_v2 failed\n");
+      _exit(2);
+    }
 
-    for (auto const& gpu : gpus) {
-      if (!gpu.runtime_attributes.has_value()) { _exit(3); }
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+      auto const& gpu = gpus[i];
+      if (!gpu.runtime_attributes.has_value()) {
+        std::fprintf(
+          stderr, "GPU %zu (%s): runtime attributes missing\n", i, gpu.pci_bus_id.c_str());
+        _exit(3);
+      }
 
-      // Recompute the evidence independently of the discovery code.
+      // Gather the evidence directly from NVML and the driver, independently of the discovery code.
       std::optional<bool> nvml;
+#if defined(nvmlC2cModeInfo_v1)
       nvmlDevice_t handle{};
       nvmlC2cModeInfo_v1_t info{};
       if (nvmlDeviceGetHandleByPciBusId_v2(gpu.pci_bus_id.c_str(), &handle) == NVML_SUCCESS &&
           nvmlDeviceGetC2cModeInfoV(handle, &info) == NVML_SUCCESS) {
         nvml = info.isC2cEnabled != 0;
       }
+#endif
       int atomics     = 0;
       int page_tables = 0;
       CUdevice device = 0;
@@ -448,10 +460,22 @@ TEST_CASE("Runtime attributes report each GPU's C2C link", "[hw_topology][c2c]")
         }
       }
 
-      bool const c2c = gpu.runtime_attributes->c2c;
-      if (c2c != detail::c2c_from(nvml, atomics, page_tables)) { _exit(4); }
-      // A PCIe-attached GPU (no native host atomics, and no NVML report of C2C) is never C2C.
-      if (atomics == 0 && nvml != true && c2c) { _exit(5); }
+      // NVML's answer is final; without one, both driver attributes are required.
+      bool const expected = nvml.has_value() ? *nvml : (atomics != 0 && page_tables != 0);
+      bool const c2c      = gpu.runtime_attributes->c2c;
+      if (c2c != expected) {
+        std::fprintf(stderr,
+                     "GPU %zu (%s): c2c=%d, expected %d (nvml=%s, host_native_atomics=%d, "
+                     "host_page_tables=%d)\n",
+                     i,
+                     gpu.pci_bus_id.c_str(),
+                     static_cast<int>(c2c),
+                     static_cast<int>(expected),
+                     nvml.has_value() ? (*nvml ? "true" : "false") : "none",
+                     atomics,
+                     page_tables);
+        _exit(4);
+      }
     }
     _exit(0);
   }
