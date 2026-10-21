@@ -133,10 +133,28 @@ void write_disk_file_host(io::ioctx& ctx,
     throw std::logic_error("disk tier: the io context of the DISK memory space cannot write");
   }
   if (slices.empty()) { return; }
+  auto const object = ctx.open_io_object_for_write(path, batch_file_open_options(file_size));
+  write_disk_file_host(ctx, *object, slices);
+}
+
+std::shared_ptr<io::io_object> open_disk_file_for_write(io::ioctx& ctx,
+                                                        std::string const& path,
+                                                        std::size_t file_size)
+{
+  if (!ctx.supports_write()) {
+    throw std::logic_error("disk tier: the io context of the DISK memory space cannot write");
+  }
+  return ctx.open_io_object_for_write(path, batch_file_open_options(file_size));
+}
+
+void write_disk_file_host(io::ioctx& ctx,
+                          io::io_object const& file,
+                          std::span<io::write_slice const> slices)
+{
+  if (slices.empty()) { return; }
   auto const expected = total_bytes(slices);
-  auto const object   = ctx.open_io_object_for_write(path, batch_file_open_options(file_size));
-  await_on_unwind request{ctx.host_writev_async(*object, slices)};
-  check_transferred(request.get(), expected, "write", path);
+  await_on_unwind request{ctx.host_writev_async(file, slices)};
+  check_transferred(request.get(), expected, "write", file.object_path());
 }
 
 void read_disk_file_device(io::ioctx& ctx,
@@ -160,10 +178,18 @@ void read_disk_file_device(io::ioctx& ctx,
 void read_disk_file_host(io::ioctx& ctx, std::string const& path, std::span<io::slice const> slices)
 {
   if (slices.empty()) { return; }
+  auto const object = ctx.open_io_object(path);
+  read_disk_file_host(ctx, *object, slices);
+}
+
+void read_disk_file_host(io::ioctx& ctx,
+                         io::io_object const& file,
+                         std::span<io::slice const> slices)
+{
+  if (slices.empty()) { return; }
   auto const expected = total_bytes(slices);
-  auto const object   = ctx.open_io_object(path);
-  await_on_unwind request{ctx.host_readv_async_io(*object, slices)};
-  check_transferred(request.get(), expected, "read", path);
+  await_on_unwind request{ctx.host_readv_async_io(file, slices)};
+  check_transferred(request.get(), expected, "read", file.object_path());
 }
 
 }  // namespace detail

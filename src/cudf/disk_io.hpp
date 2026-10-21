@@ -39,6 +39,7 @@
 namespace cucascade {
 
 namespace io {
+class io_object;
 class ioctx;
 }  // namespace io
 
@@ -94,6 +95,26 @@ void write_disk_file_host(io::ioctx& ctx,
                           std::size_t file_size);
 
 /**
+ * @brief Open an existing (freshly created) batch file once for a series of chunked host writes.
+ *
+ * @param file_size Size the file will have; used as a preallocation hint.
+ * @throws std::logic_error if @p ctx cannot write.
+ * @throws std::system_error on an open failure.
+ */
+[[nodiscard]] std::shared_ptr<io::io_object> open_disk_file_for_write(io::ioctx& ctx,
+                                                                      std::string const& path,
+                                                                      std::size_t file_size);
+
+/**
+ * @brief Write host buffers into a batch file opened by open_disk_file_for_write() and wait.
+ *
+ * @throws std::system_error / std::runtime_error on any I/O or short-write failure.
+ */
+void write_disk_file_host(io::ioctx& ctx,
+                          io::io_object const& file,
+                          std::span<io::write_slice const> slices);
+
+/**
  * @brief Read ranges of a batch file into device buffers and wait.
  *
  * One device_readv_async_io on @p stream. It relies on the ioctx read contract:
@@ -121,6 +142,16 @@ void read_disk_file_device(io::ioctx& ctx,
  */
 void read_disk_file_host(io::ioctx& ctx,
                          std::string const& path,
+                         std::span<io::slice const> slices);
+
+/**
+ * @brief Read ranges of a batch file opened with @p ctx (io::ioctx::open_io_object) into host
+ *        buffers and wait.
+ *
+ * @throws std::system_error / std::runtime_error on any I/O or short-read failure.
+ */
+void read_disk_file_host(io::ioctx& ctx,
+                         io::io_object const& file,
                          std::span<io::slice const> slices);
 
 }  // namespace detail

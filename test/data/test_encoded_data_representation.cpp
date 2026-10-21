@@ -166,7 +166,7 @@ std::unique_ptr<memory::memory_space> make_disk(const std::filesystem::path& dir
 
 /**
  * @brief An io context that forwards to a real one, with switches to fail requests or to hide
- *        device writes, and counters of what reached the real context.
+ *        device reads or (device) writes, and counters of what reached the real context.
  */
 class scripted_ioctx final : public io::ioctx {
  public:
@@ -180,7 +180,7 @@ class scripted_ioctx final : public io::ioctx {
   }
   [[nodiscard]] bool supports_device_read() const noexcept override
   {
-    return _inner->supports_device_read();
+    return device_read && _inner->supports_device_read();
   }
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override
   {
@@ -194,7 +194,10 @@ class scripted_ioctx final : public io::ioctx {
   {
     return _inner->supports_device_range_read();
   }
-  [[nodiscard]] bool supports_write() const noexcept override { return _inner->supports_write(); }
+  [[nodiscard]] bool supports_write() const noexcept override
+  {
+    return write && _inner->supports_write();
+  }
   [[nodiscard]] bool supports_device_write() const noexcept override
   {
     return device_write && _inner->supports_device_write();
@@ -236,8 +239,11 @@ class scripted_ioctx final : public io::ioctx {
 
   std::atomic<bool> fail_read{false};
   std::atomic<bool> fail_write{false};
+  std::atomic<bool> device_read{true};
+  std::atomic<bool> write{true};
   std::atomic<bool> device_write{true};
   std::atomic<std::size_t> device_write_slices{0};
+  std::atomic<std::size_t> write_opens{0};
 
  protected:
   std::shared_ptr<io::io_object> create_io_object(std::string path) override
@@ -247,6 +253,7 @@ class scripted_ioctx final : public io::ioctx {
   std::shared_ptr<io::io_object> create_io_object_for_write(std::string path,
                                                             io::write_open_options options) override
   {
+    write_opens.fetch_add(1);
     return _inner->open_io_object_for_write(std::move(path), options);
   }
 
@@ -505,6 +512,77 @@ TEST_CASE("encoded GPU to DISK relocation stages through host memory without dev
   auto direct           = device->relocate(disk.get(), stream);
   REQUIRE(context->device_write_slices > 0);
   REQUIRE(read_bytes(direct->cast<encoded_data_representation>()) == bytes);
+}
+
+TEST_CASE("encoded multi-chunk DISK copies open their target file once",
+          "[encoded][relocation][disk]")
+{
+  temp_directory directory;
+  auto context = std::make_shared<scripted_ioctx>(make_disk_io_context());
+  auto disk    = make_disk(directory.path, 64ull << 20);
+  disk->set_io_context(context);
+  auto config      = host_config(-1, 32ull << 20);
+  config.pool_size = 256;
+  memory::memory_space host{config};
+  memory::memory_space gpu{gpu_config()};
+  rmm::cuda_stream stream;
+  // Three staging chunks, the last one partial.
+  const auto bytes      = payload((16ull << 20) + 4097);
+  auto host_source      = encoded_data_representation::from_host(bytes, make_metadata(), host);
+  auto disk_source      = host_source->relocate(disk.get(), stream);
+  auto device           = host_source->relocate(&gpu, stream);
+  context->device_write = false;
+  for (idata_representation* source :
+       std::array<idata_representation*, 2>{disk_source.get(), device.get()}) {
+    INFO("source tier=" << static_cast<int>(source->get_current_tier()));
+    const auto opens_before = context->write_opens.load();
+    auto copy               = source->relocate(disk.get(), stream);
+    REQUIRE(context->write_opens == opens_before + 1);
+    REQUIRE(read_bytes(copy->cast<encoded_data_representation>()) == bytes);
+  }
+}
+
+TEST_CASE("encoded relocation rejects an io context without the leg's capability up front",
+          "[encoded][relocation][disk][failure]")
+{
+  temp_directory directory;
+  auto context = std::make_shared<scripted_ioctx>(make_disk_io_context());
+  auto disk    = make_disk(directory.path);
+  disk->set_io_context(context);
+  memory::memory_space host{host_config()};
+  memory::memory_space gpu{gpu_config()};
+  rmm::cuda_stream stream;
+  const auto bytes       = payload(8193);
+  auto host_source       = encoded_data_representation::from_host(bytes, make_metadata(), host);
+  auto gpu_source        = host_source->relocate(&gpu, stream);
+  auto disk_source       = host_source->relocate(disk.get(), stream);
+  auto* host_allocator   = host.get_memory_resource_of<memory::Tier::HOST>();
+  auto* gpu_allocator    = gpu.get_memory_resource_of<memory::Tier::GPU>();
+  const auto host_before = host_allocator->get_total_allocated_bytes();
+  const auto gpu_before  = gpu_allocator->get_total_allocated_bytes();
+  const auto opens       = context->write_opens.load();
+
+  // No DISK copy is created (or reserved) for a context that cannot write, from any source.
+  context->write = false;
+  for (idata_representation* source : std::array<idata_representation*, 3>{
+         host_source.get(), gpu_source.get(), disk_source.get()}) {
+    INFO("source tier=" << static_cast<int>(source->get_current_tier()));
+    REQUIRE_THROWS_AS(source->relocate(disk.get(), stream), std::logic_error);
+    REQUIRE(file_count(directory.path) == 1);
+    REQUIRE(disk->get_total_reserved_memory() == bytes.size());
+  }
+  REQUIRE(context->write_opens == opens);
+  context->write = true;
+
+  // No GPU buffer is allocated for a context that cannot read into device memory; reads into
+  // host memory are unaffected.
+  context->device_read = false;
+  REQUIRE_THROWS_AS(disk_source->relocate(&gpu, stream), std::logic_error);
+  REQUIRE(gpu_allocator->get_total_allocated_bytes() == gpu_before);
+  auto restored = disk_source->relocate(&host, stream);
+  REQUIRE(read_bytes(restored->cast<encoded_data_representation>()) == bytes);
+  restored.reset();
+  REQUIRE(host_allocator->get_total_allocated_bytes() == host_before);
 }
 
 TEST_CASE("encoded relocation removes a failed DISK copy and keeps its source",
@@ -785,6 +863,54 @@ TEST_CASE("encoded relocation waits for a pending GPU writer for every target",
       check(reader);
     }
   }
+}
+
+TEST_CASE("encoded DISK to GPU relocation is ordered after earlier work on its stream",
+          "[encoded][relocation][disk][gpu][stream]")
+{
+  const auto backend = GENERATE(disk_io_backend::uring, disk_io_backend::cufile);
+  CAPTURE(test::to_string(backend));
+  auto context = test::try_make_disk_io_context(backend);
+  if (context == nullptr) {
+    SKIP("the " << test::to_string(backend) << " backend cannot run here");
+  }
+  temp_directory directory;
+  auto disk = make_disk(directory.path);
+  disk->set_io_context(context);
+  memory::memory_space gpu{gpu_config()};
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{gpu.get_device_id()}};
+  rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream reader{rmm::cuda_stream::flags::non_blocking};
+  const auto bytes = payload(65537);
+  const auto path  = directory.path / "input.bin";
+  write_file(path, bytes);
+  auto source =
+    encoded_data_representation::from_disk(path, 0, bytes.size(), make_metadata(), *disk);
+
+  // Leave a delayed overwrite of a payload-sized block queued on the stream and free the block in
+  // stream order, so the destination allocated on the same stream may reuse it. A read that is not
+  // ordered after the queued work would be overwritten once the delay ends.
+  {
+    rmm::device_buffer stale{bytes.size(), stream, gpu.get_default_allocator()};
+    CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(stream.value(), delay_stream, nullptr));
+    CUCASCADE_CUDA_TRY(cudaMemsetAsync(stale.data(), 0x5A, bytes.size(), stream.value()));
+  }
+  auto result = source->relocate(&gpu, stream);
+  auto& copy  = result->cast<encoded_data_representation>();
+  REQUIRE(copy.get_writer_event() != nullptr);
+
+  // Observe the copy only through its writer event, from a stream that does not synchronize with
+  // the relocation stream.
+  std::vector<std::byte> observed(bytes.size());
+  CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(reader.value(), copy.get_writer_event(), 0));
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(observed.data(),
+                                     copy.get_device_buffer().data(),
+                                     observed.size(),
+                                     cudaMemcpyDeviceToHost,
+                                     reader.value()));
+  CUCASCADE_CUDA_TRY(cudaStreamSynchronize(reader.value()));
+  REQUIRE(observed == bytes);
+  CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.value()));
 }
 
 TEST_CASE("encoded GPU relocation uses a reservation already attached to its stream",
