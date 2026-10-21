@@ -25,6 +25,7 @@
 #include <concepts>
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 
 namespace cucascade {
 
@@ -106,6 +107,31 @@ class idata_representation {
    * @return std::unique_ptr<idata_representation> A new data representation with copied data
    */
   virtual std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) const = 0;
+
+  /**
+   * @brief Copy this representation to another memory space while preserving its encoding.
+   *
+   * A successful relocation preserves the payload bytes, encoding, and logical metadata. It
+   * returns a fully completed, independently owned copy in @p target_memory_space. The source
+   * remains valid and unchanged on success and failure. Implementations must finish any work
+   * using temporary or destination storage before destroying that storage on an error path.
+   *
+   * The default implementation reports unsupported relocation. Derived representations may
+   * implement this operation without registering a representation converter.
+   *
+   * @param target_memory_space Destination memory space; must not be null.
+   * @param stream CUDA stream on the participating GPU (the target for cross-GPU copies).
+   * @param reservation Optional caller-owned reservation belonging to the destination.
+   * @return An independent copy whose encoding and logical contents match this representation.
+   * @throws std::logic_error if this representation does not support relocation.
+   */
+  virtual std::unique_ptr<idata_representation> relocate(
+    [[maybe_unused]] const memory::memory_space* target_memory_space,
+    [[maybe_unused]] ::cuda::stream_ref stream,
+    [[maybe_unused]] memory::reservation* reservation = nullptr) const
+  {
+    throw std::logic_error("This data representation does not support relocation");
+  }
 
   /**
    * @brief Record a CUDA event marking completion of the most recent writes to this
