@@ -29,6 +29,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_executable(
     cucascade_tests
     # Memory tests
+    memory/test_fixed_size_host_memory_resource.cpp
     memory/test_memory_reservation_manager.cpp
     memory/test_reservation_aware_resource_adaptor.cpp
     memory/test_reservation_manager_configurator.cpp
