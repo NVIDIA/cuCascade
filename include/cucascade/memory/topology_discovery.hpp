@@ -6,8 +6,10 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace cucascade::memory {
@@ -22,6 +24,13 @@ namespace cucascade::memory {
  */
 struct gpu_runtime_attributes {
   bool hw_decomp{false};  ///< Hardware-accelerated decompression engine present.
+  /**
+   * The GPU reaches host memory over a cache-coherent chip-to-chip link (e.g. NVLink-C2C on
+   * Grace Hopper / Grace Blackwell) rather than PCIe. Taken from NVML's C2C mode when the driver
+   * reports it, otherwise from the CUDA driver: native host atomics together with pageable
+   * memory access through the host page tables.
+   */
+  bool c2c{false};
 };
 
 /**
@@ -240,7 +249,8 @@ class topology_discovery {
    * transitively initializes the driver. This function does not call `cuInit`
    * and does not create a CUDA context; per-GPU queries that fail (e.g.
    * because the driver library is unavailable or uninitialized) leave
-   * `hw_decomp` as `false`.
+   * `hw_decomp` and `c2c` as `false`. The C2C query initializes NVML for the
+   * calling process if needed.
    *
    * @param topology Topology to enrich in place.
    */
@@ -264,5 +274,36 @@ class topology_discovery {
  private:
   std::optional<system_topology_info> _topology;  ///< Discovered topology information.
 };
+
+namespace detail {
+
+/// Reports a GPU's NVML C2C mode by PCI bus id; `std::nullopt` when NVML cannot tell.
+using c2c_nvml_probe = std::function<std::optional<bool>(std::string const& pci_bus_id)>;
+
+/// Reports a GPU's CUDA driver attributes by PCI bus id, as the pair
+/// (`CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED`,
+/// `CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`); 0 for a failed query.
+using c2c_attribute_probe = std::function<std::pair<int, int>(std::string const& pci_bus_id)>;
+
+/**
+ * @brief Combine the C2C evidence for one GPU.
+ *
+ * An NVML answer is authoritative. Without one, the link counts as C2C only when it supports
+ * native host atomics and the GPU accesses pageable memory through the host page tables.
+ */
+[[nodiscard]] bool c2c_from(std::optional<bool> nvml,
+                            int host_native_atomics,
+                            int host_page_tables) noexcept;
+
+/**
+ * @brief Decide whether the GPU at @p pci_bus_id has a C2C host link.
+ *
+ * Asks @p nvml_probe first and calls @p attribute_probe only when NVML has no answer.
+ */
+[[nodiscard]] bool c2c_decision(std::string const& pci_bus_id,
+                                c2c_nvml_probe const& nvml_probe,
+                                c2c_attribute_probe const& attribute_probe);
+
+}  // namespace detail
 
 }  // namespace cucascade::memory

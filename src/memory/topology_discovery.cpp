@@ -25,10 +25,12 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -154,7 +156,7 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
 }
 
 /**
- * @brief Query whether a GPU has a hardware-accelerated decompression engine.
+ * @brief Resolve a GPU's CUDA driver device handle from its PCI bus id.
  *
  * The device is identified by PCI bus id rather than by ordinal. Device ordinals are
  * not a stable identity across APIs: NVML enumerates in PCI-bus order while the CUDA
@@ -163,39 +165,73 @@ void report_nvml_error(nvmlReturn_t result, std::string const& context)
  * host. `cuDeviceGetByPCIBusId` sidesteps both that reordering and any
  * `CUDA_VISIBLE_DEVICES` remapping.
  *
- * `cuDeviceGetAttribute` takes its device explicitly, so no context is created and
- * the calling thread's current device is left untouched.
- *
- * Best-effort: a bus id CUDA does not expose (e.g. masked out by
- * `CUDA_VISIBLE_DEVICES`) or an attribute unsupported by the running driver both
- * yield false.
- *
  * @note The caller is responsible for having invoked `cuInit(0)` beforehand.
  *
  * @param pci_bus_id PCI bus id of the GPU, in NVML's `domain:bus:device.function`
  * form. For a MIG instance this is the parent physical GPU's bus id, which is the
- * correct scope: the decompression engine is a property of the physical device.
+ * correct scope for the attributes queried here: they describe the physical device.
+ * @return The device; empty when the driver is unavailable or does not expose the bus id
+ * (e.g. masked out by `CUDA_VISIBLE_DEVICES`).
+ */
+std::optional<CUdevice> cuda_device_from_pci_bus_id(std::string const& pci_bus_id)
+{
+  if (pci_bus_id.empty()) { return std::nullopt; }
+
+  auto const& driver = cuda_driver_api::instance();
+  if (!driver.available()) { return std::nullopt; }
+
+  CUdevice device = 0;
+  if (driver.device_get_by_pci_bus_id(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) {
+    return std::nullopt;
+  }
+  return device;
+}
+
+/**
+ * @brief Read one CUDA driver attribute of @p device.
+ *
+ * `cuDeviceGetAttribute` takes its device explicitly, so no context is created and
+ * the calling thread's current device is left untouched.
+ *
+ * @return The attribute value, or 0 when the running driver does not support it.
+ */
+int query_device_attribute(CUdevice device, CUdevice_attribute attribute)
+{
+  int value = 0;
+  if (cuda_driver_api::instance().device_get_attribute(&value, attribute, device) != CUDA_SUCCESS) {
+    return 0;
+  }
+  return value;
+}
+
+/**
+ * @brief Query whether a GPU has a hardware-accelerated decompression engine.
+ *
+ * Best-effort: a bus id CUDA does not expose or an attribute unsupported by the
+ * running driver both yield false.
+ *
  * @return true iff the device reports at least one hardware decompression algorithm.
  */
 bool query_hw_decompression(std::string const& pci_bus_id)
 {
-  if (pci_bus_id.empty()) { return false; }
+  auto const device = cuda_device_from_pci_bus_id(pci_bus_id);
+  if (!device) { return false; }
+  return query_device_attribute(*device, CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK) != 0;
+}
 
-  auto const& driver = cuda_driver_api::instance();
-  if (!driver.available()) { return false; }
-
-  CUdevice device = 0;
-  if (driver.device_get_by_pci_bus_id(&device, pci_bus_id.c_str()) != CUDA_SUCCESS) {
-    return false;
-  }
-
-  int algorithm_mask = 0;
-  if (driver.device_get_attribute(&algorithm_mask,
-                                  CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
-                                  device) != CUDA_SUCCESS) {
-    return false;
-  }
-  return algorithm_mask != 0;
+/**
+ * @brief Read the CUDA driver attributes that indicate a coherent C2C host link.
+ *
+ * @return (`HOST_NATIVE_ATOMIC_SUPPORTED`, `PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`),
+ * each 0 when it cannot be queried.
+ */
+std::pair<int, int> query_c2c_driver_attributes(std::string const& pci_bus_id)
+{
+  auto const device = cuda_device_from_pci_bus_id(pci_bus_id);
+  if (!device) { return {0, 0}; }
+  return {query_device_attribute(*device, CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED),
+          query_device_attribute(*device,
+                                 CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES)};
 }
 
 /**
@@ -927,7 +963,54 @@ nvmlReturn_t initialize_nvml_for_current_process()
   return init_result;
 }
 
+/**
+ * @brief Read a GPU's C2C mode from NVML.
+ *
+ * Every failure gives no answer, so the caller falls back to the CUDA driver attributes:
+ * NVML could not be initialized, the bus id has no NVML device, the running driver predates
+ * the query (the NVML stub reports `NVML_ERROR_FUNCTION_NOT_FOUND`), or the device does not
+ * support it (`NVML_ERROR_NOT_SUPPORTED`, as on some VMs).
+ */
+std::optional<bool> query_nvml_c2c_mode(std::string const& pci_bus_id)
+{
+#if defined(nvmlC2cModeInfo_v1)
+  if (pci_bus_id.empty() || initialize_nvml_for_current_process() != NVML_SUCCESS) {
+    return std::nullopt;
+  }
+  nvmlDevice_t device{};
+  if (nvmlDeviceGetHandleByPciBusId_v2(pci_bus_id.c_str(), &device) != NVML_SUCCESS) {
+    return std::nullopt;
+  }
+  nvmlC2cModeInfo_v1_t info{};
+  if (nvmlDeviceGetC2cModeInfoV(device, &info) != NVML_SUCCESS) { return std::nullopt; }
+  return info.isC2cEnabled != 0;
+#else
+  static_cast<void>(pci_bus_id);
+  return std::nullopt;
+#endif
+}
+
 }  // namespace
+
+namespace detail {
+
+bool c2c_from(std::optional<bool> nvml, int host_native_atomics, int host_page_tables) noexcept
+{
+  if (nvml.has_value()) { return *nvml; }
+  return host_native_atomics != 0 && host_page_tables != 0;
+}
+
+bool c2c_decision(std::string const& pci_bus_id,
+                  c2c_nvml_probe const& nvml_probe,
+                  c2c_attribute_probe const& attribute_probe)
+{
+  auto const nvml = nvml_probe(pci_bus_id);
+  if (nvml.has_value()) { return c2c_from(nvml, 0, 0); }
+  auto const [host_native_atomics, host_page_tables] = attribute_probe(pci_bus_id);
+  return c2c_from(std::nullopt, host_native_atomics, host_page_tables);
+}
+
+}  // namespace detail
 
 bool topology_discovery::discover(NetworkDeviceVerification net_verification,
                                   bool with_runtime_attributes)
@@ -1120,7 +1203,9 @@ void topology_discovery::discover_runtime_attributes(system_topology_info& topol
   // This function does not call cuInit and does not create a CUDA context.
   for (auto& gpu : topology.gpus) {
     gpu_runtime_attributes attrs;
-    attrs.hw_decomp        = query_hw_decompression(gpu.pci_bus_id);
+    attrs.hw_decomp = query_hw_decompression(gpu.pci_bus_id);
+    attrs.c2c =
+      detail::c2c_decision(gpu.pci_bus_id, query_nvml_c2c_mode, query_c2c_driver_attributes);
     gpu.runtime_attributes = attrs;
   }
 }

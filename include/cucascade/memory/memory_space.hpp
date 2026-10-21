@@ -118,6 +118,21 @@ class memory_space {
   [[nodiscard]] size_t get_total_reserved_memory() const;
   [[nodiscard]] size_t get_max_memory() const noexcept;
 
+  /** @brief Configured capacity of this space in bytes (the base of the threshold fractions). */
+  [[nodiscard]] size_t get_capacity() const noexcept;
+
+  /**
+   * @brief Consumed bytes (`get_max_memory() - get_available_memory()`) at or above which
+   * `should_downgrade_memory()` reports true: capacity x downgrade trigger fraction.
+   */
+  [[nodiscard]] size_t get_downgrade_trigger_threshold() const noexcept;
+
+  /**
+   * @brief Consumed bytes at or below which `should_stop_downgrading_memory()` reports true:
+   * capacity x downgrade stop fraction.
+   */
+  [[nodiscard]] size_t get_downgrade_stop_threshold() const noexcept;
+
   // Allocator management
   [[nodiscard]] rmm::device_async_resource_ref get_default_allocator() const noexcept;
 
