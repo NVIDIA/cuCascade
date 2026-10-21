@@ -361,6 +361,18 @@ size_t memory_space::get_total_reserved_memory() const
 
 size_t memory_space::get_max_memory() const noexcept { return _memory_limit; }
 
+size_t memory_space::get_capacity() const noexcept { return _capacity; }
+
+size_t memory_space::get_downgrade_trigger_threshold() const noexcept
+{
+  return _start_downgrading_memory_threshold;
+}
+
+size_t memory_space::get_downgrade_stop_threshold() const noexcept
+{
+  return _stop_downgrading_memory_threshold;
+}
+
 rmm::device_async_resource_ref memory_space::get_default_allocator() const noexcept
 {
   return std::visit(
