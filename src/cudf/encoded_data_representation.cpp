@@ -93,13 +93,22 @@ void validate_reservation(const memory::memory_space& space,
   }
 }
 
-/** Drain submitted transfers before a failed operation destroys their buffers. */
+/**
+ * Drain submitted transfers before a failed operation destroys their buffers.
+ *
+ * The destructor only synchronizes on an exceptional path (finish() was not reached or itself
+ * failed), so it is best effort: a failed synchronize means the stream or context is already in
+ * an error state, and aborting here would hide the exception being propagated.
+ */
 class transfer_guard {
  public:
   explicit transfer_guard(::cuda::stream_ref stream) : _stream(stream) {}
   ~transfer_guard()
   {
-    if (_pending) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(_stream.get())); }
+    if (_pending && cudaStreamSynchronize(_stream.get()) != cudaSuccess) {
+      // Clear a non-sticky error so it is not reported by an unrelated later CUDA call.
+      (void)cudaGetLastError();
+    }
   }
   transfer_guard(const transfer_guard&)            = delete;
   transfer_guard& operator=(const transfer_guard&) = delete;
@@ -163,11 +172,8 @@ encoded_data_representation::~encoded_data_representation() noexcept
   }
   if (auto* device = std::get_if<std::unique_ptr<rmm::device_buffer>>(&_storage->buffer)) {
     // RMM resources and stream-ordered frees belong to the buffer's device.
-    int previous = -1;
-    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaGetDevice(&previous));
-    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaSetDevice(get_device_id()));
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{get_device_id()}};
     device->reset();
-    if (previous >= 0) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaSetDevice(previous)); }
   }
 }
 
@@ -380,6 +386,9 @@ std::unique_ptr<idata_representation> encoded_data_representation::relocate(
   }
   validate_reservation(*target, _payload_size, reservation);
   wait_for_writer();
+  // The idata_representation::relocate() contract takes a const target, but allocating in a space
+  // draws from its (mutable) allocator, stream pool, and reservation accounting. Memory space
+  // objects are not themselves const, so the cast is well defined.
   auto result = allocate(
     *const_cast<memory::memory_space*>(target), _payload_size, _metadata, stream, reservation);
 

@@ -451,6 +451,7 @@ void mutable_data_batch::relocate_impl(const memory::memory_space* target_memory
   if (target_memory_space == nullptr) {
     throw std::invalid_argument("Relocation target memory space must not be null");
   }
+  if (_batch->_data == nullptr) { throw std::runtime_error("Cannot relocate: data is null"); }
   if (target_memory_space == &_batch->_data->get_memory_space()) { return; }
 
   _batch->_probe->relocation_started(*_batch->_data, target_memory_space);
