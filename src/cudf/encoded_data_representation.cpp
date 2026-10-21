@@ -33,7 +33,10 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
+#include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -51,8 +54,60 @@ constexpr std::size_t staging_size = 1ull << 20;
 
 /// Chunk size of the pageable bounce buffer of DISK legs that cannot transfer directly (between
 /// two files, or from a GPU when the target io context cannot write device memory). Each chunk is
-/// one io request, so it is larger than the GPU bounce buffer.
+/// one io request, so it is larger than the GPU bounce buffer. A multiple of the io block size, so
+/// every chunk but the last is written at a block-aligned offset.
 constexpr std::size_t disk_staging_size = 8ull << 20;
+static_assert(disk_staging_size % io::IO_BLOCK_SIZE == 0);
+
+struct block_aligned_delete {
+  void operator()(std::uint8_t* buffer) const noexcept
+  {
+    ::operator delete[](buffer, std::align_val_t{io::IO_BLOCK_SIZE});
+  }
+};
+
+/**
+ * Uninitialized pageable bounce buffer of a DISK leg. Block alignment lets a backend write its
+ * aligned chunks with direct I/O straight from the buffer, without first copying them into its
+ * own staging or falling back to the page cache.
+ */
+std::unique_ptr<std::uint8_t[], block_aligned_delete> make_disk_staging(std::size_t size)
+{
+  return std::unique_ptr<std::uint8_t[], block_aligned_delete>{
+    static_cast<std::uint8_t*>(::operator new[](size, std::align_val_t{io::IO_BLOCK_SIZE}))};
+}
+
+/// The io contexts of the DISK side(s) of a relocation; null for a side that is not DISK.
+struct disk_io_contexts {
+  std::shared_ptr<io::ioctx> source;
+  std::shared_ptr<io::ioctx> target;
+};
+
+/**
+ * Resolve the io contexts a relocation from @p source to @p target goes through, and reject a pair
+ * they cannot transfer before anything is allocated for it. The contexts are held for the whole
+ * relocation, so a concurrent memory_space::set_io_context() cannot replace them mid-copy.
+ */
+disk_io_contexts resolve_disk_io_contexts(const memory::memory_space& source,
+                                          const memory::memory_space& target)
+{
+  disk_io_contexts contexts;
+  if (source.get_tier() == Tier::DISK) {
+    contexts.source = detail::resolve_disk_io_context(source);
+    if (target.get_tier() == Tier::GPU && !contexts.source->supports_device_read()) {
+      throw std::logic_error(
+        "disk tier: the io context of the DISK memory space cannot read into device memory");
+    }
+  }
+  if (target.get_tier() == Tier::DISK) {
+    // Writing device memory implies supports_write(); without it a GPU source is staged on host.
+    contexts.target = detail::resolve_disk_io_context(target);
+    if (!contexts.target->supports_write()) {
+      throw std::logic_error("disk tier: the io context of the DISK memory space cannot write");
+    }
+  }
+  return contexts;
+}
 
 void validate_metadata(const encoded_data_metadata& metadata)
 {
@@ -463,6 +518,7 @@ std::unique_ptr<idata_representation> encoded_data_representation::relocate(
     validate_stream(stream, get_device_id());
   }
   validate_reservation(*target, _payload_size, reservation);
+  auto disk_contexts = resolve_disk_io_contexts(get_memory_space(), *target);
   wait_for_writer();
   // The idata_representation::relocate() contract takes a const target, but allocating in a space
   // draws from its (mutable) allocator, stream pool, and reservation accounting. Memory space
@@ -499,7 +555,7 @@ std::unique_ptr<idata_representation> encoded_data_representation::relocate(
   }
 
   if (source_tier == Tier::DISK || target_tier == Tier::DISK) {
-    relocate_disk(*result, stream);
+    relocate_disk(*result, disk_contexts.source.get(), disk_contexts.target.get(), stream);
     complete_device();
     return result;
   }
@@ -600,30 +656,31 @@ std::unique_ptr<idata_representation> encoded_data_representation::relocate(
 }
 
 void encoded_data_representation::relocate_disk(encoded_data_representation& result,
+                                                io::ioctx* source_io,
+                                                io::ioctx* target_io,
                                                 ::cuda::stream_ref stream) const
 {
-  // Every leg goes through the io context of the DISK space(s) involved, and each helper waits for
-  // its request before it returns or unwinds. So when this function is left, normally or by an
-  // exception, no I/O touches either payload or either file any more, and a failed copy can be
-  // destroyed (removing its file) without racing the transfer.
+  // Every leg goes through the io context of the DISK space(s) involved, resolved and checked for
+  // the leg's capabilities by relocate(), and each helper waits for its request before it returns
+  // or unwinds. So when this function is left, normally or by an exception, no I/O touches either
+  // payload or either file any more, and a failed copy can be destroyed (removing its file) without
+  // racing the transfer.
   auto source_tier = get_current_tier();
   auto target_tier = result.get_current_tier();
   auto& target     = result.get_memory_space();
 
   if (source_tier == Tier::HOST && target_tier == Tier::DISK) {
-    auto context = detail::resolve_disk_io_context(target);
-    auto slices  = host_write_slices(get_host_buffer(), _payload_size);
-    detail::write_disk_file_host(*context, result.get_file_path().string(), slices, _payload_size);
+    auto slices = host_write_slices(get_host_buffer(), _payload_size);
+    detail::write_disk_file_host(
+      *target_io, result.get_file_path().string(), slices, _payload_size);
     return;
   }
   if (source_tier == Tier::DISK && target_tier == Tier::HOST) {
-    auto context = detail::resolve_disk_io_context(get_memory_space());
-    auto slices  = host_read_slices(result.get_host_buffer(), _payload_size, get_file_offset());
-    detail::read_disk_file_host(*context, get_file_path().string(), slices);
+    auto slices = host_read_slices(result.get_host_buffer(), _payload_size, get_file_offset());
+    detail::read_disk_file_host(*source_io, get_file_path().string(), slices);
     return;
   }
   if (source_tier == Tier::DISK && target_tier == Tier::GPU) {
-    auto context = detail::resolve_disk_io_context(get_memory_space());
     // The io context binds device destinations to the current device. The destination is a
     // stream-ordered allocation on `stream`; the read is ordered after the work enqueued on
     // `stream` before it, and its bytes are in device memory once the helper returns, so the
@@ -631,34 +688,34 @@ void encoded_data_representation::relocate_disk(encoded_data_representation& res
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target.get_device_id()}};
     std::array<io::slice, 1> slices{io::slice{
       get_file_offset(), _payload_size, static_cast<std::uint8_t*>(result.device_data())}};
-    detail::read_disk_file_device(*context, get_file_path().string(), slices, stream);
+    detail::read_disk_file_device(*source_io, get_file_path().string(), slices, stream);
     return;
   }
   if (source_tier == Tier::GPU && target_tier == Tier::DISK) {
-    auto context    = detail::resolve_disk_io_context(target);
     const auto path = result.get_file_path().string();
     // The io context binds device sources to the current device. The source writer has completed
     // (wait_for_writer), and `stream` belongs to the source device.
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{get_device_id()}};
     const auto* source = static_cast<const std::uint8_t*>(get_device_buffer().data());
-    if (context->supports_device_write()) {
+    if (target_io->supports_device_write()) {
       std::array<io::write_slice, 1> slices{io::write_slice{0, _payload_size, source}};
-      detail::write_disk_file_device(*context, path, slices, stream, _payload_size);
+      detail::write_disk_file_device(*target_io, path, slices, stream, _payload_size);
       return;
     }
     // The context can only write host memory: stage through bounded pageable memory, completing
     // each device-to-host copy before its chunk is written and the buffer reused.
-    std::vector<std::byte> staging(std::min(disk_staging_size, _payload_size));
+    const auto staging_bytes = std::min(disk_staging_size, _payload_size);
+    auto staging             = make_disk_staging(staging_bytes);
+    auto file                = detail::open_disk_file_for_write(*target_io, path, _payload_size);
     for (std::size_t offset = 0; offset < _payload_size;) {
-      auto count = std::min(staging.size(), _payload_size - offset);
+      auto count = std::min(staging_bytes, _payload_size - offset);
       transfer_guard transfers{stream};
       transfers.submitted();
       CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-        staging.data(), source + offset, count, cudaMemcpyDeviceToHost, stream.get()));
+        staging.get(), source + offset, count, cudaMemcpyDeviceToHost, stream.get()));
       transfers.finish();
-      std::array<io::write_slice, 1> slices{
-        io::write_slice{offset, count, reinterpret_cast<const std::uint8_t*>(staging.data())}};
-      detail::write_disk_file_host(*context, path, slices, _payload_size);
+      std::array<io::write_slice, 1> slices{io::write_slice{offset, count, staging.get()}};
+      detail::write_disk_file_host(*target_io, *file, slices);
       offset += count;
     }
     return;
@@ -666,18 +723,17 @@ void encoded_data_representation::relocate_disk(encoded_data_representation& res
   if (source_tier == Tier::DISK && target_tier == Tier::DISK) {
     // Between two files (possibly of the same space, as for clone()), through bounded pageable
     // staging: each chunk is read completely before it is written.
-    auto source_context    = detail::resolve_disk_io_context(get_memory_space());
-    auto target_context    = detail::resolve_disk_io_context(target);
-    const auto source_path = get_file_path().string();
-    const auto target_path = result.get_file_path().string();
-    std::vector<std::byte> staging(std::min(disk_staging_size, _payload_size));
-    auto* buffer = reinterpret_cast<std::uint8_t*>(staging.data());
+    const auto staging_bytes = std::min(disk_staging_size, _payload_size);
+    auto staging             = make_disk_staging(staging_bytes);
+    auto source_file         = source_io->open_io_object(get_file_path().string());
+    auto target_file =
+      detail::open_disk_file_for_write(*target_io, result.get_file_path().string(), _payload_size);
     for (std::size_t offset = 0; offset < _payload_size;) {
-      auto count = std::min(staging.size(), _payload_size - offset);
-      std::array<io::slice, 1> reads{io::slice{get_file_offset() + offset, count, buffer}};
-      detail::read_disk_file_host(*source_context, source_path, reads);
-      std::array<io::write_slice, 1> writes{io::write_slice{offset, count, buffer}};
-      detail::write_disk_file_host(*target_context, target_path, writes, _payload_size);
+      auto count = std::min(staging_bytes, _payload_size - offset);
+      std::array<io::slice, 1> reads{io::slice{get_file_offset() + offset, count, staging.get()}};
+      detail::read_disk_file_host(*source_io, *source_file, reads);
+      std::array<io::write_slice, 1> writes{io::write_slice{offset, count, staging.get()}};
+      detail::write_disk_file_host(*target_io, *target_file, writes);
       offset += count;
     }
     return;

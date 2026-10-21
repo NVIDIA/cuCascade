@@ -32,6 +32,10 @@
 
 namespace cucascade {
 
+namespace io {
+class ioctx;
+}  // namespace io
+
 /** @brief Encoding and logical layout information retained verbatim during relocation. */
 struct encoded_data_metadata {
   std::string encoding;              ///< Application-defined, nonempty format or codec name.
@@ -151,10 +155,10 @@ class encoded_data_representation : public idata_representation {
    * use the stream.
    * An optional reservation must belong to the target space and cover
    * relocation_reservation_bytes(). HOST allocations draw from that reservation. A DISK
-   * reservation is caller-owned and must outlive the copy's file; without one, the copy owns a
-   * reservation for its payload. GPU allocations follow the target allocator's existing
-   * reservation tracker; pass no reservation pointer and attach owned GPU reservations to the
-   * tracker before calling. A non-null GPU reservation pointer is rejected.
+   * reservation is only validated, not consumed: it stays caller-owned and must outlive the copy's
+   * file. Without one, the copy owns a reservation for its payload. GPU allocations follow the
+   * target allocator's existing reservation tracker; pass no reservation pointer and attach owned
+   * GPU reservations to the tracker before calling. A non-null GPU reservation pointer is rejected.
    *
    * A GPU source is written to DISK directly from device memory when the target space's io context
    * can write device memory, and through bounded pageable host staging otherwise. A failed copy
@@ -164,7 +168,8 @@ class encoded_data_representation : public idata_representation {
    *         that belongs to another space, is too small, or is a GPU reservation.
    * @throws rmm::out_of_memory if no reservation is passed and a DISK target has no room left.
    * @throws std::logic_error if a DISK source's io context cannot read into device memory for a
-   *         GPU target, or a DISK target's io context cannot write.
+   *         GPU target, or a DISK target's io context cannot write. Checked before anything is
+   *         allocated in the target space.
    * @throws std::system_error / std::runtime_error on an I/O failure, including a DISK source
    *         whose file is shorter than its range.
    */
@@ -191,8 +196,14 @@ class encoded_data_representation : public idata_representation {
                                                                ::cuda::stream_ref stream,
                                                                memory::reservation* reservation);
   void wait_for_writer() const;
-  /// Copy the payload into @p result when either side is a DISK space (see relocate()).
-  void relocate_disk(encoded_data_representation& result, ::cuda::stream_ref stream) const;
+  /**
+   * Copy the payload into @p result when either side is a DISK space (see relocate()), through
+   * @p source_io (set when the source is a DISK space) and @p target_io (set when the target is).
+   */
+  void relocate_disk(encoded_data_representation& result,
+                     io::ioctx* source_io,
+                     io::ioctx* target_io,
+                     ::cuda::stream_ref stream) const;
   [[nodiscard]] void* device_data();
 
   std::size_t _payload_size;

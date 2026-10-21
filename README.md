@@ -119,7 +119,8 @@ footprint, including host block rounding. `get_uncompressed_data_size_in_bytes()
 logical size supplied in the metadata. Reserve destination capacity for the physical footprint:
 `encoded_data_representation::relocation_reservation_bytes(space, payload_size)` returns the
 bytes a destination reservation must cover. The HOST/DISK reservation overload is
-`writable.relocate_to(*reservation, stream)`; a DISK reservation must outlive the copy's file. For GPU reservations, first transfer the
+`writable.relocate_to(*reservation, stream)`; a DISK reservation is validated but not consumed,
+and must outlive the copy's file. For GPU reservations, first transfer the
 reservation to the GPU allocator's stream tracker using `attach_reservation_to_tracker()`, then
 use `relocate_to(&gpu_space, stream)`. Passing a caller-owned GPU reservation is rejected because
 attaching it consumes its ownership. The participating GPU owns `stream`; for cross-GPU
