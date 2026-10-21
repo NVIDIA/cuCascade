@@ -113,7 +113,10 @@ class encoded_data_representation : public idata_representation {
    *        bytes there: the payload rounded up to whole host blocks for HOST, the payload itself
    *        for GPU and DISK.
    *
-   * relocate() rejects a HOST or DISK reservation smaller than this.
+   * relocate() rejects a HOST reservation smaller than this. relocate() never accepts a GPU
+   * reservation pointer, so the GPU value is for sizing a reservation that the caller attaches to
+   * the target allocator's tracker before relocating. The DISK value describes the footprint of a
+   * DISK copy; relocation to or from DISK is not supported yet.
    *
    * @throws std::invalid_argument if a HOST space's block size is not a power of two.
    * @throws std::overflow_error if rounding up to whole blocks overflows.
@@ -144,7 +147,8 @@ class encoded_data_representation : public idata_representation {
    * @brief Make a complete byte-preserving copy in a target space, leaving the source untouched.
    *
    * For transfers to GPU, @p stream belongs to the destination device. For transfers from GPU to
-   * HOST or DISK, it belongs to the source device. HOST/DISK-only transfers do not use the stream.
+   * HOST, it belongs to the source device. HOST-only transfers do not use the stream. DISK sources
+   * and targets are not supported yet.
    * An optional reservation must belong to the target space and cover
    * relocation_reservation_bytes(). HOST allocations draw from that reservation. GPU allocations
    * follow the target allocator's existing reservation tracker; pass no reservation pointer and

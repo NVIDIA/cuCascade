@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
@@ -39,6 +40,7 @@
 #include <memory>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 using namespace cucascade;
@@ -422,6 +424,65 @@ TEST_CASE("encoded GPU writer events order relocation on another stream", "[enco
   auto result = source->relocate(&host, reader);
   REQUIRE(read_bytes(result->cast<encoded_data_representation>()) ==
           std::vector<std::byte>(bytes.size(), std::byte{0xA7}));
+}
+
+namespace {
+
+/// Hold back later work on a stream long enough that an unordered reader would observe stale bytes.
+void delay_stream(void*) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+
+}  // namespace
+
+TEST_CASE("encoded relocation waits for a pending GPU writer for every target",
+          "[encoded][gpu][stream]")
+{
+  int count = 0;
+  CUCASCADE_CUDA_TRY(cudaGetDeviceCount(&count));
+  memory::memory_space host{host_config()};
+  memory::memory_space gpu{gpu_config()};
+  std::unique_ptr<memory::memory_space> other_gpu;
+  if (count >= 2) {
+    memory::gpu_memory_space_config config;
+    config.device_id       = 1;
+    config.memory_capacity = 32ull << 20;
+    other_gpu              = std::make_unique<memory::memory_space>(config);
+  }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  rmm::cuda_stream writer;
+  rmm::cuda_stream reader;
+  const auto bytes = payload(65537);
+  const std::vector<std::byte> written(bytes.size(), std::byte{0xC3});
+  auto seed = encoded_data_representation::from_host(bytes, make_metadata(), host);
+
+  std::vector<memory::memory_space*> targets{&gpu, &host};
+  if (other_gpu) { targets.push_back(other_gpu.get()); }
+  for (auto* target : targets) {
+    INFO("target tier=" << static_cast<int>(target->get_tier())
+                        << " device=" << target->get_device_id());
+    auto source = seed->relocate(&gpu, writer);
+    REQUIRE(read_bytes(source->cast<encoded_data_representation>()) == bytes);
+    // The overwrite is still queued behind the delay when relocation starts on another stream.
+    CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(writer.value(), delay_stream, nullptr));
+    auto* data =
+      const_cast<void*>(source->cast<encoded_data_representation>().get_device_buffer().data());
+    CUCASCADE_CUDA_TRY(cudaMemsetAsync(data, 0xC3, bytes.size(), writer.value()));
+    source->record_writer_event(writer);
+    source->rebind_stream(reader);
+
+    auto check = [&](::cuda::stream_ref stream) {
+      auto result = source->relocate(target, stream);
+      REQUIRE(&result->get_memory_space() == target);
+      REQUIRE(read_bytes(result->cast<encoded_data_representation>()) == written);
+    };
+    if (target == other_gpu.get()) {
+      // A stream on the destination device, destroyed only after the result is released.
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{1}};
+      rmm::cuda_stream target_stream;
+      check(target_stream);
+    } else {
+      check(reader);
+    }
+  }
 }
 
 TEST_CASE("encoded GPU relocation uses a reservation already attached to its stream",
