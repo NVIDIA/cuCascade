@@ -18,6 +18,7 @@
 
 #include "cache_test_fixture.hpp"
 #include "io/rest/rest_contract_test_utils.hpp"
+#include "utils/cuda_test_utils.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -41,6 +42,8 @@ namespace {
 using cucascade::io::open_datasource;
 using cucascade::io::open_hint;
 using cucascade::io::rest::rest_io_object;
+using cucascade::test::controlled_chunk_bytes;
+using cucascade::test::cuda_device_count;
 using cucascade::test::identity_memory;
 using cucascade::test::loopback_range_server;
 using cucascade::test::make_rest_contract_ioctx;
@@ -124,7 +127,7 @@ TEST_CASE("footer probe open uses the configured suffix window", "[rest][footer]
   CHECK(server.get_count() == (covered ? 1 : 2));
 }
 
-TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on SeaweedFS fixtures", "[rest][data]")
+TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on loopback fixtures", "[rest][data]")
 {
   auto const small = rest_test_payload(64UL << 10);
   loopback_range_server server(small);
@@ -144,6 +147,8 @@ TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on SeaweedFS fixture
   auto const tail_offset = small.size() - 17;
   REQUIRE(datasource->host_read(tail_offset, crossing.size(), crossing.data()) == 17);
   require_rest_bytes_equal({crossing.data(), 17}, {small.data() + tail_offset, 17});
+  CHECK(std::all_of(
+    crossing.begin() + 17, crossing.end(), [](std::uint8_t byte) { return byte == 0xaa; }));
   eof.fill(std::uint8_t{0xcc});
   CHECK(datasource->host_read(small.size(), eof.size(), eof.data()) == 0);
   CHECK(datasource->host_read(small.size() + 99, eof.size(), eof.data()) == 0);
@@ -152,19 +157,17 @@ TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on SeaweedFS fixture
 
 TEST_CASE(
   "rest_ioctx stages device reads through the fixed-size host memory resource for single and multi "
-  "chunk SeaweedFS reads",
+  "chunk loopback reads",
   "[rest][data][gpu]")
 {
-  int count = 0;
-  REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
-  if (count == 0) { SKIP("requires a CUDA device"); }
+  if (cuda_device_count() == 0) { SKIP("requires a CUDA device"); }
   auto memory       = identity_memory();
   auto const spaces = memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
   REQUIRE_FALSE(spaces.empty());
   auto* host = const_cast<cucascade::memory::memory_space*>(spaces.front())
                  ->get_memory_resource_of<cucascade::memory::Tier::HOST>();
   REQUIRE(host != nullptr);
-  REQUIRE(host->get_block_size() == (1U << 20));
+  REQUIRE(host->get_block_size() == controlled_chunk_bytes);
 
   SECTION("single chunk")
   {
@@ -181,6 +184,7 @@ TEST_CASE(
             small.size());
     auto bytes = rest_device_bytes(destination.data(), small.size(), stream.value());
     require_rest_bytes_equal(bytes, small);
+    CHECK(host->get_peak_total_allocated_bytes() > 0);
   }
   SECTION("multi chunk")
   {
@@ -198,5 +202,6 @@ TEST_CASE(
               offset, size, static_cast<std::uint8_t*>(destination.data()), stream) == size);
     auto bytes = rest_device_bytes(destination.data(), size, stream.value());
     require_rest_bytes_equal(bytes, {medium.data() + offset, size});
+    CHECK(host->get_peak_total_allocated_bytes() > 0);
   }
 }

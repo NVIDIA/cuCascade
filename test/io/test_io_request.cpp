@@ -84,7 +84,8 @@ TEST_CASE("physical completion publishes cache state before the future", "[io][c
   operation.coordinator = coordinator;
   operation.on_complete = std::make_shared<prepared_io_completion>(
     [&](std::span<cucascade::io::cache::cached_chunk* const>, bool success) noexcept {
-      callback_ran.store(success, std::memory_order_release);
+      // Sampled inside the callback: the future must still be pending here.
+      callback_ran.store(success && !future.is_ready(), std::memory_order_release);
     });
   operation.finish_success();
   CHECK(callback_ran.load(std::memory_order_acquire));

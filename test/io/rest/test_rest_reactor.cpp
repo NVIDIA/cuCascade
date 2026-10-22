@@ -43,10 +43,10 @@ using cucascade::io::prepared_io_slice;
 using cucascade::io::range;
 using cucascade::io::rest::rest_io_object;
 using cucascade::io::rest::rest_reactor;
-using cucascade::test::child_test_runner;
 using cucascade::test::loopback_range_server;
 using cucascade::test::make_rest_contract_reactor;
 using cucascade::test::rest_contract_config;
+using cucascade::test::run_in_child;
 using namespace std::chrono_literals;
 
 std::vector<byte_range> coalesce(std::vector<byte_range> ranges,
@@ -154,18 +154,7 @@ TEST_CASE("rest_reactor drops an empty grouped request without live-locking", "[
   auto empty_coordinator = std::make_shared<grouped_coordinator>(0, 0);
   auto empty_future      = empty_coordinator->get_future();
   CHECK(empty_future.is_ready());
-  if (auto const* child = std::getenv("CUCASCADE_REST_EMPTY_GROUP_CHILD");
-      child == nullptr || std::string_view{child} != "1") {
-    child_test_runner process{"rest_reactor drops an empty grouped request without live-locking",
-                              {{"CUCASCADE_REST_EMPTY_GROUP_CHILD", std::string{"1"}}}};
-    bool const completed = process.wait_for(5s);
-    if (!completed) { process.stop(); }
-    INFO(process.output());
-    REQUIRE(completed);
-    REQUIRE(WIFEXITED(process.status()));
-    CHECK(WEXITSTATUS(process.status()) == 0);
-    return;
-  }
+  if (run_in_child("CUCASCADE_REST_EMPTY_GROUP_CHILD", 5s)) { return; }
 
   std::array<std::uint8_t, 1> destination{};
   loopback_range_server server({0x5a});
@@ -177,6 +166,7 @@ TEST_CASE("rest_reactor drops an empty grouped request without live-locking", "[
   auto object = std::make_shared<rest_io_object>("s3://bucket/object", "bucket", "object", 1);
   reactor->enqueue(grouped_io_request::create(std::move(object), {}, empty_coordinator));
   auto future = enqueue_one(*reactor, destination.data());
-  static_cast<void>(std::move(future).get_try());
+  CHECK(std::move(future).get(5s) == 1);
+  CHECK(destination[0] == 0x5a);
   reactor->shutdown();
 }

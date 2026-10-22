@@ -158,9 +158,14 @@ struct response_release_guard {
 };
 
 struct response_body_policy {
+  /// Send the body in pieces of this many bytes; 0 sends it in one write.
   std::size_t chunk_bytes{0};
+  /// Pause between pieces; requires a non-zero `chunk_bytes`.
   std::chrono::milliseconds chunk_delay{0};
+  /// Stop after this many body bytes until `control->release_all()`; requires `control`.
   std::optional<std::size_t> hold_after_bytes;
+  /// Observes header/body progress and owns the hold; the server rejects a
+  /// policy that violates these rules in its constructor (`invalid_argument`).
   std::shared_ptr<range_response_control> control;
 };
 
@@ -174,6 +179,8 @@ struct range_fault_policy {
   std::chrono::milliseconds response_delay{0};
   /// Hold GET responses until this many GET requests have arrived; 0 disables the barrier.
   std::size_t get_response_barrier{0};
+  /// Answer every ranged data GET with a 200 carrying the whole object; its ETag
+  /// comes from the script or `successful_get_etag`.
   bool ignore_range_with_200{false};
   bool fail_range_with_416{false};
   bool malformed_content_range{false};
@@ -189,8 +196,6 @@ struct range_fault_policy {
   std::string interim_get_retry_after;
   std::string interim_head_etag;
   std::string interim_head_retry_after;
-  /// Answer every ranged data GET with a 200 carrying the whole object.
-  bool full_object_with_200{false};
   /// Failed GETs advertise a 64-byte error body, send 5 bytes, then close.
   bool truncate_error_body{false};
   std::optional<std::string> content_range;
@@ -337,6 +342,9 @@ class loopback_range_server {
   {
     return request_count(_get_counts_by_key, key);
   }
+  /// Data GETs in flight / at peak; suffix-range (`bytes=-N`) footer probes are
+  /// not counted here (nor by wait_for_active_gets / wait_for_idle), while
+  /// get_count() counts every GET.
   [[nodiscard]] std::size_t active_data_gets() const noexcept { return _active_data_gets.load(); }
   [[nodiscard]] std::size_t peak_active_gets() const noexcept { return _peak_active_gets.load(); }
   [[nodiscard]] std::size_t body_bytes_sent() const noexcept { return _body_bytes_sent.load(); }
@@ -614,19 +622,10 @@ class loopback_range_server {
         bool const sent = send_response(fd, response, {}, body_policy);
         return close_connection || !sent;
       }
-      if (_fault.full_object_with_200) {
-        std::string response =
-          "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
-        append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
-        append_connection_header(response, close_connection);
-        response += "\r\n\r\n";
-        bool const sent = send_body(fd, response, 0, _object.size(), body_xor, body_policy);
-        return close_connection || !sent;
-      }
       if (_fault.ignore_range_with_200) {
         std::string response =
           "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
-        append_etag_header(response, _fault.failed_get_etag);
+        append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
         append_connection_header(response, close_connection);
         response += "\r\n\r\n";
         bool const sent = send_body(fd, response, 0, _object.size(), body_xor, body_policy);

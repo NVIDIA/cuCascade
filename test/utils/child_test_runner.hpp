@@ -18,9 +18,11 @@
 
 #pragma once
 
+#include <catch2/catch_all.hpp>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -32,15 +34,21 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
+extern char** environ;  // NOLINT(readability-redundant-declaration)
+
 namespace cucascade::test {
 
 using environment_override = std::pair<std::string, std::optional<std::string>>;
 
+/// Sets variables of this process for the guard's lifetime and restores the
+/// previous values on destruction. setenv() is not thread-safe: construct the
+/// guard before any thread that may read the environment is running.
 class scoped_test_environment {
  public:
   explicit scoped_test_environment(std::initializer_list<environment_override> overrides)
@@ -48,53 +56,24 @@ class scoped_test_environment {
     _entries.reserve(overrides.size());
     for (auto const& [name, value] : overrides) {
       auto const* previous = std::getenv(name.c_str());
-      _entries.push_back(
-        {name, value, previous ? std::optional<std::string>{previous} : std::nullopt, false});
+      _entries.push_back({name, previous ? std::optional<std::string>{previous} : std::nullopt});
+      if (set_value(name, value) != 0) {
+        int const error = errno;
+        restore();
+        throw std::system_error(error, std::generic_category(), "setting test environment");
+      }
     }
   }
 
-  ~scoped_test_environment()
-  {
-    for (auto it = _entries.rbegin(); it != _entries.rend(); ++it) {
-      if (it->active) { set_value(it->name, it->previous); }
-    }
-  }
+  ~scoped_test_environment() { restore(); }
 
   scoped_test_environment(scoped_test_environment const&)            = delete;
   scoped_test_environment& operator=(scoped_test_environment const&) = delete;
 
-  void apply()
-  {
-    for (auto& entry : _entries) {
-      entry.active = true;
-      if (set_value(entry.name, entry.value) != 0) {
-        throw std::system_error(errno, std::generic_category(), "setting test environment");
-      }
-    }
-  }
-
-  void restore()
-  {
-    int error = 0;
-    for (auto it = _entries.rbegin(); it != _entries.rend(); ++it) {
-      if (!it->active) { continue; }
-      if (set_value(it->name, it->previous) == 0) {
-        it->active = false;
-      } else if (error == 0) {
-        error = errno;
-      }
-    }
-    if (error != 0) {
-      throw std::system_error(error, std::generic_category(), "restoring test environment");
-    }
-  }
-
  private:
   struct entry {
     std::string name;
-    std::optional<std::string> value;
     std::optional<std::string> previous;
-    bool active;
   };
 
   static int set_value(std::string const& name, std::optional<std::string> const& value) noexcept
@@ -102,9 +81,30 @@ class scoped_test_environment {
     return value ? ::setenv(name.c_str(), value->c_str(), 1) : ::unsetenv(name.c_str());
   }
 
+  void restore() noexcept
+  {
+    for (auto it = _entries.rbegin(); it != _entries.rend(); ++it) {
+      set_value(it->name, it->previous);
+    }
+    _entries.clear();
+  }
+
   std::vector<entry> _entries;
 };
 
+/**
+ * @brief Runs one test case of this binary in a child process
+ * (`/proc/self/exe <test_name>`).
+ *
+ * The child's environment is this process's environment with @p overrides
+ * applied (names must be unique within one call); it is assembled before
+ * fork() and handed to execve(), so this process's environment is never
+ * modified. The named test must use one of the overrides to detect that it is
+ * the child. stdout/stderr go to a temporary log
+ * that output() returns once the child has been reaped (exited()/wait_for());
+ * status() is the raw waitpid status. A child that is still running is SIGKILLed
+ * on destruction.
+ */
 class child_test_runner {
  public:
   child_test_runner(std::string const& test_name,
@@ -112,26 +112,24 @@ class child_test_runner {
     : _log(std::tmpfile(), &std::fclose)
   {
     if (!_log) { throw std::system_error(errno, std::generic_category(), "creating child log"); }
-    int const log_fd         = ::fileno(_log.get());
-    char const* const filter = test_name.c_str();
-    scoped_test_environment environment(overrides);
-    environment.apply();
+    int const log_fd = ::fileno(_log.get());
+    std::vector<std::string> arguments{"cucascade_tests",
+                                       "--order",
+                                       "decl",
+                                       "--reporter",
+                                       "compact",
+                                       "--success",
+                                       test_spec(test_name)};
+    auto environment     = child_environment(overrides);
+    auto const argv      = pointers(arguments);
+    auto const envp      = pointers(environment);
     _child.pid           = ::fork();
     int const fork_error = errno;
     if (_child.pid == 0) {
       if (::dup2(log_fd, STDOUT_FILENO) < 0 || ::dup2(log_fd, STDERR_FILENO) < 0) { ::_exit(126); }
-      ::execl("/proc/self/exe",
-              "cucascade_tests",
-              "--order",
-              "decl",
-              "--reporter",
-              "compact",
-              "--success",
-              filter,
-              static_cast<char*>(nullptr));
+      ::execve("/proc/self/exe", argv.data(), envp.data());
       ::_exit(127);
     }
-    environment.restore();
     if (_child.pid < 0) {
       throw std::system_error(fork_error, std::generic_category(), "fork failed");
     }
@@ -187,6 +185,48 @@ class child_test_runner {
   }
 
  private:
+  /// Catch2 parses the filter as a test spec: escape the `,` separator and `\`.
+  /// Names starting with `~` or `[`, or containing `*`, are still read as
+  /// spec syntax; no child test case uses them.
+  static std::string test_spec(std::string const& test_name)
+  {
+    std::string spec;
+    spec.reserve(test_name.size());
+    for (char const c : test_name) {
+      if (c == ',' || c == '\\') { spec.push_back('\\'); }
+      spec.push_back(c);
+    }
+    return spec;
+  }
+
+  static std::vector<std::string> child_environment(
+    std::initializer_list<environment_override> overrides)
+  {
+    std::vector<std::string> result;
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+      std::string_view const assignment{*entry};
+      auto const name       = assignment.substr(0, assignment.find('='));
+      bool const overridden = std::any_of(
+        overrides.begin(), overrides.end(), [&](auto const& o) { return o.first == name; });
+      if (!overridden) { result.emplace_back(assignment); }
+    }
+    for (auto const& [name, value] : overrides) {
+      if (value) { result.push_back(name + "=" + *value); }
+    }
+    return result;
+  }
+
+  static std::vector<char*> pointers(std::vector<std::string>& strings)
+  {
+    std::vector<char*> result;
+    result.reserve(strings.size() + 1);
+    for (auto& string : strings) {
+      result.push_back(string.data());
+    }
+    result.push_back(nullptr);
+    return result;
+  }
+
   struct child_owner {
     pid_t pid{-1};
     int status{0};
@@ -207,5 +247,25 @@ class child_test_runner {
   std::unique_ptr<std::FILE, decltype(&std::fclose)> _log;
   child_owner _child;
 };
+
+/// Runs the current test case in a child that sees @p marker set to "1".
+/// In the parent it waits for the child, asserts that it passed and returns
+/// true so the caller returns; in the child (marker already "1") it returns
+/// false and the caller runs the test body.
+inline bool run_in_child(char const* marker, std::chrono::milliseconds timeout)
+{
+  if (auto const* value = std::getenv(marker); value != nullptr && std::string_view{value} == "1") {
+    return false;
+  }
+  child_test_runner child{Catch::getResultCapture().getCurrentTestName(),
+                          {{marker, std::string{"1"}}}};
+  bool const finished = child.wait_for(timeout);
+  if (!finished) { child.stop(); }
+  INFO(child.output());
+  REQUIRE(finished);
+  REQUIRE(WIFEXITED(child.status()));
+  REQUIRE(WEXITSTATUS(child.status()) == 0);
+  return true;
+}
 
 }  // namespace cucascade::test

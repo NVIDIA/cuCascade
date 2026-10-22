@@ -18,6 +18,7 @@
 
 #include "rest_contract_test_utils.hpp"
 #include "utils/child_test_runner.hpp"
+#include "utils/cuda_test_utils.hpp"
 
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
@@ -32,19 +33,15 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -54,7 +51,7 @@ namespace {
 using cucascade::io::open_hint;
 using cucascade::io::slice;
 using cucascade::io::rest::rest_io_object;
-using cucascade::test::child_test_runner;
+using cucascade::test::cuda_device_count;
 using cucascade::test::loopback_range_server;
 using cucascade::test::make_rest_contract_ioctx;
 using cucascade::test::make_rest_contract_reactor;
@@ -69,6 +66,8 @@ using cucascade::test::rest_shutdown_guard;
 using cucascade::test::rest_test_footer_bytes;
 using cucascade::test::rest_test_parquet_bytes;
 using cucascade::test::rest_test_payload;
+using cucascade::test::run_in_child;
+using cucascade::test::stream_gate;
 using namespace std::chrono_literals;
 
 struct server_stop_guard {
@@ -81,65 +80,6 @@ struct cuda_host_deleter {
   {
     if (bytes) { (void)cudaFreeHost(bytes); }
   }
-};
-
-class delayed_stream_gate {
- public:
-  explicit delayed_stream_gate(cudaStream_t stream) : _stream(stream) {}
-  ~delayed_stream_gate()
-  {
-    release();
-    if (_timer.joinable()) { _timer.join(); }
-    (void)cudaStreamSynchronize(_stream);
-  }
-
-  void arm()
-  {
-    REQUIRE(cudaLaunchHostFunc(
-              _stream,
-              [](void* opaque) {
-                auto& gate = *static_cast<delayed_stream_gate*>(opaque);
-                std::unique_lock lock{gate._mutex};
-                gate._entered = true;
-                gate._cv.notify_all();
-                gate._cv.wait(lock, [&] { return gate._released; });
-              },
-              this) == cudaSuccess);
-  }
-
-  bool wait_entered(std::chrono::milliseconds timeout)
-  {
-    std::unique_lock lock{_mutex};
-    return _cv.wait_for(lock, timeout, [&] { return _entered; });
-  }
-
-  void release_after(std::chrono::milliseconds delay)
-  {
-    _timer = std::jthread([this, delay] {
-      std::unique_lock lock{_mutex};
-      _cv.wait_for(lock, delay, [&] { return _released; });
-      _released = true;
-      lock.unlock();
-      _cv.notify_all();
-    });
-  }
-
-  void release()
-  {
-    {
-      std::scoped_lock lock{_mutex};
-      _released = true;
-    }
-    _cv.notify_all();
-  }
-
- private:
-  cudaStream_t _stream;
-  std::mutex _mutex;
-  std::condition_variable _cv;
-  bool _entered{false};
-  bool _released{false};
-  std::jthread _timer;
 };
 
 void check_rest_pool(std::size_t reactors, std::size_t connections, bool multiple)
@@ -358,14 +298,14 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses", 
   }
   SECTION("server ignores Range with 200 full-body")
   {
-    fault.full_object_with_200 = true;
-    fault.successful_get_etag  = "\"discarded-200-tag\"";
+    fault.ignore_range_with_200 = true;
+    fault.successful_get_etag   = "\"discarded-200-tag\"";
   }
   SECTION("server ignores Range with 200 full-body on a large object")
   {
-    large                      = true;
-    fault.full_object_with_200 = true;
-    fault.body.chunk_bytes     = 64UL << 10;
+    large                       = true;
+    fault.ignore_range_with_200 = true;
+    fault.body.chunk_bytes      = 64UL << 10;
   }
   SECTION("suffix 416 falls back to HEAD") { fault.fail_range_with_416 = true; }
   SECTION("missing object fails the footer-probe open after HEAD fallback") { error_status = 404; }
@@ -556,7 +496,7 @@ TEST_CASE("concurrent footer probes each get an object-local suffix stash", "[re
   CHECK(server.get_count() == futures.size());
 }
 
-TEST_CASE("rest_ioctx fans out host_readv_async_io ranges against the SeaweedFS medium fixture",
+TEST_CASE("rest_ioctx fans out host_readv_async_io ranges against the loopback range server",
           "[rest][data]")
 {
   auto const medium = rest_test_payload(4UL << 20);
@@ -589,9 +529,7 @@ TEST_CASE("rest_ioctx fans out host_readv_async_io ranges against the SeaweedFS 
 TEST_CASE("rest_ioctx keeps caller host buffers until the device event completes",
           "[rest][data][gpu]")
 {
-  int count = 0;
-  REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
-  if (count == 0) { SKIP("requires a CUDA device"); }
+  if (cuda_device_count() == 0) { SKIP("requires a CUDA device"); }
   auto payload = rest_test_payload(256 * 1024);
   loopback_range_server server(payload);
   auto ioctx     = make_rest_contract_ioctx(server);
@@ -602,7 +540,7 @@ TEST_CASE("rest_ioctx keeps caller host buffers until the device event completes
   rmm::cuda_stream stream;
   rmm::device_buffer destination(payload.size(), stream);
   rest_shutdown_guard cleanup{*ioctx};
-  delayed_stream_gate gate{stream.value()};
+  stream_gate gate{stream.value()};
   gate.arm();
   REQUIRE(gate.wait_entered(5s));
   gate.release_after(500ms);
@@ -645,7 +583,7 @@ TEST_CASE("rest_ioctx retries transient fake-server failures and reports termina
   rest_shutdown_guard cleanup{*ioctx};
   if (exhausted) {
     CHECK_THROWS(ioctx->host_read(*object, 0, bytes.size(), bytes.data()));
-    CHECK(server.get_count() >= 2);
+    CHECK(server.get_count() == 2);
   } else {
     REQUIRE(ioctx->host_read(*object, 128, bytes.size(), bytes.data()) == bytes.size());
     require_rest_bytes_equal(bytes, {payload.data() + 128, bytes.size()});
@@ -666,19 +604,7 @@ TEST_CASE("rest_ioctx spreads one batched range read across the reactor pool", "
 TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging",
           "[rest][lifecycle]")
 {
-  if (auto const* child = std::getenv("CUCASCADE_REST_TEARDOWN_CHILD");
-      child == nullptr || std::string_view{child} != "1") {
-    child_test_runner process{
-      "rest_ioctx teardown resolves an in-flight async read without hanging",
-      {{"CUCASCADE_REST_TEARDOWN_CHILD", std::string{"1"}}}};
-    bool const completed = process.wait_for(30s);
-    if (!completed) { process.stop(); }
-    INFO(process.output());
-    REQUIRE(completed);
-    REQUIRE(WIFEXITED(process.status()));
-    CHECK(WEXITSTATUS(process.status()) == 0);
-    return;
-  }
+  if (run_in_child("CUCASCADE_REST_TEARDOWN_CHILD", 30s)) { return; }
 
   auto payload = rest_test_payload(128 * 1024);
   auto control = std::make_shared<range_response_control>();
@@ -709,14 +635,18 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
   worker.join();
   REQUIRE(future.valid());
   REQUIRE(std::move(future).wait(5s));
+  std::optional<std::size_t> bytes;
+  std::string error;
   try {
-    auto const bytes = std::move(future).get();
-    if (bytes != 0) {
-      REQUIRE(bytes == buffer->size());
-      require_rest_bytes_equal(*buffer, {payload.data(), buffer->size()});
-    }
-  } catch (std::exception const& error) {
-    INFO("teardown completed in-flight request with exception: " << error.what());
+    bytes = std::move(future).get();
+  } catch (std::exception const& e) {
+    error = e.what();
+  }
+  if (bytes) {
+    REQUIRE(*bytes == buffer->size());
+    require_rest_bytes_equal(*buffer, {payload.data(), buffer->size()});
+  } else {
+    INFO("teardown completed in-flight request with exception: " << error);
     SUCCEED("future resolved with an exception during teardown");
   }
 }

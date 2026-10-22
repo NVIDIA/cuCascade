@@ -126,8 +126,8 @@ void verify_conditional_get(range_fault_policy fault,
   std::string const expected = "\"opened-generation\"";
   fault.successful_head_etag = expected;
   auto const bytes_in        = payload(64U << 10);
-  auto const offset          = fault.full_object_with_200 ? std::size_t{0} : std::size_t{17};
-  auto const length          = fault.full_object_with_200 ? bytes_in.size() : std::size_t{4096};
+  auto const offset          = fault.ignore_range_with_200 ? std::size_t{0} : std::size_t{17};
+  auto const length          = fault.ignore_range_with_200 ? bytes_in.size() : std::size_t{4096};
   auto const attempts        = fault.fail_all_gets ? std::size_t{1} : fault.fail_first_gets + 1;
   for (auto mode : {signing::presigned, signing::header}) {
     DYNAMIC_SECTION("signing=" << (mode == signing::header ? "header" : "presigned"))
@@ -303,16 +303,16 @@ TEST_CASE("cache identity does not retry a 412 with a truncated error body",
 TEST_CASE("cache identity rejects a different ETag on full-object 200", "[rest][cache_identity]")
 {
   range_fault_policy fault;
-  fault.full_object_with_200 = true;
-  fault.successful_get_etag  = "\"replacement\"";
+  fault.ignore_range_with_200 = true;
+  fault.successful_get_etag   = "\"replacement\"";
   verify_conditional_get(fault, true, fault.successful_get_etag);
 }
 
 TEST_CASE("cache identity accepts a matching ETag on full-object 200", "[rest][cache_identity]")
 {
   range_fault_policy fault;
-  fault.full_object_with_200 = true;
-  fault.successful_get_etag  = "\"opened-generation\"";
+  fault.ignore_range_with_200 = true;
+  fault.successful_get_etag   = "\"opened-generation\"";
   verify_conditional_get(fault, false);
 }
 

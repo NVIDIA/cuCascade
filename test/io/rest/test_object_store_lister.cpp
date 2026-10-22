@@ -814,6 +814,9 @@ TEST_CASE("rest_ioctx lists S3 objects with sizes and follows encoded continuati
   CHECK(queries[2].continuation_token == "page /+=2");
 }
 
+// Child half of "rest_ioctx terminates empty LIST loops ...": that test runs
+// this case in a forked child against its own server, so a LIST that never
+// terminates can be killed instead of hanging the suite.
 TEST_CASE("rest LIST loop watchdog child runner", "[.][rest][listing][watchdog_child]")
 {
   auto const* endpoint = std::getenv("CUCASCADE_TEST_REST_LIST_WATCHDOG_ENDPOINT");
@@ -1043,19 +1046,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumul
 TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
           "[rest][listing][stress]")
 {
-  if (auto const* child = std::getenv("CUCASCADE_REST_LIST_STRESS_CHILD");
-      child == nullptr || std::string_view{child} != "1") {
-    cucascade::test::child_test_runner process{
-      "rest_ioctx generated LIST scale obeys the default safety caps",
-      {{"CUCASCADE_REST_LIST_STRESS_CHILD", std::string{"1"}}}};
-    bool const completed = process.wait_for(180s);
-    if (!completed) { process.stop(); }
-    INFO(process.output());
-    REQUIRE(completed);
-    REQUIRE(WIFEXITED(process.status()));
-    CHECK(WEXITSTATUS(process.status()) == 0);
-    return;
-  }
+  if (cucascade::test::run_in_child("CUCASCADE_REST_LIST_STRESS_CHILD", 180s)) { return; }
 
   SECTION("default scanned cap trips at one million entries without retaining pages")
   {

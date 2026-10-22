@@ -267,21 +267,6 @@ class raw_http_connection {
   std::string _pending;
 };
 
-struct fixture_child_result {
-  bool timed_out;
-  int status;
-  std::string output;
-};
-
-fixture_child_result run_fixture_child(char const* test_name)
-{
-  cucascade::test::child_test_runner child{test_name,
-                                           {{"CUCASCADE_REST_FIXTURE_CHILD", std::string{"1"}}}};
-  bool const completed = child.wait_for(30s);
-  if (!completed) { child.stop(); }
-  return {!completed, child.status(), child.output()};
-}
-
 }  // namespace
 
 TEST_CASE("loopback range server keeps connections alive and counts requests per key",
@@ -483,6 +468,7 @@ TEST_CASE("unusable footer responses discard their tag before HEAD fallback",
 {
   auto check_fallback = [](range_fault_policy fault) {
     fault.failed_get_etag      = "\"discarded-probe\"";
+    fault.successful_get_etag  = "\"discarded-probe\"";
     fault.successful_head_etag = "\"fallback-head\"";
     loopback_range_server server(test_payload(), fault);
     auto ioctx  = make_ioctx(server, test_config());
@@ -797,6 +783,8 @@ TEST_CASE("loopback range server releases held responses on stop", "[rest][fixtu
 {
   if (auto const* child = std::getenv("CUCASCADE_REST_FIXTURE_CHILD");
       child == nullptr || std::string_view{child} != "1") {
+    // The child must see the override whatever the parent holds, and the
+    // parent's own value must survive the run.
     for (bool initially_set : {false, true}) {
       DYNAMIC_SECTION((initially_set ? "marker initially set" : "marker initially absent"))
       {
@@ -804,9 +792,7 @@ TEST_CASE("loopback range server releases held responses on stop", "[rest][fixtu
           initially_set ? std::optional<std::string>{"parent-value"} : std::nullopt;
         cucascade::test::scoped_test_environment initial{
           {"CUCASCADE_REST_FIXTURE_CHILD", expected}};
-        initial.apply();
-        auto const result =
-          run_fixture_child("loopback range server releases held responses on stop");
+        REQUIRE(cucascade::test::run_in_child("CUCASCADE_REST_FIXTURE_CHILD", 30s));
         auto const* restored = std::getenv("CUCASCADE_REST_FIXTURE_CHILD");
         if (expected) {
           REQUIRE(restored != nullptr);
@@ -814,11 +800,6 @@ TEST_CASE("loopback range server releases held responses on stop", "[rest][fixtu
         } else {
           CHECK(restored == nullptr);
         }
-        initial.restore();
-        INFO(result.output);
-        REQUIRE_FALSE(result.timed_out);
-        REQUIRE(WIFEXITED(result.status));
-        CHECK(WEXITSTATUS(result.status) == 0);
       }
     }
     return;

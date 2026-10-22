@@ -23,6 +23,8 @@
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <catch2/catch_all.hpp>
 
 #include <algorithm>
@@ -49,12 +51,16 @@ namespace cucascade::test {
 // A backend whose fills the test holds, completes and fails by hand.
 // ---------------------------------------------------------------------------
 
+/// Staging block of the controlled reactor, which the fs_cache adopts as its
+/// chunk size; held_request fills are clamped to it.
+inline constexpr std::size_t controlled_chunk_bytes = 1U << 20;
+
 struct controlled_reactor_config {
   [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
   [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
 
   std::size_t n_max_concurrent_scans{1};
-  std::size_t staging_bytes{1U << 20};
+  std::size_t staging_bytes{controlled_chunk_bytes};
 };
 
 class controlled_reactor {
@@ -140,7 +146,8 @@ class controlled_reactor {
 
   static std::unique_ptr<io_object_type> create_io_object(std::string path)
   {
-    return std::make_unique<io_object_type>(std::move(path), "bucket", "key", 1U << 20, "\"one\"");
+    return std::make_unique<io_object_type>(
+      std::move(path), "bucket", "key", controlled_chunk_bytes, "\"one\"");
   }
   static bool supports(std::string_view) { return true; }
   static std::vector<io::byte_range> align_and_coalesce(std::span<io::byte_range const> ranges,
@@ -190,7 +197,10 @@ class controlled_ioctx final : public io::templated_ioctx<controlled_reactor> {
 /// One request taken off the held backend; a request still held when the test
 /// ends is cancelled so no completion is left dangling.
 struct held_request {
-  explicit held_request(std::size_t chunk_bytes = 1U << 20) : _chunk_bytes(chunk_bytes) {}
+  explicit held_request(std::size_t chunk_bytes = controlled_chunk_bytes)
+    : _chunk_bytes(chunk_bytes)
+  {
+  }
   ~held_request() { cancel(); }
 
   void cancel() noexcept
@@ -203,7 +213,10 @@ struct held_request {
   held_request(held_request const&)            = delete;
   held_request& operator=(held_request const&) = delete;
 
-  /// Fill every slice with @p value and complete it successfully.
+  /// Fill every slice with @p value and complete it successfully: host bytes
+  /// land in the caller's buffer or the cache chunks, and a slice with a device
+  /// request also receives them on its destination stream, as a reactor's H2D
+  /// leg would deliver them.
   void complete(std::uint8_t value)
   {
     REQUIRE(request != nullptr);
@@ -220,6 +233,15 @@ struct held_request {
           auto const bytes = std::min(slice.size() - source_offset, _chunk_bytes - chunk_offset);
           std::fill_n(chunk->data + chunk_offset, bytes, value);
         }
+      }
+      if (slice.has_device_request()) {
+        std::vector<std::uint8_t> const bytes(slice.size(), value);
+        auto const stream = slice.d_buffer.stream.get();
+        REQUIRE(
+          cudaMemcpyAsync(
+            slice.d_buffer.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice, stream) ==
+          cudaSuccess);
+        REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
       }
       if (slice.on_complete) { (*slice.on_complete)(slice.h_buffer.fragments(), true); }
       request->coordinator->on_complete();
@@ -243,9 +265,8 @@ struct held_request {
   std::exception_ptr _cancel_error{std::make_exception_ptr(std::runtime_error("test cleanup"))};
 };
 
-inline std::shared_ptr<io::rest::rest_io_object> held_object(std::string const& path,
-                                                             std::string const& tag,
-                                                             std::size_t bytes = 1U << 20)
+inline std::shared_ptr<io::rest::rest_io_object> held_object(
+  std::string const& path, std::string const& tag, std::size_t bytes = controlled_chunk_bytes)
 {
   return std::make_shared<io::rest::rest_io_object>(
     path, "controlled", "generation.bin", bytes, tag);

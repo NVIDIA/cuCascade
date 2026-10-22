@@ -22,6 +22,7 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <memory>
@@ -57,7 +58,7 @@ TEST_CASE("claimed_bytes tracks the staging memory the cache is holding",
   CHECK(cache.claimed_bytes() == 0);
   REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
   INFO(cache.summary());
-  CHECK(cache.claimed_bytes() > 0);
+  CHECK(cache.claimed_bytes() == 4 * mib);
 }
 
 TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would not",
@@ -77,7 +78,7 @@ TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would
   REQUIRE(cache.claimed_bytes() == claimed);
   cache.evict(claimed);
   INFO(cache.summary());
-  CHECK(wait_for_cache([&] { return cache.claimed_bytes() < claimed; }, 2s));
+  CHECK(wait_for_cache([&] { return cache.claimed_bytes() == 0; }, 2s));
 }
 
 TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retrying",
@@ -140,14 +141,14 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
 {
   cache_test_fixture fixture{allocation_cache_config(eviction_policy::lru, true)};
   auto& cache = checked_cache(fixture);
-  REQUIRE(cache.chunk_size() == mib);
+  REQUIRE(cache.chunk_size() == controlled_chunk_bytes);
   auto spaces = fixture.memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
   REQUIRE(spaces.size() == 1);
   REQUIRE(spaces.front()->get_max_memory() == 256 * mib);
   auto* host = const_cast<cucascade::memory::memory_space*>(spaces.front())
                  ->get_memory_resource_of<cucascade::memory::Tier::HOST>();
   REQUIRE(host != nullptr);
-  REQUIRE(host->get_block_size() == mib);
+  REQUIRE(host->get_block_size() == controlled_chunk_bytes);
   REQUIRE(host->get_total_reserved_bytes() == 64 * mib);
   auto victim = fixture.open(object_path, 2ULL << 30);
   REQUIRE(victim != nullptr);
@@ -199,8 +200,8 @@ TEST_CASE("an explicit evict frees at least what was asked for", "[cache][evicti
   }
   auto const claimed = cache.claimed_bytes();
   REQUIRE(claimed > 0);
-  cache.evict_sync(1);
-  CHECK(cache.claimed_bytes() < claimed);
+  cache.evict_sync(2 * mib);
+  CHECK(cache.claimed_bytes() <= claimed - std::min(claimed, 2 * mib));
 }
 
 TEST_CASE("a zero-byte evict is a no-op", "[cache][eviction][explicit]")

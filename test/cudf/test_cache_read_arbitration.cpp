@@ -30,33 +30,15 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <future>
 #include <memory>
-#include <string>
-#include <string_view>
 
 namespace {
 using namespace std::chrono_literals;
 using namespace cucascade::test;
 using cucascade::io::prefetch_refusal;
 using cucascade::io::prepare_result;
-constexpr std::size_t chunk_size = 1U << 20;
-constexpr std::size_t read_size  = 4096;
-
-bool run_arbitration_child(std::string const& name)
-{
-  auto const* marker = std::getenv("CUCASCADE_CACHE_ARBITRATION_CHILD");
-  if (marker != nullptr && std::string_view{marker} == "1") { return false; }
-  child_test_runner child{name, {{"CUCASCADE_CACHE_ARBITRATION_CHILD", std::string{"1"}}}};
-  bool const finished = child.wait_for(30s);
-  if (!finished) { child.stop(); }
-  INFO(child.output());
-  REQUIRE(finished);
-  REQUIRE(WIFEXITED(child.status()));
-  REQUIRE(WEXITSTATUS(child.status()) == 0);
-  return true;
-}
+constexpr std::size_t read_size = 4096;
 
 struct read_cleanup {
   controlled_ioctx& context;
@@ -79,10 +61,10 @@ struct arbitration_fixture : cache_test_fixture {
   arbitration_fixture() : cache_test_fixture(allocation_cache_config())
   {
     REQUIRE(context->cache() != nullptr);
-    REQUIRE(context->cache()->chunk_size() == chunk_size);
+    REQUIRE(context->cache()->chunk_size() == controlled_chunk_bytes);
   }
   std::unique_ptr<cucascade::io::datasource> datasource =
-    open("controlled://arbitration", 4 * chunk_size);
+    open("controlled://arbitration", 4 * controlled_chunk_bytes);
   void advise(std::size_t offset)
   {
     advise_range(*datasource, offset, read_size);
@@ -94,9 +76,7 @@ struct arbitration_fixture : cache_test_fixture {
 TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
           "[cache][cache_handle][read-arbitration]")
 {
-  if (run_arbitration_child("an overlapping cache read waits for prefetch and reuses its chunk")) {
-    return;
-  }
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
   arbitration_fixture fixture;
   fixture.advise(0);
   std::atomic<bool> prefetched{false};
@@ -130,10 +110,7 @@ TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
 TEST_CASE("a cached device read retires its pin through the stream completion poll",
           "[cache][cache_handle][completion-poll][gpu_execution]")
 {
-  if (run_arbitration_child(
-        "a cached device read retires its pin through the stream completion poll")) {
-    return;
-  }
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
   arbitration_fixture fixture;
   fixture.advise(0);
   std::atomic<bool> prefetched{false};
@@ -160,14 +137,21 @@ TEST_CASE("a cached device read retires its pin through the stream completion po
           cudaSuccess);
   stream.synchronize();
   CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x6c; }));
+  // A pin the copy failed to retire would keep chunk 0 from being reclaimed.
+  fixture.datasource.reset();
+  auto& cache = *fixture.context->cache();
+  CHECK(wait_for_cache(
+    [&] {
+      cache.evict_sync(controlled_chunk_bytes);
+      return cache.claimed_bytes() == 0;
+    },
+    2s));
 }
 
 TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
           "[cache][cache_handle][read-arbitration]")
 {
-  if (run_arbitration_child("a cache read does not wait for unrelated chunks in the same handle")) {
-    return;
-  }
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
   arbitration_fixture fixture;
   fixture.advise(0);
   std::array<std::uint8_t, read_size> destination{};
@@ -181,7 +165,7 @@ TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
   CHECK(prefetch.request->priority == cucascade::io::io_priority::low);
   read_call           = std::async(std::launch::async, [&] {
     return fixture.datasource->host_read_async(
-      2 * chunk_size, destination.size(), destination.data());
+      2 * controlled_chunk_bytes, destination.size(), destination.data());
   });
   auto const returned = read_call.wait_for(100ms) == std::future_status::ready;
   CHECK(returned);
@@ -202,18 +186,15 @@ TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
 TEST_CASE("a cached multi-range host read sends its backend work on the high tier",
           "[cache][cache_handle][read-arbitration][priority]")
 {
-  if (run_arbitration_child(
-        "a cached multi-range host read sends its backend work on the high tier")) {
-    return;
-  }
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
   // A native decoder's vectored host read is demand work: left at automatic,
   // the part the cache cannot serve must not land on the low (prefetch) tier.
   arbitration_fixture fixture;
   fixture.advise(0);
   std::array<std::uint8_t, 2 * read_size> destination{};
   std::array<cucascade::io::slice, 2> const ranges{
-    cucascade::io::slice{2 * chunk_size, read_size, destination.data()},
-    cucascade::io::slice{3 * chunk_size, read_size, destination.data() + read_size}};
+    cucascade::io::slice{2 * controlled_chunk_bytes, read_size, destination.data()},
+    cucascade::io::slice{3 * controlled_chunk_bytes, read_size, destination.data() + read_size}};
   held_request first;
   held_request second;
   read_cleanup cleanup{*fixture.context, {&first, &second}};
@@ -234,9 +215,9 @@ TEST_CASE("a cached multi-range host read sends its backend work on the high tie
 TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
           "[cache][cache_handle][read-arbitration]")
 {
-  if (run_arbitration_child("a demand-owned loading chunk uses reactor bounce staging")) { return; }
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
   arbitration_fixture fixture;
-  fixture.advise(chunk_size);
+  fixture.advise(controlled_chunk_bytes);
   rmm::cuda_stream stream;
   rmm::device_buffer first_destination(read_size, stream);
   rmm::device_buffer second_destination(read_size, stream);
@@ -245,14 +226,20 @@ TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
   held_request bounced;
   std::future<std::future<std::size_t>> second_call;
   read_cleanup cleanup{*fixture.context, {&cache_load, &bounced}};
-  auto first = fixture.datasource->device_read_async(
-    chunk_size, read_size, static_cast<std::uint8_t*>(first_destination.data()), stream);
+  auto first =
+    fixture.datasource->device_read_async(controlled_chunk_bytes,
+                                          read_size,
+                                          static_cast<std::uint8_t*>(first_destination.data()),
+                                          stream);
   cache_load.request = fixture.context->backend().wait_take(2s);
   REQUIRE(cache_load.request != nullptr);
   CHECK(cache_load.request->front().h_buffer.is_fragmented());
   second_call         = std::async(std::launch::async, [&] {
     return fixture.datasource->device_read_async(
-      chunk_size, read_size, static_cast<std::uint8_t*>(second_destination.data()), stream);
+      controlled_chunk_bytes,
+      read_size,
+      static_cast<std::uint8_t*>(second_destination.data()),
+      stream);
   });
   auto const returned = second_call.wait_for(100ms) == std::future_status::ready;
   CHECK(returned);
@@ -264,12 +251,28 @@ TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
   CHECK(bounced.request->front().needs_staging());
   CHECK_FALSE(bounced.request->front().is_fragmented());
   CHECK(bounced.request->front().has_device_request());
-  bounced.complete(0x5a);
+  // Distinct fills: the first read must carry the chunk's bytes, the second
+  // the bounced bytes.
+  bounced.complete(0x7e);
   if (cache_load.request) { cache_load.complete(0x5a); }
   REQUIRE(first.wait_for(2s) == std::future_status::ready);
   REQUIRE(second.wait_for(2s) == std::future_status::ready);
   CHECK(first.get() == read_size);
   CHECK(second.get() == read_size);
+  std::array<std::uint8_t, read_size> host{};
+  REQUIRE(
+    cudaMemcpyAsync(
+      host.data(), first_destination.data(), host.size(), cudaMemcpyDeviceToHost, stream.value()) ==
+    cudaSuccess);
+  stream.synchronize();
+  CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x5a; }));
+  REQUIRE(cudaMemcpyAsync(host.data(),
+                          second_destination.data(),
+                          host.size(),
+                          cudaMemcpyDeviceToHost,
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+  CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x7e; }));
 }
 
 TEST_CASE("a cache whose chunk size differs from the reactor staging block is refused", "[cache]")

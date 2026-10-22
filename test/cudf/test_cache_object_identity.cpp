@@ -95,7 +95,7 @@ using cucascade::test::loopback_range_server;
 using cucascade::test::range_fault_policy;
 using cucascade::test::scripted_response;
 
-constexpr std::size_t chunk_bytes  = 1U << 20;
+constexpr std::size_t chunk_bytes  = cucascade::test::controlled_chunk_bytes;
 constexpr std::size_t object_bytes = 64U << 10;  // one chunk, only partly populated
 constexpr char const* object_uri   = "s3://bucket/object.bin";
 

@@ -18,6 +18,7 @@
 
 #include "io/rest/loopback_range_server.hpp"
 #include "utils/child_test_runner.hpp"
+#include "utils/cuda_test_utils.hpp"
 
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/io/object_store_config.hpp>
@@ -32,17 +33,13 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace {
@@ -86,52 +83,13 @@ io::object_store_config test_store(std::string endpoint)
   return store;
 }
 
-class stream_gate {
- public:
-  explicit stream_gate(cudaStream_t stream) : _stream(stream) {}
-  ~stream_gate()
-  {
-    open();
-    (void)cudaStreamSynchronize(_stream);
-  }
-  void arm()
-  {
-    REQUIRE(cudaLaunchHostFunc(
-              _stream,
-              [](void* opaque) {
-                auto& gate = *static_cast<stream_gate*>(opaque);
-                std::unique_lock lock{gate._mutex};
-                gate._entered = true;
-                gate._cv.notify_all();
-                gate._cv.wait(lock, [&] { return gate._open; });
-              },
-              this) == cudaSuccess);
-  }
-  bool entered(std::chrono::milliseconds budget)
-  {
-    std::unique_lock lock{_mutex};
-    return _cv.wait_for(lock, budget, [&] { return _entered; });
-  }
-  void open()
-  {
-    {
-      std::scoped_lock lock{_mutex};
-      _open = true;
-    }
-    _cv.notify_all();
-  }
-
- private:
-  cudaStream_t _stream;
-  std::mutex _mutex;
-  std::condition_variable _cv;
-  bool _entered{false};
-  bool _open{false};
-};
+using cucascade::test::cuda_device_count;
+using cucascade::test::run_in_child;
+using cucascade::test::stream_gate;
 
 struct release_before_join {
   stream_gate& gate;
-  ~release_before_join() { gate.open(); }
+  ~release_before_join() { gate.release(); }
 };
 }  // namespace
 
@@ -188,22 +146,9 @@ TEST_CASE("kvikio_context clamps local reads past the end of the object", "[io][
 TEST_CASE("kvikio_context orders remote device reads behind the destination stream",
           "[io][kvikio][gpu]")
 {
-  if (auto const* marker = std::getenv("CUCASCADE_KVIKIO_REMOTE_CHILD");
-      marker == nullptr || std::string_view{marker} != "1") {
-    cucascade::test::child_test_runner child{
-      "kvikio_context orders remote device reads behind the destination stream",
-      {{"CUCASCADE_KVIKIO_REMOTE_CHILD", std::string{"1"}}}};
-    bool const completed = child.wait_for(150s);
-    if (!completed) { child.stop(); }
-    INFO(child.output());
-    REQUIRE(completed);
-    REQUIRE(WIFEXITED(child.status()));
-    REQUIRE(WEXITSTATUS(child.status()) == 0);
-    return;
-  }
-  int count = 0;
-  REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
-  REQUIRE(count > 0);
+  // Decided in the parent: a SKIP inside the child would exit non-zero.
+  if (cuda_device_count() == 0) { SKIP("requires a CUDA device"); }
+  if (run_in_child("CUCASCADE_KVIKIO_REMOTE_CHILD", 150s)) { return; }
   std::vector<std::uint8_t> payload(256 * 1024);
   for (std::size_t i = 0; i < payload.size(); ++i) {
     payload[i] = static_cast<std::uint8_t>((i * 31U + 7U) & 0xffU);
@@ -220,7 +165,7 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
   rmm::device_buffer destination(payload.size(), stream);
   stream_gate gate{stream.value()};
   gate.arm();
-  REQUIRE(gate.entered(5s));
+  REQUIRE(gate.wait_entered(5s));
   std::promise<void> issued;
   auto started = issued.get_future();
   std::future<std::size_t> read;
@@ -236,7 +181,8 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
   });
   REQUIRE(started.wait_for(5s) == std::future_status::ready);
   REQUIRE(read.wait_for(200ms) == std::future_status::timeout);
-  gate.open();
+  CHECK(server.get_count() == 0);  // no body fetched while the destination stream is gated
+  gate.release();
   REQUIRE(read.wait_for(120s) == std::future_status::ready);
   REQUIRE(read.get() == payload.size());
   REQUIRE(
