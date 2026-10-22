@@ -18,6 +18,7 @@
 
 #include "loopback_range_server.hpp"
 #include "mock_authorizer.hpp"
+#include "utils/child_test_runner.hpp"
 
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
@@ -25,17 +26,23 @@
 #include <arpa/inet.h>
 #include <catch2/catch_all.hpp>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -50,6 +57,9 @@ using cucascade::io::rest::rest_reactor;
 using cucascade::test::key_response_script;
 using cucascade::test::loopback_range_server;
 using cucascade::test::range_fault_policy;
+using cucascade::test::range_response_control;
+using cucascade::test::response_body_policy;
+using cucascade::test::response_release_guard;
 using cucascade::test::scripted_response;
 using namespace std::chrono_literals;
 
@@ -120,6 +130,16 @@ class raw_http_connection {
   {
     _fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (_fd < 0) { throw std::runtime_error("socket failed"); }
+    timeval timeout{};
+    timeout.tv_sec    = 5;
+    int receive_bytes = 4096;
+    if (::setsockopt(_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        ::setsockopt(_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        ::setsockopt(_fd, SOL_SOCKET, SO_RCVBUF, &receive_bytes, sizeof(receive_bytes)) != 0) {
+      ::close(_fd);
+      _fd = -1;
+      throw std::runtime_error("socket options failed");
+    }
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -140,18 +160,52 @@ class raw_http_connection {
   raw_http_connection(raw_http_connection const&)            = delete;
   raw_http_connection& operator=(raw_http_connection const&) = delete;
 
-  raw_http_response request(std::string_view method,
-                            std::string_view target,
-                            bool close_connection = false)
+  void send_request(std::string_view method,
+                    std::string_view target,
+                    bool close_connection  = false,
+                    std::string_view range = "bytes=-16")
   {
     std::string request{method};
     request += " ";
     request += target;
     request += " HTTP/1.1\r\nHost: 127.0.0.1\r\n";
-    if (method == "GET") { request += "Range: bytes=-16\r\n"; }
+    if (method == "GET" && !range.empty()) { request += "Range: " + std::string{range} + "\r\n"; }
     request += close_connection ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
     send_all(request);
+  }
+
+  raw_http_response request(std::string_view method,
+                            std::string_view target,
+                            bool close_connection  = false,
+                            std::string_view range = "bytes=-16")
+  {
+    send_request(method, target, close_connection, range);
     return read_response(method != "HEAD");
+  }
+
+  raw_http_response response(bool has_body = true) { return read_response(has_body); }
+
+  std::string read_to_close()
+  {
+    std::string result = std::exchange(_pending, {});
+    std::array<char, 8192> bytes{};
+    while (true) {
+      auto const n = ::recv(_fd, bytes.data(), bytes.size(), 0);
+      if (n == 0) { return result; }
+      if (n < 0 && errno == EINTR) { continue; }
+      if (n < 0) { throw std::runtime_error("HTTP receive failed"); }
+      result.append(bytes.data(), static_cast<std::size_t>(n));
+    }
+  }
+
+  void abort()
+  {
+    linger reset{1, 0};
+    if (::setsockopt(_fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset)) != 0) {
+      throw std::runtime_error("socket linger failed");
+    }
+    ::close(_fd);
+    _fd = -1;
   }
 
   [[nodiscard]] bool peer_closed()
@@ -414,6 +468,7 @@ TEST_CASE("unusable footer responses discard their tag before HEAD fallback",
 {
   auto check_fallback = [](range_fault_policy fault) {
     fault.failed_get_etag      = "\"discarded-probe\"";
+    fault.successful_get_etag  = "\"discarded-probe\"";
     fault.successful_head_etag = "\"fallback-head\"";
     loopback_range_server server(test_payload(), fault);
     auto ioctx  = make_ioctx(server, test_config());
@@ -646,4 +701,189 @@ TEST_CASE("known-size open stays tagless and performs no requests", "[rest][vali
   CHECK(object->validation_tag().empty());
   CHECK(server.head_count() == 0);
   CHECK(server.get_count() == 0);
+}
+
+TEST_CASE("loopback range server exposes paced body progress", "[rest][fixture]")
+{
+  auto control = std::make_shared<range_response_control>();
+  range_fault_policy fault{};
+  fault.body = response_body_policy{
+    .chunk_bytes = 64, .chunk_delay = 25ms, .hold_after_bytes = 128, .control = control};
+  auto const payload = test_payload();
+  loopback_range_server server(payload, fault);
+  response_release_guard release{control};
+  raw_http_connection connection(server);
+  connection.send_request("GET", "/bucket/paced.bin", true, "bytes=0-255");
+
+  REQUIRE(control->wait_for_headers(1, 5s));
+  REQUIRE(control->wait_for_body_bytes(128, 5s));
+  REQUIRE(control->wait_for_holds(1, 5s));
+  auto const held = control->snapshot();
+  CHECK(held.headers == 1);
+  CHECK(held.body_bytes == 128);
+  CHECK(held.body_writes == 2);
+  CHECK(held.last_body_write - held.first_body_write >= 25ms);
+  CHECK(server.body_bytes_sent() == 128);
+  CHECK(server.active_data_gets() == 1);
+
+  control->release_all();
+  auto const response = connection.response();
+  CHECK(response.status == 206);
+  CHECK(response.body == std::vector<std::uint8_t>(payload.begin(), payload.begin() + 256));
+  REQUIRE(server.wait_for_idle(5s));
+  CHECK(server.body_bytes_sent() == 256);
+  CHECK(control->snapshot().body_bytes == 256);
+  CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("loopback range server counts overlapping data GETs", "[rest][fixture]")
+{
+  auto first_control  = std::make_shared<range_response_control>();
+  auto second_control = std::make_shared<range_response_control>();
+  std::unordered_map<std::string, key_response_script> scripts;
+  scripts["first.bin"].gets  = {scripted_response{
+     .body = response_body_policy{.hold_after_bytes = 0, .control = first_control}}};
+  scripts["second.bin"].gets = {scripted_response{
+    .body = response_body_policy{.hold_after_bytes = 0, .control = second_control}}};
+  auto const payload         = test_payload();
+  loopback_range_server server(payload, {}, {}, std::move(scripts));
+  response_release_guard release_first{first_control};
+  response_release_guard release_second{second_control};
+  raw_http_connection first(server);
+  CHECK(first.request("HEAD", "/bucket/meta.bin").status == 200);
+  CHECK(first.request("GET", "/bucket/meta.bin").body.size() == 16);
+  CHECK(server.active_data_gets() == 0);
+  CHECK(server.peak_active_gets() == 0);
+
+  first.send_request("GET", "/bucket/first.bin", false, "bytes=0-127");
+  REQUIRE(first_control->wait_for_holds(1, 5s));
+  raw_http_connection second(server);
+  second.send_request("GET", "/bucket/second.bin", true, "bytes=256-383");
+  REQUIRE(second_control->wait_for_holds(1, 5s));
+  REQUIRE(server.wait_for_active_gets(2, 5s));
+  CHECK(server.active_data_gets() == 2);
+  CHECK(server.peak_active_gets() == 2);
+  CHECK(server.accepted_connection_count() == 2);
+
+  first_control->release_all();
+  second_control->release_all();
+  CHECK(first.response().body == std::vector<std::uint8_t>(payload.begin(), payload.begin() + 128));
+  CHECK(second.response().body ==
+        std::vector<std::uint8_t>(payload.begin() + 256, payload.begin() + 384));
+  REQUIRE(server.wait_for_idle(5s));
+  raw_http_connection third(server);
+  CHECK(third.request("GET", "/bucket/third.bin", true, "bytes=0-3").body.size() == 4);
+  REQUIRE(server.wait_for_idle(5s));
+  CHECK(server.accepted_connection_count() == 3);
+  CHECK(server.peak_active_gets() == 2);
+  CHECK(server.get_count() == 4);
+}
+
+TEST_CASE("loopback range server releases held responses on stop", "[rest][fixture]")
+{
+  if (auto const* child = std::getenv("CUCASCADE_REST_FIXTURE_CHILD");
+      child == nullptr || std::string_view{child} != "1") {
+    // The child must see the override whatever the parent holds, and the
+    // parent's own value must survive the run.
+    for (bool initially_set : {false, true}) {
+      DYNAMIC_SECTION((initially_set ? "marker initially set" : "marker initially absent"))
+      {
+        auto const expected =
+          initially_set ? std::optional<std::string>{"parent-value"} : std::nullopt;
+        cucascade::test::scoped_test_environment initial{
+          {"CUCASCADE_REST_FIXTURE_CHILD", expected}};
+        REQUIRE(cucascade::test::run_in_child("CUCASCADE_REST_FIXTURE_CHILD", 30s));
+        auto const* restored = std::getenv("CUCASCADE_REST_FIXTURE_CHILD");
+        if (expected) {
+          REQUIRE(restored != nullptr);
+          CHECK(std::string_view{restored} == *expected);
+        } else {
+          CHECK(restored == nullptr);
+        }
+      }
+    }
+    return;
+  }
+
+  auto control = std::make_shared<range_response_control>();
+  range_fault_policy fault{};
+  fault.body = response_body_policy{.hold_after_bytes = 0, .control = control};
+  loopback_range_server server(test_payload(), fault);
+  raw_http_connection connection(server);
+  raw_http_connection idle_connection(server);
+  CHECK(idle_connection.request("HEAD", "/bucket/idle.bin").status == 200);
+  connection.send_request("GET", "/bucket/held.bin", false, "bytes=0-255");
+  REQUIRE(control->wait_for_holds(1, 5s));
+  CHECK(connection.response(false).status == 206);
+  CHECK(server.active_data_gets() == 1);
+  auto const started = std::chrono::steady_clock::now();
+  server.stop();
+  CHECK(std::chrono::steady_clock::now() - started < 2s);
+  CHECK(server.active_data_gets() == 0);
+  CHECK(control->snapshot().held_responses == 0);
+  CHECK(server.body_bytes_sent() == 0);
+  CHECK(connection.peer_closed());
+  CHECK(idle_connection.peer_closed());
+  CHECK_NOTHROW(server.stop());
+}
+
+TEST_CASE("loopback range server reports header overrides and partial body delivery",
+          "[rest][fixture]")
+{
+  SECTION("unknown totals and per-key overrides are sent literally")
+  {
+    range_fault_policy fault{};
+    fault.content_range = "bytes 0-15/*";
+    std::unordered_map<std::string, key_response_script> scripts;
+    scripts["override.bin"].gets = {scripted_response{.content_range = "bytes custom"}};
+    auto const payload           = test_payload();
+    loopback_range_server server(payload, fault, {}, std::move(scripts));
+    raw_http_connection connection(server);
+    auto const first = connection.request("GET", "/bucket/default.bin", false, "bytes=0-15");
+    CHECK(first.header("Content-Range") == "bytes 0-15/*");
+    CHECK(first.body == std::vector<std::uint8_t>(payload.begin(), payload.begin() + 16));
+    auto const second = connection.request("GET", "/bucket/override.bin", true, "bytes=0-15");
+    CHECK(second.header("Content-Range") == "bytes custom");
+    REQUIRE(server.wait_for_idle(5s));
+    CHECK(server.body_bytes_sent() == 32);
+  }
+
+  SECTION("advertised error bytes are not counted as sent")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets       = true;
+    fault.truncate_error_body = true;
+    loopback_range_server server(test_payload(), fault);
+    raw_http_connection connection(server);
+    connection.send_request("GET", "/bucket/error.bin", true, "bytes=0-15");
+    auto const raw = connection.read_to_close();
+    REQUIRE(raw.find("Content-Length: 64") != std::string::npos);
+    auto const body = raw.find("\r\n\r\n");
+    REQUIRE(body != std::string::npos);
+    CHECK(raw.substr(body + 4) == "short");
+    REQUIRE(server.wait_for_idle(5s));
+    CHECK(server.body_bytes_sent() == 5);
+  }
+
+  SECTION("a peer abort accounts only successful body sends")
+  {
+    constexpr std::size_t bytes = 8U << 20;
+    auto control                = std::make_shared<range_response_control>();
+    range_fault_policy fault{};
+    fault.body =
+      response_body_policy{.chunk_bytes = 4096, .hold_after_bytes = 4096, .control = control};
+    loopback_range_server server(std::vector<std::uint8_t>(bytes, 0x5a), fault);
+    response_release_guard release{control};
+    raw_http_connection connection(server);
+    connection.send_request(
+      "GET", "/bucket/abort.bin", false, "bytes=0-" + std::to_string(bytes - 1));
+    REQUIRE(control->wait_for_holds(1, 5s));
+    CHECK(server.body_bytes_sent() == 4096);
+    connection.abort();
+    control->release_all();
+    REQUIRE(server.wait_for_idle(5s));
+    CHECK(server.body_bytes_sent() >= 4096);
+    CHECK(server.body_bytes_sent() < bytes);
+    CHECK(control->snapshot().body_bytes == server.body_bytes_sent());
+  }
 }
