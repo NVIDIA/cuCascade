@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
@@ -25,11 +26,14 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <limits>
+#include <list>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace cucascade {
@@ -52,12 +56,9 @@ namespace memory {
  * retain every buffer of a steady workload, size the limit as the sum over buckets of
  * (bucket size x peak number of buffers of that bucket outstanding at once).
  *
- * Allocation and deallocation are thread-safe and stream-ordered. The caller must order every prior
- * GPU access before the deallocation stream (the stream passed to the deallocation call). Before
- * accessing an asynchronous allocation on the CPU, synchronize its allocation stream (the stream
- * passed to the allocation call); `allocate_sync` supplies this synchronization. All allocations
- * must be deallocated and no calls may be in flight when this resource is destroyed. Destruction
- * waits for recorded work before returning storage.
+ * Allocation and deallocation are thread-safe. Memory is stream-ordered; see `allocate` and
+ * `deallocate` for the caller's obligations. All allocations must be deallocated and no calls may
+ * be in flight when this resource is destroyed.
  *
  * Provides the `::cuda::mr::device_accessible` and `::cuda::mr::host_accessible` properties
  * required by `rmm::host_device_async_resource_ref`.
@@ -88,7 +89,7 @@ class small_pinned_host_memory_resource {
     std::uint64_t large_requests;         ///< Nonzero requests larger than `MAX_SLAB_SIZE`.
     std::uint64_t large_hits;         ///< Successful cache takes after establishing reuse order.
     std::uint64_t large_misses;       ///< Initial cache lookups that found no entry.
-    std::uint64_t large_uncacheable;  ///< Requests whose computed bucket exceeds the limit.
+    std::uint64_t large_uncacheable;  ///< Requests whose bucket is not cacheable.
     std::uint64_t large_evictions;    ///< Cached entries detached for cap eviction or purge.
   };
 
@@ -108,6 +109,13 @@ class small_pinned_host_memory_resource {
   small_pinned_host_memory_resource& operator=(const small_pinned_host_memory_resource&) = delete;
   small_pinned_host_memory_resource(small_pinned_host_memory_resource&&)                 = delete;
   small_pinned_host_memory_resource& operator=(small_pinned_host_memory_resource&&)      = delete;
+
+  /**
+   * @brief Waits for recorded work before returning storage
+   *
+   * Wait failures are handled as in `deallocate`. Errors from destroying the pooled events are left
+   * to `cuda::cuda_event`'s destructor, which does not clear them.
+   */
   ~small_pinned_host_memory_resource() noexcept;
 
   /**
@@ -118,13 +126,22 @@ class small_pinned_host_memory_resource {
   /**
    * @brief Allocates pinned host memory
    *
-   * On a direct pinned-allocation failure, releases the retained large buffers and retries once. A
-   * CUDA synchronization failure quarantines affected storage instead of freeing or reusing it.
+   * The returned memory is ready in stream order on `stream`: GPU work enqueued on `stream` after
+   * this call may use it, but GPU work from an earlier deallocation may still be using it until
+   * that point in `stream`. Before the host reads or writes it, synchronize `stream` or use
+   * `allocate_sync`. This applies to every request, including reused slabs and cached large
+   * buffers. A freshly allocated large buffer is host-ready on return, but callers must not rely on
+   * which case occurred.
    *
-   * @throw rmm::out_of_memory If a direct pinned allocation still fails after releasing retained
-   *        buffers, or the upstream resource cannot supply a block for a slab pool
-   * @throw rmm::bad_alloc If a direct pinned allocation fails with a non-OOM CUDA error
-   * @throw cucascade::cuda_error If waiting on a reused buffer's pending GPU work fails
+   * When a direct pinned allocation runs out of memory, releases the retained large buffers the way
+   * `deallocate` releases evicted ones, then retries once.
+   *
+   * @throw rmm::out_of_memory If a direct pinned allocation fails with `cudaErrorMemoryAllocation`
+   * after releasing retained large buffers, or the upstream resource cannot supply a block for a
+   * slab pool
+   * @throw rmm::bad_alloc If a direct pinned allocation fails with any other CUDA error; retained
+   * buffers are kept
+   * @throw cucascade::cuda_error If ordering a reused buffer after its pending GPU work fails
    * @throw std::invalid_argument If the upstream block size is smaller than the needed slab size
    * @param stream Stream on which reuse dependencies are inserted
    * @param bytes Requested size
@@ -138,9 +155,17 @@ class small_pinned_host_memory_resource {
   /**
    * @brief Returns memory to its pool or releases a noncacheable large buffer
    *
-   * @param stream Stream ordered after the final use of `ptr`
+   * A large buffer that needs room in a full cache evicts the oldest cached entries first. This
+   * call may block until GPU work completes on `stream` or on the streams that freed the evicted
+   * entries, possibly on other devices. A CUDA failure inside this call is cleared from the calling
+   * thread's last-error state (sticky context errors excepted). Storage whose GPU completion cannot
+   * be confirmed is withheld: it is never reused or freed.
+   *
+   * @param stream Every prior GPU access to `ptr` must be ordered before work subsequently enqueued
+   * on `stream`; the storage may be reused once that point is reached
    * @param ptr Pointer returned by this resource, or `nullptr` for a no-op
-   * @param bytes Original requested allocation size
+   * @param bytes Must equal the `bytes` passed to the matching `allocate` call. It selects the slab
+   * pool or bucket the storage returns to; any other value is undefined behavior
    * @param alignment Original requested alignment
    */
   void deallocate(::cuda::stream_ref stream,
@@ -168,14 +193,12 @@ class small_pinned_host_memory_resource {
 
   /**
    * @brief Deallocates on the default stream, then synchronizes it
+   *
+   * A failed synchronization is ignored.
    */
   void deallocate_sync(void* ptr,
                        std::size_t bytes,
-                       std::size_t alignment = alignof(std::max_align_t)) noexcept
-  {
-    deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, ptr, bytes, alignment);
-    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(cudaStreamDefault));
-  }
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
   /**
    * @brief Returns retained large-buffer capacity available for reuse
@@ -222,47 +245,101 @@ class small_pinned_host_memory_resource {
    * @brief Computes the storage size for a direct large allocation
    *
    * @param bytes Requested allocation size
-   * @return Bucket capacity when it fits the limit, or `bytes` otherwise
+   * @return Bucket capacity when the bucket is a power of two no larger than the cache limit,
+   * otherwise `bytes`
    */
   [[nodiscard]] std::size_t large_allocation_size(std::size_t bytes) const noexcept;
 
  private:
-  struct device_event {
-    cudaEvent_t handle{nullptr};
-    int device{-1};
+  /**
+   * @brief An event and the device whose pool in `_event_pools` owns it
+   */
+  struct pooled_event {
+    cuda::cuda_event event;
+    int device;
+  };
+
+  /**
+   * @brief Recycled events of one device
+   *
+   * Every event `acquire` hands out keeps a reserved slot in the idle list, so `release` never
+   * allocates. Events are therefore destroyed only with this resource.
+   */
+  class event_pool {
+   public:
+    /**
+     * @brief Returns an idle event, or creates one on `device`
+     *
+     * @return The event, or `std::nullopt` if creating it failed
+     */
+    [[nodiscard]] std::optional<cuda::cuda_event> acquire(int device) noexcept;
+
+    /**
+     * @brief Takes back an event that `acquire` handed out
+     */
+    void release(cuda::cuda_event&& event) noexcept;
+
+   private:
+    std::vector<cuda::cuda_event> _idle;
+    std::size_t _created{0};  ///< Events created; `_idle.capacity()` never falls below it
   };
 
   struct free_slab {
     void* ptr;
-    device_event ready;
+    std::optional<pooled_event> ready;  ///< Empty when the slab has no pending GPU use
   };
 
   struct large_cache_entry {
     void* ptr;
-    device_event ready;
-    std::uint64_t sequence;
+    pooled_event ready;      ///< Always present: only event-ordered buffers are cached
+    std::uint64_t sequence;  ///< Value of `_large_cache_sequence` at insertion
   };
 
-  using large_cache_type = std::map<std::size_t, std::deque<large_cache_entry>>;
+  static constexpr std::size_t LARGE_BUCKET_COUNT = static_cast<std::size_t>(
+    std::numeric_limits<std::size_t>::digits - std::countr_zero(MIN_LARGE_BUCKET));
 
-  // Helpers ending in _locked require _mutex. Detached entries are synchronized outside it.
-  void expand_pool_locked(std::size_t slab_idx);
-  static int device_of_stream(::cuda::stream_ref stream) noexcept;
-  device_event acquire_event_locked(int device) noexcept;
-  void release_event_locked(device_event event) noexcept;
+  // Helpers ending in _locked require _mutex. No helper waits for GPU work while it is held, but
+  // slab-pool growth may call the upstream pinned allocator.
+
+  /**
+   * @brief Decides whether buffers of `bucket` are cached; the only cacheability policy
+   *
+   * Only powers of two no larger than the cache limit are cached, so every cacheable bucket has a
+   * list in `_large_cache`.
+   */
+  [[nodiscard]] bool is_cacheable(std::size_t bucket) const noexcept;
+
+  /**
+   * @brief Returns the index of a cacheable bucket's list in `_large_cache`
+   *
+   * `bucket == MIN_LARGE_BUCKET << index`. Each list holds its entries in insertion order.
+   */
+  [[nodiscard]] static std::size_t large_bucket_index(std::size_t bucket) noexcept;
+
+  void* allocate_slab(::cuda::stream_ref stream, std::size_t bytes);
+  void* allocate_large(::cuda::stream_ref stream, std::size_t bytes);
+  void deallocate_slab(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
+  void deallocate_large(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
+
+  [[nodiscard]] std::optional<pooled_event> acquire_event_locked(int device) noexcept;
+  [[nodiscard]] std::optional<pooled_event> record_ready_event_locked(
+    ::cuda::stream_ref stream) noexcept;
+  void return_event_locked(pooled_event&& event) noexcept;
+
   void* try_take_cached_large_locked(std::size_t bucket, ::cuda::stream_ref stream);
-  large_cache_entry evict_oldest_large_locked() noexcept;
-  large_cache_type purge_large_cache_locked() noexcept;
-  void sync_and_free_large_victim(large_cache_entry const& victim) noexcept;
-  static bool synchronize_stream_no_throw(::cuda::stream_ref stream) noexcept;
+  bool evict_oldest_large_locked(std::list<large_cache_entry>& victims) noexcept;
+  [[nodiscard]] std::list<large_cache_entry> purge_large_cache_locked() noexcept;
+  void release_detached(std::list<large_cache_entry>&& detached) noexcept;
+
+  void expand_pool_locked(std::size_t slab_idx);
 
   fixed_size_host_memory_resource& _upstream;
   mutable std::mutex _mutex;
   std::array<std::vector<free_slab>, SLAB_SIZES.size()> _free_lists{};
-  std::map<int, std::vector<cudaEvent_t>> _event_pools;
+  std::map<int, event_pool> _event_pools;
   std::vector<fixed_multiple_blocks_allocation> _owned_allocations;
   bool _has_quarantined_slab{false};  ///< A slab was withheld; destructor keeps backing blocks.
-  large_cache_type _large_cache;      ///< Reusable large buffers keyed by bucket size.
+  std::array<std::list<large_cache_entry>, LARGE_BUCKET_COUNT> _large_cache{};
   std::size_t _large_cache_bytes{0};  ///< Sum of bucket sizes in `_large_cache`.
   std::size_t const _large_cache_limit_bytes;
   std::uint64_t _large_cache_sequence{0};  ///< Insertion counter; lowest sequence is evicted first.

@@ -36,10 +36,14 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <optional>
+#include <ranges>
 #include <set>
 #include <stdexcept>
 #include <stop_token>
 #include <thread>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace cucascade::memory;
@@ -96,6 +100,36 @@ class pending_stream_work {
  private:
   rmm::cuda_stream const& _stream;
   std::atomic<bool> _released{false};
+};
+
+// While alive, blocking CUDA calls made on this thread (synchronization, cudaHostAlloc,
+// cudaFreeHost) fail with the non-sticky cudaErrorStreamCaptureUnsupported. Create every stream the
+// code under test uses before constructing this helper, because stream creation is rejected too.
+class blocking_cuda_calls_rejected {
+ public:
+  blocking_cuda_calls_rejected()
+  {
+    CUCASCADE_CUDA_TRY(
+      ::cudaStreamBeginCapture(_capture.value(), cudaStreamCaptureModeThreadLocal));
+  }
+
+  blocking_cuda_calls_rejected(blocking_cuda_calls_rejected const&)            = delete;
+  blocking_cuda_calls_rejected& operator=(blocking_cuda_calls_rejected const&) = delete;
+  blocking_cuda_calls_rejected(blocking_cuda_calls_rejected&&)                 = delete;
+  blocking_cuda_calls_rejected& operator=(blocking_cuda_calls_rejected&&)      = delete;
+
+  ~blocking_cuda_calls_rejected()
+  {
+    // A rejected call invalidates the capture, so ending it normally reports
+    // cudaErrorStreamCaptureInvalidated; the thread is healthy once that error is cleared.
+    cudaGraph_t graph = nullptr;
+    std::ignore       = ::cudaStreamEndCapture(_capture.value(), &graph);
+    if (graph != nullptr) { std::ignore = ::cudaGraphDestroy(graph); }
+    std::ignore = ::cudaGetLastError();
+  }
+
+ private:
+  rmm::cuda_stream _capture{rmm::cuda_stream::flags::non_blocking};
 };
 
 void require_no_large_activity(small_pinned_host_memory_resource::statistics const& stats)
@@ -247,46 +281,68 @@ TEST_CASE("do_is_equal identity check", "[small_pinned]")
 
 TEST_CASE("Concurrent allocations are thread-safe", "[small_pinned][threading]")
 {
+  // Catch2 assertions must not run on worker threads, so the workers only record what they observe
+  // and the main thread checks it after joining them.
   test_fixture f;
-  constexpr int num_threads        = 8;
-  constexpr int allocs_per_thread  = 32;
-  constexpr std::size_t alloc_size = 2048;
+  constexpr std::size_t num_threads       = 8;
+  constexpr std::size_t allocs_per_thread = 32;
+  constexpr std::size_t alloc_size        = 2048;
 
-  std::vector<std::thread> threads;
   std::vector<std::vector<void*>> per_thread_allocs(num_threads);
+  std::vector<std::exception_ptr> failures(num_threads);
+  std::atomic<bool> start{false};
+  {
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+    for (std::size_t t = 0; t < num_threads; ++t) {
+      threads.emplace_back([&, t](std::stop_token stop) {
+        try {
+          auto& allocs = per_thread_allocs[t];
+          allocs.reserve(allocs_per_thread);
+          // Every worker starts allocating at once so that their allocations overlap. A failure to
+          // create a later thread stops the waiting ones instead of leaving them blocked.
+          while (!start.load(std::memory_order_acquire)) {
+            if (stop.stop_requested()) { return; }
+            std::this_thread::yield();
+          }
+          for (std::size_t i = 0; i < allocs_per_thread; ++i) {
+            auto* p =
+              f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, alloc_size);
+            allocs.push_back(p);
+            // Touch the memory
+            if (p != nullptr) { std::memset(p, static_cast<int>(t), alloc_size); }
+          }
+        } catch (...) {
+          failures[t] = std::current_exception();
+        }
+      });
+    }
+    start.store(true, std::memory_order_release);
+  }  // The jthreads join here.
 
-  for (int t = 0; t < num_threads; ++t) {
-    threads.emplace_back([&, t]() {
-      per_thread_allocs[t].reserve(allocs_per_thread);
-      for (int i = 0; i < allocs_per_thread; ++i) {
-        auto* p =
-          f.slab_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, alloc_size);
-        REQUIRE(p != nullptr);
-        // Touch the memory
-        std::memset(p, static_cast<int>(t), alloc_size);
-        per_thread_allocs[t].push_back(p);
+  std::size_t allocated = 0;
+  std::size_t null_ptrs = 0;
+  std::set<void*> unique_ptrs;
+  for (auto const& allocs : per_thread_allocs) {
+    for (auto* p : allocs) {
+      ++allocated;
+      if (p == nullptr) {
+        ++null_ptrs;
+      } else {
+        unique_ptrs.insert(p);
       }
-    });
-  }
-
-  for (auto& th : threads) {
-    th.join();
-  }
-
-  // Verify all pointers are unique across all threads
-  std::set<void*> all_ptrs;
-  for (auto& vec : per_thread_allocs) {
-    for (auto* p : vec) {
-      REQUIRE(all_ptrs.insert(p).second);
     }
   }
-
-  // Deallocate everything
-  for (auto& vec : per_thread_allocs) {
-    for (auto* p : vec) {
-      f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p, alloc_size);
-    }
+  // Each distinct slab is returned once, even if a defect handed it out twice.
+  for (auto* p : unique_ptrs) {
+    f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p, alloc_size);
   }
+  for (auto const& failure : failures) {
+    if (failure) { std::rethrow_exception(failure); }
+  }
+  REQUIRE(allocated == num_threads * allocs_per_thread);
+  REQUIRE(null_ptrs == 0);
+  REQUIRE(unique_ptrs.size() == allocated);  // all pointers are unique across threads
 }
 
 TEST_CASE("Mixed slab sizes allocated and freed correctly", "[small_pinned]")
@@ -717,6 +773,175 @@ TEST_CASE("Failed large allocation purges the cache and throws out_of_memory",
   REQUIRE(mr.large_cache_bytes() == 128 * 1024);
 }
 
+TEST_CASE("Non-OOM pinned allocation failure throws bad_alloc and keeps the cache",
+          "[small_pinned][cuda_errors][statistics]")
+{
+  using mr_t = small_pinned_host_memory_resource;
+  // The 20000-byte request has a 32 KiB bucket: cacheable under the default limit, which makes its
+  // lookup miss because only a 16 KiB entry is cached, and uncacheable under a 16 KiB limit.
+  auto const limit     = GENERATE(mr_t::DEFAULT_LARGE_CACHE_LIMIT, std::size_t{16 * 1024});
+  bool const cacheable = limit == mr_t::DEFAULT_LARGE_CACHE_LIMIT;
+  constexpr std::size_t seed_bytes    = 9000;  // 16 KiB bucket, cacheable under both limits
+  constexpr std::size_t failing_bytes = 20000;
+  test_fixture f;
+  mr_t mr{f.upstream, limit};
+  auto* seed = mr.allocate_sync(seed_bytes);
+  mr.deallocate_sync(seed, seed_bytes);
+  REQUIRE(mr.large_cache_bytes() == 16 * 1024);
+  rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+  {
+    blocking_cuda_calls_rejected rejected;
+    REQUIRE_THROWS_MATCHES(mr.allocate(stream, failing_bytes),
+                           rmm::bad_alloc,
+                           Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring(
+                             "cudaErrorStreamCaptureUnsupported")));
+    REQUIRE(::cudaGetLastError() == cudaSuccess);
+  }
+  REQUIRE(mr.large_cache_bytes() == 16 * 1024);
+  auto const stats = mr.get_statistics();
+  REQUIRE(stats.cached_large_bytes == 16 * 1024);
+  REQUIRE(stats.large_requests == 2);
+  REQUIRE(stats.large_hits == 0);
+  REQUIRE(stats.large_misses == (cacheable ? 2 : 1));
+  REQUIRE(stats.large_uncacheable == (cacheable ? 0 : 1));
+  REQUIRE(stats.large_evictions == 0);
+
+  auto* reused = mr.allocate_sync(seed_bytes);
+  REQUIRE(reused == seed);
+  REQUIRE(mr.get_statistics().large_hits == 1);
+  mr.deallocate_sync(reused, seed_bytes);
+}
+
+TEST_CASE("Release paths consume CUDA failures and withhold unconfirmed storage",
+          "[small_pinned][cuda_errors]")
+{
+  // Inside each blocking_cuda_calls_rejected scope, every wait the resource makes fails. Each
+  // section then checks that the failure did not stay in this thread's last-error state, and that
+  // the storage was neither freed nor reused: a later cudaFreeHost of it succeeds.
+  test_fixture f;
+
+  SECTION("uncacheable deallocate")
+  {
+    constexpr std::size_t bytes = 100000;  // 128 KiB bucket, beyond the 64 KiB cap
+    small_pinned_host_memory_resource mr{f.upstream, 64 * 1024};
+    rmm::cuda_stream other_stream{rmm::cuda_stream::flags::non_blocking};
+    auto* ptr = mr.allocate_sync(bytes);
+    {
+      blocking_cuda_calls_rejected rejected;
+      mr.deallocate(other_stream, ptr, bytes);
+      REQUIRE(::cudaGetLastError() == cudaSuccess);
+    }
+    REQUIRE(::cudaFreeHost(ptr) == cudaSuccess);
+  }
+
+  SECTION("deallocate_sync")
+  {
+    constexpr std::size_t bytes = 100000;  // 128 KiB bucket, beyond the 64 KiB cap
+    small_pinned_host_memory_resource mr{f.upstream, 64 * 1024};
+    auto* ptr = mr.allocate_sync(bytes);
+    {
+      blocking_cuda_calls_rejected rejected;
+      mr.deallocate_sync(ptr, bytes);
+      REQUIRE(::cudaGetLastError() == cudaSuccess);
+    }
+    REQUIRE(::cudaFreeHost(ptr) == cudaSuccess);
+  }
+
+  SECTION("evicting deallocate")
+  {
+    constexpr std::size_t small_bytes = 9000;       // 16 KiB bucket; two fill the 32 KiB cap
+    constexpr std::size_t large_bytes = 20 * 1024;  // 32 KiB bucket; evicts both
+    small_pinned_host_memory_resource mr{f.upstream, 32 * 1024};
+    rmm::cuda_stream other_stream{rmm::cuda_stream::flags::non_blocking};
+    auto* a = mr.allocate_sync(small_bytes);
+    auto* b = mr.allocate_sync(small_bytes);
+    mr.deallocate_sync(a, small_bytes);
+    mr.deallocate_sync(b, small_bytes);
+    auto* c = mr.allocate_sync(large_bytes);
+    {
+      blocking_cuda_calls_rejected rejected;
+      mr.deallocate(other_stream, c, large_bytes);
+      REQUIRE(::cudaGetLastError() == cudaSuccess);
+      REQUIRE(mr.get_statistics().large_evictions == 2);
+      REQUIRE(mr.large_cache_bytes() == 32 * 1024);
+    }
+    REQUIRE(::cudaFreeHost(a) == cudaSuccess);
+    REQUIRE(::cudaFreeHost(b) == cudaSuccess);
+    auto* reused = mr.allocate_sync(large_bytes);
+    REQUIRE(reused == c);
+    mr.deallocate_sync(reused, large_bytes);
+  }
+
+  SECTION("destructor keeps upstream blocks after an unconfirmed slab wait")
+  {
+    constexpr std::size_t bytes = 512;
+    rmm::cuda_stream other_stream{rmm::cuda_stream::flags::non_blocking};
+    auto const free_blocks = f.upstream.get_free_blocks();
+    {
+      // Control: after a confirmed wait, destruction returns the slab's block upstream.
+      small_pinned_host_memory_resource control{f.upstream};
+      control.deallocate(other_stream, control.allocate_sync(bytes), bytes);
+      REQUIRE(f.upstream.get_free_blocks() < free_blocks);
+    }
+    REQUIRE(f.upstream.get_free_blocks() == free_blocks);
+
+    std::optional<small_pinned_host_memory_resource> mr{std::in_place, f.upstream};
+    mr->deallocate(other_stream, mr->allocate_sync(bytes), bytes);
+    auto const free_blocks_in_use = f.upstream.get_free_blocks();
+    REQUIRE(free_blocks_in_use < free_blocks);
+    {
+      blocking_cuda_calls_rejected rejected;
+      mr.reset();
+      REQUIRE(::cudaGetLastError() == cudaSuccess);
+    }
+    REQUIRE(f.upstream.get_free_blocks() == free_blocks_in_use);
+  }
+
+  SECTION("destructor")
+  {
+    // No slab is used, so the destructor has no upstream blocks to retain.
+    constexpr std::size_t bytes = 9000;
+    std::optional<small_pinned_host_memory_resource> mr{std::in_place, f.upstream};
+    auto* ptr = mr->allocate_sync(bytes);
+    mr->deallocate_sync(ptr, bytes);
+    REQUIRE(mr->large_cache_bytes() == 16 * 1024);
+    {
+      blocking_cuda_calls_rejected rejected;
+      mr.reset();
+      REQUIRE(::cudaGetLastError() == cudaSuccess);
+    }
+    REQUIRE(::cudaFreeHost(ptr) == cudaSuccess);
+  }
+}
+
+TEST_CASE("A deallocation evicts every victim it needs in one step", "[small_pinned][statistics]")
+{
+  test_fixture f;
+  constexpr std::size_t cap         = 64 * 1024;
+  constexpr std::size_t small_bytes = 9000;       // 16 KiB bucket; four fill the cap
+  constexpr std::size_t large_bytes = 40 * 1024;  // 64 KiB bucket; needs all four evicted
+  small_pinned_host_memory_resource mr{f.upstream, cap};
+  auto* large = mr.allocate_sync(large_bytes);
+  std::array<void*, 4> smalls{};
+  for (auto*& ptr : smalls) {
+    ptr = mr.allocate_sync(small_bytes);
+  }
+  for (auto* ptr : smalls) {
+    mr.deallocate_sync(ptr, small_bytes);
+  }
+  REQUIRE(mr.large_cache_bytes() == cap);
+  REQUIRE(mr.get_statistics().large_evictions == 0);
+
+  mr.deallocate_sync(large, large_bytes);
+  auto const stats = mr.get_statistics();
+  REQUIRE(stats.large_evictions == 4);
+  REQUIRE(stats.cached_large_bytes == cap);
+  REQUIRE(stats.peak_cached_large_bytes == cap);
+  auto* reused = mr.allocate_sync(large_bytes);
+  REQUIRE(reused == large);
+  mr.deallocate_sync(reused, large_bytes);
+}
+
 TEST_CASE("Slab pool rejects an upstream block smaller than the slab", "[small_pinned]")
 {
   constexpr std::size_t block_size = 4096;
@@ -839,6 +1064,207 @@ TEST_CASE("Large allocation statistics remain consistent during mixed concurrent
   REQUIRE(final.peak_cached_large_bytes <= cap);
 }
 
+TEST_CASE("Concurrent evicting deallocations finish while other threads refill the cache",
+          "[small_pinned][threading]")
+{
+  // A liveness and stress smoke test: deallocations that must evict to fit a 256 KiB bucket run
+  // while refill workers cycle 16 KiB entries through the cache, and all of them must finish. Each
+  // refill round first takes entries out of the cache, which opens room rather than competing for
+  // it, so this test does not reliably detect starvation. "A deallocation reserves its room before
+  // waiting on the buffers it evicts" covers the one-step reservation.
+  test_fixture f;
+  constexpr std::size_t cap                         = 1 << 20;
+  constexpr std::size_t small_bytes                 = 9000;        // 16 KiB bucket
+  constexpr std::size_t large_bytes                 = 200 * 1024;  // 256 KiB bucket
+  constexpr std::size_t evicting_workers            = 4;
+  constexpr std::size_t buffers_per_evicting_worker = 8;
+  constexpr std::size_t refill_workers              = 4;
+  constexpr std::size_t refill_batch                = 16;
+  constexpr auto deadline                           = std::chrono::seconds{20};
+  small_pinned_host_memory_resource mr{f.upstream, cap};
+  auto const current_device = rmm::get_current_cuda_device();
+
+  std::array<std::array<void*, buffers_per_evicting_worker>, evicting_workers> large_buffers{};
+  for (auto& buffer : large_buffers | std::views::join) {
+    buffer = mr.allocate_sync(large_bytes);
+  }
+  std::vector<void*> seeds(cap / small_pinned_host_memory_resource::MIN_LARGE_BUCKET);
+  for (auto& seed : seeds) {
+    seed = mr.allocate_sync(small_bytes);
+  }
+  for (auto* seed : seeds) {
+    mr.deallocate_sync(seed, small_bytes);
+  }
+  REQUIRE(mr.large_cache_bytes() == cap);
+
+  std::atomic<bool> start{false};
+  std::atomic<std::size_t> finished{0};
+  std::atomic<std::uint64_t> refill_rounds{0};
+  std::array<std::exception_ptr, refill_workers + evicting_workers> worker_failures{};
+  // Returns early when a main-thread failure stops the workers before they start.
+  auto const wait_for_start = [&start](std::stop_token const& stop) {
+    while (!start.load(std::memory_order_acquire) && !stop.stop_requested()) {
+      std::this_thread::yield();
+    }
+  };
+
+  std::array<std::jthread, refill_workers> refills;
+  for (std::size_t index = 0; index < refill_workers; ++index) {
+    refills[index] = std::jthread{[&, index](std::stop_token stop) {
+      try {
+        wait_for_start(stop);
+        rmm::cuda_set_device_raii device_guard{current_device};
+        rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+        std::array<void*, refill_batch> batch{};
+        auto const release_batch = [&] {
+          for (auto*& ptr : batch) {
+            mr.deallocate(stream, std::exchange(ptr, nullptr), small_bytes);
+          }
+        };
+        while (!stop.stop_requested()) {
+          try {
+            for (auto*& ptr : batch) {
+              ptr = mr.allocate(stream, small_bytes);
+            }
+            stream.synchronize();
+          } catch (...) {
+            release_batch();
+            throw;
+          }
+          release_batch();
+          refill_rounds.fetch_add(1, std::memory_order_relaxed);
+        }
+        stream.synchronize();
+      } catch (...) {
+        worker_failures[index] = std::current_exception();
+      }
+    }};
+  }
+
+  // Declared after the refill workers so that, on an early main-thread failure, these workers are
+  // stopped and joined first; they still return their buffers, which keeps the test leak-free.
+  std::array<std::jthread, evicting_workers> evictors;
+  for (std::size_t index = 0; index < evicting_workers; ++index) {
+    evictors[index] = std::jthread{[&, index](std::stop_token stop) {
+      try {
+        wait_for_start(stop);
+        rmm::cuda_set_device_raii device_guard{current_device};
+        rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+        for (auto* ptr : large_buffers[index]) {
+          mr.deallocate(stream, ptr, large_bytes);
+        }
+        stream.synchronize();
+      } catch (...) {
+        worker_failures[refill_workers + index] = std::current_exception();
+      }
+      finished.fetch_add(1, std::memory_order_release);
+    }};
+  }
+
+  start.store(true, std::memory_order_release);
+  auto const give_up_at = std::chrono::steady_clock::now() + deadline;
+  while (finished.load(std::memory_order_acquire) != evicting_workers &&
+         std::chrono::steady_clock::now() < give_up_at) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  bool const finished_in_time = finished.load(std::memory_order_acquire) == evicting_workers;
+  // Stopping the refills lets a deallocation that is still running finish, so a liveness failure is
+  // reported instead of hanging the test.
+  for (auto& refill : refills) {
+    refill.request_stop();
+  }
+  for (auto& worker : refills) {
+    worker.join();
+  }
+  for (auto& worker : evictors) {
+    worker.join();
+  }
+  for (auto const& failure : worker_failures) {
+    if (failure) { std::rethrow_exception(failure); }
+  }
+
+  INFO("refill rounds completed: " << refill_rounds.load());
+  REQUIRE(finished_in_time);
+  auto const stats = mr.get_statistics();
+  REQUIRE(mr.large_cache_bytes() <= cap);
+  REQUIRE(stats.peak_cached_large_bytes <= cap);
+  REQUIRE(stats.cached_large_bytes == mr.large_cache_bytes());
+  REQUIRE(stats.large_evictions > 0);
+  REQUIRE(::cudaGetLastError() == cudaSuccess);
+}
+
+TEST_CASE("A deallocation reserves its room before waiting on the buffers it evicts",
+          "[small_pinned][threading][statistics]")
+{
+  // The evicted buffers have GPU work pending until the gate opens, so waiting on any of them
+  // blocks. The deallocation must detach all four victims and publish its own buffer first, then
+  // wait without holding the lock, so other threads observe the finished reservation meanwhile.
+  test_fixture f;
+  constexpr std::size_t cap          = 64 * 1024;
+  constexpr std::size_t small_bytes  = 9000;       // 16 KiB bucket; four fill the cap
+  constexpr std::size_t large_bytes  = 40 * 1024;  // 64 KiB bucket; needs all four evicted
+  constexpr std::size_t victim_count = cap / small_pinned_host_memory_resource::MIN_LARGE_BUCKET;
+  constexpr auto deadline            = std::chrono::seconds{5};
+  small_pinned_host_memory_resource mr{f.upstream, cap};
+  auto const current_device = rmm::get_current_cuda_device();
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
+  auto* large = mr.allocate_sync(large_bytes);
+  std::array<void*, victim_count> victims{};
+  for (auto*& victim : victims) {
+    victim = mr.allocate_sync(small_bytes);
+  }
+
+  std::atomic<bool> returned{false};
+  // Declared before the gate so that, if an assertion fails, the gate is released before this
+  // thread is joined.
+  std::jthread evictor;
+  pending_stream_work gate{producer};
+  for (auto* victim : victims) {
+    mr.deallocate(producer, victim, small_bytes);
+  }
+  REQUIRE(mr.large_cache_bytes() == cap);
+
+  auto const give_up_at = std::chrono::steady_clock::now() + deadline;
+  std::atomic<bool> deadline_reached{false};
+  // Opens the gate at the deadline even while the main thread is blocked, so an implementation that
+  // waits on the victims while holding the lock fails here instead of hanging.
+  std::jthread watchdog{[&](std::stop_token stop) {
+    while (!stop.stop_requested() && std::chrono::steady_clock::now() < give_up_at) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    if (!stop.stop_requested()) { deadline_reached.store(true); }
+    gate.release();
+  }};
+  evictor          = std::jthread{[&] {
+    rmm::cuda_set_device_raii device_guard{current_device};
+    mr.deallocate(consumer, large, large_bytes);
+    returned.store(true, std::memory_order_release);
+  }};
+  auto during_wait = mr.get_statistics();
+  while (during_wait.large_evictions != victim_count &&
+         std::chrono::steady_clock::now() < give_up_at) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    during_wait = mr.get_statistics();
+  }
+  bool const observed_before_deadline = !deadline_reached.load();
+  bool const returned_before_release  = returned.load(std::memory_order_acquire);
+  watchdog.request_stop();
+  watchdog.join();
+  evictor.join();
+
+  REQUIRE(observed_before_deadline);
+  REQUIRE_FALSE(returned_before_release);
+  REQUIRE(during_wait.large_evictions == victim_count);
+  REQUIRE(during_wait.cached_large_bytes == cap);
+  REQUIRE(during_wait.peak_cached_large_bytes == cap);
+  REQUIRE(returned.load(std::memory_order_acquire));
+  auto* reused = mr.allocate_sync(large_bytes);
+  REQUIRE(reused == large);
+  mr.deallocate_sync(reused, large_bytes);
+  REQUIRE(::cudaGetLastError() == cudaSuccess);
+}
+
 TEST_CASE("Reuse orders pending DMA across allocation streams",
           "[small_pinned][stream_ordering][statistics]")
 {
@@ -930,9 +1356,14 @@ TEST_CASE("Event ownership follows the freeing stream's device", "[small_pinned]
   {
     rmm::cuda_set_device_raii other_device{rmm::cuda_device_id{1}};
     f.slab_mr.deallocate(device_zero_stream, original, bytes);
+    REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{1});
   }
   auto* reused = f.slab_mr.allocate(device_zero_stream, bytes);
   REQUIRE(reused == original);
+  if (bytes > small_pinned_host_memory_resource::MAX_SLAB_SIZE) {
+    // A stream-synchronize-and-free fallback could return the same address, but not as a hit.
+    REQUIRE(f.slab_mr.get_statistics().large_hits == 1);
+  }
   device_zero_stream.synchronize();
   f.slab_mr.deallocate(device_zero_stream, reused, bytes);
 }
