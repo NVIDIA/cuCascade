@@ -237,7 +237,7 @@ in-flight prefetch IO. Sync `host_write` simply calls `invalidate` before and af
 invalidated generation carries an `invalidated` flag and is never handed out again, even to a
 later request for the same key while an old reader keeps it alive (a superseded generation keeps
 its old behaviour). The same two passes drop the path's entry in the ioctx's `metadata_store`
-(new `metadata_store::invalidate(path)`): a parsed footer of the old bytes is as stale as the
+(`metadata_store::invalidate_written(path)`): a parsed footer of the old bytes is as stale as the
 chunks. `flush` does not invalidate.
 
 Additions from the review (w1-review):
@@ -245,8 +245,22 @@ Additions from the review (w1-review):
   it changes (or replaces) the bytes as much as a write.
 - A footer parsed from the old bytes can finish after both passes. `metadata_store` therefore keeps
   a per-path epoch (a fixed 256-slot table indexed by path hash, so it does not grow with spill
-  paths): `invalidate` advances it, `ioctx` stamps every object it opens with it, and
+  paths): `invalidate_written` advances it, `ioctx` stamps every object it opens with it, and
   `register_metadata` drops a registration from an object stamped before the last invalidation.
+- Writes and object identity (ported from Sirius #2132) are two fences on the same store. Entries
+  carry the `io_object::identity()` of the open that published them and are reused only by an
+  open with an equal identity; a newer identity observed for a path (by open generation) retires
+  its entry and fences slower publications of the old one. The write epoch covers what identity
+  cannot: an in-place write that leaves the stat identity unchanged (coarse ctime). It is checked
+  under the store lock before any identity bookkeeping (an object opened before the write can
+  neither observe nor publish), it is part of the `get_or_load` single-flight key (a post-write
+  open never joins a pre-write parse), and `invalidate_written` also erases the path's observed
+  identity so its history restarts. The epoch is advanced before the lock is taken and
+  `invalidate_written` does not allocate. A writable object always has an open-local
+  (`opened_handle`) identity, so nothing parsed through it is reused by another open.
+- The fs_cache keys its generations by `io_object::identity_cache_key()`: separate opens of an
+  unchanged local file share a generation, and a file replaced by another process (which this
+  ioctx's write invalidation never sees) gets a new generation that retires the old one.
 - Scope (documented on the write API): only the writing ioctx's cache and metadata store are
   invalidated; paths are matched as given (no normalisation); a reader holding a cache handle
   from before the write keeps its view of the old bytes.

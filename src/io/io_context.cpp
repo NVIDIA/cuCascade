@@ -272,7 +272,7 @@ std::shared_ptr<io_object> ioctx::open_io_object_for_write(std::string path,
 void ioctx::invalidate_cached(std::string_view object_path) noexcept
 {
   if (_cache) { _cache->invalidate(object_path); }
-  _metadata_store.invalidate(object_path);
+  _metadata_store.invalidate_written(object_path);
 }
 
 std::size_t ioctx::host_write(const io_object& obj,
@@ -396,7 +396,7 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
          path     = std::move(path_copy),
          bridge   = std::move(bridge)](exec::try_t<std::size_t>&& outcome) mutable {
           pending.fire();
-          metadata->invalidate(path);
+          metadata->invalidate_written(path);
           bridge.set_try(std::move(outcome));
         });
       return result;

@@ -258,3 +258,35 @@ TEST_CASE("local opens share a generation until the file is replaced",
   CHECK(wait_for_cache([&] { return cache.generation_count(fixture.path) == 1; }, 5s));
   CHECK(cache.retired_generation_count() == 0);
 }
+
+TEST_CASE("local reopens reuse parsed metadata until the file is replaced",
+          "[cache][uring][object_identity][metadata_store]")
+{
+  write_cache_fixture fixture;
+  auto& store       = fixture.context->metadata_store();
+  auto const parsed = std::make_shared<cucascade::io::io_object_metadata>();
+
+  datasource first(fixture.context, fixture.context->open_io_object(fixture.path));
+  REQUIRE(first.store_metadata(parsed));
+  CHECK(store.has_path(fixture.path));
+  // A separate open of the unchanged file has the same stat identity.
+  datasource const reopened(fixture.context, fixture.context->open_io_object(fixture.path));
+  CHECK(reopened.metadata() == parsed);
+
+  // An atomic replacement by someone else: the next open has a new identity, so
+  // it neither sees the old metadata nor lets the old open publish more.
+  auto const staged = fixture.path + ".next";
+  {
+    auto const new_bytes = pattern(fixture.bytes, 9);
+    std::ofstream out(staged, std::ios::binary);
+    out.write(reinterpret_cast<char const*>(new_bytes.data()),
+              static_cast<std::streamsize>(new_bytes.size()));
+  }
+  std::filesystem::rename(staged, fixture.path);
+  datasource const replaced(fixture.context, fixture.context->open_io_object(fixture.path));
+  CHECK_FALSE(replaced.metadata());
+  CHECK_FALSE(store.has_path(fixture.path));
+  REQUIRE(first.store_metadata(std::make_shared<cucascade::io::io_object_metadata>()));
+  CHECK_FALSE(replaced.metadata());
+  CHECK_FALSE(first.metadata());
+}

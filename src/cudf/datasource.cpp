@@ -70,6 +70,9 @@ std::future<size_t> bridge_semi_to_std(Producer&& producer)
 datasource::datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj))
 {
+  // A newer identity of the path retires the metadata of the version it replaced
+  // and fences slow parses of that version.
+  if (_io_ctx && _io_object) { _io_ctx->metadata_store().open_observed(*_io_object); }
 }
 
 datasource::~datasource() {}
@@ -77,8 +80,7 @@ datasource::~datasource() {}
 std::shared_ptr<io_object_metadata> datasource::metadata() const
 {
   if (!_io_ctx || !_io_object) { return nullptr; }
-  auto& cache = _io_ctx->metadata_store();
-  return cache.get_metadata(*_io_object);
+  return _io_ctx->metadata_store().get_metadata(*_io_object);
 }
 
 [[nodiscard]] bool datasource::store_metadata(std::shared_ptr<io_object_metadata> metadata)
