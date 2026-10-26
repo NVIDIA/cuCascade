@@ -209,9 +209,11 @@ class datasource : public cudf::io::datasource {
 
   /// Issue prefetch IO for the stashed handle.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
-  /// completion.  Returns @c prefetch_refusal::issued when IO went out, and
-  /// otherwise why it did not.
-  prefetch_refusal prefetch_async(exec::invocable<void(bool) noexcept> on_done);
+  /// completion; every refusal reports @c {ok = false, covered = false}.
+  /// Coverage is separate from success: another loader can own chunks that
+  /// this prefetch skipped (see @c fs_cache::prefetch).  Returns
+  /// @c prefetch_refusal::issued when IO went out, and otherwise why it did not.
+  prefetch_refusal prefetch_async(exec::invocable<void(cache::prefetch_result) noexcept> on_done);
 
   /// Why this datasource's prefetch failed, if it did: null otherwise, and
   /// null when no prefetch was ever issued.  Set before the prefetch's

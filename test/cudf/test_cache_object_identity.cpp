@@ -82,6 +82,7 @@ namespace {
 using namespace std::chrono_literals;
 using cucascade::io::datasource;
 using cucascade::io::object_changed_error;
+using cucascade::io::cache::prefetch_result;
 using cucascade::io::rest::rest_io_object;
 using cucascade::io::rest::rest_ioctx;
 using cucascade::io::rest::rest_reactor;
@@ -710,11 +711,11 @@ TEST_CASE("cache identity publishes prefetch failure before notifying the consum
   };
   auto watcher   = std::make_shared<observer>();
   auto completed = watcher->completed.get_future();
-  REQUIRE(source->prefetch_async([watcher, source](bool ok) noexcept {
+  REQUIRE(source->prefetch_async([watcher, source](prefetch_result result) noexcept {
     // Read from the completion callback itself: the failure must already be there.
     std::exception_ptr failure = source->prefetch_failure();
     if (watcher->calls.fetch_add(1) == 0) {
-      watcher->completed.set_value(outcome{ok, std::move(failure)});
+      watcher->completed.set_value(outcome{result.ok, std::move(failure)});
     }
   }) == cucascade::io::prefetch_refusal::issued);
   REQUIRE(completed.wait_for(5s) == std::future_status::ready);
@@ -812,16 +813,17 @@ TEST_CASE("cache identity retains a retired generation until a held fill release
   held_request new_fill;
 
   advise(*first, chunk_bytes);
-  REQUIRE(first->prefetch_async([&](bool) noexcept { first_completions.fetch_add(1); }) ==
-          cucascade::io::prefetch_refusal::issued);
+  REQUIRE(first->prefetch_async([&](prefetch_result) noexcept {
+    first_completions.fetch_add(1);
+  }) == cucascade::io::prefetch_refusal::issued);
   old_fill.request = context->backend().take();
   REQUIRE(old_fill.request != nullptr);
   require_generations(cache, path, 1, 0);
 
   // A second generation of the path supersedes the first while its fill is held.
   advise(*second, chunk_bytes);
-  REQUIRE(second->prefetch_async([&](bool ok) noexcept {
-    second_ok.store(ok);
+  REQUIRE(second->prefetch_async([&](prefetch_result result) noexcept {
+    second_ok.store(result.ok);
     second_completions.fetch_add(1);
   }) == cucascade::io::prefetch_refusal::issued);
   new_fill.request = context->backend().take();
@@ -870,8 +872,8 @@ TEST_CASE("cache identity delivers a held fill's failure through the datasource"
   std::exception_ptr seen;
   bool ok_seen = true;
   std::atomic<int> calls{0};
-  REQUIRE(source->prefetch_async([&, source](bool ok) noexcept {
-    ok_seen = ok;
+  REQUIRE(source->prefetch_async([&, source](prefetch_result result) noexcept {
+    ok_seen = result.ok;
     seen    = source->prefetch_failure();
     calls.fetch_add(1);
   }) == cucascade::io::prefetch_refusal::issued);

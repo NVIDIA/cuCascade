@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <latch>
 #include <memory>
 #include <mutex>
@@ -122,6 +123,13 @@ struct prefetch_failure_slot {
   std::exception_ptr failure;
 };
 
+/// Completion of the IO submitted by one prefetch. Success alone does not
+/// imply coverage: another loader may own some of the requested chunks.
+struct prefetch_result {
+  bool ok{false};       ///< the IO this prefetch submitted (if any) succeeded
+  bool covered{false};  ///< ...and every requested extent is now resident
+};
+
 /// One prefetch request: the two stage machines plus the chunk set they cover.
 /// Held by value — the cache's queues and the owning @ref cache_handle
 /// each carry a copy, so the stages outlive whichever side finishes first.
@@ -135,6 +143,9 @@ struct prefetch_request {
   std::shared_ptr<producer_stage> producer;
   std::shared_ptr<consumer_stage> consumer;
   std::shared_ptr<const std::vector<cached_chunk*>> chunks;
+  /// Immutable requested extents, index-parallel with @c chunks. A resident
+  /// chunk can have a narrower fill than this request needs.
+  std::shared_ptr<const std::vector<chunk_fill>> required_fills;
   std::weak_ptr<cache_generation> generation;
   std::shared_ptr<prefetch_failure_slot> failure;
   std::uint32_t timestamp{0};
@@ -389,8 +400,19 @@ class fs_cache {
 
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
-  /// completion.  Returns whether IO was issued.
-  bool prefetch(cache_handle& handle, exec::invocable<void(bool) noexcept> on_done);
+  /// completion.  The outcome is @c covered only when every extent the request
+  /// asked for is either filled by the IO it submitted or already resident;
+  /// a chunk another loader (a demand read) claimed first is not covered, even
+  /// when this prefetch's own IO succeeded.  Returns whether IO was issued.
+  bool prefetch(cache_handle& handle, exec::invocable<void(prefetch_result) noexcept> on_done);
+
+  /// Test-only hook run inside @ref prefetch after the producer is published
+  /// as loading and before any chunk is claimed, with no cache lock held.
+  /// Configure only while no prefetch can run.
+  void set_before_prefetch_claim_for_testing(std::function<void()> hook)
+  {
+    _before_prefetch_claim = std::move(hook);
+  }
 
   /// Bytes of staging memory the cache currently holds: every chunk buffer
   /// handed out by the pool and not yet reclaimed.  This is what an explicit
@@ -601,6 +623,7 @@ class fs_cache {
 
   void reclaim_idle_chunks(cache_generation& generation) noexcept;
 
+  std::function<void()> _before_prefetch_claim;
   const config _cfg;
   std::shared_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;

@@ -46,6 +46,7 @@ using namespace std::chrono_literals;
 using namespace cucascade::test;
 using cucascade::io::prefetch_refusal;
 using cucascade::io::prepare_result;
+using cucascade::io::cache::prefetch_result;
 constexpr std::size_t chunk_size = 1U << 20;
 constexpr std::size_t read_size  = 4096;
 
@@ -103,7 +104,8 @@ struct arbitration_fixture : cache_test_fixture {
   /// Issue a prefetch of the advised range and take its fill off the backend.
   void prefetch(held_request& fill)
   {
-    REQUIRE(datasource->prefetch_async([](bool) noexcept {}) == prefetch_refusal::issued);
+    REQUIRE(datasource->prefetch_async([](prefetch_result) noexcept {}) ==
+            prefetch_refusal::issued);
     fill.request = context->backend().wait_take(2s);
     REQUIRE(fill.request != nullptr);
   }
@@ -134,8 +136,8 @@ TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
   held_request prefetch;
   std::future<std::future<std::size_t>> read_call;
   read_cleanup cleanup{*fixture.context, {&prefetch, nullptr}};
-  REQUIRE(fixture.datasource->prefetch_async([&](bool ok) noexcept {
-    prefetched.store(ok, std::memory_order_release);
+  REQUIRE(fixture.datasource->prefetch_async([&](prefetch_result result) noexcept {
+    prefetched.store(result.ok, std::memory_order_release);
     callbacks.fetch_add(1);
   }) == prefetch_refusal::issued);
   prefetch.request = fixture.context->backend().wait_take(2s);
@@ -168,8 +170,8 @@ TEST_CASE("a cached device read retires its pin through the stream completion po
   std::atomic<bool> prefetched{false};
   held_request prefetch;
   read_cleanup cleanup{*fixture.context, {&prefetch, nullptr}};
-  REQUIRE(fixture.datasource->prefetch_async([&](bool ok) noexcept {
-    prefetched.store(ok, std::memory_order_release);
+  REQUIRE(fixture.datasource->prefetch_async([&](prefetch_result result) noexcept {
+    prefetched.store(result.ok, std::memory_order_release);
   }) == prefetch_refusal::issued);
   prefetch.request = fixture.context->backend().wait_take(2s);
   REQUIRE(prefetch.request != nullptr);
@@ -204,7 +206,8 @@ TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
   held_request demand;
   std::future<std::future<std::size_t>> read_call;
   read_cleanup cleanup{*fixture.context, {&prefetch, &demand}};
-  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) == prefetch_refusal::issued);
+  REQUIRE(fixture.datasource->prefetch_async([](prefetch_result) noexcept {}) ==
+          prefetch_refusal::issued);
   prefetch.request = fixture.context->backend().wait_take(2s);
   REQUIRE(prefetch.request != nullptr);
   CHECK(prefetch.request->priority == cucascade::io::io_priority::low);

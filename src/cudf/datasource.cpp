@@ -271,28 +271,29 @@ prepare_result datasource::prepare_prefetch(bool wait_for_eviction)
   return prepare_result::nothing_to_prepare;
 }
 
-prefetch_refusal datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
+prefetch_refusal datasource::prefetch_async(
+  exec::invocable<void(cache::prefetch_result) noexcept> on_done)
 {
   if (!_prefetch_handle || !uses_fs_cache()) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::no_cache;
   }
 
   if (_prefetch_handle.has_started_reading()) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::consumer_ahead;
   }
 
   auto const producer = _prefetch_handle.producer_state();
   if (producer == cache::producer_stage::abandoned) {
-    on_done(false);
+    on_done({});
     // Allocation pressure no longer abandons a request: prepare() leaves it
     // queued so readahead can evict and retry.  An abandoned request therefore
     // lost the race with its consumer (or was cancelled), not its buffers.
     return prefetch_refusal::other;
   }
   if (producer < cache::producer_stage::prepared) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::other;
   }
   if (_io_ctx->cache()->prefetch(_prefetch_handle, std::move(on_done))) {

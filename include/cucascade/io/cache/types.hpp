@@ -57,7 +57,7 @@ namespace cucascade::io::cache {
  * `stage >= reading` (is the executor pulling these bytes itself?) and
  * `stage == disposed` (is this split finished?).  Read-ahead is not a stage
  * here -- it is producer-side work that runs alongside this progression, and
- * @c scan_info::prefetch_state tracks it separately.
+ * the embedding readahead tracks its own ticket ownership separately.
  */
 enum class scan_stage { none, initialized, queued, preparing, reading, disposed };
 
