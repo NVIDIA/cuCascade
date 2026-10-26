@@ -95,6 +95,15 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
                                                    CUDA::cudart_static)
 
   add_test(NAME cucascade_io_tests COMMAND cucascade_io_tests)
+
+  option(CUCASCADE_BUILD_S3_HARNESS
+         "Build the opt-in local S3 integration probe" OFF)
+  if(CUCASCADE_BUILD_S3_HARNESS)
+    add_executable(cucascade_direct_s3_smoke io/integration/direct_s3_smoke.cpp)
+    target_link_libraries(cucascade_direct_s3_smoke PRIVATE cucascade_io)
+    # This executable needs a seeded external service. Run via
+    # scripts/cache-harness.
+  endif()
 endif()
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
