@@ -401,6 +401,13 @@ class fs_cache {
     return _ticker.load(std::memory_order_relaxed);
   }
 
+  /// Test-only: how many generations are reachable by key (live, not retired).
+  [[nodiscard]] std::size_t file_entry_count_for_testing() const noexcept
+  {
+    std::shared_lock lock(_map_mtx);
+    return _file_cache.size();
+  }
+
   /// Test-only: how many prefetch requests @ref evict_loop was tracking at the
   /// start of its last round, once that round's new arrivals were absorbed.
   [[nodiscard]] std::size_t eviction_batch_size_for_testing() const noexcept

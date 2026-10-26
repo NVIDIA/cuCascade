@@ -17,17 +17,19 @@
  */
 
 // Cache-level object identity: the fs_cache keys its chunks by object
-// generation (path + strong ETag), retires a path's older generations when a
-// new one appears, keeps a retired generation alive for as long as a handle or
-// an in-flight operation uses it, and fails a read whose object changed rather
-// than publishing the replacement's bytes under the old identity.
+// identity (path + strong ETag, or a local file's stat tuple), retires a
+// path's older generations when a new one appears, keeps a retired generation
+// alive for as long as a handle or an in-flight operation uses it, and fails a
+// read whose object changed rather than publishing the replacement's bytes
+// under the old identity.
 //
 // These tests drive the cache through the real cudf-coupled
 // cucascade::io::datasource, the friend that reaches the cache's prefetch
 // paths.  Two kinds of backend stand behind it: a loopback REST server whose
 // per-key scripts overwrite an object between opens (end to end through the
 // reactor), and a held backend whose fills the test completes or fails by hand
-// (deterministic lifetime and ordering checks).  The wire-level conditional-GET
+// (deterministic lifetime and ordering checks); a uring case covers local
+// files replaced behind the cache's back.  The wire-level conditional-GET
 // contract is covered by test/io/rest/test_rest_cache_identity.cpp.
 //
 // The same fixture also hosts the fs_cache summary snapshot test, which needs a
@@ -40,6 +42,9 @@
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/config.hpp>
+#include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
@@ -53,6 +58,7 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -63,6 +69,8 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <optional>
@@ -71,6 +79,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -1194,4 +1203,116 @@ TEST_CASE("a datasource reports whether its ioctx reads through an fs_cache",
   CHECK(source.uses_fs_cache());
   context->shutdown_cache();
   CHECK_FALSE(source.uses_fs_cache());
+}
+
+// ===========================================================================
+// Local files: identity across opens and replacement
+// ===========================================================================
+
+namespace {
+
+[[nodiscard]] std::vector<std::uint8_t> local_pattern(std::size_t bytes, std::uint8_t seed)
+{
+  std::vector<std::uint8_t> out(bytes);
+  for (std::size_t i = 0; i < bytes; ++i) {
+    out[i] = static_cast<std::uint8_t>(i * 31U + seed);
+  }
+  return out;
+}
+
+void write_local_file(std::string const& path, std::vector<std::uint8_t> const& bytes)
+{
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<char const*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+  out.close();
+  REQUIRE(out);
+}
+
+/** A uring ioctx with an armed fs_cache, and a scratch file of known bytes. */
+struct local_cache_fixture {
+  local_cache_fixture() : memory(identity_memory())
+  {
+    cucascade::io::io_config config;
+    config.uring_n_reactors = 1;
+    context                 = cucascade::io::make_uring_ioctx_factory(*memory)(config);
+    REQUIRE(context != nullptr);
+    context->start();
+    context->initialize_cache(*memory, identity_cache_config(), nullptr);
+    REQUIRE(context->uses_fs_cache());
+    bytes = 2 * context->cache()->chunk_size();
+    path  = (std::filesystem::temp_directory_path() /
+            ("cucascade_local_identity_" + std::to_string(::getpid()) + "_" +
+             std::to_string(next_id.fetch_add(1)) + ".bin"))
+             .string();
+    write_local_file(path, local_pattern(bytes, 1));
+  }
+
+  ~local_cache_fixture()
+  {
+    context->shutdown();
+    context->shutdown_cache();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path + ".next", ec);
+  }
+
+  local_cache_fixture(local_cache_fixture const&)            = delete;
+  local_cache_fixture& operator=(local_cache_fixture const&) = delete;
+
+  /// A datasource over a fresh object, its whole range prefetched and read
+  /// through the cache.
+  std::unique_ptr<datasource> cached_reader()
+  {
+    auto reader = std::make_unique<datasource>(context, context->open_io_object(path));
+    advise(*reader, bytes);
+    std::ignore = read_all(*reader);
+    return reader;
+  }
+
+  static inline std::atomic<int> next_id{0};
+  std::unique_ptr<cucascade::memory::memory_reservation_manager> memory;
+  std::shared_ptr<cucascade::io::ioctx> context;
+  std::size_t bytes{0};
+  std::string path;
+};
+
+}  // namespace
+
+TEST_CASE("local opens share a generation until the file is replaced",
+          "[cache][cache_identity][uring][object_identity]")
+{
+  local_cache_fixture fixture;
+  auto& cache = *fixture.context->cache();
+  auto first  = fixture.cached_reader();
+  REQUIRE(cache.generation_count(fixture.path) == 1);
+  auto const resident = cache.claimed_bytes();
+
+  // A second open of the unchanged file has the same stat identity: it reuses
+  // the first open's generation and its resident chunks.
+  auto second = fixture.cached_reader();
+  CHECK(cache.generation_count(fixture.path) == 1);
+  CHECK(cache.file_entry_count_for_testing() == 1);
+  CHECK(cache.claimed_bytes() == resident);
+  CHECK(read_all(*second) == local_pattern(fixture.bytes, 1));
+
+  // The file is replaced atomically by someone else: nothing tells the cache,
+  // but the next open has a new identity, so it builds a new generation and
+  // retires the old one.
+  auto const new_bytes = local_pattern(fixture.bytes, 9);
+  write_local_file(fixture.path + ".next", new_bytes);
+  std::filesystem::rename(fixture.path + ".next", fixture.path);
+  auto third = fixture.cached_reader();
+  CHECK(read_all(*third) == new_bytes);
+  CHECK(cache.generation_count(fixture.path) == 2);
+  CHECK(cache.retired_generation_count() == 1);
+  CHECK(cache.file_entry_count_for_testing() == 1);
+
+  // The earlier opens keep the bytes of the file they opened.
+  CHECK(read_all(*first) == local_pattern(fixture.bytes, 1));
+  first.reset();
+  second.reset();
+  CHECK(
+    cucascade::test::wait_for_cache([&] { return cache.generation_count(fixture.path) == 1; }, 5s));
+  CHECK(cache.retired_generation_count() == 0);
 }

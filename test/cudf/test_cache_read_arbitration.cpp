@@ -30,8 +30,15 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <memory>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 namespace {
 using namespace std::chrono_literals;
@@ -70,7 +77,32 @@ struct arbitration_fixture : cache_test_fixture {
     advise_range(*datasource, offset, read_size);
     REQUIRE(datasource->prepare_prefetch(false) == prepare_result::prepared);
   }
+  /// A datasource over a new open of @p path at @p version (see controlled_object).
+  std::unique_ptr<cucascade::io::datasource> open_version(std::string path, std::string version)
+  {
+    return std::make_unique<cucascade::io::datasource>(
+      context,
+      std::make_shared<controlled_object>(
+        std::move(path), 4 * controlled_chunk_bytes, std::move(version)));
+  }
+  /// Issue a prefetch of the advised range and take its fill off the backend.
+  void prefetch(held_request& fill)
+  {
+    REQUIRE(datasource->prefetch_async([](bool) noexcept {}) == prefetch_refusal::issued);
+    fill.request = context->backend().wait_take(2s);
+    REQUIRE(fill.request != nullptr);
+  }
 };
+
+template <typename Predicate>
+bool eventually(Predicate predicate)
+{
+  auto const deadline = std::chrono::steady_clock::now() + 3s;
+  while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  return predicate();
+}
 }  // namespace
 
 TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
@@ -303,4 +335,171 @@ TEST_CASE("a cache whose chunk size differs from the reactor staging block is re
   matched->initialize_cache(*memory, config, nullptr);
   CHECK(matched->cache() != nullptr);
   matched->shutdown_cache();
+}
+
+TEST_CASE("raw cache validates identities across opens", "[cache][object_identity]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  int const mode            = GENERATE(0, 1, 2);  // same version, changed version, no validator
+  std::string const version = mode == 2 ? "" : "v1";
+  held_request fill;
+  held_request miss;
+  read_cleanup cleanup{*fixture.context, {&fill, &miss}};
+  fixture.datasource = fixture.open_version("controlled://versioned", version);
+  fixture.advise(0);
+  fixture.prefetch(fill);
+  fill.complete(0x5a);
+  auto reopened = fixture.open_version("controlled://versioned", mode == 1 ? "v2" : version);
+  std::array<std::uint8_t, read_size> bytes{};
+  auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
+  if (mode != 0) {
+    miss.request = fixture.context->backend().wait_take(2s);
+    REQUIRE(miss.request != nullptr);
+    miss.complete(0x7b);
+  }
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [&](auto b) { return b == (mode == 0 ? 0x5a : 0x7b); }));
+  CHECK(fixture.context->backend().pending_count() == 0);
+}
+
+TEST_CASE("a late old raw-cache fill cannot overwrite the new version", "[cache][object_identity]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  held_request old_fill;
+  held_request new_fill;
+  read_cleanup cleanup{*fixture.context, {&old_fill, &new_fill}};
+  fixture.datasource = fixture.open_version("controlled://versioned", "v1");
+  fixture.advise(0);
+  fixture.prefetch(old_fill);
+  auto old_source    = std::move(fixture.datasource);
+  fixture.datasource = fixture.open_version("controlled://versioned", "v2");
+  fixture.advise(0);
+  fixture.prefetch(new_fill);
+  new_fill.complete(0x7b);
+  old_fill.complete(0x5a);
+  auto reopened = fixture.open_version("controlled://versioned", "v2");
+  std::array<std::uint8_t, read_size> bytes{};
+  auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x7b; }));
+  read = old_source->host_read_async(0, bytes.size(), bytes.data());
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x5a; }));
+  CHECK(fixture.context->backend().pending_count() == 0);
+}
+
+TEST_CASE("superseded raw cache entries release their arenas and handles without pressure",
+          "[cache][object_identity][raw_retirement]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  bool const validated = GENERATE(true, false);
+  std::vector<std::weak_ptr<controlled_object>> versions;
+  for (int i = 0; i < 24; ++i) {
+    auto object = std::make_shared<controlled_object>(
+      "controlled://retirement", 4 * controlled_chunk_bytes, validated ? std::to_string(i) : "");
+    versions.emplace_back(object);
+    fixture.datasource = std::make_unique<cucascade::io::datasource>(fixture.context, object);
+    fixture.advise(0);
+    held_request fill;
+    fixture.prefetch(fill);
+    fill.complete(0x11);
+    CHECK(fixture.context->cache()->file_entry_count_for_testing() == 1);
+  }
+  fixture.datasource.reset();
+  // No query, allocation pressure or explicit evict call is needed to retire old versions.
+  CHECK(eventually([&] {
+    return std::all_of(
+      versions.begin(), versions.end() - 1, [](auto const& v) { return v.expired(); });
+  }));
+  CHECK_FALSE(versions.back().expired());
+  CHECK(fixture.context->cache()->claimed_bytes() == controlled_chunk_bytes);
+  fixture.context->shutdown_cache();
+  CHECK(versions.back().expired());
+}
+
+TEST_CASE("retired raw arena survives an abandoned in-flight fill until physical completion",
+          "[cache][object_identity][raw_retirement]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  held_request fill;
+  read_cleanup cleanup{*fixture.context, {&fill, nullptr}};
+  auto object = std::make_shared<controlled_object>(
+    "controlled://retirement", 4 * controlled_chunk_bytes, "v1");
+  std::weak_ptr<controlled_object> old = object;
+  fixture.datasource = std::make_unique<cucascade::io::datasource>(fixture.context, object);
+  object.reset();
+  fixture.advise(0);
+  fixture.prefetch(fill);
+  fixture.datasource = fixture.open_version("controlled://retirement", "v2");
+  fixture.advise(0);
+  std::this_thread::sleep_for(250ms);  // let the evictor release the disposed v1 request
+  CHECK_FALSE(old.expired());
+  CHECK(fixture.context->cache()->claimed_bytes() == 2 * controlled_chunk_bytes);
+  fill.complete(0x11);
+  CHECK(eventually([&] { return old.expired(); }));
+  CHECK(fixture.context->cache()->claimed_bytes() == controlled_chunk_bytes);
+}
+
+TEST_CASE("retired raw arena survives a cache-hit CUDA copy without a prefetch handle",
+          "[cache][object_identity][raw_retirement][gpu_execution]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  arbitration_fixture fixture;
+  held_request fill;
+  read_cleanup cleanup{*fixture.context, {&fill, nullptr}};
+  auto object = std::make_shared<controlled_object>(
+    "controlled://retirement", 4 * controlled_chunk_bytes, "v1");
+  std::weak_ptr<controlled_object> old = object;
+  fixture.datasource = std::make_unique<cucascade::io::datasource>(fixture.context, object);
+  object.reset();
+  fixture.advise(0);
+  fixture.prefetch(fill);
+  fill.complete(0x6c);
+  // A separate open of the same version reads the resident chunk without a handle.
+  auto reader = fixture.open_version("controlled://retirement", "v1");
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination{read_size, stream};
+  struct gate {
+    cudaStream_t stream;
+    std::atomic<bool> released{false};
+    ~gate()
+    {
+      released.store(true);
+      std::ignore = cudaStreamSynchronize(stream);
+    }
+  } blocked{stream.value()};
+  REQUIRE(cudaLaunchHostFunc(
+            stream.value(),
+            [](void* ptr) {
+              auto& ready = static_cast<gate*>(ptr)->released;
+              while (!ready.load()) {
+                std::this_thread::sleep_for(1ms);
+              }
+            },
+            &blocked) == cudaSuccess);
+  auto read =
+    reader->device_read_async(0, read_size, static_cast<std::uint8_t*>(destination.data()), stream);
+  reader.reset();
+  fixture.datasource = fixture.open_version("controlled://retirement", "v2");
+  fixture.advise(0);
+  std::this_thread::sleep_for(250ms);
+  CHECK(read.wait_for(0ms) != std::future_status::ready);
+  CHECK_FALSE(old.expired());
+  blocked.released.store(true);
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == read_size);
+  std::array<std::uint8_t, read_size> host{};
+  REQUIRE(cudaMemcpyAsync(
+            host.data(), destination.data(), host.size(), cudaMemcpyDeviceToHost, stream.value()) ==
+          cudaSuccess);
+  stream.synchronize();
+  CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x6c; }));
+  CHECK(eventually([&] { return old.expired(); }));
 }

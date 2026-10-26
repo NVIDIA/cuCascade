@@ -56,7 +56,7 @@
 
 namespace cucascade::io::cache {
 
-/// One version of a cached object, keyed by @c io_object::raw_file_cache_id().
+/// One version of a cached object, keyed by @c io_object::identity_cache_key().
 /// Shared by the cache map, handles and in-flight reads.  Opening a new version
 /// of the same object path marks older ones @c retired and drops them from the
 /// map; the last owner's deleter hands their chunk buffers back to the pool.
@@ -78,7 +78,7 @@ struct cache_generation {
 
   mutable std::shared_mutex mtx;
   std::shared_ptr<const io_object> io_obj;
-  std::string key;          ///< @c io_object::raw_file_cache_id()
+  std::string key;          ///< @c io_object::identity_cache_key()
   std::string object_path;  ///< @c io_object::object_path(), for grouping generations
   /// Direct-mapped: slot i covers [i * chunk_size, (i + 1) * chunk_size);
   /// nullptr means that chunk has never been materialised.  Sized once at
@@ -487,7 +487,11 @@ fs_cache::~fs_cache()
 
 std::shared_ptr<cache_generation> fs_cache::get_or_create_generation(const io_object& obj)
 {
-  const auto& key = obj.raw_file_cache_id();
+  // Keyed by the object's identity, not its locator: separate opens of an
+  // unchanged file (equal local stat identity) share one generation, so
+  // adjacent splits share their boundary chunks, while a replaced file or a
+  // new object version gets a new generation that retires the old one.
+  auto const key = obj.identity_cache_key();
   {
     std::shared_lock lk(_map_mtx);
     if (auto it = _file_cache.find(key); it != _file_cache.end()) { return it->second; }
@@ -805,8 +809,11 @@ std::shared_ptr<cache_generation> fs_cache::generation_for(const io_object& obj,
                                                            cache_handle* handle) const
 {
   if (handle != nullptr && *handle && handle->_generation) { return handle->_generation; }
+  // Built before the lock: identity() is virtual and the key allocates, and
+  // writers of the map wait behind this shared lock.
+  auto const key = obj.identity_cache_key();
   std::shared_lock lk(_map_mtx);
-  auto const it = _file_cache.find(obj.raw_file_cache_id());
+  auto const it = _file_cache.find(key);
   return it == _file_cache.end() ? nullptr : it->second;
 }
 
