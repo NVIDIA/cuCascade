@@ -82,9 +82,12 @@ struct string_hash {
  *    overwrite the current one.
  *  - Writes: every path has a write epoch (@ref invalidate_written advances it;
  *    @c ioctx @ref stamp s every object it opens with it).  An object opened
- *    before the last write of its path can neither observe nor publish, and a
- *    load never joins one started under another epoch.  This covers in-place
- *    writes that leave the stat identity unchanged (coarse ctime).
+ *    before the last write of its path can neither observe nor publish, a load
+ *    never joins one started under another epoch, and an entry records the
+ *    epoch it was published under and is returned only to an open stamped with
+ *    the same one (so a parse that raced a write is never reused once the write
+ *    advanced the epoch, even before it erased the entry).  This covers
+ *    in-place writes that leave the stat identity unchanged (coarse ctime).
  *
  * @ref get_or_load is single-flight: concurrent misses for one identity share
  * one load; a failed load is not cached and the next miss retries; a waiter can
@@ -118,8 +121,8 @@ class metadata_store {
   /// are ignored.  The datasource calls this when it is constructed.
   void open_observed(io_object const& obj);
 
-  /// The metadata registered for @p obj's identity under @p profile or, on a
-  /// miss, the result of @p loader, registered for it (see
+  /// The metadata registered for @p obj's identity and write epoch under
+  /// @p profile or, on a miss, the result of @p loader, registered for it (see
   /// @ref register_metadata).  Concurrent misses for the same identity,
   /// profile and write epoch share one call of
   /// @p loader; a loader failure is rethrown to every caller sharing it and is
@@ -134,25 +137,29 @@ class metadata_store {
                                                   std::stop_token stop     = {},
                                                   std::string_view profile = {});
 
-  /// Record @p metadata for @p obj's path, @p profile and identity, replacing
-  /// the entry of another identity when @p obj is the newer open.  A registration for an
-  /// identity that already has an entry keeps the existing value.  Ignored
-  /// (silently) when @p metadata is null, when @p obj is older than the path's
-  /// entry or its observed identity differs, and when @p obj was opened before
-  /// the last @ref invalidate_written of its path (see @ref stamp): its bytes,
-  /// and so the parse, may predate a write.  That covers a parse that raced the
-  /// write and finishes after both of the write's invalidation passes.
+  /// Record @p metadata for @p obj's path, @p profile, identity and write
+  /// epoch, replacing the entry of another identity when @p obj is the newer
+  /// open, and an entry published under an older write epoch in any case.  A
+  /// registration for an identity that already has an entry of the same epoch
+  /// keeps the existing value.  Ignored (silently) when @p metadata is null,
+  /// when @p obj is older than the path's entry of the same epoch or its
+  /// observed identity differs, and when @p obj was opened before the last
+  /// @ref invalidate_written of its path (see @ref stamp): its bytes, and so
+  /// the parse, may predate a write.  That covers a parse that raced the write
+  /// and finishes after both of the write's invalidation passes.
   void register_metadata(io_object const& obj,
                          std::shared_ptr<io_object_metadata> metadata,
                          std::string_view profile = {});
 
   /// The metadata registered for @p obj's path and @p profile if it was
-  /// published for an equal identity; nullptr otherwise.
+  /// published for an equal identity under @p obj's write epoch; nullptr
+  /// otherwise.
   [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(
     io_object const& obj, std::string_view profile = {}) const;
 
-  /// True when @p object_path has a canonical-profile entry whose identity a
-  /// later open can reuse (not @c opened_handle).  A hint for choosing how to open the object
+  /// True when @p object_path has a canonical-profile entry that a later open
+  /// can reuse: its identity is not @c opened_handle and it was published under
+  /// the path's current write epoch.  A hint for choosing how to open the object
   /// (a known footer needs no probe), never a source of metadata: only
   /// @ref get_metadata / @ref get_or_load with the opened object are.
   [[nodiscard]] bool has_path(std::string_view object_path) const;
@@ -182,7 +189,9 @@ class metadata_store {
 
   [[nodiscard]] counters statistics() const;
 
-  /// One summary line of the counters, then one line per entry.
+  /// One summary line of the counters, then one line per entry.  Bytes of a key
+  /// or identity outside printable ASCII (a profile may hold any) and the
+  /// backslash are escaped (@c \\xNN, @c \\\\), so an entry stays on its line.
   [[nodiscard]] std::string describe_metadata_store() const;
 
  private:
@@ -193,7 +202,11 @@ class metadata_store {
     std::string key;
     std::string path;
     std::uint64_t generation;
+    /// The write epoch of the publishing object (see @ref stamp).
+    std::uint64_t epoch;
     object_identity identity;
+    /// Last, so a member that throws while an entry is built leaves the
+    /// payload with the caller (see @ref put_identity).
     std::shared_ptr<io_object_metadata> value;
   };
   using entries  = std::list<entry>;
@@ -218,21 +231,31 @@ class metadata_store {
   /// Whether @p obj was opened before the last write of its path.
   [[nodiscard]] bool predates_write(io_object const& obj) const noexcept;
 
-  void observe_locked(io_object const& obj, entries& retired);
+  /// Observe @p identity, computed by the caller from @p obj before it took
+  /// @c _mutex (a backend's @c identity() runs outside the store lock).
+  void observe_locked(io_object const& obj, object_identity const& identity, entries& retired);
   void retire(iterator it, entries& retired) noexcept;
   /// Retire every entry of @p path, of any profile; returns how many.
   std::size_t retire_path(std::string_view path, entries& retired) noexcept;
+  /// Publish @p value for (@p path, @p profile).  @p value is moved into the
+  /// store only when it is published; when it is not, or when publishing
+  /// throws, it stays with the caller, which releases it after @c _mutex.
   bool put_identity(std::string const& path,
                     object_identity identity,
                     std::uint64_t generation,
-                    std::shared_ptr<io_object_metadata> value,
+                    std::uint64_t epoch,
+                    std::shared_ptr<io_object_metadata>& value,
                     std::string_view profile,
                     entries& retired);
 
   /// Epochs live in a fixed table indexed by path hash, so the store does not
   /// grow with every written (spill) path.  Paths sharing a slot share an
-  /// epoch: a write of one only makes the other drop a registration, never
-  /// accept a stale one.
+  /// epoch, so a write of one also fences the other as if it were written:
+  /// its objects opened before the write can neither observe nor publish, and
+  /// its entries are no longer returned to later opens until republished.
+  /// That only costs reuse: it never makes a path accept a stale entry.  (An
+  /// open fenced this way cannot retire an entry superseded by its identity
+  /// either; that entry stays unreachable, because hits compare identities.)
   static constexpr std::size_t epoch_slots = 256;
   [[nodiscard]] std::atomic<std::uint64_t>& epoch_of(std::string_view object_path) const noexcept;
 

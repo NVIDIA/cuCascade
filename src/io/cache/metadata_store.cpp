@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -30,6 +31,28 @@
 #include <utility>
 
 namespace cucascade::io::cache {
+
+namespace {
+
+// Write `text` to `out` with the backslash and every byte outside printable
+// ASCII escaped (as \\ and \xNN): an entry key may hold any bytes (the profile
+// is free-form), and one entry must stay on one line of a log.
+void write_escaped(std::ostream& out, std::string_view text)
+{
+  constexpr std::string_view digits = "0123456789abcdef";
+  for (char const c : text) {
+    auto const byte = static_cast<unsigned char>(c);
+    if (byte == '\\') {
+      out << "\\\\";
+    } else if (byte >= 0x20 && byte < 0x7f) {
+      out << c;
+    } else {
+      out << "\\x" << digits[byte >> 4U] << digits[byte & 0xfU];
+    }
+  }
+}
+
+}  // namespace
 
 metadata_store::~metadata_store() { clear(); }
 
@@ -84,16 +107,18 @@ bool metadata_store::invalidate(std::string_view path, std::string_view profile)
 
 void metadata_store::open_observed(io_object const& obj)
 {
+  auto const identity = obj.identity();
   entries retired;
   std::lock_guard lock{_mutex};
-  observe_locked(obj, retired);
+  observe_locked(obj, identity, retired);
 }
 
-void metadata_store::observe_locked(io_object const& obj, entries& retired)
+void metadata_store::observe_locked(io_object const& obj,
+                                    object_identity const& identity,
+                                    entries& retired)
 {
   // An object opened before a write of its path describes bytes that may be gone.
   if (predates_write(obj)) return;
-  auto identity = obj.identity();
   if (identity.kind == identity_kind::opened_handle) return;
   auto [it, inserted] =
     _observed.try_emplace(obj.object_path(), observation{identity, obj.open_generation()});
@@ -103,7 +128,7 @@ void metadata_store::observe_locked(io_object const& obj, entries& retired)
     return;
   }
   if (obj.open_generation() <= it->second.generation) return;
-  it->second = observation{std::move(identity), obj.open_generation()};
+  it->second = observation{identity, obj.open_generation()};
   _stats.replacements += retire_path(obj.object_path(), retired);
 }
 
@@ -134,8 +159,11 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(io_object const&
   std::shared_ptr<flight> work;
   {
     std::unique_lock lock{_mutex};
+    // An entry of an older epoch may hold a parse that raced a write: a write
+    // advances the epoch before it erases the path's entries.
     auto found = _index.find(lookup);
-    if (found != _index.end() && found->second->identity == identity) {
+    if (found != _index.end() && found->second->identity == identity &&
+        found->second->epoch == obj._metadata_epoch) {
       ++_stats.hits;
       if (cache_hit) *cache_hit = true;
       return found->second->value;
@@ -229,20 +257,19 @@ void metadata_store::clear()
 bool metadata_store::put_identity(std::string const& path,
                                   object_identity identity,
                                   std::uint64_t generation,
-                                  std::shared_ptr<io_object_metadata> value,
+                                  std::uint64_t epoch,
+                                  std::shared_ptr<io_object_metadata>& value,
                                   std::string_view profile,
                                   entries& retired)
 {
+  // A payload that is not published stays in `value`: the caller releases it
+  // after _mutex, because metadata destructors may inspect their owning ioctx.
   if (!value) return false;
-  // Keep discarded payloads alive until the caller releases _mutex: metadata
-  // destructors are allowed to inspect their owning ioctx.
-  auto defer_value = [&] { retired.push_back({{}, {}, generation, {}, std::move(value)}); };
   if (identity.kind != identity_kind::opened_handle) {
     auto current = _observed.find(path);
     if (current != _observed.end() && current->second.identity != identity) {
       ++_stats.bypasses;
       ++_stats.stale;
-      defer_value();
       return false;
     }
   }
@@ -250,26 +277,34 @@ bool metadata_store::put_identity(std::string const& path,
   auto found  = _index.find(lookup);
   if (found != _index.end()) {
     auto it = found->second;
-    if (generation < it->generation) {
-      ++_stats.bypasses;
-      defer_value();
-      return false;
-    }
-    if (it->identity == identity) {
-      // A duplicate publication keeps the first value but still advances the
-      // ordering fence; otherwise an older, different-version fill could
-      // replace this record.
-      it->generation = std::max(it->generation, generation);
-      defer_value();
-      return true;
+    // An entry of an older write epoch is replaced whatever its open order or
+    // identity: it may hold a parse that raced the write.  The publisher's
+    // epoch is the path's current one (checked by the caller under _mutex).
+    if (it->epoch == epoch) {
+      if (generation < it->generation) {
+        ++_stats.bypasses;
+        return false;
+      }
+      if (it->identity == identity) {
+        // A duplicate publication keeps the first value but still advances the
+        // ordering fence; otherwise an older, different-version fill could
+        // replace this record.
+        it->generation = std::max(it->generation, generation);
+        return true;
+      }
     }
     ++_stats.replacements;
     retire(it, retired);
   }
   auto const [counted, inserted] = _entries_per_path.try_emplace(path, 0);
   try {
-    _entries.push_front(
-      {std::move(lookup), path, generation, std::move(identity), std::move(value)});
+    // The node is allocated before anything is moved into it, and `value` is
+    // the entry's last member: if building the entry throws, the payload is
+    // still the caller's and is not released under _mutex.
+    entries staged;
+    staged.emplace_front(
+      std::move(lookup), path, generation, epoch, std::move(identity), std::move(value));
+    _entries.splice(_entries.begin(), staged);
     try {
       _index.emplace(_entries.front().key, _entries.begin());
     } catch (...) {
@@ -290,7 +325,12 @@ void metadata_store::register_metadata(io_object const& obj,
                                        std::string_view profile)
 {
   if (!metadata) return;
+  auto identity = obj.identity();
+  // Both outlive the lock below: payloads leaving the store (retired entries,
+  // and this one when it is dropped or publishing it throws) are released
+  // after _mutex is unlocked.
   entries retired;
+  auto payload = std::move(metadata);
   std::lock_guard lock{_mutex};
   // Checked under the lock: invalidate_written() advances the epoch before it
   // takes the lock to erase, so a registration either sees the new epoch or is
@@ -298,14 +338,14 @@ void metadata_store::register_metadata(io_object const& obj,
   if (predates_write(obj)) {
     ++_stats.bypasses;
     ++_stats.stale;
-    retired.push_back({{}, {}, obj.open_generation(), {}, std::move(metadata)});
     return;
   }
-  observe_locked(obj, retired);
+  observe_locked(obj, identity, retired);
   put_identity(obj.object_path(),
-               obj.identity(),
+               std::move(identity),
                obj.open_generation(),
-               std::move(metadata),
+               obj._metadata_epoch,
+               payload,
                profile,
                retired);
 }
@@ -317,7 +357,8 @@ std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const
   auto const identity = obj.identity();
   std::lock_guard lock{_mutex};
   auto const found = _index.find(lookup);
-  if (found != _index.end() && found->second->identity == identity) {
+  if (found != _index.end() && found->second->identity == identity &&
+      found->second->epoch == obj._metadata_epoch) {
     ++_stats.hits;
     return found->second->value;
   }
@@ -334,8 +375,10 @@ bool metadata_store::has_path(std::string_view object_path) const
   // An opened-handle identity is scoped to one datasource and cannot justify
   // replacing a footer probe for a later open.  Strong object tags and local
   // stat identities are reusable candidates; the full identity check still
-  // happens after the datasource is opened.
-  return it->second->identity.kind != identity_kind::opened_handle;
+  // happens after the datasource is opened.  An entry of an older write epoch
+  // is never returned to a later open.
+  return it->second->identity.kind != identity_kind::opened_handle &&
+         it->second->epoch == epoch_of(object_path).load(std::memory_order_acquire);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +400,12 @@ std::string metadata_store::describe_metadata_store() const
       << " failures=" << _stats.failures << " cancelled_waiters=" << _stats.cancelled_waiters
       << " stale=" << _stats.stale << " in_flight=" << _flights.size() << '\n';
   for (auto const& entry : _entries) {
-    out << "key=" << entry.key << " identity=" << entry.identity.cache_key("")
-        << " generation=" << entry.generation << " holders=" << entry.value.use_count() << '\n';
+    out << "key=";
+    write_escaped(out, entry.key);
+    out << " identity=";
+    write_escaped(out, entry.identity.cache_key(""));
+    out << " generation=" << entry.generation << " epoch=" << entry.epoch
+        << " holders=" << entry.value.use_count() << '\n';
   }
   return out.str();
 }

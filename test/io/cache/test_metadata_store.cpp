@@ -20,6 +20,7 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -111,6 +112,26 @@ std::size_t bytes_of(std::shared_ptr<io_object_metadata> const& metadata)
 {
   REQUIRE(metadata);
   return std::static_pointer_cast<value>(metadata)->bytes;
+}
+
+/// A path that shares @p path's write epoch (the store keeps its epochs in a
+/// fixed table indexed by path hash), found by trying candidates until a write
+/// of one makes a registration for @p path stale.  A write of it advances
+/// @p path's epoch but leaves @p path's entries in place: the state between
+/// invalidate_written's epoch bump and its erase.
+std::string epoch_neighbour(std::string const& path)
+{
+  for (int i = 0; i < (1 << 16); ++i) {
+    auto candidate = path + ".neighbour" + std::to_string(i);
+    metadata_store probe;
+    fake_object object(path, path, local());
+    probe.stamp(object);
+    probe.invalidate_written(candidate);
+    probe.register_metadata(object, std::make_shared<value>(0));
+    if (probe.statistics().stale == 1) { return candidate; }
+  }
+  FAIL("no candidate path shares a write epoch with " << path);
+  return {};
 }
 
 }  // namespace
@@ -635,6 +656,45 @@ TEST_CASE("Metadata replacement releases payloads outside the store lock",
   CHECK(released);
 }
 
+TEST_CASE("Metadata registrations the store drops are released outside its lock",
+          "[cache][metadata_store]")
+{
+  metadata_store store;
+  struct reentrant_value : value {
+    metadata_store& store;
+    bool& released;
+    reentrant_value(metadata_store& owner, bool& flag) : value(16), store(owner), released(flag) {}
+    // Takes the store lock: released under it, this would deadlock.
+    ~reentrant_value() override { released = store.statistics().entries <= 1; }
+  };
+  bool released = false;
+  fake_object first("file", "file", tag());
+  store.register_metadata(first, std::make_shared<value>(1));
+
+  SECTION("a duplicate of a published identity")
+  {
+    store.register_metadata(fake_object("file", "file", tag()),
+                            std::make_shared<reentrant_value>(store, released));
+  }
+  SECTION("a registration from an object opened before a write")
+  {
+    fake_object before("file", "file", tag());
+    store.stamp(before);
+    store.invalidate_written("file");
+    store.register_metadata(before, std::make_shared<reentrant_value>(store, released));
+    CHECK(store.statistics().stale == 1);
+  }
+  SECTION("a registration of an identity older than the observed one")
+  {
+    fake_object older("file", "file", tag("v0"));
+    fake_object newer("file", "file", tag("v2"));
+    store.register_metadata(newer, std::make_shared<value>(2));
+    store.register_metadata(older, std::make_shared<reentrant_value>(store, released));
+    CHECK(store.statistics().stale == 1);
+  }
+  CHECK(released);
+}
+
 TEST_CASE("Metadata path and profile delimiters cannot alias another tuple",
           "[cache][metadata_store][key_encoding]")
 {
@@ -875,6 +935,58 @@ TEST_CASE("metadata_store write invalidation drops every profile of the path onl
   // A path without entries is a no-op beyond its epoch.
   store.invalidate_written("/data/never-registered.parquet");
   CHECK(store.statistics().entries == 3);
+}
+
+TEST_CASE("metadata_store returns an entry only to opens of the epoch it was published under",
+          "[cache][metadata_store][write]")
+{
+  // A parse through an object opened while a write was in progress can land
+  // after the write advanced the path's epoch and before the write erased the
+  // path's entries.  A write of a path sharing the epoch reproduces that state.
+  std::string const path = "/data/t.parquet";
+  auto const neighbour   = epoch_neighbour(path);
+  metadata_store store;
+  // Opened (constructed) before `torn`, stamped only after the write: an older
+  // open generation must not keep it from replacing the older-epoch entry.
+  fake_object after(path, path, local());
+  fake_object torn(path, path, local());
+  REQUIRE(after.open_generation() < torn.open_generation());
+  store.stamp(torn);
+  store.register_metadata(torn, std::make_shared<value>(1));
+  REQUIRE(store.has_path(path));
+
+  store.invalidate_written(neighbour);
+  REQUIRE(store.statistics().entries == 1);
+  // The entry is still there for the open it was published by ...
+  CHECK(bytes_of(store.get_metadata(torn)) == 1);
+  // ... but an open stamped after the write, with an equal stat identity, gets
+  // neither the entry nor a path hint.
+  store.stamp(after);
+  CHECK_FALSE(store.has_path(path));
+  CHECK_FALSE(store.get_metadata(after));
+  bool hit       = true;
+  auto const own = std::make_shared<value>(2);
+  CHECK(store.get_or_load(after, [&] { return own; }, &hit) == own);
+  CHECK_FALSE(hit);
+
+  // Its publication replaced the older-epoch entry.
+  CHECK(store.get_metadata(after) == own);
+  CHECK(store.has_path(path));
+  CHECK(store.statistics().entries == 1);
+  CHECK(store.statistics().replacements == 1);
+  CHECK_FALSE(store.get_metadata(torn));
+}
+
+TEST_CASE("metadata_store dump keeps every entry on one escaped line", "[cache][metadata_store]")
+{
+  metadata_store store;
+  fake_object object("dir\\file", "dir\\file", tag());
+  store.register_metadata(object, std::make_shared<value>(1), std::string("a\nb\0c", 5));
+  auto const dump = store.describe_metadata_store();
+  // The summary line and one line for the entry.
+  CHECK(std::count(dump.begin(), dump.end(), '\n') == 2);
+  CHECK(dump.find('\0') == std::string::npos);
+  CHECK(dump.find("key=8:dir\\\\filea\\x0ab\\x00c ") != std::string::npos);
 }
 
 TEST_CASE("metadata_store targeted invalidation leaves the write epoch alone",
