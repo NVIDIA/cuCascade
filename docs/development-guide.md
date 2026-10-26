@@ -321,8 +321,6 @@ python scripts/compare_benchmarks.py baseline.json current.json --threshold 10
 - Default threshold: 10% (configurable)
 - Exit codes: 0 (pass), 1 (regression detected), 2 (no baseline)
 
-In CI, the benchmark job uses a 120% alert threshold (20% regression tolerance).
-
 ---
 
 ## Code Quality
@@ -395,13 +393,6 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on pushes to `main` and pull re
 |-------|--------|-------------|
 | **Build** | `linux-amd64-cpu4` (CPU only) | `pixi run build` with sccache, uploads artifacts |
 | **Test** | `linux-amd64-gpu-t4-latest-1` (T4 GPU) | Downloads build, runs `pixi run test` |
-| **Benchmark** | `linux-amd64-gpu-t4-latest-1` (T4 GPU) | Downloads build, runs benchmarks, compares to baseline |
-
-The benchmark stage:
-- Runs `Convert` filter benchmarks with 2.0s minimum time
-- Compares against cached baseline from main branch
-- Alerts on >20% regression
-- Posts summary comment on PRs
 
 ---
 
