@@ -315,6 +315,44 @@ TEST_CASE("cufile create_io_object honours the compat mode", "[io][cufile]")
   }
 }
 
+TEST_CASE("cufile opens carry the stat identity of their descriptors",
+          "[io][cufile][object_identity]")
+{
+  using cucascade::io::capture_local_identity;
+  using cucascade::io::identity_kind;
+  using cucascade::io::object_identity;
+  pattern_file const file{1 << 20};
+
+  for (auto const mode :
+       {cucascade::io::cufile::compat::on, cucascade::io::cufile::compat::automatic}) {
+    auto const first    = cufile_reactor::create_io_object(file.path(), true, mode);
+    auto const identity = first->identity();
+    CHECK(identity.kind == identity_kind::local_stat);
+    CHECK(identity.size == file.size());
+    CHECK(first->size() == file.size());
+    // The O_DIRECT descriptor, when the filesystem has one, names the same file.
+    if (first->direct_fd() >= 0) {
+      object_identity direct;
+      REQUIRE(capture_local_identity(first->direct_fd(), direct));
+      CHECK(direct == identity);
+    }
+    // Two opens of the unchanged file share one version, whichever reactor
+    // opened them.
+    auto const second = cufile_reactor::create_io_object(file.path(), true, mode);
+    CHECK(second->identity() == identity);
+    CHECK(second->identity_cache_key() == first->identity_cache_key());
+    CHECK(cucascade::io::uring::uring_reactor::create_io_object(file.path())->identity() ==
+          identity);
+  }
+
+  // A writable object never carries a reusable identity.
+  auto const writer = cufile_reactor::create_io_object_for_write(
+    file.path(), {.mode = cucascade::io::write_mode::open_existing});
+  CHECK(writer->identity().kind == identity_kind::opened_handle);
+  CHECK(writer->identity().size == 0);
+  CHECK(writer->size() == file.size());
+}
+
 TEST_CASE("cufile ioctx reads host destinations", "[io][cufile]")
 {
   constexpr std::size_t file_bytes = 8UL << 20;

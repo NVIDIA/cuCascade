@@ -65,24 +65,31 @@ namespace cucascade::io::uring {
  * @c uring_reactor::create_io_object_for_write (@c O_RDWR). This class does no
  * I/O of its own.  A writable object's size grows as writes complete (see
  * @c io_object::note_written).
+ *
+ * A read-only object carries the @c local_stat identity of its buffered fd
+ * (captured by the reactor, or from the fd here) and takes its size from it;
+ * when the fd cannot be stat'ed, and for every writable object, the identity
+ * is the base class's open-local one.
  */
 class local_io_object : public io_object {
  public:
+  /// A read-only object.  @p captured is the identity the reactor took from
+  /// @p fd; when it is not a @c local_stat identity, it is captured from @p fd
+  /// here.
   local_io_object(std::string path,
                   file_descriptor fd,
                   file_descriptor fd_direct,
                   size_t file_size,
-                  std::string_view hash = "")
-    : _path(std::move(path)),
-      _fd(std::move(fd)),
-      _fd_direct(std::move(fd_direct)),
-      _file_size(file_size)
+                  std::string_view hash    = "",
+                  object_identity captured = {})
+    : local_io_object(std::move(path),
+                      std::move(fd),
+                      std::move(fd_direct),
+                      file_size,
+                      hash,
+                      std::move(captured),
+                      io_access::read_only)
   {
-    if (hash.empty()) {
-      _hash = _path;
-    } else {
-      _hash = hash;
-    }
   }
 
   /// As above with an explicit @p access: @c io_access::read_write makes the
@@ -92,9 +99,9 @@ class local_io_object : public io_object {
                   file_descriptor fd_direct,
                   size_t file_size,
                   io_access access)
-    : local_io_object(std::move(path), std::move(fd), std::move(fd_direct), file_size)
+    : local_io_object(
+        std::move(path), std::move(fd), std::move(fd_direct), file_size, "", {}, access)
   {
-    _access = access;
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
@@ -102,6 +109,11 @@ class local_io_object : public io_object {
   [[nodiscard]] size_t size() const noexcept override
   {
     return _file_size.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] object_identity identity() const override
+  {
+    return _has_identity ? _identity : io_object::identity();
   }
 
   [[nodiscard]] bool writable() const noexcept override { return _access == io_access::read_write; }
@@ -119,12 +131,40 @@ class local_io_object : public io_object {
   [[nodiscard]] int odirect_handle() const noexcept { return _fd_direct.get(); }
 
  private:
+  local_io_object(std::string path,
+                  file_descriptor fd,
+                  file_descriptor fd_direct,
+                  size_t file_size,
+                  std::string_view hash,
+                  object_identity captured,
+                  io_access access)
+    : _path(std::move(path)),
+      _hash(hash.empty() ? std::string_view{_path} : hash),
+      _fd(std::move(fd)),
+      _fd_direct(std::move(fd_direct)),
+      _file_size(file_size),
+      _access(access)
+  {
+    // A writable object's bytes change as it is written: it never carries a
+    // reusable identity, and keeps the size it was opened with.
+    if (writable()) { return; }
+    _has_identity = captured.kind == identity_kind::local_stat;
+    if (_has_identity) {
+      _identity = std::move(captured);
+    } else {
+      _has_identity = capture_local_identity(_fd.get(), _identity);
+    }
+    if (_has_identity) { _file_size.store(_identity.size, std::memory_order_relaxed); }
+  }
+
   std::string _path;
   std::string _hash;
   file_descriptor _fd;
   file_descriptor _fd_direct;
   mutable std::atomic<size_t> _file_size{0};
   io_access _access{io_access::read_only};
+  object_identity _identity;
+  bool _has_identity{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -321,7 +361,11 @@ class uring_reactor {
 
   /// Open the buffered fd and opportunistically open an O_DIRECT fd for
   /// @p path. The buffered handle is always required; an unsupported direct
-  /// handle simply makes worker-planned operations use buffered I/O.
+  /// handle simply makes worker-planned operations use buffered I/O.  The
+  /// O_DIRECT fd reopens the buffered one (see @ref reopen_local_descriptor),
+  /// and the object carries the buffered fd's @c local_stat identity and size.
+  /// @throws descriptor_mismatch_error when, on two attempts, the two fds do
+  ///         not name the same file (the path is being replaced concurrently).
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
   /// Open (per @p options.mode, creating with @p options.permissions) a buffered

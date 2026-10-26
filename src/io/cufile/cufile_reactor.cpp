@@ -23,7 +23,9 @@
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
@@ -147,24 +149,29 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
 }
 
 /**
- * @brief Finish opening a cuFile object: open the O_DIRECT fd (@p direct_flags)
- *        when @p use_odirect and the compat mode allow it, register it with
- *        cuFile, and wrap both fds.
+ * @brief Open the O_DIRECT fd of a cuFile object (@p direct_flags) when
+ *        @p use_odirect and the compat mode allow it; an invalid descriptor
+ *        when they do not or the open failed in a mode that tolerates it.
  *
- * @p mode decides what a file that cannot use cuFile means: @c on never
- * registers, @c automatic falls back to POSIX for that file, @c off throws.
+ * With @p reopen_buffered the descriptor reopens @p buffered (see
+ * @ref reopen_local_descriptor) rather than the path, so a concurrent rename
+ * cannot pair it with another file; the caller still compares the identities.
+ * @p mode decides what a file that cannot use O_DIRECT means: @c on never opens
+ * it, @c automatic falls back to POSIX for that file, @c off throws.
  */
-[[nodiscard]] std::unique_ptr<cufile_io_object> open_with_cufile(std::string path,
-                                                                 file_descriptor buffered,
-                                                                 int direct_flags,
-                                                                 bool use_odirect,
-                                                                 compat mode,
-                                                                 io_access access,
-                                                                 std::string const& what)
+[[nodiscard]] file_descriptor open_direct_fd(std::string const& path,
+                                             file_descriptor const& buffered,
+                                             int direct_flags,
+                                             bool reopen_buffered,
+                                             bool use_odirect,
+                                             compat mode,
+                                             std::string const& what)
 {
   file_descriptor direct;
   if (use_odirect && mode != compat::on) {
-    direct = file_descriptor{::open(path.c_str(), direct_flags)};
+    direct = file_descriptor{reopen_buffered
+                               ? reopen_local_descriptor(buffered.get(), path.c_str(), direct_flags)
+                               : ::open(path.c_str(), direct_flags)};
     if (!direct) {
       if (mode == compat::off) {
         throw std::system_error(
@@ -178,13 +185,27 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
         strerror(errno));
     }
   }
+  return direct;
+}
 
-  struct stat stat_buffer{};
-  if (::fstat(buffered.get(), &stat_buffer) != 0) {
-    throw std::system_error(errno, std::generic_category(), what + ": fstat");
-  }
-  auto const file_size = static_cast<std::size_t>(stat_buffer.st_size);
-
+/**
+ * @brief Finish opening a cuFile object: register its O_DIRECT fd (when it has
+ *        one) with cuFile, and wrap both fds.
+ *
+ * @p mode decides what a file that cannot use cuFile means: @c on never
+ * registers, @c automatic falls back to POSIX for that file, @c off throws.
+ * @p identity is a read-only object's @c local_stat identity (see
+ * @ref cufile_io_object::identity).
+ */
+[[nodiscard]] std::unique_ptr<cufile_io_object> register_with_cufile(std::string path,
+                                                                     file_descriptor buffered,
+                                                                     file_descriptor direct,
+                                                                     std::size_t file_size,
+                                                                     compat mode,
+                                                                     io_access access,
+                                                                     object_identity identity,
+                                                                     std::string const& what)
+{
   // Automatic mode registers only when the cuFile driver opened, so a host without
   // libcufile goes straight to POSIX instead of failing a registration per file.
   CUfileHandle_t handle{nullptr};
@@ -224,8 +245,13 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
   }
 
   try {
-    return std::make_unique<cufile_io_object>(
-      std::move(path), std::move(buffered), std::move(direct), handle, file_size, access);
+    return std::make_unique<cufile_io_object>(std::move(path),
+                                              std::move(buffered),
+                                              std::move(direct),
+                                              handle,
+                                              file_size,
+                                              access,
+                                              std::move(identity));
   } catch (...) {
     deregister_cufile(handle);  // before the fds close as this frame unwinds
     throw;
@@ -671,7 +697,8 @@ cufile_io_object::cufile_io_object(std::string path,
                                    file_descriptor direct_fd,
                                    CUfileHandle_t cufile_handle,
                                    std::size_t file_size,
-                                   io_access access)
+                                   io_access access,
+                                   object_identity identity)
   : _path(std::move(path)),
     _buffered_fd(std::move(buffered_fd)),
     _direct_fd(std::move(direct_fd)),
@@ -679,6 +706,17 @@ cufile_io_object::cufile_io_object(std::string path,
     _file_size(file_size),
     _access(access)
 {
+  // A writable object's bytes change as it is written: it never carries a
+  // reusable identity, and keeps the size it was opened with.
+  if (!writable() && identity.kind == identity_kind::local_stat) {
+    _identity = std::move(identity);
+    _file_size.store(static_cast<std::size_t>(_identity->size), std::memory_order_relaxed);
+  }
+}
+
+object_identity cufile_io_object::identity() const
+{
+  return _identity ? *_identity : io_object::identity();
 }
 
 cufile_io_object::~cufile_io_object()
@@ -826,18 +864,48 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object(
       "but use_odirect is false");
   }
 
-  file_descriptor buffered{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
-  if (!buffered) {
-    throw std::system_error(
-      errno, std::generic_category(), "cufile_reactor::create_io_object: buffered open");
+  std::string const what = "cufile_reactor::create_io_object";
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    file_descriptor buffered{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+    if (!buffered) {
+      throw std::system_error(errno, std::generic_category(), what + ": buffered open");
+    }
+    // Reopen the owned descriptor, not the pathname: a concurrent rename must
+    // not pair the buffered fd with a different O_DIRECT data file.
+    auto direct = open_direct_fd(path,
+                                 buffered,
+                                 O_RDONLY | O_DIRECT | O_CLOEXEC,
+                                 /*reopen_buffered=*/true,
+                                 use_odirect,
+                                 mode,
+                                 what);
+
+    // Checked before registering with cuFile, so a retry never has a handle to drop.
+    object_identity captured;
+    if (!capture_local_identity(buffered.get(), captured)) {
+      throw std::system_error(errno, std::generic_category(), what + ": fstat");
+    }
+    if (direct) {
+      object_identity direct_identity;
+      if (!capture_local_identity(direct.get(), direct_identity)) {
+        throw descriptor_mismatch_error(what + ": identity_descriptor_mismatch");
+      }
+      if (captured.device != direct_identity.device || captured.inode != direct_identity.inode) {
+        // Destroy the entire descriptor set before retrying the open.
+        continue;
+      }
+    }
+    auto const file_size = static_cast<std::size_t>(captured.size);
+    return register_with_cufile(std::move(path),
+                                std::move(buffered),
+                                std::move(direct),
+                                file_size,
+                                mode,
+                                io_access::read_only,
+                                std::move(captured),
+                                what);
   }
-  return open_with_cufile(std::move(path),
-                          std::move(buffered),
-                          O_RDONLY | O_DIRECT | O_CLOEXEC,
-                          use_odirect,
-                          mode,
-                          io_access::read_only,
-                          "cufile_reactor::create_io_object");
+  throw descriptor_mismatch_error(what + ": identity_descriptor_mismatch");
 }
 
 std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
@@ -876,14 +944,29 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
     std::ignore =
       ::fallocate(buffered.get(), FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(options.size_hint));
   }
+  std::string const what = "cufile_reactor::create_io_object_for_write";
   // The file exists now; the direct fd only adds O_DIRECT (no create / truncate).
-  return open_with_cufile(std::move(path),
-                          std::move(buffered),
-                          O_RDWR | O_DIRECT | O_CLOEXEC,
-                          use_odirect,
-                          mode,
-                          io_access::read_write,
-                          "cufile_reactor::create_io_object_for_write");
+  auto direct = open_direct_fd(path,
+                               buffered,
+                               O_RDWR | O_DIRECT | O_CLOEXEC,
+                               /*reopen_buffered=*/false,
+                               use_odirect,
+                               mode,
+                               what);
+  struct stat stat_buffer{};
+  if (::fstat(buffered.get(), &stat_buffer) != 0) {
+    throw std::system_error(errno, std::generic_category(), what + ": fstat");
+  }
+  auto const file_size = static_cast<std::size_t>(stat_buffer.st_size);
+  // A writable object never carries a reusable identity (see io_object::identity).
+  return register_with_cufile(std::move(path),
+                              std::move(buffered),
+                              std::move(direct),
+                              file_size,
+                              mode,
+                              io_access::read_write,
+                              object_identity{},
+                              what);
 }
 
 std::vector<byte_range> cufile_reactor::align_and_coalesce(

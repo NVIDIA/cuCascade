@@ -19,15 +19,22 @@
 #include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/uring_reactor.hpp>
 
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 using cucascade::io::capture_local_identity;
@@ -57,6 +64,54 @@ class plain_object final : public io_object {
   std::string _path;
   std::string _tag;
   bool _writable;
+};
+
+/// A temporary file holding @p bytes copies of @p fill, removed on scope exit;
+/// @ref replace atomically renames a new file of the same size over it.
+class identity_file {
+ public:
+  explicit identity_file(std::size_t bytes, char fill = 'a')
+    : _path(std::filesystem::temp_directory_path() /
+            ("cucascade_identity_" + std::to_string(::getpid()) + "_" +
+             std::to_string(next_id.fetch_add(1)) + ".bin")),
+      _bytes(bytes)
+  {
+    write(_path, fill);
+  }
+
+  ~identity_file()
+  {
+    std::error_code ec;
+    std::filesystem::remove(_path, ec);
+  }
+
+  identity_file(identity_file const&)            = delete;
+  identity_file& operator=(identity_file const&) = delete;
+
+  void replace(char fill) const
+  {
+    auto staged = _path;
+    staged += ".next";
+    write(staged, fill);
+    std::filesystem::rename(staged, _path);
+  }
+
+  [[nodiscard]] std::string path() const { return _path.string(); }
+  [[nodiscard]] std::size_t bytes() const noexcept { return _bytes; }
+
+ private:
+  void write(std::filesystem::path const& target, char fill) const
+  {
+    std::string const data(_bytes, fill);
+    std::ofstream out(target, std::ios::binary);
+    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    out.close();
+    REQUIRE(out);
+  }
+
+  static inline std::atomic<int> next_id{0};
+  std::filesystem::path _path;
+  std::size_t _bytes;
 };
 
 }  // namespace
@@ -201,4 +256,69 @@ TEST_CASE("A writable object never carries a reusable identity", "[object_identi
   CHECK(identity.size == 0);
   CHECK(identity.version == std::to_string(writer.open_generation()));
   CHECK(identity != plain_object("file", "\"t\"").identity());
+}
+
+TEST_CASE("uring opens carry the stat identity of their descriptors", "[object_identity][uring]")
+{
+  using cucascade::io::uring::uring_reactor;
+  identity_file const file{12345};
+
+  auto const first    = uring_reactor::create_io_object(file.path());
+  auto const identity = first->identity();
+  CHECK(identity.kind == identity_kind::local_stat);
+  CHECK(identity.size == file.bytes());
+  CHECK(first->size() == file.bytes());
+  struct stat info{};
+  REQUIRE(::stat(file.path().c_str(), &info) == 0);
+  CHECK(identity.device == static_cast<std::uint64_t>(info.st_dev));
+  CHECK(identity.inode == static_cast<std::uint64_t>(info.st_ino));
+  // The O_DIRECT descriptor, when the filesystem has one, names the same file.
+  if (first->fd_direct() >= 0) {
+    object_identity direct;
+    REQUIRE(capture_local_identity(first->fd_direct(), direct));
+    CHECK(direct == identity);
+  }
+
+  // A second open of the unchanged file is the same version: equal identity and key.
+  auto const second = uring_reactor::create_io_object(file.path());
+  CHECK(second->open_generation() > first->open_generation());
+  CHECK(second->identity() == identity);
+  CHECK(second->identity_cache_key() == first->identity_cache_key());
+
+  // An atomic replacement of the same size is a new version; the object opened
+  // before it still describes the file it holds.
+  file.replace('b');
+  auto const third = uring_reactor::create_io_object(file.path());
+  CHECK(third->identity().kind == identity_kind::local_stat);
+  CHECK(third->identity() != identity);
+  CHECK(third->identity_cache_key() != first->identity_cache_key());
+  CHECK(first->identity() == identity);
+}
+
+TEST_CASE("uring writable and unstatable objects have no reusable identity",
+          "[object_identity][uring]")
+{
+  using cucascade::io::file_descriptor;
+  using cucascade::io::uring::local_io_object;
+  using cucascade::io::uring::uring_reactor;
+  identity_file const file{4096};
+
+  auto const writer = uring_reactor::create_io_object_for_write(
+    file.path(), {.mode = cucascade::io::write_mode::open_existing});
+  REQUIRE(writer->writable());
+  CHECK(writer->identity().kind == identity_kind::opened_handle);
+  CHECK(writer->identity().size == 0);
+  CHECK(writer->size() == file.bytes());
+  auto const writer_key = writer->identity_cache_key();
+  writer->note_written(2 * file.bytes());
+  CHECK(writer->size() == 2 * file.bytes());
+  CHECK(writer->identity_cache_key() == writer_key);
+  CHECK(writer->identity_cache_key() !=
+        uring_reactor::create_io_object(file.path())->identity_cache_key());
+
+  // Without a descriptor to stat, an object keeps its given size and falls back
+  // to the open-local identity.
+  local_io_object const detached("/dev/null", file_descriptor{}, file_descriptor{}, 1);
+  CHECK(detached.identity().kind == identity_kind::opened_handle);
+  CHECK(detached.size() == 1);
 }

@@ -18,12 +18,18 @@
 
 #pragma once
 
+#include <fcntl.h>
 #include <sys/stat.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace cucascade::io {
 
@@ -104,6 +110,26 @@ inline bool capture_local_identity(int fd, object_identity& result) noexcept
   // the free-form version field used by object-store validators.
   result.version.clear();
   return true;
+}
+
+/// Open the file that is open as @p fd again, with @p flags (a local reactor
+/// adds @c O_DIRECT this way).  Goes through @c /proc/self/fd so a concurrent
+/// rename of @p path cannot pair @p fd with a different file; where procfs is
+/// not mounted it falls back to opening @p path.  Either way the caller must
+/// compare the two descriptors' device and inode before trusting the pair.
+/// Returns the new descriptor, or -1 with @c errno set.
+inline int reopen_local_descriptor(int fd, char const* path, int flags) noexcept
+{
+  constexpr std::string_view prefix = "/proc/self/fd/";
+  std::array<char, prefix.size() + 16> proc_path{};
+  auto* out            = std::copy(prefix.begin(), prefix.end(), proc_path.begin());
+  auto const [end, ec] = std::to_chars(out, proc_path.end() - 1, fd);
+  if (ec == std::errc{}) {
+    *end             = '\0';
+    int const direct = ::open(proc_path.data(), flags);
+    if (direct >= 0 || errno != ENOENT) return direct;
+  }
+  return ::open(path, flags);
 }
 
 }  // namespace cucascade::io

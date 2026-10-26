@@ -61,17 +61,24 @@ namespace cucascade::io::cufile {
  * it before the fds close.  All I/O is performed by the reactor -- this class is
  * a passive bag of native handles plus the file size, which writes through a
  * writable object raise (@ref note_written).
+ *
+ * A read-only object opened by the reactor carries the @c local_stat identity
+ * of its buffered fd and takes its size from it; a writable object, or one
+ * constructed without such an identity, has the base class's open-local one.
  */
 class cufile_io_object final : public io_object {
  public:
   /// @p cufile_handle is null when the file was not registered with cuFile; the
-  /// reactor then serves every read and write of it through POSIX.
+  /// reactor then serves every read and write of it through POSIX.  @p identity
+  /// is the @c local_stat identity of @p buffered_fd; it is ignored for a
+  /// writable object or when it is not a @c local_stat identity.
   cufile_io_object(std::string path,
                    file_descriptor buffered_fd,
                    file_descriptor direct_fd,
                    CUfileHandle_t cufile_handle,
                    std::size_t file_size,
-                   io_access access = io_access::read_only);
+                   io_access access         = io_access::read_only,
+                   object_identity identity = {});
 
   ~cufile_io_object() override;
 
@@ -84,6 +91,8 @@ class cufile_io_object final : public io_object {
   {
     return _file_size.load(std::memory_order_acquire);
   }
+
+  [[nodiscard]] object_identity identity() const override;
 
   [[nodiscard]] bool writable() const noexcept override { return _access == io_access::read_write; }
 
@@ -113,6 +122,7 @@ class cufile_io_object final : public io_object {
   CUfileHandle_t _cufile_handle{nullptr};
   mutable std::atomic<std::size_t> _file_size{0};
   io_access _access{io_access::read_only};
+  std::optional<object_identity> _identity;
 };
 
 // ---------------------------------------------------------------------------
@@ -277,11 +287,14 @@ class cufile_reactor {
    *
    * @p compat_mode (default @c compat::automatic) selects what a file that cannot
    * be registered means: @c on never registers, @c automatic falls back to POSIX
-   * for that file, @c off treats it as an error.
+   * for that file, @c off treats it as an error.  The O_DIRECT fd reopens the
+   * buffered one (see @ref reopen_local_descriptor), and the object carries the
+   * buffered fd's @c local_stat identity and size.
    *
    * @throws std::runtime_error / std::system_error when the file cannot be
    *         opened or stat'ed, or when @p compat_mode is @c off and cuFile
-   *         registration fails.
+   *         registration fails; descriptor_mismatch_error when, on two
+   *         attempts, the two fds do not name the same file.
    */
   static std::unique_ptr<cufile_io_object> create_io_object(std::string path,
                                                             bool use_odirect,
