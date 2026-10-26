@@ -254,9 +254,12 @@ Additions from the review (w1-review):
   cannot: an in-place write that leaves the stat identity unchanged (coarse ctime). It is checked
   under the store lock before any identity bookkeeping (an object opened before the write can
   neither observe nor publish), it is part of the `get_or_load` single-flight key (a post-write
-  open never joins a pre-write parse), and `invalidate_written` also erases the path's observed
-  identity so its history restarts. The epoch is advanced before the lock is taken and
-  `invalidate_written` does not allocate. A writable object always has an open-local
+  open never joins a pre-write parse), and `invalidate_written` drops the entries of every
+  metadata profile of the path (ported from Sirius #2231) and erases its observed identity so its
+  history restarts. The epoch is advanced before the lock is taken and `invalidate_written` does
+  not allocate (a per-path entry count lets a path without entries skip the scan). The targeted
+  `invalidate(path, profile)` retires one entry and leaves the epoch alone, so the open that
+  found the entry inconsistent can rebuild and republish it. A writable object always has an open-local
   (`opened_handle`) identity, so nothing parsed through it is reused by another open.
 - The fs_cache keys its generations by `io_object::identity_cache_key()`: separate opens of an
   unchanged local file share a generation, and a file replaced by another process (which this
