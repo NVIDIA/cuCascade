@@ -81,6 +81,13 @@ struct stream_cleanup {
   ~stream_cleanup() { stream.synchronize_no_throw(); }
 };
 
+/// Clears the cache's before-claim hook on scope exit, so a failed assertion
+/// cannot leave it holding references to the test's locals.
+struct claim_hook_reset {
+  cucascade::io::cache::fs_cache& cache;
+  ~claim_hook_reset() { cache.set_before_prefetch_claim_for_testing({}); }
+};
+
 struct arbitration_fixture : cache_test_fixture {
   arbitration_fixture() : cache_test_fixture(allocation_cache_config())
   {
@@ -591,6 +598,7 @@ TEST_CASE("a prefetch beaten to a chunk by a demand read completes uncovered",
   // Demand runs at the claim boundary: the producer is already loading but no
   // chunk is, so the read does not wait for the prefetch and claims chunk A.
   bool first = true;
+  claim_hook_reset const hook_reset{*fixture.context->cache()};
   fixture.context->cache()->set_before_prefetch_claim_for_testing([&] {
     if (!std::exchange(first, false)) { return; }
     read = device_read

@@ -77,7 +77,9 @@ enum class prefetch_refusal : std::uint8_t {
   /// issued.  Normal allocation pressure is reported earlier by prepare().
   memory_pressure,
   /// The cache refused for a reason of its own (already loading, request
-  /// cancelled, backend cannot serve vectored host reads).
+  /// cancelled, backend cannot serve vectored host reads), or found nothing to
+  /// claim, in which case the completion reports @c {ok = true, covered} (see
+  /// @c datasource::prefetch_async).
   other,
 };
 
@@ -209,10 +211,16 @@ class datasource : public cudf::io::datasource {
 
   /// Issue prefetch IO for the stashed handle.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
-  /// completion; every refusal reports @c {ok = false, covered = false}.
-  /// Coverage is separate from success: another loader can own chunks that
-  /// this prefetch skipped (see @c fs_cache::prefetch).  Returns
+  /// completion.  Coverage is separate from success: another loader can own
+  /// chunks that this prefetch skipped (see @c fs_cache::prefetch).  Returns
   /// @c prefetch_refusal::issued when IO went out, and otherwise why it did not.
+  /// A refusal (@c no_cache, @c consumer_ahead, a request not prepared or
+  /// abandoned, or one the cache refused) reports
+  /// @c {ok = false, covered = false}, with one exception: when nothing was
+  /// claimable — every requested chunk already resident or loading for another
+  /// reader — the cache settles @c {ok = true, covered}, and this still returns
+  /// @c other (or @c consumer_ahead if the consumer started reading meanwhile).
+  /// @c covered then says whether the requested bytes are already resident.
   prefetch_refusal prefetch_async(exec::invocable<void(cache::prefetch_result) noexcept> on_done);
 
   /// Why this datasource's prefetch failed, if it did: null otherwise, and

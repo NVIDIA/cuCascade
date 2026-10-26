@@ -404,6 +404,11 @@ class fs_cache {
   /// asked for is either filled by the IO it submitted or already resident;
   /// a chunk another loader (a demand read) claimed first is not covered, even
   /// when this prefetch's own IO succeeded.  Returns whether IO was issued.
+  /// Without IO the outcome is @c {false, false} when the request is refused
+  /// (empty, fallen behind, cancelled, already loading, a backend without
+  /// vectored host reads, or a failed setup), and @c {true, covered} when
+  /// nothing was claimable (every chunk already resident or loading for
+  /// another reader).
   bool prefetch(cache_handle& handle, exec::invocable<void(prefetch_result) noexcept> on_done);
 
   /// Test-only hook run inside @ref prefetch after the producer is published
