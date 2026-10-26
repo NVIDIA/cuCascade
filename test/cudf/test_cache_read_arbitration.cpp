@@ -502,3 +502,174 @@ TEST_CASE("retired raw arena survives a cache-hit CUDA copy without a prefetch h
   CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x6c; }));
   CHECK(eventually([&] { return old.expired(); }));
 }
+
+// ===========================================================================
+// Prefetch coverage
+// ===========================================================================
+
+TEST_CASE("prefetch coverage distinguishes resident extents from successful submitted IO",
+          "[cache][read-arbitration][prefetch-coverage]")
+{
+  if (run_arbitration_child(
+        "prefetch coverage distinguishes resident extents from successful submitted IO")) {
+    return;
+  }
+  arbitration_fixture fixture;
+  // Independent opens share cached bytes only with a stable object identity.
+  fixture.datasource = fixture.open_version("controlled://resident-coverage", "v1");
+  fixture.advise(0);
+  {
+    held_request warm;
+    fixture.prefetch(warm);
+    warm.complete(0x5a);
+  }
+
+  bool include_b = true;
+  bool wider_a   = false;
+  bool fail_b    = false;
+  SECTION("resident A and successful B") {}
+  SECTION("resident A is narrower than requested") { wider_a = true; }
+  SECTION("all requested bytes already resident") { include_b = false; }
+  SECTION("resident A and failed B") { fail_b = true; }
+  auto ds = fixture.open_version("controlled://resident-coverage", "v1");
+  std::vector<cudf::io::text::byte_range_info> ranges{
+    {0, static_cast<std::int64_t>(wider_a ? 2 * read_size : read_size)}};
+  if (include_b) { ranges.emplace_back(chunk_size, read_size); }
+  ds->fadvise(ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == prepare_result::prepared);
+  std::promise<prefetch_result> done;
+  auto result = done.get_future();
+  std::atomic<int> calls{0};
+  auto const issued = ds->prefetch_async([&](prefetch_result out) noexcept {
+    if (calls.fetch_add(1) == 0) { done.set_value(out); }
+  });
+  // Issue is synchronous even though completion is controlled by the test.
+  // Own unexpected IO too, so a failed no-IO assertion cannot hang teardown.
+  held_request io;
+  io.request = fixture.context->backend().take();
+  if (include_b) {
+    CHECK(issued == prefetch_refusal::issued);
+    REQUIRE(io.request != nullptr);
+    if (fail_b) {
+      io.cancel();
+    } else {
+      io.complete(0x7b);
+    }
+  } else {
+    CHECK(issued != prefetch_refusal::issued);
+    CHECK(io.request == nullptr);
+  }
+  REQUIRE(result.wait_for(2s) == std::future_status::ready);
+  auto const out = result.get();
+  CHECK(out.ok == !fail_b);
+  CHECK(out.covered == (!wider_a && !fail_b));
+  CHECK(calls == 1);
+}
+
+TEST_CASE("a prefetch beaten to a chunk by a demand read completes uncovered",
+          "[cache][read-arbitration][prefetch-coverage]")
+{
+  if (run_arbitration_child("a prefetch beaten to a chunk by a demand read completes uncovered")) {
+    return;
+  }
+  arbitration_fixture fixture;
+  bool const device_read = GENERATE(false, true);
+  std::array<cudf::io::text::byte_range_info, 2> const ranges{
+    cudf::io::text::byte_range_info{0, read_size},
+    cudf::io::text::byte_range_info{static_cast<std::int64_t>(chunk_size), read_size}};
+  fixture.datasource->fadvise(ranges, 0);
+  REQUIRE(fixture.datasource->prepare_prefetch(false) == prepare_result::prepared);
+
+  std::array<std::uint8_t, read_size> destination{};
+  rmm::cuda_stream stream;
+  rmm::device_buffer device_destination(read_size, stream);
+  stream_cleanup drain{stream};
+  std::future<std::size_t> read;
+  held_request demand;
+  held_request prefetch;
+  read_cleanup cleanup{*fixture.context, {&demand, &prefetch}};
+  // Demand runs at the claim boundary: the producer is already loading but no
+  // chunk is, so the read does not wait for the prefetch and claims chunk A.
+  bool first = true;
+  fixture.context->cache()->set_before_prefetch_claim_for_testing([&] {
+    if (!std::exchange(first, false)) { return; }
+    read = device_read
+             ? fixture.datasource->device_read_async(
+                 0, read_size, static_cast<std::uint8_t*>(device_destination.data()), stream)
+             : fixture.datasource->host_read_async(0, read_size, destination.data());
+  });
+  std::promise<prefetch_result> done;
+  auto result = done.get_future();
+  std::atomic<int> calls{0};
+  REQUIRE(fixture.datasource->prefetch_async([&](prefetch_result out) noexcept {
+    if (calls.fetch_add(1) == 0) { done.set_value(out); }
+  }) == prefetch_refusal::issued);
+  fixture.context->cache()->set_before_prefetch_claim_for_testing({});
+
+  // Two backend requests: the demand read of A, then the prefetch of B alone.
+  demand.request = fixture.context->backend().take();
+  REQUIRE(demand.request != nullptr);
+  CHECK(demand.request->priority == cucascade::io::io_priority::high);
+  CHECK(demand.request->front().offset() < chunk_size);
+  prefetch.request = fixture.context->backend().take();
+  REQUIRE(prefetch.request != nullptr);
+  CHECK(prefetch.request->priority == cucascade::io::io_priority::low);
+  CHECK(prefetch.request->front().offset() >= chunk_size);
+  CHECK(fixture.context->backend().pending_count() == 0);
+
+  // The prefetch's own IO succeeds, but A is still loading for demand.
+  prefetch.complete(0x5a);
+  REQUIRE(result.wait_for(2s) == std::future_status::ready);
+  auto const out = result.get();
+  CHECK(out.ok);
+  CHECK_FALSE(out.covered);
+  CHECK(calls == 1);
+  CHECK(read.wait_for(0ms) == std::future_status::timeout);
+
+  demand.complete(0x2b);
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == read_size);
+  // The held backend does not copy to the device: check the bytes of a host read.
+  if (!device_read) {
+    CHECK(std::ranges::all_of(destination, [](auto byte) { return byte == 0x2b; }));
+  }
+}
+
+TEST_CASE("every prefetch refusal reports neither success nor coverage exactly once",
+          "[cache][read-arbitration][prefetch-coverage]")
+{
+  if (run_arbitration_child(
+        "every prefetch refusal reports neither success nor coverage exactly once")) {
+    return;
+  }
+  arbitration_fixture fixture;
+  auto& ds = *fixture.datasource;
+  // Every section sets the refusal it expects.
+  auto expected = prefetch_refusal::issued;
+  SECTION("no cache request") { expected = prefetch_refusal::no_cache; }
+  SECTION("request not prepared")
+  {
+    advise_range(ds, 0, read_size);
+    expected = prefetch_refusal::other;
+  }
+  SECTION("consumer already reading")
+  {
+    fixture.advise(0);
+    for (auto const stage : {cucascade::io::cache::scan_stage::queued,
+                             cucascade::io::cache::scan_stage::preparing,
+                             cucascade::io::cache::scan_stage::reading}) {
+      ds.update(stage);
+    }
+    expected = prefetch_refusal::consumer_ahead;
+  }
+  std::array<prefetch_result, 2> seen{prefetch_result{true, true}, prefetch_result{true, true}};
+  std::atomic<int> calls{0};
+  CHECK(ds.prefetch_async([&](prefetch_result out) noexcept {
+    auto const index = calls.fetch_add(1);
+    if (index < 2) { seen[static_cast<std::size_t>(index)] = out; }
+  }) == expected);
+  CHECK(calls == 1);
+  CHECK_FALSE(seen[0].ok);
+  CHECK_FALSE(seen[0].covered);
+  CHECK(fixture.context->backend().pending_count() == 0);
+}
