@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+#include "io/churning_file.hpp"
+
 #include <cucascade/error.hpp>
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_api.hpp>
@@ -351,6 +353,28 @@ TEST_CASE("cufile opens carry the stat identity of their descriptors",
   CHECK(writer->identity().kind == identity_kind::opened_handle);
   CHECK(writer->identity().size == 0);
   CHECK(writer->size() == file.size());
+}
+
+TEST_CASE("cufile opens of a path being replaced report the file they opened",
+          "[io][cufile][object_identity]")
+{
+  // Every open races an atomic replacement of its path: the object's identity
+  // and size describe the file its buffered descriptor holds, and its O_DIRECT
+  // descriptor (reopened from that one) holds the same file, so no open sees a
+  // mismatch to retry or throw on.
+  cucascade::test::churning_file const file;
+  for (auto const mode :
+       {cucascade::io::cufile::compat::on, cucascade::io::cufile::compat::automatic}) {
+    auto const deadline = std::chrono::steady_clock::now() + 5s;
+    auto const baseline = file.replacements();
+    for (int opens = 0; opens < 100 || (file.replacements() < baseline + 100 &&
+                                        std::chrono::steady_clock::now() < deadline);
+         ++opens) {
+      auto const object = cufile_reactor::create_io_object(file.path(), true, mode);
+      cucascade::test::churning_file::check_opened(
+        object->identity(), object->size(), object->buffered_fd(), object->direct_fd());
+    }
+  }
 }
 
 TEST_CASE("cufile ioctx reads host destinations", "[io][cufile]")

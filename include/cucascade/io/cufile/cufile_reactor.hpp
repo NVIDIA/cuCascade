@@ -288,13 +288,15 @@ class cufile_reactor {
    * @p compat_mode (default @c compat::automatic) selects what a file that cannot
    * be registered means: @c on never registers, @c automatic falls back to POSIX
    * for that file, @c off treats it as an error.  The O_DIRECT fd reopens the
-   * buffered one (see @ref reopen_local_descriptor), and the object carries the
-   * buffered fd's @c local_stat identity and size.
+   * buffered one through @c /proc/self/fd (the path only where procfs is not
+   * mounted), and the object carries the buffered fd's @c local_stat identity
+   * and size.
    *
    * @throws std::runtime_error / std::system_error when the file cannot be
    *         opened or stat'ed, or when @p compat_mode is @c off and cuFile
    *         registration fails; descriptor_mismatch_error when, on two
-   *         attempts, the two fds do not name the same file.
+   *         attempts, the two fds do not name the same file, or when the
+   *         O_DIRECT fd cannot be stat'ed.
    */
   static std::unique_ptr<cufile_io_object> create_io_object(std::string path,
                                                             bool use_odirect,

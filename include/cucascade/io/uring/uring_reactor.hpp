@@ -146,8 +146,10 @@ class local_io_object : public io_object {
       _access(access)
   {
     // A writable object's bytes change as it is written: it never carries a
-    // reusable identity, and keeps the size it was opened with.
-    if (writable()) { return; }
+    // reusable identity, and keeps the size it was opened with.  Tested on the
+    // access mode itself rather than the virtual writable(), which a subclass
+    // may override.
+    if (_access == io_access::read_write) { return; }
     _has_identity = captured.kind == identity_kind::local_stat;
     if (_has_identity) {
       _identity = std::move(captured);
@@ -362,10 +364,12 @@ class uring_reactor {
   /// Open the buffered fd and opportunistically open an O_DIRECT fd for
   /// @p path. The buffered handle is always required; an unsupported direct
   /// handle simply makes worker-planned operations use buffered I/O.  The
-  /// O_DIRECT fd reopens the buffered one (see @ref reopen_local_descriptor),
-  /// and the object carries the buffered fd's @c local_stat identity and size.
+  /// O_DIRECT fd reopens the buffered one through @c /proc/self/fd (the path
+  /// only where procfs is not mounted), and the object carries the buffered
+  /// fd's @c local_stat identity and size.
   /// @throws descriptor_mismatch_error when, on two attempts, the two fds do
-  ///         not name the same file (the path is being replaced concurrently).
+  ///         not name the same file (the path is being replaced concurrently),
+  ///         or when the O_DIRECT fd cannot be stat'ed.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
   /// Open (per @p options.mode, creating with @p options.permissions) a buffered

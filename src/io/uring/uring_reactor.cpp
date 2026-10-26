@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+#include "io/detail/local_descriptor.hpp"
+
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/types.hpp>
@@ -862,14 +864,15 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
   for (int attempt = 0; attempt < 2; ++attempt) {
     file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
     if (!buffered) {
+      int const error = errno;
       throw std::system_error(
-        errno, std::generic_category(), "uring_reactor::create_io_object: buffered open");
+        error, std::generic_category(), "uring_reactor::create_io_object: buffered open");
     }
 
     // Reopen the owned descriptor, not the pathname: a concurrent rename must
     // not pair the old buffered footer with a different O_DIRECT data file.
-    file_descriptor direct{
-      reopen_local_descriptor(buffered.get(), path.c_str(), O_RDONLY | O_DIRECT)};
+    file_descriptor direct{cucascade::io::detail::reopen_local_descriptor(
+      buffered.get(), path.c_str(), O_RDONLY | O_DIRECT)};
     if (!direct) {
       CUCASCADE_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
                          path,
@@ -878,8 +881,9 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
 
     object_identity captured;
     if (!capture_local_identity(buffered.get(), captured)) {
+      int const error = errno;
       throw std::system_error(
-        errno, std::generic_category(), "uring_reactor::create_io_object: fstat");
+        error, std::generic_category(), "uring_reactor::create_io_object: fstat");
     }
     if (direct) {
       object_identity direct_identity;
@@ -912,7 +916,8 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object_for_write(
 
   file_descriptor buffered{::open(path.c_str(), flags, options.permissions)};
   if (!buffered) {
-    throw std::system_error(errno,
+    int const error = errno;  // before the message allocates
+    throw std::system_error(error,
                             std::generic_category(),
                             "uring_reactor::create_io_object_for_write: open '" + path + "'");
   }

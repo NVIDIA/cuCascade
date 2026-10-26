@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+#include "io/detail/local_descriptor.hpp"
+
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/exec/thread_util.hpp>
@@ -154,7 +156,7 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
  *        when they do not or the open failed in a mode that tolerates it.
  *
  * With @p reopen_buffered the descriptor reopens @p buffered (see
- * @ref reopen_local_descriptor) rather than the path, so a concurrent rename
+ * @ref detail::reopen_local_descriptor) rather than the path, so a concurrent rename
  * cannot pair it with another file; the caller still compares the identities.
  * @p mode decides what a file that cannot use O_DIRECT means: @c on never opens
  * it, @c automatic falls back to POSIX for that file, @c off throws.
@@ -169,20 +171,21 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
 {
   file_descriptor direct;
   if (use_odirect && mode != compat::on) {
-    direct = file_descriptor{reopen_buffered
-                               ? reopen_local_descriptor(buffered.get(), path.c_str(), direct_flags)
-                               : ::open(path.c_str(), direct_flags)};
+    direct = file_descriptor{reopen_buffered ? cucascade::io::detail::reopen_local_descriptor(
+                                                 buffered.get(), path.c_str(), direct_flags)
+                                             : ::open(path.c_str(), direct_flags)};
     if (!direct) {
+      int const error = errno;  // before a message allocates
       if (mode == compat::off) {
         throw std::system_error(
-          errno,
+          error,
           std::generic_category(),
           what + ": O_DIRECT open of '" + path + "' (compat mode OFF enforces cuFile)");
       }
       CUCASCADE_LOG_WARN(
         "cufile_reactor: O_DIRECT unavailable for '{}': {}; GDS fast path disabled for this file",
         path,
-        strerror(errno));
+        strerror(error));
     }
   }
   return direct;
@@ -868,7 +871,8 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object(
   for (int attempt = 0; attempt < 2; ++attempt) {
     file_descriptor buffered{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
     if (!buffered) {
-      throw std::system_error(errno, std::generic_category(), what + ": buffered open");
+      int const error = errno;  // before the message allocates
+      throw std::system_error(error, std::generic_category(), what + ": buffered open");
     }
     // Reopen the owned descriptor, not the pathname: a concurrent rename must
     // not pair the buffered fd with a different O_DIRECT data file.
@@ -883,7 +887,8 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object(
     // Checked before registering with cuFile, so a retry never has a handle to drop.
     object_identity captured;
     if (!capture_local_identity(buffered.get(), captured)) {
-      throw std::system_error(errno, std::generic_category(), what + ": fstat");
+      int const error = errno;  // before the message allocates
+      throw std::system_error(error, std::generic_category(), what + ": fstat");
     }
     if (direct) {
       object_identity direct_identity;
@@ -934,7 +939,8 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
   }
   file_descriptor buffered{::open(path.c_str(), flags, options.permissions)};
   if (!buffered) {
-    throw std::system_error(errno,
+    int const error = errno;  // before the message allocates
+    throw std::system_error(error,
                             std::generic_category(),
                             "cufile_reactor::create_io_object_for_write: open '" + path + "'");
   }
@@ -955,7 +961,8 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
                                what);
   struct stat stat_buffer{};
   if (::fstat(buffered.get(), &stat_buffer) != 0) {
-    throw std::system_error(errno, std::generic_category(), what + ": fstat");
+    int const error = errno;  // before the message allocates
+    throw std::system_error(error, std::generic_category(), what + ": fstat");
   }
   auto const file_size = static_cast<std::size_t>(stat_buffer.st_size);
   // A writable object never carries a reusable identity (see io_object::identity).

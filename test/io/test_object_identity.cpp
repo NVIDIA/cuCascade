@@ -16,6 +16,9 @@
  * limitations under the License.
  */
 
+#include "io/churning_file.hpp"
+#include "io/detail/local_descriptor.hpp"
+
 #include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/types.hpp>
@@ -27,6 +30,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
@@ -38,6 +43,7 @@
 #include <utility>
 
 using cucascade::io::capture_local_identity;
+using cucascade::io::file_descriptor;
 using cucascade::io::identity_kind;
 using cucascade::io::io_object;
 using cucascade::io::next_open_generation;
@@ -67,7 +73,8 @@ class plain_object final : public io_object {
 };
 
 /// A temporary file holding @p bytes copies of @p fill, removed on scope exit;
-/// @ref replace atomically renames a new file of the same size over it.
+/// @ref replace atomically renames a new file of the same size over it (with
+/// the access and modification @p times given, if any).
 class identity_file {
  public:
   explicit identity_file(std::size_t bytes, char fill = 'a')
@@ -83,17 +90,18 @@ class identity_file {
   {
     std::error_code ec;
     std::filesystem::remove(_path, ec);
+    std::filesystem::remove(staged(), ec);
   }
 
   identity_file(identity_file const&)            = delete;
   identity_file& operator=(identity_file const&) = delete;
 
-  void replace(char fill) const
+  void replace(char fill, timespec const* times = nullptr) const
   {
-    auto staged = _path;
-    staged += ".next";
-    write(staged, fill);
-    std::filesystem::rename(staged, _path);
+    auto const next = staged();
+    write(next, fill);
+    if (times != nullptr) { REQUIRE(::utimensat(AT_FDCWD, next.c_str(), times, 0) == 0); }
+    std::filesystem::rename(next, _path);
   }
 
   [[nodiscard]] std::string path() const { return _path.string(); }
@@ -109,10 +117,25 @@ class identity_file {
     REQUIRE(out);
   }
 
+  [[nodiscard]] std::filesystem::path staged() const
+  {
+    auto next = _path;
+    next += ".next";
+    return next;
+  }
+
   static inline std::atomic<int> next_id{0};
   std::filesystem::path _path;
   std::size_t _bytes;
 };
+
+/// The @c local_stat identity of the file open as @p fd.
+object_identity identity_of(int fd)
+{
+  object_identity identity;
+  REQUIRE(capture_local_identity(fd, identity));
+  return identity;
+}
 
 }  // namespace
 
@@ -135,44 +158,28 @@ TEST_CASE("Object identity separates version kinds and unambiguous locators", "[
 
 TEST_CASE("Local identity separates replacement with preserved mtime", "[object_identity]")
 {
-  char name[]             = "/tmp/cucascade-identity-XXXXXX";
-  char replacement_name[] = "/tmp/cucascade-identity-replacement-XXXXXX";
-  int first_fd            = ::mkstemp(name);
-  REQUIRE(first_fd >= 0);
-  REQUIRE(::write(first_fd, "abc", 3) == 3);
-  timespec times[2]{{123, 456}, {123, 456}};
-  REQUIRE(::futimens(first_fd, times) == 0);
+  // Owned by RAII from the start, in the platform's temporary directory.
+  identity_file const file{3, 'a'};
+  timespec const times[2]{{123, 456}, {123, 456}};
   object_identity first;
-  REQUIRE(capture_local_identity(first_fd, first));
-  ::close(first_fd);
+  {
+    file_descriptor const first_fd{::open(file.path().c_str(), O_RDWR | O_CLOEXEC)};
+    REQUIRE(first_fd);
+    REQUIRE(::futimens(first_fd.get(), times) == 0);
+    REQUIRE(capture_local_identity(first_fd.get(), first));
+  }
+  file.replace('x', times);
 
-  int replacement_fd = ::mkstemp(replacement_name);
-  REQUIRE(replacement_fd >= 0);
-  REQUIRE(::write(replacement_fd, "xyz", 3) == 3);
-  REQUIRE(::futimens(replacement_fd, times) == 0);
-  ::close(replacement_fd);
-  REQUIRE(::rename(replacement_name, name) == 0);
-
-  int fd = ::open(name, O_RDONLY);
-  REQUIRE(fd >= 0);
-  struct cleanup {
-    int fd;
-    char* name;
-    char* replacement;
-    ~cleanup()
-    {
-      ::close(fd);
-      ::unlink(name);
-      ::unlink(replacement);
-    }
-  } owner{fd, name, replacement_name};
+  file_descriptor const owned{::open(file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+  REQUIRE(owned);
+  int const fd = owned.get();
   object_identity replaced;
   REQUIRE(capture_local_identity(fd, replaced));
   CHECK(replaced.kind == identity_kind::local_stat);
   CHECK(replaced.size == first.size);
   CHECK(replaced != first);
   CHECK((replaced.inode != first.inode || replaced.ctime_ns != first.ctime_ns));
-  REQUIRE(::unlink(name) == 0);
+  REQUIRE(::unlink(file.path().c_str()) == 0);
   object_identity held;
   REQUIRE(capture_local_identity(fd, held));
   // Removing a directory entry can change ctime as the link count drops. The open descriptor
@@ -183,14 +190,70 @@ TEST_CASE("Local identity separates replacement with preserved mtime", "[object_
   // The local reactors reopen the owned descriptor for O_DIRECT, so pathname
   // removal cannot switch the data descriptor to another object.
   auto proc_path = "/proc/self/fd/" + std::to_string(fd);
-  int reopened   = ::open(proc_path.c_str(), O_RDONLY);
-  REQUIRE(reopened >= 0);
+  file_descriptor const reopened{::open(proc_path.c_str(), O_RDONLY | O_CLOEXEC)};
+  REQUIRE(reopened);
   object_identity reopened_identity;
-  bool captured = capture_local_identity(reopened, reopened_identity);
-  ::close(reopened);
-  CHECK(captured);
+  CHECK(capture_local_identity(reopened.get(), reopened_identity));
   CHECK(reopened_identity == held);
+  errno = 0;
   CHECK_FALSE(capture_local_identity(-1, held));
+  CHECK(errno == EBADF);
+}
+
+TEST_CASE("Reopening a local descriptor reopens the open file, not its path", "[object_identity]")
+{
+  using cucascade::io::detail::reopen_local_descriptor;
+  identity_file const file{4096, 'a'};
+  file_descriptor const original{::open(file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+  REQUIRE(original);
+  auto const held = identity_of(original.get());
+  // Another file now owns the path.  It was created while the original still
+  // existed, so the two inodes differ.
+  file.replace('b');
+  object_identity replacement;
+  {
+    file_descriptor const by_path{::open(file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+    REQUIRE(by_path);
+    replacement = identity_of(by_path.get());
+  }
+  REQUIRE(replacement.inode != held.inode);
+
+  SECTION("an open descriptor is reopened through /proc/self/fd")
+  {
+    file_descriptor const reopened{
+      reopen_local_descriptor(original.get(), file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+    REQUIRE(reopened);
+    auto const identity = identity_of(reopened.get());
+    CHECK(identity.device == held.device);
+    CHECK(identity.inode == held.inode);
+    char byte = 0;
+    REQUIRE(::pread(reopened.get(), &byte, 1, 0) == 1);
+    CHECK(byte == 'a');
+  }
+  SECTION("only a descriptor without a /proc/self/fd entry falls back to the path")
+  {
+    // No /proc/self/fd entry (ENOENT), as on a host without procfs.  The
+    // caller's dev/inode cross-check is what catches a replaced path then.
+    file_descriptor const reopened{
+      reopen_local_descriptor(-1, file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+    REQUIRE(reopened);
+    CHECK(identity_of(reopened.get()).inode == replacement.inode);
+  }
+  SECTION("any other failure is reported, never retried on the path")
+  {
+    // A directory cannot be reopened for writing (EISDIR); the path, a regular
+    // file, could be.
+    auto const directory_path = std::filesystem::temp_directory_path();
+    file_descriptor const directory{
+      ::open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    REQUIRE(directory);
+    errno = 0;
+    file_descriptor const reopened{
+      reopen_local_descriptor(directory.get(), file.path().c_str(), O_WRONLY | O_CLOEXEC)};
+    int const error = errno;
+    CHECK_FALSE(reopened);
+    CHECK(error == EISDIR);
+  }
 }
 
 TEST_CASE("REST identity only reuses strong ETags", "[object_identity]")
@@ -321,4 +384,24 @@ TEST_CASE("uring writable and unstatable objects have no reusable identity",
   local_io_object const detached("/dev/null", file_descriptor{}, file_descriptor{}, 1);
   CHECK(detached.identity().kind == identity_kind::opened_handle);
   CHECK(detached.size() == 1);
+}
+
+TEST_CASE("uring opens of a path being replaced report the file they opened",
+          "[object_identity][uring]")
+{
+  // Every open races an atomic replacement of its path.  The object's
+  // identity and size must describe the file its buffered descriptor holds,
+  // its O_DIRECT descriptor must hold that file too, and reopening the
+  // descriptor (not the path) means no open ever sees a mismatch to retry or
+  // throw on.
+  using cucascade::io::uring::uring_reactor;
+  cucascade::test::churning_file const file;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (int opens = 0;
+       opens < 200 || (file.replacements() < 200 && std::chrono::steady_clock::now() < deadline);
+       ++opens) {
+    auto const object = uring_reactor::create_io_object(file.path());
+    cucascade::test::churning_file::check_opened(
+      object->identity(), object->size(), object->fd(), object->fd_direct());
+  }
 }

@@ -18,18 +18,12 @@
 
 #pragma once
 
-#include <fcntl.h>
 #include <sys/stat.h>
 
-#include <algorithm>
-#include <array>
-#include <atomic>
 #include <cerrno>
-#include <charconv>
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <system_error>
 
 namespace cucascade::io {
 
@@ -54,12 +48,7 @@ struct object_identity {
   std::uint64_t inode    = 0;
   std::uint64_t ctime_ns = 0;
 
-  bool operator==(object_identity const& other) const noexcept
-  {
-    return kind == other.kind && size == other.size && version == other.version &&
-           device == other.device && inode == other.inode && ctime_ns == other.ctime_ns;
-  }
-  bool operator!=(object_identity const& other) const noexcept { return !(*this == other); }
+  bool operator==(object_identity const& other) const noexcept = default;
 
   /// A key naming this identity of the object at @p locator.  The length
   /// prefix makes arbitrary paths and tags unambiguous; an ETag is never parsed.
@@ -85,21 +74,26 @@ struct object_identity {
 };
 
 /// A process-wide, strictly increasing number for each opened object (never 0):
-/// it orders the publications of different opens of the same path.
-inline std::uint64_t next_open_generation() noexcept
-{
-  static std::atomic<std::uint64_t> generation{0};
-  return generation.fetch_add(1, std::memory_order_relaxed) + 1;
-}
+/// it orders the publications of different opens of the same path.  One
+/// counter per process: it is defined in the cucascade_io library.
+[[nodiscard]] std::uint64_t next_open_generation() noexcept;
 
 /// Capture the @c local_stat identity of the file open as @p fd into @p result.
 /// Reads the open descriptor, never the path: a second path lookup could stat a
-/// replacement.  Returns false (leaving @p result unchanged) when @p fd cannot
-/// be stat'ed; callers then fall back to open-local identity.
-inline bool capture_local_identity(int fd, object_identity& result) noexcept
+/// replacement.  Returns false (leaving @p result unchanged, @c errno set) when
+/// @p fd cannot be stat'ed; callers then fall back to open-local identity.
+[[nodiscard]] inline bool capture_local_identity(int fd, object_identity& result) noexcept
 {
   struct stat info{};
-  if (fd < 0 || ::fstat(fd, &info) != 0 || info.st_size < 0) return false;
+  if (fd < 0) {
+    errno = EBADF;
+    return false;
+  }
+  if (::fstat(fd, &info) != 0) return false;
+  if (info.st_size < 0) {
+    errno = EOVERFLOW;
+    return false;
+  }
   result.kind     = identity_kind::local_stat;
   result.size     = static_cast<std::uint64_t>(info.st_size);
   result.device   = static_cast<std::uint64_t>(info.st_dev);
@@ -110,26 +104,6 @@ inline bool capture_local_identity(int fd, object_identity& result) noexcept
   // the free-form version field used by object-store validators.
   result.version.clear();
   return true;
-}
-
-/// Open the file that is open as @p fd again, with @p flags (a local reactor
-/// adds @c O_DIRECT this way).  Goes through @c /proc/self/fd so a concurrent
-/// rename of @p path cannot pair @p fd with a different file; where procfs is
-/// not mounted it falls back to opening @p path.  Either way the caller must
-/// compare the two descriptors' device and inode before trusting the pair.
-/// Returns the new descriptor, or -1 with @c errno set.
-inline int reopen_local_descriptor(int fd, char const* path, int flags) noexcept
-{
-  constexpr std::string_view prefix = "/proc/self/fd/";
-  std::array<char, prefix.size() + 16> proc_path{};
-  auto* out            = std::copy(prefix.begin(), prefix.end(), proc_path.begin());
-  auto const [end, ec] = std::to_chars(out, proc_path.end() - 1, fd);
-  if (ec == std::errc{}) {
-    *end             = '\0';
-    int const direct = ::open(proc_path.data(), flags);
-    if (direct >= 0 || errno != ENOENT) return direct;
-  }
-  return ::open(path, flags);
 }
 
 }  // namespace cucascade::io

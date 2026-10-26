@@ -855,8 +855,11 @@ std::shared_ptr<cache_generation> fs_cache::generation_for(const io_object& obj,
                                                            cache_handle* handle) const
 {
   if (handle != nullptr && *handle && handle->_generation) { return handle->_generation; }
+  // Built before the lock: identity() is virtual and the key allocates, and
+  // writers of the map wait behind this shared lock.
+  auto const key = obj.identity_cache_key();
   std::shared_lock lk(_map_mtx);
-  auto const it = _file_cache.find(obj.identity_cache_key());
+  auto const it = _file_cache.find(key);
   return it == _file_cache.end() ? nullptr : it->second;
 }
 
