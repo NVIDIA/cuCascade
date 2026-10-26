@@ -20,6 +20,7 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uri_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/object_identity.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp

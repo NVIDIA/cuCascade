@@ -20,6 +20,7 @@
 
 #include <cucascade/exec/invocable.hpp>
 #include <cucascade/io/byte_range.hpp>
+#include <cucascade/io/object_identity.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
@@ -95,9 +96,38 @@ class io_object : public std::enable_shared_from_this<io_object> {
  public:
   virtual ~io_object() = default;
 
-  /// Stable identifier used as the prefetching-cache key.  Often equal to
-  /// @c object_path() but may differ for backends that need to distinguish
-  /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
+  /// This open's process-wide order (see @ref next_open_generation): a later
+  /// open of a path has a larger generation than an earlier one.
+  [[nodiscard]] std::uint64_t open_generation() const noexcept { return _open_generation; }
+
+  /// The evidence that another open of this path sees the same version of the
+  /// object.  A backend overrides it with what it can prove (a local file's
+  /// stat tuple, a remote object's strong validator).  The default uses
+  /// @ref validation_tag as an @c object_tag; without a tag the identity is
+  /// scoped to this open (@c opened_handle, versioned by @ref open_generation),
+  /// never to the path.
+  [[nodiscard]] virtual object_identity identity() const
+  {
+    object_identity result;
+    auto const tag = validation_tag();
+    result.kind    = tag.empty() ? identity_kind::opened_handle : identity_kind::object_tag;
+    result.size    = size();
+    result.version = tag.empty() ? std::to_string(_open_generation) : std::string(tag);
+    return result;
+  }
+
+  /// The key of this object's version: @ref identity framed with
+  /// @ref raw_file_cache_id.  Two opens with equal keys may share what was
+  /// derived from either (the @c fs_cache keys its generations by it).
+  [[nodiscard]] std::string identity_cache_key() const
+  {
+    return identity().cache_key(raw_file_cache_id());
+  }
+
+  /// Backend locator, part of the identity-aware prefetching-cache key (see
+  /// @ref identity_cache_key).  Often equal to @c object_path() but may differ
+  /// for backends that need to distinguish otherwise-equal paths (versioned S3
+  /// keys, normalized URLs, …).
   [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
 
   /// The path / URL / key the caller used to construct this object.
@@ -114,6 +144,9 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// sends a weak or otherwise unusable one.  The view is valid for this
   /// object's lifetime.
   [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
+
+ private:
+  std::uint64_t const _open_generation = next_open_generation();
 };
 
 class io_object_metadata {

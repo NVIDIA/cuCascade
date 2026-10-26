@@ -67,6 +67,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
+    io/test_object_identity.cpp
     io/test_templated_ioctx.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
