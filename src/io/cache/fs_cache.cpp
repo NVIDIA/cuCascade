@@ -441,7 +441,11 @@ fs_cache::~fs_cache()
 
 std::shared_ptr<cache_generation> fs_cache::get_or_create_generation(const io_object& obj)
 {
-  const auto& key = obj.raw_file_cache_id();
+  // Keyed by the object's identity, not its locator: separate opens of an
+  // unchanged file (equal local stat identity) share one generation, so
+  // adjacent splits share their boundary chunks, while a replaced file or a
+  // new object version gets a new generation that retires the old one.
+  auto const key = obj.identity_cache_key();
   {
     std::shared_lock lk(_map_mtx);
     if (auto it = _file_cache.find(key); it != _file_cache.end()) { return it->second; }
@@ -841,7 +845,7 @@ std::shared_ptr<cache_generation> fs_cache::generation_for(const io_object& obj,
 {
   if (handle != nullptr && *handle && handle->_generation) { return handle->_generation; }
   std::shared_lock lk(_map_mtx);
-  auto const it = _file_cache.find(obj.raw_file_cache_id());
+  auto const it = _file_cache.find(obj.identity_cache_key());
   return it == _file_cache.end() ? nullptr : it->second;
 }
 

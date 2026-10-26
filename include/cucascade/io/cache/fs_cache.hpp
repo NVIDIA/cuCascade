@@ -95,7 +95,7 @@ struct cache_generation {
 
   mutable std::shared_mutex mtx;
   std::shared_ptr<const io_object> io_obj;
-  std::string key;          ///< @c io_object::raw_file_cache_id()
+  std::string key;          ///< @c io_object::identity_cache_key()
   std::string object_path;  ///< @c io_object::object_path(), for grouping generations
   /// Direct-mapped: slot i covers [i * chunk_size, (i + 1) * chunk_size);
   /// nullptr means that chunk has never been materialised.  Sized once at
@@ -433,6 +433,13 @@ class fs_cache {
   [[nodiscard]] uint32_t query_epoch() const noexcept
   {
     return _ticker.load(std::memory_order_relaxed);
+  }
+
+  /// Test-only: how many generations are reachable by key (live, not retired).
+  [[nodiscard]] std::size_t file_entry_count_for_testing() const noexcept
+  {
+    std::shared_lock lock(_map_mtx);
+    return _file_cache.size();
   }
 
   /// Test-only: how many prefetch requests @ref evict_loop was tracking at the

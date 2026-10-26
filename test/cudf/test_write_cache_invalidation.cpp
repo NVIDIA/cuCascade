@@ -16,8 +16,9 @@
  */
 
 // A write through an ioctx drops what its prefetching cache and metadata store
-// hold for the written path.  Generations are only ever built through the cudf
-// datasource's fadvise, so this lives with the cudf cache tests.
+// hold for the written path; a file replaced by someone else is told apart by
+// its object identity instead.  Generations are only ever built through the
+// cudf datasource's fadvise, so this lives with the cudf cache tests.
 
 #include "cache_test_fixture.hpp"
 
@@ -214,4 +215,46 @@ TEST_CASE("shutting the cache down waits for a pending invalidation", "[cache][w
   closer.join();
   CHECK(closed.load());
   CHECK(fixture.context->cache() == nullptr);
+}
+
+TEST_CASE("local opens share a generation until the file is replaced",
+          "[cache][uring][object_identity]")
+{
+  write_cache_fixture fixture;
+  auto& cache = *fixture.context->cache();
+  auto first  = fixture.cached_reader();
+  REQUIRE(cache.generation_count(fixture.path) == 1);
+  auto const resident = cache.claimed_bytes();
+
+  // A second open of the unchanged file has the same stat identity: it reuses
+  // the first open's generation and its resident chunks.
+  auto second = fixture.cached_reader();
+  CHECK(cache.generation_count(fixture.path) == 1);
+  CHECK(cache.file_entry_count_for_testing() == 1);
+  CHECK(cache.claimed_bytes() == resident);
+  CHECK(read_all(*second) == pattern(fixture.bytes, 1));
+
+  // The file is replaced atomically by someone else: nothing written through
+  // this ioctx invalidates the path, but the next open has a new identity, so
+  // it builds a new generation and retires the old one.
+  auto const new_bytes = pattern(fixture.bytes, 9);
+  auto const staged    = fixture.path + ".next";
+  {
+    std::ofstream out(staged, std::ios::binary);
+    out.write(reinterpret_cast<char const*>(new_bytes.data()),
+              static_cast<std::streamsize>(new_bytes.size()));
+  }
+  std::filesystem::rename(staged, fixture.path);
+  auto third = fixture.cached_reader();
+  CHECK(read_all(*third) == new_bytes);
+  CHECK(cache.generation_count(fixture.path) == 2);
+  CHECK(cache.retired_generation_count() == 1);
+  CHECK(cache.file_entry_count_for_testing() == 1);
+
+  // The earlier opens keep the bytes of the file they opened.
+  CHECK(read_all(*first) == pattern(fixture.bytes, 1));
+  first.reset();
+  second.reset();
+  CHECK(wait_for_cache([&] { return cache.generation_count(fixture.path) == 1; }, 5s));
+  CHECK(cache.retired_generation_count() == 0);
 }
