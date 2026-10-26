@@ -20,6 +20,7 @@
 
 #include <cucascade/exec/invocable.hpp>
 #include <cucascade/io/byte_range.hpp>
+#include <cucascade/io/object_identity.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
@@ -115,9 +116,47 @@ class io_object : public std::enable_shared_from_this<io_object> {
  public:
   virtual ~io_object() = default;
 
-  /// Stable identifier used as the prefetching-cache key.  Often equal to
-  /// @c object_path() but may differ for backends that need to distinguish
-  /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
+  /// This open's process-wide order (see @ref next_open_generation): a later
+  /// open of a path has a larger generation than an earlier one.
+  [[nodiscard]] std::uint64_t open_generation() const noexcept { return _open_generation; }
+
+  /// The evidence that another open of this path sees the same version of the
+  /// object.  A backend overrides it with what it can prove (a local file's
+  /// stat tuple, a remote object's strong validator).  The default uses
+  /// @ref validation_tag as an @c object_tag; without a tag the identity is
+  /// scoped to this open (@c opened_handle, versioned by @ref open_generation),
+  /// never to the path.  A writable object always has an @c opened_handle
+  /// identity of size 0: its bytes and size change as it is written, so nothing
+  /// derived from them may be reused through another open, and its identity
+  /// stays stable while it grows.
+  [[nodiscard]] virtual object_identity identity() const
+  {
+    object_identity result;
+    auto const tag = validation_tag();
+    if (writable() || tag.empty()) {
+      result.kind    = identity_kind::opened_handle;
+      result.size    = writable() ? 0 : size();
+      result.version = std::to_string(_open_generation);
+    } else {
+      result.kind    = identity_kind::object_tag;
+      result.size    = size();
+      result.version = std::string(tag);
+    }
+    return result;
+  }
+
+  /// The key of this object's version: @ref identity framed with
+  /// @ref raw_file_cache_id.  Two opens with equal keys may share what was
+  /// derived from either (the @c fs_cache keys its generations by it).
+  [[nodiscard]] std::string identity_cache_key() const
+  {
+    return identity().cache_key(raw_file_cache_id());
+  }
+
+  /// Backend locator, part of the identity-aware prefetching-cache key (see
+  /// @ref identity_cache_key).  Often equal to @c object_path() but may differ
+  /// for backends that need to distinguish otherwise-equal paths (versioned S3
+  /// keys, normalized URLs, …).
   [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
 
   /// The path / URL / key the caller used to construct this object.
@@ -154,6 +193,8 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// ioctx opened it (see @c cache::metadata_store::register_metadata): metadata
   /// parsed through an object opened before a write of its path is dropped.
   std::uint64_t _metadata_epoch{0};
+
+  std::uint64_t const _open_generation = next_open_generation();
 };
 
 /// Whether a backend opened an @c io_object for reading only or for reading and
