@@ -57,6 +57,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -65,6 +66,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -318,6 +320,20 @@ std::vector<std::uint64_t> summary_counts(std::string const& text)
     counts.push_back(std::stoull(text.substr(pos + 1)));
   }
   return counts;
+}
+
+/// Pull one counter from either section (`global` or `last_cycle`) of a cache
+/// report; a report without it fails the test rather than reading as zero.
+std::uint64_t report_counter(std::string const& summary,
+                             std::string const& name,
+                             std::string const& section = "global")
+{
+  std::smatch m;
+  auto const re = std::regex(section + "\\[[^\\]]*" + name + "=(\\d+)");
+  if (!std::regex_search(summary, m, re)) {
+    throw std::runtime_error("Missing cache counter: " + summary);
+  }
+  return std::stoull(m[1].str());
 }
 
 }  // namespace
@@ -1075,6 +1091,87 @@ TEST_CASE("cache summary snapshots stay consistent under concurrent queries",
   auto const after = summary_counts(cache.summary());
   REQUIRE(after.size() == 10);
   CHECK(after[1] > before[1]);
+  CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("cache refresh reports each increment once across overlapping refreshes",
+          "[cache][cache_summary][rest]")
+{
+  range_fault_policy fault;
+  fault.successful_head_etag = "\"generation-one\"";
+  fault.successful_get_etag  = fault.successful_head_etag;
+  loopback_range_server server(base_object(), fault);
+  rest_cache_fixture fixture(server);
+  auto& cache = *fixture.context->cache();
+  // The chunk is resident, so every read below is a cache hit.
+  auto source = fixture.open_resident(server, object_uri, base_object());
+  std::vector<std::uint8_t> bytes(source->size());
+  auto read = [&] {
+    if (source->host_read(0, bytes.size(), bytes.data()) != bytes.size()) {
+      throw std::runtime_error("Incomplete cache read");
+    }
+  };
+  auto const before = cache.prepare_for_query();
+  std::vector<std::string> reports;
+  constexpr std::array names{"reads", "hits", "h2d", "miss", "evictions"};
+
+  SECTION("diagnostic observations do not consume a reporting interval")
+  {
+    read();
+    auto const observed = cache.summary();
+    CHECK(cache.summary() == observed);
+    auto const epoch = cache.query_epoch();
+    reports.push_back(cache.prepare_for_query());
+    CHECK(reports.back() == observed);
+    CHECK(cache.query_epoch() == epoch + 1);
+    reports.push_back(cache.prepare_for_query());
+    for (auto const* name : names) {
+      CHECK(report_counter(reports.back(), name, "last_cycle") == 0);
+    }
+    read();
+  }
+  SECTION("two refreshers race with actual cache reads")
+  {
+    // Seed a nonzero interval even if the refreshers finish before the read loop.
+    read();
+    std::barrier start{3};
+    std::array<std::vector<std::string>, 2> concurrent_reports;
+    std::array<std::exception_ptr, 2> errors;
+    auto refresh = [&](std::size_t index) {
+      start.arrive_and_wait();
+      try {
+        for (int i = 0; i < 100; ++i) {
+          concurrent_reports[index].push_back(cache.prepare_for_query());
+        }
+      } catch (...) {
+        errors[index] = std::current_exception();
+      }
+    };
+    {
+      std::jthread first(refresh, 0), second(refresh, 1);
+      start.arrive_and_wait();
+      for (int i = 0; i < 100; ++i) {
+        read();
+      }
+    }
+    for (std::size_t i = 0; i < errors.size(); ++i) {
+      REQUIRE_FALSE(errors[i]);
+      reports.insert(reports.end(), concurrent_reports[i].begin(), concurrent_reports[i].end());
+    }
+  }
+
+  // Every increment since `before` lands in exactly one closed interval.
+  reports.push_back(cache.prepare_for_query());
+  auto const after = cache.summary();
+  CHECK(report_counter(after, "hits") > report_counter(before, "hits"));
+  for (auto const* name : names) {
+    INFO(name);
+    std::uint64_t reported = 0;
+    for (auto const& report : reports) {
+      reported += report_counter(report, name, "last_cycle");
+    }
+    CHECK(reported == report_counter(after, name) - report_counter(before, name));
+  }
   CHECK(server.get_count() == 1);
 }
 
