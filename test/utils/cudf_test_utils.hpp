@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "../../src/cudf/cudf_compat.hpp"
+
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
 
@@ -43,13 +45,14 @@ namespace cucascade {
 namespace test {
 
 inline auto make_null_mask_from_host(cudf::size_type rows,
-                                     std::vector<std::uint8_t> const& host_mask,
+                                     std::vector<cudf::bitmask_type> const& host_mask,
                                      ::cuda::stream_ref stream)
 {
-  auto mask = cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream);
-  REQUIRE(host_mask.size() <= mask.size());
+  auto mask             = cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream);
+  auto const mask_bytes = host_mask.size() * sizeof(cudf::bitmask_type);
+  REQUIRE(mask_bytes <= cudf_compat::get_null_mask_size_bytes(mask));
   CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-    mask.data(), host_mask.data(), host_mask.size(), cudaMemcpyHostToDevice, stream.get()));
+    mask.data(), host_mask.data(), mask_bytes, cudaMemcpyHostToDevice, stream.get()));
   stream.sync();
   return mask;
 }
@@ -86,8 +89,8 @@ inline cudf::table create_simple_cudf_table(
   if (num_rows > 0) {
     auto view  = col1->mutable_view();
     auto bytes = static_cast<size_t>(num_rows) * sizeof(int32_t);
-    CUCASCADE_CUDA_TRY(
-      cudaMemset(const_cast<void*>(view.head()), (num_columns == 1) ? 0x42 : 0x11, bytes));
+    CUCASCADE_CUDA_TRY(cudaMemsetAsync(
+      const_cast<void*>(view.head()), (num_columns == 1) ? 0x42 : 0x11, bytes, stream.get()));
   }
   columns.push_back(std::move(col1));
 
@@ -98,7 +101,8 @@ inline cudf::table create_simple_cudf_table(
     if (num_rows > 0) {
       auto view  = col2->mutable_view();
       auto bytes = static_cast<size_t>(num_rows) * sizeof(int64_t);
-      CUCASCADE_CUDA_TRY(cudaMemset(const_cast<void*>(view.head()), 0x22, bytes));
+      CUCASCADE_CUDA_TRY(
+        cudaMemsetAsync(const_cast<void*>(view.head()), 0x22, bytes, stream.get()));
     }
     columns.push_back(std::move(col2));
   }

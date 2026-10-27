@@ -87,10 +87,10 @@ class exclusive_stream_pool {
    *
    * This function is thread safe with respect to other calls to the same function.
    *
-   * @return ::cuda::stream_ref
+   * @throws rmm::cuda_error if creating a stream under GROW fails.
+   * @return An exclusive stream lease.
    */
-  borrowed_stream acquire_stream(
-    stream_acquire_policy policy = stream_acquire_policy::BLOCK) noexcept;
+  borrowed_stream acquire_stream(stream_acquire_policy policy = stream_acquire_policy::BLOCK);
 
   std::size_t size() const noexcept;
 

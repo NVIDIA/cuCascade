@@ -27,7 +27,7 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/version_config.hpp>
 
-#if CUDF_VERSION_MAJOR < 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR < 12)
+#if CUDF_VERSION_MAJOR < 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR < 10)
 #include <rmm/cuda_stream_view.hpp>
 #endif
 
@@ -36,7 +36,7 @@
 
 namespace cucascade::io {
 
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 10)
 using cudf_stream_type = ::cuda::stream_ref;
 #else
 using cudf_stream_type = rmm::cuda_stream_view;

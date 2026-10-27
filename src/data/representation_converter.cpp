@@ -56,7 +56,7 @@ bool representation_converter_registry::has_converter_impl(const converter_key& 
 
 std::unique_ptr<idata_representation> representation_converter_registry::convert_impl(
   const converter_key& key,
-  idata_representation& source,
+  const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   memory::reservation* reservation) const
@@ -80,7 +80,7 @@ std::unique_ptr<idata_representation> representation_converter_registry::convert
 }
 
 std::unique_ptr<idata_representation> representation_converter_registry::convert(
-  idata_representation& source,
+  const idata_representation& source,
   std::type_index target_type,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream) const
