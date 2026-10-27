@@ -156,3 +156,17 @@ with production credentials or on a public interface.
 Not qualified: concurrent cancellation/connection retention, AIS LIST,
 production authentication, arbitrary-key transparency, fresh-machine bootstrap,
 GPU transfer/GDS/RDMA, memory/FD leak freedom, or query/performance gains.
+
+## Reliability controls
+
+Standalone `report` exits nonzero for failed, incomplete, empty, malformed or
+unknown results. Characterization may report `PASS_WITH_LIMITATIONS` for recorded
+unsupported/not-tested capabilities; this is not a required-feature qualification.
+Cleanup requires Linux Python `os.pidfd_open` and `signal.pidfd_send_signal`. It
+opens a process handle before checking start time and run-specific command
+arguments and never falls back to signaling a numeric PID. Repeated INT/TERM/ALRM
+are ignored only during bounded cleanup. This protects against stale state and
+PID reuse; it is not a security boundary against an attacker running as this user.
+Lifecycle accepts `--weed-sha256` and forwards it to every service launch.
+Run `python scripts/cache-harness/test_reliability.py` on Linux in addition to
+`test_harness.py` and the full `ais_test_lifecycle.py` suite.

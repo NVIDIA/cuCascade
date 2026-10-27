@@ -5,6 +5,8 @@
 import argparse
 from contextlib import contextmanager
 import hashlib
+from functools import wraps
+import select
 import json
 import os
 from pathlib import Path
@@ -89,27 +91,76 @@ def state_for(run):
     return state
 
 
+def protect_cleanup(function):
+    """Bounded cleanup must finish even when termination is requested repeatedly."""
+
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        signals = (signal.SIGINT, signal.SIGTERM, signal.SIGALRM)
+        previous = {sig: signal.getsignal(sig) for sig in signals}
+        try:
+            for sig in signals:
+                signal.signal(sig, signal.SIG_IGN)
+            return function(*args, **kwargs)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    return guarded
+
+
+@protect_cleanup
+def stop_owned(pid, start, marker, term_seconds=8, kill_seconds=3):
+    """Bind identity checks and every signal to one Linux process, never its PID reuse."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        raise RuntimeError("invalid owned PID")
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError(
+            "Linux pidfd support required; refusing numeric-PID fallback"
+        )
+    try:
+        fd = os.pidfd_open(pid, 0)
+    except ProcessLookupError:
+        return []
+    sent = []
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        if poller.poll(0):
+            return sent
+        if process_identity(pid) != start:
+            raise RuntimeError("PID reused; refusing to stop unrelated process")
+        try:
+            command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except FileNotFoundError:
+            if poller.poll(0):
+                return sent
+            raise
+        if marker.encode() not in command:
+            raise RuntimeError("process command mismatch; refusing to stop")
+        # If the original process exits after validation, the fd cannot signal a
+        # replacement even if /proc now exposes the same numeric PID again.
+        for sig, seconds in (
+            (signal.SIGTERM, term_seconds),
+            (signal.SIGKILL, kill_seconds),
+        ):
+            try:
+                signal.pidfd_send_signal(fd, sig)
+            except ProcessLookupError:
+                return sent
+            sent.append(sig.name)
+            if poller.poll(int(seconds * 1000)):
+                return sent
+        raise RuntimeError("owned service failed to stop")
+    finally:
+        os.close(fd)
+
+
+@protect_cleanup
 def down(run):
     state = state_for(run)
-    pid = state.get("pid")
-    if pid and process_identity(pid) is not None:
-        if process_identity(pid) != state["process_start"]:
-            raise RuntimeError("PID reused; refusing to stop unrelated process")
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        if f"-dir={run / 'data'}".encode() not in cmdline:
-            raise RuntimeError("process command mismatch; refusing to stop")
-        for sig, seconds in ((signal.SIGTERM, 8), (signal.SIGKILL, 3)):
-            if process_identity(pid) != state["process_start"]:
-                break
-            os.kill(pid, sig)
-            end = time.monotonic() + seconds
-            while (
-                process_identity(pid) == state["process_start"]
-                and time.monotonic() < end
-            ):
-                time.sleep(0.1)
-        if process_identity(pid) == state["process_start"]:
-            raise RuntimeError("owned service failed to stop")
+    if state.get("pid"):
+        stop_owned(state["pid"], state["process_start"], f"-dir={run / 'data'}")
     state["stopped"] = True
     save(run / "state.json", state)
     # Preserve all data/logs for inspection. No recursive deletion, no pkill.
@@ -117,6 +168,10 @@ def down(run):
 
 
 def preflight(args):
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("Linux pidfd support required before starting services")
+    fd = os.pidfd_open(os.getpid(), 0)
+    os.close(fd)
     weed = args.weed.resolve(strict=True)
     binary = args.binary.resolve(strict=True)
     digest = sha(weed)
@@ -494,16 +549,16 @@ def report(run):
         "complete"
     ]
     success = (
-        complete
+        complete is True
         and bool(cases)
         and not (run / "failure.json").exists()
-        and not any(c["status"] == "FAIL" for c in cases)
+        and all(c["status"] in ("PASS", "UNSUPPORTED", "NOT_TESTED") for c in cases)
     )
     result = dict(
         run_dir=str(run),
         status=(
             "PASS_WITH_LIMITATIONS"
-            if success and any(c["status"] == "UNSUPPORTED" for c in cases)
+            if success and any(c["status"] != "PASS" for c in cases)
             else "PASS" if success else "FAIL"
         ),
         stopped=state["stopped"],
@@ -525,6 +580,12 @@ def report(run):
     ]
     (run / "report.md").write_text("\n".join(lines) + "\n")
     return result
+
+
+@protect_cleanup
+def cleanup_report(run):
+    down(run)
+    report(run)
 
 
 def main():
@@ -567,8 +628,7 @@ def main():
                 raise
             finally:
                 if (args.run_dir / "state.json").exists():
-                    down(args.run_dir)
-                    report(args.run_dir)
+                    cleanup_report(args.run_dir)
         elif args.command == "up":
             up(args)
         elif args.command == "preflight":
@@ -578,9 +638,13 @@ def main():
         elif args.command == "test-direct":
             test_direct(args)
         elif args.command == "report":
-            print(json.dumps(report(args.run_dir), indent=2))
+            result = report(args.run_dir)
+            print(json.dumps(result, indent=2))
+            return int(result["status"] == "FAIL")
         else:
             down(args.run_dir)
+        if args.command == "all":
+            return int(load(args.run_dir / "report.json")["status"] == "FAIL")
         return 0
     except Exception as error:
         print(f"harness: {type(error).__name__}: {error}", file=sys.stderr)

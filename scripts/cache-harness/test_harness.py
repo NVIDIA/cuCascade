@@ -247,6 +247,7 @@ class HarnessControls(unittest.TestCase):
             "sigterm",
             "sigint",
             "sigalrm",
+            "signal-storm",
         ):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
                 run = Path(tmp) / "run"
@@ -265,7 +266,15 @@ class HarnessControls(unittest.TestCase):
                 def identity(pid):
                     if failure == "identity-interrupt":
                         raise KeyboardInterrupt("injected")
-                    if failure.startswith("sig"):
+                    if failure == "signal-storm":
+                        for _ in range(3):
+                            for signum in (
+                                signal.SIGTERM,
+                                signal.SIGINT,
+                                signal.SIGALRM,
+                            ):
+                                signal.raise_signal(signum)
+                    elif failure.startswith("sig"):
                         signal.raise_signal(getattr(signal, failure.upper()))
                     return "test-start"
 

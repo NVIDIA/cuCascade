@@ -33,32 +33,21 @@ def state_for(run):
     return state
 
 
+@origin.protect_cleanup
 def stop_node(run, role):
     state = state_for(run)
     node = state["nodes"].get(role)
     if not node:
         return
-    pid, start = node["pid"], node["start"]
-    if origin.process_identity(pid) is not None:
-        if origin.process_identity(pid) != start:
-            raise RuntimeError("PID reused; refusing to stop")
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        if f"-local_config={run / role / 'local.json'}".encode() not in cmdline:
-            raise RuntimeError("node command does not belong to this run")
-        for sig, seconds in ((signal.SIGTERM, 10), (signal.SIGKILL, 3)):
-            if origin.process_identity(pid) != start:
-                break
-            os.kill(pid, sig)
-            node.setdefault("signals_sent", []).append(sig.name)
-            deadline = time.monotonic() + seconds
-            while origin.process_identity(pid) == start and time.monotonic() < deadline:
-                time.sleep(0.1)
-        if origin.process_identity(pid) == start:
-            raise RuntimeError("owned node failed to stop")
+    sent = origin.stop_owned(
+        node["pid"], node["start"], f"-local_config={run / role / 'local.json'}", 10
+    )
+    node.setdefault("signals_sent", []).extend(sent)
     node["stopped"] = True
     origin.save(run / "ais-state.json", state)
 
 
+@origin.protect_cleanup
 def down(run):
     errors = []
     for role in ("target", "proxy"):

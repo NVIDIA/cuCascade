@@ -209,6 +209,7 @@ def main():
     parser.add_argument("--aisnode", type=Path, required=True)
     parser.add_argument("--aisnode-sha256", required=True)
     parser.add_argument("--weed", type=Path, required=True)
+    parser.add_argument("--weed-sha256", default=ais.origin.WEED_SHA)
     parser.add_argument("--binary", type=Path, required=True)
     args = parser.parse_args()
     root = args.run_root.resolve()
@@ -227,6 +228,8 @@ def main():
         args.aisnode_sha256,
         "--weed",
         str(args.weed),
+        "--weed-sha256",
+        args.weed_sha256,
         "--binary",
         str(args.binary),
     ]
@@ -315,7 +318,6 @@ def main():
             ais_port_base=19430,
             ready_timeout=75,
             mode="root",
-            weed_sha256=ais.origin.WEED_SHA,
         )
         saved = ais.origin.seed
 
