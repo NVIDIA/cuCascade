@@ -20,8 +20,6 @@ import harness as origin
 
 AIS_COMMIT = "a3769a15d9a28ad69ec7f9f0785577b0fa2c7af9"
 MODES = {"prefix": 16384, "root": 16392, "reverse": 24584}
-_LAUNCHING = False
-_PENDING_SIGNAL = None
 
 
 class RunInterrupted(BaseException):
@@ -216,7 +214,6 @@ def configure(args, role, ports):
 
 
 def up(args):
-    global _LAUNCHING
     run = args.run_dir
     source = args.ais_source.resolve(strict=True)
     head = subprocess.check_output(
@@ -300,25 +297,24 @@ def up(args):
             ]
             if role == "proxy":
                 cmd.append("-ntargets=1")
-            _LAUNCHING = True
-            try:
-                with (directory / "console.log").open("wb") as log:
-                    proc = subprocess.Popen(
-                        cmd,
-                        env=env,
-                        cwd=directory,
-                        stdout=log,
-                        stderr=log,
-                        start_new_session=True,
-                    )
-                state["nodes"][role] = dict(
-                    pid=proc.pid, start=origin.process_identity(proc.pid), command=cmd
-                )
+
+            def persist(proc):
+                start = origin.process_identity(proc.pid)
+                if start is None:
+                    raise RuntimeError("AIS node exited before ownership was recorded")
+                state["nodes"][role] = dict(pid=proc.pid, start=start, command=cmd)
                 origin.save(run / "ais-state.json", state)
-            finally:
-                _LAUNCHING = False
-                if _PENDING_SIGNAL is not None:
-                    raise RunInterrupted(f"interrupted by signal {_PENDING_SIGNAL}")
+
+            with (directory / "console.log").open("wb") as log:
+                origin.launch_owned(
+                    cmd,
+                    persist,
+                    env=env,
+                    cwd=directory,
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                )
         deadline = time.monotonic() + args.ready_timeout
         while time.monotonic() < deadline:
             for node in state["nodes"].values():
@@ -343,6 +339,16 @@ def up(args):
     except BaseException:
         down(run)
         raise
+
+
+def cold_fill_status(read_status, before, after, count0, count1):
+    if read_status == "UNSUPPORTED":
+        return "NOT_TESTED"
+    if read_status != "PASS" or before != 404 or after != 200:
+        return "FAIL"
+    if not all(type(n) is int and n >= 0 for n in (count0, count1)):
+        return "UNKNOWN"
+    return "PASS" if count1 > count0 else "FAIL"
 
 
 def qualify(args):
@@ -419,38 +425,41 @@ def qualify(args):
         origin.state_for(run / "origin"),
         endpoint=state["endpoint"] + ("/s3" if state["mode"] == "prefix" else ""),
     )
-    # A separate fixture stays cold until the actual C++ probe starts.
-    library_fixture = next(f for f in fixtures if f["key"] == "ordinary/1048607.bin")
-    library_path = f"/v1/objects/{bucket}/{library_fixture['key']}?provider=aws&presence=3&silent=true"
-    library_before, _ = snapshot(run, "library-presence-before", "HEAD", library_path)
-    library_count0 = stats(run, "library-stats-before")
-    result = origin.probe(args.binary, ctx, library_fixture, run, "cucascade-ais")
-    library_after, _ = snapshot(run, "library-presence-after", "HEAD", library_path)
-    library_count1 = stats(run, "library-stats-after")
-    # Only known, directly evidenced compatibility failures are UNSUPPORTED.
-    error = (
-        (run / "cucascade-ais.stderr").read_text()
-        if (run / "cucascade-ais.stderr").exists()
-        else ""
-    )
-    unsupported = (
-        state["mode"] == "prefix"
-        and "endpoint must be scheme://host[:port] only" in error
-    ) or (front["status"] == 307 and "307" in error)
-    row(
-        "A2-cucascade",
-        (
+    # Each library mode gets its own untouched object and independent cold evidence.
+    for label, key, mode in (
+        ("cucascade-ais", "ordinary/1048607.bin", "read"),
+        ("cucascade-footer-first", "qualification/footer-first.bin", "footer-first"),
+    ):
+        library_fixture = next(f for f in fixtures if f["key"] == key)
+        library_path = f"/v1/objects/{bucket}/{key}?provider=aws&presence=3&silent=true"
+        before, _ = snapshot(run, label + "-presence-before", "HEAD", library_path)
+        count0 = stats(run, label + "-stats-before")
+        result = origin.probe(args.binary, ctx, library_fixture, run, label, mode=mode)
+        after, _ = snapshot(run, label + "-presence-after", "HEAD", library_path)
+        count1 = stats(run, label + "-stats-after")
+        error_file = run / (label + ".stderr")
+        error = error_file.read_text() if error_file.exists() else ""
+        unsupported = (
+            state["mode"] == "prefix"
+            and "endpoint must be scheme://host[:port] only" in error
+        ) or (
+            state["mode"] == "root" and front["status"] == 307 and "HTTP 307" in error
+        )
+        status = (
             "UNSUPPORTED"
-            if result["status"] == "FAIL" and unsupported
+            if result.get("exit") == 1 and unsupported
             else result["status"]
-        ),
-        probe=result,
-        error=error[:2000],
-        presence_before=library_before["status"],
-        presence_after=library_after["status"],
-        origin_get_before=library_count0,
-        origin_get_after=library_count1,
-    )
+        )
+        case = "A2-cucascade" if mode == "read" else "A2-footer-first"
+        row(case, status, probe=result, error=error[:2000])
+        row(
+            case + "-cold-fill",
+            cold_fill_status(status, before["status"], after["status"], count0, count1),
+            presence_before=before["status"],
+            presence_after=after["status"],
+            origin_get_before=count0,
+            origin_get_after=count1,
+        )
     for label, path, headers, expected_status in (
         ("missing", s3path + ".missing", {}, 404),
         ("invalid-range", s3path, {"Range": "bytes=999999999-"}, 416),
@@ -474,7 +483,7 @@ def qualify(args):
     # Authentication is disabled on this isolated AIS deployment. Do not claim IAM coverage.
     row(
         "F-ais-client-auth",
-        "UNSUPPORTED",
+        "NOT_TESTED",
         reason="client_auth_required=false; origin 403 covered separately",
     )
     backing = origin.state_for(run / "origin")
@@ -535,12 +544,12 @@ def qualify(args):
         dict(
             status=(
                 "FAIL"
-                if any(r["status"] == "FAIL" for r in rows)
+                if any(r["status"] in ("FAIL", "UNKNOWN") for r in rows)
                 else "PASS_WITH_LIMITATIONS"
             ),
             counts={
                 s: sum(r["status"] == s for r in rows)
-                for s in ("PASS", "FAIL", "UNSUPPORTED", "UNKNOWN")
+                for s in ("PASS", "FAIL", "UNSUPPORTED", "UNKNOWN", "NOT_TESTED")
             },
         ),
     )
@@ -576,10 +585,6 @@ def main():
         parser.error("deadlines must be positive")
 
     def interrupted(signum, frame):
-        global _PENDING_SIGNAL
-        if _LAUNCHING:
-            _PENDING_SIGNAL = signum
-            return
         raise RunInterrupted(f"interrupted by signal {signum}")
 
     signal.signal(signal.SIGINT, interrupted)

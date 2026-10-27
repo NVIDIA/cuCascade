@@ -32,8 +32,10 @@ std::string required_env(char const* name)
 
 int main(int argc, char** argv)
 {
+  char const* stage = "setup";
   try {
-    require(argc == 6, "usage: direct_s3_smoke ENDPOINT S3_URI FILE ETAG MODE(read|404|403)");
+    require(argc == 6,
+            "usage: direct_s3_smoke ENDPOINT S3_URI FILE ETAG MODE(read|footer-first|404|403)");
     cucascade::io::rest::config cfg{};
     cfg.request_timeout_s       = 5;
     cfg.stall_time_s            = 5;
@@ -64,16 +66,38 @@ int main(int argc, char** argv)
       }
       throw std::runtime_error("expected HTTP error but object opened successfully");
     }
-    require(mode == "read", "unknown mode");
+    require(mode == "read" || mode == "footer-first", "unknown mode");
     std::ifstream input(argv[3], std::ios::binary);
     require(input.good(), "cannot open expected bytes");
     std::vector<std::uint8_t> expected{std::istreambuf_iterator<char>(input), {}};
+    std::size_t checks{0};
+    auto check_footer = [&] {
+      stage       = "footer";
+      auto footer = std::dynamic_pointer_cast<cucascade::io::rest::rest_io_object>(
+        ctx->open_io_object(argv[2], cucascade::io::open_hint::parquet_footer_probe));
+      require(footer != nullptr && footer->size() == expected.size(), "footer size mismatch");
+      require(footer->validation_tag() == argv[4], "footer ETag mismatch");
+      if (!expected.empty()) {
+        auto const& stash = footer->stash();
+        auto const n      = std::min(expected.size(), std::size_t{512});
+        require(stash != nullptr && stash->size() == n,
+                "suffix GET did not provide expected stash");
+        require(footer->stash_window_lo() == expected.size() - n, "suffix offset mismatch");
+        for (std::size_t i = 0; i < n; ++i)
+          require((*stash)[i] == expected[expected.size() - n + i], "suffix bytes mismatch");
+      }
+      ++checks;
+    };
+    // No ordinary HEAD/full read precedes this open on the independent cold object.
+    if (mode == "footer-first") check_footer();
+    stage       = "open";
     auto object = ctx->open_io_object(argv[2]);
     require(object->size() == expected.size(), "HEAD size mismatch");
     require(object->validation_tag() == argv[4], "HEAD ETag mismatch");
     ctx->start();
-    std::size_t checks{2};
+    checks += 2;
     auto check_read = [&](std::size_t offset, std::size_t length, bool asynchronous) {
+      stage = "read";
       std::vector<std::uint8_t> bytes(length + 16, 0xa5);
       // Buffer and object remain alive until the public future completes.
       auto const n =
@@ -96,24 +120,13 @@ int main(int argc, char** argv)
     check_read(expected.size(), 16, false);
     check_read(expected.size() + 7, 16, true);
     check_read(0, 0, false);
-    auto footer = std::dynamic_pointer_cast<cucascade::io::rest::rest_io_object>(
-      ctx->open_io_object(argv[2], cucascade::io::open_hint::parquet_footer_probe));
-    require(footer != nullptr && footer->size() == expected.size(), "footer size mismatch");
-    require(footer->validation_tag() == argv[4], "footer ETag mismatch");
-    if (!expected.empty()) {
-      auto const& stash = footer->stash();
-      auto const n      = std::min(expected.size(), std::size_t{512});
-      require(stash != nullptr && stash->size() == n, "suffix GET did not provide expected stash");
-      require(footer->stash_window_lo() == expected.size() - n, "suffix offset mismatch");
-      for (std::size_t i = 0; i < n; ++i)
-        require((*stash)[i] == expected[expected.size() - n + i], "suffix bytes mismatch");
-    }
-    ++checks;
+    if (mode == "read") check_footer();
     ctx->shutdown();
     std::cout << "{\"status\":\"PASS\",\"bytes\":" << expected.size() << ",\"checks\":" << checks
               << ",\"etag\":" << std::quoted(std::string(object->validation_tag())) << "}\n";
     return 0;
   } catch (std::exception const& error) {
+    std::cout << "{\"status\":\"FAIL\",\"stage\":" << std::quoted(stage) << "}\n";
     std::cerr << "direct_s3_smoke: " << error.what() << '\n';
     return 1;
   }

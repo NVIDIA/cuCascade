@@ -15,23 +15,82 @@ sys.dont_write_bytecode = True
 import ais_harness as ais
 
 
+def classify_fault(kind, result, calls, error, elapsed):
+    """Require the intended HTTP fault, smoke stage and expected rejection."""
+    methods = [c["method"] for c in calls]
+    delivered = any(c.get("fault_sent") == kind for c in calls)
+    if elapsed >= 35 or not methods or result.get("exit") not in (0, 1):
+        return "FAIL"
+    payload = result.get("result") or {}
+    if kind in ("healthy", "footer-first"):
+        if result["status"] != "PASS":
+            return "FAIL"
+        if kind == "footer-first":
+            return (
+                "PASS"
+                if calls[0]["method"] == "GET" and calls[0].get("range") == "bytes=-512"
+                else "FAIL"
+            )
+        return "PASS" if methods[0] == "HEAD" and "GET" in methods else "FAIL"
+    if not delivered:
+        return "FAIL"
+    if kind in ("redirect", "timeout"):
+        reached = all(m == "HEAD" for m in methods)
+        stage = "open"
+    else:
+        reached = methods[0] == "HEAD" and "GET" in methods
+        stage = "read"
+    if not reached:
+        return "FAIL"
+    if (
+        kind == "changed-validator"
+        and result["status"] == "PASS"
+        and result["exit"] == 0
+    ):
+        return "UNSUPPORTED"
+    if (
+        result["status"] != "FAIL"
+        or result["exit"] != 1
+        or payload.get("stage") != stage
+    ):
+        return "FAIL"
+    expected = {
+        "redirect": ("rest_reactor::head_object: HTTP 307",),
+        "timeout": (
+            "rest_reactor::head_object:",
+            "exhausted retries",
+            "Timeout was reached",
+        ),
+        "truncated": ("rest_reactor: exhausted retries",),
+        "malformed-range": ("206 Content-Range mismatch",),
+        "changed-validator": ("ETag", "mismatch"),
+        "wrong-block": ("read bytes mismatch",),
+    }[kind]
+    return "PASS" if all(token in error for token in expected) else "FAIL"
+
+
 def library_faults(args, root):
-    """Adversarial HTTP fixtures; capability observations are not positive reads."""
+    """Actual HTTP delivery plus semantic rejection, with positive controls."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
 
-    data = bytes((i * 37 + 11) & 255 for i in range(4096))
-    fixture_path = root / "fault-fixture.bin"
-    fixture_path.write_bytes(data)
-    fixture = dict(key="object.bin", file=str(fixture_path), etag='"v1"')
     rows = []
     for kind in (
+        "healthy",
+        "footer-first",
         "redirect",
         "truncated",
         "timeout",
         "changed-validator",
         "malformed-range",
+        "wrong-block",
     ):
+        data = ais.origin.fixture_bytes(
+            "fault-object", 131103 if kind == "wrong-block" else 4096
+        )
+        fixture_path = root / (kind + "-fixture.bin")
+        fixture_path.write_bytes(data)
+        fixture = dict(key="object.bin", file=str(fixture_path), etag='"v1"')
         calls = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -39,8 +98,10 @@ def library_faults(args, root):
                 pass
 
             def do_HEAD(self):
-                calls.append("HEAD")
+                event = dict(method="HEAD", path=self.path)
+                calls.append(event)
                 if kind == "timeout":
+                    event["fault_sent"] = kind  # Request reached the deliberate stall.
                     time.sleep(6)
                 self.send_response(307 if kind == "redirect" else 200)
                 if kind == "redirect":
@@ -51,15 +112,16 @@ def library_faults(args, root):
                 self.send_header("ETag", '"v1"')
                 try:
                     self.end_headers()
+                    if kind == "redirect":
+                        event["fault_sent"] = kind
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
             def do_GET(self):
-                calls.append("GET")
-                bounds = self.headers.get("Range", "bytes=0-4095").removeprefix(
-                    "bytes="
-                )
-                first, last = bounds.split("-", 1)
+                range_header = self.headers.get("Range", f"bytes=0-{len(data)-1}")
+                event = dict(method="GET", path=self.path, range=range_header)
+                calls.append(event)
+                first, last = range_header.removeprefix("bytes=").split("-", 1)
                 start = int(first) if first else max(0, len(data) - int(last))
                 end = min(int(last), len(data) - 1) if first and last else len(data) - 1
                 if start >= len(data):
@@ -68,6 +130,9 @@ def library_faults(args, root):
                     self.end_headers()
                     return
                 payload = data[start : end + 1]
+                wrong_block = kind == "wrong-block" and start >= 65536 and bool(first)
+                if wrong_block:
+                    payload = data[: len(payload)]
                 self.send_response(206)
                 self.send_header("Content-Length", str(len(payload)))
                 self.send_header(
@@ -81,18 +146,23 @@ def library_faults(args, root):
                 self.send_header(
                     "ETag", '"v2"' if kind == "changed-validator" and first else '"v1"'
                 )
-                self.end_headers()
                 try:
-                    self.wfile.write(
-                        payload[: max(0, len(payload) - 1)]
-                        if kind == "truncated"
-                        else payload
-                    )
+                    self.end_headers()
+                    self.wfile.write(payload[:-1] if kind == "truncated" else payload)
+                    self.wfile.flush()
+                    if (
+                        kind in ("truncated", "malformed-range")
+                        or (kind == "changed-validator" and first)
+                        or wrong_block
+                    ):
+                        event["fault_sent"] = kind
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 self.close_connection = True
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # Join all handlers before the loop changes their captured fixture state.
+        server.daemon_threads = False
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         started = time.monotonic()
@@ -106,6 +176,7 @@ def library_faults(args, root):
                 fixture,
                 root,
                 "library-" + kind,
+                mode="footer-first" if kind == "footer-first" else "read",
             )
         finally:
             server.shutdown()
@@ -114,34 +185,20 @@ def library_faults(args, root):
         elapsed = round(time.monotonic() - started, 3)
         error_file = root / f"library-{kind}.stderr"
         error = error_file.read_text() if error_file.exists() else ""
-        if kind in ("changed-validator", "malformed-range"):
-            status = "UNSUPPORTED" if result["status"] == "PASS" else "PASS"
-        else:
-            status = (
-                "PASS"
-                if result["status"] == "FAIL"
-                and result.get("exit", 0) != 0
-                and elapsed < 35
-                else "FAIL"
-            )
-            if kind == "redirect":
-                status = (
-                    "PASS"
-                    if status == "PASS" and "307" in error and "GET" not in calls
-                    else "FAIL"
-                )
+        status = classify_fault(kind, result, calls, error, elapsed)
         rows.append(
             dict(
                 case=kind,
                 status=status,
                 probe=result,
                 elapsed_seconds=elapsed,
-                request_methods=calls,
+                requests=calls,
                 error=error[:2000],
             )
         )
         ais.origin.save(root / "library-faults.json", rows)
-        assert status != "FAIL", rows[-1]
+    if any(row["status"] == "FAIL" for row in rows):
+        raise AssertionError("protocol regression failed; inspect library-faults.json")
     return rows
 
 

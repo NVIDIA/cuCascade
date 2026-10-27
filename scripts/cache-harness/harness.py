@@ -3,6 +3,7 @@
 """Isolated local SeaweedFS lifecycle; reference probes never count as library tests."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -135,6 +136,58 @@ def preflight(args):
     }
 
 
+@contextmanager
+def defer_signals():
+    """Defer Python handlers, not OS delivery (children inherit no blocked mask)."""
+    pending = []
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGALRM)
+    previous = {sig: signal.getsignal(sig) for sig in signals}
+
+    def remember(signum, frame):
+        pending.append((signum, frame))
+
+    for sig in signals:
+        signal.signal(sig, remember)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if pending:
+            signum, frame = pending[0]
+            handler = previous[signum]
+            if callable(handler):
+                handler(signum, frame)
+            elif handler != signal.SIG_IGN:
+                raise KeyboardInterrupt(f"interrupted by signal {signum}")
+
+
+def launch_owned(command, persist, **kwargs):
+    """Retain the child handle until ownership is durable, including save failure."""
+    proc = None
+    try:
+        with defer_signals():
+            proc = subprocess.Popen(command, **kwargs)
+            persist(proc)
+        return proc
+    except BaseException:
+        # A direct child handle is authoritative even if no PID was saved.
+        with defer_signals():
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=3)
+        raise
+
+
+def fixture_bytes(identity, size):
+    """Stable SHAKE256 stream; offset-aligned blocks are not periodic copies."""
+    return hashlib.shake_256(b"cucascade-fixture-v2\0" + identity.encode()).digest(size)
+
+
 def up(args):
     info = preflight(args)
     run = args.run_dir
@@ -212,13 +265,24 @@ def up(args):
         for k, v in os.environ.items()
         if not k.startswith(("AWS_", "WEED_", "S3_"))
     }
-    with (run / "service.log").open("wb") as log:
-        proc = subprocess.Popen(
-            cmd, cwd=run, env=env, stdout=log, stderr=log, start_new_session=True
-        )
-    state.update(pid=proc.pid, process_start=process_identity(proc.pid))
-    save(run / "state.json", state)
+
+    def persist(proc):
+        state.update(pid=proc.pid, process_start=process_identity(proc.pid))
+        if state["process_start"] is None:
+            raise RuntimeError("service exited before ownership could be recorded")
+        save(run / "state.json", state)
+
     try:
+        with (run / "service.log").open("wb") as log:
+            proc = launch_owned(
+                cmd,
+                persist,
+                cwd=run,
+                env=env,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
         s3 = client(state)
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
@@ -253,15 +317,21 @@ def seed(run):
             "keys/a/b",
         ]
     ]
+    specs.append(("qualification/footer-first.bin", 1048607))
     fixtures = []
     for i, (key, size) in enumerate(specs):
-        data = bytes((j * 37 + 11 + i * 19) & 255 for j in range(size))
+        data = fixture_bytes(key, size)
         file = run / "fixtures" / f"{i}.bin"
         file.write_bytes(data)
         reply = s3.put_object(Bucket=state["bucket"], Key=key, Body=data)
         fixtures.append(
             dict(
-                key=key, size=size, file=str(file), sha256=sha(file), etag=reply["ETag"]
+                key=key,
+                size=size,
+                file=str(file),
+                sha256=sha(file),
+                etag=reply["ETag"],
+                generator="shake256-v2",
             )
         )
         if size == 0:
@@ -293,24 +363,33 @@ def probe(binary, state, fixture, run, label, mode="read", bad=False):
         )
         (run / f"{label}.stdout").write_text(result.stdout)
         (run / f"{label}.stderr").write_text(result.stderr)
-        payload = json.loads(result.stdout) if result.returncode == 0 else None
+        try:
+            payload = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            payload = None
         return dict(
             case=label,
             path="cuCascade",
             status=(
                 "PASS"
-                if result.returncode == 0 and payload.get("status") == "PASS"
+                if result.returncode == 0
+                and isinstance(payload, dict)
+                and payload.get("status") == "PASS"
                 else "FAIL"
             ),
             exit=result.returncode,
             result=payload,
         )
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError) as exc:
         return dict(
             case=label,
             path="cuCascade",
             status="FAIL",
-            error="45 second subprocess timeout",
+            error=(
+                "45 second subprocess timeout"
+                if isinstance(exc, subprocess.TimeoutExpired)
+                else str(exc)
+            ),
         )
 
 
@@ -378,14 +457,14 @@ def test_direct(args):
     save(run / "results.json", cases)
     for i, fixture in enumerate(fixtures):
         if not fixture["reference_exact"]:
-            # This is a service identity failure. Do not substitute normalized key/content.
+            # Client/service combination changed identity; attribution is unverified.
             cases.append(
                 dict(
                     case=f"object-{i}",
                     key=fixture["key"],
                     path="boto3-service-probe",
                     status="UNSUPPORTED" if fixture["key"] == "keys/a//b" else "FAIL",
-                    reason="read-after-all-puts differs; service key identity failure",
+                    reason="read-after-all-puts differs; client/service key identity mismatch (attribution unverified)",
                 )
             )
         else:
