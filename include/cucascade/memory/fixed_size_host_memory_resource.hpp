@@ -217,15 +217,17 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
    * @param block_size Size of each block in bytes
    * @param pool_size Number of blocks to pre-allocate
    * @param initial_pools Number of pools to pre-allocate
+   * @param initial_pool_threads Threads that allocate the initial pools. Above 1, @p upstream_mr
+   *        is called concurrently, so it must be thread-safe.
    */
-  explicit fixed_size_host_memory_resource(
-    int device_id,
-    rmm::device_async_resource_ref upstream_mr,
-    std::size_t mem_limit,
-    std::size_t capacity,
-    std::size_t block_size    = default_block_size,
-    std::size_t pool_size     = default_pool_size,
-    std::size_t initial_pools = default_initial_number_pools);
+  explicit fixed_size_host_memory_resource(int device_id,
+                                           rmm::device_async_resource_ref upstream_mr,
+                                           std::size_t mem_limit,
+                                           std::size_t capacity,
+                                           std::size_t block_size    = default_block_size,
+                                           std::size_t pool_size     = default_pool_size,
+                                           std::size_t initial_pools = default_initial_number_pools,
+                                           std::size_t initial_pool_threads = 1);
 
   // Disable copy and move
   fixed_size_host_memory_resource(const fixed_size_host_memory_resource&)            = delete;
@@ -389,12 +391,14 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
   void expand_pool();
 
   /**
-   * @brief Allocate @p n_pools pools from upstream concurrently, for the constructor.
+   * @brief Allocate @p n_pools pools from upstream on up to @p n_threads threads, for the
+   * constructor.
    *
    * Pinning is dominated by faulting in and zeroing pages, which the upstream does in the
-   * calling thread; spreading the pools over threads overlaps that work.
+   * calling thread; spreading the pools over threads overlaps that work. On failure, frees
+   * every pool allocated so far and rethrows.
    */
-  void expand_pools_parallel(std::size_t n_pools);
+  void expand_pools_parallel(std::size_t n_pools, std::size_t n_threads);
 
   /// Add one upstream allocation of @c _block_size * @c _pool_size bytes to the free list.
   void add_pool(void* large_allocation);

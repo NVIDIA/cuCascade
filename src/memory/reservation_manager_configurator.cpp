@@ -278,6 +278,9 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
     config.pool_size                  = block_size.value_or(memory::default_pool_size);
     config.initial_number_pools =
       initial_block_count.value_or(memory::default_initial_number_pools);
+    // Pin the initial pools concurrently only from the default resource, which is known to be
+    // thread-safe; a caller-supplied one keeps being called serially.
+    config.initial_pool_threads = _cpu_mr_fn ? 1 : memory::default_host_initial_pool_threads;
     configs.emplace_back(config);
   }
 

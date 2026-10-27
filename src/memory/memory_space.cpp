@@ -160,7 +160,8 @@ memory_space::memory_space(const host_memory_space_config& config)
                                                       _capacity,
                                                       config.block_size,
                                                       config.pool_size,
-                                                      config.initial_number_pools);
+                                                      config.initial_number_pools,
+                                                      config.initial_pool_threads);
   auto& host_allocator =
     std::get<std::unique_ptr<fixed_size_host_memory_resource>>(_reservation_allocator);
   _reservation_allocator_resource.emplace(fixed_size_host_resource_ref{*host_allocator});

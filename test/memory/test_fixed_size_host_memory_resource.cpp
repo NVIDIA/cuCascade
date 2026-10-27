@@ -28,6 +28,9 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <thread>
 #include <vector>
 
 using namespace cucascade::memory;
@@ -44,12 +47,18 @@ class counting_host_resource {
     std::atomic<int> allocations{0};
     std::atomic<int> live{0};
     int fail_after{-1};
+    std::mutex threads_mutex;
+    std::set<std::thread::id> threads;  ///< Threads that called allocate()
   };
 
   explicit counting_host_resource(std::shared_ptr<state> s) : _s(std::move(s)) {}
 
   void* allocate(::cuda::stream_ref, std::size_t bytes, std::size_t = alignof(std::max_align_t))
   {
+    {
+      std::lock_guard lock(_s->threads_mutex);
+      _s->threads.insert(std::this_thread::get_id());
+    }
     if (_s->fail_after >= 0 && _s->allocations.fetch_add(1) >= _s->fail_after) {
       throw rmm::bad_alloc("counting_host_resource: injected failure");
     }
@@ -94,11 +103,12 @@ class counting_host_resource {
 
 TEST_CASE("Initial pools are all pinned and usable", "[fixed_size_host]")
 {
+  auto const threads = GENERATE(std::size_t{1}, std::size_t{16});
   numa_region_pinned_host_memory_resource upstream(0);
   constexpr std::size_t initial_pools = 40;  // more pools than allocator threads
   constexpr std::size_t capacity      = initial_pools * pool_size * block_size;
   fixed_size_host_memory_resource mr(
-    0, upstream, capacity, capacity, block_size, pool_size, initial_pools);
+    0, upstream, capacity, capacity, block_size, pool_size, initial_pools, threads);
 
   REQUIRE(mr.get_total_blocks() == initial_pools * pool_size);
   REQUIRE(mr.get_free_blocks() == initial_pools * pool_size);
@@ -118,14 +128,32 @@ TEST_CASE("Initial pools are all pinned and usable", "[fixed_size_host]")
 
 TEST_CASE("A failed initial pool frees the pools already allocated", "[fixed_size_host]")
 {
-  auto state        = std::make_shared<counting_host_resource::state>();
-  state->fail_after = 10;
+  auto const threads = GENERATE(std::size_t{1}, std::size_t{16});
+  auto state         = std::make_shared<counting_host_resource::state>();
+  state->fail_after  = 10;
   counting_host_resource upstream(state);
   constexpr std::size_t initial_pools = 40;
   constexpr std::size_t capacity      = initial_pools * pool_size * block_size;
 
-  REQUIRE_THROWS_AS(fixed_size_host_memory_resource(
-                      0, upstream, capacity, capacity, block_size, pool_size, initial_pools),
-                    rmm::bad_alloc);
+  REQUIRE_THROWS_AS(
+    fixed_size_host_memory_resource(
+      0, upstream, capacity, capacity, block_size, pool_size, initial_pools, threads),
+    rmm::bad_alloc);
+  REQUIRE(state->live.load() == 0);
+}
+
+TEST_CASE("Initial pools are allocated on the calling thread by default", "[fixed_size_host]")
+{
+  auto state = std::make_shared<counting_host_resource::state>();
+  counting_host_resource upstream(state);
+  constexpr std::size_t initial_pools = 40;
+  constexpr std::size_t capacity      = initial_pools * pool_size * block_size;
+  {
+    fixed_size_host_memory_resource mr(
+      0, upstream, capacity, capacity, block_size, pool_size, initial_pools);
+    REQUIRE(mr.get_total_blocks() == initial_pools * pool_size);
+    REQUIRE(state->live.load() == static_cast<int>(initial_pools));
+  }
+  REQUIRE(state->threads == std::set<std::thread::id>{std::this_thread::get_id()});
   REQUIRE(state->live.load() == 0);
 }

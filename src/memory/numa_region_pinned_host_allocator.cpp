@@ -22,11 +22,33 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
 #include <tuple>
 
 namespace cucascade {
 namespace memory {
+
+namespace {
+
+/// Faults in every page of [ptr, ptr + bytes) for writing. Returns 0 or an errno value.
+int prefault(void* ptr, std::size_t bytes)
+{
+#ifdef MADV_POPULATE_WRITE
+  // Unlike touching the pages, this reports a shortage as ENOMEM instead of raising SIGBUS
+  // or invoking the OOM killer.
+  if (madvise(ptr, bytes, MADV_POPULATE_WRITE) == 0) { return 0; }
+  if (errno != EINVAL) { return errno; }  // EINVAL: kernel older than 5.14
+#endif
+  auto* const p   = static_cast<volatile char*>(ptr);
+  auto const page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  for (std::size_t off = 0; off < bytes; off += page) {
+    p[off] = 0;
+  }
+  return 0;
+}
+
+}  // namespace
 
 numa_region_pinned_host_memory_resource::numa_region_pinned_host_memory_resource(int numa_node,
                                                                                  bool make_portable)
@@ -66,14 +88,18 @@ void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda:
     // concurrent callers. Faulting them in here (with transparent huge pages where allowed)
     // does the zeroing in the calling thread, so concurrent allocations overlap it and the
     // register only pins resident pages.
-    std::ignore     = madvise(ptr, bytes, MADV_HUGEPAGE);
-    auto* const p   = static_cast<volatile char*>(ptr);
-    auto const page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-    for (std::size_t off = 0; off < bytes; off += page) {
-      p[off] = 0;
+    std::ignore = madvise(ptr, bytes, MADV_HUGEPAGE);
+    if (int const err = prefault(ptr, bytes); err != 0) {
+      numa_free(ptr, bytes);
+      if (err == ENOMEM) { throw rmm::out_of_memory(std::strerror(err)); }
+      throw rmm::bad_alloc(std::strerror(err));
     }
-    CUCASCADE_CUDA_TRY_ALLOC(
-      cudaHostRegister(ptr, bytes, static_cast<unsigned int>(_cuda_host_flags)), bytes);
+    if (cudaError_t const status =
+          cudaHostRegister(ptr, bytes, static_cast<unsigned int>(_cuda_host_flags));
+        status != cudaSuccess) {
+      numa_free(ptr, bytes);
+      CUCASCADE_CUDA_TRY_ALLOC(status, bytes);
+    }
     return ptr;
   }
 }
