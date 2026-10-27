@@ -77,38 +77,8 @@ namespace cucascade::io::cache {
   });
 }
 
-struct cache_generation {
-  /// Materialise a chunk for every offset in @p incoming, fold the matching
-  /// entry of @p desired into its populated extent, and count the calling
-  /// request as a subscriber of each.  Returns the chunks in @p incoming
-  /// order.  @p desired runs index-parallel to @p incoming.
-  std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
-                                                   std::span<const chunk_fill> desired);
-
-  std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
-                                          std::size_t size,
-                                          coverage_policy policy) const;
-
-  /// Slot index covering byte @p off.  Callers must bounds-check against
-  /// @c slots.size() — a read past EOF has no slot.
-  [[nodiscard]] std::size_t slot_of(std::size_t off) const noexcept { return off / chunk_size; }
-
-  mutable std::shared_mutex mtx;
-  std::shared_ptr<const io_object> io_obj;
-  std::string key;          ///< @c io_object::raw_file_cache_id()
-  std::string object_path;  ///< @c io_object::object_path(), for grouping generations
-  /// Direct-mapped: slot i covers [i * chunk_size, (i + 1) * chunk_size);
-  /// nullptr means that chunk has never been materialised.  Sized once at
-  /// creation — exactly the capacity the old sorted vector reserved — so a
-  /// lookup is an index instead of a search.
-  std::vector<cached_chunk*> slots;
-  chunk_arena arena;  ///< owns the chunks `slots` points at; append-only
-  std::vector<cached_chunk*> reclaim_claimed;
-  std::vector<std::byte*> reclaim_batch;
-  size_t file_size{0};
-  size_t chunk_size{1};
-  std::atomic<bool> retired{false};
-};
+/// One version of a cached object; defined in fs_cache.cpp.
+struct cache_generation;
 
 /// The last failure of an issued prefetch attempt, kept by the request so its
 /// consumer can ask after the terminal notification.  Stored before the

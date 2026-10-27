@@ -84,6 +84,7 @@ using cucascade::io::rest::rest_io_object;
 using cucascade::io::rest::rest_ioctx;
 using cucascade::io::rest::rest_reactor;
 using cucascade::test::advise;
+using cucascade::test::advise_range;
 using cucascade::test::held_object;
 using cucascade::test::held_request;
 using cucascade::test::identity_cache_config;
@@ -296,6 +297,15 @@ void require_changed(std::exception_ptr failure,
   } catch (...) {
     FAIL("expected object_changed_error");
   }
+}
+
+/// Wait until the evictor reports a batch of exactly @p size tracked requests.
+/// The size is published at the start of a round, after that round has absorbed
+/// its arrivals, so seeing it means every earlier round has finished.
+bool wait_for_eviction_batch(cucascade::io::cache::fs_cache const& cache, std::size_t size)
+{
+  return cucascade::test::wait_for_cache(
+    [&] { return cache.eviction_batch_size_for_testing() == size; }, 5s);
 }
 
 /// The counters of one fs_cache::summary() line: the five `global[...]` values
@@ -827,11 +837,132 @@ TEST_CASE("cache identity retains a retired generation until a held fill release
   require_generations(cache, path, 1, 0);
   CHECK(cache.claimed_bytes() == chunk_bytes);
 
-  // The current generation kept its own bytes throughout.
-  auto bytes = read_all(*second);
+  // The current generation kept its own bytes throughout.  Bounded: a read that
+  // missed the cache would go to the held backend, which nothing serves.
+  std::vector<std::uint8_t> bytes(second->size());
+  auto read = second->host_read_async(0, bytes.size(), bytes.data());
+  if (read.wait_for(2s) != std::future_status::ready) {
+    // Cancel the stranded backend request so the read settles before `bytes`
+    // goes away; the failure then unwinds without anything left parked.
+    context->shutdown();
+    FAIL("the current generation's read was not served from the cache");
+  }
+  REQUIRE(read.get() == bytes.size());
   CHECK(std::ranges::all_of(bytes, [](auto value) { return value == 0x22; }));
   second.reset();
   context->shutdown_cache();
+}
+
+TEST_CASE("cache identity reclaims an idle superseded generation's chunks at overwrite",
+          "[cache][cache_identity]")
+{
+  auto memory  = identity_memory();
+  auto context = std::make_shared<held_context>();
+  context->initialize_cache(*memory, identity_cache_config(), nullptr);
+  REQUIRE(context->cache() != nullptr);
+  auto& cache            = *context->cache();
+  std::string const path = "s3://controlled/generation.bin";
+  auto first             = std::make_unique<datasource>(context, held_object(path, "\"one\""));
+
+  // Version one becomes resident.
+  advise(*first, chunk_bytes);
+  REQUIRE(wait_for_eviction_batch(cache, 1));
+  REQUIRE(first->prefetch_async([](bool) noexcept {}) == cucascade::io::prefetch_refusal::issued);
+  held_request fill;
+  fill.request = context->backend().take();
+  REQUIRE(fill.request != nullptr);
+  fill.complete(0x11);
+  REQUIRE(cache.claimed_bytes() == chunk_bytes);
+
+  // Its scan ends, but the datasource stays open and keeps the generation alive.
+  // The evictor hands back the request's subscriber reference only in a round,
+  // and runs a round only when something is queued: hints on unrelated paths
+  // (fadvise alone, so they claim nothing) wake it.  The round that reports a
+  // batch of two drops the subscriber; one reporting three starts after that
+  // round has finished, so the chunk is idle from then on.
+  first->update(cucascade::io::cache::scan_stage::disposed);
+  auto wake_one =
+    std::make_unique<datasource>(context, held_object("s3://controlled/wake-one.bin", "\"one\""));
+  advise_range(*wake_one, 0, 4096);
+  REQUIRE(wait_for_eviction_batch(cache, 2));
+  auto wake_two =
+    std::make_unique<datasource>(context, held_object("s3://controlled/wake-two.bin", "\"one\""));
+  advise_range(*wake_two, 0, 4096);
+  REQUIRE(wait_for_eviction_batch(cache, 3));
+  // Nothing is under pressure, so the idle chunk is still resident.
+  REQUIRE(cache.claimed_bytes() == chunk_bytes);
+  require_generations(cache, path, 1, 0);
+
+  // The key is overwritten.  Superseding the idle generation reclaims its chunk
+  // on the spot: while `first` still holds the retired generation, only the new
+  // version's chunk is claimed.
+  auto second = std::make_unique<datasource>(context, held_object(path, "\"two\""));
+  advise(*second, chunk_bytes);
+  require_generations(cache, path, 2, 1);
+  CHECK(cache.claimed_bytes() == chunk_bytes);
+
+  // Releasing the retired generation has nothing left to give back.
+  first.reset();
+  require_generations(cache, path, 1, 0);
+  CHECK(cache.claimed_bytes() == chunk_bytes);
+  second.reset();
+  wake_one.reset();
+  wake_two.reset();
+  context->shutdown_cache();
+}
+
+TEST_CASE("cache identity returns a held retired generation's buffers at cache teardown",
+          "[cache][cache_identity]")
+{
+  auto memory = identity_memory();
+  auto* host  = const_cast<cucascade::memory::memory_space*>(
+    memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front());
+  REQUIRE(host != nullptr);
+  auto const* host_mr = host->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host_mr != nullptr);
+  REQUIRE(host_mr->get_block_size() == chunk_bytes);
+  // Blocks handed out of the host resource: the cache's pool takes one per
+  // resident chunk and gives it back when the chunk is reclaimed.
+  auto blocks_in_use = [host_mr] {
+    return host_mr->get_total_blocks() - host_mr->get_free_blocks();
+  };
+
+  auto context = std::make_shared<held_context>();
+  context->initialize_cache(*memory, identity_cache_config(), nullptr);
+  REQUIRE(context->cache() != nullptr);
+  auto& cache            = *context->cache();
+  auto const baseline    = blocks_in_use();
+  std::string const path = "s3://controlled/generation.bin";
+
+  auto make_resident = [&](datasource& source, std::uint8_t value) {
+    advise(source, chunk_bytes);
+    REQUIRE(source.prefetch_async([](bool) noexcept {}) == cucascade::io::prefetch_refusal::issued);
+    held_request fill;
+    fill.request = context->backend().take();
+    REQUIRE(fill.request != nullptr);
+    fill.complete(value);
+  };
+
+  // Version one is resident and its reader is still subscribed, so the
+  // overwrite retires the generation without reclaiming its chunk.
+  auto first = std::make_unique<datasource>(context, held_object(path, "\"one\""));
+  make_resident(*first, 0x11);
+  auto second = std::make_unique<datasource>(context, held_object(path, "\"two\""));
+  make_resident(*second, 0x22);
+  require_generations(cache, path, 2, 1);
+  REQUIRE(cache.claimed_bytes() == 2 * chunk_bytes);
+  REQUIRE(blocks_in_use() == baseline + 2);
+  second.reset();
+
+  // The cache goes away while `first` still holds the retired generation.  The
+  // teardown reclaims it too: both chunks are back in the host resource now,
+  // not only once that reader lets go.
+  context->shutdown_cache();
+  CHECK(blocks_in_use() == baseline);
+
+  // The reader's late release finds nothing left to return.
+  first.reset();
+  CHECK(blocks_in_use() == baseline);
 }
 
 TEST_CASE("cache identity delivers a held fill's failure through the datasource",

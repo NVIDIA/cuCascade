@@ -20,6 +20,7 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/io/uring/types.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
@@ -41,9 +42,11 @@
 #include <fstream>
 #include <future>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -62,6 +65,7 @@ using cucascade::io::uring::local_io_object;
 using cucascade::io::uring::max_dynamic_io_size;
 using cucascade::io::uring::min_dynamic_io_size;
 using cucascade::io::uring::uring_io_op;
+using cucascade::io::uring::uring_ioctx;
 using cucascade::io::uring::uring_reactor;
 using cucascade::io::uring::detail::dynamic_io_target;
 using cucascade::io::uring::detail::fill_remaining_iovecs;
@@ -209,7 +213,8 @@ class spp_reactor {
   std::shared_ptr<cucascade::io::io_object const> object,
   std::vector<range> const& ranges,
   std::uint8_t* destination,
-  cucascade::io::io_priority priority = cucascade::io::io_priority::high)
+  cucascade::io::io_priority priority                   = cucascade::io::io_priority::high,
+  std::shared_ptr<grouped_coordinator>* coordinator_out = nullptr)
 {
   std::size_t bytes = 0;
   std::vector<prepared_io_slice> slices;
@@ -221,9 +226,124 @@ class spp_reactor {
   }
   auto coordinator = std::make_shared<grouped_coordinator>(bytes, slices.size());
   auto future      = coordinator->get_future();
+  if (coordinator_out != nullptr) *coordinator_out = coordinator;
   reactor.enqueue(
     grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
   return future;
+}
+
+/**
+ * Holds reactor workers inside a read's completion callback until released, so a
+ * test can fill a reactor's queue while its worker provably takes nothing from it.
+ * The hold gives up after 30 s so a failing test cannot wedge a worker forever;
+ * destroying the plug releases it (declare it after the reactor it holds).
+ */
+class worker_plug {
+ public:
+  worker_plug() = default;
+  ~worker_plug() { release(); }
+
+  worker_plug(worker_plug const&)            = delete;
+  worker_plug& operator=(worker_plug const&) = delete;
+
+  /// A completion that holds the worker that runs it.
+  [[nodiscard]] std::shared_ptr<prepared_io_completion> completion() const
+  {
+    return std::make_shared<prepared_io_completion>(
+      [state = _state](std::span<cached_chunk* const>, bool) noexcept {
+        state->entered.fetch_add(1);
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!state->released.load() && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+      });
+  }
+
+  /// Wait until @p count workers are held; false on timeout.
+  [[nodiscard]] bool wait_held(std::size_t count) const
+  {
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (_state->entered.load() < count) {
+      if (std::chrono::steady_clock::now() >= deadline) return false;
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    return true;
+  }
+
+  void release() noexcept { _state->released.store(true); }
+
+ private:
+  struct state {
+    std::atomic<std::size_t> entered{0};
+    std::atomic<bool> released{false};
+  };
+  std::shared_ptr<state> _state = std::make_shared<state>();
+};
+
+/// Enqueue a one-block high read whose completion is @p plug's hold.
+[[nodiscard]] cucascade::exec::semi_future<std::size_t> enqueue_plug(
+  uring_reactor& reactor,
+  std::shared_ptr<cucascade::io::io_object const> object,
+  std::uint8_t* destination,
+  worker_plug const& plug)
+{
+  std::vector<prepared_io_slice> slices;
+  slices.emplace_back(range{0, IO_BLOCK_SIZE}, host_buffer{destination});
+  slices.back().priority    = cucascade::io::io_priority::high;
+  slices.back().on_complete = plug.completion();
+  auto coordinator          = std::make_shared<grouped_coordinator>(IO_BLOCK_SIZE, 1);
+  auto future               = coordinator->get_future();
+  reactor.enqueue(
+    grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
+  return future;
+}
+
+/// How a future settled within a deadline.
+struct settle_outcome {
+  bool ready{false};        ///< settled before the deadline
+  std::size_t bytes{0};     ///< its value, when it succeeded
+  std::error_code error{};  ///< its std::system_error code, when it failed with one
+  bool other_error{false};  ///< failed with any other exception
+};
+
+[[nodiscard]] settle_outcome settle_within(cucascade::exec::semi_future<std::size_t>&& future,
+                                           std::chrono::seconds timeout)
+{
+  settle_outcome out;
+  try {
+    out.bytes = std::move(future).get(timeout);
+    out.ready = true;
+  } catch (std::system_error const& error) {
+    out.ready = true;
+    out.error = error.code();
+  } catch (std::runtime_error const& error) {
+    // get() reports a timeout as a plain runtime_error.
+    out.ready       = std::string_view{error.what()}.find("timed out") == std::string_view::npos;
+    out.other_error = out.ready;
+  } catch (...) {
+    out.ready       = true;
+    out.other_error = true;
+  }
+  return out;
+}
+
+/// Wait until @p reactor has parked a low request for a high one; false on timeout.
+[[nodiscard]] bool wait_for_preemption(uring_reactor& reactor)
+{
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (reactor.take_gauges().preemptions == 0) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::yield();
+  }
+  return true;
+}
+
+/// Stop @p coordinator the way a caller cancelling its read does: the extra credit
+/// keeps the cancellation from consuming a credit that belongs to a slice.
+void cancel_coordinator(grouped_coordinator& coordinator)
+{
+  coordinator.add_tasks(1);
+  coordinator.report_error(std::make_error_code(std::errc::interrupted));
 }
 
 }  // namespace
@@ -479,40 +599,46 @@ TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[io][uring
 
   // Detached so that a re-entrant self-deadlock fails the watchdog instead of hanging the
   // whole test binary.
+  // The body reports any exception through the watchdog: one escaping a thread terminates.
   std::thread([destination, outer_canceled, inner_canceled, finished] {
-    cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
-    cucascade::memory::fixed_size_host_memory_resource mr{
-      0, upstream, capacity, capacity, block_size, 4, 0};
+    try {
+      cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+      cucascade::memory::fixed_size_host_memory_resource mr{
+        0, upstream, capacity, capacity, block_size, 4, 0};
 
-    auto ctx =
-      std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
-    uring_reactor reactor{ctx, ""};
-    reactor.start();
-    reactor.shutdown();
+      auto ctx =
+        std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+      uring_reactor reactor{ctx, ""};
+      reactor.start();
+      reactor.shutdown();
 
-    auto submit = [&](std::shared_ptr<prepared_io_completion> on_complete) {
-      auto object =
-        std::make_shared<local_io_object>("/dev/null", file_descriptor{}, file_descriptor{}, 1);
-      auto coordinator = std::make_shared<grouped_coordinator>(1, 1);
-      auto future      = coordinator->get_future();
-      std::vector<prepared_io_slice> slices;
-      slices.emplace_back(range{0, 1}, host_buffer{destination->data()});
-      slices.back().on_complete = std::move(on_complete);
-      reactor.enqueue(
-        grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
-      return future;
-    };
+      auto submit = [&](std::shared_ptr<prepared_io_completion> on_complete) {
+        auto object =
+          std::make_shared<local_io_object>("/dev/null", file_descriptor{}, file_descriptor{}, 1);
+        auto coordinator = std::make_shared<grouped_coordinator>(1, 1);
+        auto future      = coordinator->get_future();
+        std::vector<prepared_io_slice> slices;
+        slices.emplace_back(range{0, 1}, host_buffer{destination->data()});
+        slices.back().on_complete = std::move(on_complete);
+        reactor.enqueue(
+          grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
+        return future;
+      };
 
-    auto reenter =
-      std::make_shared<prepared_io_completion>([&](std::span<cached_chunk* const>, bool) noexcept {
-        *inner_canceled = canceled(submit(nullptr));
-      });
+      auto reenter = std::make_shared<prepared_io_completion>(
+        [&](std::span<cached_chunk* const>, bool) noexcept {
+          *inner_canceled = canceled(submit(nullptr));
+        });
 
-    *outer_canceled = canceled(submit(std::move(reenter)));
-    finished->set_value();
+      *outer_canceled = canceled(submit(std::move(reenter)));
+      finished->set_value();
+    } catch (...) {
+      finished->set_exception(std::current_exception());
+    }
   }).detach();
 
   REQUIRE(watchdog.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  REQUIRE_NOTHROW(watchdog.get());
   CHECK(*outer_canceled);
   CHECK(*inner_canceled);
 }
@@ -526,8 +652,10 @@ TEST_CASE("io_uring slices_per_pass sets how deep a single request queues",
   auto const ranges = slice_ranges(n_slices, stride, false);
 
   auto max_inflight = [&](std::size_t slices_per_pass) {
-    spp_reactor reactor{slices_per_pass};
+    // Destination first: it must outlive the reactor, which settles in-flight reads into
+    // it on shutdown.
     aligned_bytes destination{n_slices * stride};
+    spp_reactor reactor{slices_per_pass};
     auto future = enqueue_ranges(reactor.get(), file.open(), ranges, destination.get());
     CHECK(std::move(future).get(std::chrono::seconds(30)) == n_slices * stride);
     // The worker publishes its depth after submitting and before reaping, so the
@@ -552,9 +680,10 @@ TEST_CASE("io_uring queue-delay gauge counts each request once, per priority tie
   pattern_file const file{n_slices * stride};
   auto const ranges = slice_ranges(n_slices, stride, false);
 
-  spp_reactor reactor{8};
+  // Destinations first: they must outlive the reactor (see the slices_per_pass test).
   aligned_bytes prefetch_dst{n_slices * stride};
   aligned_bytes demand_dst{n_slices * stride};
+  spp_reactor reactor{8};
   auto prefetch =
     enqueue_ranges(reactor.get(), file.open(), ranges, prefetch_dst.get(), io_priority::low);
   auto demand_a = enqueue_ranges(reactor.get(), file.open(), ranges, demand_dst.get());
@@ -565,8 +694,8 @@ TEST_CASE("io_uring queue-delay gauge counts each request once, per priority tie
 
   // [0] = high tier, [1] = low tier.
   auto const g    = reactor.get().take_gauges();
-  auto const& d   = g.queue_delay[0];
-  auto const& p   = g.queue_delay[1];
+  auto const& d   = g.queue_delay_for(io_priority::high);
+  auto const& p   = g.queue_delay_for(io_priority::low);
   auto hist_total = [](auto const& s) {
     std::uint64_t n = 0;
     for (auto c : s.histogram)
@@ -582,9 +711,9 @@ TEST_CASE("io_uring queue-delay gauge counts each request once, per priority tie
 
   // The window resets: nothing new was expanded since the previous take.
   auto const again = reactor.get().take_gauges();
-  CHECK(again.queue_delay[0].count == 0);
-  CHECK(again.queue_delay[1].count == 0);
-  CHECK(again.queue_delay[0].max_ns == 0);
+  CHECK(again.queue_delay_high.count == 0);
+  CHECK(again.queue_delay_low.count == 0);
+  CHECK(again.queue_delay_high.max_ns == 0);
 }
 
 TEST_CASE("io_uring parks an active low request for a high one and resumes it",
@@ -599,9 +728,10 @@ TEST_CASE("io_uring parks an active low request for a high one and resumes it",
   pattern_file const file{total};
   auto const ranges = slice_ranges(n_slices, stride, false);
 
-  spp_reactor reactor{1};
+  // Destinations first: they must outlive the reactor.
   aligned_bytes low_dst{total};
   aligned_bytes high_dst{total};
+  spp_reactor reactor{1};
   auto low = enqueue_ranges(reactor.get(), file.open(), ranges, low_dst.get(), io_priority::low);
   // Wait until the worker has taken the low request; otherwise the high one could
   // simply be dequeued first, with nothing to preempt.
@@ -637,9 +767,10 @@ struct low_vs_high_outcome {
 };
 
 /**
- * Enqueue one @p n_low_slices-slice low request, then @p n_high high requests
- * of @p high_slices slices each, all at once (so the high tier stays backed
- * up), on a reactor expanding one slice per pass.  Report how many high
+ * Queue @p n_high high requests of @p high_slices slices each and then one
+ * @p n_low_slices-slice low request on a reactor expanding one slice per pass,
+ * all while its worker is held (see @ref worker_plug), so the worker first sees
+ * the whole high backlog with the low request behind it.  Report how many high
  * requests finished before the low one.
  */
 low_vs_high_outcome race_low_against_high_backlog(std::size_t low_service_interval,
@@ -657,9 +788,20 @@ low_vs_high_outcome race_low_against_high_backlog(std::size_t low_service_interv
   std::vector<range> const high_ranges(all.begin() + static_cast<std::ptrdiff_t>(n_low_slices),
                                        all.end());
 
-  spp_reactor reactor{1, low_service_interval};
+  // Open every object up front, so nothing slow sits between the enqueues.
+  auto plug_object = file.open();
+  auto low_object  = file.open();
+  std::vector<std::shared_ptr<cucascade::io::io_object const>> high_objects;
+  for (std::size_t i = 0; i < n_high; ++i) {
+    high_objects.push_back(file.open());
+  }
+
+  // Destinations first: they must outlive the reactor.
   aligned_bytes low_dst{n_slices * stride};
   aligned_bytes high_dst{n_slices * stride};
+  aligned_bytes plug_dst{IO_BLOCK_SIZE};
+  spp_reactor reactor{1, low_service_interval};
+  worker_plug plug;
 
   struct shared_state {
     std::atomic<std::size_t> highs_done{0};
@@ -670,19 +812,24 @@ low_vs_high_outcome race_low_against_high_backlog(std::size_t low_service_interv
   };
   auto state = std::make_shared<shared_state>();
 
-  enqueue_ranges(reactor.get(), file.open(), low_ranges, low_dst.get(), io_priority::low)
-    .install_callback([state](cucascade::exec::try_t<std::size_t>&& result) {
-      state->highs_before_low.store(state->highs_done.load());
-      state->low_ok.store(result.has_value());
-      state->low_done.store(true);
-    });
-  for (std::size_t i = 0; i < n_high; ++i) {
-    enqueue_ranges(reactor.get(), file.open(), high_ranges, high_dst.get(), io_priority::high)
+  auto plugged = enqueue_plug(reactor.get(), std::move(plug_object), plug_dst.get(), plug);
+  REQUIRE(plug.wait_held(1));
+  for (auto& object : high_objects) {
+    enqueue_ranges(reactor.get(), std::move(object), high_ranges, high_dst.get(), io_priority::high)
       .install_callback([state](cucascade::exec::try_t<std::size_t>&& result) {
         if (!result.has_value()) state->high_errors.fetch_add(1);
         state->highs_done.fetch_add(1);
       });
   }
+  enqueue_ranges(reactor.get(), std::move(low_object), low_ranges, low_dst.get(), io_priority::low)
+    .install_callback([state](cucascade::exec::try_t<std::size_t>&& result) {
+      state->highs_before_low.store(state->highs_done.load());
+      state->low_ok.store(result.has_value());
+      state->low_done.store(true);
+    });
+  REQUIRE(reactor.get().take_gauges().queued_requests == n_high + 1);
+  plug.release();
+  CHECK(std::move(plugged).get(std::chrono::seconds(30)) == IO_BLOCK_SIZE);
 
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (!state->low_done.load() || state->highs_done.load() < n_high) {
@@ -756,9 +903,10 @@ TEST_CASE("io_uring a read waiting on low work completes while high traffic cont
   std::vector<range> const low_ranges(all.begin(), split);
   std::vector<range> const high_ranges(split, all.end());
 
-  spp_reactor reactor{1};
+  // Destinations first: they must outlive the reactor.
   aligned_bytes low_dst{n_slices * stride};
   aligned_bytes high_dst{n_slices * stride};
+  spp_reactor reactor{1};
 
   struct shared_state {
     std::atomic<std::size_t> highs_issued{0};
@@ -827,8 +975,9 @@ TEST_CASE("io_uring slices_per_pass never changes the bytes read", "[io][uring][
 
   for (std::size_t const slices_per_pass : {std::size_t{1}, std::size_t{8}, std::size_t{0}}) {
     CAPTURE(slices_per_pass);
-    spp_reactor reactor{slices_per_pass};
+    // Destination first: it must outlive the reactor.
     aligned_bytes destination{total};
+    spp_reactor reactor{slices_per_pass};
     std::memset(destination.get(), untouched, total);
 
     auto future = enqueue_ranges(reactor.get(), file.open(), ranges, destination.get());
@@ -876,53 +1025,395 @@ TEST_CASE("io_uring shutdown settles a large active request with an uncapped pas
   auto finished    = std::make_shared<std::promise<void>>();
   auto watchdog    = finished->get_future();
 
-  // Detached so a hung shutdown fails the watchdog instead of hanging the binary.
+  // Detached so a hung shutdown fails the watchdog instead of hanging the binary; the
+  // body reports any exception through the watchdog, as one escaping a thread terminates.
   std::thread([file, destination, outcome, finished] {
-    spp_reactor reactor{0};
+    try {
+      spp_reactor reactor{0};
 
-    std::vector<prepared_io_slice> slices;
-    slices.reserve(n_slices);
-    for (std::size_t i = 0; i < n_slices; ++i) {
-      slices.emplace_back(range{(i % file_blocks) * slice_bytes, slice_bytes},
-                          host_buffer{destination->get() + i * slice_bytes});
-    }
-    auto coordinator = std::make_shared<grouped_coordinator>(n_slices * slice_bytes, n_slices);
-    auto future      = coordinator->get_future();
-    reactor.get().enqueue(
-      grouped_io_request::create(file->open(), std::move(slices), std::move(coordinator)));
-
-    // Shut down only once the worker has taken the request, so it is active.
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (std::chrono::steady_clock::now() < deadline) {
-      if (reactor.get().take_gauges().requests_started != 0) {
-        outcome->started = true;
-        break;
+      std::vector<prepared_io_slice> slices;
+      slices.reserve(n_slices);
+      for (std::size_t i = 0; i < n_slices; ++i) {
+        slices.emplace_back(range{(i % file_blocks) * slice_bytes, slice_bytes},
+                            host_buffer{destination->get() + i * slice_bytes});
       }
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
-    reactor.get().shutdown();
+      auto coordinator = std::make_shared<grouped_coordinator>(n_slices * slice_bytes, n_slices);
+      auto future      = coordinator->get_future();
+      reactor.get().enqueue(
+        grouped_io_request::create(file->open(), std::move(slices), std::move(coordinator)));
 
-    // shutdown() joined the worker, which settles everything it owned on the way out.
-    auto result = std::move(future).get_try();
-    if (result.has_value()) {
-      outcome->settled = settled_as::value;
-    } else {
-      try {
-        std::move(result).get();
-      } catch (std::system_error const& error) {
-        if (error.code() == std::errc::operation_canceled) {
-          outcome->settled = settled_as::canceled;
+      // Shut down only once the worker has taken the request, so it is active.
+      auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (reactor.get().take_gauges().requests_started != 0) {
+          outcome->started = true;
+          break;
         }
-      } catch (...) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
       }
+      reactor.get().shutdown();
+
+      // shutdown() joined the worker, which settles everything it owned on the way out.
+      auto result = std::move(future).get_try();
+      if (result.has_value()) {
+        outcome->settled = settled_as::value;
+      } else {
+        try {
+          std::move(result).get();
+        } catch (std::system_error const& error) {
+          if (error.code() == std::errc::operation_canceled) {
+            outcome->settled = settled_as::canceled;
+          }
+        } catch (...) {
+        }
+      }
+      outcome->queued_bytes = reactor.get().queued_bytes();
+      finished->set_value();
+    } catch (...) {
+      finished->set_exception(std::current_exception());
     }
-    outcome->queued_bytes = reactor.get().queued_bytes();
-    finished->set_value();
   }).detach();
 
   REQUIRE(watchdog.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+  REQUIRE_NOTHROW(watchdog.get());
   CHECK(outcome->started);
   // Either the reads beat the shutdown or the remainder was canceled; never another error.
   CHECK(outcome->settled != settled_as::other_error);
+  CHECK(outcome->queued_bytes == 0);
+}
+
+namespace {
+
+/// Pinned staging for a pool of @p n_reactors uring reactors sharing one context.
+class ioctx_staging {
+ public:
+  static constexpr std::size_t block_size = 1UL << 20;
+
+  explicit ioctx_staging(std::size_t n_reactors, cucascade::io::uring::config cfg = {})
+    : _mr{0, _upstream, n_reactors * (128UL << 20), n_reactors * (128UL << 20), block_size, 64, 0},
+      _ctx{std::make_shared<uring_reactor::reactor_context>(cfg, &_mr)}
+  {
+  }
+
+  [[nodiscard]] std::shared_ptr<uring_reactor::reactor_context> const& context() const noexcept
+  {
+    return _ctx;
+  }
+
+ private:
+  cucascade::memory::numa_region_pinned_host_memory_resource _upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource _mr;
+  std::shared_ptr<uring_reactor::reactor_context> _ctx;
+};
+
+}  // namespace
+
+TEST_CASE("io_uring ioctx reads a range-batched host read end to end",
+          "[io][uring][uring_ioctx][range_batch_slices]")
+{
+  // 20 ranges is past the default range_batch_slices of 8, so each reactor's share
+  // is split into several queue entries sharing one coordinator.  Odd ranges are
+  // unaligned at both ends and take the buffered path.
+  constexpr std::size_t n_ranges   = 20;
+  constexpr std::size_t stride     = 64UL << 10;
+  constexpr std::size_t total      = n_ranges * stride;
+  constexpr std::uint8_t untouched = 0xA5;
+  pattern_file const file{total};
+  auto const ranges    = slice_ranges(n_ranges, stride, true);
+  std::size_t expected = 0;
+  for (auto const& r : ranges) {
+    expected += r.size;
+  }
+
+  for (std::size_t const n_reactors : {std::size_t{1}, std::size_t{2}}) {
+    CAPTURE(n_reactors);
+    // Destination and staging first: both must outlive the ioctx's reactors.
+    aligned_bytes destination{total};
+    std::memset(destination.get(), untouched, total);
+    ioctx_staging staging{n_reactors};
+    uring_ioctx ioctx{n_reactors, staging.context()};
+    ioctx.start();
+    REQUIRE(ioctx.range_batch_slices() == 8);
+
+    std::vector<cucascade::io::slice> slices;
+    for (auto const& r : ranges) {
+      slices.emplace_back(r.offset, r.size, destination.get() + r.offset);
+    }
+    auto const object = file.open();
+    auto future       = ioctx.host_readv_async_io(*object, slices);
+    REQUIRE(std::move(future).get(std::chrono::seconds(30)) == expected);
+
+    // Every requested byte matches the file; every byte between ranges is untouched.
+    std::size_t wrong = 0;
+    std::size_t next  = 0;
+    auto const* bytes = destination.get();
+    for (auto const& r : ranges) {
+      for (; next < r.offset; ++next) {
+        wrong += bytes[next] != untouched ? 1 : 0;
+      }
+      for (; next < r.end(); ++next) {
+        wrong += bytes[next] != pattern_byte(next) ? 1 : 0;
+      }
+    }
+    for (; next < total; ++next) {
+      wrong += bytes[next] != untouched ? 1 : 0;
+    }
+    CHECK(wrong == 0);
+
+    // The read really was split: one reactor takes 8 + 8 + 4; two reactors take
+    // their shares in at least three entries between them.
+    auto const gauges = ioctx.reactor_gauges();
+    REQUIRE(gauges.size() == n_reactors);
+    std::uint64_t started = 0;
+    for (auto const& g : gauges) {
+      started += g.requests_started;
+    }
+    if (n_reactors == 1) {
+      CHECK(started == 3);
+    } else {
+      CHECK(started >= 3);
+    }
+  }
+}
+
+TEST_CASE("io_uring ioctx reactor_gauges reports low requests queued behind a held request",
+          "[io][uring][uring_ioctx][gauges]")
+{
+  using cucascade::io::io_priority;
+  constexpr std::size_t n_reactors = 2;
+  constexpr std::size_t n_ranges   = 40;
+  constexpr std::size_t stride     = 64UL << 10;
+  constexpr std::size_t total      = n_ranges * stride;
+  pattern_file const file{total};
+  auto const object = file.open();
+
+  // Destinations and staging first: they must outlive the reactors.
+  aligned_bytes plug_dst{2 * IO_BLOCK_SIZE};
+  aligned_bytes destination{total};
+  ioctx_staging staging{n_reactors};
+  uring_ioctx ioctx{n_reactors, staging.context()};
+  ioctx.start();
+  worker_plug plug;
+
+  // A two-slice read lands one slice on each reactor; both workers then hold
+  // inside its completion, so nothing queued after it can be taken.
+  std::vector<prepared_io_slice> plug_slices;
+  for (std::size_t i = 0; i < n_reactors; ++i) {
+    plug_slices.emplace_back(range{i * IO_BLOCK_SIZE, IO_BLOCK_SIZE},
+                             host_buffer{plug_dst.get() + i * IO_BLOCK_SIZE});
+    plug_slices.back().on_complete = plug.completion();
+  }
+  auto plugged = ioctx.mixed_readv_async_io(*object, std::move(plug_slices));
+  REQUIRE(plug.wait_held(n_reactors));
+
+  // 40 equal low ranges: 20 per reactor, each share split 8 + 8 + 4.
+  std::vector<cucascade::io::slice> slices;
+  for (std::size_t i = 0; i < n_ranges; ++i) {
+    slices.emplace_back(i * stride, stride, destination.get() + i * stride);
+  }
+  auto low = ioctx.host_readv_async_io(*object, slices, io_priority::low);
+
+  auto const gauges = ioctx.reactor_gauges();
+  REQUIRE(gauges.size() == n_reactors);
+  for (auto const& g : gauges) {
+    CHECK(g.queued_low_requests == 3);
+    CHECK(g.queued_requests == 3);
+    CHECK(g.queued_bytes == (n_ranges / n_reactors) * stride);
+  }
+
+  plug.release();
+  CHECK(std::move(plugged).get(std::chrono::seconds(30)) == n_reactors * IO_BLOCK_SIZE);
+  CHECK(std::move(low).get(std::chrono::seconds(30)) == total);
+  for (std::size_t i = 0; i < total; i += 4093) {
+    REQUIRE(destination.get()[i] == pattern_byte(i));
+  }
+  for (auto const& g : ioctx.reactor_gauges()) {
+    CHECK(g.queued_low_requests == 0);
+  }
+}
+
+TEST_CASE("io_uring cancels a parked low request whose coordinator stopped",
+          "[io][uring][priority][cancel]")
+{
+  // Strict priority and a long high request keep the low request parked; stopping
+  // its coordinator must settle it without waiting for the high tier to drain,
+  // and must not disturb the high request.
+  using cucascade::io::io_priority;
+  constexpr std::size_t n_slices = 512;
+  constexpr std::size_t stride   = 64UL << 10;
+  constexpr std::size_t total    = n_slices * stride;
+  pattern_file const file{total};
+  auto const ranges      = slice_ranges(n_slices, stride, false);
+  auto const low_object  = file.open();
+  auto const high_object = file.open();
+
+  // Destinations first: they must outlive the reactor.
+  aligned_bytes low_dst{total};
+  aligned_bytes high_dst{total};
+  spp_reactor reactor{1, 0};
+
+  std::shared_ptr<grouped_coordinator> low_coordinator;
+  auto low = enqueue_ranges(
+    reactor.get(), low_object, ranges, low_dst.get(), io_priority::low, &low_coordinator);
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (reactor.get().take_gauges().requests_started == 0) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::yield();
+  }
+  auto high = enqueue_ranges(reactor.get(), high_object, ranges, high_dst.get(), io_priority::high);
+  REQUIRE(wait_for_preemption(reactor.get()));
+
+  cancel_coordinator(*low_coordinator);
+  auto const low_outcome = settle_within(std::move(low), std::chrono::seconds(10));
+  CHECK(low_outcome.ready);
+  CHECK(low_outcome.error == std::errc::interrupted);
+
+  CHECK(std::move(high).get(std::chrono::seconds(30)) == total);
+  for (std::size_t i = 0; i < total; i += 4093) {
+    REQUIRE(high_dst.get()[i] == pattern_byte(i));
+  }
+  CHECK(reactor.get().queued_bytes() == 0);
+}
+
+TEST_CASE("io_uring settles a stopped parked low request under continuous high traffic",
+          "[io][uring][priority][cancel]")
+{
+  // Strict priority (low_service_interval = 0) and a high stream that never lets
+  // the high tier drain: the parked request is never resumed, so only the
+  // per-pass check of its coordinator can settle it.
+  using cucascade::io::io_priority;
+  constexpr std::size_t stride      = 64UL << 10;
+  constexpr std::size_t n_low       = 512;
+  constexpr std::size_t high_slices = 4;
+  constexpr std::size_t max_backlog = 32;
+  constexpr std::size_t n_slices    = n_low + high_slices;
+  pattern_file const file{n_slices * stride};
+  auto const all   = slice_ranges(n_slices, stride, false);
+  auto const split = all.begin() + static_cast<std::ptrdiff_t>(n_low);
+  std::vector<range> const low_ranges(all.begin(), split);
+  std::vector<range> const high_ranges(split, all.end());
+  auto const object = file.open();
+
+  // Destinations first: they must outlive the reactor.
+  aligned_bytes low_dst{n_slices * stride};
+  aligned_bytes high_dst{n_slices * stride};
+  spp_reactor reactor{1, 0};
+
+  struct shared_state {
+    std::atomic<std::size_t> highs_issued{0};
+    std::atomic<std::size_t> highs_done{0};
+    std::atomic<std::size_t> high_errors{0};
+  };
+  auto state = std::make_shared<shared_state>();
+
+  std::shared_ptr<grouped_coordinator> low_coordinator;
+  auto low = enqueue_ranges(
+    reactor.get(), object, low_ranges, low_dst.get(), io_priority::low, &low_coordinator);
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (reactor.get().take_gauges().requests_started == 0) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::yield();
+  }
+  {
+    // Joined (stop requested first) before the reactor and buffers go away, even
+    // when an assertion below throws.
+    std::jthread high_traffic([&](std::stop_token const& stop) {
+      while (!stop.stop_requested()) {
+        if (state->highs_issued.load() - state->highs_done.load() >= max_backlog) {
+          std::this_thread::yield();
+          continue;
+        }
+        state->highs_issued.fetch_add(1);
+        enqueue_ranges(reactor.get(), object, high_ranges, high_dst.get(), io_priority::high)
+          .install_callback([state](cucascade::exec::try_t<std::size_t>&& result) {
+            if (!result.has_value()) state->high_errors.fetch_add(1);
+            state->highs_done.fetch_add(1);
+          });
+      }
+    });
+    REQUIRE(wait_for_preemption(reactor.get()));
+
+    cancel_coordinator(*low_coordinator);
+    auto const low_outcome = settle_within(std::move(low), std::chrono::seconds(10));
+    // The high stream is still running: the low request settled without a drain.
+    auto const highs_after_low = state->highs_issued.load();
+    CHECK(low_outcome.ready);
+    CHECK(low_outcome.error == std::errc::interrupted);
+    auto const traffic_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (state->highs_done.load() <= highs_after_low) {
+      REQUIRE(std::chrono::steady_clock::now() < traffic_deadline);
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+  }
+
+  auto const drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (state->highs_done.load() < state->highs_issued.load()) {
+    REQUIRE(std::chrono::steady_clock::now() < drain_deadline);
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+  CHECK(state->high_errors.load() == 0);
+  CHECK(reactor.get().queued_bytes() == 0);
+}
+
+TEST_CASE("io_uring shutdown cancels a parked low request", "[io][uring][priority][shutdown]")
+{
+  using cucascade::io::io_priority;
+  constexpr std::size_t n_slices = 512;
+  constexpr std::size_t stride   = 64UL << 10;
+  constexpr std::size_t total    = n_slices * stride;
+
+  struct outcome_t {
+    bool parked{false};
+    bool low_canceled{false};
+    bool high_settled_cleanly{false};
+    std::size_t queued_bytes{1};
+  };
+
+  auto file     = std::make_shared<pattern_file>(total);
+  auto low_dst  = std::make_shared<aligned_bytes>(total);
+  auto high_dst = std::make_shared<aligned_bytes>(total);
+  auto outcome  = std::make_shared<outcome_t>();
+  auto finished = std::make_shared<std::promise<void>>();
+  auto watchdog = finished->get_future();
+
+  // Detached so a hung shutdown fails the watchdog instead of hanging the binary; the
+  // body reports any exception through the watchdog, as one escaping a thread terminates.
+  std::thread([file, low_dst, high_dst, outcome, finished] {
+    try {
+      auto const ranges = slice_ranges(n_slices, stride, false);
+      // Strict priority, so nothing resumes the parked request before shutdown.
+      spp_reactor reactor{1, 0};
+      auto low =
+        enqueue_ranges(reactor.get(), file->open(), ranges, low_dst->get(), io_priority::low);
+      auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (reactor.get().take_gauges().requests_started == 0 &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+      }
+      auto high =
+        enqueue_ranges(reactor.get(), file->open(), ranges, high_dst->get(), io_priority::high);
+      outcome->parked = wait_for_preemption(reactor.get());
+      reactor.get().shutdown();
+
+      // shutdown() joined the worker, which settles everything it owned on the way out.
+      outcome->low_canceled         = canceled(std::move(low));
+      auto const high_outcome       = settle_within(std::move(high), std::chrono::seconds(0));
+      outcome->high_settled_cleanly = high_outcome.ready && !high_outcome.other_error &&
+                                      (high_outcome.error == std::error_code{}
+                                         ? high_outcome.bytes == total
+                                         : high_outcome.error == std::errc::operation_canceled);
+      outcome->queued_bytes = reactor.get().queued_bytes();
+      finished->set_value();
+    } catch (...) {
+      finished->set_exception(std::current_exception());
+    }
+  }).detach();
+
+  REQUIRE(watchdog.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+  REQUIRE_NOTHROW(watchdog.get());
+  CHECK(outcome->parked);
+  CHECK(outcome->low_canceled);
+  // The high request either beat the shutdown or was canceled; never another error.
+  CHECK(outcome->high_settled_cleanly);
   CHECK(outcome->queued_bytes == 0);
 }

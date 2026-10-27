@@ -56,6 +56,43 @@
 
 namespace cucascade::io::cache {
 
+/// One version of a cached object, keyed by @c io_object::raw_file_cache_id().
+/// Shared by the cache map, handles and in-flight reads.  Opening a new version
+/// of the same object path marks older ones @c retired and drops them from the
+/// map; the last owner's deleter hands their chunk buffers back to the pool.
+struct cache_generation {
+  /// Materialise a chunk for every offset in @p incoming, fold the matching
+  /// entry of @p desired into its populated extent, and count the calling
+  /// request as a subscriber of each.  Returns the chunks in @p incoming
+  /// order.  @p desired runs index-parallel to @p incoming.
+  std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
+                                                   std::span<const chunk_fill> desired);
+
+  std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
+                                          std::size_t size,
+                                          coverage_policy policy) const;
+
+  /// Slot index covering byte @p off.  Callers must bounds-check against
+  /// @c slots.size() — a read past EOF has no slot.
+  [[nodiscard]] std::size_t slot_of(std::size_t off) const noexcept { return off / chunk_size; }
+
+  mutable std::shared_mutex mtx;
+  std::shared_ptr<const io_object> io_obj;
+  std::string key;          ///< @c io_object::raw_file_cache_id()
+  std::string object_path;  ///< @c io_object::object_path(), for grouping generations
+  /// Direct-mapped: slot i covers [i * chunk_size, (i + 1) * chunk_size);
+  /// nullptr means that chunk has never been materialised.  Sized once at
+  /// creation — exactly the capacity the old sorted vector reserved — so a
+  /// lookup is an index instead of a search.
+  std::vector<cached_chunk*> slots;
+  chunk_arena arena;  ///< owns the chunks `slots` points at; append-only
+  std::vector<cached_chunk*> reclaim_claimed;
+  std::vector<std::byte*> reclaim_batch;
+  size_t file_size{0};
+  size_t chunk_size{1};
+  std::atomic<bool> retired{false};
+};
+
 namespace {
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 
@@ -392,6 +429,19 @@ void fs_cache::reclaim_all_chunks() noexcept
       // never pull a buffer out from under a live reader.
       stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false);
       current.push_back(std::move(generation));
+    }
+    // Retired generations are out of _file_cache but may still be held by a
+    // reader of the old version; reclaim them too rather than leaving their
+    // buffers checked out until that reader lets go.  Holding them in
+    // `current` keeps their deleter (which takes _retire_mtx) from running here.
+    for (auto& [_, family] : _generations_by_path) {
+      for (auto const& weak : family) {
+        auto generation = weak.lock();
+        if (!generation || !generation->retired.load(std::memory_order_acquire)) { continue; }
+        std::unique_lock elk(generation->mtx);
+        stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false);
+        current.push_back(std::move(generation));
+      }
     }
     _file_cache.clear();
     _generations_by_path.clear();
@@ -1066,9 +1116,7 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
     completion = std::make_shared<prepared_io_completion>(
       [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
         std::ignore = lifetime;
-        for (auto* chunk : completed) {
-          std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
-        }
+        publish_chunk_fill(completed, host_ok);
       });
     for (auto const& raw : requests) {
       if (raw.size() == 0) { continue; }
@@ -1400,9 +1448,7 @@ bool fs_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcep
     auto completion = std::make_shared<prepared_io_completion>(
       [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
         std::ignore = lifetime;
-        for (auto* chunk : completed) {
-          std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
-        }
+        publish_chunk_fill(completed, host_ok);
       });
     done_owner = std::make_shared<exec::invocable<void(bool) noexcept>>(std::move(on_done));
     terminal   = size_terminal{

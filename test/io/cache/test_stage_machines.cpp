@@ -20,8 +20,11 @@
 #include <cucascade/io/cache/types.hpp>
 
 #include <catch2/catch_all.hpp>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <chrono>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <string>
@@ -85,45 +88,71 @@ struct release_outcome {
   producer_stage::value final;  ///< the stage's state once the waiter returned
 };
 
-// Drives a wait/release pair until the waiter is known to have parked.
+// Linux scheduler state of thread `tid` in this process ('R' running, 'S'
+// sleeping, ...), or '\0' if it cannot be read.
+char thread_state(pid_t tid)
+{
+  std::ifstream stat("/proc/self/task/" + std::to_string(tid) + "/stat");
+  std::string line;
+  if (!std::getline(stat, line)) { return '\0'; }
+  // "tid (comm) S ..." -- comm may contain spaces or ')', so key off the last ')'.
+  auto const close = line.rfind(')');
+  if (close == std::string::npos || close + 2 >= line.size()) { return '\0'; }
+  return line[close + 2];
+}
+
+// Drives a wait/release pair with the waiter known to be parked.
 //
 // Builds a fresh stage at `blocking`, runs `park` on it from a helper thread
 // and `release` from this one, and requires the waiter to return within
 // WAIT_TIMEOUT so a missed notify fails instead of hanging the suite.
 //
-// Nothing can observe "parked inside std::atomic::wait" from outside, so the
-// waiter records the state it saw on entry instead.  If that was `blocking` it
-// parked and `release` is what woke it, so its answer is meaningful.  If it saw
-// a later state, `release` ran first -- under CPU starvation the helper thread
-// can be descheduled between signalling `started` and calling `park` -- and the
-// wait's answer is the documented late-arrival one, which says nothing about
-// the notify.  That attempt is discarded and the scenario runs again on a fresh
-// stage; only a run where every attempt arrives late fails.
+// `release` must not run until the waiter is actually blocked inside
+// std::atomic::wait: a waiter that arrives after `release` takes the
+// documented late-arrival path (wait_till_not_loading, for one, declines on a
+// request already past `loading`), which says nothing about the notify.  The
+// helper publishes its kernel thread id and this thread polls the scheduler
+// state until the helper is sleeping.  After it signals `started` the helper's
+// only blocking point is the futex wait inside `park`; being descheduled
+// before it shows up as runnable ('R'), never sleeping ('S').
+//
+// Every failure path first abandons the stage, which wakes a parked waiter, so
+// the std::async future's destructor cannot hang joining it.
 template <class Park, class Release>
 release_outcome wait_is_released_by(producer_stage::value blocking, Park&& park, Release&& release)
 {
-  constexpr int max_attempts = 20;
-  for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-    auto stage = std::make_shared<producer_stage>();
-    advance_to(*stage, blocking);
+  auto stage = std::make_shared<producer_stage>();
+  advance_to(*stage, blocking);
 
-    auto started = std::make_shared<std::promise<void>>();
-    auto entered = started->get_future();
-    auto done    = std::async(std::launch::async, [stage, &park, started, blocking]() {
-      bool const parked = stage->get() == blocking;
-      started->set_value();
-      return std::pair{parked, park(*stage)};
-    });
+  auto started = std::make_shared<std::promise<pid_t>>();
+  auto entered = started->get_future();
+  auto done    = std::async(std::launch::async, [stage, &park, started]() {
+    started->set_value(static_cast<pid_t>(::syscall(SYS_gettid)));
+    return park(*stage);
+  });
 
-    REQUIRE(entered.wait_for(WAIT_TIMEOUT) == std::future_status::ready);
-    release(*stage);
-    REQUIRE(done.wait_for(WAIT_TIMEOUT) == std::future_status::ready);
-    auto const [parked, reached] = done.get();
-    if (parked) { return {reached, stage->get()}; }
-    WARN("waiter arrived after release on attempt " << attempt << "; retrying on a fresh stage");
+  if (entered.wait_for(WAIT_TIMEOUT) != std::future_status::ready) {
+    stage->mark_abandoned();
+    FAIL("waiter thread never started");
   }
-  FAIL("waiter never parked before release in " << max_attempts << " attempts");
-  return {false, producer_stage::initialized};
+  auto const tid      = entered.get();
+  auto const deadline = std::chrono::steady_clock::now() + WAIT_TIMEOUT;
+  while (thread_state(tid) != 'S') {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      stage->mark_abandoned();
+      FAIL("waiter never blocked in its wait");
+    }
+    std::this_thread::yield();
+  }
+  REQUIRE(stage->get() == blocking);
+
+  release(*stage);
+  if (done.wait_for(WAIT_TIMEOUT) != std::future_status::ready) {
+    stage->mark_abandoned();
+    FAIL("release did not wake the parked waiter");
+  }
+  bool const reached = done.get();
+  return {reached, stage->get()};
 }
 
 }  // namespace

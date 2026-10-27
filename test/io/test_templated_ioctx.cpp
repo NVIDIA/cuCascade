@@ -241,22 +241,42 @@ struct reactor_pool {
     context = std::make_unique<fake_context>(std::move(reactors));
   }
 
-  /// Dispatch one request of @p n_slices slices stamped @p priority; return how
-  /// many requests each reactor received from it.
-  std::vector<std::size_t> dispatch(
-    std::size_t n_slices                = 3,
-    cucascade::io::io_priority priority = cucascade::io::io_priority::automatic)
+  /// Submit one read of @p n_slices host slices stamped @p priority, plus one
+  /// device slice after them when @p device_slice is set; return its future.
+  /// The fake reactors never touch the buffers, so no GPU is needed.
+  [[nodiscard]] cucascade::exec::semi_future<std::size_t> submit(
+    std::size_t n_slices,
+    cucascade::io::io_priority priority = cucascade::io::io_priority::automatic,
+    bool device_slice                   = false)
   {
-    std::vector<std::size_t> before;
-    for (auto* reactor : raw) {
-      before.push_back(reactor->requests.size());
-    }
     std::vector<cucascade::io::prepared_io_slice> slices;
     for (std::size_t i = 0; i < n_slices; ++i) {
       slices.emplace_back(cucascade::io::range{i * 100, 40}, cucascade::io::host_buffer{&byte});
       slices.back().priority = priority;
     }
-    static_cast<void>(context->mixed_readv_async_io(*object, std::move(slices)));
+    if (device_slice) {
+      // An explicit device id keeps dispatch from querying the current CUDA device.
+      slices.emplace_back(
+        cucascade::io::range{n_slices * 100, 40},
+        cucascade::io::device_buffer{&byte, ::cuda::stream_ref{cudaStream_t{nullptr}}, 0});
+      slices.back().priority = priority;
+    }
+    return context->mixed_readv_async_io(*object, std::move(slices));
+  }
+
+  /// Dispatch one request of @p n_slices slices stamped @p priority (plus one
+  /// device slice when @p device_slice is set); return how many requests each
+  /// reactor received from it.
+  std::vector<std::size_t> dispatch(
+    std::size_t n_slices                = 3,
+    cucascade::io::io_priority priority = cucascade::io::io_priority::automatic,
+    bool device_slice                   = false)
+  {
+    std::vector<std::size_t> before;
+    for (auto* reactor : raw) {
+      before.push_back(reactor->requests.size());
+    }
+    static_cast<void>(submit(n_slices, priority, device_slice));
     std::vector<std::size_t> received;
     for (std::size_t i = 0; i < raw.size(); ++i) {
       received.push_back(raw[i]->requests.size() - before[i]);
@@ -341,6 +361,40 @@ TEST_CASE("a host-only range read is split into range_batch_slices-sized request
     CHECK(pool.dispatch(10) == std::vector<std::size_t>{2, 2});
     CHECK(slice_counts(*pool.raw[0]) == std::vector<std::size_t>{3, 2});
     CHECK(slice_counts(*pool.raw[1]) == std::vector<std::size_t>{3, 2});
+  }
+
+  SECTION("batch 3: a split read still settles as one future with the full byte count")
+  {
+    reactor_pool pool{{0, 0}, 3};
+    auto future = pool.submit(10);
+    std::vector<cucascade::io::grouped_io_request*> requests;
+    for (auto* reactor : pool.raw) {
+      for (auto& request : reactor->requests) {
+        requests.push_back(request.get());
+      }
+    }
+    REQUIRE(requests.size() == 4);
+    for (auto* request : requests) {
+      CHECK(request->coordinator == requests.front()->coordinator);
+    }
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      CAPTURE(i);
+      CHECK_FALSE(future.is_ready());
+      complete_request(*requests[i]);
+    }
+    REQUIRE(future.is_ready());
+    CHECK(std::move(future).get() == 10 * 40);
+  }
+
+  SECTION("batch 3: a read carrying a device slice is never split")
+  {
+    reactor_pool pool{{0, 0}, 3};
+    // Nine host slices and one device slice: each reactor's 5-slice partition
+    // would split at batch 3 if the read were host-only.
+    CHECK(pool.dispatch(9, cucascade::io::io_priority::automatic, true) ==
+          std::vector<std::size_t>{1, 1});
+    CHECK(slice_counts(*pool.raw[0]) == std::vector<std::size_t>{5});
+    CHECK(slice_counts(*pool.raw[1]) == std::vector<std::size_t>{5});
   }
 
   SECTION("batch 0 keeps one request per selected reactor")

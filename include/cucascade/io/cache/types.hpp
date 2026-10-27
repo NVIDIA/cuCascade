@@ -38,6 +38,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -932,6 +933,16 @@ struct cached_chunk {
 };
 
 static_assert(sizeof(cached_chunk) == 32, "cached_chunk should stay 4 per cache line");
+
+/// Settle the chunks one physical segment of a cache fill covered: @c cached when
+/// its host leg succeeded, @c load_failed otherwise.  Chunks of other segments
+/// are untouched.  The completion callback of every fs_cache fill.
+inline void publish_chunk_fill(std::span<cached_chunk* const> completed, bool host_ok) noexcept
+{
+  for (auto* chunk : completed) {
+    std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // chunk_arena — append-only, pointer-stable storage for cached_chunk

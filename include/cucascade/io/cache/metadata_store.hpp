@@ -70,9 +70,8 @@ class metadata_store {
   metadata_store& operator=(metadata_store&&)      = delete;
 
   /// Record the metadata for @p obj's cache key, dropping any other generation
-  /// of the same path.  A null @p metadata is silently ignored — symmetric with
-  /// the older @c fs_cache::register_metadata contract so callers that
-  /// pass through pre-parsed metadata don't have to null-check.
+  /// of the same path.  A null @p metadata is ignored, so callers that pass
+  /// through pre-parsed metadata need not null-check.
   void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
 
   /// True when some generation of @p object_path is registered.  A hint for

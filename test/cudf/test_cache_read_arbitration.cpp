@@ -78,7 +78,12 @@ TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
 {
   if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
   arbitration_fixture fixture;
+  CHECK(fixture.datasource->cache_chunk_count() == 0);
   fixture.advise(0);
+  // One read_size range at offset 0 lies inside the first chunk.
+  static_assert(read_size <= controlled_chunk_bytes);
+  CHECK(fixture.datasource->cache_chunk_count() == 1);
+  CHECK(fixture.datasource->demand_wait_ns() == 0);
   std::atomic<bool> prefetched{false};
   std::atomic<int> callbacks{0};
   std::array<std::uint8_t, read_size> destination{};
@@ -105,6 +110,10 @@ TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
   CHECK(prefetched.load(std::memory_order_acquire));
   CHECK(callbacks.load() == 1);
   CHECK(fixture.context->backend().pending_count() == 0);
+  // The read parked on the in-flight prefetch (it was still blocked after
+  // 50ms above), and that wait is charged to the datasource's handle.
+  CHECK(fixture.datasource->demand_wait_ns() > 0);
+  CHECK(fixture.datasource->cache_chunk_count() == 1);
 }
 
 TEST_CASE("a cached device read retires its pin through the stream completion poll",

@@ -90,7 +90,7 @@ constexpr auto POLL_INTERVAL_US =
 }
 
 static_assert(max_slices_per_pass == MAX_NUM_SLOTS,
-              "config::slices_per_pass is validated against the reactor's slot cap");
+              "max_slices_per_pass must match the reactor's slot cap");
 
 /// Per-pass expansion cap for @p configured (see config::slices_per_pass): 0 lifts
 /// the cap, leaving the free staging slots as the only bound.
@@ -499,16 +499,16 @@ uring_reactor::gauges uring_reactor::take_gauges() noexcept
   out.bytes_submitted         = _gauge_bytes_submitted.load(std::memory_order_relaxed);
   out.preemptions             = _gauge_preemptions.load(std::memory_order_relaxed);
   out.low_service_grants      = _gauge_low_service_grants.load(std::memory_order_relaxed);
-  for (std::size_t c = 0; c < 2; ++c) {
-    auto& src  = _gauge_queue_delay[c];
-    auto& dst  = out.queue_delay[c];
+  auto const drain            = [](queue_delay_atomics& src, queue_delay_stats& dst) noexcept {
     dst.count  = src.count.exchange(0, std::memory_order_relaxed);
     dst.sum_ns = src.sum_ns.exchange(0, std::memory_order_relaxed);
     dst.max_ns = src.max_ns.exchange(0, std::memory_order_relaxed);
     for (std::size_t b = 0; b < queue_delay_buckets; ++b) {
       dst.histogram[b] = src.histogram[b].exchange(0, std::memory_order_relaxed);
     }
-  }
+  };
+  drain(_gauge_queue_delay_high, out.queue_delay_high);
+  drain(_gauge_queue_delay_low, out.queue_delay_low);
   return out;
 }
 
@@ -521,7 +521,8 @@ void uring_reactor::record_queue_delay(grouped_io_request const& request) noexce
                                                          request.enqueued_at)
       .count()));
   constexpr auto relaxed = std::memory_order_relaxed;
-  auto& dst              = _gauge_queue_delay[request.priority == io_priority::low ? 1 : 0];
+  auto& dst =
+    request.priority == io_priority::low ? _gauge_queue_delay_low : _gauge_queue_delay_high;
   dst.count.fetch_add(1, relaxed);
   dst.sum_ns.fetch_add(ns, relaxed);
   // Only the worker raises the max; a racing take_gauges() reset can lose one sample's peak.
@@ -1188,6 +1189,12 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           if (parked != nullptr && parked->coordinator == cancelled) {
             cancel_request(parked, canceled_error());
           }
+        }
+        // A parked request with no ops in flight would otherwise only notice its
+        // coordinator stopped (another split failed, or the caller cancelled) once
+        // resumed, holding its credits and future until then.
+        if (parked != nullptr && !parked->coordinator->should_continue()) {
+          cancel_request(parked, canceled_error());
         }
 
         dispatch_pending();

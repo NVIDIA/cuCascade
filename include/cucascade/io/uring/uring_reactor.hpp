@@ -214,7 +214,7 @@ class uring_reactor {
   /// std::bit_width(d) == b, i.e. [2^(b-1), 2^b) us; the last bucket is open-ended.
   static constexpr std::size_t queue_delay_buckets = 26;
 
-  /// One io_priority tier's queue-delay window (see @ref gauges::queue_delay).
+  /// One io_priority tier's queue-delay window (see @ref gauges::queue_delay_for).
   struct queue_delay_stats {
     std::uint64_t count{0};
     std::uint64_t sum_ns{0};
@@ -242,9 +242,16 @@ class uring_reactor {
     /// the bounded-service rule (see @c config::low_service_interval).
     std::uint64_t low_service_grants{0};
     /// Queue delay (enqueue -> first slice expanded) of requests whose first slice
-    /// was expanded since the previous take_gauges(), per priority tier:
-    /// [0] = @c io_priority::high, [1] = @c io_priority::low.
-    queue_delay_stats queue_delay[2]{};
+    /// was expanded since the previous take_gauges(), per priority tier.
+    queue_delay_stats queue_delay_high{};
+    queue_delay_stats queue_delay_low{};
+
+    /// The queue-delay window of @p priority's tier (@c automatic counts as high,
+    /// as requests are resolved before they are queued).
+    [[nodiscard]] queue_delay_stats const& queue_delay_for(io_priority priority) const noexcept
+    {
+      return priority == io_priority::low ? queue_delay_low : queue_delay_high;
+    }
   };
 
   /// Snapshot the gauges and restart the @c max_inflight_ops window.
@@ -316,7 +323,8 @@ class uring_reactor {
     std::atomic<std::uint64_t> max_ns{0};
     std::array<std::atomic<std::uint32_t>, queue_delay_buckets> histogram{};
   };
-  queue_delay_atomics _gauge_queue_delay[2];
+  queue_delay_atomics _gauge_queue_delay_high;
+  queue_delay_atomics _gauge_queue_delay_low;
   /// Record one request's queue delay (worker thread only).
   void record_queue_delay(grouped_io_request const& request) noexcept;
 

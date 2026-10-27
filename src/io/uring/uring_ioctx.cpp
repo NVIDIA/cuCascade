@@ -32,11 +32,6 @@ uring_ioctx::uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::react
 {
 }
 
-// Sirius also runs a gauge-sampler thread here that logs one `[uring_gauges]`
-// DEBUG line per busy reactor every 250 ms, gated on the runtime log level.
-// cuCascade's CUCASCADE_LOG_* macros are compiled out (no sink, no runtime
-// level), so such a sampler could never emit anything; only the data path is
-// kept.  Callers that want the gauges poll reactor_gauges() themselves.
 std::vector<uring_reactor::gauges> uring_ioctx::reactor_gauges() noexcept
 {
   std::vector<uring_reactor::gauges> out;

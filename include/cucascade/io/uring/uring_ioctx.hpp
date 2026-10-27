@@ -44,10 +44,8 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
 
   /// One gauge snapshot per reactor, in reactor order.  Each call restarts the
-  /// reactors' max-inflight and queue-delay windows.
-  ///
-  /// @note Unlike sirius, no background sampler thread logs these periodically:
-  /// cuCascade logging is compiled out, so callers poll this directly.
+  /// reactors' max-inflight and queue-delay windows.  Nothing samples them in
+  /// the background; callers that want them poll this.
   [[nodiscard]] std::vector<uring_reactor::gauges> reactor_gauges() noexcept;
 };
 

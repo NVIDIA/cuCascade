@@ -21,6 +21,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -89,10 +90,20 @@ TEST_CASE("tiered_blocking_queue wakes a blocked consumer and loses nothing unde
   tiered_blocking_queue<int> queue;
   std::atomic<long long> sum{0};
   std::atomic<int> taken{0};
+  // Catch2 assertions are not thread-safe and a throw out of a jthread terminates, so the
+  // producers only count failed enqueues; the main thread checks them after the joins.
+  std::atomic<int> enqueue_failures{0};
+  std::atomic<bool> timed_out{false};
 
   std::jthread consumer([&] {
-    int item = 0;
-    while (taken.load() < 2 * per_producer) {
+    // Bounded, so a lost item fails the test instead of hanging it.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    int item            = 0;
+    while (taken.load() + enqueue_failures.load() < 2 * per_producer) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        timed_out.store(true);
+        return;
+      }
       if (queue.wait_dequeue_timed(item, 10000)) {
         sum += item;
         ++taken;
@@ -101,18 +112,21 @@ TEST_CASE("tiered_blocking_queue wakes a blocked consumer and loses nothing unde
   });
   std::jthread high([&] {
     for (int i = 1; i <= per_producer; ++i) {
-      REQUIRE(queue.enqueue(int{i}, io_priority::high));
+      if (!queue.enqueue(int{i}, io_priority::high)) { enqueue_failures.fetch_add(1); }
     }
   });
   std::jthread low([&] {
     for (int i = 1; i <= per_producer; ++i) {
-      REQUIRE(queue.enqueue(int{i}, io_priority::low));
+      if (!queue.enqueue(int{i}, io_priority::low)) { enqueue_failures.fetch_add(1); }
     }
   });
   high.join();
   low.join();
   consumer.join();
 
+  CHECK(enqueue_failures.load() == 0);
+  CHECK_FALSE(timed_out.load());
+  CHECK(taken.load() == 2 * per_producer);
   constexpr long long expected = 2LL * per_producer * (per_producer + 1) / 2;
   CHECK(sum.load() == expected);
   CHECK(queue.size_approx() == 0);

@@ -507,9 +507,12 @@ TEST_CASE("a reader is never told bytes are present that the loader did not writ
 
   std::atomic<bool> corrupted{false};
   std::atomic<long> concurrent_hits{0};
+  constexpr std::size_t PAGES = CHUNK / PAGE;
+  static_assert(PAGES >= 2);
 
   for (int round = 0; round < 64; ++round) {
-    auto const filled_pages = 1 + (round % 15);
+    // At least one page, never the whole chunk, so a refused tail always exists.
+    auto const filled_pages = std::size_t{1} + static_cast<std::size_t>(round) % (PAGES - 1);
     std::vector<std::uint8_t> buffer(CHUNK, POISON);
     chunk_state s;
     make_allocated(s);
@@ -535,10 +538,13 @@ TEST_CASE("a reader is never told bytes are present that the loader did not writ
       readers.emplace_back([&, r] {
         int attempt = 0;
         while (!published.load() || attempt < 32) {
-          auto const lo = OFF + static_cast<std::size_t>((r + attempt) % 16) * PAGE;
+          auto const lo = OFF + static_cast<std::size_t>(r + attempt) % PAGES * PAGE;
           auto const hi = std::min(lo + PAGE, OFF + CHUNK);
           ++attempt;
-          if (!s.try_pin_covering(OFF, CHUNK, lo, hi)) { continue; }
+          if (!s.try_pin_covering(OFF, CHUNK, lo, hi)) {
+            std::this_thread::yield();
+            continue;
+          }
           for (auto b = lo; b < hi; ++b) {
             if (buffer[b - OFF] != WRITTEN) { corrupted.store(true); }
           }
@@ -563,9 +569,7 @@ TEST_CASE("a reader is never told bytes are present that the loader did not writ
     }
     std::ignore = s.release_read();
 
-    if (filled_pages < 16) {
-      REQUIRE_FALSE(s.try_pin_covering(OFF, CHUNK, OFF, OFF + (filled_pages + 1) * PAGE));
-    }
+    REQUIRE_FALSE(s.try_pin_covering(OFF, CHUNK, OFF, OFF + (filled_pages + 1) * PAGE));
   }
 
   // The concurrent phase is only meaningful if reads actually got through it at
@@ -626,9 +630,7 @@ TEST_CASE("prepared cache completion publishes only its exact physical segment",
 
   auto completion = std::make_shared<cucascade::io::prepared_io_completion>(
     [](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
-      for (auto* chunk : completed) {
-        std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
-      }
+      cucascade::io::cache::publish_chunk_fill(completed, host_ok);
     });
 
   std::array<cached_chunk*, 1> first{&succeeded};

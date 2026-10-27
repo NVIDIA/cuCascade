@@ -24,9 +24,9 @@
 
 namespace cucascade::io::uring {
 
-/// Largest accepted @c config::slices_per_pass: a reactor never owns more than
+/// Largest effective @c config::slices_per_pass: a reactor never owns more than
 /// this many staging slots (each in-flight operation holds at least one), so a
-/// larger cap could never take effect.
+/// larger value is accepted but behaves exactly like this one.
 inline constexpr std::size_t max_slices_per_pass = 64;
 
 struct config {
@@ -35,9 +35,8 @@ struct config {
   ///
   /// Local NVMe has no round trip to hide, so a readahead competes with the
   /// executor's own reads for the same device and just reorders the queue
-  /// rather than adding throughput.  Measured on SF1000 local-parquet, turning
-  /// it off is a large net win, so the local backend defaults to 0 (off).  Set
-  /// a positive value (or `max_readahead_scans`) to opt the local path back in.
+  /// rather than adding throughput, so the local backend defaults to 0 (off).
+  /// Set a positive value to opt the local path back in.
   std::size_t n_max_concurrent_scans{0};
 
   /// Whether the config named @c n_max_concurrent_scans explicitly. Preserved
