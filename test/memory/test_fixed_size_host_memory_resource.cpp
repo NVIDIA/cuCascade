@@ -23,6 +23,7 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <sched.h>
 
 #include <atomic>
 #include <cstddef>
@@ -156,4 +157,23 @@ TEST_CASE("Initial pools are allocated on the calling thread by default", "[fixe
   }
   REQUIRE(state->threads == std::set<std::thread::id>{std::this_thread::get_id()});
   REQUIRE(state->live.load() == 0);
+}
+
+TEST_CASE("NUMA pinned allocation restores the caller's CPU affinity", "[fixed_size_host]")
+{
+  cpu_set_t original;
+  REQUIRE(sched_getaffinity(0, sizeof(original), &original) == 0);
+  cpu_set_t one_cpu;
+  CPU_ZERO(&one_cpu);
+  CPU_SET(sched_getcpu(), &one_cpu);
+  REQUIRE(sched_setaffinity(0, sizeof(one_cpu), &one_cpu) == 0);
+
+  numa_region_pinned_host_memory_resource upstream(0);
+  void* p = upstream.allocate_sync(block_size);
+  cpu_set_t after;
+  REQUIRE(sched_getaffinity(0, sizeof(after), &after) == 0);
+  upstream.deallocate_sync(p, block_size);
+  REQUIRE(sched_setaffinity(0, sizeof(original), &original) == 0);
+
+  REQUIRE(CPU_EQUAL(&after, &one_cpu));
 }
