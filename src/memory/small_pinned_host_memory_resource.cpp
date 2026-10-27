@@ -18,8 +18,6 @@
 #include <cucascade/error.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
-#include <rmm/cuda_device.hpp>
-
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -47,6 +45,45 @@ namespace {
 // cuDF 26.04+ may read hostdevice_vector memory directly from kernels (for example
 // detect_malformed_pages), and this resource advertises ::cuda::mr::device_accessible.
 constexpr unsigned int pinned_host_alloc_flags = cudaHostAllocPortable | cudaHostAllocMapped;
+
+// Event creation must use the freeing stream's device even when another device is current.
+class event_creation_device_guard {
+ public:
+  explicit event_creation_device_guard(int device) noexcept
+  {
+    int current_device = -1;
+    if (cudaGetDevice(&current_device) != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+      return;
+    }
+    if (current_device != device) {
+      if (cudaSetDevice(device) != cudaSuccess) {
+        std::ignore = cudaGetLastError();
+        return;
+      }
+      _previous_device = current_device;
+    }
+    _is_ready = true;
+  }
+
+  event_creation_device_guard(event_creation_device_guard const&)            = delete;
+  event_creation_device_guard& operator=(event_creation_device_guard const&) = delete;
+  event_creation_device_guard(event_creation_device_guard&&)                 = delete;
+  event_creation_device_guard& operator=(event_creation_device_guard&&)      = delete;
+
+  ~event_creation_device_guard() noexcept
+  {
+    if (_previous_device >= 0 && cudaSetDevice(_previous_device) != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+    }
+  }
+
+  [[nodiscard]] bool is_ready() const noexcept { return _is_ready; }
+
+ private:
+  int _previous_device{-1};
+  bool _is_ready{false};
+};
 
 int device_of_stream(::cuda::stream_ref stream) noexcept
 {
@@ -382,7 +419,8 @@ std::optional<cuda::cuda_event> small_pinned_host_memory_resource::event_pool::a
     // Reserve the slot this event occupies when it returns, so release cannot allocate.
     _idle.reserve(_created + 1);
     // An event can be recorded only on a stream of the device that was current at its creation.
-    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{device}};
+    event_creation_device_guard const device_guard{device};
+    if (!device_guard.is_ready()) { return std::nullopt; }
     cuda::cuda_event created{cudaEventDisableTiming};
     ++_created;
     return created;

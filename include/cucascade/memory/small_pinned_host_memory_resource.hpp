@@ -61,7 +61,14 @@ namespace memory {
  * be in flight when this resource is destroyed.
  *
  * Provides the `::cuda::mr::device_accessible` and `::cuda::mr::host_accessible` properties
- * required by `rmm::host_device_async_resource_ref`.
+ * required by `rmm::host_device_async_resource_ref`, so it can serve as cuDF's pinned resource:
+ *
+ * @code
+ *   small_pinned_host_memory_resource slab_mr(host_fixed_mr);
+ *   cudf::set_pinned_memory_resource(slab_mr);
+ *   cudf::set_allocate_host_as_pinned_threshold(
+ *       small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+ * @endcode
  */
 class small_pinned_host_memory_resource {
  public:

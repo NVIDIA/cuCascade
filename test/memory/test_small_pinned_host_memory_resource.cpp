@@ -143,6 +143,13 @@ void require_no_large_activity(small_pinned_host_memory_resource::statistics con
   REQUIRE(stats.large_evictions == 0);
 }
 
+void require_pointer_type(void const* ptr, cudaMemoryType expected)
+{
+  cudaPointerAttributes attributes{};
+  REQUIRE(::cudaPointerGetAttributes(&attributes, ptr) == cudaSuccess);
+  REQUIRE(attributes.type == expected);
+}
+
 }  // namespace
 
 TEST_CASE("Zero-byte allocation returns nullptr", "[small_pinned][statistics]")
@@ -302,7 +309,7 @@ TEST_CASE("Concurrent allocations are thread-safe", "[small_pinned][threading]")
           // Every worker starts allocating at once so that their allocations overlap. A failure to
           // create a later thread stops the waiting ones instead of leaving them blocked.
           while (!start.load(std::memory_order_acquire)) {
-            if (stop.stop_requested()) { return; }
+            if (stop.stop_requested() && !start.load(std::memory_order_acquire)) { return; }
             std::this_thread::yield();
           }
           for (std::size_t i = 0; i < allocs_per_thread; ++i) {
@@ -621,6 +628,8 @@ TEST_CASE("Slab and large reuse work on a real stream", "[small_pinned]")
 TEST_CASE("Destruction with a populated large cache is safe", "[small_pinned]")
 {
   test_fixture f;
+  void* p2 = nullptr;
+  void* p3 = nullptr;
   {
     // Deallocate -> allocate -> deallocate cycles on both paths recycle events through the idle
     // pool, so the events destroyed with this resource include recycled ones, not only fresh
@@ -633,14 +642,19 @@ TEST_CASE("Destruction with a populated large cache is safe", "[small_pinned]")
     mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, s2, 512);
 
     auto* p1 = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 10 * 1024);
-    auto* p2 = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 100 * 1024);
+    p2       = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 100 * 1024);
     mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p1, 10 * 1024);
     mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p2, 100 * 1024);
-    auto* p3 = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 10 * 1024);
+    p3 = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 10 * 1024);
     REQUIRE(p3 == p1);
     mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p3, 10 * 1024);
     REQUIRE(mr.large_cache_bytes() == 16 * 1024 + 128 * 1024);
+    require_pointer_type(p2, cudaMemoryTypeHost);
+    require_pointer_type(p3, cudaMemoryTypeHost);
   }
+  require_pointer_type(p2, cudaMemoryTypeUnregistered);
+  require_pointer_type(p3, cudaMemoryTypeUnregistered);
+  void* c = nullptr;
   {
     // A 32 KB insertion into a cap-full cache of two 16 KB entries evicts both victims but
     // re-acquires only one event, so this resource is destroyed while its pool holds an idle
@@ -650,13 +664,14 @@ TEST_CASE("Destruction with a populated large cache is safe", "[small_pinned]")
     mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, s, 512);
     auto* a = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 9000);
     auto* b = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 9000);
-    auto* c = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 20 * 1024);
+    c       = mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, 20 * 1024);
     mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, a, 9000);
     mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, b, 9000);
     mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, c, 20 * 1024);
     REQUIRE(mr.large_cache_bytes() == 32 * 1024);
+    require_pointer_type(c, cudaMemoryTypeHost);
   }
-  SUCCEED("resources destroyed with cached buffers, attached events, and pooled idle events");
+  require_pointer_type(c, cudaMemoryTypeUnregistered);
 }
 
 TEST_CASE("Bucket rounding handles the largest representable sizes", "[small_pinned]")
@@ -812,43 +827,51 @@ TEST_CASE("Non-OOM pinned allocation failure throws bad_alloc and keeps the cach
   mr.deallocate_sync(reused, seed_bytes);
 }
 
-TEST_CASE("Release paths consume CUDA failures and withhold unconfirmed storage",
+TEST_CASE("Release paths free completed storage and withhold unconfirmed storage",
           "[small_pinned][cuda_errors]")
 {
-  // Inside each blocking_cuda_calls_rejected scope, every wait the resource makes fails. Each
-  // section then checks that the failure did not stay in this thread's last-error state, and that
-  // the storage was neither freed nor reused: a later cudaFreeHost of it succeeds.
+  // Each large-buffer section also runs without rejected calls to prove that confirmed work
+  // releases storage. Failed waits must leave storage pinned without leaving a thread error.
   test_fixture f;
 
   SECTION("uncacheable deallocate")
   {
+    bool const reject_waits     = GENERATE(false, true);
     constexpr std::size_t bytes = 100000;  // 128 KiB bucket, beyond the 64 KiB cap
     small_pinned_host_memory_resource mr{f.upstream, 64 * 1024};
     rmm::cuda_stream other_stream{rmm::cuda_stream::flags::non_blocking};
     auto* ptr = mr.allocate_sync(bytes);
+    require_pointer_type(ptr, cudaMemoryTypeHost);
     {
-      blocking_cuda_calls_rejected rejected;
+      std::optional<blocking_cuda_calls_rejected> rejected;
+      if (reject_waits) { rejected.emplace(); }
       mr.deallocate(other_stream, ptr, bytes);
       REQUIRE(::cudaGetLastError() == cudaSuccess);
     }
-    REQUIRE(::cudaFreeHost(ptr) == cudaSuccess);
+    require_pointer_type(ptr, reject_waits ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered);
+    if (reject_waits) { REQUIRE(::cudaFreeHost(ptr) == cudaSuccess); }
   }
 
   SECTION("deallocate_sync")
   {
+    bool const reject_waits     = GENERATE(false, true);
     constexpr std::size_t bytes = 100000;  // 128 KiB bucket, beyond the 64 KiB cap
     small_pinned_host_memory_resource mr{f.upstream, 64 * 1024};
     auto* ptr = mr.allocate_sync(bytes);
+    require_pointer_type(ptr, cudaMemoryTypeHost);
     {
-      blocking_cuda_calls_rejected rejected;
+      std::optional<blocking_cuda_calls_rejected> rejected;
+      if (reject_waits) { rejected.emplace(); }
       mr.deallocate_sync(ptr, bytes);
       REQUIRE(::cudaGetLastError() == cudaSuccess);
     }
-    REQUIRE(::cudaFreeHost(ptr) == cudaSuccess);
+    require_pointer_type(ptr, reject_waits ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered);
+    if (reject_waits) { REQUIRE(::cudaFreeHost(ptr) == cudaSuccess); }
   }
 
   SECTION("evicting deallocate")
   {
+    bool const reject_waits           = GENERATE(false, true);
     constexpr std::size_t small_bytes = 9000;       // 16 KiB bucket; two fill the 32 KiB cap
     constexpr std::size_t large_bytes = 20 * 1024;  // 32 KiB bucket; evicts both
     small_pinned_host_memory_resource mr{f.upstream, 32 * 1024};
@@ -858,15 +881,23 @@ TEST_CASE("Release paths consume CUDA failures and withhold unconfirmed storage"
     mr.deallocate_sync(a, small_bytes);
     mr.deallocate_sync(b, small_bytes);
     auto* c = mr.allocate_sync(large_bytes);
+    require_pointer_type(a, cudaMemoryTypeHost);
+    require_pointer_type(b, cudaMemoryTypeHost);
     {
-      blocking_cuda_calls_rejected rejected;
+      std::optional<blocking_cuda_calls_rejected> rejected;
+      if (reject_waits) { rejected.emplace(); }
       mr.deallocate(other_stream, c, large_bytes);
       REQUIRE(::cudaGetLastError() == cudaSuccess);
       REQUIRE(mr.get_statistics().large_evictions == 2);
       REQUIRE(mr.large_cache_bytes() == 32 * 1024);
     }
-    REQUIRE(::cudaFreeHost(a) == cudaSuccess);
-    REQUIRE(::cudaFreeHost(b) == cudaSuccess);
+    require_pointer_type(a, reject_waits ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered);
+    require_pointer_type(b, reject_waits ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered);
+    require_pointer_type(c, cudaMemoryTypeHost);
+    if (reject_waits) {
+      REQUIRE(::cudaFreeHost(a) == cudaSuccess);
+      REQUIRE(::cudaFreeHost(b) == cudaSuccess);
+    }
     auto* reused = mr.allocate_sync(large_bytes);
     REQUIRE(reused == c);
     mr.deallocate_sync(reused, large_bytes);
@@ -899,18 +930,22 @@ TEST_CASE("Release paths consume CUDA failures and withhold unconfirmed storage"
 
   SECTION("destructor")
   {
+    bool const reject_waits = GENERATE(false, true);
     // No slab is used, so the destructor has no upstream blocks to retain.
     constexpr std::size_t bytes = 9000;
     std::optional<small_pinned_host_memory_resource> mr{std::in_place, f.upstream};
     auto* ptr = mr->allocate_sync(bytes);
     mr->deallocate_sync(ptr, bytes);
     REQUIRE(mr->large_cache_bytes() == 16 * 1024);
+    require_pointer_type(ptr, cudaMemoryTypeHost);
     {
-      blocking_cuda_calls_rejected rejected;
+      std::optional<blocking_cuda_calls_rejected> rejected;
+      if (reject_waits) { rejected.emplace(); }
       mr.reset();
       REQUIRE(::cudaGetLastError() == cudaSuccess);
     }
-    REQUIRE(::cudaFreeHost(ptr) == cudaSuccess);
+    require_pointer_type(ptr, reject_waits ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered);
+    if (reject_waits) { REQUIRE(::cudaFreeHost(ptr) == cudaSuccess); }
   }
 }
 
