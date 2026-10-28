@@ -73,7 +73,10 @@ struct loaded_library {
   need(api.driver_get_properties, "cuFileDriverGetProperties");
   need(api.handle_register, "cuFileHandleRegister");
   need(api.handle_deregister, "cuFileHandleDeregister");
+  need(api.buf_register, "cuFileBufRegister");
+  need(api.buf_deregister, "cuFileBufDeregister");
   need(api.read, "cuFileRead");
+  need(api.write, "cuFileWrite");
   if (!complete) { return loaded; }
 
   loaded.api  = api;
