@@ -91,6 +91,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/net/test_net_dns.cpp
     io/rest/net/test_net_transport.cpp
     io/uring/test_uring_readv.cpp
+    io/uring/test_uring_write.cpp
     # Main test runner
     unittest.cpp)
 
@@ -155,7 +156,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
               cudf/test_rest_datasource_contracts.cpp
               cudf/test_cache_read_arbitration.cpp
               cudf/test_dispose_eviction.cpp
-              cudf/test_explicit_eviction.cpp)
+              cudf/test_explicit_eviction.cpp
+              cudf/test_write_cache_invalidation.cpp)
   endif()
 
   set_target_properties(cucascade_cudf_tests
