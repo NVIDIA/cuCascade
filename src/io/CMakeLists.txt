@@ -38,7 +38,10 @@ target_sources(
 
 # Modules of the io_uring REST transport (docs/io/rest-uring-design.md).  Each
 # fragment adds its own sources to cucascade_io_objects.
+target_sources(cucascade_io_objects
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rest/errc.cpp)
 include(${CMAKE_CURRENT_SOURCE_DIR}/tls/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/http/sources.cmake)
 
 # Sources include src-private headers (io/detail/..., the transport modules'
 # headers) from src/.
