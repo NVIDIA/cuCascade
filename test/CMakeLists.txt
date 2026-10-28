@@ -87,6 +87,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_shared_byte_span.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
+    io/rest/s3/test_sigv4_write.cpp
     io/rest/s3/test_static_credentials.cpp
     io/rest/net/test_net_dns.cpp
     io/rest/net/test_net_transport.cpp

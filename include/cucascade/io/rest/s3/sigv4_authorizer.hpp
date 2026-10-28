@@ -78,6 +78,18 @@ class sigv4_presigned_authorizer final : public sigv4_authorizer_base {
                                request_method method,
                                std::chrono::seconds timeout) override;
 
+  /// Presigned request of any method (the S3 write path: PUT object / part,
+  /// POST @c ?uploads / @c ?uploadId=U, DELETE @c ?uploadId=U). The method and
+  /// the canonicalized @c spec.query are part of the signed canonical request;
+  /// the payload is @c UNSIGNED-PAYLOAD and only @c host is signed, so
+  /// @c Content-Length, @c If-None-Match, @c Expect and @c Range can be added
+  /// unsigned. Headers are empty. GET / HEAD with an empty query return exactly
+  /// what @ref authorize returns.
+  /// @throw cucascade::io::credential_error on empty bucket / key, an X-Amz-*
+  ///        key inside @c spec.query, or SigV4 failure.
+  authorized_request authorize_request(request_spec const& spec,
+                                       std::chrono::seconds timeout) override;
+
   /// Presigned bucket-level ListObjectsV2: the request params are merged into
   /// the signed query, so the returned URL carries both the list params and the
   /// X-Amz-* auth params; headers are empty.
@@ -114,6 +126,17 @@ class sigv4_header_authorizer final : public sigv4_authorizer_base {
   authorized_request authorize(object_ref const& obj,
                                request_method method,
                                std::chrono::seconds timeout) override;
+
+  /// Header-signed request of any method (the S3 write path). Returns
+  /// @c "{scheme}://{host}/{bucket}/{key}[?{spec.query}]" plus the signed
+  /// headers; the canonicalized query is signed, and
+  /// @c x-amz-content-sha256 is @c UNSIGNED-PAYLOAD when @c spec.has_body, else
+  /// @c sha256(""). Only @c host, @c x-amz-content-sha256, @c x-amz-date (and
+  /// @c x-amz-security-token) are signed. @c timeout is unused.
+  /// @throw cucascade::io::credential_error on empty bucket / key, an X-Amz-*
+  ///        key inside @c spec.query, or SigV4 failure.
+  authorized_request authorize_request(request_spec const& spec,
+                                       std::chrono::seconds timeout) override;
 
   /// Header-signed bucket-level ListObjectsV2: returns a plain
   /// @c "{scheme}://{host}/{bucket}?{canonical_query}" URL plus the signed
