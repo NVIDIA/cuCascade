@@ -40,7 +40,10 @@ namespace cucascade::io::cufile {
  * A pool of @c cufile_reactor s serves device reads with synchronous
  * @c cuFileRead (or, when cuFile cannot or should not serve them, POSIX reads
  * staged through each reactor's pinned scratch) and host reads with POSIX
- * @c pread; the pool shares one @c reactor_context (config only).  Read-only.
+ * @c pread; the pool shares one @c reactor_context (config only).  Writes
+ * (@c open_io_object_for_write and the write API) use @c cuFileWrite for large
+ * aligned device bodies on a real GDS platform and staged / direct @c pwrite
+ * otherwise (see @c cufile_reactor).
  * Selected by @c io_backend::cufile and registered from the datasource factory
  * like the uring / rest backends.
  *
@@ -65,7 +68,11 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
    * A cuFile reactor serves one transfer at a time (synchronous cuFile and POSIX
    * calls), so a request's queue depth is the number of reactors it is spread
    * over.  A vectored read with more slices than the base's two gets every
-   * reactor, least backlogged first.  Other operations keep the base selection.
+   * reactor, least backlogged first.  A host-only vectored write goes to one
+   * reactor: its page-cache writes with early writeback keep the device busy,
+   * and interleaving writers of one file only contends on its inode
+   * (docs/io/gpuio-gds-practices.md section 8).  Other operations keep the base
+   * selection.
    */
   std::vector<cufile_reactor*> next_reactor(cufile_io_object const& object,
                                             std::size_t n_slices,
@@ -88,6 +95,10 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the
   /// static @c cufile_reactor::create_io_object(path) cannot see.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
+
+  /// Opens @p path for writing with this ioctx's @c use_odirect / @c compat_mode.
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) override;
 };
 
 }  // namespace cucascade::io::cufile

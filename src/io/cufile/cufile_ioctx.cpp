@@ -43,6 +43,13 @@ std::shared_ptr<io_object> cufile_ioctx::create_io_object(std::string path)
     cufile_reactor::create_io_object(std::move(path), _config.use_odirect, _config.compat_mode));
 }
 
+std::shared_ptr<io_object> cufile_ioctx::create_io_object_for_write(std::string path,
+                                                                    write_open_options options)
+{
+  return std::shared_ptr<io_object>(cufile_reactor::create_io_object_for_write(
+    std::move(path), options, _config.use_odirect, _config.compat_mode));
+}
+
 path_info cufile_ioctx::path_capability(io_object const& object) const
 {
   auto const* typed = dynamic_cast<cufile_io_object const*>(&object);
@@ -59,6 +66,16 @@ std::vector<cufile_reactor*> cufile_ioctx::next_reactor(cufile_io_object const& 
                                                         int device_id)
 {
   auto const count = _reactors.size();
+  if (type == io_op_type::write_vector_async && device_id < 0 && count > 1) {
+    // A host-only vectored write (device_id stays unresolved without device
+    // slices) goes to one reactor: its page-cache writes with early writeback
+    // already keep the device busy, and interleaving writers of one file only
+    // contends on its inode.
+    auto selected =
+      templated_ioctx<cufile_reactor>::next_reactor(object, n_slices, type, device_id);
+    if (selected.size() > 1) selected.resize(1);
+    return selected;
+  }
   if (type != io_op_type::host_vector_async || n_slices <= 2 || count <= 2) {
     return templated_ioctx<cufile_reactor>::next_reactor(object, n_slices, type, device_id);
   }
