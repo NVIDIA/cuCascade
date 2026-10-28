@@ -136,7 +136,7 @@ class cufile_io_object final : public io_object {
  * @c cuFileReadAsync serialises a stream's operations, runs synchronously in
  * the submitting thread in compatibility mode, and keeps per-stream state keyed
  * by caller stream handles the reactor neither registers nor deregisters.  See
- * docs/io/gpuio-gds-practices.md (G1).
+ * docs/io/gpuio-gds-practices.md, section 2.
  *
  * The worker takes a high-priority request before a low one and parks an active
  * low request at a slice boundary while high requests wait.  Priority is bounded
