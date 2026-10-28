@@ -81,8 +81,10 @@ class WholeEntrypoint(unittest.TestCase):
             (root / "service.py").write_text(
                 'import socket,time,os,signal\nfrom pathlib import Path\nr=Path(os.environ["H_TEST_ROOT"])\ns=socket.socket();s.bind(("127.0.0.1",0));s.listen(1)\n(r/"port").write_text(str(s.getsockname()[1]))\nif os.environ.get("H_TEST_IGNORE_TERM"): signal.signal(signal.SIGTERM,signal.SIG_IGN)\ntime.sleep(60)\n'
             )
-            # Keep actual main/parser/signal/up/down flow; only LIST business work
-            # is replaced in this lifecycle fixture. Real AIS is checked separately.
+            # Keep actual H main/parser/signals/finally and ownership helpers.
+            # AIS up/qualify/down use STUB above; LIST is also replaced. These
+            # harmless-service cases are not real AIS cluster fault tests.
+            # Real AIS root/reverse normal runs provide separate evidence.
             (root / "entry.py").write_text(
                 "import required_ais as h\nh.observe_list=lambda *a: None\nraise SystemExit(h.main())\n"
             )

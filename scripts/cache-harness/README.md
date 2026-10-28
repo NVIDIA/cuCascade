@@ -296,9 +296,13 @@ python3 -B scripts/cache-harness/test_required_ais_lifecycle.py
 
 The first suite rejects the six independent review counterexamples and twenty
 adjacent semantic mutations via both CLIs. The Linux lifecycle suite exercises
-the whole H entrypoint with original ownership helpers and isolated harmless
-services: before launch, before journal persistence and after persistence,
-SIGINT/SIGTERM, repeated signals, deadline, normal completion and cleanup
-escalation. Only its LIST business work is stubbed; actual AIS root/reverse runs
-remain separate evidence. A successful expected-red check still never grants
-full feature qualification.
+the actual H main, argument parsing, signal handling and finally path, with
+original ownership helpers and isolated harmless services. AIS up/qualify/down
+are stubs: up launches the harmless service and gates ownership recording,
+qualify writes a fixed PASS, and down uses the original helpers to clean up that
+service. LIST observation is also stubbed. The 17 scenarios cover before launch,
+before journal persistence and after persistence, SIGINT/SIGTERM, repeated
+signals, deadline, normal completion and cleanup escalation; they are not fault
+tests against a real AIS cluster. Actual AIS root/reverse normal runs remain
+separate evidence. A successful expected-red check still never grants full
+feature qualification.
