@@ -381,9 +381,26 @@ TEST_CASE("uring opens carry the stat identity of their descriptors", "[object_i
   CHECK(first->identity() == identity);
 }
 
-TEST_CASE("uring unstatable objects have no reusable identity", "[object_identity][uring]")
+TEST_CASE("uring writable and unstatable objects have no reusable identity",
+          "[object_identity][uring]")
 {
+  using cucascade::io::file_descriptor;
   using cucascade::io::uring::local_io_object;
+  using cucascade::io::uring::uring_reactor;
+  identity_file const file{4096};
+
+  auto const writer = uring_reactor::create_io_object_for_write(
+    file.path(), {.mode = cucascade::io::write_mode::open_existing});
+  REQUIRE(writer->writable());
+  CHECK(writer->identity().kind == identity_kind::opened_handle);
+  CHECK(writer->identity().size == 0);
+  CHECK(writer->size() == file.bytes());
+  auto const writer_key = writer->identity_cache_key();
+  writer->note_written(2 * file.bytes());
+  CHECK(writer->size() == 2 * file.bytes());
+  CHECK(writer->identity_cache_key() == writer_key);
+  CHECK(writer->identity_cache_key() !=
+        uring_reactor::create_io_object(file.path())->identity_cache_key());
 
   // Without a descriptor to stat, an object keeps its given size and falls back
   // to the open-local identity.
