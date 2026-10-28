@@ -49,6 +49,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -1416,4 +1417,100 @@ TEST_CASE("io_uring shutdown cancels a parked low request", "[io][uring][priorit
   // The high request either beat the shutdown or was canceled; never another error.
   CHECK(outcome->high_settled_cleanly);
   CHECK(outcome->queued_bytes == 0);
+}
+
+namespace {
+
+/** Makes the uring reactors report a failed event record after each H2D copy, for the guard's life.
+ */
+class copy_event_record_failure {
+ public:
+  copy_event_record_failure()
+  {
+    cucascade::io::uring::detail::set_copy_event_record_failure_for_testing(true);
+  }
+  ~copy_event_record_failure()
+  {
+    cucascade::io::uring::detail::set_copy_event_record_failure_for_testing(false);
+  }
+  copy_event_record_failure(copy_event_record_failure const&)            = delete;
+  copy_event_record_failure& operator=(copy_event_record_failure const&) = delete;
+};
+
+/// Hold @p stream on the host for @p duration (a host function that sleeps).
+void hold_stream(cudaStream_t stream, std::chrono::milliseconds duration)
+{
+  auto* const heap = new std::chrono::milliseconds{duration};
+  REQUIRE(cudaLaunchHostFunc(
+            stream,
+            [](void* arg) {
+              std::unique_ptr<std::chrono::milliseconds> const time{
+                static_cast<std::chrono::milliseconds*>(arg)};
+              std::this_thread::sleep_for(*time);
+            },
+            heap) == cudaSuccess);
+}
+
+/// Copy @p bytes of device memory back on a separate stream, so the read does
+/// not wait for work still queued on the stream the device bytes were written on.
+[[nodiscard]] std::vector<std::uint8_t> device_bytes_elsewhere(void const* device,
+                                                               std::size_t bytes)
+{
+  cudaStream_t other{};
+  REQUIRE(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking) == cudaSuccess);
+  std::vector<std::uint8_t> out(bytes);
+  REQUIRE(cudaMemcpyAsync(out.data(), device, bytes, cudaMemcpyDeviceToHost, other) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(other) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(other) == cudaSuccess);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("io_uring device reads that fail after enqueuing a copy settle only once it landed",
+          "[io][uring][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+
+  // The caller's stream is held on the host, so the H2D copy queued behind the
+  // hold cannot have run yet when its event record "fails".  The read reports
+  // the error, but only after the queued copy finished: the destination holds
+  // the file's bytes when the future settles, so the caller may free it (and
+  // the reactor may reuse the staging block the copy reads).
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+  ioctx_staging staging{1};
+  uring_ioctx ioctx{1, staging.context()};
+  ioctx.start();
+  auto const object = file.open();
+
+  cudaStream_t stream{};
+  REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+  void* destination = nullptr;
+  REQUIRE(cudaMalloc(&destination, size) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(destination, 0xAB, size, stream) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  {
+    hold_stream(stream, std::chrono::milliseconds{300});
+    copy_event_record_failure const failing;
+    auto future = ioctx.device_read_async_io(
+      *object, 0, size, static_cast<std::uint8_t*>(destination), ::cuda::stream_ref{stream});
+    CHECK_THROWS(std::move(future).get(std::chrono::seconds(30)));
+  }
+  auto const bytes  = device_bytes_elsewhere(destination, size);
+  std::size_t wrong = 0;
+  for (std::size_t i = 0; i < size; ++i) {
+    wrong += bytes[i] != pattern_byte(i) ? 1 : 0;
+  }
+  CHECK(wrong == 0);
+
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+  REQUIRE(cudaFree(destination) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+  ioctx.shutdown();
 }

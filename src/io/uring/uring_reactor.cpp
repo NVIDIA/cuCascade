@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cassert>
 #include <cerrno>
@@ -62,6 +63,17 @@
 namespace cucascade::io::uring {
 
 namespace {
+
+/// Test seam (see uring/types.hpp).
+std::atomic<bool> fail_copy_event_record{false};
+
+/// Record @p event on @p stream after a copy was enqueued there; tests can make
+/// the record fail (@ref detail::set_copy_event_record_failure_for_testing).
+[[nodiscard]] cudaError_t record_copy_event(cudaEvent_t event, cudaStream_t stream) noexcept
+{
+  if (fail_copy_event_record.load(std::memory_order_relaxed)) return cudaErrorNotPermitted;
+  return cudaEventRecord(event, stream);
+}
 
 // Staging geometry: the reactor stages through whole host-resource blocks, so the slot
 // count is derived from a fixed 64 MiB pinned budget per reactor (the footprint before
@@ -942,9 +954,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           slot.copy_event   = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
           slot.event_device = device;
         }
-        auto const status =
-          copy.copy_async(slot.op->request.io_rng, slot.op->request.iovecs, slot.copy_event->get());
+        auto const stream = copy.d_buffer.stream.get();
+        auto status       = copy.copy_async(slot.op->request.io_rng, slot.op->request.iovecs);
+        if (status == cudaSuccess) status = record_copy_event(slot.copy_event->get(), stream);
         if (status != cudaSuccess) {
+          // Some copies may already be queued on the caller's stream (copy_async
+          // can fail part-way, or only the event record failed): they still read
+          // the staging block and write the destination, so wait for them before
+          // the slot (and its staging) is released and the request settles.
+          std::ignore = cudaStreamSynchronize(stream);
+          std::ignore = cudaGetLastError();
           settle_slot_error(slot, status, true);
           return;
         }
@@ -1425,5 +1444,14 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     cancel_queued(error);
   }
 }
+
+namespace detail {
+
+void set_copy_event_record_failure_for_testing(bool enabled) noexcept
+{
+  fail_copy_event_record.store(enabled, std::memory_order_relaxed);
+}
+
+}  // namespace detail
 
 }  // namespace cucascade::io::uring
