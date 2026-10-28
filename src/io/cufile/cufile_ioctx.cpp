@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +41,16 @@ std::shared_ptr<io_object> cufile_ioctx::create_io_object(std::string path)
 {
   return std::shared_ptr<io_object>(
     cufile_reactor::create_io_object(std::move(path), _config.use_odirect, _config.compat_mode));
+}
+
+path_info cufile_ioctx::path_capability(io_object const& object) const
+{
+  auto const* typed = dynamic_cast<cufile_io_object const*>(&object);
+  if (typed == nullptr) {
+    throw std::invalid_argument(
+      "cufile_ioctx::path_capability: I/O object belongs to another backend");
+  }
+  return probe_object(*typed, _config);
 }
 
 std::vector<cufile_reactor*> cufile_ioctx::next_reactor(cufile_io_object const& object,

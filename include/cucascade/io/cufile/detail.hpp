@@ -25,10 +25,26 @@
  *        should include this header.
  */
 
+#include <cucascade/io/cufile/platform.hpp>
+
 #include <chrono>
 #include <cstddef>
 
 namespace cucascade::io::cufile::detail {
+
+/**
+ * @brief The verdict of @ref probe_path from the evidence already in @p info.
+ *
+ * Reads the policy, platform, storage and opened-file fields and sets
+ * @c capability, @c reason, @c matched_class, @c class_supported and
+ * @c filesystem_supported.  Pure: no I/O, no cuFile calls.
+ */
+void decide_path_capability(path_info& info) noexcept;
+
+/// Whether a CUFILE_FORCE_COMPAT_MODE value forces compatibility mode as
+/// libcufile (1.17) reads it: its first four characters are true, any case;
+/// 1/on/yes do not. Pure.
+[[nodiscard]] bool force_compat_env_on(char const* value) noexcept;
 
 /**
  * @brief Length of the next @c cuFileRead of a device slice.
