@@ -43,6 +43,7 @@ target_sources(cucascade_io_objects
 include(${CMAKE_CURRENT_SOURCE_DIR}/tls/sources.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/rest/http/sources.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/rest/planner/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/net/sources.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/rest/cloud/sources.cmake)
 
 # Sources include src-private headers (io/detail/..., the transport modules'
