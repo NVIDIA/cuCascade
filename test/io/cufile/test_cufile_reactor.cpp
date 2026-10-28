@@ -1455,3 +1455,40 @@ TEST_CASE("cufile throughput probe", "[.cufile-bench]")
     ioctx.shutdown();
   }
 }
+
+TEST_CASE("cufile device reads order after the caller's default streams", "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  // cudaStreamPerThread names the per-thread stream of whichever thread uses it:
+  // the stream gate must be taken on the SUBMITTING thread's.  The legacy
+  // default stream is the same from every thread.
+  auto const [label, caller_stream] =
+    GENERATE(std::pair{"per-thread default stream", cudaStreamPerThread},
+             std::pair{"legacy default stream", cudaStreamLegacy});
+  auto const threshold =
+    GENERATE(std::size_t{cucascade::io::IO_BLOCK_SIZE}, std::size_t{1UL << 40});
+  CAPTURE(label, threshold);
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+  config cfg{};
+  cfg.gds_threshold = threshold;  // cuFile reads, or staged POSIX reads
+  started_ioctx ioctx{cfg, 1};
+  auto object = ioctx.get().open_io_object(file.path());
+
+  void* destination = nullptr;
+  REQUIRE(cudaMalloc(&destination, size) == cudaSuccess);
+  // Hold the caller's stream, then queue a memset of the destination behind it:
+  // a read not ordered after it lands first and is then zeroed.
+  hold_stream(caller_stream, std::chrono::milliseconds{300});
+  REQUIRE(cudaMemsetAsync(destination, 0, size, caller_stream) == cudaSuccess);
+  CHECK(ioctx.get()
+          .device_read_async_io(*object,
+                                0,
+                                size,
+                                static_cast<std::uint8_t*>(destination),
+                                ::cuda::stream_ref{caller_stream})
+          .get(30s) == size);
+  REQUIRE(cudaStreamSynchronize(caller_stream) == cudaSuccess);
+  CHECK(matches_file(device_bytes_elsewhere(destination, size), 0, size));
+  REQUIRE(cudaFree(destination) == cudaSuccess);
+}

@@ -51,6 +51,7 @@
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using cucascade::io::file_descriptor;
@@ -1648,5 +1649,50 @@ TEST_CASE("io_uring device reads that fail after enqueuing a copy settle only on
   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
   REQUIRE(cudaFree(destination) == cudaSuccess);
   REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+  ioctx.shutdown();
+}
+
+TEST_CASE("io_uring device reads order after the caller's default streams", "[io][uring][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+  // cudaStreamPerThread names the per-thread stream of whichever thread uses it:
+  // the H2D copy must be ordered after the SUBMITTING thread's.  The legacy
+  // default stream is the same from every thread.
+  auto const [label, caller_stream] =
+    GENERATE(std::pair{"per-thread default stream", cudaStreamPerThread},
+             std::pair{"legacy default stream", cudaStreamLegacy});
+  CAPTURE(label);
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+  ioctx_staging staging{1};
+  uring_ioctx ioctx{1, staging.context()};
+  ioctx.start();
+  auto const object = file.open();
+
+  void* destination = nullptr;
+  REQUIRE(cudaMalloc(&destination, size) == cudaSuccess);
+  // Hold the caller's stream, then queue a memset of the destination behind it:
+  // a copy not ordered after it lands first and is then zeroed.
+  hold_stream(caller_stream, std::chrono::milliseconds{300});
+  REQUIRE(cudaMemsetAsync(destination, 0, size, caller_stream) == cudaSuccess);
+  CHECK(ioctx
+          .device_read_async_io(*object,
+                                0,
+                                size,
+                                static_cast<std::uint8_t*>(destination),
+                                ::cuda::stream_ref{caller_stream})
+          .get(std::chrono::seconds(30)) == size);
+  REQUIRE(cudaStreamSynchronize(caller_stream) == cudaSuccess);
+  auto const bytes  = device_bytes_elsewhere(destination, size);
+  std::size_t wrong = 0;
+  for (std::size_t i = 0; i < size; ++i) {
+    wrong += bytes[i] != pattern_byte(i) ? 1 : 0;
+  }
+  CHECK(wrong == 0);
+  REQUIRE(cudaFree(destination) == cudaSuccess);
   ioctx.shutdown();
 }

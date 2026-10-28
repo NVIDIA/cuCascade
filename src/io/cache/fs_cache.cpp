@@ -17,6 +17,7 @@
  */
 
 #include <cucascade/cuda/device_copy_batch.hpp>
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
@@ -213,6 +214,9 @@ struct fs_cache::cached_copy_retirement {
   std::latch published{1};
   std::atomic<bool> finished{false};
   bool pins_released{false};
+  /// Set (before @ref signal_published) when the copies were retired by their
+  /// own event rather than a stream lane; see retire_pins_after_stream.
+  std::unique_ptr<cucascade::cuda::cuda_event> copies_done;
 
   ~cached_copy_retirement() { release_pins(); }
 
@@ -233,6 +237,10 @@ struct fs_cache::cached_copy_retirement {
   void wait_and_finish(exec::cuda_event_completion_poll& poll) noexcept
   {
     published.wait();
+    if (copies_done != nullptr) {
+      finish(copies_done->synchronize_no_throw());
+      return;
+    }
     while (!finished.load(std::memory_order_acquire)) {
       switch (poll.wait_for_progress()) {
         case exec::cuda_event_completion_poll::progress::made: break;
@@ -1426,6 +1434,50 @@ void fs_cache::retire_pins_after_stream(::cuda::stream_ref stream,
                                         cucascade::cuda::device_copy_batch const& copies,
                                         std::shared_ptr<cached_copy_retirement> retirement) noexcept
 {
+  if (stream.get() == cudaStreamPerThread) {
+    // The per-thread default stream has the same handle on every thread but is
+    // a different stream on each, so it cannot share a FIFO retirement lane
+    // keyed by handle: one thread's completion would retire another thread's
+    // copies.  Retire this request by its own event, recorded here on the
+    // submitting thread, after its copies.  The event exists before any copy is
+    // enqueued, so nothing can fail between enqueuing and recording but the
+    // record itself.
+    std::unique_ptr<cucascade::cuda::cuda_event> done;
+    try {
+      done = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
+    } catch (...) {
+      done.reset();
+    }
+    cudaError_t status = cudaErrorUnknown;
+    if (done != nullptr) {
+      try {
+        status = copies.enqueue(stream);
+      } catch (...) {
+        status = cudaErrorUnknown;
+      }
+      if (status == cudaSuccess) { status = cudaEventRecord(done->get(), cudaStreamPerThread); }
+      if (status == cudaSuccess) {
+        retirement->copies_done = std::move(done);
+        retirement->signal_published();
+        return;
+      }
+    } else {
+      // No event: run the copies and wait for them on this thread.
+      try {
+        status = copies.enqueue(stream);
+      } catch (...) {
+        status = cudaErrorUnknown;
+      }
+    }
+    // Copies may be queued without an event to wait on: synchronize before the
+    // pins go.
+    auto const sync = cudaStreamSynchronize(cudaStreamPerThread);
+    std::ignore     = cudaGetLastError();
+    retirement->finish(status == cudaSuccess ? sync : status);
+    retirement->signal_published();
+    return;
+  }
+
   exec::retire_lane* lane = nullptr;
   try {
     lane = &_completion_poll.lane_for(stream.get());
