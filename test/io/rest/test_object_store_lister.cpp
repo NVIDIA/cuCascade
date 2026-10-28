@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "utils/child_test_runner.hpp"
+
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/object_store_lister.hpp>
@@ -27,13 +29,18 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -77,9 +84,20 @@ struct observed_query {
 
 class scripted_list_server {
  public:
-  explicit scripted_list_server(std::vector<scripted_page> pages) : _pages(std::move(pages))
+  using page_source = std::function<std::optional<scripted_page>(observed_query const&)>;
+
+  explicit scripted_list_server(std::vector<scripted_page> pages,
+                                page_source source                       = {},
+                                std::size_t observation_limit            = 2048,
+                                std::chrono::milliseconds response_delay = {})
+    : _pages(std::move(pages)),
+      _source(std::move(source)),
+      _observation_limit(observation_limit),
+      _response_delay(response_delay)
   {
-    if (_pages.empty()) { throw std::invalid_argument("scripted LIST server needs a page"); }
+    if (_pages.empty() && !_source) {
+      throw std::invalid_argument("scripted LIST server needs a page");
+    }
 
     _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (_listen_fd < 0) { throw std::runtime_error("socket failed: " + errno_message()); }
@@ -115,8 +133,16 @@ class scripted_list_server {
 
   ~scripted_list_server()
   {
-    _stop.store(true, std::memory_order_relaxed);
+    {
+      std::scoped_lock lock{_observations_mutex};
+      _stop.store(true, std::memory_order_relaxed);
+    }
+    _progress_cv.notify_all();
     if (_listen_fd >= 0) { (void)::shutdown(_listen_fd, SHUT_RDWR); }
+    {
+      std::scoped_lock lock{_client_mutex};
+      if (_client_fd >= 0) { (void)::shutdown(_client_fd, SHUT_RDWR); }
+    }
     if (_thread.joinable()) { _thread.join(); }
     close_listener();
   }
@@ -130,11 +156,28 @@ class scripted_list_server {
   {
     return _request_count.load(std::memory_order_relaxed);
   }
+  [[nodiscard]] std::size_t get_count() const noexcept { return _get_count.load(); }
+  [[nodiscard]] std::size_t head_count() const noexcept { return _head_count.load(); }
+  [[nodiscard]] std::size_t max_page_entries() const noexcept { return _max_page_entries.load(); }
 
   [[nodiscard]] std::vector<observed_query> observations() const
   {
     std::scoped_lock lock{_observations_mutex};
     return _observations;
+  }
+
+  bool wait_for_requests(std::size_t count, std::chrono::milliseconds timeout)
+  {
+    std::unique_lock lock{_observations_mutex};
+    _progress_cv.wait_for(
+      lock, timeout, [&] { return _request_count.load() >= count || _stop.load(); });
+    return _request_count.load() >= count;
+  }
+
+  [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> first_request_at() const
+  {
+    std::scoped_lock lock{_observations_mutex};
+    return _first_request_at;
   }
 
  private:
@@ -157,8 +200,20 @@ class scripted_list_server {
         if (_stop.load(std::memory_order_relaxed)) { return; }
         continue;
       }
+      {
+        std::scoped_lock lock{_client_mutex};
+        if (_stop.load(std::memory_order_relaxed)) {
+          (void)::close(fd);
+          return;
+        }
+        _client_fd = fd;
+      }
       handle_client(fd);
-      (void)::close(fd);
+      {
+        std::scoped_lock lock{_client_mutex};
+        _client_fd = -1;
+        (void)::close(fd);
+      }
     }
   }
 
@@ -167,6 +222,7 @@ class scripted_list_server {
     timeval timeout{};
     timeout.tv_sec = 5;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     std::string request;
     std::array<char, 4096> buffer{};
@@ -177,7 +233,11 @@ class scripted_list_server {
     }
 
     std::string const target = request_target(request);
-    if (request.rfind("GET ", 0) != 0 || target.find("list-type=2") == std::string::npos) {
+    bool const is_get        = request.rfind("GET ", 0) == 0;
+    bool const is_list       = is_get && target.find("list-type=2") != std::string::npos;
+    if (request.rfind("HEAD ", 0) == 0) { _head_count.fetch_add(1); }
+    if (is_get && !is_list) { _get_count.fetch_add(1); }
+    if (!is_list) {
       send_all(fd,
                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: "
                "close\r\n\r\n");
@@ -189,14 +249,25 @@ class scripted_list_server {
                                .prefix             = query_value(target, "prefix")};
     {
       std::scoped_lock lock{_observations_mutex};
-      _observations.push_back(observation);
+      if (_observations.size() < _observation_limit) { _observations.push_back(observation); }
+      if (!_first_request_at) { _first_request_at = std::chrono::steady_clock::now(); }
+      _request_count.fetch_add(1, std::memory_order_relaxed);
     }
-    _request_count.fetch_add(1, std::memory_order_relaxed);
+    _progress_cv.notify_all();
+    if (_response_delay.count() > 0) {
+      std::unique_lock lock{_observations_mutex};
+      if (_progress_cv.wait_for(lock, _response_delay, [&] { return _stop.load(); })) { return; }
+    }
 
-    auto const* page = find_page(observation.continuation_token);
+    auto generated = _source ? _source(observation) : std::optional<scripted_page>{};
+    auto const* page =
+      _source ? (generated ? &*generated : nullptr) : find_page(observation.continuation_token);
     if (page == nullptr) {
       send_all(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
       return;
+    }
+    if (page->objects.size() > _max_page_entries.load()) {
+      _max_page_entries.store(page->objects.size());
     }
 
     std::string const body = page_xml(*page);
@@ -315,12 +386,78 @@ class scripted_list_server {
   int _listen_fd{-1};
   std::uint16_t _port{0};
   std::vector<scripted_page> _pages;
+  page_source _source;
+  std::size_t _observation_limit;
+  std::chrono::milliseconds _response_delay;
+  std::mutex _client_mutex;
+  int _client_fd{-1};
   std::atomic<bool> _stop{false};
   std::atomic<std::size_t> _request_count{0};
+  std::atomic<std::size_t> _get_count{0};
+  std::atomic<std::size_t> _head_count{0};
+  std::atomic<std::size_t> _max_page_entries{0};
   mutable std::mutex _observations_mutex;
+  std::condition_variable _progress_cv;
+  std::optional<std::chrono::steady_clock::time_point> _first_request_at;
   std::vector<observed_query> _observations;
   std::thread _thread;
 };
+
+scripted_list_server::page_source make_listing_source(
+  std::size_t count, std::function<listed_object(std::size_t)> object_at)
+{
+  return [count, object_at = std::move(object_at)](
+           observed_query const& query) -> std::optional<scripted_page> {
+    scripted_page page;
+    page.request_token                      = query.continuation_token;
+    constexpr std::string_view token_prefix = "page /+=";
+    std::string_view token{query.continuation_token};
+    std::size_t offset = 0;
+    if (!token.empty()) {
+      if (!token.starts_with(token_prefix)) { return std::nullopt; }
+      token.remove_prefix(token_prefix.size());
+      auto const parsed = std::from_chars(token.data(), token.data() + token.size(), offset);
+      if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || offset > count) {
+        return std::nullopt;
+      }
+    }
+    std::size_t limit = 1000;
+    if (!query.max_keys.empty()) {
+      auto const* begin = query.max_keys.data();
+      auto const parsed = std::from_chars(begin, begin + query.max_keys.size(), limit);
+      if (parsed.ec != std::errc{} || parsed.ptr != begin + query.max_keys.size() || limit == 0) {
+        return std::nullopt;
+      }
+      limit = std::min(limit, std::size_t{1000});
+    }
+    page.objects.reserve(std::min(limit, count - offset));
+    while (offset < count && page.objects.size() < limit) {
+      auto object = object_at(offset);
+      if (object.key.starts_with(query.prefix)) { page.objects.push_back(std::move(object)); }
+      ++offset;
+    }
+    while (offset < count && !object_at(offset).key.starts_with(query.prefix)) {
+      ++offset;
+    }
+    page.truncated = offset < count;
+    if (page.truncated) { page.next_token = std::string{token_prefix} + std::to_string(offset); }
+    return page;
+  };
+}
+
+scripted_list_server::page_source generated_listing(std::size_t count, std::string prefix)
+{
+  return make_listing_source(count, [prefix = std::move(prefix)](std::size_t index) {
+    return listed_object{prefix + std::to_string(index), static_cast<std::uint64_t>(index)};
+  });
+}
+
+scripted_list_server::page_source fixed_listing(std::vector<listed_object> objects)
+{
+  auto const count = objects.size();
+  return make_listing_source(
+    count, [objects = std::move(objects)](std::size_t index) { return objects[index]; });
+}
 
 class loopback_list_authorizer final : public request_authorizer {
  public:
@@ -344,7 +481,8 @@ class loopback_list_authorizer final : public request_authorizer {
   std::string _endpoint;
 };
 
-config listing_config(std::size_t list_max_matches = 100'000)
+config listing_config(std::size_t list_max_matches = config{}.list_max_matches,
+                      std::size_t list_max_scanned = config{}.list_max_scanned)
 {
   config cfg{};
   cfg.request_timeout_s       = 5;
@@ -356,6 +494,7 @@ config listing_config(std::size_t list_max_matches = 100'000)
   cfg.retry_jitter            = 0ms;
   cfg.honor_retry_after       = false;
   cfg.list_max_matches        = list_max_matches;
+  cfg.list_max_scanned        = list_max_scanned;
   return cfg;
 }
 
@@ -409,13 +548,25 @@ object_store_lister make_direct_lister(std::shared_ptr<stub_page_fetch> fetch,
 }
 
 struct listing_fixture {
-  explicit listing_fixture(std::vector<scripted_page> pages, std::size_t list_max_matches = 100'000)
-    : server(std::move(pages)),
+  explicit listing_fixture(std::vector<scripted_page> pages,
+                           std::size_t list_max_matches             = 100'000,
+                           scripted_list_server::page_source source = {},
+                           std::size_t list_max_scanned             = 1'000'000)
+    : server(std::move(pages), std::move(source)),
       authorizer(std::make_shared<loopback_list_authorizer>(server.endpoint()))
   {
     auto context = std::make_shared<rest_reactor::reactor_context>(
-      listing_config(list_max_matches), authorizer, nullptr);
+      listing_config(list_max_matches, list_max_scanned), authorizer, nullptr);
     ioctx = std::make_shared<rest_ioctx>(1, std::move(context));
+    ioctx->start();
+  }
+
+  explicit listing_fixture(scripted_list_server::page_source source, config cfg = listing_config())
+    : server({}, std::move(source)),
+      authorizer(std::make_shared<loopback_list_authorizer>(server.endpoint()))
+  {
+    auto context = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr);
+    ioctx        = std::make_shared<rest_ioctx>(1, std::move(context));
     ioctx->start();
   }
 
@@ -476,6 +627,35 @@ TEST_CASE("rest ioctx delegates paged listing to its composed lister", "[rest][l
     CHECK_THROWS_WITH(fixture.ioctx->list_objects("bucket", "prefix/", 2, 2),
                       Catch::Matchers::ContainsSubstring("rest_ioctx::list_objects:") &&
                         Catch::Matchers::ContainsSubstring("more than 2 objects"));
+  }
+
+  SECTION("generated pages remain bounded and round-trip opaque tokens")
+  {
+    listing_fixture generated({}, 100'000, generated_listing(1005, "generated/"));
+    std::size_t seen  = 0;
+    std::size_t pages = 0;
+    bool ordered      = true;
+    generated.ioctx->list_objects_paged(
+      "bucket", "generated/", 1000, [&](list_objects_v2_page const& page) {
+        ++pages;
+        CHECK(page.entries.size() <= 1000);
+        for (auto const& entry : page.entries) {
+          ordered =
+            ordered && entry.key == "generated/" + std::to_string(seen) && entry.size == seen;
+          ++seen;
+        }
+        return true;
+      });
+    CHECK(ordered);
+    CHECK(seen == 1005);
+    CHECK(pages == 2);
+    CHECK(generated.server.max_page_entries() == 1000);
+    CHECK(generated.server.request_count() == 2);
+    CHECK(generated.server.get_count() == 0);
+    CHECK(generated.server.head_count() == 0);
+    auto const queries = generated.server.observations();
+    REQUIRE(queries.size() == 2);
+    CHECK(queries[1].continuation_token == "page /+=1000");
   }
 }
 
@@ -607,5 +787,302 @@ TEST_CASE("object store lister rejects unsafe pagination and result growth", "[r
     CHECK_THROWS_WITH(lister.list_objects("bucket", "prefix/"),
                       Catch::Matchers::ContainsSubstring("test_lister::list_objects:") &&
                         Catch::Matchers::ContainsSubstring("more than 1 objects"));
+  }
+}
+
+TEST_CASE("rest_ioctx lists S3 objects with sizes and follows encoded continuation tokens",
+          "[rest][listing]")
+{
+  listing_fixture fixture{fixed_listing({{"data/part-000.parquet", 11},
+                                         {"data/year=2024/part-001.parquet", 22},
+                                         {"data/year=2025/part-002.parquet", 0},
+                                         {"other/ignored.parquet", 99}})};
+  auto listed = fixture.ioctx->list_objects("bucket", "data/", 1);
+  REQUIRE(listed.size() == 3);
+  CHECK(listed[0].key == "data/part-000.parquet");
+  CHECK(listed[0].size == 11);
+  CHECK(listed[1].key == "data/year=2024/part-001.parquet");
+  CHECK(listed[1].size == 22);
+  CHECK(listed[2].key == "data/year=2025/part-002.parquet");
+  CHECK(listed[2].size == 0);
+  CHECK(fixture.server.request_count() == 3);
+  CHECK(fixture.server.get_count() == 0);
+  CHECK(fixture.server.head_count() == 0);
+  auto const queries = fixture.server.observations();
+  REQUIRE(queries.size() == 3);
+  CHECK(queries[1].continuation_token == "page /+=1");
+  CHECK(queries[2].continuation_token == "page /+=2");
+}
+
+// Child half of "rest_ioctx terminates empty LIST loops ...": that test runs
+// this case in a forked child against its own server, so a LIST that never
+// terminates can be killed instead of hanging the suite.
+TEST_CASE("rest LIST loop watchdog child runner", "[.][rest][listing][watchdog_child]")
+{
+  auto const* endpoint = std::getenv("CUCASCADE_TEST_REST_LIST_WATCHDOG_ENDPOINT");
+  if (endpoint == nullptr) { SKIP("requires the parent-owned LIST endpoint"); }
+  auto authorizer = std::make_shared<loopback_list_authorizer>(endpoint);
+  auto services =
+    std::make_shared<rest_reactor::reactor_context>(listing_config(), authorizer, nullptr);
+  auto context = std::make_shared<rest_ioctx>(1, std::move(services));
+  context->start();
+  std::string error;
+  try {
+    (void)context->list_objects("bucket", "loop/", 1);
+  } catch (std::exception const& e) {
+    error = e.what();
+  }
+  INFO(error);
+  CHECK((error.find("continuation token did not advance") != std::string::npos ||
+         (error.find("truncated") != std::string::npos &&
+          error.find("no entries") != std::string::npos)));
+}
+
+TEST_CASE("rest_ioctx terminates empty LIST loops whose continuation token repeats or alternates",
+          "[rest][listing]")
+{
+  for (bool alternate : {false, true}) {
+    DYNAMIC_SECTION((alternate ? "alternating empty tokens" : "repeated empty token"))
+    {
+      scripted_list_server server{
+        {scripted_page{
+           .request_token = "", .objects = {}, .truncated = true, .next_token = "first"},
+         scripted_page{.request_token = "first",
+                       .objects       = {},
+                       .truncated     = true,
+                       .next_token    = alternate ? "second" : "first"},
+         scripted_page{
+           .request_token = "second", .objects = {}, .truncated = true, .next_token = "first"}},
+        {},
+        2048,
+        100ms};
+      cucascade::test::child_test_runner child{
+        "rest LIST loop watchdog child runner",
+        {{"CUCASCADE_TEST_REST_LIST_WATCHDOG_ENDPOINT", server.endpoint()}}};
+      bool const request_seen = server.wait_for_requests(1, 10s);
+      bool completed          = false;
+      if (request_seen) {
+        auto const first = server.first_request_at();
+        REQUIRE(first.has_value());
+        completed = child.wait_until(*first + 5s);
+      }
+      if (!completed) { child.stop(); }
+      INFO(child.output());
+      INFO("LIST requests=" << server.request_count());
+      REQUIRE(request_seen);
+      CHECK(completed);
+      CHECK(WIFEXITED(child.status()));
+      if (WIFEXITED(child.status())) { CHECK(WEXITSTATUS(child.status()) == 0); }
+      CHECK(server.request_count() <= 3);
+    }
+  }
+}
+
+TEST_CASE(
+  "rest_ioctx accepts an empty final LIST page and rejects a truncated page without a continuation "
+  "token",
+  "[rest][listing]")
+{
+  SECTION("empty final page")
+  {
+    listing_fixture fixture{fixed_listing({})};
+    auto listed = fixture.ioctx->list_objects("bucket", "empty/", 1);
+    CHECK(listed.empty());
+    CHECK(fixture.server.request_count() == 1);
+  }
+  SECTION("truncated page without a continuation token")
+  {
+    listing_fixture fixture{
+      {scripted_page{.request_token = "", .objects = {}, .truncated = true, .next_token = ""}}};
+    CHECK_THROWS_WITH(fixture.ioctx->list_objects("bucket", "empty/", 1),
+                      Catch::Matchers::ContainsSubstring("without") &&
+                        Catch::Matchers::ContainsSubstring("continuation token"));
+    CHECK(fixture.server.request_count() == 1);
+  }
+}
+
+TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps", "[rest][listing]")
+{
+  std::vector<listed_object> const objects{
+    {"data/a.parquet", 1}, {"data/b.parquet", 2}, {"data/c.parquet", 3}};
+  SECTION("sink false stops after one page")
+  {
+    listing_fixture fixture{fixed_listing(objects)};
+    std::size_t pages = 0;
+    fixture.ioctx->list_objects_paged("bucket", "data/", 1, [&](list_objects_v2_page const& page) {
+      ++pages;
+      REQUIRE(page.entries.size() == 1);
+      CHECK(page.entries[0].key == "data/a.parquet");
+      return false;
+    });
+    CHECK(pages == 1);
+    CHECK(fixture.server.request_count() == 1);
+  }
+  SECTION("wrapper throws instead of truncating past max_keys")
+  {
+    listing_fixture fixture{fixed_listing(objects)};
+    CHECK_THROWS_WITH(fixture.ioctx->list_objects("bucket", "data/", 1000, 2),
+                      Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
+    CHECK(fixture.ioctx->list_objects("bucket", "data/", 1000, 3).size() == 3);
+  }
+  SECTION("primitive throws instead of scanning unbounded pages")
+  {
+    listing_fixture fixture{fixed_listing(objects)};
+    CHECK_THROWS_WITH(fixture.ioctx->list_objects_paged(
+                        "bucket", "data/", 1, [](list_objects_v2_page const&) { return true; }, 2),
+                      Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
+  }
+  SECTION("primitive uses configured scanned cap unless an explicit override is passed")
+  {
+    auto cfg             = listing_config();
+    cfg.list_max_scanned = 2;
+    listing_fixture capped{fixed_listing(objects), cfg};
+    CHECK_THROWS_WITH(capped.ioctx->list_objects_paged(
+                        "bucket", "data/", 1, [](list_objects_v2_page const&) { return true; }),
+                      Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
+    listing_fixture overridden{fixed_listing(objects), cfg};
+    std::size_t pages = 0;
+    overridden.ioctx->list_objects_paged(
+      "bucket",
+      "data/",
+      1,
+      [&](list_objects_v2_page const& page) {
+        ++pages;
+        REQUIRE(page.entries.size() == 1);
+        return true;
+      },
+      3);
+    CHECK(pages == 3);
+    CHECK(overridden.server.request_count() == 3);
+  }
+  SECTION("wrapper uses configured matched cap unless an explicit override is passed")
+  {
+    auto cfg             = listing_config();
+    cfg.list_max_matches = 2;
+    listing_fixture capped{fixed_listing(objects), cfg};
+    CHECK_THROWS_WITH(capped.ioctx->list_objects("bucket", "data/", 1000),
+                      Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
+    listing_fixture overridden{fixed_listing(objects), cfg};
+    auto all = overridden.ioctx->list_objects("bucket", "data/", 1000, 3);
+    CHECK(all.size() == 3);
+    CHECK(overridden.server.request_count() == 1);
+  }
+  SECTION("empty prefix returns an empty vector")
+  {
+    listing_fixture fixture{fixed_listing(objects)};
+    CHECK(fixture.ioctx->list_objects("bucket", "missing/", 1).empty());
+    CHECK(fixture.server.request_count() == 1);
+  }
+}
+
+TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumulating pages",
+          "[rest][listing]")
+{
+  SECTION("scanned cap triggers page-by-page with one page held at a time")
+  {
+    auto cfg             = listing_config();
+    cfg.list_max_scanned = 5000;
+    listing_fixture fixture{generated_listing(6000, "big/"), cfg};
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+    bool threw             = false;
+    try {
+      fixture.ioctx->list_objects_paged(
+        "bucket", "big/", 1000, [&](list_objects_v2_page const& page) {
+          max_seen = std::max(max_seen, page.entries.size());
+          ++sink_calls;
+          return true;
+        });
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("scanned more than 5000") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK(max_seen <= 1000);
+    CHECK(fixture.server.max_page_entries() <= 1000);
+    CHECK(sink_calls == 5);
+    CHECK(fixture.server.request_count() == 6);
+  }
+  SECTION("matched cap stops the accumulating wrapper")
+  {
+    auto cfg             = listing_config();
+    cfg.list_max_matches = 500;
+    listing_fixture fixture{generated_listing(600, "big/"), cfg};
+    CHECK_THROWS_WITH(fixture.ioctx->list_objects("bucket", "big/", 1000),
+                      Catch::Matchers::ContainsSubstring("more than 500") &&
+                        Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
+    CHECK(fixture.server.request_count() == 1);
+  }
+  SECTION("under the default caps succeeds and preserves generated key order")
+  {
+    listing_fixture fixture{generated_listing(500, "big/")};
+    auto listed = fixture.ioctx->list_objects("bucket", "big/", 1000);
+    REQUIRE(listed.size() == 500);
+    CHECK(listed.front().key == "big/0");
+    CHECK(listed.front().size == 0);
+    CHECK(listed.back().key == "big/499");
+    CHECK(listed.back().size == 499);
+    CHECK(fixture.server.request_count() == 1);
+  }
+  SECTION("early stop returns after the first generated page even for a large prefix")
+  {
+    listing_fixture fixture{generated_listing(100000, "big/")};
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+    fixture.ioctx->list_objects_paged(
+      "bucket", "big/", 1000, [&](list_objects_v2_page const& page) {
+        max_seen = std::max(max_seen, page.entries.size());
+        ++sink_calls;
+        return false;
+      });
+    CHECK(max_seen <= 1000);
+    CHECK(sink_calls == 1);
+    CHECK(fixture.server.request_count() == 1);
+  }
+}
+
+TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
+          "[rest][listing][stress]")
+{
+  if (cucascade::test::run_in_child("CUCASCADE_REST_LIST_STRESS_CHILD", 180s)) { return; }
+
+  SECTION("default scanned cap trips at one million entries without retaining pages")
+  {
+    auto cfg = listing_config();
+    CHECK(cfg.list_max_scanned == 1'000'000);
+    listing_fixture fixture{generated_listing(1'000'001, "big/"), cfg};
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+    bool threw             = false;
+    try {
+      fixture.ioctx->list_objects_paged(
+        "bucket", "big/", 1000, [&](list_objects_v2_page const& page) {
+          max_seen = std::max(max_seen, page.entries.size());
+          ++sink_calls;
+          return true;
+        });
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("scanned more than 1000000") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK(max_seen <= 1000);
+    CHECK(fixture.server.max_page_entries() <= 1000);
+    CHECK(sink_calls == 1000);
+    CHECK(fixture.server.request_count() == 1001);
+  }
+  SECTION("default matched cap trips at one hundred thousand accumulated entries")
+  {
+    auto cfg = listing_config();
+    CHECK(cfg.list_max_matches == 100'000);
+    listing_fixture fixture{generated_listing(100'001, "big/"), cfg};
+    CHECK_THROWS_WITH(fixture.ioctx->list_objects("bucket", "big/", 1000),
+                      Catch::Matchers::ContainsSubstring("more than 100000") &&
+                        Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
+    CHECK(fixture.server.request_count() == 101);
   }
 }

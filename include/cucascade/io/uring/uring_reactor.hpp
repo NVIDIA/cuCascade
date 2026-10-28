@@ -22,6 +22,7 @@
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
+#include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/io/uring/types.hpp>
@@ -35,6 +36,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -104,9 +106,17 @@ class local_io_object : public io_object {
  * @brief Single-threaded local-file I/O reactor.
  *
  * Owns one @c io_uring, one worker thread, a fixed pool of pinned staging
- * blocks, and an MPSC request queue. Physical operations use O_DIRECT only
- * when the worker determines that the complete transfer is compatible.
- * Models the reactor concept consumed by @c templated_ioctx.
+ * blocks, and a two-tier request queue (see @ref io_priority). The worker
+ * takes a high-priority request before a low one, and parks an active low
+ * request at a slice boundary while high requests are waiting, so a demand
+ * read does not wait behind a whole-split readahead.  Priority is bounded,
+ * not strict: after @c config::low_service_interval high requests have
+ * started while low work waited, the low tier gets one turn of at least one
+ * quantum (@c config::slices_per_pass slices) even if high work is waiting, so
+ * a demand read blocked on an in-flight prefetch is not starved by a stream of
+ * other high requests (0 restores strict priority). Physical operations use
+ * O_DIRECT only when the worker determines that the complete transfer is
+ * compatible. Models the reactor concept consumed by @c templated_ioctx.
  */
 class uring_reactor {
  public:
@@ -200,6 +210,53 @@ class uring_reactor {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
 
+  /// Log2 histogram of queue delays: bucket b counts delays d (microseconds) with
+  /// std::bit_width(d) == b, i.e. [2^(b-1), 2^b) us; the last bucket is open-ended.
+  static constexpr std::size_t queue_delay_buckets = 26;
+
+  /// One io_priority tier's queue-delay window (see @ref gauges::queue_delay_for).
+  struct queue_delay_stats {
+    std::uint64_t count{0};
+    std::uint64_t sum_ns{0};
+    std::uint64_t max_ns{0};
+    std::array<std::uint32_t, queue_delay_buckets> histogram{};
+  };
+
+  /// Diagnostic view of the worker's depth and queueing.  The worker publishes
+  /// these with relaxed stores once per loop pass (right before it waits for a
+  /// completion), so every field is approximate and may be one pass stale.
+  struct gauges {
+    std::uint32_t inflight_ops{0};      ///< physical ops owned by the kernel
+    std::uint32_t max_inflight_ops{0};  ///< peak since the previous take_gauges()
+    std::uint32_t pending_ops{0};       ///< planned ops waiting for a staging slot
+    /// Slices of the active request not yet expanded into physical ops.
+    std::uint32_t active_remaining_slices{0};
+    std::size_t queued_requests{0};      ///< requests queued behind the active one
+    std::size_t queued_low_requests{0};  ///< of which on the low-priority tier
+    std::size_t queued_bytes{0};         ///< see @ref queued_bytes
+    std::uint64_t requests_started{0};   ///< cumulative requests taken off the queue
+    std::uint64_t bytes_submitted{0};    ///< cumulative physical bytes submitted
+    /// Cumulative times an active low request was parked for a high one.
+    std::uint64_t preemptions{0};
+    /// Cumulative times the low tier was served ahead of waiting high work by
+    /// the bounded-service rule (see @c config::low_service_interval).
+    std::uint64_t low_service_grants{0};
+    /// Queue delay (enqueue -> first slice expanded) of requests whose first slice
+    /// was expanded since the previous take_gauges(), per priority tier.
+    queue_delay_stats queue_delay_high{};
+    queue_delay_stats queue_delay_low{};
+
+    /// The queue-delay window of @p priority's tier (@c automatic counts as high,
+    /// as requests are resolved before they are queued).
+    [[nodiscard]] queue_delay_stats const& queue_delay_for(io_priority priority) const noexcept
+    {
+      return priority == io_priority::low ? queue_delay_low : queue_delay_high;
+    }
+  };
+
+  /// Snapshot the gauges and restart the @c max_inflight_ops window.
+  [[nodiscard]] gauges take_gauges() noexcept;
+
   /// Whether @p path can be served by this reactor.  Local-disk only:
   /// returns true iff the path refers to an existing, accessible file.
   [[nodiscard]] static bool supports(std::string_view path);
@@ -244,10 +301,39 @@ class uring_reactor {
   std::size_t _bounce_slot_size;
   std::stop_source _stop_source;
   std::jthread _worker;
-  blocking_concurrent_queue<std::unique_ptr<grouped_io_request>> _requests;
+  tiered_blocking_queue<std::unique_ptr<grouped_io_request>> _requests;
   mutable std::mutex _enqueue_mutex;
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
+
+  // Gauges (see @ref gauges): written only by the worker, read by take_gauges().
+  std::atomic<std::uint32_t> _gauge_inflight{0};
+  std::atomic<std::uint32_t> _gauge_max_inflight{0};
+  std::atomic<std::uint32_t> _gauge_pending{0};
+  std::atomic<std::uint32_t> _gauge_active_slices{0};
+  std::atomic<std::uint64_t> _gauge_requests_started{0};
+  std::atomic<std::uint64_t> _gauge_bytes_submitted{0};
+  std::atomic<std::uint64_t> _gauge_preemptions{0};
+  std::atomic<std::uint64_t> _gauge_low_service_grants{0};
+
+  /// Worker-side accumulators behind gauges::queue_delay; take_gauges() swaps them out.
+  struct queue_delay_atomics {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> sum_ns{0};
+    std::atomic<std::uint64_t> max_ns{0};
+    std::array<std::atomic<std::uint32_t>, queue_delay_buckets> histogram{};
+  };
+  queue_delay_atomics _gauge_queue_delay_high;
+  queue_delay_atomics _gauge_queue_delay_low;
+  /// Record one request's queue delay (worker thread only).
+  void record_queue_delay(grouped_io_request const& request) noexcept;
+
+  /// config::slices_per_pass with 0 (no cap) mapped to SIZE_MAX; read once at
+  /// construction.
+  std::size_t _slices_per_pass{1};
+  /// Slices a low request granted service must expand before it can be parked
+  /// again: _slices_per_pass, capped at max_slices_per_pass.
+  std::size_t _low_service_quantum{1};
 };
 
 }  // namespace cucascade::io::uring
