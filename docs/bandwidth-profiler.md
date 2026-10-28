@@ -13,6 +13,7 @@ Measurements flow through the **existing converter registry and each DISK space'
 
 - Measure GPU↔GPU, GPU↔HOST, HOST↔HOST as a full all-pairs matrix.
 - Measure DISK↔{GPU, HOST} for every (disk, non-disk) pair. **No disk↔disk entries** — not a routing path engines care about.
+- Measure REMOTE↔{GPU, HOST} only when `measure_remote_pairs` is set (default off: every iteration uploads, downloads and deletes objects). Never REMOTE↔{DISK, REMOTE}.
 - Measure **both directions** of every pair separately (`src→dst` and `dst→src`). PCIe, NVLink asymmetries, and especially disk read/write asymmetry must be visible.
 - Pure end-to-end function. No caching, no state. Runs at init time.
 - Does **not** go through `memory_reservation_manager` — allocates directly from each space's allocator. Caller is responsible for running this before production load begins.

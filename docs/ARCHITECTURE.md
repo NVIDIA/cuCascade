@@ -56,6 +56,7 @@ graph TB
         MS_GPU[memory_space GPU]
         MS_HOST[memory_space HOST]
         MS_DISK[memory_space DISK]
+        MS_REMOTE[memory_space REMOTE]
         RARA[reservation_aware_resource_adaptor]
         FSHMR[fixed_size_host_memory_resource]
         DAL[disk_access_limiter]
@@ -67,6 +68,7 @@ graph TB
         GPU_MEM[GPU Memory]
         HOST_MEM[Pinned Host Memory]
         DISK_MEM[Disk Storage]
+        REMOTE_MEM[S3 Object Store]
     end
 
     APP --> DRM
@@ -80,16 +82,19 @@ graph TB
     MRM --> MS_GPU
     MRM --> MS_HOST
     MRM --> MS_DISK
+    MRM --> MS_REMOTE
     TD --> RMC
     RMC --> MRM
 
     MS_GPU --> RARA
     MS_HOST --> FSHMR
     MS_DISK --> DAL
+    MS_REMOTE --> DAL
 
     RARA --> GPU_MEM
     FSHMR --> HOST_MEM
     DAL --> DISK_MEM
+    DAL --> REMOTE_MEM
 
     RC --> MS_GPU
     RC --> MS_HOST
@@ -97,17 +102,18 @@ graph TB
 
 ## Memory Tier System
 
-cuCascade organizes memory into three tiers, each with different performance and capacity characteristics:
+cuCascade organizes memory into four tiers, each with different performance and capacity characteristics:
 
 | Tier | Backing | Speed | Capacity | Allocator |
 |------|---------|-------|----------|-----------|
 | **GPU** | Device VRAM | Fastest | Limited (8-80 GB typical) | `reservation_aware_resource_adaptor` |
 | **HOST** | Pinned CPU RAM | Medium | Large (64-512 GB typical) | `fixed_size_host_memory_resource` |
-| **DISK** | NVMe/SSD | Slowest | Very large (TB+) | `disk_access_limiter` |
+| **DISK** | NVMe/SSD | Slow | Very large (TB+) | `disk_access_limiter` |
+| **REMOTE** | S3 object store | Slowest | Effectively unbounded | `disk_access_limiter` (in-flight bytes; see [the REMOTE tier](io/remote-tier-design.md)) |
 
 Each tier is identified by a `memory_space_id` -- a `(Tier, device_id)` pair. For example, GPU device 0 is `(GPU, 0)`, NUMA node 1's host memory is `(HOST, 1)`.
 
-Data flows downward (GPU -> HOST -> DISK) when memory pressure is high (**downgrade**), and upward (DISK -> HOST -> GPU) when data is needed for processing (**upgrade**).
+Data flows downward (GPU -> HOST -> DISK, or GPU/HOST -> REMOTE) when memory pressure is high (**downgrade**), and upward (DISK/REMOTE -> HOST -> GPU) when data is needed for processing (**upgrade**).
 
 ---
 
@@ -369,7 +375,7 @@ Key synchronization primitives:
 | File | Purpose |
 |------|---------|
 | `include/cucascade/memory/common.hpp` | `Tier` enum, `memory_space_id`, factory functions |
-| `include/cucascade/memory/config.hpp` | Configuration structs for GPU, HOST, DISK |
+| `include/cucascade/memory/config.hpp` | Configuration structs for GPU, HOST, DISK, REMOTE |
 | `include/cucascade/memory/memory_reservation_manager.hpp` | Central reservation coordinator and strategies |
 | `include/cucascade/memory/memory_space.hpp` | Per-location memory container |
 | `include/cucascade/memory/memory_reservation.hpp` | Reservation objects, arenas, and limit policies |

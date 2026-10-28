@@ -354,6 +354,18 @@ it already does for opens):
 - **Signing:** `request_method` gains `PUT`, `POST` and `DELETE`; bodies are
   `UNSIGNED-PAYLOAD` (S3); header SigV4 signs `x-amz-content-sha256: UNSIGNED-PAYLOAD` for bodies
   and `sha256("")` for the empty-body requests, as before.
+- **Delete:** `ioctx::remove_io_object[_async]` maps to `DeleteObject` (`DELETE /bucket/key`, an
+  engine control call signed through `authorize_request`, retried like the other control calls
+  with `max_retry_attempts`; a 403 is final). 204 and 404 `NoSuchKey` are success (the key is gone), also
+  while the reactor stops; another 404 (e.g. `NoSuchBucket`) fails, and a 404 whose body was cut
+  off before its code was read is retried like a transport error.
+  `rest_reactor::delete_object_async` runs it on the worker (`io_priority::low` → bulk class)
+  and keeps the call in a reactor-owned list until it settled, so the returned future may be
+  dropped; before `start()` / after `shutdown()` it runs on a private ring like `head_object`.
+  A delete in flight when the reactor shuts down fails with `operation_canceled`. The ioctx
+  front end invalidates the path before and after, as for a write. The REMOTE memory tier
+  deletes its objects this way (remote-tier-design.md §7); the local backends report
+  `not_supported`.
 - Not supported: server-side copy (`UploadPartCopy`) for the keep-content modes, checksums
   (gpuio has none either), S3 Express sessions (S2).
 
