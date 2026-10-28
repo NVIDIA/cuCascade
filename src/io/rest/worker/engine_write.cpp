@@ -315,6 +315,15 @@ void engine::continue_direct(mail& m) noexcept
 {
   std::string upload_id;
   if (!ensure_upload_id(m, upload_id)) return;
+  // A direct write may have waited for the UploadId: when a sibling of its request failed
+  // meanwhile, it is cancelled rather than sent (its part is left unwritten, as for a failure).
+  if (!m.op->op->coordinator->should_continue()) {
+    auto const canceled = std::make_error_code(std::errc::operation_canceled);
+    auto const r        = m.upload->state.abandon_write(m.part_number, canceled);
+    m.upload->resume(r.flush_waiters, {});
+    m.op->op->finish_error(canceled);
+    return;
+  }
   auto pu = m.upload->state.begin_upload(m.part_number);
   if (!pu) {
     auto const r = m.upload->state.abandon_write(m.part_number, pu.error());

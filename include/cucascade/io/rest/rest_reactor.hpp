@@ -24,7 +24,6 @@
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
-#include <cucascade/io/templated_ioctx.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
@@ -510,25 +509,22 @@ class rest_reactor {
                         std::string_view prefix,
                         std::string_view canonical_query);
 
-  // -- writes: not enabled yet ------------------------------------------------
-  //
-  // The worker carries the S3 upload machinery, but writes are not enabled yet:
-  // the write entry points throw @c not_implemented_error
-  // (@c std::errc::not_supported) without any network traffic, @ref enqueue
-  // fails write and flush slices with it, and @c reactor_write_traits is
-  // specialized below to advertise no writes.
+  // -- writes ---------------------------------------------------------------
 
-  /// Always throws @c not_implemented_error; no object is created.
+  /// Concept stub: an upload needs the pool's context; @c rest_ioctx overrides
+  /// @c create_io_object_for_write.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object_for_write(std::string path,
                                                                     write_open_options options);
 
-  /// Always throws @c not_implemented_error; nothing is sent.
+  /// Synchronous write through the worker (blocking the caller; the reactor must
+  /// run).  Writes every byte or throws.
   std::size_t host_write(const io_object_type& object,
                          std::size_t offset,
                          std::size_t size,
                          const std::uint8_t* src);
 
-  /// Always throws @c not_implemented_error.
+  /// Concept stub: a commit needs a reactor; @c rest_ioctx overrides
+  /// @c flush_io.  Always throws.
   static void flush(const io_object_type& object);
 
   /// Commit @p object through the worker (blocking): upload what is left and
@@ -571,17 +567,3 @@ class rest_reactor {
 };
 
 }  // namespace cucascade::io::rest
-
-namespace cucascade::io {
-
-/// Writes are not enabled on the REST reactor yet (see @c rest_reactor): it
-/// advertises none, so @c templated_ioctx<rest::rest_reactor> reports
-/// @c supports_write() == @c supports_device_write() == false.  Declared here,
-/// next to the reactor, so it precedes every instantiation of the context.
-template <>
-struct reactor_write_traits<rest::rest_reactor> {
-  static constexpr bool supports_write        = false;
-  static constexpr bool supports_device_write = false;
-};
-
-}  // namespace cucascade::io

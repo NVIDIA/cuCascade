@@ -32,7 +32,6 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
-#include <exception>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -385,19 +384,6 @@ void rest_reactor::shutdown() noexcept
 void rest_reactor::enqueue(std::unique_ptr<grouped_io_request> req) noexcept
 {
   if (req == nullptr) return;
-  // Writes are not enabled yet: a write or flush slice fails the whole request.
-  if (std::ranges::any_of(req->slices, [](prepared_io_slice const& slice) {
-        return slice.kind != io_op_kind::read;
-      })) {
-    std::exception_ptr error;
-    try {
-      throw not_implemented_error("rest: write");
-    } catch (...) {
-      error = std::current_exception();
-    }
-    req->cancel_remaining(error);
-    return;
-  }
   auto const bytes = req->remaining_bytes();
   _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
   if (_worker->enqueue(req)) return;
@@ -572,20 +558,43 @@ void rest_reactor::warmup(std::string bucket) { _worker->warmup(std::move(bucket
 std::unique_ptr<rest_reactor::io_object_type> rest_reactor::create_io_object_for_write(
   std::string /*path*/, write_open_options /*options*/)
 {
-  throw not_implemented_error("rest: open_io_object_for_write");
+  throw std::logic_error(
+    "rest_reactor::create_io_object_for_write: use rest_ioctx (an upload needs its context)");
 }
 
 void rest_reactor::flush(io_object_type const& /*object*/)
 {
-  throw not_implemented_error("rest: flush");
+  throw std::logic_error("rest_reactor::flush: use rest_ioctx::flush (a commit needs a reactor)");
 }
 
-std::size_t rest_reactor::host_write(io_object_type const& /*object*/,
-                                     std::size_t /*offset*/,
-                                     std::size_t /*size*/,
-                                     std::uint8_t const* /*src*/)
+std::size_t rest_reactor::host_write(io_object_type const& object,
+                                     std::size_t offset,
+                                     std::size_t size,
+                                     std::uint8_t const* src)
 {
-  throw not_implemented_error("rest: host_write");
+  if (size == 0) return 0;
+  std::shared_ptr<const io_object> owner;
+  try {
+    owner = object.shared_from_this();
+  } catch (std::bad_weak_ptr const&) {
+    owner = std::shared_ptr<const io_object>(&object, [](io_object const*) {});
+  }
+  // One write slice per part: cut at the multiples of the split rounded down to the write
+  // granule, as rest_ioctx sizes the parts.
+  auto const granule = write_granule();
+  auto const split =
+    std::max(granule, _config.write_split_bytes - _config.write_split_bytes % granule);
+  std::vector<prepared_io_slice> slices;
+  for (std::size_t cursor = offset; cursor < offset + size;) {
+    auto const boundary = cursor - cursor % split + split;
+    auto const stop     = std::min(offset + size, boundary);
+    slices.push_back(make_host_write_slice(range{cursor, stop - cursor}, src + (cursor - offset)));
+    cursor = stop;
+  }
+  auto coordinator = std::make_shared<grouped_coordinator>(size, slices.size());
+  auto future      = coordinator->get_future();
+  enqueue(grouped_io_request::create(std::move(owner), std::move(slices), coordinator));
+  return std::move(future).get();
 }
 
 void rest_reactor::commit(io_object_type const& object)

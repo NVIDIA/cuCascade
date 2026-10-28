@@ -146,27 +146,6 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// for back-to-back queries and self-correcting for spaced-out ones.
   void warmup(std::string_view bucket_url) noexcept override;
 
-  // -- Writes: not enabled yet ----------------------------------------------
-  //
-  // REST writes (S3 PUT / multipart upload) are not enabled yet.  Every write
-  // and flush hook reports @c not_implemented_error (@c std::errc::not_supported)
-  // without touching the network: the synchronous ones throw, the asynchronous
-  // ones return a failed future, and @c supports_write() /
-  // @c supports_device_write() stay false.
-
-  std::size_t host_write_io(io_object const& obj,
-                            std::size_t offset,
-                            std::size_t size,
-                            std::uint8_t const* src) override;
-
-  exec::semi_future<std::size_t> mixed_writev_async_io(
-    io_object const& obj, std::vector<prepared_io_slice>&& slices) noexcept override;
-
-  void flush_io(io_object const& obj) override;
-
-  exec::semi_future<void> flush_async_io(io_object const& obj,
-                                         io_priority priority) noexcept override;
-
  protected:
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
@@ -183,10 +162,28 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// HEAD, no probe.
   std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size) override;
 
-  /// Always throws @c not_implemented_error: no object is created, no HEAD is
-  /// sent.
+  /// Open @p path (s3://bucket/key) for writing: a @c rest_write_object whose
+  /// writes become an S3 upload, committed by @c flush (docs/io/rest-uring-design.md
+  /// section 5).  No request is sent here.  @c write_mode::create_or_truncate and
+  /// @c create_new are supported (the latter commits with `If-None-Match: *`);
+  /// the modes that keep existing content fail with @c not_supported (an S3
+  /// object cannot be modified in place).
   std::shared_ptr<io_object> create_io_object_for_write(std::string path,
                                                         write_open_options options) override;
+
+  /// Commit @p object: upload what is left and complete the upload (blocking).  The path's
+  /// cached bytes and metadata are invalidated once the commit settled.
+  void flush_io(io_object const& object) override;
+
+  /// As @ref flush_io, asynchronously: one flush slice on a reactor, the path invalidated once
+  /// it settled and before the returned future resolves.
+  exec::semi_future<void> flush_async_io(io_object const& object,
+                                         io_priority priority) noexcept override;
+
+  /// Cut every write slice that straddles a part boundary at it (one write operation is never
+  /// spread over two S3 parts), then dispatch as the base does.
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept override;
 
  private:
   /// Resolve @p path with a single suffix-range GET: it discovers the size and

@@ -16,6 +16,9 @@
  * limitations under the License.
  */
 
+#include "io/rest/s3/multipart.hpp"
+#include "io/rest/worker/upload.hpp"
+
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uri_parser.hpp>
@@ -316,6 +319,131 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, std::u
                                                                  static_cast<size_t>(known_size)));
 }
 
+std::shared_ptr<io_object> rest_ioctx::create_io_object_for_write(std::string path,
+                                                                  write_open_options options)
+{
+  auto parsed = cucascade::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object_for_write: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  if (_reactors.empty()) {
+    throw std::runtime_error("rest_ioctx::create_io_object_for_write: no reactors");
+  }
+  if (options.mode == write_mode::create_or_open || options.mode == write_mode::open_existing) {
+    throw std::system_error(std::make_error_code(std::errc::not_supported),
+                            "rest_ioctx: an S3 object cannot be modified in place ('" + path +
+                              "' opened in a mode that keeps its content)");
+  }
+  // The part size is the write split (templated_ioctx cuts every write slice at its multiples,
+  // so one write operation never spans two parts), or a multiple of it when size_hint needs
+  // more than 10000 parts.
+  auto const granule = write_granule();
+  auto const split =
+    std::max(granule, _config.write_split_bytes - _config.write_split_bytes % granule);
+  s3::upload_state::options opts;
+  opts.part_size  = s3::choose_part_size(split, options.size_hint, split);
+  opts.create_new = options.mode == write_mode::create_new;
+  auto upload     = std::make_shared<detail::upload_session>(
+    object_ref{parsed.host, parsed.path}, path, opts, _reactors.front()->write_inbox());
+  return std::make_shared<rest_write_object>(
+    std::move(path), std::move(parsed.host), std::move(parsed.path), std::move(upload));
+}
+
+void rest_ioctx::flush_io(io_object const& object)
+{
+  auto const* typed = dynamic_cast<rest_write_object const*>(&object);
+  if (typed == nullptr) {
+    throw std::system_error(
+      std::make_error_code(std::errc::bad_file_descriptor),
+      "rest_ioctx::flush: '" + object.object_path() + "' was not opened for writing");
+  }
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::flush: no reactors"); }
+  // The commit is where the written bytes become the object readers see: drop what the cache
+  // and metadata store hold for the path once it settled (succeeded or not), before the caller
+  // sees it, as a local write does when its bytes land.
+  try {
+    _reactors.front()->commit(*typed);
+  } catch (...) {
+    invalidate_cached(object.object_path());
+    throw;
+  }
+  invalidate_cached(object.object_path());
+}
+
+exec::semi_future<void> rest_ioctx::flush_async_io(io_object const& object,
+                                                   io_priority priority) noexcept
+{
+  // As flush_io: the path is invalidated once the commit settled, before the caller sees it.  The
+  // callback runs on the completing reactor thread, and this ioctx joins its reactors before it
+  // is destroyed.
+  try {
+    exec::promise<void> bridge;
+    auto result         = bridge.get_semi_future();
+    using terminal_type = exec::invocable<void(exec::try_t<void>&&)>;
+    terminal_type terminal{[self   = this,
+                            path   = std::string{object.object_path()},
+                            bridge = std::move(bridge)](exec::try_t<void>&& outcome) mutable {
+      self->invalidate_cached(path);
+      bridge.set_try(std::move(outcome));
+    }};
+    auto backend = templated_ioctx<rest_reactor>::flush_async_io(object, priority);
+    try {
+      std::move(backend).install_callback(std::move(terminal));
+    } catch (...) {
+      if (!backend.valid() || !terminal) throw;
+      terminal(std::move(backend).get_try());
+    }
+    return result;
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
+
+exec::semi_future<std::size_t> rest_ioctx::mixed_writev_async_io(
+  io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept
+{
+  // The base cuts only slices larger than the split, at its multiples; a smaller one may still
+  // straddle a multiple. Part sizes are multiples of the split (create_io_object_for_write), so
+  // cutting at every multiple keeps each write operation inside one part. A slice whose range or
+  // source is invalid is left alone: the base's validation rejects it.
+  try {
+    auto const granule = write_granule();
+    auto const piece =
+      std::max(granule, _config.write_split_bytes - _config.write_split_bytes % granule);
+    std::vector<prepared_io_slice> cut;
+    cut.reserve(slices.size() + 1);
+    for (auto& slice : slices) {
+      auto const begin     = slice.offset();
+      auto const size      = slice.size();
+      auto* const host     = std::get_if<std::uint8_t*>(&slice.h_buffer.buffer);
+      bool const source    = slice.has_device_request() || (host != nullptr && *host != nullptr);
+      bool const straddles = slice.is_write() && source && size > 1 && size <= piece &&
+                             size - 1 <= std::numeric_limits<std::size_t>::max() - begin &&
+                             begin / piece != (begin + size - 1) / piece;
+      if (!straddles) {
+        cut.push_back(std::move(slice));
+        continue;
+      }
+      auto const boundary = begin - begin % piece + piece;
+      auto tail           = slice;
+      slice.rng           = range{begin, boundary - begin};
+      tail.rng            = range{boundary, begin + size - boundary};
+      if (tail.has_device_request()) {
+        tail.d_buffer.data += boundary - begin;
+      } else {
+        tail.h_buffer.buffer = *host + (boundary - begin);
+      }
+      cut.push_back(std::move(slice));
+      cut.push_back(std::move(tail));
+    }
+    slices = std::move(cut);
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+  return templated_ioctx<rest_reactor>::mixed_writev_async_io(object, std::move(slices));
+}
+
 namespace {
 
 /// The bucket out of an @c s3:// URL, whether or not it names an object.
@@ -405,46 +533,6 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
                                                                  probe.window_lo,
                                                                  probe.bytes,
                                                                  std::move(probe.etag)));
-}
-
-// ---------------------------------------------------------------------------
-// Writes: not enabled yet
-// ---------------------------------------------------------------------------
-
-std::shared_ptr<io_object> rest_ioctx::create_io_object_for_write(std::string /*path*/,
-                                                                  write_open_options /*options*/)
-{
-  throw not_implemented_error("rest: open_io_object_for_write");
-}
-
-std::size_t rest_ioctx::host_write_io(io_object const& /*obj*/,
-                                      std::size_t /*offset*/,
-                                      std::size_t /*size*/,
-                                      std::uint8_t const* /*src*/)
-{
-  throw not_implemented_error("rest: host_write");
-}
-
-exec::semi_future<std::size_t> rest_ioctx::mixed_writev_async_io(
-  io_object const& /*obj*/, std::vector<prepared_io_slice>&& /*slices*/) noexcept
-{
-  try {
-    throw not_implemented_error("rest: mixed_writev_async");
-  } catch (...) {
-    return exec::make_semi_future<std::size_t>(std::current_exception());
-  }
-}
-
-void rest_ioctx::flush_io(io_object const& /*obj*/) { throw not_implemented_error("rest: flush"); }
-
-exec::semi_future<void> rest_ioctx::flush_async_io(io_object const& /*obj*/,
-                                                   io_priority /*priority*/) noexcept
-{
-  try {
-    throw not_implemented_error("rest: flush_async");
-  } catch (...) {
-    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
-  }
 }
 
 }  // namespace cucascade::io::rest

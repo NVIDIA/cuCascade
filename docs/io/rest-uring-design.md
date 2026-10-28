@@ -306,10 +306,52 @@ per-connection byte guard (T7) and the WAITALL watchdog stay.
 
 ## 5. S3 writes
 
-The worker carries the S3 upload machinery (multipart protocol, part assembly, commit), but REST
-writes are not enabled yet: `rest_ioctx` and `rest_reactor` report `io::not_implemented_error`
-for every write and flush entry point and `supports_write()` is false
-(docs/io/write-api-design.md section 8). This section is completed when they are enabled.
+The write API maps onto S3 as follows (REST implements `io_write_reactor_c`; the static
+`create_io_object_for_write` / `flush` are stubs and `rest_ioctx` overrides the ioctx hooks, as
+it already does for opens):
+
+- **Open:** `create_or_truncate` (default) starts a new upload; `create_new` adds
+  `If-None-Match: *` to the final PUT or CompleteMultipartUpload; `create_or_open` and
+  `open_existing` fail with `not_supported` (an S3 object cannot be modified in place).
+  `size_hint` picks the part size when it is larger than `write_split_bytes × 10000`.
+  No request is sent at open.
+- **Parts:** the part size `P` (`write_split_bytes`, 16 MiB default, ≥ 5 MiB, a multiple of the
+  write granule) is also `write_split_bytes`, so templated_ioctx cuts every write slice at part
+  boundaries. Part `k + 1` holds bytes `[kP, (k+1)P)`.
+  - A host slice that covers a whole part is uploaded straight from the caller's buffer
+    (UploadPart; head + up to 255 iovecs in one SENDMSG, W1/W2); the write completes when S3
+    answered.
+  - Anything else is copied (memcpy, or D2H on the caller's stream for device sources) into the
+    part's pinned assembly buffer; the write completes once copied. The write that completes a
+    part's coverage uploads it and completes when S3 answered, so upload errors surface on a
+    write, and buffered memory stays bounded by the parts being filled.
+  - The upload id is created lazily by the first part upload (CreateMultipartUpload, never
+    retried after a lost response); parts that need it wait on the object.
+  - Throughput comes from parts in flight (W3: about 128 × 16 MiB parts across the pools on a
+    100 Gbps link); that is the caller's window (writes in flight), not a library knob.
+- **Flush (= commit):** uploads the remaining parts (the last part with its real size; a gap
+  inside a part reads back as zeros; a part that was never written is uploaded as zeros, so holes
+  keep POSIX semantics), then CompleteMultipartUpload (a `200 OK` carrying an S3 error is retried up
+  to 3 times). An object of at most one part that was never uploaded is written with a single PUT.
+  After a successful flush the object is committed: `flush` again is a no-op, further writes fail
+  with `bad_file_descriptor`. After a failed flush the upload stays usable (flush again).
+- **Visibility:** an object store makes the bytes visible at the commit, so for REST "a new
+  io_object opened afterwards sees the bytes" holds after `flush`, not after each write. This is
+  the one documented deviation from the file semantics of the write API. The ioctx invalidates
+  the path's cached bytes and metadata around every write, as for a file, and once more when the
+  commit settled (`flush` and `flush_async`), before the caller sees it.
+- **Identity:** a `rest_write_object` is writable, so its `identity()` is `opened_handle` with
+  size 0 (nothing derived from it is shared with another open); the committed object, opened
+  again, has the new strong ETag as its identity.
+- **Destruction without flush:** the upload is aborted (AbortMultipartUpload, best effort through
+  a live reactor of the ioctx; bucket lifecycle rules collect what is left when the ioctx is gone).
+- **Size:** `size()` is the end of the highest byte written (atomic max, raised before the write's
+  credit settles); `validation_tag()` is empty until the commit, then the new ETag.
+- **Signing:** `request_method` gains `PUT`, `POST` and `DELETE`; bodies are
+  `UNSIGNED-PAYLOAD` (S3); header SigV4 signs `x-amz-content-sha256: UNSIGNED-PAYLOAD` for bodies
+  and `sha256("")` for the empty-body requests, as before.
+- Not supported: server-side copy (`UploadPartCopy`) for the keep-content modes, checksums
+  (gpuio has none either), S3 Express sessions (S2).
 
 ## 6. Configuration (`rest::config`)
 
@@ -383,5 +425,10 @@ Counters kept (E2): `ktls_fallbacks`, `no_pad_set`, `waitall_watchdog_cancels`, 
   - Read robustness (`test_rest_read_robustness.cpp`): demand reads ahead of a prefetch backlog,
     data-path 403 re-sign, Content-Range mismatch, ignored Range, mid-body drop and resume,
     Retry-After replacing the backoff, staging OOM on device reads, transport counters.
+  - Writes (`test_rest_write.cpp`): single PUT at flush (both signing modes), empty objects,
+    multipart with direct and assembled parts, slices crossing part boundaries, holes, `create_new`
+    (412 → `file_exists`), refused open modes, device sources, abort on destruction, transient and
+    final errors on every write request, concurrent writers on three reactors, flush joining,
+    writes during a flush, a lost CreateMultipartUpload response not re-sent.
   - The footer batch with an io_uring that cannot be set up (seccomp in a child process): every
     entry delivered as canceled, on the caller's thread.
