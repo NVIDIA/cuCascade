@@ -5,7 +5,6 @@ import argparse
 import json
 from pathlib import Path
 import signal
-import subprocess
 import sys
 from urllib.parse import urlencode
 import xml.etree.ElementTree as ET
@@ -102,48 +101,68 @@ def observe_list(run, binary):
     save(out / "observation.json", observation)
 
 
+class RunInterrupted(BaseException):
+    """Catchable whole-run termination; never SIGKILL the ownership registrar."""
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument("--probe", type=Path, required=True)
     p.add_argument("--mode", choices=("root", "reverse"), required=True)
-    args, rest = p.parse_known_args()
-    run = args.run_dir.resolve()
+    for name in ("ais-source", "aisnode", "weed", "binary"):
+        p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument("--aisnode-sha256", required=True)
+    p.add_argument("--weed-sha256", default=harness.WEED_SHA)
+    p.add_argument("--port-base", type=int, default=19330)
+    p.add_argument("--ais-port-base", type=int, default=19430)
+    p.add_argument("--ready-timeout", type=float, default=75)
+    p.add_argument("--deadline", type=int, default=300)
+    args = p.parse_args()
+    if args.deadline <= 0 or args.ready_timeout <= 0:
+        p.error("deadlines must be positive")
+    run = args.run_dir = args.run_dir.resolve()
     if run.exists():
         p.error("run-dir must be fresh")
-    script = Path(__file__).with_name("ais_harness.py")
-    common = ["--run-dir", str(run), "--mode", args.mode, *rest]
     commands = []
 
-    def execute(command):
-        result = subprocess.run(
-            [sys.executable, "-B", str(script), command, *common],
-            capture_output=True,
-            text=True,
-            timeout=400,
-        )
-        commands.append(
-            dict(
-                command=command,
-                exit=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
-            )
-        )
-        if result.returncode:
-            raise RuntimeError(f"AIS {command} failed; inspect commands.json")
+    def execute(command, function):
+        entry = dict(command=command, execution="in-process", exit=1)
+        commands.append(entry)
+        try:
+            result = function(args)
+            if (
+                command == "qualify"
+                and harness.load(run / "summary.json")["status"] == "FAIL"
+            ):
+                raise RuntimeError("AIS qualification control failed")
+            entry["exit"] = 0
+            return result
+        except BaseException as exc:
+            entry["error"] = type(exc).__name__ + ": " + str(exc)
+            raise
 
     def interrupted(signum, frame):
-        raise KeyboardInterrupt(f"signal {signum}")
+        # Original launch_owned/defer_signals defers this handler until the
+        # service handle is journaled. No subprocess.run exception can SIGKILL
+        # the registrar in the middle of its ownership critical section.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
+            signal.signal(sig, signal.SIG_IGN)
+        raise RunInterrupted(f"signal {signum}")
 
-    signal.signal(signal.SIGTERM, interrupted)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
+        signal.signal(sig, interrupted)
+    signal.alarm(args.deadline)
     try:
-        execute("up")
+        execute("up", ais.up)
         observe_list(run, args.probe.resolve())
-        execute("qualify")
+        execute("qualify", ais.qualify)
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.alarm(0)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
+            signal.signal(sig, signal.SIG_IGN)
+        # Same original identity-checked TERM/KILL cleanup, with its own bounds.
+        # Even a failed up records the error and attempts idempotent cleanup.
         if (run / "ais-state.json").exists():
             try:
                 ais.down(run)
@@ -158,7 +177,8 @@ def main():
         },
     )
     print(json.dumps(dict(mode=args.mode, status="OBSERVED", run=str(run))))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

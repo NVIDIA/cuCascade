@@ -259,3 +259,46 @@ suite includes complete required-status checks, 17 real-receipt mutation cases
 through both CLIs, and synthetic delegated-wire oracle controls. Synthetic
 successes are never reported as successful engine runs. No performance claim is
 made by these tests.
+
+### H review fixes: evidence and lifecycle
+
+The strict evaluator also validates the concrete Location and owned authority for
+all redirect cases. A first-hop-unsupported verdict requires one corresponding
+307 for every failed operation and **no target or canary request**. Admission
+labels alone are not evidence that the intended negative was delivered.
+
+`required_ais_evidence.py` declares the raw receipts needed by every AIS control,
+rejudges HTTP status/body hashes/presence/counters, and compares those results
+with the original summary. An absent counter is zero only when the recorded
+metric registry proves the counter exists. Removing a required file from both
+the directory and manifest still fails. `target-stopped` currently requires the
+recorded HTTP failure: a summary-only transport exception is insufficient.
+
+LIST validation parses IsTruncated and NextContinuationToken from every raw XML
+page, checks its own request/token chain, and checks library page boundaries,
+entries and non-repeating tokens. The reference and library LIST requests are
+independent AIS sessions, whose opaque token values need not be equal. This does
+not change the empty/absent ETag characterization rule.
+
+The H AIS wrapper now calls the original `ais_harness.up` and `qualify` functions
+in its own process. It does not start a registrar child that Python can SIGKILL
+on interruption. The original `defer_signals`/`launch_owned` critical section
+therefore completes ownership recording before handling a signal; original
+identity-checked, bounded TERM/KILL cleanup remains responsible for services.
+`--deadline` (default 300 seconds) is a catchable whole-run alarm, deferred during
+that critical section. Repeated termination signals cannot interrupt final
+cleanup. No production library or original lifecycle helper was changed.
+
+```sh
+python3 -B scripts/cache-harness/test_required_review.py "$RUN/packet.json"
+python3 -B scripts/cache-harness/test_required_ais_lifecycle.py
+```
+
+The first suite rejects the six independent review counterexamples and twenty
+adjacent semantic mutations via both CLIs. The Linux lifecycle suite exercises
+the whole H entrypoint with original ownership helpers and isolated harmless
+services: before launch, before journal persistence and after persistence,
+SIGINT/SIGTERM, repeated signals, deadline, normal completion and cleanup
+escalation. Only its LIST business work is stubbed; actual AIS root/reverse runs
+remain separate evidence. A successful expected-red check still never grants
+full feature qualification.
