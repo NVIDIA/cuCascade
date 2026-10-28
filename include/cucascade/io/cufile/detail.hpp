@@ -62,14 +62,37 @@ void decide_path_capability(path_info& info) noexcept;
                                      std::size_t file_size,
                                      std::size_t max_op) noexcept;
 
+/// Let aligned device-write bodies use @c cuFileWrite even on a platform without
+/// a real GDS mode, so hosts without GDS still cover that path.  Process-wide.
+void set_cufile_writes_in_compat_for_testing(bool enabled) noexcept;
+
 /// Hold every reactor's staging-copy stream on the host for @p delay before each
 /// staging copy (0 = off), so tests can catch a scratch slot reused, or a request
 /// settled, before its copy landed.  Process-wide.
 void set_staging_copy_delay_for_testing(std::chrono::microseconds delay) noexcept;
 
-/// Make every reactor report a failed CUDA event record after enqueuing an
-/// H2D copy (staged device reads and host+device pairs), so tests can check
-/// the request does not settle while that copy may still run.  Process-wide.
+/// Make every reactor report a failed CUDA event record after enqueuing a
+/// staging copy (H2D for staged device reads and host+device pairs, D2H for
+/// staged device writes), so tests can check the request does not settle, nor
+/// the scratch get reused, while that copy may still run.  Process-wide.
 void set_copy_event_record_failure_for_testing(bool enabled) noexcept;
+
+/// @c cuFileWrite calls issued by every cuFile reactor so far.
+[[nodiscard]] std::size_t cufile_write_calls_for_testing() noexcept;
+
+/// Buffers currently registered with cuFile through the reactors' registration
+/// table (@c config::register_min_bytes).
+[[nodiscard]] std::size_t live_registrations_for_testing() noexcept;
+
+/// Run @p hook(@p arg) on the worker just before every @c cuFileRead /
+/// @c cuFileWrite call (null removes it).  Process-wide.
+void set_cufile_transfer_hook_for_testing(void (*hook)(void*), void* arg) noexcept;
+
+/// Whether [@p base, @p base + @p bytes) overlaps a live registration or a
+/// cuFile transfer in flight, as the registration table sees it.
+[[nodiscard]] bool transfer_tracked_for_testing(void const* base, std::size_t bytes) noexcept;
+
+/// Buffer registrations the reactors' registration table has created so far.
+[[nodiscard]] std::size_t registrations_created_for_testing() noexcept;
 
 }  // namespace cucascade::io::cufile::detail

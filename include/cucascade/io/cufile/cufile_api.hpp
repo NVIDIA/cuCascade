@@ -32,8 +32,8 @@ namespace cucascade::io::cufile {
  * enabled).
  *
  * Every member is required; a library that lacks one is treated as absent.  Only the entry points
- * the read path calls are resolved.  The members are plain C function pointers: no state, no
- * virtual call.
+ * the read and write paths call are resolved.  The members are plain C function pointers: no
+ * state, no virtual call.
  *
  * This is a private detail of the cuFile backend; nothing outside the backend and its tests
  * should include this header.
@@ -43,7 +43,10 @@ struct cufile_api {
   decltype(&cuFileDriverGetProperties) driver_get_properties{nullptr};
   decltype(&cuFileHandleRegister) handle_register{nullptr};
   decltype(&cuFileHandleDeregister) handle_deregister{nullptr};
+  decltype(&cuFileBufRegister) buf_register{nullptr};
+  decltype(&cuFileBufDeregister) buf_deregister{nullptr};
   decltype(&cuFileRead) read{nullptr};
+  decltype(&cuFileWrite) write{nullptr};
 
   /**
    * @brief The process-wide table, loaded on first call.
