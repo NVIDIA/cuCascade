@@ -61,6 +61,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -351,18 +352,124 @@ struct BatchCopyAccumulator {
 };
 
 /**
+ * @brief Whether the serializers below would copy more (or other) rows of @p col, or of a column
+ *        under it, than the column holds.
+ *
+ * They copy every buffer of a column and its children from the start, which is right only when
+ * each column starts at its first element and every child holds exactly the elements its parent
+ * uses. A slice breaks that in two ways: a non-zero offset, and -- for a prefix slice, whose
+ * offset is 0 -- children that keep the extent of the column it was cut from (the offsets of a
+ * STRING or LIST, the fields of a STRUCT, the indices of a DICTIONARY32 hold more than the
+ * parent's rows). Either needs a compacted copy.
+ */
+static bool needs_compaction(const cudf::column_view& col) noexcept
+{
+  if (col.offset() != 0) { return true; }
+  auto const rows = col.size();
+  switch (col.type().id()) {
+    case cudf::type_id::STRING:
+    case cudf::type_id::LIST:
+      // child 0 = offsets: rows + 1 entries (an empty column may have none, or one).
+      if (col.num_children() > 0) {
+        auto const offsets = col.child(0).size();
+        if (rows == 0 ? offsets > 1 : offsets != rows + 1) { return true; }
+      }
+      break;
+    case cudf::type_id::STRUCT:
+      for (cudf::size_type i = 0; i < col.num_children(); ++i) {
+        if (col.child(i).size() != rows) { return true; }
+      }
+      break;
+    case cudf::type_id::DICTIONARY32:
+      // child 0 = indices, one per row (child 1 = keys, any number).
+      if (col.num_children() > 0 && col.child(0).size() != rows) { return true; }
+      break;
+    default: break;
+  }
+  for (cudf::size_type i = 0; i < col.num_children(); ++i) {
+    if (needs_compaction(col.child(i))) { return true; }
+  }
+  return false;
+}
+
+/// Whether any column of @p view needs compaction (see needs_compaction(cudf::column_view)).
+static bool needs_compaction(const cudf::table_view& view) noexcept
+{
+  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+    if (needs_compaction(view.column(i))) { return true; }
+  }
+  return false;
+}
+
+/**
+ * @brief Synchronizes a stream when destroyed during unwinding.
+ *
+ * A converter that throws after it enqueued work reading the source table on the conversion
+ * stream (a compaction copy, D2H copies) must not let the caller release or mutate the source
+ * while that work may still run. Construct it with the source device current (and keep it
+ * current until it is destroyed): a null stream names that device's default stream. A failure of
+ * the synchronization itself is swallowed so it neither replaces the original exception nor stays
+ * pending for later CUDA calls.
+ */
+class drain_on_unwind {
+ public:
+  explicit drain_on_unwind(::cuda::stream_ref stream) noexcept
+    : _stream(stream), _exceptions(std::uncaught_exceptions())
+  {
+  }
+  ~drain_on_unwind()
+  {
+    if (std::uncaught_exceptions() > _exceptions &&
+        cudaStreamSynchronize(_stream.get()) != cudaSuccess) {
+      static_cast<void>(cudaGetLastError());
+    }
+  }
+  drain_on_unwind(drain_on_unwind const&)            = delete;
+  drain_on_unwind& operator=(drain_on_unwind const&) = delete;
+
+ private:
+  ::cuda::stream_ref _stream;
+  int _exceptions;
+};
+
+/**
+ * @brief The view the buffer serializers below may copy from: @p view itself, or, when one of its
+ *        columns needs it (see needs_compaction()), a compacted copy of the whole table.
+ *
+ * A view-backed gpu_table_representation may hold a slice, so such a table is first compacted
+ * (cudf::table's deep copy normalizes every nested offset, child extent and null mask) on
+ * @p stream, which must already be ordered after the table's writer, with the source device
+ * current. The copy needs device memory for the whole table on the source GPU; if it cannot be
+ * made, the conversion fails and the batch stays where it is. The copy is kept in @p holder: free
+ * it only after the work reading it on @p stream (its buffers are freed in stream order on
+ * @p stream). If the copy fails part-way, the column copies already enqueued may still be reading
+ * the source, so @p stream is synchronized before the exception propagates.
+ */
+static cudf::table_view serializable_view(const cudf::table_view& view,
+                                          ::cuda::stream_ref stream,
+                                          rmm::device_async_resource_ref mr,
+                                          std::unique_ptr<cudf::table>& holder)
+{
+  if (!needs_compaction(view)) { return view; }
+  drain_on_unwind drain{stream};
+  holder = std::make_unique<cudf::table>(view, stream, mr);
+  return holder->view();
+}
+
+/**
  * @brief Recursively plan the buffer layout for one column, filling in column_metadata.
  *
  * Advances @p current_offset by the bytes needed for the column's null mask and data buffer
  * (8-byte aligned), then recurses into any children.
  *
- * @note We assume the column view has offset == 0 (i.e., the table is not a slice).
+ * @note The column view must not need compaction (see serializable_view()).
  */
 static memory::column_metadata plan_column_copy(const cudf::column_view& col,
                                                 std::size_t& current_offset,
                                                 ::cuda::stream_ref stream)
 {
-  assert(col.offset() == 0 && "column_view with non-zero offset is not supported");
+  // Callers compact sliced tables first (serializable_view()).
+  assert(!needs_compaction(col) && "sliced column_view: compact it first (serializable_view)");
 
   memory::column_metadata meta{};
   meta.type_id    = static_cast<int32_t>(col.type().id());
@@ -504,9 +611,22 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
 {
   nvtx_scope convert_range{"convert:gpu_to_host"};
   auto& gpu_source = source.cast<gpu_table_representation>();
+  // The source device is current from the writer ordering until the copies completed and the
+  // compacted copy (if any) is freed: a null `stream` names the current device's default stream,
+  // so the writer wait, the planning, the compaction and the D2H copies must resolve it alike.
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_source.get_device_id()}};
   // Planning reads string offsets on the device, so it must already be ordered after the writer.
   gpu_source.wait_for_writer(stream);
-  const cudf::table_view view = gpu_source.get_table_view();
+  // On a failure after work reading the source was enqueued, wait for it before unwinding.
+  drain_on_unwind drain{stream};
+  // A sliced table is compacted first (the copy is freed after the D2H copies below, which this
+  // function waits for).
+  std::unique_ptr<cudf::table> compacted;
+  cudf::table_view const view =
+    serializable_view(gpu_source.get_table_view(),
+                      stream,
+                      gpu_source.get_memory_space().get_default_allocator(),
+                      compacted);
 
   // --- Pass 1: plan the allocation layout ---
   std::size_t current_offset = 0;
@@ -618,6 +738,8 @@ static Buffer peer_copy_into(Buffer buf,
     // (slow path — preserves correctness, never reached in production Sirius).
     memory::numa_region_pinned_host_memory_resource mr(resolve_gpu_numa_node(dst_device),
                                                        /*make_portable=*/true);
+    // A throw below leaks host_buf (and may leave a copy reading it in flight); this branch is
+    // unreachable in production, where the HOST space registers the pool, so it stays simple.
     void* host_buf = mr.allocate_sync(size);
     {
       rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
@@ -635,7 +757,11 @@ static Buffer peer_copy_into(Buffer buf,
     return buf;
   }
 
-  auto allocation            = host_pool->allocate_multiple_blocks(size);
+  auto allocation = host_pool->allocate_multiple_blocks(size);
+  // Destroyed before `allocation`: if a copy below throws, the chunks already enqueued on
+  // target_stream finish before ~multiple_blocks_allocation returns their blocks to the pool.
+  // target_stream is a pool stream, never the null handle, so the current device does not matter.
+  drain_on_unwind drain{target_stream};
   const std::size_t block_sz = allocation->block_size();
 
   // Pass 1: device-to-host, chunked across blocks. Issued on target_stream
@@ -751,8 +877,8 @@ static cudf_compat::null_mask_buffer alloc_and_peer_copy_sync(
  * @p target_stream; the caller must sync that stream before the resulting cudf::table
  * is observed by another stream.
  *
- * @note Assumes the source column_view has offset == 0 (no slicing), matching the
- *       same constraint imposed by plan_column_copy() on the GPU↔Host fast path.
+ * @note The column view must not need compaction (see serializable_view()), the same
+ *       precondition as plan_column_copy() on the GPU↔Host fast path: a slice is compacted first.
  */
 static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_view& src,
                                                             int src_device,
@@ -760,7 +886,8 @@ static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_v
                                                             ::cuda::stream_ref stream,
                                                             rmm::device_async_resource_ref mr)
 {
-  assert(src.offset() == 0 && "column_view with non-zero offset is not supported");
+  // Callers compact sliced tables first (serializable_view()).
+  assert(!needs_compaction(src) && "sliced column_view: compact it first (serializable_view)");
 
   auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED);
   if (src.nullable()) {
@@ -889,6 +1016,12 @@ static std::unique_ptr<cudf::column> reconstruct_column_p2p(const cudf::column_v
  * by compute-sanitizer) and silently produced garbage packed bytes. This path mirrors
  * convert_gpu_to_host_fast / convert_host_fast_to_gpu: walk the source column tree,
  * allocate target-side buffers, and peer-copy each leaf buffer directly.
+ *
+ * The walk copies every buffer of a column from its start, so a view-backed source that is a
+ * slice (see needs_compaction()) is first compacted on the source device, with the same cost as
+ * the other buffer copiers: device memory for the whole table on the source GPU. If anything
+ * throws after copies were enqueued, the target stream is drained before the exception
+ * propagates, so the caller may release or mutate the source.
  */
 std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   const idata_representation& source,
@@ -933,7 +1066,24 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   // that a recorded writer event avoids.
   gpu_source.wait_for_writer(target_stream);
 
-  cudf::table_view const src_view = gpu_source.get_table_view();
+  // A view-backed source may be a slice: the walker copies every buffer from its start, so a
+  // sliced table is compacted first, on the source device (see serializable_view()).
+  std::unique_ptr<cudf::table> compacted;  // outlives every copy reading it
+  // Destroyed first: on a throw, the copies enqueued on target_stream (reading the source or
+  // `compacted`) finish before either may be released. target_stream is a pool stream, never the
+  // null handle, so the device current at destruction does not matter.
+  drain_on_unwind drain{target_stream};
+  cudf::table_view src_view = gpu_source.get_table_view();
+  if (needs_compaction(src_view)) {
+    rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device_id}};
+    auto const src_stream = gpu_source.get_memory_space().acquire_stream();
+    gpu_source.wait_for_writer(src_stream);
+    src_view = serializable_view(
+      src_view, src_stream, gpu_source.get_memory_space().get_default_allocator(), compacted);
+    // The cross-device copies on target_stream read the compacted copy. Its buffers are later
+    // freed in stream order on src_stream, after target_stream.sync() below (or the drain).
+    src_stream.sync();
+  }
 
   std::vector<std::unique_ptr<cudf::column>> target_columns;
   target_columns.reserve(static_cast<std::size_t>(src_view.num_columns()));
@@ -1686,13 +1836,22 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   nvtx_scope convert_range{"convert:gpu_to_disk"};
   auto const io_context = detail::resolve_disk_io_context(*target_memory_space);
   auto& gpu_source      = source.cast<gpu_table_representation>();
-  // Keep the source device current from writer ordering through the write: a null stream must
-  // name the same default stream for the writer wait, planning's string-offset reads, and I/O.
-  // The io context also binds device sources to the current device.
+  // The source device is current from the writer ordering through the write: a null `stream`
+  // names the current device's default stream, so the stream the writer is waited on, the one
+  // planning and compaction run on, and the one the io context reads the sources on must all be
+  // resolved on the same device. The io context also binds device sources to the current device.
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_source.get_device_id()}};
   require_stream_on_device(stream, gpu_source.get_device_id());
+  // Planning reads string offsets on the device, and the write is stream-ordered after `stream`.
   gpu_source.wait_for_writer(stream);
-  cudf::table_view tv = gpu_source.get_table_view();
+  // On a failure after work reading the source was enqueued, wait for it before unwinding.
+  drain_on_unwind drain{stream};
+  // A sliced table is compacted first; the copy lives until the write below has completed.
+  std::unique_ptr<cudf::table> compacted;
+  cudf::table_view tv = serializable_view(gpu_source.get_table_view(),
+                                          stream,
+                                          gpu_source.get_memory_space().get_default_allocator(),
+                                          compacted);
 
   // Generate unique file path under the disk memory space's mount directory
   auto mount_path = target_memory_space->get_disk_mount_path();
@@ -1978,9 +2137,10 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 
 void register_builtin_converters(representation_converter_registry& registry)
 {
-  // GPU -> GPU (cross-device copy). convert_gpu_to_gpu copies each column buffer with
-  // cudaMemcpyPeerAsync when cucascade::memory::probe_peer_dma_works() verifies the direction, and
-  // stages through pinned host memory otherwise. The cached probe copies bytes between two mutually
+  // GPU -> GPU (cross-device copy). convert_gpu_to_gpu compacts a sliced source on its device
+  // first, then copies each column buffer with cudaMemcpyPeerAsync when
+  // cucascade::memory::probe_peer_dma_works() verifies the direction, and stages through pinned
+  // host memory otherwise. The cached probe copies bytes between two mutually
   // granted private pools, so a verification failure means the pool peer route delivered wrong
   // bytes, as on platforms whose direct route reports success but leaves stale data.
   registry.register_converter<gpu_table_representation, gpu_table_representation>(
