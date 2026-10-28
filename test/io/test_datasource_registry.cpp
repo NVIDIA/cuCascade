@@ -100,8 +100,9 @@ TEST_CASE("replace rejects an already registered new backend", "[io][registry]")
 {
   registry_fixture fixture;
 
+  // uring is registered in every build (kvikio only in a cudf build).
   CHECK_THROWS_AS(fixture.registry.replace_ioctx(
-                    io_context_type::restful, io_context_type::kvikio, &s3_checker, &null_factory),
+                    io_context_type::restful, io_context_type::uring, &s3_checker, &null_factory),
                   std::invalid_argument);
   CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::restful);
 }
@@ -134,7 +135,13 @@ TEST_CASE("replace is forbidden after the first path lookup", "[io][registry]")
 {
   registry_fixture fixture;
 
+  // Any lookup latches the registry; the unmatched path resolves to the kvikio
+  // catch-all only in a build that has it.
+#ifdef CUCASCADE_HAS_KVIKIO
   REQUIRE(fixture.registry.lookup_path("unmatched-before-bootstrap") == io_context_type::kvikio);
+#else
+  REQUIRE_FALSE(fixture.registry.lookup_path("unmatched-before-bootstrap").has_value());
+#endif
   CHECK_THROWS_AS(fixture.registry.replace_ioctx(
                     io_context_type::restful, io_context_type::s3rdma, &s3_checker, &null_factory),
                   std::logic_error);
