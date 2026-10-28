@@ -363,6 +363,10 @@ struct device_buffer {
   // to preserve the same null-stream semantics without the warning.
   ::cuda::stream_ref stream{cudaStream_t{nullptr}};
   int device_id{-1};
+  /// Keeps alive a stream the dispatcher created in place of the caller's
+  /// (see @c detail::resolve_per_thread_streams in templated_ioctx.hpp); null
+  /// when @c stream is the caller's own.
+  std::shared_ptr<void> stream_owner;
 };
 
 class prepared_io_completion final {
