@@ -146,6 +146,8 @@ class pattern_file {
     return uring_reactor::create_io_object(_path.string());
   }
 
+  [[nodiscard]] std::string path() const { return _path.string(); }
+
  private:
   static inline std::atomic<int> next_id{0};
   std::filesystem::path _path;
@@ -1419,6 +1421,140 @@ TEST_CASE("io_uring shutdown cancels a parked low request", "[io][uring][priorit
   CHECK(outcome->queued_bytes == 0);
 }
 
+namespace {
+
+/// The errc a failed read future carries (errc{} when it did not fail with a system_error).
+[[nodiscard]] std::errc read_error(cucascade::exec::semi_future<std::size_t>&& future)
+{
+  try {
+    std::ignore = std::move(future).get(std::chrono::seconds(30));
+  } catch (std::system_error const& error) {
+    return static_cast<std::errc>(error.code().value());
+  } catch (...) {
+  }
+  return std::errc{};
+}
+
+/// Device memory of @p bytes filled with 0xAB, freed on scope exit.
+class device_scratch {
+ public:
+  explicit device_scratch(std::size_t bytes) : _bytes(bytes)
+  {
+    REQUIRE(cudaMalloc(&_data, bytes) == cudaSuccess);
+    REQUIRE(cudaMemset(_data, 0xAB, bytes) == cudaSuccess);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  }
+  ~device_scratch() { std::ignore = cudaFree(_data); }
+  device_scratch(device_scratch const&)            = delete;
+  device_scratch& operator=(device_scratch const&) = delete;
+
+  [[nodiscard]] std::uint8_t* get() const noexcept { return static_cast<std::uint8_t*>(_data); }
+  [[nodiscard]] std::vector<std::uint8_t> bytes() const
+  {
+    std::vector<std::uint8_t> out(_bytes);
+    REQUIRE(cudaMemcpy(out.data(), _data, _bytes, cudaMemcpyDeviceToHost) == cudaSuccess);
+    return out;
+  }
+
+ private:
+  void* _data{nullptr};
+  std::size_t _bytes;
+};
+
+}  // namespace
+
+TEST_CASE("io_uring device reads past EOF resolve with the bytes delivered", "[io][uring][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+  constexpr std::size_t size = (1UL << 20) + 123;
+  pattern_file const file{size};
+  ioctx_staging staging{1};
+  uring_ioctx ioctx{1, staging.context()};
+  ioctx.start();
+  auto const object = file.open();
+  auto const stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+
+  device_scratch dst{2 * size};
+  // A read running past EOF delivers the bytes up to it, and reports exactly those.
+  CHECK(ioctx.device_read_async_io(*object, 0, 2 * size, dst.get(), stream)
+          .get(std::chrono::seconds(30)) == size);
+  CHECK(ioctx.device_read_async_io(*object, size - 100, 5000, dst.get(), stream)
+          .get(std::chrono::seconds(30)) == 100);
+  CHECK(ioctx.device_read_async_io(*object, size, 4096, dst.get(), stream)
+          .get(std::chrono::seconds(30)) == 0);
+  // The vector form reports the sum of what each slice delivered.
+  using cucascade::io::slice;
+  std::vector<slice> const slices{slice{0, 4096, dst.get()},
+                                  slice{size - 10, 4096, dst.get() + 4096},
+                                  slice{size + 4096, 4096, dst.get() + 8192}};
+  CHECK(ioctx.device_readv_async_io(*object, slices, stream).get(std::chrono::seconds(30)) ==
+        4096 + 10);
+  auto const got = dst.bytes();
+  for (std::size_t i = 0; i < 10; ++i) {
+    CHECK(got[4096 + i] == pattern_byte(size - 10 + i));
+  }
+  ioctx.shutdown();
+}
+
+TEST_CASE("io_uring reads of a file truncated after open never report unread bytes",
+          "[io][uring][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("requires a CUDA device");
+  }
+  // The object keeps the size it was opened with.  A read the file can no longer
+  // fill fails (EIO) instead of resolving with the requested count and an
+  // untouched tail.
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+  ioctx_staging staging{1};
+  uring_ioctx ioctx{1, staging.context()};
+  ioctx.start();
+  auto const object = file.open();
+  REQUIRE(object->size() == size);
+  std::filesystem::resize_file(file.path(), size / 2 + 100);
+  auto const stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+
+  device_scratch dst{size};
+  SECTION("aligned device read (O_DIRECT where available)")
+  {
+    CHECK(read_error(ioctx.device_read_async_io(*object, 0, size, dst.get(), stream)) ==
+          std::errc::io_error);
+  }
+  SECTION("unaligned device read (buffered)")
+  {
+    CHECK(read_error(ioctx.device_read_async_io(*object, 1, size - 1, dst.get(), stream)) ==
+          std::errc::io_error);
+  }
+  SECTION("device read entirely past the new end")
+  {
+    CHECK(read_error(ioctx.device_read_async_io(*object, size - 8192, 8192, dst.get(), stream)) ==
+          std::errc::io_error);
+  }
+  SECTION("asynchronous host read")
+  {
+    std::vector<std::uint8_t> host(size);
+    CHECK(read_error(ioctx.host_read_async_io(*object, 0, size, host.data())) ==
+          std::errc::io_error);
+  }
+  SECTION("synchronous host read reports what pread delivered")
+  {
+    std::vector<std::uint8_t> host(size);
+    CHECK(ioctx.host_read_io(*object, 0, size, host.data()) == size / 2 + 100);
+  }
+  SECTION("a part the file still holds reads in full")
+  {
+    CHECK(ioctx.device_read_async_io(*object, 0, size / 2, dst.get(), stream)
+            .get(std::chrono::seconds(30)) == size / 2);
+  }
+  ioctx.shutdown();
+}
 namespace {
 
 /** Makes the uring reactors report a failed event record after each H2D copy, for the guard's life.
