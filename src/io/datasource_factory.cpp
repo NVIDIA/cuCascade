@@ -17,6 +17,10 @@
  */
 
 #include <cucascade/io/config.hpp>
+#ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/cufile_reactor.hpp>
+#endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #ifdef CUCASCADE_HAS_KVIKIO
@@ -96,6 +100,21 @@ factory_type make_kvikio_ioctx_factory()
 }
 #endif
 
+#ifdef CUCASCADE_HAS_CUFILE
+factory_type make_cufile_ioctx_factory()
+{
+  return [](const io_config& config) -> std::shared_ptr<ioctx> {
+    try {
+      auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile);
+      return std::make_shared<cufile::cufile_ioctx>(config.cufile_n_reactors, std::move(ctx));
+    } catch (const std::exception& e) {
+      CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
+#endif
+
 factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
@@ -154,13 +173,28 @@ io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
-    _prefer_kvikio(_config.backend == io_backend::kvikio)
+    _prefer_kvikio(_config.backend == io_backend::kvikio),
+    _prefer_cufile(_config.backend == io_backend::cufile)
 {
+#ifndef CUCASCADE_HAS_CUFILE
+  if (_prefer_cufile) {
+    throw std::invalid_argument(
+      "io_context_registry: io_backend::cufile requested, but this cuCascade build has no cuFile "
+      "backend (cufile.h was not found at configure time)");
+  }
+#endif
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  kvikio is the universal fallback —
   // it can open any local path — so it matches everything and lookup_path
   // defers it behind the explicit backends.  Without kvikIO (a cudf-free
-  // build) there is no catch-all and unmatched paths resolve to nothing.
+  // build) there is no catch-all and unmatched paths resolve to nothing.  cufile
+  // claims local regular files like uring; lookup_path decides between them by
+  // the configured backend, never by iteration order.
+#ifdef CUCASCADE_HAS_CUFILE
+  _entries.emplace(
+    io_context_type::cufile,
+    entry{io_context_type::cufile, &cufile::cufile_reactor::supports, make_cufile_ioctx_factory()});
+#endif
 #ifdef CUCASCADE_HAS_KVIKIO
   _entries.emplace(
     io_context_type::kvikio,
@@ -219,7 +253,14 @@ std::optional<io_context_type> io_context_registry::lookup_path(
   std::shared_lock lk{_mtx};
   _lookup_latched.store(true, std::memory_order_release);
   // kvikio's checker matches everything; _entries iterates in unspecified order,
-  // so defer the catch-all and let an explicit backend (uring/restful) win.
+  // so defer the catch-all and let an explicit backend (uring/restful/cufile) win.
+  //
+  // Both cufile and uring answer true for a local file, and iteration order must
+  // not decide between them: cufile is considered only when the config asked for
+  // it, and then it displaces uring.  The rules, per configured backend:
+  //   * kvikio -- skip uring, rest and cufile; kvikio serves everything.
+  //   * cufile -- skip uring for local files (cufile wins); rest keeps s3://.
+  //   * native -- skip cufile for local files (uring wins); rest keeps s3://.
   std::optional<io_context_type> fallback;
   for (const auto& [type, entry] : _entries) {
     if (!entry.checker(path)) continue;
@@ -230,9 +271,12 @@ std::optional<io_context_type> io_context_registry::lookup_path(
     // backend=kvikio takes over reads from BOTH explicit backends: local files
     // from uring, s3:// objects from rest (kvikIO's RemoteHandle serves them).
     // LIST still needs the rest ioctx, which callers fetch by type instead.
-    if (_prefer_kvikio && (type == io_context_type::uring || type == io_context_type::restful)) {
+    if (_prefer_kvikio && (type == io_context_type::uring || type == io_context_type::restful ||
+                           type == io_context_type::cufile)) {
       continue;
     }
+    if (_prefer_cufile && type == io_context_type::uring) { continue; }
+    if (!_prefer_cufile && type == io_context_type::cufile) { continue; }
     return type;
   }
   return fallback;

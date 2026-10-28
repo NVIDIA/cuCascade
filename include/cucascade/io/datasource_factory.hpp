@@ -42,7 +42,8 @@ namespace cucascade::io {
  * @brief Thread-safe registry of @c ioctx backends, resolved by full path.
  *
  * The engine constructs a registry at startup and registers one entry per
- * backend (kvikio / uring / restful), each carrying a path-capability checker.
+ * backend (kvikio / uring / restful / cufile), each carrying a path-capability
+ * checker.
  * At datasource-creation time @c lookup_path runs the checkers against a full
  * path (the checkers parse the URI / stat the filesystem themselves) and picks
  * the backend, preferring an explicit backend over the kvikio catch-all.
@@ -61,6 +62,10 @@ class io_context_registry {
   ///                            resource for the uring / rest reactors).  Must
   ///                            outlive the registry — the factory closures hold
   ///                            it by reference.
+  /// @throws std::invalid_argument when @c config.backend is
+  ///         @c io_backend::cufile in a build without the cuFile backend
+  ///         (@c CUCASCADE_HAS_CUFILE undefined): an explicit cuFile request is
+  ///         never served by another backend.
   io_context_registry(config_type config,
                       cucascade::memory::memory_reservation_manager& reservation_manager);
   ~io_context_registry() = default;
@@ -121,7 +126,11 @@ class io_context_registry {
   /// universal fallback.  When the registry was built with
   /// `backend = io_backend::kvikio`, the uring local backend and the REST
   /// backend are suppressed so local files and `s3://` objects fall through to
-  /// kvikio.  std::nullopt when nothing matches.
+  /// kvikio.  Both uring and cufile claim local regular files, so the cufile
+  /// backend is skipped unless `backend = io_backend::cufile`, in which case it
+  /// wins local files over uring (`s3://` still resolves to REST, and paths
+  /// neither claims keep falling back to kvikio).  Routing never probes or
+  /// initializes cuFile.  std::nullopt when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
@@ -144,6 +153,10 @@ class io_context_registry {
   /// of uring) and @c s3:// objects (instead of rest) for reads.  LIST / glob
   /// still goes to the REST backend, which callers obtain by type.
   bool _prefer_kvikio{false};
+  /// Set when @c backend=cufile: the cuFile / GDS reactor then serves local
+  /// files instead of uring.  @c s3:// objects still go to REST -- the cuFile
+  /// backend is local-disk only.
+  bool _prefer_cufile{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
   /// Set by the first @c lookup_path; @c replace_ioctx refuses afterwards
@@ -168,6 +181,15 @@ class io_context_registry {
 /// HOST-tier resource block size; physical grouping is chosen by the worker.
 io_context_registry::factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);
+
+#ifdef CUCASCADE_HAS_CUFILE
+/// cuFile / GPUDirect Storage local-disk read backend.  Builds a
+/// @c cufile_reactor::reactor_context from @c config.cufile and a pool of
+/// @c config.cufile_n_reactors reactors.  Takes no reservation manager: the
+/// reactor stages through its own pooled pinned scratch.  Declared only in a
+/// build that found @c cufile.h.
+io_context_registry::factory_type make_cufile_ioctx_factory();
+#endif
 
 /// RESTful object-store (s3://) backend.  Builds a SigV4 authorizer from
 /// @c config.object_store and a @c rest_reactor::reactor_context from

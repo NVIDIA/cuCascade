@@ -37,7 +37,7 @@
 
 namespace cucascade::io {
 
-enum class io_context_type { uring, restful, kvikio, s3rdma };
+enum class io_context_type { uring, restful, kvikio, s3rdma, cufile };
 
 /// Hint passed to @c open_io_object so a backend can tailor how it resolves an
 /// object's metadata.  @c generic resolves the size however is cheapest for the
@@ -344,6 +344,14 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     std::span<const slice> slices,
     io_priority priority = io_priority::automatic) noexcept;
 
+  /// Read every slice of @p slices into its device destination, ordered after
+  /// the work queued on @p stream before the call.  The future resolves to the
+  /// total bytes read (each slice clamped to EOF) and settles only once every
+  /// slice has stopped touching its destination -- a failed or cancelled slice
+  /// does not settle the future while a sibling is still writing.  On success
+  /// the bytes are in place: no further synchronization of @p stream is needed
+  /// to finish the read (ordering later consumer work is the caller's
+  /// business).  The destinations must stay valid until the future settles.
   virtual exec::semi_future<size_t> device_readv_async_io(
     const io_object& obj,
     std::span<const slice> slices,
