@@ -92,6 +92,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
             io/test_io_request.cpp)
   # Tests of the io_uring REST transport modules.
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)
   # Tests of src-private helpers (io/detail/..., the transport modules) include
   # them from src/.
   target_include_directories(cucascade_io_tests
