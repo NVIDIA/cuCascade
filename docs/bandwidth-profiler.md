@@ -7,7 +7,7 @@
 
 Given a list of `memory_space*`, measure pairwise transfer throughput between them so engines can use the resulting bandwidth matrix for routing decisions (where to place / downgrade / upgrade data).
 
-Measurements flow through the **existing converter registry and `disk_io_backend`** — results reflect the actual transfer paths engines will pay at runtime, including user-registered converters.
+Measurements flow through the **existing converter registry and each DISK space's io context** (`memory_space::get_io_context()`) — results reflect the actual transfer paths engines will pay at runtime, including user-registered converters.
 
 ## Scope
 
@@ -25,7 +25,7 @@ Use `representation_converter_registry::convert<T>()` for every transfer. The re
 **Why:** Engines route based on what converters will actually do at runtime. Raw `cudaMemcpyAsync` / `cuFileRead` numbers would diverge from production overhead (packing, metadata handling, backend selection).
 
 ### D-02. Disk backend selection
-The profiler accepts an `std::shared_ptr<idisk_io_backend>` (same parameter as `register_builtin_converters`). Profiler results are scoped to that backend — a kvikIO profile is not interchangeable with a GDS profile. Callers wanting both profile twice.
+The profiler takes no backend parameter: every DISK `memory_space` carries the `io::ioctx` that serves its files (uring, cuFile/GDS, or the process-shared default adopted on first use — see `include/cucascade/cudf/disk_io_context.hpp`). Profiler results are scoped to those contexts — a uring profile is not interchangeable with a GDS profile. Callers wanting both profile twice with differently configured disk spaces.
 
 ### D-03. Chunked-allocator detection — `chunked_resource_info` mixin
 New interface lives at `include/cucascade/memory/chunked_resource_info.hpp`:
@@ -119,14 +119,13 @@ namespace cucascade::data {
 [[nodiscard]] bandwidth_profile measure_bandwidth(
   std::span<memory_space* const> spaces,
   representation_converter_registry const& registry,
-  std::shared_ptr<idisk_io_backend> disk_backend = nullptr,
   bandwidth_profile_config const& config = {});
 
 }  // namespace cucascade::data
 ```
 
 - No caching, no internal state. Call it at init, hand the result to engines.
-- `disk_backend` may be null if no DISK spaces are present; required when any DISK space is passed in.
+- DISK spaces use their own io context (`memory_space::get_io_context()`); no backend argument is needed.
 - Errors in individual pairs (OOM, transfer failure) mark that pair as `converter_available = false` with zeroed samples; they do not abort the whole profile.
 
 ### D-10. Header locations
