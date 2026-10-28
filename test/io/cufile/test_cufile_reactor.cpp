@@ -25,7 +25,10 @@
 #include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -845,5 +848,531 @@ TEST_CASE("cufile ioctx vectored host reads fan out over every reactor", "[io][c
   REQUIRE(ioctx.get().host_readv_async_io(*object, slices).get(30s) == count * length);
   for (std::size_t i = 0; i < count; ++i) {
     CHECK(matches_file(parts[i], slices[i].rng.offset, length));
+  }
+}
+
+TEST_CASE("cufile reactor serves other requests while a device slice waits for its stream",
+          "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+  auto const threshold = GENERATE(std::size_t{1}, std::size_t{1} << 40);
+  CAPTURE(threshold);
+  config cfg{};
+  cfg.gds_threshold = threshold;
+  started_ioctx ioctx{cfg, 1};  // one reactor: everything below shares its worker
+  auto object = ioctx.get().open_io_object(file.path());
+
+  rmm::cuda_stream held;
+  rmm::cuda_stream idle;
+  rmm::device_buffer held_dst(size, held);
+  rmm::device_buffer idle_dst(size, idle);
+  held.synchronize();
+  idle.synchronize();
+  hold_stream(held.value(), std::chrono::milliseconds{2000});
+
+  auto waiting = ioctx.get().device_read_async_io(
+    *object, 0, size, static_cast<std::uint8_t*>(held_dst.data()), held);
+  auto served = ioctx.get().device_read_async_io(
+    *object, 0, size, static_cast<std::uint8_t*>(idle_dst.data()), idle);
+  std::vector<std::uint8_t> host(64UL << 10);
+  auto host_read = ioctx.get().host_read_async_io(*object, 4096, host.size(), host.data());
+
+  // Both later requests complete while the first still waits for its stream.
+  REQUIRE(std::move(served).get(1500ms) == size);
+  REQUIRE(std::move(host_read).get(1500ms) == host.size());
+  CHECK_FALSE(waiting.is_ready());
+  REQUIRE(std::move(waiting).get(30s) == size);
+  CHECK(matches_file(device_bytes_elsewhere(held_dst.data(), size), 0, size));
+  CHECK(matches_file(device_bytes_elsewhere(idle_dst.data(), size), 0, size));
+}
+
+TEST_CASE("cufile settles a parked device slice at once when a sibling slice fails",
+          "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  // Slice 0 parks behind a held stream; slice 1 (a null host destination) fails
+  // the shared request.  The request must settle with that error now, not when
+  // the unrelated stream drains: nothing was issued for the parked slice.
+  constexpr std::size_t size = 1UL << 20;
+  pattern_file const file{size};
+  cufile_reactor reactor{std::make_shared<cufile_reactor::reactor_context>(config{}), ""};
+  reactor.start();
+  std::shared_ptr<cucascade::io::io_object const> object{
+    cufile_reactor::create_io_object(file.path())};
+
+  rmm::cuda_stream held;
+  rmm::device_buffer dst(size, held);
+  held.synchronize();
+  hold_stream(held.value(), std::chrono::milliseconds{3000});
+
+  std::vector<prepared_io_slice> slices;
+  slices.emplace_back(range{0, size},
+                      cucascade::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), held});
+  host_buffer null_host;
+  null_host.buffer = static_cast<std::uint8_t*>(nullptr);
+  slices.emplace_back(range{0, 4096}, std::move(null_host));
+  auto coordinator = std::make_shared<grouped_coordinator>(size + 4096, 2);
+  auto future      = coordinator->get_future();
+  auto const start = std::chrono::steady_clock::now();
+  reactor.enqueue(grouped_io_request::create(object, std::move(slices), std::move(coordinator)));
+
+  CHECK_THROWS(std::move(future).get(2s));
+  CHECK(std::chrono::steady_clock::now() - start < 1500ms);
+  held.synchronize();
+  reactor.shutdown();
+}
+
+namespace {
+
+/** Makes the reactors report a failed event record after each H2D copy, for the guard's life. */
+class copy_event_record_failure {
+ public:
+  copy_event_record_failure()
+  {
+    cucascade::io::cufile::detail::set_copy_event_record_failure_for_testing(true);
+  }
+  ~copy_event_record_failure()
+  {
+    cucascade::io::cufile::detail::set_copy_event_record_failure_for_testing(false);
+  }
+  copy_event_record_failure(copy_event_record_failure const&)            = delete;
+  copy_event_record_failure& operator=(copy_event_record_failure const&) = delete;
+};
+
+}  // namespace
+
+TEST_CASE("cufile reads that fail after enqueuing a copy settle only once it landed",
+          "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  // The copy is held back (a delayed staging stream, or a held caller stream)
+  // and its event record "fails".  The read reports the error, but only after
+  // the queued copy finished: the bytes are in place when the future settles,
+  // so the caller may free the destination and the scratch may be reused.
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+
+  SECTION("staged device read")
+  {
+    config cfg{};
+    cfg.gds_threshold = 1UL << 40;
+    started_ioctx ioctx{cfg, 1};
+    auto object = ioctx.get().open_io_object(file.path());
+    rmm::cuda_stream stream;
+    rmm::device_buffer dst(size, stream);
+    REQUIRE(cudaMemsetAsync(dst.data(), 0xAB, size, stream.value()) == cudaSuccess);
+    stream.synchronize();
+    staging_copy_delay const slow{std::chrono::milliseconds{300}};
+    copy_event_record_failure const failing;
+    CHECK_THROWS(
+      ioctx.get()
+        .device_read_async_io(*object, 0, size, static_cast<std::uint8_t*>(dst.data()), stream)
+        .get(30s));
+    CHECK(matches_file(device_bytes_elsewhere(dst.data(), size), 0, size));
+  }
+
+  SECTION("host + device pair")
+  {
+    started_ioctx ioctx{config{}, 1};
+    auto object = ioctx.get().open_io_object(file.path());
+    rmm::cuda_stream stream;
+    rmm::device_buffer dst(size, stream);
+    REQUIRE(cudaMemsetAsync(dst.data(), 0xAB, size, stream.value()) == cudaSuccess);
+    stream.synchronize();
+    // Pinned, so the H2D copy is truly asynchronous (a pageable source is
+    // staged synchronously by the driver).
+    void* pinned = nullptr;
+    REQUIRE(cudaMallocHost(&pinned, size) == cudaSuccess);
+    std::unique_ptr<void, void (*)(void*)> const host_owner{
+      pinned, [](void* p) { std::ignore = cudaFreeHost(p); }};
+    auto* const host = static_cast<std::uint8_t*>(pinned);
+    hold_stream(stream.value(), std::chrono::milliseconds{300});
+    copy_event_record_failure const failing;
+    std::vector<prepared_io_slice> slices;
+    slices.emplace_back(
+      range{0, size},
+      host_buffer{host},
+      cucascade::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), stream});
+    CHECK_THROWS(ioctx.get().host_device_readv_async_io(*object, std::move(slices)).get(30s));
+    CHECK(matches_file(std::vector<std::uint8_t>(host, host + size), 0, size));
+    CHECK(matches_file(device_bytes_elsewhere(dst.data(), size), 0, size));
+  }
+}
+
+TEST_CASE("cufile shutdown cancels a device read still waiting for its stream", "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t size = 1UL << 20;
+  pattern_file const file{size};
+  // cuFile path, and the staged path after a first read gave the reactor its
+  // pinned scratch (which shutdown must hand back without synchronizing the
+  // device behind the held stream).
+  auto const threshold = GENERATE(std::size_t{1}, std::size_t{1} << 40);
+  CAPTURE(threshold);
+  config cfg{};
+  cfg.gds_threshold = threshold;
+  cufile_ioctx ioctx{1, std::make_shared<cufile_reactor::reactor_context>(cfg)};
+  ioctx.start();
+  auto object = ioctx.open_io_object(file.path());
+  rmm::cuda_stream held;
+  rmm::device_buffer dst(size, held);
+  held.synchronize();
+  REQUIRE(ioctx.device_read_async_io(*object, 0, size, static_cast<std::uint8_t*>(dst.data()), held)
+            .get(30s) == size);
+  hold_stream(held.value(), std::chrono::milliseconds{3000});
+  auto future =
+    ioctx.device_read_async_io(*object, 0, size, static_cast<std::uint8_t*>(dst.data()), held);
+  std::this_thread::sleep_for(50ms);  // let the worker park it
+
+  auto const start = std::chrono::steady_clock::now();
+  ioctx.shutdown();
+  CHECK(canceled(std::move(future)));
+  CHECK(std::chrono::steady_clock::now() - start < 1500ms);
+  held.synchronize();
+}
+
+TEST_CASE("cufile ioctx cancels reads submitted before start", "[io][cufile]")
+{
+  pattern_file const file{64 * 1024};
+  cufile_ioctx ioctx{1, std::make_shared<cufile_reactor::reactor_context>(config{})};
+  auto object = ioctx.open_io_object(file.path());
+
+  std::vector<std::uint8_t> dst(4096);
+  CHECK(canceled(ioctx.host_read_async_io(*object, 0, dst.size(), dst.data())));
+  ioctx.shutdown();
+}
+
+namespace {
+
+/** Records the order in which tagged slices complete on the worker thread. */
+class completion_log {
+ public:
+  void record(std::string tag)
+  {
+    std::lock_guard lock(_mutex);
+    _tags.push_back(std::move(tag));
+  }
+
+  [[nodiscard]] std::vector<std::string> tags() const
+  {
+    std::lock_guard lock(_mutex);
+    return _tags;
+  }
+
+ private:
+  mutable std::mutex _mutex;
+  std::vector<std::string> _tags;
+};
+
+/**
+ * Enqueue a request of @p n_slices 4 KiB host slices, each logging "<tag><index>" as it
+ * completes.  When @p first_slice_hook is set it runs on the worker inside slice 0's
+ * completion, which parks the worker there until the hook returns.
+ */
+[[nodiscard]] cucascade::exec::semi_future<std::size_t> enqueue_tagged(
+  cufile_reactor& reactor,
+  std::shared_ptr<cucascade::io::io_object const> object,
+  std::string const& tag,
+  std::size_t n_slices,
+  io_priority priority,
+  completion_log& log,
+  std::vector<std::uint8_t>& destination,
+  std::function<void()> first_slice_hook = nullptr)
+{
+  constexpr std::size_t slice_bytes = 4096;
+  std::vector<prepared_io_slice> slices;
+  slices.reserve(n_slices);
+  for (std::size_t i = 0; i < n_slices; ++i) {
+    slices.emplace_back(range{i * slice_bytes, slice_bytes},
+                        host_buffer{destination.data() + i * slice_bytes});
+    slices.back().priority    = priority;
+    slices.back().on_complete = std::make_shared<prepared_io_completion>(
+      [&log, tag, i, first_slice_hook](std::span<cucascade::io::cache::cached_chunk* const>,
+                                       bool) noexcept {
+        if (i == 0 && first_slice_hook) first_slice_hook();
+        log.record(tag + std::to_string(i));
+      });
+  }
+  auto coordinator = std::make_shared<grouped_coordinator>(n_slices * slice_bytes, n_slices);
+  auto future      = coordinator->get_future();
+  reactor.enqueue(
+    grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
+  return future;
+}
+
+/**
+ * One low request of 12 slices is parked mid-way by a backlog of @p n_high high requests.  The
+ * worker is held inside the low request's first slice while the backlog is queued, so the order
+ * the worker then serves them in is a function of the scheduling policy alone.
+ */
+[[nodiscard]] std::vector<std::string> run_low_against_high_backlog(
+  std::size_t low_service_interval, std::size_t n_high)
+{
+  pattern_file const file{1 << 20};
+  config cfg{};
+  cfg.max_inflight         = 2;  // a pass is two slices
+  cfg.low_service_interval = low_service_interval;
+  cufile_reactor reactor{std::make_shared<cufile_reactor::reactor_context>(cfg), ""};
+  reactor.start();
+  std::shared_ptr<cucascade::io::io_object const> object{
+    cufile_reactor::create_io_object(file.path())};
+
+  completion_log log;
+  std::promise<void> entered;
+  std::promise<void> release;
+  auto const release_future = release.get_future().share();
+
+  std::vector<std::uint8_t> low_dst(12 * 4096);
+  std::vector<std::vector<std::uint8_t>> high_dst(n_high, std::vector<std::uint8_t>(4096));
+  std::vector<cucascade::exec::semi_future<std::size_t>> futures;
+
+  futures.push_back(enqueue_tagged(
+    reactor, object, "L", 12, io_priority::low, log, low_dst, [&entered, release_future] {
+      entered.set_value();
+      release_future.wait();
+    }));
+  REQUIRE(entered.get_future().wait_for(10s) == std::future_status::ready);
+  for (std::size_t i = 0; i < n_high; ++i) {
+    futures.push_back(enqueue_tagged(
+      reactor, object, "H" + std::to_string(i) + "_", 1, io_priority::high, log, high_dst[i]));
+  }
+  release.set_value();
+
+  for (auto& future : futures) {
+    REQUIRE(std::move(future).get(30s) > 0);
+  }
+  reactor.shutdown();
+  for (std::size_t i = 0; i < low_dst.size(); i += 509) {
+    REQUIRE(low_dst[i] == pattern_byte(i));  // parking and resuming lost no bytes
+  }
+  return log.tags();
+}
+
+}  // namespace
+
+TEST_CASE("cufile reactor parks an active low request for a high one and resumes it",
+          "[io][cufile][priority]")
+{
+  auto const order = run_low_against_high_backlog(/*low_service_interval=*/0, /*n_high=*/1);
+
+  // The pass is two slices, so the low request is parked after L0, L1, served the high
+  // request, then resumed where it left off.
+  REQUIRE(order.size() == 13);
+  CHECK(order[0] == "L0");
+  CHECK(order[1] == "L1");
+  CHECK(order[2] == "H0_0");
+  for (std::size_t i = 2; i < 12; ++i) {
+    CHECK(order[i + 1] == "L" + std::to_string(i));
+  }
+}
+
+TEST_CASE("cufile reactor keeps priority strict when low_service_interval is 0",
+          "[io][cufile][priority]")
+{
+  auto const order = run_low_against_high_backlog(/*low_service_interval=*/0, /*n_high=*/40);
+
+  REQUIRE(order.size() == 52);
+  // Every high request is served before the parked low request gets another turn.
+  CHECK(order.back() == "L11");
+}
+
+TEST_CASE("cufile reactor grants a waiting low request bounded service under a high backlog",
+          "[io][cufile][priority]")
+{
+  auto const order = run_low_against_high_backlog(/*low_service_interval=*/2, /*n_high=*/40);
+
+  REQUIRE(order.size() == 52);
+  // The low request finishes while most of the high backlog is still waiting.
+  auto const low_done = std::find(order.begin(), order.end(), "L11") - order.begin();
+  CHECK(low_done < 24);
+  // ...and the grants interleave: two highs, then a two-slice quantum of low, repeating.
+  CHECK(order[2] == "H0_0");
+  CHECK(order[3] == "H1_0");
+  CHECK(order[4] == "L2");
+  CHECK(order[5] == "L3");
+}
+
+// ---------------------------------------------------------------------------
+// Read throughput probe (hidden; run explicitly with "[.cufile-bench]").
+// Reads an existing operator-supplied file; it never writes to it.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Check that @p path is an existing regular file of at least @p bytes.  The
+/// probe only reads it: it never creates, extends or truncates the input.
+void require_bench_file(std::string const& path, std::size_t bytes)
+{
+  std::error_code ec;
+  INFO("CUCASCADE_IO_BENCH_FILE=" << path << ", CUCASCADE_IO_BENCH_BYTES=" << bytes);
+  REQUIRE(std::filesystem::is_regular_file(path, ec));
+  REQUIRE(std::filesystem::file_size(path, ec) >= bytes);
+  REQUIRE_FALSE(ec);
+}
+
+/// Evict @p path from the page cache (no root needed for clean pages).
+void drop_file_cache(std::string const& path)
+{
+  file_descriptor fd{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+  if (!fd) return;
+  std::ignore = ::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_DONTNEED);
+}
+
+[[nodiscard]] std::size_t env_size(char const* name, std::size_t fallback)
+{
+  char const* value = std::getenv(name);
+  return value != nullptr && *value != '\0' ? std::stoull(value) : fallback;
+}
+
+/// GB/s of @p run over @p bytes, median of @p rounds, each after a page-cache drop.
+template <class Run>
+[[nodiscard]] double measure(std::string const& path, std::size_t bytes, int rounds, Run&& run)
+{
+  std::vector<double> rates;
+  for (int r = 0; r < rounds; ++r) {
+    drop_file_cache(path);
+    auto const start = std::chrono::steady_clock::now();
+    run();
+    auto const secs =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    rates.push_back(static_cast<double>(bytes) / secs / 1e9);
+  }
+  std::sort(rates.begin(), rates.end());
+  return rates[rates.size() / 2];
+}
+
+/// Run every probe scenario against @p ctx and print one line per scenario.
+void run_probe(std::string const& label,
+               cucascade::io::ioctx& ctx,
+               std::string const& path,
+               std::size_t file_bytes,
+               int rounds)
+{
+  auto object                    = ctx.open_io_object(path);
+  constexpr std::size_t window   = 1UL << 30;
+  constexpr std::size_t n_stream = 8;
+  rmm::cuda_stream alloc_stream;
+  rmm::device_buffer dst(window, alloc_stream);
+  alloc_stream.synchronize();
+  auto* const base = static_cast<std::uint8_t*>(dst.data());
+  std::vector<rmm::cuda_stream> streams(n_stream);
+  auto const bytes = file_bytes / window * window;
+
+  // CUCASCADE_IO_BENCH_ONLY=<substring>[,<substring>...] runs only the scenarios whose
+  // name holds one of them.
+  std::vector<std::string> only;
+  if (char const* only_env = std::getenv("CUCASCADE_IO_BENCH_ONLY"); only_env != nullptr) {
+    std::string list{only_env};
+    for (std::size_t start = 0; start <= list.size();) {
+      auto const comma = std::min(list.find(',', start), list.size());
+      if (comma > start) only.push_back(list.substr(start, comma - start));
+      start = comma + 1;
+    }
+  }
+  auto selected = [&](std::string const& name) {
+    return only.empty() || std::any_of(only.begin(), only.end(), [&](std::string const& part) {
+             return name.find(part) != std::string::npos;
+           });
+  };
+  auto scenario = [&](std::string const& name, std::size_t total, auto&& run) {
+    if (!selected(name)) return;
+    auto const gbps = measure(path, total, rounds, run);
+    std::printf("%-8s %-28s %7.2f GB/s\n", label.c_str(), name.c_str(), gbps);
+    std::fflush(stdout);
+  };
+
+  for (std::size_t const piece : {256UL << 20, 1UL << 30}) {
+    scenario("dev 1 slice x " + std::to_string(piece >> 20) + " MiB, QD1", bytes, [&] {
+      for (std::size_t off = 0; off < bytes; off += piece) {
+        REQUIRE(ctx.device_read_async_io(*object, off, piece, base, streams[0]).get(120s) == piece);
+      }
+    });
+  }
+
+  for (std::size_t const piece : {4UL << 20, 16UL << 20}) {
+    scenario("dev readv " + std::to_string(piece >> 20) + " MiB, 1 stream", bytes, [&] {
+      for (std::size_t off = 0; off < bytes; off += window) {
+        std::vector<cucascade::io::slice> slices;
+        for (std::size_t p = 0; p < window; p += piece) {
+          slices.emplace_back(off + p, piece, base + p);
+        }
+        REQUIRE(ctx.device_readv_async_io(*object, slices, streams[0]).get(120s) == window);
+      }
+    });
+  }
+
+  for (std::size_t const piece : {64UL << 10, 256UL << 10, 1UL << 20, 8UL << 20}) {
+    auto const total = piece < (1UL << 20) ? std::min(bytes, std::size_t{1} << 30) : bytes;
+    scenario("dev " + std::to_string(piece >> 10) + " KiB x 8 streams", total, [&] {
+      for (std::size_t off = 0; off < total; off += window) {
+        std::vector<cucascade::exec::semi_future<std::size_t>> futures;
+        std::size_t i = 0;
+        for (std::size_t p = 0; p < window; p += piece, ++i) {
+          futures.push_back(
+            ctx.device_read_async_io(*object, off + p, piece, base + p, streams[i % n_stream]));
+        }
+        for (auto& future : futures) {
+          REQUIRE(std::move(future).get(120s) == piece);
+        }
+      }
+    });
+  }
+
+  {
+    constexpr std::size_t piece = 4UL << 20;
+    std::vector<std::uint8_t> host(window);
+    scenario("host 4 MiB, all queued", bytes, [&] {
+      for (std::size_t off = 0; off < bytes; off += window) {
+        std::vector<cucascade::exec::semi_future<std::size_t>> futures;
+        for (std::size_t p = 0; p < window; p += piece) {
+          futures.push_back(ctx.host_read_async_io(*object, off + p, piece, host.data() + p));
+        }
+        for (auto& future : futures) {
+          REQUIRE(std::move(future).get(120s) == piece);
+        }
+      }
+    });
+  }
+}
+
+}  // namespace
+
+TEST_CASE("cufile throughput probe", "[.cufile-bench]")
+{
+  char const* path_env = std::getenv("CUCASCADE_IO_BENCH_FILE");
+  if (path_env == nullptr || !has_cuda_device()) {
+    SKIP("set CUCASCADE_IO_BENCH_FILE (and have a GPU) to run the probe");
+  }
+  std::string const path  = path_env;
+  auto const file_bytes   = env_size("CUCASCADE_IO_BENCH_BYTES", 4UL << 30);
+  auto const rounds       = static_cast<int>(env_size("CUCASCADE_IO_BENCH_ROUNDS", 3));
+  auto const reactors     = env_size("CUCASCADE_IO_BENCH_REACTORS", 4);
+  char const* backend     = std::getenv("CUCASCADE_IO_BENCH_BACKEND");
+  std::string const which = backend != nullptr ? backend : "both";
+  require_bench_file(path, file_bytes);
+
+  if (which == "both" || which == "cufile") {
+    config cfg{};
+    cfg.gds_threshold = env_size("CUCASCADE_IO_BENCH_GDS_THRESHOLD", cfg.gds_threshold);
+    started_ioctx ioctx{cfg, reactors};
+    run_probe("cufile", ioctx.get(), path, file_bytes, rounds);
+  }
+  if (which == "both" || which == "uring") {
+    cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+    cucascade::memory::fixed_size_host_memory_resource mr{
+      0, upstream, 2UL << 30, 2UL << 30, 1UL << 20, 128, 8};
+    cucascade::io::uring::uring_ioctx ioctx{
+      reactors,
+      std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+        cucascade::io::uring::config{}, &mr)};
+    ioctx.start();
+    run_probe("uring", ioctx, path, file_bytes, rounds);
+    ioctx.shutdown();
   }
 }
