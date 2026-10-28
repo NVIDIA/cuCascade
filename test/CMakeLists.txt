@@ -175,15 +175,19 @@ endif()
 # Create topology discovery test executable
 add_executable(
   cucascade_topology_discovery_tests
-  memory/test_topology_discovery.cpp memory/test_net_topology.cpp
-  unittest_topology_discovery.cpp)
+  memory/test_path_storage.cpp memory/test_topology_discovery.cpp
+  memory/test_net_topology.cpp unittest_topology_discovery.cpp)
 set_target_properties(cucascade_topology_discovery_tests
                       PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
 # Set include directories
 target_include_directories(
-  cucascade_topology_discovery_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                                             ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  cucascade_topology_discovery_tests
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+          ${CMAKE_CURRENT_SOURCE_DIR}/utils
+          # Tests of src-private helpers (memory/detail/...) include them from
+          # src/.
+          ${PROJECT_SOURCE_DIR}/src)
 
 # Link dependencies
 target_link_libraries(
