@@ -41,8 +41,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # Data tests
     data/test_data_repository.cpp
     data/test_data_repository_manager.cpp
-    data/test_disk_io_backend.cpp
-    data/test_io_worker.cpp
+    data/test_disk_memory_space.cpp
     # Logging tests
     log/test_logging.cpp
     log/test_logging_pruned.cpp
@@ -177,6 +176,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_data_batch.cpp
     data/test_data_representation.cpp
     data/test_disk_host_converters.cpp
+    data/test_disk_io_context.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
     cudf/test_gpu_to_gpu_converter.cpp

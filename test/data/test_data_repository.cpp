@@ -1214,7 +1214,8 @@ TEST_CASE("allocation-limit rejection is distinct from a repository conflict",
   REQUIRE(repository.get_ordering() == data_repository_ordering::UNKNOWN);
 }
 
-TEST_CASE("DISK mock clones retain metadata and reject I/O", "[data_repository][mock_disk_cpu]")
+TEST_CASE("DISK mock clones retain metadata and carry no io context",
+          "[data_repository][mock_disk_cpu]")
 {
   mock_data_representation original(memory::Tier::DISK, 512, 3);
   auto clone = original.clone(::cuda::stream_ref{cudaStream_t{nullptr}});
@@ -1224,8 +1225,6 @@ TEST_CASE("DISK mock clones retain metadata and reject I/O", "[data_repository][
   CHECK(clone->get_size_in_bytes() == 512);
   CHECK(clone->get_uncompressed_data_size_in_bytes() == 512);
   for (auto* representation : {static_cast<idata_representation*>(&original), clone.get()}) {
-    auto& backend = representation->get_memory_space().get_io_backend();
-    REQUIRE_THROWS_AS(backend.read(std::filesystem::path{}, nullptr, 0, 0), std::logic_error);
-    REQUIRE_THROWS_AS(backend.write(std::filesystem::path{}, nullptr, 0, 0), std::logic_error);
+    CHECK(representation->get_memory_space().get_io_context() == nullptr);
   }
 }
