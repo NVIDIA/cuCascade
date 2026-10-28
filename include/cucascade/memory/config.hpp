@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace cucascade {
@@ -125,6 +126,55 @@ struct disk_memory_space_config {
   }
 };
 
+/// Default capacity of a REMOTE memory space: "effectively unbounded" (1 PiB) while keeping the
+/// threshold arithmetic far from overflow.
+inline constexpr std::size_t unbounded_remote_capacity = std::size_t{1} << 50;
+
+/**
+ * @brief Check and normalize the URI prefix of a REMOTE memory space.
+ *
+ * Accepted form: `s3://bucket[/prefix]`. The scheme is matched case-insensitively and returned
+ * lower-case; trailing '/' are removed. Rejected (std::invalid_argument): an empty string, any
+ * other scheme, an empty bucket, a bucket carrying userinfo ('@') or a port (':'), a query
+ * ('?') or fragment ('#'), whitespace or control characters anywhere, and empty path segments
+ * ("//" inside the prefix). No I/O: the bucket is not contacted.
+ *
+ * @param uri_prefix The configured prefix.
+ * @return The normalized prefix, e.g. "s3://bucket/spill" for "S3://bucket/spill/".
+ * @throws std::invalid_argument if @p uri_prefix is malformed.
+ */
+[[nodiscard]] std::string validate_remote_uri_prefix(std::string_view uri_prefix);
+
+/**
+ * Configuration of a REMOTE-tier memory space: spilled batches become objects under
+ * `uri_prefix` in an object store (see docs/io/remote-tier-design.md).
+ *
+ * Like DISK, the capacity bounds the bytes of the reservations in flight (spills being written),
+ * not the bytes stored; REMOTE is the last tier, so nothing downgrades out of it.
+ */
+struct remote_memory_space_config {
+  int remote_id{0};
+  std::size_t memory_capacity{unbounded_remote_capacity};
+  /// Where the space's objects live: `s3://bucket[/prefix]` (see validate_remote_uri_prefix()).
+  std::string uri_prefix;
+  /// I/O context that writes, reads and deletes this space's objects (a started, write-capable
+  /// REST context; see cucascade/cudf/remote_io_context.hpp). May be set later with
+  /// memory_space::set_io_context(). There is no default: without one the REMOTE converters
+  /// throw std::logic_error.
+  std::shared_ptr<io::ioctx> io_context{};
+
+  [[nodiscard]] Tier tier() const { return Tier::REMOTE; }
+
+  [[nodiscard]] std::size_t reservation_limit() const { return memory_capacity; }
+
+  [[nodiscard]] std::size_t downgrade_trigger_threshold() const { return memory_capacity; }
+
+  [[nodiscard]] std::size_t downgrade_stop_threshold() const
+  {
+    return static_cast<std::size_t>(static_cast<double>(memory_capacity) * 0.99);
+  }
+};
+
 /**
  * Configuration for a single memory_space.
  * Contains all parameters needed to create a memory_space instance.
@@ -132,7 +182,8 @@ struct disk_memory_space_config {
 using memory_space_config = std::variant<std::monostate,
                                          gpu_memory_space_config,
                                          host_memory_space_config,
-                                         disk_memory_space_config>;
+                                         disk_memory_space_config,
+                                         remote_memory_space_config>;
 
 }  // namespace memory
 }  // namespace cucascade
