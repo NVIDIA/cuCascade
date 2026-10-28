@@ -1004,6 +1004,85 @@ TEST_CASE("cufile reads that fail after enqueuing a copy settle only once it lan
   }
 }
 
+namespace {
+
+/// The errc a failed read future carries (errc{} when it did not fail with a system_error).
+[[nodiscard]] std::errc read_error(cucascade::exec::semi_future<std::size_t>&& future)
+{
+  try {
+    std::ignore = std::move(future).get(30s);
+  } catch (std::system_error const& error) {
+    return static_cast<std::errc>(error.code().value());
+  } catch (...) {
+  }
+  return std::errc{};
+}
+
+/// The cuFile read paths: cuFileRead for large device reads, or staged POSIX.
+[[nodiscard]] std::vector<std::pair<char const*, config>> read_paths()
+{
+  config cufile_reads{};
+  cufile_reads.gds_threshold = cucascade::io::IO_BLOCK_SIZE;
+  config staged{};
+  staged.gds_threshold = 1UL << 40;
+  return {{"cuFileRead", cufile_reads}, {"staged POSIX", staged}};
+}
+
+}  // namespace
+
+TEST_CASE("cufile device reads past EOF resolve with the bytes delivered", "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  auto const [label, cfg] = GENERATE(from_range(read_paths()));
+  CAPTURE(label);
+  constexpr std::size_t size = (1UL << 20) + 123;
+  pattern_file const file{size};
+  started_ioctx ioctx{cfg, 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  rmm::cuda_stream stream;
+  rmm::device_buffer dst(2 * size, stream);
+  auto* const out = static_cast<std::uint8_t*>(dst.data());
+
+  CHECK(ioctx.get().device_read_async_io(*object, 0, 2 * size, out, stream).get(30s) == size);
+  CHECK(matches_file(device_bytes_elsewhere(out, size), 0, size));
+  CHECK(ioctx.get().device_read_async_io(*object, size - 100, 5000, out, stream).get(30s) == 100);
+  CHECK(ioctx.get().device_read_async_io(*object, size, 4096, out, stream).get(30s) == 0);
+  using cucascade::io::slice;
+  std::vector<slice> const slices{
+    slice{0, 4096, out}, slice{size - 10, 4096, out + 4096}, slice{size + 4096, 4096, out + 8192}};
+  CHECK(ioctx.get().device_readv_async_io(*object, slices, stream).get(30s) == 4096 + 10);
+}
+
+TEST_CASE("cufile reads of a file truncated after open never report unread bytes",
+          "[io][cufile][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  auto const [label, cfg] = GENERATE(from_range(read_paths()));
+  CAPTURE(label);
+  // The object keeps the size it was opened with.  A read the file can no longer
+  // fill fails (EIO) instead of resolving with the requested count and an
+  // untouched tail.
+  constexpr std::size_t size = 4UL << 20;
+  pattern_file const file{size};
+  started_ioctx ioctx{cfg, 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  REQUIRE(object->size() == size);
+  std::filesystem::resize_file(file.path(), size / 2 + 100);
+  rmm::cuda_stream stream;
+  rmm::device_buffer dst(size, stream);
+  auto* const out = static_cast<std::uint8_t*>(dst.data());
+
+  CHECK(read_error(ioctx.get().device_read_async_io(*object, 0, size, out, stream)) ==
+        std::errc::io_error);
+  CHECK(read_error(ioctx.get().device_read_async_io(*object, size - 8192, 8192, out, stream)) ==
+        std::errc::io_error);
+  std::vector<std::uint8_t> host(size);
+  CHECK(read_error(ioctx.get().host_read_async_io(*object, 0, size, host.data())) ==
+        std::errc::io_error);
+  CHECK(ioctx.get().host_read_io(*object, 0, size, host.data()) == size / 2 + 100);
+  CHECK(ioctx.get().device_read_async_io(*object, 0, size / 2, out, stream).get(30s) == size / 2);
+}
+
 TEST_CASE("cufile shutdown cancels a device read still waiting for its stream", "[io][cufile][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }

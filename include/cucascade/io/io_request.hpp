@@ -57,6 +57,12 @@ namespace cucascade::io {
  * success, failure, or cancellation settles exactly one credit. The first
  * error stops further dispatch immediately, but the future is not fulfilled
  * until all already-published operations have drained.
+ *
+ * A successful future resolves with @c bytes_requested, the bytes of the
+ * slices as clamped to EOF at dispatch, so a reactor reports a slice as
+ * successful only once every one of those bytes was delivered: a transfer that
+ * comes up short of them (the file shrank after it was opened) settles its
+ * credit with an error, never with success.
  */
 class grouped_coordinator final {
  public:
