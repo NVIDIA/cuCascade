@@ -50,6 +50,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -96,6 +97,10 @@ struct cache_generation {
   size_t file_size{0};
   size_t chunk_size{1};
   std::atomic<bool> retired{false};
+  /// Retired by @c fs_cache::invalidate (its object was written): unlike a
+  /// generation superseded by a new version, it is never handed out again,
+  /// even to a request for the same key.
+  std::atomic<bool> invalidated{false};
 };
 
 namespace {
@@ -553,7 +558,11 @@ std::shared_ptr<cache_generation> fs_cache::get_or_create_generation(const io_ob
     auto& family = _generations_by_path[obj.object_path()];
     std::erase_if(family, [](auto const& weak) { return weak.expired(); });
     for (auto const& weak : family) {
-      if (auto alive = weak.lock(); alive && alive->key == key) { return alive; }
+      // An invalidated generation holds bytes from before a write: never reuse it.
+      if (auto alive = weak.lock();
+          alive && alive->key == key && !alive->invalidated.load(std::memory_order_acquire)) {
+        return alive;
+      }
     }
 
     created              = std::shared_ptr<cache_generation>(new cache_generation(),
@@ -605,6 +614,97 @@ std::size_t fs_cache::generation_count(std::string_view object_path) const noexc
   if (it == _generations_by_path.end()) { return 0; }
   return static_cast<std::size_t>(
     std::ranges::count_if(it->second, [](auto const& weak) { return !weak.expired(); }));
+}
+
+void fs_cache::invalidate(std::string_view object_path) noexcept
+{
+  if (_shutting_down.load(std::memory_order_acquire)) { return; }
+  try {
+    {
+      // Most writes target paths the cache never saw (spill files, outputs).
+      std::shared_lock lk(_map_mtx);
+      if (!_generations_by_path.contains(object_path)) { return; }
+    }
+    // Retiring a generation is allocation-free and comes first: once a write
+    // returns, no generation of the path is handed out again, whatever happens
+    // below.  Only collecting them for the eager reclaim of their idle chunks
+    // allocates; if that fails, a retired generation's chunks are reclaimed when
+    // its last owner lets go of it instead.
+    std::vector<std::shared_ptr<cache_generation>> retired;
+    {
+      std::unique_lock ulk(_map_mtx);
+      auto const it = _generations_by_path.find(object_path);
+      if (it == _generations_by_path.end()) { return; }
+      bool collect = true;
+      try {
+        retired.reserve(it->second.size());
+      } catch (...) {
+        collect = false;
+      }
+      for (auto const& weak : it->second) {
+        auto generation = weak.lock();
+        if (!generation || generation->invalidated.load(std::memory_order_acquire)) { continue; }
+        // Same retirement a superseding generation performs
+        // (get_or_create_generation), plus the flag that keeps the generation
+        // from being handed out again.
+        generation->invalidated.store(true, std::memory_order_release);
+        generation->retired.store(true, std::memory_order_release);
+        if (auto map_it = _file_cache.find(generation->key);
+            map_it != _file_cache.end() && map_it->second == generation) {
+          _file_cache.erase(map_it);
+        }
+        if (collect) { retired.push_back(std::move(generation)); }  // capacity reserved
+      }
+    }
+    for (auto const& generation : retired) {
+      reclaim_idle_chunks(*generation);
+    }
+  } catch (...) {
+    // Only taking the map lock can fail here (std::system_error).
+    CUCASCADE_LOG_ERROR("[fs_cache] invalidate failed for '{}'", object_path);
+  }
+}
+
+fs_cache::pending_invalidation::pending_invalidation(
+  fs_cache* cache, std::string object_path, exec::completion_controller::slot slot) noexcept
+  : _cache(cache), _object_path(std::move(object_path)), _slot(std::move(slot))
+{
+}
+
+fs_cache::pending_invalidation::pending_invalidation(pending_invalidation&& other) noexcept
+  : _cache(std::exchange(other._cache, nullptr)),
+    _object_path(std::move(other._object_path)),
+    _slot(std::move(other._slot))
+{
+}
+
+fs_cache::pending_invalidation& fs_cache::pending_invalidation::operator=(
+  pending_invalidation&& other) noexcept
+{
+  if (this != &other) {
+    fire();
+    _cache       = std::exchange(other._cache, nullptr);
+    _object_path = std::move(other._object_path);
+    _slot        = std::move(other._slot);
+  }
+  return *this;
+}
+
+void fs_cache::pending_invalidation::fire() noexcept
+{
+  auto* const cache = std::exchange(_cache, nullptr);
+  if (cache == nullptr) { return; }
+  cache->invalidate(_object_path);
+  // Releasing the slot last lets a destructor waiting in drain_inflight_io()
+  // proceed only once the invalidation is done with the cache.
+  _slot = {};
+}
+
+fs_cache::pending_invalidation fs_cache::invalidate_later(std::string object_path) noexcept
+{
+  auto slot = acquire_inflight_io();
+  if (!slot) { return {}; }
+  return pending_invalidation{this, std::move(object_path), std::move(slot)};
 }
 
 std::size_t fs_cache::retired_generation_count() const noexcept
