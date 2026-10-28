@@ -77,9 +77,10 @@ struct loaded_library {
   need(api.handle_register, "cuFileHandleRegister");
   need(api.handle_deregister, "cuFileHandleDeregister");
   need(api.read, "cuFileRead");
+  need(api.write, "cuFileWrite");
   if (!complete) { return loaded; }
 
-  // Optional entry points: a library without them still serves reads.  Buffer registration is
+  // Optional entry points: a library without them still serves reads and writes.  Buffer registration is
   // usable only as a pair, so a library exporting one without the other gets neither.
   bool const has_register   = resolve(api.buf_register, library, "cuFileBufRegister");
   bool const has_deregister = resolve(api.buf_deregister, library, "cuFileBufDeregister");

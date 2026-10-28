@@ -42,9 +42,11 @@ namespace cucascade::io::cufile {
  * @c cuFileRead (staged through registered slots on a GDS-capable host, see
  * @ref staging; or, when cuFile cannot or should not serve them, POSIX reads
  * staged through each reactor's pinned scratch) and host reads with POSIX
- * @c pread; the pool shares one @c reactor_context.  Read-only.  Selected by
- * @c io_backend::cufile and registered from the datasource factory like the
- * uring / rest backends.
+ * @c pread; the pool shares one @c reactor_context.  Writes
+ * (@c open_io_object_for_write and the write API) use @c cuFileWrite for large
+ * aligned device bodies on a real GDS platform and staged / direct @c pwrite
+ * otherwise (see @c cufile_reactor).  Selected by @c io_backend::cufile and
+ * registered from the datasource factory like the uring / rest backends.
  *
  * Built from a @ref pool_plan (see @ref plan_cufile_pool), the pool has a group
  * of reactors per GPU, pinned to the CPUs local to that GPU: a device read goes
@@ -93,9 +95,12 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
    * A cuFile reactor serves one transfer at a time (synchronous cuFile and POSIX
    * calls), so a request's queue depth is the number of reactors it is spread
    * over.  The candidates are the reactors of @p device_id's group (every
-   * reactor when the pool is flat or the read is host-only); a vectored read
+   * reactor when the pool is flat or the request is host-only); a vectored read
    * with more slices than the base's two gets every candidate, least backlogged
-   * first, any other operation the two least backlogged.
+   * first, a host-only vectored write the least backlogged one (its page-cache
+   * writes with early writeback keep the device busy, and interleaving writers
+   * of one file only contends on its inode), any other operation the two least
+   * backlogged.
    */
   std::vector<cufile_reactor*> next_reactor(cufile_io_object const& object,
                                             std::size_t n_slices,
@@ -133,6 +138,10 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the
   /// static @c cufile_reactor::create_io_object(path) cannot see.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
+
+  /// Opens @p path for writing with this ioctx's @c use_odirect / @c compat_mode.
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) override;
 
  private:
   /// The reactors of one GPU: @c _reactors[first, first + count).

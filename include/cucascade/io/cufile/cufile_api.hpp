@@ -83,11 +83,11 @@ enum class string_parameter : int {
  * keeps the library mapped for the life of the process (it can crash at `dlclose` with statistics
  * enabled).
  *
- * The read entry points are required; a library that lacks one is treated as absent.  The
- * optional members are null when the loaded library predates them, and every caller checks:
- * without @c buf_register / @c buf_deregister the reactor reads into unregistered memory, and
- * without the parameter getters the platform probe reports cuFile's driver properties only.  The
- * members are plain C function pointers: no state, no virtual call.
+ * The read and write entry points are required; a library that lacks one is treated as absent.
+ * The optional members are null when the loaded library predates them, and every caller checks:
+ * without @c buf_register / @c buf_deregister the reactor reads and writes unregistered memory,
+ * and without the parameter getters the platform probe reports cuFile's driver properties only.
+ * The members are plain C function pointers: no state, no virtual call.
  *
  * This is a private detail of the cuFile backend; nothing outside the backend and its tests
  * should include this header.
@@ -99,10 +99,11 @@ struct cufile_api {
   decltype(&cuFileHandleRegister) handle_register{nullptr};
   decltype(&cuFileHandleDeregister) handle_deregister{nullptr};
   decltype(&cuFileRead) read{nullptr};
+  decltype(&cuFileWrite) write{nullptr};
 
   // -- optional -------------------------------------------------------------
   /// @c cuFileBufRegister: pins device memory for direct DMA (every libcufile has it, but a
-  /// library without it still serves reads).
+  /// library without it still serves reads and writes).
   decltype(&cuFileBufRegister) buf_register{nullptr};
   /// @c cuFileBufDeregister; resolved together with @c buf_register (both or neither).
   decltype(&cuFileBufDeregister) buf_deregister{nullptr};

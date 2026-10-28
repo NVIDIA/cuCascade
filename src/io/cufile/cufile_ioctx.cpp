@@ -201,6 +201,13 @@ std::shared_ptr<io_object> cufile_ioctx::create_io_object(std::string path)
     cufile_reactor::create_io_object(std::move(path), _config.use_odirect, _config.compat_mode));
 }
 
+std::shared_ptr<io_object> cufile_ioctx::create_io_object_for_write(std::string path,
+                                                                    write_open_options options)
+{
+  return std::shared_ptr<io_object>(cufile_reactor::create_io_object_for_write(
+    std::move(path), options, _config.use_odirect, _config.compat_mode));
+}
+
 path_info cufile_ioctx::path_capability(io_object const& object) const
 {
   auto const* typed = dynamic_cast<cufile_io_object const*>(&object);
@@ -260,9 +267,14 @@ std::vector<cufile_reactor*> cufile_ioctx::next_reactor(
     ranked.emplace_back(_reactors[first + (start + distance) % count]->queued_bytes(), distance);
   }
   // A vectored read with more slices than the default fan-out gets every
-  // candidate; anything else the two least backlogged.
+  // candidate; anything else the two least backlogged.  A host-only vectored
+  // write (device_id stays unresolved without device slices) gets one: its
+  // page-cache writes with early writeback already keep the device busy, and
+  // interleaving writers of one file only contends on its inode.
   bool const fan_out_all = type == io_op_type::host_vector_async && n_slices > 2 && count > 2;
-  auto const selected    = fan_out_all ? count : std::min<std::size_t>(count, 2);
+  bool const host_write  = type == io_op_type::write_vector_async && device_id < 0;
+  auto const selected =
+    fan_out_all ? count : std::min<std::size_t>(count, host_write ? 1 : 2);
   std::partial_sort(
     ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(selected), ranked.end());
   std::vector<cufile_reactor*> result;

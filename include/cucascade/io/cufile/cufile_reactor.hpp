@@ -54,28 +54,31 @@ namespace cucascade::io::cufile {
 /**
  * @brief @c io_object backed by a local filesystem path and a cuFile handle.
  *
- * Owns two @c O_RDONLY @c file_descriptor s -- a buffered fd for POSIX I/O and,
- * when O_DIRECT is enabled and supported, an O_DIRECT fd registered with cuFile
- * via @c cuFileHandleRegister for GDS DMA.  The registered handle lives for the
- * object's lifetime; the destructor deregisters it before the fds close.  All
- * I/O is performed by the reactor -- this class is a passive bag of native
- * handles plus the file size.
+ * Owns two @c file_descriptor s -- a buffered fd for POSIX I/O and, when
+ * O_DIRECT is enabled and supported, an O_DIRECT fd registered with cuFile via
+ * @c cuFileHandleRegister for GDS DMA.  Both are @c O_RDONLY for an object opened
+ * for reading and @c O_RDWR for one opened for writing (@ref writable).  The
+ * registered handle lives for the object's lifetime; the destructor deregisters
+ * it before the fds close.  All I/O is performed by the reactor -- this class is
+ * a passive bag of native handles plus the file size, which writes through a
+ * writable object raise (@ref note_written).
  *
- * An object opened by the reactor carries the @c local_stat identity of its
- * buffered fd and takes its (immutable) size from it; one constructed without
- * such an identity has the base class's open-local one.
+ * A read-only object opened by the reactor carries the @c local_stat identity
+ * of its buffered fd and takes its size from it; a writable object, or one
+ * constructed without such an identity, has the base class's open-local one.
  */
 class cufile_io_object final : public io_object {
  public:
   /// @p cufile_handle is null when the file was not registered with cuFile; the
-  /// reactor then serves every read of it through POSIX.  @p identity is the
-  /// @c local_stat identity of @p buffered_fd; when it is not a @c local_stat
-  /// identity it is ignored and the object keeps @p file_size.
+  /// reactor then serves every read and write of it through POSIX.  @p identity
+  /// is the @c local_stat identity of @p buffered_fd; it is ignored for a
+  /// writable object or when it is not a @c local_stat identity.
   cufile_io_object(std::string path,
                    file_descriptor buffered_fd,
                    file_descriptor direct_fd,
                    CUfileHandle_t cufile_handle,
                    std::size_t file_size,
+                   io_access access         = io_access::read_only,
                    object_identity identity = {});
 
   ~cufile_io_object() override;
@@ -85,15 +88,26 @@ class cufile_io_object final : public io_object {
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
-  [[nodiscard]] std::size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] std::size_t size() const noexcept override
+  {
+    return _file_size.load(std::memory_order_acquire);
+  }
 
   [[nodiscard]] object_identity identity() const override;
+
+  [[nodiscard]] bool writable() const noexcept override { return _access == io_access::read_write; }
+
+  void note_written(std::size_t end) const noexcept override
+  {
+    if (writable()) atomic_store_max(_file_size, end);
+  }
 
   /// The buffered fd (page cache).  Always valid.
   [[nodiscard]] int buffered_fd() const noexcept { return _buffered_fd.get(); }
 
   /// The O_DIRECT fd cuFile was registered against, or -1 when none was opened.
-  /// Reads through it are cuFile's and the aligned host reads'.
+  /// Reads through it are cuFile's; the reactor @c pwrite s aligned write
+  /// pieces through it.
   [[nodiscard]] int direct_fd() const noexcept { return _direct_fd.get(); }
 
   /// The handle to pass to @c cuFileRead; null when the GDS fast path is
@@ -107,7 +121,8 @@ class cufile_io_object final : public io_object {
   file_descriptor _buffered_fd;
   file_descriptor _direct_fd;
   CUfileHandle_t _cufile_handle{nullptr};
-  std::size_t _file_size{0};
+  mutable std::atomic<std::size_t> _file_size{0};
+  io_access _access{io_access::read_only};
   std::optional<object_identity> _identity;
 };
 
@@ -192,8 +207,26 @@ struct reactor_stats {
  * when a device destination was also requested.  A cuFile read that fails
  * degrades to that fallback instead of failing the read.
  *
- * Host-only reads go O_DIRECT, through the scratch when not block-aligned.  The
- * reactor is read-only: it opens files @c O_RDONLY and has no write path.
+ * Writes (on objects from @ref create_io_object_for_write) are split at the
+ * write granule like the uring reactor's: the granule-aligned body of a device
+ * source of at least @ref config::gds_threshold bytes goes to synchronous
+ * @c cuFileWrite calls (after the work queued on the source's stream), while
+ * the sub-granule head and tail, smaller bodies and host sources are written
+ * with @c pwrite -- O_DIRECT for aligned pieces, buffered otherwise -- device
+ * bytes being staged through the reactor's pinned scratch by D2H copies.  A
+ * host source that lines up with the file goes O_DIRECT straight from the
+ * caller when its body is at least 4 MiB; any other host source is written
+ * through the page cache with its writeback started at once
+ * (@c sync_file_range), which overlaps the kernel's copy with the device write
+ * and measured faster than staging it for O_DIRECT -- so spilled host data can
+ * transiently occupy the page cache (clean and reclaimable once written back;
+ * durability still needs a flush).
+ * Host-only reads go O_DIRECT, through the scratch when not block-aligned.  A
+ * flush is an @c fdatasync.  On a platform where cuFile
+ * runs only in compatibility mode (@c probe_platform().compat_only) aligned
+ * device bodies are staged too: cuFile then bounces through host memory itself,
+ * and its 1 MiB writes measured about half as fast as the staged path when they
+ * extend a file.
  *
  * The synchronous API is deliberate (it is what NVIDIA's own consumers use, with
  * one thread per read in flight): @c cuFileReadAsync serialises a stream's
@@ -215,19 +248,21 @@ struct reactor_stats {
  * (see @ref config::low_service_interval) so waiting low work is never starved.
  *
  * Completion: a request's future settles only once every one of its slices has
- * stopped touching its destination, failed and cancelled siblings included.
- * cuFile and POSIX reads are synchronous on the worker; scatter and H2D copies
- * run on reactor-owned streams and are host-complete (their event completed)
- * before their slice settles; a parked or cancelled slice settles without
- * having issued anything.  The bytes of a successful read are therefore visible
- * from any stream without further CUDA synchronization; the caller owns the
- * destination memory until the future settles.
+ * stopped touching its destination (or, for a write, its source), failed and
+ * cancelled siblings included.  cuFile and POSIX transfers are synchronous on
+ * the worker; scatter and staging copies run on reactor-owned streams and are
+ * host-complete (their event completed) before their slice settles; a parked or
+ * cancelled slice settles without having issued anything.  The bytes of a
+ * successful read are therefore visible from any stream without further CUDA
+ * synchronization; the caller owns the destination (or source) memory until the
+ * future settles.
  *
  * Fragmented (cache-chunk) destinations are not served: the reactor's pinned
  * scratch is not shaped like cache chunks, so it opts out of the prefetching
  * cache (@c reactor_traits::supports_vector_host_read is false).
  *
- * @note Destinations are never registered: registering a one-shot buffer costs
+ * @note By default destinations and sources are not registered (see
+ *       @ref config::register_min_bytes): registering a one-shot buffer costs
  *       about as much as reading it, and its 4 KiB phase rarely matches the file
  *       offset anyway.  The staging slots are registered once and reused by the
  *       whole process (see @c reserve_staging).
@@ -364,6 +399,39 @@ class cufile_reactor {
                                                             bool use_odirect,
                                                             std::optional<compat> compat_mode);
 
+  // -- Writes (the reactor write contract, templated_ioctx.hpp) -------------
+
+  /// Open @p path for writing with default options (O_DIRECT,
+  /// @c compat::automatic).  See the four-argument overload.
+  static std::unique_ptr<cufile_io_object> create_io_object_for_write(std::string path,
+                                                                      write_open_options options);
+
+  /**
+   * @brief Open @p path read+write per @p options and register its O_DIRECT fd
+   *        with cuFile, with the same @p use_odirect / @p compat_mode rules as
+   *        @ref create_io_object.
+   *
+   * @throws std::system_error for open failures (@c ENOENT, @c EEXIST, ...);
+   *         std::invalid_argument / std::runtime_error as @ref create_io_object.
+   */
+  static std::unique_ptr<cufile_io_object> create_io_object_for_write(
+    std::string path,
+    write_open_options options,
+    bool use_odirect,
+    std::optional<compat> compat_mode);
+
+  /// Synchronous host write on the calling thread: the write-granule-aligned
+  /// body goes O_DIRECT when the source is block-aligned, head and tail through
+  /// the page cache.  Raises the object's size; returns @p size.
+  /// @throws std::system_error (@c EBADF for an object not opened for writing).
+  std::size_t host_write(cufile_io_object const& file,
+                         std::size_t offset,
+                         std::size_t size,
+                         std::uint8_t const* source);
+
+  /// @c fdatasync the file on the calling thread.  @throws std::system_error.
+  static void flush(cufile_io_object const& file);
+
   /// Same alignment / coalescing policy as the uring reactor: outward to page
   /// boundaries, then merge overlapping / adjacent ranges.  @p alignment smaller
   /// than @c IO_BLOCK_SIZE is ignored in favour of @c IO_BLOCK_SIZE.
@@ -478,6 +546,25 @@ class cufile_reactor {
                                  prepared_io_slice const& slice,
                                  std::unique_ptr<io_op_request>& request);
 
+  /// Serve a write slice: host sources by @c pwrite, device sources by
+  /// @c cuFileWrite for the aligned body and staged @c pwrite for the rest.
+  void dispatch_write(cufile_io_object const& file,
+                      prepared_io_slice const& slice,
+                      io_op_request& request);
+
+  /// Write the device-source pieces @p pieces of @p slice by D2H copies (on the
+  /// reactor's copy stream) into the pinned scratch and @c pwrite, double-buffered.
+  void write_device_staged(cufile_io_object const& file,
+                           prepared_io_slice const& slice,
+                           std::span<range const> pieces,
+                           int device_id);
+
+  /// Write @p piece from device memory @p source with @c cuFileWrite.  Returns
+  /// false when cuFile failed and the caller must stage the piece instead.
+  [[nodiscard]] bool write_cufile(cufile_io_object const& file,
+                                  std::uint8_t const* source,
+                                  range piece);
+
   /// The scratch, allocated on first use.
   [[nodiscard]] std::uint8_t* scratch();
 
@@ -577,9 +664,10 @@ class cufile_reactor {
   std::vector<owned_stream> _copy_streams;
   /// Gated pair-copy streams, indexed by device id.
   std::vector<owned_stream> _pair_streams;
-  /// Pinned (portable) staging for device-only POSIX reads and unaligned host
-  /// reads, taken from a process-wide pool on first use (so a reactor that never
-  /// stages holds no pinned memory) and given back to it at shutdown.
+  /// Pinned (portable) staging for device-only POSIX reads and writes and
+  /// unaligned host reads, taken from a process-wide pool on first use (so a
+  /// reactor that never stages holds no pinned memory) and given back to it at
+  /// shutdown.
   pinned_scratch _scratch;
   /// Registered device staging, indexed by device id (null until first used).
   std::vector<std::unique_ptr<device_staging>> _staging;
