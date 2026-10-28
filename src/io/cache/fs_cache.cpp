@@ -44,6 +44,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <shared_mutex>
 #include <span>
@@ -63,10 +64,14 @@ namespace cucascade::io::cache {
 struct cache_generation {
   /// Materialise a chunk for every offset in @p incoming, fold the matching
   /// entry of @p desired into its populated extent, and count the calling
-  /// request as a subscriber of each.  Returns the chunks in @p incoming
-  /// order.  @p desired runs index-parallel to @p incoming.
-  std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
-                                                   std::span<const chunk_fill> desired);
+  /// request as a subscriber of each.  @p desired runs index-parallel to
+  /// @p incoming.  Records each acquired subscription in @p result (which
+  /// must be empty), in @p incoming order, as it is acquired; an offset past
+  /// EOF stays null.  The caller owns the rollback of what was recorded, even
+  /// when acquisition throws part-way.
+  void subscribe_chunks(std::span<const size_t> incoming,
+                        std::span<const chunk_fill> desired,
+                        std::vector<cached_chunk*>& result);
 
   std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                           std::size_t size,
@@ -293,11 +298,13 @@ std::shared_ptr<const std::vector<cached_chunk*>> cache_handle::chunks() const n
 
 cache_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
 
-std::vector<cached_chunk*> cache_generation::update_and_get_chunks(
-  std::span<const size_t> incoming, std::span<const chunk_fill> desired)
+void cache_generation::subscribe_chunks(std::span<const size_t> incoming,
+                                        std::span<const chunk_fill> desired,
+                                        std::vector<cached_chunk*>& result)
 {
   assert(incoming.size() == desired.size());
-  std::vector<cached_chunk*> result(incoming.size(), nullptr);
+  assert(result.empty());
+  result.resize(incoming.size(), nullptr);
 
   // Claim an already-materialised chunk for this request: count the subscriber
   // and widen the extent it is expected to hold.  merge_fill is itself gated on
@@ -324,7 +331,7 @@ std::vector<cached_chunk*> cache_generation::update_and_get_chunks(
         missing_indices.push_back(i);
       }
     }
-    if (missing_indices.empty()) { return result; }
+    if (missing_indices.empty()) { return; }
   }
 
   // Phase 2: materialise the missing chunks.  Another writer may have filled
@@ -339,8 +346,6 @@ std::vector<cached_chunk*> cache_generation::update_and_get_chunks(
       result[idx] = entry;
     }
   }
-
-  return result;
 }
 
 std::vector<cached_chunk*> cache_generation::fetch_chunks(std::size_t offset,
@@ -669,7 +674,24 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
   req.generation = generation;
   req.timestamp  = _ticker.load(std::memory_order_relaxed);
 
-  auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
+  // Until the evictor owns the request, this guard owns every subscription
+  // acquired for it: a failure part-way through acquisition, allocating the
+  // request or enqueueing it drops each one exactly once.  `generation` keeps
+  // the recorded chunks alive until the rollback completes.
+  auto subscribed = std::make_shared<std::vector<cached_chunk*>>();
+  struct subscription_rollback {
+    std::vector<cached_chunk*> const& chunks;
+    bool committed = false;
+    ~subscription_rollback()
+    {
+      if (committed) { return; }
+      for (auto* chunk : chunks) {
+        if (chunk != nullptr) { chunk->state.drop_subscriber(); }
+      }
+    }
+  } rollback{*subscribed};
+  auto& chunks_to_fetch = *subscribed;
+  file.subscribe_chunks(chunk_offsets, desired, chunks_to_fetch);
   // Offsets past EOF have no slot.  Drop them while keeping the requested
   // extents index-parallel, reusing the normalized extents instead of
   // allocating a second per-chunk vector.
@@ -682,7 +704,7 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
   chunks_to_fetch.resize(count);
   desired.resize(count);
   req.required_fills = std::make_shared<const std::vector<chunk_fill>>(std::move(desired));
-  req.chunks = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
+  req.chunks         = subscribed;
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
   if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
@@ -690,7 +712,9 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
   std::ignore              = req.producer->mark_queued();
   prefetch_request tracked = req;
   tracked.obj.reset();
-  _eviction_queue.enqueue(cache_request{std::move(tracked)});
+  if (_before_request_enqueue) { _before_request_enqueue(); }
+  if (!_eviction_queue.enqueue(cache_request{std::move(tracked)})) { throw std::bad_alloc(); }
+  rollback.committed = true;  // The evictor now owns exactly one release per subscription.
 
   return cache_handle(std::move(req), std::move(generation));
 }

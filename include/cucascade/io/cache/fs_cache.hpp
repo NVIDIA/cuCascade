@@ -292,6 +292,7 @@ class fs_cache {
   // fadvise dispatch through it.
   friend class cucascade::io::datasource;
   friend class cache_handle;
+  friend struct fs_cache_test_access;
 
  public:
   using byte_range = cucascade::io::byte_range;
@@ -383,6 +384,15 @@ class fs_cache {
   void set_before_prefetch_claim_for_testing(std::function<void()> hook)
   {
     _before_prefetch_claim = std::move(hook);
+  }
+
+  /// Test-only hook run when a new prefetch request has subscribed to its
+  /// chunks and is about to be handed to the evictor; a throw from it takes
+  /// the path of a failed hand-off (the request's subscriptions are rolled
+  /// back).  Configure only while no request can be created.
+  void set_before_request_enqueue_for_testing(std::function<void()> hook)
+  {
+    _before_request_enqueue = std::move(hook);
   }
 
   /// Bytes of staging memory the cache currently holds: every chunk buffer
@@ -543,6 +553,7 @@ class fs_cache {
   void reclaim_idle_chunks(cache_generation& generation) noexcept;
 
   std::function<void()> _before_prefetch_claim;
+  std::function<void()> _before_request_enqueue;
   const config _cfg;
   std::shared_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;
