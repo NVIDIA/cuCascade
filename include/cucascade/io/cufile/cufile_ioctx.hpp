@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/io/cufile/cufile_reactor.hpp>
+#include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
 #include <cstddef>
@@ -70,6 +71,18 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
                                             std::size_t n_slices,
                                             io_op_type type,
                                             int device_id = -1) override;
+
+  /**
+   * @brief What GPUDirect Storage can do for reads of @p object, an object this
+   *        ioctx opened, under this ioctx's configuration (see @ref probe_object).
+   *
+   * Advisory: computed on each call from the object's own descriptors and
+   * registration (passive storage discovery is not cached), and logged once
+   * per device and verdict.  Reads never depend on it.
+   *
+   * @throws std::invalid_argument when @p object was not opened by a cuFile ioctx.
+   */
+  [[nodiscard]] path_info path_capability(io_object const& object) const;
 
  protected:
   /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the
