@@ -48,7 +48,7 @@ namespace cucascade::io::rest {
  * Default behavior: every call to @c authorize returns the
  * @c authorized_request passed to the constructor verbatim (independent of
  * @p obj / @p method) so tests can verify "the reactor passed our URL +
- * headers to libcurl unchanged". To exercise error paths, call @c set_throw to
+ * headers to the transport unchanged". To exercise error paths, call @c set_throw to
  * make subsequent calls throw @c cucascade::io::credential_error.
  *
  * Thread safety: counters are atomic; @c last_bucket / @c last_key are
@@ -83,6 +83,51 @@ class mock_authorizer final : public request_authorizer {
     return _canned;
   }
 
+  /// The write-path seam. A GET / HEAD without a query is forwarded to
+  /// @c authorize (same counters and canned result as before); any other request
+  /// counts in @c put_count / @c post_count / @c delete_count and returns the
+  /// canned URL with @c spec.query appended (and the canned headers). Records
+  /// the last method, query and body flag. Honours @c set_throw.
+  authorized_request authorize_request(request_spec const& spec,
+                                       std::chrono::seconds timeout) override
+  {
+    ++_request_count;
+    {
+      std::scoped_lock lk{_last_mtx};
+      _last_method   = spec.method;
+      _last_query    = std::string{spec.query};
+      _last_has_body = spec.has_body;
+    }
+    if ((spec.method == request_method::GET || spec.method == request_method::HEAD) &&
+        spec.query.empty()) {
+      return authorize(spec.object, spec.method, timeout);
+    }
+    ++_call_count;
+    if (spec.method == request_method::PUT) ++_put_count;
+    if (spec.method == request_method::POST) ++_post_count;
+    if (spec.method == request_method::DELETE) ++_delete_count;
+    {
+      std::scoped_lock lk{_last_mtx};
+      _last_bucket  = spec.object.bucket;
+      _last_key     = spec.object.key;
+      _last_timeout = timeout;
+    }
+    if (_should_throw.load()) {
+      std::string msg;
+      {
+        std::scoped_lock lk{_last_mtx};
+        msg = _throw_msg.empty() ? std::string{"mock_authorizer: forced failure"} : _throw_msg;
+      }
+      throw credential_error(msg);
+    }
+    authorized_request out = _canned;
+    if (!spec.query.empty()) {
+      out.url += out.url.find('?') == std::string::npos ? '?' : '&';
+      out.url += spec.query;
+    }
+    return out;
+  }
+
   /// Subsequent calls throw @c credential_error with @p msg (or default).
   void set_throw(std::string msg = {})
   {
@@ -106,6 +151,27 @@ class mock_authorizer final : public request_authorizer {
   [[nodiscard]] int call_count() const noexcept { return _call_count.load(); }
   [[nodiscard]] int get_count() const noexcept { return _get_count.load(); }
   [[nodiscard]] int head_count() const noexcept { return _head_count.load(); }
+  /// Calls of @c authorize_request (any method, including forwarded reads).
+  [[nodiscard]] int request_count() const noexcept { return _request_count.load(); }
+  [[nodiscard]] int put_count() const noexcept { return _put_count.load(); }
+  [[nodiscard]] int post_count() const noexcept { return _post_count.load(); }
+  [[nodiscard]] int delete_count() const noexcept { return _delete_count.load(); }
+
+  [[nodiscard]] request_method last_method() const
+  {
+    std::scoped_lock lk{_last_mtx};
+    return _last_method;
+  }
+  [[nodiscard]] std::string last_query() const
+  {
+    std::scoped_lock lk{_last_mtx};
+    return _last_query;
+  }
+  [[nodiscard]] bool last_has_body() const
+  {
+    std::scoped_lock lk{_last_mtx};
+    return _last_has_body;
+  }
 
   [[nodiscard]] std::string last_bucket() const
   {
@@ -128,11 +194,18 @@ class mock_authorizer final : public request_authorizer {
   std::atomic<int> _call_count{0};
   std::atomic<int> _get_count{0};
   std::atomic<int> _head_count{0};
+  std::atomic<int> _request_count{0};
+  std::atomic<int> _put_count{0};
+  std::atomic<int> _post_count{0};
+  std::atomic<int> _delete_count{0};
   std::atomic<bool> _should_throw{false};
   mutable std::mutex _last_mtx;
   std::string _last_bucket;
   std::string _last_key;
   std::chrono::seconds _last_timeout{0};
+  request_method _last_method{request_method::GET};
+  std::string _last_query;
+  bool _last_has_body{false};
   std::string _throw_msg;
 };
 
