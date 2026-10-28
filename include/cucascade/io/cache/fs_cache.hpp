@@ -35,6 +35,7 @@
 #include <exception>
 #include <functional>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -65,6 +66,18 @@ class memory_reservation_manager;
 }  // namespace cucascade::memory
 
 namespace cucascade::io::cache {
+
+/// Which resident chunks @ref fs_cache::reclaim may take.
+enum class reclaim_mode : std::uint8_t {
+  /// Only chunks no live prefetch request subscribes to -- what the background
+  /// evictor reclaims first.  Safe under ordinary memory pressure: it costs
+  /// only future hits on data nobody has asked for.
+  idle,
+  /// Also chunks a live request still subscribes to (their request falls back
+  /// to reading from the backend).  A last resort for an embedder that still
+  /// owes memory after everything else.
+  forced,
+};
 
 /// True when every chunk of @p chunks owns a staging buffer, i.e. its
 /// @c chunk_state has reached @c allocated and has not been reclaimed since.
@@ -420,6 +433,26 @@ class fs_cache {
   /// A zero request is a no-op, as is one on a cache that is not armed or is
   /// already shutting down.
   void evict(std::size_t bytes_to_free);
+
+  /// Synchronously return resident chunk buffers to the cache's pool, on the
+  /// calling thread, independent of the evictor and its queue: an embedder
+  /// under host memory pressure (for example a HOST downgrade executor) frees
+  /// cache memory before it spills anything else.
+  ///
+  /// Sweeps every live generation (retired ones first) and stops once
+  /// @p target_bytes worth of chunks were reclaimed -- whole chunks, so up to
+  /// one chunk more than asked -- or every chunk was visited.  A chunk pinned
+  /// by a reader or still loading is never taken; @ref reclaim_mode::idle also
+  /// spares chunks a live request subscribes to.  Each reclaimed chunk counts
+  /// as an eviction in @ref summary.
+  ///
+  /// A zero target, an unarmed cache and a cache shutting down return 0.
+  /// Takes the map lock shared and each generation's lock exclusively, so it
+  /// must not be called with a cache lock held.
+  ///
+  /// @return bytes returned to the pool.
+  std::size_t reclaim(reclaim_mode mode,
+                      std::size_t target_bytes = std::numeric_limits<std::size_t>::max());
 
   /// Ask the evictor to free at least @p bytes_to_free and wait until that
   /// request has been processed. This acknowledges an eviction pass, not that

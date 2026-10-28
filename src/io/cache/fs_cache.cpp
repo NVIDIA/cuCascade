@@ -101,21 +101,36 @@ struct cache_generation {
 namespace {
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 
-std::size_t reclaim_chunk_buffers(cache_generation& generation,
-                                  buffer_pool& pool,
-                                  bool only_unsubscribed) noexcept
+/// What one @ref reclaim_chunk_buffers pass did: chunks whose buffers went back
+/// to the pool, and chunks that hold a buffer it could not take (pinned,
+/// loading, or being evicted by someone else).
+struct reclaim_outcome {
+  std::size_t reclaimed{0};
+  std::size_t stuck{0};
+};
+
+/// Return the buffers of up to @p max_chunks of @p generation's chunks to
+/// @p pool, skipping chunks a live request subscribes to when
+/// @p only_unsubscribed.  The caller holds @c generation.mtx exclusively (the
+/// scratch vectors are the generation's) or is its last owner.
+reclaim_outcome reclaim_chunk_buffers(
+  cache_generation& generation,
+  buffer_pool& pool,
+  bool only_unsubscribed,
+  std::size_t max_chunks = std::numeric_limits<std::size_t>::max()) noexcept
 {
   auto& claimed = generation.reclaim_claimed;
   auto& batch   = generation.reclaim_batch;
   claimed.clear();
-  std::size_t stuck = 0;
+  reclaim_outcome outcome;
   for (cached_chunk* c : generation.slots) {
+    if (claimed.size() >= max_chunks) { break; }
     if (c == nullptr) { continue; }
     auto const snap = c->state.load();
     if (snap.state() == chunk_state::empty) { continue; }
     if (only_unsubscribed && snap.subscribers() != 0) { continue; }
     if (!c->state.mark_evicting(only_unsubscribed)) {
-      ++stuck;  // pinned, loading, or already being evicted by someone else
+      ++outcome.stuck;  // pinned, loading, or already being evicted by someone else
       continue;
     }
     claimed.push_back(c);  // capacity reserved at creation: one per slot
@@ -132,9 +147,10 @@ std::size_t reclaim_chunk_buffers(cache_generation& generation,
     }
     pool.deallocate_bulk(std::span<std::byte* const>(batch), numa);
   }
+  outcome.reclaimed = claimed.size();
   claimed.clear();
   batch.clear();
-  return stuck;
+  return outcome;
 }
 
 struct generation_deleter {
@@ -146,7 +162,7 @@ struct generation_deleter {
     std::size_t stuck = 0;
     {
       std::unique_lock lk(*retire_mtx);
-      stuck = reclaim_chunk_buffers(*generation, *pool, /*only_unsubscribed=*/false);
+      stuck = reclaim_chunk_buffers(*generation, *pool, /*only_unsubscribed=*/false).stuck;
       delete generation;
     }
     if (stuck > 0) {
@@ -432,7 +448,7 @@ void fs_cache::reclaim_all_chunks() noexcept
       // executing while a cache is reset/torn down. mark_evicting() still
       // unconditionally refuses a chunk with an active pin, so this can
       // never pull a buffer out from under a live reader.
-      stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false);
+      stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false).stuck;
       current.push_back(std::move(generation));
     }
     // Retired generations are out of _file_cache but may still be held by a
@@ -444,7 +460,7 @@ void fs_cache::reclaim_all_chunks() noexcept
         auto generation = weak.lock();
         if (!generation || !generation->retired.load(std::memory_order_acquire)) { continue; }
         std::unique_lock elk(generation->mtx);
-        stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false);
+        stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false).stuck;
         current.push_back(std::move(generation));
       }
     }
@@ -1414,6 +1430,47 @@ void fs_cache::evict(std::size_t bytes_to_free)
   // demand queued behind the stop sentinel would never be looked at.
   if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_relaxed)) { return; }
   _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, nullptr}});
+}
+
+std::size_t fs_cache::reclaim(reclaim_mode mode, std::size_t target_bytes)
+{
+  if (target_bytes == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return 0; }
+  // Whole chunks are the only granularity there is: a target of part of a
+  // chunk still costs the whole thing.
+  auto const chunk_bytes = std::max<std::size_t>(_chunk_size, 1);
+  std::size_t const budget =
+    target_bytes / chunk_bytes + static_cast<std::size_t>(target_bytes % chunk_bytes != 0);
+
+  // Snapshot every live generation, current and retired, under the map's
+  // shared lock only; the sweep below runs without it.  Holding the owners
+  // keeps each generation (and its chunks) alive until the sweep is done.
+  std::vector<std::shared_ptr<cache_generation>> generations;
+  {
+    std::shared_lock lk(_map_mtx);
+    for (auto const& [_, family] : _generations_by_path) {
+      for (auto const& weak : family) {
+        if (auto generation = weak.lock()) { generations.push_back(std::move(generation)); }
+      }
+    }
+  }
+  // Retired generations first: no later open can hit their chunks.
+  std::ranges::stable_partition(generations, [](auto const& generation) {
+    return generation->retired.load(std::memory_order_acquire);
+  });
+
+  // idle: mark_evicting(true) spares every chunk a live request still names.
+  // forced: mark_evicting(false) also takes those.  Both refuse a chunk that
+  // is pinned by a reader or loading, so no in-flight read loses its buffer.
+  bool const only_unsubscribed = mode == reclaim_mode::idle;
+  std::size_t reclaimed        = 0;
+  for (auto const& generation : generations) {
+    if (reclaimed >= budget) { break; }
+    std::unique_lock elk(generation->mtx);
+    reclaimed +=
+      reclaim_chunk_buffers(*generation, *_pool, only_unsubscribed, budget - reclaimed).reclaimed;
+  }
+  if (reclaimed > 0) { _counters.evictions.fetch_add(reclaimed, std::memory_order_relaxed); }
+  return reclaimed * chunk_bytes;
 }
 
 void fs_cache::evict_sync(std::size_t bytes_to_free)
