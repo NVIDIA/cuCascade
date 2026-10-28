@@ -39,6 +39,15 @@ target_sources(
 target_include_directories(cucascade_io_objects
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+# The cuFile / GDS reactor loads libcufile at run time; building it needs only
+# cufile.h (see CUCASCADE_CUFILE_INCLUDE_DIR in the top-level CMakeLists.txt).
+if(CUCASCADE_CUFILE_INCLUDE_DIR)
+  target_sources(
+    cucascade_io_objects
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_api.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/platform.cpp)
+endif()
+
 # kvikIO reaches the environment only via libcudf's dependency closure, so the
 # fallback ioctx is built only alongside the cudf layer.
 if(CUCASCADE_BUILD_CUDF)
