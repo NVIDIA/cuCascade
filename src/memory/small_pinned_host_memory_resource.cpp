@@ -15,218 +15,299 @@
  * limitations under the License.
  */
 
+#include <cucascade/error.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
-#include <cstdlib>
+#include <algorithm>
+#include <bit>
+#include <cassert>
+#include <concepts>
+#include <limits>
+#include <list>
+#include <optional>
+#include <ranges>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 
 namespace cucascade {
 namespace memory {
+namespace {
 
-small_pinned_host_memory_resource::small_pinned_host_memory_resource(
-  fixed_size_host_memory_resource& upstream)
-  : upstream_(upstream)
-{
-}
+// Every function in this file clears the calling thread's CUDA error state only right after one of
+// its own CUDA calls failed, so it never clears an unrelated error the caller has not checked yet.
 
-small_pinned_host_memory_resource::~small_pinned_host_memory_resource()
-{
-  // owned_allocations_ destructor returns upstream blocks to the free list.
-  // free_lists_ entries are raw pointers into those blocks; no individual cleanup needed.
-  // Destroy every CUDA event we own — both idle (pooled) and still attached to a
-  // free slab that was never re-allocated.
-  bool retain_backing_allocations = has_quarantined_slab_;
-  int prev_device                 = 0;
-  bool const have_prev            = (::cudaGetDevice(&prev_device) == cudaSuccess);
-  auto destroy_on                 = [&retain_backing_allocations](cudaEvent_t event, int device) {
-    if (event == nullptr) { return; }
-    // cudaEventDestroy is device-agnostic, but making the owning device current
-    // keeps the call on the context the event was created in.
-    if (device >= 0) { (void)::cudaSetDevice(device); }
-    // Destroying an incomplete event does not wait for its captured work. Wait
-    // explicitly before owned_allocations_ returns the backing slabs upstream.
-    if (::cudaEventSynchronize(event) != cudaSuccess) {
-      // Fail closed: cudaEventDestroy is non-blocking for incomplete events.
-      // Retain every backing allocation so upstream cannot reuse its slabs.
-      (void)::cudaGetLastError();
-      retain_backing_allocations = true;
+// Portable: DMA-visible from every CUDA context, which multi-GPU consumers need. PR #115 observed
+// CUDA 13's cudaMemcpyBatchAsync rejecting a cross-device source allocated without this flag
+// (cudaErrorInvalidValue) on its multi-GPU host; other hosts accept such sources. Mapped:
+// cuDF 26.04+ may read hostdevice_vector memory directly from kernels (for example
+// detect_malformed_pages), and this resource advertises ::cuda::mr::device_accessible.
+constexpr unsigned int pinned_host_alloc_flags = cudaHostAllocPortable | cudaHostAllocMapped;
+
+// Event creation must use the freeing stream's device even when another device is current.
+class event_creation_device_guard {
+ public:
+  explicit event_creation_device_guard(int device) noexcept
+  {
+    int current_device = -1;
+    if (cudaGetDevice(&current_device) != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+      return;
     }
-    CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(event));
-  };
-  for (auto& [device, events] : event_pool_) {
-    for (auto& event : events) {
-      destroy_on(event, device);
+    if (current_device != device) {
+      if (cudaSetDevice(device) != cudaSuccess) {
+        std::ignore = cudaGetLastError();
+        return;
+      }
+      _previous_device = current_device;
+    }
+    _is_ready = true;
+  }
+
+  event_creation_device_guard(event_creation_device_guard const&)            = delete;
+  event_creation_device_guard& operator=(event_creation_device_guard const&) = delete;
+  event_creation_device_guard(event_creation_device_guard&&)                 = delete;
+  event_creation_device_guard& operator=(event_creation_device_guard&&)      = delete;
+
+  ~event_creation_device_guard() noexcept
+  {
+    if (_previous_device >= 0 && cudaSetDevice(_previous_device) != cudaSuccess) {
+      std::ignore = cudaGetLastError();
     }
   }
-  for (auto& list : free_lists_) {
-    for (auto& slab : list) {
-      destroy_on(slab.ready_event, slab.event_device);
-    }
-  }
-  if (have_prev) { (void)::cudaSetDevice(prev_device); }
-  if (retain_backing_allocations) {
-    // Intentionally leak the allocation handles on an unrecoverable CUDA error.
-    // Returning their blocks upstream would risk use-after-free or unordered reuse.
-    for (auto& allocation : owned_allocations_) {
-      (void)allocation.release();
-    }
-  }
-}
 
-int small_pinned_host_memory_resource::device_of_stream(::cuda::stream_ref stream) noexcept
+  [[nodiscard]] bool is_ready() const noexcept { return _is_ready; }
+
+ private:
+  int _previous_device{-1};
+  bool _is_ready{false};
+};
+
+int device_of_stream(::cuda::stream_ref stream) noexcept
 {
   int device = -1;
-  // A CUDA event is bound to the device current at creation time, and
-  // cudaEventRecord requires the event and stream to be on the same device.
-  // Ask the driver which device this stream belongs to rather than assuming it
-  // matches the calling thread's current device.
-  if (::cudaStreamGetDevice(stream.get(), &device) == cudaSuccess) { return device; }
-  (void)::cudaGetLastError();
-  if (::cudaGetDevice(&device) == cudaSuccess) { return device; }
-  (void)::cudaGetLastError();
+  if (cudaStreamGetDevice(stream.get(), &device) == cudaSuccess) { return device; }
+  std::ignore = cudaGetLastError();
+  if (cudaGetDevice(&device) == cudaSuccess) { return device; }
+  std::ignore = cudaGetLastError();
   return -1;
 }
 
-cudaEvent_t small_pinned_host_memory_resource::acquire_event_locked(int device)
+// Blocks until the work is complete. Returns false if the wait failed; the caller must then
+// withhold storage the work may still use.
+[[nodiscard]] bool wait_no_throw(::cuda::stream_ref stream) noexcept
 {
-  auto const pool_it = event_pool_.find(device);
-  if (pool_it != event_pool_.end() && !pool_it->second.empty()) {
-    auto& pool        = pool_it->second;
-    cudaEvent_t event = pool.back();
-    pool.pop_back();
-    return event;
-  }
+  if (cudaStreamSynchronize(stream.get()) == cudaSuccess) { return true; }
+  std::ignore = cudaGetLastError();
+  return false;
+}
 
-  // Create the event on the device it will be recorded against. Without this,
-  // an event created while another GPU was current fails cudaEventRecord with
-  // cudaErrorInvalidResourceHandle, and the slab would be recycled unordered.
-  int prev_device = -1;
-  bool switched   = false;
-  if (device >= 0 && ::cudaGetDevice(&prev_device) == cudaSuccess && prev_device != device) {
-    if (::cudaSetDevice(device) == cudaSuccess) {
-      switched = true;
-    } else {
-      (void)::cudaGetLastError();
-      return nullptr;
+[[nodiscard]] bool wait_no_throw(cuda::cuda_event const& event) noexcept
+{
+  if (event.synchronize_no_throw() == cudaSuccess) { return true; }
+  std::ignore = cudaGetLastError();
+  return false;
+}
+
+// A failed free has an unknown effect, so the buffer is leaked.
+void free_pinned_no_throw(void* ptr) noexcept
+{
+  if (cudaFreeHost(ptr) != cudaSuccess) { std::ignore = cudaGetLastError(); }
+}
+
+// Frees a direct pinned buffer once `completion` confirms its GPU work is done, and leaks it
+// otherwise.
+template <typename Completion>
+  requires requires(Completion const& completion) {
+    { wait_no_throw(completion) } noexcept -> std::same_as<bool>;
+  }
+void free_pinned_after(Completion const& completion, void* ptr) noexcept
+{
+  if (wait_no_throw(completion)) { free_pinned_no_throw(ptr); }
+}
+
+}  // namespace
+
+small_pinned_host_memory_resource::small_pinned_host_memory_resource(
+  fixed_size_host_memory_resource& upstream, std::size_t large_cache_limit_bytes)
+  : _upstream(upstream), _large_cache_limit_bytes(large_cache_limit_bytes)
+{
+}
+
+small_pinned_host_memory_resource::~small_pinned_host_memory_resource() noexcept
+{
+  bool retain_backing_allocations = _has_quarantined_slab;
+  for (auto const& slab : _free_lists | std::views::join) {
+    if (slab.ready && !wait_no_throw(slab.ready->event)) { retain_backing_allocations = true; }
+  }
+  for (auto const& entry : _large_cache | std::views::join) {
+    free_pinned_after(entry.ready.event, entry.ptr);
+  }
+  if (retain_backing_allocations) {
+    // Unknown completion requires retaining backing blocks, including quarantined slabs.
+    for (auto& allocation : _owned_allocations) {
+      std::ignore = allocation.release();
     }
   }
-
-  cudaEvent_t event = nullptr;
-  // Timing is not needed; disabling it makes record/wait cheaper.
-  bool const created = (::cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess);
-  if (!created) {
-    // The caller synchronizes the freeing stream when no event is available, so
-    // losing an event costs performance but never ordering.
-    (void)::cudaGetLastError();
-    event = nullptr;
-  }
-
-  if (switched) { (void)::cudaSetDevice(prev_device); }
-  return event;
+  // Idle pooled events guard no storage, so the members' destructors release them without waiting.
 }
 
-void small_pinned_host_memory_resource::release_event_locked(cudaEvent_t event, int device) noexcept
-{
-  if (event == nullptr) { return; }
-  try {
-    event_pool_[device].push_back(event);
-  } catch (...) {
-    // Pool growth is only a cache optimization. Avoid terminating a noexcept
-    // deallocation if host allocation fails; an already-enqueued wait is not
-    // affected by destroying the event handle.
-    CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(event));
-  }
-}
-
-void* small_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda::stream_ref stream,
+void* small_pinned_host_memory_resource::allocate(::cuda::stream_ref stream,
                                                   std::size_t bytes,
                                                   [[maybe_unused]] std::size_t alignment)
 {
   if (bytes == 0) { return nullptr; }
-  // cuDF calls get_pinned_memory_resource() directly from some code paths (e.g. join/sort
-  // staging buffers) that bypass the allocate_host_as_pinned threshold check.  Serve those
-  // with cudaHostAlloc(Portable) so the memory remains pinned AND DMA-accessible from
-  // every CUDA context (multi-GPU consumers need the Portable flag; cudaMallocHost /
-  // cudaHostAllocDefault produce memory that is only DMA-accessible from the allocating
-  // device's context, which under CUDA 13+ makes cudaMemcpyBatchAsync reject cross-device
-  // sources with cudaErrorInvalidValue). cuDF 26.04+ may access hostdevice_vector memory
-  // directly from GPU kernels (e.g. detect_malformed_pages), so returning pageable memory
-  // here would cause cudaErrorIllegalAddress.
-  if (bytes > MAX_SLAB_SIZE) {
-    void* ptr = nullptr;
-    // Portable + Mapped — see numa_region_pinned_host_allocator.cpp comment.
-    auto err = ::cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
-    if (err != cudaSuccess) { throw std::bad_alloc{}; }
-    return ptr;
-  }
-
-  std::size_t idx = slab_index_for(bytes);
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (free_lists_[idx].empty()) { expand_pool_locked(idx); }
-  free_slab slab = free_lists_[idx].back();
-  free_lists_[idx].pop_back();
-  // If this slab was recently deallocated, its ready_event captures the freeing
-  // stream's last use (e.g. an in-flight async H2D copy still reading the slab).
-  // Make the reusing stream wait for it so we cannot overwrite the slab before
-  // that copy completes. Recording the event again (on a later deallocate) does
-  // not disturb this already-enqueued wait, so the event is safe to recycle.
-  if (slab.ready_event != nullptr) {
-    // cudaStreamWaitEvent is legal across devices, so the reusing stream may
-    // belong to a different GPU than the one that recorded the event.
-    cudaError_t const wait_status = ::cudaStreamWaitEvent(stream.get(), slab.ready_event, 0);
-    if (wait_status != cudaSuccess) {
-      // The wait was not established, so returning this pointer would recreate
-      // the unordered-reuse race. Keep the slab tracked and propagate the error.
-      free_lists_[idx].push_back(slab);
-      CUCASCADE_CUDA_TRY(wait_status);
-    }
-    release_event_locked(slab.ready_event, slab.event_device);
-  }
-  return slab.ptr;
+  return bytes > MAX_SLAB_SIZE ? allocate_large(stream, bytes) : allocate_slab(stream, bytes);
 }
 
-void small_pinned_host_memory_resource::deallocate([[maybe_unused]] ::cuda::stream_ref stream,
+void small_pinned_host_memory_resource::deallocate(::cuda::stream_ref stream,
                                                    void* ptr,
                                                    std::size_t bytes,
                                                    [[maybe_unused]] std::size_t alignment) noexcept
 {
   if (ptr == nullptr || bytes == 0) { return; }
   if (bytes > MAX_SLAB_SIZE) {
-    ::cudaFreeHost(ptr);
-    return;
+    deallocate_large(stream, ptr, bytes);
+  } else {
+    deallocate_slab(stream, ptr, bytes);
+  }
+}
+
+void small_pinned_host_memory_resource::deallocate_sync(void* ptr,
+                                                        std::size_t bytes,
+                                                        std::size_t alignment) noexcept
+{
+  ::cuda::stream_ref const stream{cudaStream_t{cudaStreamDefault}};
+  deallocate(stream, ptr, bytes, alignment);
+  std::ignore = wait_no_throw(stream);
+}
+
+void* small_pinned_host_memory_resource::allocate_slab(::cuda::stream_ref stream, std::size_t bytes)
+{
+  std::size_t const idx = slab_index_for(bytes);
+  std::lock_guard lock(_mutex);
+  auto& free_list = _free_lists[idx];
+  if (free_list.empty()) { expand_pool_locked(idx); }
+  free_slab& slab = free_list.back();
+  // A failed wait leaves the slab tracked and available for a later request or the destructor.
+  if (slab.ready) { slab.ready->event.wait(stream); }
+  void* const ptr = slab.ptr;
+  if (slab.ready) { return_event_locked(std::move(*slab.ready)); }
+  free_list.pop_back();
+  return ptr;
+}
+
+void* small_pinned_host_memory_resource::allocate_large(::cuda::stream_ref stream,
+                                                        std::size_t bytes)
+{
+  std::size_t const bucket      = large_bucket_size_for(bytes);
+  bool const cacheable          = is_cacheable(bucket);
+  std::size_t const alloc_bytes = large_allocation_size(bytes);
+  if (cacheable) {
+    std::lock_guard lock(_mutex);
+    ++_large_cacheable_requests;
+    if (void* cached = try_take_cached_large_locked(bucket, stream)) { return cached; }
+    ++_large_misses;
+  } else {
+    _large_uncacheable.fetch_add(1, std::memory_order_relaxed);
   }
 
-  std::size_t idx         = slab_index_for(bytes);
-  int const stream_device = device_of_stream(stream);
-  std::unique_lock<std::mutex> lock(mutex_);
-  // Record an event on the freeing stream so a future reuse of this slab can wait
-  // for any still-pending work on it (the async H2D copy in cuDF's stats filter).
-  cudaEvent_t event = acquire_event_locked(stream_device);
-  if (event != nullptr && ::cudaEventRecord(event, stream.get()) != cudaSuccess) {
-    (void)::cudaGetLastError();
-    release_event_locked(event, stream_device);
-    event = nullptr;
+  void* ptr = nullptr;
+  if (auto const status = cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags);
+      status != cudaErrorMemoryAllocation) {
+    // Returns on success. Releasing cached buffers cannot fix any other failure, so it throws.
+    CUCASCADE_CUDA_TRY_ALLOC(status, alloc_bytes);
+    return ptr;
   }
-  if (event == nullptr) {
-    // No event means no ordering, and an unordered slab hands still-in-flight
-    // source memory to the next writer. Pay for a synchronize instead: dropping
-    // ordering here silently corrupts whatever the pending copy was reading.
-    // The slab is not published yet, so do not hold the allocator-wide mutex
-    // while waiting for unrelated work on this stream to complete.
+  std::ignore = cudaGetLastError();
+  release_detached([this] {
+    std::lock_guard lock(_mutex);
+    return purge_large_cache_locked();
+  }());
+  if (cacheable) {
+    // Another thread may have cached a buffer of this bucket since the first lookup.
+    std::lock_guard lock(_mutex);
+    if (void* cached = try_take_cached_large_locked(bucket, stream)) { return cached; }
+  }
+  CUCASCADE_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags), alloc_bytes);
+  return ptr;
+}
+
+void small_pinned_host_memory_resource::deallocate_slab(::cuda::stream_ref stream,
+                                                        void* ptr,
+                                                        std::size_t bytes) noexcept
+{
+  std::size_t const idx = slab_index_for(bytes);
+  std::unique_lock lock(_mutex);
+  auto ready = record_ready_event_locked(stream);
+  if (!ready) {
     lock.unlock();
-    if (::cudaStreamSynchronize(stream.get()) != cudaSuccess) {
-      // Synchronization failure leaves ordering unknown. Quarantine this slab
-      // instead of making it available for unsafe reuse.
-      (void)::cudaGetLastError();
-      lock.lock();
-      has_quarantined_slab_ = true;
+    bool const completed = wait_no_throw(stream);
+    lock.lock();
+    if (!completed) {
+      _has_quarantined_slab = true;
       return;
     }
-    lock.lock();
   }
-  free_lists_[idx].push_back(free_slab{ptr, event, stream_device});
+  try {
+    // expand_pool_locked reserved room for every slab, so this grows the list only when `bytes`
+    // broke the deallocate contract.
+    _free_lists[idx].emplace_back(ptr, std::move(ready));
+  } catch (...) {
+    // The growth failed before `ready` was moved. The slab stays backed by _owned_allocations and
+    // is never published again.
+    _has_quarantined_slab = true;
+    if (ready) { return_event_locked(std::move(*ready)); }
+  }
+}
+
+void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stream,
+                                                         void* ptr,
+                                                         std::size_t bytes) noexcept
+{
+  std::size_t const bucket = large_bucket_size_for(bytes);
+  if (!is_cacheable(bucket)) {
+    free_pinned_after(stream, ptr);
+    return;
+  }
+  // One critical section detaches every victim this buffer needs and publishes it, so the room it
+  // frees cannot be taken by another thread. The victims are released after the lock is dropped.
+  std::list<large_cache_entry> victims;
+  std::optional<pooled_event> ready;
+  bool published = false;
+  {
+    std::lock_guard lock(_mutex);
+    ready = record_ready_event_locked(stream);
+    if (ready) {
+      // `_large_cache_bytes` and `bucket` never exceed the limit, so the subtraction cannot wrap.
+      while (bucket > _large_cache_limit_bytes - _large_cache_bytes &&
+             evict_oldest_large_locked(victims)) {}
+      assert(bucket <= _large_cache_limit_bytes - _large_cache_bytes);
+      try {
+        _large_cache[large_bucket_index(bucket)].emplace_back(
+          ptr, std::move(*ready), _large_cache_sequence);
+        ++_large_cache_sequence;
+        _large_cache_bytes += bucket;
+        _peak_cached_large_bytes = std::max(_peak_cached_large_bytes, _large_cache_bytes);
+        published                = true;
+      } catch (...) {
+        // The node allocation failed before `*ready` was moved, so `ready` still owns the event and
+        // the buffer is released below. Detaching victims first only shrank the cache.
+      }
+    }
+  }
+  if (!published) {
+    if (ready) {
+      free_pinned_after(ready->event, ptr);
+      std::lock_guard lock(_mutex);
+      return_event_locked(std::move(*ready));
+    } else {
+      free_pinned_after(stream, ptr);
+    }
+  }
+  release_detached(std::move(victims));
 }
 
 bool small_pinned_host_memory_resource::operator==(
@@ -243,21 +324,195 @@ std::size_t small_pinned_host_memory_resource::slab_index_for(std::size_t bytes)
   return SLAB_SIZES.size() - 1;
 }
 
+std::size_t small_pinned_host_memory_resource::large_bucket_size_for(std::size_t bytes) noexcept
+{
+  if (bytes <= MIN_LARGE_BUCKET) { return MIN_LARGE_BUCKET; }
+  constexpr std::size_t max_bucket = std::size_t{1}
+                                     << (std::numeric_limits<std::size_t>::digits - 1);
+  if (bytes > max_bucket) { return bytes; }
+  return std::bit_ceil(bytes);
+}
+
+std::size_t small_pinned_host_memory_resource::large_allocation_size(
+  std::size_t bytes) const noexcept
+{
+  std::size_t const bucket = large_bucket_size_for(bytes);
+  return is_cacheable(bucket) ? bucket : bytes;
+}
+
+std::size_t small_pinned_host_memory_resource::large_cache_bytes() const
+{
+  std::lock_guard lock(_mutex);
+  return _large_cache_bytes;
+}
+
+small_pinned_host_memory_resource::statistics small_pinned_host_memory_resource::get_statistics()
+  const
+{
+  std::lock_guard lock(_mutex);
+  auto const uncacheable = _large_uncacheable.load(std::memory_order_relaxed);
+  return {_large_cache_bytes,
+          _peak_cached_large_bytes,
+          _large_cacheable_requests + uncacheable,
+          _large_hits,
+          _large_misses,
+          uncacheable,
+          _large_evictions};
+}
+
+bool small_pinned_host_memory_resource::is_cacheable(std::size_t bucket) const noexcept
+{
+  return std::has_single_bit(bucket) && bucket <= _large_cache_limit_bytes;
+}
+
+std::size_t small_pinned_host_memory_resource::large_bucket_index(std::size_t bucket) noexcept
+{
+  assert(std::has_single_bit(bucket) && bucket >= MIN_LARGE_BUCKET);
+  return static_cast<std::size_t>(std::countr_zero(bucket) - std::countr_zero(MIN_LARGE_BUCKET));
+}
+
+std::optional<small_pinned_host_memory_resource::pooled_event>
+small_pinned_host_memory_resource::acquire_event_locked(int device) noexcept
+{
+  if (device < 0) { return std::nullopt; }
+  try {
+    if (auto event = _event_pools[device].acquire(device)) {
+      return pooled_event{std::move(*event), device};
+    }
+  } catch (...) {
+    // Only adding the device's pool to the map can throw here.
+  }
+  return std::nullopt;
+}
+
+std::optional<small_pinned_host_memory_resource::pooled_event>
+small_pinned_host_memory_resource::record_ready_event_locked(::cuda::stream_ref stream) noexcept
+{
+  auto ready = acquire_event_locked(device_of_stream(stream));
+  if (!ready) { return std::nullopt; }
+  try {
+    ready->event.record(stream);
+    return ready;
+  } catch (...) {
+    // The CUDA error behind a thrown cuda_error was cleared before the throw.
+    return_event_locked(std::move(*ready));
+    return std::nullopt;
+  }
+}
+
+void small_pinned_host_memory_resource::return_event_locked(pooled_event&& event) noexcept
+{
+  auto const found = _event_pools.find(event.device);
+  assert(found != _event_pools.end());
+  found->second.release(std::move(event.event));
+}
+
+std::optional<cuda::cuda_event> small_pinned_host_memory_resource::event_pool::acquire(
+  int device) noexcept
+{
+  if (!_idle.empty()) {
+    cuda::cuda_event recycled = std::move(_idle.back());
+    _idle.pop_back();
+    return recycled;
+  }
+  try {
+    // Reserve the slot this event occupies when it returns, so release cannot allocate.
+    _idle.reserve(_created + 1);
+    // An event can be recorded only on a stream of the device that was current at its creation.
+    event_creation_device_guard const device_guard{device};
+    if (!device_guard.is_ready()) { return std::nullopt; }
+    cuda::cuda_event created{cudaEventDisableTiming};
+    ++_created;
+    return created;
+  } catch (...) {
+    // The CUDA error behind a thrown cuda_error was cleared before the throw.
+    return std::nullopt;
+  }
+}
+
+void small_pinned_host_memory_resource::event_pool::release(cuda::cuda_event&& event) noexcept
+{
+  assert(_idle.size() < _idle.capacity());
+  _idle.push_back(std::move(event));
+}
+
+void* small_pinned_host_memory_resource::try_take_cached_large_locked(std::size_t bucket,
+                                                                      ::cuda::stream_ref stream)
+{
+  auto& entries = _large_cache[large_bucket_index(bucket)];
+  if (entries.empty()) { return nullptr; }
+  auto& entry = entries.front();
+  // A failed wait leaves the entry cached for a later request or the destructor.
+  entry.ready.event.wait(stream);
+  // The wait captured the event's recorded work, so the event can be recorded again at once.
+  void* const ptr = entry.ptr;
+  return_event_locked(std::move(entry.ready));
+  entries.pop_front();
+  _large_cache_bytes -= bucket;
+  ++_large_hits;
+  return ptr;
+}
+
+bool small_pinned_host_memory_resource::evict_oldest_large_locked(
+  std::list<large_cache_entry>& victims) noexcept
+{
+  auto non_empty =
+    _large_cache | std::views::filter([](auto const& entries) { return !entries.empty(); });
+  auto const oldest = std::ranges::min_element(
+    non_empty, {}, [](auto const& entries) { return entries.front().sequence; });
+  if (oldest == non_empty.end()) { return false; }
+  victims.splice(victims.end(), *oldest, oldest->begin());
+  auto const index = static_cast<std::size_t>(oldest.base() - _large_cache.begin());
+  _large_cache_bytes -= MIN_LARGE_BUCKET << index;
+  ++_large_evictions;
+  return true;
+}
+
+std::list<small_pinned_host_memory_resource::large_cache_entry>
+small_pinned_host_memory_resource::purge_large_cache_locked() noexcept
+{
+  std::list<large_cache_entry> purged;
+  for (auto& entries : _large_cache) {
+    _large_evictions += static_cast<std::uint64_t>(entries.size());
+    purged.splice(purged.end(), entries);
+  }
+  _large_cache_bytes = 0;
+  return purged;
+}
+
+void small_pinned_host_memory_resource::release_detached(
+  std::list<large_cache_entry>&& detached) noexcept
+{
+  if (detached.empty()) { return; }
+  for (auto const& entry : detached) {
+    free_pinned_after(entry.ready.event, entry.ptr);
+  }
+  // An event whose wait failed is reusable too: recording it again replaces its pending work.
+  std::lock_guard lock(_mutex);
+  for (auto& entry : detached) {
+    return_event_locked(std::move(entry.ready));
+  }
+}
+
 void small_pinned_host_memory_resource::expand_pool_locked(std::size_t slab_idx)
 {
-  // Acquire one upstream block and carve it into slabs.
-  std::size_t upstream_block_size = upstream_.get_block_size();
-  auto allocation                 = upstream_.allocate_multiple_blocks(upstream_block_size);
-
-  std::size_t slab_size = SLAB_SIZES[slab_idx];
-  std::size_t num_slabs = upstream_block_size / slab_size;
-  for (std::byte* block : allocation->get_blocks()) {
+  std::size_t const upstream_block_size = _upstream.get_block_size();
+  std::size_t const slab_size           = SLAB_SIZES[slab_idx];
+  if (upstream_block_size < slab_size) {
+    throw std::invalid_argument{"upstream block is smaller than the requested slab"};
+  }
+  auto allocation             = _upstream.allocate_multiple_blocks(upstream_block_size);
+  std::size_t const num_slabs = upstream_block_size / slab_size;
+  auto const blocks           = allocation->get_blocks();
+  auto& free_list             = _free_lists[slab_idx];
+  // Finish every potentially throwing metadata allocation before publishing raw slab pointers.
+  free_list.reserve(free_list.capacity() + blocks.size() * num_slabs);
+  _owned_allocations.push_back(std::move(allocation));
+  for (std::byte* block : blocks) {
     for (std::size_t i = 0; i < num_slabs; ++i) {
-      // Freshly-carved slabs were never used, so they carry no pending-work event.
-      free_lists_[slab_idx].push_back(free_slab{block + i * slab_size, nullptr, -1});
+      free_list.emplace_back(block + i * slab_size, std::nullopt);
     }
   }
-  owned_allocations_.push_back(std::move(allocation));
 }
 
 }  // namespace memory
