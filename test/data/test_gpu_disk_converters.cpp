@@ -18,10 +18,12 @@
 #include "utils/cuda_test_utils.hpp"
 #include "utils/cudf_test_utils.hpp"
 #include "utils/disk_test_utils.hpp"
+#include "utils/gpu_source_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 
@@ -46,6 +48,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <thread>
 #include <vector>
@@ -849,6 +852,253 @@ TEST_CASE("gpu disk round-trip sliced column with nulls", "[disk][gpu-converter]
   auto compacted = std::make_unique<cudf::table>(sliced_views[0], shared_stream());
 
   gpu_disk_round_trip_test(std::move(compacted));
+}
+
+// Regression: the serializers copy buffers from their start, so a view-backed slice (non-zero
+// offset: null mask bits, string / list offsets) used to round-trip as the leading rows of the
+// table it slices, with unshifted validity. Both buffer-serializing routes (host_data and DISK)
+// compact such a table first.
+TEST_CASE("view-backed sliced nested nullable tables round-trip through host_data and disk",
+          "[disk][gpu-converter][sliced]")
+{
+  auto& gpu_space = shared_gpu_space();
+  auto host_space = test::make_mock_memory_space(memory::Tier::HOST, 0);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  auto source = test::make_sliced_source(*gpu_space, shared_stream());
+
+  auto host = registry.convert<host_data_representation>(
+    *source.representation, host_space.get(), shared_stream());
+  auto from_host =
+    registry.convert<gpu_table_representation>(*host, gpu_space.get(), shared_stream());
+  test::expect_cudf_tables_equal_on_stream(
+    source.expected->view(), from_host->get_table_view(), shared_stream());
+
+  for (auto const backend : test::disk_test_backends) {
+    auto* disk_space = test::shared_disk_space_for(backend);
+    if (disk_space == nullptr || !test::disk_space_can_write(*disk_space, /*device=*/true)) {
+      continue;
+    }
+    CAPTURE(test::to_string(backend));
+    auto disk = registry.convert<disk_data_representation>(
+      *source.representation, disk_space, shared_stream());
+    auto back = registry.convert<gpu_table_representation>(*disk, gpu_space.get(), shared_stream());
+    test::expect_cudf_tables_equal_on_stream(
+      source.expected->view(), back->get_table_view(), shared_stream());
+  }
+}
+
+// Regression: a prefix slice has offset 0, but its children keep the extent of the table it was
+// cut from (dictionary indices, string / list offsets, struct fields); it used to be serialized
+// with those extents and restored with the wrong row count.
+TEST_CASE("view-backed prefix slices round-trip through host_data and disk",
+          "[disk][gpu-converter][sliced]")
+{
+  auto& gpu_space = shared_gpu_space();
+  auto host_space = test::make_mock_memory_space(memory::Tier::HOST, 0);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  auto source = test::make_prefix_sliced_source(*gpu_space, shared_stream());
+
+  auto host = registry.convert<host_data_representation>(
+    *source.representation, host_space.get(), shared_stream());
+  auto from_host =
+    registry.convert<gpu_table_representation>(*host, gpu_space.get(), shared_stream());
+  REQUIRE(from_host->get_table_view().num_rows() == 10);
+  test::expect_cudf_tables_equal_on_stream(
+    source.expected->view(), from_host->get_table_view(), shared_stream());
+
+  for (auto const backend : test::disk_test_backends) {
+    auto* disk_space = test::shared_disk_space_for(backend);
+    if (disk_space == nullptr || !test::disk_space_can_write(*disk_space, /*device=*/true)) {
+      continue;
+    }
+    CAPTURE(test::to_string(backend));
+    auto disk = registry.convert<disk_data_representation>(
+      *source.representation, disk_space, shared_stream());
+    auto back = registry.convert<gpu_table_representation>(*disk, gpu_space.get(), shared_stream());
+    REQUIRE(back->get_table_view().num_rows() == 10);
+    test::expect_cudf_tables_equal_on_stream(
+      source.expected->view(), back->get_table_view(), shared_stream());
+  }
+}
+
+// Regression: when the compaction of a sliced source failed part-way, the column copies already
+// enqueued on the conversion stream could still be reading the source after the error reached the
+// caller. The stream is now drained before the exception propagates.
+TEST_CASE("a failed compaction drains the conversion stream before throwing",
+          "[disk][gpu-converter][sliced]")
+{
+  auto gpu_space = test::make_refusing_gpu_space(std::size_t{3} << 20);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  auto host_space  = test::make_mock_memory_space(memory::Tier::HOST, 0);
+  auto* disk_space = test::shared_disk_space_for(disk_io_backend::uring);
+  bool const disk  = disk_space != nullptr && test::disk_space_can_write(*disk_space, true);
+
+  for (int route = 0; route < (disk ? 2 : 1); ++route) {
+    CAPTURE(route);
+    // The stream sleeps first, so the INT32 column's copy is still queued when the INT64
+    // column's allocation is refused.
+    auto source = test::make_compaction_failure_source(*gpu_space, std::chrono::milliseconds{300});
+    ::cuda::stream_ref const stream{source.stream};
+    if (route == 0) {
+      CHECK_THROWS(registry.convert<host_data_representation>(
+        *source.representation, host_space.get(), stream));
+    } else {
+      CHECK_THROWS(
+        registry.convert<disk_data_representation>(*source.representation, disk_space, stream));
+    }
+    CHECK(cudaStreamQuery(source.stream) == cudaSuccess);
+  }
+}
+
+// Regression: GPU -> DISK waited for the writer on the default stream of the CURRENT device and
+// then made the source device current for the write, whose default stream had not waited.
+TEST_CASE("gpu disk spill of a table on another GPU waits for its writer on the default stream",
+          "[disk][gpu-converter][multi_gpu]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
+  auto gpu1 = test::make_mock_memory_space(memory::Tier::GPU, 1);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  auto* disk_space = test::shared_disk_space_for(disk_io_backend::uring);
+  if (disk_space == nullptr || !test::disk_space_can_write(*disk_space, /*device=*/true)) {
+    SKIP("the uring disk backend cannot run in this process");
+  }
+
+  // Also as a slice, which is compacted first on the source device.
+  auto const slice_begin = GENERATE(0, 1);
+  CAPTURE(slice_begin);
+  auto source =
+    test::make_late_written_source(*gpu1, 1 << 20, std::chrono::milliseconds{300}, slice_begin);
+  rmm::cuda_set_device_raii current{rmm::cuda_device_id{0}};
+  ::cuda::stream_ref const default_stream{cudaStream_t{nullptr}};
+  auto disk =
+    registry.convert<disk_data_representation>(*source.representation, disk_space, default_stream);
+  auto back = registry.convert<gpu_table_representation>(*disk, gpu1.get(), default_stream);
+  CHECK(test::all_bytes_are_5a(back->get_table_view(), 1));
+}
+
+// Regression: GPU -> host_data made the source device current only around the compaction, so the
+// writer wait, the planning (which launches work on the stream) and the D2H copies ran with the
+// caller's current device: a table on GPU 1 converted from GPU 0 on one of GPU 1's streams failed.
+// (This converter needs a non-default stream: cudaMemcpyBatchAsync.)
+TEST_CASE("gpu host_data conversion of a table on another GPU runs on the source device",
+          "[disk][gpu-converter][multi_gpu]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
+  auto gpu1       = test::make_mock_memory_space(memory::Tier::GPU, 1);
+  auto host_space = test::make_mock_memory_space(memory::Tier::HOST, 0);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  auto const prefix = GENERATE(false, true);
+  CAPTURE(prefix);
+
+  std::optional<rmm::cuda_stream> stream1;
+  test::sliced_source source;
+  {
+    rmm::cuda_set_device_raii on_gpu1{rmm::cuda_device_id{1}};
+    stream1.emplace();
+    source = prefix ? test::make_prefix_sliced_source(*gpu1, ::cuda::stream_ref{stream1->value()})
+                    : test::make_sliced_source(*gpu1, ::cuda::stream_ref{stream1->value()});
+  }
+  std::unique_ptr<gpu_table_representation> back;
+  {
+    rmm::cuda_set_device_raii on_gpu0{rmm::cuda_device_id{0}};
+    auto host = registry.convert<host_data_representation>(
+      *source.representation, host_space.get(), ::cuda::stream_ref{stream1->value()});
+    back = registry.convert<gpu_table_representation>(
+      *host, gpu1.get(), ::cuda::stream_ref{stream1->value()});
+  }
+  rmm::cuda_set_device_raii on_gpu1{rmm::cuda_device_id{1}};
+  test::expect_cudf_tables_equal_on_stream(
+    source.expected->view(), back->get_table_view(), ::cuda::stream_ref{stream1->value()});
+  back.reset();
+  source = {};
+}
+
+// Regression: GPU -> GPU copied a view-backed slice's buffers from their start, like the other
+// buffer copiers did: a nested slice failed with cudaErrorInvalidValue, a prefix slice with cuDF's
+// "Invalid offsets column size", and a fixed-width nullable slice silently came back as the
+// table's leading rows with unshifted validity.
+TEST_CASE("gpu to gpu conversion of view-backed slices copies the sliced rows",
+          "[gpu-converter][sliced][multi_gpu]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
+  // Registers the pinned pool, so the production host-staged path runs where peer DMA is not
+  // verified.
+  auto host_space = test::make_mock_memory_space(memory::Tier::HOST, 0);
+  std::shared_ptr<memory::memory_space> gpus[2] = {
+    test::make_mock_memory_space(memory::Tier::GPU, 0),
+    test::make_mock_memory_space(memory::Tier::GPU, 1)};
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  auto const kind = GENERATE(0, 1, 2);  // nested slice, prefix slice, fixed-width slice
+  auto const from = GENERATE(0, 1);
+  int const to    = 1 - from;
+  CAPTURE(kind, from);
+
+  rmm::cuda_set_device_raii on_source{rmm::cuda_device_id{from}};
+  rmm::cuda_stream source_stream;
+  ::cuda::stream_ref const stream{source_stream.value()};
+  auto source     = kind == 0   ? test::make_sliced_source(*gpus[from], stream)
+                    : kind == 1 ? test::make_prefix_sliced_source(*gpus[from], stream)
+                                : test::make_fixed_width_sliced_source(*gpus[from], stream);
+  auto const rows = source.expected->num_rows();
+  auto there =
+    registry.convert<gpu_table_representation>(*source.representation, gpus[to].get(), stream);
+  REQUIRE(there->get_device_id() == to);
+  REQUIRE(there->get_table_view().num_rows() == rows);
+  // Back on the source device: the second leg copies an owned, compact table.
+  auto back = registry.convert<gpu_table_representation>(*there, gpus[from].get(), stream);
+  REQUIRE(back->get_device_id() == from);
+  test::expect_cudf_tables_equal_on_stream(source.expected->view(), back->get_table_view(), stream);
+}
+
+// Regression: a failed GPU -> GPU conversion returned while a peer copy of an earlier column was
+// still queued on the target stream (behind the source's writer), reading the source. Only a
+// regression check where peer DMA is verified: on a host-staged pair each staged leg synchronizes,
+// so it passes either way.
+TEST_CASE("a failed gpu to gpu conversion waits for its copies before throwing",
+          "[gpu-converter][multi_gpu]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
+  auto host_space = test::make_mock_memory_space(memory::Tier::HOST, 0);
+  auto gpu0       = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  // Refuses the 4 MiB INT64 column's buffer, after the 2 MiB INT32 column's copy was enqueued.
+  auto target = test::make_refusing_gpu_space(std::size_t{3} << 20, 1);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  auto source = test::make_late_written_pair_source(*gpu0, std::chrono::milliseconds{300});
+  rmm::cuda_set_device_raii on_gpu0{rmm::cuda_device_id{0}};
+  rmm::cuda_stream idle;
+  CHECK_THROWS(registry.convert<gpu_table_representation>(
+    *source.representation, target.get(), ::cuda::stream_ref{idle.value()}));
+  // The drained target stream had waited on the writer event, so the producer has finished.
+  CHECK(cudaStreamQuery(source.producer) == cudaSuccess);
+}
+
+// A sliced GPU -> GPU source whose compaction on the source device is refused after the INT32
+// column's copy was enqueued behind the writer: the compaction drains before the error leaves.
+TEST_CASE("a gpu to gpu conversion whose compaction fails drains before throwing",
+          "[gpu-converter][sliced][multi_gpu]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
+  auto host_space = test::make_mock_memory_space(memory::Tier::HOST, 0);
+  auto gpu0       = test::make_refusing_gpu_space(std::size_t{3} << 20, 0);
+  auto gpu1       = test::make_mock_memory_space(memory::Tier::GPU, 1);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  auto source =
+    test::make_late_written_pair_source(*gpu0, std::chrono::milliseconds{300}, /*slice_begin=*/1);
+  rmm::cuda_set_device_raii on_gpu0{rmm::cuda_device_id{0}};
+  rmm::cuda_stream idle;
+  CHECK_THROWS(registry.convert<gpu_table_representation>(
+    *source.representation, gpu1.get(), ::cuda::stream_ref{idle.value()}));
+  CHECK(cudaStreamQuery(source.producer) == cudaSuccess);
 }
 
 // =============================================================================
