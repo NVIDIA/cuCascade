@@ -43,6 +43,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -60,6 +61,90 @@ namespace detail {
                              cudaGetErrorString(err));
   }
   return id;
+}
+
+/**
+ * @brief A non-blocking stream ordered after the work the calling thread had
+ *        queued on its per-thread default stream.
+ *
+ * @c cudaStreamPerThread names the per-thread default stream of whichever
+ * thread uses the handle, so a reactor worker given it would order the
+ * transfer after its own (empty) per-thread stream instead of the caller's.
+ * This stream is created on the submitting thread, waits there on an event
+ * recorded on that thread's per-thread stream, and can then be used from any
+ * thread.  Destroyed (asynchronously, per CUDA) when the last slice holding it
+ * goes.
+ */
+class per_thread_stream_stand_in {
+ public:
+  explicit per_thread_stream_stand_in(int device) : _device(device)
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+    auto status = cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
+    if (status != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+      throw std::runtime_error(std::string("templated_ioctx: cudaStreamCreate failed: ") +
+                               cudaGetErrorString(status));
+    }
+    cudaEvent_t ready{};
+    status = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+    if (status == cudaSuccess) {
+      // Resolved here, on the submitting thread: its own per-thread stream.
+      status = cudaEventRecord(ready, cudaStreamPerThread);
+      if (status == cudaSuccess) status = cudaStreamWaitEvent(_stream, ready, 0);
+      std::ignore = cudaEventDestroy(ready);
+    }
+    if (status != cudaSuccess) {
+      std::ignore = cudaStreamDestroy(_stream);
+      std::ignore = cudaGetLastError();
+      throw std::runtime_error(
+        std::string("templated_ioctx: ordering after the per-thread default stream failed: ") +
+        cudaGetErrorString(status));
+    }
+  }
+
+  ~per_thread_stream_stand_in() { std::ignore = cudaStreamDestroy(_stream); }
+
+  per_thread_stream_stand_in(per_thread_stream_stand_in const&)            = delete;
+  per_thread_stream_stand_in& operator=(per_thread_stream_stand_in const&) = delete;
+
+  [[nodiscard]] cudaStream_t get() const noexcept { return _stream; }
+  [[nodiscard]] int device() const noexcept { return _device; }
+
+ private:
+  int _device;
+  cudaStream_t _stream{};
+};
+
+/**
+ * @brief Replace every @c cudaStreamPerThread of @p slices' device requests by
+ *        a stand-in stream ordered after the calling thread's per-thread
+ *        default stream (one per device).  Must run on the submitting thread,
+ *        before the slices reach a reactor.  Device ids must be resolved.
+ *
+ * The legacy default stream needs nothing: it is one stream per device, the
+ * same from every thread, and synchronizes with every blocking stream.
+ */
+inline void resolve_per_thread_streams(std::vector<prepared_io_slice>& slices)
+{
+  std::vector<std::shared_ptr<per_thread_stream_stand_in>> stand_ins;
+  for (auto& slice : slices) {
+    if (!slice.has_device_request() || slice.d_buffer.stream.get() != cudaStreamPerThread) {
+      continue;
+    }
+    auto const device =
+      slice.d_buffer.device_id >= 0 ? slice.d_buffer.device_id : current_cuda_device();
+    std::shared_ptr<per_thread_stream_stand_in> stand_in;
+    for (auto const& existing : stand_ins) {
+      if (existing->device() == device) stand_in = existing;
+    }
+    if (stand_in == nullptr) {
+      stand_in = std::make_shared<per_thread_stream_stand_in>(device);
+      stand_ins.push_back(stand_in);
+    }
+    slice.d_buffer.stream       = ::cuda::stream_ref{stand_in->get()};
+    slice.d_buffer.stream_owner = stand_in;
+  }
 }
 
 }  // namespace detail
@@ -622,6 +707,10 @@ class templated_ioctx : public ioctx {
                                                  int device_id,
                                                  io_op_type operation)
   {
+    // A device slice on the per-thread default stream must be ordered against
+    // THIS thread's stream before a reactor worker sees it.
+    if (has_device_slice) detail::resolve_per_thread_streams(slices);
+
     // One call site issues one priority, so the first slice speaks for the
     // request; stamp the resolved value on every slice so each queue entry
     // built below carries it.
