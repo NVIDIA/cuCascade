@@ -509,6 +509,18 @@ class rest_reactor {
                         std::string_view prefix,
                         std::string_view canonical_query);
 
+  /// DeleteObject of @p bucket / @p key.  Resolves once the store answered (204, or a 404
+  /// @c NoSuchKey or without an error code: the key is already gone, which is success; another
+  /// 404, e.g. @c NoSuchBucket, fails) or the retries (@c max_retry_attempts, like the
+  /// other control calls) are exhausted.  Runs on the worker while the reactor runs (the future
+  /// then resolves on the worker thread; @p priority @c low uses the bulk class); before
+  /// start() or after shutdown() it runs blocking on a private ring, as @ref head_object does,
+  /// and returns a ready future.  The future may be dropped: the request keeps running.  A
+  /// delete still in flight when the reactor shuts down fails with @c operation_canceled.
+  [[nodiscard]] exec::semi_future<void> delete_object_async(std::string bucket,
+                                                            std::string key,
+                                                            io_priority priority) noexcept;
+
   // -- writes ---------------------------------------------------------------
 
   /// Concept stub: an upload needs the pool's context; @c rest_ioctx overrides
@@ -558,11 +570,18 @@ class rest_reactor {
 
  private:
   class worker;
+  struct pending_delete;
 
   std::shared_ptr<reactor_context> _ctx;
   config _config;
   std::string _tname;
   std::atomic<std::size_t> _queued_bytes{0};
+  /// Deletes handed to the worker: each owns the call the engine holds until it finished.
+  /// Settled ones are reclaimed by the next delete_object_async and by the destructor, which
+  /// joins the worker (settling every call) first.  Declared before @c _worker so the worker is
+  /// destroyed first.
+  std::mutex _deletes_mutex;
+  std::vector<std::unique_ptr<pending_delete>> _deletes;
   std::unique_ptr<worker> _worker;
 };
 

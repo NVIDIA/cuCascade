@@ -72,7 +72,8 @@ constexpr std::size_t xml_capture_bytes = std::size_t{64} << 10;
     case call::kind::upload_part: return http::method::put;
     case call::kind::create_upload:
     case call::kind::complete_upload: return http::method::post;
-    case call::kind::abort_upload: return http::method::delete_;
+    case call::kind::abort_upload:
+    case call::kind::delete_object: return http::method::delete_;
     default: return http::method::get;
   }
 }
@@ -85,7 +86,8 @@ constexpr std::size_t xml_capture_bytes = std::size_t{64} << 10;
     case call::kind::upload_part: return request_method::PUT;
     case call::kind::create_upload:
     case call::kind::complete_upload: return request_method::POST;
-    case call::kind::abort_upload: return request_method::DELETE;
+    case call::kind::abort_upload:
+    case call::kind::delete_object: return request_method::DELETE;
     default: return request_method::GET;
   }
 }
@@ -558,7 +560,7 @@ void engine::start_calls() noexcept
     if (cl.k == call::kind::list) op->capture.resize(list_capture_bytes);
     if (cl.k == call::kind::create_upload || cl.k == call::kind::complete_upload ||
         cl.k == call::kind::upload_part || cl.k == call::kind::put_object ||
-        cl.k == call::kind::abort_upload) {
+        cl.k == call::kind::abort_upload || cl.k == call::kind::delete_object) {
       op->capture.resize(xml_capture_bytes);
     }
     requeue(*op);
@@ -1293,7 +1295,15 @@ void engine::exchange_done(op_rec& op) noexcept
     }
     return;
   }
-  if (!o.ec && !transport) {
+  // DeleteObject of a key that is already gone has reached its goal: S3 answers 204 either way,
+  // S3-compatible stores (and a retry whose first attempt's response was lost) may answer 404
+  // NoSuchKey. Any other 404 (NoSuchBucket, ...) is a failure; a 404 whose body was cut off
+  // before its code could be read takes the transport-error path. A fully received 404 is
+  // terminal, also while stopping (the key is gone either way).
+  auto const code         = op.meta.amz_error_code.view();
+  bool const already_gone = op.cl->k == call::kind::delete_object && r.head_received && st == 404 &&
+                            (code == "NoSuchKey" || (code.empty() && !transport));
+  if ((!o.ec && !transport) || already_gone) {
     call_done(op, r);
   } else {
     call_failed(op, o, transport);

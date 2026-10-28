@@ -418,6 +418,13 @@ class loopback_connection {
 
 class loopback_range_server {
  public:
+  /// The S3 `<Error>` document the server answers a `status` fault (and S3 errors) with.
+  static std::string s3_error_body(std::string const& code, std::string const& message)
+  {
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>" + code + "</Code><Message>" +
+           message + "</Message><RequestId>LOOPBACK</RequestId></Error>";
+  }
+
   struct get_record {
     std::vector<std::string> if_match;
     std::vector<std::string> ranges;
@@ -1283,12 +1290,6 @@ class loopback_range_server {
     } catch (...) {
       return false;
     }
-  }
-
-  static std::string s3_error_body(std::string const& code, std::string const& message)
-  {
-    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>" + code + "</Code><Message>" +
-           message + "</Message><RequestId>LOOPBACK</RequestId></Error>";
   }
 
   static write_response s3_error(int status, std::string const& code, std::string const& message)

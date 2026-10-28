@@ -70,7 +70,7 @@ using exchange_t = net::http1_exchange<pool_t, op_rec>;
 
 /**
  * @brief One control-plane or write request the engine runs for a caller: HEAD, footer probe,
- *        LIST page, and the S3 write calls.
+ *        LIST page, the S3 write calls and DeleteObject.
  *
  * Owned by the caller; must stay alive until @c on_done ran.  Results are valid in @c on_done.
  * Retries follow the engine's policy with @c max_attempts total attempts; a 403 is final (only
@@ -86,6 +86,7 @@ struct call {
     upload_part,      ///< PUT ?partNumber=N&uploadId=U
     complete_upload,  ///< POST ?uploadId=U with the part list
     abort_upload,     ///< DELETE ?uploadId=U
+    delete_object,    ///< DELETE the object (DeleteObject); a 404 counts as success
   };
 
   kind k{kind::head};

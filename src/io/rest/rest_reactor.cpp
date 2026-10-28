@@ -354,6 +354,28 @@ class rest_reactor::worker {
   std::jthread _thread;
 };
 
+/// A delete handed to the worker (see rest_reactor::_deletes).
+struct rest_reactor::pending_delete {
+  detail::call c;
+  exec::promise<void> promise;
+  std::atomic<bool> settled{false};
+
+  /// Hand the call's outcome to the future; the record may be reclaimed from then on.
+  void settle() noexcept
+  {
+    try {
+      if (c.error != nullptr) {
+        promise.set_exception(c.error);
+      } else {
+        promise.set_value();
+      }
+    } catch (...) {
+      // Already satisfied: nothing left to report.
+    }
+    settled.store(true, std::memory_order_release);
+  }
+};
+
 // =================================================================================================
 // construction / lifecycle
 // =================================================================================================
@@ -460,6 +482,50 @@ head_object_result rest_reactor::head_object(std::string_view bucket, std::strin
     c);
   if (c.error != nullptr) std::rethrow_exception(c.error);
   return head_object_result{static_cast<size_t>(c.content_length.value_or(0)), std::move(c.etag)};
+}
+
+exec::semi_future<void> rest_reactor::delete_object_async(std::string bucket,
+                                                          std::string key,
+                                                          io_priority priority) noexcept
+{
+  try {
+    auto job       = std::make_unique<pending_delete>();
+    auto& c        = job->c;
+    c.k            = detail::call::kind::delete_object;
+    c.object       = object_ref{std::move(bucket), std::move(key)};
+    c.prio         = priority == io_priority::low ? rest::priority::bulk : rest::priority::high;
+    c.max_attempts = _config.max_retry_attempts;
+    c.timeout      = std::chrono::seconds{std::max<long>(_config.request_timeout_s, 0)};
+    c.what         = "delete_object";
+    auto result    = job->promise.get_semi_future();
+    pending_delete* const raw = job.get();
+    // Runs on the engine thread once the call finished; the record stays owned by _deletes.
+    c.on_done = [raw](detail::call&) { raw->settle(); };
+    {
+      std::lock_guard lock(_deletes_mutex);
+      std::erase_if(_deletes, [](std::unique_ptr<pending_delete> const& d) {
+        return d->settled.load(std::memory_order_acquire);
+      });
+      _deletes.push_back(std::move(job));
+    }
+    if (_worker->post(raw->c)) return result;
+    // The worker does not run (not started, or shut down): run it now on a private ring.
+    // run_call installs its own completion; settle from here once it returned.
+    try {
+      run_call(
+        _ctx,
+        _tname,
+        [](void* w, detail::call& call) { return static_cast<worker*>(w)->post(call); },
+        _worker.get(),
+        raw->c);
+    } catch (...) {
+      if (raw->c.error == nullptr) raw->c.error = std::current_exception();
+    }
+    raw->settle();
+    return result;
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
 }
 
 size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)

@@ -24,6 +24,7 @@
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -180,6 +181,13 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   exec::semi_future<void> flush_async_io(io_object const& object,
                                          io_priority priority) noexcept override;
 
+  /// DeleteObject of @p path (s3://bucket/key) on the next reactor in rotation; a 404
+  /// @c NoSuchKey (or a 404 without an error code) is success, other 404s fail.  Retried like the
+  /// other control calls (@c max_retry_attempts).  Invalidation of the path is done by the @c ioctx
+  /// front end.
+  exec::semi_future<void> remove_io_object_async_io(std::string path,
+                                                    io_priority priority) noexcept override;
+
   /// Cut every write slice that straddles a part boundary at it (one write operation is never
   /// spread over two S3 parts), then dispatch as the base does.
   exec::semi_future<std::size_t> mixed_writev_async_io(
@@ -193,6 +201,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
 
   object_store_lister _lister;
+
+  /// Round-robin cursor of remove_io_object_async_io (deletes carry no bytes to balance).
+  std::atomic<std::size_t> _delete_next{0};
 
   /// The effective resolve_footer_objects concurrency cap: the configured
   /// knob, or n_reactors * max_connections under footer_resolve_auto.  0 =

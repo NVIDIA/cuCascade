@@ -90,7 +90,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   target_sources(
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
-            io/rest/test_rest_write.cpp io/test_io_request.cpp)
+            io/rest/test_rest_write.cpp io/rest/test_rest_delete.cpp
+            io/test_io_request.cpp)
   # A PTDS-built caller must still get legacy null-stream I/O ordering.
   set_source_files_properties(
     io/test_null_stream_ptds.cpp PROPERTIES COMPILE_DEFINITIONS
