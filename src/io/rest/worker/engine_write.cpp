@@ -634,7 +634,12 @@ void engine::run_flush(std::shared_ptr<upload_session> up,
     rq.prio          = priority::high;
     rq.max_attempts  = _cfg.max_retry_attempts;
     rq.what          = "put_object";
-    rq.on_done       = [this, job](call&) {
+    // A weak reference: the call is a member of the job, so a strong one would keep the job
+    // (its upload session, and through it the upload's abort on destruction) alive forever.
+    // _flush_jobs owns the job until finish_flush hands it to the graveyard.
+    rq.on_done = [this, weak = std::weak_ptr<flush_job>(job)](call&) {
+      auto job = weak.lock();
+      if (job == nullptr) return;
       auto error = commit_error(job->request, job->plan.if_none_match, job->up->path);
       auto ec    = code_of(error);
       // The single PUT carries the flush's only part upload: settle it like UploadPart.
@@ -731,7 +736,10 @@ void engine::send_complete(std::shared_ptr<flush_job> job) noexcept
   rq.prio          = priority::high;
   rq.max_attempts  = _cfg.max_retry_attempts;
   rq.what          = "complete_multipart_upload";
-  rq.on_done       = [this, job](call&) { complete_done(job); };
+  // Weak, as for the single PUT: the call is a member of the job.
+  rq.on_done = [this, weak = std::weak_ptr<flush_job>(job)](call&) {
+    if (auto job = weak.lock()) complete_done(std::move(job));
+  };
   ++job->complete_attempts;
   submit(rq);
 }

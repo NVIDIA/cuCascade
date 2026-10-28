@@ -482,6 +482,10 @@ std::uint64_t engine::pump() noexcept
   retire_copies();
   handle_mail();
   dispatch();
+  // Jobs that finished during this pump (e.g. a call failed before it was sent) wait in the
+  // graveyard for the next pump: run it without blocking, so what they hold -- an upload whose
+  // last reference aborts it -- is released now rather than when the next request arrives.
+  if (!_graveyard.empty()) return 0;
   if (_copies.empty()) return net::uring_loop::no_bound;
   auto const due = _copies.next_due_ns();
   auto const now = _loop.now_ns();

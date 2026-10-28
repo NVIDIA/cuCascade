@@ -595,6 +595,41 @@ TEST_CASE("rest_ioctx aborts an upload that is destroyed without a flush", "[res
   }
 }
 
+TEST_CASE("rest_ioctx aborts an upload whose commit failed once the object is destroyed",
+          "[rest][write]")
+{
+  // The flush job of a failed commit must not outlive it: it holds the upload session, whose
+  // destruction is what aborts an upload that was never committed.
+  s3_write_policy policy;
+  policy.faults.push_back(write_fault{.kind   = write_kind::complete_upload,
+                                      .count  = 100,
+                                      .status = 400,
+                                      .code   = "InvalidRequest"});
+  auto server = make_store(policy);
+  auto ioctx  = make_write_ioctx(*server);
+  rest_shutdown_guard cleanup{*ioctx};
+  auto const data = rest_test_payload(part_bytes + 4096);
+  {
+    auto object = ioctx->open_io_object_for_write(uri("failed-commit.bin"));
+    REQUIRE(ioctx->host_write(*object, 0, data.size(), data.data()) == data.size());
+    CHECK_THROWS(ioctx->flush(*object));
+    CHECK(server->active_upload_count() == 1);
+  }
+  CHECK(eventually([&] { return server->abort_upload_count() == 1; }));
+  CHECK(server->active_upload_count() == 0);
+  CHECK_FALSE(server->stored_object("failed-commit.bin").has_value());
+
+  // Nothing the commit used keeps a committed object alive either.
+  std::weak_ptr<cucascade::io::io_object> committed;
+  {
+    auto object = ioctx->open_io_object_for_write(uri("committed.bin"));
+    REQUIRE(ioctx->host_write(*object, 0, 4096, data.data()) == 4096);
+    ioctx->flush(*object);
+    committed = object;
+  }
+  CHECK(eventually([&] { return committed.expired(); }));
+}
+
 TEST_CASE("rest_ioctx retries transient write failures and surfaces final ones", "[rest][write]")
 {
   auto const data = rest_test_payload(part_bytes + 4096);
