@@ -112,5 +112,11 @@ inline void fill_remaining_iovecs(std::span<iovec const> source,
   }
 }
 
+/// Make every uring reactor report a failed CUDA event record after enqueuing
+/// the H2D copy of a staged device read, so tests can check the request does
+/// not settle (and release its staging) while that copy may still run.
+/// Process-wide; tests only.
+void set_copy_event_record_failure_for_testing(bool enabled) noexcept;
+
 }  // namespace detail
 }  // namespace cucascade::io::uring
