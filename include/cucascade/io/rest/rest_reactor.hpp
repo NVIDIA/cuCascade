@@ -24,6 +24,7 @@
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/templated_ioctx.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -534,6 +535,29 @@ class rest_reactor {
   /// @c rest_ioctx::create_io_object.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
+  // -- writes: not yet implemented --------------------------------------------
+  //
+  // The write entry points exist so the reactor's write surface is explicit,
+  // but REST writes (S3 PUT / multipart upload) are not implemented yet: each
+  // throws @c not_implemented_error (@c std::errc::not_supported) without any
+  // network traffic, and @ref enqueue fails write and flush slices with it
+  // instead of reading them as GETs.  These signatures would satisfy
+  // @c io_write_reactor_c structurally, so @c reactor_write_traits<rest_reactor>
+  // is specialized below to advertise no writes.
+
+  /// Always throws @c not_implemented_error; no object is created.
+  static std::unique_ptr<io_object_type> create_io_object_for_write(std::string path,
+                                                                    write_open_options options);
+
+  /// Always throws @c not_implemented_error; nothing is sent.
+  std::size_t host_write(io_object_type const& object,
+                         std::size_t offset,
+                         std::size_t size,
+                         std::uint8_t const* src);
+
+  /// Always throws @c not_implemented_error.
+  static void flush(io_object_type const& object);
+
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
   /// bound) into a minimal sorted set — fewer ranges means fewer GETs.
@@ -589,3 +613,17 @@ class rest_reactor {
 };
 
 }  // namespace cucascade::io::rest
+
+namespace cucascade::io {
+
+/// The REST reactor declares write stubs only (see @c rest_reactor): it
+/// advertises no writes, so @c templated_ioctx<rest::rest_reactor> reports
+/// @c supports_write() == @c supports_device_write() == false.  Declared here,
+/// next to the reactor, so it precedes every instantiation of the context.
+template <>
+struct reactor_write_traits<rest::rest_reactor> {
+  static constexpr bool supports_write        = false;
+  static constexpr bool supports_device_write = false;
+};
+
+}  // namespace cucascade::io

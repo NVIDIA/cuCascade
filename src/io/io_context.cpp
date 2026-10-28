@@ -20,6 +20,7 @@
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/log/logging.hpp>
 
@@ -57,11 +58,26 @@ struct io_write_from_host_message {
   throw std::system_error(std::make_error_code(code), what);
 }
 
+/// Name of a backend in error messages.
+[[nodiscard]] std::string_view backend_name(io_context_type type) noexcept
+{
+  switch (type) {
+    case io_context_type::uring: return "uring";
+    case io_context_type::restful: return "rest";
+    case io_context_type::s3rdma: return "s3rdma";
+    case io_context_type::cufile: return "cufile";
+  }
+  return "ioctx";
+}
+
 /// Throw unless @p ctx can write @p obj (with a device source when @p device).
-void require_writable(ioctx const& ctx, io_object const& obj, bool device)
+/// A backend that cannot write at all reports @c not_implemented_error; one
+/// that writes host sources only reports a plain @c not_supported for a device
+/// source.
+void require_writable(ioctx const& ctx, io_object const& obj, bool device, char const* operation)
 {
   if (!ctx.supports_write()) {
-    throw_errc(std::errc::not_supported, "ioctx: backend cannot write");
+    throw not_implemented_error(std::string(backend_name(ctx.type())) + ": " + operation);
   }
   if (device && !ctx.supports_device_write()) {
     throw_errc(std::errc::not_supported, "ioctx: backend cannot write from device memory");
@@ -289,7 +305,7 @@ std::size_t ioctx::host_write(const io_object& obj,
   if (size > max_end || offset > max_end - size) {
     throw std::invalid_argument("host write range exceeds the largest file offset");
   }
-  require_writable(*this, obj, false);
+  require_writable(*this, obj, false, "host_write");
 
   // Drop cached bytes of the path before and after the write: the second pass
   // catches a prefetch that read pre-write bytes while the write ran.
@@ -373,7 +389,7 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
       slices.push_back(make_device_write_slice(current.rng, current.src, stream, -1, resolved));
     }
     if (slices.empty()) return exec::make_semi_future<std::size_t>(0);
-    require_writable(*this, obj, has_device);
+    require_writable(*this, obj, has_device, "write");
 
     auto const& path = obj.object_path();
     invalidate_cached(path);
@@ -420,26 +436,26 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
 
 void ioctx::flush(const io_object& obj)
 {
-  require_writable(*this, obj, false);
+  require_writable(*this, obj, false, "flush");
   flush_io(obj);
 }
 
 exec::semi_future<void> ioctx::flush_async(const io_object& obj, io_priority priority) noexcept
 {
   try {
-    require_writable(*this, obj, false);
+    require_writable(*this, obj, false, "flush_async");
   } catch (...) {
     return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
   }
   return flush_async_io(obj, resolve_priority(priority, io_priority::high));
 }
 
-// -- Default write hooks: not supported ---------------------------------------
+// -- Default write hooks: not implemented ---------------------------------------
 
 std::shared_ptr<io_object> ioctx::create_io_object_for_write(std::string /*path*/,
                                                              write_open_options /*options*/)
 {
-  throw_errc(std::errc::not_supported, "ioctx: backend cannot write");
+  throw not_implemented_error(std::string(backend_name(type())) + ": open_io_object_for_write");
 }
 
 std::size_t ioctx::host_write_io(const io_object& /*obj*/,
@@ -447,14 +463,14 @@ std::size_t ioctx::host_write_io(const io_object& /*obj*/,
                                  std::size_t /*size*/,
                                  const std::uint8_t* /*src*/)
 {
-  throw_errc(std::errc::not_supported, "ioctx: backend cannot write");
+  throw not_implemented_error(std::string(backend_name(type())) + ": host_write");
 }
 
 exec::semi_future<std::size_t> ioctx::mixed_writev_async_io(
   const io_object& /*obj*/, std::vector<prepared_io_slice>&& /*slices*/) noexcept
 {
   try {
-    throw_errc(std::errc::not_supported, "ioctx: backend cannot write");
+    throw not_implemented_error(std::string(backend_name(type())) + ": mixed_writev_async");
   } catch (...) {
     return exec::make_semi_future<std::size_t>(std::current_exception());
   }
@@ -462,14 +478,14 @@ exec::semi_future<std::size_t> ioctx::mixed_writev_async_io(
 
 void ioctx::flush_io(const io_object& /*obj*/)
 {
-  throw_errc(std::errc::not_supported, "ioctx: backend cannot write");
+  throw not_implemented_error(std::string(backend_name(type())) + ": flush");
 }
 
 exec::semi_future<void> ioctx::flush_async_io(const io_object& /*obj*/,
                                               io_priority /*priority*/) noexcept
 {
   try {
-    throw_errc(std::errc::not_supported, "ioctx: backend cannot write");
+    throw not_implemented_error(std::string(backend_name(type())) + ": flush_async");
   } catch (...) {
     return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
   }

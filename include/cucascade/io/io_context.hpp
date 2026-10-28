@@ -136,7 +136,8 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
    * replaces) the file's bytes, so it invalidates the path in this ioctx's
    * cache and metadata store like a write does.
    *
-   * @throws std::system_error with @c std::errc::not_supported when the backend
+   * @throws not_implemented_error (a @c std::system_error with
+   *         @c std::errc::not_supported) when the backend
    *         cannot write; @c std::system_error with the @c errno of the failed
    *         open otherwise (e.g. @c ENOENT for @c write_mode::open_existing on a
    *         missing file, @c EEXIST for @c write_mode::create_new).
@@ -377,7 +378,8 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   // Semantics shared by every form:
   //  - @p obj must come from @ref open_io_object_for_write (otherwise
   //    @c std::errc::bad_file_descriptor); a backend without writes reports
-  //    @c std::errc::not_supported.
+  //    @c not_implemented_error (a @c std::system_error with
+  //    @c std::errc::not_supported).
   //  - Writes are never clamped: one at or past EOF extends the file (a gap
   //    reads back as zeros) and @c obj.size() grows to cover every completed
   //    write before its future resolves.  A new io_object opened afterwards,
@@ -512,7 +514,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   }
 
   /// Backend hook behind @ref host_write.  The default throws
-  /// @c std::system_error(std::errc::not_supported).
+  /// @c not_implemented_error (@c std::errc::not_supported).
   virtual std::size_t host_write_io(const io_object& obj,
                                     std::size_t offset,
                                     std::size_t size,
@@ -522,7 +524,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// builds write slices (@c make_host_write_slice / @c make_device_write_slice)
   /// and forwards here.  An implementation validates them with
   /// @c validate_write_slices.  The default resolves with
-  /// @c std::errc::not_supported.  Contract: the returned future must resolve
+  /// @c not_implemented_error.  Contract: the returned future must resolve
   /// before this ioctx is destroyed (the front end's completion pass touches
   /// its metadata store) -- reactor-backed contexts join their reactors in
   /// their destructor, eager ones resolve before returning.
@@ -530,11 +532,11 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept;
 
   /// Backend hook behind @ref flush.  The default throws
-  /// @c std::system_error(std::errc::not_supported).
+  /// @c not_implemented_error (@c std::errc::not_supported).
   virtual void flush_io(const io_object& obj);
 
   /// Backend hook behind @ref flush_async.  The default resolves with
-  /// @c std::errc::not_supported.
+  /// @c not_implemented_error.
   virtual exec::semi_future<void> flush_async_io(const io_object& obj,
                                                  io_priority priority) noexcept;
 
@@ -565,7 +567,8 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   virtual std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size);
 
   /// Backend hook behind @ref open_io_object_for_write (scheme already
-  /// stripped).  The default throws @c std::system_error(std::errc::not_supported).
+  /// stripped).  The default throws @c not_implemented_error
+  /// (@c std::errc::not_supported).
   virtual std::shared_ptr<io_object> create_io_object_for_write(std::string path,
                                                                 write_open_options options);
 
