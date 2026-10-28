@@ -78,6 +78,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_rest_cache_identity.cpp
     io/rest/test_rest_footer_resolve.cpp
     io/rest/test_rest_validation_tag.cpp
+    io/rest/test_rest_write_unimplemented.cpp
     io/rest/test_shared_byte_span.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
@@ -110,7 +111,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
       cucascade_io_tests
       PRIVATE io/kvikio/test_kvikio_config.cpp
               io/kvikio/test_kvikio_identity.cpp
-              io/kvikio/test_kvikio_remote.cpp)
+              io/kvikio/test_kvikio_remote.cpp
+              io/kvikio/test_kvikio_write_unimplemented.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

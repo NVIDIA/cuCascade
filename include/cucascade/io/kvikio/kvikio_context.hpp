@@ -233,6 +233,26 @@ class kvikio_context final : public ioctx {
   exec::semi_future<size_t> mixed_readv_async_io(
     const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept final;
 
+  // -- Writes: not yet implemented ------------------------------------------
+  //
+  // kvikIO stays a read-only backend.  Every write and flush hook reports
+  // @c not_implemented_error (@c std::errc::not_supported): the synchronous
+  // ones throw, the asynchronous ones return a failed future.  No file is
+  // opened, created or truncated, nothing is synchronized and no kvikIO write
+  // is issued; @c supports_write() / @c supports_device_write() stay false.
+
+  std::size_t host_write_io(io_object const& obj,
+                            std::size_t offset,
+                            std::size_t size,
+                            std::uint8_t const* src) final;
+
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& obj, std::vector<prepared_io_slice>&& slices) noexcept final;
+
+  void flush_io(io_object const& obj) final;
+
+  exec::semi_future<void> flush_async_io(io_object const& obj, io_priority priority) noexcept final;
+
   /// The config this context was built with (default-constructed when none was
   /// supplied).  Only @c compat_mode is still consulted after construction; the
   /// rest already went into kvikIO's globals.
@@ -252,6 +272,10 @@ class kvikio_context final : public ioctx {
   /// buffered and O_DIRECT descriptors do not name the same file (the path is
   /// being replaced concurrently) or the O_DIRECT one cannot be stat'ed.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
+
+  /// Always throws @c not_implemented_error; the path is not touched.
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) final;
 
  private:
   kvikio_config _config;

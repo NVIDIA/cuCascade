@@ -310,4 +310,47 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Writes: not yet implemented
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<io_object> kvikio_context::create_io_object_for_write(
+  std::string /*path*/, write_open_options /*options*/)
+{
+  throw not_implemented_error("kvikio: open_io_object_for_write");
+}
+
+std::size_t kvikio_context::host_write_io(io_object const& /*obj*/,
+                                          std::size_t /*offset*/,
+                                          std::size_t /*size*/,
+                                          std::uint8_t const* /*src*/)
+{
+  throw not_implemented_error("kvikio: host_write");
+}
+
+exec::semi_future<std::size_t> kvikio_context::mixed_writev_async_io(
+  io_object const& /*obj*/, std::vector<prepared_io_slice>&& /*slices*/) noexcept
+{
+  try {
+    throw not_implemented_error("kvikio: mixed_writev_async");
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+}
+
+void kvikio_context::flush_io(io_object const& /*obj*/)
+{
+  throw not_implemented_error("kvikio: flush");
+}
+
+exec::semi_future<void> kvikio_context::flush_async_io(io_object const& /*obj*/,
+                                                       io_priority /*priority*/) noexcept
+{
+  try {
+    throw not_implemented_error("kvikio: flush_async");
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
+
 }  // namespace cucascade::io

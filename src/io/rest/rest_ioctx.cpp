@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uri_parser.hpp>
 #include <cucascade/log/logging.hpp>
@@ -401,6 +402,46 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
                                                                  probe.window_lo,
                                                                  probe.bytes,
                                                                  std::move(probe.etag)));
+}
+
+// ---------------------------------------------------------------------------
+// Writes: not yet implemented
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<io_object> rest_ioctx::create_io_object_for_write(std::string /*path*/,
+                                                                  write_open_options /*options*/)
+{
+  throw not_implemented_error("rest: open_io_object_for_write");
+}
+
+std::size_t rest_ioctx::host_write_io(io_object const& /*obj*/,
+                                      std::size_t /*offset*/,
+                                      std::size_t /*size*/,
+                                      std::uint8_t const* /*src*/)
+{
+  throw not_implemented_error("rest: host_write");
+}
+
+exec::semi_future<std::size_t> rest_ioctx::mixed_writev_async_io(
+  io_object const& /*obj*/, std::vector<prepared_io_slice>&& /*slices*/) noexcept
+{
+  try {
+    throw not_implemented_error("rest: mixed_writev_async");
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+}
+
+void rest_ioctx::flush_io(io_object const& /*obj*/) { throw not_implemented_error("rest: flush"); }
+
+exec::semi_future<void> rest_ioctx::flush_async_io(io_object const& /*obj*/,
+                                                   io_priority /*priority*/) noexcept
+{
+  try {
+    throw not_implemented_error("rest: flush_async");
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
 }
 
 }  // namespace cucascade::io::rest

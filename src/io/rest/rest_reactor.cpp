@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <format>
 #include <limits>
 #include <new>
@@ -649,6 +650,19 @@ void rest_reactor::shutdown() noexcept
 void rest_reactor::enqueue(std::unique_ptr<grouped_io_request> req) noexcept
 {
   if (req == nullptr) return;
+  // A write or flush slice must never be read as a GET: fail the whole request.
+  if (std::ranges::any_of(req->slices, [](prepared_io_slice const& slice) {
+        return slice.kind != io_op_kind::read;
+      })) {
+    std::exception_ptr error;
+    try {
+      throw not_implemented_error("rest: write");
+    } catch (...) {
+      error = std::current_exception();
+    }
+    req->cancel_remaining(error);
+    return;
+  }
   auto const bytes = req->remaining_bytes();
   auto const error = std::make_error_code(std::errc::operation_canceled);
 
@@ -1385,6 +1399,25 @@ std::unique_ptr<rest_reactor::io_object_type> rest_reactor::create_io_object(std
   // which live on the reactor instance — see rest_ioctx::create_io_object.
   throw std::logic_error(
     "rest_reactor::create_io_object: use rest_ioctx::create_io_object (needs HEAD + authorizer)");
+}
+
+std::unique_ptr<rest_reactor::io_object_type> rest_reactor::create_io_object_for_write(
+  std::string /*path*/, write_open_options /*options*/)
+{
+  throw not_implemented_error("rest: open_io_object_for_write");
+}
+
+std::size_t rest_reactor::host_write(io_object_type const& /*object*/,
+                                     std::size_t /*offset*/,
+                                     std::size_t /*size*/,
+                                     std::uint8_t const* /*src*/)
+{
+  throw not_implemented_error("rest: host_write");
+}
+
+void rest_reactor::flush(io_object_type const& /*object*/)
+{
+  throw not_implemented_error("rest: flush");
 }
 
 std::vector<byte_range> rest_reactor::align_and_coalesce(std::span<const byte_range> ranges,

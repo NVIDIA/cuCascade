@@ -145,7 +145,33 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// for back-to-back queries and self-correcting for spaced-out ones.
   void warmup(std::string_view bucket_url) noexcept override;
 
+  // -- Writes: not yet implemented ------------------------------------------
+  //
+  // REST writes (S3 PUT / multipart upload) are not implemented yet.  Every
+  // write and flush hook reports @c not_implemented_error
+  // (@c std::errc::not_supported) without touching the network: the
+  // synchronous ones throw, the asynchronous ones return a failed future, and
+  // @c supports_write() / @c supports_device_write() stay false.
+
+  std::size_t host_write_io(io_object const& obj,
+                            std::size_t offset,
+                            std::size_t size,
+                            std::uint8_t const* src) override;
+
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& obj, std::vector<prepared_io_slice>&& slices) noexcept override;
+
+  void flush_io(io_object const& obj) override;
+
+  exec::semi_future<void> flush_async_io(io_object const& obj,
+                                         io_priority priority) noexcept override;
+
  protected:
+  /// Always throws @c not_implemented_error: no object is created, no HEAD is
+  /// sent.
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) override;
+
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
