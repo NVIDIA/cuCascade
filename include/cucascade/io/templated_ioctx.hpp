@@ -103,7 +103,8 @@ concept io_reactor_c = requires(R reactor,
 /**
  * @brief Optional write contract of a reactor (see docs/io/write-api-design.md
  *        section 6).  A reactor that does not model it serves reads only, and
- *        @c templated_ioctx reports @c std::errc::not_supported for writes.
+ *        @c templated_ioctx reports @c not_implemented_error (a
+ *        @c std::system_error with @c std::errc::not_supported) for writes.
  *
  * Synchronous members (caller thread, may block, throw on error):
  *  - @c create_io_object_for_write(path, options): open @p path read+write per
