@@ -161,6 +161,8 @@ class StrictTests(unittest.TestCase):
                 )
                 targets.append(t)
         delegated["wire"].extend(targets)
+        for index, w in enumerate(delegated["wire"]):
+            w["sequence"] = index
         delegated["probe"]["exit"] = 0
         for e in delegated["probe"]["events"]:
             if "status" in e:

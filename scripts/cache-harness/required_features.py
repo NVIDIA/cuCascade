@@ -6,7 +6,9 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from urllib.parse import urlsplit, parse_qs
 import xml.etree.ElementTree as ET
+from required_ais_evidence import ais_controls, http_response
 
 BASE = "1a9281093a0fe49634594d541d7ce327129f53d6"
 WIRE_CASES = (
@@ -125,17 +127,89 @@ def origin_requests_valid(o):
     )
 
 
+def fixture_location_valid(o):
+    endpoints = o["endpoints"]
+    if (
+        len(endpoints) != 5
+        or o["allowed_targets"] != endpoints[1:4]
+        or len(set(endpoints)) != 5
+    ):
+        return False
+    for i, endpoint in enumerate(endpoints):
+        url = urlsplit(endpoint)
+        scheme = (
+            "https" if i == 0 and o["name"] in ("tls-direct", "downgrade") else "http"
+        )
+        if (
+            url.scheme != scheme
+            or url.hostname != "127.0.0.1"
+            or not url.port
+            or url.username
+            or url.password
+            or url.path
+            or url.query
+            or url.fragment
+        ):
+            return False
+    name = o["name"]
+    case = (
+        name
+        if name in ("nonallowlisted", "second-307", "userinfo", "fragment", "downgrade")
+        else (
+            "direct"
+            if name.startswith("direct-") or name in ("list-fixture", "tls-direct")
+            else "rewrite"
+        )
+    )
+    if o["fixture_case"] != case or o["probe"]["command"][1] != endpoints[0]:
+        return False
+    redirects = [w for w in o["wire"] if w["role"] == "origin" and w["response"] == 307]
+    allowed_roles = {"origin", "canary", "target-0", "target-1", "target-2"}
+    if any(
+        w["role"] not in allowed_roles or w["sequence"] != i
+        for i, w in enumerate(o["wire"])
+    ):
+        return False
+    for n, w in enumerate(redirects):
+        target = endpoints[1 + (n % 3 if o["mode"] == "queue" else 0)]
+        expected = target + "/s3/h/object?pid=fixture&utm=fixture"
+        if case == "nonallowlisted":
+            expected = endpoints[4] + "/h/object"
+        elif case == "userinfo":
+            expected = target.replace("://", "://fixture-user@") + "/h/object"
+        elif case == "fragment":
+            expected += "#fragment"
+        if w["response_headers"].get("Location") != expected:
+            return False
+    return True
+
+
 def delivered_307(o):
     p = o["probe"]
     failures = [e for e in p["events"] if e["event"] in ("error", "result")]
+    # First-hop rejection means *every* failed operation stopped there. Even
+    # one target/canary attempt invalidates this classification.
+    if not fixture_location_valid(o) or any(w["role"] != "origin" for w in o["wire"]):
+        return False
+    reads = [
+        w
+        for w in o["wire"]
+        if w["method"] == ("HEAD" if o["mode"] == "head" else "GET")
+    ]
+    expected_count = 1 if o["mode"] in ("head", "footer") else o["count"]
     return (
         p["exit"] == 1
         and not p["timeout"]
         and not p["parse_errors"]
-        and any(w.get("response") == 307 and w["role"] == "origin" for w in o["wire"])
-        and bool(failures)
+        and len(reads) == len(failures) == expected_count
+        and all(w["response"] == 307 for w in reads)
         and all("HTTP 307" in e.get("error", "") for e in failures)
-        and (o["mode"] in ("head", "footer") or range_results(o, False))
+        and (
+            o["mode"] in ("head", "footer")
+            and failures[0].get("stage") == "open"
+            or o["mode"] in ("serial", "queue")
+            and range_results(o, False)
+        )
     )
 
 
@@ -192,6 +266,10 @@ def wire_pair_valid(o):
 
 
 def wire_verdict(name, o, *, needs_control=False):
+    if not fixture_location_valid(o):
+        return row(
+            name, "FAIL", "fixture Location/authority/protocol does not match case"
+        )
     if not origin_requests_valid(o):
         return row(
             name, "FAIL", "origin method/Range/If-Match/signing does not match workload"
@@ -223,6 +301,8 @@ def wire_verdict(name, o, *, needs_control=False):
             and len({w["role"] for w in o["wire"] if w["role"].startswith("target-")})
             == 3
         )
+    if o["probe"]["exit"] != 0:
+        return row(name, "FAIL", "failure is not a verified first-hop rejection")
     if needs_control and not o["policy_controls_available"]:
         return row(
             name,
@@ -234,6 +314,27 @@ def wire_verdict(name, o, *, needs_control=False):
         "PASS" if ok else "FAIL",
         "actual method/Range/If-Match, credential absence, payload and gateway path checks",
     )
+
+
+def xml_page(body):
+    root = ET.fromstring(body)
+    if root.tag.split("}")[-1] != "ListBucketResult":
+        raise ValueError("not a LIST page")
+    values = {}
+    for node in root:
+        key = node.tag.split("}")[-1]
+        if key in ("IsTruncated", "NextContinuationToken"):
+            if key in values:
+                raise ValueError("duplicate LIST page metadata")
+            values[key] = node.text or ""
+    if values.get("IsTruncated") not in ("true", "false"):
+        raise ValueError("missing/invalid LIST IsTruncated")
+    truncated, token = values["IsTruncated"] == "true", values.get(
+        "NextContinuationToken", ""
+    )
+    if bool(token) != truncated:
+        raise ValueError("LIST truncation/token mismatch")
+    return dict(truncated=truncated, next=token, entries=xml_entries(body))
 
 
 def xml_entries(body):
@@ -277,7 +378,12 @@ def assess_wire(observations):
     rows, controls = [], []
     for name in WIRE_CASES[:6]:
         o = observations[name]
-        ok = completed(o) and o["cleanup"] and origin_requests_valid(o)
+        ok = (
+            completed(o)
+            and o["cleanup"]
+            and origin_requests_valid(o)
+            and fixture_location_valid(o)
+        )
         if o["mode"] in ("serial", "queue"):
             ok = ok and range_results(o, True)
         if o["mode"] == "queue":
@@ -487,6 +593,9 @@ def evaluate(packet_path):
             or state.get("cleanup_errors")
         ):
             raise ValueError("AIS mode or cleanup mismatch")
+        raw_statuses, raw_count, raw_response = ais_controls(
+            load, prefix, by_name, state
+        )
         for label, source, name in (
             ("cucascade-ais", "A2-cucascade", "read"),
             ("cucascade-footer-first", "A2-footer-first", "footer"),
@@ -504,11 +613,15 @@ def evaluate(packet_path):
             )
             status = "PASS" if success else "UNSUPPORTED" if unsupported else "FAIL"
             cold = by_name[source + "-cold-fill"]
-            before = load(prefix + label + "-presence-before.json")["status"]
-            after = load(prefix + label + "-presence-after.json")["status"]
+            before = raw_response(label + "-presence-before")["status"]
+            after = raw_response(label + "-presence-after")["status"]
             if before != cold["presence_before"] or after != cold["presence_after"]:
                 raise ValueError("cold presence binding mismatch")
-            counts = cold["origin_get_before"], cold["origin_get_after"]
+            counts = raw_count(label + "-stats-before"), raw_count(
+                label + "-stats-after"
+            )
+            if counts != (cold["origin_get_before"], cold["origin_get_after"]):
+                raise ValueError("library cold-fill raw counter/summary mismatch")
             cold_ok = (
                 success
                 and before == 404
@@ -547,12 +660,12 @@ def evaluate(packet_path):
                 "A2-footer-first"
             ):
                 continue
-            if r["status"] == "PASS":
+            if raw_statuses[source] == "PASS":
                 controls.append(
                     row(
                         mode + ":" + source,
                         "PASS",
-                        "unchanged original characterization control",
+                        "rejudged from required raw HTTP/hash/presence/counter receipts",
                     )
                 )
             elif not (
@@ -569,10 +682,45 @@ def evaluate(packet_path):
                 )
     prefix = packet["root_dir"] + "/h-list/"
     listed = load(prefix + "observation.json")
+    list_state = load(packet["root_dir"] + "/ais-state.json")
     raw_pages = []
-    for page in listed["pages"]:
+    previous, seen = None, set()
+    library_pages = [e for e in listed["probe"]["events"] if e["event"] == "page"]
+    if not listed["pages"] or len(library_pages) != len(listed["pages"]):
+        raise ValueError("LIST page count mismatch")
+    library_tokens = set()
+    for index, page in enumerate(listed["pages"]):
         body = checked_file(root, prefix + page["body"], manifest).read_bytes()
-        entries = xml_entries(body)
+        terminal = http_response(page["response"], list_state)
+        if terminal["sha256"] != hashlib.sha256(body).hexdigest() or terminal[
+            "length"
+        ] != len(body):
+            raise ValueError("LIST response body binding mismatch")
+        raw = xml_page(body)
+        entries = raw["entries"]
+        lib = library_pages[index]
+        query = parse_qs(urlsplit(page["response"]["chain"][0]["url"]).query)
+        if (
+            page["truncated"] != raw["truncated"]
+            or page["token_in"] != previous
+            or query.get("continuation-token", [None]) != [previous]
+            or raw["truncated"] != (index < len(listed["pages"]) - 1)
+            or lib["truncated"] != raw["truncated"]
+            or lib["entries"] != [dict(key=e["key"], size=e["size"]) for e in entries]
+            or bool(lib["next"]) != lib["truncated"]
+            or (lib["next"] and lib["next"] in library_tokens)
+            or (raw["next"] and raw["next"] in seen)
+        ):
+            raise ValueError(
+                "LIST raw page/token chain disagrees with observation/library"
+            )
+        # Tokens belong to independent AIS listing sessions; never compare their
+        # opaque byte values across the reference and library calls.
+        if raw["next"]:
+            seen.add(raw["next"])
+        if lib["next"]:
+            library_tokens.add(lib["next"])
+        previous = raw["next"] or None
         if (
             sha(root / prefix / page["body"]) != page["sha256"]
             or entries != page["entries"]
