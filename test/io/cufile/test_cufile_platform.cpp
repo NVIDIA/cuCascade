@@ -45,9 +45,14 @@ TEST_CASE("cufile platform probe is cached and self-consistent", "[io][cufile]")
   CHECK(&first == &second);
   CHECK(first.library_available == (cucascade::io::cufile::cufile_api::get() != nullptr));
   CHECK(cucascade::io::cufile::gds_available() ==
-        (first.driver_opened && !first.compat_only && !first.forced_compat));
-  if (!first.driver_opened) return;
+        (first.driver_opened && first.properties_available && !first.compat_only &&
+         !first.forced_compat));
+  if (!first.driver_opened) {
+    CHECK_FALSE(first.properties_available);
+    return;
+  }
   CHECK(first.library_available);
+  if (!first.properties_available) return;  // mode unknown, not compatibility-only
   CHECK(first.compat_only == (first.dstatusflags == 0));
   CHECK(first.max_direct_io_size_kb > 0);
   INFO("cuFile " << first.version << ", dstatusflags " << first.dstatusflags
