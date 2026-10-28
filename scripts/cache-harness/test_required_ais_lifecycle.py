@@ -181,6 +181,16 @@ class WholeEntrypoint(unittest.TestCase):
                     self.assertTrue(
                         (root / "cleaned").exists(), (root / "out.log").read_text()
                     )
+                    if trigger != "normal":
+                        expected_signal = (
+                            signal.SIGALRM
+                            if trigger == "deadline"
+                            else signal.SIGINT if "INT" in trigger else signal.SIGTERM
+                        )
+                        self.assertIn(
+                            f"RunInterrupted: signal {int(expected_signal)}",
+                            (root / "out.log").read_text(),
+                        )
                     if (root / "child.pid").exists():
                         child = int((root / "child.pid").read_text())
                         with self.assertRaises(ProcessLookupError):
