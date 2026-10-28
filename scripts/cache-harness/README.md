@@ -170,3 +170,92 @@ PID reuse; it is not a security boundary against an attacker running as this use
 Lifecycle accepts `--weed-sha256` and forwards it to every service launch.
 Run `python scripts/cache-harness/test_reliability.py` on Linux in addition to
 `test_harness.py` and the full `ais_test_lifecycle.py` suite.
+
+## H: required-feature profile (fixed old cuCascade baseline)
+
+H adds test tools, not an external-cache implementation. Its production baseline
+is `1a9281093a0fe49634594d541d7ce327129f53d6`; the E1 harness fixes remain in
+place. `required_features.py` is independent of the original characterization
+report. All **17 mandatory rows** and all retained green controls must PASS;
+missing, duplicate, malformed, changed evidence, timeout, UNSUPPORTED, UNKNOWN
+or NOT_TESTED never qualify. It prints FAIL and exits **1** on the old library.
+
+| Mandatory rows | Evidence / interpretation |
+| --- | --- |
+| root-read, root-full-cold, root-footer, root-footer-cold | Real AIStore, actual original C++ smoke, independent untouched objects, presence and backend GET counts. Reverse mode is only a separate green control. |
+| admission-nonallowlisted/second-307/userinfo/fragment/downgrade | Actual requests to controlled redirect fixtures. Legal delegation must work before rejecting bad redirects can count as policy success. Downgrade starts with verified local TLS. |
+| delegated-head/footer/range | Legitimate `/s3/` + `pid`/`utm` rewrite; method, Range and validator preservation, credential-header absence, exact bytes. A ranged read requires the strong fixture If-Match. |
+| reuse-off | Two different ranges on one open object must rediscover the origin; the real policy control must be selectable. |
+| retention-f0 | W1/C1, 32 serial ranged reads, one origin/one target: expanded <=2 GET connections plus separately counted HEAD warmup, legacy >=16. |
+| stress-q64/q256 | All futures submitted before collection, buffers retained through every result; a server gate prevents early responses. Three targets are configured. This is not the F0 retention proof. |
+| list-etag | Actual library pagination/key/size compared with captured service and backing LIST inventories. Raw ETag presence/empty/nonempty is observed separately. |
+
+The old public API has no redirect-policy, reuse or retention switches. The two
+retention runs explicitly say `policy_controls_available=false`; they do not
+pretend different modes were selected. Old code rejects the first 307, so no
+delegated requests reach the three stress targets and admission cannot be
+qualified. Direct Q64/Q256 controls do establish queued reads and correct bytes.
+The old data GET also omits If-Match: healthy direct reads are **not** validator
+coverage. Future production-port work must supply its real configuration adapter
+and revise the explicit source pin before using this rig for green qualification.
+Do not set a receipt flag to stand in for an unimplemented API.
+
+`list_entry` in this baseline exposes only key/size, not ETag. Empty or absent
+service ETags do not fail an otherwise complete characterization, and do not
+grant nonempty-validator capability. A two-page fixture covers empty, absent and
+nonempty values; the actual AIS observation records whatever the service returns.
+The backend inventory includes the readiness object and reflects the already
+known duplicate-slash limitation; uploaded fixture names are not an inventory
+oracle. No object GET is used to prepare LIST or prewarm the cold-read objects.
+
+### Reproduce H
+
+Use the existing Python environment with boto3 and the frozen build, without
+updating dependencies. All run/output directories must be fresh. For example,
+from this checkout, with `$FROZEN_REPO` set to the original P0 checkout:
+
+```sh
+pixi run --as-is --offline -e cuda-13-stable \
+  --manifest-path "$FROZEN_REPO/pixi.toml" \
+  python -B scripts/cache-harness/build_required_probe.py \
+  --frozen-repo "$FROZEN_REPO" \
+  --build-dir "$FROZEN_REPO/build/p0-io-cudf" --output-dir "$RUN/build"
+
+python3 -B scripts/cache-harness/required_fixture.py \
+  --binary "$RUN/build/required_feature_probe" --run-dir "$RUN/wire"
+
+# Run each mode with fresh services and distinct run directories. The wrapper
+# cleans up before returning; sequential runs may reuse the released port range.
+for mode in root reverse; do
+  python3 -B scripts/cache-harness/required_ais.py \
+    --run-dir "$RUN/ais-$mode" --mode "$mode" \
+    --probe "$RUN/build/required_feature_probe" \
+    --binary "$FROZEN_REPO/build/p0-io-cudf/test/cucascade_direct_s3_smoke" \
+    --ais-source "$AIS_SOURCE" --aisnode "$AIS_NODE" \
+    --aisnode-sha256 "$AIS_SHA" --weed "$WEED" \
+    --port-base 21130 --ais-port-base 21230 || break
+done
+
+python3 -B scripts/cache-harness/package_required_evidence.py \
+  --root "$RUN" --wire wire --ais-root ais-root --ais-reverse ais-reverse --build build
+python3 -B scripts/cache-harness/required_features.py "$RUN/packet.json" \
+  --output "$RUN/required-report.json"
+# Expected exit 1. Do not suppress it in a feature qualification pipeline.
+
+# Separate implementation checks; a baseline-check PASS still means qualification FAIL.
+python3 -B scripts/cache-harness/check_required_baseline.py "$RUN/packet.json"
+python3 -B scripts/cache-harness/test_required_features.py "$RUN/packet.json"
+```
+
+The builder compiles a new test-only probe against the existing shared libraries,
+checks both production source trees against the pin, and records compile/link
+commands, source, lock, library and binary hashes. This is not a fresh library
+build. Packet paths are relative for offline review; subprocess commands retain
+the original execution paths. Hashes detect changed evidence, not malicious
+rewriting of both evidence and its manifest. Keep the original receipts.
+
+Use the original regression/lifecycle/I/O commands above as well. The H unit
+suite includes complete required-status checks, 17 real-receipt mutation cases
+through both CLIs, and synthetic delegated-wire oracle controls. Synthetic
+successes are never reported as successful engine runs. No performance claim is
+made by these tests.
