@@ -36,7 +36,12 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
 
-# Sources include src-private headers (io/detail/...) from src/.
+# Modules of the io_uring REST transport (docs/io/rest-uring-design.md).  Each
+# fragment adds its own sources to cucascade_io_objects.
+include(${CMAKE_CURRENT_SOURCE_DIR}/tls/sources.cmake)
+
+# Sources include src-private headers (io/detail/..., the transport modules'
+# headers) from src/.
 target_include_directories(cucascade_io_objects
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
