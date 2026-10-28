@@ -90,7 +90,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
-  # Tests of src-private helpers (io/detail/...) include them from src/.
+  # Tests of the io_uring REST transport modules.
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
+  # Tests of src-private helpers (io/detail/..., the transport modules) include
+  # them from src/.
   target_include_directories(cucascade_io_tests
                              PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
