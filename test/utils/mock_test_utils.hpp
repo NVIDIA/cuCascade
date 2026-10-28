@@ -74,6 +74,12 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier
   } else if (tier == memory::Tier::DISK) {
     return std::make_shared<memory::memory_space>(
       memory::disk_memory_space_config{static_cast<int>(device_id), 1024 * 1024 * 1024, "/tmp"});
+  } else if (tier == memory::Tier::REMOTE) {
+    memory::remote_memory_space_config config;
+    config.remote_id       = static_cast<int>(device_id);
+    config.memory_capacity = 1024 * 1024 * 1024;
+    config.uri_prefix      = "s3://mock-bucket/spill";
+    return std::make_shared<memory::memory_space>(config);
   } else {
     throw std::invalid_argument("Unsupported tier for mock memory space");
   }

@@ -172,6 +172,22 @@ class reservation_manager_configurator {
                                              std::string mounting_point,
                                              std::shared_ptr<io::ioctx> io_context = nullptr);
 
+  // --- remote settings ---
+
+  /// \brief add a REMOTE memory space backed by objects under an object-store prefix
+  /// @param remote_id REMOTE memory space id.
+  /// @param uri_prefix Where the space's objects live, `s3://bucket[/prefix]`; validated and
+  ///        normalized with validate_remote_uri_prefix().
+  /// @param capacity Bound on the bytes of spills in flight (not on the bytes stored).
+  /// @param io_context io context serving the space's objects (a started, write-capable REST
+  ///        context, see make_remote_io_context()); null: set it later with
+  ///        memory_space::set_io_context() (until then the REMOTE converters throw).
+  /// @throws std::invalid_argument if @p uri_prefix is malformed.
+  builder_reference& add_remote_space(int remote_id,
+                                      std::string uri_prefix,
+                                      std::size_t capacity = unbounded_remote_capacity,
+                                      std::shared_ptr<io::ioctx> io_context = nullptr);
+
   /// \brief build the memory space configurations based on the provided system topology
   /// @param topology System topology information.
   /// @return Vector of memory space configurations.
@@ -261,6 +277,7 @@ class reservation_manager_configurator {
   std::optional<bool> _host_memory_portability;
 
   std::vector<disk_memory_space_config> _disk_mounting_points{};
+  std::vector<remote_memory_space_config> _remote_spaces{};
 };
 
 }  // namespace memory
