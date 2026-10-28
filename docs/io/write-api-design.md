@@ -425,8 +425,12 @@ guarantees to deliver and what the reactor must guarantee back.
   is an atomic max); new constructor overload taking `io_access::{read_only, read_write}` (a scoped
   enum so a string literal can never bind to it); `writable()`; cache id stays the path.
 - `create_io_object_for_write`: buffered fd `open(path, O_RDWR | O_CLOEXEC | mode flags, perms)`,
-  direct fd `open(path, O_RDWR | O_DIRECT | O_CLOEXEC)` (optional, warn on failure),
-  `fallocate(KEEP_SIZE)` for `size_hint`, `fstat`.
+  then the direct fd `O_RDWR | O_DIRECT | O_CLOEXEC` (optional, warn on failure) reopened from the
+  buffered fd through `/proc/self/fd` (`detail::reopen_writable_direct`), not from the path: a
+  concurrent rename cannot pair the two with different files. The create / truncate is never
+  repeated; when procfs is missing and the pathname fallback opens a different file (device /
+  inode differ) the open fails with `descriptor_mismatch_error`. Then `fallocate(KEEP_SIZE)` for
+  `size_hint`, `fstat`. Writable objects carry an `opened_handle` identity (size 0).
 - `host_write` (sync) and `flush` as in section 6, using the 3.3 split (body O_DIRECT only when
   address-congruent; no staging on the caller thread).
 - Planner: `plan_slice` dispatches on `slice.kind`. Write: split head/body/tail (pure helper
