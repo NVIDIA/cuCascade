@@ -102,23 +102,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
 
   # The cuFile backend exists only when cufile.h was found
   # (CUCASCADE_HAS_CUFILE); see src/io/CMakeLists.txt.  It does not depend on
-  # kvikIO or cudf.
+  # cudf.
   if(CUCASCADE_CUFILE_INCLUDE_DIR)
     target_sources(
       cucascade_io_tests
       PRIVATE io/cufile/test_cufile_platform.cpp
               io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp
               io/cufile/test_cufile_write.cpp)
-  endif()
-
-  # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
-  if(CUCASCADE_BUILD_CUDF)
-    target_sources(
-      cucascade_io_tests
-      PRIVATE io/kvikio/test_kvikio_config.cpp
-              io/kvikio/test_kvikio_identity.cpp
-              io/kvikio/test_kvikio_remote.cpp
-              io/kvikio/test_kvikio_write_unimplemented.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

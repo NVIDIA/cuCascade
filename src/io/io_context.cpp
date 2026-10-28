@@ -64,7 +64,6 @@ struct io_write_from_host_message {
   switch (type) {
     case io_context_type::uring: return "uring";
     case io_context_type::restful: return "rest";
-    case io_context_type::kvikio: return "kvikio";
     case io_context_type::s3rdma: return "s3rdma";
     case io_context_type::cufile: return "cufile";
   }

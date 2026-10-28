@@ -3,9 +3,9 @@
 
 **cuCascade Disk I/O Performance Optimization**
 
-Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to approach raw hardware throughput on NVMe storage. The disk tier enables persisting GPU data batches to disk and reading them back, but current throughput is 5-11x below what the hardware can deliver. This project closes that gap.
+Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to approach raw hardware throughput on NVMe storage. The disk tier enables persisting GPU data batches to disk and reading them back, but current throughput is 5-11x below what the hardware can deliver. This project closes that gap.
 
-**Core Value:** Both GDS and kvikIO disk I/O backends achieve within 80% of raw hardware throughput (gdsio/dd baselines) for read and write paths.
+**Core Value:** Both GDS and io_uring disk I/O backends achieve within 80% of raw hardware throughput (gdsio/dd baselines) for read and write paths.
 
 ### Constraints
 
@@ -50,7 +50,6 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `RMM` (via cudf) - `rmm::mr::device_memory_resource` is the base class for all custom allocators; `::cuda::stream_ref` is used throughout for CUDA stream propagation
 - `CUDA::cudart` - Direct CUDA runtime API calls (`cudaMalloc`, `cudaMemcpyAsync`, `cudaStreamSynchronize`, `cudaFree`, `cudaMallocHost`, `cudaFreeHost`)
 - `CUDA::nvml` - GPU topology discovery via NVML in `src/memory/topology_discovery.cpp`
-- `kvikio` 26.12 / 26.08 - Async file I/O with automatic GDS/POSIX fallback; used by the read-only `io::kvikio_context` (`src/io/kvikio/kvikio_context.cpp`, cudf builds) via `kvikio::FileHandle`; its write entry points report `io::not_implemented_error`
 - `libcufile` (cuFile / GDS) - NVIDIA GPUDirect Storage for direct GPU↔NVMe transfers; the cuFile reactor (`src/io/cufile/`) loads it at run time through `io::cufile::cufile_api`; building it needs only `<cufile.h>` (`CUCASCADE_HAS_CUFILE`); without libcufile every transfer takes the POSIX path
 - `libnuma` - NUMA-aware pinned host memory allocation in `src/memory/numa_region_pinned_host_allocator.cpp`; found via `find_library(NUMA_LIB numa REQUIRED)`
 - `Threads::Threads` (pthreads) - Thread support; `std::mutex`, `std::condition_variable`, `std::async` throughout
@@ -69,7 +68,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `release` → `build/release/`
 - `relwithdebinfo` → `build/relwithdebinfo/`
 ## Library Outputs
-- `cucascade_shared` (`libcucascade.so`, versioned) - alias `cuCascade::cucascade_shared`; **cudf-free core** (RMM + CUDA + numa + kvikIO/cuFile)
+- `cucascade_shared` (`libcucascade.so`, versioned) - alias `cuCascade::cucascade_shared`; **cudf-free core** (RMM + CUDA + numa + cuFile)
 - `cucascade_static` (`libcucascade.a`) - alias `cuCascade::cucascade_static`
 - `cuCascade::cucascade` - Default alias pointing to shared if available, else static
 - `cucascade_cudf_shared`/`cucascade_cudf_static` (`libcucascade_cudf.{so,a}`) - aliases `cuCascade::cucascade_cudf[_shared|_static]`, default alias `cuCascade::cucascade_cudf`; the cudf-coupled layer (links `cudf::cudf` + the core), built only when `CUCASCADE_BUILD_CUDF=ON`. Headers under `include/cucascade/cudf/`

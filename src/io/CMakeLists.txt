@@ -50,10 +50,3 @@ if(CUCASCADE_CUFILE_INCLUDE_DIR)
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_reactor.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/platform.cpp)
 endif()
-
-# kvikIO reaches the environment only via libcudf's dependency closure, so the
-# fallback ioctx is built only alongside the cudf layer.
-if(CUCASCADE_BUILD_CUDF)
-  target_sources(cucascade_io_objects
-                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp)
-endif()

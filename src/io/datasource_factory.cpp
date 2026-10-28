@@ -23,9 +23,6 @@
 #endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
-#ifdef CUCASCADE_HAS_KVIKIO
-#include <cucascade/io/kvikio/kvikio_context.hpp>
-#endif
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
@@ -83,22 +80,6 @@ std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_
 
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
-
-#ifdef CUCASCADE_HAS_KVIKIO
-factory_type make_kvikio_ioctx_factory()
-{
-  return [](const io_config& config) -> std::shared_ptr<ioctx> {
-    try {
-      // Applies config.kvikio to kvikIO's process-global defaults (see
-      // kvikio_config): unset fields keep kvikIO's env-var-seeded values.
-      return std::make_shared<kvikio_context>(config.kvikio, config.object_store);
-    } catch (const std::exception& e) {
-      CUCASCADE_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
-      return nullptr;
-    }
-  };
-}
-#endif
 
 #ifdef CUCASCADE_HAS_CUFILE
 factory_type make_cufile_ioctx_factory()
@@ -173,7 +154,6 @@ io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
-    _prefer_kvikio(_config.backend == io_backend::kvikio),
     _prefer_cufile(_config.backend == io_backend::cufile)
 {
 #ifndef CUCASCADE_HAS_CUFILE
@@ -184,22 +164,14 @@ io_context_registry::io_context_registry(
   }
 #endif
   // uring / rest claim paths via their reactor's static supports() (local
-  // files and s3:// URLs respectively).  kvikio is the universal fallback —
-  // it can open any local path — so it matches everything and lookup_path
-  // defers it behind the explicit backends.  Without kvikIO (a cudf-free
-  // build) there is no catch-all and unmatched paths resolve to nothing.  cufile
-  // claims local regular files like uring; lookup_path decides between them by
-  // the configured backend, never by iteration order.
+  // files and s3:// URLs respectively).  There is no catch-all: a path no
+  // backend claims resolves to nothing.  cufile claims local regular files like
+  // uring; lookup_path decides between them by the configured backend, never by
+  // iteration order.
 #ifdef CUCASCADE_HAS_CUFILE
   _entries.emplace(
     io_context_type::cufile,
     entry{io_context_type::cufile, &cufile::cufile_reactor::supports, make_cufile_ioctx_factory()});
-#endif
-#ifdef CUCASCADE_HAS_KVIKIO
-  _entries.emplace(
-    io_context_type::kvikio,
-    entry{
-      io_context_type::kvikio, [](std::string_view) { return true; }, make_kvikio_ioctx_factory()});
 #endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
@@ -252,34 +224,19 @@ std::optional<io_context_type> io_context_registry::lookup_path(
 {
   std::shared_lock lk{_mtx};
   _lookup_latched.store(true, std::memory_order_release);
-  // kvikio's checker matches everything; _entries iterates in unspecified order,
-  // so defer the catch-all and let an explicit backend (uring/restful/cufile) win.
-  //
-  // Both cufile and uring answer true for a local file, and iteration order must
-  // not decide between them: cufile is considered only when the config asked for
-  // it, and then it displaces uring.  The rules, per configured backend:
-  //   * kvikio -- skip uring, rest and cufile; kvikio serves everything.
+  // Both cufile and uring answer true for a local file, and _entries iterates in
+  // unspecified order, so iteration order must not decide between them: cufile
+  // is considered only when the config asked for it, and then it displaces
+  // uring.  The rules, per configured backend:
   //   * cufile -- skip uring for local files (cufile wins); rest keeps s3://.
   //   * native -- skip cufile for local files (uring wins); rest keeps s3://.
-  std::optional<io_context_type> fallback;
   for (const auto& [type, entry] : _entries) {
     if (!entry.checker(path)) continue;
-    if (type == io_context_type::kvikio) {
-      fallback = type;
-      continue;
-    }
-    // backend=kvikio takes over reads from BOTH explicit backends: local files
-    // from uring, s3:// objects from rest (kvikIO's RemoteHandle serves them).
-    // LIST still needs the rest ioctx, which callers fetch by type instead.
-    if (_prefer_kvikio && (type == io_context_type::uring || type == io_context_type::restful ||
-                           type == io_context_type::cufile)) {
-      continue;
-    }
     if (_prefer_cufile && type == io_context_type::uring) { continue; }
     if (!_prefer_cufile && type == io_context_type::cufile) { continue; }
     return type;
   }
-  return fallback;
+  return std::nullopt;
 }
 
 std::shared_ptr<ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept

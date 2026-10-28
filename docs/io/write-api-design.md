@@ -2,7 +2,7 @@
 
 Status: approved by the lead (decisions recorded in section 12). Scope: `include/cucascade/io/{io_context,templated_ioctx,io_request,types}.hpp`,
 `src/io/io_context.cpp`, the uring reactor, the explicit "not yet implemented" write stubs of the
-kvikIO and curl REST contexts (section 8), tests in `test/io/`.
+curl REST context (section 8), tests in `test/io/`.
 The cuFile reactor's writes (W2) build on the reactor contract in section 6.
 
 Guiding rule: the read side's shape, reused. One reactor per thread, configuration static at the
@@ -461,18 +461,17 @@ guarantees to deliver and what the reactor must guarantee back.
   writes too. Expected pipeline for a 1 GiB device column: 32 sub-slices over 2 reactors, each up to 64 MiB of staging in flight (D2H of op k+1
   overlapping the write of op k).
 
-## 8. Backends without writes: kvikIO and REST
+## 8. Backends without writes: REST
 
 Writes are implemented by the io_uring reactor (section 7) and the cuFile reactor (W2) only.
+(The kvikIO context, read-only too, has been removed.)
 
-- `kvikio` (`kvikio_context`) stays read-only. It reports `supports_write() ==
+- `restful` (the curl `rest_ioctx` / `rest_reactor`) reports `supports_write() ==
   supports_device_write() == false`, and each write hook (`create_io_object_for_write`,
   `host_write_io`, `mixed_writev_async_io`, `flush_io`, `flush_async_io`) reports
   `io::not_implemented_error`: a `std::system_error` with `std::errc::not_supported` whose message
   says "not yet implemented" and names the backend and operation. The synchronous hooks throw it;
-  the asynchronous ones return a failed future. No file is opened, created or truncated, nothing
-  is synchronized and `kvikio::FileHandle::pwrite` is never called.
-- `restful` (the curl `rest_ioctx` / `rest_reactor`) exposes the same failing hooks. The reactor
+  the asynchronous ones return a failed future. The reactor
   also has static `create_io_object_for_write` / `host_write` / `flush` stubs that throw
   `not_implemented_error`, and its `enqueue` fails write and flush slices with it instead of
   issuing a GET. Because those stub signatures would satisfy `io_write_reactor_c` structurally,
@@ -521,9 +520,8 @@ and every write API `not_supported`; a fake writing reactor receives `kind == wr
 unclamped past EOF, device ids resolved, large slices split, partitions balanced, flush routed to
 one reactor as a single flush slice; `io_op_request::finish_success` raises `size()` for writes only.
 
-`test/io/kvikio/test_kvikio_write_unimplemented.cpp` and
 `test/io/rest/test_rest_write_unimplemented.cpp` (`[unimplemented]`): every write and flush entry
-point of the read-only backends fails with `not_implemented_error` (type, code and message), through
+point of the read-only backend fails with `not_implemented_error` (type, code and message), through
 `ioctx&`, the direct backend hooks and (REST) direct reactor submission, with no file or network
 side effect; zero-size calls stay no-ops.
 
@@ -540,7 +538,7 @@ All added to `test/CMakeLists.txt` next to their read counterparts.
 Changed: `include/cucascade/io/{types,io_request,io_context,templated_ioctx}.hpp`,
 `src/io/io_context.cpp`, `include/cucascade/io/uring/{uring_reactor,types}.hpp`,
 `src/io/uring/uring_reactor.cpp`, `include/cucascade/io/io_errors.hpp` (`not_implemented_error`),
-the kvikIO context and the curl REST context / reactor (write stubs), tests above,
+the curl REST context / reactor (write stubs), tests above,
 `test/CMakeLists.txt`.
 `include/cucascade/io/cache/{fs_cache,metadata_store}.hpp`, `src/io/cache/{fs_cache,metadata_store}.cpp`
 (`invalidate`, `invalidate_later`), `test/cudf/test_write_cache_invalidation.cpp`.

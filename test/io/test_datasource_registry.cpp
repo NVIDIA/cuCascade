@@ -100,7 +100,7 @@ TEST_CASE("replace rejects an already registered new backend", "[io][registry]")
 {
   registry_fixture fixture;
 
-  // uring is registered in every build (kvikio only in a cudf build).
+  // uring is registered in every build.
   CHECK_THROWS_AS(fixture.registry.replace_ioctx(
                     io_context_type::restful, io_context_type::uring, &s3_checker, &null_factory),
                   std::invalid_argument);
@@ -135,13 +135,9 @@ TEST_CASE("replace is forbidden after the first path lookup", "[io][registry]")
 {
   registry_fixture fixture;
 
-  // Any lookup latches the registry; the unmatched path resolves to the kvikio
-  // catch-all only in a build that has it.
-#ifdef CUCASCADE_HAS_KVIKIO
-  REQUIRE(fixture.registry.lookup_path("unmatched-before-bootstrap") == io_context_type::kvikio);
-#else
+  // Any lookup latches the registry, even one no backend claims (there is no
+  // catch-all backend).
   REQUIRE_FALSE(fixture.registry.lookup_path("unmatched-before-bootstrap").has_value());
-#endif
   CHECK_THROWS_AS(fixture.registry.replace_ioctx(
                     io_context_type::restful, io_context_type::s3rdma, &s3_checker, &null_factory),
                   std::logic_error);
@@ -182,14 +178,14 @@ TEST_CASE("native routing keeps local files on uring and s3 on rest", "[io][regi
   CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::restful);
 }
 
-#ifdef CUCASCADE_HAS_KVIKIO
-TEST_CASE("kvikio routing still takes local files and s3 objects", "[io][registry][cufile]")
+TEST_CASE("a path no backend claims resolves to nothing", "[io][registry]")
 {
-  registry_fixture fixture{config_for(io_backend::kvikio)};
-  CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::kvikio);
-  CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::kvikio);
+  // There is no catch-all backend: a scheme neither uring nor REST serves is
+  // unrouted rather than handed to a fallback.
+  registry_fixture fixture{config_for(io_backend::native)};
+  CHECK_FALSE(fixture.registry.lookup_path("https://example.com/bucket/key").has_value());
+  CHECK_FALSE(fixture.registry.lookup_path("gs://bucket/key").has_value());
 }
-#endif
 
 #ifdef CUCASCADE_HAS_CUFILE
 TEST_CASE("cufile routing takes local regular files only", "[io][registry][cufile]")
@@ -238,12 +234,10 @@ TEST_CASE("cufile factory builds a cufile ioctx from the configured settings",
   CHECK(broken.registry.make_ioctx(io_context_type::cufile) == nullptr);
 }
 
-TEST_CASE("native and kvikio routing never pick cufile", "[io][registry][cufile]")
+TEST_CASE("native routing never picks cufile", "[io][registry][cufile]")
 {
-  for (auto const backend : {io_backend::native, io_backend::kvikio}) {
-    registry_fixture fixture{config_for(backend)};
-    CHECK(fixture.registry.lookup_path("/proc/self/exe") != io_context_type::cufile);
-  }
+  registry_fixture fixture{config_for(io_backend::native)};
+  CHECK(fixture.registry.lookup_path("/proc/self/exe") != io_context_type::cufile);
 }
 #else
 TEST_CASE("cufile backend is refused by a build without cuFile", "[io][registry][cufile]")

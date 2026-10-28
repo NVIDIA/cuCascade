@@ -16,8 +16,8 @@ defaults derived from them should be re-swept on a host with a real GDS mode.
 
 The backend exists in builds that found `cufile.h` at configure time (`CUCASCADE_HAS_CUFILE`,
 propagated to consumers). libcufile itself is loaded with `dlopen` at run time (`cufile_api`), never
-linked, and kvikIO's cuFile shim is not used: a build without cudf / kvikIO still has the backend,
-and a host without libcufile serves every read through POSIX.
+linked: a build without cudf still has the backend, and a host without libcufile serves every read
+through POSIX.
 
 ```cpp
 cucascade::io::io_config cfg;
@@ -28,8 +28,8 @@ cucascade::io::io_context_registry registry{cfg, reservation_manager};
 ```
 
 Routing with `backend = cufile`: local regular files go to `cufile_ioctx`; `s3://` objects stay on
-the REST backend; paths neither claims fall back as with `native`. `native` keeps local files on
-io_uring and `kvikio` keeps its catch-all routing; neither ever picks cuFile. A registry built with
+the REST backend; paths neither claims resolve to no backend, as with `native`. `native` keeps local
+files on io_uring and never picks cuFile. A registry built with
 `backend = cufile` in a build without the backend throws `std::invalid_argument` instead of quietly
 serving the request with another backend. Routing never loads or probes cuFile.
 
@@ -159,7 +159,7 @@ read handle failures and renames themselves. Verdicts are logged once per device
 
 - The first `cufile_reactor::start()`, `probe_platform()` or `probe_path()` opens the cuFile driver
   once per process; it costs a few hundred milliseconds and cuFile's thread pool can retain a CUDA
-  context on each visible GPU. It is never closed (cuFile releases it at exit; kvikIO may share it).
+  context on each visible GPU. It is never closed (cuFile releases it at exit).
   Passive topology discovery never does this, and a native-only configuration never loads cuFile.
 - cuFile writes `cufile.log` into the working directory. libcufile ignores its log-directory setters;
   the working controls are `CUFILE_LOGFILE_PATH` set before the first cuFile call, or a

@@ -135,11 +135,10 @@ struct disk_io_context_options {
   through the cufile reactor's host path, which runs at uring speed (docs/io/gpuio-gds-practices.md,
   section 8).
   Without GDS, automatic picks uring when this process may use io_uring and the cuFile reactor's
-  POSIX path otherwise (forced uring fails fast with the errno instead). kvikIO is never
-  selected: its context serves reads only (writes report `io::not_implemented_error`). The cuFile
+  POSIX path otherwise (forced uring fails fast with the errno instead). The cuFile
   reactor loads libcufile itself (`io::cufile::cufile_api`) and is built when `cufile.h` was found
   (`CUCASCADE_HAS_CUFILE`); a build without it has no cufile choice, and automatic then fails when
-  io_uring is unavailable. The kvikIO read backend and its dependency stay as they are.
+  io_uring is unavailable.
 - uring staging ownership uses the hook the reactor already provides: a private subclass of
   `uring_reactor::reactor_context` owns the upstream pinned resource and the
   `fixed_size_host_memory_resource` (base-from-member); every reactor's shared `_ctx` keeps it
@@ -149,7 +148,7 @@ struct disk_io_context_options {
   `cucascade::io::cufile::gds_available()` in `include/cucascade/io/cufile/platform.hpp` —
   process-wide, computed once, never throws; true iff libcufile loads, the driver opened, it reports
   a real GDS mode (`nvfs.dstatusflags != 0`) and `CUFILE_FORCE_COMPAT_MODE` does not force compat
-  (`KVIKIO_COMPAT_MODE` is no longer read). The disk tier asks it through one private
+  (`KVIKIO_COMPAT_MODE` is not read). The disk tier asks it through one private
   helper (`detail::gds_is_available()`); the first call opens the cuFile driver (~0.3 s), which only
   happens when an automatic context is built. False on this host (no
   nvidia-fs), so the tests drive both backends through `disk_io_context_options::backend`. A file on a
