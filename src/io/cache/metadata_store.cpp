@@ -18,47 +18,246 @@
 
 #include <cucascade/io/cache/metadata_store.hpp>
 
+#include <algorithm>
+#include <cstdint>
 #include <mutex>
+#include <sstream>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace cucascade::io::cache {
+
+metadata_store::~metadata_store() { clear(); }
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+void metadata_store::open_observed(io_object const& obj)
+{
+  entries retired;
+  std::lock_guard lock{_mutex};
+  observe_locked(obj, retired);
+}
+
+void metadata_store::observe_locked(io_object const& obj, entries& retired)
+{
+  auto identity = obj.identity();
+  if (identity.kind == identity_kind::opened_handle) return;
+  auto [it, inserted] =
+    _observed.try_emplace(obj.object_path(), observation{identity, obj.open_generation()});
+  if (inserted) return;
+  if (it->second.identity == identity) {
+    it->second.generation = std::max(it->second.generation, obj.open_generation());
+    return;
+  }
+  if (obj.open_generation() <= it->second.generation) return;
+  it->second   = observation{std::move(identity), obj.open_generation()};
+  auto current = _index.find(cache_key(obj.object_path()));
+  if (current != _index.end()) {
+    ++_stats.replacements;
+    retire(current->second, retired);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lookup and publication
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<io_object_metadata> metadata_store::get_or_load(io_object const& obj,
+                                                                loader_type const& loader,
+                                                                bool* cache_hit,
+                                                                std::stop_token stop)
+{
+  if (stop.stop_requested()) {
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+  }
+  open_observed(obj);
+  auto const lookup   = cache_key(obj.object_path());
+  auto const identity = obj.identity();
+  // A local stat identity may be shared by separate opens while the stat tuple
+  // is unchanged, so two opens of one file share a load.
+  auto const flight_key = identity.cache_key(obj.raw_file_cache_id()) + ":" + lookup;
+  std::shared_ptr<flight> work;
+  {
+    std::unique_lock lock{_mutex};
+    auto found = _index.find(lookup);
+    if (found != _index.end() && found->second->identity == identity) {
+      ++_stats.hits;
+      if (cache_hit) *cache_hit = true;
+      return found->second->value;
+    }
+    ++_stats.misses;
+    if (cache_hit) *cache_hit = false;
+    auto active = _flights.find(flight_key);
+    if (active != _flights.end()) {
+      work = active->second;
+      ++_stats.joined;
+      if (!work->ready.wait(lock, stop, [&] { return work->done; })) {
+        ++_stats.cancelled_waiters;
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      }
+      if (work->error) std::rethrow_exception(work->error);
+      return work->value;
+    }
+    work = std::make_shared<flight>();
+    _flights.emplace(flight_key, work);
+    ++_stats.builds;
+  }
+  // No store lock during I/O, parsing, or publication.  Waiters hold their own
+  // reference to this flight, including when it is removed after an error.
+  std::shared_ptr<io_object_metadata> value;
+  std::exception_ptr error;
+  try {
+    value = loader();
+    register_metadata(obj, value);
+  } catch (...) {
+    error = std::current_exception();
+  }
+  {
+    std::lock_guard lock{_mutex};
+    work->value = value;
+    work->error = error;
+    work->done  = true;
+    if (error) ++_stats.failures;
+    _flights.erase(flight_key);
+  }
+  work->ready.notify_all();
+  if (error) std::rethrow_exception(error);
+  return value;
+}
+
+std::string metadata_store::cache_key(std::string_view path) { return std::string(path); }
+
+void metadata_store::retire(iterator it, entries& retired) noexcept
+{
+  --_stats.entries;
+  _index.erase(it->key);
+  retired.splice(retired.end(), _entries, it);
+}
+
+void metadata_store::clear()
+{
+  entries retired;
+  std::lock_guard lock{_mutex};
+  for (auto it = _entries.begin(); it != _entries.end();) {
+    retire(it++, retired);
+  }
+}
+
+bool metadata_store::put_identity(std::string const& path,
+                                  object_identity identity,
+                                  std::uint64_t generation,
+                                  std::shared_ptr<io_object_metadata> value,
+                                  entries& retired)
+{
+  if (!value) return false;
+  // Keep discarded payloads alive until the caller releases _mutex: metadata
+  // destructors are allowed to inspect their owning ioctx.
+  auto defer_value = [&] { retired.push_back({{}, generation, {}, std::move(value)}); };
+  if (identity.kind != identity_kind::opened_handle) {
+    auto current = _observed.find(path);
+    if (current != _observed.end() && current->second.identity != identity) {
+      ++_stats.bypasses;
+      ++_stats.stale;
+      defer_value();
+      return false;
+    }
+  }
+  auto lookup = cache_key(path);
+  auto found  = _index.find(lookup);
+  if (found != _index.end()) {
+    auto it = found->second;
+    if (generation < it->generation) {
+      ++_stats.bypasses;
+      defer_value();
+      return false;
+    }
+    if (it->identity == identity) {
+      // A duplicate publication keeps the first value but still advances the
+      // ordering fence; otherwise an older, different-version fill could
+      // replace this record.
+      it->generation = std::max(it->generation, generation);
+      defer_value();
+      return true;
+    }
+    ++_stats.replacements;
+    retire(it, retired);
+  }
+  _entries.push_front({std::move(lookup), generation, std::move(identity), std::move(value)});
+  try {
+    _index.emplace(_entries.front().key, _entries.begin());
+  } catch (...) {
+    retired.splice(retired.end(), _entries, _entries.begin());
+    throw;
+  }
+  ++_stats.entries;
+  return true;
+}
 
 void metadata_store::register_metadata(io_object const& obj,
                                        std::shared_ptr<io_object_metadata> metadata)
 {
   if (!metadata) return;
-  auto const& key  = obj.raw_file_cache_id();
-  auto const& path = obj.object_path();
-  std::unique_lock lk(_mtx);
-  if (auto it = _key_by_path.find(path); it != _key_by_path.end() && it->second != key) {
-    _by_key.erase(it->second);
-    it->second = key;
-  } else if (it == _key_by_path.end()) {
-    _key_by_path.emplace(path, key);
-  }
-  _by_key[key] = std::move(metadata);
-}
-
-bool metadata_store::has_path(std::string_view object_path) const noexcept
-{
-  std::shared_lock lk(_mtx);
-  return _key_by_path.contains(object_path);
+  entries retired;
+  std::lock_guard lock{_mutex};
+  observe_locked(obj, retired);
+  put_identity(
+    obj.object_path(), obj.identity(), obj.open_generation(), std::move(metadata), retired);
 }
 
 std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
 {
-  return get_metadata(obj.raw_file_cache_id());
+  auto const lookup   = cache_key(obj.object_path());
+  auto const identity = obj.identity();
+  std::lock_guard lock{_mutex};
+  auto const found = _index.find(lookup);
+  if (found != _index.end() && found->second->identity == identity) {
+    ++_stats.hits;
+    return found->second->value;
+  }
+  ++_stats.misses;
+  return {};
 }
 
-std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string_view cache_key) const
+bool metadata_store::has_path(std::string_view object_path) const
 {
-  std::shared_lock lk(_mtx);
-  // Heterogeneous find (transparent hash + std::equal_to<>): no temporary
-  // std::string is built for the probe.
-  auto it = _by_key.find(cache_key);
-  if (it == _by_key.end()) return nullptr;
-  return it->second;
+  auto const lookup = cache_key(object_path);
+  std::lock_guard lock{_mutex};
+  auto const it = _index.find(lookup);
+  if (it == _index.end()) return false;
+  // An opened-handle identity is scoped to one datasource and cannot justify
+  // replacing a footer probe for a later open.  Strong object tags and local
+  // stat identities are reusable candidates; the full identity check still
+  // happens after the datasource is opened.
+  return it->second->identity.kind != identity_kind::opened_handle;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+metadata_store::counters metadata_store::statistics() const
+{
+  std::lock_guard lock{_mutex};
+  return _stats;
+}
+
+std::string metadata_store::describe_metadata_store() const
+{
+  std::lock_guard lock{_mutex};
+  std::ostringstream out;
+  out << "entries=" << _stats.entries << " hits=" << _stats.hits << " misses=" << _stats.misses
+      << " joined=" << _stats.joined << " builds=" << _stats.builds
+      << " failures=" << _stats.failures << " cancelled_waiters=" << _stats.cancelled_waiters
+      << " stale=" << _stats.stale << " in_flight=" << _flights.size() << '\n';
+  for (auto const& entry : _entries) {
+    out << "key=" << entry.key << " identity=" << entry.identity.cache_key("")
+        << " generation=" << entry.generation << " holders=" << entry.value.use_count() << '\n';
+  }
+  return out.str();
 }
 
 }  // namespace cucascade::io::cache

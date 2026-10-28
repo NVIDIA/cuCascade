@@ -97,6 +97,8 @@ enum class prepare_result : std::uint8_t {
 
 class datasource : public cudf::io::datasource {
  public:
+  /// Reads @p io_obj through @p io_ctx, and records the object's identity as
+  /// observed in the ioctx's metadata store (@c metadata_store::open_observed).
   explicit datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj);
 
   ~datasource() override;
@@ -114,10 +116,14 @@ class datasource : public cudf::io::datasource {
   [[nodiscard]] const io_object& get_io_object() const noexcept { return *_io_object; }
 
   /// Backend-parsed metadata for this datasource's io_object, looked up in the
-  /// ioctx's metadata store (null when no cache or no entry). Independent of
-  /// the prefetching machinery.
+  /// ioctx's metadata store: published for an equal object identity (null when
+  /// there is none). Independent of the prefetching machinery.
   [[nodiscard]] std::shared_ptr<io_object_metadata> metadata() const;
 
+  /// Publish @p metadata for this datasource's io_object in the ioctx's
+  /// metadata store (see @c cache::metadata_store::register_metadata: an entry
+  /// already published for the same identity is kept).  False only without an
+  /// ioctx or io_object.
   [[nodiscard]] bool store_metadata(std::shared_ptr<io_object_metadata> metadata);
 
   // ---- cudf::io::datasource overrides ---------------------------------------

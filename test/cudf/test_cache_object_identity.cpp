@@ -1185,6 +1185,45 @@ TEST_CASE("cache refresh reports each increment once across overlapping refreshe
 }
 
 // ===========================================================================
+// Metadata store through the datasource
+// ===========================================================================
+
+TEST_CASE("a datasource observes its object identity in the metadata store",
+          "[cache][cache_identity][metadata_store]")
+{
+  auto context           = std::make_shared<held_context>();
+  auto& store            = context->metadata_store();
+  std::string const path = "s3://controlled/footer.bin";
+  auto const parsed      = std::make_shared<cucascade::io::io_object_metadata>();
+
+  datasource first(context, held_object(path, "\"one\""));
+  REQUIRE(first.store_metadata(parsed));
+  CHECK(first.metadata() == parsed);
+  // A strong ETag is reusable across opens.
+  datasource const same(context, held_object(path, "\"one\""));
+  CHECK(same.metadata() == parsed);
+  CHECK(store.has_path(path));
+
+  // Opening a newer version retires the entry of the old one, and a parse of
+  // the old version that finishes afterwards is not published.
+  datasource const second(context, held_object(path, "\"two\""));
+  CHECK_FALSE(first.metadata());
+  CHECK_FALSE(store.has_path(path));
+  REQUIRE(first.store_metadata(std::make_shared<cucascade::io::io_object_metadata>()));
+  CHECK_FALSE(second.metadata());
+  CHECK_FALSE(store.has_path(path));
+  CHECK(store.statistics().stale == 1);
+
+  // Without a strong ETag the metadata stays with the open that parsed it.
+  datasource weak(context, held_object(path, "W/\"three\""));
+  datasource const weak_again(context, held_object(path, "W/\"three\""));
+  REQUIRE(weak.store_metadata(parsed));
+  CHECK(weak.metadata() == parsed);
+  CHECK_FALSE(weak_again.metadata());
+  CHECK_FALSE(store.has_path(path));
+}
+
+// ===========================================================================
 // Datasource cache query
 // ===========================================================================
 
