@@ -94,15 +94,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   target_include_directories(cucascade_io_tests
                              PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-  # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
-  if(CUCASCADE_BUILD_CUDF)
-    target_sources(
-      cucascade_io_tests
-      PRIVATE io/kvikio/test_kvikio_config.cpp
-              io/kvikio/test_kvikio_identity.cpp
-              io/kvikio/test_kvikio_remote.cpp)
-  endif()
-
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
                                                       CUDA_STANDARD_REQUIRED ON)
 

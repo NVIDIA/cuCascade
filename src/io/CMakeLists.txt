@@ -38,10 +38,3 @@ target_sources(
 # Sources include src-private headers (io/detail/...) from src/.
 target_include_directories(cucascade_io_objects
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
-
-# kvikIO reaches the environment only via libcudf's dependency closure, so the
-# fallback ioctx is built only alongside the cudf layer.
-if(CUCASCADE_BUILD_CUDF)
-  target_sources(cucascade_io_objects
-                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp)
-endif()

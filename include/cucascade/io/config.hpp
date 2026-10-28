@@ -18,9 +18,6 @@
 #pragma once
 
 #include <cucascade/io/cache/config.hpp>
-#ifdef CUCASCADE_HAS_KVIKIO
-#include <cucascade/io/kvikio/config.hpp>
-#endif
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/uring/config.hpp>
@@ -33,8 +30,6 @@ namespace cucascade::io {
 enum class io_backend {
   /// cuCascade's own IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
-  /// The kvikIO backend (drives @c kvikio::FileHandle directly).
-  kvikio,
 };
 
 /**
@@ -43,9 +38,7 @@ enum class io_backend {
  * Consumed by @c io_context_registry and the per-backend ioctx factories.
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
- * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
- * routes both local paths and @c s3:// objects to @c kvikio_context (LIST still
- * goes to the REST backend).
+ * to @c uring_ioctx and @c s3:// URLs to the REST backend.
  *
  * @c cache is the read path's whole caching configuration, and its only home;
  * @ref apply_cache_mode derives @c uring.use_odirect and @c cache.dispose_on_idle
@@ -54,9 +47,6 @@ enum class io_backend {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c kvikio  — kvikIO fallback tunables (local-disk catch-all path); present
- *    only when the library is built with CUCASCADE_BUILD_CUDF, which is what
- *    supplies kvikIO.
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -79,14 +69,6 @@ struct io_config {
   /// merge hints, retry policy, and connection limits.  Physical GET sizing is
   /// worker-owned.
   rest::config rest{};
-
-#ifdef CUCASCADE_HAS_KVIKIO
-  /// kvikIO fallback configuration — thread-pool size, task/bounce sizing,
-  /// O_DIRECT, compat mode.  All fields default to "unset", leaving kvikIO's
-  /// own env-var-seeded defaults in place.  Note these are process-global once
-  /// applied; see @ref kvikio_config.
-  kvikio_config kvikio{};
-#endif
 
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
