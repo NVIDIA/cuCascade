@@ -16,7 +16,8 @@
  */
 
 // Standalone S3 parquet read benchmark: the cucascade::io REST datasource
-// (libcurl scatter GETs authorized via AWS-SDK presigned URLs).
+// (io_uring HTTP/1.1 GETs over kTLS or user-space TLS, authorized via AWS-SDK
+// presigned URLs).
 //
 // The AWS SDK is used for (a) listing the parquet objects under the given
 // bucket/prefix and (b) presigning each GET/HEAD the REST reactor issues.

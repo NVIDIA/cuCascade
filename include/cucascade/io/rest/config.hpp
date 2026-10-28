@@ -20,9 +20,11 @@
 
 #include <cucascade/exec/config.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
+#include <cucascade/io/tls/config.hpp>
 
 #include <chrono>
 #include <cstddef>
+#include <string>
 
 namespace cucascade::io::rest {
 
@@ -60,24 +62,32 @@ struct config {
   /// a slow link — data GETs are bounded by the stall detector below instead.
   long request_timeout_s{30};
 
-  /// Stall detector for data GETs (CURLOPT_LOW_SPEED_LIMIT / CURLOPT_LOW_SPEED_TIME):
-  /// a transfer that stays below @c stall_speed_limit_bytes bytes/s for
-  /// @c stall_time_s consecutive seconds fails with CURLE_OPERATION_TIMEDOUT and is
-  /// retried like any other transient transport error.  This bounds a dead or
+  /// Stall detector for data GETs (a low-speed rule): a transfer whose wire
+  /// progress stays below @c stall_speed_limit_bytes bytes/s for @c stall_time_s
+  /// consecutive seconds is cancelled as timed out and retried like any other
+  /// transient transport error.  This bounds a dead or
   /// crawling connection without bounding a big transfer that is making progress.
   /// Either value at 0 disables the detector (the transfer then has no time bound).
   long stall_speed_limit_bytes{64 << 10};  // 64 KiB/s
   long stall_time_s{30};
 
   /// TLS: optional CA bundle path; when @c tls_verify is false, peer/host
-  /// verification is disabled (self-signed dev endpoints / MinIO).
+  /// verification is disabled (self-signed dev endpoints / MinIO).  Both are
+  /// applied on top of @c tls: a non-empty path sets @c tls.ca_file, and
+  /// @c tls_verify == false clears @c tls.verify.
   std::string ca_bundle_path;
   bool tls_verify{true};
 
-  /// Max concurrent in-flight easy handles per reactor, i.e. the ceiling on
-  /// simultaneous ranged GETs this reactor drives.  Fixed at 64, not exposed to
-  /// YAML: the useful value is a property of one reactor thread rather than of a
-  /// deployment.
+  /// TLS policy of https:// endpoints: kTLS first (RX and TX, AES-GCM, NO_PAD on
+  /// TLS 1.3), the built-in user-space record layer otherwise, trust anchors,
+  /// version bounds (docs/io/rest-uring-design.md section 4).
+  tls::config tls{};
+
+  /// Max connections per reactor per endpoint, i.e. the ceiling on
+  /// simultaneous requests one reactor drives against one endpoint (gpuio N6).
+  /// The default of 64 suits one reactor thread on any link; the useful value
+  /// is a property of a reactor thread rather than of a deployment, so tune
+  /// the reactor count first.
   ///
   /// More is not better, and past the point where the link is full it is
   /// actively worse: extra connections only split the same bandwidth into
@@ -93,20 +103,55 @@ struct config {
   /// GET segmentation is deliberately worker-owned and does not use this value.
   std::size_t merge_max_gap{512UL << 10};  // 0.5 MiB
 
-  /// Idle-connection keepalive.  While the reactor is idle, every
-  /// @c upkeep_interval the worker calls @c curl_easy_upkeep on its pooled
-  /// connections, which sends an HTTP/2 PING on any connection idle at least
-  /// this long — keeping the endpoint from idle-closing it (and detecting
-  /// dead ones).  No effect on HTTP/1.1 (TCP keepalive covers that).  Zero
-  /// disables upkeep.
+  /// Accepted for configuration compatibility and ignored: it drove HTTP/2 PING
+  /// upkeep in the former libcurl transport, which has no HTTP/1.1 equivalent.
+  /// @c keep_warm_connections covers the use.
   std::chrono::milliseconds upkeep_interval{std::chrono::seconds{15}};
 
-  /// How long curl may reuse a pooled connection before discarding it
-  /// (CURLOPT_MAXAGE_CONN).  Pairs with @c upkeep_interval: upkeep keeps idle
-  /// connections warm, so keep this within the endpoint's idle timeout so a
-  /// reused connection is not one the server already closed.  Zero leaves
-  /// curl's default.
-  std::chrono::seconds conn_max_age{std::chrono::seconds{20}};
+  /// Idle cutoff of a pooled connection: one idle for longer is closed instead
+  /// of reused (gpuio N7: S3 closes idle keep-alive connections after ~5 s, so
+  /// a reused connection is never one the server already dropped).  Also the
+  /// warm-up rate limit of @c rest_ioctx::warmup.  Zero = 4 s.
+  std::chrono::seconds conn_max_age{std::chrono::seconds{4}};
+
+  /// Connections kept open per endpoint across the pool while idle (gpuio
+  /// keep-warm, N11); 0 = off.
+  unsigned keep_warm_connections{0};
+
+  /// TCP connect bound per connection (the TLS handshake has its own,
+  /// @c tls_handshake_timeout).
+  std::chrono::milliseconds connect_timeout{std::chrono::seconds{3}};
+  std::chrono::milliseconds tls_handshake_timeout{std::chrono::seconds{3}};
+
+  /// Physical GET size bounds (gpuio P2/P7): the worker sizes each request's
+  /// GETs as clamp(max(s_util, s_rate), min, max) from the endpoint estimator,
+  /// cuts them evenly with no runt, and never exceeds the maximum.
+  std::size_t min_segment_bytes{1UL << 20};
+  std::size_t max_segment_bytes{32UL << 20};
+
+  /// Endpoint controller (gpuio C1-C8): AIMD on the 503/429 share, an
+  /// admission cap that binds only after a throttle, link discovery.  On by
+  /// default; @c false pins the seeds and uses every warm connection.
+  bool enable_controller{true};
+
+  /// Link speed seed of the controller in Gbps; 0 = automatic (the EC2
+  /// instance type's NIC from IMDS, 10 Gbps elsewhere).
+  double link_gbps{0};
+
+  /// Submission queue entries of each reactor's io_uring (CQ = 4x; gpuio U5).
+  unsigned ring_entries{1024};
+
+  /// io-wq unbound workers when kTLS decryption runs on io-wq (0 = automatic =
+  /// 16, never unlimited; gpuio U15).
+  unsigned iowq_max_unbound{0};
+
+  /// S3 multipart part size of writes (>= 5 MiB, rounded down to the write
+  /// granule).  @c templated_ioctx cuts every write slice at multiples of it,
+  /// so one write operation never spans two parts.
+  std::size_t write_split_bytes{16UL << 20};
+
+  /// Send PUT bodies only after `100 Continue` (gpuio W4/H6: off by default).
+  bool expect_continue{false};
 
   // -- retry policy ------------------------------------------------------
   std::size_t max_retry_attempts{10};
@@ -115,7 +160,11 @@ struct config {
   /// re-authorizes (a fresh presigned URL), a small number of retries can
   /// recover from expiry.  Kept low so a genuine AccessDenied fails fast.
   std::size_t max_auth_retry_attempts{3};
+  /// Base of the transient back-off (throttles back off from 20x it), with
+  /// full jitter.
   std::chrono::milliseconds retry_backoff_base{50};
+  /// Accepted for configuration compatibility and ignored: the back-off is
+  /// fully jittered (gpuio X1), so there is no separate jitter term.
   std::chrono::milliseconds retry_jitter{50};
   bool honor_retry_after{true};
 
@@ -146,7 +195,7 @@ struct config {
 
   /// Concurrency cap for one @c rest_ioctx::resolve_footer_objects batch: at
   /// most this many probe/HEAD transfers are on the wire at once, and the
-  /// batch's curl multi pools at most this many connections.
+  /// batch's private connection pool holds at most this many connections.
   /// @c footer_resolve_auto derives n_reactors * max_connections at the ioctx;
   /// 0 disables the API entirely (resolve_footer_objects throws) — the
   /// rollback switch.

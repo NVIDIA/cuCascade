@@ -2,7 +2,7 @@
 
 Status: approved by the lead (decisions recorded in section 12). Scope: `include/cucascade/io/{io_context,templated_ioctx,io_request,types}.hpp`,
 `src/io/io_context.cpp`, the uring reactor, the explicit "not yet implemented" write stubs of the
-curl REST context (section 8), tests in `test/io/`.
+REST context (section 8), tests in `test/io/`.
 The cuFile reactor's writes (W2) build on the reactor contract in section 6.
 
 Guiding rule: the read side's shape, reused. One reactor per thread, configuration static at the
@@ -466,7 +466,7 @@ guarantees to deliver and what the reactor must guarantee back.
 Writes are implemented by the io_uring reactor (section 7) and the cuFile reactor (W2) only.
 (The kvikIO context, read-only too, has been removed.)
 
-- `restful` (the curl `rest_ioctx` / `rest_reactor`) reports `supports_write() ==
+- `restful` (`rest_ioctx` / `rest_reactor`) reports `supports_write() ==
   supports_device_write() == false`, and each write hook (`create_io_object_for_write`,
   `host_write_io`, `mixed_writev_async_io`, `flush_io`, `flush_async_io`) reports
   `io::not_implemented_error`: a `std::system_error` with `std::errc::not_supported` whose message
@@ -477,8 +477,9 @@ Writes are implemented by the io_uring reactor (section 7) and the cuFile reacto
   issuing a GET. Because those stub signatures would satisfy `io_write_reactor_c` structurally,
   `reactor_write_traits<rest::rest_reactor>` is explicitly specialized to false/false (before any
   `templated_ioctx<rest_reactor>` is instantiated), so the context never advertises writes. No
-  writable REST object, HEAD, PUT or upload state is created. S3 writes (multipart upload) arrive
-  with the io_uring REST transport.
+  writable REST object, HEAD, PUT or upload state is created. The io_uring REST transport
+  carries the S3 upload machinery (docs/io/rest-uring-design.md); S3 writes are enabled in a
+  following change.
 - The front wrappers check `supports_write()` first and report `not_implemented_error` for a
   backend that cannot write at all; a writing backend asked for a device source it does not
   accept reports a plain `std::system_error(std::errc::not_supported)`. Callers that catch
@@ -538,7 +539,7 @@ All added to `test/CMakeLists.txt` next to their read counterparts.
 Changed: `include/cucascade/io/{types,io_request,io_context,templated_ioctx}.hpp`,
 `src/io/io_context.cpp`, `include/cucascade/io/uring/{uring_reactor,types}.hpp`,
 `src/io/uring/uring_reactor.cpp`, `include/cucascade/io/io_errors.hpp` (`not_implemented_error`),
-the curl REST context / reactor (write stubs), tests above,
+the REST context / reactor (write stubs), tests above,
 `test/CMakeLists.txt`.
 `include/cucascade/io/cache/{fs_cache,metadata_store}.hpp`, `src/io/cache/{fs_cache,metadata_store}.cpp`
 (`invalidate`, `invalidate_later`), `test/cudf/test_write_cache_invalidation.cpp`.

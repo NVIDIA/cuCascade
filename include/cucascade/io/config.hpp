@@ -73,7 +73,7 @@ struct io_config {
   std::size_t uring_n_reactors{4};
 
   /// Number of REST reactor worker threads for the S3/object-store IO path
-  /// (each its own libcurl event loop + connection pool).
+  /// (each its own io_uring ring + connection pools).
   std::size_t rest_n_reactors{2};
 
   /// Local (uring) reactor configuration.  @c use_odirect is derived from

@@ -233,6 +233,8 @@ class raw_http_connection {
     while (_pending.size() < bytes) {
       std::array<char, 8192> buffer{};
       auto const n = ::recv(_fd, buffer.data(), buffer.size(), 0);
+      // EINTR: a ring this thread used was torn down (io_uring's exit task work) -- retry.
+      if (n < 0 && errno == EINTR) { continue; }
       if (n <= 0) { throw std::runtime_error("unexpected end of HTTP response"); }
       _pending.append(buffer.data(), static_cast<std::size_t>(n));
     }

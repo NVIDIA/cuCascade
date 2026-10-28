@@ -99,8 +99,8 @@ class object_changed_error : public std::runtime_error {
  * @brief The backend does not implement this operation yet.
  *
  * Reported by every write and flush entry point of a backend that serves
- * reads only (the curl REST context and reactor), and by
- * the @c ioctx write front ends when the backend cannot write at all.  A
+ * reads only (the REST context and reactor until S3 writes are enabled), and
+ * by the @c ioctx write front ends when the backend cannot write at all.  A
  * @c std::system_error with @c std::errc::not_supported, so callers that catch
  * @c std::system_error and compare its code keep working; the message names
  * the backend and operation and says "not yet implemented".

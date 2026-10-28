@@ -22,7 +22,6 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/object_identity.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/detail/local_descriptor.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
@@ -46,6 +45,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/rest/planner/sources.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/rest/net/sources.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sources.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/rest/cloud/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/worker/sources.cmake)
 
 # Sources include src-private headers (io/detail/..., the transport modules'
 # headers) from src/.

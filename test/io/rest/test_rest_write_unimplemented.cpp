@@ -16,8 +16,8 @@
  * limitations under the License.
  */
 
-// REST writes (S3 PUT / multipart upload) are not implemented yet: every write
-// and flush entry point of the curl REST context and reactor must fail with
+// REST writes (S3 PUT / multipart upload) are not enabled yet: every write
+// and flush entry point of the REST context and reactor must fail with
 // io::not_implemented_error, without any request reaching the server.
 
 #include "rest_contract_test_utils.hpp"

@@ -104,8 +104,8 @@ struct file_descriptor {
 
 /**
  * @brief Abstract per-file handle.  A passive bag of native handles
- * produced by a backend reactor (e.g. file descriptors, CURL easy
- * handles, S3 client state).  Performs no I/O of its own.
+ * produced by a backend reactor (e.g. file descriptors, S3 object
+ * identity and validators).  Performs no I/O of its own.
  *
  * Inherits from @c std::enable_shared_from_this so the prefetching cache can
  * take a reference to an io_object and safely extend its lifetime via

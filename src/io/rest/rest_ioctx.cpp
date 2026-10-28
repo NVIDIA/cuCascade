@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <exception>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -35,6 +36,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace cucascade::io::rest {
@@ -350,8 +352,9 @@ void rest_ioctx::warmup(std::string_view bucket_url) noexcept
     {
       std::lock_guard lk{_warm_mtx};
       auto const now = std::chrono::steady_clock::now();
-      // conn_max_age of 0 means "no cap" to libcurl, which leaves us no honest
-      // staleness horizon; fall back to a minute rather than re-warm forever.
+      // A pooled connection idle for longer than conn_max_age is closed rather
+      // than reused, so a warm-up older than that is stale; 0 (the 4 s
+      // default) has no honest horizon of its own: fall back to a minute.
       auto const stale_after =
         _config.conn_max_age.count() > 0
           ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(_config.conn_max_age)
@@ -405,7 +408,7 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
 }
 
 // ---------------------------------------------------------------------------
-// Writes: not yet implemented
+// Writes: not enabled yet
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<io_object> rest_ioctx::create_io_object_for_write(std::string /*path*/,

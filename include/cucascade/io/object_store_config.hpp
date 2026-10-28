@@ -49,10 +49,10 @@ struct object_store_config {
   enum class signing_mode { presigned, header };
   signing_mode s3_signing_mode = signing_mode::presigned;
 
-  /// PEM CA bundle used to verify the S3 endpoint's TLS certificate
-  /// (CURLOPT_CAINFO). Empty (default) uses libcurl's system CA bundle —
-  /// correct for AWS. Point it at a private / self-signed CA for on-prem or
-  /// S3-compatible gateways (and the local-HTTPS test).
+  /// PEM CA bundle used to verify the S3 endpoint's TLS certificate. Empty
+  /// (default) uses the system trust store (SSL_CERT_FILE / SSL_CERT_DIR,
+  /// OpenSSL's defaults, then the usual distribution bundles) — correct for AWS. Point it at a
+  /// private / self-signed CA for on-prem or S3-compatible gateways (and the local-HTTPS test).
   std::string ca_bundle_path;
 
   /// Verify the S3 endpoint's TLS certificate (peer + host). Default true;

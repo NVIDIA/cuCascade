@@ -96,6 +96,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   set_source_files_properties(
     io/test_null_stream_ptds.cpp PROPERTIES COMPILE_DEFINITIONS
                                             CUDA_API_PER_THREAD_DEFAULT_STREAM)
+  # End-to-end read path over the io_uring transport: HTTPS and plain-HTTP
+  # robustness.
+  target_sources(
+    cucascade_io_tests PRIVATE io/rest/test_rest_https.cpp
+                               io/rest/test_rest_read_robustness.cpp)
   # Tests of the io_uring REST transport modules (docs/io/rest-uring-design.md).
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)

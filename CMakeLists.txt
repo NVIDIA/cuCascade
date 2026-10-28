@@ -167,7 +167,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   if(CUCASCADE_BUILD_IO)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
     # OpenSSL: TLS for the REST transport (handshakes, the user-space record
     # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
     find_package(OpenSSL REQUIRED)
@@ -417,7 +416,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # The datasource bridge (src/cudf/datasource.cpp) compiles against the io
   # core's headers, which need the io usage requirements (concurrentqueue
-  # include dir, curl/uring types, ...).
+  # include dir, uring types, ...).
   if(CUCASCADE_BUILD_IO)
     target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_io_objects)
   endif()
@@ -428,8 +427,7 @@ if(CUCASCADE_BUILD_IO)
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
   # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
   # approach.
-  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL OpenSSL::SSL
-                             OpenSSL::Crypto)
+  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING OpenSSL::SSL OpenSSL::Crypto)
 
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}

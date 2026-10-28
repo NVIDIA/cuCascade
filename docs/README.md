@@ -13,6 +13,7 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
 | [GDS reads](io/gpuio-gds-practices.md) | The cuFile / GPUDirect Storage read backend: configuration, fallbacks, capability probe, measurements |
+| [REST over io_uring](io/rest-uring-design.md) | The S3 / object-store backend: io_uring HTTP/1.1 transport, kTLS and user-space TLS, S3 writes |
 
 ## Reading Paths
 
