@@ -90,11 +90,17 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
+  # Tests of src-private helpers (io/detail/...) include them from src/.
+  target_include_directories(cucascade_io_tests
+                             PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
   if(CUCASCADE_BUILD_CUDF)
-    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp
-                                              io/kvikio/test_kvikio_remote.cpp)
+    target_sources(
+      cucascade_io_tests
+      PRIVATE io/kvikio/test_kvikio_config.cpp
+              io/kvikio/test_kvikio_identity.cpp
+              io/kvikio/test_kvikio_remote.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

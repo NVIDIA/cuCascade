@@ -16,9 +16,13 @@
  * limitations under the License.
  */
 
+#include "io/churning_file.hpp"
+#include "io/detail/local_descriptor.hpp"
+
 #include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/uring_reactor.hpp>
 
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
@@ -27,6 +31,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
@@ -119,6 +124,14 @@ class identity_file {
   std::size_t _bytes;
 };
 
+/// The @c local_stat identity of the file open as @p fd.
+object_identity identity_of(int fd)
+{
+  object_identity identity;
+  REQUIRE(capture_local_identity(fd, identity));
+  return identity;
+}
+
 }  // namespace
 
 TEST_CASE("Object identity separates version kinds and unambiguous locators", "[object_identity]")
@@ -182,6 +195,62 @@ TEST_CASE("Local identity separates replacement with preserved mtime", "[object_
   CHECK(errno == EBADF);
 }
 
+TEST_CASE("Reopening a local descriptor reopens the open file, not its path", "[object_identity]")
+{
+  using cucascade::io::detail::reopen_local_descriptor;
+  identity_file const file{4096, 'a'};
+  file_descriptor const original{::open(file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+  REQUIRE(original);
+  auto const held = identity_of(original.get());
+  // Another file now owns the path.  It was created while the original still
+  // existed, so the two inodes differ.
+  file.replace('b');
+  object_identity replacement;
+  {
+    file_descriptor const by_path{::open(file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+    REQUIRE(by_path);
+    replacement = identity_of(by_path.get());
+  }
+  REQUIRE(replacement.inode != held.inode);
+
+  SECTION("an open descriptor is reopened through /proc/self/fd")
+  {
+    file_descriptor const reopened{
+      reopen_local_descriptor(original.get(), file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+    REQUIRE(reopened);
+    auto const identity = identity_of(reopened.get());
+    CHECK(identity.device == held.device);
+    CHECK(identity.inode == held.inode);
+    char byte = 0;
+    REQUIRE(::pread(reopened.get(), &byte, 1, 0) == 1);
+    CHECK(byte == 'a');
+  }
+  SECTION("only a descriptor without a /proc/self/fd entry falls back to the path")
+  {
+    // No /proc/self/fd entry (ENOENT), as on a host without procfs.  The
+    // caller's dev/inode cross-check is what catches a replaced path then.
+    file_descriptor const reopened{
+      reopen_local_descriptor(-1, file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+    REQUIRE(reopened);
+    CHECK(identity_of(reopened.get()).inode == replacement.inode);
+  }
+  SECTION("any other failure is reported, never retried on the path")
+  {
+    // A directory cannot be reopened for writing (EISDIR); the path, a regular
+    // file, could be.
+    auto const directory_path = std::filesystem::temp_directory_path();
+    file_descriptor const directory{
+      ::open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    REQUIRE(directory);
+    errno = 0;
+    file_descriptor const reopened{
+      reopen_local_descriptor(directory.get(), file.path().c_str(), O_WRONLY | O_CLOEXEC)};
+    int const error = errno;
+    CHECK_FALSE(reopened);
+    CHECK(error == EISDIR);
+  }
+}
+
 TEST_CASE("REST identity only reuses strong ETags", "[object_identity]")
 {
   using cucascade::io::rest::rest_io_object;
@@ -235,4 +304,72 @@ TEST_CASE("Default identity is a tag or scoped to the open", "[object_identity]"
   // Stable for one open.
   CHECK(untagged.identity() == untagged.identity());
   CHECK(untagged.identity_cache_key() == untagged.identity_cache_key());
+}
+
+TEST_CASE("uring opens carry the stat identity of their descriptors", "[object_identity][uring]")
+{
+  using cucascade::io::uring::uring_reactor;
+  identity_file const file{12345};
+
+  auto const first    = uring_reactor::create_io_object(file.path());
+  auto const identity = first->identity();
+  CHECK(identity.kind == identity_kind::local_stat);
+  CHECK(identity.size == file.bytes());
+  CHECK(first->size() == file.bytes());
+  struct stat info{};
+  REQUIRE(::stat(file.path().c_str(), &info) == 0);
+  CHECK(identity.device == static_cast<std::uint64_t>(info.st_dev));
+  CHECK(identity.inode == static_cast<std::uint64_t>(info.st_ino));
+  // The O_DIRECT descriptor, when the filesystem has one, names the same file.
+  if (first->fd_direct() >= 0) {
+    object_identity direct;
+    REQUIRE(capture_local_identity(first->fd_direct(), direct));
+    CHECK(direct == identity);
+  }
+
+  // A second open of the unchanged file is the same version: equal identity and key.
+  auto const second = uring_reactor::create_io_object(file.path());
+  CHECK(second->open_generation() > first->open_generation());
+  CHECK(second->identity() == identity);
+  CHECK(second->identity_cache_key() == first->identity_cache_key());
+
+  // An atomic replacement of the same size is a new version; the object opened
+  // before it still describes the file it holds.
+  file.replace('b');
+  auto const third = uring_reactor::create_io_object(file.path());
+  CHECK(third->identity().kind == identity_kind::local_stat);
+  CHECK(third->identity() != identity);
+  CHECK(third->identity_cache_key() != first->identity_cache_key());
+  CHECK(first->identity() == identity);
+}
+
+TEST_CASE("uring unstatable objects have no reusable identity", "[object_identity][uring]")
+{
+  using cucascade::io::uring::local_io_object;
+
+  // Without a descriptor to stat, an object keeps its given size and falls back
+  // to the open-local identity.
+  local_io_object const detached("/dev/null", file_descriptor{}, file_descriptor{}, 1);
+  CHECK(detached.identity().kind == identity_kind::opened_handle);
+  CHECK(detached.size() == 1);
+}
+
+TEST_CASE("uring opens of a path being replaced report the file they opened",
+          "[object_identity][uring]")
+{
+  // Every open races an atomic replacement of its path.  The object's
+  // identity and size must describe the file its buffered descriptor holds,
+  // its O_DIRECT descriptor must hold that file too, and reopening the
+  // descriptor (not the path) means no open ever sees a mismatch to retry or
+  // throw on.
+  using cucascade::io::uring::uring_reactor;
+  cucascade::test::churning_file const file;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (int opens = 0;
+       opens < 200 || (file.replacements() < 200 && std::chrono::steady_clock::now() < deadline);
+       ++opens) {
+    auto const object = uring_reactor::create_io_object(file.path());
+    cucascade::test::churning_file::check_opened(
+      object->identity(), object->size(), object->fd(), object->fd_direct());
+  }
 }

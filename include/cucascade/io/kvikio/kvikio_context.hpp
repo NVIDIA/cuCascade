@@ -21,6 +21,7 @@
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/kvikio/config.hpp>
+#include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/object_store_config.hpp>
 
 #include <kvikio/file_handle.hpp>
@@ -73,14 +74,24 @@ class kvikio_object : public io_object {
  */
 class kvikio_io_object final : public kvikio_object {
  public:
+  /// Captures the @c local_stat identity of @p handle's buffered descriptor
+  /// and takes the size from it; when the descriptor cannot be stat'ed, the
+  /// object keeps @p file_size and the base class's open-local identity.
   kvikio_io_object(std::string path, kvikio::FileHandle handle, size_t file_size)
     : _path(std::move(path)), _handle(std::move(handle)), _file_size(file_size)
   {
+    _has_identity = capture_local_identity(_handle.fd(), _identity);
+    if (_has_identity) { _file_size = _identity.size; }
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept final { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept final { return _path; }
   [[nodiscard]] size_t size() const noexcept final { return _file_size; }
+
+  [[nodiscard]] object_identity identity() const override
+  {
+    return _has_identity ? _identity : io_object::identity();
+  }
 
   /// Mutable: kvikIO's read entry points are non-const, and the reads issued
   /// through them do not mutate observable file state.
@@ -92,6 +103,8 @@ class kvikio_io_object final : public kvikio_object {
   std::string _path;
   mutable kvikio::FileHandle _handle;
   size_t _file_size{0};
+  object_identity _identity;
+  bool _has_identity{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -233,8 +246,11 @@ class kvikio_context final : public ioctx {
   /// kvikIO and record its size.  An @c s3:// path builds a signed
   /// @c RemoteHandle from @ref object_store (throwing when the store is not
   /// configured); anything else opens a @c FileHandle, applying
-  /// @c config().compat_mode when set.  Throws when the object cannot be
-  /// opened.
+  /// @c config().compat_mode when set; the object carries the @c local_stat
+  /// identity of the buffered descriptor.  Throws when the object cannot be
+  /// opened, and @c descriptor_mismatch_error when, on two attempts, the
+  /// buffered and O_DIRECT descriptors do not name the same file (the path is
+  /// being replaced concurrently) or the O_DIRECT one cannot be stat'ed.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
 
  private:

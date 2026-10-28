@@ -16,7 +16,9 @@
  * limitations under the License.
  */
 
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
+#include <cucascade/io/object_identity.hpp>
 
 #include <kvikio/defaults.hpp>
 #include <kvikio/remote_handle.hpp>
@@ -162,12 +164,33 @@ std::shared_ptr<io_object> kvikio_context::create_io_object(std::string path)
   // compat_mode is passed per handle (rather than through kvikio::defaults) so
   // it applies only to files this ioctx opens; unset falls back to kvikIO's own
   // default, which honours KVIKIO_COMPAT_MODE.
-  kvikio::FileHandle handle =
-    _config.compat_mode
-      ? kvikio::FileHandle{path, "r", kvikio::FileHandle::m644, *_config.compat_mode}
-      : kvikio::FileHandle{path, "r"};
-  auto const file_size = handle.nbytes();
-  return std::make_shared<kvikio_io_object>(std::move(path), std::move(handle), file_size);
+  //
+  // kvikIO opens its buffered and O_DIRECT descriptors from the path, so a
+  // concurrent replacement of the path can pair two different files: compare
+  // their device and inode and retry the open once before giving up.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    kvikio::FileHandle handle =
+      _config.compat_mode
+        ? kvikio::FileHandle{path, "r", kvikio::FileHandle::m644, *_config.compat_mode}
+        : kvikio::FileHandle{path, "r"};
+    if (handle.fd(true) >= 0) {
+      object_identity buffered_identity;
+      object_identity direct_identity;
+      if (!capture_local_identity(handle.fd(false), buffered_identity) ||
+          !capture_local_identity(handle.fd(true), direct_identity)) {
+        throw descriptor_mismatch_error(
+          "kvikio_context::create_io_object: identity_descriptor_mismatch");
+      }
+      if (buffered_identity.device != direct_identity.device ||
+          buffered_identity.inode != direct_identity.inode) {
+        // The FileHandle owns both descriptors; discard both before retrying.
+        continue;
+      }
+    }
+    auto const file_size = handle.nbytes();
+    return std::make_shared<kvikio_io_object>(std::move(path), std::move(handle), file_size);
+  }
+  throw descriptor_mismatch_error("kvikio_context::create_io_object: identity_descriptor_mismatch");
 }
 
 bool kvikio_context::supports(std::string_view /*path*/) const noexcept
