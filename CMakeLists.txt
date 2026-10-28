@@ -157,6 +157,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
     pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+    # OpenSSL: TLS for the REST transport (handshakes, the user-space record
+    # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
     find_package(OpenSSL REQUIRED)
 
     # cucascade_io_thirdparty carries the swappable moodycamel + invocable
@@ -389,7 +391,7 @@ if(CUCASCADE_BUILD_IO)
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
   # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
   # approach.
-  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
+  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL OpenSSL::SSL
                              OpenSSL::Crypto)
 
   target_link_libraries(
