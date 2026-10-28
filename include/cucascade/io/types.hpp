@@ -378,6 +378,10 @@ struct device_buffer {
   std::shared_ptr<cucascade::cuda::cuda_event> ready_gate;
   /// Whether the submission path resolved @c ready_gate (see there).
   bool ready_gate_set{false};
+  /// Keeps alive a stream the dispatcher created in place of the caller's
+  /// (see @c detail::resolve_per_thread_streams in templated_ioctx.hpp); null
+  /// when @c stream is the caller's own.
+  std::shared_ptr<void> stream_owner;
 };
 
 class prepared_io_completion final {
