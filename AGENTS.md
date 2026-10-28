@@ -12,7 +12,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to 
 - **Buffer registration**: Cannot assume RMM-allocated GPU memory is pre-registered with cuFile — but CAN register temporarily per-transfer for large I/O
 - **Thread safety**: Disk I/O operations must remain safe for concurrent use
 - **RAII**: All file handles and disk resources must follow existing RAII patterns
-- **API compatibility**: idisk_io_backend interface must not change (backends are swappable)
+- **API compatibility**: DISK spaces take any started, write-capable `io::ioctx` (uring or cuFile contexts are swappable per space)
 - **Benchmark path**: Benchmarks should use /mnt/disk_2 for NVMe-fair comparison with baselines
 <!-- GSD:project-end -->
 
@@ -50,7 +50,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to 
 - `RMM` (via cudf) - `rmm::mr::device_memory_resource` is the base class for all custom allocators; `::cuda::stream_ref` is used throughout for CUDA stream propagation
 - `CUDA::cudart` - Direct CUDA runtime API calls (`cudaMalloc`, `cudaMemcpyAsync`, `cudaStreamSynchronize`, `cudaFree`, `cudaMallocHost`, `cudaFreeHost`)
 - `CUDA::nvml` - GPU topology discovery via NVML in `src/memory/topology_discovery.cpp`
-- `libcufile` (cuFile / GDS) - NVIDIA GPUDirect Storage for direct GPU↔NVMe transfers; `<cufile.h>` used in `src/data/gds_io_backend.cpp`; found via `find_library(CUFILE_LIB cufile ...)` — optional at configure time, required at runtime for GDS backend
+- `libcufile` (cuFile / GDS) - NVIDIA GPUDirect Storage for direct GPU↔NVMe transfers; the cuFile reactor (`src/io/cufile/`) loads it at run time through `io::cufile::cufile_api`; building it needs only `<cufile.h>` (`CUCASCADE_HAS_CUFILE`); without libcufile every transfer takes the POSIX path
 - `libnuma` - NUMA-aware pinned host memory allocation in `src/memory/numa_region_pinned_host_allocator.cpp`; found via `find_library(NUMA_LIB numa REQUIRED)`
 - `Threads::Threads` (pthreads) - Thread support; `std::mutex`, `std::condition_variable`, `std::async` throughout
 - `fmt` - Format library (pixi dependency; available in environment)
@@ -93,10 +93,10 @@ Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to 
 - Headers: `snake_case.hpp` — never `.h` for project headers
 - CUDA headers: `snake_case.cuh` (e.g., `test/memory/test_gpu_kernels.cuh`)
 - Source: `snake_case.cpp` for C++, `snake_case.cu` for CUDA kernels
-- Test files: `test_<module_name>.cpp` (e.g., `test/data/test_disk_io_backend.cpp`)
+- Test files: `test_<module_name>.cpp` (e.g., `test/data/test_disk_io_context.cpp`)
 - Benchmark files: `benchmark_<module_name>.cpp` (e.g., `benchmark/benchmark_disk_converter.cpp`)
 - `snake_case` for all: `memory_space`, `data_batch`, `disk_data_representation`
-- Interface classes prefixed with `i`: `idata_representation`, `idisk_io_backend`
+- Interface classes prefixed with `i`: `idata_representation`, `ioctx`
 - Config structs suffixed with `_config`: `gpu_memory_space_config`, `disk_memory_space_config`
 - Hash structs suffixed with `_hash`: `converter_key_hash`
 - RAII handles suffixed with `_handle`: `data_batch_processing_handle`
@@ -266,14 +266,14 @@ Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to 
 - Contains: `representation_converter_registry`, `converter_key` (`{source_type_index, target_type_index}`), `representation_converter_fn`
 - Registration: `register_converter<SourceType, TargetType>(fn)` with static_assert constraints
 - Lookup: `convert<TargetType>(source, memory_space, stream)` uses `typeid(source)` at runtime
-- The core converter registry ships empty; `register_builtin_converters()` (declared in `include/cucascade/cudf/builtin_converters.hpp`, defined in `src/cudf/representation_converter_builtins.cpp`, part of `cucascade-cudf`) registers GPU↔HOST and GPU↔DISK and HOST↔DISK converters; overload accepts `shared_ptr<idisk_io_backend>` to select I/O backend
-- Depends on: `idata_representation`, `idisk_io_backend`
+- The core converter registry ships empty; `register_builtin_converters()` (declared in `include/cucascade/cudf/builtin_converters.hpp`, defined in `src/cudf/representation_converter_builtins.cpp`, part of `cucascade-cudf`) registers GPU↔HOST and GPU↔DISK and HOST↔DISK converters; the DISK converters do their I/O through the target / source DISK space's `io::ioctx` (`memory_space::get_or_init_io_context`, defaulting to `default_disk_io_context()`)
+- Depends on: `idata_representation`, `io::ioctx`
 - Used by: `data_batch::convert_to()`, `data_batch::clone_to()`
-- Purpose: Abstract disk I/O; concrete backends selectable at runtime
-- Location: `include/cucascade/data/disk_io_backend.hpp`, `src/data/gds_io_backend.cpp`, `src/data/pipeline_io_backend.cpp`, `src/data/io_backend_internal.hpp`
-- Contains: `idisk_io_backend` (abstract with `write_device`, `read_device`, `write_host`, `read_host`, `write_device_batch`, `read_device_batch`), `io_backend_type` enum (`GDS`, `PIPELINE`), `make_io_backend(type)` factory
-- `GDS` uses raw cuFile batch API; `PIPELINE` uses double-buffered pinned host transfer for D2H overlap with disk writes
-- Depends on: cuFile (GDS)
+- Purpose: DISK-tier I/O through `io::ioctx`; one context per DISK space, selectable at runtime
+- Location: `include/cucascade/cudf/disk_io_context.hpp`, `src/cudf/disk_io_context.cpp`, `src/cudf/disk_io.{hpp,cpp}`; design in `docs/io/disk-tier-io-context-design.md`
+- Contains: `make_disk_io_context(disk_io_context_options)` (backend `automatic` / `uring` / `cufile`, built and started), `default_disk_io_context()` (lazily built, process-shared, weakly cached); `memory_space::{get_io_context, set_io_context, get_or_init_io_context}`; `disk_memory_space_config::io_context`
+- `automatic` = cuFile with real GDS, else io_uring when this process may use it, else the cuFile reactor's POSIX path; one vectored request per table
+- Depends on: cucascade-io (uring and cuFile reactors)
 - Used by: built-in disk converters registered via `register_builtin_converters()`
 - Purpose: Lifecycle management; substription-count reference counting, read-only and mutable locking
 - Location: `include/cucascade/data/data_batch.hpp`, `src/data/data_batch.cpp`
@@ -317,9 +317,9 @@ Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to 
 - Purpose: On-disk file descriptor and binary format for a serialized cuDF table
 - Location: `include/cucascade/memory/disk_table.hpp`, `include/cucascade/data/disk_file_format.hpp`
 - Pattern: File starts with 32-byte `disk_file_header` (magic `0x43554353`, version, num_columns, metadata_size, data_offset); column metadata serialized depth-first; column data aligned to 4096-byte boundaries for GDS DMA
-- Purpose: Abstraction over GDS and pipeline I/O strategies
-- Location: `include/cucascade/data/disk_io_backend.hpp`
-- Pattern: Interface with `write_device`/`read_device`/`write_host`/`read_host` and batch variants; `make_io_backend(io_backend_type)` factory
+- Purpose: Abstraction over the uring and cuFile/GDS I/O stacks
+- Location: `include/cucascade/io/io_context.hpp`, `include/cucascade/io/templated_ioctx.hpp`
+- Pattern: `ioctx` read and write API (`open_io_object_for_write`, `host_writev_async`, `device_writev_async`, `mixed_writev_async`, `flush`) over reactor backends; `make_disk_io_context(options)` factory for DISK spaces
 - Purpose: Cross-component signaling when reservations are released
 - Location: `include/cucascade/memory/notification_channel.hpp`
 - Pattern: Shared ownership via `shared_ptr`; `event_notifier` instances post notifications; `wait()` blocks until notified or shutdown
