@@ -34,6 +34,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_pool_peer_access.cpp
     memory/test_pool_peer_access_regression.cpp
     memory/test_reservation_aware_resource_adaptor.cpp
+    memory/test_remote_memory_space.cpp
     memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
     memory/test_gpu_kernels.cu

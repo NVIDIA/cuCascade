@@ -204,6 +204,21 @@ builder_reference& reservation_manager_configurator::set_disk_mounting_point(
   return *this;
 }
 
+builder_reference& reservation_manager_configurator::add_remote_space(
+  int remote_id,
+  std::string uri_prefix,
+  std::size_t capacity,
+  std::shared_ptr<io::ioctx> io_context)
+{
+  remote_memory_space_config config;
+  config.remote_id       = remote_id;
+  config.memory_capacity = capacity;
+  config.uri_prefix      = validate_remote_uri_prefix(uri_prefix);
+  config.io_context      = std::move(io_context);
+  _remote_spaces.push_back(std::move(config));
+  return *this;
+}
+
 std::vector<memory_space_config> reservation_manager_configurator::build() const
 {
   topology_discovery discovery;
@@ -291,6 +306,11 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
 
   for (const auto& disk_config : _disk_mounting_points) {
     configs.emplace_back(disk_config);
+  }
+
+  // REMOTE spaces last: the tiers are emitted fastest to slowest.
+  for (const auto& remote_config : _remote_spaces) {
+    configs.emplace_back(remote_config);
   }
 
   return configs;
