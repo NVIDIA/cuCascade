@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -364,6 +365,21 @@ authorized_request sigv4_header_authorizer::authorize_request(request_spec const
   } catch (std::exception const& e) {
     throw credential_error(std::string("sigv4_header_authorizer: ") + e.what());
   }
+}
+
+std::shared_ptr<request_authorizer> make_authorizer(object_store_config const& os)
+{
+  if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
+    return nullptr;
+  }
+  auto creds = static_credentials_from(os);
+  switch (os.s3_signing_mode) {
+    case object_store_config::signing_mode::header:
+      return std::make_shared<sigv4_header_authorizer>(std::move(creds), os.region, os.endpoint);
+    case object_store_config::signing_mode::presigned:
+      return std::make_shared<sigv4_presigned_authorizer>(std::move(creds), os.region, os.endpoint);
+  }
+  return nullptr;
 }
 
 }  // namespace cucascade::io::rest::s3

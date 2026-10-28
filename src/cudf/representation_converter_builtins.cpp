@@ -17,6 +17,7 @@
 
 #include "cudf_compat.hpp"
 #include "disk_io.hpp"
+#include "remote_io.hpp"
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
@@ -26,6 +27,7 @@
 #include <cucascade/cudf/host_table_packed.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/disk_file_format.hpp>
+#include <cucascade/data/remote_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/io/types.hpp>
@@ -66,8 +68,12 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -1682,6 +1688,83 @@ static void collect_column_read_slices(
 }
 
 /**
+ * @brief Where a batch's buffers go in a DISK file or REMOTE object, and the slices that write
+ *        them.
+ *
+ * The layout is the same for both: column buffers at 4KB-aligned offsets from 0, no header; the
+ * column metadata (with those offsets) stays in memory with the representation.
+ */
+struct batch_layout {
+  std::vector<memory::column_metadata> columns;
+  std::size_t size{0};
+  std::vector<io::write_slice> slices;
+  /// A GPU source that is a slice is serialized from this compacted copy (see
+  /// serializable_view()); keep the layout alive until the write completed.
+  std::unique_ptr<cudf::table> compacted{};
+};
+
+/// The batch layout of a host table; the slices point into its host blocks.
+static batch_layout layout_host_batch(const host_data_representation& host_source)
+{
+  const auto& host_table = host_source.get_host_table();
+  batch_layout layout;
+  std::size_t cursor = 0;
+  layout.columns.reserve(host_table->columns.size());
+  for (const auto& col : host_table->columns) {
+    layout.columns.push_back(recompute_file_offsets(col, cursor));
+  }
+  layout.size = cursor;
+  for (std::size_t i = 0; i < host_table->columns.size(); ++i) {
+    collect_column_write_slices(
+      host_table->columns[i], layout.columns[i], *host_table->allocation, layout.slices);
+  }
+  return layout;
+}
+
+/**
+ * @brief Rebuild a host_data_representation from a batch's column metadata.
+ *
+ * Allocates the host blocks and hands every buffer's read to @p read_into (one call, all
+ * slices), which must fill them before it returns.
+ */
+template <typename ReadFn>
+static std::unique_ptr<idata_representation> restore_host_batch(
+  const std::vector<memory::column_metadata>& batch_columns,
+  const memory::memory_space* target_memory_space,
+  memory::reservation* reservation,
+  ReadFn&& read_into)
+{
+  // Compute host allocation size with 8-byte alignment
+  std::size_t host_cursor = 0;
+  std::vector<memory::column_metadata> host_columns;
+  host_columns.reserve(batch_columns.size());
+  for (const auto& col : batch_columns) {
+    host_columns.push_back(recompute_host_offsets(col, host_cursor));
+  }
+  std::size_t total_host_size = host_cursor;
+
+  // Allocate host blocks
+  auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
+  if (mr == nullptr) {
+    throw std::runtime_error(
+      "Target HOST memory_space does not have a fixed_size_host_memory_resource");
+  }
+  auto allocation = mr->allocate_multiple_blocks(total_host_size, reservation);
+
+  // Read every column buffer into the host blocks with one request
+  std::vector<io::slice> slices;
+  for (std::size_t i = 0; i < batch_columns.size(); ++i) {
+    collect_column_read_slices(batch_columns[i], host_columns[i], *allocation, slices);
+  }
+  std::forward<ReadFn>(read_into)(std::span<io::slice const>{slices});
+
+  auto host_alloc = memory::host_table_allocation::create(
+    std::move(allocation), std::move(host_columns), total_host_size);
+  return std::make_unique<host_data_representation>(
+    std::move(host_alloc), const_cast<memory::memory_space*>(target_memory_space));
+}
+
+/**
  * @brief Convert host_data_representation to disk_data_representation.
  *
  * Writes every column buffer at its 4KB-aligned file offset with one host write request; the
@@ -1694,38 +1777,19 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   [[maybe_unused]] memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:host_to_disk"};
-  auto const io_context  = detail::resolve_disk_io_context(*target_memory_space);
-  auto& host_source      = source.cast<host_data_representation>();
-  const auto& host_table = host_source.get_host_table();
+  auto const io_context = detail::resolve_disk_io_context(*target_memory_space);
+  auto layout           = layout_host_batch(source.cast<host_data_representation>());
 
   // Generate unique file path under the disk memory space's mount directory
   auto mount_path = target_memory_space->get_disk_mount_path();
   auto file_path  = memory::generate_disk_file_path(mount_path);
 
   disk_file_guard guard{file_path};
-
-  // Recompute column metadata with 4KB-aligned file offsets starting at offset 0.
-  // No header or serialized metadata is written — metadata stays in memory.
-  std::size_t cursor = 0;
-  std::vector<memory::column_metadata> disk_columns;
-  disk_columns.reserve(host_table->columns.size());
-  for (const auto& col : host_table->columns) {
-    disk_columns.push_back(recompute_file_offsets(col, cursor));
-  }
-  std::size_t total_file_data_size = cursor;
-
-  // Write all column buffers with one request
-  std::vector<io::write_slice> slices;
-  for (std::size_t i = 0; i < host_table->columns.size(); ++i) {
-    collect_column_write_slices(
-      host_table->columns[i], disk_columns[i], *host_table->allocation, slices);
-  }
-  detail::write_disk_file_host(*io_context, file_path, slices, total_file_data_size);
-
+  detail::write_disk_file_host(*io_context, file_path, layout.slices, layout.size);
   guard.release();
 
   auto disk_table = std::make_unique<memory::disk_table_allocation>(
-    std::move(file_path), std::move(disk_columns), total_file_data_size);
+    std::move(file_path), std::move(layout.columns), layout.size);
   return std::make_unique<disk_data_representation>(
     std::move(disk_table), const_cast<memory::memory_space&>(*target_memory_space));
 }
@@ -1744,41 +1808,11 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
 {
   nvtx_scope convert_range{"convert:disk_to_host"};
   auto const io_context  = detail::resolve_disk_io_context(source.get_memory_space());
-  auto& disk_source      = source.cast<disk_data_representation>();
-  const auto& disk_table = disk_source.get_disk_table();
-  const auto& file_path  = disk_table.file_path;
-
-  // Column metadata is already in memory — no file header or metadata to read
-  const auto& disk_columns = disk_table.columns;
-
-  // Compute host allocation size with 8-byte alignment
-  std::size_t host_cursor = 0;
-  std::vector<memory::column_metadata> host_columns;
-  host_columns.reserve(disk_columns.size());
-  for (const auto& col : disk_columns) {
-    host_columns.push_back(recompute_host_offsets(col, host_cursor));
-  }
-  std::size_t total_host_size = host_cursor;
-
-  // Allocate host blocks
-  auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
-  if (mr == nullptr) {
-    throw std::runtime_error(
-      "Target HOST memory_space does not have a fixed_size_host_memory_resource");
-  }
-  auto allocation = mr->allocate_multiple_blocks(total_host_size, reservation);
-
-  // Read every column buffer from the file into the host blocks with one request
-  std::vector<io::slice> slices;
-  for (std::size_t i = 0; i < disk_columns.size(); ++i) {
-    collect_column_read_slices(disk_columns[i], host_columns[i], *allocation, slices);
-  }
-  detail::read_disk_file_host(*io_context, file_path, slices);
-
-  auto host_alloc = memory::host_table_allocation::create(
-    std::move(allocation), std::move(host_columns), total_host_size);
-  return std::make_unique<host_data_representation>(
-    std::move(host_alloc), const_cast<memory::memory_space*>(target_memory_space));
+  const auto& disk_table = source.cast<disk_data_representation>().get_disk_table();
+  return restore_host_batch(
+    disk_table.columns, target_memory_space, reservation, [&](std::span<io::slice const> slices) {
+      detail::read_disk_file_host(*io_context, disk_table.file_path, slices);
+    });
 }
 
 // =============================================================================
@@ -1786,13 +1820,16 @@ static std::unique_ptr<idata_representation> convert_disk_to_host_data(
 // =============================================================================
 
 /// Call after making the source device current so default handles resolve on it.
-static void require_stream_on_device(::cuda::stream_ref stream, int source_device)
+static void require_stream_on_device(::cuda::stream_ref stream,
+                                     int source_device,
+                                     std::string_view converter)
 {
   int stream_device = -1;
   CUCASCADE_CUDA_TRY(cudaStreamGetDevice(stream.get(), &stream_device));
   if (stream_device != source_device) {
-    CUCASCADE_FAIL("gpu_to_disk: stream belongs to CUDA device " + std::to_string(stream_device) +
-                   " but the source table lives on device " + std::to_string(source_device));
+    CUCASCADE_FAIL(std::string{converter} + ": stream belongs to CUDA device " +
+                   std::to_string(stream_device) + " but the source table lives on device " +
+                   std::to_string(source_device));
   }
 }
 
@@ -1820,6 +1857,50 @@ static void collect_gpu_column_write_slices(const cudf::column_view& col,
 }
 
 /**
+ * @brief The batch layout of a GPU table; the slices point at its device buffers (or at those of
+ *        a compacted copy, when the table is a slice).
+ *
+ * Waits for the table's writer on @p stream first: planning reads string offsets on the device,
+ * and the writes that follow are stream-ordered after @p stream.
+ *
+ * @pre The source table's device is current, and stays current through the write that consumes
+ *      the layout: a null @p stream names the current device's default stream, so the writer
+ *      wait, the planning and the write must all resolve it on the source device.
+ */
+static batch_layout layout_gpu_batch(const gpu_table_representation& gpu_source,
+                                     ::cuda::stream_ref stream)
+{
+  gpu_source.wait_for_writer(stream);
+  batch_layout layout;
+  cudf::table_view tv = serializable_view(gpu_source.get_table_view(),
+                                          stream,
+                                          gpu_source.get_memory_space().get_default_allocator(),
+                                          layout.compacted);
+
+  // Plan column layout with 8-byte aligned offsets (same as host path)
+  std::size_t plan_offset = 0;
+  std::vector<memory::column_metadata> planned_columns;
+  planned_columns.reserve(static_cast<std::size_t>(tv.num_columns()));
+  for (cudf::size_type i = 0; i < tv.num_columns(); ++i) {
+    planned_columns.push_back(plan_column_copy(tv.column(i), plan_offset, stream));
+  }
+
+  // Recompute with 4KB-aligned offsets starting at offset 0.
+  // No header or serialized metadata is written — metadata stays in memory.
+  std::size_t cursor = 0;
+  layout.columns.reserve(planned_columns.size());
+  for (const auto& col : planned_columns) {
+    layout.columns.push_back(recompute_file_offsets(col, cursor));
+  }
+  layout.size = cursor;
+  for (cudf::size_type i = 0; i < tv.num_columns(); ++i) {
+    collect_gpu_column_write_slices(
+      tv.column(i), layout.columns[static_cast<std::size_t>(i)], layout.slices);
+  }
+  return layout;
+}
+
+/**
  * @brief Convert gpu_table_representation to disk_data_representation.
  *
  * Writes every GPU column buffer straight from device memory with one device write request.
@@ -1841,54 +1922,21 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   // planning and compaction run on, and the one the io context reads the sources on must all be
   // resolved on the same device. The io context also binds device sources to the current device.
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_source.get_device_id()}};
-  require_stream_on_device(stream, gpu_source.get_device_id());
-  // Planning reads string offsets on the device, and the write is stream-ordered after `stream`.
-  gpu_source.wait_for_writer(stream);
+  require_stream_on_device(stream, gpu_source.get_device_id(), "gpu_to_disk");
   // On a failure after work reading the source was enqueued, wait for it before unwinding.
   drain_on_unwind drain{stream};
-  // A sliced table is compacted first; the copy lives until the write below has completed.
-  std::unique_ptr<cudf::table> compacted;
-  cudf::table_view tv = serializable_view(gpu_source.get_table_view(),
-                                          stream,
-                                          gpu_source.get_memory_space().get_default_allocator(),
-                                          compacted);
+  auto layout = layout_gpu_batch(gpu_source, stream);
 
   // Generate unique file path under the disk memory space's mount directory
   auto mount_path = target_memory_space->get_disk_mount_path();
   auto file_path  = memory::generate_disk_file_path(mount_path);
 
   disk_file_guard guard{file_path};
-
-  // Plan column layout with 8-byte aligned offsets (same as host path)
-  std::size_t plan_offset = 0;
-  std::vector<memory::column_metadata> planned_columns;
-  planned_columns.reserve(static_cast<std::size_t>(tv.num_columns()));
-  for (cudf::size_type i = 0; i < tv.num_columns(); ++i) {
-    planned_columns.push_back(plan_column_copy(tv.column(i), plan_offset, stream));
-  }
-
-  // Recompute with 4KB-aligned disk offsets starting at offset 0.
-  // No header or serialized metadata is written — metadata stays in memory.
-  std::size_t cursor = 0;
-  std::vector<memory::column_metadata> disk_columns;
-  disk_columns.reserve(planned_columns.size());
-  for (const auto& col : planned_columns) {
-    disk_columns.push_back(recompute_file_offsets(col, cursor));
-  }
-  std::size_t total_file_data_size = cursor;
-
-  // Collect every column buffer, then write them all with one request.
-  std::vector<io::write_slice> slices;
-  for (cudf::size_type i = 0; i < tv.num_columns(); ++i) {
-    collect_gpu_column_write_slices(
-      tv.column(i), disk_columns[static_cast<std::size_t>(i)], slices);
-  }
-  detail::write_disk_file_device(*io_context, file_path, slices, stream, total_file_data_size);
-
+  detail::write_disk_file_device(*io_context, file_path, layout.slices, stream, layout.size);
   guard.release();
 
   auto disk_table = std::make_unique<memory::disk_table_allocation>(
-    std::move(file_path), std::move(disk_columns), total_file_data_size);
+    std::move(file_path), std::move(layout.columns), layout.size);
   return std::make_unique<disk_data_representation>(
     std::move(disk_table), const_cast<memory::memory_space&>(*target_memory_space));
 }
@@ -2070,6 +2118,63 @@ static std::unique_ptr<cudf::column> assemble_disk_column(const memory::column_m
 }
 
 /**
+ * @brief Rebuild a gpu_table_representation from a batch's column metadata.
+ *
+ * Allocates every device buffer of the table, hands all their reads to @p read_into (ONE call,
+ * made with the target device current; it must fill them before it returns, see below), then
+ * assembles the cudf columns.
+ */
+template <typename ReadFn>
+static std::unique_ptr<idata_representation> restore_gpu_batch(
+  const std::vector<memory::column_metadata>& batch_columns,
+  const memory::memory_space* target_memory_space,
+  ::cuda::stream_ref stream,
+  ReadFn&& read_into)
+{
+  // Set CUDA device to target GPU (RAII restores previous device on scope exit). The io context
+  // binds device destinations to the current device.
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
+
+  auto mr = target_memory_space->get_default_allocator();
+
+  // Phase 1: allocate every buffer of the table (stream-ordered) and collect one slice per buffer.
+  // Declared before the read so the buffers outlive it on every path.
+  std::vector<io::slice> slices;
+  std::vector<disk_column_buffers> buffers;
+  buffers.reserve(batch_columns.size());
+  for (const auto& col_meta : batch_columns) {
+    buffers.push_back(allocate_disk_column(col_meta, stream, mr, slices));
+  }
+
+  // Phase 2: one batched device read of the whole table, awaited before returning or unwinding.
+  std::forward<ReadFn>(read_into)(std::span<io::slice const>{slices});
+
+  // Phase 3: assemble the columns; the casts it may enqueue are ordered on `stream`.
+  std::vector<std::unique_ptr<cudf::column>> gpu_columns;
+  gpu_columns.reserve(batch_columns.size());
+  for (std::size_t i = 0; i < batch_columns.size(); ++i) {
+    gpu_columns.push_back(assemble_disk_column(batch_columns[i], buffers[i], stream, mr));
+  }
+
+  // No host-side stream.sync() is needed here. It rests on the ioctx read contract, not on how a
+  // particular backend implements it:
+  //  1. The read future resolves only after every byte is in device memory, on whichever stream
+  //     the backend used (uring / rest: their H2D copies on `stream`, settled once their event
+  //     completes; cuFile: a synchronous cuFileRead, or POSIX + H2D on its own copy stream,
+  //     settled after the copy events). So the buffers are complete when `read_into` returns.
+  //  2. A backend writes the destinations only after the work enqueued on `stream` before the read
+  //     (uring / rest copy on `stream`; cuFile waits for `stream` before it writes from
+  //     elsewhere). The destinations are stream-ordered allocations on `stream`, so this ordering
+  //     is required.
+  // Everything assemble_disk_column enqueues (offset casts) is ordered on `stream` after that, and
+  // make_written_on() records the table's writer event on `stream` behind it, which every reader
+  // waits on before touching the data.
+  auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
+  return gpu_table_representation::make_written_on(
+    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
+}
+
+/**
  * @brief Convert disk_data_representation to gpu_table_representation.
  *
  * Allocates every device buffer of the table, reads them all from the file with ONE batched
@@ -2084,53 +2189,139 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 {
   nvtx_scope convert_range{"convert:disk_to_gpu"};
   auto const io_context  = detail::resolve_disk_io_context(source.get_memory_space());
-  auto& disk_source      = source.cast<disk_data_representation>();
-  const auto& disk_table = disk_source.get_disk_table();
-  const auto& file_path  = disk_table.file_path;
+  const auto& disk_table = source.cast<disk_data_representation>().get_disk_table();
+  return restore_gpu_batch(
+    disk_table.columns, target_memory_space, stream, [&](std::span<io::slice const> slices) {
+      detail::read_disk_file_device(*io_context, disk_table.file_path, slices, stream);
+    });
+}
 
-  // Column metadata is already in memory — no file header or metadata to read
-  const auto& disk_columns = disk_table.columns;
+// =============================================================================
+// Remote <-> Host / GPU converters
+// =============================================================================
+//
+// A REMOTE batch is one object with the DISK file layout, written through the io context of the
+// REMOTE memory space (there is no default context: a space without one is a configuration
+// error). The steps differ from DISK only where an object store differs from a file
+// (remote_io.hpp): the name is generated without I/O and opened create_new, the object is
+// committed by a flush, a failed write is cleaned up by destroying the unflushed object (which
+// aborts its upload), the object is read back through the committed write object (its size is
+// known: no HEAD), and the representation's release deletes the object asynchronously.
 
-  // Set CUDA device to target GPU (RAII restores previous device on scope exit). The io context
-  // binds device destinations to the current device.
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
-
-  auto mr = target_memory_space->get_default_allocator();
-
-  // Phase 1: allocate every buffer of the table (stream-ordered) and collect one slice per buffer.
-  // Declared before the read so the buffers outlive it on every path.
-  std::vector<io::slice> slices;
-  std::vector<disk_column_buffers> buffers;
-  buffers.reserve(disk_columns.size());
-  for (const auto& col_meta : disk_columns) {
-    buffers.push_back(allocate_disk_column(col_meta, stream, mr, slices));
+/// The written object of a REMOTE representation (null when it was not made by a converter).
+static const detail::remote_object& remote_object_of(const remote_data_representation& source)
+{
+  auto const& object = source.get_remote_object();
+  if (object == nullptr || object->context == nullptr || object->object == nullptr) {
+    throw std::logic_error("remote tier: the REMOTE representation of '" + source.get_object_uri() +
+                           "' has no readable object");
   }
+  return *object;
+}
 
-  // Phase 2: one batched device read of the whole table, awaited before returning or unwinding.
-  detail::read_disk_file_device(*io_context, file_path, slices, stream);
+/**
+ * @brief Convert host_data_representation to remote_data_representation.
+ *
+ * Writes the host table as one object (one host write request per staging window, normally one)
+ * and commits it. The source is untouched on failure.
+ */
+static std::unique_ptr<idata_representation> convert_host_data_to_remote(
+  const idata_representation& source,
+  const memory::memory_space* target_memory_space,
+  [[maybe_unused]] ::cuda::stream_ref stream,
+  [[maybe_unused]] memory::reservation* reservation)
+{
+  nvtx_scope convert_range{"convert:host_to_remote"};
+  auto io_context = detail::require_remote_io_context(*target_memory_space, /*device=*/false);
+  auto layout     = layout_host_batch(source.cast<host_data_representation>());
+  auto object     = detail::write_remote_object(std::move(io_context),
+                                            target_memory_space->get_remote_uri_prefix(),
+                                            layout.slices,
+                                            layout.size,
+                                            std::nullopt);
+  auto table      = std::make_unique<memory::disk_table_allocation>(
+    object->uri, std::move(layout.columns), layout.size);
+  return std::make_unique<remote_data_representation>(
+    std::move(table), const_cast<memory::memory_space&>(*target_memory_space), std::move(object));
+}
 
-  // Phase 3: assemble the columns; the casts it may enqueue are ordered on `stream`.
-  std::vector<std::unique_ptr<cudf::column>> gpu_columns;
-  gpu_columns.reserve(disk_columns.size());
-  for (std::size_t i = 0; i < disk_columns.size(); ++i) {
-    gpu_columns.push_back(assemble_disk_column(disk_columns[i], buffers[i], stream, mr));
-  }
+/**
+ * @brief Convert remote_data_representation to host_data_representation.
+ *
+ * Reads every buffer of the object into fresh host blocks with one request. On failure the
+ * REMOTE representation stays valid (the conversion may be retried).
+ */
+static std::unique_ptr<idata_representation> convert_remote_to_host_data(
+  const idata_representation& source,
+  const memory::memory_space* target_memory_space,
+  [[maybe_unused]] ::cuda::stream_ref stream,
+  memory::reservation* reservation)
+{
+  nvtx_scope convert_range{"convert:remote_to_host"};
+  auto& remote_source = source.cast<remote_data_representation>();
+  auto const& object  = remote_object_of(remote_source);
+  return restore_host_batch(
+    remote_source.get_object_table().columns,
+    target_memory_space,
+    reservation,
+    [&](std::span<io::slice const> slices) { detail::read_remote_object_host(object, slices); });
+}
 
-  // No host-side stream.sync() is needed here. It rests on the ioctx read contract, not on how a
-  // particular backend implements it:
-  //  1. The read future resolves only after every byte is in device memory, on whichever stream
-  //     the backend used (uring: its H2D copies on `stream`, settled once their event completes;
-  //     cuFile: a synchronous cuFileRead, or POSIX + H2D on its own copy stream, settled after the
-  //     copy events). So the buffers are complete when read_disk_file_device() returns.
-  //  2. A backend writes the destinations only after the work enqueued on `stream` before the read
-  //     (uring copies on `stream`; cuFile waits for `stream` before it writes from elsewhere). The
-  //     destinations are stream-ordered allocations on `stream`, so this ordering is required.
-  // Everything assemble_disk_column enqueues (offset casts) is ordered on `stream` after that, and
-  // make_written_on() records the table's writer event on `stream` behind it, which every reader
-  // waits on before touching the data.
-  auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
-  return gpu_table_representation::make_written_on(
-    std::move(new_table), *const_cast<memory::memory_space*>(target_memory_space), stream);
+/**
+ * @brief Convert gpu_table_representation to remote_data_representation.
+ *
+ * Writes every GPU column buffer as one object: the REST context copies the device sources into
+ * pinned part buffers on @p stream and uploads them; the object is committed by the flush.
+ */
+static std::unique_ptr<idata_representation> convert_gpu_to_remote(
+  const idata_representation& source,
+  const memory::memory_space* target_memory_space,
+  ::cuda::stream_ref stream,
+  [[maybe_unused]] memory::reservation* reservation)
+{
+  nvtx_scope convert_range{"convert:gpu_to_remote"};
+  auto io_context  = detail::require_remote_io_context(*target_memory_space, /*device=*/true);
+  auto& gpu_source = source.cast<gpu_table_representation>();
+  // The source device is current from the writer ordering through the write (see
+  // layout_gpu_batch()); the io context also binds device sources to the current device.
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_source.get_device_id()}};
+  require_stream_on_device(stream, gpu_source.get_device_id(), "gpu_to_remote");
+  // On a failure after work reading the source was enqueued, wait for it before unwinding.
+  drain_on_unwind drain{stream};
+  auto layout = layout_gpu_batch(gpu_source, stream);
+  auto object = detail::write_remote_object(std::move(io_context),
+                                            target_memory_space->get_remote_uri_prefix(),
+                                            layout.slices,
+                                            layout.size,
+                                            stream);
+  auto table  = std::make_unique<memory::disk_table_allocation>(
+    object->uri, std::move(layout.columns), layout.size);
+  return std::make_unique<remote_data_representation>(
+    std::move(table), const_cast<memory::memory_space&>(*target_memory_space), std::move(object));
+}
+
+/**
+ * @brief Convert remote_data_representation to gpu_table_representation.
+ *
+ * Allocates every device buffer of the table and reads them from the object (one batched device
+ * read per staging window, normally one), then assembles the cudf columns. On failure the
+ * REMOTE representation stays valid.
+ */
+static std::unique_ptr<idata_representation> convert_remote_to_gpu(
+  const idata_representation& source,
+  const memory::memory_space* target_memory_space,
+  ::cuda::stream_ref stream,
+  [[maybe_unused]] memory::reservation* reservation)
+{
+  nvtx_scope convert_range{"convert:remote_to_gpu"};
+  auto& remote_source = source.cast<remote_data_representation>();
+  auto const& object  = remote_object_of(remote_source);
+  return restore_gpu_batch(remote_source.get_object_table().columns,
+                           target_memory_space,
+                           stream,
+                           [&](std::span<io::slice const> slices) {
+                             detail::read_remote_object_device(object, slices, stream);
+                           });
 }
 
 }  // namespace
@@ -2185,6 +2376,22 @@ void register_builtin_converters(representation_converter_registry& registry)
   // DISK -> GPU (io context resolved from the source disk memory_space)
   registry.register_converter<disk_data_representation, gpu_table_representation>(
     convert_disk_to_gpu);
+
+  // HOST DATA -> REMOTE (io context of the target REMOTE memory_space; required)
+  registry.register_converter<host_data_representation, remote_data_representation>(
+    convert_host_data_to_remote);
+
+  // REMOTE -> HOST DATA (through the context that wrote the object)
+  registry.register_converter<remote_data_representation, host_data_representation>(
+    convert_remote_to_host_data);
+
+  // GPU -> REMOTE (io context of the target REMOTE memory_space; required)
+  registry.register_converter<gpu_table_representation, remote_data_representation>(
+    convert_gpu_to_remote);
+
+  // REMOTE -> GPU (through the context that wrote the object)
+  registry.register_converter<remote_data_representation, gpu_table_representation>(
+    convert_remote_to_gpu);
 }
 
 }  // namespace cucascade

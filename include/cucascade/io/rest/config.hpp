@@ -24,6 +24,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace cucascade::io::rest {
@@ -211,5 +212,16 @@ struct config {
   /// cannot be honored as a hard cap.
   std::size_t footer_resolve_stash_budget{footer_resolve_auto};
 };
+
+/**
+ * @brief The most GETs the REST transport cuts one contiguous read of @p bytes into under @p cfg.
+ *
+ * Uses the planner's effective segment bounds (zero = the defaults; a @c min_segment_bytes above
+ * @c max_segment_bytes is lowered to it) and the bound its chunk cutter guarantees; cuts at an
+ * object's multipart part boundaries come on top (at most one more GET per boundary crossed). A
+ * device read stages every GET in whole blocks of the context's pinned staging, so this is what a
+ * caller budgeting that staging needs. At least 1.
+ */
+[[nodiscard]] std::size_t max_read_gets(config const& cfg, std::uint64_t bytes) noexcept;
 
 }  // namespace cucascade::io::rest

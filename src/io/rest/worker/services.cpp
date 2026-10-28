@@ -232,6 +232,13 @@ rest_reactor::reactor_context::reactor_context(
 
 rest_reactor::reactor_context::~reactor_context() = default;
 
+std::size_t max_read_gets(config const& cfg, std::uint64_t bytes) noexcept
+{
+  // The same planner config the engines plan with (make_planner_config), and the capacity bound
+  // of its chunk cutter: no plan of `bytes` has more GETs.
+  return planner::remote_chunk_capacity(bytes, detail::make_planner_config(cfg));
+}
+
 detail::shared_services& rest_reactor::reactor_context::services() const
 {
   std::lock_guard lock(_services_mutex);
