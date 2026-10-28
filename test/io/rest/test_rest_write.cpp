@@ -601,10 +601,8 @@ TEST_CASE("rest_ioctx aborts an upload whose commit failed once the object is de
   // The flush job of a failed commit must not outlive it: it holds the upload session, whose
   // destruction is what aborts an upload that was never committed.
   s3_write_policy policy;
-  policy.faults.push_back(write_fault{.kind   = write_kind::complete_upload,
-                                      .count  = 100,
-                                      .status = 400,
-                                      .code   = "InvalidRequest"});
+  policy.faults.push_back(write_fault{
+    .kind = write_kind::complete_upload, .count = 100, .status = 400, .code = "InvalidRequest"});
   auto server = make_store(policy);
   auto ioctx  = make_write_ioctx(*server);
   rest_shutdown_guard cleanup{*ioctx};

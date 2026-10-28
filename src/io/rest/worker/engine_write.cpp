@@ -645,7 +645,7 @@ void engine::run_flush(std::shared_ptr<upload_session> up,
       // The single PUT carries the flush's only part upload: settle it like UploadPart.
       for (auto const& pu : job->plan.uploads) {
         auto const r = error == nullptr ? job->up->state.finish_upload(pu, job->request.etag)
-                                              : job->up->state.finish_upload(pu, ec);
+                                        : job->up->state.finish_upload(pu, ec);
         job->up->resume(r.flush_waiters, {});
       }
       job->plan.uploads.clear();
