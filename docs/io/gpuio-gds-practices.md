@@ -1,8 +1,8 @@
-# cuFile / GPUDirect Storage reads in cuCascade
+# cuFile / GPUDirect Storage reads and writes in cuCascade
 
-The cuFile backend (`cucascade::io::cufile`) serves reads of local regular files with NVIDIA
-cuFile / GPUDirect Storage (GDS). It is **read-only**. This document covers how to select and
-configure it, what it does with each kind of read, how to find out what GDS can do for a given
+The cuFile backend (`cucascade::io::cufile`) serves reads and writes of local regular files with
+NVIDIA cuFile / GPUDirect Storage (GDS). This document covers how to select and configure it, what
+it does with each kind of read (writes: section 8), how to find out what GDS can do for a given
 file, and what was measured. The practices come from gpuio's GDS module and were adapted to
 cuCascade's reactor model (one worker thread per reactor, the tiered request queue, `templated_ioctx`
 dispatch) without importing gpuio's architecture.
@@ -203,10 +203,69 @@ CUCASCADE_IO_BENCH_FILE=/mnt/nvme/large.bin CUCASCADE_IO_BENCH_BYTES=$((4<<30)) 
 (comma-separated scenario substrings) narrow it. Record `cufile::probe_path` for the file next to
 the numbers: a run whose verdict is not `direct_candidate` measured compatibility mode.
 
-## 8. Not done here
+## 8. Writes
+
+The cuFile reactor implements the write API (docs/io/write-api-design.md, section 6) for objects
+opened with `open_io_object_for_write`.
+
+**Open.** The buffered fd is opened `O_RDWR` with the mode flags (create / truncate / exclusive,
+permissions), preallocated best-effort for `size_hint` (`fallocate(KEEP_SIZE)`), then the
+`O_RDWR | O_DIRECT` fd is reopened from it through `/proc/self/fd` and registered with cuFile under
+the same `compat` rules as a read open. The create / truncate is never repeated; a pathname
+fallback (no procfs) that opens another file fails with `descriptor_mismatch_error`. A writable
+object has an `opened_handle` identity and grows atomically as writes complete.
+
+**Placement.** Each write slice is split at the write granule (`max(4 KiB, page size)`) into an
+unaligned head, an aligned body and an unaligned tail, as in the uring reactor.
+- Device sources: on a platform with a real GDS mode, a body of at least `gds_threshold` goes to
+  chunked synchronous `cuFileWrite` (at most `max_op_bytes` per call) after the slice passed its
+  stream gate; short writes are resubmitted and a 0-byte write is `EIO`. Head, tail, smaller bodies
+  and every body on a compatibility-only platform (`!gds_available()`, including a mode forced by
+  `CUFILE_FORCE_COMPAT_MODE`) are staged: D2H copies on the reactor's own copy stream into the
+  double-buffered pinned scratch, then `pwrite` (O_DIRECT for granule-aligned chunks). In
+  compatibility mode cuFile bounces through its own 1 MiB host buffers and measured about half as
+  fast as the staged path when the writes extend a file, so there is no setting to force it; tests
+  reach the `cuFileWrite` path through `detail::set_cufile_writes_in_compat_for_testing`.
+- Host sources: a body of at least 4 MiB whose source address lines up with its file offset goes
+  O_DIRECT straight from the caller (head and tail buffered). Anything else -- for example the
+  DISK tier's pinned pool blocks, whose column buffers are only 8 B-aligned -- is written through
+  the page cache with its writeback started at once (`sync_file_range(SYNC_FILE_RANGE_WRITE)`),
+  which overlaps the kernel's copy with the device write of earlier segments and measured faster
+  than a synchronous O_DIRECT write per segment. Such pages are clean, hence reclaimable, soon
+  after; durability still needs `flush`. A host-only vectored write goes to one reactor
+  (interleaved writers of one file only contend on its inode).
+- `flush` is `fdatasync` of the buffered fd; the asynchronous form runs it on a reactor.
+
+**Safety.** A device-source slice whose stream still has queued work is parked behind an event
+like a device read; the worker never blocks on a caller's stream. Staging copies drain before the
+scratch is reused or the request settles, also when an event record fails after a copy was queued
+(the whole reactor copy stream is synchronized then; covered by the
+`detail::set_copy_event_record_failure_for_testing` seam). Shutdown cancels parked and pending
+slices with `operation_canceled` and checks for stop between cuFile and staged chunks.
+
+**Registration (opt-in).** `config::register_min_bytes` (default 0 = never) registers a 4 KiB-
+aligned device buffer of at least that many bytes with `cuFileBufRegister` for one transfer.
+Registrations live in a process-wide table keyed by base address: a transfer starting at a live
+registration's base and fitting inside it shares it (the last user deregisters); one overlapping a
+live registration any other way, or memory registered outside the table
+(`CU_FILE_MEMORY_ALREADY_REGISTERED`), takes the staged path; while the knob is set, unregistered
+cuFile reads and writes are recorded too, so a registration never covers memory one of them is
+using. NVIDIA advises against registering one-shot buffers, and in compatibility mode a 1 GiB
+registration took 1.3-27 ms for no measurable gain, hence off by default.
+
+**Measured (compatibility mode, root NVMe ext4, 4 reactors, GB/s, timed including the final
+`fdatasync`).** Overwriting an existing file every path saturates the device (5.5-6.7). Extending
+a fresh file, compat-mode `cuFileWrite` reached 2.1-3.0 while the staged path reached 4.8-5.5,
+which is why device bodies are staged without real GDS. For the DISK tier's host transfers the
+page-cache-with-early-writeback path brought HOST -> DISK from 2.2-2.9 to 3.0-4.2 GiB/s (uring:
+3.3-4.4) and DISK -> HOST (O_DIRECT reads) from 1.5-1.8 to 5.5-6.4. These numbers come from a
+host without nvidia-fs; they say nothing about real GDS throughput. Sustained writes beyond the
+SSD's SLC cache drop every writer to about 1.4 GB/s.
+
+## 9. Not done here
 
 - cuFile parameters (`max_direct_io_size_kb` and friends before the first driver open): the only
   change measured here made large reads slower; to be evaluated on a GDS host.
-- Per-transfer buffer registration (an opt-in A/B knob on a GDS host).
+- Measuring the opt-in per-transfer buffer registration (`register_min_bytes`) on a GDS host.
 - Per-reactor counters (bytes by path, fallback reasons).
 - Re-sweeping `max_op_bytes` and `gds_threshold` in real GDS mode.

@@ -103,7 +103,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     target_sources(
       cucascade_io_tests
       PRIVATE io/cufile/test_cufile_platform.cpp
-              io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp)
+              io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp
+              io/cufile/test_cufile_write.cpp)
   endif()
 
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.

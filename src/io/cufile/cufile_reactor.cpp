@@ -54,6 +54,7 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -150,28 +151,39 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
 }
 
 /**
- * @brief Open the O_DIRECT fd of a cuFile object when @p use_odirect and the
- *        compat mode allow it; an invalid descriptor when they do not or the
- *        open failed in a mode that tolerates it.
+ * @brief Open the O_DIRECT fd of a cuFile object (@p direct_flags) when
+ *        @p use_odirect and the compat mode allow it; an invalid descriptor
+ *        when they do not or the open failed in a mode that tolerates it.
  *
  * The descriptor reopens @p buffered (see @ref detail::reopen_local_descriptor)
  * rather than the path, so a concurrent rename cannot pair it with another
- * file; the caller still compares the identities.  @p mode decides what a file
- * that cannot use O_DIRECT means: @c on never opens it, @c automatic falls back
- * to POSIX for that file, @c off throws.
+ * file.  For a read open the caller still compares the identities (and may
+ * retry the open).  A write open (@p writable) cannot be retried -- its
+ * create / truncate is destructive -- so the pair is verified here and a
+ * pathname fallback that sees another file throws
+ * @c descriptor_mismatch_error.  @p mode decides what a file that cannot use
+ * O_DIRECT means: @c on never opens it, @c automatic falls back to POSIX for
+ * that file, @c off throws.
  */
 [[nodiscard]] file_descriptor open_direct_fd(std::string const& path,
                                              file_descriptor const& buffered,
+                                             int direct_flags,
+                                             bool writable,
                                              bool use_odirect,
                                              compat mode,
                                              std::string const& what)
 {
   file_descriptor direct;
   if (use_odirect && mode != compat::on) {
-    direct = file_descriptor{cucascade::io::detail::reopen_local_descriptor(
-      buffered.get(), path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC)};
+    direct = file_descriptor{writable ? cucascade::io::detail::reopen_writable_direct(
+                                          buffered.get(), path.c_str(), direct_flags)
+                                      : cucascade::io::detail::reopen_local_descriptor(
+                                          buffered.get(), path.c_str(), direct_flags)};
     if (!direct) {
       int const error = errno;  // before a message allocates
+      if (writable && error == EXDEV) {
+        throw descriptor_mismatch_error(what + ": identity_descriptor_mismatch for '" + path + "'");
+      }
       if (mode == compat::off) {
         throw std::system_error(
           error,
@@ -193,7 +205,7 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
  *
  * @p mode decides what a file that cannot use cuFile means: @c on never
  * registers, @c automatic falls back to POSIX for that file, @c off throws.
- * @p identity is the buffered fd's @c local_stat identity (see
+ * @p identity is a read-only object's @c local_stat identity (see
  * @ref cufile_io_object::identity).
  */
 [[nodiscard]] std::unique_ptr<cufile_io_object> register_with_cufile(std::string path,
@@ -201,6 +213,7 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
                                                                      file_descriptor direct,
                                                                      std::size_t file_size,
                                                                      compat mode,
+                                                                     io_access access,
                                                                      object_identity identity,
                                                                      std::string const& what)
 {
@@ -248,6 +261,7 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
                                               std::move(direct),
                                               handle,
                                               file_size,
+                                              access,
                                               std::move(identity));
   } catch (...) {
     deregister_cufile(handle);  // before the fds close as this frame unwinds
@@ -255,12 +269,288 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
   }
 }
 
+/// Full-range pwrite that retries EINTR and short writes; a 0-byte write is EIO.
+void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size_t offset)
+{
+  std::size_t completed = 0;
+  while (completed < bytes) {
+    auto const result =
+      ::pwrite(fd, source + completed, bytes - completed, static_cast<off_t>(offset + completed));
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      throw std::system_error(errno, std::generic_category(), "cufile_reactor: pwrite");
+    }
+    if (result == 0) {
+      throw std::system_error(std::make_error_code(std::errc::io_error),
+                              "cufile_reactor: pwrite wrote nothing");
+    }
+    completed += static_cast<std::size_t>(result);
+  }
+}
+
+/// Whether @p piece starts and ends on a multiple of @p granule.
+[[nodiscard]] bool is_granule_aligned(range piece, std::size_t granule) noexcept
+{
+  return piece.offset % granule == 0 && piece.size % granule == 0;
+}
+
 [[nodiscard]] bool is_block_aligned(void const* pointer) noexcept
 {
   return reinterpret_cast<std::uintptr_t>(pointer) % IO_BLOCK_SIZE == 0;
 }
 
+/**
+ * @brief Write @p piece from host memory @p source to @p file.
+ *
+ * Through the O_DIRECT fd when @p direct is set (the caller checked the piece is
+ * granule-aligned and the source block-aligned), falling back to the buffered fd
+ * when the filesystem refuses O_DIRECT at run time; through the buffered fd
+ * otherwise.
+ */
+void write_host_piece(cufile_io_object const& file,
+                      bool direct,
+                      std::uint8_t const* source,
+                      range piece)
+{
+  if (!direct) {
+    pwrite_all(file.buffered_fd(), source, piece.size, piece.offset);
+    return;
+  }
+  try {
+    pwrite_all(file.direct_fd(), source, piece.size, piece.offset);
+  } catch (std::system_error const& error) {
+    if (!uring::detail::is_odirect_runtime_error(error.code().value())) throw;
+    pwrite_all(file.buffered_fd(), source, piece.size, piece.offset);
+  }
+}
+
+/**
+ * @brief Process-wide table of the device ranges the reactors registered with
+ *        @c cuFileBufRegister, keyed by base address.
+ *
+ * cuFile identifies a registered buffer by its base pointer, so two transfers
+ * that pass the same base share one registration; deregistering it while the
+ * other transfer's I/O runs would pull it from under that I/O.  The table makes
+ * the sharing explicit (reference counted, the last user deregisters) and
+ * refuses a transfer whose range overlaps a live registration any other way.
+ */
+class registration_table {
+ public:
+  /// What a transfer may do with its buffer.
+  enum class grant {
+    unregistered,  ///< pass the exact pointer, cuFile bounces it
+    registered,    ///< pass the base and an offset; release() when done
+    conflict       ///< overlaps a live registration: do not use cuFile at all
+  };
+
+  static registration_table& instance()
+  {
+    static registration_table table;
+    return table;
+  }
+
+  /// Decide for a transfer of [@p base, @p base + @p bytes); register it when
+  /// @p want_registration and nothing overlaps.  An unregistered grant is
+  /// recorded too (release it with @ref release_unregistered), so a later
+  /// registration never covers memory an unregistered transfer is using.
+  grant acquire(void const* base, std::size_t bytes, bool want_registration)
+  {
+    auto const begin = reinterpret_cast<std::uintptr_t>(base);
+    auto const end   = begin + bytes;
+    std::lock_guard lock(_mutex);
+    if (auto it = _live.find(begin); it != _live.end()) {
+      if (end > it->first + it->second.bytes) return grant::conflict;
+      ++it->second.users;
+      return grant::registered;
+    }
+    if (overlaps(begin, end)) return grant::conflict;
+    if (!want_registration || overlaps_unregistered(begin, end)) {
+      _unregistered.emplace(begin, bytes);
+      return grant::unregistered;
+    }
+    auto const* api = cufile_api::get();
+    if (api == nullptr) return grant::unregistered;
+    auto const status = api->buf_register(base, bytes, 0);
+    if (status.err != CU_FILE_SUCCESS) {
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true, std::memory_order_relaxed)) {
+        CUCASCADE_LOG_WARN(
+          "cufile_reactor: cuFileBufRegister of {} bytes failed (err={}); transferring "
+          "unregistered (logged once per process)",
+          bytes,
+          static_cast<int>(status.err));
+      }
+      // Registered by someone outside the table: its owner may deregister it at
+      // any time, so keep cuFile away from it.
+      if (status.err == CU_FILE_MEMORY_ALREADY_REGISTERED) return grant::conflict;
+      _unregistered.emplace(begin, bytes);
+      return grant::unregistered;
+    }
+    try {
+      _live.emplace(begin, entry{bytes, 1});
+    } catch (...) {
+      // Never leave a registration the table does not know about.
+      std::ignore = api->buf_deregister(base);
+      throw;
+    }
+    ++_created;
+    return grant::registered;
+  }
+
+  /// Drop one user of the registration at @p base; the last one deregisters.
+  void release(void const* base) noexcept
+  {
+    std::lock_guard lock(_mutex);
+    auto it = _live.find(reinterpret_cast<std::uintptr_t>(base));
+    if (it == _live.end() || --it->second.users != 0) return;
+    _live.erase(it);
+    // A live registration implies the library loaded, so the table is present.
+    if (auto const* api = cufile_api::get(); api != nullptr) {
+      std::ignore = api->buf_deregister(base);
+    }
+  }
+
+  /// End an unregistered transfer of [@p base, @p base + @p bytes).
+  void release_unregistered(void const* base, std::size_t bytes) noexcept
+  {
+    std::lock_guard lock(_mutex);
+    auto const range = _unregistered.equal_range(reinterpret_cast<std::uintptr_t>(base));
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second == bytes) {
+        _unregistered.erase(it);
+        return;
+      }
+    }
+  }
+
+  [[nodiscard]] std::size_t live() const
+  {
+    std::lock_guard lock(_mutex);
+    return _live.size();
+  }
+
+  /// Registrations created so far (tests).
+  [[nodiscard]] std::size_t created() const
+  {
+    std::lock_guard lock(_mutex);
+    return _created;
+  }
+
+  /// Whether [base, base + bytes) overlaps a live registration or an
+  /// unregistered transfer in flight (tests).
+  [[nodiscard]] bool tracked(void const* base, std::size_t bytes) const
+  {
+    auto const begin = reinterpret_cast<std::uintptr_t>(base);
+    std::lock_guard lock(_mutex);
+    return overlaps(begin, begin + bytes) || overlaps_unregistered(begin, begin + bytes);
+  }
+
+ private:
+  struct entry {
+    std::size_t bytes;
+    std::size_t users;
+  };
+
+  /// Whether [begin, end) overlaps a live registration (caller holds the lock).
+  [[nodiscard]] bool overlaps(std::uintptr_t begin, std::uintptr_t end) const
+  {
+    auto it = _live.lower_bound(begin);
+    if (it != _live.end() && it->first < end) return true;
+    if (it == _live.begin()) return false;
+    --it;
+    return it->first + it->second.bytes > begin;
+  }
+
+  /// Whether [begin, end) overlaps an unregistered transfer in flight (caller
+  /// holds the lock).  Few transfers are in flight at once: a scan is enough.
+  [[nodiscard]] bool overlaps_unregistered(std::uintptr_t begin, std::uintptr_t end) const
+  {
+    return std::any_of(_unregistered.begin(), _unregistered.end(), [&](auto const& transfer) {
+      return transfer.first < end && transfer.first + transfer.second > begin;
+    });
+  }
+
+  mutable std::mutex _mutex;
+  std::map<std::uintptr_t, entry> _live;
+  std::multimap<std::uintptr_t, std::size_t> _unregistered;
+  std::size_t _created{0};
+};
+
+/**
+ * @brief The registration decision for one cuFile transfer, released on
+ *        destruction -- before the transfer's request settles, so the caller may
+ *        free the buffer as soon as its future resolves.
+ *
+ * Every non-empty transfer consults the table, whatever @p min_bytes: the table
+ * is process-wide, so another context with registration enabled must see this
+ * transfer before it registers (and later deregisters) memory it uses.  One
+ * that is at least @p min_bytes (0 = never) and whose buffer is 4 KiB-aligned
+ * registers (or shares a live registration at the same base); one that
+ * overlaps a live registration otherwise is a conflict the caller serves
+ * without cuFile; any other is recorded as an unregistered transfer.
+ */
+class transfer_registration {
+ public:
+  transfer_registration(void const* base,
+                        std::size_t bytes,
+                        bool aligned,
+                        std::size_t min_bytes) noexcept
+  {
+    if (bytes == 0) return;
+    bool const want = min_bytes != 0 && aligned && bytes >= min_bytes &&
+                      reinterpret_cast<std::uintptr_t>(base) % IO_BLOCK_SIZE == 0;
+    try {
+      _grant = registration_table::instance().acquire(base, bytes, want);
+    } catch (...) {
+      _grant = registration_table::grant::conflict;
+    }
+    if (_grant != registration_table::grant::conflict) {
+      _base  = base;
+      _bytes = bytes;
+    }
+  }
+
+  ~transfer_registration()
+  {
+    if (_base == nullptr) return;
+    if (registered()) {
+      registration_table::instance().release(_base);
+    } else {
+      registration_table::instance().release_unregistered(_base, _bytes);
+    }
+  }
+
+  transfer_registration(transfer_registration const&)            = delete;
+  transfer_registration& operator=(transfer_registration const&) = delete;
+
+  [[nodiscard]] bool registered() const noexcept
+  {
+    return _grant == registration_table::grant::registered;
+  }
+  [[nodiscard]] bool conflict() const noexcept
+  {
+    return _grant == registration_table::grant::conflict;
+  }
+
+ private:
+  registration_table::grant _grant{registration_table::grant::unregistered};
+  void const* _base{nullptr};  ///< set when the table recorded this transfer
+  std::size_t _bytes{0};
+};
+
 /// Test seams (see cufile/detail.hpp).
+std::atomic<bool> cufile_writes_in_compat{false};
+std::atomic<void (*)(void*)> cufile_transfer_hook{nullptr};
+std::atomic<void*> cufile_transfer_hook_arg{nullptr};
+
+/// Tests only: run the installed hook before a cuFile read or write call.
+void run_cufile_transfer_hook() noexcept
+{
+  if (auto* hook = cufile_transfer_hook.load(std::memory_order_acquire); hook != nullptr) {
+    hook(cufile_transfer_hook_arg.load(std::memory_order_acquire));
+  }
+}
+std::atomic<std::size_t> cufile_write_calls{0};
 std::atomic<std::int64_t> staging_copy_delay_us{0};
 std::atomic<bool> fail_copy_event_record{false};
 
@@ -333,6 +623,19 @@ class scratch_pool {
   std::mutex _mutex;
   std::vector<std::uint8_t*> _free;
 };
+
+/// Smallest host-write body worth an O_DIRECT write from the caller's buffer:
+/// below it, a synchronous O_DIRECT write per slice leaves the device idle
+/// between slices, and the page cache with early writeback is faster.
+constexpr std::size_t min_direct_host_write = 4UL << 20;
+
+/// Start writeback of @p rng (written through the page cache) without waiting
+/// for it.  Best effort: a failure only means the data is written back later.
+void start_writeback(int fd, range rng) noexcept
+{
+  std::ignore = ::sync_file_range(
+    fd, static_cast<off_t>(rng.offset), static_cast<off_t>(rng.size), SYNC_FILE_RANGE_WRITE);
+}
 
 /// Short reads tolerated in a row before a device slice is declared failed.
 constexpr int max_short_reads = 64;
@@ -450,16 +753,20 @@ cufile_io_object::cufile_io_object(std::string path,
                                    file_descriptor direct_fd,
                                    CUfileHandle_t cufile_handle,
                                    std::size_t file_size,
+                                   io_access access,
                                    object_identity identity)
   : _path(std::move(path)),
     _buffered_fd(std::move(buffered_fd)),
     _direct_fd(std::move(direct_fd)),
     _cufile_handle(cufile_handle),
-    _file_size(file_size)
+    _file_size(file_size),
+    _access(access)
 {
-  if (identity.kind == identity_kind::local_stat) {
-    _identity  = std::move(identity);
-    _file_size = static_cast<std::size_t>(_identity->size);
+  // A writable object's bytes change as it is written: it never carries a
+  // reusable identity, and keeps the size it was opened with.
+  if (!writable() && identity.kind == identity_kind::local_stat) {
+    _identity = std::move(identity);
+    _file_size.store(static_cast<std::size_t>(_identity->size), std::memory_order_relaxed);
   }
 }
 
@@ -616,7 +923,13 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object(
     }
     // Reopen the owned descriptor, not the pathname: a concurrent rename must
     // not pair the buffered fd with a different O_DIRECT data file.
-    auto direct = open_direct_fd(path, buffered, use_odirect, mode, what);
+    auto direct = open_direct_fd(path,
+                                 buffered,
+                                 O_RDONLY | O_DIRECT | O_CLOEXEC,
+                                 /*writable=*/false,
+                                 use_odirect,
+                                 mode,
+                                 what);
 
     // Checked before registering with cuFile, so a retry never has a handle to drop.
     object_identity captured;
@@ -640,10 +953,76 @@ std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object(
                                 std::move(direct),
                                 file_size,
                                 mode,
+                                io_access::read_only,
                                 std::move(captured),
                                 what);
   }
   throw descriptor_mismatch_error(what + ": identity_descriptor_mismatch");
+}
+
+std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
+  std::string path, write_open_options options)
+{
+  return create_io_object_for_write(
+    std::move(path), options, /*use_odirect=*/true, /*compat_mode=*/std::nullopt);
+}
+
+std::unique_ptr<cufile_io_object> cufile_reactor::create_io_object_for_write(
+  std::string path, write_open_options options, bool use_odirect, std::optional<compat> compat_mode)
+{
+  auto const mode = resolve_compat_mode(compat_mode);
+  if (mode == compat::off && !use_odirect) {
+    throw std::invalid_argument(
+      "cufile_reactor::create_io_object_for_write: compat mode OFF enforces cuFile, which needs "
+      "O_DIRECT, but use_odirect is false");
+  }
+
+  int flags = O_RDWR | O_CLOEXEC;
+  switch (options.mode) {
+    case write_mode::create_or_truncate: flags |= O_CREAT | O_TRUNC; break;
+    case write_mode::create_or_open: flags |= O_CREAT; break;
+    case write_mode::open_existing: break;
+    case write_mode::create_new: flags |= O_CREAT | O_EXCL; break;
+  }
+  file_descriptor buffered{::open(path.c_str(), flags, options.permissions)};
+  if (!buffered) {
+    int const error = errno;  // before the message allocates
+    throw std::system_error(error,
+                            std::generic_category(),
+                            "cufile_reactor::create_io_object_for_write: open '" + path + "'");
+  }
+  constexpr auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+  if (options.size_hint != 0 && options.size_hint <= max_offset) {
+    // Best effort: a filesystem without preallocation simply grows as it is written.
+    std::ignore =
+      ::fallocate(buffered.get(), FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(options.size_hint));
+  }
+  std::string const what = "cufile_reactor::create_io_object_for_write";
+  // The file exists now; the direct fd only adds O_DIRECT (no create / truncate).
+  // It reopens the owned buffered fd, so a concurrent rename cannot pair the two
+  // with different files; the create / truncate above is never repeated.
+  auto direct = open_direct_fd(path,
+                               buffered,
+                               O_RDWR | O_DIRECT | O_CLOEXEC,
+                               /*writable=*/true,
+                               use_odirect,
+                               mode,
+                               what);
+  struct stat stat_buffer{};
+  if (::fstat(buffered.get(), &stat_buffer) != 0) {
+    int const error = errno;  // before the message allocates
+    throw std::system_error(error, std::generic_category(), what + ": fstat");
+  }
+  auto const file_size = static_cast<std::size_t>(stat_buffer.st_size);
+  // A writable object never carries a reusable identity (see io_object::identity).
+  return register_with_cufile(std::move(path),
+                              std::move(buffered),
+                              std::move(direct),
+                              file_size,
+                              mode,
+                              io_access::read_write,
+                              object_identity{},
+                              what);
 }
 
 std::vector<byte_range> cufile_reactor::align_and_coalesce(
@@ -682,9 +1061,9 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
                                   "' was not created by this backend");
     }
 
-    // A device-only slice must not touch its buffer before the work queued on its
-    // stream before the call has finished.  Park it rather than block the worker
-    // on someone else's GPU work.
+    // A device-only slice (a read into or a write from device memory) must not
+    // touch its buffer before the work queued on its stream before the call has
+    // finished.  Park it rather than block the worker on someone else's GPU work.
     bool const device_only = slice.has_device_request() && !slice.has_host_request();
     if (device_only && !stream_ready && park_if_stream_busy(obj, slice, coordinator)) return;
 
@@ -697,6 +1076,22 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
       request->device_copy->req_rng   = slice.rng;
       request->device_copy->d_buffer  = slice.d_buffer;
       request->device_copy->device_id = slice.d_buffer.device_id;
+    }
+
+    if (slice.is_write() || slice.is_flush()) {
+      if (!file->writable()) {
+        throw std::system_error(
+          std::make_error_code(std::errc::bad_file_descriptor),
+          "cufile_reactor: '" + file->object_path() + "' was not opened for writing");
+      }
+      if (slice.is_flush()) {
+        request->kind = io_op_kind::flush;
+        flush(*file);
+        request->finish_success();
+      } else {
+        dispatch_write(*file, slice, *request);
+      }
+      return;
     }
 
     // Clamp to EOF up front so the terminal paths can trust request->io_rng.
@@ -764,8 +1159,11 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
   auto* const dst   = slice.d_buffer.data;
   std::optional<std::error_code> failure;
   {
-    // The destination is never registered with cuFile: each piece is addressed
-    // by its exact device pointer with a zero buffer offset.
+    // A registered range is addressed by its base plus an offset (cuFile requires
+    // the registered base); an unregistered one by the exact pointer.
+    transfer_registration const registration{
+      dst, request->io_rng.size, offset % IO_BLOCK_SIZE == 0, _config.register_min_bytes};
+    if (registration.conflict()) return false;
     auto pos        = offset;
     int short_reads = 0;
     while (pos < end) {
@@ -774,9 +1172,16 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
         break;
       }
       auto const want = detail::next_piece(pos, end, file.size(), _config.max_op_bytes);
-      errno           = 0;
+      run_cufile_transfer_hook();
+      errno = 0;
       auto const got =
-        api->read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
+        registration.registered()
+          ? api->read(file.cufile_handle(),
+                      dst,
+                      want,
+                      static_cast<off_t>(pos),
+                      static_cast<off_t>(pos - offset))
+          : api->read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
       if (got < 0) {
         auto const saved_errno = errno;
         static std::atomic<bool> logged{false};
@@ -1068,6 +1473,258 @@ cufile_reactor::owned_stream::~owned_stream()
   }
 }
 
+// ---------------------------------------------------------------------------
+// cufile_reactor: writes
+// ---------------------------------------------------------------------------
+
+std::size_t cufile_reactor::host_write(cufile_io_object const& file,
+                                       std::size_t offset,
+                                       std::size_t size,
+                                       std::uint8_t const* source)
+{
+  if (!file.writable()) {
+    throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
+                            "cufile_reactor::host_write: object was not opened for writing");
+  }
+  if (size == 0) return 0;
+  if (source == nullptr) throw std::invalid_argument("cufile_reactor::host_write: null source");
+
+  bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+  auto const granule   = write_granule();
+  for (auto const& piece : uring::detail::split_write_range(range{offset, size}, granule)) {
+    if (piece.empty()) continue;
+    auto const* src = source + (piece.offset - offset);
+    write_host_piece(
+      file, direct_fd && is_granule_aligned(piece, granule) && is_block_aligned(src), src, piece);
+  }
+  file.note_written(offset + size);
+  return size;
+}
+
+void cufile_reactor::flush(cufile_io_object const& file)
+{
+  if (!file.writable()) {
+    throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
+                            "cufile_reactor::flush: object was not opened for writing");
+  }
+  while (::fdatasync(file.buffered_fd()) != 0) {
+    if (errno == EINTR) continue;
+    throw std::system_error(errno, std::generic_category(), "cufile_reactor::flush: fdatasync");
+  }
+}
+
+void cufile_reactor::dispatch_write(cufile_io_object const& file,
+                                    prepared_io_slice const& slice,
+                                    io_op_request& request)
+{
+  request.kind       = io_op_kind::write;
+  request.io_rng     = slice.rng;  // writes are never clamped: they may extend the file
+  auto const granule = write_granule();
+  auto const pieces  = uring::detail::split_write_range(slice.rng, granule);
+
+  if (!slice.has_device_request()) {
+    auto* const source = std::get<std::uint8_t*>(slice.h_buffer.buffer);
+    if (source == nullptr) throw std::invalid_argument("cufile_reactor: null write source");
+    bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+    bool const congruent = is_block_aligned(source + (pieces[1].offset - slice.rng.offset));
+    if (direct_fd && congruent && pieces[1].size >= min_direct_host_write) {
+      // A large body that lines up with its source goes O_DIRECT straight from it,
+      // head and tail through the page cache.
+      for (auto const& piece : pieces) {
+        if (piece.empty()) continue;
+        auto const* src = source + (piece.offset - slice.rng.offset);
+        write_host_piece(file, is_granule_aligned(piece, granule), src, piece);
+      }
+    } else {
+      // Otherwise (e.g. 1 MiB pinned pool blocks, 8 B-aligned or not) the whole
+      // slice goes through the page cache and its writeback starts at once: the
+      // kernel's copy then overlaps the device write of earlier slices, where a
+      // synchronous O_DIRECT write leaves the device idle between slices (and an
+      // unaligned source would first need a staging copy).  Measured, one writer
+      // of 1 MiB slices into a fresh file: about 5.3 GB/s this way against
+      // 3.0-4.3 GB/s O_DIRECT (docs/io/gpuio-gds-practices.md section 8).
+      write_host_piece(file, /*direct=*/false, source, slice.rng);
+      start_writeback(file.buffered_fd(), slice.rng);
+    }
+    request.finish_success();
+    return;
+  }
+
+  int device_id = slice.d_buffer.device_id;
+  if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+
+  // The granule-aligned body goes to cuFile (whatever the source pointer's
+  // alignment: cuFile bounces an unaligned one inside the GPU); the sub-granule
+  // head and tail, and a body cuFile cannot or should not take, are staged.
+  auto const& body = pieces[1];
+  std::array<range, 3> staged{pieces[0], range{}, pieces[2]};
+  // In compatibility mode (including one forced by the environment) cuFile
+  // bounces through host memory anyway, and staging measured faster for extending
+  // writes: keep cuFileWrite for real GDS.
+  bool const use_cufile =
+    gds_available() || cufile_writes_in_compat.load(std::memory_order_relaxed);
+  bool const try_cufile =
+    file.cufile_registered() && use_cufile && !body.empty() && body.size >= _config.gds_threshold;
+  if (try_cufile) {
+    // The slice passed its stream gate in dispatch_slice, so the work queued on
+    // the source's stream before the call has finished: cuFile may read it.
+    if (!write_cufile(file, slice.d_buffer.data + (body.offset - slice.rng.offset), body)) {
+      staged[1] = body;
+    }
+  } else {
+    staged[1] = body;
+  }
+  write_device_staged(file, slice, staged, device_id);
+  request.finish_success();
+}
+
+bool cufile_reactor::write_cufile(cufile_io_object const& file,
+                                  std::uint8_t const* source,
+                                  range piece)
+{
+  auto const* api = cufile_api::get();
+  if (api == nullptr) return false;
+
+  auto const max_op = _config.max_op_bytes - _config.max_op_bytes % IO_BLOCK_SIZE;
+  // Deregistered when this function returns or throws, before the request settles.
+  transfer_registration const registration{
+    source, piece.size, /*aligned=*/true, _config.register_min_bytes};
+  if (registration.conflict()) return false;
+  std::size_t done = 0;
+  int short_writes = 0;
+  while (done < piece.size) {
+    if (_stop_source.stop_requested()) {
+      throw std::system_error(canceled_error(), "cufile_reactor: write canceled by shutdown");
+    }
+    auto const want = std::min(max_op, piece.size - done);
+    cufile_write_calls.fetch_add(1, std::memory_order_relaxed);
+    run_cufile_transfer_hook();
+    errno = 0;
+    auto const got =
+      registration.registered()
+        ? api->write(file.cufile_handle(),
+                     source,
+                     want,
+                     static_cast<off_t>(piece.offset + done),
+                     static_cast<off_t>(done))
+        : api->write(
+            file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
+    if (got < 0) {
+      auto const saved_errno = errno;
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true, std::memory_order_relaxed)) {
+        CUCASCADE_LOG_WARN(
+          "cufile_reactor: cuFileWrite of '{}' failed: {}; staging such writes through POSIX "
+          "(logged once per process)",
+          file.object_path(),
+          describe_cufile_failure(got, saved_errno));
+      }
+      return false;
+    }
+    if (got == 0 || static_cast<std::size_t>(got) > want || ++short_writes > max_short_reads) {
+      throw std::system_error(std::make_error_code(std::errc::io_error),
+                              "cufile_reactor: cuFileWrite wrote nothing or too much");
+    }
+    if (static_cast<std::size_t>(got) == want) short_writes = 0;
+    done += static_cast<std::size_t>(got);
+  }
+  return true;
+}
+
+void cufile_reactor::write_device_staged(cufile_io_object const& file,
+                                         prepared_io_slice const& slice,
+                                         std::span<range const> pieces,
+                                         int device_id)
+{
+  // Chunks of at most one scratch slot, never crossing a piece boundary, so a
+  // granule-aligned piece yields granule-aligned chunks (slot size is a multiple
+  // of every granule) that can go O_DIRECT.
+  std::vector<range> chunks;
+  for (auto const& piece : pieces) {
+    for (std::size_t done = 0; done < piece.size; done += scratch_slot_bytes) {
+      chunks.push_back(range{piece.offset + done, std::min(scratch_slot_bytes, piece.size - done)});
+    }
+  }
+  if (chunks.empty()) return;
+
+  auto* const scratch_base = scratch();
+  // The slice passed its stream gate (dispatch_slice), so the source's earlier
+  // work is done: the copies run on the reactor's own stream, where later work
+  // of the caller cannot hold the worker.
+  auto const stream    = copy_stream(device_id);
+  auto const granule   = write_granule();
+  bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+  static_assert(scratch_slots == 2, "one event per scratch slot below");
+  std::array<cucascade::cuda::cuda_event, scratch_slots> copied{
+    cucascade::cuda::cuda_event{cudaEventDisableTiming},
+    cucascade::cuda::cuda_event{cudaEventDisableTiming}};
+  std::array<bool, scratch_slots> pending{};
+  // Wait for every copy issued so far.  When a slot's event cannot be waited on,
+  // fall back to the whole (reactor-owned) copy stream: the scratch must not be
+  // released, nor the request settle, while a copy may still fill it.
+  auto drain = [&]() noexcept {
+    auto status = cudaSuccess;
+    for (std::size_t slot = 0; slot < scratch_slots; ++slot) {
+      if (!pending[slot]) continue;
+      pending[slot] = false;
+      if (auto const s = copied[slot].synchronize_no_throw(); s != cudaSuccess) status = s;
+    }
+    if (status != cudaSuccess) {
+      std::ignore = cudaStreamSynchronize(stream);
+      std::ignore = cudaGetLastError();
+    }
+  };
+  // D2H of chunk k into its slot.  The slot's previous chunk was written already.
+  auto stage = [&](std::size_t k) {
+    auto const slot = k % scratch_slots;
+    auto status     = delay_staging_copy(stream);
+    if (status == cudaSuccess) {
+      status = cudaMemcpyAsync(scratch_base + slot * scratch_slot_bytes,
+                               slice.d_buffer.data + (chunks[k].offset - slice.rng.offset),
+                               chunks[k].size,
+                               cudaMemcpyDeviceToHost,
+                               stream);
+    }
+    if (status == cudaSuccess) status = record_copy_event(copied[slot].get(), stream);
+    if (status != cudaSuccess) {
+      // This chunk's copy may be queued without an event to wait on (only the
+      // record failed): wait for the whole copy stream, which carries only this
+      // reactor's copies, before the scratch is released.
+      std::ignore = cudaStreamSynchronize(stream);
+      std::ignore = cudaGetLastError();
+      drain();
+      throw cucascade::cuda_error(std::string{"cufile_reactor: staging copy failed: "} +
+                                  cudaGetErrorString(status));
+    }
+    pending[slot] = true;
+  };
+
+  try {
+    stage(0);
+    for (std::size_t k = 0; k < chunks.size(); ++k) {
+      if (_stop_source.stop_requested()) {
+        throw std::system_error(canceled_error(), "cufile_reactor: write canceled by shutdown");
+      }
+      if (k + 1 < chunks.size()) stage(k + 1);  // overlaps the write of chunk k
+      auto const slot = k % scratch_slots;
+      pending[slot]   = false;
+      if (auto const status = copied[slot].synchronize_no_throw(); status != cudaSuccess) {
+        throw cucascade::cuda_error(std::string{"cufile_reactor: staging copy failed: "} +
+                                    cudaGetErrorString(status));
+      }
+      write_host_piece(file,
+                       direct_fd && is_granule_aligned(chunks[k], granule),
+                       scratch_base + slot * scratch_slot_bytes,
+                       chunks[k]);
+    }
+  } catch (...) {
+    // Never release the scratch to the next op while a copy may still fill it.
+    drain();
+    throw;
+  }
+}
+
 void cufile_reactor::poll_completions() noexcept
 {
   // Parked device slices whose stream reached the point recorded at dispatch.
@@ -1290,6 +1947,50 @@ std::size_t next_piece(std::size_t pos,
   auto const tail_start = align_down_block(file_size);
   if (stop == file_size && tail_start > pos && tail_start < stop) { stop = tail_start; }
   return stop - pos;
+}
+
+std::size_t live_registrations_for_testing() noexcept
+{
+  try {
+    return registration_table::instance().live();
+  } catch (...) {
+    return 0;
+  }
+}
+
+void set_cufile_transfer_hook_for_testing(void (*hook)(void*), void* arg) noexcept
+{
+  cufile_transfer_hook.store(nullptr, std::memory_order_release);
+  cufile_transfer_hook_arg.store(arg, std::memory_order_release);
+  cufile_transfer_hook.store(hook, std::memory_order_release);
+}
+
+bool transfer_tracked_for_testing(void const* base, std::size_t bytes) noexcept
+{
+  try {
+    return registration_table::instance().tracked(base, bytes);
+  } catch (...) {
+    return false;
+  }
+}
+
+std::size_t registrations_created_for_testing() noexcept
+{
+  try {
+    return registration_table::instance().created();
+  } catch (...) {
+    return 0;
+  }
+}
+
+void set_cufile_writes_in_compat_for_testing(bool enabled) noexcept
+{
+  cufile_writes_in_compat.store(enabled, std::memory_order_relaxed);
+}
+
+std::size_t cufile_write_calls_for_testing() noexcept
+{
+  return cufile_write_calls.load(std::memory_order_relaxed);
 }
 
 void set_staging_copy_delay_for_testing(std::chrono::microseconds delay) noexcept
