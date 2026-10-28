@@ -362,7 +362,109 @@ struct device_cpy_request {
       return cudaErrorUnknown;
     }
   }
+
+  /**
+   * @brief Copy the device source bytes of @p io_rng into host staging (writes).
+   *
+   * The mirror of @ref copy_async: @p io_rng must lie inside @c req_rng, and
+   * @p host_buf receives its bytes in order.  The copies are enqueued on
+   * @c d_buffer.stream, so they read the source after all work queued there
+   * before this call; the optional @p event is recorded after the last copy.
+   */
+  [[nodiscard]] cudaError_t copy_to_host_async(range io_rng,
+                                               std::span<iovec const> host_buf,
+                                               cudaEvent_t event = nullptr) const noexcept
+  {
+    try {
+      if (d_buffer.data == nullptr) return cudaErrorInvalidValue;
+      if (io_rng.empty()) return cudaErrorInvalidValue;
+      if (io_rng.offset < req_rng.offset || io_rng.end() > req_rng.end()) {
+        return cudaErrorInvalidValue;
+      }
+
+      int target_device = device_id >= 0 ? device_id : d_buffer.device_id;
+      if (target_device < 0) {
+        auto const status = cudaGetDevice(&target_device);
+        if (status != cudaSuccess) return status;
+      }
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{target_device}};
+
+      auto const* device_src = d_buffer.data + (io_rng.offset - req_rng.offset);
+      std::size_t copied     = 0;
+      std::size_t remaining  = io_rng.size;
+
+      cucascade::cuda::device_copy_batch batch;
+      batch.reserve(host_buf.size());
+      for (auto const& entry : host_buf) {
+        if (remaining == 0) break;
+        auto const bytes = std::min(entry.iov_len, remaining);
+        if (bytes == 0) continue;
+        batch.add(entry.iov_base, device_src + copied, bytes);
+        copied += bytes;
+        remaining -= bytes;
+      }
+
+      if (remaining != 0) return cudaErrorInvalidValue;
+      auto const copy_status = batch.enqueue(d_buffer.stream);
+      if (copy_status != cudaSuccess) return copy_status;
+      return event == nullptr ? cudaSuccess : cudaEventRecord(event, d_buffer.stream.get());
+    } catch (...) {
+      return cudaErrorUnknown;
+    }
+  }
 };
+
+/**
+ * @brief Validate the write slices of one request.
+ *
+ * Every slice must be a non-empty write with exactly one non-null source: a
+ * contiguous host buffer or a device buffer (never fragmented, never both).
+ * Ranges must neither overflow nor exceed the largest @c off_t, and must not
+ * overlap each other (any order is accepted).
+ *
+ * @return Total bytes over all slices.
+ * @throws std::invalid_argument when a slice breaks one of the rules above.
+ * @throws std::overflow_error when the total byte count overflows.
+ */
+[[nodiscard]] inline std::size_t validate_write_slices(std::span<prepared_io_slice const> slices)
+{
+  constexpr auto max_end = static_cast<std::size_t>(std::numeric_limits<off_t>::max());
+  std::vector<range> ranges;
+  ranges.reserve(slices.size());
+  std::size_t total = 0;
+  for (auto const& slice : slices) {
+    if (!slice.is_write()) throw std::invalid_argument("write request holds a non-write slice");
+    if (slice.size() == 0) throw std::invalid_argument("write slice is empty");
+    if (slice.is_fragmented()) {
+      throw std::invalid_argument("write slice source cannot be a cache buffer");
+    }
+    bool const host   = slice.is_contiguous();
+    bool const device = slice.has_device_request();
+    if (host == device) {
+      throw std::invalid_argument("write slice needs exactly one host or device source");
+    }
+    if (host && std::get<std::uint8_t*>(slice.h_buffer.buffer) == nullptr) {
+      throw std::invalid_argument("write slice source is null");
+    }
+    if (slice.size() > max_end || slice.offset() > max_end - slice.size()) {
+      throw std::invalid_argument("write slice range exceeds the largest file offset");
+    }
+    if (slice.size() > std::numeric_limits<std::size_t>::max() - total) {
+      throw std::overflow_error("write byte count overflow");
+    }
+    total += slice.size();
+    ranges.push_back(slice.rng);
+  }
+  std::sort(ranges.begin(), ranges.end(), [](range const& lhs, range const& rhs) {
+    return lhs.offset < rhs.offset;
+  });
+  for (std::size_t i = 1; i < ranges.size(); ++i) {
+    if (ranges[i].offset < ranges[i - 1].end()) {
+      throw std::invalid_argument("write slices overlap");
+    }
+  }
+  return total;
+}
 
 /**
  * @brief Backend-neutral physical operation produced by a reactor worker.
@@ -370,9 +472,15 @@ struct device_cpy_request {
  * Reactor-specific transfer state may be retained through @ref staging_owner.
  * Every terminal path must call exactly one of finish_success/finish_error;
  * the cache callback runs before the final coordinator decrement.
+ *
+ * For a write (@c kind == io_op_kind::write) @ref io_rng is the exact file
+ * range the operation wrote; @ref finish_success first raises the object's
+ * size to its end (@c io_object::note_written), so a reactor reports a write
+ * as successful only once every byte of @ref io_rng is in the file.
  */
 struct io_op_request {
   std::shared_ptr<const io_object> obj;
+  io_op_kind kind{io_op_kind::read};
   range io_rng;
   std::vector<iovec> iovecs;
   std::shared_ptr<void> staging_owner;
@@ -384,6 +492,7 @@ struct io_op_request {
   void finish_success() noexcept
   {
     if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
+    if (kind == io_op_kind::write && obj != nullptr) { obj->note_written(io_rng.end()); }
     if (on_complete != nullptr) { (*on_complete)(completion_chunks, true); }
     coordinator->on_complete();
   }
