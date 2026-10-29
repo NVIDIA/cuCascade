@@ -20,9 +20,11 @@
 // write API (open_io_object_for_write, host / device writes, flush) against the loopback
 // server's in-memory object store, signed by the SigV4 authorizers.
 
+#include "io/rest/worker/upload.hpp"
 #include "rest_contract_test_utils.hpp"
 
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
 #include <cucascade/io/rest/s3/static_credentials.hpp>
@@ -38,10 +40,13 @@
 #include <catch2/catch_all.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -835,6 +840,125 @@ TEST_CASE("rest_ioctx writes concurrently from several threads on several reacto
     CHECK(server->upload_part_count() == 4);
     require_rest_bytes_equal(read_back(*ioctx, "shared.bin"), data);
   }
+}
+
+TEST_CASE("rest_ioctx starts a write's first request without waiting for a loop tick",
+          "[rest][write]")
+{
+  // A direct part submits CreateMultipartUpload and then UploadPart from inside the worker's
+  // dispatch pass; both must start in the wake-up that queued them.  Without that, nothing
+  // else wakes the idle loop and each write waits for the 1 s idle tick.
+  auto server = make_store();
+  auto ioctx  = make_write_ioctx(*server);
+  rest_shutdown_guard cleanup{*ioctx};
+  auto const data = rest_test_payload(part_bytes);
+  auto object     = ioctx->open_io_object_for_write(uri("first-write.bin"));
+  auto const t0   = std::chrono::steady_clock::now();
+  REQUIRE(ioctx->host_write(*object, 0, part_bytes, data.data()) == part_bytes);
+  auto const elapsed = std::chrono::steady_clock::now() - t0;
+  CHECK(elapsed < 500ms);
+  ioctx->flush(*object);
+  require_stored(*server, "first-write.bin", data);
+}
+
+namespace {
+
+/// Delegates to @p inner, except that the first authorization of @p key blocks until
+/// @ref release and then fails (credential_error): the worker is held inside its dispatch pass
+/// and the call settles without network activity.
+class gated_authorizer final : public cucascade::io::rest::request_authorizer {
+ public:
+  gated_authorizer(std::shared_ptr<cucascade::io::rest::request_authorizer> inner, std::string key)
+    : _inner(std::move(inner)), _key(std::move(key))
+  {
+  }
+
+  cucascade::io::rest::authorized_request authorize(cucascade::io::rest::object_ref const& obj,
+                                                    cucascade::io::rest::request_method method,
+                                                    std::chrono::seconds timeout) override
+  {
+    gate(obj);
+    return _inner->authorize(obj, method, timeout);
+  }
+  cucascade::io::rest::authorized_request authorize_request(
+    cucascade::io::rest::request_spec const& spec, std::chrono::seconds timeout) override
+  {
+    gate(spec.object);
+    return _inner->authorize_request(spec, timeout);
+  }
+
+  bool wait_entered(std::chrono::milliseconds timeout)
+  {
+    std::unique_lock lock(_mutex);
+    return _cv.wait_for(lock, timeout, [this] { return _entered; });
+  }
+  void release()
+  {
+    {
+      std::lock_guard lock(_mutex);
+      _released = true;
+    }
+    _cv.notify_all();
+  }
+
+ private:
+  void gate(cucascade::io::rest::object_ref const& obj)
+  {
+    if (obj.key != _key || _used.exchange(true)) return;
+    std::unique_lock lock(_mutex);
+    _entered = true;
+    _cv.notify_all();
+    _cv.wait(lock, [this] { return _released; });
+    throw cucascade::io::credential_error("gated_authorizer: refused");
+  }
+
+  std::shared_ptr<cucascade::io::rest::request_authorizer> _inner;
+  std::string _key;
+  std::atomic<bool> _used{false};
+  std::mutex _mutex;
+  std::condition_variable _cv;
+  bool _entered{false};
+  bool _released{false};
+};
+
+}  // namespace
+
+TEST_CASE("rest reactor serves write mail posted during its dispatch pass without a tick",
+          "[rest][write]")
+{
+  // Write mail (a write parked on this reactor resumed by another one's CreateMultipartUpload,
+  // an abort) can arrive after the pass's handle_mail; the loop must not then park on it until
+  // its next tick (idle: 1 s).  The authorizer holds the worker inside dispatch while the mail
+  // is posted; the held call then fails at once, so no CQE wakes the loop either.
+  auto server = make_store();
+  auto gate =
+    std::make_shared<gated_authorizer>(make_authorizer(*server, signing::presigned), "gate");
+  auto context = std::make_shared<rest_reactor::reactor_context>(write_config(), gate, nullptr);
+  rest_reactor reactor(context);
+  reactor.start();
+
+  std::thread head([&] {
+    try {
+      std::ignore = reactor.head_object("bkt", "gate");
+    } catch (...) {  // the gated authorization fails, by design
+    }
+  });
+  bool const entered = gate->wait_entered(5s);
+  if (!entered) gate->release();
+  REQUIRE(entered);
+  auto box = reactor.write_inbox().lock();
+  REQUIRE(box != nullptr);
+  cucascade::io::rest::detail::mail m;
+  m.what      = cucascade::io::rest::detail::resume_kind::abort_upload;
+  m.object    = cucascade::io::rest::object_ref{"bkt", "orphan.bin"};
+  m.upload_id = "orphan-upload";
+  REQUIRE(box->post(m));
+  auto const t0 = std::chrono::steady_clock::now();
+  gate->release();
+  head.join();
+  REQUIRE(eventually([&] { return count_requests(*server, write_kind::abort_upload) == 1; }));
+  CHECK(std::chrono::steady_clock::now() - t0 < 500ms);
+  reactor.shutdown();
 }
 
 TEST_CASE("rest_ioctx flush_async commits on any reactor and is idempotent", "[rest][write]")

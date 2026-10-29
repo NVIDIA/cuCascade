@@ -482,10 +482,15 @@ std::uint64_t engine::pump() noexcept
   retire_copies();
   handle_mail();
   dispatch();
-  // Jobs that finished during this pump (e.g. a call failed before it was sent) wait in the
-  // graveyard for the next pump: run it without blocking, so what they hold -- an upload whose
-  // last reference aborts it -- is released now rather than when the next request arrives.
-  if (!_graveyard.empty()) return 0;
+  // Runnable now, so the next pass must not park:
+  //  - jobs that finished during this pump (e.g. a call failed before it was sent) wait in the
+  //    graveyard, and what they hold -- an upload whose last reference aborts it -- must be
+  //    released now rather than when the next request arrives;
+  //  - calls submitted during dispatch (a write's CreateMultipartUpload / UploadPart from
+  //    start_new, a call settled synchronously by start_calls whose completion queued the next
+  //    one) wait in _calls.
+  // start_calls() drains _calls every pass (each call is requeued or failed), so this cannot spin.
+  if (!_graveyard.empty() || !_calls.empty()) return 0;
   if (_copies.empty()) return net::uring_loop::no_bound;
   auto const due = _copies.next_due_ns();
   auto const now = _loop.now_ns();

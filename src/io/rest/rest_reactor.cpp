@@ -264,8 +264,13 @@ class rest_reactor::worker {
           calls.clear();
           warm.clear();
         }
+        // Every producer's work, re-checked after the parked flag is published (Dekker):
+        // the intake flag, and write mail -- posted by another reactor, or by this one during
+        // dispatch, after this pass's handle_mail.  `mailbox::post` counts the mail before it
+        // notifies, so mail is either seen here or the loop is woken.
         e->pass([this, &st]() noexcept {
-          return _has_work.load(std::memory_order_acquire) || st.stop_requested();
+          return _has_work.load(std::memory_order_acquire) || !_inbox->empty() ||
+                 st.stop_requested();
         });
         auto const now = std::chrono::steady_clock::now();
         if (now - last_publish >= std::chrono::milliseconds{100}) {
