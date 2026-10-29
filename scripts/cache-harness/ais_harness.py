@@ -126,17 +126,17 @@ def request(state, method, path, *, headers=None, body=None, follow=True, target
     raise RuntimeError("redirect hop limit exceeded")
 
 
-def snapshot(run, label, method, path, **kwargs):
+def snapshot(run, label, method, path, *, save_body=False, **kwargs):
     result, body = request(state_for(run), method, path, **kwargs)
     origin.save(run / f"{label}.json", result)
-    if body and result["status"] >= 400:
+    if save_body or (body and result["status"] >= 400):
         (run / f"{label}.body").write_bytes(body)
     return result, body
 
 
 def stats(run, label):
     result, body = snapshot(
-        run, label, "GET", "/v1/daemon?what=node_stats", target=True
+        run, label, "GET", "/v1/daemon?what=node_stats", target=True, save_body=True
     )
     try:
         payload = json.loads(body)
@@ -146,7 +146,12 @@ def stats(run, label):
             # Pinned stats/common_prom.go omits zero-valued counters. Require
             # the metric registry to confirm the counter exists before using 0.
             names_result, names_body = snapshot(
-                run, label + "-names", "GET", "/v1/daemon?what=metrics", target=True
+                run,
+                label + "-names",
+                "GET",
+                "/v1/daemon?what=metrics",
+                target=True,
+                save_body=True,
             )
             names = json.loads(names_body)
             origin.save(run / f"{label}-names-payload.json", names)

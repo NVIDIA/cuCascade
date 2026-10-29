@@ -48,7 +48,7 @@ def main():
         files[str(file.relative_to(root))] = sha(file)
     binding = json.loads((root / args.build / "build.json").read_text())
     packet = dict(
-        schema=1,
+        schema=2,
         production_base=BASE,
         wire_dir=args.wire,
         root_dir=args.ais_root,

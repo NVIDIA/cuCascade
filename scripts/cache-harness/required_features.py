@@ -496,12 +496,15 @@ def checked_file(root, path, manifest):
 def evaluate(packet_path):
     root = packet_path.resolve().parent
     packet = read(packet_path)
-    if packet.get("schema") != 1 or packet.get("production_base") != BASE:
-        raise ValueError("unexpected profile schema/base")
+    if packet.get("schema") != 2 or packet.get("production_base") != BASE:
+        raise ValueError(
+            "unexpected profile schema/base: schema 2 requires captured stats/metrics bodies"
+        )
     manifest = packet["files"]
     for path in manifest:
         checked_file(root, path, manifest)
     load = lambda path: read(checked_file(root, path, manifest))
+    load_bytes = lambda path: checked_file(root, path, manifest).read_bytes()
     binding = load(packet["build_receipt"])
     if (
         binding["binary_sha256"] != packet["probe_sha256"]
@@ -594,7 +597,7 @@ def evaluate(packet_path):
         ):
             raise ValueError("AIS mode or cleanup mismatch")
         raw_statuses, raw_count, raw_response = ais_controls(
-            load, prefix, by_name, state
+            load, load_bytes, prefix, by_name, state
         )
         for label, source, name in (
             ("cucascade-ais", "A2-cucascade", "read"),

@@ -306,3 +306,35 @@ signals, deadline, normal completion and cleanup escalation; they are not fault
 tests against a real AIS cluster. Actual AIS root/reverse normal runs remain
 separate evidence. A successful expected-red check still never grants full
 feature qualification.
+
+
+### Stats/metrics evidence binding (packet schema 2)
+
+New H packets require captured `.body` bytes for every consumed stats response
+and for the metrics registry when an omitted counter must be established as zero.
+The evaluator checks the owned target URL, HTTP status, length and SHA256 against
+those bytes, parses unambiguous JSON, and compares the retained `-payload.json`
+with type-sensitive JSON equality before using counters. Every body and payload
+must be present in the packet manifest. Duplicate keys and nonfinite JSON values
+are rejected. Formatting and object-key order do not change JSON semantics.
+
+Schema 1 archives remain historical evidence. The current strict and expected-red
+baseline entry points reject them; do not synthesize missing response bytes from
+formatted JSON or re-label an old packet as schema 2. Collect a fresh AIS run.
+This consistency check does not authenticate a packet against an actor who can
+replace every observation and its manifest together.
+
+After collecting a valid schema-2 packet, run:
+
+```bash
+python3 -B scripts/cache-harness/test_required_evidence_binding.py "$RUN/packet.json" \
+  --results "$RUN/dx9-results.json"
+```
+
+The test first exercises actual loopback HTTP capture (a controlled JSON server,
+not AIStore), then mutates copies of the real packet through both evaluator CLIs.
+It covers stats, omitted-zero registry, and library cold-fill counters in both
+root and reverse modes, including missing/truncated bytes, upstream metadata,
+downstream payload, cross-mode and before/after mismatches. A normal packet and
+JSON reformatting controls must still produce the frozen engine's expected red
+qualification, with a successful baseline check; this never grants feature PASS.

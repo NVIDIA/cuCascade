@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Rejudge AIS controls from required HTTP, fixture and counter receipts."""
 import hashlib
+import json
 from urllib.parse import urlsplit
 
 
@@ -36,7 +37,56 @@ def http_response(value, state):
     return chain[-1]
 
 
-def ais_controls(load, prefix, summaries, state):
+def decode_json_body(body):
+    """Parse one unambiguous JSON observation, without duplicate/nonfinite values."""
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, "duplicate JSON key: " + key)
+            result[key] = value
+        return result
+
+    def invalid(value):
+        raise ValueError("nonfinite JSON value: " + value)
+
+    return json.loads(body, object_pairs_hook=pairs, parse_constant=invalid)
+
+
+def bound_payload(load, load_bytes, prefix, label, state, path):
+    """Bind a daemon response to captured bytes before trusting parsed counters."""
+    record = load(prefix + label + ".json")
+    terminal = http_response(record, state)
+    require(
+        len(record["chain"]) == 1
+        and terminal["url"] == state["target_endpoint"] + path
+        and terminal["status"] == 200,
+        label + ": daemon response endpoint/status mismatch",
+    )
+    body = load_bytes(prefix + label + ".body")
+    require(
+        type(terminal.get("length")) is int
+        and terminal["length"] == len(body)
+        and terminal.get("sha256") == hashlib.sha256(body).hexdigest(),
+        label + ": raw body length/hash mismatch",
+    )
+    try:
+        decoded = decode_json_body(body)
+    except ValueError as error:
+        raise ValueError(label + ": invalid raw JSON: " + str(error)) from error
+    payload = load(prefix + label + "-payload.json")
+    # Python equality alone equates True/1 and 1/1.0. Compare JSON types too,
+    # while permitting equivalent object order and whitespace in captured bytes.
+    require(
+        isinstance(decoded, dict)
+        and json.dumps(decoded, sort_keys=True, allow_nan=False)
+        == json.dumps(payload, sort_keys=True, allow_nan=False),
+        label + ": raw body/payload mismatch",
+    )
+    return decoded
+
+
+def ais_controls(load, load_bytes, prefix, summaries, state):
     """Return raw-derived statuses/count reader; missing required files raise."""
     bucket = state["bucket"]
     fixtures = load(prefix + "origin/fixtures.json")
@@ -75,11 +125,19 @@ def ais_controls(load, prefix, summaries, state):
         return terminal
 
     def count(label):
-        response(label, "/v1/daemon?what=node_stats", 200)
-        tracker = load(prefix + label + "-payload.json")["tracker"]
+        tracker = bound_payload(
+            load, load_bytes, prefix, label, state, "/v1/daemon?what=node_stats"
+        )["tracker"]
+        require(isinstance(tracker, dict), "invalid stats tracker")
         if "aws.get.n" not in tracker:
-            response(label + "-names", "/v1/daemon?what=metrics", 200)
-            registry = load(prefix + label + "-names-payload.json")
+            registry = bound_payload(
+                load,
+                load_bytes,
+                prefix,
+                label + "-names",
+                state,
+                "/v1/daemon?what=metrics",
+            )
             require(
                 registry.get("aws.get.n") == "counter",
                 "absent counter lacks metric registry",
