@@ -617,9 +617,9 @@ void engine::run_flush(std::shared_ptr<upload_session> up,
           zero_fill(pu.buffer->iov, pu.zero_fill);
           rq.body = sub_iovecs(pu.buffer->iov, 0, pu.size());
         } else if (pu.zeros && pu.size() != 0) {
-          auto z = zeros(pu.size());
-          if (z == nullptr) throw std::bad_alloc();
-          auto const* v = static_cast<std::vector<std::byte> const*>(z.get());
+          job->zeros = zeros(pu.size());
+          if (job->zeros == nullptr) throw std::bad_alloc();
+          auto const* v = static_cast<std::vector<std::byte> const*>(job->zeros.get());
           rq.body.push_back(
             iovec{const_cast<std::byte*>(v->data()), static_cast<std::size_t>(pu.size())});
           job->xml.clear();

@@ -232,6 +232,9 @@ struct flush_job {
   std::exception_ptr first_error;
   unsigned complete_attempts{0};
   std::string xml;
+  /// Owns a single PUT's zero body: request.body points into it for every attempt, and
+  /// engine::zeros() may replace its own buffer at any time.
+  std::shared_ptr<void const> zeros;
   call request;
 };
 
