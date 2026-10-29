@@ -318,7 +318,11 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
           "cufile_ioctx: a device read cannot be issued on a stream that is being captured");
       }
       std::shared_ptr<cucascade::cuda::cuda_event> gate;
-      auto const state = cudaStreamQuery(stream);
+      // The legacy default stream (also the null handle) orders after prior
+      // work on every blocking stream, which a query of it does not report:
+      // always record its event and query that instead.
+      bool const legacy = stream == nullptr || stream == cudaStreamLegacy;
+      auto const state  = legacy ? cudaErrorNotReady : cudaStreamQuery(stream);
       if (state == cudaErrorNotReady) {
         std::ignore       = cudaGetLastError();
         int stream_device = 0;
@@ -326,6 +330,18 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
         rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{stream_device}};
         gate = std::make_shared<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
         CUCASCADE_CUDA_TRY(cudaEventRecord(gate->get(), stream));
+        if (legacy) {
+          auto const recorded = cudaEventQuery(gate->get());
+          if (recorded == cudaSuccess) {
+            gate.reset();
+          } else if (recorded != cudaErrorNotReady) {
+            std::ignore = cudaGetLastError();
+            throw cucascade::cuda_error(std::string{"cufile_ioctx: cudaEventQuery failed: "} +
+                                        cudaGetErrorString(recorded));
+          } else {
+            std::ignore = cudaGetLastError();
+          }
+        }
       } else if (state != cudaSuccess) {
         std::ignore = cudaGetLastError();
         throw cucascade::cuda_error(std::string{"cufile_ioctx: cudaStreamQuery failed: "} +
