@@ -201,15 +201,33 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY
              "${CMAKE_CURRENT_BINARY_DIR}/fake_cuda_driver/incomplete")
 
+# A fake NVML, so the C2C query's NVML failure paths can be exercised on any
+# host.
+add_library(cucascade_fake_nvml SHARED fake_nvml.cpp)
+target_link_libraries(cucascade_fake_nvml PRIVATE CUDA::toolkit)
+set_target_properties(
+  cucascade_fake_nvml
+  PROPERTIES OUTPUT_NAME nvidia-ml
+             SOVERSION 1
+             LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fake_nvml")
+
+find_package(Threads REQUIRED)
 add_executable(cucascade_cuda_driver_loading_test cuda_driver_loading_test.cpp)
-target_link_libraries(cucascade_cuda_driver_loading_test
-                      PRIVATE cucascade_topology_discovery ${CMAKE_DL_LIBS})
+target_link_libraries(
+  cucascade_cuda_driver_loading_test
+  PRIVATE cucascade_topology_discovery CUDA::nvml_static Threads::Threads
+          ${CMAKE_DL_LIBS})
 # The test interposes dlopen to attribute CUDA driver loads to their caller.
 # Export it so every module resolves to the interposer, and compile as PIE so
 # the address of a shared-library function is its real definition rather than a
 # local PLT stub.
 set_target_properties(cucascade_cuda_driver_loading_test
                       PROPERTIES ENABLE_EXPORTS ON POSITION_INDEPENDENT_CODE ON)
+# Keep the NVML stub out of those exports: libnvidia-ml.so calls back into the
+# stub (https://nvbugspro.nvidia.com/bug/6174166), and resolving that callback
+# to this executable's stub deadlocks on the stub's lock.
+target_link_options(cucascade_cuda_driver_loading_test PRIVATE
+                    "LINKER:--exclude-libs,libnvidia-ml")
 
 function(add_cuda_driver_loading_test test_name fake_driver mode)
   add_test(
@@ -232,6 +250,47 @@ add_test(NAME cucascade_passive_discovery_does_not_load_driver
          COMMAND cucascade_cuda_driver_loading_test passive)
 add_cuda_driver_loading_test(cucascade_cuda_driver_loader_has_process_lifetime
                              cucascade_fake_cuda_driver_available shutdown)
+
+# C2C decisions against the fake NVML and the fake available CUDA driver. Each
+# test runs `c2c <expected c2c> <threads> <expected NVML C2C queries>` with the
+# fakes configured by the trailing environment settings.
+function(add_c2c_fake_nvml_test test_name expected_c2c threads nvml_queries)
+  add_test(
+    NAME ${test_name}
+    COMMAND
+      ${CMAKE_COMMAND} -E env --modify
+      "LD_LIBRARY_PATH=path_list_prepend:$<TARGET_FILE_DIR:cucascade_fake_cuda_driver_available>"
+      --modify
+      "LD_LIBRARY_PATH=path_list_prepend:$<TARGET_FILE_DIR:cucascade_fake_nvml>"
+      ${ARGN} -- $<TARGET_FILE:cucascade_cuda_driver_loading_test> c2c
+      ${expected_c2c} ${threads} ${nvml_queries})
+endfunction()
+
+add_c2c_fake_nvml_test(cucascade_c2c_nvml_false_overrides_driver 0 1 2
+                       CUCASCADE_FAKE_NVML_C2C=false)
+add_c2c_fake_nvml_test(
+  cucascade_c2c_nvml_true_overrides_failed_driver_attribute 1 1 2
+  CUCASCADE_FAKE_NVML_C2C=true
+  CUCASCADE_FAKE_CUDA_FAILING_ATTRIBUTE=host_native_atomics)
+add_c2c_fake_nvml_test(cucascade_c2c_nvml_not_supported_uses_driver 1 1 2
+                       CUCASCADE_FAKE_NVML_C2C=not_supported)
+add_c2c_fake_nvml_test(cucascade_c2c_nvml_unknown_error_uses_driver 1 1 2
+                       CUCASCADE_FAKE_NVML_C2C=unknown)
+add_c2c_fake_nvml_test(cucascade_c2c_nvml_init_failure_uses_driver 1 1 0
+                       CUCASCADE_FAKE_NVML_INIT_FAIL=1)
+add_c2c_fake_nvml_test(cucascade_c2c_nvml_handle_failure_uses_driver 1 1 0
+                       CUCASCADE_FAKE_NVML_HANDLE_FAIL=1)
+add_c2c_fake_nvml_test(
+  cucascade_c2c_failed_host_native_atomics_attribute_is_not_c2c 0 1 2
+  CUCASCADE_FAKE_NVML_C2C=not_supported
+  CUCASCADE_FAKE_CUDA_FAILING_ATTRIBUTE=host_native_atomics)
+add_c2c_fake_nvml_test(
+  cucascade_c2c_failed_host_page_tables_attribute_is_not_c2c 0 1 2
+  CUCASCADE_FAKE_NVML_C2C=not_supported
+  CUCASCADE_FAKE_CUDA_FAILING_ATTRIBUTE=host_page_tables)
+# A missing NVML function is asked once per process, even by concurrent callers.
+add_c2c_fake_nvml_test(cucascade_c2c_missing_nvml_function_queried_once 1 8 1
+                       CUCASCADE_FAKE_NVML_C2C=function_not_found)
 
 # Verify that topology discovery remains loadable on systems without the CUDA
 # driver. Shared libraries can be inspected directly. Static libraries need a
