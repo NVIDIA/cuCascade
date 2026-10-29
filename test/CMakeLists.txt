@@ -74,6 +74,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_iobuf_fragmented_sink.cpp
     io/test_object_identity.cpp
     io/test_semi_future_callback.cpp
+    io/test_null_stream_ptds.cpp
     io/test_templated_ioctx.cpp
     io/test_thread_pool_construction.cpp
     io/test_tiered_queue.cpp
@@ -109,6 +110,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
+  # A PTDS-built caller must still get legacy null-stream I/O ordering.
+  set_source_files_properties(
+    io/test_null_stream_ptds.cpp PROPERTIES COMPILE_DEFINITIONS
+                                            CUDA_API_PER_THREAD_DEFAULT_STREAM)
   # Tests of the io_uring REST transport modules.
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)

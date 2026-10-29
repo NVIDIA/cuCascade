@@ -690,7 +690,8 @@ TEST_CASE("uring device writes order after the caller's default streams", "[io][
   // The legacy default stream is the same from every thread.
   auto const [label, caller_stream] =
     GENERATE(std::pair{"per-thread default stream", cudaStreamPerThread},
-             std::pair{"legacy default stream", cudaStreamLegacy});
+             std::pair{"legacy default stream", cudaStreamLegacy},
+             std::pair{"null stream", cudaStream_t{nullptr}});
   CAPTURE(label);
   write_context ctx;
   scratch_path path;

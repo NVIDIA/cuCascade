@@ -114,6 +114,38 @@ bool eventually(Predicate predicate)
 }
 }  // namespace
 
+TEST_CASE("device dispatch canonicalizes default stream handles before enqueue",
+          "[io][templated_ioctx][cache][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    SKIP("requires a CUDA device");
+  }
+  auto const caller_stream = GENERATE(cudaStream_t{nullptr}, cudaStreamPerThread);
+  controlled_ioctx context;
+  context.start();
+  auto object = std::make_shared<controlled_object>("controlled://default-stream", read_size);
+  rmm::cuda_stream allocation_stream;
+  rmm::device_buffer destination{read_size, allocation_stream};
+  allocation_stream.synchronize();
+  std::array<cucascade::io::slice, 1> slices{
+    cucascade::io::slice{0, read_size, static_cast<std::uint8_t*>(destination.data())}};
+  auto future = context.device_readv_async_io(*object, slices, ::cuda::stream_ref{caller_stream});
+  held_request held;
+  held.request = context.backend().wait_take(2s);
+  REQUIRE(held.request != nullptr);
+  REQUIRE_FALSE(held.request->slices.empty());
+  for (auto const& slice : held.request->slices) {
+    REQUIRE(slice.has_device_request());
+    CHECK(slice.d_buffer.stream.get() != nullptr);
+    CHECK(slice.d_buffer.stream.get() != cudaStreamPerThread);
+    if (caller_stream == nullptr) { CHECK(slice.d_buffer.stream.get() == cudaStreamLegacy); }
+  }
+  held.complete(0x5a);
+  CHECK(std::move(future).get() == read_size);
+  context.shutdown();
+}
+
 TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
           "[cache][cache_handle][read-arbitration]")
 {
