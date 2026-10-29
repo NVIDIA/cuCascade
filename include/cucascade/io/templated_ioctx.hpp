@@ -117,21 +117,29 @@ class per_thread_stream_stand_in {
 };
 
 /**
- * @brief Replace every @c cudaStreamPerThread of @p slices' device requests by
- *        a stand-in stream ordered after the calling thread's per-thread
- *        default stream (one per device).  Must run on the submitting thread,
- *        before the slices reach a reactor.  Device ids must be resolved.
+ * @brief Resolve default streams on the submitting thread before any slice
+ *        reaches a reactor. Device ids must be resolved.
  *
- * The legacy default stream needs nothing: it is one stream per device, the
- * same from every thread, and synchronizes with every blocking stream.
+ * Pin null handles to @c cudaStreamLegacy, independent of how any translation
+ * unit was compiled. A PTDS caller's null stream is covered too: per-thread
+ * default streams are blocking streams, so legacy work orders after them.
+ * This over-orders behind the device's other blocking streams; PTDS callers
+ * should pass @c cudaStreamPerThread or an explicit stream for tight ordering.
+ * In a non-PTDS build this costs nothing and preserves null-stream semantics.
+ *
+ * Replace @c cudaStreamPerThread with a stand-in ordered after the submitting
+ * thread's per-thread default stream (one per device).
  */
-inline void resolve_per_thread_streams(std::vector<prepared_io_slice>& slices)
+inline void resolve_default_streams(std::vector<prepared_io_slice>& slices)
 {
   std::vector<std::shared_ptr<per_thread_stream_stand_in>> stand_ins;
   for (auto& slice : slices) {
-    if (!slice.has_device_request() || slice.d_buffer.stream.get() != cudaStreamPerThread) {
+    if (!slice.has_device_request()) continue;
+    if (slice.d_buffer.stream.get() == nullptr) {
+      slice.d_buffer.stream = ::cuda::stream_ref{cudaStreamLegacy};
       continue;
     }
+    if (slice.d_buffer.stream.get() != cudaStreamPerThread) continue;
     auto const device =
       slice.d_buffer.device_id >= 0 ? slice.d_buffer.device_id : current_cuda_device();
     std::shared_ptr<per_thread_stream_stand_in> stand_in;
@@ -709,7 +717,7 @@ class templated_ioctx : public ioctx {
   {
     // A device slice on the per-thread default stream must be ordered against
     // THIS thread's stream before a reactor worker sees it.
-    if (has_device_slice) detail::resolve_per_thread_streams(slices);
+    if (has_device_slice) detail::resolve_default_streams(slices);
 
     // One call site issues one priority, so the first slice speaks for the
     // request; stamp the resolved value on every slice so each queue entry

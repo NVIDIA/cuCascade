@@ -590,7 +590,8 @@ TEST_CASE("cufile device writes order after the caller's default streams",
   // default stream is the same from every thread.
   auto const [label, caller_stream] =
     GENERATE(std::pair{"per-thread default stream", cudaStreamPerThread},
-             std::pair{"legacy default stream", cudaStreamLegacy});
+             std::pair{"legacy default stream", cudaStreamLegacy},
+             std::pair{"null stream", cudaStream_t{nullptr}});
   auto const [path_label, cfg, force_cufile] = GENERATE(from_range(write_paths()));
   CAPTURE(label, path_label);
   force_cufile_writes const force{force_cufile};
