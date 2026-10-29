@@ -32,9 +32,11 @@
 #include "utils/test_memory_resources.hpp"
 
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
@@ -45,6 +47,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <vector>
 
@@ -605,5 +608,61 @@ SCENARIO("Host Reservation", "[memory_space][host_reservation]")
         REQUIRE(mr->get_total_allocated_bytes() == 0);
       }
     }
+  }
+}
+
+TEST_CASE("Memory space threshold getters report capacity times the configured fractions",
+          "[memory_space]")
+{
+  auto const expected = [](std::size_t capacity, double fraction) {
+    return static_cast<std::size_t>(static_cast<double>(capacity) * fraction);
+  };
+
+  SECTION("GPU")
+  {
+    gpu_memory_space_config config;
+    config.device_id                  = 0;
+    config.memory_capacity            = 3ull << 30;
+    config.reservation_limit_fraction = 0.9;
+    config.downgrade_trigger_fraction = 0.8;
+    config.downgrade_stop_fraction    = 0.6;
+    config.mr_factory_fn              = cucascade::test::make_shared_current_device_resource;
+    memory_space space{config};
+
+    REQUIRE(space.get_capacity() == config.memory_capacity);
+    REQUIRE(space.get_downgrade_trigger_threshold() == expected(config.memory_capacity, 0.8));
+    REQUIRE(space.get_downgrade_stop_threshold() == expected(config.memory_capacity, 0.6));
+    REQUIRE(space.get_downgrade_stop_threshold() < space.get_downgrade_trigger_threshold());
+    REQUIRE(space.get_downgrade_trigger_threshold() < space.get_max_memory());
+  }
+
+  SECTION("HOST")
+  {
+    host_memory_space_config config;
+    config.numa_id                    = 0;
+    config.memory_capacity            = 64ull << 20;
+    config.reservation_limit_fraction = 0.95;
+    config.downgrade_trigger_fraction = 0.9;
+    config.downgrade_stop_fraction    = 0.8;
+    config.pool_size                  = 4;
+    config.initial_number_pools       = 1;
+    memory_space space{config};
+
+    REQUIRE(space.get_capacity() == config.memory_capacity);
+    REQUIRE(space.get_downgrade_trigger_threshold() == expected(config.memory_capacity, 0.9));
+    REQUIRE(space.get_downgrade_stop_threshold() == expected(config.memory_capacity, 0.8));
+  }
+
+  SECTION("DISK")
+  {
+    disk_memory_space_config config;
+    config.disk_id         = 0;
+    config.memory_capacity = 1ull << 30;
+    config.mount_paths     = std::filesystem::temp_directory_path().string();
+    memory_space space{config};
+
+    REQUIRE(space.get_capacity() == config.memory_capacity);
+    REQUIRE(space.get_downgrade_trigger_threshold() == config.memory_capacity);
+    REQUIRE(space.get_downgrade_stop_threshold() == expected(config.memory_capacity, 0.99));
   }
 }
