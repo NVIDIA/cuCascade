@@ -1273,6 +1273,8 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
   io_priority priority)
 {
   if (requests.empty()) { return exec::make_semi_future<std::size_t>(0); }
+  // One per-device legacy retirement lane, even in a PTDS-built library.
+  if (stream.get() == nullptr) { stream = ::cuda::stream_ref{cudaStreamLegacy}; }
 
   bool const cache_while_reading = _io_ctx->supports_host_to_device_read();
   auto const device_id           = rmm::get_current_cuda_device();
