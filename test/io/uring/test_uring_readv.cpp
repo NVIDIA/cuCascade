@@ -1664,7 +1664,8 @@ TEST_CASE("io_uring device reads order after the caller's default streams", "[io
   // default stream is the same from every thread.
   auto const [label, caller_stream] =
     GENERATE(std::pair{"per-thread default stream", cudaStreamPerThread},
-             std::pair{"legacy default stream", cudaStreamLegacy});
+             std::pair{"legacy default stream", cudaStreamLegacy},
+             std::pair{"null stream", cudaStream_t{nullptr}});
   CAPTURE(label);
   constexpr std::size_t size = 4UL << 20;
   pattern_file const file{size};

@@ -68,6 +68,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
     io/test_object_identity.cpp
+    io/test_null_stream_ptds.cpp
     io/test_templated_ioctx.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
@@ -92,6 +93,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
+  # A PTDS-built caller must still get legacy null-stream I/O ordering.
+  set_source_files_properties(
+    io/test_null_stream_ptds.cpp PROPERTIES COMPILE_DEFINITIONS
+                                            CUDA_API_PER_THREAD_DEFAULT_STREAM)
   # Tests of src-private helpers (io/detail/...) include them from src/.
   target_include_directories(cucascade_io_tests
                              PRIVATE ${PROJECT_SOURCE_DIR}/src)

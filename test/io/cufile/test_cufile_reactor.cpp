@@ -1464,7 +1464,8 @@ TEST_CASE("cufile device reads order after the caller's default streams", "[io][
   // default stream is the same from every thread.
   auto const [label, caller_stream] =
     GENERATE(std::pair{"per-thread default stream", cudaStreamPerThread},
-             std::pair{"legacy default stream", cudaStreamLegacy});
+             std::pair{"legacy default stream", cudaStreamLegacy},
+             std::pair{"null stream", cudaStream_t{nullptr}});
   auto const threshold =
     GENERATE(std::size_t{cucascade::io::IO_BLOCK_SIZE}, std::size_t{1UL << 40});
   CAPTURE(label, threshold);

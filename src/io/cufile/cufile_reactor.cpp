@@ -1128,17 +1128,29 @@ bool cufile_reactor::park_if_stream_busy(std::shared_ptr<const io_object> const&
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
 
   auto const stream = slice.d_buffer.stream.get();
-  auto const state  = cudaStreamQuery(stream);
-  if (state == cudaSuccess) return false;
-  std::ignore = cudaGetLastError();
-  if (state != cudaErrorNotReady) {
-    throw cucascade::cuda_error(std::string{"cufile_reactor: cudaStreamQuery failed: "} +
-                                cudaGetErrorString(state));
+  if (stream != cudaStreamLegacy) {
+    auto const state = cudaStreamQuery(stream);
+    if (state == cudaSuccess) return false;
+    std::ignore = cudaGetLastError();
+    if (state != cudaErrorNotReady) {
+      throw cucascade::cuda_error(std::string{"cufile_reactor: cudaStreamQuery failed: "} +
+                                  cudaGetErrorString(state));
+    }
   }
-  // The event marks "everything queued before this dispatch"; work the caller
-  // queues later does not hold the slice back.
+  // A legacy-stream event orders after prior work on every blocking stream,
+  // including a PTDS caller's null stream. A bare legacy-stream query does not
+  // promise that dependency. Explicit streams keep the cheap query above.
   cucascade::cuda::cuda_event event{cudaEventDisableTiming};
   CUCASCADE_CUDA_TRY(cudaEventRecord(event.get(), stream));
+  if (stream == cudaStreamLegacy) {
+    auto const state = cudaEventQuery(event.get());
+    if (state == cudaSuccess) return false;
+    std::ignore = cudaGetLastError();
+    if (state != cudaErrorNotReady) {
+      throw cucascade::cuda_error(std::string{"cufile_reactor: cudaEventQuery failed: "} +
+                                  cudaGetErrorString(state));
+    }
+  }
   _waiting.push_back(waiting_slice{obj, std::move(slice), coordinator, std::move(event)});
   return true;
 }

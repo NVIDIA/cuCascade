@@ -421,7 +421,8 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     io_priority priority = io_priority::automatic) noexcept;
 
   /// Write @p size bytes of device memory @p src (stream-ordered on @p stream,
-  /// see SOURCE LIFETIME above) at @p offset.
+  /// see SOURCE LIFETIME above) at @p offset. A null @p stream is the legacy
+  /// default stream.
   [[nodiscard]] exec::semi_future<std::size_t> device_write_async(
     const io_object& obj,
     std::size_t offset,
@@ -437,7 +438,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     io_priority priority = io_priority::automatic) noexcept;
 
   /// Vectored device write: every segment's @c src is device memory, read in
-  /// stream order on @p stream.
+  /// stream order on @p stream. A null @p stream is the legacy default stream.
   [[nodiscard]] exec::semi_future<std::size_t> device_writev_async(
     const io_object& obj,
     std::span<const write_slice> slices,
@@ -446,7 +447,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
 
   /// Host and device segments in one request (one future); the device
   /// segments are read in stream order on @p stream.  No segment may overlap
-  /// another, host or device.
+  /// another, host or device. A null @p stream is the legacy default stream.
   [[nodiscard]] exec::semi_future<std::size_t> mixed_writev_async(
     const io_object& obj,
     std::span<const write_slice> host_slices,
@@ -488,7 +489,8 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     io_priority priority = io_priority::automatic) noexcept;
 
   /// Read every slice of @p slices into its device destination, ordered after
-  /// the work queued on @p stream before the call.  The future resolves to the
+  /// the work queued on @p stream before the call. A null @p stream is the
+  /// legacy default stream. The future resolves to the
   /// total bytes read: each slice is clamped to EOF, the size recorded on @p obj
   /// (a slice starting past it reads 0 bytes), and every clamped byte is
   /// delivered -- a file that shrank below that size after the open fails the
