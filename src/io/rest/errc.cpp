@@ -66,6 +66,9 @@ class rest_error_category final : public std::error_category {
       case errc::credentials_unavailable: return "no credentials available";
       case errc::not_supported: return "not supported";
       case errc::unhandled_exception: return "continuation threw an unhandled exception";
+      case errc::http_unsupported_framing:
+        return "chunked or close-delimited GET body (not supported; S3-compatible stores send "
+               "Content-Length)";
     }
     return "unknown cucascade.rest error " + std::to_string(value);
   }

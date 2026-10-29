@@ -176,6 +176,10 @@ defaults on. The IMDS seed is resolved once on a helper thread and is skipped wh
   (host memory or pinned staging), no cmsg, never linked; WAITALL watchdog (N4, T13b rule);
 - HTTP/1.1 only, no pipelining, no HTTP/2 (curl negotiated HTTP/2 but never multiplexed, so nothing
   is lost); `Expect: 100-continue` off by default; no redirects (a 3xx is an error, as before);
+  2xx GET bodies must be `Content-Length`-framed: a chunked or close-delimited data or footer GET
+  body (CloudFront, S3 Object Lambda, some proxies) fails at once with `http_unsupported_framing`
+  and is not retried. libcurl decoded these; S3, MinIO and Ceph never send them. Captured control
+  bodies (LIST pages, S3 write responses) are decoded when chunked;
 - DNS on a resolver thread shared by the ioctx (TTL 30 s, refresh-ahead, benching, round robin);
 - request heads are written into slot storage (`request_head`); the authorizer's URL and headers
   are copied in, then `Range`, then `If-Match` (header order pinned by tests). The authorization
@@ -402,6 +406,7 @@ Counters kept (E2): `ktls_fallbacks`, `no_pad_set`, `waitall_watchdog_cancels`, 
 
 - libcurl is dropped (`curl_handle.{hpp,cpp}`, the pkg-config lookup, the package-config line and
   the pixi dependency). OpenSSL `SSL` joins `Crypto` in the io link set and the package config.
+  One libcurl capability is gone: decoding chunked or close-delimited 2xx GET bodies (section 3.3).
 - liburing ≥ 2.14 (`pixi.toml` requires `liburing >= 2.14`). Kernel ≥ 6.1; kTLS needs `tls.ko` (else user space,
   counted).
 - memlock: nothing on the REST ring is registered (no fixed buffers or files), so the REST backend

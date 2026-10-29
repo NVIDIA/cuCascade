@@ -284,8 +284,10 @@ class http1_exchange {
     std::uint64_t obj_off = 0;
     std::uint64_t len     = 0;
     if (_spec.suffix) {
-      if (c.meta.body != http::framing::length || !c.meta.content_length)
-        return fail_outcome(c, make_error_code(errc::http_bad_message));
+      // Chunked / close-delimited 2xx GET bodies are not supported (design section 3.3): final.
+      if (c.meta.body != http::framing::length)
+        return fail_outcome(c, make_error_code(errc::http_unsupported_framing));
+      if (!c.meta.content_length) return fail_outcome(c, make_error_code(errc::http_bad_message));
       len = *c.meta.content_length;
       if (c.meta.status == 206) {
         if (!c.meta.range || c.meta.range->unsatisfied) {
@@ -313,10 +315,13 @@ class http1_exchange {
                                              0,
                                              c.reused);
       if (o.ec) return finish_failed_head(c, o);
-      if (c.meta.body != http::framing::length || !c.meta.content_length) {
-        // Chunked / EOF-delimited 2xx GET bodies are not used by S3-compatible stores.
-        return fail_outcome(c, make_error_code(errc::http_bad_message));
+      if (c.meta.body != http::framing::length) {
+        // Chunked / close-delimited 2xx GET bodies are not supported (design section 3.3; S3,
+        // MinIO and Ceph always send Content-Length): a final error, no retry can succeed.
+        // Decoding them through `chunked_decoder` into the sink is a follow-up.
+        return fail_outcome(c, make_error_code(errc::http_unsupported_framing));
       }
+      if (!c.meta.content_length) return fail_outcome(c, make_error_code(errc::http_bad_message));
       len     = *c.meta.content_length;
       obj_off = c.meta.status == 206 && c.meta.range ? c.meta.range->first : 0;
     }

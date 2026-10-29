@@ -25,6 +25,7 @@
 /// the io_context layer: a failed copy enqueue settles only once the queued copy landed, and a
 /// copy is ordered after the caller's per-thread or legacy default stream.
 
+#include "io/rest/errc.hpp"
 #include "io/rest/worker/copy_tracker.hpp"
 #include "rest_contract_test_utils.hpp"
 
@@ -263,6 +264,33 @@ TEST_CASE("rest data GET fails a 206 whose Content-Range does not match without 
   CHECK_THROWS_WITH(fx.ioctx->host_read(*object, 8192, out.size(), out.data()),
                     Catch::Matchers::ContainsSubstring("Content-Range mismatch"));
   CHECK(server.get_count("shifted.bin") == 1);
+}
+
+TEST_CASE("rest data GET with a chunked 206 body fails as unsupported framing without retrying",
+          "[rest][e2e][framing]")
+{
+  // libcurl decoded chunked GET bodies; this transport does not (design section 3.3).  The
+  // failure names the cause and is final: a retry cannot succeed, so the second (Content-Length)
+  // step of the script is never served.
+  auto payload = rest_test_payload(64UL << 10);
+  std::unordered_map<std::string, key_response_script> scripts;
+  scripts["chunked.bin"].gets = {scripted_response{.chunked_transfer_encoding = true},
+                                 scripted_response{}};
+  loopback_range_server server(payload, {}, {}, scripts);
+  auto cfg               = rest_contract_config();
+  cfg.max_retry_attempts = 4;
+  auto fx                = make_ioctx(server, cfg);
+  rest_shutdown_guard cleanup{*fx.ioctx};
+  auto object = fx.ioctx->open_io_object("s3://range-bucket/chunked.bin", payload.size());
+  std::vector<std::uint8_t> out(4096);
+  CHECK_THROWS_WITH(fx.ioctx->host_read(*object, 8192, out.size(), out.data()),
+                    Catch::Matchers::ContainsSubstring("chunked or close-delimited GET body"));
+  CHECK(server.get_count("chunked.bin") == 1);
+
+  auto const message =
+    make_error_code(cucascade::io::rest::errc::http_unsupported_framing).message();
+  CHECK_THAT(message, Catch::Matchers::ContainsSubstring("chunked"));
+  CHECK_THAT(message, !Catch::Matchers::ContainsSubstring("unknown"));
 }
 
 TEST_CASE("rest data GET against a server that ignores Range", "[rest][e2e][range_ignored]")

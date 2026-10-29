@@ -42,6 +42,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -257,6 +258,9 @@ struct scripted_response {
   /// Answer this ranged GET with a 200 carrying the whole object (as
   /// `range_fault_policy::ignore_range_with_200` does for every GET).
   bool ignore_range{false};
+  /// Frame a successful GET body with `Transfer-Encoding: chunked` (one chunk, then the last
+  /// chunk) instead of `Content-Length`, as CloudFront or S3 Object Lambda may.  GET only.
+  bool chunked_transfer_encoding{false};
 };
 
 struct key_response_script {
@@ -977,6 +981,7 @@ class loopback_range_server {
     delay_response(scripted);
     auto const& body_policy = scripted && scripted->body ? *scripted->body : _fault.body;
     auto const body_xor     = scripted ? scripted->body_xor : std::uint8_t{0};
+    bool const chunked      = scripted && scripted->chunked_transfer_encoding;
     send_interim_headers(conn,
                          _fault.interim_get_etag,
                          _fault.interim_get_content_range,
@@ -1042,7 +1047,7 @@ class loopback_range_server {
         append_connection_header(response, close_connection);
         response += "\r\n\r\n";
         bool const sent =
-          send_body(conn, response, object, 0, object.size(), body_xor, body_policy);
+          send_body(conn, response, object, 0, object.size(), body_xor, body_policy, chunked);
         return close_connection || !sent;
       }
       auto const [start, end] = *range;
@@ -1065,7 +1070,8 @@ class loopback_range_server {
       }
       append_connection_header(response, close_connection);
       response += "\r\n\r\n";
-      bool const sent = send_body(conn, response, object, start, size, body_xor, body_policy);
+      bool const sent =
+        send_body(conn, response, object, start, size, body_xor, body_policy, chunked);
       return close_connection || !sent;
     }
 
@@ -1073,7 +1079,8 @@ class loopback_range_server {
     append_etag_header(response, ok_etag());
     append_connection_header(response, close_connection);
     response += "\r\n\r\n";
-    bool const sent = send_body(conn, response, object, 0, object.size(), body_xor, body_policy);
+    bool const sent =
+      send_body(conn, response, object, 0, object.size(), body_xor, body_policy, chunked);
     return close_connection || !sent;
   }
 
@@ -1885,8 +1892,10 @@ class loopback_range_server {
                  std::size_t start,
                  std::size_t size,
                  std::uint8_t mask,
-                 response_body_policy const& policy)
+                 response_body_policy const& policy,
+                 bool chunked = false)
   {
+    if (chunked) { return send_chunked(conn, headers, object.subspan(start, size), mask); }
     if (mask == 0) { return send_response(conn, headers, object.subspan(start, size), policy); }
     std::vector<std::uint8_t> masked(object.begin() + static_cast<std::ptrdiff_t>(start),
                                      object.begin() + static_cast<std::ptrdiff_t>(start + size));
@@ -1894,6 +1903,35 @@ class loopback_range_server {
       byte = static_cast<std::uint8_t>(byte ^ mask);
     }
     return send_response(conn, headers, masked, policy);
+  }
+
+  /// @p headers (which carry `Content-Length`) re-framed as `Transfer-Encoding: chunked`, and
+  /// @p body sent as one chunk followed by the last chunk.
+  bool send_chunked(loopback_connection& conn,
+                    std::string_view headers,
+                    std::span<std::uint8_t const> body,
+                    std::uint8_t mask)
+  {
+    std::string head{headers};
+    auto const at = head.find("\r\nContent-Length: ");
+    if (at != std::string::npos) {
+      auto const eol = head.find("\r\n", at + 2);
+      head.replace(at, eol - at, "\r\nTransfer-Encoding: chunked");
+    }
+    std::string framed = head;
+    if (!body.empty()) {
+      char size_line[32];
+      std::snprintf(size_line, sizeof(size_line), "%zx\r\n", body.size());
+      framed += size_line;
+      for (auto const byte : body) {
+        framed.push_back(static_cast<char>(byte ^ mask));
+      }
+      framed += "\r\n";
+    }
+    framed += "0\r\n\r\n";
+    auto const sent = send_all(conn, framed);
+    _body_bytes_sent.fetch_add(body.size(), std::memory_order_relaxed);
+    return sent == framed.size();
   }
 
   bool send_response(loopback_connection& conn,
