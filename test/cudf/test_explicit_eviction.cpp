@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <regex>
 #include <string>
@@ -58,6 +59,32 @@ std::uint64_t evictions_from(std::string const& summary)
   if (!std::regex_search(summary, match, expression)) { return 0; }
   return std::stoull(match[1].str());
 }
+// A 1.5-chunk request rounds up to a reservation of exactly two chunks.
+struct reserved_reclaim_fixture : cache_test_fixture {
+  static cucascade::io::cache::config config()
+  {
+    auto cfg = allocation_cache_config();
+    cfg.min_prefetching_budget_fraction =
+      static_cast<double>(2 * controlled_chunk_bytes - controlled_chunk_bytes / 2) / (256 * mib);
+    return cfg;
+  }
+
+  reserved_reclaim_fixture() : cache_test_fixture(config())
+  {
+    auto const spaces = memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    REQUIRE(spaces.size() == 1);
+    host = spaces.front();
+    REQUIRE(host->get_max_memory() == 256 * mib);
+    source = open(object_path, 8 * controlled_chunk_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, 0, 4 * controlled_chunk_bytes);
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+    REQUIRE(checked_cache(*this).claimed_bytes() == 4 * controlled_chunk_bytes);
+  }
+
+  cucascade::memory::memory_space const* host{nullptr};
+  std::unique_ptr<cucascade::io::datasource> source;
+};
 }  // namespace
 
 TEST_CASE("claimed_bytes tracks the staging memory the cache is holding",
@@ -255,6 +282,42 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
 // ===========================================================================
 // Synchronous reclaim (the cache side of sirius-db/sirius#1933)
 // ===========================================================================
+
+TEST_CASE("releasable bytes exclude the per-NUMA prefetch reservation",
+          "[cache][eviction][explicit][reclaim]")
+{
+  reserved_reclaim_fixture fixture;
+  auto& cache      = checked_cache(fixture);
+  auto const chunk = cache.chunk_size();
+  CHECK(cache.releasable_bytes() == 2 * chunk);
+  CHECK(cache.releasable_bytes(fixture.host->get_device_id()) == 2 * chunk);
+}
+
+TEST_CASE("a NUMA-scoped reclaim leaves other arenas alone", "[cache][eviction][explicit][reclaim]")
+{
+  reserved_reclaim_fixture fixture;
+  auto& cache        = checked_cache(fixture);
+  auto const numa    = fixture.host->get_device_id();
+  auto const claimed = cache.claimed_bytes();
+  CHECK(cache.releasable_bytes(numa + 99) == 0);
+  CHECK(cache.reclaim(reclaim_mode::forced, std::numeric_limits<std::size_t>::max(), numa + 99) ==
+        0);
+  CHECK(cache.claimed_bytes() == claimed);
+}
+
+TEST_CASE("reclaiming the releasable bytes returns only the overflow to the HOST space",
+          "[cache][eviction][explicit][reclaim]")
+{
+  reserved_reclaim_fixture fixture;
+  auto& cache          = checked_cache(fixture);
+  auto const chunk     = cache.chunk_size();
+  auto const available = fixture.host->get_available_memory();
+  CHECK(cache.reclaim(reclaim_mode::forced, 2 * chunk, fixture.host->get_device_id()) == 2 * chunk);
+  CHECK(cache.releasable_bytes() == 0);
+  CHECK(cache.releasable_bytes(fixture.host->get_device_id()) == 0);
+  CHECK(cache.claimed_bytes() == 2 * chunk);
+  CHECK(fixture.host->get_available_memory() - available == 2 * chunk);
+}
 
 TEST_CASE("a synchronous reclaim spares subscribed chunks when idle and takes them when forced",
           "[cache][eviction][explicit][reclaim]")

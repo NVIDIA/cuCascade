@@ -137,7 +137,8 @@ reclaim_outcome reclaim_chunk_buffers(
   cache_generation& generation,
   buffer_pool& pool,
   bool only_unsubscribed,
-  std::size_t max_chunks = std::numeric_limits<std::size_t>::max()) noexcept
+  std::size_t max_chunks         = std::numeric_limits<std::size_t>::max(),
+  std::optional<int> numa_filter = std::nullopt) noexcept
 {
   auto& claimed = generation.reclaim_claimed;
   auto& batch   = generation.reclaim_batch;
@@ -148,6 +149,10 @@ reclaim_outcome reclaim_chunk_buffers(
     if (c == nullptr) { continue; }
     auto const snap = c->state.load();
     if (snap.state() == chunk_state::empty) { continue; }
+    // numa_node is published by mark_allocated(), not while still queued.
+    if (numa_filter && (snap.state() == chunk_state::queued || c->numa_node != *numa_filter)) {
+      continue;
+    }
     if (only_unsubscribed && snap.subscribers() != 0) { continue; }
     if (!c->state.mark_evicting(only_unsubscribed)) {
       ++outcome.stuck;  // pinned, loading, or already being evicted by someone else
@@ -1443,6 +1448,11 @@ std::size_t fs_cache::claimed_bytes() const noexcept
   return _pool ? _pool->total_allocated_bytes() : 0;
 }
 
+std::size_t fs_cache::releasable_bytes(std::optional<int> numa_node) const noexcept
+{
+  return _pool ? (numa_node ? _pool->releasable_bytes(*numa_node) : _pool->releasable_bytes()) : 0;
+}
+
 void fs_cache::evict(std::size_t bytes_to_free)
 {
   // Nothing to free, nothing holding memory, or a cache on its way down -- in
@@ -1452,7 +1462,9 @@ void fs_cache::evict(std::size_t bytes_to_free)
   _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, nullptr}});
 }
 
-std::size_t fs_cache::reclaim(reclaim_mode mode, std::size_t target_bytes)
+std::size_t fs_cache::reclaim(reclaim_mode mode,
+                              std::size_t target_bytes,
+                              std::optional<int> numa_node)
 {
   if (target_bytes == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return 0; }
   // Whole chunks are the only granularity there is: a target of part of a
@@ -1487,7 +1499,8 @@ std::size_t fs_cache::reclaim(reclaim_mode mode, std::size_t target_bytes)
     if (reclaimed >= budget) { break; }
     std::unique_lock elk(generation->mtx);
     reclaimed +=
-      reclaim_chunk_buffers(*generation, *_pool, only_unsubscribed, budget - reclaimed).reclaimed;
+      reclaim_chunk_buffers(*generation, *_pool, only_unsubscribed, budget - reclaimed, numa_node)
+        .reclaimed;
   }
   if (reclaimed > 0) { _counters.evictions.fetch_add(reclaimed, std::memory_order_relaxed); }
   return reclaimed * chunk_bytes;

@@ -130,6 +130,10 @@ class buffer_pool {
 
   [[nodiscard]] size_t total_allocated_chunks() const noexcept { return _n_allocated_chunks; }
 
+  /// Relaxed snapshot of held bytes above each arena's prefetch reservation.
+  [[nodiscard]] std::size_t releasable_bytes(int numa) const noexcept;
+  [[nodiscard]] std::size_t releasable_bytes() const noexcept;
+
   [[nodiscard]] size_t reservation_size_for_prefetching() const noexcept;
 
   [[nodiscard]] size_t max_allowed_budget_for_prefetching() const noexcept;
@@ -150,6 +154,8 @@ class buffer_pool {
   size_t _max_allowed_budget_for_prefetching{0};
   std::unordered_map<int, size_t> _numa_to_arena_index;
   std::vector<host_arena> _host_arenas;
+  std::unique_ptr<std::atomic<std::size_t>[]> _arena_chunks;
+  std::vector<std::size_t> _arena_reserved;
   std::atomic<size_t> _n_allocated_chunks{0};
 };
 

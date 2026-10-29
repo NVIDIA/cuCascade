@@ -422,6 +422,13 @@ class fs_cache {
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
 
+  /// Bytes that returning chunks would give back to the HOST space(s) right now.
+  /// Chunks inside each space's prefetch reservation do not count. Optionally
+  /// restrict to one NUMA node. This is a relaxed snapshot, not a guarantee that
+  /// the chunks are currently reclaimable (readers or IO may hold them).
+  [[nodiscard]] std::size_t releasable_bytes(
+    std::optional<int> numa_node = std::nullopt) const noexcept;
+
   /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
   ///
   /// Asynchronous and best-effort: this enqueues the demand and returns.  The
@@ -455,9 +462,11 @@ class fs_cache {
   /// Takes the map lock shared and each generation's lock exclusively, so it
   /// must not be called with a cache lock held.
   ///
-  /// @return bytes returned to the pool.
+  /// @param numa_node Only reclaim chunks from this NUMA node, if specified.
+  /// @return bytes returned to the pool (including bytes inside the reservation).
   std::size_t reclaim(reclaim_mode mode,
-                      std::size_t target_bytes = std::numeric_limits<std::size_t>::max());
+                      std::size_t target_bytes     = std::numeric_limits<std::size_t>::max(),
+                      std::optional<int> numa_node = std::nullopt);
 
   /// Ask the evictor to free at least @p bytes_to_free and wait until that
   /// request has been processed. This acknowledges an eviction pass, not that
