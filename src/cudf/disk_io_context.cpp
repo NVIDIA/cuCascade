@@ -138,12 +138,14 @@ class owning_uring_reactor_context final : private owned_uring_staging,
 void validate(disk_io_context_options const& options, disk_io_backend backend)
 {
   auto const& cfg = options.io;
-  if (backend == disk_io_backend::uring && cfg.uring_n_reactors == 0) {
-    throw std::invalid_argument("make_disk_io_context: io.uring_n_reactors must be at least 1");
+  if (backend == disk_io_backend::uring && cfg.uring_reactors_per_gpu == 0) {
+    throw std::invalid_argument(
+      "make_disk_io_context: io.uring_reactors_per_gpu must be at least 1");
   }
 #ifdef CUCASCADE_HAS_CUFILE
-  if (backend == disk_io_backend::cufile && cfg.cufile_n_reactors == 0) {
-    throw std::invalid_argument("make_disk_io_context: io.cufile_n_reactors must be at least 1");
+  if (backend == disk_io_backend::cufile && cfg.cufile_reactors_per_gpu == 0) {
+    throw std::invalid_argument(
+      "make_disk_io_context: io.cufile_reactors_per_gpu must be at least 1");
   }
 #endif
   if (backend == disk_io_backend::uring && uring_setup_errno() != 0) {
@@ -163,7 +165,7 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
     case disk_io_backend::cufile: {
 #ifdef CUCASCADE_HAS_CUFILE
       auto reactor_ctx = std::make_shared<io::cufile::cufile_reactor::reactor_context>(cfg.cufile);
-      return std::make_shared<io::cufile::cufile_ioctx>(cfg.cufile_n_reactors,
+      return std::make_shared<io::cufile::cufile_ioctx>(cfg.cufile_reactors_per_gpu,
                                                         std::move(reactor_ctx));
 #else
       throw std::invalid_argument(
@@ -174,8 +176,9 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
     case disk_io_backend::automatic: break;
   }
   auto reactor_ctx = std::make_shared<owning_uring_reactor_context>(
-    cfg.uring, cfg.uring_n_reactors, options.staging_numa_node);
-  return std::make_shared<io::uring::uring_ioctx>(cfg.uring_n_reactors, std::move(reactor_ctx));
+    cfg.uring, cfg.uring_reactors_per_gpu, options.staging_numa_node);
+  return std::make_shared<io::uring::uring_ioctx>(cfg.uring_reactors_per_gpu,
+                                                  std::move(reactor_ctx));
 }
 
 }  // namespace

@@ -60,6 +60,11 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// config is sourced from the reactors themselves -- see @c templated_ioctx.
   cufile_ioctx(std::size_t n_reactors, std::shared_ptr<cufile_reactor::reactor_context> ctx);
 
+  /// Build one reactor per placement of @p layout, all sharing @p ctx; each
+  /// worker is pinned to its placement's CPUs, and device requests prefer the
+  /// reactors of their GPU's NUMA node (see @c templated_ioctx::next_reactor).
+  cufile_ioctx(reactor_layout const& layout, std::shared_ptr<cufile_reactor::reactor_context> ctx);
+
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::cufile; }
 
   /**
@@ -68,11 +73,12 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
    * A cuFile reactor serves one transfer at a time (synchronous cuFile and POSIX
    * calls), so a request's queue depth is the number of reactors it is spread
    * over.  A vectored read with more slices than the base's two gets every
-   * reactor, least backlogged first.  A host-only vectored write goes to one
-   * reactor: its page-cache writes with early writeback keep the device busy,
-   * and interleaving writers of one file only contends on its inode
-   * (docs/io/gpuio-gds-practices.md section 8).  Other operations keep the base
-   * selection.
+   * reactor it may use (its GPU's NUMA-local reactors unless they spill, see
+   * @c templated_ioctx::routable_reactors), least backlogged first.  A
+   * host-only vectored write goes to one reactor: its page-cache writes with
+   * early writeback keep the device busy, and interleaving writers of one file
+   * only contends on its inode (docs/io/gpuio-gds-practices.md section 8).
+   * Other operations keep the base selection.
    */
   std::vector<cufile_reactor*> next_reactor(cufile_io_object const& object,
                                             std::size_t n_slices,
