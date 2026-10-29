@@ -22,6 +22,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/object_identity.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/detail/local_descriptor.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/reactor_placement.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/config.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/reactor_placement.cpp
