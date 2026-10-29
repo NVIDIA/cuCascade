@@ -352,6 +352,64 @@ TEST_CASE("a synchronous reclaim never takes a loading or pinned chunk",
   CHECK(cache.claimed_bytes() == 0);
 }
 
+TEST_CASE("a resident chunk forcibly reclaimed during a prefetch is reported uncovered",
+          "[cache][eviction][explicit][reclaim][prefetch-coverage]")
+{
+  bool reclaim = false;
+  SECTION("resident chunk is reclaimed before completion") { reclaim = true; }
+  SECTION("resident chunk remains available") {}
+
+  using access               = cucascade::io::cache::fs_cache_test_access;
+  using byte_range           = cucascade::io::cache::fs_cache::byte_range;
+  using cache_prepare_result = cucascade::io::cache::prepare_result;
+  using cucascade::io::cache::chunk_state;
+  using cucascade::io::cache::prefetch_result;
+  cache_test_fixture fixture{allocation_cache_config()};
+  auto& cache       = checked_cache(fixture);
+  auto const n      = cache.chunk_size();
+  auto const source = fixture.open("controlled://coverage", 4 * n);
+  REQUIRE(source != nullptr);
+
+  std::vector<byte_range> const first_range{byte_range{0, 1}};
+  auto first_handle = access::request(cache, source->get_io_object(), first_range);
+  REQUIRE(access::prepare(cache, first_handle) == cache_prepare_result::prepared);
+  prefetch_result first_result;
+  std::atomic<bool> first_done{false};
+  held_request first;
+  REQUIRE(cache.prefetch(first_handle, [&](prefetch_result result) noexcept {
+    first_result = result;
+    first_done.store(true, std::memory_order_release);
+  }));
+  first.request = fixture.context->backend().wait_take(2s);
+  REQUIRE(first.request != nullptr);
+  first.complete(0x5a);
+  REQUIRE(wait_for_cache([&] { return first_done.load(std::memory_order_acquire); }, 2s));
+  REQUIRE(first_result.ok);
+  REQUIRE(first_result.covered);
+
+  std::vector<byte_range> const both_ranges{byte_range{0, 1},
+                                            byte_range{static_cast<std::int64_t>(n), 1}};
+  auto second_handle = access::request(cache, source->get_io_object(), both_ranges);
+  REQUIRE(access::prepare(cache, second_handle) == cache_prepare_result::prepared);
+  prefetch_result second_result;
+  std::atomic<bool> second_done{false};
+  held_request second;
+  REQUIRE(cache.prefetch(second_handle, [&](prefetch_result result) noexcept {
+    second_result = result;
+    second_done.store(true, std::memory_order_release);
+  }));
+  second.request = fixture.context->backend().wait_take(2s);
+  REQUIRE(second.request != nullptr);
+  if (reclaim) {
+    CHECK(cache.reclaim(reclaim_mode::forced) == n);
+    CHECK(second_handle.chunks()->front()->state.get_state() == chunk_state::empty);
+  }
+  second.complete(0x7b);
+  REQUIRE(wait_for_cache([&] { return second_done.load(std::memory_order_acquire); }, 2s));
+  CHECK(second_result.ok);
+  CHECK(second_result.covered == !reclaim);
+}
+
 TEST_CASE("a synchronous reclaim of zero bytes is a no-op", "[cache][eviction][explicit][reclaim]")
 {
   cache_test_fixture fixture{allocation_cache_config()};

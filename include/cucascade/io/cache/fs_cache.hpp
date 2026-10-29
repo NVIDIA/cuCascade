@@ -105,8 +105,10 @@ struct prefetch_failure_slot {
 /// Completion of the IO submitted by one prefetch. Success alone does not
 /// imply coverage: another loader may own some of the requested chunks.
 struct prefetch_result {
-  bool ok{false};       ///< the IO this prefetch submitted (if any) succeeded
-  bool covered{false};  ///< ...and every requested extent is now resident
+  bool ok{false};  ///< the IO this prefetch submitted (if any) succeeded
+  /// Every requested extent is resident (cached or pinned) as on_done runs,
+  /// re-checked at IO completion. Residency is not pinned against later reclaim.
+  bool covered{false};
 };
 
 /// One prefetch request: the two stage machines plus the chunk set they cover.
@@ -380,10 +382,13 @@ class fs_cache {
 
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
-  /// completion.  The outcome is @c covered only when every extent the request
-  /// asked for is either filled by the IO it submitted or already resident;
-  /// a chunk another loader (a demand read) claimed first is not covered, even
-  /// when this prefetch's own IO succeeded.  Returns whether IO was issued.
+  /// completion. The outcome is @c covered only when every requested extent
+  /// is resident (cached or pinned) as @p on_done runs. Coverage is re-checked
+  /// when the submitted IO completes: a resident chunk reclaimed meanwhile is
+  /// uncovered. A chunk another loader (a demand read) claimed first is not
+  /// covered, even when this prefetch's own IO succeeded. Residency is not
+  /// pinned afterwards: later reclaim may take it, and readers fall back to
+  /// the backend. Returns whether IO was issued.
   /// Without IO the outcome is @c {false, false} when the request is refused
   /// (empty, fallen behind, cancelled, already loading, a backend without
   /// vectored host reads, or a failed setup), and @c {true, covered} when

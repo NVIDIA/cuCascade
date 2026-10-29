@@ -101,6 +101,26 @@ struct cache_generation {
 namespace {
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 
+[[nodiscard]] bool resident_covers(cached_chunk const& chunk,
+                                   chunk_fill const& required,
+                                   std::size_t chunk_size) noexcept
+{
+  auto const [lo, hi] = fill_span(required, chunk.offset, chunk_size);
+  auto const snapshot = chunk.state.load();
+  return (snapshot.state() == chunk_state::cached || snapshot.state() == chunk_state::in_use) &&
+         covers(snapshot.fill(), chunk.offset, chunk_size, lo, hi);
+}
+
+[[nodiscard]] bool extents_resident(std::span<cached_chunk* const> chunks,
+                                    std::span<chunk_fill const> required,
+                                    std::size_t chunk_size) noexcept
+{
+  for (std::size_t i = 0; i < chunks.size(); ++i) {
+    if (!resident_covers(*chunks[i], required[i], chunk_size)) { return false; }
+  }
+  return true;
+}
+
 /// What one @ref reclaim_chunk_buffers pass did: chunks whose buffers went back
 /// to the pool, and chunks that hold a buffer it could not take (pinned,
 /// loading, or being evicted by someone else).
@@ -1558,10 +1578,7 @@ bool fs_cache::prefetch(cache_handle& handle,
         // Read state and extent together. A loading chunk belongs to another
         // IO, whose completion this prefetch does not observe. Never promote
         // that incomplete coverage when our own submitted subset finishes.
-        auto const snapshot = c->state.load();
-        covered =
-          (snapshot.state() == chunk_state::cached || snapshot.state() == chunk_state::in_use) &&
-          covers(snapshot.fill(), c->offset, _chunk_size, needed_lo, needed_hi);
+        covered = resident_covers(*c, (*required)[i], _chunk_size);
       }
     }
   } catch (...) {
@@ -1587,17 +1604,20 @@ bool fs_cache::prefetch(cache_handle& handle,
       });
     done_owner =
       std::make_shared<exec::invocable<void(prefetch_result) noexcept>>(std::move(on_done));
-    terminal = size_terminal{[req, done_owner, covered, owner = handle._generation](
-                               exec::try_t<size_t>&& res) mutable noexcept {
-      owner.reset();
-      auto const ok = res.has_value();
-      if (!ok && req.failure) {
-        std::lock_guard lk(req.failure->mtx);
-        req.failure->failure = std::move(res).exception();
-      }
-      std::ignore = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
-      (*done_owner)({ok, ok && covered});
-    }};
+    terminal = size_terminal{
+      [req, done_owner, covered, chunk_size = _chunk_size, owner = handle._generation](
+        exec::try_t<size_t>&& res) mutable noexcept {
+        auto const ok = res.has_value();
+        bool const resident =
+          ok && covered && extents_resident(*req.chunks, *req.required_fills, chunk_size);
+        owner.reset();
+        if (!ok && req.failure) {
+          std::lock_guard lk(req.failure->mtx);
+          req.failure->failure = std::move(res).exception();
+        }
+        std::ignore = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
+        (*done_owner)({ok, resident});
+      }};
     for (auto& slice : prepared) {
       slice.on_complete = completion;
       slice.priority    = io_priority::low;
