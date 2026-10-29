@@ -31,6 +31,7 @@
 
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -469,6 +470,52 @@ TEST_CASE("rest device read fails fast when pinned staging is exhausted",
   REQUIRE(std::move(ok).get(10s) == fits);
   auto const got = rest_device_bytes(destination.data(), fits, stream.value());
   require_rest_bytes_equal(got, {payload.data() + 8192, fits});
+}
+
+TEST_CASE("a placed rest reactor stages device reads from its placement's resource",
+          "[rest][e2e][staging][reactor_placement][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  constexpr std::size_t block_size = 512UL << 10;
+  constexpr std::size_t capacity   = 4UL << 20;
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource shared{
+    0, upstream, capacity, capacity, block_size / 2, 16, 0};
+  cucascade::memory::fixed_size_host_memory_resource local{
+    0, upstream, capacity, capacity, block_size, 8, 0};
+  auto payload = rest_test_payload(1UL << 20);
+  loopback_range_server server(payload);
+
+  cucascade::io::reactor_placement placement;
+  placement.gpu_id     = 0;
+  placement.numa_node  = 0;
+  placement.staging_mr = &local;
+  cucascade::io::reactor_layout layout;
+  layout.placements = {placement};
+  auto authorizer   = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
+  auto context =
+    std::make_shared<rest_reactor::reactor_context>(rest_contract_config(), authorizer, &shared);
+  auto ioctx = std::make_shared<probed_ioctx>(layout, std::move(context));
+  ioctx->start();
+  rest_shutdown_guard cleanup{*ioctx};
+  CHECK(ioctx->staging_block_size() == block_size);
+
+  auto object = ioctx->open_io_object("s3://placed-bucket/object.bin", payload.size());
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(payload.size(), stream);
+  auto read = ioctx->device_read_async_io(*object,
+                                          0,
+                                          payload.size(),
+                                          static_cast<std::uint8_t*>(destination.data()),
+                                          ::cuda::stream_ref{stream.value()});
+  REQUIRE(std::move(read).get(10s) == payload.size());
+  require_rest_bytes_equal(rest_device_bytes(destination.data(), payload.size(), stream.value()),
+                           payload);
+
+  // The read staged through the placement's resource; the context's stayed untouched.
+  CHECK(local.get_peak_total_allocated_bytes() > 0);
+  CHECK(shared.get_peak_total_allocated_bytes() == 0);
+  CHECK(available_after_release(local, capacity) == capacity);
 }
 
 TEST_CASE("rest transport counters follow the reads and survive shutdown", "[rest][e2e][stats]")
