@@ -67,6 +67,22 @@ namespace {
 /// The common part of gpuio's `xml_done`: a 2xx body that is (or a header code that says it is)
 /// an S3 error document fails the call; @return true when it did. The `<Code>` comes from the
 /// HTTP codec's scan (`http::extract_error_code`), as for error statuses.
+/// @return whether @p doc has an element @p name: `<name` followed by `>`, `/` or whitespace (so
+///         attributes such as `xmlns` are accepted and a longer name is not mistaken for it).
+bool has_element(std::string_view doc, std::string_view name) noexcept
+{
+  for (std::size_t at = doc.find('<'); at != std::string_view::npos; at = doc.find('<', at + 1)) {
+    auto const rest = doc.substr(at + 1);
+    if (!rest.starts_with(name)) { continue; }
+    if (rest.size() == name.size()) { return false; }  // cut inside the tag
+    char const next = rest[name.size()];
+    if (next == '>' || next == '/' || next == ' ' || next == '\t' || next == '\r' || next == '\n') {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool map_body_error(std::string_view body, std::string_view header_code, xml_outcome& out)
 {
   std::string_view code     = header_code;
@@ -206,7 +222,14 @@ xml_outcome interpret_complete_response(std::string_view body,
     // gpuio T18b: Complete succeeded (2xx) but the body did not fit: the ETag comes from a HEAD.
     if (overflow) { return out; }
     if (map_body_error(body, header_error_code, out)) { return out; }
-    // Empty when the captured body did not carry it (keep-alive whitespace before the XML).
+    // Neither an <Error> nor the result document (a proxy page, keep-alive whitespace only): the
+    // commit was never acknowledged, so it is not a success.  The root may carry attributes
+    // (xmlns).
+    if (!has_element(body, "CompleteMultipartUploadResult")) {
+      out.ec = make_error_code(errc::http_bad_message);
+      return out;
+    }
+    // Empty when the result did not carry it (tolerated: some S3-compatible stores omit it).
     out.value = xml_unescape(trim(xml_text(body, "ETag")));
   } catch (std::bad_alloc const&) {
     out    = xml_outcome{};

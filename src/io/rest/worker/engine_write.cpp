@@ -752,18 +752,19 @@ void engine::complete_done(std::shared_ptr<flush_job> job) noexcept
     return;
   }
   // "200 OK" whose body is an S3 <Error> (S3 sends the status before the assembly finished):
-  // retried up to complete_attempts times (gpuio).
+  // retried up to complete_attempts times (gpuio).  A 2xx without a result document (a proxy
+  // answering in S3's place) fails the flush too: complete_failed keeps the UploadId, so a later
+  // flush re-sends Complete (it succeeds if the first had not taken effect, or fails NoSuchUpload
+  // if it had -- never a false success), and destroying the object aborts the upload.
   auto const out = s3::interpret_complete_response(rq.response, false);
   if (out.ec) {
     if (out.retriable && job->complete_attempts < s3::complete_attempts) {
       send_complete(std::move(job));
       return;
     }
-    finish_flush(*job,
-                 {},
-                 as_exception(out.ec,
-                              "rest_reactor: CompleteMultipartUpload for " + job->up->path + " (" +
-                                out.error_code + ")"));
+    auto what = "rest_reactor: CompleteMultipartUpload for " + job->up->path;
+    if (!out.error_code.empty()) what += " (" + out.error_code + ")";
+    finish_flush(*job, {}, as_exception(out.ec, what));
     return;
   }
   finish_flush(*job, out.value.empty() ? rq.etag : out.value, nullptr);

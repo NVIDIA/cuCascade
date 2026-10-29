@@ -146,11 +146,26 @@ TEST_CASE("multipart: CompleteMultipartUpload response (200 OK + <Error>)", "[re
     REQUIRE(s3::etag_part_count(r.value));
     CHECK(*s3::etag_part_count(r.value) == 9);
   }
-  SECTION("success without an ETag (keep-alive whitespace only, or above the window): HEAD")
+  SECTION("a 2xx without a result document is a malformed answer, not a commit")
   {
     auto const ws = s3::interpret_complete_response("      ", false);
-    CHECK_FALSE(ws.ec);
-    CHECK(ws.value.empty());
+    CHECK(ws.ec == make_error_code(errc::http_bad_message));
+    CHECK_FALSE(ws.retriable);
+    auto const proxy = s3::interpret_complete_response("<html>proxy failure</html>", false);
+    CHECK(proxy.ec == make_error_code(errc::http_bad_message));
+    CHECK_FALSE(proxy.retriable);
+    auto const lookalike = s3::interpret_complete_response(
+      "<CompleteMultipartUploadResultX><ETag>\"e\"</ETag></CompleteMultipartUploadResultX>", false);
+    CHECK(lookalike.ec == make_error_code(errc::http_bad_message));
+  }
+  SECTION("a result without an ETag, or above the window: success without an ETag")
+  {
+    auto const no_tag = s3::interpret_complete_response(
+      "<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+      "<Bucket>b</Bucket></CompleteMultipartUploadResult>",
+      false);
+    CHECK_FALSE(no_tag.ec);
+    CHECK(no_tag.value.empty());
     auto const big = s3::interpret_complete_response("<Error>ignored", true);
     CHECK_FALSE(big.ec);
     CHECK(big.value.empty());

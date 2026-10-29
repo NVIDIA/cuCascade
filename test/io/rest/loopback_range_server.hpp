@@ -287,6 +287,8 @@ struct write_fault {
   enum class action : std::uint8_t {
     status,           ///< answer @c status with an S3 error document (@c code); body read first
     ok_with_error,    ///< `200 OK` whose body is an S3 `<Error>` (@c code), e.g. on Complete
+    ok_with_body,     ///< `200 OK`, `text/html`, carrying @c body; the request is not applied (a
+                      ///< proxy answering in S3's place)
     drop_mid_body,    ///< read about half of the body, then close the connection, no response
     drop_after_body,  ///< read the body (perform it when @c apply), close without a response
     hold,             ///< hold the response on @c control until released, then answer normally
@@ -299,6 +301,7 @@ struct write_fault {
   int status{503};
   std::string code{"SlowDown"};
   std::string retry_after;  ///< Retry-After header of a `status` answer (empty: none)
+  std::string body;         ///< ok_with_body: the response body
   bool apply{false};        ///< drop_after_body: the request takes effect (a lost response)
   std::shared_ptr<range_response_control> control;  ///< hold
 };
@@ -1473,6 +1476,13 @@ class loopback_range_server {
           write_response r;
           r.headers = "Content-Type: application/xml\r\n";
           r.body    = s3_error_body(fault->code, "injected 200 with an error");
+          record_write(std::move(rec), 200);
+          return !send_write_response(conn, r, close_connection) || close_connection;
+        }
+        case write_fault::action::ok_with_body: {
+          write_response r;
+          r.headers = "Content-Type: text/html\r\n";
+          r.body    = fault->body;
           record_write(std::move(rec), 200);
           return !send_write_response(conn, r, close_connection) || close_connection;
         }

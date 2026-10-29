@@ -713,6 +713,29 @@ TEST_CASE("rest_ioctx retries transient write failures and surfaces final ones",
     require_stored(*server, "complete-403.bin", data);
   }
 
+  SECTION("a 200 Complete without a result document fails the flush; flushing again commits")
+  {
+    // A proxy answering in S3's place: the commit was never acknowledged, so it must not read as
+    // committed (with an empty tag).
+    s3_write_policy policy;
+    policy.faults.push_back(write_fault{.kind = write_kind::complete_upload,
+                                        .nth  = 0,
+                                        .what = write_fault::action::ok_with_body,
+                                        .body = "<html>proxy failure</html>"});
+    auto server = make_store(policy);
+    auto ioctx  = make_write_ioctx(*server);
+    rest_shutdown_guard cleanup{*ioctx};
+    auto object = ioctx->open_io_object_for_write(uri("complete-proxy.bin"));
+    REQUIRE(ioctx->host_write(*object, 0, data.size(), data.data()) == data.size());
+    CHECK_THROWS(ioctx->flush(*object));
+    CHECK(server->complete_upload_count() == 1);
+    CHECK(server->active_upload_count() == 1);
+    CHECK_FALSE(server->stored_object("complete-proxy.bin").has_value());
+    ioctx->flush(*object);
+    CHECK(server->complete_upload_count() == 2);
+    require_stored(*server, "complete-proxy.bin", data);
+  }
+
   SECTION("a final error on a write-started part upload poisons the object")
   {
     s3_write_policy policy;

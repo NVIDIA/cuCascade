@@ -140,9 +140,12 @@ struct xml_outcome {
  * @brief CompleteMultipartUpload answered 2xx: success, or the "200 OK with an S3 `<Error>`"
  *        case (S3 sends the status before it finished the assembly).
  * @param overflow the body did not fit the window: success without an ETag (take it from a
- *        HEAD; gpuio T18b).
- * @return the object ETag (unescaped; empty when the body did not carry it, e.g. keep-alive
- *         whitespace only) in @c value, or the mapped error with @c retriable.
+ *        HEAD; gpuio T18b).  The engine re-issues an overflowing capture with a larger window
+ *        instead, so it always passes false.
+ * @return the object ETag (unescaped; empty when the `CompleteMultipartUploadResult` did not
+ *         carry one) in @c value, or the mapped error with @c retriable.  A 2xx body that is
+ *         neither an `<Error>` nor a `CompleteMultipartUploadResult` (a proxy page, keep-alive
+ *         whitespace only) is `http_bad_message`, not retried.
  */
 [[nodiscard]] xml_outcome interpret_complete_response(std::string_view body,
                                                       bool overflow,
