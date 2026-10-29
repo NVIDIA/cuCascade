@@ -53,7 +53,7 @@ namespace {
 
 /// An io_object with only the base class's identity: a validation tag, no
 /// backend override.
-class plain_object final : public io_object {
+class plain_object : public io_object {
  public:
   plain_object(std::string path, std::string tag) : _path(std::move(path)), _tag(std::move(tag)) {}
 
@@ -65,6 +65,12 @@ class plain_object final : public io_object {
  private:
   std::string _path;
   std::string _tag;
+};
+
+class strong_object final : public plain_object {
+ public:
+  using plain_object::plain_object;
+  [[nodiscard]] bool validation_tag_is_strong() const noexcept override { return true; }
 };
 
 /// A temporary file holding @p bytes copies of @p fill, removed on scope exit;
@@ -258,15 +264,18 @@ TEST_CASE("REST identity only reuses strong ETags", "[object_identity]")
   rest_io_object weak("s3://bucket/key", "bucket", "key", 3, "W/\"v1\"");
   CHECK(weak.identity().kind == identity_kind::opened_handle);
   CHECK(weak.validation_tag() == "W/\"v1\"");
+  CHECK_FALSE(weak.validation_tag_is_strong());
 
   rest_io_object invalid("s3://bucket/key", "bucket", "key", 3, "v1");
   CHECK(invalid.identity().kind == identity_kind::opened_handle);
+  CHECK_FALSE(invalid.validation_tag_is_strong());
 
   rest_io_object absent("s3://bucket/key", "bucket", "key", 3);
   CHECK(absent.identity().kind == identity_kind::opened_handle);
 
   rest_io_object strong("s3://bucket/key", "bucket", "key", 3, "\"v1\"");
   CHECK(strong.identity().kind == identity_kind::object_tag);
+  CHECK(strong.validation_tag_is_strong());
   CHECK(strong.identity().version == "\"v1\"");
   CHECK(strong.identity().size == 3);
 
@@ -285,14 +294,15 @@ TEST_CASE("REST identity only reuses strong ETags", "[object_identity]")
   CHECK(next.identity_cache_key() != strong.identity_cache_key());
 }
 
-TEST_CASE("Default identity is a tag or scoped to the open", "[object_identity]")
+TEST_CASE("Default identity ignores a validation tag the backend has not declared strong",
+          "[object_identity]")
 {
-  plain_object const tagged("file", "\"t\"");
-  auto const tag_identity = tagged.identity();
-  CHECK(tag_identity.kind == identity_kind::object_tag);
-  CHECK(tag_identity.version == "\"t\"");
-  CHECK(tag_identity.size == 7);
-  CHECK(plain_object("file", "\"t\"").identity() == tag_identity);
+  for (auto const* tag : {"W/\"v1\"", "\"t\""}) {
+    plain_object const a("p", tag), b("p", tag);
+    CHECK(a.identity().kind == identity_kind::opened_handle);
+    CHECK(a.identity() != b.identity());
+    CHECK(a.identity_cache_key() != b.identity_cache_key());
+  }
 
   plain_object const untagged("file", "");
   plain_object const reopened("file", "");
@@ -304,6 +314,19 @@ TEST_CASE("Default identity is a tag or scoped to the open", "[object_identity]"
   // Stable for one open.
   CHECK(untagged.identity() == untagged.identity());
   CHECK(untagged.identity_cache_key() == untagged.identity_cache_key());
+}
+
+TEST_CASE("A backend that declares its tag strong shares an object_tag identity",
+          "[object_identity]")
+{
+  strong_object const a("file", "\"t\""), b("file", "\"t\"");
+  CHECK(a.identity().kind == identity_kind::object_tag);
+  CHECK(a.identity().version == "\"t\"");
+  CHECK(a.identity().size == 7);
+  CHECK(a.identity() == b.identity());
+  CHECK(a.identity_cache_key() == b.identity_cache_key());
+  strong_object const empty("file", "");
+  CHECK(empty.identity().kind == identity_kind::opened_handle);
 }
 
 TEST_CASE("uring opens carry the stat identity of their descriptors", "[object_identity][uring]")

@@ -267,9 +267,9 @@ struct held_request {
 
 /// A backend-neutral object for the held backend: keyed by its path like a
 /// local file, with an optional @p version reported as its validation tag and
-/// the base @c io_object identity (a version is an @c object_tag; without one
-/// the identity is scoped to this open).  The REST object type only carries it
-/// to the backend; none of its ETag rules apply.
+/// declared strong for the base @c io_object identity (a version is an
+/// @c object_tag; without one the identity is scoped to this open).  The REST object type only
+/// carries it to the backend; none of its ETag rules apply.
 class controlled_object final : public io::rest::rest_io_object {
  public:
   controlled_object(std::string path, std::size_t bytes, std::string version = {})
@@ -283,7 +283,7 @@ class controlled_object final : public io::rest::rest_io_object {
     return object_path();
   }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return _version; }
-  [[nodiscard]] io::object_identity identity() const override { return io_object::identity(); }
+  [[nodiscard]] bool validation_tag_is_strong() const noexcept override { return true; }
 
  private:
   std::string _version;

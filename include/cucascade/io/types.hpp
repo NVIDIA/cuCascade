@@ -103,16 +103,18 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// The evidence that another open of this path sees the same version of the
   /// object.  A backend overrides it with what it can prove (a local file's
   /// stat tuple, a remote object's strong validator).  The default uses
-  /// @ref validation_tag as an @c object_tag; without a tag the identity is
+  /// @ref validation_tag as an @c object_tag only when the backend declares it
+  /// strong via @ref validation_tag_is_strong. Otherwise the identity is
   /// scoped to this open (@c opened_handle, versioned by @ref open_generation),
   /// never to the path.
   [[nodiscard]] virtual object_identity identity() const
   {
     object_identity result;
-    auto const tag = validation_tag();
-    result.kind    = tag.empty() ? identity_kind::opened_handle : identity_kind::object_tag;
-    result.size    = size();
-    result.version = tag.empty() ? std::to_string(_open_generation) : std::string(tag);
+    auto const tag      = validation_tag();
+    bool const reusable = !tag.empty() && validation_tag_is_strong();
+    result.kind         = reusable ? identity_kind::object_tag : identity_kind::opened_handle;
+    result.size         = size();
+    result.version      = reusable ? std::string(tag) : std::to_string(_open_generation);
     return result;
   }
 
@@ -141,9 +143,15 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// unavailable.  HTTP backends preserve quotes and a weak W/ prefix.  A
   /// backend decides whether it may be sent back as a request condition: the
   /// REST reactor sends a strong tag as @c If-Match on its data GETs and never
-  /// sends a weak or otherwise unusable one.  The view is valid for this
-  /// object's lifetime.
+  /// sends a weak or otherwise unusable one. The default identity uses a
+  /// nonempty tag only when @ref validation_tag_is_strong holds. The view is
+  /// valid for this object's lifetime.
   [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
+
+  /// Whether a nonempty validation_tag() is a strong validator: equal tags
+  /// of the same size at the same raw_file_cache_id() name byte-identical
+  /// versions. Default false: an opaque tag is not reusable evidence.
+  [[nodiscard]] virtual bool validation_tag_is_strong() const noexcept { return false; }
 
  private:
   std::uint64_t const _open_generation = next_open_generation();

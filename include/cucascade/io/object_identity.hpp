@@ -33,7 +33,8 @@ namespace cucascade::io {
 ///    opened object (its @c version is that object's open generation), so it
 ///    never authorizes reuse through a separately opened handle.
 ///  - @c local_stat: device, inode, size and ctime of an opened local file.
-///  - @c object_tag: a strong validator of a remote object (its ETag).
+///  - @c object_tag: a tag the backend declared strong
+///    (@c io_object::validation_tag_is_strong).
 enum class identity_kind : std::uint8_t { opened_handle, local_stat, object_tag };
 
 /// Evidence that two opens of a path see the same version of the object.  Two

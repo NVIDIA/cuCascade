@@ -66,8 +66,8 @@ class fake_object final : public io_object {
   object_identity identity_;
 };
 
-/// An object with the base io_object identity: its validation tag (if any)
-/// decides it.
+/// An object with the base io_object identity: a backend that declares its
+/// tag strong.
 class tagged_object final : public io_object {
  public:
   explicit tagged_object(std::string path, std::string tag = {})
@@ -78,6 +78,7 @@ class tagged_object final : public io_object {
   [[nodiscard]] const std::string& object_path() const noexcept override { return path_; }
   [[nodiscard]] size_t size() const noexcept override { return 64; }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return tag_; }
+  [[nodiscard]] bool validation_tag_is_strong() const noexcept override { return true; }
 
  private:
   std::string path_;
@@ -246,6 +247,7 @@ TEST_CASE("Metadata store validates reopened objects and isolates access namespa
     const std::string& raw_file_cache_id() const noexcept override { return raw; }
     size_t size() const noexcept override { return 64; }
     std::string_view validation_tag() const noexcept override { return etag; }
+    bool validation_tag_is_strong() const noexcept override { return true; }
   };
   object first, reopened;
   metadata_store store, other_scope;

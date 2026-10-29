@@ -223,14 +223,9 @@ class rest_io_object : public io_object {
   /// A strong ETag is the object's version (@c object_tag); a weak, malformed
   /// or absent one scopes the identity to this open (@c opened_handle), exactly
   /// as @ref raw_file_cache_id scopes the cache id.
-  [[nodiscard]] object_identity identity() const override
+  [[nodiscard]] bool validation_tag_is_strong() const noexcept override
   {
-    auto result = io_object::identity();
-    if (!is_strong_tag(_etag)) {
-      result.kind    = identity_kind::opened_handle;
-      result.version = std::to_string(open_generation());
-    }
-    return result;
+    return is_strong_tag(validation_tag());
   }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
