@@ -1316,17 +1316,32 @@ bool cufile_reactor::park_if_stream_busy(std::shared_ptr<const io_object> const&
   // the null handle is the caller's legacy default stream, never the worker's
   // per-thread one.
   auto const stream = worker_view_of(slice.d_buffer.stream.get());
-  auto const state  = cudaStreamQuery(stream);
-  if (state == cudaSuccess) return false;
-  std::ignore = cudaGetLastError();
-  if (state != cudaErrorNotReady) {
-    throw cucascade::cuda_error(std::string{"cufile_reactor: cudaStreamQuery failed: "} +
-                                cudaGetErrorString(state));
+  if (stream != cudaStreamLegacy) {
+    auto const state = cudaStreamQuery(stream);
+    if (state == cudaSuccess) return false;
+    std::ignore = cudaGetLastError();
+    if (state != cudaErrorNotReady) {
+      throw cucascade::cuda_error(std::string{"cufile_reactor: cudaStreamQuery failed: "} +
+                                  cudaGetErrorString(state));
+    }
   }
   // The event marks "everything queued before this dispatch"; work the caller
-  // queues later does not hold the slice back.
+  // queues later does not hold the slice back.  A legacy-stream event orders
+  // after prior work on every blocking stream, including a PTDS caller's null
+  // stream; a bare legacy-stream query does not promise that dependency, so
+  // explicit streams keep the cheap query above and the legacy stream is
+  // checked through the event.
   auto event = std::make_shared<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
   CUCASCADE_CUDA_TRY(cudaEventRecord(event->get(), stream));
+  if (stream == cudaStreamLegacy) {
+    auto const state = cudaEventQuery(event->get());
+    if (state == cudaSuccess) return false;
+    std::ignore = cudaGetLastError();
+    if (state != cudaErrorNotReady) {
+      throw cucascade::cuda_error(std::string{"cufile_reactor: cudaEventQuery failed: "} +
+                                  cudaGetErrorString(state));
+    }
+  }
   _waiting.push_back(waiting_slice{obj, std::move(slice), coordinator, std::move(event)});
   _counters.parked_slices.fetch_add(1, std::memory_order_relaxed);
   return true;

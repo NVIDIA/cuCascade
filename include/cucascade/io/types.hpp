@@ -362,9 +362,10 @@ struct device_buffer {
   }
 
   std::uint8_t* data{nullptr};
-  // Default to the null stream explicitly: cuda::stream_ref's default
-  // constructor is deprecated by CCCL, so initialize from cudaStream_t{nullptr}
-  // to preserve the same null-stream semantics without the warning.
+  // The dispatcher pins null to cudaStreamLegacy and replaces cudaStreamPerThread
+  // with a stand-in: a reactor never sees a default handle whose meaning depends
+  // on its translation unit or thread. Initialize explicitly (CCCL deprecates
+  // stream_ref's default constructor).
   ::cuda::stream_ref stream{cudaStream_t{nullptr}};
   int device_id{-1};
   /// Set by a backend's submission path on the submitting thread: an event
@@ -379,7 +380,7 @@ struct device_buffer {
   /// Whether the submission path resolved @c ready_gate (see there).
   bool ready_gate_set{false};
   /// Keeps alive a stream the dispatcher created in place of the caller's
-  /// (see @c detail::resolve_per_thread_streams in templated_ioctx.hpp); null
+  /// (see @c detail::resolve_default_streams in templated_ioctx.hpp); null
   /// when @c stream is the caller's own.
   std::shared_ptr<void> stream_owner;
 };
