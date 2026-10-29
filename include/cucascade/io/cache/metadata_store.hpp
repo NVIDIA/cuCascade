@@ -55,7 +55,7 @@ struct string_hash {
 
 /**
  * @brief Thread-safe per-ioctx metadata cache: one entry per object path and
- *        profile, reusable only by an open with the same object identity.
+ *        profile, reusable only by an open with the same identity and locator.
  *
  * Owned by @c ioctx and always present, independent of the @c fs_cache.
  * Callers that have parsed file metadata (e.g. a parquet footer) park it here
@@ -65,17 +65,19 @@ struct string_hash {
  * Path and profile are encoded unambiguously, so no (path, profile) pair can
  * alias another.
  *
- * An entry records the @c io_object::identity() of the open that published it
- * and is returned only to an open with an equal identity: a strong ETag or a
+ * An entry records the @c io_object::identity() and backend locator
+ * (@c io_object::raw_file_cache_id()) of the open that published it and is
+ * returned only to an open with both equal: a strong ETag or a
  * local file's stat tuple can be shared by separate opens, an open-local
  * (@c opened_handle) identity only by the publishing object itself.  A path
  * lookup (@ref has_path) is a candidate hint, never permission to consume
  * metadata.
  *
- * The store remembers the newest identity observed for each path
- * (@ref open_observed, by open generation).  Observing a newer identity retires
- * the path's entries (every profile), and a publication from an open of any
- * other identity is dropped, so a slow parse of a replaced version cannot
+ * The store remembers the newest identity and locator observed for each path
+ * (@ref open_observed, by open generation). Observing a newer open with a
+ * different identity or locator retires the path's entries (every profile),
+ * and a publication from an open with either different is dropped, so a slow
+ * parse of a replaced version cannot
  * overwrite the current one.
  *
  * @ref get_or_load is single-flight: concurrent misses for one identity share
@@ -104,7 +106,7 @@ class metadata_store {
   metadata_store& operator=(metadata_store&&)      = delete;
 
   /// Record @p obj's identity as observed for its path.  A newer open (by
-  /// @c io_object::open_generation) with a different identity retires the
+  /// @c io_object::open_generation) with a different identity or locator retires the
   /// path's entries of every profile; an older one changes nothing.
   /// @c opened_handle identities are not evidence and are ignored.  The
   /// datasource calls this when it is constructed.
@@ -135,7 +137,7 @@ class metadata_store {
                          std::string_view profile = {});
 
   /// The metadata registered for @p obj's path and @p profile if it was
-  /// published for an equal identity; nullptr otherwise.
+  /// published for an equal identity and backend locator; nullptr otherwise.
   [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(
     io_object const& obj, std::string_view profile = {}) const;
 
@@ -173,6 +175,7 @@ class metadata_store {
     std::string path;
     std::uint64_t generation;
     object_identity identity;
+    std::string locator;
     /// Last, so a member that throws while an entry is built leaves the
     /// payload with the caller (see @ref put_identity).
     std::shared_ptr<io_object_metadata> value;
@@ -183,6 +186,7 @@ class metadata_store {
   struct observation {
     object_identity identity;
     std::uint64_t generation;
+    std::string locator;
   };
 
   struct flight {
@@ -197,8 +201,11 @@ class metadata_store {
   static std::string cache_key(std::string_view path, std::string_view profile = {});
 
   /// Observe @p identity, computed by the caller from @p obj before it took
-  /// @c _mutex (a backend's @c identity() runs outside the store lock).
-  void observe_locked(io_object const& obj, object_identity const& identity, entries& retired);
+  /// @c _mutex (backend identity and locator virtuals run outside the store lock).
+  void observe_locked(io_object const& obj,
+                      std::string_view locator,
+                      object_identity const& identity,
+                      entries& retired);
   void retire(iterator it, entries& retired) noexcept;
   /// Retire every entry of @p path, of any profile; returns how many.
   std::size_t retire_path(std::string_view path, entries& retired) noexcept;
@@ -206,6 +213,7 @@ class metadata_store {
   /// store only when it is published; when it is not, or when publishing
   /// throws, it stays with the caller, which releases it after @c _mutex.
   bool put_identity(std::string const& path,
+                    std::string_view locator,
                     object_identity identity,
                     std::uint64_t generation,
                     std::shared_ptr<io_object_metadata>& value,

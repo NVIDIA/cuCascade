@@ -238,6 +238,39 @@ TEST_CASE("metadata_store has_path is a reusable-identity hint for an exact path
   CHECK(store.has_path("s3://bucket/t.parquet"));
 }
 
+TEST_CASE("Metadata entries are scoped to the backend locator",
+          "[cache][metadata_store][object_identity]")
+{
+  metadata_store store;
+  fake_object a("shared", "locator-A", tag("\"same-tag\""));
+  fake_object b("shared", "locator-B", tag("\"same-tag\""));
+  auto pa = std::make_shared<value>(1);
+  auto pb = std::make_shared<value>(2);
+  store.register_metadata(a, pa);
+  CHECK_FALSE(store.get_metadata(b));
+  CHECK(store.get_metadata(a) == pa);
+
+  bool hit    = true;
+  int loads   = 0;
+  auto loaded = store.get_or_load(
+    b,
+    [&] {
+      ++loads;
+      return pb;
+    },
+    &hit);
+  CHECK_FALSE(hit);
+  CHECK(loads == 1);
+  CHECK(loaded == pb);
+  CHECK(store.get_metadata(b) == pb);
+  CHECK_FALSE(store.get_metadata(a));
+
+  auto const stale = store.statistics().stale;
+  store.register_metadata(a, std::make_shared<value>(3));
+  CHECK(store.get_metadata(b) == pb);
+  CHECK(store.statistics().stale == stale + 1);
+}
+
 TEST_CASE("Metadata store validates reopened objects and isolates access namespaces",
           "[cache][metadata_store][object_identity]")
 {
@@ -266,6 +299,7 @@ TEST_CASE("Metadata store validates reopened objects and isolates access namespa
   CHECK(first.identity_cache_key() != reopened.identity_cache_key());
   reopened.etag = first.etag;
   reopened.raw  = "different-backend-locator";
+  CHECK_FALSE(store.get_metadata(reopened));
   CHECK(first.identity_cache_key() != reopened.identity_cache_key());
 }
 
