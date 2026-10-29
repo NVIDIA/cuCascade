@@ -70,6 +70,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_iobuf_fragmented_sink.cpp
     io/test_object_identity.cpp
     io/test_null_stream_ptds.cpp
+    io/test_reactor_placement.cpp
     io/test_templated_ioctx.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
