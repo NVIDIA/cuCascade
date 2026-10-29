@@ -114,15 +114,16 @@ struct disk_io_context_options {
   /// automatic: cufile when io::cufile::gds_available(), else uring when io_uring is allowed in
   /// this process, else cufile (its POSIX path).
   disk_io_backend backend{disk_io_backend::automatic};
-  /// The io stack's own static configuration: uring_n_reactors / uring, cufile_n_reactors /
-  /// cufile. backend and cache are ignored (the disk tier never arms an fs_cache).
+  /// The io stack's own static configuration: uring_reactors_per_gpu / uring,
+  /// cufile_reactors_per_gpu / cufile. backend and cache are ignored (the disk tier never arms an
+  /// fs_cache).
   io::io_config io{};
   /// NUMA node of the uring context's private pinned staging (-1: unbound, portable).
   int staging_numa_node{-1};
 };
 
 /// Build AND start a context for DISK spaces. It owns everything it needs: for uring a private
-/// pinned fixed_size_host_memory_resource (uring_n_reactors x 64 MiB).
+/// pinned fixed_size_host_memory_resource (uring_reactors_per_gpu x 64 MiB).
 [[nodiscard]] std::shared_ptr<io::ioctx> make_disk_io_context(disk_io_context_options const& = {});
 
 /// The process-shared default adopted by DISK spaces configured without a context: the shared
@@ -180,8 +181,9 @@ struct disk_io_context_options {
   the context outlives it. Destruction never happens on a reactor thread (no callbacks run there).
   `memory_space::shutdown()` keeps its current meaning and does not touch the context (it may be
   shared).
-- Footprint of the default: uring — `uring_n_reactors` (4) threads + 4 x 64 MiB pinned staging (vs 1
-  thread + 128 MiB per space today); cuFile — `cufile_n_reactors` (4) threads, no staging.
+- Footprint of the default: uring — `uring_reactors_per_gpu` (1; the DISK context has no topology
+  index, so it runs one GPU's worth) threads + 64 MiB pinned staging each (vs 1 thread + 128 MiB per
+  space before); cuFile — `cufile_reactors_per_gpu` (1) threads, no staging.
 
 ## 4. Reader / writer path (cudf layer, private `src/cudf/disk_io.{hpp,cpp}`)
 

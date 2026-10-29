@@ -21,6 +21,7 @@
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/log/logging.hpp>
 
@@ -37,6 +38,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -44,6 +46,7 @@
 #include <string_view>
 #include <system_error>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -315,6 +318,16 @@ class templated_ioctx : public ioctx {
     : _reactors(std::move(reactors))
   {
     if (!_reactors.empty()) _config = _reactors.front()->get_config();
+    init_locality({}, numa_spill_policy{});
+  }
+
+  /// Already-built @p reactors placed per @p layout: one placement per reactor,
+  /// in the same order.  @throws std::invalid_argument on a count mismatch.
+  templated_ioctx(std::vector<std::unique_ptr<Reactor>> reactors, reactor_layout const& layout)
+    : _reactors(std::move(reactors))
+  {
+    if (!_reactors.empty()) _config = _reactors.front()->get_config();
+    init_locality(layout.placements, layout.spill);
   }
 
   template <class Factory>
@@ -327,6 +340,22 @@ class templated_ioctx : public ioctx {
       _reactors.emplace_back(factory());
     }
     if (!_reactors.empty()) _config = _reactors.front()->get_config();
+    init_locality({}, numa_spill_policy{});
+  }
+
+  /// One reactor per placement of @p layout, built by @p factory from it.
+  template <class Factory>
+    requires std::invocable<Factory&, reactor_placement const&> &&
+             std::convertible_to<std::invoke_result_t<Factory&, reactor_placement const&>,
+                                 std::unique_ptr<Reactor>>
+  templated_ioctx(reactor_layout const& layout, Factory factory)
+  {
+    _reactors.reserve(layout.placements.size());
+    for (auto const& placement : layout.placements) {
+      _reactors.emplace_back(factory(placement));
+    }
+    if (!_reactors.empty()) _config = _reactors.front()->get_config();
+    init_locality(layout.placements, layout.spill);
   }
 
   ~templated_ioctx() override
@@ -419,6 +448,10 @@ class templated_ioctx : public ioctx {
   /**
    * @brief Select at most two least-backlogged reactors for a request.
    *
+   * A request for a GPU (@p device_id >= 0, the GPU of its first device slice)
+   * is kept on the reactors of that GPU's NUMA node -- whose staging and worker
+   * CPUs are local to it -- unless they are much busier than the rest of the
+   * pool (see @ref routable_reactors); host-only requests use the whole pool.
    * Rotation breaks load ties and keeps synchronous reads from sticking to
    * reactor zero. queued_bytes is advisory; slot limits remain authoritative.
    * Demand reads are kept ahead of readahead by each reactor's priority tiers
@@ -427,29 +460,10 @@ class templated_ioctx : public ioctx {
   virtual std::vector<Reactor*> next_reactor([[maybe_unused]] io_object_type const& object,
                                              [[maybe_unused]] std::size_t n_slices,
                                              [[maybe_unused]] io_op_type type,
-                                             [[maybe_unused]] int device_id = -1)
+                                             int device_id = -1)
   {
     constexpr std::size_t dispatch_fanout = 2;
-    auto const count                      = _reactors.size();
-    if (count == 0) return {};
-
-    auto const start = _next.fetch_add(1, std::memory_order_relaxed) % count;
-    std::vector<std::pair<std::size_t, std::size_t>> ranked;
-    ranked.reserve(count);
-    for (std::size_t distance = 0; distance < count; ++distance) {
-      ranked.emplace_back(_reactors[(start + distance) % count]->queued_bytes(), distance);
-    }
-
-    auto const selected = std::min(count, dispatch_fanout);
-    std::partial_sort(
-      ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(selected), ranked.end());
-
-    std::vector<Reactor*> result;
-    result.reserve(selected);
-    for (std::size_t i = 0; i < selected; ++i) {
-      result.push_back(_reactors[(start + ranked[i].second) % count].get());
-    }
-    return result;
+    return least_backlogged(routable_reactors(device_id), dispatch_fanout);
   }
 
   /// Most slices one queue entry of a host-only range read may hold when the
@@ -492,7 +506,8 @@ class templated_ioctx : public ioctx {
 
       slices.reserve(input_slices.size());
       std::size_t total_bytes = 0;
-      int device_id           = -1;
+      int device_id           = -1;  // routes the request: GPU of its first device slice
+      int current_device      = -1;
 
       for (auto& slice : input_slices) {
         // A dropped slice reads nothing, so its completion always reports failure: reporting
@@ -522,8 +537,11 @@ class templated_ioctx : public ioctx {
 
         if (slice.has_device_request()) {
           has_device_slice = true;
-          if (device_id < 0) device_id = detail::current_cuda_device();
-          if (slice.d_buffer.device_id < 0) slice.d_buffer.device_id = device_id;
+          if (slice.d_buffer.device_id < 0) {
+            if (current_device < 0) current_device = detail::current_cuda_device();
+            slice.d_buffer.device_id = current_device;
+          }
+          if (device_id < 0) device_id = slice.d_buffer.device_id;
         }
         slices.push_back(std::move(slice));
       }
@@ -885,6 +903,67 @@ class templated_ioctx : public ioctx {
     return result;
   }
 
+  /**
+   * @brief Indices of the reactors a request for GPU @p device_id may use.
+   *
+   * The reactors local to the GPU (placed on its NUMA node, or homed on the GPU
+   * itself when the node is unknown) while they keep up; the whole pool for a
+   * host-only request (@p device_id < 0), a GPU without local reactors, a pool
+   * that is all local, or once the least backlogged local reactor holds more
+   * than @c numa_spill_policy::min_backlog_bytes and more than
+   * @c numa_spill_policy::ratio times the least remote backlog.
+   */
+  [[nodiscard]] std::span<std::size_t const> routable_reactors(int device_id) const noexcept
+  {
+    if (device_id < 0) return _all_reactors;
+    auto const it = _locality.find(device_id);
+    if (it == _locality.end() || it->second.remote.empty()) return _all_reactors;
+    auto const& locality = it->second;
+
+    auto const least = [this](std::span<std::size_t const> candidates) {
+      auto backlog = std::numeric_limits<std::size_t>::max();
+      for (auto const index : candidates) {
+        backlog = std::min(backlog, static_cast<std::size_t>(_reactors[index]->queued_bytes()));
+      }
+      return backlog;
+    };
+    auto const local = least(locality.local);
+    if (local <= _spill.min_backlog_bytes) return locality.local;
+    auto const remote = least(locality.remote);
+    if (static_cast<double>(local) > _spill.ratio * static_cast<double>(remote)) {
+      return _all_reactors;
+    }
+    return locality.local;
+  }
+
+  /// Up to @p fanout reactors of @p candidates (indices into @c _reactors),
+  /// least backlogged first; ties go to the next reactor in rotation.
+  [[nodiscard]] std::vector<Reactor*> least_backlogged(std::span<std::size_t const> candidates,
+                                                       std::size_t fanout)
+  {
+    auto const count = candidates.size();
+    if (count == 0) return {};
+
+    auto const start = _next.fetch_add(1, std::memory_order_relaxed) % count;
+    std::vector<std::pair<std::size_t, std::size_t>> ranked;
+    ranked.reserve(count);
+    for (std::size_t distance = 0; distance < count; ++distance) {
+      ranked.emplace_back(_reactors[candidates[(start + distance) % count]]->queued_bytes(),
+                          distance);
+    }
+
+    auto const selected = std::min(count, fanout);
+    std::partial_sort(
+      ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(selected), ranked.end());
+
+    std::vector<Reactor*> result;
+    result.reserve(selected);
+    for (std::size_t i = 0; i < selected; ++i) {
+      result.push_back(_reactors[candidates[(start + ranked[i].second) % count]].get());
+    }
+    return result;
+  }
+
   reactor_config_type _config{};
   std::vector<std::unique_ptr<Reactor>> _reactors;
   std::atomic<std::size_t> _next{0};
@@ -897,6 +976,51 @@ class templated_ioctx : public ioctx {
     if (typed == nullptr) throw std::invalid_argument("I/O object belongs to another backend");
     return *typed;
   }
+
+  /// The reactors of one GPU's NUMA node and the rest of the pool.
+  struct reactor_locality {
+    std::vector<std::size_t> local;
+    std::vector<std::size_t> remote;
+  };
+
+  /// Build @c _all_reactors and, from @p placements (one per reactor, or none
+  /// for an unplaced pool), the per-GPU split @ref routable_reactors uses.
+  /// @throws std::invalid_argument when @p spill is invalid
+  /// (@ref validate_spill_policy), the placements do not match the reactors one
+  /// to one, or the reactors stage in different block sizes: the pool reports
+  /// one @ref staging_block_size, which a prefetching cache's chunks must match.
+  void init_locality(std::span<reactor_placement const> placements, numa_spill_policy spill)
+  {
+    validate_spill_policy(spill);
+    _spill = spill;
+    _all_reactors.resize(_reactors.size());
+    std::iota(_all_reactors.begin(), _all_reactors.end(), std::size_t{0});
+    for (auto const& reactor : _reactors) {
+      if (reactor->staging_block_size() != _reactors.front()->staging_block_size()) {
+        throw std::invalid_argument(
+          "templated_ioctx: every reactor of a pool must stage in the same block size");
+      }
+    }
+    if (placements.empty()) return;
+    if (placements.size() != _reactors.size()) {
+      throw std::invalid_argument("templated_ioctx: the layout must place every reactor");
+    }
+    for (auto const& home : placements) {
+      if (home.gpu_id < 0 || _locality.contains(home.gpu_id)) continue;
+      reactor_locality locality;
+      for (std::size_t i = 0; i < placements.size(); ++i) {
+        auto const& placement = placements[i];
+        bool const is_local   = placement.gpu_id == home.gpu_id ||
+                              (home.numa_node >= 0 && placement.numa_node == home.numa_node);
+        (is_local ? locality.local : locality.remote).push_back(i);
+      }
+      _locality.emplace(home.gpu_id, std::move(locality));
+    }
+  }
+
+  std::vector<std::size_t> _all_reactors;               ///< 0 .. _reactors.size() - 1
+  std::unordered_map<int, reactor_locality> _locality;  ///< by CUDA device id
+  numa_spill_policy _spill{};
 
   /// @ref as_typed, plus @c bad_file_descriptor for an object opened read-only.
   static io_object_type const& as_writable(io_object const& object)

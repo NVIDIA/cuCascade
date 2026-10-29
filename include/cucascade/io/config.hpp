@@ -22,6 +22,7 @@
 #include <cucascade/io/cufile/config.hpp>
 #endif
 #include <cucascade/io/object_store_config.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 
@@ -52,6 +53,14 @@ enum class io_backend {
  * @ref io_backend::cufile routes local regular files to @c cufile_ioctx
  * (@c s3:// stays on REST).
  *
+ * Reactor counts are per GPU: a backend built with a topology index (see
+ * @c io_context_registry) runs @c *_reactors_per_gpu reactors for every GPU of
+ * the index, each placed on its GPU's NUMA node -- pinned staging from that
+ * node's HOST space, worker pinned to the GPU's local CPUs (@ref
+ * pin_reactor_threads) -- and device requests prefer the reactors of their GPU's
+ * node (@ref reactor_spill).  Without a topology index a backend runs one GPU's
+ * worth of unplaced reactors.
+ *
  * @c cache is the read path's whole caching configuration, and its only home;
  * @ref apply_cache_mode derives @c uring.use_odirect and @c cache.dispose_on_idle
  * from it, so neither is settable on its own.
@@ -69,12 +78,23 @@ struct io_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring reactor worker threads for the local-disk IO path.
-  std::size_t uring_n_reactors{4};
+  /// uring reactor worker threads per GPU for the local-disk IO path.
+  std::size_t uring_reactors_per_gpu{1};
 
-  /// Number of REST reactor worker threads for the S3/object-store IO path
-  /// (each its own io_uring ring + connection pools).
-  std::size_t rest_n_reactors{2};
+  /// REST reactor worker threads per GPU for the S3/object-store IO path (each
+  /// its own io_uring ring + connection pools).
+  std::size_t rest_reactors_per_gpu{1};
+
+  /// Pin every reactor worker to the CPUs local to its GPU (from the topology
+  /// index's GPU CPU affinity) that the process's inherited affinity allows;
+  /// a worker none of whose GPU's CPUs is allowed stays unpinned.  Has no
+  /// effect without a topology index.
+  bool pin_reactor_threads{true};
+
+  /// When a device request leaves the reactors of its GPU's NUMA node for the
+  /// rest of the pool.  Its @c ratio must be finite and at least 1
+  /// (@c io_context_registry throws std::invalid_argument otherwise).
+  numa_spill_policy reactor_spill{};
 
   /// Local (uring) reactor configuration.  @c use_odirect is derived from
   /// @ref cache; physical operation size is selected by the worker.
@@ -86,10 +106,10 @@ struct io_config {
   rest::config rest{};
 
 #ifdef CUCASCADE_HAS_CUFILE
-  /// Number of cuFile reactor worker threads for the GDS local-disk IO path.
+  /// cuFile reactor worker threads per GPU for the GDS local-disk IO path.
   /// Each reactor serves one synchronous transfer at a time; a vectored read
-  /// with more than two slices fans out across all of them.
-  std::size_t cufile_n_reactors{4};
+  /// with more than two slices fans out across every reactor it may use.
+  std::size_t cufile_reactors_per_gpu{1};
 
   /// cuFile / GDS read reactor configuration.  Only consulted when
   /// @c backend == @ref io_backend::cufile.  Not derived from @ref cache: the

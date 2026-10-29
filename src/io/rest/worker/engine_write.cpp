@@ -359,7 +359,7 @@ void engine::assemble(std::shared_ptr<upload_session> up,
     auto const bytes = up->state.part_size();
     auto fresh       = std::make_shared<s3::assembly_buffer>();
     try {
-      if (auto* resource = _ctx->host_memory_resource(); resource != nullptr) {
+      if (auto* resource = _staging_mr; resource != nullptr) {
         auto allocation = resource->allocate_multiple_blocks(bytes);
         if (allocation == nullptr || allocation->size_bytes() < bytes) {
           throw rmm::out_of_memory("rest_reactor: part buffer allocation came up short");

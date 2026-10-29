@@ -64,6 +64,13 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @c templated_ioctx.
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
+  /// Build one reactor per placement of @p layout, all sharing @p ctx (and its
+  /// transport services).  Each reactor stages through its placement's pinned
+  /// resource (the context's when it has none) and pins its worker to the
+  /// placement's CPUs; device requests prefer the reactors of their GPU's NUMA
+  /// node (see @c templated_ioctx::next_reactor).
+  rest_ioctx(reactor_layout const& layout, std::shared_ptr<rest_reactor::reactor_context> ctx);
+
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call

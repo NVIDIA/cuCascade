@@ -207,11 +207,11 @@ TEST_CASE("cufile routing takes local regular files only", "[io][registry][cufil
 TEST_CASE("cufile factory builds a cufile ioctx from the configured settings",
           "[io][registry][cufile]")
 {
-  auto config                 = config_for(io_backend::cufile);
-  config.cufile_n_reactors    = 1;
-  config.cufile.compat_mode   = cucascade::io::cufile::compat::on;
-  config.cufile.max_inflight  = 7;
-  config.cufile.gds_threshold = 1UL << 20;
+  auto config                    = config_for(io_backend::cufile);
+  config.cufile_reactors_per_gpu = 1;
+  config.cufile.compat_mode      = cucascade::io::cufile::compat::on;
+  config.cufile.max_inflight     = 7;
+  config.cufile.gds_threshold    = 1UL << 20;
   registry_fixture fixture{config};
 
   auto ctx = fixture.registry.make_ioctx(io_context_type::cufile);

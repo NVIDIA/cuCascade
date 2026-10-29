@@ -96,7 +96,7 @@ struct config {
   /// reactor thread spends its time in per-read callback and TLS-record overhead
   /// rather than moving bytes, and time-to-first-byte climbs because it cannot
   /// service that many sockets promptly.  To drive more concurrency, add
-  /// reactors (@c rest_n_reactors) rather than sockets per reactor — each
+  /// reactors (@c rest_reactors_per_gpu) rather than sockets per reactor — each
   /// reactor brings its own thread to service them.
   std::size_t max_connections{64};
 

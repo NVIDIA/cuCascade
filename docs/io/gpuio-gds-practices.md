@@ -21,8 +21,8 @@ through POSIX.
 
 ```cpp
 cucascade::io::io_config cfg;
-cfg.backend           = cucascade::io::io_backend::cufile;
-cfg.cufile_n_reactors = 4;                 // CUCASCADE_HAS_CUFILE builds only
+cfg.backend                 = cucascade::io::io_backend::cufile;
+cfg.cufile_reactors_per_gpu = 4;           // CUCASCADE_HAS_CUFILE builds only
 cfg.cufile.compat_mode = cucascade::io::cufile::compat::automatic;
 cucascade::io::io_context_registry registry{cfg, reservation_manager};
 ```
@@ -109,9 +109,10 @@ reactors: its high-water mark is 16 MiB per reactor that ever staged.
 | `low_service_interval` | 4 | high starts before a waiting low request gets a turn; 0 = strict priority |
 | `n_max_concurrent_scans` | 4 | readahead budget advertised to scan managers |
 
-`io_config::cufile_n_reactors` (4) sizes the pool. 64 MiB and 256 KiB were chosen in compatibility
-mode (64 MiB: 6.83 vs 6.00 GB/s at 16 MiB from one thread; 256 KiB sits above the <= 128 KiB
-small-I/O regression NVIDIA documents for real GDS on kernels >= 6.11).
+`io_config::cufile_reactors_per_gpu` (1) sizes the pool, per GPU of the registry's topology index
+(one GPU's worth without one). 64 MiB and 256 KiB were chosen in compatibility mode (64 MiB: 6.83
+vs 6.00 GB/s at 16 MiB from one thread; 256 KiB sits above the <= 128 KiB small-I/O regression
+NVIDIA documents for real GDS on kernels >= 6.11).
 
 **Known gap.** Device reads below `gds_threshold`, and every device read of a file without a cuFile
 handle, are a synchronous `pread` plus H2D copy per reactor: 64 KiB reads reach about 1.2-1.3 GB/s

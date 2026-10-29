@@ -392,7 +392,7 @@ connections at about 5 s). `tls_verify = false` is supported
 |---|---|
 | U1-U6, U10-U16, R5, R7-R10, K1-K3 (ring, enter, deadlines, sockets, rejected features) | kept |
 | R6 (min-wait batching) | not applicable: storage-dense waits only, this ring has sockets only |
-| R1-R4 (run() threads, pinning, reactor count) | cuCascade threads (`rest_n_reactors`); pinning not offered |
+| R1-R4 (run() threads, pinning, reactor count) | cuCascade threads (`rest_reactors_per_gpu` per GPU of the topology index); workers pinned to their GPU's local CPUs (`io_config::pin_reactor_threads`) |
 | R11, G-4, G-5 (copy wait) | kept |
 | D1-D3, D5, D7-D10, D12 (pull distribution) | replaced by cuCascade's push dispatch (design kept) |
 | D4 (wake) | kept |

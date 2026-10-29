@@ -22,6 +22,7 @@
 #include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/types.hpp>
@@ -412,8 +413,12 @@ class rest_reactor {
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
 
+  /// Device reads and part buffers stage through @p placement's pinned resource,
+  /// or the context's when it has none; the worker pins itself to
+  /// @p placement's CPUs before it sets up its ring.
   explicit rest_reactor(std::shared_ptr<reactor_context> ctx,
-                        std::string_view tname = "rest_reactor");
+                        std::string_view tname      = "rest_reactor",
+                        reactor_placement placement = {});
   ~rest_reactor();
 
   rest_reactor(rest_reactor const&)            = delete;
@@ -424,8 +429,8 @@ class rest_reactor {
   /// so the config lives in one place — the context.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  /// Staging block size, taken from the context's host resource (0 when the
-  /// context has none).  INVARIANT: when a prefetching cache is present this
+  /// Staging block size, taken from the staging resource (the placement's, else
+  /// the context's; 0 when there is none).  INVARIANT: when a prefetching cache is present this
   /// MUST equal its chunk size — the worker plans a fragmented fill's extent as
   /// @c cache::fill_span(fill, chunk->offset, this value), so a larger staging
   /// block writes past the end of the pinned chunk and a smaller one marks a
@@ -433,10 +438,14 @@ class rest_reactor {
   /// @c ioctx::initialize_cache.
   [[nodiscard]] std::size_t staging_block_size() const noexcept
   {
-    return _ctx == nullptr || _ctx->host_memory_resource() == nullptr
-             ? std::size_t{0}
-             : _ctx->host_memory_resource()->get_block_size();
+    auto const* resource = _placement.staging_mr != nullptr
+                             ? _placement.staging_mr
+                             : (_ctx == nullptr ? nullptr : _ctx->host_memory_resource());
+    return resource == nullptr ? std::size_t{0} : resource->get_block_size();
   }
+
+  /// Where this reactor lives (home GPU, NUMA node, staging, worker CPUs).
+  [[nodiscard]] reactor_placement const& placement() const noexcept { return _placement; }
 
   // -- dispatch / lifecycle ------------------------------------------------
 
@@ -575,6 +584,7 @@ class rest_reactor {
   std::shared_ptr<reactor_context> _ctx;
   config _config;
   std::string _tname;
+  reactor_placement _placement;
   std::atomic<std::size_t> _queued_bytes{0};
   /// Deletes handed to the worker: each owns the call the engine holds until it finished.
   /// Settled ones are reclaimed by the next delete_object_async and by the destructor, which

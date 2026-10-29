@@ -45,11 +45,17 @@
 namespace cucascade::io::rest {
 
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
-  : templated_ioctx<rest_reactor>(n_reactors,
-                                  [ctx = std::move(ctx), i = 0]() mutable {
-                                    return std::make_unique<rest_reactor>(
-                                      ctx, "rest-" + std::to_string(i++));
-                                  }),
+  : rest_ioctx(reactor_layout::unplaced(n_reactors), std::move(ctx))
+{
+}
+
+rest_ioctx::rest_ioctx(reactor_layout const& layout,
+                       std::shared_ptr<rest_reactor::reactor_context> ctx)
+  : templated_ioctx<rest_reactor>(
+      layout,
+      [ctx = std::move(ctx), i = 0](reactor_placement const& placement) mutable {
+        return std::make_unique<rest_reactor>(ctx, "rest-" + std::to_string(i++), placement);
+      }),
     _lister(
       [this](std::string_view bucket, std::string_view prefix, std::string_view canonical_query) {
         if (_reactors.empty()) {

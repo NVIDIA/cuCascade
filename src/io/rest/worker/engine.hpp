@@ -282,10 +282,12 @@ class engine {
   /// @param ctx       the pool's context (config, authorizer, staging resource, services)
   /// @param name      for log lines
   /// @param max_connections  per-endpoint connection ceiling of this engine (0 = config)
+  /// @param staging_mr       pinned staging of this engine (null = the context's resource)
   engine(std::shared_ptr<rest_reactor::reactor_context> ctx,
          std::string name,
-         std::atomic<std::size_t>* queued_bytes = nullptr,
-         unsigned max_connections               = 0);
+         std::atomic<std::size_t>* queued_bytes                         = nullptr,
+         unsigned max_connections                                       = 0,
+         cucascade::memory::fixed_size_host_memory_resource* staging_mr = nullptr);
   ~engine();
 
   engine(engine const&)            = delete;
@@ -439,6 +441,8 @@ class engine {
   [[nodiscard]] std::uint64_t rng() noexcept;
 
   std::shared_ptr<rest_reactor::reactor_context> _ctx;
+  /// Pinned staging of device reads and part buffers (null when there is none).
+  cucascade::memory::fixed_size_host_memory_resource* _staging_mr{nullptr};
   shared_services* _svc{nullptr};
   config _cfg;
   std::string _name;

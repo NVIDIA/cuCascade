@@ -208,8 +208,10 @@ void pool_handler::on_connect_failed(std::uint32_t endpoint, std::error_code ec)
 engine::engine(std::shared_ptr<rest_reactor::reactor_context> ctx,
                std::string name,
                std::atomic<std::size_t>* queued_bytes,
-               unsigned max_connections)
+               unsigned max_connections,
+               cucascade::memory::fixed_size_host_memory_resource* staging_mr)
   : _ctx(std::move(ctx)),
+    _staging_mr(staging_mr != nullptr ? staging_mr : _ctx->host_memory_resource()),
     _svc(&_ctx->services()),
     _cfg(_ctx->cfg()),
     _name(std::move(name)),
@@ -422,9 +424,7 @@ void engine::expand(entry& e) noexcept
   if (!e.pending.empty() || e.group == nullptr || e.group->empty()) return;
   auto& cfg              = ep(e.endpoint).control->planner;
   auto const slice_bytes = e.group->front().size();
-  auto const block       = _ctx->host_memory_resource() == nullptr
-                             ? std::size_t{0}
-                             : _ctx->host_memory_resource()->get_block_size();
+  auto const block       = _staging_mr == nullptr ? std::size_t{0} : _staging_mr->get_block_size();
   cut_fn const cut       = [&e, &cfg](range r, std::vector<range>& out) {
     std::vector<file_range> pieces(planner::remote_chunk_capacity(r.size, cfg));
     auto const n = planner::cut_remote_chunks(
@@ -704,7 +704,7 @@ bool engine::start_entry_op(entry& e) noexcept
   // pinned staging resource.  Exhaustion fails the read (the engine retries rmm::out_of_memory).
   if (front->needs_staging && front->op->staging_owner == nullptr) {
     try {
-      auto* resource = _ctx->host_memory_resource();
+      auto* resource = _staging_mr;
       if (resource == nullptr) {
         throw std::runtime_error("rest_reactor: staged device read requires host memory resource");
       }
