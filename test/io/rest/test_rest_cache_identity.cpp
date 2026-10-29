@@ -499,3 +499,69 @@ TEST_CASE("cache identity conditions reads of a batch object resolved by HEAD fa
   CHECK(records[1].if_match == std::vector<std::string>{"\"head-tag\""});
   ctx->shutdown();
 }
+
+TEST_CASE("rest range reads bind to the identity captured by HEAD or footer probe",
+          "[rest][cache_identity][object_identity]")
+{
+  // The tag an open captured, from its HEAD or from its footer probe's GET, is
+  // both the object's identity and the If-Match condition of its data GETs: a
+  // replacement of the key after the open fails the read instead of serving
+  // the new bytes under the old identity, and is not retried.
+  bool const from_footer = GENERATE(false, true);
+  bool replaced          = false;
+  SECTION("an unchanged object accepts the captured tag") {}
+  SECTION("a replacement rejects the captured tag without a retry") { replaced = true; }
+  INFO((from_footer ? "footer probe" : "HEAD"));
+
+  range_fault_policy fault;
+  fault.successful_head_etag = "\"v1\"";
+  fault.successful_get_etag  = "\"v1\"";
+  std::unordered_map<std::string, key_response_script> scripts;
+  if (replaced) {
+    // The key changes right after the open: every data GET finds the
+    // condition false.  A footer probe is the first GET and still sees v1.
+    auto& gets = scripts["object.bin"].gets;
+    if (from_footer) { gets.push_back(scripted_response{.etag = "\"v1\""}); }
+    gets.push_back(scripted_response{.status = 412, .etag = "\"v2\""});
+  }
+  auto const bytes = payload(64U << 10);
+  loopback_range_server server(bytes, fault, {}, std::move(scripts));
+  auto cfg               = test_config();
+  cfg.footer_probe_bytes = 512;
+  auto ctx               = make_ctx(server, signing::canned, cfg);
+
+  auto obj = from_footer ? ctx->open_io_object(object_path, open_hint::parquet_footer_probe)
+                         : ctx->open_io_object(object_path);
+  CHECK(obj->validation_tag() == "\"v1\"");
+  auto const identity = obj->identity();
+  CHECK(identity.kind == cucascade::io::identity_kind::object_tag);
+  CHECK(identity.version == "\"v1\"");
+  CHECK(identity.size == bytes.size());
+  CHECK(server.head_count() == (from_footer ? 0U : 1U));
+  auto const gets_after_open = server.get_count();
+  CHECK(gets_after_open == (from_footer ? 1U : 0U));
+
+  std::vector<std::uint8_t> out(128);
+  if (replaced) {
+    bool caught = false;
+    try {
+      static_cast<void>(ctx->host_read(*obj, 0, out.size(), out.data()));
+    } catch (object_changed_error const& e) {
+      caught = true;
+      CHECK(e.object_path() == object_path);
+      CHECK(e.expected_tag() == "\"v1\"");
+      // A 412's own validator is not evidence of what the object now is.
+      CHECK(e.observed_tag().empty());
+    }
+    CHECK(caught);
+  } else {
+    REQUIRE(ctx->host_read(*obj, 0, out.size(), out.data()) == out.size());
+    CHECK(std::equal(out.begin(), out.end(), bytes.begin()));
+  }
+  // Exactly one data GET, conditioned on the captured tag.
+  CHECK(server.get_count() == gets_after_open + 1);
+  auto const records = server.get_requests();
+  REQUIRE(!records.empty());
+  CHECK(records.back().if_match == std::vector<std::string>{"\"v1\""});
+  ctx->shutdown();
+}

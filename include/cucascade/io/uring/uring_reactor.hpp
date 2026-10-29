@@ -59,29 +59,45 @@ namespace cucascade::io::uring {
  * Passive bag of native handles. The buffered @c O_RDONLY fd and, when the
  * filesystem supports it, an optional @c O_DIRECT fd are produced by
  * @c uring_reactor::create_io_object. This class does no I/O of its own.
+ *
+ * The object carries the @c local_stat identity of its buffered fd (captured
+ * by the reactor, or from the fd here) and takes its size from it; when the fd
+ * cannot be stat'ed, the object keeps the given size and the base class's
+ * open-local identity.
  */
 class local_io_object : public io_object {
  public:
+  /// @p captured is the identity the reactor took from @p fd; when it is not a
+  /// @c local_stat identity, it is captured from @p fd here.
   local_io_object(std::string path,
                   file_descriptor fd,
                   file_descriptor fd_direct,
                   size_t file_size,
-                  std::string_view hash = "")
+                  std::string_view hash    = "",
+                  object_identity captured = {})
     : _path(std::move(path)),
+      _hash(hash.empty() ? std::string_view{_path} : hash),
       _fd(std::move(fd)),
       _fd_direct(std::move(fd_direct)),
       _file_size(file_size)
   {
-    if (hash.empty()) {
-      _hash = _path;
+    _has_identity = captured.kind == identity_kind::local_stat;
+    if (_has_identity) {
+      _identity = std::move(captured);
     } else {
-      _hash = hash;
+      _has_identity = capture_local_identity(_fd.get(), _identity);
     }
+    if (_has_identity) { _file_size = _identity.size; }
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+
+  [[nodiscard]] object_identity identity() const override
+  {
+    return _has_identity ? _identity : io_object::identity();
+  }
 
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
   [[nodiscard]] int fd_direct() const noexcept { return _fd_direct.get(); }
@@ -96,6 +112,8 @@ class local_io_object : public io_object {
   file_descriptor _fd;
   file_descriptor _fd_direct;
   size_t _file_size{0};
+  object_identity _identity;
+  bool _has_identity{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -263,7 +281,13 @@ class uring_reactor {
 
   /// Open the buffered fd and opportunistically open an O_DIRECT fd for
   /// @p path. The buffered handle is always required; an unsupported direct
-  /// handle simply makes worker-planned operations use buffered I/O.
+  /// handle simply makes worker-planned operations use buffered I/O.  The
+  /// O_DIRECT fd reopens the buffered one through @c /proc/self/fd (the path
+  /// only where procfs is not mounted), and the object carries the buffered
+  /// fd's @c local_stat identity and size.
+  /// @throws descriptor_mismatch_error when, on two attempts, the two fds do
+  ///         not name the same file (the path is being replaced concurrently),
+  ///         or when the O_DIRECT fd cannot be stat'ed.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
   /// fstat the open fd to get the file's current size.

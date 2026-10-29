@@ -77,7 +77,9 @@ enum class prefetch_refusal : std::uint8_t {
   /// issued.  Normal allocation pressure is reported earlier by prepare().
   memory_pressure,
   /// The cache refused for a reason of its own (already loading, request
-  /// cancelled, backend cannot serve vectored host reads).
+  /// cancelled, backend cannot serve vectored host reads), or found nothing to
+  /// claim, in which case the completion reports @c {ok = true, covered} (see
+  /// @c datasource::prefetch_async).
   other,
 };
 
@@ -97,6 +99,8 @@ enum class prepare_result : std::uint8_t {
 
 class datasource : public cudf::io::datasource {
  public:
+  /// Reads @p io_obj through @p io_ctx, and records the object's identity as
+  /// observed in the ioctx's metadata store (@c metadata_store::open_observed).
   explicit datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj);
 
   ~datasource() override;
@@ -114,10 +118,14 @@ class datasource : public cudf::io::datasource {
   [[nodiscard]] const io_object& get_io_object() const noexcept { return *_io_object; }
 
   /// Backend-parsed metadata for this datasource's io_object, looked up in the
-  /// ioctx's metadata store (null when no cache or no entry). Independent of
-  /// the prefetching machinery.
+  /// ioctx's metadata store: published for an equal object identity (null when
+  /// there is none). Independent of the prefetching machinery.
   [[nodiscard]] std::shared_ptr<io_object_metadata> metadata() const;
 
+  /// Publish @p metadata for this datasource's io_object in the ioctx's
+  /// metadata store (see @c cache::metadata_store::register_metadata: an entry
+  /// already published for the same identity is kept).  False only without an
+  /// ioctx or io_object.
   [[nodiscard]] bool store_metadata(std::shared_ptr<io_object_metadata> metadata);
 
   // ---- cudf::io::datasource overrides ---------------------------------------
@@ -203,9 +211,17 @@ class datasource : public cudf::io::datasource {
 
   /// Issue prefetch IO for the stashed handle.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
-  /// completion.  Returns @c prefetch_refusal::issued when IO went out, and
-  /// otherwise why it did not.
-  prefetch_refusal prefetch_async(exec::invocable<void(bool) noexcept> on_done);
+  /// completion.  Coverage is separate from success: another loader can own
+  /// chunks that this prefetch skipped (see @c fs_cache::prefetch).  Returns
+  /// @c prefetch_refusal::issued when IO went out, and otherwise why it did not.
+  /// A refusal (@c no_cache, @c consumer_ahead, a request not prepared or
+  /// abandoned, or one the cache refused) reports
+  /// @c {ok = false, covered = false}, with one exception: when nothing was
+  /// claimable — every requested chunk already resident or loading for another
+  /// reader — the cache settles @c {ok = true, covered}, and this still returns
+  /// @c other (or @c consumer_ahead if the consumer started reading meanwhile).
+  /// @c covered then says whether the requested bytes are already resident.
+  prefetch_refusal prefetch_async(exec::invocable<void(cache::prefetch_result) noexcept> on_done);
 
   /// Why this datasource's prefetch failed, if it did: null otherwise, and
   /// null when no prefetch was ever issued.  Set before the prefetch's

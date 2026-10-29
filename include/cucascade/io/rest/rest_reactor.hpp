@@ -220,6 +220,14 @@ class rest_io_object : public io_object {
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
 
+  /// A strong ETag is the object's version (@c object_tag); a weak, malformed
+  /// or absent one scopes the identity to this open (@c opened_handle), exactly
+  /// as @ref raw_file_cache_id scopes the cache id.
+  [[nodiscard]] bool validation_tag_is_strong() const noexcept override
+  {
+    return is_strong_tag(validation_tag());
+  }
+
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
   [[nodiscard]] object_ref get_object_ref() const { return object_ref{_bucket, _key}; }

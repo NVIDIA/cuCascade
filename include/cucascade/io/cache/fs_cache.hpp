@@ -33,7 +33,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -65,6 +67,18 @@ class memory_reservation_manager;
 
 namespace cucascade::io::cache {
 
+/// Which resident chunks @ref fs_cache::reclaim may take.
+enum class reclaim_mode : std::uint8_t {
+  /// Only chunks no live prefetch request subscribes to -- what the background
+  /// evictor reclaims first.  Safe under ordinary memory pressure: it costs
+  /// only future hits on data nobody has asked for.
+  idle,
+  /// Also chunks a live request still subscribes to (their request falls back
+  /// to reading from the backend).  A last resort for an embedder that still
+  /// owes memory after everything else.
+  forced,
+};
+
 /// True when every chunk of @p chunks owns a staging buffer, i.e. its
 /// @c chunk_state has reached @c allocated and has not been reclaimed since.
 /// This is the precondition of the producer's @c prepared stage.  One relaxed
@@ -88,6 +102,15 @@ struct prefetch_failure_slot {
   std::exception_ptr failure;
 };
 
+/// Completion of the IO submitted by one prefetch. Success alone does not
+/// imply coverage: another loader may own some of the requested chunks.
+struct prefetch_result {
+  bool ok{false};  ///< the IO this prefetch submitted (if any) succeeded
+  /// Every requested extent is resident (cached or pinned) as on_done runs,
+  /// re-checked at IO completion. Residency is not pinned against later reclaim.
+  bool covered{false};
+};
+
 /// One prefetch request: the two stage machines plus the chunk set they cover.
 /// Held by value — the cache's queues and the owning @ref cache_handle
 /// each carry a copy, so the stages outlive whichever side finishes first.
@@ -101,6 +124,9 @@ struct prefetch_request {
   std::shared_ptr<producer_stage> producer;
   std::shared_ptr<consumer_stage> consumer;
   std::shared_ptr<const std::vector<cached_chunk*>> chunks;
+  /// Immutable requested extents, index-parallel with @c chunks. A resident
+  /// chunk can have a narrower fill than this request needs.
+  std::shared_ptr<const std::vector<chunk_fill>> required_fills;
   std::weak_ptr<cache_generation> generation;
   std::shared_ptr<prefetch_failure_slot> failure;
   std::uint32_t timestamp{0};
@@ -281,6 +307,7 @@ class fs_cache {
   // fadvise dispatch through it.
   friend class cucascade::io::datasource;
   friend class cache_handle;
+  friend struct fs_cache_test_access;
 
  public:
   using byte_range = cucascade::io::byte_range;
@@ -355,8 +382,36 @@ class fs_cache {
 
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
-  /// completion.  Returns whether IO was issued.
-  bool prefetch(cache_handle& handle, exec::invocable<void(bool) noexcept> on_done);
+  /// completion. The outcome is @c covered only when every requested extent
+  /// is resident (cached or pinned) as @p on_done runs. Coverage is re-checked
+  /// when the submitted IO completes: a resident chunk reclaimed meanwhile is
+  /// uncovered. A chunk another loader (a demand read) claimed first is not
+  /// covered, even when this prefetch's own IO succeeded. Residency is not
+  /// pinned afterwards: later reclaim may take it, and readers fall back to
+  /// the backend. Returns whether IO was issued.
+  /// Without IO the outcome is @c {false, false} when the request is refused
+  /// (empty, fallen behind, cancelled, already loading, a backend without
+  /// vectored host reads, or a failed setup), and @c {true, covered} when
+  /// nothing was claimable (every chunk already resident or loading for
+  /// another reader).
+  bool prefetch(cache_handle& handle, exec::invocable<void(prefetch_result) noexcept> on_done);
+
+  /// Test-only hook run inside @ref prefetch after the producer is published
+  /// as loading and before any chunk is claimed, with no cache lock held.
+  /// Configure only while no prefetch can run.
+  void set_before_prefetch_claim_for_testing(std::function<void()> hook)
+  {
+    _before_prefetch_claim = std::move(hook);
+  }
+
+  /// Test-only hook run when a new prefetch request has subscribed to its
+  /// chunks and is about to be handed to the evictor; a throw from it takes
+  /// the path of a failed hand-off (the request's subscriptions are rolled
+  /// back).  Configure only while no request can be created.
+  void set_before_request_enqueue_for_testing(std::function<void()> hook)
+  {
+    _before_request_enqueue = std::move(hook);
+  }
 
   /// Bytes of staging memory the cache currently holds: every chunk buffer
   /// handed out by the pool and not yet reclaimed.  This is what an explicit
@@ -366,6 +421,13 @@ class fs_cache {
   /// A relaxed read of a counter other threads are moving, so it is a snapshot
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
+
+  /// Bytes that returning chunks would give back to the HOST space(s) right now.
+  /// Chunks inside each space's prefetch reservation do not count. Optionally
+  /// restrict to one NUMA node. This is a relaxed snapshot, not a guarantee that
+  /// the chunks are currently reclaimable (readers or IO may hold them).
+  [[nodiscard]] std::size_t releasable_bytes(
+    std::optional<int> numa_node = std::nullopt) const noexcept;
 
   /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
   ///
@@ -384,18 +446,50 @@ class fs_cache {
   /// already shutting down.
   void evict(std::size_t bytes_to_free);
 
+  /// Synchronously return resident chunk buffers to the cache's pool, on the
+  /// calling thread, independent of the evictor and its queue: an embedder
+  /// under host memory pressure (for example a HOST downgrade executor) frees
+  /// cache memory before it spills anything else.
+  ///
+  /// Sweeps every live generation (retired ones first) and stops once
+  /// @p target_bytes worth of chunks were reclaimed -- whole chunks, so up to
+  /// one chunk more than asked -- or every chunk was visited.  A chunk pinned
+  /// by a reader or still loading is never taken; @ref reclaim_mode::idle also
+  /// spares chunks a live request subscribes to.  Each reclaimed chunk counts
+  /// as an eviction in @ref summary.
+  ///
+  /// A zero target, an unarmed cache and a cache shutting down return 0.
+  /// Takes the map lock shared and each generation's lock exclusively, so it
+  /// must not be called with a cache lock held.
+  ///
+  /// @param numa_node Only reclaim chunks from this NUMA node, if specified.
+  /// @return bytes returned to the pool (including bytes inside the reservation).
+  std::size_t reclaim(reclaim_mode mode,
+                      std::size_t target_bytes     = std::numeric_limits<std::size_t>::max(),
+                      std::optional<int> numa_node = std::nullopt);
+
   /// Ask the evictor to free at least @p bytes_to_free and wait until that
   /// request has been processed. This acknowledges an eviction pass, not that
   /// the requested number of bytes could necessarily be reclaimed.
   void evict_sync(std::size_t bytes_to_free);
 
+  /// Observe totals and activity since the last refresh without advancing the baseline.
   [[nodiscard]] std::string summary() const;
 
-  void prepare_for_query() noexcept;
+  /// Advance the query epoch and close one cache-wide reporting interval. Returns
+  /// the report for that exact sample; concurrent queries may contribute to it.
+  std::string prepare_for_query();
 
   [[nodiscard]] uint32_t query_epoch() const noexcept
   {
     return _ticker.load(std::memory_order_relaxed);
+  }
+
+  /// Test-only: how many generations are reachable by key (live, not retired).
+  [[nodiscard]] std::size_t file_entry_count_for_testing() const noexcept
+  {
+    std::shared_lock lock(_map_mtx);
+    return _file_cache.size();
   }
 
   /// Test-only: how many prefetch requests @ref evict_loop was tracking at the
@@ -505,6 +599,8 @@ class fs_cache {
 
   void reclaim_idle_chunks(cache_generation& generation) noexcept;
 
+  std::function<void()> _before_prefetch_claim;
+  std::function<void()> _before_request_enqueue;
   const config _cfg;
   std::shared_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;
@@ -523,7 +619,7 @@ class fs_cache {
 
   // ---- Telemetry counters --------------------------------------------------
   // Global cumulative counts.  @c _last_reported snapshots them on every cache
-  // refresh (prepare_for_query) so summary() can also report per-cycle deltas.
+  // refresh (prepare_for_query). Intervals are cache-wide, not attributed to a query.
   struct counters {
     std::atomic<uint64_t> n_reads{0};    // device read requests served by the cache
     std::atomic<uint64_t> hits{0};       // chunks served from cache (read pin acquired, in_use)
@@ -539,10 +635,15 @@ class fs_cache {
     uint64_t evictions{0};
   };
 
+  [[nodiscard]] counters_snapshot sample_counters() const noexcept;
+  [[nodiscard]] static std::string format_summary(counters_snapshot const& sample,
+                                                  counters_snapshot const& baseline);
+
   counters _counters;
-  /// Serializes @c _last_reported: summary() reads it and prepare_for_query()
-  /// rewrites it, and an embedder may call both from concurrent queries.  The
-  /// counters themselves are atomics and need no lock.
+  /// Serializes sampling the counters against the @c _last_reported baseline:
+  /// summary() samples and reads it, prepare_for_query() samples, reads and
+  /// advances it as one step, and an embedder may call both from concurrent
+  /// queries.  The counters themselves are atomics and need no lock.
   mutable std::mutex _summary_mutex;
   counters_snapshot _last_reported;
 
