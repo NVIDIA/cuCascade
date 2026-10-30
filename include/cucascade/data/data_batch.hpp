@@ -21,10 +21,12 @@
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/utils/on_scope_exit.hpp>
 
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -245,6 +247,19 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
    * @param data New data representation (takes ownership).
    */
   void set_data(std::unique_ptr<idata_representation> data);
+
+  // Share same-space cloning across both accessor types.
+  std::shared_ptr<data_batch> clone(uint64_t new_batch_id,
+                                    ::cuda::stream_ref stream,
+                                    std::unique_ptr<idata_batch_probe> probe) const;
+
+  // Share clone callbacks and batch creation across both accessor types.
+  template <typename MakeRepresentation>
+    requires std::is_invocable_r_v<std::unique_ptr<idata_representation>, MakeRepresentation&&>
+  std::shared_ptr<data_batch> clone_impl(uint64_t new_batch_id,
+                                         const memory::memory_space* target_memory_space,
+                                         std::unique_ptr<idata_batch_probe> probe,
+                                         MakeRepresentation&& make_representation) const;
 
   struct reader_event_pool {
     // Events are stored as a pending prefix followed by reusable completed events. This bounds
@@ -659,25 +674,12 @@ class mutable_data_batch {
    */
   mutable_data_batch(std::shared_ptr<data_batch> parent, std::unique_lock<std::shared_mutex> lock);
 
-  /**
-   * @brief Swap in a freshly converted representation, synchronizing @p stream first when the
-   * conversion touched the GPU tier.
-   *
-   * Shared tail of both convert_to overloads. A GPU conversion may still have async work on
-   * @p stream reading the old representation's buffers; synchronize before the old representation
-   * is destroyed to avoid use-after-free.
-   */
-  void install_converted_representation(std::unique_ptr<idata_representation> new_representation,
-                                        ::cuda::stream_ref stream)
-  {
-    auto old_representation = std::move(_batch->_data);
-    _batch->_data           = std::move(new_representation);
-
-    bool needs_sync = old_representation != nullptr &&
-                      (old_representation->get_current_tier() == memory::Tier::GPU ||
-                       _batch->_data->get_current_tier() == memory::Tier::GPU);
-    if (needs_sync) { stream.sync(); }
-  }
+  // Share conversion callbacks and installation across both target forms.
+  template <typename MakeRepresentation>
+    requires std::is_invocable_r_v<std::unique_ptr<idata_representation>, MakeRepresentation&&>
+  void convert_impl(const memory::memory_space* target_memory_space,
+                    ::cuda::stream_ref stream,
+                    MakeRepresentation&& make_representation);
 
   // INVARIANT: _batch must be declared before _lock -- destruction order is load-bearing.
   // When destroyed, _lock releases the exclusive lock first, then _batch drops the parent
@@ -693,11 +695,18 @@ class mutable_data_batch {
  * data_batch metadata while probing the data_batch by overriding the provided methods
  * that expose the data_batch state when certain events occur, like state transitions.
  *
- * @note All callbacks are invoked either during batch construction (created) or while
+ * @note Clone callbacks may run concurrently on the same probe.
+ * Implementations must synchronize shared mutable state for clone callbacks, but
+ * preferrably not do any mutating ops in the clone callbacks. clone_id pairs
+ * callbacks as completion order may differ from start order.
+ *
+ * All other callbacks are invoked either during batch construction (created) or while
  * the batch's exclusive lock is held via mutable_data_batch, so per batch they are
- * totally ordered and never run concurrently. It is the implementer's responsibility
- * that they return quickly, as they block other mutating changes while they execute.
- * This interface is primarily intended for bookkeeping purposes. Default impl is no-op
+ * ordered and don't run concurrently.
+ *
+ * It is the implementer's responsibility that they return quickly, as they block other
+ * mutating changes while they execute. This interface is primarily intended for
+ * bookkeeping purposes. Default impl is no-op
  */
 class idata_batch_probe {
  public:
@@ -718,11 +727,60 @@ class idata_batch_probe {
   {
   }
   virtual void data_replaced([[maybe_unused]] const idata_representation& new_data) noexcept {}
+
+  /**
+   * @brief May run concurrently with other clone_* callback invocations, mutable states should
+   * synchronized for thread satefy. Though ideally should not mutate internal state.
+   * @p clone_id allows pairing start and complete calls, *within* a batch.
+   */
+  virtual void clone_started([[maybe_unused]] const uint64_t clone_id,
+                             [[maybe_unused]] const idata_representation& source_data,
+                             [[maybe_unused]] const memory::memory_space* target_memory_space,
+                             [[maybe_unused]] const uint64_t new_batch_id) const noexcept
+  {
+  }
+  /**
+   * @brief May run concurrently with other clone_* callback invocations, mutable states should
+   * synchronized for thread satefy. Though ideally should not  mutate internal state.
+   * @p clone_id allows pairing start and complete calls, *within* a batch.
+   */
+  virtual void clone_completed([[maybe_unused]] const uint64_t clone_id,
+                               [[maybe_unused]] const bool success) const noexcept
+  {
+  }
+
+  /// IDs are unique per probe; correlate with the source batch ID.
+  [[nodiscard]] uint64_t get_next_clone_id() noexcept { return clone_id_counter.fetch_add(1); }
+
+ private:
+  std::atomic<uint64_t> clone_id_counter{0};
 };
 
 // =============================================================================
 // Template implementations (TargetRepresentation-templated methods only)
 // =============================================================================
+
+template <typename MakeRepresentation>
+  requires std::is_invocable_r_v<std::unique_ptr<idata_representation>, MakeRepresentation&&>
+std::shared_ptr<data_batch> data_batch::clone_impl(
+  const uint64_t new_batch_id,
+  const memory::memory_space* target_memory_space,
+  std::unique_ptr<idata_batch_probe> new_batch_probe,
+  MakeRepresentation&& make_representation) const
+{
+  const uint64_t current_clone_op_id = _probe->get_next_clone_id();
+  _probe->clone_started(current_clone_op_id, *_data, target_memory_space, new_batch_id);
+  bool clone_succeeded = false;
+  auto on_completion   = utils::on_scope_exit{
+    [&]() noexcept { _probe->clone_completed(current_clone_op_id, clone_succeeded); }};
+
+  auto cloned = data_batch::make(new_batch_id,
+                                 std::forward<MakeRepresentation>(make_representation)(),
+                                 std::move(new_batch_probe));
+
+  clone_succeeded = true;  // ref use by completion cleanup handle
+  return cloned;
+}
 
 template <typename TargetRepresentation>
 std::shared_ptr<data_batch> read_only_data_batch::clone_to(
@@ -732,9 +790,9 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
   ::cuda::stream_ref stream,
   std::unique_ptr<idata_batch_probe> probe) const
 {
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
-  return data_batch::make(new_batch_id, std::move(new_representation), std::move(probe));
+  return _batch->clone_impl(new_batch_id, target_memory_space, std::move(probe), [&] {
+    return registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+  });
 }
 
 template <typename TargetRepresentation>
@@ -745,38 +803,48 @@ std::shared_ptr<data_batch> read_only_data_batch::clone_to(
   ::cuda::stream_ref stream,
   std::unique_ptr<idata_batch_probe> probe) const
 {
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, reservation, stream);
-  return data_batch::make(new_batch_id, std::move(new_representation), std::move(probe));
+  return _batch->clone_impl(new_batch_id, &reservation.get_memory_space(), std::move(probe), [&] {
+    return registry.convert<TargetRepresentation>(*_batch->_data, reservation, stream);
+  });
 }
 
 // -- mutable_data_batch::convert_to (in-place conversion) --
+
+template <typename MakeRepresentation>
+  requires std::is_invocable_r_v<std::unique_ptr<idata_representation>, MakeRepresentation&&>
+void mutable_data_batch::convert_impl(const memory::memory_space* target_memory_space,
+                                      ::cuda::stream_ref stream,
+                                      MakeRepresentation&& make_representation)
+{
+  _batch->_probe->conversion_started(*(_batch->_data), target_memory_space);
+  bool conversion_succeeded = false;
+  auto on_completion        = utils::on_scope_exit{[&]() noexcept {
+    _batch->_probe->conversion_completed(*(_batch->_data), conversion_succeeded);
+  }};
+
+  auto new_representation = std::forward<MakeRepresentation>(make_representation)();
+  {
+    assert(new_representation != nullptr && "conversion must not return null representations");
+    auto old_representation = std::move(_batch->_data);
+    _batch->_data           = std::move(new_representation);
+
+    // Keep source buffers alive until GPU reads finish, then release before notification.
+    const bool needs_sync = old_representation != nullptr &&
+                            (old_representation->get_current_tier() == memory::Tier::GPU ||
+                             _batch->_data->get_current_tier() == memory::Tier::GPU);
+    if (needs_sync) { stream.sync(); }
+  }
+  conversion_succeeded = true;  // ref use by completion cleanup handle
+}
 
 template <typename TargetRepresentation>
 void mutable_data_batch::convert_to(const representation_converter_registry& registry,
                                     const memory::memory_space* target_memory_space,
                                     ::cuda::stream_ref stream)
 {
-  _batch->_probe->conversion_started(*(_batch->_data), target_memory_space);
-  bool conversion_succeeded = false;
-  // small helper that gets called when this scope is exited (including during exceptions)
-  struct OnScopeExit {
-    const std::unique_ptr<idata_batch_probe>& probe;
-    // a ref to the unique ptr so when data is updated,
-    // that new data is supplied with the notification.
-    const std::unique_ptr<idata_representation>& data;
-    const bool& success;
-
-    ~OnScopeExit() { probe->conversion_completed(*data, success); }
-  } on_scope_exit{
-    .probe   = _batch->_probe,
-    .data    = _batch->_data,
-    .success = conversion_succeeded,
-  };
-
-  install_converted_representation(
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream), stream);
-  conversion_succeeded = true;  // ref used by on_scope_exit helper.
+  convert_impl(target_memory_space, stream, [&] {
+    return registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+  });
 }
 
 template <typename TargetRepresentation>
@@ -784,26 +852,9 @@ void mutable_data_batch::convert_to(const representation_converter_registry& reg
                                     memory::reservation& reservation,
                                     ::cuda::stream_ref stream)
 {
-  _batch->_probe->conversion_started(*(_batch->_data), &reservation.get_memory_space());
-  bool conversion_succeeded = false;
-  // small helper that gets called when this scope is exited (including during exceptions)
-  struct OnScopeExit {
-    const std::unique_ptr<idata_batch_probe>& probe;
-    // a ref to the unique ptr so when data is updated,
-    // that new data is supplied with the notification.
-    const std::unique_ptr<idata_representation>& data;
-    const bool& success;
-
-    ~OnScopeExit() { probe->conversion_completed(*data, success); }
-  } on_scope_exit{
-    .probe   = _batch->_probe,
-    .data    = _batch->_data,
-    .success = conversion_succeeded,
-  };
-
-  install_converted_representation(
-    registry.convert<TargetRepresentation>(*_batch->_data, reservation, stream), stream);
-  conversion_succeeded = true;  // ref used by on_scope_exit helper.
+  convert_impl(&reservation.get_memory_space(), stream, [&] {
+    return registry.convert<TargetRepresentation>(*_batch->_data, reservation, stream);
+  });
 }
 
 template <typename TargetRepresentation>
@@ -814,9 +865,9 @@ std::shared_ptr<data_batch> mutable_data_batch::clone_to(
   ::cuda::stream_ref stream,
   std::unique_ptr<idata_batch_probe> probe) const
 {
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
-  return data_batch::make(new_batch_id, std::move(new_representation), std::move(probe));
+  return _batch->clone_impl(new_batch_id, target_memory_space, std::move(probe), [&] {
+    return registry.convert<TargetRepresentation>(*_batch->_data, target_memory_space, stream);
+  });
 }
 
 template <typename TargetRepresentation>
@@ -827,9 +878,9 @@ std::shared_ptr<data_batch> mutable_data_batch::clone_to(
   ::cuda::stream_ref stream,
   std::unique_ptr<idata_batch_probe> probe) const
 {
-  auto new_representation =
-    registry.convert<TargetRepresentation>(*_batch->_data, reservation, stream);
-  return data_batch::make(new_batch_id, std::move(new_representation), std::move(probe));
+  return _batch->clone_impl(new_batch_id, &reservation.get_memory_space(), std::move(probe), [&] {
+    return registry.convert<TargetRepresentation>(*_batch->_data, reservation, stream);
+  });
 }
 
 }  // namespace cucascade
