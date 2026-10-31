@@ -16,8 +16,7 @@
  */
 
 // Standalone S3 parquet read benchmark: the cucascade::io REST datasource
-// (libcurl scatter GETs authorized via AWS-SDK presigned URLs) vs kvikIO's
-// remote S3 handle wrapped as a cudf datasource.
+// (libcurl scatter GETs authorized via AWS-SDK presigned URLs).
 //
 // The AWS SDK is used for (a) listing the parquet objects under the given
 // bucket/prefix and (b) presigning each GET/HEAD the REST reactor issues.
@@ -26,7 +25,7 @@
 //
 // Credentials / region / endpoint come from the standard AWS environment
 // (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
-// AWS_DEFAULT_REGION, AWS_ENDPOINT_URL) and are honored by both backends.
+// AWS_DEFAULT_REGION, AWS_ENDPOINT_URL).
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
@@ -42,8 +41,6 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
-
-#include <kvikio/remote_handle.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -75,26 +72,23 @@ static const std::vector<std::string> COLUMNS = {
   "l_shipdate",
 };
 
-enum class DataSource { rest, kvikio };
+enum class DataSource { rest };
 
 static DataSource parse_source(std::string_view s)
 {
   if (s == "rest") return DataSource::rest;
-  if (s == "kvikio") return DataSource::kvikio;
   throw std::invalid_argument(std::string("unknown datasource: ") + std::string(s) +
-                              "  (expected: rest | kvikio)");
+                              "  (expected: rest)");
 }
 
 static void usage(char const* prog)
 {
   std::cerr
-    << "usage: " << prog
-    << " <bucket> <prefix> <rest|kvikio> <num_rows> [n_reactors] [key=value ...]\n"
+    << "usage: " << prog << " <bucket> <prefix> <rest> <num_rows> [n_reactors] [key=value ...]\n"
     << "  bucket     – S3 bucket name (no scheme)\n"
     << "  prefix     – key prefix to list ('-' for the whole bucket); only\n"
     << "               keys ending in .parquet are read\n"
     << "  rest       – cucascade::io REST reactor (AWS-SDK presigned URLs)\n"
-    << "  kvikio     – kvikIO RemoteHandle S3 endpoint\n"
     << "  num_rows   – rows to read (0 = all)\n"
     << "  n_reactors – REST reactor threads (default 2; rest only)\n"
     << "\n"
@@ -104,7 +98,7 @@ static void usage(char const* prog)
     << "  request_timeout_s=<S>   whole-request timeout, 0 = no limit (def 30)\n"
     << "  max_retry_attempts=<N>  retry attempts (def 10)\n"
     << "\n"
-    << "Read parallelism (both backends):\n"
+    << "Read parallelism:\n"
     << "  read_threads=<N>        split num_rows across N host threads, each reading its\n"
     << "                          own row-range on its own CUDA stream (def 1)\n"
     << "\n"
@@ -153,7 +147,7 @@ struct aws_api {
 
 /// Client configuration from the AWS environment.  AWS_ENDPOINT_URL (e.g. a
 /// MinIO endpoint) switches the client to endpoint-override + path-style
-/// addressing, matching what kvikIO does with the same variable.
+/// addressing.
 static std::shared_ptr<Aws::S3::S3Client> make_s3_client()
 {
   Aws::Client::ClientConfiguration cfg;
@@ -238,85 +232,6 @@ class awssdk_presigned_authorizer final : public cucascade::io::rest::request_au
 };
 
 // ---------------------------------------------------------------------------
-// kvikIO adapter: cudf::io::datasource over kvikio::RemoteHandle
-// ---------------------------------------------------------------------------
-
-class kvikio_s3_datasource final : public cudf::io::datasource {
- public:
-  explicit kvikio_s3_datasource(std::string const& s3_url)
-    : _handle(kvikio::RemoteHandle::open(to_https_url(s3_url), kvikio::RemoteEndpointType::S3))
-  {
-  }
-
-  [[nodiscard]] size_t size() const override { return _handle.nbytes(); }
-
-  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
-  {
-    size_t const n = clamp(offset, size);
-    if (n == 0) { return 0; }
-    return _handle.read(dst, n, offset);
-  }
-
-  std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
-  {
-    size_t const n = clamp(offset, size);
-    std::vector<uint8_t> data(n);
-    if (n != 0) { _handle.read(data.data(), n, offset); }
-    return buffer::create(std::move(data));
-  }
-
-  [[nodiscard]] bool supports_device_read() const override { return true; }
-
-  size_t device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref) override
-  {
-    size_t const n = clamp(offset, size);
-    if (n == 0) { return 0; }
-    // RemoteHandle::read accepts device memory (staged through kvikIO's
-    // internal bounce buffer).
-    return _handle.read(dst, n, offset);
-  }
-
-  std::future<size_t> device_read_async(size_t offset,
-                                        size_t size,
-                                        uint8_t* dst,
-                                        ::cuda::stream_ref) override
-  {
-    size_t const n = clamp(offset, size);
-    return _handle.pread(dst, n, offset);
-  }
-
-  std::unique_ptr<buffer> device_read(size_t offset,
-                                      size_t size,
-                                      ::cuda::stream_ref stream) override
-  {
-    size_t const n = clamp(offset, size);
-    rmm::device_buffer out(n, stream);
-    if (n != 0) { _handle.read(out.data(), n, offset); }
-    return buffer::create(std::move(out));
-  }
-
- private:
-  // kvikIO's RemoteHandle::open rejects the "s3://" scheme; convert it to the
-  // virtual-hosted "https://<bucket>.s3.<region>.amazonaws.com/<object>" form
-  // (region/endpoint from AWS_DEFAULT_REGION / AWS_ENDPOINT_URL) that the S3
-  // endpoint expects.
-  [[nodiscard]] static std::string to_https_url(std::string const& s3_url)
-  {
-    auto [bucket, object] = kvikio::S3Endpoint::parse_s3_url(s3_url);
-    return kvikio::S3Endpoint::url_from_bucket_and_object(
-      std::move(bucket), std::move(object), std::nullopt, std::nullopt);
-  }
-
-  [[nodiscard]] size_t clamp(size_t offset, size_t size) const
-  {
-    size_t const fsize = _handle.nbytes();
-    return offset < fsize ? std::min(size, fsize - offset) : 0;
-  }
-
-  kvikio::RemoteHandle _handle;
-};
-
-// ---------------------------------------------------------------------------
 
 int main(int argc, char** argv)
 {
@@ -329,7 +244,8 @@ int main(int argc, char** argv)
   std::string prefix       = argv[2];
   if (prefix == "-") { prefix.clear(); }
 
-  DataSource source;
+  // Validated only: the REST reactor is the one datasource.
+  [[maybe_unused]] DataSource source;
   try {
     source = parse_source(argv[3]);
   } catch (std::invalid_argument const& e) {
@@ -435,8 +351,8 @@ int main(int argc, char** argv)
                                                              CHUNKS_PER_SLAB,  // pool_size
                                                              1);               // initial_pools
 
-  std::shared_ptr<cucascade::io::rest::rest_ioctx> io_ctx;  // rest path only
-  if (source == DataSource::rest) {
+  std::shared_ptr<cucascade::io::rest::rest_ioctx> io_ctx;
+  {
     std::cout << "REST   : n_reactors=" << n_reactors
               << "  max_connections=" << rest_cfg.max_connections << "\n\n";
 
@@ -454,11 +370,7 @@ int main(int argc, char** argv)
     std::vector<std::unique_ptr<cudf::io::datasource>> v;
     v.reserve(keys.size());
     for (auto const& key : keys) {
-      if (source == DataSource::rest) {
-        v.push_back(cucascade::io::open_datasource(io_ctx, "s3://" + bucket + "/" + key));
-      } else {
-        v.push_back(std::make_unique<kvikio_s3_datasource>("s3://" + bucket + "/" + key));
-      }
+      v.push_back(cucascade::io::open_datasource(io_ctx, "s3://" + bucket + "/" + key));
     }
     return v;
   };

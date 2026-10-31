@@ -3,9 +3,9 @@
 
 **cuCascade Disk I/O Performance Optimization**
 
-Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to approach raw hardware throughput on NVMe storage. The disk tier enables persisting GPU data batches to disk and reading them back, but current throughput is 5-11x below what the hardware can deliver. This project closes that gap.
+Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to approach raw hardware throughput on NVMe storage. The disk tier enables persisting GPU data batches to disk and reading them back, but current throughput is 5-11x below what the hardware can deliver. This project closes that gap.
 
-**Core Value:** Both GDS and kvikIO disk I/O backends achieve within 80% of raw hardware throughput (gdsio/dd baselines) for read and write paths.
+**Core Value:** Both GDS and io_uring disk I/O backends achieve within 80% of raw hardware throughput (gdsio/dd baselines) for read and write paths.
 
 ### Constraints
 
@@ -50,7 +50,6 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `RMM` (via cudf) - `rmm::mr::device_memory_resource` is the base class for all custom allocators; `::cuda::stream_ref` is used throughout for CUDA stream propagation
 - `CUDA::cudart` - Direct CUDA runtime API calls (`cudaMalloc`, `cudaMemcpyAsync`, `cudaStreamSynchronize`, `cudaFree`, `cudaMallocHost`, `cudaFreeHost`)
 - `CUDA::nvml` - GPU topology discovery via NVML in `src/memory/topology_discovery.cpp`
-- `kvikio` 26.12 / 26.08 - Async disk I/O with automatic GDS/POSIX fallback; used in `src/data/kvikio_io_backend.cpp` via `kvikio::FileHandle`; linked PRIVATE via `kvikio::kvikio`
 - `libcufile` (cuFile / GDS) - NVIDIA GPUDirect Storage for direct GPU↔NVMe transfers; `<cufile.h>` used in `src/data/gds_io_backend.cpp`; found via `find_library(CUFILE_LIB cufile ...)` — optional at configure time, required at runtime for GDS backend
 - `libnuma` - NUMA-aware pinned host memory allocation in `src/memory/numa_region_pinned_host_allocator.cpp`; found via `find_library(NUMA_LIB numa REQUIRED)`
 - `Threads::Threads` (pthreads) - Thread support; `std::mutex`, `std::condition_variable`, `std::async` throughout
@@ -69,7 +68,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `release` → `build/release/`
 - `relwithdebinfo` → `build/relwithdebinfo/`
 ## Library Outputs
-- `cucascade_shared` (`libcucascade.so`, versioned) - alias `cuCascade::cucascade_shared`; **cudf-free core** (RMM + CUDA + numa + kvikIO/cuFile)
+- `cucascade_shared` (`libcucascade.so`, versioned) - alias `cuCascade::cucascade_shared`; **cudf-free core** (RMM + CUDA + numa + cuFile)
 - `cucascade_static` (`libcucascade.a`) - alias `cuCascade::cucascade_static`
 - `cuCascade::cucascade` - Default alias pointing to shared if available, else static
 - `cucascade_cudf_shared`/`cucascade_cudf_static` (`libcucascade_cudf.{so,a}`) - aliases `cuCascade::cucascade_cudf[_shared|_static]`, default alias `cuCascade::cucascade_cudf`; the cudf-coupled layer (links `cudf::cudf` + the core), built only when `CUCASCADE_BUILD_CUDF=ON`. Headers under `include/cucascade/cudf/`
@@ -271,10 +270,10 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Depends on: `idata_representation`, `idisk_io_backend`
 - Used by: `data_batch::convert_to()`, `data_batch::clone_to()`
 - Purpose: Abstract disk I/O; concrete backends selectable at runtime
-- Location: `include/cucascade/data/disk_io_backend.hpp`, `src/data/gds_io_backend.cpp`, `src/data/kvikio_io_backend.cpp`, `src/data/pipeline_io_backend.cpp`, `src/data/io_backend_internal.hpp`
-- Contains: `idisk_io_backend` (abstract with `write_device`, `read_device`, `write_host`, `read_host`, `write_device_batch`, `read_device_batch`), `io_backend_type` enum (`KVIKIO`, `GDS`, `PIPELINE`), `make_io_backend(type)` factory
-- `GDS` uses raw cuFile batch API; `KVIKIO` uses kvikIO with automatic GDS/POSIX fallback; `PIPELINE` uses double-buffered pinned host transfer for D2H overlap with disk writes
-- Depends on: kvikIO, cuFile (GDS)
+- Location: `include/cucascade/data/disk_io_backend.hpp`, `src/data/gds_io_backend.cpp`, `src/data/pipeline_io_backend.cpp`, `src/data/io_backend_internal.hpp`
+- Contains: `idisk_io_backend` (abstract with `write_device`, `read_device`, `write_host`, `read_host`, `write_device_batch`, `read_device_batch`), `io_backend_type` enum (`GDS`, `PIPELINE`), `make_io_backend(type)` factory
+- `GDS` uses raw cuFile batch API; `PIPELINE` uses double-buffered pinned host transfer for D2H overlap with disk writes
+- Depends on: cuFile (GDS)
 - Used by: built-in disk converters registered via `register_builtin_converters()`
 - Purpose: Lifecycle management; substription-count reference counting, read-only and mutable locking
 - Location: `include/cucascade/data/data_batch.hpp`, `src/data/data_batch.cpp`
@@ -318,7 +317,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Purpose: On-disk file descriptor and binary format for a serialized cuDF table
 - Location: `include/cucascade/memory/disk_table.hpp`, `include/cucascade/data/disk_file_format.hpp`
 - Pattern: File starts with 32-byte `disk_file_header` (magic `0x43554353`, version, num_columns, metadata_size, data_offset); column metadata serialized depth-first; column data aligned to 4096-byte boundaries for GDS DMA
-- Purpose: Abstraction over GDS, kvikIO, and pipeline I/O strategies
+- Purpose: Abstraction over GDS and pipeline I/O strategies
 - Location: `include/cucascade/data/disk_io_backend.hpp`
 - Pattern: Interface with `write_device`/`read_device`/`write_host`/`read_host` and batch variants; `make_io_backend(io_backend_type)` factory
 - Purpose: Cross-component signaling when reservations are released

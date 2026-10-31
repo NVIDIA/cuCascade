@@ -25,7 +25,7 @@ Use `representation_converter_registry::convert<T>()` for every transfer. The re
 **Why:** Engines route based on what converters will actually do at runtime. Raw `cudaMemcpyAsync` / `cuFileRead` numbers would diverge from production overhead (packing, metadata handling, backend selection).
 
 ### D-02. Disk backend selection
-The profiler accepts an `std::shared_ptr<idisk_io_backend>` (same parameter as `register_builtin_converters`). Profiler results are scoped to that backend — a kvikIO profile is not interchangeable with a GDS profile. Callers wanting both profile twice.
+The profiler accepts an `std::shared_ptr<idisk_io_backend>` (same parameter as `register_builtin_converters`). Profiler results are scoped to that backend — a GDS profile is not interchangeable with a pipeline profile. Callers wanting both profile twice.
 
 ### D-03. Chunked-allocator detection — `chunked_resource_info` mixin
 New interface lives at `include/cucascade/memory/chunked_resource_info.hpp`:

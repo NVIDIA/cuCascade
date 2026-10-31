@@ -67,6 +67,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
+    io/test_iobuf_fragmented_sink.cpp
+    io/test_object_identity.cpp
     io/test_templated_ioctx.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
@@ -76,11 +78,17 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_object_store_lister.cpp
     io/rest/test_rest_cache_identity.cpp
     io/rest/test_rest_footer_resolve.cpp
+    io/rest/test_rest_https.cpp
+    io/rest/test_rest_pool_parity.cpp
+    io/rest/test_rest_pool_plan.cpp
+    io/rest/test_rest_read_robustness.cpp
     io/rest/test_rest_validation_tag.cpp
     io/rest/test_shared_byte_span.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
+    io/rest/net/test_net_dns.cpp
+    io/rest/net/test_net_transport.cpp
     io/uring/test_uring_readv.cpp
     # Main test runner
     unittest.cpp)
@@ -89,11 +97,22 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
+  # Tests of the io_uring REST transport modules.
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)
+  # Tests of src-private helpers (io/detail/..., the transport modules) include
+  # them from src/.
+  target_include_directories(cucascade_io_tests
+                             PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-  # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
-  if(CUCASCADE_BUILD_CUDF)
-    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp
-                                              io/kvikio/test_kvikio_remote.cpp)
+  # The cuFile backend exists only when cufile.h was found
+  # (CUCASCADE_HAS_CUFILE); see src/io/CMakeLists.txt.  It does not depend on
+  # cudf.
+  if(CUCASCADE_CUFILE_INCLUDE_DIR)
+    target_sources(
+      cucascade_io_tests
+      PRIVATE io/cufile/test_cufile_platform.cpp
+              io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
@@ -157,15 +176,20 @@ endif()
 
 # Create topology discovery test executable
 add_executable(
-  cucascade_topology_discovery_tests memory/test_topology_discovery.cpp
-                                     unittest_topology_discovery.cpp)
+  cucascade_topology_discovery_tests
+  memory/test_path_storage.cpp memory/test_topology_discovery.cpp
+  memory/test_net_topology.cpp unittest_topology_discovery.cpp)
 set_target_properties(cucascade_topology_discovery_tests
                       PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
 # Set include directories
 target_include_directories(
-  cucascade_topology_discovery_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                                             ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  cucascade_topology_discovery_tests
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+          ${CMAKE_CURRENT_SOURCE_DIR}/utils
+          # Tests of src-private helpers (memory/detail/...) include them from
+          # src/.
+          ${PROJECT_SOURCE_DIR}/src)
 
 # Link dependencies
 target_link_libraries(

@@ -12,6 +12,7 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | [Topology & Configuration](topology-and-configuration.md) | Hardware discovery, NUMA awareness, and system configuration |
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
+| [GDS reads](io/gpuio-gds-practices.md) | The cuFile / GPUDirect Storage read backend: configuration, fallbacks, capability probe, measurements |
 
 ## Reading Paths
 
