@@ -85,6 +85,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_rest_validation_tag.cpp
     io/rest/test_rest_write_unimplemented.cpp
     io/rest/test_shared_byte_span.cpp
+    io/rest/s3/test_loopback_s3_server.cpp
     io/rest/s3/test_multipart.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
