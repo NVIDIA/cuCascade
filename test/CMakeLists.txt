@@ -105,6 +105,14 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   target_include_directories(cucascade_io_tests
                              PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+  # The cuFile backend exists only when cufile.h was found
+  # (CUCASCADE_HAS_CUFILE); see src/io/CMakeLists.txt.  It does not depend on
+  # cudf.
+  if(CUCASCADE_CUFILE_INCLUDE_DIR)
+    target_sources(cucascade_io_tests
+                   PRIVATE io/cufile/test_cufile_platform.cpp)
+  endif()
+
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
                                                       CUDA_STANDARD_REQUIRED ON)
 
