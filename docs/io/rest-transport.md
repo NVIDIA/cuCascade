@@ -10,7 +10,7 @@ reactor contract.
 
 | Layer | Where | Role |
 |---|---|---|
-| `rest_ioctx` | `src/io/rest/rest_ioctx.cpp` | warm-up rate limit, LIST, batched footer resolve, `stats()` |
+| `rest_ioctx` | `src/io/rest/rest_ioctx.cpp` | pool sizing and placement (`plan_rest_pool`), warm-up rate limit, LIST, batched footer resolve, `stats()` |
 | `rest_reactor` + `reactor_worker` | `src/io/rest/rest_reactor.cpp` | one worker thread: two-tier request queue (demand before prefetch), control-plane queue (HEAD, footer probe, LIST, warm-up), adaptive physical GET planner, retries, staged device copies |
 | `uring_transport` | `src/io/rest/net/uring_transport.{hpp,cpp}` | one ring, `max_connections` slots, one keep-alive connection per slot, the HTTP exchange state machine |
 | `tls_stream` / `tls_support` | `src/io/rest/net/tls_stream.{hpp,cpp}` | after the handshake: kTLS, or the user-space record layer (ciphertext ring + `tls::record_opener` / `record_sealer`) |
@@ -85,6 +85,13 @@ parks the operation while copies of the reactor still hold blocks, and fails it 
 request that arrived meanwhile) starts in the same pass; the loop blocks only when nothing is
 runnable (`epoll_pwait2` over the wake-up eventfd, the retry timerfd and the ring fd, or
 `io_uring_submit_and_wait_timeout` with `wait_mode = uring`).
+
+## Pool size and placement
+
+`rest_n_reactors` is a total. `0` sizes the pool from the egress NIC (`rest.interface`, else the
+default route): when its queue IRQs are steered to a strict subset of its NUMA node's cores, one
+reactor per IRQ CPU, each pinned to it (`pin_to_irq_cpus`) and raised to the highest priority the
+process may set before it creates its ring; otherwise 2, unpinned.
 
 ## Counters
 

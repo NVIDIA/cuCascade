@@ -57,8 +57,10 @@ struct io_config {
   /// Number of uring reactor worker threads for the local-disk IO path.
   std::size_t uring_n_reactors{4};
 
-  /// Number of REST reactor worker threads for the S3/object-store IO path
-  /// (each its own io_uring transport and connection pool).
+  /// Number of REST reactor worker threads for the S3/object-store IO path (each its own
+  /// io_uring transport and connection pool).  A total, never per GPU.  0 = size from the
+  /// egress NIC: one reactor per IRQ CPU, pinned to it, when the NIC's queue IRQs are steered
+  /// to a strict subset of its NUMA node's cores (@c rest.pin_to_irq_cpus); 2 otherwise.
   std::size_t rest_n_reactors{2};
 
   /// Local (uring) reactor configuration.  @c use_odirect is derived from
