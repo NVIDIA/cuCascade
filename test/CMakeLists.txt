@@ -71,6 +71,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
     io/test_io_utils.cpp
+    io/test_iobuf_fragmented_sink.cpp
     io/test_object_identity.cpp
     io/test_semi_future_callback.cpp
     io/test_templated_ioctx.cpp
