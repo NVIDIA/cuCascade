@@ -405,6 +405,7 @@ void transport_stats::merge(transport_stats const& o) noexcept
   CUCASCADE_REST_SUM(completes)
   CUCASCADE_REST_SUM(complete_error_retries)
   CUCASCADE_REST_SUM(aborts)
+  CUCASCADE_REST_SUM(deletes)
   CUCASCADE_REST_SUM(commits)
   CUCASCADE_REST_SUM(commit_failures)
   CUCASCADE_REST_SUM(write_failures)
@@ -484,6 +485,7 @@ detail::shared_services& rest_reactor::reactor_context::services() const
   X(completes) \
   X(complete_error_retries) \
   X(aborts) \
+  X(deletes) \
   X(commits) \
   X(commit_failures) \
   X(write_failures) \
@@ -831,6 +833,10 @@ reactor_worker::work reactor_worker::next_work(std::size_t free_connections)
     while (_in.take_control(w.ctl)) {
       if (w.ctl != nullptr) { return w; }
     }
+    // Background control jobs (low-priority deletes) only once no data work was handed out.
+    while (_in.take_control(w.ctl, /*background=*/true)) {
+      if (w.ctl != nullptr) { return w; }
+    }
     return w;
   }
 }
@@ -1020,10 +1026,10 @@ void reactor_worker::start_control(std::size_t index, std::shared_ptr<control_jo
         x.accept_status    = job->k == kind::list ? 200 : 0;
         x.fresh_connection = job->fresh_connection;
         break;
-      case kind::abort: {
+      case kind::abort:
+      case kind::delete_object: {
         // Any object-level request signed from its spec (method, sub-resource query, body):
-        // AbortMultipartUpload today; another kind (DeleteObject) only adds its case here and
-        // its classification in finish_control.
+        // AbortMultipartUpload and DeleteObject; each kind's classification is in finish_control.
         request_spec const spec{job->object, job->method, job->query, job->has_body};
         auth               = _r._ctx->authorizer()->authorize_request(spec, presign_ttl(_cfg));
         x.method           = detail::http_method_of(job->method);
@@ -1031,7 +1037,7 @@ void reactor_worker::start_control(std::size_t index, std::shared_ptr<control_jo
         x.target           = net::body_target::discard;
         x.accept_status    = 0;
         x.fresh_connection = job->fresh_connection;
-        ++_s.aborts;
+        ++(job->k == kind::abort ? _s.aborts : _s.deletes);
         break;
       }
     }
@@ -1321,8 +1327,14 @@ void reactor_worker::finish_control(std::size_t index, net::exchange_result& r)
     _ready.push_front(work{nullptr, std::move(job), nullptr});
     return;
   }
-  auto const status    = static_cast<unsigned>(r.meta.status);
-  bool const retriable = (r.ec && is_retriable(r.ec)) || (!r.ec && is_retriable_status(status));
+  auto const status = static_cast<unsigned>(r.meta.status);
+  // DeleteObject: a fully received 404 is final (delete_object_async tells NoSuchKey or a
+  // code-less 404, "already gone", from NoSuchBucket & co.); a 404 whose error body was cut
+  // before its code could be read is retried like a transport error.
+  bool const cut_404 =
+    job->k == kind::delete_object && !r.ec && status == 404 && !r.error_body_complete;
+  bool const retriable =
+    (r.ec && is_retriable(r.ec)) || (!r.ec && is_retriable_status(status)) || cut_404;
   if (retriable && !job->canceled.load(std::memory_order_acquire)) {
     job->last_error = r.ec ? r.ec.message() : "HTTP " + std::to_string(status);
     if (job->attempt + 1 < _cfg.max_retry_attempts) {
@@ -1971,6 +1983,50 @@ head_object_result rest_reactor::head_object(std::string_view bucket, std::strin
   }
   throw std::runtime_error("rest_reactor::head_object: HTTP " + std::to_string(r.meta.status) +
                            " for " + where);
+}
+
+exec::semi_future<void> rest_reactor::delete_object_async(std::string bucket,
+                                                          std::string key,
+                                                          io_priority priority) noexcept
+{
+  try {
+    auto promise    = std::make_shared<exec::promise<void>>();
+    auto result     = promise->get_semi_future();
+    auto job        = std::make_shared<control_job>();
+    job->k          = control_job::kind::delete_object;
+    job->object     = object_ref{std::move(bucket), std::move(key)};
+    job->method     = request_method::DELETE;
+    job->background = priority == io_priority::low;
+    // The job (owned by the intake, a slot or the retry queue until it completed) owns the
+    // promise, so a dropped future needs no reactor-side bookkeeping.
+    job->on_done = [promise](std::shared_ptr<control_job> const& done) {
+      auto const& r    = done->result;
+      auto const where = done->object.bucket + "/" + done->object.key;
+      try {
+        if (auto const failure = control_failure(*done); !failure.empty()) {
+          throw std::runtime_error("rest_reactor::delete_object: " + failure + " for " + where);
+        }
+        auto const code = r.meta.amz_error_code.view();
+        // S3 answers 204 whether or not the key existed; S3-compatible stores (and a retry whose
+        // first answer was lost) may answer 404 NoSuchKey: the key is gone either way.
+        bool const gone =
+          r.meta.status == 404 && (code == "NoSuchKey" || (code.empty() && r.error_body_complete));
+        if (r.meta.status / 100 != 2 && !gone) {
+          throw std::runtime_error(
+            "rest_reactor::delete_object: HTTP " + std::to_string(r.meta.status) +
+            (code.empty() ? std::string{} : " " + std::string{code}) + " for " + where);
+        }
+        promise->set_value();
+      } catch (...) {
+        promise->set_exception(std::current_exception());
+      }
+    };
+    // Not running (or called from a reactor loop): run it blocking on a private helper.
+    if (!post_control(job)) { run_controls({job}); }
+    return result;
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
 }
 
 size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)

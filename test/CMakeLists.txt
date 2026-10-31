@@ -83,6 +83,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_rest_pool_plan.cpp
     io/rest/test_rest_read_robustness.cpp
     io/rest/test_rest_validation_tag.cpp
+    io/rest/test_rest_delete.cpp
     io/rest/test_rest_write.cpp
     io/rest/test_shared_byte_span.cpp
     io/rest/s3/test_loopback_s3_server.cpp

@@ -450,6 +450,49 @@ exec::semi_future<void> ioctx::flush_async(const io_object& obj, io_priority pri
   return flush_async_io(obj, resolve_priority(priority, io_priority::high));
 }
 
+// ---------------------------------------------------------------------------
+// Removal
+// ---------------------------------------------------------------------------
+
+exec::semi_future<void> ioctx::remove_io_object_async(std::string path,
+                                                      io_priority priority) noexcept
+{
+  try {
+    path = strip_file_scheme(path);
+    if (path.empty()) { throw std::invalid_argument("ioctx::remove_io_object: empty path"); }
+    // As for a write: drop what the cache and metadata store hold for the path now, and again
+    // once the removal settled (a prefetch that raced it may have cached the old bytes).  The
+    // completion is allocated before the request is issued, so nothing can fail in between.
+    invalidate_cached(path);
+    cache::fs_cache::pending_invalidation pending;
+    if (_cache) { pending = _cache->invalidate_later(path); }
+    exec::promise<void> bridge;
+    auto result         = bridge.get_semi_future();
+    using terminal_type = exec::invocable<void(exec::try_t<void>&&)>;
+    terminal_type terminal{[pending  = std::move(pending),
+                            metadata = &_metadata_store,
+                            removed  = path,
+                            bridge   = std::move(bridge)](exec::try_t<void>&& outcome) mutable {
+      pending.fire();
+      metadata->invalidate_written(removed);
+      bridge.set_try(std::move(outcome));
+    }};
+    auto backend =
+      remove_io_object_async_io(std::move(path), resolve_priority(priority, io_priority::high));
+    try {
+      std::move(backend).install_callback(std::move(terminal));
+    } catch (...) {
+      if (!backend.valid() || !terminal) throw;
+      terminal(std::move(backend).get_try());
+    }
+    return result;
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
+
+void ioctx::remove_io_object(std::string const& path) { remove_io_object_async(path).get(); }
+
 // -- Default write hooks: not implemented ---------------------------------------
 
 std::shared_ptr<io_object> ioctx::create_io_object_for_write(std::string /*path*/,
@@ -486,6 +529,16 @@ exec::semi_future<void> ioctx::flush_async_io(const io_object& /*obj*/,
 {
   try {
     throw not_implemented_error(std::string(backend_name(type())) + ": flush_async");
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
+
+exec::semi_future<void> ioctx::remove_io_object_async_io(std::string /*path*/,
+                                                         io_priority /*priority*/) noexcept
+{
+  try {
+    throw not_implemented_error(std::string(backend_name(type())) + ": remove_io_object");
   } catch (...) {
     return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
   }

@@ -464,6 +464,34 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   [[nodiscard]] exec::semi_future<void> flush_async(
     const io_object& obj, io_priority priority = io_priority::automatic) noexcept;
 
+  // -- Removal -----------------------------------------------------------------
+  //
+  // Delete the object @p path names (a leading @c file: scheme is stripped, as
+  // for @ref open_io_object).  Removing an object that does not exist succeeds:
+  // the post-condition "no such object" holds either way.  The path is
+  // invalidated in this ioctx's cache and metadata store before the request is
+  // issued and again once it settled, before the caller sees the outcome, as
+  // for a write.
+  //
+  // Backends that do not implement it (the local-file backends today: DISK
+  // spaces remove their files with std::filesystem) report
+  // @c not_implemented_error (a @c std::system_error with
+  // @c std::errc::not_supported).
+  //
+  // The returned future may be dropped: the request keeps running and settles
+  // on its own (the future's state is shared with the backend's promise).  It
+  // still belongs to this ioctx, though: destroying the ioctx (or shutting it
+  // down) cancels a removal that has not completed yet, so a caller that
+  // releases the last reference to the ioctx should wait for the future first.
+
+  /// Remove @p path asynchronously.  Never throws: every error, including an
+  /// unsupported backend, arrives through the future.
+  [[nodiscard]] exec::semi_future<void> remove_io_object_async(
+    std::string path, io_priority priority = io_priority::automatic) noexcept;
+
+  /// Remove @p path and wait.  @throws on any error (see above).
+  void remove_io_object(std::string const& path);
+
   // -- Backend primitives (cache-unaware) ----------------------------------------
 
   virtual size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
@@ -547,6 +575,13 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// @c not_implemented_error.
   virtual exec::semi_future<void> flush_async_io(const io_object& obj,
                                                  io_priority priority) noexcept;
+
+  /// Backend hook behind @ref remove_io_object_async (scheme already stripped,
+  /// priority resolved).  The default resolves with @c not_implemented_error.
+  /// Same completion contract as @ref mixed_writev_async_io: the future must
+  /// resolve before this ioctx is destroyed.
+  virtual exec::semi_future<void> remove_io_object_async_io(std::string path,
+                                                            io_priority priority) noexcept;
 
   bool can_use_fs_cache() const noexcept
   {
