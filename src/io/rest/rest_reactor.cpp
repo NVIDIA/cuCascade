@@ -141,6 +141,18 @@ std::size_t dynamic_segment_target(std::size_t backlog,
   return std::clamp(bytes_per_connection, cfg.min_segment_bytes, cfg.max_segment_bytes);
 }
 
+/// GETs a contiguous read of @p size (> 0) bytes is cut into at a segment @p target already
+/// clamped to the segment bounds: about size / target, none above @p max_segment.  Shared by
+/// physical_ranges and max_read_gets.
+std::size_t contiguous_segment_count(std::size_t size,
+                                     std::size_t target,
+                                     std::size_t max_segment) noexcept
+{
+  auto const preferred_count = std::max<std::size_t>(1, size / target);
+  auto const max_bound_count = 1 + (size - 1) / max_segment;
+  return std::max(preferred_count, max_bound_count);
+}
+
 /// Physical GET ranges of one logical slice: equal parts of about @p target bytes (never more
 /// than max_segment_bytes) for a contiguous or device slice; for an fs_cache fill, the chunks'
 /// fill spans, fused while contiguous up to the target (one fill may reach the cache block size:
@@ -154,11 +166,9 @@ std::vector<range> physical_ranges(prepared_io_slice const& slice,
   target = std::clamp(target, cfg.min_segment_bytes, cfg.max_segment_bytes);
 
   if (!slice.is_fragmented()) {
-    auto const preferred_count = std::max<std::size_t>(1, slice.rng.size / target);
-    auto const max_bound_count = 1 + (slice.rng.size - 1) / cfg.max_segment_bytes;
-    auto const count           = std::max(preferred_count, max_bound_count);
-    auto const base            = slice.rng.size / count;
-    auto const rem             = slice.rng.size % count;
+    auto const count = contiguous_segment_count(slice.rng.size, target, cfg.max_segment_bytes);
+    auto const base  = slice.rng.size / count;
+    auto const rem   = slice.rng.size % count;
     std::vector<range> result;
     result.reserve(count);
     auto offset = slice.rng.offset;
@@ -315,6 +325,17 @@ int epoll_wait_precise(int epfd, std::span<epoll_event> events, timespec const* 
 // =================================================================================================
 // public helpers
 // =================================================================================================
+
+std::size_t max_read_gets(config const& cfg, std::uint64_t bytes) noexcept
+{
+  // physical_ranges cuts a contiguous (host or device) read at the adaptive segment target,
+  // clamped to [min_segment_bytes, max_segment_bytes]; the smallest target cuts the most GETs.
+  // Defensive bounds for an unvalidated config (validate() rejects both).
+  if (bytes == 0) { return 1; }
+  auto const min_segment = std::max<std::size_t>(cfg.min_segment_bytes, 1);
+  auto const max_segment = std::max(cfg.max_segment_bytes, min_segment);
+  return contiguous_segment_count(static_cast<std::size_t>(bytes), min_segment, max_segment);
+}
 
 shared_byte_span make_shared_byte_span(std::vector<std::uint8_t> bytes)
 {

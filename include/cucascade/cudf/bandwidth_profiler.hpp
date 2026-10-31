@@ -88,6 +88,9 @@ struct bandwidth_profile_config {
   std::size_t timed_iterations = 10;
   /// Skip disk pairs (useful when you only care about GPU/HOST cells).
   bool measure_disk_pairs = true;
+  /// Measure REMOTE pairs (GPU/HOST <-> REMOTE). Off by default: every iteration uploads,
+  /// downloads and deletes objects in the store.
+  bool measure_remote_pairs = false;
   /// When true, call `posix_fadvise(POSIX_FADV_DONTNEED)` on disk source files between timed
   /// iterations so every read hits the disk instead of the Linux page cache. Process-local;
   /// no sudo required. Disable to measure warm-cache behavior.
@@ -131,11 +134,14 @@ struct bandwidth_profile {
  *   - GPU and HOST spaces are measured against each other in both directions, including
  *     self-to-self across distinct device ids.
  *   - DISK spaces are measured against each GPU and HOST space only (no disk-to-disk).
+ *   - REMOTE spaces likewise (no REMOTE <-> DISK / REMOTE), and only when
+ *     `bandwidth_profile_config::measure_remote_pairs` is set.
  *   - Pairs that reduce to the same memory space id are skipped.
  *
  * Transfers flow through the converter registry, using the built-in canonical
  * representation for each tier (GPU -> gpu_table_representation,
- * HOST -> host_data_representation, DISK -> disk_data_representation). Pairs without a
+ * HOST -> host_data_representation, DISK -> disk_data_representation,
+ * REMOTE -> remote_data_representation). Pairs without a
  * registered converter are marked `converter_available == false`.
  *
  * This function is pure and synchronous. It does not reserve through

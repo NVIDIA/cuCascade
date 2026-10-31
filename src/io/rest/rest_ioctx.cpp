@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include "io/rest/errc.hpp"
 #include "io/rest/reactor_placement.hpp"
 #include "io/rest/s3/multipart.hpp"
 #include "io/rest/shared_services.hpp"
@@ -641,6 +642,11 @@ exec::semi_future<std::size_t> rest_ioctx::mixed_writev_async_io(
     return exec::make_semi_future<std::size_t>(std::current_exception());
   }
   return templated_ioctx<rest_reactor>::mixed_writev_async_io(object, std::move(slices));
+}
+
+bool may_be_commit_outcome_unknown(std::error_code ec) noexcept
+{
+  return ec == make_error_code(errc::io_error);
 }
 
 }  // namespace cucascade::io::rest

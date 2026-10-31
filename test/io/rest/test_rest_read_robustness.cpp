@@ -876,3 +876,32 @@ TEST_CASE("rest connections with bytes past the response are not reused", "[rest
   CHECK(server.max_requests_per_connection() == 1);
   reactor.shutdown();
 }
+
+TEST_CASE("max_read_gets bounds the GETs the segment planner cuts a read into", "[rest][e2e]")
+{
+  using cucascade::io::rest::max_read_gets;
+  constexpr std::size_t MiB = 1UL << 20;
+  auto cfg                  = rest_contract_config();
+  cfg.min_segment_bytes     = 4 * MiB;
+  cfg.max_segment_bytes     = 16 * MiB;
+  CHECK(max_read_gets(cfg, 0) == 1);
+  CHECK(max_read_gets(cfg, 1) == 1);
+  CHECK(max_read_gets(cfg, 8 * MiB - 1) == 1);  // the smallest target cuts floor(n / min)
+  CHECK(max_read_gets(cfg, 9 * MiB) == 2);
+  CHECK(max_read_gets(cfg, 64 * MiB) == 16);
+  // No GET above max_segment_bytes, even when n / min_segment_bytes rounds down.
+  cfg.min_segment_bytes = 1 * MiB;
+  cfg.max_segment_bytes = 1 * MiB;
+  CHECK(max_read_gets(cfg, MiB + 1) == 2);
+  CHECK(max_read_gets(cfg, 192UL << 10) == 1);
+
+  // The reactor never cuts more: with the bounds equal the target is fixed, so the bound is
+  // exact.
+  auto payload = rest_test_payload(5 * MiB + 4096);
+  loopback_range_server server(payload);
+  auto fx     = make_ioctx(server, cfg);
+  auto object = fx.ioctx->open_io_object("s3://bucket/object.bin", payload.size());
+  require_rest_bytes_equal(read_range(*fx.ioctx, *object, 0, payload.size()), payload);
+  CHECK(server.get_count() == max_read_gets(cfg, payload.size()));
+  fx.ioctx->shutdown();
+}

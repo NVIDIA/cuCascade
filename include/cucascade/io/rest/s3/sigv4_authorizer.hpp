@@ -22,6 +22,7 @@
 #include <cucascade/io/rest/s3/static_credentials.hpp>
 
 #include <chrono>
+#include <memory>
 #include <string>
 
 namespace cucascade::io::rest::s3 {
@@ -148,5 +149,19 @@ class sigv4_header_authorizer final : public sigv4_authorizer_base {
                                     std::string_view canonical_query,
                                     std::chrono::seconds timeout) override;
 };
+
+/**
+ * @brief The SigV4 authorizer of an object store: @c sigv4_header_authorizer or
+ *        @c sigv4_presigned_authorizer after @c os.s3_signing_mode, signing for @c os.region
+ *        against @c os.endpoint with the static credentials of @p os.
+ *
+ * Shared by the io_context registry (s3:// reads) and the REMOTE memory tier's
+ * @c make_remote_io_context, so both sign alike.
+ *
+ * @return null when the store is not configured: an empty endpoint, region, access key or secret
+ *         key.
+ * @throw cucascade::io::credential_error on a malformed endpoint (see sigv4_authorizer_base).
+ */
+[[nodiscard]] std::shared_ptr<request_authorizer> make_authorizer(object_store_config const& os);
 
 }  // namespace cucascade::io::rest::s3

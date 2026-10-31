@@ -38,6 +38,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace cucascade::io::rest {
@@ -272,5 +273,18 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::string _warmed_bucket;
   std::optional<std::chrono::steady_clock::time_point> _warmed_at;
 };
+
+/**
+ * @brief True when a flush (commit) failed with the code under which the REST backend reports
+ *        a commit whose outcome it cannot know.
+ *
+ * A @c write_mode::create_new commit whose earlier attempt went out whole and lost its answer,
+ * and whose retry was refused with 412, may or may not have created the key; likewise a
+ * CompleteMultipartUpload whose lost answer could not be verified.  Neither @c EEXIST nor
+ * success is claimed: the flush fails with the backend's generic I/O error code, which this
+ * recognizes.  That code also marks other failures without a more specific one, so a caller
+ * must only act on it where acting is safe either way (e.g. writing again under a fresh key).
+ */
+[[nodiscard]] bool may_be_commit_outcome_unknown(std::error_code ec) noexcept;
 
 }  // namespace cucascade::io::rest
