@@ -20,6 +20,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace cucascade::io {
@@ -39,6 +40,20 @@ namespace cucascade::io {
  * Future IO-layer error types share this header.
  */
 class credential_error : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+/**
+ * @brief Opening a local file paired descriptors of two different files.
+ *
+ * A local reactor opens a buffered descriptor and reopens it for @c O_DIRECT;
+ * when the two do not name the same file (device and inode) on every attempt,
+ * for example because the path is being replaced concurrently, the open fails
+ * with this error rather than read the data of one file and the footer of
+ * another.
+ */
+class descriptor_mismatch_error : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };
@@ -78,6 +93,26 @@ class object_changed_error : public std::runtime_error {
   std::string _object_path;
   std::string _expected_tag;
   std::string _observed_tag;
+};
+
+/**
+ * @brief The backend does not implement this operation yet.
+ *
+ * Reported by the default write and flush hooks of @c ioctx (a backend that
+ * serves reads only, e.g. s3rdma), and by the @c ioctx write front ends when
+ * the backend cannot write at all.  A
+ * @c std::system_error with @c std::errc::not_supported, so callers that catch
+ * @c std::system_error and compare its code keep working; the message names
+ * the backend and operation and says "not yet implemented".
+ */
+class not_implemented_error : public std::system_error {
+ public:
+  /// @p what names the backend and the operation, e.g. "rest: host_write".
+  explicit not_implemented_error(std::string const& what)
+    : std::system_error(std::make_error_code(std::errc::not_supported),
+                        what + ": not yet implemented")
+  {
+  }
 };
 
 }  // namespace cucascade::io

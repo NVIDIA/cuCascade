@@ -24,6 +24,7 @@
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -61,7 +62,24 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// the pinned bounce-staging resource — all of which must outlive this ioctx).
   /// The ioctx config is sourced from the reactors themselves — see
   /// @c templated_ioctx.
+  ///
+  /// @p n_reactors is a total; 0 sizes the pool from the egress NIC (one reactor per IRQ CPU,
+  /// pinned to it at the highest permitted priority, when the NIC's queue IRQs are steered to a
+  /// strict subset of its NUMA node's cores; the default 2 otherwise).
+  /// @throws std::invalid_argument when the config is invalid (@c config::validate) or
+  /// @c rest.fan_out exceeds a positive @p n_reactors (the default fan-out of 2 is clamped to a
+  /// one-reactor pool instead, as the former hard-coded fan-out was).
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
+  ~rest_ioctx() override;
+
+  rest_ioctx(rest_ioctx const&)            = delete;
+  rest_ioctx& operator=(rest_ioctx const&) = delete;
+  rest_ioctx(rest_ioctx&&)                 = delete;
+  rest_ioctx& operator=(rest_ioctx&&)      = delete;
+
+  /// Counters of the whole pool: the reactors' @c transport_stats summed (extremes for the MSS
+  /// and in-flight peaks).  A snapshot; safe while the pool runs.
+  [[nodiscard]] transport_stats stats() const noexcept;
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
@@ -99,9 +117,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// IDENTICAL to @c open_io_object(path, parquet_footer_probe): one verified
   /// suffix GET; 200/416/unverifiable-206 fall back to a HEAD supplying
   /// size+tag; the same retry policy per entry, never stalling siblings.  The
-  /// caller's thread drives one curl multi with connection reuse across
-  /// entries, and @p on_result is invoked ON THE CALLER'S THREAD, SERIALLY,
-  /// as each entry lands — completion order, no all-entries barrier.
+  /// exchanges run on the first reactor's connections (on a private helper
+  /// transport when the pool is not running), and @p on_result is invoked ON
+  /// THE CALLER'S THREAD, SERIALLY, as each entry lands — completion order, no
+  /// all-entries barrier.
   ///
   /// Every input occurrence is delivered exactly once (duplicates delivered
   /// per occurrence, disambiguated by index); no callback runs after the
@@ -116,10 +135,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @c config::footer_resolve_max_inflight == 0, or an explicit
   /// @c footer_resolve_stash_budget smaller than @c footer_probe_bytes.  An
   /// unparsable or non-s3 path is a per-entry error, not a batch error.
-  /// Should the transfer driver itself fail mid-batch (a curl multi error),
-  /// every undelivered entry is delivered as canceled before that failure
-  /// is rethrown — exactly-once holds on every exit path.  This ioctx must
-  /// outlive the call.
+  /// Should the transfer driver itself fail (its helper thread cannot be
+  /// started, or it fails mid-batch), every undelivered entry is delivered as
+  /// canceled before that failure is rethrown — exactly-once holds on every
+  /// exit path.  This ioctx must outlive the call.
   void resolve_footer_objects(std::span<std::string const> paths,
                               std::function<void(footer_resolve_result)> const& on_result,
                               std::stop_token stop = {});
@@ -138,7 +157,7 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   ///
   /// Rate-limited rather than run once, because what goes stale is the
   /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
-  /// pooled connection (@c CURLOPT_MAXAGE_CONN), so a pool warmed before an idle
+  /// pooled connection (its idle cutoff), so a pool warmed before an idle
   /// gap longer than that is cold again by the next query -- a warm-once flag
   /// would serve the first query and no other.  Re-warms when the endpoint
   /// changes or the last warm-up is at least @c conn_max_age old, which is free
@@ -146,6 +165,39 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   void warmup(std::string_view bucket_url) noexcept override;
 
  protected:
+  /// This pool's placement (plan and NIC), computed at construction and shared with its
+  /// reactors; never stored on the reactor_context, which several pools may share.
+  std::shared_ptr<detail::pool_placement const> _placement;
+
+  /// Open @p path (s3://bucket/key) for writing: a @c rest_write_object whose
+  /// writes become an S3 upload, committed by @c flush (docs/io/rest-transport.md
+  /// "Writes").  No request is sent here.  @c write_mode::create_or_truncate and
+  /// @c create_new are supported (the latter commits with `If-None-Match: *`);
+  /// the modes that keep existing content fail with @c not_supported (an S3
+  /// object cannot be modified in place).
+  ///
+  /// Lifetime: flush or drop every write object before destroying this ioctx.  An object that
+  /// outlives it gives back its part buffers when the ioctx is destroyed (they belong to the
+  /// context's host memory resource), can no longer write or commit (@c operation_canceled),
+  /// and its upload is not aborted (bucket lifecycle rules collect it).
+  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
+                                                        write_open_options options) override;
+
+  /// Commit @p object: upload what is left and complete the upload (blocking): one flush slice
+  /// through @ref flush_async_io.  The path's cached bytes and metadata are invalidated once
+  /// the commit settled.
+  void flush_io(io_object const& object) override;
+
+  /// As @ref flush_io, asynchronously: one flush slice on the least-backlogged reactor, the
+  /// path invalidated once it settled and before the returned future resolves.
+  exec::semi_future<void> flush_async_io(io_object const& object,
+                                         io_priority priority) noexcept override;
+
+  /// Cut every write slice that straddles a part boundary at it (one write operation is never
+  /// spread over two S3 parts), then dispatch as the base does.
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept override;
+
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
@@ -162,6 +214,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size) override;
 
  private:
+  rest_ioctx(std::shared_ptr<detail::pool_placement const> placement,
+             std::shared_ptr<rest_reactor::reactor_context> ctx);
+
   /// Resolve @p path with a single suffix-range GET: it discovers the size and
   /// stashes the object's trailing bytes on the returned io_object so cuDF's
   /// footer reads are served locally.  Falls back to a plain HEAD (no stash)
@@ -169,11 +224,19 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
 
   object_store_lister _lister;
+  /// Where uploads destroyed uncommitted send their AbortMultipartUpload (closed first in the
+  /// destructor, before the reactors go).
+  std::shared_ptr<detail::abort_sink> _abort_sink;
+  std::atomic<std::size_t> _control_next{0};
 
-  /// The effective resolve_footer_objects concurrency cap: the configured
-  /// knob, or n_reactors * max_connections under footer_resolve_auto.  0 =
+  /// The effective resolve_footer_objects concurrency cap: the configured knob, or one
+  /// reactor's max_connections under footer_resolve_auto (a batch runs on one reactor).  0 =
   /// the API is disabled.
   [[nodiscard]] std::size_t footer_resolve_inflight_cap() const;
+
+  /// The reactor a control-plane call (HEAD, footer probe, LIST, footer batch) runs on: the
+  /// least backlogged, ties rotated, so control traffic does not pile onto reactor 0.
+  [[nodiscard]] rest_reactor& control_reactor();
 
   // Batched-footer-resolve coordination: one active batch per ioctx, later
   // calls FIFO-parked on the ticket queue (stop-aware — a queued batch whose

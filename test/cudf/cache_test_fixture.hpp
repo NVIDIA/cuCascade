@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -139,3 +140,26 @@ struct cache_test_fixture {
 };
 
 }  // namespace cucascade::test
+
+namespace cucascade::io::cache {
+
+/// Reaches the private request entry points a datasource uses through
+/// fadvise / prepare_prefetch, so a test can hold the handles and inspect
+/// their chunks.
+struct fs_cache_test_access {
+  static cache_handle request(fs_cache& cache,
+                              io_object const& obj,
+                              std::span<const fs_cache::byte_range> ranges)
+  {
+    return cache.initiate_prefetching_request(obj, ranges);
+  }
+
+  static prepare_result prepare(fs_cache& cache,
+                                cache_handle& handle,
+                                bool wait_for_eviction = false)
+  {
+    return cache.prepare(handle, wait_for_eviction);
+  }
+};
+
+}  // namespace cucascade::io::cache

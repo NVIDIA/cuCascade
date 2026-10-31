@@ -408,3 +408,30 @@ TEST_CASE("presign_url preserves the caller-selected scheme", "[s3][sigv4]")
   CHECK(url.find("http://minio.local:9000/bucket/test.txt?") == 0);
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
 }
+
+TEST_CASE("sign_request canonicalizes extra headers: case, whitespace and repeated names",
+          "[s3][sigv4]")
+{
+  auto sign = [](std::vector<std::pair<std::string, std::string>> const& extra) {
+    return authorization_header(sign_request("GET",
+                                             "examplebucket.s3.amazonaws.com",
+                                             "/test.txt",
+                                             "",
+                                             sha256_hex(""),
+                                             extra,
+                                             aws_example_creds(),
+                                             1369353600));
+  };
+  // Trimmed, interior runs collapsed, one header per name with the values joined by ',' in order.
+  auto const canonical = sign({{"x-amz-meta-a", "a b,c"}, {"range", "bytes=0-9"}});
+  CHECK(sign({{"X-Amz-Meta-A", "  a \t  b "}, {"Range", "bytes=0-9"}, {"x-amz-meta-a", " c"}}) ==
+        canonical);
+  CHECK(
+    contains(canonical, "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date;x-amz-meta-a"));
+  // Order of the repeated values matters.
+  CHECK(sign({{"x-amz-meta-a", "c"}, {"x-amz-meta-a", "a b"}, {"range", "bytes=0-9"}}) !=
+        canonical);
+  // Headers the signer sets itself cannot be passed as extras.
+  CHECK_THROWS_AS(sign({{"Host", "evil.example"}}), std::invalid_argument);
+  CHECK_THROWS_AS(sign({{"x-amz-date", "20130524T000000Z"}}), std::invalid_argument);
+}
