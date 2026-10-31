@@ -69,8 +69,10 @@ enum class errc : int {
   throttled,  ///< terminal 503/429 after budget exhaustion
   credentials_unavailable,
   not_supported,
-  unhandled_exception,  ///< a then(ex, f) continuation threw something that is not a
-                        ///< std::system_error (kept) or std::bad_alloc (not_enough_memory)
+  unhandled_exception,       ///< a then(ex, f) continuation threw something that is not a
+                             ///< std::system_error (kept) or std::bad_alloc (not_enough_memory)
+  http_unsupported_framing,  ///< 2xx GET body that is chunked or close-delimited (S3 stores
+                             ///< always send Content-Length)
 };
 
 /// @return the "cucascade.rest" category (values are `errc`).
