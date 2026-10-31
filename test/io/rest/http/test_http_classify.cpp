@@ -26,6 +26,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <cerrno>
+#include <string>
 
 using namespace cucascade::io::http;
 using rclass = outcome::retry_class;
@@ -135,6 +136,23 @@ TEST_CASE("http.classify.row02_transient_connect_and_tls_failures", "[rest][http
         cucascade::io::rest::make_error_code(cucascade::io::rest::errc::operation_canceled))
       .retryable);
   CHECK_FALSE(get(none, sys(ECANCELED)).retryable);
+}
+
+TEST_CASE("http.classify.unsupported_framing_is_final_and_named", "[rest][http][classify]")
+{
+  namespace rest = cucascade::io::rest;
+  // Appended after unhandled_exception, so every earlier value stays stable.
+  CHECK(static_cast<int>(rest::errc::http_unsupported_framing) ==
+        static_cast<int>(rest::errc::unhandled_exception) + 1);
+  auto const ec = rest::make_error_code(rest::errc::http_unsupported_framing);
+  CHECK(&ec.category() == &rest::error_category());
+  // The message names the cause instead of reporting a malformed message.
+  CHECK(ec.message().find("chunked or close-delimited") != std::string::npos);
+  CHECK(ec.message() != rest::make_error_code(rest::errc::http_bad_message).message());
+  // No retry can succeed: the failure is final on a fresh and a reused connection.
+  response_meta const none;
+  CHECK_FALSE(get(none, ec, 0, 1023, 0, false).retryable);
+  CHECK_FALSE(get(none, ec).retryable);
 }
 
 TEST_CASE("http.classify.row03_throttle_503_slowdown_429", "[rest][http][classify]")
