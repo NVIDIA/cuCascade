@@ -21,16 +21,17 @@
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/cache/types.hpp>
-#include <cucascade/io/concurrent_queue.hpp>
+#include <cucascade/io/io_request.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
-#include <cucascade/io/rest/types.hpp>
+#include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -44,6 +45,13 @@
 #include <vector>
 
 namespace cucascade::io::rest {
+
+namespace detail {
+class shared_services;
+}  // namespace detail
+
+class reactor_worker;
+class private_driver;
 
 /// Parse the total object length out of a Content-Range value of the form
 /// "bytes <first>-<last>/<total>".  Returns nullopt when the unit is not
@@ -257,18 +265,81 @@ class rest_io_object : public io_object {
 };
 
 // ---------------------------------------------------------------------------
+// transport_stats
+// ---------------------------------------------------------------------------
+
+/// Cumulative counters of one REST reactor (its scheduler and its io_uring transport), a
+/// snapshot published by the worker once per loop pass.  @c rest_ioctx::stats sums them over the
+/// pool.
+struct transport_stats {
+  // scheduler
+  std::uint64_t requests_started{0};  ///< grouped requests taken from the queue
+  std::uint64_t gets{0};              ///< data GETs completed successfully
+  std::uint64_t get_bytes{0};         ///< bytes delivered by those GETs
+  std::uint64_t heads{0};             ///< HEAD exchanges completed
+  std::uint64_t control_requests{0};  ///< HEAD / footer probe / LIST exchanges completed
+  std::uint64_t warmups{0};           ///< warm-up exchanges issued
+  std::uint64_t upkeeps{0};           ///< idle upkeep exchanges issued
+  std::uint64_t retries{0};           ///< transient retries scheduled (data and control)
+  std::uint64_t auth_retries{0};      ///< 403 re-sign retries
+  std::uint64_t stale_retries{0};     ///< free retries after a pooled connection died
+  std::uint64_t failures{0};          ///< operations that failed terminally
+  std::uint64_t h2d_copies{0};        ///< staged host-to-device copies
+  std::uint64_t staging_waits{0};     ///< operations parked until staging blocks returned
+  std::uint64_t passes{0};            ///< worker loop iterations
+  std::uint64_t waits{0};             ///< blocking waits
+  std::uint64_t max_inflight{0};
+  std::uint64_t established{0};  ///< connected connections right now
+  std::uint64_t responses_2xx{0};
+  std::uint64_t responses_3xx{0};
+  std::uint64_t responses_4xx{0};
+  std::uint64_t responses_5xx{0};
+  // transport
+  std::uint64_t connects{0};
+  std::uint64_t connect_failures{0};
+  std::uint64_t handshakes{0};
+  std::uint64_t ktls_sessions{0};           ///< connections with kTLS RX and TX
+  std::uint64_t userspace_tls_sessions{0};  ///< connections on the user-space record layer
+  std::uint64_t ktls_fallbacks{0};          ///< user space although kTLS was allowed
+  std::uint64_t reused{0};                  ///< exchanges on a pooled connection
+  std::uint64_t closed{0};
+  std::uint64_t idle_closes{0};     ///< reuse refused: idle longer than conn_max_age
+  std::uint64_t dead_closes{0};     ///< reuse refused: input / HUP / error on the idle socket
+  std::uint64_t stale_failures{0};  ///< pooled connections that died before any response byte
+  std::uint64_t sends{0};
+  std::uint64_t recvs{0};
+  std::uint64_t bytes_sent{0};
+  std::uint64_t recv_direct_bytes{0};   ///< body bytes received straight into the destination
+  std::uint64_t recv_scratch_bytes{0};  ///< bytes received through the scratch buffer
+  std::uint64_t timeouts{0};
+  std::uint64_t stalls{0};  ///< data GETs cancelled by the stall detector
+  std::uint64_t net_errors{0};
+  std::uint64_t control_records{0};  ///< kTLS control records consumed
+
+  /// Add @p other (sums; the extreme for @c max_inflight).
+  void merge(transport_stats const& other) noexcept;
+};
+
+// ---------------------------------------------------------------------------
 // rest_reactor
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Single-threaded I/O reactor for RESTful object storage (s3://...).
+ * @brief Single-threaded io_uring reactor for RESTful object storage (s3://...).
  *
- * Owns one worker thread driving a libcurl multi handle over an epoll event
- * loop (curl_multi_socket_action), a pool of reusable easy handles, dynamic
- * CuCascade staging for device reads, a timerfd + min-heap retry
- * scheduler, and an MPSC request queue.  Models the reactor concept consumed
- * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
- * @c s3_request_authorizer, re-issued on every attempt.
+ * Owns one worker thread driving one io_uring HTTP/1.1 transport (up to
+ * @c config::max_connections keep-alive connections; kTLS when the kernel accepts the keys,
+ * the user-space TLS record layer otherwise), a two-tier MPSC request queue (demand before
+ * prefetch), a control-plane queue (HEAD, footer probe, LIST, warm-up), dynamic CuCascade
+ * staging for device reads, and a retry heap.  Physical GETs are sized from the backlog
+ * (uring_ultra's adaptive segment planner).  Models the reactor concept consumed by
+ * @c templated_ioctx.  Every attempt is authorized afresh through the context's
+ * @c request_authorizer.  Blocking control-plane calls run on the worker's connections while
+ * it runs, else on a private transport on a short-lived helper thread (never the caller's).
+ * That helper is a whole reactor loop (a thread, an io_uring ring, new connections) per call,
+ * far heavier than the libcurl easy handle it replaces: start the pool before issuing
+ * control-plane calls.  A call made from a reactor thread (a completion callback) also takes
+ * the helper path, so it never waits on a reactor loop that may be its own.
  */
 class rest_reactor {
  public:
@@ -294,6 +365,9 @@ class rest_reactor {
     {
     }
 
+    reactor_context(reactor_context const&)            = delete;
+    reactor_context& operator=(reactor_context const&) = delete;
+
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
     [[nodiscard]] const std::shared_ptr<request_authorizer>& authorizer() const noexcept
     {
@@ -305,10 +379,16 @@ class rest_reactor {
       return _host_mr;
     }
 
+    /// Transport state every reactor of the pool shares (internal): the DNS resolver thread and
+    /// the TLS provider.  Built on first call; thread-safe.
+    [[nodiscard]] detail::shared_services& services() const;
+
    private:
     config _config;
     std::shared_ptr<request_authorizer> _authorizer;
     cucascade::memory::fixed_size_host_memory_resource* _host_mr{nullptr};
+    mutable std::mutex _services_mutex;
+    mutable std::shared_ptr<detail::shared_services> _services;
   };
 
   using io_object_type       = rest_io_object;
@@ -370,26 +450,23 @@ class rest_reactor {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
 
-  /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
+  /// Synchronous host read: served from the footer stash when it covers the range, else a
+  /// ranged GET through the worker.  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  /// Ask the worker to open its connection pool against @p bucket before any
-  /// read needs it.  Returns immediately: the worker does the HEADs on its own
-  /// thread at the top of its next pass, because the connection cache it fills
-  /// is thread-confined (see the @c curl_share warning) and is reachable from
-  /// nowhere else.  Coalescing is the caller's job -- a second call before the
-  /// first is serviced simply replaces the target.
-  ///
-  /// The request is a bucket-scoped @c ListObjectsV2 capped at zero keys, not a
-  /// HEAD: a HEAD is signed per object and @c sigv4_authorizer refuses an empty
-  /// key, whereas @c authorize_list already signs a bucket-only URI, so this
-  /// keeps warm-up traffic off the query's data files without touching the
-  /// signing path.  The response is discarded and never inspected -- the
-  /// handshake is what is being bought, so even a 403 is a success.
+  /// Ask the worker to make its connection pool hot against @p bucket before any read needs
+  /// it.  Returns immediately: the worker issues, at the top of its next pass, one
+  /// bucket-scoped @c ListObjectsV2 capped at zero keys per idle connection slot (up to
+  /// @c max_connections), each on a fresh connection (an idle connection in the slot is closed
+  /// first, like curl's FRESH_CONNECT), so TCP, TLS and HTTP are all validated.  A HEAD is not
+  /// used because it is signed per object and @c sigv4_authorizer refuses an empty key.  The
+  /// responses are discarded and failures are logged at debug only; a second call before the
+  /// first is serviced replaces the target.  Rate limiting is @c rest_ioctx::warmup's job.
   void warmup(std::string bucket);
 
   /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
-  /// build an @c rest_io_object.  @p bucket / @p key identify the object.
+  /// build an @c rest_io_object.  @p bucket / @p key identify the object.  Bounded by
+  /// @c request_timeout_s per attempt; transient failures are retried.
   head_object_result head_object(std::string_view bucket, std::string_view key);
 
   /// Size-only convenience wrapper around @c head_object.
@@ -404,10 +481,14 @@ class rest_reactor {
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
 
   /// Batched footer resolve engine: every entry gets the same per-attempt
-  /// semantics as @c fetch_footer_suffix plus the HEAD fallback, but all
-  /// entries share one curl multi driven on the caller's thread, so
-  /// connections are reused across entries (at most @p max_inflight pooled)
-  /// and at most @p max_inflight transfers are on the wire at once.
+  /// semantics as @c fetch_footer_suffix plus the HEAD fallback, run as
+  /// exchanges on this reactor's connections (or, when the reactor is not
+  /// running, on a private transport on a short-lived helper thread), so
+  /// connections are reused across entries and at most @p max_inflight
+  /// transfers are on the wire at once.  The caller's thread only
+  /// coordinates (budget, retries' fallbacks, delivery); io_uring never runs
+  /// on it, and when the helper cannot be started every entry is delivered
+  /// as canceled before the error is rethrown.
   /// @p paths / @p objects / @p indices are parallel: @p indices carries each
   /// entry's position in the caller's original batch.  Each probe reserves
   /// @c footer_probe_bytes from @p budget before its GET is issued
@@ -450,8 +531,26 @@ class rest_reactor {
   static std::vector<byte_range> align_and_coalesce(std::span<const byte_range> ranges,
                                                     std::optional<size_t> alignment = std::nullopt);
 
+  // -- observability ---------------------------------------------------------
+
+  /// This reactor's counters (a snapshot published once per worker pass; zero before it ran).
+  [[nodiscard]] transport_stats stats() const noexcept;
+
+  /// Worker-side control-plane work (HEAD, probe, LIST, warm-up); internal.
+  struct control_job;
+
  private:
+  friend class reactor_worker;
+  friend class private_driver;
+  struct intake;
+  struct atomic_stats;
+
   void worker_loop(const std::stop_token& stop_token);
+  /// Hand @p jobs to the worker, or run them on a private transport on a helper thread when
+  /// the worker is not running.  Blocks until every job completed.
+  void run_controls(std::vector<std::shared_ptr<control_job>> const& jobs);
+  /// Queue @p job on the running worker.  False when the worker does not accept work.
+  bool post_control(std::shared_ptr<control_job> job);
 
   // Shared services + tunables for the whole reactor pool; kept alive for this
   // reactor's lifetime (the authorizer is used on every request).
@@ -460,25 +559,17 @@ class rest_reactor {
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
 
-  // Set by warmup() on a caller thread, consumed by the worker at the top of a
-  // pass.  The bucket is guarded because a std::string is not atomically
-  // publishable; the flag is what the worker actually polls.
-  std::atomic<bool> _warm_requested{false};
-  std::mutex _warm_mtx;
-  std::string _warm_bucket;
-
-  // Cross-thread wakeup: written by enqueue()/interrupt() to break the worker
-  // out of epoll_wait.
-  file_descriptor _wakeup_fd;
+  // The worker's queues and wake-up fd (shared with a private helper's layout).
+  std::unique_ptr<intake> _intake;
+  std::unique_ptr<atomic_stats> _stats;
 
   std::stop_source _stop_source;
-  blocking_concurrent_queue<std::unique_ptr<grouped_io_request>> _requests;
   mutable std::mutex _enqueue_mutex;
   bool _running{false};
   bool _accepting{false};
   bool _stopped{false};
 
-  // Logical bytes not yet assigned to a curl slot. Retries are already claimed
+  // Logical bytes not yet assigned to a connection.  Retries are already claimed
   // work and therefore never get counted a second time.
   std::atomic<std::size_t> _queued_bytes{0};
 
