@@ -199,14 +199,15 @@ struct rest_reactor::control_job {
   /// the response storage it accounts for (`result`) is freed before the credit returns.
   std::shared_ptr<void> retained;
 
-  /// @c abort: DELETE <key>?uploadId=U (AbortMultipartUpload, best effort, one attempt), signed
-  /// through @c request_authorizer::authorize_request from @c method / @c query like any other
-  /// object-level request (a DeleteObject kind needs only a classification rule).
-  enum class kind : std::uint8_t { head, probe, list, warm, abort };
+  /// @c abort: DELETE <key>?uploadId=U (AbortMultipartUpload, best effort, one attempt);
+  /// @c delete_object: DELETE <key> (DeleteObject, retried like the other control jobs).  Both are
+  /// signed through @c request_authorizer::authorize_request from @c method / @c query like any
+  /// other object-level request.
+  enum class kind : std::uint8_t { head, probe, list, warm, abort, delete_object };
   kind k{kind::head};
   object_ref object;
-  request_method method{request_method::GET};  ///< abort: the signed request's method
-  bool has_body{false};                        ///< abort: the signed request carries a body
+  request_method method{request_method::GET};  ///< abort / delete: the signed request's method
+  bool has_body{false};                        ///< abort / delete: the request carries a body
   std::string bucket;                          ///< list / warm
   std::string query;  ///< list / warm: canonical query; abort: the sub-resource query
   std::size_t probe_bytes{0};
@@ -215,6 +216,9 @@ struct rest_reactor::control_job {
   std::size_t tag{0};            ///< caller's bookkeeping (batch entry index)
   std::size_t attempt{0};
   bool stale_retried{false};
+  /// Started only when no data work is waiting (@c io_priority::low deletes): queued behind reads
+  /// and writes instead of ahead of them like the blocking control-plane calls.
+  bool background{false};
   std::atomic<bool> canceled{false};
 
   // outcome (written by the worker before `done`)
@@ -270,6 +274,7 @@ struct rest_reactor::intake {
   /// Write work parked on an object by this reactor and handed back by another reactor's
   /// settlement (guarded by control_mtx).
   std::deque<std::pair<std::shared_ptr<detail::upload_session>, detail::parked_write>> resumed;
+  std::deque<std::shared_ptr<control_job>> background_controls;  ///< control_job::background
   std::atomic<bool> warm_requested{false};
   /// A caller canceled control jobs that may be in flight: the worker aborts their exchanges.
   std::atomic<bool> abort_requested{false};
@@ -291,12 +296,13 @@ struct rest_reactor::intake {
     interrupt();
   }
 
-  bool take_control(std::shared_ptr<control_job>& out)
+  bool take_control(std::shared_ptr<control_job>& out, bool background = false)
   {
     std::lock_guard lock{control_mtx};
-    if (controls.empty()) { return false; }
-    out = std::move(controls.front());
-    controls.pop_front();
+    auto& queue = background ? background_controls : controls;
+    if (queue.empty()) { return false; }
+    out = std::move(queue.front());
+    queue.pop_front();
     return true;
   }
 
@@ -306,7 +312,8 @@ struct rest_reactor::intake {
     {
       std::lock_guard lock{control_mtx};
       if (closed) { return false; }
-      controls.push_back(std::move(job));
+      auto& queue = job != nullptr && job->background ? background_controls : controls;
+      queue.push_back(std::move(job));
     }
     interrupt();
     return true;
@@ -325,9 +332,10 @@ struct rest_reactor::intake {
       std::shared_ptr<control_job> job;
       {
         std::lock_guard lock{control_mtx};
-        if (controls.empty()) { return; }
-        job = std::move(controls.front());
-        controls.pop_front();
+        auto& queue = controls.empty() ? background_controls : controls;
+        if (queue.empty()) { return; }
+        job = std::move(queue.front());
+        queue.pop_front();
       }
       if (job == nullptr) { continue; }
       job->error = error;

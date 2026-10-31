@@ -384,6 +384,7 @@ struct transport_stats {
   std::uint64_t completes{0};               ///< CompleteMultipartUpload answered with a result
   std::uint64_t complete_error_retries{0};  ///< Complete re-sent after a `200 OK` + `<Error>`
   std::uint64_t aborts{0};                  ///< AbortMultipartUpload requests sent
+  std::uint64_t deletes{0};                 ///< DeleteObject requests sent (attempts)
   std::uint64_t commits{0};                 ///< flushes that committed an object
   std::uint64_t commit_failures{0};         ///< flushes that failed
   std::uint64_t write_failures{0};          ///< write operations that failed
@@ -594,6 +595,19 @@ class rest_reactor {
   std::string list_page(std::string_view bucket,
                         std::string_view prefix,
                         std::string_view canonical_query);
+
+  /// DeleteObject of @p bucket / @p key.  Resolves once the store answered (2xx, or a 404
+  /// @c NoSuchKey or a complete 404 without an error code: the key is already gone, which is
+  /// success; another 404, e.g. @c NoSuchBucket, fails; a 404 whose body was cut is retried) or
+  /// the retries (@c max_retry_attempts, like the other control calls) are exhausted; a 403 is
+  /// final.  Runs on the worker as a control job while the reactor runs (the future then
+  /// resolves on the worker thread; @p priority @c low starts it only when no reads or writes
+  /// wait); otherwise it runs blocking on a private helper, as @ref head_object does, and returns
+  /// a ready future.  The future may be dropped: the job owns its outcome.  A delete still
+  /// queued or in flight when the reactor shuts down fails with @c operation_canceled.
+  [[nodiscard]] exec::semi_future<void> delete_object_async(std::string bucket,
+                                                            std::string key,
+                                                            io_priority priority) noexcept;
 
   // -- capabilities / factory ----------------------------------------------
 
