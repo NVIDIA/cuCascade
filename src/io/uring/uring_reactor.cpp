@@ -16,11 +16,15 @@
  * limitations under the License.
  */
 
+#include "io/detail/local_descriptor.hpp"
+
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
@@ -634,22 +638,46 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
     throw std::runtime_error("uring_reactor::create_io_object: unsupported path: " + path);
   }
 
-  file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
-  if (!buffered) {
-    throw std::system_error(
-      errno, std::generic_category(), "uring_reactor::create_io_object: buffered open");
-  }
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
+    if (!buffered) {
+      int const error = errno;
+      throw std::system_error(
+        error, std::generic_category(), "uring_reactor::create_io_object: buffered open");
+    }
 
-  file_descriptor direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
-  if (!direct) {
-    CUCASCADE_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
-                       path,
-                       strerror(errno));
-  }
+    // Reopen the owned descriptor, not the pathname: a concurrent rename must
+    // not pair the old buffered footer with a different O_DIRECT data file.
+    file_descriptor direct{cucascade::io::detail::reopen_local_descriptor(
+      buffered.get(), path.c_str(), O_RDONLY | O_DIRECT)};
+    if (!direct) {
+      CUCASCADE_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
+                         path,
+                         strerror(errno));
+    }
 
-  auto const file_size = size(buffered.get());
-  return std::make_unique<local_io_object>(
-    std::move(path), std::move(buffered), std::move(direct), file_size);
+    object_identity captured;
+    if (!capture_local_identity(buffered.get(), captured)) {
+      int const error = errno;
+      throw std::system_error(
+        error, std::generic_category(), "uring_reactor::create_io_object: fstat");
+    }
+    if (direct) {
+      object_identity direct_identity;
+      if (!capture_local_identity(direct.get(), direct_identity)) {
+        throw descriptor_mismatch_error(
+          "uring_reactor::create_io_object: identity_descriptor_mismatch");
+      }
+      if (captured.device != direct_identity.device || captured.inode != direct_identity.inode) {
+        // Destroy the entire descriptor set before retrying the open.
+        continue;
+      }
+    }
+    auto const file_size = captured.size;
+    return std::make_unique<local_io_object>(
+      std::move(path), std::move(buffered), std::move(direct), file_size, "", std::move(captured));
+  }
+  throw descriptor_mismatch_error("uring_reactor::create_io_object: identity_descriptor_mismatch");
 }
 
 std::size_t uring_reactor::size(int native_handle)

@@ -20,10 +20,13 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uri_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/object_identity.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/rest/config.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/rest/reactor_placement.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/rest/shared_services.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma/s3rdma_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_reactor.cpp
@@ -34,9 +37,15 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
 
-# kvikIO reaches the environment only via libcudf's dependency closure, so the
-# fallback ioctx is built only alongside the cudf layer.
-if(CUCASCADE_BUILD_CUDF)
-  target_sources(cucascade_io_objects
-                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp)
-endif()
+# Modules of the io_uring REST transport.  Each fragment adds its own sources to
+# cucascade_io_objects.
+target_sources(cucascade_io_objects
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rest/errc.cpp)
+include(${CMAKE_CURRENT_SOURCE_DIR}/tls/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/http/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/rest/net/sources.cmake)
+
+# Sources include src-private headers (io/detail/..., the transport modules'
+# headers) from src/.
+target_include_directories(cucascade_io_objects
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)

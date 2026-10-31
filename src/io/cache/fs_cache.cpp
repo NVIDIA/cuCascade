@@ -44,6 +44,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <shared_mutex>
 #include <span>
@@ -56,17 +57,21 @@
 
 namespace cucascade::io::cache {
 
-/// One version of a cached object, keyed by @c io_object::raw_file_cache_id().
+/// One version of a cached object, keyed by @c io_object::identity_cache_key().
 /// Shared by the cache map, handles and in-flight reads.  Opening a new version
 /// of the same object path marks older ones @c retired and drops them from the
 /// map; the last owner's deleter hands their chunk buffers back to the pool.
 struct cache_generation {
   /// Materialise a chunk for every offset in @p incoming, fold the matching
   /// entry of @p desired into its populated extent, and count the calling
-  /// request as a subscriber of each.  Returns the chunks in @p incoming
-  /// order.  @p desired runs index-parallel to @p incoming.
-  std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
-                                                   std::span<const chunk_fill> desired);
+  /// request as a subscriber of each.  @p desired runs index-parallel to
+  /// @p incoming.  Records each acquired subscription in @p result (which
+  /// must be empty), in @p incoming order, as it is acquired; an offset past
+  /// EOF stays null.  The caller owns the rollback of what was recorded, even
+  /// when acquisition throws part-way.
+  void subscribe_chunks(std::span<const size_t> incoming,
+                        std::span<const chunk_fill> desired,
+                        std::vector<cached_chunk*>& result);
 
   std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                           std::size_t size,
@@ -78,7 +83,7 @@ struct cache_generation {
 
   mutable std::shared_mutex mtx;
   std::shared_ptr<const io_object> io_obj;
-  std::string key;          ///< @c io_object::raw_file_cache_id()
+  std::string key;          ///< @c io_object::identity_cache_key()
   std::string object_path;  ///< @c io_object::object_path(), for grouping generations
   /// Direct-mapped: slot i covers [i * chunk_size, (i + 1) * chunk_size);
   /// nullptr means that chunk has never been materialised.  Sized once at
@@ -96,21 +101,61 @@ struct cache_generation {
 namespace {
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 
-std::size_t reclaim_chunk_buffers(cache_generation& generation,
-                                  buffer_pool& pool,
-                                  bool only_unsubscribed) noexcept
+[[nodiscard]] bool resident_covers(cached_chunk const& chunk,
+                                   chunk_fill const& required,
+                                   std::size_t chunk_size) noexcept
+{
+  auto const [lo, hi] = fill_span(required, chunk.offset, chunk_size);
+  auto const snapshot = chunk.state.load();
+  return (snapshot.state() == chunk_state::cached || snapshot.state() == chunk_state::in_use) &&
+         covers(snapshot.fill(), chunk.offset, chunk_size, lo, hi);
+}
+
+[[nodiscard]] bool extents_resident(std::span<cached_chunk* const> chunks,
+                                    std::span<chunk_fill const> required,
+                                    std::size_t chunk_size) noexcept
+{
+  for (std::size_t i = 0; i < chunks.size(); ++i) {
+    if (!resident_covers(*chunks[i], required[i], chunk_size)) { return false; }
+  }
+  return true;
+}
+
+/// What one @ref reclaim_chunk_buffers pass did: chunks whose buffers went back
+/// to the pool, and chunks that hold a buffer it could not take (pinned,
+/// loading, or being evicted by someone else).
+struct reclaim_outcome {
+  std::size_t reclaimed{0};
+  std::size_t stuck{0};
+};
+
+/// Return the buffers of up to @p max_chunks of @p generation's chunks to
+/// @p pool, skipping chunks a live request subscribes to when
+/// @p only_unsubscribed.  The caller holds @c generation.mtx exclusively (the
+/// scratch vectors are the generation's) or is its last owner.
+reclaim_outcome reclaim_chunk_buffers(
+  cache_generation& generation,
+  buffer_pool& pool,
+  bool only_unsubscribed,
+  std::size_t max_chunks         = std::numeric_limits<std::size_t>::max(),
+  std::optional<int> numa_filter = std::nullopt) noexcept
 {
   auto& claimed = generation.reclaim_claimed;
   auto& batch   = generation.reclaim_batch;
   claimed.clear();
-  std::size_t stuck = 0;
+  reclaim_outcome outcome;
   for (cached_chunk* c : generation.slots) {
+    if (claimed.size() >= max_chunks) { break; }
     if (c == nullptr) { continue; }
     auto const snap = c->state.load();
     if (snap.state() == chunk_state::empty) { continue; }
+    // numa_node is published by mark_allocated(), not while still queued.
+    if (numa_filter && (snap.state() == chunk_state::queued || c->numa_node != *numa_filter)) {
+      continue;
+    }
     if (only_unsubscribed && snap.subscribers() != 0) { continue; }
     if (!c->state.mark_evicting(only_unsubscribed)) {
-      ++stuck;  // pinned, loading, or already being evicted by someone else
+      ++outcome.stuck;  // pinned, loading, or already being evicted by someone else
       continue;
     }
     claimed.push_back(c);  // capacity reserved at creation: one per slot
@@ -127,9 +172,10 @@ std::size_t reclaim_chunk_buffers(cache_generation& generation,
     }
     pool.deallocate_bulk(std::span<std::byte* const>(batch), numa);
   }
+  outcome.reclaimed = claimed.size();
   claimed.clear();
   batch.clear();
-  return stuck;
+  return outcome;
 }
 
 struct generation_deleter {
@@ -141,7 +187,7 @@ struct generation_deleter {
     std::size_t stuck = 0;
     {
       std::unique_lock lk(*retire_mtx);
-      stuck = reclaim_chunk_buffers(*generation, *pool, /*only_unsubscribed=*/false);
+      stuck = reclaim_chunk_buffers(*generation, *pool, /*only_unsubscribed=*/false).stuck;
       delete generation;
     }
     if (stuck > 0) {
@@ -293,11 +339,13 @@ std::shared_ptr<const std::vector<cached_chunk*>> cache_handle::chunks() const n
 
 cache_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
 
-std::vector<cached_chunk*> cache_generation::update_and_get_chunks(
-  std::span<const size_t> incoming, std::span<const chunk_fill> desired)
+void cache_generation::subscribe_chunks(std::span<const size_t> incoming,
+                                        std::span<const chunk_fill> desired,
+                                        std::vector<cached_chunk*>& result)
 {
   assert(incoming.size() == desired.size());
-  std::vector<cached_chunk*> result(incoming.size(), nullptr);
+  assert(result.empty());
+  result.resize(incoming.size(), nullptr);
 
   // Claim an already-materialised chunk for this request: count the subscriber
   // and widen the extent it is expected to hold.  merge_fill is itself gated on
@@ -324,7 +372,7 @@ std::vector<cached_chunk*> cache_generation::update_and_get_chunks(
         missing_indices.push_back(i);
       }
     }
-    if (missing_indices.empty()) { return result; }
+    if (missing_indices.empty()) { return; }
   }
 
   // Phase 2: materialise the missing chunks.  Another writer may have filled
@@ -339,8 +387,6 @@ std::vector<cached_chunk*> cache_generation::update_and_get_chunks(
       result[idx] = entry;
     }
   }
-
-  return result;
 }
 
 std::vector<cached_chunk*> cache_generation::fetch_chunks(std::size_t offset,
@@ -427,7 +473,7 @@ void fs_cache::reclaim_all_chunks() noexcept
       // executing while a cache is reset/torn down. mark_evicting() still
       // unconditionally refuses a chunk with an active pin, so this can
       // never pull a buffer out from under a live reader.
-      stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false);
+      stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false).stuck;
       current.push_back(std::move(generation));
     }
     // Retired generations are out of _file_cache but may still be held by a
@@ -439,7 +485,7 @@ void fs_cache::reclaim_all_chunks() noexcept
         auto generation = weak.lock();
         if (!generation || !generation->retired.load(std::memory_order_acquire)) { continue; }
         std::unique_lock elk(generation->mtx);
-        stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false);
+        stuck += reclaim_chunk_buffers(*generation, *_pool, /*only_unsubscribed=*/false).stuck;
         current.push_back(std::move(generation));
       }
     }
@@ -487,7 +533,11 @@ fs_cache::~fs_cache()
 
 std::shared_ptr<cache_generation> fs_cache::get_or_create_generation(const io_object& obj)
 {
-  const auto& key = obj.raw_file_cache_id();
+  // Keyed by the object's identity, not its locator: separate opens of an
+  // unchanged file (equal local stat identity) share one generation, so
+  // adjacent splits share their boundary chunks, while a replaced file or a
+  // new object version gets a new generation that retires the old one.
+  auto const key = obj.identity_cache_key();
   {
     std::shared_lock lk(_map_mtx);
     if (auto it = _file_cache.find(key); it != _file_cache.end()) { return it->second; }
@@ -665,9 +715,37 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
   req.generation = generation;
   req.timestamp  = _ticker.load(std::memory_order_relaxed);
 
-  auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
-  std::erase(chunks_to_fetch, nullptr);  // offsets past EOF have no slot
-  req.chunks = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
+  // Until the evictor owns the request, this guard owns every subscription
+  // acquired for it: a failure part-way through acquisition, allocating the
+  // request or enqueueing it drops each one exactly once.  `generation` keeps
+  // the recorded chunks alive until the rollback completes.
+  auto subscribed = std::make_shared<std::vector<cached_chunk*>>();
+  struct subscription_rollback {
+    std::vector<cached_chunk*> const& chunks;
+    bool committed = false;
+    ~subscription_rollback()
+    {
+      if (committed) { return; }
+      for (auto* chunk : chunks) {
+        if (chunk != nullptr) { chunk->state.drop_subscriber(); }
+      }
+    }
+  } rollback{*subscribed};
+  auto& chunks_to_fetch = *subscribed;
+  file.subscribe_chunks(chunk_offsets, desired, chunks_to_fetch);
+  // Offsets past EOF have no slot.  Drop them while keeping the requested
+  // extents index-parallel, reusing the normalized extents instead of
+  // allocating a second per-chunk vector.
+  std::size_t count = 0;
+  for (std::size_t i = 0; i < chunks_to_fetch.size(); ++i) {
+    if (!chunks_to_fetch[i]) continue;
+    chunks_to_fetch[count] = chunks_to_fetch[i];
+    desired[count++]       = desired[i];
+  }
+  chunks_to_fetch.resize(count);
+  desired.resize(count);
+  req.required_fills = std::make_shared<const std::vector<chunk_fill>>(std::move(desired));
+  req.chunks         = subscribed;
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
   if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
@@ -675,7 +753,9 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
   std::ignore              = req.producer->mark_queued();
   prefetch_request tracked = req;
   tracked.obj.reset();
-  _eviction_queue.enqueue(cache_request{std::move(tracked)});
+  if (_before_request_enqueue) { _before_request_enqueue(); }
+  if (!_eviction_queue.enqueue(cache_request{std::move(tracked)})) { throw std::bad_alloc(); }
+  rollback.committed = true;  // The evictor now owns exactly one release per subscription.
 
   return cache_handle(std::move(req), std::move(generation));
 }
@@ -805,8 +885,11 @@ std::shared_ptr<cache_generation> fs_cache::generation_for(const io_object& obj,
                                                            cache_handle* handle) const
 {
   if (handle != nullptr && *handle && handle->_generation) { return handle->_generation; }
+  // Built before the lock: identity() is virtual and the key allocates, and
+  // writers of the map wait behind this shared lock.
+  auto const key = obj.identity_cache_key();
   std::shared_lock lk(_map_mtx);
-  auto const it = _file_cache.find(obj.raw_file_cache_id());
+  auto const it = _file_cache.find(key);
   return it == _file_cache.end() ? nullptr : it->second;
 }
 
@@ -1296,48 +1379,66 @@ void fs_cache::retire_pins_after_stream(::cuda::stream_ref stream,
   }
 }
 
-std::string fs_cache::summary() const
+fs_cache::counters_snapshot fs_cache::sample_counters() const noexcept
 {
-  std::lock_guard lock(_summary_mutex);
-  // Global totals plus the deltas since the last refresh (the most recent
-  // query cycle), reported separately.
-  uint64_t const reads = _counters.n_reads.load(std::memory_order_relaxed);
-  uint64_t const hits  = _counters.hits.load(std::memory_order_relaxed);
-  uint64_t const h2d   = _counters.h2d.load(std::memory_order_relaxed);
-  uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
-  uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
-
-  return std::format(
-    "fs_cache: "
-    "global[reads={} hits={} h2d={} miss={} evictions={}] "
-    "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
-    reads,
-    hits,
-    h2d,
-    miss,
-    evict,
-    reads - _last_reported.n_reads,
-    hits - _last_reported.hits,
-    h2d - _last_reported.h2d,
-    miss - _last_reported.misses,
-    evict - _last_reported.evictions);
-}
-
-void fs_cache::prepare_for_query() noexcept
-{
-  CUCASCADE_LOG_TRACE("fs_cache: summary of cache performance {}", summary());
-
-  _ticker.fetch_add(1, std::memory_order_relaxed);
-
-  std::lock_guard lock(_summary_mutex);
-  // Snapshot the counters so the next summary() can report this cycle's deltas.
-  _last_reported = {
+  // Each counter is monotonic, but these relaxed loads are not one atomic
+  // snapshot across counters. Counter writers never take the reporting mutex.
+  return {
     _counters.n_reads.load(std::memory_order_relaxed),
     _counters.hits.load(std::memory_order_relaxed),
     _counters.h2d.load(std::memory_order_relaxed),
     _counters.misses.load(std::memory_order_relaxed),
     _counters.evictions.load(std::memory_order_relaxed),
   };
+}
+
+std::string fs_cache::format_summary(counters_snapshot const& sample,
+                                     counters_snapshot const& baseline)
+{
+  // Global totals plus the deltas since the baseline (the last closed
+  // reporting interval), reported separately.
+  return std::format(
+    "fs_cache: "
+    "global[reads={} hits={} h2d={} miss={} evictions={}] "
+    "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
+    sample.n_reads,
+    sample.hits,
+    sample.h2d,
+    sample.misses,
+    sample.evictions,
+    sample.n_reads - baseline.n_reads,
+    sample.hits - baseline.hits,
+    sample.h2d - baseline.h2d,
+    sample.misses - baseline.misses,
+    sample.evictions - baseline.evictions);
+}
+
+std::string fs_cache::summary() const
+{
+  counters_snapshot sample, baseline;
+  {
+    std::lock_guard lock(_summary_mutex);
+    sample   = sample_counters();
+    baseline = _last_reported;
+  }
+  return format_summary(sample, baseline);
+}
+
+std::string fs_cache::prepare_for_query()
+{
+  counters_snapshot sample, baseline;
+  {
+    std::lock_guard lock(_summary_mutex);
+    sample         = sample_counters();
+    baseline       = _last_reported;
+    _last_reported = sample;
+    _ticker.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Logging can overlap another refresh. Every log site must use this captured
+  // report, never resample counters or advance the baseline after logging.
+  auto report = format_summary(sample, baseline);
+  CUCASCADE_LOG_TRACE("fs_cache: summary of cache performance {}", report);
+  return report;
 }
 
 // ===========================================================================
@@ -1347,6 +1448,11 @@ std::size_t fs_cache::claimed_bytes() const noexcept
   return _pool ? _pool->total_allocated_bytes() : 0;
 }
 
+std::size_t fs_cache::releasable_bytes(std::optional<int> numa_node) const noexcept
+{
+  return _pool ? (numa_node ? _pool->releasable_bytes(*numa_node) : _pool->releasable_bytes()) : 0;
+}
+
 void fs_cache::evict(std::size_t bytes_to_free)
 {
   // Nothing to free, nothing holding memory, or a cache on its way down -- in
@@ -1354,6 +1460,50 @@ void fs_cache::evict(std::size_t bytes_to_free)
   // demand queued behind the stop sentinel would never be looked at.
   if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_relaxed)) { return; }
   _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, nullptr}});
+}
+
+std::size_t fs_cache::reclaim(reclaim_mode mode,
+                              std::size_t target_bytes,
+                              std::optional<int> numa_node)
+{
+  if (target_bytes == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return 0; }
+  // Whole chunks are the only granularity there is: a target of part of a
+  // chunk still costs the whole thing.
+  auto const chunk_bytes = std::max<std::size_t>(_chunk_size, 1);
+  std::size_t const budget =
+    target_bytes / chunk_bytes + static_cast<std::size_t>(target_bytes % chunk_bytes != 0);
+
+  // Snapshot every live generation, current and retired, under the map's
+  // shared lock only; the sweep below runs without it.  Holding the owners
+  // keeps each generation (and its chunks) alive until the sweep is done.
+  std::vector<std::shared_ptr<cache_generation>> generations;
+  {
+    std::shared_lock lk(_map_mtx);
+    for (auto const& [_, family] : _generations_by_path) {
+      for (auto const& weak : family) {
+        if (auto generation = weak.lock()) { generations.push_back(std::move(generation)); }
+      }
+    }
+  }
+  // Retired generations first: no later open can hit their chunks.
+  std::ranges::stable_partition(generations, [](auto const& generation) {
+    return generation->retired.load(std::memory_order_acquire);
+  });
+
+  // idle: mark_evicting(true) spares every chunk a live request still names.
+  // forced: mark_evicting(false) also takes those.  Both refuse a chunk that
+  // is pinned by a reader or loading, so no in-flight read loses its buffer.
+  bool const only_unsubscribed = mode == reclaim_mode::idle;
+  std::size_t reclaimed        = 0;
+  for (auto const& generation : generations) {
+    if (reclaimed >= budget) { break; }
+    std::unique_lock elk(generation->mtx);
+    reclaimed +=
+      reclaim_chunk_buffers(*generation, *_pool, only_unsubscribed, budget - reclaimed, numa_node)
+        .reclaimed;
+  }
+  if (reclaimed > 0) { _counters.evictions.fetch_add(reclaimed, std::memory_order_relaxed); }
+  return reclaimed * chunk_bytes;
 }
 
 void fs_cache::evict_sync(std::size_t bytes_to_free)
@@ -1386,47 +1536,62 @@ prepare_result fs_cache::prepare(cache_handle& handle, bool wait_for_eviction)
   return prepare_request(handle._req, wait_for_eviction);
 }
 
-bool fs_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcept> on_done)
+bool fs_cache::prefetch(cache_handle& handle,
+                        exec::invocable<void(prefetch_result) noexcept> on_done)
 {
   auto& req   = handle._req;
-  auto settle = [&on_done](bool ok) {
-    on_done(ok);
+  auto settle = [&on_done](prefetch_result result) {
+    on_done(result);
     return false;
   };
 
-  if (!req || req.has_fallen_behind() || !req.chunks) { return settle(false); }
-  if (!_io_ctx->supports_vector_host_read()) { return settle(false); }
-  if (!req.producer->mark_loading()) { return settle(false); }
+  if (!req || req.has_fallen_behind() || !req.chunks) { return settle({}); }
+  if (!_io_ctx->supports_vector_host_read()) { return settle({}); }
+  if (!req.producer->mark_loading()) { return settle({}); }
 
   std::vector<prepared_io_slice> prepared;
   std::vector<cached_chunk*> claimed_chunks;
-  std::shared_ptr<exec::invocable<void(bool) noexcept>> done_owner;
+  std::shared_ptr<exec::invocable<void(prefetch_result) noexcept>> done_owner;
   size_terminal terminal;
-  auto fail_setup = [&]() noexcept {
+  // A request without one requested extent per chunk (only a hand-built one can
+  // lack them) has unknown coverage: report it as not covered.
+  auto const& required = req.required_fills;
+  bool covered         = required != nullptr && required->size() == req.chunks->size();
+  auto fail_setup      = [&]() noexcept {
     for (auto* chunk : claimed_chunks) {
       std::ignore = chunk->state.mark_load_failed();
     }
     std::ignore = req.producer->mark_load_failed();
     if (done_owner != nullptr) {
-      (*done_owner)(false);
+      (*done_owner)({});
     } else {
-      on_done(false);
+      on_done({});
     }
     return false;
   };
 
   try {
+    if (_before_prefetch_claim) { _before_prefetch_claim(); }
     prepared.reserve(req.chunks->size());
     claimed_chunks.reserve(req.chunks->size());
-    for (cached_chunk* c : *req.chunks) {
+    for (std::size_t i = 0; i < req.chunks->size(); ++i) {
+      auto* c = (*req.chunks)[i];
+      auto const [needed_lo, needed_hi] =
+        covered ? fill_span((*required)[i], c->offset, _chunk_size) : std::pair<size_t, size_t>{};
       // Claim the chunk and preserve the promised fill as this prefetch's logical
       // range. The reactor owns any further physical chunking and alignment.
       chunk_fill fill;
       if (c->state.take_loading(fill)) {
         auto const [seg_lo, seg_hi] = fill_span(fill, c->offset, _chunk_size);
+        covered = covered && covers(fill, c->offset, _chunk_size, needed_lo, needed_hi);
         claimed_chunks.push_back(c);
         prepared.emplace_back(range{seg_lo, seg_hi - seg_lo},
                               host_buffer{std::vector<cached_chunk*>{c}});
+      } else if (covered) {
+        // Read state and extent together. A loading chunk belongs to another
+        // IO, whose completion this prefetch does not observe. Never promote
+        // that incomplete coverage when our own submitted subset finishes.
+        covered = resident_covers(*c, (*required)[i], _chunk_size);
       }
     }
   } catch (...) {
@@ -1436,7 +1601,7 @@ bool fs_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcep
     // Nothing was claimable: the ranges are already cached or host-backed, or
     // demand reached them before the prefetch could attach buffers.
     std::ignore = req.producer->mark_ready();
-    return settle(true);
+    return settle({true, covered});
   }
 
   if (req.is_cancelled()) { return fail_setup(); }
@@ -1450,17 +1615,21 @@ bool fs_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcep
         std::ignore = lifetime;
         publish_chunk_fill(completed, host_ok);
       });
-    done_owner = std::make_shared<exec::invocable<void(bool) noexcept>>(std::move(on_done));
-    terminal   = size_terminal{
-      [req, done_owner, owner = handle._generation](exec::try_t<size_t>&& res) mutable noexcept {
-        owner.reset();
+    done_owner =
+      std::make_shared<exec::invocable<void(prefetch_result) noexcept>>(std::move(on_done));
+    terminal = size_terminal{
+      [req, done_owner, covered, chunk_size = _chunk_size, owner = handle._generation](
+        exec::try_t<size_t>&& res) mutable noexcept {
         auto const ok = res.has_value();
+        bool const resident =
+          ok && covered && extents_resident(*req.chunks, *req.required_fills, chunk_size);
+        owner.reset();
         if (!ok && req.failure) {
           std::lock_guard lk(req.failure->mtx);
           req.failure->failure = std::move(res).exception();
         }
         std::ignore = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
-        (*done_owner)(ok);
+        (*done_owner)({ok, resident});
       }};
     for (auto& slice : prepared) {
       slice.on_complete = completion;
