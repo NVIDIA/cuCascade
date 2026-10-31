@@ -22,9 +22,12 @@
 /// is detected before reuse, a pooled connection that dies before any response byte is retried
 /// once for free, warm-up issues exactly max_connections zero-key LIST exchanges once per
 /// conn_max_age on fresh connections, HTTP/1.1 upkeep is off by default and staggered when on;
-/// plus the pool size and reactor pinning of the placement plan, the same-pass start invariant
-/// of the worker loop, the request_timeout bound of control-plane calls, and config validation.
+/// plus sockets closed with RST (no TIME_WAIT), the min_mtu rejection (through the MSS probe
+/// seam), the pool size and reactor pinning of the placement plan, the same-pass start
+/// invariant of the worker loop, the request_timeout bound of control-plane calls, and config
+/// validation.
 
+#include "io/rest/net/uring_transport.hpp"
 #include "io/rest/reactor_placement.hpp"
 #include "io/rest/reactor_test_hooks.hpp"
 #include "io/rest/shared_services.hpp"
@@ -53,6 +56,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -76,6 +80,7 @@ using cucascade::test::rest_test_payload;
 using cucascade::test::scripted_response;
 using namespace std::chrono_literals;
 namespace rest = cucascade::io::rest;
+namespace net  = cucascade::io::net;
 
 /// A @c rest_ioctx whose reactors' counters the test can read.
 class probed_ioctx final : public rest_ioctx {
@@ -283,6 +288,29 @@ class scripted_server {
   std::vector<std::thread> _connections;
   std::thread _thread;
 };
+
+/// TCP sockets in TIME_WAIT (state 06) with @p port at either end (/proc/net/tcp and tcp6).
+std::size_t time_wait_sockets(std::uint16_t port)
+{
+  std::size_t count = 0;
+  for (char const* file : {"/proc/net/tcp", "/proc/net/tcp6"}) {
+    std::ifstream in(file);
+    std::string line;
+    std::getline(in, line);  // header
+    while (std::getline(in, line)) {
+      std::istringstream fields(line);
+      std::string slot, local, remote, state;
+      fields >> slot >> local >> remote >> state;
+      auto port_of = [](std::string const& endpoint) {
+        auto const colon = endpoint.rfind(':');
+        return colon == std::string::npos ? 0UL
+                                          : std::stoul(endpoint.substr(colon + 1), nullptr, 16);
+      };
+      if (state == "06" && (port_of(local) == port || port_of(remote) == port)) { ++count; }
+    }
+  }
+  return count;
+}
 
 }  // namespace
 
@@ -544,6 +572,111 @@ TEST_CASE("rest pool: idle upkeep is off by default and staggered when enabled",
   }
   CHECK(server.accepted_connection_count() == 2);  // the warm connections are what is kept
   CHECK(ioctx->reactor_stats().upkeeps == lists.size() - 2);
+}
+
+// ---- RST close ----------------------------------------------------------------------------------
+
+TEST_CASE("rest sockets close with RST and leave nothing in TIME_WAIT", "[rest][pool][rst]")
+{
+  auto const rst = GENERATE(true, false);
+  CAPTURE(rst);
+  auto payload = rest_test_payload(64UL << 10);
+  loopback_range_server server(payload);
+  auto cfg            = rest_contract_config();
+  cfg.max_connections = 4;
+  cfg.close_with_rst  = rst;
+  {
+    auto ioctx  = make_ioctx(server.endpoint(), cfg);
+    auto object = ioctx->open_io_object("s3://rst-bucket/object.bin");
+    require_rest_bytes_equal(read_range(*ioctx, *object, 0, payload.size()), payload);
+    ioctx->shutdown();  // closes the pool's connections
+  }
+  std::this_thread::sleep_for(100ms);
+  if (rst) {
+    CHECK(time_wait_sockets(server.port()) == 0);
+  } else {
+    // The control: an orderly close leaves the closing side in TIME_WAIT.
+    CHECK(time_wait_sockets(server.port()) >= 1);
+  }
+}
+
+// ---- min_mtu ------------------------------------------------------------------------------------
+
+namespace {
+
+std::atomic<int> g_small_probes{0};
+
+/// Loopback cannot negotiate a small MSS: the first g_small_probes connections report 1000.
+net::mtu_sample fake_probe(int) noexcept
+{
+  int const left = g_small_probes.fetch_sub(1);
+  return net::mtu_sample{.ok = true, .mss = left > 0 ? 1000 : 8948, .timestamps = true};
+}
+
+struct probe_guard {
+  explicit probe_guard(int small)
+  {
+    g_small_probes = small;
+    net::set_mtu_probe_for_testing(&fake_probe);
+  }
+  ~probe_guard() { net::set_mtu_probe_for_testing(nullptr); }
+  probe_guard(probe_guard const&)            = delete;
+  probe_guard& operator=(probe_guard const&) = delete;
+};
+
+}  // namespace
+
+TEST_CASE("rest connections below min_mtu are reset and replaced, then accepted after the budget",
+          "[rest][pool][mtu]")
+{
+  auto payload = rest_test_payload(64UL << 10);
+  loopback_range_server server(payload);
+  auto cfg                    = rest_contract_config();
+  cfg.max_connections         = 1;
+  cfg.min_mtu                 = 1500;
+  cfg.mtu_reject_max_attempts = 3;
+  SECTION("two small connections, then a large one")
+  {
+    probe_guard const probe{2};
+    auto ioctx = make_ioctx(server.endpoint(), cfg);
+    rest_shutdown_guard cleanup{*ioctx};
+    auto object = ioctx->open_io_object("s3://mtu-bucket/object.bin", payload.size());
+    require_rest_bytes_equal(read_range(*ioctx, *object, 0, 4096), {payload.data(), 4096});
+    auto const stats = wait_for_stats(*ioctx, [](transport_stats const& s) { return s.gets >= 1; });
+    CHECK(stats.mtu_rejects == 2);
+    CHECK(stats.mtu_fallbacks == 0);
+    CHECK(stats.mss_min == 1000);
+    CHECK(stats.mss_max == 8948);
+    CHECK(stats.connects == 3);
+    CHECK(stats.retries == 0);
+    CHECK(server.accepted_connection_count() == 3);
+    CHECK(server.get_count() == 1);
+  }
+  SECTION("only small connections: accepted after mtu_reject_max_attempts rejections")
+  {
+    probe_guard const probe{1000};
+    auto ioctx = make_ioctx(server.endpoint(), cfg);
+    rest_shutdown_guard cleanup{*ioctx};
+    auto object = ioctx->open_io_object("s3://mtu-bucket/object.bin", payload.size());
+    require_rest_bytes_equal(read_range(*ioctx, *object, 0, 4096), {payload.data(), 4096});
+    auto const stats = wait_for_stats(*ioctx, [](transport_stats const& s) { return s.gets >= 1; });
+    CHECK(stats.mtu_rejects == 3);
+    CHECK(stats.mtu_fallbacks == 1);
+    CHECK(stats.connects == 4);
+  }
+  SECTION("min_mtu 0 never rejects")
+  {
+    probe_guard const probe{1000};
+    cfg.min_mtu = 0;
+    auto ioctx  = make_ioctx(server.endpoint(), cfg);
+    rest_shutdown_guard cleanup{*ioctx};
+    auto object = ioctx->open_io_object("s3://mtu-bucket/object.bin", payload.size());
+    require_rest_bytes_equal(read_range(*ioctx, *object, 0, 4096), {payload.data(), 4096});
+    auto const stats = wait_for_stats(*ioctx, [](transport_stats const& s) { return s.gets >= 1; });
+    CHECK(stats.mtu_rejects == 0);
+    CHECK(stats.connects == 1);
+    CHECK(stats.mss_min == 1000);
+  }
 }
 
 // ---- placement ----------------------------------------------------------------------------------
@@ -872,6 +1005,8 @@ TEST_CASE("rest config validates every field", "[rest][config]")
   CHECK_THROWS_AS(bad([](rest::config& c) { c.connect_timeout = 0ms; }).validate(),
                   std::invalid_argument);
   CHECK_THROWS_AS(bad([](rest::config& c) { c.keepalive_idle_s = 0; }).validate(),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(bad([](rest::config& c) { c.mtu_reject_max_attempts = 0; }).validate(),
                   std::invalid_argument);
   CHECK_THROWS_AS(bad([](rest::config& c) { c.request_timeout_s = -1; }).validate(),
                   std::invalid_argument);

@@ -28,6 +28,10 @@ transport on a short-lived helper thread; io_uring never runs on the caller's th
   address is benched and the next one tried), `connect_timeout` bounds TCP + TLS. Socket
   options: `TCP_NODELAY`, `SO_KEEPALIVE` (`keepalive_idle_s` 60, `keepalive_interval_s` 60,
   `keepalive_count`), optional `SO_RCVBUF` / `SO_SNDBUF`, `SO_BUSY_POLL`, `TCP_USER_TIMEOUT`.
+- `min_mtu` (0 = off): right after the TCP connect, effective MTU = `TCP_MAXSEG` + 40 (IPv4) /
+  60 (IPv6) + 12 with TCP timestamps; below `min_mtu` the connection is reset and the next address
+  tried, up to `mtu_reject_max_attempts` per request, then accepted (`mtu_fallbacks`).
+- Every close is an RST (`SO_LINGER {1, 0}`, `close_with_rst`), so nothing lingers in TIME_WAIT.
 - TLS: the TLS layer's non-blocking handshake (readiness through `IORING_OP_POLL_ADD`), then per
   `tls.ktls`: kTLS RX+TX installed by cuCascade (plain SEND / RECV; a `-EIO` receive is drained
   with a `TLS_GET_RECORD_TYPE` cmsg and handled by `tls::ktls::on_control_record`: tickets
@@ -98,4 +102,5 @@ process may set before it creates its ring; otherwise 2, unpinned.
 `rest_ioctx::stats()` sums every reactor's `transport_stats`: gets, heads, bytes, retries
 (transient, auth, stale), failures, passes, waits, established connections, connects,
 handshakes, kTLS and user-space TLS sessions, kTLS fallbacks, reused, closed (idle / dead),
-sends, receives, direct and scratch bytes, timeouts and stalls, kTLS control records.
+sends, receives, direct and scratch bytes, timeouts and stalls, kTLS control records, MTU
+rejects and fallbacks, the smallest and largest MSS observed.

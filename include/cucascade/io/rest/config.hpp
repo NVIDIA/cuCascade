@@ -205,6 +205,17 @@ struct config {
   /// TCP_USER_TIMEOUT milliseconds (0 = kernel default).
   unsigned tcp_user_timeout_ms{0};
 
+  /// Reject connections whose effective MTU (TCP_MAXSEG + 40 / 60 IPv4 / IPv6 header bytes,
+  /// + 12 with TCP timestamps) is below this many bytes: the connection is reset and the next
+  /// DNS address tried.  0 = off.  With jumbo frames some connections may negotiate small
+  /// segments, which costs per-byte decryption time.
+  std::size_t min_mtu{0};
+  /// Consecutive @c min_mtu rejections of one request after which the connection is accepted
+  /// anyway (counted in @c mtu_fallbacks).  >= 1.
+  unsigned mtu_reject_max_attempts{8};
+  /// Close every socket with an RST (SO_LINGER {on, 0}) so none lingers in TIME_WAIT/FIN_WAIT.
+  bool close_with_rst{true};
+
   // -- placement ---------------------------------------------------------------
 
   /// Egress interface whose queue IRQs size and place the reactor pool when

@@ -468,8 +468,12 @@ void transport_stats::merge(transport_stats const& o) noexcept
   CUCASCADE_REST_SUM(stalls)
   CUCASCADE_REST_SUM(net_errors)
   CUCASCADE_REST_SUM(control_records)
+  CUCASCADE_REST_SUM(mtu_rejects)
+  CUCASCADE_REST_SUM(mtu_fallbacks)
 #undef CUCASCADE_REST_SUM
   max_inflight = std::max(max_inflight, o.max_inflight);
+  if (o.mss_min != 0) { mss_min = mss_min == 0 ? o.mss_min : std::min(mss_min, o.mss_min); }
+  mss_max = std::max(mss_max, o.mss_max);
 }
 
 detail::shared_services& rest_reactor::reactor_context::services() const
@@ -636,7 +640,11 @@ struct rest_reactor::intake {
   X(timeouts) \
   X(stalls) \
   X(net_errors) \
-  X(control_records)
+  X(control_records) \
+  X(mtu_rejects) \
+  X(mtu_fallbacks) \
+  X(mss_min) \
+  X(mss_max)
 // clang-format on
 
 struct rest_reactor::atomic_stats {
@@ -886,6 +894,10 @@ net::transport_options reactor_worker::transport_options() const
   o.ktls_recv_async      = net::ktls_recv_async(tls.placement, _r._ctx->services().on_ec2());
   o.user_space.waitall   = _cfg.recv_waitall;
   o.user_space.rx_record_layer = tls.fallback_rx == tls::user_space_rx::record_layer;
+
+  o.close_with_rst          = _cfg.close_with_rst;
+  o.min_mtu                 = _cfg.min_mtu;
+  o.mtu_reject_max_attempts = _cfg.mtu_reject_max_attempts;
   return o;
 }
 
@@ -1751,6 +1763,11 @@ void reactor_worker::publish_stats() noexcept
   s.stalls                 = t.stalls;
   s.net_errors             = t.errors;
   s.control_records        = t.control_records;
+
+  s.mtu_rejects   = t.mtu_rejects;
+  s.mtu_fallbacks = t.mtu_fallbacks;
+  s.mss_min       = t.mss_min;
+  s.mss_max       = t.mss_max;
   _r._stats->store(s);
 }
 

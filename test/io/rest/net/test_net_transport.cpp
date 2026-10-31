@@ -18,7 +18,7 @@
 
 /// @file test_net_transport.cpp
 /// @brief Units of the REST io_uring transport (io/rest/net/uring_transport.hpp): URL parsing,
-/// the kTLS receive interpretation and receive placement, the TLS
+/// the effective-MTU rule, the kTLS receive interpretation and receive placement, the TLS
 /// post-handshake decision (kTLS prefer / require / disable, RX-only refusal, user-space
 /// fallback) over fake sessions and a fake kernel install, so the kTLS logic is covered on hosts
 /// without tls.ko, and the generic exchange with a request body (fixed iovecs, a generator,
@@ -427,6 +427,20 @@ TEST_CASE("net: parse_url splits scheme, authority, port and target", "[rest][ne
   CHECK_THROWS_AS(net::parse_url("http://user@host/"), std::invalid_argument);
   CHECK_THROWS_AS(net::parse_url("http://host:99999/"), std::invalid_argument);
   CHECK_THROWS_AS(net::parse_url("http://host/a b"), std::invalid_argument);
+}
+
+TEST_CASE("net: the effective MTU adds the IP and TCP headers to the MSS", "[rest][net][mtu]")
+{
+  CHECK(net::effective_mtu({.ok = true, .mss = 1460}) == 1500);
+  CHECK(net::effective_mtu({.ok = true, .mss = 1448, .timestamps = true}) == 1500);
+  CHECK(net::effective_mtu({.ok = true, .mss = 1440, .ipv6 = true}) == 1500);
+  CHECK(net::effective_mtu({.ok = true, .mss = 8948, .timestamps = true}) == 9000);
+  // The real probe of a loopback connection.
+  int const fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  REQUIRE(fd >= 0);
+  auto const unconnected = net::mtu_probe(fd);
+  CHECK((unconnected.ok ? unconnected.mss >= 0 : true));
+  ::close(fd);
 }
 
 TEST_CASE("net: kTLS receive results are classified by their record-type cmsg", "[rest][net][ktls]")

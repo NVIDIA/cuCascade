@@ -579,6 +579,8 @@ TEST_CASE("rest reactor counters follow the reads and survive shutdown", "[rest]
   CHECK(live.failures == 0);
   CHECK(live.userspace_tls_sessions == 0);
   CHECK(live.ktls_sessions == 0);
+  CHECK(live.mss_min > 0);
+  CHECK(live.mss_max >= live.mss_min);
   CHECK(live.established == 1);
   CHECK(fx.ioctx->stats().gets == gets);  // the pool aggregate
 
