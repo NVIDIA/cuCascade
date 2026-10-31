@@ -249,6 +249,10 @@ struct exchange {
   std::function<std::span<iovec const>()> body_next;
   /// Send the body only after `100 Continue` (a final response first ends the exchange).
   bool expect_continue{false};
+  /// With `expect_continue`: send the body anyway when neither an interim nor a final response
+  /// arrived this long after the head went out (a server that ignores `Expect`; curl's
+  /// CURLOPT_EXPECT_100_TIMEOUT_MS).  0 = wait for the response.
+  std::chrono::milliseconds continue_timeout{0};
 
   /// Response body handling.
   body_target target{body_target::discard};
@@ -264,8 +268,10 @@ struct exchange {
   bool fresh_connection{false};
   /// Whole-exchange bound (0 = none).
   std::chrono::milliseconds timeout{0};
-  /// Stall detector: fail when fewer than `stall_bytes_per_s * stall_time` bytes arrived during
-  /// the last `stall_time` (either 0 = off).
+  /// Stall detector: fail when fewer than `stall_bytes_per_s * stall_time` bytes moved during
+  /// the last `stall_time` (either 0 = off).  Request body bytes sent count as well as response
+  /// bytes received, so an upload is not cancelled while it is still sending (curl's low-speed
+  /// check measures the transfer in either direction).
   std::uint64_t stall_bytes_per_s{0};
   std::chrono::seconds stall_time{0};
 };
@@ -279,7 +285,18 @@ struct exchange_result {
   bool truncated{false};         ///< buffer target: the body exceeded `buffer_limit`
   bool reused{false};            ///< ran on a pooled keep-alive connection
   bool response_started{false};  ///< at least one response byte arrived
-  std::vector<char> body;        ///< target == buffer
+  /// The request head and its whole body were written to the connection (false when it failed
+  /// before, or when a final response arrived before `100 Continue` and the body was held).
+  /// With `!response_started` and a transport error, the server may have acted on the request
+  /// without anyone learning the answer.
+  bool request_sent{false};
+  /// A status the exchange does not accept carried a body that was drained to its end (or had
+  /// none); false when the body was cut, too large to drain, or there was no such status.
+  /// `meta.amz_error_code` is filled from the drained body (`http::extract_error_code`).
+  bool error_body_complete{false};
+  /// target == buffer; for a status the exchange does not accept, the drained error body
+  /// (at most 64 KiB).
+  std::vector<char> body;
 };
 
 /// Cumulative counters of one transport.

@@ -237,10 +237,15 @@ net::tls_support::setup_result finish_with(tls::ktls_mode mode,
 /// `100 Continue` first when the request asks for it.  Keep-alive.
 class echo_server {
  public:
-  echo_server()
+  /// @p rcvbuf > 0: the accepted connections' SO_RCVBUF (a small one makes a slow reader pace
+  /// the sender instead of the kernel absorbing the whole body).
+  explicit echo_server(int rcvbuf = 0)
   {
     _fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     REQUIRE(_fd >= 0);
+    if (rcvbuf > 0) {
+      REQUIRE(::setsockopt(_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf) == 0);
+    }
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -279,6 +284,17 @@ class echo_server {
     _canned       = std::move(response);
     _canned_delay = delay;
   }
+  /// Read the next request's whole body, then close without any response.
+  void drop_next_after_body() { _drop_next = true; }
+  /// Never answer `Expect: 100-continue` (wait for the body as if it were not there).
+  void ignore_expect(bool on) { _ignore_expect = on; }
+  /// Sleep this long after every receive (a slow reader).
+  void pace_reads(std::chrono::milliseconds pause) { _pace_ms = pause.count(); }
+  /// When the last request's body was complete, relative to when its head was.
+  [[nodiscard]] std::chrono::milliseconds last_body_delay() const noexcept
+  {
+    return std::chrono::milliseconds{_body_delay_ms.load()};
+  }
 
  private:
   void accept_loop()
@@ -315,6 +331,9 @@ class echo_server {
       auto const n = ::recv(conn, buf.data(), buf.size(), 0);
       if (n <= 0) { return false; }
       pending.append(buf.data(), static_cast<std::size_t>(n));
+      if (auto const pace = _pace_ms.load(); pace > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{pace});
+      }
       return true;
     };
     for (;;) {
@@ -345,15 +364,23 @@ class echo_server {
         ::shutdown(conn, SHUT_RDWR);
         return;
       }
-      if (lower.find("\r\nexpect: 100-continue") != std::string::npos) {
+      if (lower.find("\r\nexpect: 100-continue") != std::string::npos && !_ignore_expect) {
         ++_continues;
         if (!send_all(conn, "HTTP/1.1 100 Continue\r\n\r\n")) { return; }
       }
+      auto const head_at = std::chrono::steady_clock::now();
       while (pending.size() < length) {
         if (!fill()) { return; }
       }
+      _body_delay_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - head_at)
+                         .count();
       auto const body = pending.substr(0, length);
       pending.erase(0, length);
+      if (_drop_next.exchange(false)) {
+        ::shutdown(conn, SHUT_RDWR);
+        return;
+      }
       if (!send_all(conn,
                     "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
                       "\r\n\r\n" + body)) {
@@ -366,6 +393,10 @@ class echo_server {
   std::uint16_t _port{0};
   std::atomic<bool> _stop{false};
   std::atomic<std::size_t> _continues{0};
+  std::atomic<bool> _drop_next{false};
+  std::atomic<bool> _ignore_expect{false};
+  std::atomic<long> _pace_ms{0};
+  std::atomic<long> _body_delay_ms{0};
   std::mutex _mutex;
   std::string _canned;
   std::chrono::milliseconds _canned_delay{};
@@ -379,13 +410,14 @@ net::exchange_result run_exchange(net::uring_transport& t, net::exchange x)
 {
   t.submit(0, std::move(x));
   t.flush();
-  auto const deadline = std::chrono::steady_clock::now() + 10s;
+  auto const deadline = std::chrono::steady_clock::now() + 20s;
   while (std::chrono::steady_clock::now() < deadline) {
     auto& done = t.poll();
     if (!done.empty()) {
       REQUIRE(done.size() == 1);
       return std::move(done.front().result);
     }
+    t.flush();
     std::this_thread::sleep_for(200us);
   }
   FAIL("the exchange did not complete");
@@ -700,6 +732,255 @@ TEST_CASE("net: buffered exchanges decode chunked bodies; data GETs refuse them"
     CHECK(r.meta.status == 200);
   }
   t.shutdown();
+}
+
+TEST_CASE("net: the stall detector counts request body bytes sent",
+          "[rest][net][transport][body][stall]")
+{
+  echo_server server{64 * 1024};
+  net::transport_options opts;
+  opts.max_connections = 1;
+  opts.queue_depth     = 8;
+  opts.so_sndbuf       = 64 * 1024;  // keep the body in user space: the reader paces the send
+  net::uring_transport t{opts, net::transport_services{}};
+  auto const payload = pattern(8UL << 20);
+  auto put           = [&] {
+    net::exchange x;
+    x.method            = http::method::put;
+    x.url               = server.url();
+    x.has_body          = true;
+    x.body_length       = payload.size();
+    x.body              = {iovec{const_cast<char*>(payload.data()), payload.size()}};
+    x.target            = net::body_target::discard;
+    x.stall_bytes_per_s = 256 * 1024;
+    x.stall_time        = 1s;
+    return x;
+  };
+  SECTION("a slowly read upload is not cancelled while it is sending")
+  {
+    // <= 6 MiB/s for 8 MiB: the upload takes well over one stall window, and no response byte
+    // arrives before its end; only the sent bytes keep the exchange alive.
+    server.pace_reads(10ms);
+    auto const r = run_exchange(t, put());
+    REQUIRE_FALSE(r.ec);
+    CHECK(r.meta.status == 200);
+    CHECK(r.request_sent);
+    CHECK(t.counters().stalls == 0);
+    CHECK(server.last_body_delay() >= 1s);
+  }
+  SECTION("a server that never answers still stalls")
+  {
+    server.answer_next_with("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 2500ms);
+    auto x        = put();
+    x.has_body    = false;
+    x.body_length = 0;
+    x.body        = {};
+    x.method      = http::method::get;
+    auto const r  = run_exchange(t, std::move(x));
+    CHECK(r.ec == make_error_code(rest::errc::request_timeout));
+    CHECK(t.counters().stalls == 1);
+  }
+  t.shutdown();
+}
+
+TEST_CASE("net: exchange results tell whether the request went out and why it failed",
+          "[rest][net][transport][body]")
+{
+  echo_server server;
+  net::transport_options opts;
+  opts.max_connections = 1;
+  opts.queue_depth     = 8;
+  net::uring_transport t{opts, net::transport_services{}};
+  auto const payload = pattern(100'000);
+  auto put           = [&](std::string url) {
+    net::exchange x;
+    x.method       = http::method::put;
+    x.url          = std::move(url);
+    x.has_body     = true;
+    x.body_length  = payload.size();
+    x.body         = {iovec{const_cast<char*>(payload.data()), payload.size()}};
+    x.target       = net::body_target::buffer;
+    x.buffer_limit = 1024;
+    return x;
+  };
+  SECTION("a refused connection: nothing was sent")
+  {
+    // A port nobody listens on (bound, then closed).
+    int const fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0);
+    socklen_t len = sizeof addr;
+    REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+    ::close(fd);
+    auto const r = run_exchange(t, put("http://127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
+    CHECK(r.ec);
+    CHECK_FALSE(r.request_sent);
+    CHECK_FALSE(r.response_started);
+  }
+  SECTION("a dropped response: the request went out, no answer came back")
+  {
+    server.drop_next_after_body();
+    auto const r = run_exchange(t, put(server.url()));
+    CHECK(r.ec);
+    CHECK(r.request_sent);
+    CHECK_FALSE(r.response_started);
+    CHECK_FALSE(t.established(0));
+  }
+  SECTION("an S3 error body is drained and its code extracted")
+  {
+    std::string const body =
+      "<?xml version=\"1.0\"?>\n<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>";
+    server.answer_next_with("HTTP/1.1 404 Not Found\r\nContent-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body);
+    auto const r = run_exchange(t, put(server.url()));
+    REQUIRE_FALSE(r.ec);
+    CHECK(r.meta.status == 404);
+    CHECK(r.meta.amz_error_code.view() == "NoSuchUpload");
+    CHECK(r.error_body_complete);
+    CHECK_FALSE(r.body_complete);
+  }
+  SECTION("a cut error body is reported as incomplete")
+  {
+    server.answer_next_with(
+      "HTTP/1.1 404 Not Found\r\nContent-Length: 500\r\n\r\n<Error><Code>NoSuchKey</Code>");
+    auto const r = run_exchange(t, put(server.url()));
+    REQUIRE_FALSE(r.ec);
+    CHECK(r.meta.status == 404);
+    CHECK_FALSE(r.error_body_complete);
+  }
+  SECTION("a 2xx answer is the caller's: no error body, no code")
+  {
+    auto const r = run_exchange(t, put(server.url()));
+    REQUIRE_FALSE(r.ec);
+    CHECK(r.request_sent);
+    CHECK_FALSE(r.error_body_complete);
+    CHECK(r.meta.amz_error_code.view().empty());
+  }
+  t.shutdown();
+}
+
+TEST_CASE("net: a held body goes out after continue_timeout when Expect is ignored",
+          "[rest][net][transport][body]")
+{
+  echo_server server;
+  server.ignore_expect(true);
+  net::transport_options opts;
+  opts.max_connections = 1;
+  opts.queue_depth     = 8;
+  net::uring_transport t{opts, net::transport_services{}};
+  auto const payload = pattern(200'000);
+  net::exchange x;
+  x.method           = http::method::put;
+  x.url              = server.url();
+  x.has_body         = true;
+  x.body_length      = payload.size();
+  x.body             = {iovec{const_cast<char*>(payload.data()), payload.size()}};
+  x.expect_continue  = true;
+  x.continue_timeout = 300ms;
+  x.target           = net::body_target::buffer;
+  x.buffer_limit     = payload.size();
+  auto const start   = std::chrono::steady_clock::now();
+  auto const r       = run_exchange(t, std::move(x));
+  REQUIRE_FALSE(r.ec);
+  CHECK(r.meta.status == 200);
+  CHECK(r.request_sent);
+  CHECK(server.continues() == 0);
+  CHECK(std::chrono::steady_clock::now() - start >= 300ms);
+  CHECK(std::string(r.body.begin(), r.body.end()) == payload);
+  // The connection is clean: the next exchange (with a 100 Continue this time) reuses it.
+  server.ignore_expect(false);
+  net::exchange y;
+  y.method           = http::method::put;
+  y.url              = server.url();
+  y.has_body         = true;
+  y.body_length      = payload.size();
+  y.body             = {iovec{const_cast<char*>(payload.data()), payload.size()}};
+  y.expect_continue  = true;
+  y.continue_timeout = 10s;
+  y.target           = net::body_target::buffer;
+  y.buffer_limit     = payload.size();
+  auto const again   = run_exchange(t, std::move(y));
+  REQUIRE_FALSE(again.ec);
+  CHECK(again.reused);
+  CHECK(server.continues() == 1);
+  CHECK(std::string(again.body.begin(), again.body.end()) == payload);
+  t.shutdown();
+}
+
+namespace {
+
+/// Records the record budget of every seal and "encrypts" by copying.
+class counting_sealer final : public tls::record_sealer {
+ public:
+  tls::seal_result seal(std::span<iovec const> in,
+                        std::size_t skip,
+                        std::span<std::byte> out,
+                        unsigned max_records) noexcept override
+  {
+    last_max_records = max_records;
+    tls::seal_result r;
+    for (auto const& v : in) {
+      if (skip >= v.iov_len) {
+        skip -= v.iov_len;
+        continue;
+      }
+      auto const n = std::min(v.iov_len - skip, out.size() - r.ciphertext);
+      std::memcpy(out.data() + r.ciphertext, static_cast<char const*>(v.iov_base) + skip, n);
+      r.ciphertext += n;
+      r.plaintext += n;
+      skip = 0;
+    }
+    return r;
+  }
+  [[nodiscard]] std::size_t record_overhead() const noexcept override { return 64; }
+  std::error_code request_key_update_reply() noexcept override { return {}; }
+  unsigned last_max_records{0};
+};
+
+class sealing_session final : public tls::session {
+ public:
+  tls::handshake_status handshake(std::error_code&) noexcept override
+  {
+    return tls::handshake_status::done;
+  }
+  [[nodiscard]] tls::session_info info() const noexcept override { return {}; }
+  std::error_code export_keys(tls::direction, tls::traffic_keys&) noexcept override { return {}; }
+  std::error_code detach_from_socket() noexcept override { return {}; }
+  tls::record_opener* opener() noexcept override { return &_opener; }
+  tls::record_sealer* sealer() noexcept override { return &sealer_; }
+  std::size_t describe_error(std::span<char>) const noexcept override { return 0; }
+  counting_sealer sealer_;
+
+ private:
+  fake_opener _opener;
+};
+
+}  // namespace
+
+TEST_CASE("net: the user-space TLS stream seals request bodies in configurable batches",
+          "[rest][net][tls]")
+{
+  auto const configured = GENERATE(0U, 3U, 16U, 64U);
+  CAPTURE(configured);
+  sealing_session session;
+  net::stream_options opts;
+  if (configured != 0) { opts.tx_batch_records = configured; }
+  int const fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  REQUIRE(fd >= 0);
+  std::error_code ec;
+  auto* stream = net::tls_stream::create(fd, session, nullptr, opts, ec);
+  REQUIRE(stream != nullptr);
+  std::vector<char> body(1 << 20, 'x');
+  iovec const v{body.data(), body.size()};
+  io_uring_sqe sqe{};
+  stream->prep_send(&sqe, std::span<iovec const>{&v, 1});
+  auto const expected = configured == 0 ? 16U : std::min(configured, 16U);
+  CHECK(session.sealer_.last_max_records == expected);
+  CHECK(net::tls_stream::tx_bytes >= 16 * tls::max_record_ciphertext);
+  net::tls_stream::destroy(stream);
+  ::close(fd);
 }
 
 TEST_CASE("net: a response that landed by the deadline completes instead of timing out",

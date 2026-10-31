@@ -48,12 +48,23 @@ transport on a short-lived helper thread; io_uring never runs on the caller's th
   once with `http_unsupported_framing` and is not retried. libcurl decoded these; S3, MinIO and
   Ceph never send them. LIST pages are decoded when chunked; a close-delimited body never counts
   as complete. Error bodies up to 64 KiB are drained (the connection is kept), larger ones close
-  the connection; their bytes never reach the destination.
+  the connection; their bytes never reach the destination. The S3 `<Code>` of a drained error
+  body is extracted into `response_meta::amz_error_code`, and `exchange_result::error_body_complete`
+  says whether the body was drained to its end.
 - Generic exchange: `submit(slot, exchange)` with an optional request body (fixed iovecs or a
-  generator) and optional `Expect: 100-continue`, the hook for S3 writes.
+  generator, at most 64 iovecs per SENDMSG) and optional `Expect: 100-continue`. With
+  `continue_timeout` the held body goes out anyway when no interim or final response arrived in
+  time (a server that ignores `Expect`; curl's 1 s default): the wait is a `POLL_ADD` that the
+  deadline cancels, so a TLS stream's receive state is never disturbed.
+  `exchange_result::request_sent` is set once the head and the whole body were written; with
+  `!response_started` and an error the server may have acted on a request whose answer was lost.
+  On the user-space TLS path a body is sealed `stream_options::tx_batch_records` (16) records
+  per SEND.
 - Time bounds: data GETs use the stall detector (fail when fewer than
-  `stall_speed_limit_bytes x stall_time_s` bytes arrived during the last `stall_time_s`);
-  control-plane requests use `request_timeout_s` (curl's LOW_SPEED vs TIMEOUT rule).
+  `stall_speed_limit_bytes x stall_time_s` bytes moved during the last `stall_time_s`; request
+  body bytes sent count as well as response bytes received, so an upload is never cancelled
+  while it is still sending: curl's low-speed check measures either direction); control-plane
+  requests use `request_timeout_s` (curl's LOW_SPEED vs TIMEOUT rule).
 
 ## Pool behaviour (libcurl parity)
 

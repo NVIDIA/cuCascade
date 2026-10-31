@@ -178,6 +178,7 @@ tls_stream* tls_stream::create(int fd,
   s->_tier2      = static_cast<bool>(opener);
   s->_own_opener = std::move(opener);
   s->_waitall    = opts.waitall;
+  s->_tx_batch   = std::clamp(opts.tx_batch_records, 1U, max_tx_batch_records);
   return s;
 }
 
@@ -211,7 +212,7 @@ void tls_stream::prep_send(io_uring_sqe* sqe, std::span<iovec const> tx) noexcep
 void tls_stream::seal(std::span<iovec const> tx) noexcept
 {
   _tx.compact();  // no SEND in flight here
-  // At most 3 records (48 KiB of plaintext) per batch; an owed KeyUpdate reply goes first (the
+  // At most `_tx_batch` records per batch; an owed KeyUpdate reply goes first (the
   // sealer emits it before the next record, RFC 8446 §4.6.3). The sealer stops on its own when
   // the FIFO has no room for another record (its `record_overhead()` reserve).
   std::span<std::byte> const out = _tx.write_span();
@@ -219,7 +220,7 @@ void tls_stream::seal(std::span<iovec const> tx) noexcept
     _broken = true;  // unreachable: the FIFO is empty after a completed SEND
     return;
   }
-  tls::seal_result const r = _sealer->seal(tx, 0, out, tx_batch_records);
+  tls::seal_result const r = _sealer->seal(tx, 0, out, _tx_batch);
   if (r.error) {
     _broken = true;
     return;
@@ -234,7 +235,7 @@ void tls_stream::seal_control() noexcept
 {
   // No plaintext: the sealer emits what the library owes (a KeyUpdate reply, an alert) only.
   _tx.compact();  // no SEND in flight here
-  tls::seal_result const r = _sealer->seal({}, 0, _tx.write_span(), tx_batch_records);
+  tls::seal_result const r = _sealer->seal({}, 0, _tx.write_span(), _tx_batch);
   if (r.error) {
     _broken = true;
     return;
