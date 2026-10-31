@@ -56,5 +56,7 @@ if(CUCASCADE_CUFILE_INCLUDE_DIR)
   target_sources(
     cucascade_io_objects
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_api.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_ioctx.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_reactor.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/platform.cpp)
 endif()
