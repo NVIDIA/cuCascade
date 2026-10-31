@@ -25,6 +25,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <pthread.h>
 #include <signal.h>  // NOLINT(modernize-deprecated-headers): POSIX pthread_sigmask
@@ -33,6 +34,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -44,6 +46,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -58,15 +61,26 @@
 
 /**
  * @file loopback_range_server.hpp
- * @brief Raw-socket HTTP/1.1 loopback server for the REST read tests (header-only).
+ * @brief Raw-socket HTTP/1.1 loopback server for the REST tests (header-only).
  *
- * Ranged / suffix / full GET, HEAD and ListObjectsV2 of one fixture object (any key), with the
- * fault policies of @ref cucascade::test::range_fault_policy and per-key scripts (including a
- * chunked-framed GET body).  HTTPS: with @ref cucascade::test::loopback_tls enabled every
- * accepted socket is wrapped in an OpenSSL server `SSL*` (blocking `SSL_accept`) presenting the
- * test PKI's server certificate (`io/tls/tls_test_pki.hpp`); the same request handling runs over
- * `SSL_read` / `SSL_write`, and a body may carry a mid-body KeyUpdate or end without
- * close_notify.
+ * Reads: ranged / suffix / full GET, HEAD and ListObjectsV2 of one fixture object (any key), with
+ * the fault policies of @ref cucascade::test::range_fault_policy and per-key scripts (including a
+ * chunked-framed GET body).
+ *
+ * Writes (S3, path style `/<bucket>/<key>`): an in-memory object store. PutObject (with
+ * `If-None-Match: *` -> 412 when the key exists), CreateMultipartUpload (`POST ?uploads`),
+ * UploadPart (`PUT ?partNumber=N&uploadId=U`, ETag header), CompleteMultipartUpload (`POST
+ * ?uploadId=U`: parts assembled in part-number order; order, ETags and the minimum part size of
+ * every part but the last are validated), AbortMultipartUpload (`DELETE ?uploadId=U`) and
+ * DeleteObject. Written objects are what later GET / HEAD / LIST of their key see; other keys
+ * keep returning the fixture object. ETags are S3's: the MD5 of a single PUT's body, and
+ * `md5(concat(binary part MD5s))-N` for a multipart object. Fault injection for writes (@ref
+ * cucascade::test::write_fault), `Expect: 100-continue` handling and request records.
+ *
+ * HTTPS: with @ref cucascade::test::loopback_tls enabled every accepted socket is wrapped in an
+ * OpenSSL server `SSL*` (blocking `SSL_accept`) presenting the test PKI's server certificate
+ * (`io/tls/tls_test_pki.hpp`); the same request handling runs over `SSL_read` / `SSL_write`, and
+ * a body may carry a mid-body KeyUpdate or end without close_notify.
  */
 
 namespace cucascade::test {
@@ -259,6 +273,67 @@ struct key_response_script {
   std::vector<scripted_response> heads;
 };
 
+/// S3 write request kinds served by @ref loopback_range_server.
+enum class write_kind : std::uint8_t {
+  put_object,       ///< PUT /b/k
+  create_upload,    ///< POST /b/k?uploads
+  upload_part,      ///< PUT /b/k?partNumber=N&uploadId=U
+  complete_upload,  ///< POST /b/k?uploadId=U
+  abort_upload,     ///< DELETE /b/k?uploadId=U
+  delete_object,    ///< DELETE /b/k
+};
+
+/**
+ * @brief One injected write fault: matches the requests of @c kind whose arrival index (0-based,
+ *        among the requests of that kind, or among the UploadParts of @c part_number when set)
+ *        lies in [nth, nth + count).
+ */
+struct write_fault {
+  enum class action : std::uint8_t {
+    status,           ///< answer @c status with an S3 error document (@c code); body read first
+    ok_with_error,    ///< `200 OK` whose body is an S3 `<Error>` (@c code), e.g. on Complete
+    ok_with_body,     ///< `200 OK`, `text/html`, carrying @c body; the request is not applied (a
+                      ///< proxy answering in S3's place)
+    drop_mid_body,    ///< read about half of the body, then close the connection, no response
+    drop_after_body,  ///< read the body (perform it when @c apply), close without a response
+    hold,             ///< hold the response on @c control until released, then answer normally
+  };
+  write_kind kind{write_kind::upload_part};
+  std::size_t nth{0};
+  std::size_t count{1};
+  std::optional<unsigned> part_number;  ///< upload_part only: count this part number's requests
+  action what{action::status};
+  int status{503};
+  std::string code{"SlowDown"};
+  std::string retry_after;  ///< Retry-After header of a `status` answer (empty: none)
+  std::string body;         ///< ok_with_body: the response body
+  bool apply{false};        ///< drop_after_body: the request takes effect (a lost response)
+  std::shared_ptr<range_response_control> control;  ///< hold
+};
+
+/// How a write request carrying `Expect: 100-continue` is answered.
+enum class expect_continue_mode : std::uint8_t {
+  honor,   ///< `100 Continue`, then read the body
+  ignore,  ///< no interim response; read the body when it comes
+  reject,  ///< final @c expect_reject_status at once, without reading the body; close
+};
+
+/// S3 write behaviour of @ref loopback_range_server.
+struct s3_write_policy {
+  /// CompleteMultipartUpload: every part but the last must be at least this large
+  /// (EntityTooSmall otherwise); S3 uses 5 MiB, tests may lower it.
+  std::uint64_t min_part_size{std::uint64_t{5} << 20};
+  /// GET / HEAD of a key that was never written: 404 NoSuchKey instead of the fixture object.
+  bool missing_key_404{false};
+  expect_continue_mode expect{expect_continue_mode::honor};
+  int expect_reject_status{403};
+  /// Spaces before the CreateMultipartUpload / CompleteMultipartUpload XML (S3 sends keep-alive
+  /// whitespace while it assembles).
+  std::size_t create_whitespace_prefix{0};
+  std::size_t complete_whitespace_prefix{0};
+  std::vector<write_fault> faults;
+};
+
 /// HTTPS mode of @ref loopback_range_server.
 struct loopback_tls {
   bool enabled{false};
@@ -348,11 +423,35 @@ class loopback_connection {
 
 class loopback_range_server {
  public:
+  /// The S3 `<Error>` document the server answers a `status` fault (and S3 errors) with.
+  static std::string s3_error_body(std::string const& code, std::string const& message)
+  {
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>" + code + "</Code><Message>" +
+           message + "</Message><RequestId>LOOPBACK</RequestId></Error>";
+  }
+
   struct get_record {
     std::vector<std::string> if_match;
     std::vector<std::string> ranges;
     bool header_authorized{false};
     bool presigned{false};
+  };
+
+  /// One write request as the server saw it.
+  struct write_record {
+    write_kind kind{write_kind::put_object};
+    std::string bucket;
+    std::string key;    ///< percent-decoded
+    std::string query;  ///< as sent (without '?')
+    unsigned part_number{0};
+    std::string upload_id;  ///< percent-decoded
+    std::size_t content_length{0};
+    bool if_none_match{false};    ///< `If-None-Match: *`
+    bool expect_continue{false};  ///< `Expect: 100-continue`
+    bool header_authorized{false};
+    bool presigned{false};
+    std::string content_sha256;  ///< x-amz-content-sha256
+    int status{0};               ///< 0: no response was sent (dropped connection)
   };
 
   [[nodiscard]] std::vector<get_record> get_requests() const
@@ -361,15 +460,32 @@ class loopback_range_server {
     return _get_records;
   }
 
+  /// Read-only HTTPS fixture (no write policy).
+  loopback_range_server(std::vector<std::uint8_t> object,
+                        range_fault_policy fault,
+                        std::vector<listed_object> listed,
+                        std::unordered_map<std::string, key_response_script> scripts,
+                        loopback_tls tls)
+    : loopback_range_server(std::move(object),
+                            std::move(fault),
+                            std::move(listed),
+                            std::move(scripts),
+                            s3_write_policy{},
+                            tls)
+  {
+  }
+
   explicit loopback_range_server(std::vector<std::uint8_t> object,
                                  range_fault_policy fault                                     = {},
                                  std::vector<listed_object> listed                            = {},
                                  std::unordered_map<std::string, key_response_script> scripts = {},
+                                 s3_write_policy write                                        = {},
                                  loopback_tls tls                                             = {})
     : _object(std::move(object)),
       _fault(std::move(fault)),
       _listed(std::move(listed)),
-      _scripts(std::move(scripts))
+      _scripts(std::move(scripts)),
+      _write(std::move(write))
   {
     if (_object.empty()) { throw std::runtime_error("loopback object must be non-empty"); }
     add_body_control(_fault.body);
@@ -377,6 +493,10 @@ class loopback_range_server {
       for (auto const& response : script.gets) {
         if (response.body) { add_body_control(*response.body); }
       }
+    }
+    for (auto const& f : _write.faults) {
+      check_write_fault(f);
+      if (f.control) { _body_controls.push_back(f.control); }
     }
     if (tls.enabled) {
       _tls_ctx = tls.ctx != nullptr ? tls.ctx : tls::make_server_ctx(tls::default_pki());
@@ -425,8 +545,11 @@ class loopback_range_server {
       }
       _get_response_cv.notify_all();
       _data_get_cv.notify_all();
-      for (auto const& control : _body_controls) {
-        control->stop();
+      {
+        std::scoped_lock lock{_store_mutex};
+        for (auto const& control : _body_controls) {
+          control->stop();
+        }
       }
       if (_listen_fd >= 0) {
         // shutdown() wakes the blocked accept(); close() alone does not reliably interrupt it.
@@ -504,6 +627,132 @@ class loopback_range_server {
   {
     std::unique_lock lock{_data_get_mutex};
     return _data_get_cv.wait_for(lock, timeout, [&] { return _active_data_gets.load() == 0; });
+  }
+
+  //===--------------------------------------------------------------------===//
+  // S3 writes: counters, records, the object store
+  //===--------------------------------------------------------------------===//
+
+  [[nodiscard]] std::size_t put_object_count() const noexcept { return _put_object_count.load(); }
+  [[nodiscard]] std::size_t create_upload_count() const noexcept
+  {
+    return _create_upload_count.load();
+  }
+  [[nodiscard]] std::size_t upload_part_count() const noexcept { return _upload_part_count.load(); }
+  [[nodiscard]] std::size_t complete_upload_count() const noexcept
+  {
+    return _complete_upload_count.load();
+  }
+  [[nodiscard]] std::size_t abort_upload_count() const noexcept
+  {
+    return _abort_upload_count.load();
+  }
+  [[nodiscard]] std::size_t delete_object_count() const noexcept
+  {
+    return _delete_object_count.load();
+  }
+  /// Write requests that carried `Expect: 100-continue` (with a body).
+  [[nodiscard]] std::size_t expect_continue_count() const noexcept
+  {
+    return _expect_continue_count.load();
+  }
+  /// Request body bytes the server read (all write kinds).
+  [[nodiscard]] std::size_t write_body_bytes() const noexcept { return _write_body_bytes.load(); }
+  [[nodiscard]] std::size_t active_part_uploads() const noexcept
+  {
+    return _active_part_uploads.load();
+  }
+  [[nodiscard]] std::size_t peak_part_uploads() const noexcept { return _peak_part_uploads.load(); }
+
+  [[nodiscard]] std::vector<write_record> write_requests() const
+  {
+    std::scoped_lock lock{_store_mutex};
+    return _write_records;
+  }
+
+  /// @return the bytes stored under @p key (percent-decoded key), if any.
+  [[nodiscard]] std::optional<std::vector<std::uint8_t>> stored_object(std::string_view key) const
+  {
+    std::scoped_lock lock{_store_mutex};
+    auto const it = _store.find(std::string{key});
+    if (it == _store.end()) { return std::nullopt; }
+    return it->second->data;
+  }
+  /// @return the ETag (quoted) of the object stored under @p key; empty when none.
+  [[nodiscard]] std::string stored_etag(std::string_view key) const
+  {
+    std::scoped_lock lock{_store_mutex};
+    auto const it = _store.find(std::string{key});
+    return it == _store.end() ? std::string{} : it->second->etag;
+  }
+  [[nodiscard]] std::vector<std::string> stored_keys() const
+  {
+    std::scoped_lock lock{_store_mutex};
+    std::vector<std::string> keys;
+    for (auto const& [key, object] : _store) {
+      keys.push_back(key);
+    }
+    return keys;
+  }
+  /// Store @p data under @p key as if it had been PUT. @return its ETag.
+  std::string put_stored_object(std::string key, std::vector<std::uint8_t> data)
+  {
+    auto object  = std::make_shared<stored_object_t>();
+    object->etag = "\"" + digest_hex(data.data(), data.size()) + "\"";
+    object->data = std::move(data);
+    std::scoped_lock lock{_store_mutex};
+    auto etag = object->etag;
+    _store.insert_or_assign(std::move(key), std::move(object));
+    return etag;
+  }
+
+  /// Multipart uploads neither completed nor aborted.
+  [[nodiscard]] std::size_t active_upload_count() const
+  {
+    std::scoped_lock lock{_store_mutex};
+    return _uploads.size();
+  }
+  [[nodiscard]] std::vector<std::string> upload_ids() const
+  {
+    std::scoped_lock lock{_store_mutex};
+    std::vector<std::string> ids;
+    for (auto const& [id, upload] : _uploads) {
+      ids.push_back(id);
+    }
+    return ids;
+  }
+  /// @return the part numbers uploaded so far to @p upload_id (empty when it does not exist).
+  [[nodiscard]] std::vector<unsigned> upload_parts(std::string_view upload_id) const
+  {
+    std::scoped_lock lock{_store_mutex};
+    std::vector<unsigned> parts;
+    auto const it = _uploads.find(std::string{upload_id});
+    if (it != _uploads.end()) {
+      for (auto const& [n, part] : it->second.parts) {
+        parts.push_back(n);
+      }
+    }
+    return parts;
+  }
+
+  void set_min_part_size(std::uint64_t bytes)
+  {
+    std::scoped_lock lock{_store_mutex};
+    _write.min_part_size = bytes;
+  }
+  void set_expect_continue(expect_continue_mode mode, int reject_status = 403)
+  {
+    std::scoped_lock lock{_store_mutex};
+    _write.expect               = mode;
+    _write.expect_reject_status = reject_status;
+  }
+  /// Add a fault; it counts requests from the server's start (see write_fault).
+  void add_write_fault(write_fault fault)
+  {
+    check_write_fault(fault);
+    std::scoped_lock lock{_store_mutex};
+    if (fault.control) { _body_controls.push_back(fault.control); }
+    _write.faults.push_back(std::move(fault));
   }
 
  private:
@@ -657,7 +906,7 @@ class loopback_range_server {
     std::string pending;
     std::string request;
     while (!_stop.load(std::memory_order_relaxed) && read_request(conn, pending, request)) {
-      if (handle_request(conn, request)) { break; }
+      if (handle_request(conn, request, pending)) { break; }
     }
     if (ssl != nullptr) {
       if (!conn.dropped()) { conn.close_notify(); }
@@ -666,13 +915,15 @@ class loopback_range_server {
     }
   }
 
-  bool handle_request(loopback_connection& conn, std::string const& request)
+  bool handle_request(loopback_connection& conn, std::string const& request, std::string& pending)
   {
     bool const close_connection = requests_connection_close(request);
     bool const is_head          = request.rfind("HEAD ", 0) == 0;
     bool const is_get           = request.rfind("GET ", 0) == 0;
     bool const is_list = is_get && request_target(request).find("list-type=2") != std::string::npos;
     auto const key     = request_key(request);
+
+    if (is_write_request(request)) { return handle_write(conn, request, pending); }
 
     if (is_head) {
       auto const head_idx = _head_count.fetch_add(1, std::memory_order_relaxed);
@@ -694,8 +945,15 @@ class loopback_range_server {
         send_all(conn, response);
         return close_connection;
       }
-      std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
-      append_etag_header(response, response_etag(scripted, _fault.successful_head_etag));
+      auto const stored = find_stored(request);
+      if (!stored && missing_key_404()) {
+        return send_no_such_key(conn, close_connection, /*with_body=*/false);
+      }
+      std::size_t const object_size = stored ? stored->data.size() : _object.size();
+      auto etag                     = response_etag(scripted, _fault.successful_head_etag);
+      if (etag.empty() && stored) { etag = stored->etag; }
+      std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(object_size);
+      append_etag_header(response, etag);
       append_connection_header(response, close_connection);
       response += "\r\n\r\n";
       send_all(conn, response);
@@ -705,7 +963,7 @@ class loopback_range_server {
     if (is_list) {
       if (!pause_response(_fault.response_delay)) { return true; }
       _list_count.fetch_add(1, std::memory_order_relaxed);
-      auto const body = list_xml();
+      auto const body = list_xml(query_param(request, "prefix"));
       std::string response =
         "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
         std::to_string(body.size());
@@ -781,7 +1039,30 @@ class loopback_range_server {
       return close_connection || truncate || !sent;
     }
 
-    if (auto range = parse_range(request)) {
+    // A key written through the store is served from it; other keys get the fixture object.
+    auto const stored = find_stored(request);
+    if (!stored && missing_key_404()) {
+      return send_no_such_key(conn, close_connection, /*with_body=*/true);
+    }
+    std::span<std::uint8_t const> const object =
+      stored ? std::span<std::uint8_t const>{stored->data} : std::span<std::uint8_t const>{_object};
+    auto const ok_etag = [&] {
+      auto etag = response_etag(scripted, _fault.successful_get_etag);
+      if (etag.empty() && stored) { etag = stored->etag; }
+      return etag;
+    };
+    if (stored && range_unsatisfiable(request, object.size())) {
+      // S3: 416 with `Content-Range: bytes */<size>` (an empty object answers any range so).
+      std::string response = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0";
+      response += "\r\nContent-Range: bytes */" + std::to_string(object.size());
+      append_etag_header(response, ok_etag());
+      append_connection_header(response, close_connection);
+      response += "\r\n\r\n";
+      bool const sent = send_response(conn, response, {}, body_policy);
+      return close_connection || !sent;
+    }
+
+    if (auto range = parse_range(request, object.size())) {
       if (_fault.fail_range_with_416) {
         std::string response{"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0"};
         append_etag_header(response, _fault.failed_get_etag);
@@ -792,12 +1073,12 @@ class loopback_range_server {
       }
       if (_fault.ignore_range_with_200 || (scripted && scripted->ignore_range)) {
         std::string response =
-          "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
-        append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
+          "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(object.size());
+        append_etag_header(response, ok_etag());
         append_connection_header(response, close_connection);
         response += "\r\n\r\n";
-        bool const sent =
-          send_body(conn, response, 0, _object.size(), body_xor, body_policy, chunked, garbage);
+        bool const sent = send_body(
+          conn, response, object, 0, object.size(), body_xor, body_policy, chunked, garbage);
         return close_connection || !sent;
       }
       auto const [start, end] = *range;
@@ -814,24 +1095,644 @@ class loopback_range_server {
           response += "\r\nContent-Range: " + *content_range;
         } else if (!_fault.omit_successful_content_range) {
           response += "\r\nContent-Range: bytes " + std::to_string(start) + "-" +
-                      std::to_string(end) + "/" + std::to_string(_object.size());
+                      std::to_string(end) + "/" + std::to_string(object.size());
         }
-        append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
+        append_etag_header(response, ok_etag());
       }
       append_connection_header(response, close_connection);
       response += "\r\n\r\n";
       bool const sent =
-        send_body(conn, response, start, size, body_xor, body_policy, chunked, garbage);
+        send_body(conn, response, object, start, size, body_xor, body_policy, chunked, garbage);
       return close_connection || !sent;
     }
 
-    std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
-    append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
+    std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(object.size());
+    append_etag_header(response, ok_etag());
     append_connection_header(response, close_connection);
     response += "\r\n\r\n";
     bool const sent =
-      send_body(conn, response, 0, _object.size(), body_xor, body_policy, chunked, garbage);
+      send_body(conn, response, object, 0, object.size(), body_xor, body_policy, chunked, garbage);
     return close_connection || !sent;
+  }
+
+  //===--------------------------------------------------------------------===//
+  // S3 writes
+  //===--------------------------------------------------------------------===//
+
+  struct stored_object_t {
+    std::vector<std::uint8_t> data;
+    std::string etag;  ///< quoted
+  };
+  struct upload_part_t {
+    std::string etag;
+    std::vector<std::uint8_t> data;
+  };
+  struct upload_t {
+    std::string key;
+    std::map<unsigned, upload_part_t> parts;
+  };
+  /// One response of the write path.
+  struct write_response {
+    int status{200};
+    std::string reason{"OK"};
+    std::string headers;  ///< extra header lines, each ending in "\r\n"
+    std::string body;
+  };
+
+  class part_upload_guard {
+   public:
+    explicit part_upload_guard(loopback_range_server& server) : _server(server)
+    {
+      auto const current = _server._active_part_uploads.fetch_add(1) + 1;
+      auto peak          = _server._peak_part_uploads.load();
+      while (current > peak && !_server._peak_part_uploads.compare_exchange_weak(peak, current)) {}
+    }
+    ~part_upload_guard() { _server._active_part_uploads.fetch_sub(1); }
+    part_upload_guard(part_upload_guard const&)            = delete;
+    part_upload_guard& operator=(part_upload_guard const&) = delete;
+
+   private:
+    loopback_range_server& _server;
+  };
+
+  static void check_write_fault(write_fault const& f)
+  {
+    if (f.count == 0 || (f.what == write_fault::action::hold && !f.control)) {
+      throw std::invalid_argument("invalid write fault");
+    }
+  }
+
+  /// MD5 of @p data as 32 lowercase hex digits (S3's ETag of a single PUT and of a part).
+  static std::string digest_hex(void const* data, std::size_t size)
+  {
+    std::array<unsigned char, EVP_MAX_MD_SIZE> md{};
+    unsigned int len = 0;
+    if (EVP_Digest(data, size, md.data(), &len, EVP_md5(), nullptr) != 1) {
+      throw std::runtime_error("loopback: MD5 unavailable");
+    }
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out;
+    for (unsigned int i = 0; i < len; ++i) {
+      out += digits[md[i] >> 4];
+      out += digits[md[i] & 0xF];
+    }
+    return out;
+  }
+
+  /// The binary MD5 a part ETag `"<32 hex>"` names (16 bytes appended to @p out).
+  static void append_binary_digest(std::string const& etag, std::string& out)
+  {
+    auto const hex = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    for (std::size_t i = 1; i + 2 < etag.size(); i += 2) {
+      out += static_cast<char>((hex(etag[i]) << 4) | hex(etag[i + 1]));
+    }
+  }
+
+  static std::string pct_decode(std::string_view s)
+  {
+    auto const hex = [](char c) -> int {
+      if (c >= '0' && c <= '9') { return c - '0'; }
+      if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+      if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+      return -1;
+    };
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+      if (s[i] == '%' && i + 2 < s.size()) {
+        int const hi = hex(s[i + 1]);
+        int const lo = hex(s[i + 2]);
+        if (hi >= 0 && lo >= 0) {
+          out += static_cast<char>((hi << 4) | lo);
+          i += 2;
+          continue;
+        }
+      }
+      out += s[i];
+    }
+    return out;
+  }
+
+  static std::string request_method(std::string const& request)
+  {
+    return request.substr(0, request.find(' '));
+  }
+
+  static std::string request_query(std::string const& request)
+  {
+    auto const target = request_target(request);
+    auto const q      = target.find('?');
+    return q == std::string::npos ? std::string{} : target.substr(q + 1);
+  }
+
+  /// Percent-decoded query parameters (a bare key maps to "").
+  static std::map<std::string, std::string> query_params(std::string const& request)
+  {
+    std::map<std::string, std::string> params;
+    auto const query = request_query(request);
+    std::string_view rest{query};
+    while (!rest.empty()) {
+      auto const amp  = rest.find('&');
+      auto const pair = rest.substr(0, amp);
+      if (!pair.empty()) {
+        auto const eq = pair.find('=');
+        params[pct_decode(pair.substr(0, eq))] =
+          eq == std::string_view::npos ? std::string{} : pct_decode(pair.substr(eq + 1));
+      }
+      if (amp == std::string_view::npos) { break; }
+      rest.remove_prefix(amp + 1);
+    }
+    return params;
+  }
+
+  static std::string query_param(std::string const& request, std::string const& name)
+  {
+    auto const params = query_params(request);
+    auto const it     = params.find(name);
+    return it == params.end() ? std::string{} : it->second;
+  }
+
+  static std::string request_bucket(std::string const& request)
+  {
+    auto target = request_target(request);
+    if (auto const query = target.find('?'); query != std::string::npos) { target.resize(query); }
+    if (!target.empty() && target.front() == '/') { target.erase(0, 1); }
+    return pct_decode(target.substr(0, target.find('/')));
+  }
+
+  /// The object-store key of a request: its key, percent-decoded.
+  static std::string store_key(std::string const& request)
+  {
+    return pct_decode(request_key(request));
+  }
+
+  static bool is_write_request(std::string const& request)
+  {
+    return request.rfind("PUT ", 0) == 0 || request.rfind("POST ", 0) == 0 ||
+           request.rfind("DELETE ", 0) == 0;
+  }
+
+  static bool header_is(std::string const& request, std::string_view name, std::string_view value)
+  {
+    for (auto const& v : header_values(request, name)) {
+      if (std::equal(v.begin(), v.end(), value.begin(), value.end(), [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+          })) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  [[nodiscard]] std::shared_ptr<stored_object_t const> find_stored(std::string const& request) const
+  {
+    std::scoped_lock lock{_store_mutex};
+    auto const it = _store.find(store_key(request));
+    return it == _store.end() ? nullptr : it->second;
+  }
+
+  [[nodiscard]] bool missing_key_404() const
+  {
+    std::scoped_lock lock{_store_mutex};
+    return _write.missing_key_404;
+  }
+
+  /// A syntactically valid `Range: bytes=` header that the object cannot satisfy.
+  static bool range_unsatisfiable(std::string const& request, std::size_t object_size)
+  {
+    auto const ranges = header_values(request, "range");
+    if (ranges.empty()) { return false; }
+    std::string spec = ranges.front();
+    std::transform(spec.begin(), spec.end(), spec.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    if (!spec.starts_with("bytes=")) { return false; }
+    spec.erase(0, 6);
+    auto const dash = spec.find('-');
+    if (dash == std::string::npos) { return false; }
+    try {
+      if (dash == 0) { return object_size == 0 && std::stoull(spec.substr(1)) > 0; }
+      return static_cast<std::size_t>(std::stoull(spec.substr(0, dash))) >= object_size;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  static write_response s3_error(int status, std::string const& code, std::string const& message)
+  {
+    write_response r;
+    r.status  = status;
+    r.reason  = "Error";
+    r.headers = "Content-Type: application/xml\r\n";
+    r.body    = s3_error_body(code, message);
+    return r;
+  }
+
+  bool send_write_response(loopback_connection& conn,
+                           write_response const& r,
+                           bool close_connection)
+  {
+    std::string head = "HTTP/1.1 " + std::to_string(r.status) + " " + r.reason +
+                       "\r\nx-amz-request-id: LOOPBACK\r\n" + r.headers;
+    if (r.status != 204) { head += "Content-Length: " + std::to_string(r.body.size()) + "\r\n"; }
+    head += close_connection ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
+    if (send_all(conn, head) != head.size()) { return false; }
+    return send_all(conn, r.body) == r.body.size();
+  }
+
+  bool send_no_such_key(loopback_connection& conn, bool close_connection, bool with_body)
+  {
+    auto r = s3_error(404, "NoSuchKey", "The specified key does not exist.");
+    if (!with_body) {
+      // HEAD: no body (Content-Length 0).
+      r.headers.clear();
+      r.body.clear();
+    }
+    r.reason = "Not Found";
+    return !send_write_response(conn, r, close_connection) || close_connection;
+  }
+
+  /// Read @p n body bytes (after the head): first what @p pending holds, then the connection.
+  static bool read_body(loopback_connection& conn,
+                        std::string& pending,
+                        std::size_t n,
+                        std::vector<std::uint8_t>& body)
+  {
+    body.clear();
+    body.reserve(n);
+    std::size_t const take = std::min(n, pending.size());
+    body.insert(body.end(), pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(take));
+    pending.erase(0, take);
+    std::vector<char> buf(std::min<std::size_t>(n, 256 * 1024) + 1);
+    while (body.size() < n) {
+      auto const r = conn.recv_some(buf.data(), std::min(buf.size(), n - body.size()));
+      if (r <= 0) { return false; }
+      body.insert(body.end(), buf.begin(), buf.begin() + r);
+    }
+    return true;
+  }
+
+  /// The fault matching this request, if any (each request matches at most one fault).
+  [[nodiscard]] std::optional<write_fault> match_fault(write_kind kind,
+                                                       std::size_t index,
+                                                       unsigned part_number,
+                                                       std::size_t part_index) const
+  {
+    std::scoped_lock lock{_store_mutex};
+    for (auto const& f : _write.faults) {
+      if (f.kind != kind) { continue; }
+      std::size_t const i = f.part_number ? part_index : index;
+      if (f.part_number && *f.part_number != part_number) { continue; }
+      if (i >= f.nth && i - f.nth < f.count) { return f; }
+    }
+    return std::nullopt;
+  }
+
+  bool handle_write(loopback_connection& conn, std::string const& request, std::string& pending)
+  {
+    bool const close_connection = requests_connection_close(request);
+    auto const method           = request_method(request);
+    auto const params           = query_params(request);
+    write_record rec;
+    rec.bucket            = request_bucket(request);
+    rec.key               = store_key(request);
+    rec.query             = request_query(request);
+    rec.if_none_match     = header_is(request, "if-none-match", "*");
+    rec.header_authorized = !header_values(request, "authorization").empty();
+    rec.presigned         = rec.query.find("X-Amz-Signature=") != std::string::npos;
+    if (auto const sha = header_values(request, "x-amz-content-sha256"); !sha.empty()) {
+      rec.content_sha256 = sha.front();
+    }
+    if (auto const id = params.find("uploadId"); id != params.end()) { rec.upload_id = id->second; }
+
+    if (method == "POST" && params.contains("uploads")) {
+      rec.kind = write_kind::create_upload;
+    } else if (method == "POST" && params.contains("uploadId")) {
+      rec.kind = write_kind::complete_upload;
+    } else if (method == "PUT" && params.contains("partNumber") && params.contains("uploadId")) {
+      rec.kind = write_kind::upload_part;
+      try {
+        auto const n    = std::stoul(params.at("partNumber"));
+        rec.part_number = n > 100000 ? 0 : static_cast<unsigned>(n);
+      } catch (...) {
+        rec.part_number = 0;
+      }
+    } else if (method == "PUT") {
+      rec.kind = write_kind::put_object;
+    } else if (method == "DELETE" && params.contains("uploadId")) {
+      rec.kind = write_kind::abort_upload;
+    } else if (method == "DELETE") {
+      rec.kind = write_kind::delete_object;
+    } else {
+      std::string response{"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0"};
+      append_connection_header(response, close_connection);
+      response += "\r\n\r\n";
+      send_all(conn, response);
+      return close_connection;
+    }
+    if (!header_values(request, "transfer-encoding").empty()) {
+      // Only Content-Length bodies are supported.
+      record_write(std::move(rec), 501);
+      send_write_response(conn, s3_error(501, "NotImplemented", "chunked bodies"), true);
+      return true;
+    }
+    std::size_t length = 0;
+    if (auto const cl = header_values(request, "content-length"); !cl.empty()) {
+      try {
+        length = static_cast<std::size_t>(std::stoull(cl.front()));
+      } catch (...) {
+        record_write(std::move(rec), 400);
+        send_write_response(conn, s3_error(400, "InvalidArgument", "Content-Length"), true);
+        return true;
+      }
+    }
+    rec.content_length  = length;
+    rec.expect_continue = header_is(request, "expect", "100-continue") && length != 0;
+
+    auto const [index, part_index] = next_write_index(rec.kind, rec.part_number);
+    write_counter(rec.kind).fetch_add(1, std::memory_order_relaxed);
+    auto const fault = match_fault(rec.kind, index, rec.part_number, part_index);
+    std::optional<part_upload_guard> part_guard;
+    if (rec.kind == write_kind::upload_part) { part_guard.emplace(*this); }
+
+    if (rec.expect_continue) {
+      _expect_continue_count.fetch_add(1, std::memory_order_relaxed);
+      expect_continue_mode mode;
+      int reject_status = 403;
+      {
+        std::scoped_lock lock{_store_mutex};
+        mode          = _write.expect;
+        reject_status = _write.expect_reject_status;
+      }
+      if (mode == expect_continue_mode::reject) {
+        record_write(std::move(rec), reject_status);
+        send_write_response(
+          conn, s3_error(reject_status, "AccessDenied", "rejected before the body"), true);
+        return true;
+      }
+      if (mode == expect_continue_mode::honor) {
+        if (send_all(conn, std::string_view{"HTTP/1.1 100 Continue\r\n\r\n"}) == 0) { return true; }
+      }
+    }
+
+    std::vector<std::uint8_t> body;
+    if (fault && fault->what == write_fault::action::drop_mid_body) {
+      (void)read_body(conn, pending, length / 2, body);
+      _write_body_bytes.fetch_add(body.size(), std::memory_order_relaxed);
+      record_write(std::move(rec), 0);
+      conn.drop();
+      return true;
+    }
+    if (!read_body(conn, pending, length, body)) {
+      record_write(std::move(rec), 0);
+      return true;
+    }
+    _write_body_bytes.fetch_add(body.size(), std::memory_order_relaxed);
+
+    if (fault) {
+      switch (fault->what) {
+        case write_fault::action::status: {
+          auto r = s3_error(fault->status, fault->code, "injected fault");
+          if (!fault->retry_after.empty()) {
+            r.headers += "Retry-After: " + fault->retry_after + "\r\n";
+          }
+          record_write(std::move(rec), fault->status);
+          return !send_write_response(conn, r, close_connection) || close_connection;
+        }
+        case write_fault::action::ok_with_error: {
+          write_response r;
+          r.headers = "Content-Type: application/xml\r\n";
+          r.body    = s3_error_body(fault->code, "injected 200 with an error");
+          record_write(std::move(rec), 200);
+          return !send_write_response(conn, r, close_connection) || close_connection;
+        }
+        case write_fault::action::ok_with_body: {
+          write_response r;
+          r.headers = "Content-Type: text/html\r\n";
+          r.body    = fault->body;
+          record_write(std::move(rec), 200);
+          return !send_write_response(conn, r, close_connection) || close_connection;
+        }
+        case write_fault::action::drop_after_body:
+          if (fault->apply) { (void)perform_write(rec, request, std::move(body)); }
+          record_write(std::move(rec), 0);
+          conn.drop();
+          return true;
+        case write_fault::action::hold:
+          if (!fault->control->hold()) { return true; }
+          break;
+        case write_fault::action::drop_mid_body: break;  // handled above
+      }
+    }
+    auto const response = perform_write(rec, request, std::move(body));
+    record_write(std::move(rec), response.status);
+    if (fault && fault->control) { fault->control->headers_sent(); }
+    return !send_write_response(conn, response, close_connection) || close_connection;
+  }
+
+  /// Apply one write request to the store. @return the response to send.
+  write_response perform_write(write_record const& rec,
+                               std::string const& request,
+                               std::vector<std::uint8_t> body)
+  {
+    // The body's MD5 outside the store lock: uploads of several connections hash in parallel.
+    std::string const digest =
+      rec.kind == write_kind::put_object || rec.kind == write_kind::upload_part
+        ? "\"" + digest_hex(body.data(), body.size()) + "\""
+        : std::string{};
+    std::scoped_lock lock{_store_mutex};
+    switch (rec.kind) {
+      case write_kind::put_object: {
+        if (rec.if_none_match && _store.contains(rec.key)) {
+          return s3_error(412, "PreconditionFailed", "At least one of the pre-conditions failed.");
+        }
+        auto object  = std::make_shared<stored_object_t>();
+        object->etag = digest;
+        object->data = std::move(body);
+        write_response r;
+        r.headers = "ETag: " + object->etag + "\r\n";
+        _store.insert_or_assign(rec.key, std::move(object));
+        return r;
+      }
+      case write_kind::create_upload: {
+        auto const id    = "loopback-upload/" + std::to_string(++_next_upload_id) + "+id=";
+        _uploads[id].key = rec.key;
+        write_response r;
+        r.headers = "Content-Type: application/xml\r\n";
+        r.body    = std::string(_write.create_whitespace_prefix, ' ') +
+                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult "
+                 "xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>" +
+                 xml_escape(rec.bucket) + "</Bucket><Key>" + xml_escape(rec.key) +
+                 "</Key><UploadId>" + xml_escape(id) +
+                 "</UploadId></InitiateMultipartUploadResult>";
+        return r;
+      }
+      case write_kind::upload_part: {
+        auto const it = _uploads.find(rec.upload_id);
+        if (it == _uploads.end() || it->second.key != rec.key) {
+          return s3_error(404, "NoSuchUpload", "The specified upload does not exist.");
+        }
+        if (rec.part_number < 1 || rec.part_number > 10000) {
+          return s3_error(400, "InvalidArgument", "Part number must be between 1 and 10000.");
+        }
+        auto const& etag                  = digest;
+        it->second.parts[rec.part_number] = {etag, std::move(body)};
+        write_response r;
+        r.headers = "ETag: " + etag + "\r\n";
+        return r;
+      }
+      case write_kind::complete_upload: return complete_upload(rec, request, body);
+      case write_kind::abort_upload: {
+        if (_uploads.erase(rec.upload_id) == 0) {
+          return s3_error(404, "NoSuchUpload", "The specified upload does not exist.");
+        }
+        write_response r;
+        r.status = 204;
+        r.reason = "No Content";
+        return r;
+      }
+      case write_kind::delete_object: {
+        _store.erase(rec.key);
+        write_response r;
+        r.status = 204;
+        r.reason = "No Content";
+        return r;
+      }
+    }
+    return s3_error(400, "InvalidRequest", "unknown write");
+  }
+
+  /// CompleteMultipartUpload (store mutex held).
+  write_response complete_upload(write_record const& rec,
+                                 std::string const& request,
+                                 std::vector<std::uint8_t> const& body)
+  {
+    (void)request;
+    auto const it = _uploads.find(rec.upload_id);
+    if (it == _uploads.end() || it->second.key != rec.key) {
+      return s3_error(404, "NoSuchUpload", "The specified upload does not exist.");
+    }
+    if (rec.if_none_match && _store.contains(rec.key)) {
+      return s3_error(412, "PreconditionFailed", "At least one of the pre-conditions failed.");
+    }
+    std::string_view const xml{reinterpret_cast<char const*>(body.data()), body.size()};
+    auto const tag = [](std::string_view doc, std::string_view name) {
+      std::string const open  = "<" + std::string{name} + ">";
+      std::string const close = "</" + std::string{name} + ">";
+      auto const a            = doc.find(open);
+      if (a == std::string_view::npos) { return std::string_view{}; }
+      auto const b = doc.find(close, a + open.size());
+      if (b == std::string_view::npos) { return std::string_view{}; }
+      return doc.substr(a + open.size(), b - a - open.size());
+    };
+    std::vector<std::pair<unsigned, std::string>> listed;
+    for (std::size_t at = 0; (at = xml.find("<Part>", at)) != std::string_view::npos;) {
+      auto const end = xml.find("</Part>", at);
+      if (end == std::string_view::npos) { break; }
+      auto const part = xml.substr(at, end - at);
+      unsigned number = 0;
+      try {
+        number = static_cast<unsigned>(std::stoul(std::string{tag(part, "PartNumber")}));
+      } catch (...) {
+        return s3_error(400, "MalformedXML", "bad PartNumber");
+      }
+      listed.emplace_back(number, xml_unescape(tag(part, "ETag")));
+      at = end;
+    }
+    if (listed.empty()) { return s3_error(400, "MalformedXML", "no parts"); }
+    // Validated in passes: order, then every part and its ETag, then the part sizes.
+    for (std::size_t i = 1; i < listed.size(); ++i) {
+      if (listed[i].first <= listed[i - 1].first) {
+        return s3_error(400, "InvalidPartOrder", "parts out of order");
+      }
+    }
+    for (auto const& [number, etag] : listed) {
+      auto const part = it->second.parts.find(number);
+      if (part == it->second.parts.end() || part->second.etag != etag) {
+        return s3_error(400, "InvalidPart", "a part was not found or its ETag did not match");
+      }
+    }
+    for (std::size_t i = 0; i + 1 < listed.size(); ++i) {
+      if (it->second.parts.at(listed[i].first).data.size() < _write.min_part_size) {
+        return s3_error(400, "EntityTooSmall", "a part other than the last is too small");
+      }
+    }
+    std::vector<std::uint8_t> data;
+    std::string etags;
+    for (auto const& [number, etag] : listed) {
+      auto const& part = it->second.parts.at(number);
+      data.insert(data.end(), part.data.begin(), part.data.end());
+      append_binary_digest(part.etag, etags);  // S3: md5(concat(binary part MD5s))-N
+    }
+    auto object = std::make_shared<stored_object_t>();
+    object->etag =
+      "\"" + digest_hex(etags.data(), etags.size()) + "-" + std::to_string(listed.size()) + "\"";
+    object->data = std::move(data);
+    write_response r;
+    r.headers = "Content-Type: application/xml\r\n";
+    r.body    = std::string(_write.complete_whitespace_prefix, ' ') +
+             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult "
+             "xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>http://127.0.0.1/" +
+             xml_escape(rec.bucket) + "/" + xml_escape(rec.key) + "</Location><Bucket>" +
+             xml_escape(rec.bucket) + "</Bucket><Key>" + xml_escape(rec.key) + "</Key><ETag>" +
+             xml_escape(object->etag) + "</ETag></CompleteMultipartUploadResult>";
+    _store.insert_or_assign(rec.key, std::move(object));
+    _uploads.erase(it);
+    return r;
+  }
+
+  static std::string xml_unescape(std::string_view s)
+  {
+    std::string out;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+      if (s[i] == '&') {
+        auto const rest = s.substr(i);
+        bool hit        = false;
+        for (auto const& [entity, c] : std::array<std::pair<std::string_view, char>, 5>{
+               {{"&quot;", '"'}, {"&amp;", '&'}, {"&lt;", '<'}, {"&gt;", '>'}, {"&apos;", '\''}}}) {
+          if (rest.starts_with(entity)) {
+            out += c;
+            i += entity.size() - 1;
+            hit = true;
+            break;
+          }
+        }
+        if (hit) { continue; }
+      }
+      out += s[i];
+    }
+    return out;
+  }
+
+  std::atomic<std::size_t>& write_counter(write_kind kind)
+  {
+    switch (kind) {
+      case write_kind::put_object: return _put_object_count;
+      case write_kind::create_upload: return _create_upload_count;
+      case write_kind::upload_part: return _upload_part_count;
+      case write_kind::complete_upload: return _complete_upload_count;
+      case write_kind::abort_upload: return _abort_upload_count;
+      case write_kind::delete_object: return _delete_object_count;
+    }
+    return _put_object_count;
+  }
+
+  /// @return (index among the requests of @p kind, index among the UploadParts of @p part).
+  std::pair<std::size_t, std::size_t> next_write_index(write_kind kind, unsigned part)
+  {
+    std::scoped_lock lock{_store_mutex};
+    auto const k                 = static_cast<std::size_t>(kind);
+    std::size_t const index      = _write_index[k]++;
+    std::size_t const part_index = kind == write_kind::upload_part ? _part_index[part]++ : 0;
+    return {index, part_index};
+  }
+
+  void record_write(write_record rec, int status)
+  {
+    rec.status = status;
+    std::scoped_lock lock{_store_mutex};
+    _write_records.push_back(std::move(rec));
   }
 
   static bool read_request(loopback_connection& conn, std::string& pending, std::string& request)
@@ -962,7 +1863,9 @@ class loopback_range_server {
     return out;
   }
 
-  [[nodiscard]] std::string list_xml() const
+  /// The fixture's listed objects (in their order, unfiltered), then the stored objects whose
+  /// key starts with @p prefix (key order).
+  [[nodiscard]] std::string list_xml(std::string const& prefix = {}) const
   {
     std::string body =
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
@@ -971,12 +1874,24 @@ class loopback_range_server {
       body += "<Contents><Key>" + xml_escape(object.key) + "</Key><Size>" +
               std::to_string(object.size) + "</Size></Contents>";
     }
+    {
+      std::scoped_lock lock{_store_mutex};
+      for (auto const& [key, object] : _store) {
+        if (!key.starts_with(prefix)) { continue; }
+        bool const listed = std::any_of(
+          _listed.begin(), _listed.end(), [&](listed_object const& l) { return l.key == key; });
+        if (listed) { continue; }
+        body += "<Contents><Key>" + xml_escape(key) + "</Key><Size>" +
+                std::to_string(object->data.size()) + "</Size><ETag>" + xml_escape(object->etag) +
+                "</ETag></Contents>";
+      }
+    }
     body += "</ListBucketResult>";
     return body;
   }
 
-  [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> parse_range(
-    std::string const& request) const
+  [[nodiscard]] static std::optional<std::pair<std::size_t, std::size_t>> parse_range(
+    std::string const& request, std::size_t object_size)
   {
     std::string lower = request;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
@@ -994,19 +1909,19 @@ class loopback_range_server {
 
     try {
       std::size_t start = 0;
-      std::size_t end   = _object.size() - 1;
+      std::size_t end   = object_size - 1;
       if (dash == 0) {
         auto const suffix = static_cast<std::size_t>(std::stoull(spec.substr(1)));
         if (suffix == 0) { return std::nullopt; }
-        start = suffix >= _object.size() ? 0 : _object.size() - suffix;
+        start = suffix >= object_size ? 0 : object_size - suffix;
       } else {
         start = static_cast<std::size_t>(std::stoull(spec.substr(0, dash)));
         if (dash + 1 < spec.size()) {
           end = static_cast<std::size_t>(std::stoull(spec.substr(dash + 1)));
         }
       }
-      if (start >= _object.size()) { return std::nullopt; }
-      end = std::min(end, _object.size() - 1);
+      if (start >= object_size) { return std::nullopt; }
+      end = std::min(end, object_size - 1);
       if (end < start) { return std::nullopt; }
       return std::pair{start, end};
     } catch (...) {
@@ -1016,6 +1931,7 @@ class loopback_range_server {
 
   bool send_body(loopback_connection& conn,
                  std::string_view headers,
+                 std::span<std::uint8_t const> object,
                  std::size_t start,
                  std::size_t size,
                  std::uint8_t mask,
@@ -1023,7 +1939,6 @@ class loopback_range_server {
                  bool chunked        = false,
                  std::size_t garbage = 0)
   {
-    std::span<std::uint8_t const> const object{_object};
     if (chunked) { return send_chunked(conn, headers, object.subspan(start, size), mask); }
     bool sent = false;
     if (mask == 0) {
@@ -1171,6 +2086,25 @@ class loopback_range_server {
   std::mutex _workers_mutex;
   std::vector<int> _client_fds;
   std::vector<std::thread> _workers;
+  // S3 writes (the store and its policy are guarded by _store_mutex).
+  s3_write_policy _write;
+  mutable std::mutex _store_mutex;
+  std::map<std::string, std::shared_ptr<stored_object_t const>> _store;
+  std::map<std::string, upload_t> _uploads;
+  std::size_t _next_upload_id{0};
+  std::array<std::size_t, 6> _write_index{};
+  std::map<unsigned, std::size_t> _part_index;
+  std::vector<write_record> _write_records;
+  std::atomic<std::size_t> _put_object_count{0};
+  std::atomic<std::size_t> _create_upload_count{0};
+  std::atomic<std::size_t> _upload_part_count{0};
+  std::atomic<std::size_t> _complete_upload_count{0};
+  std::atomic<std::size_t> _abort_upload_count{0};
+  std::atomic<std::size_t> _delete_object_count{0};
+  std::atomic<std::size_t> _expect_continue_count{0};
+  std::atomic<std::size_t> _write_body_bytes{0};
+  std::atomic<std::size_t> _active_part_uploads{0};
+  std::atomic<std::size_t> _peak_part_uploads{0};
 };
 
 class list_capable_mock_authorizer final : public io::rest::request_authorizer {
