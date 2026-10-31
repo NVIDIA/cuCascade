@@ -218,6 +218,12 @@ struct config {
 
   // -- placement ---------------------------------------------------------------
 
+  /// Number of least-backlogged REST reactors one read is split across (templated_ioctx's
+  /// dispatch).  1 <= fan_out <= the reactor count: with a configured @c rest_n_reactors a
+  /// larger value is rejected by @c rest_ioctx, except the default 2, which is clamped to a
+  /// one-reactor pool (the former hard-coded fan-out); with @c rest_n_reactors = 0 (sized from
+  /// the NIC) any value above the planned pool size is clamped to it without an error.
+  std::size_t fan_out{2};
   /// Egress interface whose queue IRQs size and place the reactor pool when
   /// @c io_config::rest_n_reactors is 0; empty = the default route's interface.
   std::string interface{};

@@ -66,7 +66,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @p n_reactors is a total; 0 sizes the pool from the egress NIC (one reactor per IRQ CPU,
   /// pinned to it at the highest permitted priority, when the NIC's queue IRQs are steered to a
   /// strict subset of its NUMA node's cores; the default 2 otherwise).
-  /// @throws std::invalid_argument when the config is invalid (@c config::validate).
+  /// @throws std::invalid_argument when the config is invalid (@c config::validate) or
+  /// @c rest.fan_out exceeds a positive @p n_reactors (the default fan-out of 2 is clamped to a
+  /// one-reactor pool instead, as the former hard-coded fan-out was).
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
   /// Counters of the whole pool: the reactors' @c transport_stats summed (extremes for the MSS

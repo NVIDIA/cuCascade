@@ -45,7 +45,8 @@ namespace cucascade::io::rest {
 namespace {
 
 /// Size the pool (rest_n_reactors 0 = auto from the egress NIC's IRQ steering) and compute the
-/// placement every reactor applies to its own thread before it creates its ring.
+/// placement every reactor applies to its own thread before it creates its ring.  Also checks
+/// the dispatch fan-out against the reactor count.
 std::shared_ptr<detail::pool_placement const> plan_pool(
   std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> const& ctx)
 {
@@ -61,6 +62,12 @@ std::shared_ptr<detail::pool_placement const> plan_pool(
     nic.reset();  // no NIC information: the default count, unpinned
   }
   auto plan = plan_rest_pool(n_reactors, cfg.pin_to_irq_cpus, nic);
+  // The default (2) is clamped to a one-reactor pool, as the hard-coded fan-out always was;
+  // an explicit value above the configured count is a configuration error.
+  if (n_reactors > 0 && cfg.fan_out > n_reactors && cfg.fan_out != config{}.fan_out) {
+    throw std::invalid_argument("rest_ioctx: rest.fan_out (" + std::to_string(cfg.fan_out) +
+                                ") exceeds rest_n_reactors (" + std::to_string(n_reactors) + ")");
+  }
   // Reactor 0 logs the one startup line once its thread is placed (the priority is known then).
   return std::make_shared<detail::pool_placement const>(
     detail::pool_placement{std::move(plan), std::move(nic)});
@@ -95,6 +102,9 @@ rest_ioctx::rest_ioctx(std::shared_ptr<detail::pool_placement const> placement,
                         : _reactors.front()->get_config().list_max_matches,
       "rest_ioctx::list_objects")
 {
+  // An auto-sized pool may be smaller than the configured fan-out: dispatch spans all of it.
+  _config.fan_out =
+    std::clamp<std::size_t>(_config.fan_out, 1, std::max<std::size_t>(1, _reactors.size()));
   // Created once here and never reassigned: payload leases capture it by
   // shared_ptr (so they may outlive this ioctx) and the stash gauges read it
   // without the coordination mutex.
