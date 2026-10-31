@@ -23,9 +23,9 @@
 /// once for free, warm-up issues exactly max_connections zero-key LIST exchanges once per
 /// conn_max_age on fresh connections, HTTP/1.1 upkeep is off by default and staggered when on;
 /// plus sockets closed with RST (no TIME_WAIT), the min_mtu rejection (through the MSS probe
-/// seam), the pool size and reactor pinning of the placement plan, the same-pass start
-/// invariant of the worker loop, the request_timeout bound of control-plane calls, and config
-/// validation.
+/// seam), the dispatch fan-out, the pool size and reactor pinning of the placement plan, the
+/// same-pass start invariant of the worker loop, the request_timeout bound of control-plane
+/// calls, and config validation.
 
 #include "io/rest/net/uring_transport.hpp"
 #include "io/rest/reactor_placement.hpp"
@@ -677,6 +677,54 @@ TEST_CASE("rest connections below min_mtu are reset and replaced, then accepted 
     CHECK(stats.connects == 1);
     CHECK(stats.mss_min == 1000);
   }
+}
+
+// ---- fan-out ------------------------------------------------------------------------------------
+
+TEST_CASE("rest dispatch splits one read across fan_out reactors", "[rest][fan_out]")
+{
+  auto const fan_out = GENERATE(std::size_t{1}, std::size_t{2}, std::size_t{4});
+  CAPTURE(fan_out);
+  auto payload = rest_test_payload(1UL << 20);
+  loopback_range_server server(payload);
+  auto cfg    = rest_contract_config();
+  cfg.fan_out = fan_out;
+  auto ioctx  = make_ioctx(server.endpoint(), cfg, 4);
+  rest_shutdown_guard cleanup{*ioctx};
+  REQUIRE(ioctx->reactor_count() == 4);
+  auto object = ioctx->open_io_object("s3://fan-bucket/object.bin", payload.size());
+  std::vector<std::uint8_t> out(payload.size());
+  std::vector<slice> slices;
+  for (std::size_t i = 0; i < 16; ++i) {
+    slices.push_back(slice{i * (64UL << 10), 64UL << 10, out.data() + i * (64UL << 10)});
+  }
+  REQUIRE(std::move(ioctx->host_readv_async_io(*object, slices)).get(30s) == payload.size());
+  require_rest_bytes_equal(out, payload);
+  std::size_t used = 0;
+  for (std::size_t r = 0; r < 4; ++r) {
+    auto const s =
+      wait_for_stats(*ioctx, [](transport_stats const& st) { return st.passes > 0; }, r);
+    if (s.requests_started > 0) { ++used; }
+  }
+  CHECK(used == fan_out);
+}
+
+TEST_CASE("rest fan_out is validated against the reactor count", "[rest][fan_out][config]")
+{
+  loopback_range_server server(rest_test_payload(64));
+  auto cfg = rest_contract_config();
+  auto ctx = [&](rest::config c) {
+    return std::make_shared<rest_reactor::reactor_context>(
+      c, std::make_shared<list_capable_mock_authorizer>(server.endpoint()), nullptr);
+  };
+  cfg.fan_out = 3;
+  CHECK_THROWS_AS(rest_ioctx(2, ctx(cfg)), std::invalid_argument);
+  cfg.fan_out = 0;
+  CHECK_THROWS_AS(rest_ioctx(2, ctx(cfg)), std::invalid_argument);
+  cfg.fan_out = 2;  // the default is clamped to a one-reactor pool, as it always was
+  CHECK_NOTHROW(rest_ioctx(1, ctx(cfg)));
+  cfg.fan_out = 2;
+  CHECK_NOTHROW(rest_ioctx(2, ctx(cfg)));
 }
 
 // ---- placement ----------------------------------------------------------------------------------

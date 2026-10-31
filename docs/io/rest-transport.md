@@ -10,7 +10,7 @@ reactor contract.
 
 | Layer | Where | Role |
 |---|---|---|
-| `rest_ioctx` | `src/io/rest/rest_ioctx.cpp` | pool sizing and placement (`plan_rest_pool`), warm-up rate limit, LIST, batched footer resolve, `stats()` |
+| `rest_ioctx` | `src/io/rest/rest_ioctx.cpp` | pool sizing and placement (`plan_rest_pool`), dispatch fan-out, warm-up rate limit, LIST, batched footer resolve, `stats()` |
 | `rest_reactor` + `reactor_worker` | `src/io/rest/rest_reactor.cpp` | one worker thread: two-tier request queue (demand before prefetch), control-plane queue (HEAD, footer probe, LIST, warm-up), adaptive physical GET planner, retries, staged device copies |
 | `uring_transport` | `src/io/rest/net/uring_transport.{hpp,cpp}` | one ring, `max_connections` slots, one keep-alive connection per slot, the HTTP exchange state machine |
 | `tls_stream` / `tls_support` | `src/io/rest/net/tls_stream.{hpp,cpp}` | after the handshake: kTLS, or the user-space record layer (ciphertext ring + `tls::record_opener` / `record_sealer`) |
@@ -95,7 +95,8 @@ runnable (`epoll_pwait2` over the wake-up eventfd, the retry timerfd and the rin
 `rest_n_reactors` is a total. `0` sizes the pool from the egress NIC (`rest.interface`, else the
 default route): when its queue IRQs are steered to a strict subset of its NUMA node's cores, one
 reactor per IRQ CPU, each pinned to it (`pin_to_irq_cpus`) and raised to the highest priority the
-process may set before it creates its ring; otherwise 2, unpinned.
+process may set before it creates its ring; otherwise 2, unpinned. `fan_out` (2) is the number of
+least-backlogged reactors one read is split across.
 
 ## Counters
 
