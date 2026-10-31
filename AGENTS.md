@@ -1,9 +1,9 @@
 # AGENTS.md
 
-cuCascade is a C++20/CUDA library for tiered (GPU, host, disk) memory management and data
-representation, plus an optional async I/O layer (local and object-store datasources, prefetching
-cache). Each library is built as `<name>_shared` and `<name>_static`, with strict layering
-(top depends on bottom):
+cuCascade is a C++20/CUDA library for tiered (GPU, host, disk, remote) memory management and
+data representation, plus an optional async I/O layer (local and object-store datasources,
+prefetching cache). Each library is built as `<name>_shared` and `<name>_static`, with strict
+layering (top depends on bottom):
 
 | Library | Sources | Depends on |
 | --- | --- | --- |
@@ -97,10 +97,13 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
 - Change tiers with `mutable_data_batch::convert_to`, not `set_data`: `set_data` destroys the old
   representation immediately, without synchronizing or recording a writer event.
 - The converter registry starts empty. `register_builtin_converters()`
-  (`cucascade/cudf/builtin_converters.hpp`) adds the GPU/host/disk converters; registering a pair
-  twice throws.
+  (`cucascade/cudf/builtin_converters.hpp`) adds the GPU/host/disk/remote converters; registering a
+  pair twice throws.
 - `disk_data_representation` deletes its file on destruction, and its `clone()` always throws;
   materialize to another tier through a converter.
+- `Tier` has four values (`GPU`, `HOST`, `DISK`, `REMOTE`); REMOTE spaces spill to an S3 object
+  store (`docs/io/remote-tier-design.md`). Tier switches have `default:` branches, so the compiler
+  does not flag a missing tier: grep `Tier::` when adding one.
 - A repository's ordering mode (`ORDERED` / `UNORDERED`) is set by its first insertion, applies to
   all partitions and is never reset; mixing `add_data_batch` and `add_data_batch_at_position`
   throws. New methods follow the public-locks / protected `*_unlocked` hook pattern. Pops and
