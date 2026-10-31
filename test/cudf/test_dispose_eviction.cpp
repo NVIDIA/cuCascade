@@ -21,8 +21,14 @@
 #include <catch2/catch_all.hpp>
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <new>
+#include <optional>
 #include <regex>
 #include <string>
+#include <vector>
 
 namespace {
 using namespace cucascade::test;
@@ -90,4 +96,67 @@ TEST_CASE("dispose_on_idle keeps a chunk a live request still shares", "[cache][
   INFO(cache->summary());
   CHECK(wait_for_cache([&] { return cache->claimed_bytes() < 4 * chunk; }, 2s));
   CHECK(cache->claimed_bytes() == 3 * chunk);
+}
+
+TEST_CASE("a failed prefetch request hand-off rolls back only its own subscriptions",
+          "[cache][cache_subscription]")
+{
+  // sirius-db/sirius#2314: a request that subscribed to its chunks but never
+  // reached the evictor (allocating or enqueueing it failed) must drop those
+  // subscriptions exactly once, and only those.  The failure is injected at
+  // the hand-off; a failure part-way through chunk acquisition takes the same
+  // rollback guard but has no seam to inject it.
+  using access = cucascade::io::cache::fs_cache_test_access;
+  using cucascade::io::cache::cache_handle;
+  using byte_range = cucascade::io::cache::fs_cache::byte_range;
+  cache_test_fixture fixture{allocation_cache_config(eviction_policy::idle)};
+  auto* cache = fixture.context->cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->is_armed());
+  auto const chunk_bytes = cache->chunk_size();
+  auto source            = fixture.open("controlled://subscription", 3 * chunk_bytes);
+  auto const& object     = source->get_io_object();
+  std::vector<byte_range> const first{{0, 1}};
+  std::vector<byte_range> const all{{0, static_cast<std::int64_t>(3 * chunk_bytes)}};
+
+  // A live request shares the first chunk with the one that fails.
+  auto survivor = access::request(*cache, object, first);
+  REQUIRE(survivor.chunks()->size() == 1);
+  CHECK(survivor.chunks()->front()->state.get_subscribers() == 1);
+
+  struct hook_reset {
+    cucascade::io::cache::fs_cache& cache;
+    ~hook_reset() { cache.set_before_request_enqueue_for_testing({}); }
+  } reset{*cache};
+  int failures = 0;
+  cache->set_before_request_enqueue_for_testing([&failures] {
+    ++failures;
+    throw std::bad_alloc();
+  });
+  std::optional<cache_handle> rejected;
+  CHECK_THROWS_AS(rejected.emplace(access::request(*cache, object, all)), std::bad_alloc);
+  CHECK(failures == 1);
+  CHECK_FALSE(rejected.has_value());
+  cache->set_before_request_enqueue_for_testing({});
+  // The survivor keeps its own subscription; the failed request left none.
+  CHECK(survivor.chunks()->front()->state.get_subscribers() == 1);
+
+  // A retry subscribes once to each chunk, on top of the survivor's.
+  auto request = access::request(*cache, object, all);
+  auto chunks  = request.chunks();
+  REQUIRE(chunks->size() == 3);
+  for (std::size_t i = 0; i < chunks->size(); ++i) {
+    INFO("chunk " << i);
+    CHECK((*chunks)[i]->state.get_subscribers() == (i == 0 ? 2U : 1U));
+  }
+
+  // Disposing the retry and driving the evictor releases exactly its
+  // subscriptions: the survivor (which keeps the generation alive) still
+  // holds the first chunk.
+  request = {};
+  cache->evict_sync(1);
+  for (std::size_t i = 0; i < chunks->size(); ++i) {
+    INFO("chunk " << i);
+    CHECK((*chunks)[i]->state.get_subscribers() == (i == 0 ? 1U : 0U));
+  }
 }

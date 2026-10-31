@@ -7,7 +7,7 @@ A high-performance GPU memory management library for data-intensive applications
 
 
 **Key Features:**
-- **Tiered Memory Management**: Seamlessly manage GPU (fastest), pinned host (medium), and disk (largest capacity) memory tiers, provides numa aware allocators
+- **Tiered Memory Management**: Seamlessly manage GPU (fastest), pinned host (medium), disk (large capacity) and remote object-store (S3, effectively unbounded) memory tiers, provides numa aware allocators
 - **Memory Reservation System**: Avoid oversubscribing your GPU by making reservations and using allocators that respect reservations
 - **Hardware Topology Discovery**: Automatic detection of NUMA regions and GPU-CPU affinity for optimal memory placement
 - **Stream-Aware Tracking**: Per-stream memory usage tracking and reservation enforcement
@@ -49,7 +49,7 @@ pixi run benchmarks
 - **Dependencies**: RMM (core); libcudf 25.10+ (only for the optional `cucascade-cudf` library)
 
 > **Library layout:** the core `cuCascade::cucascade` target is cudf-free and depends only on
-> RMM + CUDA (plus libnuma and kvikIO/cuFile for the disk tier). The cudf-backed representations,
+> RMM + CUDA (plus libnuma and cuFile for the disk tier). The cudf-backed representations,
 > converters, and bandwidth profiler live in a separate `cuCascade::cucascade_cudf` target (headers
 > under `include/cucascade/cudf/`). The cudf library can be turned off at configure time with
 > `-DCUCASCADE_BUILD_CUDF=OFF`.

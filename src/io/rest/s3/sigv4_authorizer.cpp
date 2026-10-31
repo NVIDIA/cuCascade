@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -98,20 +99,13 @@ sigv4_signer_config make_signer(static_credentials const& creds, std::string con
   return signer;
 }
 
-std::string_view method_to_str(request_method method)
-{
-  switch (method) {
-    case request_method::GET: return "GET";
-    case request_method::HEAD: return "HEAD";
-  }
-  return "GET";  // unreachable; all enumerators handled
-}
+std::string_view method_to_str(request_method method) { return to_string(method); }
 
 // Reject X-Amz-* parameters case-insensitively to prevent signing-parameter
 // injection: a caller-supplied X-Amz-* key would otherwise be merged into the
 // signed set (presigned mode) or signed verbatim (header mode), duplicating or
 // overriding the authorizer's own signing parameters.
-void reject_amz_query_params(std::string_view canonical_query)
+void reject_amz_query_params(std::string_view canonical_query, std::string_view what = "a LIST")
 {
   constexpr std::string_view k_amz = "x-amz-";
   for (std::size_t b = 0; b < canonical_query.size();) {
@@ -128,9 +122,9 @@ void reject_amz_query_params(std::string_view canonical_query)
         }
       }
       if (amz) {
-        throw credential_error(
-          "sigv4_authorizer: X-Amz-* keys are not allowed in a LIST canonical query (got '" +
-          std::string{key} + "')");
+        throw credential_error("sigv4_authorizer: X-Amz-* keys are not allowed in " +
+                               std::string{what} + " canonical query (got '" + std::string{key} +
+                               "')");
       }
     }
     if (amp == std::string::npos) { break; }
@@ -172,6 +166,11 @@ authorized_request sigv4_presigned_authorizer::authorize(object_ref const& obj,
                                                          request_method method,
                                                          std::chrono::seconds timeout)
 {
+  if (method != request_method::GET && method != request_method::HEAD) {
+    // Write methods are signed by authorize_request (a PUT / POST carries a body).
+    return authorize_request(request_spec{obj, method, {}, method != request_method::DELETE},
+                             timeout);
+  }
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);
 
@@ -226,6 +225,39 @@ authorized_request sigv4_presigned_authorizer::authorize_list(std::string_view b
   }
 }
 
+authorized_request sigv4_presigned_authorizer::authorize_request(request_spec const& spec,
+                                                                 std::chrono::seconds timeout)
+{
+  if (spec.query.empty() &&
+      (spec.method == request_method::GET || spec.method == request_method::HEAD)) {
+    return authorize(spec.object, spec.method, timeout);
+  }
+  auto const canonical_uri = make_canonical_uri(spec.object);
+  reject_amz_query_params(spec.query, "a request");
+  auto const signer        = make_signer(_creds, _region);
+  auto const effective_ttl = timeout.count() > 0 ? timeout : _ttl;
+
+  try {
+    // The method and the sub-resource query are part of the canonical request;
+    // presign_url merges the query with the X-Amz-* params (re-sorted) and signs
+    // UNSIGNED-PAYLOAD over `host` only, so the body and every other header
+    // (Content-Length, If-None-Match, Expect) stay outside the signature.
+    return authorized_request{presign_url(method_to_str(spec.method),
+                                          _scheme,
+                                          _host,
+                                          canonical_uri,
+                                          signer,
+                                          std::time(nullptr),
+                                          effective_ttl,
+                                          canonical_query_string(spec.query)),
+                              {}};
+  } catch (credential_error const&) {
+    throw;
+  } catch (std::exception const& e) {
+    throw credential_error(std::string("sigv4_presigned_authorizer: ") + e.what());
+  }
+}
+
 sigv4_header_authorizer::sigv4_header_authorizer(static_credentials creds,
                                                  std::string region,
                                                  std::string endpoint)
@@ -235,8 +267,13 @@ sigv4_header_authorizer::sigv4_header_authorizer(static_credentials creds,
 
 authorized_request sigv4_header_authorizer::authorize(object_ref const& obj,
                                                       request_method method,
-                                                      std::chrono::seconds /*timeout*/)
+                                                      std::chrono::seconds timeout)
 {
+  if (method != request_method::GET && method != request_method::HEAD) {
+    // Write methods are signed by authorize_request: a PUT / POST body is UNSIGNED-PAYLOAD.
+    return authorize_request(request_spec{obj, method, {}, method != request_method::DELETE},
+                             timeout);
+  }
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);
 
@@ -292,6 +329,57 @@ authorized_request sigv4_header_authorizer::authorize_list(std::string_view buck
   } catch (std::exception const& e) {
     throw credential_error(std::string("sigv4_header_authorizer: ") + e.what());
   }
+}
+
+authorized_request sigv4_header_authorizer::authorize_request(request_spec const& spec,
+                                                              std::chrono::seconds timeout)
+{
+  if (spec.query.empty() && !spec.has_body &&
+      (spec.method == request_method::GET || spec.method == request_method::HEAD)) {
+    return authorize(spec.object, spec.method, timeout);
+  }
+  auto const canonical_uri = make_canonical_uri(spec.object);
+  reject_amz_query_params(spec.query, "a request");
+  auto const signer = make_signer(_creds, _region);
+
+  try {
+    // S3 bodies are sent unhashed (gpuio S3: UNSIGNED-PAYLOAD for PUT and GET; hashing would
+    // add a SHA-256 pass over every uploaded byte); a request without a body signs sha256("")
+    // as authorize() does. The canonical query is signed; the URL carries it as given.
+    auto signed_req = sign_request(method_to_str(spec.method),
+                                   _host,
+                                   canonical_uri,
+                                   canonical_query_string(spec.query),
+                                   spec.has_body ? std::string{"UNSIGNED-PAYLOAD"} : sha256_hex(""),
+                                   /*extra_headers=*/{},
+                                   signer,
+                                   std::time(nullptr));
+    std::string url = _scheme + "://" + _host + canonical_uri;
+    if (!spec.query.empty()) {
+      url += '?';
+      url += spec.query;
+    }
+    return authorized_request{std::move(url), std::move(signed_req.headers)};
+  } catch (credential_error const&) {
+    throw;
+  } catch (std::exception const& e) {
+    throw credential_error(std::string("sigv4_header_authorizer: ") + e.what());
+  }
+}
+
+std::shared_ptr<request_authorizer> make_authorizer(object_store_config const& os)
+{
+  if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
+    return nullptr;
+  }
+  auto creds = static_credentials_from(os);
+  switch (os.s3_signing_mode) {
+    case object_store_config::signing_mode::header:
+      return std::make_shared<sigv4_header_authorizer>(std::move(creds), os.region, os.endpoint);
+    case object_store_config::signing_mode::presigned:
+      return std::make_shared<sigv4_presigned_authorizer>(std::move(creds), os.region, os.endpoint);
+  }
+  return nullptr;
 }
 
 }  // namespace cucascade::io::rest::s3
