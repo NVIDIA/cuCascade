@@ -56,26 +56,6 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
   return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 }
 
-/// Build a SigV4 authorizer from the object-store credentials, or nullptr when
-/// the store is not configured (empty endpoint / credentials / region — which
-/// disables the REST backend).  The signing form follows @c s3_signing_mode.
-std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_config& os)
-{
-  if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
-    return nullptr;
-  }
-  auto creds = rest::s3::static_credentials_from(os);
-  switch (os.s3_signing_mode) {
-    case object_store_config::signing_mode::header:
-      return std::make_shared<rest::s3::sigv4_header_authorizer>(
-        std::move(creds), os.region, os.endpoint);
-    case object_store_config::signing_mode::presigned:
-      return std::make_shared<rest::s3::sigv4_presigned_authorizer>(
-        std::move(creds), os.region, os.endpoint);
-  }
-  return nullptr;
-}
-
 }  // namespace
 
 using scheme_checker_type = io_context_registry::scheme_checker_type;
@@ -122,7 +102,7 @@ factory_type make_rest_ioctx_factory(
 {
   return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      auto authorizer = make_s3_authorizer(config.object_store);
+      auto authorizer = rest::s3::make_authorizer(config.object_store);
       if (!authorizer) {
         CUCASCADE_LOG_WARN(
           "make_rest_ioctx_factory: object store not configured (endpoint / credentials / "

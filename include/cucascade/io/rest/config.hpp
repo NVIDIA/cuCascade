@@ -325,4 +325,15 @@ struct config {
   void validate() const;
 };
 
+/**
+ * @brief The most GETs the REST reactor cuts one contiguous read of @p bytes into under @p cfg.
+ *
+ * The adaptive segment planner cuts a read at a target between @c min_segment_bytes and
+ * @c max_segment_bytes that follows the backlog; the worst case is the smallest target:
+ * max(1, bytes / min_segment_bytes, ceil(bytes / max_segment_bytes)).  GETs are not cut at an
+ * object's multipart part boundaries.  A device read stages every GET in whole blocks of the
+ * context's pinned staging, so this is what a caller budgeting that staging needs.  At least 1.
+ */
+[[nodiscard]] std::size_t max_read_gets(config const& cfg, std::uint64_t bytes) noexcept;
+
 }  // namespace cucascade::io::rest
