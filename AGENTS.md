@@ -101,7 +101,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to 
 - Hash structs suffixed with `_hash`: `converter_key_hash`
 - RAII handles suffixed with `_handle`: `data_batch_processing_handle`
 - Error category structs suffixed with `_category`: `memory_error_category`
-- Exception: `Tier` enum uses PascalCase name, UPPER_CASE values: `Tier::GPU`, `Tier::HOST`, `Tier::DISK`
+- Exception: `Tier` enum uses PascalCase name, UPPER_CASE values: `Tier::GPU`, `Tier::HOST`, `Tier::DISK`, `Tier::REMOTE`
 - Exception: `MemoryError` uses PascalCase name, UPPER_CASE values: `MemoryError::ALLOCATION_FAILED`
 - `snake_case`: `get_available_memory()`, `make_reservation_or_null()`
 - Getters prefixed with `get_`: `get_tier()`, `get_device_id()`, `get_batch_id()`
@@ -216,7 +216,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to 
 ## Architecture
 
 ## Pattern Overview
-- Three memory tiers represented by `Tier::GPU`, `Tier::HOST`, `Tier::DISK` enum values (`include/cucascade/memory/common.hpp`)
+- Four memory tiers represented by `Tier::GPU`, `Tier::HOST`, `Tier::DISK`, `Tier::REMOTE` enum values (`include/cucascade/memory/common.hpp`); REMOTE spaces spill to an S3 object store (`docs/io/remote-tier-design.md`). Tier switches have `default:` branches, so the compiler does not flag a missing tier: grep `Tier::` when adding one
 - Strategy pattern for reservation requests; converter registry pattern for data tier transitions
 - RAII-first ownership: reservations, processing handles, streams, and disk files all release automatically on destruction
 - `data_batch` uses 3-class system with `data_batch`, `read_only_data_batch` and `mutable_data_batch`
@@ -332,7 +332,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and io_uring) to 
 ## Entry Points
 - Location: `include/cucascade/memory/reservation_manager_configurator.hpp`
 - Triggers: Application initialization
-- Responsibilities: Fluent builder collects GPU/HOST/DISK settings → `build()` emits `vector<memory_space_config>` → caller passes to `memory_reservation_manager` constructor
+- Responsibilities: Fluent builder collects GPU/HOST/DISK/REMOTE settings → `build()` emits `vector<memory_space_config>` → caller passes to `memory_reservation_manager` constructor
 - Location: `include/cucascade/memory/memory_reservation_manager.hpp`
 - Triggers: `request_reservation(strategy, size)`
 - Responsibilities: Evaluate strategy → iterate candidate `memory_space` objects → call `make_reservation_or_null()` → block and wait on `_wait_cv` if none available

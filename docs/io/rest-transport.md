@@ -180,6 +180,18 @@ every claim exactly once.
   without sending them.
 - **User-space TLS:** bodies are sealed 16 records (256 KiB) per SEND (`tx_batch_records`).
   kTLS sends straight from the body iovecs.
+- **Delete:** `ioctx::remove_io_object[_async]` maps to `DeleteObject` (`DELETE /bucket/key`), a
+  control job on the ioctx's control reactor signed from its request spec like
+  AbortMultipartUpload, retried with `max_retry_attempts` (403 final). 2xx is success; so is a
+  404 `NoSuchKey`, or a 404 without a code whose error body was read to its end (the key is gone,
+  also while the reactor stops); another 404 (e.g. `NoSuchBucket`) fails, and a 404 whose error
+  body was cut or not drained is retried like a transport error. `io_priority::low` queues it
+  behind data work (started only when no reads or writes wait). The job owns the promise, so the
+  future may be dropped; before `start()` / after `shutdown()` it runs on a private helper like
+  `head_object`; a delete queued or in flight at shutdown fails with `operation_canceled`. The
+  ioctx front end invalidates the path before and after, as for a write. The REMOTE memory tier
+  deletes its objects this way (remote-tier-design.md); the local backends report
+  `not_supported`.
 - **Object:** `rest_write_object::size()` is the end of the highest byte written,
   `validation_tag()` empty until the commit and the new ETag after it; its identity is
   `opened_handle` of size 0, as for every writable object. Lifetime: flush or drop every write
@@ -204,4 +216,4 @@ sends, receives, direct and scratch bytes, timeouts and stalls, kTLS control rec
 rejects and fallbacks, the smallest and largest MSS observed; for writes: PUTs and UploadParts
 (and their bytes, of which zeros), creates, completes, Complete re-sends after a `200 OK` +
 `<Error>`, aborts, commits and commit failures, write failures, D2H copies, part-buffer waits and
-the part buffers live.
+the part buffers live; DeleteObject requests (`deletes`).
