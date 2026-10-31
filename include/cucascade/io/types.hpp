@@ -20,13 +20,16 @@
 
 #include <cucascade/exec/invocable.hpp>
 #include <cucascade/io/byte_range.hpp>
+#include <cucascade/io/object_identity.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -42,11 +45,29 @@
 
 namespace cucascade::io::cache {
 struct cached_chunk;
-}
+class metadata_store;
+}  // namespace cucascade::io::cache
+
+namespace cucascade::io {
+class ioctx;
+}  // namespace cucascade::io
 
 namespace cucascade::io {
 
 inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
+
+/// The granule writes are split at: @c max(IO_BLOCK_SIZE, page size).  The
+/// aligned body of a write goes O_DIRECT and its unaligned head / tail through
+/// the page cache; splitting at a page boundary keeps the two from ever sharing
+/// a page (64 KiB pages on some aarch64 systems).
+[[nodiscard]] inline std::size_t write_granule() noexcept
+{
+  static std::size_t const granule = [] {
+    auto const page = ::sysconf(_SC_PAGESIZE);
+    return page > 0 ? std::max(IO_BLOCK_SIZE, static_cast<std::size_t>(page)) : IO_BLOCK_SIZE;
+  }();
+  return granule;
+}
 
 /**
  * @brief RAII wrapper for a POSIX file descriptor.
@@ -83,8 +104,8 @@ struct file_descriptor {
 
 /**
  * @brief Abstract per-file handle.  A passive bag of native handles
- * produced by a backend reactor (e.g. file descriptors, CURL easy
- * handles, S3 client state).  Performs no I/O of its own.
+ * produced by a backend reactor (e.g. file descriptors, an S3 object's
+ * bucket, key and validator).  Performs no I/O of its own.
  *
  * Inherits from @c std::enable_shared_from_this so the prefetching cache can
  * take a reference to an io_object and safely extend its lifetime via
@@ -95,9 +116,48 @@ class io_object : public std::enable_shared_from_this<io_object> {
  public:
   virtual ~io_object() = default;
 
-  /// Stable identifier used as the prefetching-cache key.  Often equal to
-  /// @c object_path() but may differ for backends that need to distinguish
-  /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
+  /// This open's process-wide order (see @ref next_open_generation): a later
+  /// open of a path has a larger generation than an earlier one.
+  [[nodiscard]] std::uint64_t open_generation() const noexcept { return _open_generation; }
+
+  /// The evidence that another open of this path sees the same version of the
+  /// object.  A backend overrides it with what it can prove (a local file's
+  /// stat tuple, a remote object's strong validator).  The default uses
+  /// @ref validation_tag as an @c object_tag only when the backend declares it
+  /// strong via @ref validation_tag_is_strong. Otherwise the identity is
+  /// scoped to this open (@c opened_handle, versioned by @ref open_generation),
+  /// never to the path.  A writable object always has an @c opened_handle
+  /// identity of size 0: its bytes and size change as it is written, so nothing
+  /// derived from them may be reused through another open, and its identity
+  /// stays stable while it grows.
+  [[nodiscard]] virtual object_identity identity() const
+  {
+    object_identity result;
+    auto const tag = validation_tag();
+    if (writable() || tag.empty() || !validation_tag_is_strong()) {
+      result.kind    = identity_kind::opened_handle;
+      result.size    = writable() ? 0 : size();
+      result.version = std::to_string(_open_generation);
+    } else {
+      result.kind    = identity_kind::object_tag;
+      result.size    = size();
+      result.version = std::string(tag);
+    }
+    return result;
+  }
+
+  /// The key of this object's version: @ref identity framed with
+  /// @ref raw_file_cache_id.  Two opens with equal keys may share what was
+  /// derived from either (the @c fs_cache keys its generations by it).
+  [[nodiscard]] std::string identity_cache_key() const
+  {
+    return identity().cache_key(raw_file_cache_id());
+  }
+
+  /// Backend locator, part of the identity-aware prefetching-cache key (see
+  /// @ref identity_cache_key).  Often equal to @c object_path() but may differ
+  /// for backends that need to distinguish otherwise-equal paths (versioned S3
+  /// keys, normalized URLs, …).
   [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
 
   /// The path / URL / key the caller used to construct this object.
@@ -111,10 +171,51 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// unavailable.  HTTP backends preserve quotes and a weak W/ prefix.  A
   /// backend decides whether it may be sent back as a request condition: the
   /// REST reactor sends a strong tag as @c If-Match on its data GETs and never
-  /// sends a weak or otherwise unusable one.  The view is valid for this
-  /// object's lifetime.
+  /// sends a weak or otherwise unusable one. The default identity uses a
+  /// nonempty tag only when @ref validation_tag_is_strong holds. The view is
+  /// valid for this object's lifetime.
   [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
+
+  /// Whether a nonempty validation_tag() is a strong validator: equal tags
+  /// of the same size at the same raw_file_cache_id() name byte-identical
+  /// versions. Default false: an opaque tag is not reusable evidence.
+  [[nodiscard]] virtual bool validation_tag_is_strong() const noexcept { return false; }
+
+  /// True for objects returned by @c ioctx::open_io_object_for_write: the write
+  /// API accepts them.  Objects opened for reading are read-only.
+  [[nodiscard]] virtual bool writable() const noexcept { return false; }
+
+  /// A physical write ending at byte @p end completed through this object.  A
+  /// writable object grows @ref size to cover it (an atomic maximum), so reads
+  /// issued after the write's future resolved clamp to the extended size.
+  /// Called by @c io_op_request::finish_success for write operations; a no-op
+  /// for read-only objects.
+  virtual void note_written(std::size_t /*end*/) const noexcept {}
+
+ private:
+  friend class ioctx;
+  friend class cache::metadata_store;
+
+  /// The metadata store's invalidation epoch of this object's path when an
+  /// ioctx opened it (see @c cache::metadata_store::register_metadata): metadata
+  /// parsed through an object opened before a write of its path is dropped.
+  std::uint64_t _metadata_epoch{0};
+
+  std::uint64_t const _open_generation = next_open_generation();
 };
+
+/// Whether a backend opened an @c io_object for reading only or for reading and
+/// writing.  A scoped enum so that no argument of another type converts to it.
+enum class io_access : std::uint8_t { read_only, read_write };
+
+/// Raise @p target to @p value if it is smaller (an atomic maximum).
+inline void atomic_store_max(std::atomic<std::size_t>& target, std::size_t value) noexcept
+{
+  auto current = target.load(std::memory_order_relaxed);
+  while (current < value &&
+         !target.compare_exchange_weak(
+           current, value, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+}
 
 class io_object_metadata {
  public:
@@ -158,6 +259,52 @@ struct slice {
 
   range rng;
   std::uint8_t* dst{nullptr};
+};
+
+// ---------------------------------------------------------------------------
+// Write vocabulary
+// ---------------------------------------------------------------------------
+
+/// How @c ioctx::open_io_object_for_write opens a local file.  Every mode opens
+/// the file for reading and writing.
+enum class write_mode : std::uint8_t {
+  create_or_truncate,  ///< create if missing, truncate to zero bytes otherwise
+  create_or_open,      ///< create if missing, keep the existing content otherwise
+  open_existing,       ///< fail with @c ENOENT if missing; keep the existing content
+  create_new,          ///< fail with @c EEXIST if present
+};
+
+/// Options of @c ioctx::open_io_object_for_write.
+struct write_open_options {
+  write_mode mode{write_mode::create_or_truncate};  ///< open / create behaviour
+  ::mode_t permissions{0644};                       ///< mode of a newly created file
+  /// Best-effort preallocation hint in bytes (@c fallocate with
+  /// @c FALLOC_FL_KEEP_SIZE); 0 = none.  Never changes @c size(); a backend or
+  /// filesystem that cannot preallocate ignores it.
+  std::uint64_t size_hint{0};
+};
+
+/**
+ * @brief One segment of a vectored write: the file range
+ *        [offset, offset + size) and the bytes to write there.
+ *
+ * @c src is host or device memory depending on the API it is passed to.  It
+ * must stay valid and unmodified until the write's future resolves.
+ */
+struct write_slice {
+  write_slice() noexcept = default;
+
+  write_slice(std::size_t offset, std::size_t size, std::uint8_t const* src) noexcept
+    : rng{offset, size}, src{src}
+  {
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept { return rng.size; }
+
+  [[nodiscard]] std::size_t offset() const noexcept { return rng.offset; }
+
+  range rng;
+  std::uint8_t const* src{nullptr};
 };
 
 struct host_buffer {
@@ -211,11 +358,16 @@ struct device_buffer {
   }
 
   std::uint8_t* data{nullptr};
-  // Default to the null stream explicitly: cuda::stream_ref's default
-  // constructor is deprecated by CCCL, so initialize from cudaStream_t{nullptr}
-  // to preserve the same null-stream semantics without the warning.
+  // The dispatcher pins null to cudaStreamLegacy and replaces cudaStreamPerThread
+  // with a stand-in: a reactor never sees a default handle whose meaning depends
+  // on its translation unit or thread. Initialize explicitly (CCCL deprecates
+  // stream_ref's default constructor).
   ::cuda::stream_ref stream{cudaStream_t{nullptr}};
   int device_id{-1};
+  /// Keeps alive a stream the dispatcher created in place of the caller's
+  /// (see @c detail::resolve_default_streams in templated_ioctx.hpp); null
+  /// when @c stream is the caller's own.
+  std::shared_ptr<void> stream_owner;
 };
 
 class prepared_io_completion final {
@@ -262,10 +414,16 @@ enum class io_priority : std::uint8_t { automatic, high, low };
   return requested == io_priority::automatic ? fallback : requested;
 }
 
+/// What a prepared slice asks a reactor to do.  Reads are the default; writes
+/// and flushes reach only reactors that model @c io_write_reactor_c.
+enum class io_op_kind : std::uint8_t { read, write, flush };
+
 struct prepared_io_slice {
   /// The logical caller-requested window. A reactor may widen the physical I/O
   /// for alignment or a cached chunk's advertised fill, but device copies and
-  /// returned byte accounting remain limited to this range.
+  /// returned byte accounting remain limited to this range.  A write slice's
+  /// range is the exact file range to write (never widened, never clamped to
+  /// EOF); a flush slice's range is empty.
   range rng;
   host_buffer h_buffer;  // monostate if using reactor-owned staging
   device_buffer d_buffer;
@@ -273,6 +431,9 @@ struct prepared_io_slice {
   /// Reactor queue for this slice (see @ref io_priority); a request takes its
   /// first slice's value, resolving @c automatic by call shape.
   io_priority priority{io_priority::automatic};
+  /// Read (default), write or flush.  A write slice carries exactly one source:
+  /// a contiguous host buffer or a device buffer, which the reactor only reads.
+  io_op_kind kind{io_op_kind::read};
 
   prepared_io_slice() noexcept = default;
   explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}
@@ -300,6 +461,47 @@ struct prepared_io_slice {
   [[nodiscard]] size_t size() const noexcept { return rng.size; }
 
   [[nodiscard]] size_t offset() const noexcept { return rng.offset; }
+
+  [[nodiscard]] bool is_write() const noexcept { return kind == io_op_kind::write; }
+
+  [[nodiscard]] bool is_flush() const noexcept { return kind == io_op_kind::flush; }
 };
+
+/// A write slice of @p rng whose bytes come from host memory @p src (non-null).
+/// The reactor only reads @p src; the cast merely fits the shared buffer type.
+[[nodiscard]] inline prepared_io_slice make_host_write_slice(
+  range rng, std::uint8_t const* src, io_priority priority = io_priority::automatic) noexcept
+{
+  prepared_io_slice slice{rng, host_buffer{const_cast<std::uint8_t*>(src)}};
+  slice.kind     = io_op_kind::write;
+  slice.priority = priority;
+  return slice;
+}
+
+/// A write slice of @p rng whose bytes come from device memory @p src
+/// (non-null), read in stream order on @p stream.  @p device_id < 0 is resolved
+/// to the calling thread's device when the slice is dispatched.
+[[nodiscard]] inline prepared_io_slice make_device_write_slice(
+  range rng,
+  std::uint8_t const* src,
+  ::cuda::stream_ref stream,
+  int device_id        = -1,
+  io_priority priority = io_priority::automatic) noexcept
+{
+  prepared_io_slice slice{rng, device_buffer{const_cast<std::uint8_t*>(src), stream, device_id}};
+  slice.kind     = io_op_kind::write;
+  slice.priority = priority;
+  return slice;
+}
+
+/// A flush slice: make every write that completed before it durable.
+[[nodiscard]] inline prepared_io_slice make_flush_slice(
+  io_priority priority = io_priority::automatic) noexcept
+{
+  prepared_io_slice slice;
+  slice.kind     = io_op_kind::flush;
+  slice.priority = priority;
+  return slice;
+}
 
 }  // namespace cucascade::io

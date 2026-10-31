@@ -313,10 +313,10 @@ bandwidth_profile measure_bandwidth(std::span<memory::memory_space* const> space
           auto source = build_source_representation(src, bootstrap_gpu, size_bytes, registry);
 
           // Pin the current CUDA context to the stream's device for the duration of the
-          // measurement loop. Some converter and disk-backend code paths allocate scratch on
-          // the current device rather than the stream's device — mismatch triggers
-          // cudaErrorInvalidValue / cudaErrorInvalidResourceHandle when src and dst straddle
-          // GPUs or the pipeline backend was initialized under a different context. This guard
+          // measurement loop. Some converter and disk io code paths allocate scratch on the
+          // current device rather than the stream's device (the disk io context binds device
+          // buffers to the current device) — mismatch triggers cudaErrorInvalidValue /
+          // cudaErrorInvalidResourceHandle when src and dst straddle GPUs. This guard
           // is placed AFTER build_source_representation so the bootstrap build can run with
           // bootstrap_gpu as current.
           std::optional<rmm::cuda_set_device_raii> device_guard;

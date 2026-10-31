@@ -37,6 +37,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -56,32 +58,69 @@ namespace cucascade::io::uring {
 /**
  * @brief Concrete @c io_object backed by a filesystem path.
  *
- * Passive bag of native handles. The buffered @c O_RDONLY fd and, when the
- * filesystem supports it, an optional @c O_DIRECT fd are produced by
- * @c uring_reactor::create_io_object. This class does no I/O of its own.
+ * Passive bag of native handles. The buffered fd and, when the filesystem
+ * supports it, an optional @c O_DIRECT fd are produced by
+ * @c uring_reactor::create_io_object (read-only, @c O_RDONLY) or
+ * @c uring_reactor::create_io_object_for_write (@c O_RDWR). This class does no
+ * I/O of its own.  A writable object's size grows as writes complete (see
+ * @c io_object::note_written).
+ *
+ * A read-only object carries the @c local_stat identity of its buffered fd
+ * (captured by the reactor, or from the fd here) and takes its size from it;
+ * when the fd cannot be stat'ed, and for every writable object, the identity
+ * is the base class's open-local one.
  */
 class local_io_object : public io_object {
  public:
+  /// A read-only object.  @p captured is the identity the reactor took from
+  /// @p fd; when it is not a @c local_stat identity, it is captured from @p fd
+  /// here.
   local_io_object(std::string path,
                   file_descriptor fd,
                   file_descriptor fd_direct,
                   size_t file_size,
-                  std::string_view hash = "")
-    : _path(std::move(path)),
-      _fd(std::move(fd)),
-      _fd_direct(std::move(fd_direct)),
-      _file_size(file_size)
+                  std::string_view hash    = "",
+                  object_identity captured = {})
+    : local_io_object(std::move(path),
+                      std::move(fd),
+                      std::move(fd_direct),
+                      file_size,
+                      hash,
+                      std::move(captured),
+                      io_access::read_only)
   {
-    if (hash.empty()) {
-      _hash = _path;
-    } else {
-      _hash = hash;
-    }
+  }
+
+  /// As above with an explicit @p access: @c io_access::read_write makes the
+  /// object accept writes (its fds must then be open for writing).
+  local_io_object(std::string path,
+                  file_descriptor fd,
+                  file_descriptor fd_direct,
+                  size_t file_size,
+                  io_access access)
+    : local_io_object(
+        std::move(path), std::move(fd), std::move(fd_direct), file_size, "", {}, access)
+  {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
-  [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] size_t size() const noexcept override
+  {
+    return _file_size.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] object_identity identity() const override
+  {
+    return _has_identity ? _identity : io_object::identity();
+  }
+
+  [[nodiscard]] bool writable() const noexcept override { return _access == io_access::read_write; }
+
+  void note_written(std::size_t end) const noexcept override
+  {
+    if (writable()) atomic_store_max(_file_size, end);
+  }
 
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
   [[nodiscard]] int fd_direct() const noexcept { return _fd_direct.get(); }
@@ -91,11 +130,42 @@ class local_io_object : public io_object {
   [[nodiscard]] int odirect_handle() const noexcept { return _fd_direct.get(); }
 
  private:
+  local_io_object(std::string path,
+                  file_descriptor fd,
+                  file_descriptor fd_direct,
+                  size_t file_size,
+                  std::string_view hash,
+                  object_identity captured,
+                  io_access access)
+    : _path(std::move(path)),
+      _hash(hash.empty() ? std::string_view{_path} : hash),
+      _fd(std::move(fd)),
+      _fd_direct(std::move(fd_direct)),
+      _file_size(file_size),
+      _access(access)
+  {
+    // A writable object's bytes change as it is written: it never carries a
+    // reusable identity, and keeps the size it was opened with.  Tested on the
+    // access mode itself rather than the virtual writable(), which a subclass
+    // may override.
+    if (_access == io_access::read_write) { return; }
+    _has_identity = captured.kind == identity_kind::local_stat;
+    if (_has_identity) {
+      _identity = std::move(captured);
+    } else {
+      _has_identity = capture_local_identity(_fd.get(), _identity);
+    }
+    if (_has_identity) { _file_size.store(_identity.size, std::memory_order_relaxed); }
+  }
+
   std::string _path;
   std::string _hash;
   file_descriptor _fd;
   file_descriptor _fd_direct;
-  size_t _file_size{0};
+  mutable std::atomic<size_t> _file_size{0};
+  io_access _access{io_access::read_only};
+  object_identity _identity;
+  bool _has_identity{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -117,6 +187,14 @@ class local_io_object : public io_object {
  * other high requests (0 restores strict priority). Physical operations use
  * O_DIRECT only when the worker determines that the complete transfer is
  * compatible. Models the reactor concept consumed by @c templated_ioctx.
+ *
+ * Writes (@c io_write_reactor_c): each write slice is split at the write
+ * granule into an unaligned head, an aligned body and an unaligned tail.  The
+ * body goes O_DIRECT -- straight from a host source whose address is congruent
+ * with its file offset, otherwise through the pinned staging blocks (a D2H
+ * copy on the caller's stream for device sources, a memcpy for host ones);
+ * head and tail are written through the page cache.  Short writes are
+ * resubmitted; a flush is an @c IORING_OP_FSYNC with @c IORING_FSYNC_DATASYNC.
  */
 class uring_reactor {
  public:
@@ -194,6 +272,13 @@ class uring_reactor {
   /// of the constructor so a reactor can be built cheaply (it only copies its
   /// config) and parked until it is actually needed — see @c ioctx::start.
   /// Idempotent: a second call (while the worker is already running) is a no-op.
+  ///
+  /// Waits until the worker has set up its io_uring.  When that fails (e.g.
+  /// @c EPERM where a seccomp profile blocks io_uring: Docker's default since
+  /// 25, gVisor, @c kernel.io_uring_disabled), the worker exits, the error is
+  /// logged, and start() rethrows it (a @c std::system_error with the errno).
+  /// Requests enqueued before or after the failure fail with that same error,
+  /// not with @c operation_canceled.  start() may be called again to retry.
   void start();
 
   void interrupt();
@@ -202,9 +287,25 @@ class uring_reactor {
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
+  /// Synchronous write of @p size bytes of host memory @p src at @p offset on
+  /// the calling thread, with the same head / body / tail placement as the
+  /// asynchronous path (the body O_DIRECT only when @p src is congruent; no
+  /// staging).  Raises @p file's size.  @return @p size.
+  /// @throws std::system_error (@c EBADF for a read-only object, or the errno of
+  ///         a failed write) or std::invalid_argument for a null @p src.
+  std::size_t host_write(const io_object_type& file,
+                         std::size_t offset,
+                         std::size_t size,
+                         std::uint8_t const* src);
+
+  /// @c fdatasync the file on the calling thread.  @throws std::system_error.
+  static void flush(const io_object_type& file);
+
   void enqueue(std::unique_ptr<grouped_io_request> request) noexcept;
 
-  /// Approximate bytes not yet converted from logical slices to physical ops.
+  /// Approximate bytes not yet converted from logical slices to physical ops,
+  /// plus the bytes of staged writes whose device-to-host copy is still pending
+  /// on the caller's stream (they hold staging blocks without any I/O in flight).
   [[nodiscard]] std::size_t queued_bytes() const noexcept
   {
     return _queued_bytes.load(std::memory_order_relaxed);
@@ -263,8 +364,22 @@ class uring_reactor {
 
   /// Open the buffered fd and opportunistically open an O_DIRECT fd for
   /// @p path. The buffered handle is always required; an unsupported direct
-  /// handle simply makes worker-planned operations use buffered I/O.
+  /// handle simply makes worker-planned operations use buffered I/O.  The
+  /// O_DIRECT fd reopens the buffered one through @c /proc/self/fd (the path
+  /// only where procfs is not mounted), and the object carries the buffered
+  /// fd's @c local_stat identity and size.
+  /// @throws descriptor_mismatch_error when, on two attempts, the two fds do
+  ///         not name the same file (the path is being replaced concurrently),
+  ///         or when the O_DIRECT fd cannot be stat'ed.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
+
+  /// Open (per @p options.mode, creating with @p options.permissions) a buffered
+  /// @c O_RDWR fd and opportunistically an @c O_RDWR | @c O_DIRECT fd for
+  /// @p path, preallocate @p options.size_hint bytes best-effort, and return a
+  /// writable object sized at its current length.
+  /// @throws std::system_error with the errno of the failed open.
+  static std::unique_ptr<io_object_type> create_io_object_for_write(std::string path,
+                                                                    write_open_options options);
 
   /// fstat the open fd to get the file's current size.
   static size_t size(int native_handle);
@@ -285,7 +400,8 @@ class uring_reactor {
     std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
-  void worker_loop(const std::stop_token& stop_token);
+  /// @p ready is fulfilled once the ring is set up, or failed with the setup error.
+  void worker_loop(const std::stop_token& stop_token, std::promise<void>& ready);
 
   // Shared services + tunables for the whole reactor pool, kept alive for this
   // reactor's lifetime (so the bounce-staging resource outlives _bounce_storage).
@@ -305,6 +421,11 @@ class uring_reactor {
   mutable std::mutex _enqueue_mutex;
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
+  /// Why the reactor stopped accepting work after its worker failed (ring setup
+  /// or a fatal worker error); rejected requests fail with it.  Null after a
+  /// clean shutdown, which rejects with @c operation_canceled.  Guarded by
+  /// @c _enqueue_mutex.
+  std::exception_ptr _rejection_error;
 
   // Gauges (see @ref gauges): written only by the worker, read by take_gauges().
   std::atomic<std::uint32_t> _gauge_inflight{0};
