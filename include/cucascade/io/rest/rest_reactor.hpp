@@ -48,6 +48,7 @@ namespace cucascade::io::rest {
 
 namespace detail {
 class shared_services;
+struct pool_placement;
 }  // namespace detail
 
 class reactor_worker;
@@ -395,8 +396,12 @@ class rest_reactor {
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
 
+  /// @p pool_index and @p placement (internal: the pool's placement plan, owned by the ioctx)
+  /// select this reactor's CPU pin; without a placement the worker is left where it starts.
   explicit rest_reactor(std::shared_ptr<reactor_context> ctx,
-                        std::string_view tname = "rest_reactor");
+                        std::string_view tname                                  = "rest_reactor",
+                        std::size_t pool_index                                  = 0,
+                        std::shared_ptr<detail::pool_placement const> placement = nullptr);
   ~rest_reactor();
 
   rest_reactor(rest_reactor const&)            = delete;
@@ -558,6 +563,9 @@ class rest_reactor {
   config _config;  // copy of _ctx->cfg() for hot-path access
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
+  // Position in the pool and the pool's placement (select the worker's CPU pin).
+  std::size_t _pool_index{0};
+  std::shared_ptr<detail::pool_placement const> _placement;
 
   // The worker's queues and wake-up fd (shared with a private helper's layout).
   std::unique_ptr<intake> _intake;

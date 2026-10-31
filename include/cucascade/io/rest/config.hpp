@@ -205,6 +205,15 @@ struct config {
   /// TCP_USER_TIMEOUT milliseconds (0 = kernel default).
   unsigned tcp_user_timeout_ms{0};
 
+  // -- placement ---------------------------------------------------------------
+
+  /// Egress interface whose queue IRQs size and place the reactor pool when
+  /// @c io_config::rest_n_reactors is 0; empty = the default route's interface.
+  std::string interface{};
+  /// Pin reactors to the NIC's IRQ CPUs (and raise their priority) when the IRQs are steered
+  /// to a strict subset of the NIC node's cores.
+  bool pin_to_irq_cpus{true};
+
   // -- retry policy ------------------------------------------------------
   std::size_t max_retry_attempts{10};
   /// Bounded retries for an HTTP 403.  A presigned URL that expired while the

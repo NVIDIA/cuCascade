@@ -62,6 +62,11 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// the pinned bounce-staging resource — all of which must outlive this ioctx).
   /// The ioctx config is sourced from the reactors themselves — see
   /// @c templated_ioctx.
+  ///
+  /// @p n_reactors is a total; 0 sizes the pool from the egress NIC (one reactor per IRQ CPU,
+  /// pinned to it at the highest permitted priority, when the NIC's queue IRQs are steered to a
+  /// strict subset of its NUMA node's cores; the default 2 otherwise).
+  /// @throws std::invalid_argument when the config is invalid (@c config::validate).
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
   /// Counters of the whole pool: the reactors' @c transport_stats summed (the extreme for the
@@ -152,6 +157,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   void warmup(std::string_view bucket_url) noexcept override;
 
  protected:
+  /// This pool's placement (plan and NIC), computed at construction and shared with its
+  /// reactors; never stored on the reactor_context, which several pools may share.
+  std::shared_ptr<detail::pool_placement const> _placement;
+
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
@@ -168,6 +177,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size) override;
 
  private:
+  rest_ioctx(std::shared_ptr<detail::pool_placement const> placement,
+             std::shared_ptr<rest_reactor::reactor_context> ctx);
+
   /// Resolve @p path with a single suffix-range GET: it discovers the size and
   /// stashes the object's trailing bytes on the returned io_object so cuDF's
   /// footer reads are served locally.  Falls back to a plain HEAD (no stash)

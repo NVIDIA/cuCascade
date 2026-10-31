@@ -22,19 +22,24 @@
 /// is detected before reuse, a pooled connection that dies before any response byte is retried
 /// once for free, warm-up issues exactly max_connections zero-key LIST exchanges once per
 /// conn_max_age on fresh connections, HTTP/1.1 upkeep is off by default and staggered when on;
-/// plus the same-pass start invariant of the worker loop, the request_timeout bound of
-/// control-plane calls, and config validation.
+/// plus the pool size and reactor pinning of the placement plan, the same-pass start invariant
+/// of the worker loop, the request_timeout bound of control-plane calls, and config validation.
 
+#include "io/rest/reactor_placement.hpp"
 #include "io/rest/reactor_test_hooks.hpp"
+#include "io/rest/shared_services.hpp"
 #include "rest_contract_test_utils.hpp"
 #include "utils/child_test_runner.hpp"
 
+#include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/memory/net_topology.hpp>
 
 #include <arpa/inet.h>
 #include <catch2/catch_all.hpp>
 #include <netinet/in.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -43,6 +48,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -79,6 +86,7 @@ class probed_ioctx final : public rest_ioctx {
     return _reactors.at(i)->stats();
   }
   [[nodiscard]] std::size_t reactor_count() const noexcept { return _reactors.size(); }
+  [[nodiscard]] rest::detail::pool_placement const& placement() const { return *_placement; }
 };
 
 /// Records when each LIST was authorized (the worker authorizes every exchange as it issues it).
@@ -536,6 +544,79 @@ TEST_CASE("rest pool: idle upkeep is off by default and staggered when enabled",
   }
   CHECK(server.accepted_connection_count() == 2);  // the warm connections are what is kept
   CHECK(ioctx->reactor_stats().upkeeps == lists.size() - 2);
+}
+
+// ---- placement ----------------------------------------------------------------------------------
+
+namespace {
+
+/// The kernel thread id of this process's thread named @p name (/proc/self/task/*/comm).
+pid_t thread_named(std::string const& name)
+{
+  for (auto const& task : std::filesystem::directory_iterator("/proc/self/task")) {
+    std::ifstream comm(task.path() / "comm");
+    std::string line;
+    std::getline(comm, line);
+    if (line == name) { return static_cast<pid_t>(std::stol(task.path().filename().string())); }
+  }
+  return -1;
+}
+
+}  // namespace
+
+TEST_CASE("rest pool size follows the placement plan; auto (0) sizes from the NIC",
+          "[rest][placement]")
+{
+  loopback_range_server server(rest_test_payload(64));
+  auto cfg = rest_contract_config();
+  auto ctx = std::make_shared<rest_reactor::reactor_context>(
+    cfg, std::make_shared<list_capable_mock_authorizer>(server.endpoint()), nullptr);
+  // What the ioctx computes, independently: the egress NIC (if any) and the plan.
+  std::optional<cucascade::memory::nic_topology> nic;
+  if (auto const iface = cucascade::memory::select_egress_interface(cfg.interface)) {
+    nic = cucascade::memory::discover_nic(*iface);
+  }
+  auto const expected = rest::plan_rest_pool(0, cfg.pin_to_irq_cpus, nic);
+  INFO(rest::describe_rest_pool(expected, nic, {}));
+  probed_ioctx autosized{0, ctx};
+  CHECK(autosized.reactor_count() == expected.n_reactors);
+  CHECK(autosized.reactor_count() >= 1);
+  // A second pool on the same context keeps its own plan: the plan lives in the ioctx.
+  probed_ioctx configured{3, ctx};
+  CHECK(configured.reactor_count() == 3);
+  CHECK(configured.placement().plan.n_reactors == 3);
+  CHECK(autosized.placement().plan.n_reactors == expected.n_reactors);
+  CHECK(autosized.placement().plan.pin_cpus == expected.pin_cpus);
+}
+
+TEST_CASE("rest reactor threads pin themselves to their planned CPU before serving",
+          "[rest][placement]")
+{
+  auto const allowed = cucascade::exec::thread_util::get_current_thread_affinity();
+  if (allowed.size() < 2) { SKIP("needs at least two CPUs in the affinity mask"); }
+  auto payload = rest_test_payload(4096);
+  loopback_range_server server(payload);
+  auto ctx = std::make_shared<rest_reactor::reactor_context>(
+    rest_contract_config(), std::make_shared<list_capable_mock_authorizer>(server.endpoint()));
+  auto placement             = std::make_shared<rest::detail::pool_placement>();
+  placement->plan.n_reactors = 2;
+  placement->plan.pin_cpus   = {allowed.back(), allowed.front()};
+  placement->plan.reason     = "test";
+  rest_reactor reactor{ctx, "pin-test", 1, placement};
+  reactor.start();
+  // The worker places itself first thing; it is serving once a read completes.
+  auto object = std::make_shared<cucascade::io::rest::rest_io_object>(
+    "s3://pin-bucket/object.bin", "pin-bucket", "object.bin", payload.size());
+  std::vector<std::uint8_t> out(100);
+  CHECK(reactor.host_read(*object, 0, out.size(), out.data()) == out.size());
+  auto const tid = thread_named("pin-test_worker");
+  REQUIRE(tid > 0);
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  REQUIRE(::sched_getaffinity(tid, sizeof(set), &set) == 0);
+  CHECK(CPU_COUNT(&set) == 1);
+  CHECK(CPU_ISSET(static_cast<unsigned>(allowed.front()), &set));  // pin_cpus[1]
+  reactor.shutdown();
 }
 
 // ---- same-pass start --------------------------------------------------------------------------

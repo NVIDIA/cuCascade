@@ -19,6 +19,7 @@
 #pragma once
 
 #include "io/rest/net/dns_resolver.hpp"
+#include "io/rest/reactor_placement.hpp"
 
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/tls/tls.hpp>
@@ -26,16 +27,25 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string_view>
 
 /**
  * @file shared_services.hpp
  * @brief Transport state shared by every reactor of one REST pool (one per
  *        @c rest_reactor::reactor_context): the DNS resolver thread and the TLS provider of the
- *        pool's policy.
+ *        pool's policy; and a pool's placement (@ref pool_placement, owned by its ioctx).
  */
 
 namespace cucascade::io::rest::detail {
+
+/// A pool's placement: the plan and the NIC it was derived from.  Owned by the @c rest_ioctx that
+/// computed it and shared with its reactors (never with the reactor_context, which several pools
+/// may share).
+struct pool_placement {
+  rest_pool_plan plan;
+  std::optional<memory::nic_topology> nic;
+};
 
 class shared_services {
  public:

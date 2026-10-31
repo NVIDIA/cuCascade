@@ -16,9 +16,13 @@
  * limitations under the License.
  */
 
+#include "io/rest/reactor_placement.hpp"
+#include "io/rest/shared_services.hpp"
+
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uri_parser.hpp>
 #include <cucascade/log/logging.hpp>
+#include <cucascade/memory/net_topology.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -38,12 +42,46 @@
 
 namespace cucascade::io::rest {
 
+namespace {
+
+/// Size the pool (rest_n_reactors 0 = auto from the egress NIC's IRQ steering) and compute the
+/// placement every reactor applies to its own thread before it creates its ring.
+std::shared_ptr<detail::pool_placement const> plan_pool(
+  std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> const& ctx)
+{
+  if (!ctx) { throw std::invalid_argument("rest_ioctx: reactor_context must be non-null"); }
+  auto const& cfg = ctx->cfg();
+  cfg.validate();
+  std::optional<memory::nic_topology> nic;
+  try {
+    if (auto const iface = memory::select_egress_interface(cfg.interface); iface.has_value()) {
+      nic = memory::discover_nic(*iface);
+    }
+  } catch (...) {
+    nic.reset();  // no NIC information: the default count, unpinned
+  }
+  auto plan = plan_rest_pool(n_reactors, cfg.pin_to_irq_cpus, nic);
+  // Reactor 0 logs the one startup line once its thread is placed (the priority is known then).
+  return std::make_shared<detail::pool_placement const>(
+    detail::pool_placement{std::move(plan), std::move(nic)});
+}
+
+}  // namespace
+
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
-  : templated_ioctx<rest_reactor>(n_reactors,
-                                  [ctx = std::move(ctx), i = 0]() mutable {
+  : rest_ioctx(plan_pool(n_reactors, ctx), ctx)
+{
+}
+
+rest_ioctx::rest_ioctx(std::shared_ptr<detail::pool_placement const> placement,
+                       std::shared_ptr<rest_reactor::reactor_context> ctx)
+  : templated_ioctx<rest_reactor>(placement->plan.n_reactors,
+                                  [ctx = std::move(ctx), placement, i = std::size_t{0}]() mutable {
+                                    auto const index = i++;
                                     return std::make_unique<rest_reactor>(
-                                      ctx, "rest-" + std::to_string(i++));
+                                      ctx, "rest-" + std::to_string(index), index, placement);
                                   }),
+    _placement(std::move(placement)),
     _lister(
       [this](std::string_view bucket, std::string_view prefix, std::string_view canonical_query) {
         if (_reactors.empty()) {

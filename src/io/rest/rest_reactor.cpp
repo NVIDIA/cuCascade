@@ -28,6 +28,7 @@
 
 #include "io/rest/errc.hpp"
 #include "io/rest/net/uring_transport.hpp"
+#include "io/rest/reactor_placement.hpp"
 #include "io/rest/reactor_test_hooks.hpp"
 #include "io/rest/shared_services.hpp"
 
@@ -1918,8 +1919,11 @@ class private_driver {
 // rest_reactor
 // =================================================================================================
 
-rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx)), _tname(tname)
+rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx,
+                           std::string_view tname,
+                           std::size_t pool_index,
+                           std::shared_ptr<detail::pool_placement const> placement)
+  : _ctx(std::move(ctx)), _tname(tname), _pool_index(pool_index), _placement(std::move(placement))
 {
   if (!_ctx) { throw std::invalid_argument("rest_reactor: reactor_context must be non-null"); }
   _config = _ctx->cfg();
@@ -1963,6 +1967,14 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
   std::stop_callback const wake(stop_token, [this] { interrupt(); });
   t_reactor_thread = true;
   try {
+    // Placement first, before the ring exists, so its memory lands on the pinned CPU's node.
+    if (_placement != nullptr) {
+      auto const placed = place_current_reactor_thread(_placement->plan, _pool_index);
+      if (_pool_index == 0) {
+        CUCASCADE_LOG_INFO("{}",
+                           describe_rest_pool(_placement->plan, _placement->nic, placed.priority));
+      }
+    }
     reactor_worker worker{*this, *_intake, /*private_mode=*/false};
     worker.run(stop_token);
   } catch (std::exception const& e) {
