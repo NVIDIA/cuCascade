@@ -17,17 +17,19 @@
  */
 
 // Cache-level object identity: the fs_cache keys its chunks by object
-// generation (path + strong ETag), retires a path's older generations when a
-// new one appears, keeps a retired generation alive for as long as a handle or
-// an in-flight operation uses it, and fails a read whose object changed rather
-// than publishing the replacement's bytes under the old identity.
+// identity (path + strong ETag, or a local file's stat tuple), retires a
+// path's older generations when a new one appears, keeps a retired generation
+// alive for as long as a handle or an in-flight operation uses it, and fails a
+// read whose object changed rather than publishing the replacement's bytes
+// under the old identity.
 //
 // These tests drive the cache through the real cudf-coupled
 // cucascade::io::datasource, the friend that reaches the cache's prefetch
 // paths.  Two kinds of backend stand behind it: a loopback REST server whose
 // per-key scripts overwrite an object between opens (end to end through the
 // reactor), and a held backend whose fills the test completes or fails by hand
-// (deterministic lifetime and ordering checks).  The wire-level conditional-GET
+// (deterministic lifetime and ordering checks); a uring case covers local
+// files replaced behind the cache's back.  The wire-level conditional-GET
 // contract is covered by test/io/rest/test_rest_cache_identity.cpp.
 //
 // The same fixture also hosts the fs_cache summary snapshot test, which needs a
@@ -40,6 +42,9 @@
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/config.hpp>
+#include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
@@ -53,22 +58,28 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -80,6 +91,7 @@ namespace {
 using namespace std::chrono_literals;
 using cucascade::io::datasource;
 using cucascade::io::object_changed_error;
+using cucascade::io::cache::prefetch_result;
 using cucascade::io::rest::rest_io_object;
 using cucascade::io::rest::rest_ioctx;
 using cucascade::io::rest::rest_reactor;
@@ -318,6 +330,20 @@ std::vector<std::uint64_t> summary_counts(std::string const& text)
     counts.push_back(std::stoull(text.substr(pos + 1)));
   }
   return counts;
+}
+
+/// Pull one counter from either section (`global` or `last_cycle`) of a cache
+/// report; a report without it fails the test rather than reading as zero.
+std::uint64_t report_counter(std::string const& summary,
+                             std::string const& name,
+                             std::string const& section = "global")
+{
+  std::smatch m;
+  auto const re = std::regex(section + "\\[[^\\]]*" + name + "=(\\d+)");
+  if (!std::regex_search(summary, m, re)) {
+    throw std::runtime_error("Missing cache counter: " + summary);
+  }
+  return std::stoull(m[1].str());
 }
 
 }  // namespace
@@ -704,11 +730,11 @@ TEST_CASE("cache identity publishes prefetch failure before notifying the consum
   };
   auto watcher   = std::make_shared<observer>();
   auto completed = watcher->completed.get_future();
-  REQUIRE(source->prefetch_async([watcher, source](bool ok) noexcept {
+  REQUIRE(source->prefetch_async([watcher, source](prefetch_result result) noexcept {
     // Read from the completion callback itself: the failure must already be there.
     std::exception_ptr failure = source->prefetch_failure();
     if (watcher->calls.fetch_add(1) == 0) {
-      watcher->completed.set_value(outcome{ok, std::move(failure)});
+      watcher->completed.set_value(outcome{result.ok, std::move(failure)});
     }
   }) == cucascade::io::prefetch_refusal::issued);
   REQUIRE(completed.wait_for(5s) == std::future_status::ready);
@@ -806,16 +832,17 @@ TEST_CASE("cache identity retains a retired generation until a held fill release
   held_request new_fill;
 
   advise(*first, chunk_bytes);
-  REQUIRE(first->prefetch_async([&](bool) noexcept { first_completions.fetch_add(1); }) ==
-          cucascade::io::prefetch_refusal::issued);
+  REQUIRE(first->prefetch_async([&](prefetch_result) noexcept {
+    first_completions.fetch_add(1);
+  }) == cucascade::io::prefetch_refusal::issued);
   old_fill.request = context->backend().take();
   REQUIRE(old_fill.request != nullptr);
   require_generations(cache, path, 1, 0);
 
   // A second generation of the path supersedes the first while its fill is held.
   advise(*second, chunk_bytes);
-  REQUIRE(second->prefetch_async([&](bool ok) noexcept {
-    second_ok.store(ok);
+  REQUIRE(second->prefetch_async([&](prefetch_result result) noexcept {
+    second_ok.store(result.ok);
     second_completions.fetch_add(1);
   }) == cucascade::io::prefetch_refusal::issued);
   new_fill.request = context->backend().take();
@@ -867,7 +894,8 @@ TEST_CASE("cache identity reclaims an idle superseded generation's chunks at ove
   // Version one becomes resident.
   advise(*first, chunk_bytes);
   REQUIRE(wait_for_eviction_batch(cache, 1));
-  REQUIRE(first->prefetch_async([](bool) noexcept {}) == cucascade::io::prefetch_refusal::issued);
+  REQUIRE(first->prefetch_async([](prefetch_result) noexcept {}) ==
+          cucascade::io::prefetch_refusal::issued);
   held_request fill;
   fill.request = context->backend().take();
   REQUIRE(fill.request != nullptr);
@@ -936,7 +964,8 @@ TEST_CASE("cache identity returns a held retired generation's buffers at cache t
 
   auto make_resident = [&](datasource& source, std::uint8_t value) {
     advise(source, chunk_bytes);
-    REQUIRE(source.prefetch_async([](bool) noexcept {}) == cucascade::io::prefetch_refusal::issued);
+    REQUIRE(source.prefetch_async([](prefetch_result) noexcept {}) ==
+            cucascade::io::prefetch_refusal::issued);
     held_request fill;
     fill.request = context->backend().take();
     REQUIRE(fill.request != nullptr);
@@ -985,8 +1014,8 @@ TEST_CASE("cache identity delivers a held fill's failure through the datasource"
   std::exception_ptr seen;
   bool ok_seen = true;
   std::atomic<int> calls{0};
-  REQUIRE(source->prefetch_async([&, source](bool ok) noexcept {
-    ok_seen = ok;
+  REQUIRE(source->prefetch_async([&, source](prefetch_result result) noexcept {
+    ok_seen = result.ok;
     seen    = source->prefetch_failure();
     calls.fetch_add(1);
   }) == cucascade::io::prefetch_refusal::issued);
@@ -1078,6 +1107,126 @@ TEST_CASE("cache summary snapshots stay consistent under concurrent queries",
   CHECK(server.get_count() == 1);
 }
 
+TEST_CASE("cache refresh reports each increment once across overlapping refreshes",
+          "[cache][cache_summary][rest]")
+{
+  range_fault_policy fault;
+  fault.successful_head_etag = "\"generation-one\"";
+  fault.successful_get_etag  = fault.successful_head_etag;
+  loopback_range_server server(base_object(), fault);
+  rest_cache_fixture fixture(server);
+  auto& cache = *fixture.context->cache();
+  // The chunk is resident, so every read below is a cache hit.
+  auto source = fixture.open_resident(server, object_uri, base_object());
+  std::vector<std::uint8_t> bytes(source->size());
+  auto read = [&] {
+    if (source->host_read(0, bytes.size(), bytes.data()) != bytes.size()) {
+      throw std::runtime_error("Incomplete cache read");
+    }
+  };
+  auto const before = cache.prepare_for_query();
+  std::vector<std::string> reports;
+  constexpr std::array names{"reads", "hits", "h2d", "miss", "evictions"};
+
+  SECTION("diagnostic observations do not consume a reporting interval")
+  {
+    read();
+    auto const observed = cache.summary();
+    CHECK(cache.summary() == observed);
+    auto const epoch = cache.query_epoch();
+    reports.push_back(cache.prepare_for_query());
+    CHECK(reports.back() == observed);
+    CHECK(cache.query_epoch() == epoch + 1);
+    reports.push_back(cache.prepare_for_query());
+    for (auto const* name : names) {
+      CHECK(report_counter(reports.back(), name, "last_cycle") == 0);
+    }
+    read();
+  }
+  SECTION("two refreshers race with actual cache reads")
+  {
+    // Seed a nonzero interval even if the refreshers finish before the read loop.
+    read();
+    std::barrier start{3};
+    std::array<std::vector<std::string>, 2> concurrent_reports;
+    std::array<std::exception_ptr, 2> errors;
+    auto refresh = [&](std::size_t index) {
+      start.arrive_and_wait();
+      try {
+        for (int i = 0; i < 100; ++i) {
+          concurrent_reports[index].push_back(cache.prepare_for_query());
+        }
+      } catch (...) {
+        errors[index] = std::current_exception();
+      }
+    };
+    {
+      std::jthread first(refresh, 0), second(refresh, 1);
+      start.arrive_and_wait();
+      for (int i = 0; i < 100; ++i) {
+        read();
+      }
+    }
+    for (std::size_t i = 0; i < errors.size(); ++i) {
+      REQUIRE_FALSE(errors[i]);
+      reports.insert(reports.end(), concurrent_reports[i].begin(), concurrent_reports[i].end());
+    }
+  }
+
+  // Every increment since `before` lands in exactly one closed interval.
+  reports.push_back(cache.prepare_for_query());
+  auto const after = cache.summary();
+  CHECK(report_counter(after, "hits") > report_counter(before, "hits"));
+  for (auto const* name : names) {
+    INFO(name);
+    std::uint64_t reported = 0;
+    for (auto const& report : reports) {
+      reported += report_counter(report, name, "last_cycle");
+    }
+    CHECK(reported == report_counter(after, name) - report_counter(before, name));
+  }
+  CHECK(server.get_count() == 1);
+}
+
+// ===========================================================================
+// Metadata store through the datasource
+// ===========================================================================
+
+TEST_CASE("a datasource observes its object identity in the metadata store",
+          "[cache][cache_identity][metadata_store]")
+{
+  auto context           = std::make_shared<held_context>();
+  auto& store            = context->metadata_store();
+  std::string const path = "s3://controlled/footer.bin";
+  auto const parsed      = std::make_shared<cucascade::io::io_object_metadata>();
+
+  datasource first(context, held_object(path, "\"one\""));
+  REQUIRE(first.store_metadata(parsed));
+  CHECK(first.metadata() == parsed);
+  // A strong ETag is reusable across opens.
+  datasource const same(context, held_object(path, "\"one\""));
+  CHECK(same.metadata() == parsed);
+  CHECK(store.has_path(path));
+
+  // Opening a newer version retires the entry of the old one, and a parse of
+  // the old version that finishes afterwards is not published.
+  datasource const second(context, held_object(path, "\"two\""));
+  CHECK_FALSE(first.metadata());
+  CHECK_FALSE(store.has_path(path));
+  REQUIRE(first.store_metadata(std::make_shared<cucascade::io::io_object_metadata>()));
+  CHECK_FALSE(second.metadata());
+  CHECK_FALSE(store.has_path(path));
+  CHECK(store.statistics().stale == 1);
+
+  // Without a strong ETag the metadata stays with the open that parsed it.
+  datasource weak(context, held_object(path, "W/\"three\""));
+  datasource const weak_again(context, held_object(path, "W/\"three\""));
+  REQUIRE(weak.store_metadata(parsed));
+  CHECK(weak.metadata() == parsed);
+  CHECK_FALSE(weak_again.metadata());
+  CHECK_FALSE(store.has_path(path));
+}
+
 // ===========================================================================
 // Datasource cache query
 // ===========================================================================
@@ -1097,4 +1246,116 @@ TEST_CASE("a datasource reports whether its ioctx reads through an fs_cache",
   CHECK(source.uses_fs_cache());
   context->shutdown_cache();
   CHECK_FALSE(source.uses_fs_cache());
+}
+
+// ===========================================================================
+// Local files: identity across opens and replacement
+// ===========================================================================
+
+namespace {
+
+[[nodiscard]] std::vector<std::uint8_t> local_pattern(std::size_t bytes, std::uint8_t seed)
+{
+  std::vector<std::uint8_t> out(bytes);
+  for (std::size_t i = 0; i < bytes; ++i) {
+    out[i] = static_cast<std::uint8_t>(i * 31U + seed);
+  }
+  return out;
+}
+
+void write_local_file(std::string const& path, std::vector<std::uint8_t> const& bytes)
+{
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<char const*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+  out.close();
+  REQUIRE(out);
+}
+
+/** A uring ioctx with an armed fs_cache, and a scratch file of known bytes. */
+struct local_cache_fixture {
+  local_cache_fixture() : memory(identity_memory())
+  {
+    cucascade::io::io_config config;
+    config.uring_reactors_per_gpu = 1;
+    context                       = cucascade::io::make_uring_ioctx_factory(*memory)(config);
+    REQUIRE(context != nullptr);
+    context->start();
+    context->initialize_cache(*memory, identity_cache_config(), nullptr);
+    REQUIRE(context->uses_fs_cache());
+    bytes = 2 * context->cache()->chunk_size();
+    path  = (std::filesystem::temp_directory_path() /
+            ("cucascade_local_identity_" + std::to_string(::getpid()) + "_" +
+             std::to_string(next_id.fetch_add(1)) + ".bin"))
+             .string();
+    write_local_file(path, local_pattern(bytes, 1));
+  }
+
+  ~local_cache_fixture()
+  {
+    context->shutdown();
+    context->shutdown_cache();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path + ".next", ec);
+  }
+
+  local_cache_fixture(local_cache_fixture const&)            = delete;
+  local_cache_fixture& operator=(local_cache_fixture const&) = delete;
+
+  /// A datasource over a fresh object, its whole range prefetched and read
+  /// through the cache.
+  std::unique_ptr<datasource> cached_reader()
+  {
+    auto reader = std::make_unique<datasource>(context, context->open_io_object(path));
+    advise(*reader, bytes);
+    std::ignore = read_all(*reader);
+    return reader;
+  }
+
+  static inline std::atomic<int> next_id{0};
+  std::unique_ptr<cucascade::memory::memory_reservation_manager> memory;
+  std::shared_ptr<cucascade::io::ioctx> context;
+  std::size_t bytes{0};
+  std::string path;
+};
+
+}  // namespace
+
+TEST_CASE("local opens share a generation until the file is replaced",
+          "[cache][cache_identity][uring][object_identity]")
+{
+  local_cache_fixture fixture;
+  auto& cache = *fixture.context->cache();
+  auto first  = fixture.cached_reader();
+  REQUIRE(cache.generation_count(fixture.path) == 1);
+  auto const resident = cache.claimed_bytes();
+
+  // A second open of the unchanged file has the same stat identity: it reuses
+  // the first open's generation and its resident chunks.
+  auto second = fixture.cached_reader();
+  CHECK(cache.generation_count(fixture.path) == 1);
+  CHECK(cache.file_entry_count_for_testing() == 1);
+  CHECK(cache.claimed_bytes() == resident);
+  CHECK(read_all(*second) == local_pattern(fixture.bytes, 1));
+
+  // The file is replaced atomically by someone else: nothing tells the cache,
+  // but the next open has a new identity, so it builds a new generation and
+  // retires the old one.
+  auto const new_bytes = local_pattern(fixture.bytes, 9);
+  write_local_file(fixture.path + ".next", new_bytes);
+  std::filesystem::rename(fixture.path + ".next", fixture.path);
+  auto third = fixture.cached_reader();
+  CHECK(read_all(*third) == new_bytes);
+  CHECK(cache.generation_count(fixture.path) == 2);
+  CHECK(cache.retired_generation_count() == 1);
+  CHECK(cache.file_entry_count_for_testing() == 1);
+
+  // The earlier opens keep the bytes of the file they opened.
+  CHECK(read_all(*first) == local_pattern(fixture.bytes, 1));
+  first.reset();
+  second.reset();
+  CHECK(
+    cucascade::test::wait_for_cache([&] { return cache.generation_count(fixture.path) == 1; }, 5s));
+  CHECK(cache.retired_generation_count() == 0);
 }

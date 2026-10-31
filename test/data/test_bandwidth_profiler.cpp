@@ -16,9 +16,11 @@
  */
 
 #include "utils/mock_test_utils.hpp"
+#include "utils/remote_test_utils.hpp"
 
 #include <cucascade/cudf/bandwidth_profiler.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/remote_io_context.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/chunked_resource_info.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -168,6 +170,55 @@ TEST_CASE("measure_bandwidth enumerates pairs with bidirectional entries and no 
 }
 
 // =============================================================================
+// REMOTE spaces: skipped by default, measured against GPU/HOST only when asked for
+// =============================================================================
+
+TEST_CASE("measure_bandwidth skips REMOTE pairs unless asked for", "[bandwidth_profiler][remote]")
+{
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  auto server  = test::make_remote_store();
+  auto context = make_remote_io_context(test::remote_options(*server));
+  auto remote  = test::make_remote_space(context);
+  auto& gpu    = shared_gpu_space();
+  auto& host   = shared_host_space();
+  auto& disk   = shared_disk_space();
+
+  std::array spaces_array = {gpu.get(), host.get(), disk.get(), remote.get()};
+  std::span<memory::memory_space* const> spaces{spaces_array};
+
+  auto cfg               = tiny_config();
+  cfg.measure_disk_pairs = false;
+  auto profile           = measure_bandwidth(spaces, registry, cfg);
+  for (auto const& pair : profile.pairs) {
+    CHECK(pair.src.tier != memory::Tier::REMOTE);
+    CHECK(pair.dst.tier != memory::Tier::REMOTE);
+  }
+  CHECK(server->put_object_count() == 0);
+
+  cfg.measure_disk_pairs   = true;
+  cfg.measure_remote_pairs = true;
+  profile                  = measure_bandwidth(spaces, registry, cfg);
+  for (auto const id : {gpu->get_id(), host->get_id()}) {
+    auto const* to_remote   = profile.find(id, remote->get_id());
+    auto const* from_remote = profile.find(remote->get_id(), id);
+    REQUIRE(to_remote != nullptr);
+    REQUIRE(from_remote != nullptr);
+    CHECK(to_remote->converter_available);
+    CHECK(from_remote->converter_available);
+    CHECK(to_remote->summary.gbps > 0.0);
+  }
+  // No REMOTE <-> DISK pair.
+  CHECK(profile.find(disk->get_id(), remote->get_id()) == nullptr);
+  CHECK(profile.find(remote->get_id(), disk->get_id()) == nullptr);
+  CHECK(server->put_object_count() > 0);
+  CHECK(test::eventually([&] { return server->stored_keys().empty(); }));
+  remote.reset();
+  context.reset();
+}
+
+// =============================================================================
 // Size override is honored
 // =============================================================================
 
@@ -278,6 +329,7 @@ std::string format_space_id(memory::memory_space_id id)
     case memory::Tier::GPU: os << "GPU"; break;
     case memory::Tier::HOST: os << "HOST"; break;
     case memory::Tier::DISK: os << "DISK"; break;
+    case memory::Tier::REMOTE: os << "REMOTE"; break;
     default: os << "???"; break;
   }
   os << ":" << id.device_id;

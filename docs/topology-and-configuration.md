@@ -9,6 +9,7 @@ Hardware topology discovery, NUMA-aware memory placement, and system configurati
   - [What Gets Detected](#what-gets-detected)
   - [How Detection Works](#how-detection-works)
   - [CUDA Context Independence](#cuda-context-independence)
+  - [Storage of a File Path](#storage-of-a-file-path)
   - [GPU-to-NUMA Affinity](#gpu-to-numa-affinity)
   - [PCIe Path Types](#pcie-path-types)
 - [Configuring cuCascade](#configuring-cucascade)
@@ -118,6 +119,32 @@ initialized it first. The driver library is loaded dynamically only when runtime
 requested, so passive topology discovery remains available when `libcuda.so.1` is absent. These
 queries do not initialize the driver or create a CUDA context, therefore, unavailable drivers and
 failed queries leave the corresponding runtime attributes unsupported.
+
+### Storage of a File Path
+
+`topology_discovery::discover_storage_for_path(path)` (and
+`discover_storage_for_descriptor(fd, path)` for a file that is already open) describe where one
+regular file is stored, as a `path_storage_info` snapshot:
+
+- the opened file's resolved path and `st_dev`;
+- its mount -- by `statx` mount ID when the kernel reports it, otherwise the longest covering
+  mount point of the file's device -- with mount point, root (bind mounts), filesystem type,
+  source and options from `/proc/self/mountinfo` (escaped fields decoded). A mount ID that
+  mountinfo no longer lists leaves the storage unknown unless a same-device mount covers the
+  path; path-only matching is allowed only when no mount ID is known;
+- what backs it (`storage_kind`): `local_block` with the leaf disks reached from
+  `/sys/dev/block/<major>:<minor>` through partition parents and device-mapper / md `slaves`
+  (cycle-protected), each with drive class, PCI bus ID and NUMA node; `network` (NFS, Lustre, GPFS,
+  WekaFS, BeeGFS, ...) and `memory` (tmpfs, ...) filesystems, which have no local leaves; or
+  `unknown`.
+
+`path_storage_status` separates `not_found`, `not_regular_file` and `inaccessible` paths from
+`unknown`, which is reported when procfs / sysfs cannot be read, for overlay / FUSE / pseudo
+filesystems, and for stacks that cannot be resolved -- unknown is never a negative answer, and no
+NVMe device is invented. Discovery is passive like the rest of this component (no CUDA, no cuFile,
+no file creation), never throws, and caches nothing: a file can move or a mount change right after
+the snapshot. The cuFile backend's `cufile::probe_path` builds its per-file GDS verdict on it (see
+[io/gpuio-gds-practices.md](io/gpuio-gds-practices.md)).
 
 ### Network Device Verification
 

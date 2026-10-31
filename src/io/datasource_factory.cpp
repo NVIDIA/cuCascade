@@ -17,12 +17,14 @@
  */
 
 #include <cucascade/io/config.hpp>
+#ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/cufile_reactor.hpp>
+#endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
-#ifdef CUCASCADE_HAS_KVIKIO
-#include <cucascade/io/kvikio/kvikio_context.hpp>
-#endif
 #include <cucascade/io/object_store_config.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
 #include <cucascade/io/rest/s3/static_credentials.hpp>
@@ -31,6 +33,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/topology_index.hpp>
 
 #include <cctype>
 #include <exception>
@@ -55,24 +58,16 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
   return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 }
 
-/// Build a SigV4 authorizer from the object-store credentials, or nullptr when
-/// the store is not configured (empty endpoint / credentials / region — which
-/// disables the REST backend).  The signing form follows @c s3_signing_mode.
-std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_config& os)
+/// Placements of @p reactors_per_gpu reactors per GPU of @p topology (see
+/// make_reactor_placements) with the config's spill policy.
+reactor_layout make_layout(std::size_t reactors_per_gpu,
+                           const io_config& config,
+                           const cucascade::memory::topology_index* topology,
+                           cucascade::memory::memory_reservation_manager* rm)
 {
-  if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
-    return nullptr;
-  }
-  auto creds = rest::s3::static_credentials_from(os);
-  switch (os.s3_signing_mode) {
-    case object_store_config::signing_mode::header:
-      return std::make_shared<rest::s3::sigv4_header_authorizer>(
-        std::move(creds), os.region, os.endpoint);
-    case object_store_config::signing_mode::presigned:
-      return std::make_shared<rest::s3::sigv4_presigned_authorizer>(
-        std::move(creds), os.region, os.endpoint);
-  }
-  return nullptr;
+  return reactor_layout{
+    make_reactor_placements(reactors_per_gpu, topology, rm, config.pin_reactor_threads),
+    config.reactor_spill};
 }
 
 }  // namespace
@@ -80,16 +75,19 @@ std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
 
-#ifdef CUCASCADE_HAS_KVIKIO
-factory_type make_kvikio_ioctx_factory()
+#ifdef CUCASCADE_HAS_CUFILE
+factory_type make_cufile_ioctx_factory(
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
 {
-  return [](const io_config& config) -> std::shared_ptr<ioctx> {
+  return [topology_index =
+            std::move(topology_index)](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      // Applies config.kvikio to kvikIO's process-global defaults (see
-      // kvikio_config): unset fields keep kvikIO's env-var-seeded values.
-      return std::make_shared<kvikio_context>(config.kvikio, config.object_store);
+      auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile);
+      return std::make_shared<cufile::cufile_ioctx>(
+        make_layout(config.cufile_reactors_per_gpu, config, topology_index.get(), nullptr),
+        std::move(ctx));
     } catch (const std::exception& e) {
-      CUCASCADE_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
+      CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
     }
   };
@@ -97,9 +95,11 @@ factory_type make_kvikio_ioctx_factory()
 #endif
 
 factory_type make_uring_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager)
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
 {
-  return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
+  return [&reservation_manager, topology_index = std::move(topology_index)](
+           const io_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto* host_mr = first_host_resource(reservation_manager);
       if (host_mr == nullptr) {
@@ -107,9 +107,13 @@ factory_type make_uring_ioctx_factory(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
-      // One reactor_context shares config and the pinned staging resource.
+      // One reactor_context shares config and the fallback pinned staging
+      // resource; each placed reactor stages from its own NUMA node's.
       auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
-      return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
+      return std::make_shared<uring::uring_ioctx>(
+        make_layout(
+          config.uring_reactors_per_gpu, config, topology_index.get(), &reservation_manager),
+        std::move(ctx));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -122,7 +126,7 @@ factory_type make_rest_ioctx_factory(
 {
   return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      auto authorizer = make_s3_authorizer(config.object_store);
+      auto authorizer = rest::s3::make_authorizer(config.object_store);
       if (!authorizer) {
         CUCASCADE_LOG_WARN(
           "make_rest_ioctx_factory: object store not configured (endpoint / credentials / "
@@ -132,7 +136,7 @@ factory_type make_rest_ioctx_factory(
       auto* host_mr = first_host_resource(reservation_manager);
       auto rest_cfg = config.rest;
       // The object store owns the endpoint and its TLS trust; the reactor's
-      // curl GETs must verify against the same CA bundle / policy the authorizer
+      // TLS connections must verify against the same CA bundle / policy the authorizer
       // presigns for, so source these from object_store rather than rest config.
       rest_cfg.ca_bundle_path = config.object_store.ca_bundle_path;
       rest_cfg.tls_verify     = config.object_store.tls_verify;
@@ -151,26 +155,37 @@ factory_type make_rest_ioctx_factory(
 // ---------------------------------------------------------------------------
 
 io_context_registry::io_context_registry(
-  config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
+  config_type config,
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
-    _prefer_kvikio(_config.backend == io_backend::kvikio)
+    _topology_index(std::move(topology_index)),
+    _prefer_cufile(_config.backend == io_backend::cufile)
 {
+  validate_spill_policy(_config.reactor_spill);
+#ifndef CUCASCADE_HAS_CUFILE
+  if (_prefer_cufile) {
+    throw std::invalid_argument(
+      "io_context_registry: io_backend::cufile requested, but this cuCascade build has no cuFile "
+      "backend (cufile.h was not found at configure time)");
+  }
+#endif
   // uring / rest claim paths via their reactor's static supports() (local
-  // files and s3:// URLs respectively).  kvikio is the universal fallback —
-  // it can open any local path — so it matches everything and lookup_path
-  // defers it behind the explicit backends.  Without kvikIO (a cudf-free
-  // build) there is no catch-all and unmatched paths resolve to nothing.
-#ifdef CUCASCADE_HAS_KVIKIO
-  _entries.emplace(
-    io_context_type::kvikio,
-    entry{
-      io_context_type::kvikio, [](std::string_view) { return true; }, make_kvikio_ioctx_factory()});
+  // files and s3:// URLs respectively).  There is no catch-all: a path no
+  // backend claims resolves to nothing.  cufile claims local regular files like
+  // uring; lookup_path decides between them by the configured backend, never by
+  // iteration order.
+#ifdef CUCASCADE_HAS_CUFILE
+  _entries.emplace(io_context_type::cufile,
+                   entry{io_context_type::cufile,
+                         &cufile::cufile_reactor::supports,
+                         make_cufile_ioctx_factory(_topology_index)});
 #endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
-                         make_uring_ioctx_factory(_reservation_manager)});
+                         make_uring_ioctx_factory(_reservation_manager, _topology_index)});
   _entries.emplace(io_context_type::restful,
                    entry{io_context_type::restful,
                          &rest::rest_reactor::supports,
@@ -218,24 +233,19 @@ std::optional<io_context_type> io_context_registry::lookup_path(
 {
   std::shared_lock lk{_mtx};
   _lookup_latched.store(true, std::memory_order_release);
-  // kvikio's checker matches everything; _entries iterates in unspecified order,
-  // so defer the catch-all and let an explicit backend (uring/restful) win.
-  std::optional<io_context_type> fallback;
+  // uring and rest claim disjoint paths (local files vs s3:// URLs), but both
+  // cufile and uring answer true for a local file, and iteration order must not
+  // decide between them: cufile is considered only when the config asked for
+  // it, and then it displaces uring.  The rules, per configured backend:
+  //   * cufile -- skip uring for local files (cufile wins); rest keeps s3://.
+  //   * native -- skip cufile for local files (uring wins); rest keeps s3://.
   for (const auto& [type, entry] : _entries) {
     if (!entry.checker(path)) continue;
-    if (type == io_context_type::kvikio) {
-      fallback = type;
-      continue;
-    }
-    // backend=kvikio takes over reads from BOTH explicit backends: local files
-    // from uring, s3:// objects from rest (kvikIO's RemoteHandle serves them).
-    // LIST still needs the rest ioctx, which callers fetch by type instead.
-    if (_prefer_kvikio && (type == io_context_type::uring || type == io_context_type::restful)) {
-      continue;
-    }
+    if (_prefer_cufile && type == io_context_type::uring) { continue; }
+    if (!_prefer_cufile && type == io_context_type::cufile) { continue; }
     return type;
   }
-  return fallback;
+  return std::nullopt;
 }
 
 std::shared_ptr<ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept

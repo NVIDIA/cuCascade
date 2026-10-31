@@ -56,5 +56,18 @@ struct disk_table_allocation {
  */
 std::string generate_disk_file_path(std::string_view base_path);
 
+/**
+ * @brief A fresh object URI for one batch spilled to a REMOTE memory space.
+ *
+ * `{prefix}/{run_id}/batch_{seq:016x}_{rand:08x}.cucascade`, where `run_id` =
+ * `{hostname}-{pid}-{process start, unix ms}` is fixed per process (so processes sharing a prefix
+ * never collide, and one run's objects share one sub-prefix for lifecycle rules and manual
+ * cleanup), `seq` is a process-wide counter and `rand` a random tag. No I/O: the object is created
+ * by the write that follows. Thread-safe.
+ *
+ * @param prefix A normalized REMOTE prefix (see validate_remote_uri_prefix()).
+ */
+std::string generate_remote_object_uri(std::string_view prefix);
+
 }  // namespace memory
 }  // namespace cucascade

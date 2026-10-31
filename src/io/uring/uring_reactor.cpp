@@ -16,11 +16,15 @@
  * limitations under the License.
  */
 
+#include "io/detail/local_descriptor.hpp"
+
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
@@ -35,6 +39,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cassert>
 #include <cerrno>
@@ -42,7 +47,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -59,6 +66,17 @@ namespace cucascade::io::uring {
 
 namespace {
 
+/// Test seam (see uring/types.hpp).
+std::atomic<bool> fail_copy_event_record{false};
+
+/// Record @p event on @p stream after a copy was enqueued there; tests can make
+/// the record fail (@ref detail::set_copy_event_record_failure_for_testing).
+[[nodiscard]] cudaError_t record_copy_event(cudaEvent_t event, cudaStream_t stream) noexcept
+{
+  if (fail_copy_event_record.load(std::memory_order_relaxed)) return cudaErrorNotPermitted;
+  return cudaEventRecord(event, stream);
+}
+
 // Staging geometry: the reactor stages through whole host-resource blocks, so the slot
 // count is derived from a fixed 64 MiB pinned budget per reactor (the footprint before
 // the slot size was tied to the resource's block size) and clamped to [1, MAX_NUM_SLOTS].
@@ -66,8 +84,14 @@ constexpr std::size_t STAGING_BUDGET_BYTES = 64UL << 20;
 constexpr std::size_t MAX_NUM_SLOTS        = 64;
 constexpr std::size_t MAX_PLAIN_READ_SIZE  = 1UL << 30;
 constexpr std::chrono::milliseconds POLL_INTERVAL{20};
+// How often the worker polls device copies on callers' streams (a staged write's
+// D2H, a read's H2D).  It never blocks on such a copy: the stream belongs to the
+// caller and may sit behind arbitrary GPU work, so the worker keeps serving
+// other requests and checks the copies' events at this interval instead.
+constexpr std::chrono::microseconds COPY_POLL_INTERVAL{100};
 constexpr auto POLL_INTERVAL_US =
   std::chrono::duration_cast<std::chrono::microseconds>(POLL_INTERVAL).count();
+constexpr auto COPY_POLL_INTERVAL_US = COPY_POLL_INTERVAL.count();
 
 [[nodiscard]] constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
 {
@@ -108,6 +132,18 @@ static_assert(max_slices_per_pass == MAX_NUM_SLOTS,
 [[nodiscard]] std::error_code canceled_error() noexcept
 {
   return std::make_error_code(std::errc::operation_canceled);
+}
+
+/// The message of @p error, for logging.
+[[nodiscard, maybe_unused]] std::string describe(std::exception_ptr const& error)
+{
+  try {
+    std::rethrow_exception(error);
+  } catch (std::exception const& e) {
+    return e.what();
+  } catch (...) {
+  }
+  return "unknown error";
 }
 
 struct ring_deleter {
@@ -181,12 +217,12 @@ class unique_ring {
     return io_uring_register_sync_cancel(_ring.get(), &cancel);
   }
 
-  [[nodiscard]] int wait_for(std::chrono::milliseconds timeout) const noexcept
+  [[nodiscard]] int wait_for(std::chrono::microseconds timeout) const noexcept
   {
     io_uring_cqe* cqe = nullptr;
     __kernel_timespec ts{};
-    ts.tv_sec     = timeout.count() / 1000;
-    ts.tv_nsec    = (timeout.count() % 1000) * 1'000'000L;
+    ts.tv_sec     = timeout.count() / 1'000'000;
+    ts.tv_nsec    = (timeout.count() % 1'000'000) * 1'000L;
     auto const rc = io_uring_wait_cqe_timeout(_ring.get(), &cqe, &ts);
     return rc < 0 && rc != -EINTR && rc != -ETIME ? -rc : 0;
   }
@@ -222,7 +258,9 @@ struct staging_lease {
   std::vector<slot_pool::token> tokens;
 };
 
-enum class slot_state { idle, reading, copying };
+/// idle -> reading (I/O in flight) -> [copying (read: H2D)] -> idle, and for a
+/// staged device write idle -> staging (D2H in flight) -> reading -> idle.
+enum class slot_state { idle, staging, reading, copying };
 
 struct io_slot {
   explicit io_slot(int index, bool fixed_supported) : index(index), fixed_supported(fixed_supported)
@@ -251,6 +289,10 @@ struct io_slot {
   void prepare_remaining_iovecs()
   {
     assert(op != nullptr && state == slot_state::reading);
+    if (op->is_flush()) {
+      resume_iovecs.clear();
+      return;
+    }
     auto& request = op->request;
     detail::fill_remaining_iovecs(request.iovecs, bytes_read, resume_iovecs);
     if (resume_iovecs.empty()) {
@@ -261,32 +303,68 @@ struct io_slot {
   void prepare_sqe(io_uring_sqe* sqe) noexcept
   {
     assert(sqe != nullptr && op != nullptr && state == slot_state::reading &&
-           !resume_iovecs.empty());
+           (op->is_flush() || !resume_iovecs.empty()));
     auto& request = op->request;
 
+    if (op->is_flush()) {
+      io_uring_prep_fsync(sqe, op->fd, IORING_FSYNC_DATASYNC);
+      used_fixed = false;
+      io_uring_sqe_set_data64(sqe, static_cast<__u64>(index));
+      return;
+    }
+
+    bool const write         = op->is_write();
     auto const offset        = request.io_rng.offset + bytes_read;
     bool const can_use_fixed = op->needs_staging() && op->staging_blocks == 1 &&
                                resume_iovecs.size() == 1 && bytes_read == 0 && fixed_supported;
     if (can_use_fixed) {
       auto const& iov = resume_iovecs.front();
-      io_uring_prep_read_fixed(sqe,
-                               op->fd,
-                               iov.iov_base,
-                               static_cast<unsigned>(iov.iov_len),
-                               static_cast<__u64>(offset),
-                               index);
+      if (write) {
+        io_uring_prep_write_fixed(sqe,
+                                  op->fd,
+                                  iov.iov_base,
+                                  static_cast<unsigned>(iov.iov_len),
+                                  static_cast<__u64>(offset),
+                                  index);
+      } else {
+        io_uring_prep_read_fixed(sqe,
+                                 op->fd,
+                                 iov.iov_base,
+                                 static_cast<unsigned>(iov.iov_len),
+                                 static_cast<__u64>(offset),
+                                 index);
+      }
       used_fixed = true;
     } else if (resume_iovecs.size() == 1) {
       auto const& iov = resume_iovecs.front();
-      io_uring_prep_read(
-        sqe, op->fd, iov.iov_base, static_cast<unsigned>(iov.iov_len), static_cast<__u64>(offset));
+      if (write) {
+        io_uring_prep_write(sqe,
+                            op->fd,
+                            iov.iov_base,
+                            static_cast<unsigned>(iov.iov_len),
+                            static_cast<__u64>(offset));
+      } else {
+        io_uring_prep_read(sqe,
+                           op->fd,
+                           iov.iov_base,
+                           static_cast<unsigned>(iov.iov_len),
+                           static_cast<__u64>(offset));
+      }
       used_fixed = false;
     } else {
-      io_uring_prep_readv(sqe,
-                          op->fd,
-                          resume_iovecs.data(),
-                          static_cast<unsigned>(resume_iovecs.size()),
-                          static_cast<__u64>(offset));
+      if (write) {
+        io_uring_prep_writev(sqe,
+                             op->fd,
+                             resume_iovecs.data(),
+                             static_cast<unsigned>(resume_iovecs.size()),
+                             static_cast<__u64>(offset));
+      } else {
+        io_uring_prep_readv(sqe,
+                            op->fd,
+                            resume_iovecs.data(),
+                            static_cast<unsigned>(resume_iovecs.size()),
+                            static_cast<__u64>(offset));
+      }
       used_fixed = false;
     }
     io_uring_sqe_set_data64(sqe, static_cast<__u64>(index));
@@ -338,6 +416,140 @@ void attach_common(uring_io_op& op,
   return op;
 }
 
+[[nodiscard]] bool is_granule_aligned(range piece, std::size_t granule) noexcept
+{
+  return piece.offset % granule == 0 && piece.size % granule == 0;
+}
+
+[[nodiscard]] bool is_block_aligned(void const* pointer) noexcept
+{
+  return reinterpret_cast<std::uintptr_t>(pointer) % IO_BLOCK_SIZE == 0;
+}
+
+/// Full-range pwrite that retries EINTR and short writes; a 0-byte write is EIO.
+void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size_t offset)
+{
+  std::size_t completed = 0;
+  while (completed < bytes) {
+    auto const result =
+      ::pwrite(fd, source + completed, bytes - completed, static_cast<off_t>(offset + completed));
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      throw std::system_error(errno, std::generic_category(), "uring_reactor: pwrite");
+    }
+    if (result == 0) {
+      throw std::system_error(std::make_error_code(std::errc::io_error),
+                              "uring_reactor: pwrite wrote nothing");
+    }
+    completed += static_cast<std::size_t>(result);
+  }
+}
+
+/**
+ * @brief Plan the physical operations of a write or flush slice.
+ *
+ * The slice is split at the write granule into head / body / tail.  The body
+ * goes O_DIRECT when the object has a direct fd: straight from a host source
+ * congruent with its file offset, otherwise through staging blocks (device
+ * sources by a D2H copy, host sources by a memcpy).  Head and tail go through
+ * the buffered fd -- from the caller's buffer for host sources, staged for
+ * device ones.  Staged pieces are cut into operations of the dynamic I/O
+ * target, which is a whole number of staging blocks.
+ */
+[[nodiscard]] std::vector<std::unique_ptr<uring_io_op>> plan_write_slice(
+  std::shared_ptr<const io_object> const& object,
+  local_io_object const& file,
+  prepared_io_slice const& slice,
+  std::shared_ptr<grouped_coordinator> const& coordinator,
+  config const& cfg,
+  std::size_t block_size,
+  std::size_t backlog_bytes,
+  std::size_t free_slots)
+{
+  if (!file.writable()) {
+    throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
+                            "uring_reactor: object was not opened for writing");
+  }
+
+  std::vector<std::unique_ptr<uring_io_op>> result;
+  auto make_write_op = [&](range physical, bool direct, io_op_kind kind) {
+    auto op            = std::make_unique<uring_io_op>();
+    op->fd             = direct ? file.odirect_handle() : file.buffered_handle();
+    op->file_size      = file.size();
+    op->use_odirect    = direct;
+    op->request.io_rng = physical;
+    attach_common(*op, object, slice, coordinator);
+    op->request.kind = kind;
+    return op;
+  };
+
+  if (slice.is_flush()) {
+    result.push_back(make_write_op(range{}, false, io_op_kind::flush));
+    return result;
+  }
+  if (!slice.is_write()) { throw std::invalid_argument("uring_reactor: unknown slice kind"); }
+  if (slice.rng.empty()) { throw std::invalid_argument("uring_reactor: zero-sized write slice"); }
+
+  bool const device = slice.has_device_request();
+  std::uint8_t const* host =
+    slice.is_contiguous() ? std::get<std::uint8_t*>(slice.h_buffer.buffer) : nullptr;
+  if (device == (host != nullptr)) {
+    throw std::invalid_argument("uring_reactor: write slice needs exactly one source");
+  }
+
+  bool const direct_fd   = detail::odirect_available(cfg.use_odirect, file.odirect_handle());
+  bool const can_stage   = block_size != 0;
+  bool const direct_ok   = direct_fd && block_size % IO_BLOCK_SIZE == 0;
+  auto const granule     = write_granule();
+  auto const source_from = [&](std::size_t offset) { return host + (offset - slice.rng.offset); };
+
+  auto target =
+    detail::dynamic_io_target(backlog_bytes, std::max<std::size_t>(1, free_slots), block_size);
+  if (target == 0) target = std::min(block_size, max_dynamic_io_size);
+
+  auto add_staged = [&](range piece, bool direct) {
+    if (!can_stage) throw std::invalid_argument("uring_reactor: staging block size is zero");
+    std::size_t consumed = 0;
+    while (consumed < piece.size) {
+      auto const bytes = std::min(target, piece.size - consumed);
+      auto op = make_write_op(range{piece.offset + consumed, bytes}, direct, io_op_kind::write);
+      op->staging_blocks = bytes / block_size + (bytes % block_size != 0);
+      if (!device) op->host_source = source_from(piece.offset + consumed);
+      result.push_back(std::move(op));
+      consumed += bytes;
+    }
+  };
+
+  auto add_plain = [&](range piece, bool direct) {
+    std::size_t consumed = 0;
+    while (consumed < piece.size) {
+      auto const bytes = std::min(MAX_PLAIN_READ_SIZE, piece.size - consumed);
+      auto const at    = piece.offset + consumed;
+      auto op          = make_write_op(range{at, bytes}, direct, io_op_kind::write);
+      op->request.iovecs.push_back(iovec{const_cast<std::uint8_t*>(source_from(at)), bytes});
+      result.push_back(std::move(op));
+      consumed += bytes;
+    }
+  };
+
+  for (auto const& piece : detail::split_write_range(slice.rng, granule)) {
+    if (piece.empty()) continue;
+    bool const body = is_granule_aligned(piece, granule);
+    if (device) {
+      add_staged(piece, body && direct_ok);
+    } else if (!body || !direct_fd) {
+      add_plain(piece, false);
+    } else if (is_block_aligned(source_from(piece.offset))) {
+      add_plain(piece, true);
+    } else if (direct_ok) {
+      add_staged(piece, true);
+    } else {
+      add_plain(piece, false);
+    }
+  }
+  return result;
+}
+
 [[nodiscard]] std::vector<std::unique_ptr<uring_io_op>> plan_slice(
   std::shared_ptr<const io_object> const& object,
   prepared_io_slice const& slice,
@@ -350,6 +562,10 @@ void attach_common(uring_io_op& op,
   auto const file = std::dynamic_pointer_cast<local_io_object const>(object);
   if (file == nullptr) {
     throw std::invalid_argument("uring_reactor: grouped request contains a foreign io_object");
+  }
+  if (slice.kind != io_op_kind::read) {
+    return plan_write_slice(
+      object, *file, slice, coordinator, cfg, block_size, backlog_bytes, free_slots);
   }
   if (slice.rng.empty()) {
     throw std::invalid_argument("uring_reactor: zero-sized prepared slice");
@@ -465,17 +681,19 @@ void attach_common(uring_io_op& op,
 
 }  // namespace
 
-uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx)), _tname(tname)
+uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx,
+                             std::string_view tname,
+                             reactor_placement placement)
+  : _ctx(std::move(ctx)), _tname(tname), _placement(std::move(placement))
 {
   if (_ctx == nullptr) {
     throw std::invalid_argument("uring_reactor: reactor_context must be non-null");
   }
-  if (_ctx->host_memory_resource() == nullptr) {
+  if (staging_resource() == nullptr) {
     throw std::invalid_argument("uring_reactor: host memory resource must be non-null");
   }
   _config              = _ctx->cfg();
-  _bounce_slot_size    = _ctx->host_memory_resource()->get_block_size();
+  _bounce_slot_size    = staging_resource()->get_block_size();
   _slices_per_pass     = effective_slices_per_pass(_config.slices_per_pass);
   _low_service_quantum = std::min(_slices_per_pass, max_slices_per_pass);
 }
@@ -543,7 +761,7 @@ void uring_reactor::start()
     std::clamp(STAGING_BUDGET_BYTES / _bounce_slot_size, std::size_t{1}, MAX_NUM_SLOTS);
   auto const staging_bytes = slot_count * _bounce_slot_size;
   try {
-    _bounce_storage = _ctx->host_memory_resource()->allocate_multiple_blocks(staging_bytes);
+    _bounce_storage = staging_resource()->allocate_multiple_blocks(staging_bytes);
   } catch (rmm::out_of_memory const& e) {
     throw std::runtime_error("uring_reactor: cannot reserve " + std::to_string(staging_bytes) +
                              " bytes of pinned staging (" + std::to_string(slot_count) + " x " +
@@ -554,19 +772,39 @@ void uring_reactor::start()
     throw std::runtime_error("uring_reactor: failed to allocate all staging slots");
   }
 
-  std::lock_guard lock(_enqueue_mutex);
-  try {
-    _accepting.store(true, std::memory_order_release);
-    _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(stop_token); },
-                           _stop_source.get_token());
-  } catch (...) {
-    _accepting.store(false, std::memory_order_release);
-    _bounce_storage.reset();
-    throw;
+  std::promise<void> ready;
+  auto ring_ready = ready.get_future();
+  {
+    std::lock_guard lock(_enqueue_mutex);
+    try {
+      _rejection_error = nullptr;
+      _accepting.store(true, std::memory_order_release);
+      _worker = std::jthread(
+        [this, ready = std::move(ready)](std::stop_token stop_token) mutable {
+          pin_reactor_thread(_placement, _tname);
+          worker_loop(stop_token, ready);
+        },
+        _stop_source.get_token());
+    } catch (...) {
+      _accepting.store(false, std::memory_order_release);
+      _bounce_storage.reset();
+      throw;
+    }
   }
   if (!_tname.empty()) {
     auto const name = _tname + "_worker";
     std::ignore     = cucascade::exec::thread_util::set_thread_name(_worker, name);
+  }
+
+  // Surface a ring that cannot be set up here rather than as a stream of
+  // cancelled requests.  The failed worker has already closed admission and
+  // recorded the error for later requests; it is exiting, so join it.
+  try {
+    ring_ready.get();
+  } catch (...) {
+    _worker.join();
+    _bounce_storage.reset();
+    throw;
   }
 }
 
@@ -604,7 +842,9 @@ void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcep
   grouped_coordinator::error_type error{canceled_error()};
   {
     std::lock_guard lock(_enqueue_mutex);
-    if (_accepting.load(std::memory_order_acquire)) {
+    if (!_accepting.load(std::memory_order_acquire) && _rejection_error != nullptr) {
+      error = _rejection_error;
+    } else if (_accepting.load(std::memory_order_acquire)) {
       _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
       try {
         auto const priority = request->priority;
@@ -634,22 +874,142 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
     throw std::runtime_error("uring_reactor::create_io_object: unsupported path: " + path);
   }
 
-  file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
-  if (!buffered) {
-    throw std::system_error(
-      errno, std::generic_category(), "uring_reactor::create_io_object: buffered open");
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
+    if (!buffered) {
+      int const error = errno;
+      throw std::system_error(
+        error, std::generic_category(), "uring_reactor::create_io_object: buffered open");
+    }
+
+    // Reopen the owned descriptor, not the pathname: a concurrent rename must
+    // not pair the old buffered footer with a different O_DIRECT data file.
+    file_descriptor direct{cucascade::io::detail::reopen_local_descriptor(
+      buffered.get(), path.c_str(), O_RDONLY | O_DIRECT)};
+    if (!direct) {
+      CUCASCADE_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
+                         path,
+                         strerror(errno));
+    }
+
+    object_identity captured;
+    if (!capture_local_identity(buffered.get(), captured)) {
+      int const error = errno;
+      throw std::system_error(
+        error, std::generic_category(), "uring_reactor::create_io_object: fstat");
+    }
+    if (direct) {
+      object_identity direct_identity;
+      if (!capture_local_identity(direct.get(), direct_identity)) {
+        throw descriptor_mismatch_error(
+          "uring_reactor::create_io_object: identity_descriptor_mismatch");
+      }
+      if (captured.device != direct_identity.device || captured.inode != direct_identity.inode) {
+        // Destroy the entire descriptor set before retrying the open.
+        continue;
+      }
+    }
+    auto const file_size = captured.size;
+    return std::make_unique<local_io_object>(
+      std::move(path), std::move(buffered), std::move(direct), file_size, "", std::move(captured));
+  }
+  throw descriptor_mismatch_error("uring_reactor::create_io_object: identity_descriptor_mismatch");
+}
+
+std::unique_ptr<local_io_object> uring_reactor::create_io_object_for_write(
+  std::string path, write_open_options options)
+{
+  int flags = O_RDWR | O_CLOEXEC;
+  switch (options.mode) {
+    case write_mode::create_or_truncate: flags |= O_CREAT | O_TRUNC; break;
+    case write_mode::create_or_open: flags |= O_CREAT; break;
+    case write_mode::open_existing: break;
+    case write_mode::create_new: flags |= O_CREAT | O_EXCL; break;
   }
 
-  file_descriptor direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
+  file_descriptor buffered{::open(path.c_str(), flags, options.permissions)};
+  if (!buffered) {
+    int const error = errno;  // before the message allocates
+    throw std::system_error(error,
+                            std::generic_category(),
+                            "uring_reactor::create_io_object_for_write: open '" + path + "'");
+  }
+
+  // The file exists now; the direct fd only adds O_DIRECT (no create / truncate).
+  // It reopens the owned buffered fd rather than the path, so a concurrent
+  // rename cannot pair the two with different files.  The create / truncate
+  // above is never repeated: a pair that cannot be proven to name one file
+  // fails the open.
+  file_descriptor direct{cucascade::io::detail::reopen_writable_direct(
+    buffered.get(), path.c_str(), O_RDWR | O_DIRECT | O_CLOEXEC)};
   if (!direct) {
+    int const error = errno;
+    if (error == EXDEV) {
+      throw descriptor_mismatch_error(
+        "uring_reactor::create_io_object_for_write: identity_descriptor_mismatch for '" + path +
+        "'");
+    }
     CUCASCADE_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
                        path,
-                       strerror(errno));
+                       strerror(error));
+  }
+
+  constexpr auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+  if (options.size_hint != 0 && options.size_hint <= max_offset) {
+    // Best effort: a filesystem without preallocation simply grows as it is written.
+    std::ignore =
+      ::fallocate(buffered.get(), FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(options.size_hint));
   }
 
   auto const file_size = size(buffered.get());
   return std::make_unique<local_io_object>(
-    std::move(path), std::move(buffered), std::move(direct), file_size);
+    std::move(path), std::move(buffered), std::move(direct), file_size, io_access::read_write);
+}
+
+std::size_t uring_reactor::host_write(local_io_object const& file,
+                                      std::size_t offset,
+                                      std::size_t bytes,
+                                      std::uint8_t const* source)
+{
+  if (!file.writable()) {
+    throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
+                            "uring_reactor::host_write: object was not opened for writing");
+  }
+  if (bytes == 0) return 0;
+  if (source == nullptr) throw std::invalid_argument("uring_reactor::host_write: null source");
+
+  bool const direct_fd = detail::odirect_available(_config.use_odirect, file.odirect_handle());
+  auto const granule   = write_granule();
+  for (auto const& piece : detail::split_write_range(range{offset, bytes}, granule)) {
+    if (piece.empty()) continue;
+    auto const* src   = source + (piece.offset - offset);
+    bool const direct = direct_fd && is_granule_aligned(piece, granule) && is_block_aligned(src);
+    if (!direct) {
+      pwrite_all(file.buffered_handle(), src, piece.size, piece.offset);
+      continue;
+    }
+    try {
+      pwrite_all(file.odirect_handle(), src, piece.size, piece.offset);
+    } catch (std::system_error const& error) {
+      // The filesystem refused this O_DIRECT write at run time: retry it buffered.
+      if (!detail::is_odirect_runtime_error(error.code().value())) throw;
+      pwrite_all(file.buffered_handle(), src, piece.size, piece.offset);
+    }
+  }
+  file.note_written(offset + bytes);
+  return bytes;
+}
+
+void uring_reactor::flush(local_io_object const& file)
+{
+  if (!file.writable()) {
+    throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
+                            "uring_reactor::flush: object was not opened for writing");
+  }
+  while (::fdatasync(file.buffered_handle()) != 0) {
+    if (errno == EINTR) continue;
+    throw std::system_error(errno, std::generic_category(), "uring_reactor::flush: fdatasync");
+  }
 }
 
 std::size_t uring_reactor::size(int native_handle)
@@ -745,8 +1105,9 @@ std::vector<byte_range> uring_reactor::align_and_coalesce(
   }
 }
 
-void uring_reactor::worker_loop(std::stop_token const& stop_token)
+void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<void>& ready)
 {
+  bool ring_ready    = false;
   auto cancel_queued = [&](grouped_coordinator::error_type const& error) noexcept {
     std::unique_ptr<grouped_io_request> request;
     while (_requests.try_dequeue(request)) {
@@ -775,12 +1136,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     for (std::size_t index = 0; index < slot_count; ++index) {
       slots.emplace_back(static_cast<int>(index), fixed_supported);
     }
+    ring_ready = true;
+    ready.set_value();
 
     std::array<io_uring_cqe*, MAX_NUM_SLOTS> cqes{};
     std::vector<int> incomplete;
     incomplete.reserve(slot_count);
     std::vector<int> copying;
     copying.reserve(slot_count);
+    std::vector<int> staging;
+    staging.reserve(slot_count);
     std::vector<std::unique_ptr<uring_io_op>> pending;
     std::unique_ptr<grouped_io_request> active;
     // A low-priority request set aside, part-expanded, while high requests run.
@@ -914,9 +1279,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           slot.copy_event   = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
           slot.event_device = device;
         }
-        auto const status =
-          copy.copy_async(slot.op->request.io_rng, slot.op->request.iovecs, slot.copy_event->get());
+        auto const stream = copy.d_buffer.stream.get();
+        auto status       = copy.copy_async(slot.op->request.io_rng, slot.op->request.iovecs);
+        if (status == cudaSuccess) status = record_copy_event(slot.copy_event->get(), stream);
         if (status != cudaSuccess) {
+          // Some copies may already be queued on the caller's stream (copy_async
+          // can fail part-way, or only the event record failed): they still read
+          // the staging block and write the destination, so wait for them before
+          // the slot (and its staging) is released and the request settles.
+          std::ignore = cudaStreamSynchronize(stream);
+          std::ignore = cudaGetLastError();
           settle_slot_error(slot, status, true);
           return;
         }
@@ -987,6 +1359,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         auto& slot = slots[static_cast<std::size_t>(index)];
         if (slot.op == nullptr || slot.state != slot_state::reading) continue;
 
+        if (slot.op->is_flush()) {
+          if (result < 0) {
+            settle_slot_error(slot, std::error_code{-result, std::generic_category()});
+          } else {
+            slot.op->request.finish_success();
+            reset_slot(slot);
+          }
+          continue;
+        }
+
         if (result < 0) {
           auto const errc = -result;
           if (slot.op->use_odirect && detail::is_odirect_runtime_error(errc)) {
@@ -1018,12 +1400,21 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         }
         slot.bytes_read += completed;
 
+        // A write is never clipped to the size at open: it is done when every
+        // byte of its range is in the file.
         auto const& io_range = slot.op->request.io_rng;
-        auto const available = io_range.offset < slot.op->file_size
+        bool const write     = slot.op->is_write();
+        auto const available = write ? io_range.size
+                               : io_range.offset < slot.op->file_size
                                  ? std::min(io_range.size, slot.op->file_size - io_range.offset)
                                  : std::size_t{0};
         if (slot.bytes_read >= available) {
-          finish_host_io(slot);
+          if (write) {
+            slot.op->request.finish_success();
+            reset_slot(slot);
+          } else {
+            finish_host_io(slot);
+          }
           continue;
         }
         if (completed == 0) {
@@ -1087,6 +1478,104 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       ring.submit(count, inflight);
     };
 
+    // Staged writes: a slot whose blocks are being filled by a D2H copy sits in
+    // `staging` until its event fires, then its write SQE is prepared like any
+    // other operation.
+    // A staged write's bytes count towards queued_bytes() while its D2H copy is
+    // pending, so next_reactor sees the backlog of a reactor whose staging is
+    // held by a stalled caller stream.
+    auto leave_staging = [&](io_slot& slot) noexcept {
+      _queued_bytes.fetch_sub(slot.op->request.io_rng.size, std::memory_order_relaxed);
+    };
+
+    auto prepare_staged_write = [&](io_slot& slot) noexcept {
+      if (!slot.op->request.coordinator->should_continue()) {
+        settle_slot_error(slot, canceled_error());
+        return;
+      }
+      slot.state = slot_state::reading;
+      try {
+        slot.prepare_remaining_iovecs();
+        auto* sqe = ring.get_sqe();
+        if (sqe == nullptr) {
+          incomplete.push_back(slot.index);
+          return;
+        }
+        slot.prepare_sqe(sqe);
+        prepared.push_back(slot.index);
+        bytes_submitted += slot.op->request.io_rng.size;
+      } catch (...) {
+        settle_slot_error(slot, std::current_exception());
+      }
+    };
+
+    auto start_staging_copy = [&](io_slot& slot) noexcept {
+      auto& copy = *slot.op->request.device_copy;
+      int device = copy.device_id >= 0 ? copy.device_id : copy.d_buffer.device_id;
+      if (device < 0) {
+        auto const status = cudaGetDevice(&device);
+        if (status != cudaSuccess) {
+          settle_slot_error(slot, status);
+          return;
+        }
+      }
+      try {
+        rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+        if (slot.copy_event == nullptr || slot.event_device != device) {
+          slot.copy_event   = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
+          slot.event_device = device;
+        }
+        auto const status = copy.copy_to_host_async(
+          slot.op->request.io_rng, slot.op->request.iovecs, slot.copy_event->get());
+        if (status != cudaSuccess) {
+          // Part of the copy may already be queued into the staging blocks: let
+          // the stream pass it before the blocks go back to the pool.
+          std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
+          settle_slot_error(slot, status);
+          return;
+        }
+        slot.state = slot_state::staging;
+        staging.push_back(slot.index);
+        _queued_bytes.fetch_add(slot.op->request.io_rng.size, std::memory_order_relaxed);
+      } catch (...) {
+        std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
+        settle_slot_error(slot, std::current_exception());
+      }
+    };
+
+    auto poll_staging = [&]() noexcept {
+      auto output = staging.begin();
+      for (auto it = staging.begin(); it != staging.end(); ++it) {
+        auto& slot = slots[static_cast<std::size_t>(*it)];
+        assert(slot.state == slot_state::staging && slot.op != nullptr);
+        if (slot.state != slot_state::staging || slot.op == nullptr) continue;
+        auto const status = cudaEventQuery(slot.copy_event->get());
+        if (status == cudaErrorNotReady) {
+          *output++ = *it;
+          continue;
+        }
+        leave_staging(slot);
+        if (status == cudaSuccess) {
+          prepare_staged_write(slot);
+        } else {
+          settle_slot_error(slot, status);
+        }
+      }
+      staging.erase(output, staging.end());
+    };
+
+    /// Fill a host-bounce write's staging blocks from its host source.
+    auto copy_host_bounce = [](uring_io_op& op) noexcept {
+      auto const* source    = op.host_source;
+      std::size_t remaining = op.request.io_rng.size;
+      for (auto const& iov : op.request.iovecs) {
+        auto const bytes = std::min(iov.iov_len, remaining);
+        std::memcpy(iov.iov_base, source, bytes);
+        source += bytes;
+        remaining -= bytes;
+      }
+    };
+
     auto dispatch_pending = [&]() {
       while (!pending.empty()) {
         auto& candidate = pending.back();
@@ -1134,6 +1623,15 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           slot.state      = slot_state::reading;
           slot.bytes_read = 0;
 
+          if (slot.op->is_write() && slot.op->needs_staging()) {
+            if (slot.op->request.device_copy != nullptr) {
+              // The SQE follows once the D2H copy has landed (poll_staging).
+              start_staging_copy(slot);
+              continue;
+            }
+            copy_host_bounce(*slot.op);
+          }
+
           slot.prepare_remaining_iovecs();
           auto* sqe = ring.get_sqe();
           if (sqe == nullptr) {
@@ -1178,6 +1676,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         poll_copy_completions();
         reap_completions();
         resubmit_incomplete();
+        poll_staging();
 
         if (!pending.empty() && !pending.back()->request.coordinator->should_continue()) {
           // Pending ops all come from one slice, so share one coordinator; that
@@ -1258,24 +1757,31 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         if (active == nullptr && pending.empty() && take_next()) continue;
 
         publish_gauges();
+        bool const copies_pending = !staging.empty() || !copying.empty();
         if (inflight != 0) {
-          if (auto const error = ring.wait_for(POLL_INTERVAL); error != 0) {
+          auto const timeout =
+            copies_pending ? COPY_POLL_INTERVAL : std::chrono::microseconds{POLL_INTERVAL};
+          if (auto const error = ring.wait_for(timeout); error != 0) {
             throw std::system_error(std::error_code{error, std::generic_category()},
                                     "uring_reactor: io_uring_wait_cqe_timeout");
           }
           reap_completions();
-        } else if (!copying.empty() && pending.empty() && active == nullptr) {
-          auto const index = copying.back();
-          copying.pop_back();
-          auto& slot        = slots[static_cast<std::size_t>(index)];
-          auto const status = slot.copy_event->synchronize_no_throw();
-          if (status == cudaSuccess) {
-            slot.op->request.finish_success();
-            reset_slot(slot);
-          } else {
-            settle_slot_error(slot, status, true);
+        } else if (copies_pending) {
+          // Nothing in the kernel; device copies on callers' streams are what
+          // remains.  Never block on them (a stalled caller stream would stall
+          // every request of this reactor): wait for a new request for one poll
+          // interval instead, and let the next pass poll the copies.  Work that
+          // waits for a slot backs off for the interval; an active request that
+          // can still expand goes straight to the next pass.
+          if (pending.empty() && active == nullptr) {
+            std::unique_ptr<grouped_io_request> next;
+            if (_requests.wait_dequeue_timed(next, COPY_POLL_INTERVAL_US)) {
+              if (next == nullptr) break;
+              activate(std::move(next), true);
+            }
+          } else if (!pending.empty() || available_slots.approx_free() == 0) {
+            std::this_thread::sleep_for(COPY_POLL_INTERVAL);
           }
-          poll_copy_completions();
         } else if (pending.empty() && active == nullptr) {
           std::unique_ptr<grouped_io_request> next;
           if (!_requests.wait_dequeue_timed(next, POLL_INTERVAL_US)) continue;
@@ -1289,10 +1795,15 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
     // Close admission before draining the queue.  Taking the same mutex as
     // enqueue() ensures every request that observed _accepting=true has
-    // finished publishing its queue entry before cancel_queued() runs.
+    // finished publishing its queue entry before cancel_queued() runs.  After
+    // a fatal error, later requests are rejected with it.
     {
       std::lock_guard lock(_enqueue_mutex);
       _accepting.store(false, std::memory_order_release);
+      _rejection_error = fatal_error;
+    }
+    if (fatal_error != nullptr) {
+      CUCASCADE_LOG_ERROR("uring_reactor {}: worker failed: {}", _tname, describe(fatal_error));
     }
 
     auto const cancellation = canceled_error();
@@ -1373,6 +1884,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       if (inflight == before) std::this_thread::sleep_for(POLL_INTERVAL);
     }
 
+    // Staged writes whose D2H copy never reached the kernel: let the copy land
+    // before the blocks are released, then fail them.
+    for (auto const index : staging) {
+      auto& slot  = slots[static_cast<std::size_t>(index)];
+      std::ignore = slot.copy_event->synchronize_no_throw();
+      leave_staging(slot);
+      settle_slot_error(slot, terminal_error);
+    }
+    staging.clear();
+
     for (auto const index : copying) {
       auto& slot        = slots[static_cast<std::size_t>(index)];
       auto const status = slot.copy_event->synchronize_no_throw();
@@ -1390,12 +1911,27 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     }
   } catch (...) {
     auto const error = std::current_exception();
+    CUCASCADE_LOG_ERROR("uring_reactor {}: {}: {}",
+                        _tname,
+                        ring_ready ? "worker failed" : "cannot set up its io_uring",
+                        describe(error));
     {
       std::lock_guard lock(_enqueue_mutex);
       _accepting.store(false, std::memory_order_release);
+      _rejection_error = error;
     }
     cancel_queued(error);
+    if (!ring_ready) ready.set_exception(error);
   }
 }
+
+namespace detail {
+
+void set_copy_event_record_failure_for_testing(bool enabled) noexcept
+{
+  fail_copy_event_record.store(enabled, std::memory_order_relaxed);
+}
+
+}  // namespace detail
 
 }  // namespace cucascade::io::uring

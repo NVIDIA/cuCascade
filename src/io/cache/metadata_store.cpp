@@ -18,47 +18,409 @@
 
 #include <cucascade/io/cache/metadata_store.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <mutex>
+#include <ostream>
+#include <sstream>
+#include <string>
 #include <string_view>
+#include <system_error>
+#include <tuple>
 #include <utility>
 
 namespace cucascade::io::cache {
 
+namespace {
+
+// Write `text` to `out` with the backslash and every byte outside printable
+// ASCII escaped (as \\ and \xNN): an entry key may hold any bytes (the profile
+// is free-form), and one entry must stay on one line of a log.
+void write_escaped(std::ostream& out, std::string_view text)
+{
+  constexpr std::string_view digits = "0123456789abcdef";
+  for (char const c : text) {
+    auto const byte = static_cast<unsigned char>(c);
+    if (byte == '\\') {
+      out << "\\\\";
+    } else if (byte >= 0x20 && byte < 0x7f) {
+      out << c;
+    } else {
+      out << "\\x" << digits[byte >> 4U] << digits[byte & 0xfU];
+    }
+  }
+}
+
+}  // namespace
+
+metadata_store::~metadata_store() { clear(); }
+
+// ---------------------------------------------------------------------------
+// Write epochs
+// ---------------------------------------------------------------------------
+
+std::atomic<std::uint64_t>& metadata_store::epoch_of(std::string_view object_path) const noexcept
+{
+  return _epochs[detail::string_hash{}(object_path) % epoch_slots];
+}
+
+void metadata_store::stamp(io_object& obj) const noexcept
+{
+  obj._metadata_epoch = epoch_of(obj.object_path()).load(std::memory_order_acquire);
+}
+
+bool metadata_store::predates_write(io_object const& obj) const noexcept
+{
+  return obj._metadata_epoch != epoch_of(obj.object_path()).load(std::memory_order_acquire);
+}
+
+void metadata_store::invalidate_written(std::string_view object_path) noexcept
+{
+  // The epoch advances before the lock is taken: an observation or registration
+  // checks it under the lock, so it either sees the new epoch or ran before the
+  // erase below.
+  epoch_of(object_path).fetch_add(1, std::memory_order_acq_rel);
+  entries retired;
+  std::lock_guard lock{_mutex};
+  // Heterogeneous finds by the raw path: nothing here allocates.
+  if (auto const observed = _observed.find(object_path); observed != _observed.end()) {
+    _observed.erase(observed);
+  }
+  std::ignore = retire_path(object_path, retired);
+}
+
+bool metadata_store::invalidate(std::string_view path, std::string_view profile)
+{
+  auto const lookup = cache_key(path, profile);
+  entries retired;
+  std::lock_guard lock{_mutex};
+  auto const found = _index.find(lookup);
+  if (found == _index.end()) return false;
+  retire(found->second, retired);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+void metadata_store::open_observed(io_object const& obj)
+{
+  auto const identity            = obj.identity();
+  std::string_view const locator = obj.raw_file_cache_id();
+  entries retired;
+  std::lock_guard lock{_mutex};
+  observe_locked(obj, locator, identity, retired);
+}
+
+void metadata_store::observe_locked(io_object const& obj,
+                                    std::string_view locator,
+                                    object_identity const& identity,
+                                    entries& retired)
+{
+  // An object opened before a write of its path describes bytes that may be gone.
+  if (predates_write(obj)) return;
+  if (identity.kind == identity_kind::opened_handle) return;
+  auto [it, inserted] = _observed.try_emplace(
+    obj.object_path(), observation{identity, obj.open_generation(), std::string(locator)});
+  if (inserted) return;
+  if (it->second.identity == identity && it->second.locator == locator) {
+    it->second.generation = std::max(it->second.generation, obj.open_generation());
+    return;
+  }
+  if (obj.open_generation() <= it->second.generation) return;
+  it->second = observation{identity, obj.open_generation(), std::string(locator)};
+  _stats.replacements += retire_path(obj.object_path(), retired);
+}
+
+// ---------------------------------------------------------------------------
+// Lookup and publication
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<io_object_metadata> metadata_store::get_or_load(io_object const& obj,
+                                                                loader_type const& loader,
+                                                                bool* cache_hit,
+                                                                std::stop_token stop,
+                                                                std::string_view profile)
+{
+  if (stop.stop_requested()) {
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+  }
+  open_observed(obj);
+  auto const lookup              = cache_key(obj.object_path(), profile);
+  auto const identity            = obj.identity();
+  std::string_view const locator = obj.raw_file_cache_id();
+  // A local stat identity may be shared by separate opens while the stat tuple
+  // is unchanged, so two opens of one file share a load.  The (identity, entry)
+  // tuple is framed like an entry key so that no two tuples alias.  The write
+  // epoch is part of the flight: an open after a write must never receive a
+  // parse of the bytes before it, even when the write left the stat identity
+  // unchanged.
+  auto const flight_key =
+    std::to_string(obj._metadata_epoch) + ":" + cache_key(identity.cache_key(locator), lookup);
+  std::shared_ptr<flight> work;
+  {
+    std::unique_lock lock{_mutex};
+    // An entry of an older epoch may hold a parse that raced a write: a write
+    // advances the epoch before it erases the path's entries.
+    auto found = _index.find(lookup);
+    if (found != _index.end() && found->second->identity == identity &&
+        found->second->locator == locator && found->second->epoch == obj._metadata_epoch) {
+      ++_stats.hits;
+      if (cache_hit) *cache_hit = true;
+      return found->second->value;
+    }
+    ++_stats.misses;
+    if (cache_hit) *cache_hit = false;
+    auto active = _flights.find(flight_key);
+    if (active != _flights.end()) {
+      work = active->second;
+      ++_stats.joined;
+      if (!work->ready.wait(lock, stop, [&] { return work->done; })) {
+        ++_stats.cancelled_waiters;
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      }
+      if (work->error) std::rethrow_exception(work->error);
+      return work->value;
+    }
+    work = std::make_shared<flight>();
+    _flights.emplace(flight_key, work);
+    ++_stats.builds;
+  }
+  // No store lock during I/O, parsing, or publication.  Waiters hold their own
+  // reference to this flight, including when it is removed after an error.
+  std::shared_ptr<io_object_metadata> value;
+  std::exception_ptr error;
+  try {
+    value = loader();
+    register_metadata(obj, value, profile);
+  } catch (...) {
+    error = std::current_exception();
+  }
+  {
+    std::lock_guard lock{_mutex};
+    work->value = value;
+    work->error = error;
+    work->done  = true;
+    if (error) ++_stats.failures;
+    _flights.erase(flight_key);
+  }
+  work->ready.notify_all();
+  if (error) std::rethrow_exception(error);
+  return value;
+}
+
+std::string metadata_store::cache_key(std::string_view path, std::string_view profile)
+{
+  // Frame empty profiles too, so a raw path can never impersonate an encoded tuple.
+  auto key = std::to_string(path.size());
+  key.reserve(key.size() + 1 + path.size() + profile.size());
+  key.push_back(':');
+  key.append(path);
+  key.append(profile);
+  return key;
+}
+
+void metadata_store::retire(iterator it, entries& retired) noexcept
+{
+  --_stats.entries;
+  _index.erase(it->key);
+  if (auto const counted = _entries_per_path.find(it->path);
+      counted != _entries_per_path.end() && --counted->second == 0) {
+    _entries_per_path.erase(counted);
+  }
+  retired.splice(retired.end(), _entries, it);
+}
+
+std::size_t metadata_store::retire_path(std::string_view path, entries& retired) noexcept
+{
+  auto const counted = _entries_per_path.find(path);
+  if (counted == _entries_per_path.end()) return 0;
+  auto const count = counted->second;
+  std::size_t done = 0;
+  for (auto it = _entries.begin(); it != _entries.end() && done < count;) {
+    auto current = it++;
+    if (current->path != path) continue;
+    retire(current, retired);
+    ++done;
+  }
+  return done;
+}
+
+void metadata_store::clear()
+{
+  entries retired;
+  std::lock_guard lock{_mutex};
+  for (auto it = _entries.begin(); it != _entries.end();) {
+    retire(it++, retired);
+  }
+}
+
+bool metadata_store::put_identity(std::string const& path,
+                                  std::string_view locator,
+                                  object_identity identity,
+                                  std::uint64_t generation,
+                                  std::uint64_t epoch,
+                                  std::shared_ptr<io_object_metadata>& value,
+                                  std::string_view profile,
+                                  entries& retired)
+{
+  // A payload that is not published stays in `value`: the caller releases it
+  // after _mutex, because metadata destructors may inspect their owning ioctx.
+  if (!value) return false;
+  if (identity.kind != identity_kind::opened_handle) {
+    auto current = _observed.find(path);
+    if (current != _observed.end() &&
+        (current->second.identity != identity || current->second.locator != locator)) {
+      ++_stats.bypasses;
+      ++_stats.stale;
+      return false;
+    }
+  }
+  auto lookup = cache_key(path, profile);
+  auto found  = _index.find(lookup);
+  if (found != _index.end()) {
+    auto it = found->second;
+    // An entry of an older write epoch is replaced whatever its open order or
+    // identity: it may hold a parse that raced the write.  The publisher's
+    // epoch is the path's current one (checked by the caller under _mutex).
+    if (it->epoch == epoch) {
+      if (generation < it->generation) {
+        ++_stats.bypasses;
+        return false;
+      }
+      if (it->identity == identity && it->locator == locator) {
+        // A duplicate publication keeps the first value but still advances the
+        // ordering fence; otherwise an older, different-version fill could
+        // replace this record.
+        it->generation = std::max(it->generation, generation);
+        return true;
+      }
+    }
+    ++_stats.replacements;
+    retire(it, retired);
+  }
+  auto const [counted, inserted] = _entries_per_path.try_emplace(path, 0);
+  try {
+    // The node is allocated before anything is moved into it, and `value` is
+    // the entry's last member: if building the entry throws, the payload is
+    // still the caller's and is not released under _mutex.
+    entries staged;
+    staged.emplace_front(std::move(lookup),
+                         path,
+                         generation,
+                         epoch,
+                         std::move(identity),
+                         std::string(locator),
+                         std::move(value));
+    _entries.splice(_entries.begin(), staged);
+    try {
+      _index.emplace(_entries.front().key, _entries.begin());
+    } catch (...) {
+      retired.splice(retired.end(), _entries, _entries.begin());
+      throw;
+    }
+  } catch (...) {
+    if (counted->second == 0) { _entries_per_path.erase(counted); }
+    throw;
+  }
+  ++counted->second;
+  ++_stats.entries;
+  return true;
+}
+
 void metadata_store::register_metadata(io_object const& obj,
-                                       std::shared_ptr<io_object_metadata> metadata)
+                                       std::shared_ptr<io_object_metadata> metadata,
+                                       std::string_view profile)
 {
   if (!metadata) return;
-  auto const& key  = obj.raw_file_cache_id();
-  auto const& path = obj.object_path();
-  std::unique_lock lk(_mtx);
-  if (auto it = _key_by_path.find(path); it != _key_by_path.end() && it->second != key) {
-    _by_key.erase(it->second);
-    it->second = key;
-  } else if (it == _key_by_path.end()) {
-    _key_by_path.emplace(path, key);
+  auto identity                  = obj.identity();
+  std::string_view const locator = obj.raw_file_cache_id();
+  // Both outlive the lock below: payloads leaving the store (retired entries,
+  // and this one when it is dropped or publishing it throws) are released
+  // after _mutex is unlocked.
+  entries retired;
+  auto payload = std::move(metadata);
+  std::lock_guard lock{_mutex};
+  // Checked under the lock: invalidate_written() advances the epoch before it
+  // takes the lock to erase, so a registration either sees the new epoch or is
+  // erased.
+  if (predates_write(obj)) {
+    ++_stats.bypasses;
+    ++_stats.stale;
+    return;
   }
-  _by_key[key] = std::move(metadata);
+  observe_locked(obj, locator, identity, retired);
+  put_identity(obj.object_path(),
+               locator,
+               std::move(identity),
+               obj.open_generation(),
+               obj._metadata_epoch,
+               payload,
+               profile,
+               retired);
 }
 
-bool metadata_store::has_path(std::string_view object_path) const noexcept
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj,
+                                                                 std::string_view profile) const
 {
-  std::shared_lock lk(_mtx);
-  return _key_by_path.contains(object_path);
+  auto const lookup              = cache_key(obj.object_path(), profile);
+  auto const identity            = obj.identity();
+  std::string_view const locator = obj.raw_file_cache_id();
+  std::lock_guard lock{_mutex};
+  auto const found = _index.find(lookup);
+  if (found != _index.end() && found->second->identity == identity &&
+      found->second->locator == locator && found->second->epoch == obj._metadata_epoch) {
+    ++_stats.hits;
+    return found->second->value;
+  }
+  ++_stats.misses;
+  return {};
 }
 
-std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
+bool metadata_store::has_path(std::string_view object_path) const
 {
-  return get_metadata(obj.raw_file_cache_id());
+  auto const lookup = cache_key(object_path);
+  std::lock_guard lock{_mutex};
+  auto const it = _index.find(lookup);
+  if (it == _index.end()) return false;
+  // An opened-handle identity is scoped to one datasource and cannot justify
+  // replacing a footer probe for a later open.  Strong object tags and local
+  // stat identities are reusable candidates; the full identity check still
+  // happens after the datasource is opened.  An entry of an older write epoch
+  // is never returned to a later open.
+  return it->second->identity.kind != identity_kind::opened_handle &&
+         it->second->epoch == epoch_of(object_path).load(std::memory_order_acquire);
 }
 
-std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string_view cache_key) const
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+metadata_store::counters metadata_store::statistics() const
 {
-  std::shared_lock lk(_mtx);
-  // Heterogeneous find (transparent hash + std::equal_to<>): no temporary
-  // std::string is built for the probe.
-  auto it = _by_key.find(cache_key);
-  if (it == _by_key.end()) return nullptr;
-  return it->second;
+  std::lock_guard lock{_mutex};
+  return _stats;
+}
+
+std::string metadata_store::describe_metadata_store() const
+{
+  std::lock_guard lock{_mutex};
+  std::ostringstream out;
+  out << "entries=" << _stats.entries << " hits=" << _stats.hits << " misses=" << _stats.misses
+      << " joined=" << _stats.joined << " builds=" << _stats.builds
+      << " failures=" << _stats.failures << " cancelled_waiters=" << _stats.cancelled_waiters
+      << " stale=" << _stats.stale << " in_flight=" << _flights.size() << '\n';
+  for (auto const& entry : _entries) {
+    out << "key=";
+    write_escaped(out, entry.key);
+    out << " identity=";
+    write_escaped(out, entry.identity.cache_key(entry.locator));
+    out << " generation=" << entry.generation << " epoch=" << entry.epoch
+        << " holders=" << entry.value.use_count() << '\n';
+  }
+  return out.str();
 }
 
 }  // namespace cucascade::io::cache

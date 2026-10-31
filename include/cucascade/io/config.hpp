@@ -18,10 +18,11 @@
 #pragma once
 
 #include <cucascade/io/cache/config.hpp>
-#ifdef CUCASCADE_HAS_KVIKIO
-#include <cucascade/io/kvikio/config.hpp>
+#ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/config.hpp>
 #endif
 #include <cucascade/io/object_store_config.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 
@@ -33,8 +34,13 @@ namespace cucascade::io {
 enum class io_backend {
   /// cuCascade's own IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
-  /// The kvikIO backend (drives @c kvikio::FileHandle directly).
-  kvikio,
+  /// The cuFile / GPUDirect Storage read reactor: local regular files are
+  /// served by @c cufile_ioctx instead of uring (device destinations via
+  /// @c cuFileRead, everything else via POSIX); @c s3:// URLs still go to the
+  /// REST backend.  Needs a build that found @c cufile.h
+  /// (@c CUCASCADE_HAS_CUFILE); without it no cuFile backend is registered and
+  /// local paths resolve to nothing rather than to another backend.
+  cufile,
 };
 
 /**
@@ -43,9 +49,17 @@ enum class io_backend {
  * Consumed by @c io_context_registry and the per-backend ioctx factories.
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
- * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
- * routes both local paths and @c s3:// objects to @c kvikio_context (LIST still
- * goes to the REST backend).
+ * to @c uring_ioctx and @c s3:// URLs to the REST backend, and
+ * @ref io_backend::cufile routes local regular files to @c cufile_ioctx
+ * (@c s3:// stays on REST).
+ *
+ * Reactor counts are per GPU: a backend built with a topology index (see
+ * @c io_context_registry) runs @c *_reactors_per_gpu reactors for every GPU of
+ * the index, each placed on its GPU's NUMA node -- pinned staging from that
+ * node's HOST space, worker pinned to the GPU's local CPUs (@ref
+ * pin_reactor_threads) -- and device requests prefer the reactors of their GPU's
+ * node (@ref reactor_spill).  Without a topology index a backend runs one GPU's
+ * worth of unplaced reactors.
  *
  * @c cache is the read path's whole caching configuration, and its only home;
  * @ref apply_cache_mode derives @c uring.use_odirect and @c cache.dispose_on_idle
@@ -54,9 +68,9 @@ enum class io_backend {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c kvikio  — kvikIO fallback tunables (local-disk catch-all path); present
- *    only when the library is built with CUCASCADE_BUILD_CUDF, which is what
- *    supplies kvikIO.
+ *  - @c cufile  — cuFile / GDS read reactor tunables (local-disk GDS path);
+ *    present only when the library is built with @c cufile.h
+ *    (@c CUCASCADE_HAS_CUFILE).
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -64,12 +78,26 @@ struct io_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring reactor worker threads for the local-disk IO path.
-  std::size_t uring_n_reactors{4};
+  /// uring reactor worker threads per GPU for the local-disk IO path.
+  std::size_t uring_reactors_per_gpu{1};
 
-  /// Number of REST reactor worker threads for the S3/object-store IO path
-  /// (each its own libcurl event loop + connection pool).
+  /// Number of REST reactor worker threads for the S3/object-store IO path (each its own
+  /// io_uring transport and connection pool).  A total, never per GPU.  0 = size from the
+  /// egress NIC: one reactor per IRQ CPU, pinned to it, when the NIC's queue IRQs are steered
+  /// to a strict subset of its NUMA node's cores (@c rest.pin_to_irq_cpus); 2 otherwise.
   std::size_t rest_n_reactors{2};
+
+  /// Pin every uring and cuFile reactor worker to the CPUs local to its GPU (from
+  /// the topology index's GPU CPU affinity) that the process's inherited affinity
+  /// allows; a worker none of whose GPU's CPUs is allowed stays unpinned.  Has no
+  /// effect without a topology index.  REST reactors are not placed per GPU: they
+  /// follow the NIC IRQ plan (@c rest.pin_to_irq_cpus).
+  bool pin_reactor_threads{true};
+
+  /// When a device request leaves the uring/cuFile reactors of its GPU's NUMA
+  /// node for the rest of the pool.  Its @c ratio must be finite and at least 1
+  /// (@c io_context_registry throws std::invalid_argument otherwise).
+  numa_spill_policy reactor_spill{};
 
   /// Local (uring) reactor configuration.  @c use_odirect is derived from
   /// @ref cache; physical operation size is selected by the worker.
@@ -80,12 +108,16 @@ struct io_config {
   /// worker-owned.
   rest::config rest{};
 
-#ifdef CUCASCADE_HAS_KVIKIO
-  /// kvikIO fallback configuration — thread-pool size, task/bounce sizing,
-  /// O_DIRECT, compat mode.  All fields default to "unset", leaving kvikIO's
-  /// own env-var-seeded defaults in place.  Note these are process-global once
-  /// applied; see @ref kvikio_config.
-  kvikio_config kvikio{};
+#ifdef CUCASCADE_HAS_CUFILE
+  /// cuFile reactor worker threads per GPU for the GDS local-disk IO path.
+  /// Each reactor serves one synchronous transfer at a time; a vectored read
+  /// with more than two slices fans out across every reactor it may use.
+  std::size_t cufile_reactors_per_gpu{1};
+
+  /// cuFile / GDS read reactor configuration.  Only consulted when
+  /// @c backend == @ref io_backend::cufile.  Not derived from @ref cache: the
+  /// cuFile backend never arms the prefetching cache.
+  cufile::config cufile{};
 #endif
 
   /// The read path's caching configuration: mode, eviction policy and the

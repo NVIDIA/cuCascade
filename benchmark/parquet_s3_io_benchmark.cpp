@@ -20,19 +20,17 @@
 // ranges a column projection touches, then times only the reads of those
 // ranges into a destination tier (host or device) — no parquet decode.
 //
-// Two read paths are compared:
+// Read path:
 //   rest   – the native cucascade::io REST reactor (libcurl scatter GETs
 //            authorized via AWS-SDK presigned URLs).  host reads go through the
 //            vector-I/O primitive (host_read_ranges_async_io); device reads
 //            through device_read_async (reactor-staged: the reactor streams
 //            each range network->pinned-bounce->device on its own slots).
-//   kvikio – kvikIO's RemoteHandle S3 endpoint wrapped as a cudf datasource;
-//            host_read_async / device_read_async issued per range.
 // All async operations are collected first and synchronized at the end.
 //
 // Credentials / region / endpoint come from the standard AWS environment
 // (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
-// AWS_DEFAULT_REGION, AWS_ENDPOINT_URL) and are honored by both backends.
+// AWS_DEFAULT_REGION, AWS_ENDPOINT_URL).
 
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -48,8 +46,6 @@
 #include <cudf/io/parquet_metadata.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/types.hpp>
-
-#include <kvikio/remote_handle.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -85,15 +81,14 @@ static const std::vector<std::string> COLUMNS = {
   "l_shipdate",
 };
 
-enum class Backend { rest, kvikio };
+enum class Backend { rest };
 enum class Dest { host, device };
 
 static Backend parse_backend(std::string_view s)
 {
   if (s == "rest") return Backend::rest;
-  if (s == "kvikio") return Backend::kvikio;
   throw std::invalid_argument(std::string("unknown backend: ") + std::string(s) +
-                              "  (expected: rest | kvikio)");
+                              "  (expected: rest)");
 }
 
 static Dest parse_dest(std::string_view s)
@@ -108,12 +103,11 @@ static void usage(char const* prog)
 {
   std::cerr
     << "usage: " << prog
-    << " <bucket> <prefix> <rest|kvikio> <host|device> <num_rows> [n_threads] [key=value ...]\n"
+    << " <bucket> <prefix> <rest> <host|device> <num_rows> [n_threads] [key=value ...]\n"
     << "  bucket     – S3 bucket name (no scheme)\n"
     << "  prefix     – key prefix to list ('-' for the whole bucket); only\n"
     << "               keys ending in .parquet are read\n"
     << "  rest       – native REST reactor (host=vector-io, device=host->device)\n"
-    << "  kvikio     – kvikIO RemoteHandle per-range host_read/device_read_async\n"
     << "  host|device– destination tier the ranges are read into\n"
     << "  num_rows   – rows to read (0 = all)\n"
     << "  n_threads  – reader threads / REST reactors (default 2)\n"
@@ -160,7 +154,7 @@ struct aws_api {
 
 /// Client configuration from the AWS environment.  AWS_ENDPOINT_URL (e.g. a
 /// MinIO endpoint) switches the client to endpoint-override + path-style
-/// addressing, matching what kvikIO does with the same variable.
+/// addressing.
 static std::shared_ptr<Aws::S3::S3Client> make_s3_client()
 {
   Aws::Client::ClientConfiguration cfg;
@@ -245,83 +239,6 @@ class awssdk_presigned_authorizer final : public cucascade::io::rest::request_au
 };
 
 // ---------------------------------------------------------------------------
-// kvikIO adapter: cudf::io::datasource over kvikio::RemoteHandle
-// ---------------------------------------------------------------------------
-
-class kvikio_s3_datasource final : public cudf::io::datasource {
- public:
-  explicit kvikio_s3_datasource(std::string const& s3_url)
-    : _handle(kvikio::RemoteHandle::open(to_https_url(s3_url), kvikio::RemoteEndpointType::S3))
-  {
-  }
-
-  [[nodiscard]] size_t size() const override { return _handle.nbytes(); }
-
-  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
-  {
-    size_t const n = clamp(offset, size);
-    if (n == 0) { return 0; }
-    return _handle.read(dst, n, offset);
-  }
-
-  std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
-  {
-    size_t const n = clamp(offset, size);
-    std::vector<uint8_t> data(n);
-    if (n != 0) { _handle.read(data.data(), n, offset); }
-    return buffer::create(std::move(data));
-  }
-
-  [[nodiscard]] bool supports_device_read() const override { return true; }
-
-  size_t device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref) override
-  {
-    size_t const n = clamp(offset, size);
-    if (n == 0) { return 0; }
-    return _handle.read(dst, n, offset);
-  }
-
-  std::future<size_t> device_read_async(size_t offset,
-                                        size_t size,
-                                        uint8_t* dst,
-                                        ::cuda::stream_ref) override
-  {
-    size_t const n = clamp(offset, size);
-    return _handle.pread(dst, n, offset);
-  }
-
-  std::unique_ptr<buffer> device_read(size_t offset,
-                                      size_t size,
-                                      ::cuda::stream_ref stream) override
-  {
-    size_t const n = clamp(offset, size);
-    rmm::device_buffer out(n, stream);
-    if (n != 0) { _handle.read(out.data(), n, offset); }
-    return buffer::create(std::move(out));
-  }
-
- private:
-  // kvikIO's RemoteHandle::open rejects the "s3://" scheme; convert it to the
-  // virtual-hosted "https://<bucket>.s3.<region>.amazonaws.com/<object>" form
-  // (region/endpoint from AWS_DEFAULT_REGION / AWS_ENDPOINT_URL) that the S3
-  // endpoint expects.
-  [[nodiscard]] static std::string to_https_url(std::string const& s3_url)
-  {
-    auto [bucket, object] = kvikio::S3Endpoint::parse_s3_url(s3_url);
-    return kvikio::S3Endpoint::url_from_bucket_and_object(
-      std::move(bucket), std::move(object), std::nullopt, std::nullopt);
-  }
-
-  [[nodiscard]] size_t clamp(size_t offset, size_t size) const
-  {
-    size_t const fsize = _handle.nbytes();
-    return offset < fsize ? std::min(size, fsize - offset) : 0;
-  }
-
-  kvikio::RemoteHandle _handle;
-};
-
-// ---------------------------------------------------------------------------
 
 // One coalesced column-chunk byte range in a specific object.
 struct coalesced_range {
@@ -341,7 +258,8 @@ int main(int argc, char** argv)
   std::string prefix       = argv[2];
   if (prefix == "-") { prefix.clear(); }
 
-  Backend backend;
+  // Validated only: the REST reactor is the one backend.
+  [[maybe_unused]] Backend backend;
   Dest dest;
   try {
     backend = parse_backend(argv[3]);
@@ -443,13 +361,11 @@ int main(int argc, char** argv)
                                                              CHUNKS_PER_SLAB,  // pool_size
                                                              1);               // initial_pools
 
-  // rest path: one io_object per object on the REST ioctx.
+  // One io_object per object on the REST ioctx.
   std::shared_ptr<cucascade::io::ioctx> io_ctx;
   std::vector<std::shared_ptr<cucascade::io::io_object>> io_objects;
-  // kvikio path: one datasource per object.
-  std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
 
-  if (backend == Backend::rest) {
+  {
     std::cout << "REST   : n_reactors=" << n_threads
               << "  max_connections=" << rest_cfg.max_connections << "\n";
     auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
@@ -460,21 +376,11 @@ int main(int argc, char** argv)
     io_objects.reserve(keys.size());
     for (auto const& key : keys)
       io_objects.push_back(io_ctx->open_io_object("s3://" + bucket + "/" + key));
-  } else {
-    datasources.reserve(keys.size());
-    for (auto const& key : keys)
-      datasources.push_back(std::make_unique<kvikio_s3_datasource>("s3://" + bucket + "/" + key));
   }
 
-  auto object_size = [&](size_t obj_idx) -> size_t {
-    return backend == Backend::rest ? io_objects[obj_idx]->size() : datasources[obj_idx]->size();
-  };
+  auto object_size      = [&](size_t obj_idx) -> size_t { return io_objects[obj_idx]->size(); };
   auto host_read_footer = [&](size_t obj_idx, size_t offset, size_t size, uint8_t* dst) {
-    if (backend == Backend::rest) {
-      io_ctx->host_read(*io_objects[obj_idx], offset, size, dst);
-    } else {
-      datasources[obj_idx]->host_read(offset, size, dst);
-    }
+    io_ctx->host_read(*io_objects[obj_idx], offset, size, dst);
   };
 
   auto scan_opts = cudf::io::parquet_reader_options::builder().column_names(COLUMNS).build();
@@ -553,9 +459,8 @@ int main(int argc, char** argv)
             << " MiB total\n\n";
 
   // Per-range destination buffers (untimed).  host → pinned; device → rmm.
-  // Both device paths (REST reactor-staged device_read_async and kvikIO
-  // device_read_async) manage their own host bounce slots internally, so no
-  // caller-supplied staging buffer is needed.
+  // The REST reactor-staged device_read_async manages its own host bounce slots
+  // internally, so no caller-supplied staging buffer is needed.
   rmm::cuda_stream alloc_stream;
   std::vector<uint8_t*> dsts(ranges.size(), nullptr);
   std::vector<void*> host_bufs;              // owned pinned allocations (host dest only)
@@ -608,7 +513,7 @@ int main(int argc, char** argv)
       workers.emplace_back([&, lo, hi] {
         rmm::cuda_stream stream;  // per-worker stream for device reads
 
-        if (backend == Backend::rest && dest == Dest::host) {
+        if (dest == Dest::host) {
           // Vector I/O: one host_read_ranges_async_io per object, over that
           // object's segments.  Segment vectors must outlive the futures.
           std::vector<std::vector<cucascade::io::io_object_segment>> seg_sets;
@@ -634,10 +539,9 @@ int main(int argc, char** argv)
           }
           for (auto& f : futs)
             std::move(f).get();
-        } else if (backend == Backend::rest && dest == Dest::device) {
+        } else {
           // Reactor-staged device read: one device_read_async per range (the
-          // reactor manages its own pinned bounce slots).  Mirrors kvikIO's
-          // per-range device_read_async for an apples-to-apples comparison.
+          // reactor manages its own pinned bounce slots).
           std::vector<cucascade::exec::semi_future<size_t>> futs;
           futs.reserve(hi - lo);
           for (size_t i = lo; i < hi; ++i) {
@@ -647,26 +551,6 @@ int main(int argc, char** argv)
           }
           for (auto& f : futs)
             std::move(f).get();
-          stream.synchronize();
-        } else if (backend == Backend::kvikio && dest == Dest::host) {
-          std::vector<std::future<size_t>> futs;
-          futs.reserve(hi - lo);
-          for (size_t i = lo; i < hi; ++i) {
-            auto const& r = ranges[i];
-            futs.push_back(datasources[r.obj_idx]->host_read_async(r.offset, r.size, dsts[i]));
-          }
-          for (auto& f : futs)
-            f.get();
-        } else {  // kvikio + device
-          std::vector<std::future<size_t>> futs;
-          futs.reserve(hi - lo);
-          for (size_t i = lo; i < hi; ++i) {
-            auto const& r = ranges[i];
-            futs.push_back(
-              datasources[r.obj_idx]->device_read_async(r.offset, r.size, dsts[i], stream));
-          }
-          for (auto& f : futs)
-            f.get();
           stream.synchronize();
         }
       });

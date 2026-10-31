@@ -16,9 +16,17 @@
  * limitations under the License.
  */
 
+#include "io/rest/errc.hpp"
+#include "io/rest/reactor_placement.hpp"
+#include "io/rest/s3/multipart.hpp"
+#include "io/rest/shared_services.hpp"
+#include "io/rest/write/upload.hpp"
+
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uri_parser.hpp>
 #include <cucascade/log/logging.hpp>
+#include <cucascade/memory/net_topology.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -26,6 +34,7 @@
 #include <cstdint>
 #include <exception>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -38,18 +47,59 @@
 
 namespace cucascade::io::rest {
 
+namespace {
+
+/// Size the pool (rest_n_reactors 0 = auto from the egress NIC's IRQ steering) and compute the
+/// placement every reactor applies to its own thread before it creates its ring.  Also checks
+/// the dispatch fan-out against the reactor count.
+std::shared_ptr<detail::pool_placement const> plan_pool(
+  std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> const& ctx)
+{
+  if (!ctx) { throw std::invalid_argument("rest_ioctx: reactor_context must be non-null"); }
+  auto const& cfg = ctx->cfg();
+  cfg.validate();
+  std::optional<memory::nic_topology> nic;
+  try {
+    if (auto const iface = memory::select_egress_interface(cfg.interface); iface.has_value()) {
+      nic = memory::discover_nic(*iface);
+    }
+  } catch (...) {
+    nic.reset();  // no NIC information: the default count, unpinned
+  }
+  auto plan = plan_rest_pool(n_reactors, cfg.pin_to_irq_cpus, nic);
+  // The default (2) is clamped to a one-reactor pool, as the hard-coded fan-out always was;
+  // an explicit value above the configured count is a configuration error.
+  if (n_reactors > 0 && cfg.fan_out > n_reactors && cfg.fan_out != config{}.fan_out) {
+    throw std::invalid_argument("rest_ioctx: rest.fan_out (" + std::to_string(cfg.fan_out) +
+                                ") exceeds rest_n_reactors (" + std::to_string(n_reactors) + ")");
+  }
+  // Reactor 0 logs the one startup line once its thread is placed (the priority is known then).
+  return std::make_shared<detail::pool_placement const>(
+    detail::pool_placement{std::move(plan), std::move(nic)});
+}
+
+}  // namespace
+
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
-  : templated_ioctx<rest_reactor>(n_reactors,
-                                  [ctx = std::move(ctx), i = 0]() mutable {
+  : rest_ioctx(plan_pool(n_reactors, ctx), ctx)
+{
+}
+
+rest_ioctx::rest_ioctx(std::shared_ptr<detail::pool_placement const> placement,
+                       std::shared_ptr<rest_reactor::reactor_context> ctx)
+  : templated_ioctx<rest_reactor>(placement->plan.n_reactors,
+                                  [ctx = std::move(ctx), placement, i = std::size_t{0}]() mutable {
+                                    auto const index = i++;
                                     return std::make_unique<rest_reactor>(
-                                      ctx, "rest-" + std::to_string(i++));
+                                      ctx, "rest-" + std::to_string(index), index, placement);
                                   }),
+    _placement(std::move(placement)),
     _lister(
       [this](std::string_view bucket, std::string_view prefix, std::string_view canonical_query) {
         if (_reactors.empty()) {
           throw std::runtime_error("rest_ioctx::list_objects: no reactors");
         }
-        return _reactors.front()->list_page(bucket, prefix, canonical_query);
+        return control_reactor().list_page(bucket, prefix, canonical_query);
       },
       _reactors.empty() ? s3::default_max_scanned_objects
                         : _reactors.front()->get_config().list_max_scanned,
@@ -57,6 +107,17 @@ rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::rea
                         : _reactors.front()->get_config().list_max_matches,
       "rest_ioctx::list_objects")
 {
+  {
+    std::vector<rest_reactor*> pool;
+    pool.reserve(_reactors.size());
+    for (auto const& reactor : _reactors) {
+      pool.push_back(reactor.get());
+    }
+    _abort_sink = std::make_shared<detail::abort_sink>(std::move(pool));
+  }
+  // An auto-sized pool may be smaller than the configured fan-out: dispatch spans all of it.
+  _config.fan_out =
+    std::clamp<std::size_t>(_config.fan_out, 1, std::max<std::size_t>(1, _reactors.size()));
   // Created once here and never reassigned: payload leases capture it by
   // shared_ptr (so they may outlive this ioctx) and the stash gauges read it
   // without the coordination mutex.
@@ -66,6 +127,30 @@ rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::rea
     if (bytes == config::footer_resolve_auto) { bytes = 2 * inflight * cfg.footer_probe_bytes; }
     _footer_budget = std::make_shared<exec::admission_control>(std::max<std::size_t>(bytes, 1));
   }
+}
+
+rest_reactor& rest_ioctx::control_reactor()
+{
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx: no reactors"); }
+  // The least-backlogged reactor, ties rotated: control-plane calls (HEAD, footer probe, LIST,
+  // footer batches) spread over the pool instead of all landing on reactor 0.
+  auto const count = _reactors.size();
+  auto const start = _control_next.fetch_add(1, std::memory_order_relaxed) % count;
+  std::size_t best = start;
+  for (std::size_t d = 1; d < count; ++d) {
+    auto const i = (start + d) % count;
+    if (_reactors[i]->queued_bytes() < _reactors[best]->queued_bytes()) { best = i; }
+  }
+  return *_reactors[best];
+}
+
+transport_stats rest_ioctx::stats() const noexcept
+{
+  transport_stats total;
+  for (auto const& reactor : _reactors) {
+    if (reactor) { total.merge(reactor->stats()); }
+  }
+  return total;
 }
 
 std::size_t rest_ioctx::footer_stash_reserved_bytes() const noexcept
@@ -82,8 +167,11 @@ std::size_t rest_ioctx::footer_resolve_inflight_cap() const
 {
   if (_reactors.empty()) { return 0; }
   auto const& cfg = _reactors.front()->get_config();
+  // A batch runs on one reactor's connections: the automatic cap is that reactor's
+  // max_connections (more would only queue in its intake while holding stash budget).  An
+  // explicit cap is honoured as given.
   if (cfg.footer_resolve_max_inflight == config::footer_resolve_auto) {
-    return std::max<std::size_t>(1, _reactors.size() * cfg.max_connections);
+    return std::max<std::size_t>(1, cfg.max_connections);
   }
   return cfg.footer_resolve_max_inflight;
 }
@@ -224,7 +312,7 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
 
   if (valid_indices.empty()) { return; }
 
-  _reactors.front()->resolve_footer_batch(
+  control_reactor().resolve_footer_batch(
     valid_paths, valid_objects, valid_indices, max_inflight, _footer_budget, on_result, stop);
 }
 
@@ -258,10 +346,9 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
   }
   if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
-  // A blocking HEAD on the caller thread (a one-time metadata round-trip) via
-  // any reactor's authorizer — head_object uses a local easy handle and
-  // does not touch worker state, so any reactor is equivalent.
-  auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+  // A blocking HEAD (a one-time metadata round-trip): on the first reactor's connections when
+  // it runs, else on a private helper transport.
+  auto head = control_reactor().head_object(parsed.host, parsed.path);
   return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
                                                                  std::move(parsed.host),
                                                                  std::move(parsed.path),
@@ -349,8 +436,8 @@ void rest_ioctx::warmup(std::string_view bucket_url) noexcept
     {
       std::lock_guard lk{_warm_mtx};
       auto const now = std::chrono::steady_clock::now();
-      // conn_max_age of 0 means "no cap" to libcurl, which leaves us no honest
-      // staleness horizon; fall back to a minute rather than re-warm forever.
+      // conn_max_age of 0 means "no idle cutoff", which leaves no honest staleness horizon;
+      // fall back to a minute rather than re-warm forever.
       auto const stale_after =
         _config.conn_max_age.count() > 0
           ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(_config.conn_max_age)
@@ -382,12 +469,13 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
 
   // One suffix-range GET resolves the size and stashes the footer; cuDF's
   // trailer/footer reads are then served from the stash by host_read.
-  footer_probe probe = _reactors.front()->fetch_footer_suffix(
-    parsed.host, parsed.path, _reactors.front()->get_config().footer_probe_bytes);
+  auto& reactor = control_reactor();
+  footer_probe probe =
+    reactor.fetch_footer_suffix(parsed.host, parsed.path, reactor.get_config().footer_probe_bytes);
   if (!probe.bytes) {
     // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
     // fall back to a plain HEAD for the size, with no stash.
-    auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+    auto head = reactor.head_object(parsed.host, parsed.path);
     return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
                                                                    std::move(parsed.host),
                                                                    std::move(parsed.path),
@@ -401,6 +489,164 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
                                                                  probe.window_lo,
                                                                  probe.bytes,
                                                                  std::move(probe.etag)));
+}
+
+// ---------------------------------------------------------------------------
+// Writes
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The part size unit: write_split_bytes rounded down to the write granule (templated_ioctx cuts
+/// write slices at its multiples).
+std::size_t write_piece(config const& cfg)
+{
+  auto const granule = write_granule();
+  return std::max(granule, cfg.write_split_bytes - cfg.write_split_bytes % granule);
+}
+
+}  // namespace
+
+rest_ioctx::~rest_ioctx()
+{
+  // Aborts posted by uploads destroyed from now on are dropped (the reactors go next), and the
+  // write objects still alive give back their part buffers while the host memory resource lives.
+  if (_abort_sink != nullptr) { _abort_sink->close(); }
+}
+
+std::shared_ptr<io_object> rest_ioctx::create_io_object_for_write(std::string path,
+                                                                  write_open_options options)
+{
+  auto parsed = cucascade::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object_for_write: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  if (_reactors.empty()) {
+    throw std::runtime_error("rest_ioctx::create_io_object_for_write: no reactors");
+  }
+  if (options.mode == write_mode::create_or_open || options.mode == write_mode::open_existing) {
+    throw std::system_error(std::make_error_code(std::errc::not_supported),
+                            "rest_ioctx: an S3 object cannot be modified in place ('" + path +
+                              "' opened in a mode that keeps its content)");
+  }
+  // The part size is the write split (templated_ioctx cuts every write slice at its multiples,
+  // so one write operation never spans two parts), or a multiple of it when size_hint needs
+  // more than 10000 parts.  No request is sent here.
+  auto const split = write_piece(_config);
+  s3::upload_state::options opts;
+  opts.part_size  = s3::choose_part_size(split, options.size_hint, split);
+  opts.create_new = options.mode == write_mode::create_new;
+  auto upload     = std::make_shared<detail::upload_session>(
+    object_ref{parsed.host, parsed.path}, path, opts, _abort_sink);
+  _abort_sink->track(upload);
+  return std::make_shared<rest_write_object>(
+    std::move(path), std::move(parsed.host), std::move(parsed.path), std::move(upload));
+}
+
+void rest_ioctx::flush_io(io_object const& object)
+{
+  // One flush slice through the reactors (the commit runs on the least-backlogged one); the
+  // path is invalidated before the caller sees the outcome (flush_async_io).
+  flush_async_io(object, io_priority::high).get();
+}
+
+exec::semi_future<void> rest_ioctx::flush_async_io(io_object const& object,
+                                                   io_priority priority) noexcept
+{
+  // The commit is where the written bytes become the object readers see: drop what the cache
+  // and metadata store hold for the path once it settled (succeeded or not), before the caller
+  // sees it, as a local write does when its bytes land.  The callback runs on the completing
+  // reactor thread, and this ioctx joins its reactors before it is destroyed.
+  try {
+    if (dynamic_cast<rest_write_object const*>(&object) == nullptr) {
+      throw std::system_error(
+        std::make_error_code(std::errc::bad_file_descriptor),
+        "rest_ioctx::flush: '" + object.object_path() + "' was not opened for writing");
+    }
+    exec::promise<void> bridge;
+    auto result         = bridge.get_semi_future();
+    using terminal_type = exec::invocable<void(exec::try_t<void>&&)>;
+    terminal_type terminal{[self   = this,
+                            path   = std::string{object.object_path()},
+                            bridge = std::move(bridge)](exec::try_t<void>&& outcome) mutable {
+      self->invalidate_cached(path);
+      bridge.set_try(std::move(outcome));
+    }};
+    auto backend = templated_ioctx<rest_reactor>::flush_async_io(object, priority);
+    try {
+      std::move(backend).install_callback(std::move(terminal));
+    } catch (...) {
+      if (!backend.valid() || !terminal) { throw; }
+      terminal(std::move(backend).get_try());
+    }
+    return result;
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
+
+exec::semi_future<void> rest_ioctx::remove_io_object_async_io(std::string path,
+                                                              io_priority priority) noexcept
+{
+  try {
+    auto parsed = cucascade::io::parse(path);
+    if (parsed.scheme != "s3") {
+      throw std::invalid_argument("rest_ioctx::remove_io_object: unsupported scheme '" +
+                                  parsed.scheme + "'");
+    }
+    return control_reactor().delete_object_async(
+      std::move(parsed.host), std::move(parsed.path), priority);
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
+
+exec::semi_future<std::size_t> rest_ioctx::mixed_writev_async_io(
+  io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept
+{
+  // The base cuts only slices larger than the split, at its multiples; a smaller one may still
+  // straddle a multiple.  Part sizes are multiples of the split (create_io_object_for_write), so
+  // cutting at every multiple keeps each write operation inside one part.  A slice whose range
+  // or source is invalid is left alone: the base's validation rejects it.
+  try {
+    auto const piece = write_piece(_config);
+    std::vector<prepared_io_slice> cut;
+    cut.reserve(slices.size() + 1);
+    for (auto& slice : slices) {
+      auto const begin     = slice.offset();
+      auto const size      = slice.size();
+      auto* const host     = std::get_if<std::uint8_t*>(&slice.h_buffer.buffer);
+      bool const source    = slice.has_device_request() || (host != nullptr && *host != nullptr);
+      bool const straddles = slice.is_write() && source && size > 1 && size <= piece &&
+                             size - 1 <= std::numeric_limits<std::size_t>::max() - begin &&
+                             begin / piece != (begin + size - 1) / piece;
+      if (!straddles) {
+        cut.push_back(std::move(slice));
+        continue;
+      }
+      auto const boundary = begin - begin % piece + piece;
+      auto tail           = slice;
+      slice.rng           = range{begin, boundary - begin};
+      tail.rng            = range{boundary, begin + size - boundary};
+      if (tail.has_device_request()) {
+        tail.d_buffer.data += boundary - begin;
+      } else {
+        tail.h_buffer.buffer = *host + (boundary - begin);
+      }
+      cut.push_back(std::move(slice));
+      cut.push_back(std::move(tail));
+    }
+    slices = std::move(cut);
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+  return templated_ioctx<rest_reactor>::mixed_writev_async_io(object, std::move(slices));
+}
+
+bool may_be_commit_outcome_unknown(std::error_code ec) noexcept
+{
+  return ec == make_error_code(errc::io_error);
 }
 
 }  // namespace cucascade::io::rest
