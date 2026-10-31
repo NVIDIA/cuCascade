@@ -1,6 +1,6 @@
 # Memory Management
 
-A deep dive into cuCascade's three-tier memory system, reservation model, and tier-specific allocators.
+A deep dive into cuCascade's tiered memory system, reservation model, and tier-specific allocators.
 
 ## Table of Contents
 
@@ -30,7 +30,7 @@ A deep dive into cuCascade's three-tier memory system, reservation model, and ti
 
 ## Overview
 
-The memory module is the foundation of cuCascade. It manages a three-tier memory hierarchy (GPU, HOST, DISK) using **reservation-based allocation** -- callers must reserve memory before allocating, preventing oversubscription and enabling predictable memory management under pressure.
+The memory module is the foundation of cuCascade. It manages a tiered memory hierarchy (GPU, HOST, DISK, and REMOTE object-store spaces -- see [the REMOTE tier](io/remote-tier-design.md)) using **reservation-based allocation** -- callers must reserve memory before allocating, preventing oversubscription and enabling predictable memory management under pressure.
 
 The key abstraction is the `memory_space`, which represents a single memory location (one GPU device, one NUMA host node, or one disk mount). Each memory space has its own allocator, reservation tracking, and downgrade thresholds.
 
@@ -44,26 +44,30 @@ The key abstraction is the `memory_space`, which represents a single memory loca
 │  HOST (Tier 1)  │  Medium speed, medium capacity
 │  Pinned CPU RAM │  fixed_size_host_memory_resource
 ├─────────────────┤
-│  DISK (Tier 2)  │  Slowest, largest capacity
+│  DISK (Tier 2)  │  Slow, large capacity
 │   NVMe / SSD    │  disk_access_limiter
+├─────────────────┤
+│ REMOTE (Tier 3) │  Slowest, effectively unbounded
+│  S3 object store│  disk_access_limiter (in-flight bytes)
 └─────────────────┘
 ```
 
-| Property | GPU | HOST | DISK |
-|----------|-----|------|------|
-| `Tier` enum value | `GPU` (0) | `HOST` (1) | `DISK` (2) |
-| Backing store | Device VRAM | NUMA-pinned CPU RAM | Filesystem |
-| Typical capacity | 8-80 GB | 64-512 GB | 1+ TB |
-| Allocator type | `reservation_aware_resource_adaptor` | `fixed_size_host_memory_resource` | `disk_access_limiter` |
-| Default allocation | RMM `cuda_async_memory_resource` | NUMA-pinned blocks (1 MB each) | Reservation tracking only |
-| Per-stream tracking | Yes | No | No |
-| Growable reservations | Yes | Yes | No |
-| Upstream resource | RMM async pool | `numa_region_pinned_host_memory_resource` | `null_device_memory_resource` |
+| Property | GPU | HOST | DISK | REMOTE |
+|----------|-----|------|------|--------|
+| `Tier` enum value | `GPU` (0) | `HOST` (1) | `DISK` (2) | `REMOTE` (3) |
+| Backing store | Device VRAM | NUMA-pinned CPU RAM | Filesystem | S3 object store |
+| Typical capacity | 8-80 GB | 64-512 GB | 1+ TB | unbounded (1 PiB default) |
+| Allocator type | `reservation_aware_resource_adaptor` | `fixed_size_host_memory_resource` | `disk_access_limiter` | `disk_access_limiter` |
+| Default allocation | RMM `cuda_async_memory_resource` | NUMA-pinned blocks (1 MB each) | Reservation tracking only | Reservation tracking only |
+| Per-stream tracking | Yes | No | No | No |
+| Growable reservations | Yes | Yes | No | No |
+| Upstream resource | RMM async pool | `numa_region_pinned_host_memory_resource` | `null_device_memory_resource` | `null_device_memory_resource` |
 
 Each tier is identified by a `memory_space_id` combining `(Tier, device_id)`. For example:
 - `(GPU, 0)` -- first GPU
 - `(HOST, 1)` -- host memory on NUMA node 1
 - `(DISK, 0)` -- first disk mount
+- `(REMOTE, 0)` -- first object-store prefix (see [the REMOTE tier](io/remote-tier-design.md))
 
 ## Memory Spaces
 
