@@ -70,6 +70,12 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @c rest.fan_out exceeds a positive @p n_reactors (the default fan-out of 2 is clamped to a
   /// one-reactor pool instead, as the former hard-coded fan-out was).
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
+  ~rest_ioctx() override;
+
+  rest_ioctx(rest_ioctx const&)            = delete;
+  rest_ioctx& operator=(rest_ioctx const&) = delete;
+  rest_ioctx(rest_ioctx&&)                 = delete;
+  rest_ioctx& operator=(rest_ioctx&&)      = delete;
 
   /// Counters of the whole pool: the reactors' @c transport_stats summed (extremes for the MSS
   /// and in-flight peaks).  A snapshot; safe while the pool runs.
@@ -158,36 +164,39 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// for back-to-back queries and self-correcting for spaced-out ones.
   void warmup(std::string_view bucket_url) noexcept override;
 
-  // -- Writes: not yet implemented ------------------------------------------
-  //
-  // REST writes (S3 PUT / multipart upload) are not implemented yet.  Every
-  // write and flush hook reports @c not_implemented_error
-  // (@c std::errc::not_supported) without touching the network: the
-  // synchronous ones throw, the asynchronous ones return a failed future, and
-  // @c supports_write() / @c supports_device_write() stay false.
-
-  std::size_t host_write_io(io_object const& obj,
-                            std::size_t offset,
-                            std::size_t size,
-                            std::uint8_t const* src) override;
-
-  exec::semi_future<std::size_t> mixed_writev_async_io(
-    io_object const& obj, std::vector<prepared_io_slice>&& slices) noexcept override;
-
-  void flush_io(io_object const& obj) override;
-
-  exec::semi_future<void> flush_async_io(io_object const& obj,
-                                         io_priority priority) noexcept override;
-
  protected:
   /// This pool's placement (plan and NIC), computed at construction and shared with its
   /// reactors; never stored on the reactor_context, which several pools may share.
   std::shared_ptr<detail::pool_placement const> _placement;
 
-  /// Always throws @c not_implemented_error: no object is created, no HEAD is
-  /// sent.
+  /// Open @p path (s3://bucket/key) for writing: a @c rest_write_object whose
+  /// writes become an S3 upload, committed by @c flush (docs/io/rest-transport.md
+  /// "Writes").  No request is sent here.  @c write_mode::create_or_truncate and
+  /// @c create_new are supported (the latter commits with `If-None-Match: *`);
+  /// the modes that keep existing content fail with @c not_supported (an S3
+  /// object cannot be modified in place).
+  ///
+  /// Lifetime: flush or drop every write object before destroying this ioctx.  An object that
+  /// outlives it gives back its part buffers when the ioctx is destroyed (they belong to the
+  /// context's host memory resource), can no longer write or commit (@c operation_canceled),
+  /// and its upload is not aborted (bucket lifecycle rules collect it).
   std::shared_ptr<io_object> create_io_object_for_write(std::string path,
                                                         write_open_options options) override;
+
+  /// Commit @p object: upload what is left and complete the upload (blocking): one flush slice
+  /// through @ref flush_async_io.  The path's cached bytes and metadata are invalidated once
+  /// the commit settled.
+  void flush_io(io_object const& object) override;
+
+  /// As @ref flush_io, asynchronously: one flush slice on the least-backlogged reactor, the
+  /// path invalidated once it settled and before the returned future resolves.
+  exec::semi_future<void> flush_async_io(io_object const& object,
+                                         io_priority priority) noexcept override;
+
+  /// Cut every write slice that straddles a part boundary at it (one write operation is never
+  /// spread over two S3 parts), then dispatch as the base does.
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept override;
 
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
@@ -215,6 +224,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
 
   object_store_lister _lister;
+  /// Where uploads destroyed uncommitted send their AbortMultipartUpload (closed first in the
+  /// destructor, before the reactors go).
+  std::shared_ptr<detail::abort_sink> _abort_sink;
   std::atomic<std::size_t> _control_next{0};
 
   /// The effective resolve_footer_objects concurrency cap: the configured knob, or one

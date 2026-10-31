@@ -24,12 +24,14 @@
 /// fills, footer stashes, strong-ETag If-Match reads, the control plane (HEAD, footer probe,
 /// LIST, batched footer resolve) on the same connections, and curl-parity pool behaviour
 /// (lazy replacement of idle-expired or dead connections, the free stale-connection retry,
-/// exchange-based warm-up, optional HTTP/1.1 upkeep).
+/// exchange-based warm-up, optional HTTP/1.1 upkeep).  The worker's state is declared in
+/// reactor_worker.hpp; its S3 write path lives in rest_reactor_write.cpp.
 
 #include "io/rest/errc.hpp"
 #include "io/rest/net/uring_transport.hpp"
 #include "io/rest/reactor_placement.hpp"
 #include "io/rest/reactor_test_hooks.hpp"
+#include "io/rest/reactor_worker.hpp"
 #include "io/rest/shared_services.hpp"
 
 #include <cucascade/cuda/event.hpp>
@@ -76,8 +78,6 @@
 
 namespace cucascade::io::rest {
 
-using clock_type = std::chrono::steady_clock;
-
 namespace testing {
 namespace {
 std::atomic<reactor_events const*> g_events{nullptr};
@@ -87,7 +87,20 @@ void set_reactor_events(reactor_events const* events) noexcept
 {
   g_events.store(events, std::memory_order_release);
 }
+
+reactor_events const* current_reactor_events() noexcept
+{
+  return g_events.load(std::memory_order_acquire);
+}
 }  // namespace testing
+
+using detail::canceled_exception;
+using detail::complete_job;
+using detail::compute_backoff;
+using detail::control_timeout;
+using detail::is_retriable;
+using detail::is_retriable_status;
+using detail::presign_ttl;
 
 namespace {
 
@@ -99,60 +112,6 @@ thread_local bool t_reactor_thread = false;
 
 char ascii_lower(char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
 
-/// Presigned-URL TTL for one attempt: the whole-request timeout plus clock-skew headroom.
-std::chrono::seconds presign_ttl(config const& cfg) noexcept
-{
-  long const base = cfg.request_timeout_s > 0 ? cfg.request_timeout_s + 60 : 300;
-  return std::chrono::seconds{base};
-}
-
-/// Whole-exchange bound of a control-plane request (HEAD / probe / LIST / warm-up).
-std::chrono::milliseconds control_timeout(config const& cfg) noexcept
-{
-  return std::chrono::milliseconds{cfg.request_timeout_s > 0 ? cfg.request_timeout_s * 1000 : 0};
-}
-
-/// HTTP statuses worth retrying (transient server / throttling).  Permanent 5xx (501, 505, ...)
-/// are not: they would burn the retry budget on an error that cannot succeed.
-bool is_retriable_status(unsigned status) noexcept
-{
-  return status == 408 || status == 429 || status == 500 || status == 502 || status == 503 ||
-         status == 504;
-}
-
-/// Transport failures worth retrying (libcurl's COULDNT_CONNECT / RESOLVE / OPERATION_TIMEDOUT /
-/// GOT_NOTHING / RECV_ERROR / SEND_ERROR / PARTIAL_FILE / SSL_CONNECT_ERROR equivalents).
-/// Verification failures, malformed or unsupported HTTP and policy errors are final.
-bool is_retriable(std::error_code ec) noexcept
-{
-  if (!ec) { return false; }
-  if (ec.category() == error_category()) {
-    switch (static_cast<errc>(ec.value())) {
-      case errc::dns_failed:
-      case errc::connect_failed:
-      case errc::connect_timeout:
-      case errc::tls_handshake_failed:
-      case errc::tls_protocol_error:
-      case errc::tls_bad_record_mac:
-      case errc::stale_connection:
-      case errc::http_length_mismatch:
-      case errc::request_timeout:
-      case errc::io_error: return true;
-      default: return false;
-    }
-  }
-  if (ec.category() == std::system_category() || ec.category() == std::generic_category()) {
-    switch (ec.value()) {
-      case EINVAL:
-      case EBADF:
-      case ENOMEM:
-      case EFAULT: return false;
-      default: return true;
-    }
-  }
-  return false;
-}
-
 /// "bytes a-b/c" for messages.
 std::string describe_range(http::response_meta const& meta)
 {
@@ -161,27 +120,6 @@ std::string describe_range(http::response_meta const& meta)
   if (r.unsatisfied) { return "bytes */" + std::to_string(r.complete); }
   return "bytes " + std::to_string(r.first) + "-" + std::to_string(r.last) + "/" +
          (r.complete == http::unknown_length ? std::string{"*"} : std::to_string(r.complete));
-}
-
-/// Backoff before the next attempt: a numeric Retry-After (capped at 30 s) when present and
-/// honoured, else exponential base << attempt plus uniform jitter.
-std::chrono::milliseconds compute_backoff(std::size_t attempt,
-                                          http::response_meta const& meta,
-                                          config const& cfg)
-{
-  if (cfg.honor_retry_after && meta.retry_after_present) {
-    return std::min(std::chrono::milliseconds{meta.retry_after_ms},
-                    std::chrono::milliseconds{30'000});
-  }
-  std::size_t const shift = std::min<std::size_t>(attempt, 16);
-  auto const base         = cfg.retry_backoff_base * (std::size_t{1} << shift);
-  std::chrono::milliseconds jitter{0};
-  if (cfg.retry_jitter.count() > 0) {
-    thread_local std::mt19937 rng{std::random_device{}()};
-    std::uniform_int_distribution<long> dist(0, static_cast<long>(cfg.retry_jitter.count()));
-    jitter = std::chrono::milliseconds{dist(rng)};
-  }
-  return base + jitter;
 }
 
 /// The validator a data GET for @p obj is conditioned on and checked against: the open's
@@ -339,19 +277,6 @@ shared_byte_span make_leased_byte_span(std::shared_ptr<exec::admission_control> 
   return shared_byte_span{owner, &owner->view};
 }
 
-std::exception_ptr canceled_exception(std::string const& what)
-{
-  return std::make_exception_ptr(
-    std::system_error(std::make_error_code(std::errc::operation_canceled), what));
-}
-
-file_descriptor make_event_fd()
-{
-  int const fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  if (fd < 0) { throw std::system_error(errno, std::system_category(), "rest: eventfd"); }
-  return file_descriptor{fd};
-}
-
 void drain_fd(int fd) noexcept
 {
   std::uint64_t value = 0;
@@ -471,6 +396,21 @@ void transport_stats::merge(transport_stats const& o) noexcept
   CUCASCADE_REST_SUM(control_records)
   CUCASCADE_REST_SUM(mtu_rejects)
   CUCASCADE_REST_SUM(mtu_fallbacks)
+  CUCASCADE_REST_SUM(puts)
+  CUCASCADE_REST_SUM(put_bytes)
+  CUCASCADE_REST_SUM(upload_parts)
+  CUCASCADE_REST_SUM(upload_part_bytes)
+  CUCASCADE_REST_SUM(zero_part_bytes)
+  CUCASCADE_REST_SUM(creates)
+  CUCASCADE_REST_SUM(completes)
+  CUCASCADE_REST_SUM(complete_error_retries)
+  CUCASCADE_REST_SUM(aborts)
+  CUCASCADE_REST_SUM(commits)
+  CUCASCADE_REST_SUM(commit_failures)
+  CUCASCADE_REST_SUM(write_failures)
+  CUCASCADE_REST_SUM(d2h_copies)
+  CUCASCADE_REST_SUM(part_buffer_waits)
+  CUCASCADE_REST_SUM(part_buffers_live)
 #undef CUCASCADE_REST_SUM
   max_inflight = std::max(max_inflight, o.max_inflight);
   if (o.mss_min != 0) { mss_min = mss_min == 0 ? o.mss_min : std::min(mss_min, o.mss_min); }
@@ -487,117 +427,6 @@ detail::shared_services& rest_reactor::reactor_context::services() const
 // =================================================================================================
 // worker-side state shared with callers
 // =================================================================================================
-
-struct rest_reactor::control_job {
-  enum class kind : std::uint8_t { head, probe, list, warm };
-  kind k{kind::head};
-  object_ref object;
-  std::string bucket;  ///< list / warm
-  std::string query;   ///< list / warm: canonical query
-  std::size_t probe_bytes{0};
-  int slot{-1};                  ///< warm: the slot it runs on
-  bool fresh_connection{false};  ///< warm-up: close an idle connection in the slot first
-  std::size_t tag{0};            ///< caller's bookkeeping (batch entry index)
-  std::size_t attempt{0};
-  bool stale_retried{false};
-  std::atomic<bool> canceled{false};
-
-  // outcome (written by the worker before `done`)
-  net::exchange_result result;
-  std::error_code ec;  ///< final transport failure
-  bool exhausted{false};
-  std::string last_error;
-  std::exception_ptr error;  ///< authorizer / setup failure, or cancellation
-
-  /// Called on the worker thread once the job is done (after `done` is published).
-  std::function<void(std::shared_ptr<control_job> const&)> on_done;
-
-  std::mutex m;
-  std::condition_variable cv;
-  bool done{false};
-
-  void wait()
-  {
-    std::unique_lock lock{m};
-    cv.wait(lock, [&] { return done; });
-  }
-};
-
-namespace {
-
-/// Publish @p job as done and run its completion hook (worker thread, or the thread that
-/// closes an intake).
-void complete_job(std::shared_ptr<rest_reactor::control_job> const& job) noexcept
-{
-  {
-    std::lock_guard lock{job->m};
-    job->done = true;
-  }
-  job->cv.notify_all();
-  if (job->on_done) {
-    try {
-      job->on_done(job);
-    } catch (...) {  // NOLINT(bugprone-empty-catch): the batch owner records its own errors
-    }
-  }
-}
-
-}  // namespace
-
-struct rest_reactor::intake {
-  file_descriptor wakeup{make_event_fd()};
-  tiered_blocking_queue<std::unique_ptr<grouped_io_request>> requests;
-  std::mutex control_mtx;
-  std::deque<std::shared_ptr<control_job>> controls;
-  std::atomic<bool> warm_requested{false};
-  std::mutex warm_mtx;
-  std::string warm_bucket;
-
-  void interrupt() noexcept
-  {
-    std::uint64_t one = 1;
-    std::ignore       = ::write(wakeup.get(), &one, sizeof(one));
-  }
-
-  bool closed{false};  ///< guarded by control_mtx: no more control jobs are accepted
-
-  bool take_control(std::shared_ptr<control_job>& out)
-  {
-    std::lock_guard lock{control_mtx};
-    if (controls.empty()) { return false; }
-    out = std::move(controls.front());
-    controls.pop_front();
-    return true;
-  }
-
-  /// Queue @p job.  False once the intake is closed (the job is untouched).
-  bool post_control(std::shared_ptr<control_job> job)
-  {
-    {
-      std::lock_guard lock{control_mtx};
-      if (closed) { return false; }
-      controls.push_back(std::move(job));
-    }
-    interrupt();
-    return true;
-  }
-
-  /// Refuse further control jobs and fail the queued ones with @p error.
-  void close(std::exception_ptr const& error) noexcept
-  {
-    std::deque<std::shared_ptr<control_job>> orphans;
-    {
-      std::lock_guard lock{control_mtx};
-      closed = true;
-      orphans.swap(controls);
-    }
-    for (auto& job : orphans) {
-      if (job == nullptr) { continue; }
-      job->error = error;
-      complete_job(job);
-    }
-  }
-};
 
 // clang-format off
 #define CUCASCADE_REST_STATS(X) \
@@ -645,7 +474,22 @@ struct rest_reactor::intake {
   X(mtu_rejects) \
   X(mtu_fallbacks) \
   X(mss_min) \
-  X(mss_max)
+  X(mss_max) \
+  X(puts) \
+  X(put_bytes) \
+  X(upload_parts) \
+  X(upload_part_bytes) \
+  X(zero_part_bytes) \
+  X(creates) \
+  X(completes) \
+  X(complete_error_retries) \
+  X(aborts) \
+  X(commits) \
+  X(commit_failures) \
+  X(write_failures) \
+  X(d2h_copies) \
+  X(part_buffer_waits) \
+  X(part_buffers_live)
 // clang-format on
 
 struct rest_reactor::atomic_stats {
@@ -670,177 +514,6 @@ struct rest_reactor::atomic_stats {
   }
 };
 
-// =================================================================================================
-// reactor_worker: the state uring_ultra's s3_worker keeps (one per worker thread)
-// =================================================================================================
-
-/// The worker loop of a reactor (or of a private helper serving control-plane jobs while the
-/// reactor is not running).  Thread-confined.
-class reactor_worker {
- public:
-  reactor_worker(rest_reactor& r, rest_reactor::intake& in, bool private_mode);
-  ~reactor_worker();
-
-  reactor_worker(reactor_worker const&)            = delete;
-  reactor_worker& operator=(reactor_worker const&) = delete;
-
-  void run(std::stop_token const& stop);
-
- private:
-  using control_job = rest_reactor::control_job;
-
-  /// One physical GET (the retry envelope around a backend-neutral operation).
-  struct data_op {
-    object_ref object;
-    std::unique_ptr<io_op_request> op;
-    std::size_t attempt{0};
-    std::size_t auth_attempt{0};
-    bool needs_staging{false};
-    bool stale_retried{false};
-    bool fresh{false};  ///< the free stale-connection retry: run on a fresh connection
-    std::size_t logical_bytes{0};
-
-    [[nodiscard]] bool is_device() const noexcept
-    {
-      return op != nullptr && op->device_copy != nullptr;
-    }
-  };
-
-  /// Runnable work: a data GET or a control-plane job.
-  struct work {
-    std::unique_ptr<data_op> data;
-    std::shared_ptr<control_job> ctl;
-    explicit operator bool() const noexcept { return data != nullptr || ctl != nullptr; }
-  };
-
-  struct slot_state {
-    std::unique_ptr<data_op> data;
-    std::shared_ptr<control_job> ctl;
-    bool held{false};  ///< kept during a device copy
-    [[nodiscard]] bool free() const noexcept { return data == nullptr && ctl == nullptr && !held; }
-  };
-
-  struct retry_entry {
-    clock_type::time_point due;
-    work w;
-  };
-  static bool retry_later(retry_entry const& a, retry_entry const& b) { return a.due > b.due; }
-
-  /// This reactor's staging holders: every live staging allocation of one of its operations
-  /// (in flight, waiting for a retry, or parked behind its H2D copy).  The count decides whether
-  /// staging exhaustion parks (a holder will return blocks) or fails (none will); `released`
-  /// tells the loop to re-queue the parked operations.
-  struct staging_tracker {
-    std::size_t holders{0};
-    bool released{false};
-  };
-
-  /// Owns one operation's staging allocation and reports its release to the tracker.
-  struct staging_lease {
-    using allocation_type =
-      cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
-    std::unique_ptr<allocation_type> allocation;
-    std::shared_ptr<staging_tracker> tracker;
-    staging_lease(std::unique_ptr<allocation_type> a, std::shared_ptr<staging_tracker> t)
-      : allocation(std::move(a)), tracker(std::move(t))
-    {
-      ++tracker->holders;
-    }
-    ~staging_lease()
-    {
-      allocation.reset();
-      --tracker->holders;
-      tracker->released = true;
-    }
-    staging_lease(staging_lease const&)            = delete;
-    staging_lease& operator=(staging_lease const&) = delete;
-    staging_lease(staging_lease&&)                 = delete;
-    staging_lease& operator=(staging_lease&&)      = delete;
-  };
-
-  struct parked_copy {
-    std::size_t slot{SIZE_MAX};  ///< held slot, SIZE_MAX when released at once
-    int device{-1};
-    std::unique_ptr<cuda::cuda_event> event;
-    std::unique_ptr<data_op> op;
-  };
-
-  // ---- setup ----
-  void epoll_add(int fd);
-  [[nodiscard]] net::transport_options transport_options() const;
-
-  // ---- slots ----
-  [[nodiscard]] int pick_slot() const;
-  [[nodiscard]] int pick_empty_slot() const;
-  [[nodiscard]] std::size_t control_slots() const noexcept;
-  void requeue_staging_waiters();
-  [[nodiscard]] std::size_t free_slots() const;
-  void release_slot(std::size_t index) noexcept;
-
-  // ---- intake ----
-  work next_work(std::size_t free_connections);
-  std::unique_ptr<data_op> next_fresh(std::size_t free_connections);
-  void expand_active(std::size_t free_connections);
-
-  // ---- submission ----
-  void submit();
-  void start_data(std::size_t index, std::unique_ptr<data_op> op);
-  void start_control(std::size_t index, std::shared_ptr<control_job> job);
-  void maybe_warm();
-  void maybe_upkeep();
-
-  // ---- completion ----
-  void process_completions();
-  bool finish_data(std::size_t index, net::exchange_result& r);
-  void finish_control(std::size_t index, net::exchange_result& r);
-  void complete_control(std::shared_ptr<control_job> const& job) noexcept;
-  bool start_copy(std::size_t index);
-  void poll_copies();
-  void fail_data(std::unique_ptr<data_op>& op,
-                 grouped_coordinator::error_type const& error,
-                 bool host_data_valid = false) noexcept;
-  void schedule_retry(work w, clock_type::duration delay);
-  void retry_data(std::unique_ptr<data_op> op,
-                  http::response_meta const& meta,
-                  bool is_auth,
-                  std::string const& reason);
-  void arm_retry_timer();
-  void collect_due_retries();
-  enum class staging : std::uint8_t { ok, park, failed };
-  staging allocate_staging(data_op& op);
-  std::unique_ptr<cuda::cuda_event> take_event(int device);
-
-  // ---- waiting ----
-  void wait();
-  [[nodiscard]] bool idle() const noexcept;
-  void publish_stats() noexcept;
-  void count_status(unsigned status) noexcept;
-  void drain(std::exception_ptr failure) noexcept;
-
-  rest_reactor& _r;
-  rest_reactor::intake& _in;
-  bool _private;
-  config const& _cfg;
-  bool _uring_wait{false};
-  std::unique_ptr<net::uring_transport> _transport;
-  file_descriptor _epoll_fd;
-  file_descriptor _retry_timer;
-  std::vector<slot_state> _slots;
-  std::vector<retry_entry> _retry_heap;
-  std::deque<work> _ready;
-  std::deque<std::unique_ptr<data_op>> _pending;
-  std::deque<std::unique_ptr<data_op>> _staging_wait;
-  std::shared_ptr<staging_tracker> _staging{std::make_shared<staging_tracker>()};
-  std::unique_ptr<grouped_io_request> _active;
-  std::vector<parked_copy> _copying;
-  std::unordered_map<int, std::vector<std::unique_ptr<cuda::cuda_event>>> _events;
-  std::size_t _inflight{0};
-  std::string _upkeep_bucket;
-  clock_type::time_point _next_upkeep{};
-  std::size_t _upkeep_cursor{0};
-  transport_stats _s{};
-};
-
 reactor_worker::reactor_worker(rest_reactor& r, rest_reactor::intake& in, bool private_mode)
   : _r(r), _in(in), _private(private_mode), _cfg(r._config)
 {
@@ -862,9 +535,20 @@ reactor_worker::reactor_worker(rest_reactor& r, rest_reactor::intake& in, bool p
     epoll_add(_retry_timer.get());
     epoll_add(_transport->completion_fd());
   }
+  // Part buffers may be released on any thread (where the upload state drops them): their
+  // release wakes this loop so the work parked on staging retries.
+  {
+    std::lock_guard lock{_staging->wake_mutex};
+    _staging->wake = [in = &_in] { in->interrupt(); };
+  }
 }
 
-reactor_worker::~reactor_worker() = default;
+reactor_worker::~reactor_worker()
+{
+  // Part buffers outlive the worker (an uncommitted object keeps them): stop waking it.
+  std::lock_guard lock{_staging->wake_mutex};
+  _staging->wake = nullptr;
+}
 
 net::transport_options reactor_worker::transport_options() const
 {
@@ -945,13 +629,14 @@ std::size_t reactor_worker::control_slots() const noexcept
 
 void reactor_worker::requeue_staging_waiters()
 {
-  // Staging came back: parked operations retry their allocation first, in their order.
-  if (!_staging->released) { return; }
-  _staging->released = false;
+  // Staging came back (a read's lease, a part buffer, or write work of this reactor settled):
+  // parked operations retry their allocation first, in their order.
+  if (!_staging->released.exchange(false, std::memory_order_acq_rel)) { return; }
   while (!_staging_wait.empty()) {
-    _ready.push_front(work{std::move(_staging_wait.back()), nullptr});
+    _ready.push_front(work{std::move(_staging_wait.back()), nullptr, nullptr});
     _staging_wait.pop_back();
   }
+  requeue_part_waiters();
 }
 
 std::size_t reactor_worker::free_slots() const
@@ -968,6 +653,7 @@ void reactor_worker::release_slot(std::size_t index) noexcept
   auto& s = _slots[index];
   s.data.reset();
   s.ctl.reset();
+  s.call.reset();
   s.held = false;
 }
 
@@ -1089,6 +775,12 @@ std::unique_ptr<reactor_worker::data_op> reactor_worker::next_fresh(std::size_t 
         continue;
       }
     }
+    if (_active->slices.front().kind != io_op_kind::read) {
+      // A write or flush request (homogeneous): every slice becomes write work at once (calls
+      // queued on this worker, consumed by the same submit pass).
+      expand_write();
+      continue;
+    }
     expand_active(free_connections);
   }
 }
@@ -1096,39 +788,60 @@ std::unique_ptr<reactor_worker::data_op> reactor_worker::next_fresh(std::size_t 
 reactor_worker::work reactor_worker::next_work(std::size_t free_connections)
 {
   work w;
-  if (!_ready.empty()) {
-    w = std::move(_ready.front());
-    _ready.pop_front();
-    return w;
-  }
-  // While operations are parked on staging, no fresh data is expanded: the backlog stays queued
-  // (and counted in queued_bytes()) until staging returns.
-  bool const fresh_allowed = _staging_wait.empty();
-  // Control-plane jobs (blocking callers) go first, but while data is waiting they may hold at
-  // most half of the connections, so a footer batch cannot starve demand reads.
-  bool const data_waiting =
-    fresh_allowed && (!_pending.empty() || _active != nullptr || _in.requests.size_approx() != 0);
-  std::size_t const control_cap =
-    data_waiting ? std::max<std::size_t>(1, _slots.size() / 2) : _slots.size();
-  if (control_slots() < control_cap) {
+  for (;;) {
+    // Work handed back by a settlement of this pass runs first (it only queues calls).
+    run_resumed();
+    if (take_ready(w)) { return w; }
+    // While operations are parked on staging, no fresh data is expanded: the backlog stays
+    // queued (and counted in queued_bytes()) until staging returns.
+    bool const fresh_allowed = _staging_wait.empty();
+    bool const calls_waiting = !_calls.empty() && write_slot_allowed();
+    // Control-plane jobs (blocking callers) go first, but while data is waiting they may hold at
+    // most half of the connections, so a footer batch cannot starve demand reads or writes.
+    bool const data_waiting = calls_waiting || _in.writes.size_approx() != 0 ||
+                              (fresh_allowed && (!_pending.empty() || _active != nullptr ||
+                                                 _in.requests.size_approx() != 0));
+    std::size_t const control_cap =
+      data_waiting ? std::max<std::size_t>(1, _slots.size() / 2) : _slots.size();
+    if (control_slots() < control_cap) {
+      while (_in.take_control(w.ctl)) {
+        if (w.ctl != nullptr) { return w; }
+      }
+    }
+    if (calls_waiting) {
+      w.call = std::move(_calls.front());
+      _calls.pop_front();
+      return w;
+    }
+    // Write and flush requests have their own intake, expanded even while reads are parked on
+    // staging (whole parts and commits need none).
+    if (_in.writes.size_approx() != 0) {
+      take_writes();
+      if (!_calls.empty() || !_resumed.empty()) { continue; }
+    }
+    if (fresh_allowed) {
+      auto const calls_before = _calls.size();
+      w.data                  = next_fresh(free_connections);
+      if (w.data != nullptr) { return w; }
+      // Write requests expanded into calls or resumed work: start them in this pass.
+      if ((_calls.size() != calls_before && write_slot_allowed()) || !_resumed.empty()) {
+        continue;
+      }
+    }
     while (_in.take_control(w.ctl)) {
       if (w.ctl != nullptr) { return w; }
     }
+    return w;
   }
-  if (fresh_allowed) {
-    w.data = next_fresh(free_connections);
-    if (w.data != nullptr) { return w; }
-  }
-  while (_in.take_control(w.ctl)) {
-    if (w.ctl != nullptr) { return w; }
-  }
-  return w;
 }
 
 // ---- submission -------------------------------------------------------------------------------
 
 void reactor_worker::submit()
 {
+  // Handed-back work first: it queues the calls whose settlement frees part buffers, which the
+  // parked allocations below count on.
+  run_resumed();
   requeue_staging_waiters();
   for (;;) {
     int slot = pick_slot();
@@ -1137,12 +850,17 @@ void reactor_worker::submit()
     if (!w) { break; }
     // The free stale-connection retry goes to an empty slot (a fresh connection), not to another
     // pooled one that may be just as stale; with none empty, the slot's connection is replaced.
-    if ((w.data != nullptr && w.data->fresh) || (w.ctl != nullptr && w.ctl->fresh_connection)) {
+    if ((w.data != nullptr && w.data->fresh) || (w.ctl != nullptr && w.ctl->fresh_connection) ||
+        (w.call != nullptr && w.call->fresh)) {
       if (int const empty = pick_empty_slot(); empty >= 0) { slot = empty; }
     }
     auto const index = static_cast<std::size_t>(slot);
     if (w.ctl != nullptr) {
       start_control(index, std::move(w.ctl));
+      continue;
+    }
+    if (w.call != nullptr) {
+      start_call(index, std::move(w.call));
       continue;
     }
     auto& op = w.data;
@@ -1153,11 +871,13 @@ void reactor_worker::submit()
     if (op->needs_staging && op->op->staging_owner == nullptr) {
       auto const staged = allocate_staging(*op);
       if (staged == staging::park) {
-        // Pinned staging is exhausted while operations of this reactor still hold blocks: park
-        // until one returns them, and stop here (uring_ultra) so the backlog stays queued.
+        // Pinned staging is exhausted while work of this reactor still holds blocks or will
+        // free some: park until it does.  The pass goes on (fresh reads stay queued while
+        // anything is parked, see next_work): the write calls, control jobs and retries that
+        // follow must still get their connections, they are what returns the blocks.
         ++_s.staging_waits;
         _staging_wait.push_back(std::move(op));
-        break;
+        continue;
       }
       if (staged == staging::failed) {
         op.reset();
@@ -1166,6 +886,8 @@ void reactor_worker::submit()
     }
     start_data(index, std::move(op));
   }
+  // A synchronous failure inside the loop may have handed work back: it runs in this pass.
+  run_resumed();
   if (!_uring_wait) { _transport->flush(); }
 }
 
@@ -1197,9 +919,9 @@ reactor_worker::staging reactor_worker::allocate_staging(data_op& request)
       std::unique_ptr<allocation_type>(allocation.release()), _staging);
     return staging::ok;
   } catch (rmm::out_of_memory const& e) {
-    // Operations of this reactor hold staging (GETs in flight, retries, parked copies): one of
-    // them will return blocks, so wait.
-    if (_staging->holders > 0) { return staging::park; }
+    // Operations of this reactor hold staging (GETs in flight, retries, parked copies) or write
+    // work of it is in flight (its part buffers return when it settles): wait.
+    if (_staging->holders > 0 || _write_inflight > 0 || !_resumed.empty()) { return staging::park; }
     // Nothing of this reactor will free a block: fail rather than wait.  It stays an
     // rmm::out_of_memory, which the engine retries (a runtime_error is fatal there).
     auto const what = "rest_reactor: pinned staging exhausted for " + request.object.bucket + "/" +
@@ -1298,6 +1020,20 @@ void reactor_worker::start_control(std::size_t index, std::shared_ptr<control_jo
         x.accept_status    = job->k == kind::list ? 200 : 0;
         x.fresh_connection = job->fresh_connection;
         break;
+      case kind::abort: {
+        // Any object-level request signed from its spec (method, sub-resource query, body):
+        // AbortMultipartUpload today; another kind (DeleteObject) only adds its case here and
+        // its classification in finish_control.
+        request_spec const spec{job->object, job->method, job->query, job->has_body};
+        auth               = _r._ctx->authorizer()->authorize_request(spec, presign_ttl(_cfg));
+        x.method           = detail::http_method_of(job->method);
+        x.has_body         = job->has_body;
+        x.target           = net::body_target::discard;
+        x.accept_status    = 0;
+        x.fresh_connection = job->fresh_connection;
+        ++_s.aborts;
+        break;
+      }
     }
     x.url     = std::move(auth.url);
     x.headers = std::move(auth.headers);
@@ -1339,7 +1075,8 @@ void reactor_worker::maybe_warm()
 bool reactor_worker::idle() const noexcept
 {
   if (_inflight != 0 || !_copying.empty() || !_ready.empty() || !_pending.empty() ||
-      _active != nullptr || !_retry_heap.empty() || !_staging_wait.empty()) {
+      _active != nullptr || !_retry_heap.empty() || !_staging_wait.empty() || !_calls.empty() ||
+      !_resumed.empty() || !_part_wait.empty()) {
     return false;
   }
   return std::all_of(_slots.begin(), _slots.end(), [](auto const& s) { return s.free(); });
@@ -1404,6 +1141,8 @@ void reactor_worker::process_completions()
       if (!finish_data(c.slot, c.result)) { release_slot(c.slot); }
     } else if (s.ctl != nullptr) {
       finish_control(c.slot, c.result);
+    } else if (s.call != nullptr) {
+      finish_call(c.slot, c.result);
     }
   }
 }
@@ -1449,7 +1188,7 @@ void reactor_worker::retry_data(std::unique_ptr<data_op> op,
                      limit);
   ++attempt;
   if (is_auth) { ++_s.auth_retries; }
-  schedule_retry(work{std::move(op), nullptr}, delay);
+  schedule_retry(work{std::move(op), nullptr, nullptr}, delay);
 }
 
 /// @return true when the slot stays occupied (a held device copy).
@@ -1474,7 +1213,7 @@ bool reactor_worker::finish_data(std::size_t index, net::exchange_result& r)
     request.stale_retried = true;
     request.fresh         = true;
     ++_s.stale_retries;
-    _ready.push_front(work{std::move(slot.data), nullptr});
+    _ready.push_front(work{std::move(slot.data), nullptr, nullptr});
     return false;
   }
 
@@ -1562,11 +1301,24 @@ void reactor_worker::finish_control(std::size_t index, net::exchange_result& r)
     complete_control(job);
     return;
   }
+  if (job->k == kind::abort) {
+    // Best effort, one attempt: bucket lifecycle rules collect an upload whose abort failed.
+    if (r.ec || r.meta.status / 100 != 2) {
+      CUCASCADE_LOG_DEBUG("rest_reactor: AbortMultipartUpload for {}/{} failed: {}",
+                          job->object.bucket,
+                          job->object.key,
+                          r.ec ? r.ec.message() : "HTTP " + std::to_string(r.meta.status));
+    }
+    job->ec     = r.ec;
+    job->result = std::move(r);
+    complete_control(job);
+    return;
+  }
   if (r.ec == make_error_code(errc::stale_connection) && !job->stale_retried) {
     job->stale_retried    = true;
     job->fresh_connection = true;
     ++_s.stale_retries;
-    _ready.push_front(work{nullptr, std::move(job)});
+    _ready.push_front(work{nullptr, std::move(job), nullptr});
     return;
   }
   auto const status    = static_cast<unsigned>(r.meta.status);
@@ -1580,7 +1332,7 @@ void reactor_worker::finish_control(std::size_t index, net::exchange_result& r)
                          _cfg.max_retry_attempts);
       auto const delay = compute_backoff(job->attempt, r.meta, _cfg);
       ++job->attempt;
-      schedule_retry(work{nullptr, std::move(job)}, delay);
+      schedule_retry(work{nullptr, std::move(job), nullptr}, delay);
       return;
     }
     job->exhausted = true;
@@ -1622,8 +1374,8 @@ bool reactor_worker::start_copy(std::size_t index)
     }
     ++_s.h2d_copies;
     bool const hold = _cfg.hold_slot_during_copy;
-    _copying.push_back(
-      parked_copy{hold ? index : SIZE_MAX, device, std::move(event), std::move(slot.data)});
+    _copying.push_back(parked_copy{
+      hold ? index : SIZE_MAX, device, std::move(event), std::move(slot.data), nullptr});
     slot.held = hold;
     return hold;
   } catch (...) {
@@ -1639,6 +1391,13 @@ void reactor_worker::poll_copies()
     auto const result = it->event->query();
     if (result == query_result::in_progress) {
       ++it;
+      continue;
+    }
+    if (it->write != nullptr) {
+      // D2H into a part buffer (a device write): the bytes are assembled, or the write fails.
+      _events[it->device].push_back(std::move(it->event));
+      d2h_copied(*it, result == query_result::success);
+      it = _copying.erase(it);
       continue;
     }
     if (result == query_result::success) {
@@ -1695,7 +1454,12 @@ void reactor_worker::wait()
   // control job, a request that arrived while submitting) was started by submit() already, or
   // its producer wrote the wake-up eventfd.
   std::int64_t timeout_us = _copying.empty() ? -1 : _cfg.copy_poll_interval.count();
-  auto const net_ms       = _transport->timeout_ms();
+  if (!_resumed.empty() || _staging->released.load(std::memory_order_acquire) || calls_runnable()) {
+    // Work came back during the pass (a release on another thread), or a write call could
+    // start: never block on it.
+    timeout_us = 0;
+  }
+  auto const net_ms = _transport->timeout_ms();
   if (net_ms >= 0) {
     timeout_us =
       timeout_us < 0 ? net_ms * 1000LL : std::min<std::int64_t>(timeout_us, net_ms * 1000LL);
@@ -1769,6 +1533,8 @@ void reactor_worker::publish_stats() noexcept
   s.mtu_fallbacks = t.mtu_fallbacks;
   s.mss_min       = t.mss_min;
   s.mss_max       = t.mss_max;
+
+  s.part_buffers_live = _staging->part_buffers_live.load(std::memory_order_relaxed);
   _r._stats->store(s);
 }
 
@@ -1815,9 +1581,19 @@ void reactor_worker::drain(std::exception_ptr failure) noexcept
     std::lock_guard lock(_r._enqueue_mutex);
     _r._accepting = false;
   }
+  _draining = true;  // write work settled from now on fails instead of continuing
   // The kernel may still write into staging or caller memory: reap everything first.
   _transport->shutdown();
   for (auto& copy : _copying) {
+    if (copy.write != nullptr) {
+      // A device write's D2H into a part buffer: let the DMA finish, then cancel the write.
+      try {
+        copy.event->synchronize();
+      } catch (...) {  // NOLINT(bugprone-empty-catch): the write fails either way
+      }
+      d2h_copied(copy, false);
+      continue;
+    }
     if (copy.op == nullptr) { continue; }
     try {
       copy.event->synchronize();
@@ -1831,6 +1607,7 @@ void reactor_worker::drain(std::exception_ptr failure) noexcept
     }
   }
   _copying.clear();
+  drain_writes(error);
   auto fail_work = [&](work& w) {
     if (w.data != nullptr) { fail_data(w.data, error); }
     if (w.ctl != nullptr) {
@@ -1874,11 +1651,13 @@ void reactor_worker::drain(std::exception_ptr failure) noexcept
   _in.close(control_error);
   if (!_private) {
     std::unique_ptr<grouped_io_request> group;
-    while (_in.requests.try_dequeue(group)) {
-      if (group == nullptr) { continue; }
-      _r._queued_bytes.fetch_sub(group->remaining_bytes(), std::memory_order_relaxed);
-      group->cancel_remaining(error);
-      group.reset();
+    for (auto* queue : {&_in.requests, &_in.writes}) {
+      while (queue->try_dequeue(group)) {
+        if (group == nullptr) { continue; }
+        _r._queued_bytes.fetch_sub(group->remaining_bytes(), std::memory_order_relaxed);
+        group->cancel_remaining(error);
+        group.reset();
+      }
     }
   }
 }
@@ -2004,12 +1783,15 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     }
     _intake->close(error);
     std::unique_ptr<grouped_io_request> group;
-    while (_intake->requests.try_dequeue(group)) {
-      if (group == nullptr) { continue; }
-      _queued_bytes.fetch_sub(group->remaining_bytes(), std::memory_order_relaxed);
-      group->cancel_remaining(error);
-      group.reset();
+    for (auto* queue : {&_intake->requests, &_intake->writes}) {
+      while (queue->try_dequeue(group)) {
+        if (group == nullptr) { continue; }
+        _queued_bytes.fetch_sub(group->remaining_bytes(), std::memory_order_relaxed);
+        group->cancel_remaining(error);
+        group.reset();
+      }
     }
+    reactor_worker::fail_handed_back(*_intake, std::make_error_code(std::errc::operation_canceled));
   }
   std::lock_guard lock(_enqueue_mutex);
   _accepting = false;
@@ -2041,19 +1823,6 @@ void rest_reactor::shutdown() noexcept
 void rest_reactor::enqueue(std::unique_ptr<grouped_io_request> req) noexcept
 {
   if (req == nullptr) { return; }
-  // A write or flush slice must never be read as a GET: fail the whole request.
-  if (std::ranges::any_of(req->slices, [](prepared_io_slice const& slice) {
-        return slice.kind != io_op_kind::read;
-      })) {
-    std::exception_ptr error;
-    try {
-      throw not_implemented_error("rest: write");
-    } catch (...) {
-      error = std::current_exception();
-    }
-    req->cancel_remaining(error);
-    return;
-  }
   auto const bytes = req->remaining_bytes();
   auto const error = std::make_error_code(std::errc::operation_canceled);
   bool enqueued    = false;
@@ -2062,8 +1831,9 @@ void rest_reactor::enqueue(std::unique_ptr<grouped_io_request> req) noexcept
     if (_accepting) {
       _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
       auto const priority = req->priority;
+      bool const write    = !req->slices.empty() && req->slices.front().kind != io_op_kind::read;
       try {
-        enqueued = _intake->requests.enqueue(std::move(req), priority);
+        enqueued = (write ? _intake->writes : _intake->requests).enqueue(std::move(req), priority);
       } catch (...) {
         enqueued = false;
       }
@@ -2545,25 +2315,6 @@ std::unique_ptr<rest_reactor::io_object_type> rest_reactor::create_io_object(std
   // reactor instance — see rest_ioctx::create_io_object.
   throw std::logic_error(
     "rest_reactor::create_io_object: use rest_ioctx::create_io_object (needs HEAD + authorizer)");
-}
-
-std::unique_ptr<rest_reactor::io_object_type> rest_reactor::create_io_object_for_write(
-  std::string /*path*/, write_open_options /*options*/)
-{
-  throw not_implemented_error("rest: open_io_object_for_write");
-}
-
-std::size_t rest_reactor::host_write(io_object_type const& /*object*/,
-                                     std::size_t /*offset*/,
-                                     std::size_t /*size*/,
-                                     std::uint8_t const* /*src*/)
-{
-  throw not_implemented_error("rest: host_write");
-}
-
-void rest_reactor::flush(io_object_type const& /*object*/)
-{
-  throw not_implemented_error("rest: flush");
 }
 
 std::vector<byte_range> rest_reactor::align_and_coalesce(std::span<const byte_range> ranges,

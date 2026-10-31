@@ -1,4 +1,4 @@
-# REST (S3) read transport
+# REST (S3) transport: reads and writes
 
 The REST backend (`rest_ioctx` / `rest_reactor`, `s3://` paths) runs on its own io_uring HTTP/1.1
 transport; libcurl is gone. The design is `uring_ultra`'s `uring_https_transport` + `s3_reactor`
@@ -101,6 +101,92 @@ request that arrived meanwhile) starts in the same pass; the loop blocks only wh
 runnable (`epoll_pwait2` over the wake-up eventfd, the retry timerfd and the ring fd, or
 `io_uring_submit_and_wait_timeout` with `wait_mode = uring`).
 
+## Writes
+
+S3 writes run on the same reactors and connections as reads (sources:
+`src/io/rest/rest_reactor_write.cpp`, `src/io/rest/write/`, `src/io/rest/s3/multipart.*`). The
+transport-agnostic `s3::upload_state` of each object decides; the worker moves bytes and settles
+every claim exactly once.
+
+- **Open:** `create_or_truncate` (default) starts a new upload; `create_new` adds
+  `If-None-Match: *` to the final PUT or CompleteMultipartUpload (412 -> `std::errc::file_exists`);
+  `create_or_open` and `open_existing` fail with `not_supported` (an S3 object cannot be modified
+  in place). `size_hint` raises the part size when `write_split_bytes x 10000` is too small. No
+  request is sent at open.
+- **Parts:** part size `P` = `write_split_bytes` (16 MiB, in [5 MiB, 5 GiB], rounded down to the
+  write granule); templated_ioctx and `rest_ioctx` cut every write slice at its multiples, so a
+  write operation never spans two parts. Part `k + 1` holds bytes `[kP, (k+1)P)`.
+  - A host slice covering a whole part is uploaded straight from the caller's buffer (UploadPart);
+    the write completes when S3 answered.
+  - Anything else is copied into the part's buffer: a memcpy on the worker (at most one part per
+    write, about 1-2 ms per 16 MiB, which the loop pays), or a D2H on the caller's stream for a
+    device source (an event polled like the H2D copies of reads; no connection is held). Part
+    buffers come from the context's host memory resource (pageable memory without one) and count
+    as staging: when none is free, the write parks while write work of the reactor (calls, D2H
+    copies) or staged reads are in flight and retries when they settle or a buffer is released
+    (on any thread; the release wakes the loop); with nothing in flight it fails with
+    `rmm::out_of_memory`, the read staging rule. A partly written part keeps its buffer until the
+    flush. A parked staged read never ends the loop's pass: the write calls, control jobs and
+    retries behind it still get their connections (they are what returns the blocks), and the
+    loop never blocks while a write call could start. The write that completes a part's coverage
+    uploads it and completes when S3 answered, so upload errors surface on a write.
+  - The UploadId is created lazily by the first part upload. CreateMultipartUpload is never re-sent
+    once it went out whole and its answer was lost (the orphan it may have created would be
+    invisible to the abort); a status answer, a refused connection and a pooled connection that
+    died before any response byte (the free stale retry: the request was not read) are retried.
+- **Flush (= commit):** one flush slice on the least-backlogged reactor. Waits for the writes and
+  uploads in flight (writes meanwhile fail with `device_or_resource_busy`), uploads the remaining
+  parts (the last with its real size; gaps zero-filled; a never-written part as zeros from a
+  static 1 MiB zero block, in windows of 64 iovecs), then CompleteMultipartUpload; an object of
+  at most one part that was never uploaded is one PUT (an empty object: `Content-Length: 0`).
+  After a commit `flush` is a no-op and writes fail with `bad_file_descriptor`; after a failed
+  flush the upload stays usable (flush again). Destroying an uncommitted object that has an
+  UploadId aborts it (AbortMultipartUpload through a live reactor of the ioctx; dropped when none
+  runs: bucket lifecycle rules collect it).
+- **Requests** (`s3_call`, each with its own retry envelope; signed afresh per attempt through
+  `authorize_request`, bodies `UNSIGNED-PAYLOAD`): PUT and UploadPart are data plane (stall
+  detector, both directions; 403 re-signed up to `max_auth_retry_attempts`; ETag required);
+  CreateMultipartUpload and AbortMultipartUpload use `request_timeout_s`;
+  CompleteMultipartUpload uses `complete_timeout_s` (300 s: S3 may assemble for minutes while it
+  trickles whitespace). Transport errors and 408/429/500/502/503/504 retry with backoff up to
+  `max_retry_attempts`; a pooled connection that died before any response byte gets the free
+  stale retry. A `200 OK` whose body is an S3 `<Error>` re-sends Complete up to 3 times; a 2xx
+  Complete without a `CompleteMultipartUploadResult` fails (never a false success). Create,
+  Complete and Abort are final on 403. A 409 `ConditionalRequestConflict` on a conditional
+  commit is retried. AbortMultipartUpload is one attempt, without the stale retry (best effort).
+- **Never a false commit:** the object remembers (across flushes) that a commit request (PUT,
+  Complete) of it went out whole and lost its answer. A conditional (`create_new`) PUT or
+  Complete that then answers 412 reports `errc::io_error` ("commit outcome unknown"), not
+  `file_exists`: the key may be ours. A Complete answered 404 `NoSuchUpload` after such a lost
+  answer is checked with one HEAD: the commit succeeded when the object's ETag is
+  `md5(concat(binary part MD5s))-N` of the recorded part ETags; otherwise (or when a part ETag is
+  not a plain MD5: SSE-KMS / SSE-C) the flush fails with "commit outcome unknown". Without a lost
+  answer the upload is gone (aborted, expired): the 404 fails the flush.
+- **Failed requests and connections:** any transport error closes the connection with an RST
+  (never reused; S3 drops a partial request). A mid-body failure is retried on a new connection.
+  With `expect_continue` the body goes out only after `100 Continue` (or after
+  `continue_timeout`, 1 s, when the server ignores `Expect`), so an early 4xx / 5xx costs no body
+  bytes and keeps its Retry-After.
+- **Scheduling:** writes and reads share the reactor's connections; `max_write_connections`
+  (0 = all) caps the connections write requests hold at once. Write and flush requests have
+  their own intake, expanded even while staged reads are parked (most writes need no staging).
+  Writes of one object may run on several reactors (fan-out); work parked on an object (parts
+  waiting for the UploadId, a flush waiting for in-flight writes) is released by a settlement on
+  any reactor: the settling reactor runs its own in that pass and hands the rest back to the
+  reactors that parked them (an intake queue and an eventfd wake), which start them in the pass
+  that wakes them, so the parts of a burst upload on the reactors they were dispatched to. The
+  abort of an object destroyed uncommitted is posted to a running reactor as a control job.
+  Shutdown waits for D2H copies in flight, then cancels the writes (`operation_canceled`)
+  without sending them.
+- **User-space TLS:** bodies are sealed 16 records (256 KiB) per SEND (`tx_batch_records`).
+  kTLS sends straight from the body iovecs.
+- **Object:** `rest_write_object::size()` is the end of the highest byte written,
+  `validation_tag()` empty until the commit and the new ETag after it; its identity is
+  `opened_handle` of size 0, as for every writable object. Lifetime: flush or drop every write
+  object before destroying the ioctx. One that outlives it gives back its part buffers in the
+  ioctx's destructor (they belong to the context's host memory resource), then fails every write
+  and flush (`operation_canceled`); its upload is not aborted.
+
 ## Pool size and placement
 
 `rest_n_reactors` is a total. `0` sizes the pool from the egress NIC (`rest.interface`, else the
@@ -115,4 +201,7 @@ least-backlogged reactors one read is split across.
 (transient, auth, stale), failures, passes, waits, established connections, connects,
 handshakes, kTLS and user-space TLS sessions, kTLS fallbacks, reused, closed (idle / dead),
 sends, receives, direct and scratch bytes, timeouts and stalls, kTLS control records, MTU
-rejects and fallbacks, the smallest and largest MSS observed.
+rejects and fallbacks, the smallest and largest MSS observed; for writes: PUTs and UploadParts
+(and their bytes, of which zeros), creates, completes, Complete re-sends after a `200 OK` +
+`<Error>`, aborts, commits and commit failures, write failures, D2H copies, part-buffer waits and
+the part buffers live.

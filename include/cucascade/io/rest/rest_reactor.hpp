@@ -24,7 +24,6 @@
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
-#include <cucascade/io/templated_ioctx.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -50,6 +49,9 @@ namespace cucascade::io::rest {
 namespace detail {
 class shared_services;
 struct pool_placement;
+class upload_session;
+class abort_sink;
+struct parked_write;
 }  // namespace detail
 
 class reactor_worker;
@@ -267,6 +269,57 @@ class rest_io_object : public io_object {
 };
 
 // ---------------------------------------------------------------------------
+// rest_write_object
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief An S3 object opened for writing: one upload in progress.
+ *
+ * Writes land in parts of @c config::write_split_bytes (part k+1 holds [kP, (k+1)P)); nothing
+ * is visible to readers until @c ioctx::flush commits the object (CompleteMultipartUpload, or
+ * one PUT for an object of at most one part).  @ref size is the end of the highest byte written;
+ * @ref validation_tag is empty until the commit and the new ETag after it.  Destroying an object
+ * that has an UploadId but was never committed aborts its upload (best effort, through a live
+ * reactor of the ioctx that opened it).  Design: docs/io/rest-transport.md "Writes".
+ */
+class rest_write_object final : public rest_io_object {
+ public:
+  rest_write_object(std::string path,
+                    std::string bucket,
+                    std::string key,
+                    std::shared_ptr<detail::upload_session> upload);
+  ~rest_write_object() override;
+
+  rest_write_object(rest_write_object const&)            = delete;
+  rest_write_object& operator=(rest_write_object const&) = delete;
+  rest_write_object(rest_write_object&&)                 = delete;
+  rest_write_object& operator=(rest_write_object&&)      = delete;
+
+  [[nodiscard]] size_t size() const noexcept override
+  {
+    return _size.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] bool writable() const noexcept override { return true; }
+  void note_written(std::size_t end) const noexcept override;
+  [[nodiscard]] std::string_view validation_tag() const noexcept override;
+
+  /// The upload this object writes through (internal).
+  [[nodiscard]] std::shared_ptr<detail::upload_session> const& upload() const noexcept
+  {
+    return _upload;
+  }
+
+  /// Record the committed object's ETag (internal; once).
+  void set_committed_tag(std::string etag) const noexcept;
+
+ private:
+  mutable std::atomic<std::size_t> _size{0};
+  std::shared_ptr<detail::upload_session> _upload;
+  mutable std::string _committed_tag;
+  mutable std::atomic<bool> _committed{false};
+};
+
+// ---------------------------------------------------------------------------
 // transport_stats
 // ---------------------------------------------------------------------------
 
@@ -321,6 +374,22 @@ struct transport_stats {
   std::uint64_t mtu_fallbacks{0};
   std::uint64_t mss_min{0};  ///< smallest TCP_MAXSEG observed (0 = none)
   std::uint64_t mss_max{0};
+  // writes
+  std::uint64_t puts{0};                    ///< single PUT commits answered 2xx
+  std::uint64_t put_bytes{0};               ///< body bytes of those PUTs
+  std::uint64_t upload_parts{0};            ///< UploadPart requests answered 2xx
+  std::uint64_t upload_part_bytes{0};       ///< body bytes of those parts
+  std::uint64_t zero_part_bytes{0};         ///< of which zeros (parts / PUTs never written)
+  std::uint64_t creates{0};                 ///< CreateMultipartUpload answered with an UploadId
+  std::uint64_t completes{0};               ///< CompleteMultipartUpload answered with a result
+  std::uint64_t complete_error_retries{0};  ///< Complete re-sent after a `200 OK` + `<Error>`
+  std::uint64_t aborts{0};                  ///< AbortMultipartUpload requests sent
+  std::uint64_t commits{0};                 ///< flushes that committed an object
+  std::uint64_t commit_failures{0};         ///< flushes that failed
+  std::uint64_t write_failures{0};          ///< write operations that failed
+  std::uint64_t d2h_copies{0};              ///< device sources copied into part buffers
+  std::uint64_t part_buffer_waits{0};       ///< writes parked until a part buffer was free
+  std::uint64_t part_buffers_live{0};       ///< part buffers allocated by this reactor, now
 
   /// Add @p other (sums; extremes for @c mss_min / @c mss_max / @c max_inflight).
   void merge(transport_stats const& other) noexcept;
@@ -535,28 +604,42 @@ class rest_reactor {
   /// @c rest_ioctx::create_io_object.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
-  // -- writes: not yet implemented --------------------------------------------
+  // -- writes ---------------------------------------------------------------
   //
-  // The write entry points exist so the reactor's write surface is explicit,
-  // but REST writes (S3 PUT / multipart upload) are not implemented yet: each
-  // throws @c not_implemented_error (@c std::errc::not_supported) without any
-  // network traffic, and @ref enqueue fails write and flush slices with it
-  // instead of reading them as GETs.  These signatures would satisfy
-  // @c io_write_reactor_c structurally, so @c reactor_write_traits<rest_reactor>
-  // is specialized below to advertise no writes.
+  // S3 writes (docs/io/rest-transport.md "Writes"): write slices of a
+  // @c rest_write_object become part uploads (single PUT for an object of at
+  // most one part), a flush slice commits.  Device sources are copied into
+  // pinned part buffers on the caller's stream first.
 
-  /// Always throws @c not_implemented_error; no object is created.
+  /// Device sources are written (staged through part buffers).
+  static constexpr bool supports_device_write = true;
+
+  /// Concept stub: an upload needs the pool's context; @c rest_ioctx overrides
+  /// @c create_io_object_for_write.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object_for_write(std::string path,
                                                                     write_open_options options);
 
-  /// Always throws @c not_implemented_error; nothing is sent.
+  /// Synchronous write through the worker (blocking the caller; the reactor must
+  /// run).  Writes every byte or throws.  One slice per part of
+  /// @c write_split_bytes.
   std::size_t host_write(io_object_type const& object,
                          std::size_t offset,
                          std::size_t size,
                          std::uint8_t const* src);
 
-  /// Always throws @c not_implemented_error.
+  /// Concept stub: a commit needs a reactor; @c rest_ioctx overrides
+  /// @c flush_io (a flush slice through @c flush_async_io).  Always throws.
   static void flush(io_object_type const& object);
+
+  /// Queue AbortMultipartUpload of @p upload_id for @p object on the running
+  /// worker (internal; fire and forget, any thread).  False when the worker does
+  /// not accept work.
+  bool post_abort(object_ref const& object, std::string const& upload_id) noexcept;
+
+  /// Hand write work parked by this reactor back to it (internal; any thread): it runs in the
+  /// worker's next pass.  False (and @p item untouched) when the worker does not accept work.
+  bool post_resumed(std::shared_ptr<detail::upload_session> const& session,
+                    detail::parked_write& item) noexcept;
 
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
@@ -613,17 +696,3 @@ class rest_reactor {
 };
 
 }  // namespace cucascade::io::rest
-
-namespace cucascade::io {
-
-/// The REST reactor declares write stubs only (see @c rest_reactor): it
-/// advertises no writes, so @c templated_ioctx<rest::rest_reactor> reports
-/// @c supports_write() == @c supports_device_write() == false.  Declared here,
-/// next to the reactor, so it precedes every instantiation of the context.
-template <>
-struct reactor_write_traits<rest::rest_reactor> {
-  static constexpr bool supports_write        = false;
-  static constexpr bool supports_device_write = false;
-};
-
-}  // namespace cucascade::io

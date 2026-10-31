@@ -2,7 +2,7 @@
 
 Status: approved by the lead (decisions recorded in section 12). Scope: `include/cucascade/io/{io_context,templated_ioctx,io_request,types}.hpp`,
 `src/io/io_context.cpp`, the uring reactor, the explicit "not yet implemented" write stubs of the
-REST context (section 8), tests in `test/io/`.
+REST context (section 8; S3 writes have replaced them since), tests in `test/io/`.
 The cuFile reactor's writes (W2) build on the reactor contract in section 6.
 
 Guiding rule: the read side's shape, reused. One reactor per thread, configuration static at the
@@ -461,28 +461,28 @@ guarantees to deliver and what the reactor must guarantee back.
   writes too. Expected pipeline for a 1 GiB device column: 32 sub-slices over 2 reactors, each up to 64 MiB of staging in flight (D2H of op k+1
   overlapping the write of op k).
 
-## 8. Backends without writes: REST
+## 8. REST (S3) writes
 
-Writes are implemented by the io_uring reactor (section 7) and the cuFile reactor (W2) only.
+Writes were first implemented by the io_uring reactor (section 7) and the cuFile reactor (W2); the
+REST context answered every write hook with `io::not_implemented_error` until the io_uring REST
+transport brought S3 writes. (The kvikIO context, read-only, has been removed.)
 
-- `restful` (`rest_ioctx` / `rest_reactor`) stays read-only. It reports `supports_write() ==
-  supports_device_write() == false`, and each write hook (`create_io_object_for_write`,
-  `host_write_io`, `mixed_writev_async_io`, `flush_io`, `flush_async_io`) reports
-  `io::not_implemented_error`: a `std::system_error` with `std::errc::not_supported` whose message
-  says "not yet implemented" and names the backend and operation. The synchronous hooks throw it;
-  the asynchronous ones return a failed future. The reactor also has static
-  `create_io_object_for_write` / `host_write` / `flush` stubs that throw `not_implemented_error`,
-  and its `enqueue` fails write and flush slices with it instead of issuing a GET. Because those
-  stub signatures would satisfy `io_write_reactor_c` structurally,
-  `reactor_write_traits<rest::rest_reactor>` is explicitly specialized to false/false (before any
-  `templated_ioctx<rest_reactor>` is instantiated), so the context never advertises writes. No
-  writable REST object, HEAD, PUT or upload state is created and nothing is sent. S3 writes
-  (multipart upload) arrive later on the same io_uring transport.
+- `restful` (`rest_ioctx` / `rest_reactor`) reports `supports_write() == supports_device_write()
+  == true`. `open_io_object_for_write` supports `create_or_truncate` and `create_new` (committed
+  with `If-None-Match: *`); `create_or_open` and `open_existing` report
+  `std::errc::not_supported` (an S3 object cannot be modified in place). Writes become parts of a
+  multipart upload of `write_split_bytes` each (device sources staged D2H on the caller's stream);
+  `flush` / `flush_async` commit the object (CompleteMultipartUpload, or one PUT for an object of
+  at most one part), and destroying an uncommitted object aborts its upload.
+- Visibility is the deviation from file semantics: a new `io_object` sees the bytes after the
+  commit, not after each write. The front ends invalidate the path around every write as for
+  files, and `rest_ioctx` invalidates it once more when a commit settled. Details:
+  docs/io/rest-transport.md "Writes".
 - The front wrappers check `supports_write()` first and report `not_implemented_error` for a
   backend that cannot write at all; a writing backend asked for a device source it does not
   accept reports a plain `std::system_error(std::errc::not_supported)`. Callers that catch
   `std::system_error` and compare its code keep working.
-- `s3rdma`: no change (the base defaults, which also report `not_implemented_error`).
+- `s3rdma`: no change (the base defaults, which report `not_implemented_error`).
 
 ## 9. Tests (Catch2, `cucascade_io_tests`)
 
@@ -519,10 +519,9 @@ and every write API `not_supported`; a fake writing reactor receives `kind == wr
 unclamped past EOF, device ids resolved, large slices split, partitions balanced, flush routed to
 one reactor as a single flush slice; `io_op_request::finish_success` raises `size()` for writes only.
 
-`test/io/rest/test_rest_write_unimplemented.cpp` (`[unimplemented]`): every write and flush entry
-point of the read-only REST backend fails with `not_implemented_error` (type, code and message), through
-`ioctx&`, the direct backend hooks and (REST) direct reactor submission, with no file or network
-side effect; zero-size calls stay no-ops.
+`test/io/rest/test_rest_write.cpp` (`[rest][write]`): S3 writes against the loopback S3 server
+(single PUT, multipart, holes, `create_new`, refused open modes, device sources, abort on
+destruction, error paths, concurrency); see docs/io/rest-transport.md "Writes".
 
 `test/cudf/test_write_cache_invalidation.cpp` (generations are only built through the cudf
 datasource's fadvise, so the controlled_reactor fixtures of `test/io/cache` cannot reach them): a
@@ -537,7 +536,7 @@ All added to `test/CMakeLists.txt` next to their read counterparts.
 Changed: `include/cucascade/io/{types,io_request,io_context,templated_ioctx}.hpp`,
 `src/io/io_context.cpp`, `include/cucascade/io/uring/{uring_reactor,types}.hpp`,
 `src/io/uring/uring_reactor.cpp`, `include/cucascade/io/io_errors.hpp` (`not_implemented_error`),
-the REST context / reactor (write stubs), tests above,
+the REST context / reactor (write stubs at first, S3 writes since), tests above,
 `test/CMakeLists.txt`.
 `include/cucascade/io/cache/{fs_cache,metadata_store}.hpp`, `src/io/cache/{fs_cache,metadata_store}.cpp`
 (`invalidate`, `invalidate_later`), `test/cudf/test_write_cache_invalidation.cpp`.

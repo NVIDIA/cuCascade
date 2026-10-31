@@ -589,6 +589,12 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Independent of the prefetching machinery — exposed via @c metadata_store().
   cache::metadata_store _metadata_store;
 
+  /// Drop what the prefetching cache (when attached) and the metadata store
+  /// hold for @p object_path.  The write front ends call it around every
+  /// write; a backend whose written bytes become visible later (an object
+  /// store's commit) calls it again at that point.
+  void invalidate_cached(std::string_view object_path) noexcept;
+
  private:
   /// Shared body of the asynchronous write forms: validate, build the write
   /// slices, invalidate the object's path, dispatch to @ref mixed_writev_async_io
@@ -598,10 +604,6 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
                                               std::span<const write_slice> device_slices,
                                               ::cuda::stream_ref stream,
                                               io_priority priority) noexcept;
-
-  /// Drop what the prefetching cache (when attached) and the metadata store
-  /// hold for @p object_path.
-  void invalidate_cached(std::string_view object_path) noexcept;
 
   /// Stamp a freshly opened object with its path's metadata epoch.
   std::shared_ptr<io_object> stamped(std::shared_ptr<io_object> object) noexcept
