@@ -27,7 +27,9 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/reactor_placement.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor_write.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/shared_services.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/rest/write/upload.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma/s3rdma_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_reactor.cpp
