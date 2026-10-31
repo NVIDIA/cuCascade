@@ -68,6 +68,8 @@ constexpr std::size_t drain_bytes = tls::max_record_ciphertext + 256;
 /// Sends gather at most this many iovecs.
 constexpr std::size_t max_send_iovecs = 64;
 
+std::atomic<mtu_probe_fn> g_mtu_probe{nullptr};
+
 std::error_code sys_error(int err) noexcept { return {err, std::system_category()}; }
 
 std::string read_small(std::string const& path)
@@ -146,6 +148,32 @@ url_parts parse_url(std::string_view url)
   if (out.port != default_port) { out.authority += ":" + std::to_string(out.port); }
   out.target = std::move(target);
   return out;
+}
+
+mtu_sample mtu_probe(int fd) noexcept
+{
+  mtu_sample s{};
+  int mss       = 0;
+  socklen_t len = sizeof(mss);
+  if (::getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, &len) != 0) { return s; }
+  tcp_info info{};
+  socklen_t info_len = sizeof(info);
+  if (::getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &info_len) == 0) {
+    s.timestamps = (info.tcpi_options & TCPI_OPT_TIMESTAMPS) != 0;
+  }
+  sockaddr_storage local{};
+  socklen_t local_len = sizeof(local);
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &local_len) == 0) {
+    s.ipv6 = local.ss_family == AF_INET6;
+  }
+  s.mss = mss;
+  s.ok  = true;
+  return s;
+}
+
+void set_mtu_probe_for_testing(mtu_probe_fn fn) noexcept
+{
+  g_mtu_probe.store(fn, std::memory_order_relaxed);
 }
 
 bool ec2_platform(std::string_view sysfs_root) noexcept
@@ -231,6 +259,7 @@ struct uring_transport::connection {
   sockaddr_storage addr{};
   socklen_t addr_len{0};
   std::size_t connect_tries{0};
+  unsigned mtu_rejects{0};
 
   // ---- exchange ----
   bool has_request{false};
@@ -645,6 +674,11 @@ void uring_transport::close(std::size_t index) noexcept
   c.session.reset();
   if (c.fd >= 0) {
     ++_ctr.closed;
+    if (_opts.close_with_rst) {
+      // An RST instead of a FIN: neither end lingers in TIME_WAIT / FIN_WAIT.
+      linger const lg{1, 0};
+      (void)::setsockopt(c.fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
     ::close(c.fd);
     c.fd = -1;
   }
@@ -738,6 +772,7 @@ void uring_transport::begin(std::size_t index)
   close(index);
   c.origin           = origin;
   c.connect_tries    = 0;
+  c.mtu_rejects      = 0;
   c.dns_handle       = dns_resolver::invalid;
   c.connect_deadline = clock_type::now() + _opts.connect_timeout;
   c.literal          = parse_ip_literal(c.remote.host, c.remote.port, c.addr, c.addr_len);
@@ -809,7 +844,25 @@ void uring_transport::open_socket(std::size_t index)
 
 void uring_transport::on_connected(std::size_t index)
 {
-  auto& c = *_slots[index];
+  auto& c            = *_slots[index];
+  mtu_probe_fn fn    = g_mtu_probe.load(std::memory_order_relaxed);
+  mtu_sample const s = fn != nullptr ? fn(c.fd) : mtu_probe(c.fd);
+  if (s.ok && s.mss > 0) {
+    auto const mss = static_cast<std::uint64_t>(s.mss);
+    _ctr.mss_min   = _ctr.mss_min == 0 ? mss : std::min(_ctr.mss_min, mss);
+    _ctr.mss_max   = std::max(_ctr.mss_max, mss);
+    if (_opts.min_mtu > 0 && effective_mtu(s) < _opts.min_mtu) {
+      if (c.mtu_rejects < _opts.mtu_reject_max_attempts) {
+        // Reset and reconnect on the next address; the budget is per request.
+        ++c.mtu_rejects;
+        ++_ctr.mtu_rejects;
+        close(index);
+        start_connect(index);
+        return;
+      }
+      ++_ctr.mtu_fallbacks;
+    }
+  }
   if (!c.remote.tls) {
     established_now(index);
     return;

@@ -80,6 +80,8 @@ void config::validate() const
   if (so_rcvbuf < 0) { invalid("so_rcvbuf", "must be >= 0"); }
   if (so_sndbuf < 0) { invalid("so_sndbuf", "must be >= 0"); }
   if (busy_poll_us < 0) { invalid("busy_poll_us", "must be >= 0"); }
+  if (min_mtu > 65535 + 60 + 12) { invalid("min_mtu", "must be at most 65607 bytes"); }
+  if (mtu_reject_max_attempts == 0) { invalid("mtu_reject_max_attempts", "must be >= 1"); }
   if (footer_probe_bytes > 1024 * mib) { invalid("footer_probe_bytes", "must be <= 1 GiB"); }
   if (list_max_matches == 0) { invalid("list_max_matches", "must be > 0"); }
   if (list_max_scanned == 0) { invalid("list_max_scanned", "must be > 0"); }

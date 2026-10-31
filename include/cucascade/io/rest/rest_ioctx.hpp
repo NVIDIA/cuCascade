@@ -69,8 +69,8 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @throws std::invalid_argument when the config is invalid (@c config::validate).
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
-  /// Counters of the whole pool: the reactors' @c transport_stats summed (the extreme for the
-  /// in-flight peak).  A snapshot; safe while the pool runs.
+  /// Counters of the whole pool: the reactors' @c transport_stats summed (extremes for the MSS
+  /// and in-flight peaks).  A snapshot; safe while the pool runs.
   [[nodiscard]] transport_stats stats() const noexcept;
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }

@@ -271,7 +271,7 @@ class rest_io_object : public io_object {
 
 /// Cumulative counters of one REST reactor (its scheduler and its io_uring transport), a
 /// snapshot published by the worker once per loop pass.  @c rest_ioctx::stats sums them over the
-/// pool.
+/// pool (@c mss_min / @c mss_max are the extremes).
 struct transport_stats {
   // scheduler
   std::uint64_t requests_started{0};  ///< grouped requests taken from the queue
@@ -316,8 +316,12 @@ struct transport_stats {
   std::uint64_t stalls{0};  ///< data GETs cancelled by the stall detector
   std::uint64_t net_errors{0};
   std::uint64_t control_records{0};  ///< kTLS control records consumed
+  std::uint64_t mtu_rejects{0};
+  std::uint64_t mtu_fallbacks{0};
+  std::uint64_t mss_min{0};  ///< smallest TCP_MAXSEG observed (0 = none)
+  std::uint64_t mss_max{0};
 
-  /// Add @p other (sums; the extreme for @c max_inflight).
+  /// Add @p other (sums; extremes for @c mss_min / @c mss_max / @c max_inflight).
   void merge(transport_stats const& other) noexcept;
 };
 

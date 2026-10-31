@@ -67,11 +67,12 @@
  * Connections: non-blocking `IORING_OP_CONNECT` over the resolved addresses (IP literals bypass
  * the resolver; names come from the context's resolver thread, round robin, so the loop never
  * blocks on DNS), socket options (TCP_NODELAY, SO_KEEPALIVE with idle / interval / count,
- * optional buffers, busy poll, user timeout), then for https:// the TLS layer's non-blocking
- * handshake (readiness through
+ * optional buffers, busy poll, user timeout), the @c min_mtu check right after the TCP connect,
+ * then for https:// the TLS layer's non-blocking handshake (readiness through
  * `IORING_OP_POLL_ADD`) followed by kTLS (plain SEND / RECVMSG with the `TLS_GET_RECORD_TYPE`
  * cmsg; control records follow the TLS layer's rules) or the user-space stream (ciphertext ring
- * and record layer, `tls_stream`).
+ * and record layer, `tls_stream`).  Every close resets the connection (SO_LINGER {on, 0}) unless
+ * `close_with_rst` is off.
  *
  * Reuse (curl parity): an idle connection is reused only while idle for less than
  * `conn_max_age` and when a zero-timeout poll finds it quiet (pending TLS control records are
@@ -116,6 +117,28 @@ struct url_parts {
 
 /// @throws std::invalid_argument for anything but an absolute http(s) URL without userinfo.
 [[nodiscard]] url_parts parse_url(std::string_view url);
+
+/// What @ref mtu_probe reads from a connected socket.
+struct mtu_sample {
+  bool ok{false};
+  int mss{0};              ///< TCP_MAXSEG
+  bool timestamps{false};  ///< TCPI_OPT_TIMESTAMPS negotiated
+  bool ipv6{false};
+};
+
+/// @return the effective MTU of a connection: MSS + 40 (IPv4) / 60 (IPv6) + 12 with timestamps.
+[[nodiscard]] constexpr std::size_t effective_mtu(mtu_sample const& s) noexcept
+{
+  return static_cast<std::size_t>(s.mss) + (s.ipv6 ? 60U : 40U) + (s.timestamps ? 12U : 0U);
+}
+
+/// `getsockopt(TCP_MAXSEG)` + `TCP_INFO` of @p fd.
+[[nodiscard]] mtu_sample mtu_probe(int fd) noexcept;
+
+/// TESTING ONLY: replace @ref mtu_probe process-wide (nullptr restores it); loopback cannot
+/// negotiate a small MSS.
+using mtu_probe_fn = mtu_sample (*)(int fd) noexcept;
+void set_mtu_probe_for_testing(mtu_probe_fn fn) noexcept;
 
 /// DMI / hypervisor hint of an EC2 instance (`<sysfs>/devices/virtual/dmi/id/{sys,board}_vendor`
 /// = "Amazon EC2", or `<sysfs>/hypervisor/uuid` starting with "ec2").
@@ -181,6 +204,9 @@ struct transport_options {
   int so_sndbuf{0};
   int busy_poll_us{0};
   unsigned tcp_user_timeout_ms{0};
+  bool close_with_rst{true};
+  std::size_t min_mtu{0};
+  unsigned mtu_reject_max_attempts{8};
   std::chrono::milliseconds connect_timeout{3000};
   std::chrono::milliseconds conn_max_age{20'000};  ///< idle cutoff; 0 = none
   std::uint64_t max_connection_bytes{0};           ///< retire after this many bytes; 0 = off
@@ -279,6 +305,10 @@ struct transport_counters {
   std::uint64_t stalls{0};
   std::uint64_t errors{0};
   std::uint64_t control_records{0};
+  std::uint64_t mtu_rejects{0};
+  std::uint64_t mtu_fallbacks{0};
+  std::uint64_t mss_min{0};  ///< 0 = none observed
+  std::uint64_t mss_max{0};
 };
 
 class uring_transport {
