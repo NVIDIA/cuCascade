@@ -20,6 +20,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/data/remote_data_representation.hpp>
 #include <cucascade/memory/chunked_resource_info.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -60,6 +61,7 @@ std::type_index canonical_type_for(memory::Tier tier)
     case memory::Tier::GPU: return std::type_index(typeid(gpu_table_representation));
     case memory::Tier::HOST: return std::type_index(typeid(host_data_representation));
     case memory::Tier::DISK: return std::type_index(typeid(disk_data_representation));
+    case memory::Tier::REMOTE: return std::type_index(typeid(remote_data_representation));
     default: throw std::invalid_argument("bandwidth_profiler: unsupported memory tier");
   }
 }
@@ -208,12 +210,20 @@ bandwidth_sample measure_single_size(const idata_representation& source,
 
 bool should_skip_pair(const memory::memory_space& src,
                       const memory::memory_space& dst,
-                      bool measure_disk_pairs)
+                      bool measure_disk_pairs,
+                      bool measure_remote_pairs)
 {
+  using memory::Tier;
+  auto const is_storage = [](Tier t) { return t == Tier::DISK || t == Tier::REMOTE; };
   if (src.get_id() == dst.get_id()) return true;
-  if (src.get_tier() == memory::Tier::DISK && dst.get_tier() == memory::Tier::DISK) return true;
-  if (!measure_disk_pairs &&
-      (src.get_tier() == memory::Tier::DISK || dst.get_tier() == memory::Tier::DISK)) {
+  // Storage tiers are measured only against GPU and HOST: no DISK/REMOTE <-> DISK/REMOTE pair has
+  // a converter.
+  if (is_storage(src.get_tier()) && is_storage(dst.get_tier())) return true;
+  if (!measure_disk_pairs && (src.get_tier() == Tier::DISK || dst.get_tier() == Tier::DISK)) {
+    return true;
+  }
+  // REMOTE pairs cost object-store requests (and money): only when asked for.
+  if (!measure_remote_pairs && (src.get_tier() == Tier::REMOTE || dst.get_tier() == Tier::REMOTE)) {
     return true;
   }
   return false;
@@ -283,7 +293,9 @@ bandwidth_profile measure_bandwidth(std::span<memory::memory_space* const> space
     if (src == nullptr) continue;
     for (auto* dst : spaces) {
       if (dst == nullptr) continue;
-      if (should_skip_pair(*src, *dst, config.measure_disk_pairs)) continue;
+      if (should_skip_pair(*src, *dst, config.measure_disk_pairs, config.measure_remote_pairs)) {
+        continue;
+      }
 
       bandwidth_pair_result result;
       result.src                 = src->get_id();
