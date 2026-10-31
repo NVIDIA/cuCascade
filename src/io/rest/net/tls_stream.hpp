@@ -77,8 +77,9 @@
  *    is not reused). A `key_update` stop without progress means the library must write before
  *    it reads on (tier 1: a reply OpenSSL writes while reading): the next receive SQE becomes a
  *    SEND of a control-only seal (or a NOP while the pool's own SEND is in flight).
- *  - Send: `prep_send` seals at most 3 records (48 KiB of plaintext) per batch with the session's
- *    `tls::record_sealer` into a 64 KiB ciphertext FIFO and SENDs the FIFO (`MSG_NOSIGNAL |
+ *  - Send: `prep_send` seals at most `stream_options::tx_batch_records` records (default 16:
+ *    256 KiB of plaintext) per batch with the session's
+ *    `tls::record_sealer` into a ciphertext FIFO of 17 records and SENDs the FIFO (`MSG_NOSIGNAL |
  *    MSG_WAITALL`); `on_send` maps the ciphertext CQE back to plaintext bytes of the pool's tx
  *    window (the whole batch once all of its ciphertext is out; on a short CQE part of the batch,
  *    never all of it). One ciphertext SEND in flight at a time (record order).
@@ -120,12 +121,12 @@ class tls_stream {
  public:
   /// Ciphertext receive ring (gpuio ARCHITECTURE §4.4: 256 KiB): 15 full records per RECV.
   static constexpr std::size_t ring_bytes = 256 * KiB;
-  /// Ciphertext send FIFO: one batch of 3 records plus control replies (KeyUpdate ~30 B).
-  static constexpr std::size_t tx_bytes = 64 * KiB;
-  /// Records sealed per SEND (requests are <= 4 KiB; PUT bodies go out in batches).
-  static constexpr unsigned tx_batch_records = 3;
-  /// Plaintext sealed per SEND at most (3 full records).
-  static constexpr std::size_t tx_batch_plaintext = tx_batch_records * tls::max_record_plaintext;
+  /// Largest `stream_options::tx_batch_records`.
+  static constexpr unsigned max_tx_batch_records = 16;
+  /// Ciphertext send FIFO: one batch of up to 16 full records plus control replies (KeyUpdate
+  /// ~30 B).  Not value-initialised: a connection that never sends a body touches one page of it.
+  static constexpr std::size_t tx_bytes =
+    (max_tx_batch_records + 1) * tls::max_record_ciphertext + 4 * KiB;
   /// Tier 2: smallest bounded MSG_WAITALL body receive (below it the receive is one-shot).
   static constexpr std::size_t waitall_min = 32 * KiB;
 
@@ -231,6 +232,7 @@ class tls_stream {
   std::unique_ptr<tls::record_opener> _own_opener{};
   bool _tier2{false};   ///< receive through the built-in record layer
   bool _waitall{true};  ///< tier 2: bounded MSG_WAITALL body receives (recv_waitall)
+  unsigned _tx_batch{max_tx_batch_records};  ///< records sealed per SEND
   bool _header_phase{false};
   bool _peer_eof{false};  ///< RECV returned 0 (TCP FIN)
   bool _closed{false};    ///< close_notify consumed

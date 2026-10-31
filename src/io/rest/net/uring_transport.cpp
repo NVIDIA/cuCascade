@@ -212,7 +212,8 @@ enum class uring_transport::op : std::uint8_t {
   send,
   recv,
   drain,
-  writable,  ///< POLLOUT before flushing an owed kTLS KeyUpdate reply
+  writable,       ///< POLLOUT before flushing an owed kTLS KeyUpdate reply
+  continue_poll,  ///< POLLIN while a held body waits for `100 Continue` (continue_timeout)
 };
 
 namespace {
@@ -269,6 +270,11 @@ struct uring_transport::connection {
   std::size_t tx_idx{0};
   bool body_held{false};      ///< expect-continue: body not sent yet
   bool continue_wait{false};  ///< head received while waiting for 100 Continue
+  /// expect-continue with a timeout: when the held body goes out without an answer.
+  std::optional<clock_type::time_point> continue_deadline;
+  bool continue_cancel{false};  ///< the continue poll is being cancelled (deadline)
+  bool continue_ready{false};   ///< the continue poll fired: receive, do not poll again
+  int continue_res{0};          ///< the continue poll's result, held until its cancel is reaped
   bool generator_done{false};
   msghdr txmsg{};
   http::response_parser parser;
@@ -348,7 +354,7 @@ void uring_transport::shutdown() noexcept
   // cancel every primary SQE and reap until both CQEs of every slot are in.
   for (std::size_t i = 0; i < _slots.size(); ++i) {
     auto& c = *_slots[i];
-    if (c.pending && !c.canceling) {
+    if (c.pending && !c.canceling && !c.cancel_pending) {
       try {
         cancel(i);
       } catch (...) {
@@ -408,6 +414,9 @@ int uring_transport::timeout_ms() const noexcept
     if (c.connect_deadline) { consider(*c.connect_deadline); }
     if (c.exchange_deadline) { consider(*c.exchange_deadline); }
     if (c.stall_on) { consider(c.stall_start + c.x.stall_time); }
+    if (c.cur == op::continue_poll && c.continue_deadline && !c.cancel_pending) {
+      consider(*c.continue_deadline);
+    }
   }
   if (!earliest) { return -1; }
   auto const remaining =
@@ -550,7 +559,16 @@ void uring_transport::check_deadlines()
       }
       continue;
     }
-    if (!c.pending || c.canceling) { continue; }
+    if (!c.pending || c.canceling || c.cancel_pending) { continue; }
+    if (c.cur == op::continue_poll && c.continue_deadline && now >= *c.continue_deadline) {
+      // The server ignored `Expect: 100-continue`: stop waiting and send the body.  A soft
+      // cancel: the poll's CQE then resumes the exchange (continue_body) instead of failing it.
+      auto* entry = sqe(cancel_bit | (i + 1));
+      io_uring_prep_cancel64(entry, i + 1, 0);
+      c.cancel_pending  = true;
+      c.continue_cancel = true;
+      continue;
+    }
     if (c.connect_deadline && now >= *c.connect_deadline) {
       ++_ctr.timeouts;
       c.timeout_ec = make_error_code(errc::connect_timeout);
@@ -604,6 +622,23 @@ std::vector<uring_transport::completion>& uring_transport::poll()
       c.cancel_pending = false;
     } else {
       c.pending = false;
+    }
+    if (c.continue_cancel) {
+      // Both CQEs of the soft cancel first; then the poll's result decides (cancelled: send
+      // the body; readable: the answer raced the deadline, receive it).
+      if ((id & cancel_bit) == 0) { c.continue_res = result; }
+      if (c.pending || c.cancel_pending) { continue; }
+      c.continue_cancel = false;
+      try {
+        advance(index, c.continue_res, 0);
+      } catch (transport_fatal_error const&) {
+        throw;
+      } catch (std::exception const&) {
+        if (!c.pending && !c.cancel_pending && c.has_request) {
+          finish(index, make_error_code(errc::http_bad_message));
+        }
+      }
+      continue;
     }
     if (c.canceling) {
       if (!c.pending && !c.cancel_pending) {
@@ -951,9 +986,12 @@ void uring_transport::start_exchange(std::size_t index)
   c.head_done     = false;
   c.body_done     = false;
   c.continue_wait = false;
-  c.control_run   = 0;
-  c.bmode         = body_mode::none;
-  c.meta          = http::response_meta{};
+  c.continue_deadline.reset();
+  c.continue_cancel = false;
+  c.continue_ready  = false;
+  c.control_run     = 0;
+  c.bmode           = body_mode::none;
+  c.meta            = http::response_meta{};
   c.parser.reset(http::parse_options{
     static_cast<std::uint32_t>(std::min<std::size_t>(64 * KiB, _opts.receive_buffer_bytes)),
     c.x.method == http::method::head});
@@ -1035,6 +1073,11 @@ void uring_transport::send(std::size_t index)
   }
   if (c.tx_idx == c.tx.size()) {
     // Everything owed is on the wire: the response (or 100 Continue) is next.
+    if (!c.body_held) {
+      c.res.request_sent = true;
+    } else if (c.x.continue_timeout.count() > 0 && !c.continue_deadline) {
+      c.continue_deadline = clock_type::now() + c.x.continue_timeout;
+    }
     c.ph = phase::head;
     receive(index);
     return;
@@ -1062,6 +1105,7 @@ void uring_transport::on_sent(std::size_t index, std::size_t bytes)
   auto& c = *_slots[index];
   _ctr.bytes_sent += bytes;
   c.bytes_carried += bytes;
+  c.progress += bytes;  // the stall detector counts both directions
   while (bytes > 0 && c.tx_idx < c.tx.size()) {
     auto& v      = c.tx[c.tx_idx];
     auto const n = std::min(bytes, v.iov_len);
@@ -1078,6 +1122,8 @@ void uring_transport::continue_body(std::size_t index)
   // 100 Continue arrived: the body goes out, then the final head is received.
   auto& c     = *_slots[index];
   c.body_held = false;
+  c.continue_deadline.reset();
+  c.continue_ready = false;
   c.tx.clear();
   c.tx_idx = 0;
   c.tx.insert(c.tx.end(), c.x.body.begin(), c.x.body.end());
@@ -1088,6 +1134,22 @@ void uring_transport::continue_body(std::size_t index)
 void uring_transport::receive(std::size_t index)
 {
   auto& c = *_slots[index];
+  if (c.body_held && c.continue_deadline && c.ph == phase::head && c.slen == c.sbeg) {
+    // Waiting for `100 Continue` with a deadline: wait for readability instead of receiving, so
+    // the deadline can cancel the wait without disturbing a TLS stream's receive state.
+    if (clock_type::now() >= *c.continue_deadline) {
+      continue_body(index);
+      return;
+    }
+    // (A reused user-space stream holds no read-ahead: bytes past a response retire it.)
+    if (!std::exchange(c.continue_ready, false)) {
+      auto* entry = sqe(index + 1);
+      io_uring_prep_poll_add(entry, c.fd, POLLIN);
+      c.cur     = op::continue_poll;
+      c.pending = true;
+      return;
+    }
+  }
   c.rx_iov.clear();
   bool const direct =
     c.ph == phase::body && c.bmode == body_mode::sink && c.parser.body_remaining() > 0;
@@ -1198,6 +1260,18 @@ void uring_transport::advance(std::size_t index, int res, unsigned flags)
         return;
       }
       send(index);
+      return;
+    case op::continue_poll:
+      if (res == -ECANCELED) {
+        continue_body(index);  // the continue deadline passed without an answer
+        return;
+      }
+      if (res < 0) {
+        finish(index, sys_error(-res));
+        return;
+      }
+      c.continue_ready = true;  // something arrived: receive it
+      receive(index);
       return;
     case op::none: break;
   }
@@ -1395,7 +1469,11 @@ void uring_transport::parse_head(std::size_t index)
   if (framing == http::framing::none || c.parser.done()) {
     c.bmode     = body_mode::none;
     c.body_done = true;
-    if (accept) { c.res.body_complete = true; }
+    if (accept) {
+      c.res.body_complete = true;
+    } else {
+      c.res.error_body_complete = true;
+    }
     if (c.sbeg != c.slen) { c.no_reuse = true; }  // bytes past the response
     finish(index, {});
     return;
@@ -1504,7 +1582,11 @@ void uring_transport::deliver_body(std::size_t index)
     return;
   }
   if (c.body_done) {
-    if (c.bmode != body_mode::error_body) { c.res.body_complete = true; }
+    if (c.bmode != body_mode::error_body) {
+      c.res.body_complete = true;
+    } else {
+      c.res.error_body_complete = true;
+    }
     finish(index, {});
     return;
   }
@@ -1544,12 +1626,21 @@ void uring_transport::finish(std::size_t index, std::error_code ec)
   c.idle_since = clock_type::now();
   c.connect_deadline.reset();
   c.exchange_deadline.reset();
-  c.stall_on  = false;
-  c.canceling = false;
+  c.continue_deadline.reset();
+  c.continue_cancel = false;
+  c.continue_ready  = false;
+  c.stall_on        = false;
+  c.canceling       = false;
   c.timeout_ec.clear();
   c.ph  = phase::idle;
   c.cur = op::none;
   if (c.has_request) {
+    if (c.bmode == body_mode::error_body && !c.res.body.empty()) {
+      // The S3 <Code> of a drained error body (NoSuchUpload, NoSuchKey, SlowDown, ...): the
+      // status alone does not tell a caller which 404 or 503 it got.
+      (void)http::extract_error_code(std::string_view{c.res.body.data(), c.res.body.size()},
+                                     c.meta);
+    }
     c.res.ec     = ec;
     c.res.meta   = c.meta;
     c.res.reused = c.reused;
