@@ -193,6 +193,13 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   exec::semi_future<void> flush_async_io(io_object const& object,
                                          io_priority priority) noexcept override;
 
+  /// DeleteObject of @p path (s3://bucket/key) on the control reactor (least backlogged, ties
+  /// rotated); a 404 @c NoSuchKey (or a complete 404 without an error code) is success, other
+  /// 404s fail.  Retried like the other control calls (@c max_retry_attempts).  Invalidation of
+  /// the path is done by the @c ioctx front end.
+  exec::semi_future<void> remove_io_object_async_io(std::string path,
+                                                    io_priority priority) noexcept override;
+
   /// Cut every write slice that straddles a part boundary at it (one write operation is never
   /// spread over two S3 parts), then dispatch as the base does.
   exec::semi_future<std::size_t> mixed_writev_async_io(

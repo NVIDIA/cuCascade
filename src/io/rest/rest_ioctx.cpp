@@ -585,6 +585,22 @@ exec::semi_future<void> rest_ioctx::flush_async_io(io_object const& object,
   }
 }
 
+exec::semi_future<void> rest_ioctx::remove_io_object_async_io(std::string path,
+                                                              io_priority priority) noexcept
+{
+  try {
+    auto parsed = cucascade::io::parse(path);
+    if (parsed.scheme != "s3") {
+      throw std::invalid_argument("rest_ioctx::remove_io_object: unsupported scheme '" +
+                                  parsed.scheme + "'");
+    }
+    return control_reactor().delete_object_async(
+      std::move(parsed.host), std::move(parsed.path), priority);
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
+
 exec::semi_future<std::size_t> rest_ioctx::mixed_writev_async_io(
   io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept
 {

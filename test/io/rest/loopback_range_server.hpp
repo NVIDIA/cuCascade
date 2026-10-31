@@ -306,7 +306,7 @@ struct write_fault {
   int status{503};
   std::string code{"SlowDown"};
   std::string retry_after;  ///< Retry-After header of a `status` answer (empty: none)
-  std::string body;         ///< ok_with_body: the response body
+  std::string body;         ///< ok_with_body / status (non-empty): the response body
   bool apply{false};        ///< drop_after_body: the request takes effect (a lost response)
   std::shared_ptr<range_response_control> control;  ///< hold
 };
@@ -1494,6 +1494,7 @@ class loopback_range_server {
       switch (fault->what) {
         case write_fault::action::status: {
           auto r = s3_error(fault->status, fault->code, "injected fault");
+          if (!fault->body.empty()) { r.body = fault->body; }
           if (!fault->retry_after.empty()) {
             r.headers += "Retry-After: " + fault->retry_after + "\r\n";
           }
