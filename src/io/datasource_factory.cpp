@@ -113,7 +113,7 @@ factory_type make_rest_ioctx_factory(
       auto* host_mr = first_host_resource(reservation_manager);
       auto rest_cfg = config.rest;
       // The object store owns the endpoint and its TLS trust; the reactor's
-      // curl GETs must verify against the same CA bundle / policy the authorizer
+      // TLS connections must verify against the same CA bundle / policy the authorizer
       // presigns for, so source these from object_store rather than rest config.
       rest_cfg.ca_bundle_path = config.object_store.ca_bundle_path;
       rest_cfg.tls_verify     = config.object_store.tls_verify;

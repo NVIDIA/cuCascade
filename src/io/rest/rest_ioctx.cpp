@@ -49,7 +49,7 @@ rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::rea
         if (_reactors.empty()) {
           throw std::runtime_error("rest_ioctx::list_objects: no reactors");
         }
-        return _reactors.front()->list_page(bucket, prefix, canonical_query);
+        return control_reactor().list_page(bucket, prefix, canonical_query);
       },
       _reactors.empty() ? s3::default_max_scanned_objects
                         : _reactors.front()->get_config().list_max_scanned,
@@ -68,6 +68,30 @@ rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::rea
   }
 }
 
+rest_reactor& rest_ioctx::control_reactor()
+{
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx: no reactors"); }
+  // The least-backlogged reactor, ties rotated: control-plane calls (HEAD, footer probe, LIST,
+  // footer batches) spread over the pool instead of all landing on reactor 0.
+  auto const count = _reactors.size();
+  auto const start = _control_next.fetch_add(1, std::memory_order_relaxed) % count;
+  std::size_t best = start;
+  for (std::size_t d = 1; d < count; ++d) {
+    auto const i = (start + d) % count;
+    if (_reactors[i]->queued_bytes() < _reactors[best]->queued_bytes()) { best = i; }
+  }
+  return *_reactors[best];
+}
+
+transport_stats rest_ioctx::stats() const noexcept
+{
+  transport_stats total;
+  for (auto const& reactor : _reactors) {
+    if (reactor) { total.merge(reactor->stats()); }
+  }
+  return total;
+}
+
 std::size_t rest_ioctx::footer_stash_reserved_bytes() const noexcept
 {
   return _footer_budget ? _footer_budget->reserved() : 0;
@@ -82,8 +106,11 @@ std::size_t rest_ioctx::footer_resolve_inflight_cap() const
 {
   if (_reactors.empty()) { return 0; }
   auto const& cfg = _reactors.front()->get_config();
+  // A batch runs on one reactor's connections: the automatic cap is that reactor's
+  // max_connections (more would only queue in its intake while holding stash budget).  An
+  // explicit cap is honoured as given.
   if (cfg.footer_resolve_max_inflight == config::footer_resolve_auto) {
-    return std::max<std::size_t>(1, _reactors.size() * cfg.max_connections);
+    return std::max<std::size_t>(1, cfg.max_connections);
   }
   return cfg.footer_resolve_max_inflight;
 }
@@ -224,7 +251,7 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
 
   if (valid_indices.empty()) { return; }
 
-  _reactors.front()->resolve_footer_batch(
+  control_reactor().resolve_footer_batch(
     valid_paths, valid_objects, valid_indices, max_inflight, _footer_budget, on_result, stop);
 }
 
@@ -258,10 +285,9 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
   }
   if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
-  // A blocking HEAD on the caller thread (a one-time metadata round-trip) via
-  // any reactor's authorizer — head_object uses a local easy handle and
-  // does not touch worker state, so any reactor is equivalent.
-  auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+  // A blocking HEAD (a one-time metadata round-trip): on the first reactor's connections when
+  // it runs, else on a private helper transport.
+  auto head = control_reactor().head_object(parsed.host, parsed.path);
   return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
                                                                  std::move(parsed.host),
                                                                  std::move(parsed.path),
@@ -349,8 +375,8 @@ void rest_ioctx::warmup(std::string_view bucket_url) noexcept
     {
       std::lock_guard lk{_warm_mtx};
       auto const now = std::chrono::steady_clock::now();
-      // conn_max_age of 0 means "no cap" to libcurl, which leaves us no honest
-      // staleness horizon; fall back to a minute rather than re-warm forever.
+      // conn_max_age of 0 means "no idle cutoff", which leaves no honest staleness horizon;
+      // fall back to a minute rather than re-warm forever.
       auto const stale_after =
         _config.conn_max_age.count() > 0
           ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(_config.conn_max_age)
@@ -382,12 +408,13 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
 
   // One suffix-range GET resolves the size and stashes the footer; cuDF's
   // trailer/footer reads are then served from the stash by host_read.
-  footer_probe probe = _reactors.front()->fetch_footer_suffix(
-    parsed.host, parsed.path, _reactors.front()->get_config().footer_probe_bytes);
+  auto& reactor = control_reactor();
+  footer_probe probe =
+    reactor.fetch_footer_suffix(parsed.host, parsed.path, reactor.get_config().footer_probe_bytes);
   if (!probe.bytes) {
     // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
     // fall back to a plain HEAD for the size, with no stash.
-    auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+    auto head = reactor.head_object(parsed.host, parsed.path);
     return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
                                                                    std::move(parsed.host),
                                                                    std::move(parsed.path),
