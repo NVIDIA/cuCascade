@@ -52,6 +52,14 @@ namespace {
 // detect_malformed_pages), and this resource advertises ::cuda::mr::device_accessible.
 constexpr unsigned int pinned_host_alloc_flags = cudaHostAllocPortable | cudaHostAllocMapped;
 
+[[nodiscard]] cudaError_t query_capture_status(::cuda::stream_ref stream,
+                                               cudaStreamCaptureStatus& status) noexcept
+{
+  return CUCASCADE_PINNED_HOST_CUDA_CALL(stream_capture_status,
+                                         cudaStreamIsCapturing(stream.get(), &status),
+                                         {.stream = stream.get(), .capture_status_out = &status});
+}
+
 // Event creation must use the freeing stream's device even when another device is current.
 class event_creation_device_guard {
  public:
@@ -191,6 +199,11 @@ void* small_pinned_host_memory_resource::allocate(::cuda::stream_ref stream,
   if (!std::has_single_bit(alignment)) {
     throw std::invalid_argument{"Pinned allocation alignment must be a nonzero power of two"};
   }
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  CUCASCADE_CUDA_TRY(query_capture_status(stream, capture_status));
+  if (capture_status != cudaStreamCaptureStatusNone) {
+    CUCASCADE_FAIL("Pinned host allocation is unsupported during stream capture");
+  }
   if (alignment > alignof(std::max_align_t)) {
     if (bytes > MAX_SLAB_SIZE) { _large_uncacheable.fetch_add(1, std::memory_order_relaxed); }
     return allocate_exceptional(bytes, alignment);
@@ -203,16 +216,37 @@ void small_pinned_host_memory_resource::deallocate(::cuda::stream_ref stream,
                                                    std::size_t bytes,
                                                    std::size_t alignment) noexcept
 {
-  if (ptr == nullptr || bytes == 0) { return; }
+  std::ignore = try_to_deallocate(stream, ptr, bytes, alignment);
+}
+
+bool small_pinned_host_memory_resource::try_to_deallocate(::cuda::stream_ref stream,
+                                                          void* ptr,
+                                                          std::size_t bytes,
+                                                          std::size_t alignment) noexcept
+{
+  if (ptr == nullptr || bytes == 0) { return false; }
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  auto const status                      = query_capture_status(stream, capture_status);
+  if (status != cudaSuccess || capture_status != cudaStreamCaptureStatusNone) {
+    if (status != cudaSuccess) { std::ignore = cudaGetLastError(); }
+    std::lock_guard lock(_mutex);
+    if (alignment <= alignof(std::max_align_t) && bytes <= MAX_SLAB_SIZE) {
+      quarantine_slab_locked(ptr);
+    } else {
+      std::ignore = try_take_exceptional_locked(ptr);
+    }
+    return false;
+  }
   if (alignment > alignof(std::max_align_t)) {
     deallocate_exceptional(stream, ptr);
-    return;
+    return true;
   }
   if (bytes > MAX_SLAB_SIZE) {
     deallocate_large(stream, ptr, bytes);
   } else {
     deallocate_slab(stream, ptr, bytes);
   }
+  return true;
 }
 
 void small_pinned_host_memory_resource::deallocate_sync(void* ptr,
@@ -220,8 +254,7 @@ void small_pinned_host_memory_resource::deallocate_sync(void* ptr,
                                                         std::size_t alignment) noexcept
 {
   ::cuda::stream_ref const stream{cudaStream_t{cudaStreamDefault}};
-  deallocate(stream, ptr, bytes, alignment);
-  std::ignore = wait_no_throw(stream);
+  if (try_to_deallocate(stream, ptr, bytes, alignment)) { std::ignore = wait_no_throw(stream); }
 }
 
 void* small_pinned_host_memory_resource::allocate_slab(::cuda::stream_ref stream, std::size_t bytes)
