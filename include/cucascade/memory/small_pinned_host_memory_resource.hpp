@@ -120,7 +120,8 @@ class small_pinned_host_memory_resource {
   /**
    * @brief Waits for recorded work before returning storage
    *
-   * Wait failures are handled as in `deallocate`. Pooled events use
+   * Wait failures are handled as in `deallocate`. An unconfirmed slab retains only its owning
+   * backing allocation instead of returning it upstream. Pooled events use
    * `cuda::cuda_event::reset_no_throw()` for cleanup.
    */
   ~small_pinned_host_memory_resource() noexcept;
@@ -305,6 +306,11 @@ class small_pinned_host_memory_resource {
     std::optional<pooled_event> ready;  ///< Empty when the slab has no pending GPU use
   };
 
+  struct slab_backing_allocation {
+    fixed_multiple_blocks_allocation allocation;
+    bool quarantined{false};
+  };
+
   struct large_cache_entry {
     void* ptr;
     pooled_event ready;      ///< Always present: only event-ordered buffers are cached
@@ -314,8 +320,8 @@ class small_pinned_host_memory_resource {
   static constexpr std::size_t LARGE_BUCKET_COUNT = static_cast<std::size_t>(
     std::numeric_limits<std::size_t>::digits - std::countr_zero(MIN_LARGE_BUCKET));
 
-  // Helpers ending in _locked require _mutex. No helper waits for GPU work while it is held, but
-  // slab-pool growth may call the upstream pinned allocator.
+  // Helpers ending in _locked require _mutex or exclusive destruction. No helper waits for GPU work
+  // while it is held, but slab-pool growth may call the upstream pinned allocator.
 
   /**
    * @brief Decides whether buffers of `bucket` are cached; the only cacheability policy
@@ -349,13 +355,13 @@ class small_pinned_host_memory_resource {
   void release_detached(std::list<large_cache_entry>&& detached) noexcept;
 
   void expand_pool_locked(std::size_t slab_idx);
+  void quarantine_slab_locked(void* ptr) noexcept;
 
   fixed_size_host_memory_resource& _upstream;
   mutable std::mutex _mutex;
   std::array<std::vector<free_slab>, SLAB_SIZES.size()> _free_lists{};
   std::map<int, event_pool> _event_pools;
-  std::vector<fixed_multiple_blocks_allocation> _owned_allocations;
-  bool _has_quarantined_slab{false};  ///< A slab was withheld; destructor keeps backing blocks.
+  std::vector<slab_backing_allocation> _owned_allocations;
   std::array<std::list<large_cache_entry>, LARGE_BUCKET_COUNT> _large_cache{};
   std::size_t _large_cache_bytes{0};  ///< Sum of bucket sizes in `_large_cache`.
   std::size_t const _large_cache_limit_bytes;

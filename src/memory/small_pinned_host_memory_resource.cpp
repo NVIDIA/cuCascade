@@ -26,6 +26,7 @@
 #include <bit>
 #include <cassert>
 #include <concepts>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <list>
@@ -159,17 +160,16 @@ small_pinned_host_memory_resource::small_pinned_host_memory_resource(
 
 small_pinned_host_memory_resource::~small_pinned_host_memory_resource() noexcept
 {
-  bool retain_backing_allocations = _has_quarantined_slab;
   for (auto const& slab : _free_lists | std::views::join) {
-    if (slab.ready && !wait_no_throw(slab.ready->event)) { retain_backing_allocations = true; }
+    if (slab.ready && !wait_no_throw(slab.ready->event)) { quarantine_slab_locked(slab.ptr); }
   }
   for (auto const& entry : _large_cache | std::views::join) {
     free_pinned_after(entry.ready.event, entry.ptr);
   }
-  if (retain_backing_allocations) {
-    // Unknown completion requires retaining backing blocks, including quarantined slabs.
-    for (auto& allocation : _owned_allocations) {
-      std::ignore = allocation.release();
+  for (auto& backing : _owned_allocations) {
+    if (backing.quarantined) {
+      // Leaking this handle keeps its blocks out of the upstream free list.
+      std::ignore = backing.allocation.release();
     }
   }
   // Idle pooled events guard no storage, so the members' destructors release them without waiting.
@@ -275,7 +275,7 @@ void small_pinned_host_memory_resource::deallocate_slab(::cuda::stream_ref strea
     bool const completed = wait_no_throw(stream);
     lock.lock();
     if (!completed) {
-      _has_quarantined_slab = true;
+      quarantine_slab_locked(ptr);
       return;
     }
   }
@@ -287,7 +287,7 @@ void small_pinned_host_memory_resource::deallocate_slab(::cuda::stream_ref strea
   } catch (...) {
     // The growth failed before `ready` was moved. The slab stays backed by _owned_allocations and
     // is never published again.
-    _has_quarantined_slab = true;
+    quarantine_slab_locked(ptr);
     if (ready) { return_event_locked(std::move(*ready)); }
   }
 }
@@ -564,12 +564,28 @@ void small_pinned_host_memory_resource::expand_pool_locked(std::size_t slab_idx)
   auto& free_list             = _free_lists[slab_idx];
   // Finish every potentially throwing metadata allocation before publishing raw slab pointers.
   free_list.reserve(free_list.capacity() + blocks.size() * num_slabs);
-  _owned_allocations.push_back(std::move(allocation));
+  _owned_allocations.push_back({std::move(allocation)});
   for (std::byte* block : blocks) {
     for (std::size_t i = 0; i < num_slabs; ++i) {
       free_list.emplace_back(block + i * slab_size, std::nullopt);
     }
   }
+}
+
+void small_pinned_host_memory_resource::quarantine_slab_locked(void* ptr) noexcept
+{
+  auto const address    = reinterpret_cast<std::uintptr_t>(ptr);
+  auto const block_size = _upstream.get_block_size();
+  for (auto& backing : _owned_allocations) {
+    for (auto* block : backing.allocation->get_blocks()) {
+      auto const base = reinterpret_cast<std::uintptr_t>(block);
+      if (address >= base && address - base < block_size) {
+        backing.quarantined = true;
+        return;
+      }
+    }
+  }
+  assert(false && "slab pointer has no backing allocation");
 }
 
 }  // namespace memory
