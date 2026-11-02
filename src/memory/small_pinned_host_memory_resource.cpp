@@ -232,25 +232,47 @@ void* small_pinned_host_memory_resource::allocate_slab(::cuda::stream_ref stream
   return ptr;
 }
 
-void* small_pinned_host_memory_resource::allocate_exceptional(std::size_t bytes,
-                                                              std::size_t alignment)
+void* small_pinned_host_memory_resource::allocate_exceptional(
+  std::size_t bytes,
+  std::size_t alignment,
+  bool exact_attempt_failed,
+  std::optional<::cuda::stream_ref> retry_stream)
 {
   auto const padding = alignment > alignof(std::max_align_t) ? alignment - 1 : 0;
   if (bytes > std::numeric_limits<std::size_t>::max() - padding) {
     throw rmm::bad_alloc{"Pinned allocation size and alignment padding overflow"};
   }
   auto const alloc_bytes = bytes + padding;
+  auto try_cached        = [&]() -> void* {
+    if (!retry_stream) { return nullptr; }
+    std::lock_guard lock(_mutex);
+    return try_take_cached_large_locked(large_bucket_size_for(bytes), *retry_stream);
+  };
+  if (void* cached = try_cached()) { return cached; }
   std::map<void*, void*> pending;
   CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(exceptional_allocation);
   pending.emplace(nullptr, nullptr);
   auto node = pending.extract(nullptr);
 
-  void* base = nullptr;
-  CUCASCADE_CUDA_TRY_ALLOC(
-    CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
-                                    cudaHostAlloc(&base, alloc_bytes, pinned_host_alloc_flags),
-                                    {.bytes = alloc_bytes, .buffer_out = &base}),
-    alloc_bytes);
+  void* base  = nullptr;
+  auto status = cudaErrorMemoryAllocation;
+  if (!exact_attempt_failed) {
+    status =
+      CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
+                                      cudaHostAlloc(&base, alloc_bytes, pinned_host_alloc_flags),
+                                      {.bytes = alloc_bytes, .buffer_out = &base});
+  }
+  if (status == cudaErrorMemoryAllocation) {
+    if (!exact_attempt_failed) { std::ignore = cudaGetLastError(); }
+    if (void* cached = try_cached()) { return cached; }
+    if (reclaim_large_cache(alloc_bytes)) {
+      status =
+        CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
+                                        cudaHostAlloc(&base, alloc_bytes, pinned_host_alloc_flags),
+                                        {.bytes = alloc_bytes, .buffer_out = &base});
+    }
+  }
+  CUCASCADE_CUDA_TRY_ALLOC(status, alloc_bytes);
   std::unique_ptr<void, decltype(&free_pinned_no_throw)> allocation{base, free_pinned_no_throw};
   void* ptr  = base;
   auto space = alloc_bytes;
@@ -315,15 +337,10 @@ void* small_pinned_host_memory_resource::allocate_large(::cuda::stream_ref strea
     return ptr;
   }
   std::ignore = cudaGetLastError();
-  release_detached([this] {
-    std::lock_guard lock(_mutex);
-    return purge_large_cache_locked();
-  }());
   if (cacheable) {
-    // Another thread may have cached a buffer of this bucket since the first lookup.
-    std::lock_guard lock(_mutex);
-    if (void* cached = try_take_cached_large_locked(bucket, stream)) { return cached; }
+    return allocate_exceptional(bytes, alignof(std::max_align_t), alloc_bytes == bytes, stream);
   }
+  if (!reclaim_large_cache(bytes)) { CUCASCADE_CUDA_TRY_ALLOC(cudaErrorMemoryAllocation, bytes); }
   CUCASCADE_CUDA_TRY_ALLOC(
     CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
                                     cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags),
@@ -377,7 +394,12 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
   std::optional<pooled_event> ready;
   bool published = false;
   {
-    std::lock_guard lock(_mutex);
+    std::unique_lock lock(_mutex);
+    if (void* base = try_take_exceptional_locked(ptr)) {
+      lock.unlock();
+      free_pinned_after(stream, base);
+      return;
+    }
     ready = record_ready_event_locked(stream);
     if (ready) {
       try {
@@ -596,16 +618,22 @@ bool small_pinned_host_memory_resource::evict_oldest_large_locked(
   return true;
 }
 
-std::list<small_pinned_host_memory_resource::large_cache_entry>
-small_pinned_host_memory_resource::purge_large_cache_locked() noexcept
+bool small_pinned_host_memory_resource::reclaim_large_cache(std::size_t bytes)
 {
-  std::list<large_cache_entry> purged;
-  for (auto& entries : _large_cache) {
-    _large_evictions += static_cast<std::uint64_t>(entries.size());
-    purged.splice(purged.end(), entries);
+  std::list<large_cache_entry> victims;
+  auto remaining = bytes;
+  {
+    std::lock_guard lock(_mutex);
+    if (_large_cache_bytes < bytes) { return false; }
+    while (remaining != 0) {
+      auto const before = _large_cache_bytes;
+      if (!evict_oldest_large_locked(victims)) { break; }
+      auto const reclaimed = before - _large_cache_bytes;
+      remaining            = reclaimed >= remaining ? 0 : remaining - reclaimed;
+    }
   }
-  _large_cache_bytes = 0;
-  return purged;
+  release_detached(std::move(victims));
+  return remaining == 0;
 }
 
 void small_pinned_host_memory_resource::release_detached(

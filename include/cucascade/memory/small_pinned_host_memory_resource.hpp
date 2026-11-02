@@ -47,7 +47,7 @@ namespace memory {
  * demand by carving a block from @ref fixed_size_host_memory_resource into slabs of the
  * corresponding size.
  *
- * Larger requests with ordinary alignment are rounded to a power-of-two bucket only when that
+ * Larger requests with ordinary alignment initially use a power-of-two bucket only when that
  * bucket is representable and fits the configured cache limit; other requests allocate exactly the
  * requested size. Stricter alignment uses dedicated allocations with alignment padding, which are
  * never cached. Direct allocations are portable and mapped. @p large_cache_limit_bytes bounds
@@ -142,13 +142,17 @@ class small_pinned_host_memory_resource {
    * buffers. A freshly allocated large buffer is host-ready on return, but callers must not rely on
    * which case occurred.
    *
-   * When a normally aligned large allocation runs out of memory, releases the retained large
-   * buffers the way `deallocate` releases evicted ones, then retries once.
+   * A rounded large allocation that runs out of memory first tries exact-size dedicated storage. If
+   * an exact allocation fails, recovery rechecks a matching reusable bucket and reclaims oldest
+   * entries only when retained capacity covers the exact backing size, including alignment padding.
+   * Completion waits and releases occur outside the cache mutex, followed by at most one final
+   * exact-size attempt. Smaller partial reclamation that might otherwise suffice is deliberately
+   * skipped. A non-OOM error does not start reclamation.
    *
    * @throw rmm::out_of_memory If a direct pinned allocation fails with `cudaErrorMemoryAllocation`
    * after permitted recovery, or the upstream resource cannot supply a slab block
    * @throw rmm::bad_alloc If a direct pinned allocation fails with any other CUDA error, or its
-   * size plus alignment padding overflows; retained buffers are kept
+   * size plus alignment padding overflows
    * @throw cucascade::cuda_error If ordering a reused buffer after its pending GPU work fails
    * @throw std::bad_alloc If allocation metadata cannot be acquired
    * @throw std::invalid_argument For a nonzero request, if alignment is not a nonzero power of two,
@@ -341,9 +345,16 @@ class small_pinned_host_memory_resource {
   void* allocate_slab(::cuda::stream_ref stream, std::size_t bytes);
   void* allocate_large(::cuda::stream_ref stream, std::size_t bytes);
   /**
-   * @brief Allocates dedicated storage after reserving its ownership metadata
+   * @brief Allocates tracked dedicated storage or reuses a matching bucket during recovery
+   *
+   * `exact_attempt_failed` resumes recovery after the caller's exact-size OOM without duplicating
+   * that attempt. `retry_stream` permits ordinary-alignment bucket reuse before dedicated
+   * allocation or reclamation.
    */
-  void* allocate_exceptional(std::size_t bytes, std::size_t alignment);
+  void* allocate_exceptional(std::size_t bytes,
+                             std::size_t alignment,
+                             bool exact_attempt_failed                      = false,
+                             std::optional<::cuda::stream_ref> retry_stream = std::nullopt);
   void deallocate_exceptional(::cuda::stream_ref stream, void* ptr) noexcept;
   /**
    * @brief Removes a dedicated pointer's record and returns its original base, or nullptr
@@ -360,7 +371,13 @@ class small_pinned_host_memory_resource {
 
   void* try_take_cached_large_locked(std::size_t bucket, ::cuda::stream_ref stream);
   bool evict_oldest_large_locked(std::list<large_cache_entry>& victims) noexcept;
-  [[nodiscard]] std::list<large_cache_entry> purge_large_cache_locked() noexcept;
+  /**
+   * @brief Releases enough oldest cached capacity when the cache covers `bytes`
+   *
+   * @return Whether enough capacity was detached for one retry; unconfirmed completion still
+   * withholds the affected storage
+   */
+  [[nodiscard]] bool reclaim_large_cache(std::size_t bytes);
   void release_detached(std::list<large_cache_entry>&& detached) noexcept;
 
   void expand_pool_locked(std::size_t slab_idx);
