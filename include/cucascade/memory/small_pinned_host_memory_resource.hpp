@@ -279,31 +279,37 @@ class small_pinned_host_memory_resource {
   /**
    * @brief Recycled events of one device
    *
-   * Every event `acquire` hands out keeps a reserved slot in the idle list, so `release` never
-   * allocates. Retiring an event removes its reservation from the live-event count.
+   * Checked-out events and pending creations keep reserved return slots, so `release` never
+   * allocates. Retiring an event or failing its creation removes its live reservation.
    */
   class event_pool {
    public:
     /**
-     * @brief Returns an idle event, or creates one on `device`
+     * @brief Takes an idle event without changing its reserved return capacity
      *
-     * @return The event, or `std::nullopt` if creating it failed
+     * @return An idle event, or `std::nullopt`
      */
-    [[nodiscard]] std::optional<cuda::cuda_event> acquire(int device) noexcept;
+    [[nodiscard]] std::optional<cuda::cuda_event> try_take() noexcept;
 
     /**
-     * @brief Takes back an event that `acquire` handed out
+     * @brief Reserves a return slot before an event is created outside the pool lock
+     */
+    void reserve();
+
+    /**
+     * @brief Releases the live reservation of a failed creation or retired event
+     */
+    void release_reservation() noexcept;
+
+    /**
+     * @brief Takes back an event with a reserved return slot
      */
     void release(cuda::cuda_event&& event) noexcept;
 
-    /**
-     * @brief Retires a checked-out event from the pool.
-     */
-    void retire(cuda::cuda_event&& event) noexcept;
-
    private:
     std::vector<cuda::cuda_event> _idle;
-    std::size_t _live_events{0};  ///< Idle and checked-out events with reserved return capacity
+    std::size_t _live_events{
+      0};  ///< Live events and pending creations with reserved return capacity
   };
 
   struct free_slab {
@@ -320,8 +326,9 @@ class small_pinned_host_memory_resource {
   static constexpr std::size_t LARGE_BUCKET_COUNT = static_cast<std::size_t>(
     std::numeric_limits<std::size_t>::digits - std::countr_zero(MIN_LARGE_BUCKET));
 
-  // Helpers ending in _locked require _mutex. No helper waits for GPU work while it is held, but
-  // slab-pool growth may call the upstream pinned allocator.
+  // Cache/slab/exceptional bookkeeping uses _mutex. Event-pool bookkeeping and confirmed hit
+  // counting use _event_mutex; their _locked helpers require that mutex. Slab-pool growth may
+  // call the upstream pinned allocator while holding _mutex.
 
   /**
    * @brief Decides whether an ordinarily aligned request's bucket is cacheable
@@ -352,13 +359,16 @@ class small_pinned_host_memory_resource {
   void deallocate_slab(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
   void deallocate_large(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
 
-  [[nodiscard]] std::optional<pooled_event> acquire_event_locked(int device) noexcept;
-  [[nodiscard]] std::optional<pooled_event> record_ready_event_locked(
-    ::cuda::stream_ref stream) noexcept;
+  [[nodiscard]] std::optional<pooled_event> acquire_event(int device) noexcept;
+  [[nodiscard]] std::optional<pooled_event> record_ready_event(::cuda::stream_ref stream) noexcept;
+  void return_event(pooled_event&& event) noexcept;
+  void retire_event(pooled_event&& event) noexcept;
   void return_event_locked(pooled_event&& event) noexcept;
   void retire_event_locked(pooled_event&& event) noexcept;
 
-  void* try_take_cached_large_locked(std::size_t bucket, ::cuda::stream_ref stream);
+  void* try_take_cached_large(std::size_t bucket,
+                              ::cuda::stream_ref stream,
+                              bool initial_request = false);
   bool evict_oldest_large_locked(std::list<large_cache_entry>& victims) noexcept;
   [[nodiscard]] std::list<large_cache_entry> purge_large_cache_locked() noexcept;
   void release_detached(std::list<large_cache_entry>&& detached) noexcept;
@@ -367,6 +377,7 @@ class small_pinned_host_memory_resource {
 
   fixed_size_host_memory_resource& _upstream;
   mutable std::mutex _mutex;
+  mutable std::mutex _event_mutex;
   std::array<std::vector<free_slab>, SLAB_SIZES.size()> _free_lists{};
   std::map<int, event_pool> _event_pools;
   std::map<void*, void*>
