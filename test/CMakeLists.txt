@@ -48,6 +48,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   add_executable(cucascade_pinned_host_fault_tests
                  memory/test_pinned_host_faults.cpp)
+  target_sources(cucascade_pinned_host_fault_tests
+                 PRIVATE memory/test_pinned_event_lifecycle.cpp)
   target_link_libraries(
     cucascade_pinned_host_fault_tests PRIVATE cucascade_pinned_host_test_variant
                                               Catch2::Catch2)
