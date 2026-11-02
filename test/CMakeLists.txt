@@ -53,6 +53,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_pinned_host_capture.cpp
     memory/test_pinned_host_recovery.cpp
     memory/test_pinned_cache_insertion.cpp
+    memory/test_pinned_cache_progress.cpp
     memory/test_pinned_host_device_failures.cpp
     memory/test_pinned_event_lifecycle.cpp
     memory/test_pinned_slab_quarantine.cpp)
