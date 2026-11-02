@@ -390,3 +390,22 @@ Do not make direct repo edits outside a GSD workflow unless the user explicitly 
 > Profile not yet configured. Run `/gsd:profile-user` to generate your developer profile.
 > This section is managed by `generate-claude-profile` -- do not edit manually.
 <!-- GSD:profile-end -->
+
+## GSD workflow override
+
+The user authorizes bypassing GSD workflows for all directories and tasks. GSD is optional unless
+the user explicitly requests it. This overrides the mandatory GSD workflow instructions above.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live in kevkrist/cuCascade on GitHub. See docs/agents/issue-tracker.md.
+
+### Triage labels
+
+Use the five canonical triage labels. See docs/agents/triage-labels.md.
+
+### Domain docs
+
+Single-context: root GLOSSARY.md and docs/adr/. See docs/agents/domain.md.
