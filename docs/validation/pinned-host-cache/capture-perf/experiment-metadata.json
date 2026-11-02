@@ -1,0 +1,35 @@
+{
+  "purpose": "Diagnostic only; noquery violates the capture-rejection contract and is not a candidate.",
+  "baseline_revision": "69ef173b10a75363d80aa3a8df833f2858159034",
+  "candidate_source_revision": "737bf9e272d8e8de66cc86ab3f1d85c506e0b25d",
+  "source_revision_note": "Later evidence-only commits do not alter the measured allocator files. Source and library hashes identify the artifacts.",
+  "cpu_affinity": [
+    15,
+    16,
+    17,
+    18
+  ],
+  "query_cpu_affinity": [
+    15
+  ],
+  "gpu_lock": "/tmp/cucascade-spec-implementation/gpu-tests.lock",
+  "ablation_command": "flock /tmp/cucascade-spec-implementation/gpu-tests.lock taskset --cpu-list 15-18 python3 /tmp/cucascade-spec-implementation/capture-perf/run_ablation.py",
+  "query_command": "flock /tmp/cucascade-spec-implementation/gpu-tests.lock taskset --cpu-list 15 env LD_LIBRARY_PATH=/home/kkristensen/Code/cuCascade/.pixi/envs/default/lib /tmp/cucascade-spec-implementation/capture-perf/query",
+  "query_compile_command": "/home/kkristensen/Code/cuCascade/.pixi/envs/default/bin/aarch64-conda-linux-gnu-c++ -O3 -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -Werror -I/home/kkristensen/Code/cuCascade/.pixi/envs/default/targets/sbsa-linux/include query.cpp /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libcudart_static.a -ldl -lpthread -lrt -o query",
+  "ldd_verification": {
+    "baseline": "\tlinux-vdso.so.1 (0x0000e91aa4bcf000)\n\t/tmp/cucascade-spec-builds/issue-11-baseline-default/libcucascade.so (0x0000e91aa4940000)\n\tlibrmm.so => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/librmm.so (0x0000e91aa4800000)\n\tlibrt.so.1 => /lib/aarch64-linux-gnu/librt.so.1 (0x0000e91aa47d0000)\n\tlibrapids_logger.so => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/librapids_logger.so (0x0000e91aa4740000)\n\tlibdl.so.2 => /lib/aarch64-linux-gnu/libdl.so.2 (0x0000e91aa4710000)\n\tlibpthread.so.0 => /lib/aarch64-linux-gnu/libpthread.so.0 (0x0000e91aa46e0000)\n\tlibnuma.so.1 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libnuma.so.1 (0x0000e91aa46b0000)\n\tlibcucascade_topology_discovery.so => /tmp/cucascade-spec-builds/issue-11-baseline-default/libcucascade_topology_discovery.so (0x0000e91aa4650000)\n\tlibstdc++.so.6 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libstdc++.so.6 (0x0000e91aa43b0000)\n\tlibm.so.6 => /lib/aarch64-linux-gnu/libm.so.6 (0x0000e91aa4300000)\n\tlibgcc_s.so.1 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libgcc_s.so.1 (0x0000e91aa42c0000)\n\tlibc.so.6 => /lib/aarch64-linux-gnu/libc.so.6 (0x0000e91aa4100000)\n\t/lib/ld-linux-aarch64.so.1 (0x0000e91aa4b80000)\n",
+    "intact": "\tlinux-vdso.so.1 (0x0000fb7a572ae000)\n\t/tmp/cucascade-spec-implementation/capture-perf/intact/libcucascade.so (0x0000fb7a57010000)\n\tlibrmm.so => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/librmm.so (0x0000fb7a56ed0000)\n\tlibrt.so.1 => /lib/aarch64-linux-gnu/librt.so.1 (0x0000fb7a56ea0000)\n\tlibrapids_logger.so => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/librapids_logger.so (0x0000fb7a56e10000)\n\tlibdl.so.2 => /lib/aarch64-linux-gnu/libdl.so.2 (0x0000fb7a56de0000)\n\tlibpthread.so.0 => /lib/aarch64-linux-gnu/libpthread.so.0 (0x0000fb7a56db0000)\n\tlibnuma.so.1 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libnuma.so.1 (0x0000fb7a56d80000)\n\tlibcucascade_topology_discovery.so => /tmp/cucascade-spec-builds/issue-11-default/libcucascade_topology_discovery.so (0x0000fb7a56d20000)\n\tlibstdc++.so.6 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libstdc++.so.6 (0x0000fb7a56a80000)\n\tlibm.so.6 => /lib/aarch64-linux-gnu/libm.so.6 (0x0000fb7a569d0000)\n\tlibgcc_s.so.1 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libgcc_s.so.1 (0x0000fb7a56990000)\n\tlibc.so.6 => /lib/aarch64-linux-gnu/libc.so.6 (0x0000fb7a567d0000)\n\t/lib/ld-linux-aarch64.so.1 (0x0000fb7a57260000)\n",
+    "noquery": "\tlinux-vdso.so.1 (0x0000e40b0c3bc000)\n\t/tmp/cucascade-spec-implementation/capture-perf/noquery/libcucascade.so (0x0000e40b0c130000)\n\tlibrmm.so => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/librmm.so (0x0000e40b0bff0000)\n\tlibrt.so.1 => /lib/aarch64-linux-gnu/librt.so.1 (0x0000e40b0bfb0000)\n\tlibrapids_logger.so => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/librapids_logger.so (0x0000e40b0bf20000)\n\tlibdl.so.2 => /lib/aarch64-linux-gnu/libdl.so.2 (0x0000e40b0bef0000)\n\tlibpthread.so.0 => /lib/aarch64-linux-gnu/libpthread.so.0 (0x0000e40b0bec0000)\n\tlibnuma.so.1 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libnuma.so.1 (0x0000e40b0be90000)\n\tlibcucascade_topology_discovery.so => /tmp/cucascade-spec-builds/issue-11-default/libcucascade_topology_discovery.so (0x0000e40b0be30000)\n\tlibstdc++.so.6 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libstdc++.so.6 (0x0000e40b0bb90000)\n\tlibm.so.6 => /lib/aarch64-linux-gnu/libm.so.6 (0x0000e40b0bae0000)\n\tlibgcc_s.so.1 => /home/kkristensen/Code/cuCascade/.pixi/envs/default/lib/libgcc_s.so.1 (0x0000e40b0baa0000)\n\tlibc.so.6 => /lib/aarch64-linux-gnu/libc.so.6 (0x0000e40b0b8e0000)\n\t/lib/ld-linux-aarch64.so.1 (0x0000e40b0c380000)\n"
+  },
+  "library_sha256": {
+    "baseline": "c5a2f7267fcbefc53b1fa0ce765899509fb6763351a5bd55ef76d910d56caaea",
+    "intact": "e61309a1f6f9d8aa92d4611250a7e093d43ce44ff2792475a8733770903010e6",
+    "noquery": "5556961e178ec633227457ec466d78faa3437e1c8ec446974d8161c7bf0921dc"
+  },
+  "benchmark_binary_sha256": {
+    "baseline": "e3a1325439dd47df2e1fb8010330e04e7c9a96f603819e473fb6f789876e7aa0",
+    "candidate": "cc7c6c02431271a9f5fc9407310ab1fa0984562120a87c0c266ddbc57b5f385a"
+  },
+  "source_sha256": "56f05370bc5752d445cfafd954c72789148787069e37d273024c3b8fb75f2fa0",
+  "invalid_first_run": "LD_LIBRARY_PATH did not override executable DT_RPATH. All three arms loaded the production candidate/baseline path rather than the isolated variant; excluded from conclusions. Corrected final run preloads exact SONAME library and confirms loader selection below."
+}
