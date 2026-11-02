@@ -62,6 +62,12 @@ namespace memory {
  * `deallocate` for the caller's obligations. All allocations must be deallocated and no calls may
  * be in flight when this resource is destroyed.
  *
+ * CUDA host callbacks and graph capture are unsupported. For a capturing supplied stream,
+ * allocation throws and deallocation withholds storage without waiting, freeing, or publishing it.
+ * Failure to determine capture status follows the same storage policy. Conflicting capture on
+ * another stream remains unsupported. Zero-size allocation and null/zero-size deallocation perform
+ * no CUDA calls.
+ *
  * Provides the `::cuda::mr::device_accessible` and `::cuda::mr::host_accessible` properties
  * required by `rmm::host_device_async_resource_ref`, so it can serve as cuDF's pinned resource:
  *
@@ -83,6 +89,7 @@ class small_pinned_host_memory_resource {
   /**
    * @brief Recorded activity for requests larger than `MAX_SLAB_SIZE`
    *
+   * Requests rejected for invalid alignment or unsupported/unconfirmed capture state are excluded.
    * Counters include requests that later fail, and each request is counted once regardless of
    * retries. Because of these edge cases, `large_requests` need not equal
    * `large_hits + large_misses + large_uncacheable`, and one request may count as both:
@@ -150,7 +157,8 @@ class small_pinned_host_memory_resource {
    * after permitted recovery, or the upstream resource cannot supply a slab block
    * @throw rmm::bad_alloc If a direct pinned allocation fails with any other CUDA error, or its
    * size plus alignment padding overflows; retained buffers are kept
-   * @throw cucascade::cuda_error If ordering a reused buffer after its pending GPU work fails
+   * @throw cucascade::cuda_error If querying capture status or ordering a reused buffer fails
+   * @throw cucascade::logic_error If the supplied stream is capturing
    * @throw std::bad_alloc If allocation metadata cannot be acquired
    * @throw std::invalid_argument For a nonzero request, if alignment is not a nonzero power of two,
    * or the upstream block size is smaller than the needed slab size
@@ -198,6 +206,7 @@ class small_pinned_host_memory_resource {
    */
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
+    if (bytes == 0) { return nullptr; }
     ::cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
     auto* ptr = allocate(stream, bytes, alignment);
     try {
@@ -210,7 +219,7 @@ class small_pinned_host_memory_resource {
   }
 
   /**
-   * @brief Deallocates on the default stream, then synchronizes it
+   * @brief Deallocates on the default stream and synchronizes an accepted nonempty call
    *
    * A failed synchronization is ignored.
    */
@@ -346,6 +355,14 @@ class small_pinned_host_memory_resource {
 
   void* allocate_slab(::cuda::stream_ref stream, std::size_t bytes);
   void* allocate_large(::cuda::stream_ref stream, std::size_t bytes);
+  /**
+   * @brief Deallocates storage when the stream's capture status permits it
+   * @return Whether subsequent stream synchronization is permitted
+   */
+  [[nodiscard]] bool try_to_deallocate(::cuda::stream_ref stream,
+                                       void* ptr,
+                                       std::size_t bytes,
+                                       std::size_t alignment) noexcept;
   /**
    * @brief Allocates dedicated storage after reserving its ownership metadata
    */
