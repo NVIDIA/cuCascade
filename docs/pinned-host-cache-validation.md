@@ -1,0 +1,143 @@
+# Pinned host cache validation and external handoff
+
+This is the validation record for [ticket 11](https://github.com/kevkrist/cuCascade/issues/11) and [spec 1](https://github.com/kevkrist/cuCascade/issues/1). Both remain open until the required external evidence and any performance regressions are resolved. No upstream review responses have been posted.
+
+## Local evidence
+
+The local host has one NVIDIA GB10 GPU, Linux aarch64, driver 580.126.09, GNU C++ 15.3.0, and CUDA 13.2.86. The nightly environment provides RMM/cuDF 26.12 and CCCL 3.6; the installed stable environment provides RMM/cuDF 26.10 and CCCL 3.5. Both builds use Release, warnings as errors, and the normal production core, cuDF, and I/O libraries. Local builds target SM 120; external builds must select their own GPU architectures.
+
+Initial full-suite evidence at feature revision `06a3097` plus the two production controls:
+
+| Environment | Production pinned | Private fault/event | Full cuDF |
+| --- | --- | --- | --- |
+| Nightly | 38 passed, 3 skipped; 877 assertions | 54 passed; 939 assertions | 197 passed, 2 skipped; 2,737 assertions |
+| Stable | 38 passed, 3 skipped; 886 assertions | 54 passed; 939 assertions | 197 passed, 2 skipped; 2,738 assertions |
+
+Assertion totals in concurrent cases vary with scheduling. Every skip above requires physical multiple GPUs. Both production libraries also passed a dynamic-symbol check for absence of private test hooks. Final revision checks and paired measurements will be recorded after the mechanical integration cleanup. The single-GPU host cannot satisfy the production multi-GPU gate or reproduce the original four-L40S application measurements.
+
+The fault executable compiles the real allocator and event implementation with private, scoped system-boundary hooks. It is separate from the production test executable and does not replace production-path validation. The two added `[small_pinned][production]` controls exercise over-aligned storage through a real mapped GPU kernel and zero/null synchronous and asynchronous wrappers during active capture. Existing production tests exercise real pending DMA and cross-stream reuse. Failure-path red/green evidence belongs to the implementation tickets; these additional controls verify already implemented production behavior.
+
+## Build and run on the external host
+
+Start from the final integration commit and use separate build directories for each environment. Use Pixi activation for both configuration and compilation, so NVCC uses the matching host compiler. Do not reuse local ARM binaries or copy the local SM 120 override to L40S hardware.
+
+```bash
+set -euo pipefail
+for CUCASCADE_CASE in default cuda-13-stable; do
+  pixi run -e "$CUCASCADE_CASE" cmake --preset release \
+    -B "build/pinned-spec-$CUCASCADE_CASE" \
+    -DCUCASCADE_BUILD_TESTS=ON -DCUCASCADE_BUILD_CUDF=ON \
+    -DCUCASCADE_BUILD_IO=ON -DCUCASCADE_BUILD_BENCHMARKS=ON \
+    -DCUCASCADE_WARNINGS_AS_ERRORS=ON
+  pixi run -e "$CUCASCADE_CASE" cmake --build "build/pinned-spec-$CUCASCADE_CASE" \
+    --target cucascade_tests cucascade_pinned_host_fault_tests cucascade_cudf_tests \
+    --parallel 4
+done
+```
+
+Serialize these commands with other GPU work on that machine. For example, acquire a shared `flock` lease in the shell running the following loop. Select at least two actual physical GPUs; use four IDs for the four-device stress check. Preserve inventory, environment, exact commit, compiler versions, CMake caches, and complete test reports.
+
+```bash
+set -euo pipefail
+exec 9>/tmp/cucascade-validation-gpu.lock
+flock 9
+export CUDA_VISIBLE_DEVICES=0,1
+export CUCASCADE_TEST_GPU_POOL_BYTES=67108864
+nvidia-smi --query-gpu=index,name,uuid,driver_version --format=csv
+git rev-parse HEAD
+for CUCASCADE_CASE in default cuda-13-stable; do
+  CUCASCADE_OUTPUT="build/pinned-spec-$CUCASCADE_CASE"
+  pixi run -e "$CUCASCADE_CASE" "$CUCASCADE_OUTPUT/test/cucascade_tests" \
+    '[small_pinned]' --reporter junit --out "$CUCASCADE_OUTPUT/pinned.xml"
+  pixi run -e "$CUCASCADE_CASE" "$CUCASCADE_OUTPUT/test/cucascade_pinned_host_fault_tests" \
+    --reporter junit --out "$CUCASCADE_OUTPUT/faults.xml"
+  pixi run -e "$CUCASCADE_CASE" "$CUCASCADE_OUTPUT/test/cucascade_cudf_tests" \
+    --reporter junit --out "$CUCASCADE_OUTPUT/cudf.xml"
+done
+```
+
+All three production pinned multi-GPU cases must be present and pass without skips:
+
+1. `Event ownership follows the freeing stream's device`.
+2. `Large cache reuse on another GPU waits for pending producer DMA`.
+3. `Multiple GPUs concurrently reuse one large pinned cache`.
+
+The full cuDF suite also includes two existing cases requiring two devices: `gpu_table_representation rejects a stream owned by another device` and `gpu_table_representation works on its own device whichever device is current`. A zero process exit code with skipped cases is not a completed multi-GPU gate. Check JUnit files for failures, errors, and skips, and verify case names rather than relying on an empty filtered run:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+required = {
+    "Event ownership follows the freeing stream's device",
+    "Large cache reuse on another GPU waits for pending producer DMA",
+    "Multiple GPUs concurrently reuse one large pinned cache",
+}
+for environment in ("default", "cuda-13-stable"):
+    folder = Path("build") / ("pinned-spec-" + environment)
+    for report in ("pinned.xml", "faults.xml", "cudf.xml"):
+        root = ET.parse(folder / report).getroot()
+        cases = list(root.iter("testcase"))
+        assert cases, (environment, report, "no test cases")
+        for tag in ("skipped", "failure", "error"):
+            assert not list(root.iter(tag)), (environment, report, tag)
+        if report == "pinned.xml":
+            names = {case.attrib["name"] for case in cases}
+            assert required <= names, (environment, required - names)
+        print(environment, report, len(cases), "passed without skips")
+PY
+```
+
+## Reproduce the paired microbenchmarks
+
+The reusable runner compiles `benchmark/benchmark_pinned_host_cache.cpp` against each revision's own public headers and production library. It extracts dependencies from configured Ninja builds; it does not link the fault variant. Build baseline `69ef173b10a75363d80aa3a8df833f2858159034` and candidate with identical compiler, configuration, architecture, and dependencies. At minimum build `cucascade_shared` in each; configure tests so the runner can obtain the production link command. Run from the candidate checkout under the same GPU lease, without concurrent builds or workloads:
+
+```bash
+pixi run -e default python scripts/benchmark_pinned_host_cache.py \
+  --baseline-build /path/to/baseline-build \
+  --candidate-build /path/to/candidate-build \
+  --output-dir /path/to/fresh-results --pairs 5
+```
+
+The baseline checkout does not need the benchmark source backported. The runner uses the same candidate benchmark source for both revisions, rejects differing compiler/configuration settings, alternates baseline/candidate order between pairs, and saves raw JSONL, metadata, and medians/minimum/maximum/sample coefficient of variation. Record hardware and active GPU selection separately. Keep the output directory; a second run must use a fresh directory.
+
+Each worker creates its own real nonblocking stream and completes untimed warmup before the timed gate. Timing includes the operation loops, final stream synchronization, and worker teardown. Counters subtract warmup. One operation is one allocation/deallocation pair; a two-allocation iteration counts twice. No buffer contents are initialized or copied inside the timed loops.
+
+| Case | Threads | Cache geometry | Purpose |
+| --- | --- | --- | --- |
+| `concurrent_hits` | 4 | 1 MiB cap; 9,000-byte requests | Shared-resource hit contention |
+| `concurrent_full_cap` | 4 | 64 KiB cap; 9,000 and 40,000 bytes live together | Mixed buckets, full-cap eviction and scheduling-dependent hit mix |
+| `deterministic_full_cap` | 1 | Same 64 KiB geometry | Full-cap control with repeatable hit/miss/eviction counts |
+| `half_cap_rounding` | 1 | Default 256 MiB cap; two 128 MiB + 1 byte requests live together | Both requests round to full-cap buckets; eviction of whole retained buffers |
+
+The mixed concurrent workload remains part of the result even if hit rates differ. Do not divide away misses or report only the deterministic control. A reproducible median throughput loss above 5% requires investigation and resolution or explicit revision of the approved plan. If variability prevents classification, increase iteration counts and collect additional alternating pairs. These allocation-only microbenchmarks cannot establish application performance.
+
+## Original four-GPU application gate
+
+The original four-L40S runner, Sirius commit, configuration, and SF1000 data path have not been recovered. The adjacent single-GB300 `bench/sf1000-repro` recipe describes a different workload and is not a substitute. Reuse the user's original four-GPU setup, including only `lineitem` and `orders` compression, all other tables uncompressed, original NUMA placement, cache preparation, query selection, and host-pinning mode.
+
+The existing Sirius runner accepts the following syntax; the paths/configuration below must be replaced with the original ones. This establishes a runnable interface, not equivalence to the previous measurement:
+
+```bash
+cd /path/to/sirius
+SIRIUS_CONFIG_FILE=/path/to/original-four-gpu-config.yaml \
+  pixi run ./test/tpch_performance/run_tpch_parquet.sh \
+  --parquet-dir /path/to/original-tpch-parquet-sf1000 --iterations 6 \
+  --pinning-mode none sirius 1000 $(seq 1 22)
+
+SIRIUS_CONFIG_FILE=/path/to/original-four-gpu-config.yaml SIRIUS_PIN_TIER=host \
+  pixi run ./test/tpch_performance/run_tpch_parquet.sh \
+  --parquet-dir /path/to/original-tpch-parquet-sf1000 --iterations 6 \
+  --pinning-mode pinned-hot sirius 1000 $(seq 1 22)
+```
+
+Sirius links cuCascade statically from its subdirectory: rebuild Sirius separately against the exact baseline and candidate cuCascade commits. Changing `LD_LIBRARY_PATH` is insufficient. Record both Sirius and cuCascade revisions and build commands. Preserve correctness validation against the existing CPU oracle or saved validated outputs.
+
+Six iterations in one session mean one cold and five warm iterations, not five independent paired trials. Run at least five complete baseline/candidate session pairs for each original workload, alternating AB/BA order. Save every query timing and validation result, warm aggregates, median and variability across independent sessions, configuration/data identity, cache preparation and pinning details. Do not mix host-pin-all results with warm unpinned results. Apply the same >5% regression gate to elapsed time using `(candidate - baseline) / baseline`.
+
+## Contract and compatibility audit
+
+`allocate` provides stream order; CPU access requires synchronizing that stream or using `allocate_sync`. Contents remain uninitialized. Deallocation requires the original byte count and alignment; zero/null no-ops do not infer a live allocation's size. Exceptional aligned/exact allocations retain their true release base and bypass bucket caching. The cache limit measures retained large-buffer capacity, excluding live allocations, slabs, detached pending storage, and storage withheld after failure. Recovery deliberately skips partial reclamation when retained capacity is less than the complete exact backing size, including alignment padding. CUDA graph capture and host callback allocator use remain unsupported, with documented supplied-stream rejection behavior.
+
+The public constructor and allocation/deallocation call shapes remain usable; invalid alignment is now rejected, and previously ignored larger alignment is honored. The new `cuda_event::reset_no_throw()` operation is additive. Private resource layout and synchronization state changed, so binary consumers must rebuild against matching headers and library. cuDF wiring remains `cudf::set_pinned_memory_resource(resource)` with `cudf::set_allocate_host_as_pinned_threshold(small_pinned_host_memory_resource::MAX_SLAB_SIZE)`. No `idisk_io_backend` API changes, new public fault controls, node pooling, or eviction-policy replacement are part of this work.

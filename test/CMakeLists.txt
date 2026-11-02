@@ -88,6 +88,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_reservation_aware_resource_adaptor.cpp
     memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
+    memory/test_pinned_host_production.cpp
     memory/test_gpu_kernels.cu
     # Data tests
     data/test_data_repository.cpp
