@@ -91,8 +91,11 @@ class small_pinned_host_memory_resource {
    *
    * Requests rejected for invalid alignment or unsupported/unconfirmed capture state are excluded.
    * Counters include requests that later fail, and each request is counted once regardless of
-   * retries. Because of these edge cases, `large_requests` need not equal
-   * `large_hits + large_misses + large_uncacheable`, and one request may count as both:
+   * retries. A cached request is counted before submitting its reuse wait, but its hit is counted
+   * only after submission succeeds, so concurrent snapshots can include requests whose hit
+   * classification is still pending. Because of pending requests and these failure/retry cases,
+   * `large_requests` need not equal `large_hits + large_misses + large_uncacheable`, and one
+   * request may count as both:
    * - Miss, then hit: the first lookup misses, but a buffer appears in the cache before the retry.
    * - Neither: waiting on the cached buffer's pending GPU work fails.
    *

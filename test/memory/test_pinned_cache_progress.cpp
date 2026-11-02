@@ -92,8 +92,9 @@ TEST_CASE("Pinned allocator traffic progresses while a reuse wait is submitted",
     }
   }};
   bool const entered = wait_for(gate.entered);
+  cucascade::memory::small_pinned_host_memory_resource::statistics pending{};
   std::jthread observer{[&] {
-    std::ignore = fixture.resource.get_statistics();
+    pending = fixture.resource.get_statistics();
     observed.store(true, std::memory_order_release);
   }};
   bool const progressed = wait_for(observed);
@@ -107,6 +108,19 @@ TEST_CASE("Pinned allocator traffic progresses while a reuse wait is submitted",
   REQUIRE(progressed);
   REQUIRE(error == nullptr);
   REQUIRE(reused == seed);
+  if (bytes == 9000) {
+    REQUIRE(pending.large_requests == 2);
+    REQUIRE(pending.large_hits == 0);
+    REQUIRE(pending.large_misses == 1);
+    REQUIRE(pending.large_uncacheable == 0);
+    auto const complete = fixture.resource.get_statistics();
+    REQUIRE(complete.large_requests == 2);
+    REQUIRE(complete.large_hits == 1);
+    REQUIRE(complete.large_misses == 1);
+    REQUIRE(complete.large_uncacheable == 0);
+    REQUIRE(complete.large_requests ==
+            complete.large_hits + complete.large_misses + complete.large_uncacheable);
+  }
 }
 
 TEST_CASE("Pinned allocator traffic progresses while a cold event is created",
