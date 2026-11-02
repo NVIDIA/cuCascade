@@ -48,10 +48,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   add_executable(
     cucascade_pinned_host_fault_tests
-    memory/test_pinned_host_faults.cpp memory/test_pinned_host_alignment.cpp
+    memory/test_pinned_host_faults.cpp
+    memory/test_pinned_host_alignment.cpp
     memory/test_pinned_cache_insertion.cpp
     memory/test_pinned_host_device_failures.cpp
-    memory/test_pinned_event_lifecycle.cpp)
+    memory/test_pinned_event_lifecycle.cpp
+    memory/test_pinned_slab_quarantine.cpp)
   target_link_libraries(
     cucascade_pinned_host_fault_tests PRIVATE cucascade_pinned_host_test_variant
                                               Catch2::Catch2)
