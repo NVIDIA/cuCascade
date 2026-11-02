@@ -162,12 +162,21 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--pairs", type=int, default=5)
     parser.add_argument("--hit-iterations", type=int, default=500000)
-    parser.add_argument("--full-iterations", type=int, default=3000)
+    parser.add_argument("--full-iterations", type=int, default=30000)
+    parser.add_argument("--control-iterations", type=int, default=300000)
     parser.add_argument("--half-iterations", type=int, default=40)
     args = parser.parse_args()
     if args.pairs < 5:
         parser.error("At least five paired trials are required")
-    if min(args.hit_iterations, args.full_iterations, args.half_iterations) < 1:
+    if (
+        min(
+            args.hit_iterations,
+            args.full_iterations,
+            args.control_iterations,
+            args.half_iterations,
+        )
+        < 1
+    ):
         parser.error("Iteration counts must be positive")
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -182,6 +191,7 @@ def main():
         "platform": platform.platform(),
         "benchmark_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "cpu_affinity": sorted(os.sched_getaffinity(0)),
         "pairs": args.pairs,
     }
     executables = {}
@@ -201,7 +211,7 @@ def main():
     cases = (
         ("concurrent_hits", "hits", 4, args.hit_iterations, 128),
         ("concurrent_full_cap", "full", 4, args.full_iterations, 128),
-        ("deterministic_full_cap", "full", 1, args.full_iterations, 128),
+        ("deterministic_full_cap", "full", 1, args.control_iterations, 128),
         ("half_cap_rounding", "half", 1, args.half_iterations, 4),
     )
     rows = []
