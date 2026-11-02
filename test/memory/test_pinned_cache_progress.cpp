@@ -256,3 +256,76 @@ TEST_CASE("Failed cache hit restores oldest-first reuse when retained capacity p
   fixture.resource.deallocate_sync(first, 9000);
   fixture.resource.deallocate_sync(second, 9000);
 }
+
+TEST_CASE("Failed event preparation still removes dedicated exact allocation ownership",
+          "[small_pinned][fault_injection][cache_progress][pinned_recovery]")
+{
+  progress_fixture fixture;
+  auto const failed_operation  = GENERATE(cucascade::test::pinned_host_operation::event_create,
+                                         cucascade::test::pinned_host_operation::event_record,
+                                         cucascade::test::pinned_host_operation::large_cache_entry);
+  bool const reject_completion = GENERATE(false, true);
+  void* pointer                = nullptr;
+  {
+    cucascade::test::scoped_pinned_host_hook rounded_oom{
+      cucascade::test::pinned_host_operation::host_alloc, cudaErrorMemoryAllocation};
+    pointer = fixture.resource.allocate_sync(40000);
+  }
+
+  std::size_t free_calls = 0;
+  {
+    // Keep the real storage so the next allocation can deterministically return the same address.
+    cucascade::test::scoped_pinned_host_hook keep_storage{
+      cucascade::test::pinned_host_operation::host_free,
+      [](cucascade::test::pinned_host_call const&,
+         void* context) noexcept -> std::optional<cudaError_t> {
+        ++*static_cast<std::size_t*>(context);
+        return cudaSuccess;
+      },
+      &free_calls};
+    cucascade::test::scoped_pinned_host_hook preparation_failure{failed_operation,
+                                                                 cudaErrorMemoryAllocation};
+    if (reject_completion) {
+      auto const wait_operation =
+        failed_operation == cucascade::test::pinned_host_operation::large_cache_entry
+          ? cucascade::test::pinned_host_operation::event_synchronize
+          : cucascade::test::pinned_host_operation::stream_synchronize;
+      cucascade::test::scoped_pinned_host_hook completion_failure{wait_operation,
+                                                                  cudaErrorInvalidResourceHandle};
+      fixture.resource.deallocate(
+        ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, pointer, 40000);
+    } else {
+      fixture.resource.deallocate_sync(pointer, 40000);
+    }
+  }
+  REQUIRE(free_calls == (reject_completion ? 0 : 1));
+  REQUIRE(fixture.resource.large_cache_bytes() == 0);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  struct repeated_address {
+    void* pointer;
+    std::size_t attempts{};
+  } reuse{pointer};
+  void* next = nullptr;
+  {
+    cucascade::test::scoped_pinned_host_hook same_address{
+      cucascade::test::pinned_host_operation::host_alloc,
+      [](cucascade::test::pinned_host_call const& call,
+         void* context) noexcept -> std::optional<cudaError_t> {
+        auto& state = *static_cast<repeated_address*>(context);
+        if (++state.attempts == 1) { return cudaErrorMemoryAllocation; }
+        *call.buffer_out = state.pointer;
+        return cudaSuccess;
+      },
+      &reuse};
+    REQUIRE_NOTHROW(next = fixture.resource.allocate_sync(40000));
+  }
+  REQUIRE(next == pointer);
+  REQUIRE(reuse.attempts == 2);
+  fixture.resource.deallocate_sync(next, 40000);
+  cudaPointerAttributes attributes{};
+  REQUIRE(cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess);
+  REQUIRE(attributes.type == cudaMemoryTypeUnregistered);
+  REQUIRE(fixture.resource.large_cache_bytes() == 0);
+  REQUIRE(fixture.resource.get_statistics().large_requests == 2);
+}
