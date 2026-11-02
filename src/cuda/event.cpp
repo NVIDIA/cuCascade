@@ -20,6 +20,7 @@
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
 
+#include <tuple>
 #include <utility>
 
 namespace cucascade {
@@ -31,13 +32,7 @@ cuda_event::cuda_event(unsigned int flags)
     event_create, ::cudaEventCreateWithFlags(&event_, flags), {.event_out = &event_}));
 }
 
-cuda_event::~cuda_event() noexcept
-{
-  if (event_ != nullptr) {
-    CUCASCADE_ASSERT_CUDA_SUCCESS(CUCASCADE_PINNED_HOST_CUDA_CALL(
-      event_destroy, ::cudaEventDestroy(event_), {.event = event_}));
-  }
-}
+cuda_event::~cuda_event() noexcept { std::ignore = reset_no_throw(); }
 
 cuda_event::cuda_event(cuda_event&& other) noexcept : event_(std::exchange(other.event_, nullptr))
 {
@@ -46,13 +41,20 @@ cuda_event::cuda_event(cuda_event&& other) noexcept : event_(std::exchange(other
 cuda_event& cuda_event::operator=(cuda_event&& other) noexcept
 {
   if (this != &other) {
-    if (event_ != nullptr) {
-      CUCASCADE_ASSERT_CUDA_SUCCESS(CUCASCADE_PINNED_HOST_CUDA_CALL(
-        event_destroy, ::cudaEventDestroy(event_), {.event = event_}));
-    }
-    event_ = std::exchange(other.event_, nullptr);
+    std::ignore = reset_no_throw();
+    event_      = std::exchange(other.event_, nullptr);
   }
   return *this;
+}
+
+cudaError_t cuda_event::reset_no_throw() noexcept
+{
+  cudaEvent_t const event = std::exchange(event_, nullptr);
+  if (event == nullptr) { return cudaSuccess; }
+  auto const status =
+    CUCASCADE_PINNED_HOST_CUDA_CALL(event_destroy, ::cudaEventDestroy(event), {.event = event});
+  if (status != cudaSuccess) { std::ignore = cudaGetLastError(); }
+  return status;
 }
 
 cudaEvent_t cuda_event::get() const noexcept { return event_; }

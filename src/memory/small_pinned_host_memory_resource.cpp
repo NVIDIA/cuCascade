@@ -137,15 +137,16 @@ void free_pinned_no_throw(void* ptr) noexcept
   }
 }
 
-// Frees a direct pinned buffer once `completion` confirms its GPU work is done, and leaks it
-// otherwise.
+// Returns whether completion was confirmed. An unsuccessful free still withholds the buffer.
 template <typename Completion>
   requires requires(Completion const& completion) {
     { wait_no_throw(completion) } noexcept -> std::same_as<bool>;
   }
-void free_pinned_after(Completion const& completion, void* ptr) noexcept
+bool free_pinned_after(Completion const& completion, void* ptr) noexcept
 {
-  if (wait_no_throw(completion)) { free_pinned_no_throw(ptr); }
+  if (!wait_no_throw(completion)) { return false; }
+  free_pinned_no_throw(ptr);
+  return true;
 }
 
 }  // namespace
@@ -329,9 +330,14 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
   }
   if (!published) {
     if (ready) {
-      free_pinned_after(ready->event, ptr);
+      bool const completed = free_pinned_after(ready->event, ptr);
+      if (!completed) { std::ignore = ready->event.reset_no_throw(); }
       std::lock_guard lock(_mutex);
-      return_event_locked(std::move(*ready));
+      if (completed) {
+        return_event_locked(std::move(*ready));
+      } else {
+        retire_event_locked(std::move(*ready));
+      }
     } else {
       free_pinned_after(stream, ptr);
     }
@@ -436,6 +442,13 @@ void small_pinned_host_memory_resource::return_event_locked(pooled_event&& event
   found->second.release(std::move(event.event));
 }
 
+void small_pinned_host_memory_resource::retire_event_locked(pooled_event&& event) noexcept
+{
+  auto const found = _event_pools.find(event.device);
+  assert(found != _event_pools.end());
+  found->second.retire(std::move(event.event));
+}
+
 std::optional<cuda::cuda_event> small_pinned_host_memory_resource::event_pool::acquire(
   int device) noexcept
 {
@@ -446,13 +459,15 @@ std::optional<cuda::cuda_event> small_pinned_host_memory_resource::event_pool::a
   }
   try {
     // Reserve the slot this event occupies when it returns, so release cannot allocate.
-    CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(event_pool_reserve);
-    _idle.reserve(_created + 1);
+    if (_idle.capacity() == _live_events) {
+      CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(event_pool_reserve);
+      _idle.reserve(_live_events + 1);
+    }
     // An event can be recorded only on a stream of the device that was current at its creation.
     event_creation_device_guard const device_guard{device};
     if (!device_guard.is_ready()) { return std::nullopt; }
     cuda::cuda_event created{cudaEventDisableTiming};
-    ++_created;
+    ++_live_events;
     return created;
   } catch (...) {
     // The CUDA error behind a thrown cuda_error was cleared before the throw.
@@ -464,6 +479,13 @@ void small_pinned_host_memory_resource::event_pool::release(cuda::cuda_event&& e
 {
   assert(_idle.size() < _idle.capacity());
   _idle.push_back(std::move(event));
+}
+
+void small_pinned_host_memory_resource::event_pool::retire(cuda::cuda_event&& event) noexcept
+{
+  assert(_live_events > _idle.size());
+  std::ignore = event.reset_no_throw();
+  --_live_events;
 }
 
 void* small_pinned_host_memory_resource::try_take_cached_large_locked(std::size_t bucket,
@@ -514,13 +536,18 @@ void small_pinned_host_memory_resource::release_detached(
   std::list<large_cache_entry>&& detached) noexcept
 {
   if (detached.empty()) { return; }
-  for (auto const& entry : detached) {
-    free_pinned_after(entry.ready.event, entry.ptr);
+  for (auto& entry : detached) {
+    if (!free_pinned_after(entry.ready.event, entry.ptr)) {
+      std::ignore = entry.ready.event.reset_no_throw();
+    }
   }
-  // An event whose wait failed is reusable too: recording it again replaces its pending work.
   std::lock_guard lock(_mutex);
   for (auto& entry : detached) {
-    return_event_locked(std::move(entry.ready));
+    if (entry.ready.event.get() != nullptr) {
+      return_event_locked(std::move(entry.ready));
+    } else {
+      retire_event_locked(std::move(entry.ready));
+    }
   }
 }
 
