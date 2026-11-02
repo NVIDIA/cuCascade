@@ -168,6 +168,9 @@ class small_pinned_host_memory_resource {
    * thread's last-error state (sticky context errors excepted). Storage whose GPU completion cannot
    * be confirmed is withheld: it is never reused or freed.
    *
+   * If cache-entry metadata cannot be reserved, retained entries are preserved and the incoming
+   * buffer follows the same release and withholding rules.
+   *
    * Failed stream-device discovery disables event tracking; reuse or release then requires
    * confirmed stream completion. Failure to restore the calling thread's previous CUDA device
    * terminates the process.
