@@ -18,6 +18,7 @@
 #include "io/rest/reactor_placement.hpp"
 
 #include <cucascade/exec/thread_util.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/net_topology.hpp>
 
 #include <catch2/catch_all.hpp>
@@ -341,6 +342,25 @@ TEST_CASE("describe_rest_pool renders the startup line", "[rest_pool_plan]")
     describe_rest_pool(plan_rest_pool(0, true, std::nullopt, {}), std::nullopt, reactor_priority{});
   CHECK_THAT(fallback,
              Catch::Matchers::StartsWith("rest: 2 reactors (default), nic unknown pinned no"));
+}
+
+TEST_CASE("planned_reactor_cpus matches the pool's plan", "[rest_pool_plan]")
+{
+  namespace mem = cucascade::memory;
+  cucascade::io::rest::config cfg;
+  cfg.pin_to_irq_cpus = false;
+  CHECK(cucascade::io::rest::planned_reactor_cpus(0, cfg).empty());
+  CHECK(cucascade::io::rest::planned_reactor_cpus(4, cfg).empty());
+
+  cfg.pin_to_irq_cpus = true;
+  auto const iface    = mem::select_egress_interface(cfg.interface);
+  auto const nic      = iface ? mem::discover_nic(*iface) : std::nullopt;
+  for (std::size_t const n : {std::size_t{0}, std::size_t{3}}) {
+    auto expected = plan_rest_pool(n, true, nic).pin_cpus;
+    std::sort(expected.begin(), expected.end());
+    expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+    CHECK(cucascade::io::rest::planned_reactor_cpus(n, cfg) == expected);
+  }
 }
 
 TEST_CASE("pool plan on this host (informational)", "[rest_pool_plan]")

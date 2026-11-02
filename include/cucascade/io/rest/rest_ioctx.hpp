@@ -228,4 +228,17 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::optional<std::chrono::steady_clock::time_point> _warmed_at;
 };
 
+/**
+ * @brief The CPUs a REST pool built now from the calling thread would pin its reactors to.
+ *
+ * Runs the planning a @ref rest_ioctx constructor runs (the egress NIC from
+ * @c cfg.interface, its queue-IRQ steering, @c cfg.pin_to_irq_cpus, @p n_reactors with 0 =
+ * sized from the NIC) without starting anything.  Sorted and unique; empty when the pool would
+ * run unpinned.  An embedder that sizes its own thread pools before the REST pool exists uses
+ * it to keep them off these CPUs, which then carry only the NIC's interrupts and the reactors.
+ * Call it from a thread with the affinity the pool will be built from: pins are restricted to
+ * it, exactly as for the pool.
+ */
+[[nodiscard]] std::vector<int> planned_reactor_cpus(std::size_t n_reactors, config const& cfg);
+
 }  // namespace cucascade::io::rest

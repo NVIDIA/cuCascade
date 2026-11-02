@@ -105,6 +105,9 @@ the whole pool would decrypt on the IRQ CPUs: on a g7e.12xlarge (8 IRQ CPUs of 4
 ran at 12 GiB/s pinned without this, 32 GiB/s with it and 35 GiB/s unpinned. Raising the
 reactors' priority (nice -20 or `SCHED_FIFO`) measured within noise there.
 
+`planned_reactor_cpus(n_reactors, rest_config)` returns the CPUs a pool built now would pin to,
+without starting it, so an embedder can keep its own thread pools off them.
+
 ## Counters
 
 `rest_ioctx::stats()` sums every reactor's `transport_stats`: gets, heads, bytes, retries

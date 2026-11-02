@@ -47,12 +47,12 @@ namespace {
 /// Size the pool (rest_n_reactors 0 = auto from the egress NIC's IRQ steering) and compute the
 /// placement every reactor applies to its own thread before it creates its ring.  Also checks
 /// the dispatch fan-out against the reactor count.
-std::shared_ptr<detail::pool_placement const> plan_pool(
-  std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> const& ctx)
+/// The egress NIC (rest.interface, else the default route's) and the pool plan for it, from the
+/// calling thread's affinity.  Shared by rest_ioctx and planned_reactor_cpus so both see the
+/// same placement.
+std::pair<std::optional<memory::nic_topology>, rest_pool_plan> discover_and_plan(
+  std::size_t n_reactors, config const& cfg)
 {
-  if (!ctx) { throw std::invalid_argument("rest_ioctx: reactor_context must be non-null"); }
-  auto const& cfg = ctx->cfg();
-  cfg.validate();
   std::optional<memory::nic_topology> nic;
   try {
     if (auto const iface = memory::select_egress_interface(cfg.interface); iface.has_value()) {
@@ -62,6 +62,16 @@ std::shared_ptr<detail::pool_placement const> plan_pool(
     nic.reset();  // no NIC information: the default count, unpinned
   }
   auto plan = plan_rest_pool(n_reactors, cfg.pin_to_irq_cpus, nic);
+  return {std::move(nic), std::move(plan)};
+}
+
+std::shared_ptr<detail::pool_placement const> plan_pool(
+  std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> const& ctx)
+{
+  if (!ctx) { throw std::invalid_argument("rest_ioctx: reactor_context must be non-null"); }
+  auto const& cfg = ctx->cfg();
+  cfg.validate();
+  auto [nic, plan] = discover_and_plan(n_reactors, cfg);
   // The default (2) is clamped to a one-reactor pool, as the hard-coded fan-out always was;
   // an explicit value above the configured count is a configuration error.
   if (n_reactors > 0 && cfg.fan_out > n_reactors && cfg.fan_out != config{}.fan_out) {
@@ -78,6 +88,14 @@ std::shared_ptr<detail::pool_placement const> plan_pool(
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
   : rest_ioctx(plan_pool(n_reactors, ctx), ctx)
 {
+}
+
+std::vector<int> planned_reactor_cpus(std::size_t n_reactors, config const& cfg)
+{
+  auto cpus = discover_and_plan(n_reactors, cfg).second.pin_cpus;
+  std::sort(cpus.begin(), cpus.end());
+  cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+  return cpus;
 }
 
 rest_ioctx::rest_ioctx(std::shared_ptr<detail::pool_placement const> placement,
