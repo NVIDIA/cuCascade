@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
- * All rights reserved. SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "memory/test_gpu_kernels.cuh"
@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 
 using namespace cucascade::memory;
@@ -50,13 +51,21 @@ TEST_CASE("Production zero and null wrappers preserve an active capture",
   rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
   CUCASCADE_CUDA_TRY(::cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeThreadLocal));
   // Save outcomes until capture ends so an assertion cannot strand an active capture.
-  auto* async_zero = resource.allocate(stream, 0);
-  auto* sync_zero  = resource.allocate_sync(0);
-  resource.deallocate(stream, nullptr, 42);
-  resource.deallocate_sync(nullptr, 42);
+  void* async_zero = nullptr;
+  void* sync_zero  = nullptr;
+  std::exception_ptr error;
+  try {
+    async_zero = resource.allocate(stream, 0);
+    sync_zero  = resource.allocate_sync(0);
+    resource.deallocate(stream, nullptr, 42);
+    resource.deallocate_sync(nullptr, 42);
+  } catch (...) {
+    error = std::current_exception();
+  }
   cudaGraph_t graph = nullptr;
   auto const status = ::cudaStreamEndCapture(stream.value(), &graph);
   if (graph != nullptr) { CUCASCADE_CUDA_TRY(::cudaGraphDestroy(graph)); }
+  if (error) { std::rethrow_exception(error); }
   REQUIRE(status == cudaSuccess);
   REQUIRE(async_zero == nullptr);
   REQUIRE(sync_zero == nullptr);

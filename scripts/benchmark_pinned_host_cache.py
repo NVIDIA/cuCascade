@@ -113,10 +113,17 @@ def build_benchmark(build, output, source):
             for key in (
                 "CMAKE_BUILD_TYPE",
                 "CMAKE_CXX_COMPILER",
+                "CMAKE_CXX_FLAGS",
+                "CMAKE_CXX_FLAGS_RELEASE",
                 "CMAKE_CUDA_COMPILER",
+                "CMAKE_CUDA_FLAGS",
+                "CMAKE_CUDA_FLAGS_RELEASE",
                 "CMAKE_CUDA_ARCHITECTURES",
                 "CUCASCADE_BUILD_CUDF",
                 "CUCASCADE_BUILD_IO",
+                "CUCASCADE_BUILD_BENCHMARKS",
+                "CUCASCADE_BUILD_SHARED_LIBS",
+                "CUCASCADE_BUILD_STATIC_LIBS",
                 "CUCASCADE_WARNINGS_AS_ERRORS",
             )
         },
