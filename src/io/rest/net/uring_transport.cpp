@@ -34,6 +34,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -336,6 +337,14 @@ uring_transport::uring_transport(transport_options opts, transport_services serv
   if (_opts.iowq_max_bound != 0 || _opts.iowq_max_unbound != 0) {
     unsigned values[2] = {_opts.iowq_max_bound, _opts.iowq_max_unbound};
     (void)io_uring_register_iowq_max_workers(&_ring, values);
+  }
+  if (!_opts.iowq_cpus.empty()) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int const c : _opts.iowq_cpus) {
+      if (c >= 0 && c < CPU_SETSIZE) { CPU_SET(static_cast<std::size_t>(c), &set); }
+    }
+    (void)io_uring_register_iowq_aff(&_ring, sizeof(set), &set);
   }
 }
 

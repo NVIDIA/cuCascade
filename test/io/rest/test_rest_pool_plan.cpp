@@ -281,6 +281,13 @@ TEST_CASE("place_current_reactor_thread pins within the plan", "[rest_pool_plan]
   CHECK(placed.cpu == mine.back());
   CHECK(affinity_after == std::vector<int>{mine.back()});
   CHECK_FALSE(placed.priority.description.empty());
+  // io-wq (where kTLS decryption is punted) gets the inherited mask minus every pinned CPU of
+  // the pool, not the reactor's single CPU.
+  std::vector<int> expected_iowq;
+  for (int const c : mine) {
+    if (c != mine.front() && c != mine.back()) { expected_iowq.push_back(c); }
+  }
+  CHECK(placed.iowq_cpus == expected_iowq);
 
   rest_pool_plan const unpinned{2, {}, false, false, "test"};
   std::thread([&] {
@@ -291,6 +298,7 @@ TEST_CASE("place_current_reactor_thread pins within the plan", "[rest_pool_plan]
   CHECK(placed.cpu == -1);
   CHECK(placed.priority.achieved == reactor_priority::kind::unchanged);
   CHECK(affinity_after == mine);
+  CHECK(placed.iowq_cpus.empty());  // unpinned: io-wq keeps the thread's own mask
 }
 
 TEST_CASE("place_current_reactor_thread never widens the worker's own affinity", "[rest_pool_plan]")

@@ -879,6 +879,7 @@ net::transport_options reactor_worker::transport_options() const
   o.register_ring_fd     = _cfg.register_ring_fd;
   o.iowq_max_unbound     = _cfg.iowq_max_unbound;
   o.iowq_max_bound       = _cfg.iowq_max_bound;
+  o.iowq_cpus            = _r._iowq_cpus;
   o.defer_flush          = _cfg.wait_mode == reactor_wait_mode::uring;
   o.keepalive_idle_s     = _cfg.keepalive_idle_s;
   o.keepalive_interval_s = _cfg.keepalive_interval_s;
@@ -1987,6 +1988,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     // Placement first, before the ring exists, so its memory lands on the pinned CPU's node.
     if (_placement != nullptr) {
       auto const placed = place_current_reactor_thread(_placement->plan, _pool_index);
+      _iowq_cpus        = placed.iowq_cpus;
       if (_pool_index == 0) {
         CUCASCADE_LOG_INFO("{}",
                            describe_rest_pool(_placement->plan, _placement->nic, placed.priority));

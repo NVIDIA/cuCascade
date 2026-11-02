@@ -194,6 +194,8 @@ struct transport_options {
   bool register_ring_fd{true};
   unsigned iowq_max_unbound{0};
   unsigned iowq_max_bound{0};
+  /// io_uring_register_iowq_aff CPUs (empty = io-wq inherits the creating thread's mask).
+  std::vector<int> iowq_cpus;
   /// uring wait mode: submit() leaves SQEs for wait() to flush.
   bool defer_flush{false};
 

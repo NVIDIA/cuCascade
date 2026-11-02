@@ -98,6 +98,13 @@ reactor per IRQ CPU, each pinned to it (`pin_to_irq_cpus`) and raised to the hig
 process may set before it creates its ring; otherwise 2, unpinned. `fan_out` (2) is the number of
 least-backlogged reactors one read is split across.
 
+A pinned reactor registers its ring's io-wq affinity (`io_uring_register_iowq_aff`) as its
+inherited mask minus every CPU the pool pins to. io-wq workers otherwise inherit the reactor's
+single CPU, and with `recv_placement` `iowq` (`automatic` on EC2) they do the kTLS decryption, so
+the whole pool would decrypt on the IRQ CPUs: on a g7e.12xlarge (8 IRQ CPUs of 48) a raw S3 read
+ran at 12 GiB/s pinned without this, 32 GiB/s with it and 35 GiB/s unpinned. Raising the
+reactors' priority (nice -20 or `SCHED_FIFO`) measured within noise there.
+
 ## Counters
 
 `rest_ioctx::stats()` sums every reactor's `transport_stats`: gets, heads, bytes, retries

@@ -570,6 +570,8 @@ class rest_reactor {
   // Position in the pool and the pool's placement (select the worker's CPU pin).
   std::size_t _pool_index{0};
   std::shared_ptr<detail::pool_placement const> _placement;
+  // io-wq affinity of the worker's ring, set by the placement (empty = inherit).
+  std::vector<int> _iowq_cpus;
 
   // The worker's queues and wake-up fd (shared with a private helper's layout).
   std::unique_ptr<intake> _intake;

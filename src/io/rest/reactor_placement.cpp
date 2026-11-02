@@ -224,6 +224,11 @@ reactor_placement place_current_reactor_thread(rest_pool_plan const& plan,
     if (allowed && tu::set_current_thread_affinity(std::span<int const>{cpu})) {
       placed.cpu    = cpu[0];
       placed.pinned = true;
+      for (int const c : inherited) {
+        if (std::find(plan.pin_cpus.begin(), plan.pin_cpus.end(), c) == plan.pin_cpus.end()) {
+          placed.iowq_cpus.push_back(c);
+        }
+      }
     }
   }
   if (placed.pinned) {

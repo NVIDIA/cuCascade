@@ -136,6 +136,11 @@ struct reactor_priority {
 struct reactor_placement {
   int cpu{-1};  ///< the pinned CPU, -1 when unpinned
   bool pinned{false};
+  /// io-wq affinity for the pinned reactor's ring: the thread's inherited affinity minus every
+  /// pinned (IRQ) CPU of the pool.  io-wq workers inherit the submitting thread's mask, so
+  /// without this the work punted to io-wq (kTLS decryption with recv_placement iowq) would run
+  /// on the reactor's single IRQ CPU.  Empty = leave io-wq on the thread's mask.
+  std::vector<int> iowq_cpus;
   reactor_priority priority;
 };
 
