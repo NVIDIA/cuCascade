@@ -1074,8 +1074,9 @@ TEST_CASE("Large allocation statistics remain consistent during mixed concurrent
     REQUIRE(current.peak_cached_large_bytes >= previous.peak_cached_large_bytes);
     REQUIRE(current.cached_large_bytes <= current.peak_cached_large_bytes);
     REQUIRE(current.peak_cached_large_bytes <= cap);
-    REQUIRE(current.large_requests ==
-            current.large_hits + current.large_misses + current.large_uncacheable);
+    auto const classified = current.large_hits + current.large_misses + current.large_uncacheable;
+    REQUIRE(classified <= current.large_requests);
+    REQUIRE(current.large_requests - classified <= worker_count);
     previous = current;
     std::this_thread::sleep_for(std::chrono::microseconds{25});
   } while (finished.load(std::memory_order_acquire) != worker_count);
@@ -1087,6 +1088,7 @@ TEST_CASE("Large allocation statistics remain consistent during mixed concurrent
     if (failure) { std::rethrow_exception(failure); }
   }
   auto const final = mr.get_statistics();
+  REQUIRE(final.large_requests == final.large_hits + final.large_misses + final.large_uncacheable);
   REQUIRE(final.large_requests == static_cast<std::uint64_t>(worker_count * requests_per_worker));
   REQUIRE(final.large_uncacheable ==
           static_cast<std::uint64_t>((worker_count - cacheable_workers) * requests_per_worker));
