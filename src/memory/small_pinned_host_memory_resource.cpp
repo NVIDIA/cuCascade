@@ -233,7 +233,7 @@ bool small_pinned_host_memory_resource::try_to_deallocate(::cuda::stream_ref str
     if (alignment <= alignof(std::max_align_t) && bytes <= MAX_SLAB_SIZE) {
       quarantine_slab_locked(ptr);
     } else {
-      std::ignore = try_take_exceptional_locked(ptr);
+      std::ignore = try_to_take_exceptional_locked(ptr);
     }
     return false;
   }
@@ -296,7 +296,7 @@ void* small_pinned_host_memory_resource::allocate_exceptional(
   auto const alloc_bytes = bytes + padding;
   auto try_cached        = [&]() -> void* {
     if (!retry_stream) { return nullptr; }
-    return try_take_cached_large(large_bucket_size_for(bytes), *retry_stream);
+    return try_to_take_cached_large(large_bucket_size_for(bytes), *retry_stream);
   };
   if (void* cached = try_cached()) { return cached; }
   std::map<void*, void*> pending;
@@ -343,7 +343,7 @@ void* small_pinned_host_memory_resource::allocate_exceptional(
   return ptr;
 }
 
-void* small_pinned_host_memory_resource::try_take_exceptional_locked(void* ptr) noexcept
+void* small_pinned_host_memory_resource::try_to_take_exceptional_locked(void* ptr) noexcept
 {
   auto const found = _exceptional_allocations.find(ptr);
   if (found == _exceptional_allocations.end()) { return nullptr; }
@@ -358,7 +358,7 @@ void small_pinned_host_memory_resource::deallocate_exceptional(::cuda::stream_re
   void* base = nullptr;
   {
     std::lock_guard lock(_mutex);
-    base = try_take_exceptional_locked(ptr);
+    base = try_to_take_exceptional_locked(ptr);
   }
   assert(base != nullptr);
   if (base != nullptr) { free_pinned_after(stream, base); }
@@ -371,7 +371,7 @@ void* small_pinned_host_memory_resource::allocate_large(::cuda::stream_ref strea
   bool const cacheable          = is_cacheable(bucket);
   std::size_t const alloc_bytes = large_allocation_size(bytes);
   if (cacheable) {
-    if (void* cached = try_take_cached_large(bucket, stream, true)) { return cached; }
+    if (void* cached = try_to_take_cached_large(bucket, stream, true)) { return cached; }
   } else {
     _large_uncacheable.fetch_add(1, std::memory_order_relaxed);
   }
@@ -446,7 +446,7 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
   bool published = false;
   {
     std::lock_guard lock(_mutex);
-    if (void* base = try_take_exceptional_locked(ptr)) {
+    if (void* base = try_to_take_exceptional_locked(ptr)) {
       ptr = base;
       if (!incoming.empty()) { incoming.front().ptr = base; }
     } else if (!incoming.empty() && _large_cache_bytes <= _large_cache_limit_bytes) {
@@ -548,7 +548,7 @@ small_pinned_host_memory_resource::acquire_event(int device) noexcept
   try {
     std::lock_guard lock(_event_mutex);
     pool = std::addressof(_event_pools[device]);
-    if (auto event = pool->try_take()) { return pooled_event{std::move(*event), device}; }
+    if (auto event = pool->try_to_take()) { return pooled_event{std::move(*event), device}; }
     pool->reserve();
   } catch (...) {
     return std::nullopt;
@@ -608,7 +608,8 @@ void small_pinned_host_memory_resource::retire_event_locked(pooled_event&& event
   found->second.release_reservation();
 }
 
-std::optional<cuda::cuda_event> small_pinned_host_memory_resource::event_pool::try_take() noexcept
+std::optional<cuda::cuda_event>
+small_pinned_host_memory_resource::event_pool::try_to_take() noexcept
 {
   if (_idle.empty()) { return std::nullopt; }
   cuda::cuda_event recycled = std::move(_idle.back());
@@ -637,9 +638,9 @@ void small_pinned_host_memory_resource::event_pool::release(cuda::cuda_event&& e
   _idle.push_back(std::move(event));
 }
 
-void* small_pinned_host_memory_resource::try_take_cached_large(std::size_t bucket,
-                                                               ::cuda::stream_ref stream,
-                                                               bool initial_request)
+void* small_pinned_host_memory_resource::try_to_take_cached_large(std::size_t bucket,
+                                                                  ::cuda::stream_ref stream,
+                                                                  bool initial_request)
 {
   std::list<large_cache_entry> taken;
   {

@@ -4,6 +4,7 @@
  */
 
 #include "pinned_host_test_hooks.hpp"
+#include "pinned_host_test_utils.hpp"
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
@@ -22,19 +23,14 @@
 
 namespace {
 
+using cucascade::test::require_pointer_type;
+
 struct aligned_pinned_fixture {
   rmm::mr::pinned_host_memory_resource pinned;
   cucascade::memory::fixed_size_host_memory_resource upstream{
     0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
   cucascade::memory::small_pinned_host_memory_resource resource{upstream, 64ULL << 10};
 };
-
-void require_aligned_pointer_type(void* pointer, cudaMemoryType type)
-{
-  cudaPointerAttributes attributes{};
-  REQUIRE(cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess);
-  REQUIRE(attributes.type == type);
-}
 
 struct dedicated_allocation_observation {
   void* base{};
@@ -71,10 +67,10 @@ TEST_CASE("Over-aligned large pinned storage is dedicated and released",
   auto* pointer                   = fixture.resource.allocate_sync(bytes, alignment);
   REQUIRE(reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0);
   std::memset(pointer, 0x35, bytes);
-  require_aligned_pointer_type(pointer, cudaMemoryTypeHost);
+  require_pointer_type(pointer, cudaMemoryTypeHost);
   fixture.resource.deallocate_sync(pointer, bytes, alignment);
   REQUIRE(fixture.resource.large_cache_bytes() == 0);
-  require_aligned_pointer_type(pointer, cudaMemoryTypeUnregistered);
+  require_pointer_type(pointer, cudaMemoryTypeUnregistered);
 }
 
 TEST_CASE("Nonzero pinned requests reject invalid alignment",
@@ -127,7 +123,7 @@ TEST_CASE("Exceptional metadata exhaustion acquires no pinned storage",
 
   pointer = fixture.resource.allocate_sync(9000, 64);
   fixture.resource.deallocate_sync(pointer, 9000, 64);
-  require_aligned_pointer_type(pointer, cudaMemoryTypeUnregistered);
+  require_pointer_type(pointer, cudaMemoryTypeUnregistered);
 }
 
 TEST_CASE("Dedicated storage uses alignment padding and frees its original allocation",
@@ -153,7 +149,7 @@ TEST_CASE("Dedicated storage uses alignment padding and frees its original alloc
   std::memset(pointer, 0x42, 9000);
   fixture.resource.deallocate_sync(pointer, 9000, alignment);
   REQUIRE(observation.freed == observation.base);
-  require_aligned_pointer_type(observation.base, cudaMemoryTypeUnregistered);
+  require_pointer_type(observation.base, cudaMemoryTypeUnregistered);
 }
 
 TEST_CASE("Over-aligned small storage bypasses an awkward upstream block stride",
@@ -170,7 +166,7 @@ TEST_CASE("Over-aligned small storage bypasses an awkward upstream block stride"
       REQUIRE(reinterpret_cast<std::uintptr_t>(pointer) % 64 == 0);
       std::memset(pointer, 0x53, bytes);
       resource.deallocate_sync(pointer, bytes, 64);
-      require_aligned_pointer_type(pointer, cudaMemoryTypeUnregistered);
+      require_pointer_type(pointer, cudaMemoryTypeUnregistered);
       REQUIRE(upstream.get_free_blocks() == initial_blocks);
     }
 
@@ -178,7 +174,7 @@ TEST_CASE("Over-aligned small storage bypasses an awkward upstream block stride"
     REQUIRE(reinterpret_cast<std::uintptr_t>(ordinary) % alignof(std::max_align_t) == 0);
     REQUIRE(upstream.get_free_blocks() < initial_blocks);
     resource.deallocate_sync(ordinary, 513);
-    require_aligned_pointer_type(ordinary, cudaMemoryTypeHost);
+    require_pointer_type(ordinary, cudaMemoryTypeHost);
   }
   REQUIRE(upstream.get_free_blocks() == initial_blocks);
 }
@@ -230,7 +226,7 @@ TEST_CASE("Dedicated storage release withholds unconfirmed backing and recovers 
     fixture.resource.deallocate(stream, pointer, bytes, 64);
   }
   REQUIRE(cudaGetLastError() == cudaSuccess);
-  require_aligned_pointer_type(
+  require_pointer_type(
     observation.base,
     failure == release_failure::none ? cudaMemoryTypeUnregistered : cudaMemoryTypeHost);
   REQUIRE(fixture.resource.large_cache_bytes() == 0);
@@ -241,7 +237,7 @@ TEST_CASE("Dedicated storage release withholds unconfirmed backing and recovers 
 
   pointer = fixture.resource.allocate_sync(bytes, 64);
   fixture.resource.deallocate_sync(pointer, bytes, 64);
-  require_aligned_pointer_type(observation.base, cudaMemoryTypeUnregistered);
+  require_pointer_type(observation.base, cudaMemoryTypeUnregistered);
 }
 
 TEST_CASE("Concurrent dedicated allocations preserve alignment and release ownership",
@@ -276,7 +272,7 @@ TEST_CASE("Concurrent dedicated allocations preserve alignment and release owner
     for (auto* pointer : row) {
       REQUIRE(pointer != nullptr);
       REQUIRE(reinterpret_cast<std::uintptr_t>(pointer) % 64 == 0);
-      require_aligned_pointer_type(pointer, cudaMemoryTypeUnregistered);
+      require_pointer_type(pointer, cudaMemoryTypeUnregistered);
     }
   }
   REQUIRE(fixture.resource.large_cache_bytes() == 0);
