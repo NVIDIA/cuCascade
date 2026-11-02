@@ -370,8 +370,9 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
     free_pinned_after(stream, ptr);
     return;
   }
-  // One critical section detaches every victim this buffer needs and publishes it, so the room it
-  // frees cannot be taken by another thread. The victims are released after the lock is dropped.
+  // Reserve the incoming node before eviction so metadata failure preserves retained entries.
+  // Capacity reservation and publication share one critical section; releases happen afterward.
+  std::list<large_cache_entry> incoming;
   std::list<large_cache_entry> victims;
   std::optional<pooled_event> ready;
   bool published = false;
@@ -379,26 +380,32 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
     std::lock_guard lock(_mutex);
     ready = record_ready_event_locked(stream);
     if (ready) {
-      // `_large_cache_bytes` and `bucket` never exceed the limit, so the subtraction cannot wrap.
-      while (bucket > _large_cache_limit_bytes - _large_cache_bytes &&
-             evict_oldest_large_locked(victims)) {}
-      assert(bucket <= _large_cache_limit_bytes - _large_cache_bytes);
       try {
         CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(large_cache_entry);
-        _large_cache[large_bucket_index(bucket)].emplace_back(
-          ptr, std::move(*ready), _large_cache_sequence);
-        ++_large_cache_sequence;
-        _large_cache_bytes += bucket;
-        _peak_cached_large_bytes = std::max(_peak_cached_large_bytes, _large_cache_bytes);
-        published                = true;
+        incoming.emplace_back(ptr, std::move(*ready), _large_cache_sequence);
+        ready.reset();
       } catch (...) {
         // The node allocation failed before `*ready` was moved, so `ready` still owns the event and
-        // the buffer is released below. Detaching victims first only shrank the cache.
+        // no retained entry has been detached.
+      }
+      if (!incoming.empty() && _large_cache_bytes <= _large_cache_limit_bytes) {
+        while (bucket > _large_cache_limit_bytes - _large_cache_bytes &&
+               evict_oldest_large_locked(victims)) {}
+        if (bucket <= _large_cache_limit_bytes - _large_cache_bytes) {
+          auto& entries = _large_cache[large_bucket_index(bucket)];
+          entries.splice(entries.end(), incoming);
+          ++_large_cache_sequence;
+          _large_cache_bytes += bucket;
+          _peak_cached_large_bytes = std::max(_peak_cached_large_bytes, _large_cache_bytes);
+          published                = true;
+        }
       }
     }
   }
   if (!published) {
-    if (ready) {
+    if (!incoming.empty()) {
+      release_detached(std::move(incoming));
+    } else if (ready) {
       bool const completed = free_pinned_after(ready->event, ptr);
       if (!completed) { std::ignore = ready->event.reset_no_throw(); }
       std::lock_guard lock(_mutex);
