@@ -752,16 +752,16 @@ TEST_CASE("Large FIFO eviction orders entries across buckets", "[small_pinned][s
   mr.deallocate_sync(large, 20000);
 }
 
-TEST_CASE("Failed large allocation purges the cache and throws out_of_memory",
+TEST_CASE("Impossible large allocation preserves insufficient retained capacity",
           "[small_pinned][statistics]")
 {
-  // No host can pin 1 PiB, so both cudaHostAlloc attempts fail with cudaErrorMemoryAllocation.
+  // No host can pin 1 PiB; the tiny retained cache cannot justify an allocation retry.
   constexpr std::size_t impossible = std::size_t{1} << 50;
   constexpr std::size_t seed_bytes = 100000;  // 128 KiB bucket
   bool const cacheable             = GENERATE(false, true);
   test_fixture f;
   // The default limit makes the impossible request uncacheable; an unbounded limit makes it
-  // cacheable, so it also takes the cache-lookup and post-purge retry path.
+  // cacheable, so both classifications must preserve insufficient retained capacity.
   small_pinned_host_memory_resource mr{
     f.upstream,
     cacheable ? std::numeric_limits<std::size_t>::max()
@@ -772,13 +772,13 @@ TEST_CASE("Failed large allocation purges the cache and throws out_of_memory",
   REQUIRE_THROWS_AS(mr.allocate_sync(impossible), rmm::out_of_memory);
   REQUIRE(::cudaGetLastError() == cudaSuccess);
   auto const stats = mr.get_statistics();
-  REQUIRE(stats.cached_large_bytes == 0);
+  REQUIRE(stats.cached_large_bytes == 128 * 1024);
   REQUIRE(stats.peak_cached_large_bytes == 128 * 1024);
   REQUIRE(stats.large_requests == 2);
   REQUIRE(stats.large_hits == 0);
   REQUIRE(stats.large_misses == (cacheable ? 2 : 1));
   REQUIRE(stats.large_uncacheable == (cacheable ? 0 : 1));
-  REQUIRE(stats.large_evictions == 1);
+  REQUIRE(stats.large_evictions == 0);
 
   // The resource remains usable after the failure.
   auto* ptr = mr.allocate_sync(seed_bytes);
