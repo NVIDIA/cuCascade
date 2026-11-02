@@ -102,12 +102,28 @@ def build_benchmark(build, output, source):
     status = subprocess.check_output(
         ["git", "-C", str(source_root), "status", "--short"], text=True
     )
+    implementation_files = (
+        "include/cucascade/memory/small_pinned_host_memory_resource.hpp",
+        "src/memory/small_pinned_host_memory_resource.cpp",
+        "include/cucascade/cuda/event.hpp",
+        "src/cuda/event.cpp",
+    )
     return {
         "revision": revision,
         "status": status,
         "build": str(build),
         "compile_command": compile_command,
         "link_command": result,
+        "compiler_version": subprocess.check_output(
+            [cache["CMAKE_CXX_COMPILER"], "--version"], text=True
+        ),
+        "implementation_sha256": {
+            name: hashlib.sha256((source_root / name).read_bytes()).hexdigest()
+            for name in implementation_files
+        },
+        "production_library_sha256": hashlib.sha256(
+            (build / "libcucascade.so").read_bytes()
+        ).hexdigest(),
         "configuration": {
             key: cache.get(key)
             for key in (
