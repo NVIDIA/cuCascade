@@ -6,3 +6,5 @@ docs/validation/pinned-host-cache/**/*.json -whitespace
 docs/validation/pinned-host-cache/**/*.jsonl -whitespace
 docs/validation/pinned-host-cache/**/*.csv -whitespace
 docs/validation/pinned-host-cache/**/*.txt -whitespace
+# This measured diagnostic diff retains the mandatory space on blank context lines.
+docs/validation/pinned-host-cache/capture-perf/noquery.patch -whitespace
