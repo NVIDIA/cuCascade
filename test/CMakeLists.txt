@@ -46,8 +46,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   set_target_properties(cucascade_pinned_host_test_variant
                         PROPERTIES CXX_EXTENSIONS OFF)
 
-  add_executable(cucascade_pinned_host_fault_tests
-                 memory/test_pinned_host_faults.cpp)
+  add_executable(
+    cucascade_pinned_host_fault_tests memory/test_pinned_host_faults.cpp
+                                      memory/test_pinned_host_alignment.cpp)
   target_link_libraries(
     cucascade_pinned_host_fault_tests PRIVATE cucascade_pinned_host_test_variant
                                               Catch2::Catch2)
