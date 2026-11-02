@@ -120,8 +120,8 @@ class small_pinned_host_memory_resource {
   /**
    * @brief Waits for recorded work before returning storage
    *
-   * Wait failures are handled as in `deallocate`. Errors from destroying the pooled events are left
-   * to `cuda::cuda_event`'s destructor, which does not clear them.
+   * Wait failures are handled as in `deallocate`. Pooled events use
+   * `cuda::cuda_event::reset_no_throw()` for cleanup.
    */
   ~small_pinned_host_memory_resource() noexcept;
 
@@ -277,7 +277,7 @@ class small_pinned_host_memory_resource {
    * @brief Recycled events of one device
    *
    * Every event `acquire` hands out keeps a reserved slot in the idle list, so `release` never
-   * allocates. Events are therefore destroyed only with this resource.
+   * allocates. Retiring an event removes its reservation from the live-event count.
    */
   class event_pool {
    public:
@@ -293,9 +293,14 @@ class small_pinned_host_memory_resource {
      */
     void release(cuda::cuda_event&& event) noexcept;
 
+    /**
+     * @brief Retires a checked-out event from the pool.
+     */
+    void retire(cuda::cuda_event&& event) noexcept;
+
    private:
     std::vector<cuda::cuda_event> _idle;
-    std::size_t _created{0};  ///< Events created; `_idle.capacity()` never falls below it
+    std::size_t _live_events{0};  ///< Idle and checked-out events with reserved return capacity
   };
 
   struct free_slab {
@@ -339,6 +344,7 @@ class small_pinned_host_memory_resource {
   [[nodiscard]] std::optional<pooled_event> record_ready_event_locked(
     ::cuda::stream_ref stream) noexcept;
   void return_event_locked(pooled_event&& event) noexcept;
+  void retire_event_locked(pooled_event&& event) noexcept;
 
   void* try_take_cached_large_locked(std::size_t bucket, ::cuda::stream_ref stream);
   bool evict_oldest_large_locked(std::list<large_cache_entry>& victims) noexcept;

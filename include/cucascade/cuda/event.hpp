@@ -113,6 +113,16 @@ class cuda_event {
   cuda_event(cuda_event&& other) noexcept;
   cuda_event& operator=(cuda_event&& other) noexcept;
 
+  /**
+   * @brief Relinquish ownership and destroy this event without throwing.
+   *
+   * Does not wait for completion. A failed destruction clears its CUDA error and is never retried;
+   * an empty event succeeds without a CUDA call.
+   *
+   * @return The destruction status, or cudaSuccess when already empty.
+   */
+  [[nodiscard]] cudaError_t reset_no_throw() noexcept;
+
   [[nodiscard]] cudaEvent_t get() const noexcept;
   [[nodiscard]] explicit operator cudaEvent_t() const noexcept;
 
