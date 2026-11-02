@@ -168,6 +168,10 @@ class small_pinned_host_memory_resource {
    * thread's last-error state (sticky context errors excepted). Storage whose GPU completion cannot
    * be confirmed is withheld: it is never reused or freed.
    *
+   * Failed stream-device discovery disables event tracking; reuse or release then requires
+   * confirmed stream completion. Failure to restore the calling thread's previous CUDA device
+   * terminates the process.
+   *
    * @param stream Every prior GPU access to `ptr` must be ordered before work subsequently enqueued
    * on `stream`; the storage may be reused once that point is reached
    * @param ptr Pointer returned by this resource, or `nullptr` for a no-op
