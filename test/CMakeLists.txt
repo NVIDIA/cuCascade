@@ -47,8 +47,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
                         PROPERTIES CXX_EXTENSIONS OFF)
 
   add_executable(
-    cucascade_pinned_host_fault_tests memory/test_pinned_host_faults.cpp
-                                      memory/test_pinned_host_alignment.cpp)
+    cucascade_pinned_host_fault_tests
+    memory/test_pinned_host_faults.cpp memory/test_pinned_host_alignment.cpp
+    memory/test_pinned_host_device_failures.cpp
+    memory/test_pinned_event_lifecycle.cpp)
   target_link_libraries(
     cucascade_pinned_host_fault_tests PRIVATE cucascade_pinned_host_test_variant
                                               Catch2::Catch2)
@@ -56,6 +58,19 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_options(cucascade_pinned_host_fault_tests
                          PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+  add_executable(cucascade_pinned_host_device_restore_helper
+                 memory/pinned_host_device_restore_helper.cpp)
+  target_link_libraries(cucascade_pinned_host_device_restore_helper
+                        PRIVATE cucascade_pinned_host_test_variant)
+  target_compile_options(cucascade_pinned_host_device_restore_helper
+                         PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+  target_compile_definitions(
+    cucascade_pinned_host_fault_tests
+    PRIVATE
+      CUCASCADE_PINNED_HOST_DEVICE_HELPER="$<TARGET_FILE:cucascade_pinned_host_device_restore_helper>"
+  )
+  add_dependencies(cucascade_pinned_host_fault_tests
+                   cucascade_pinned_host_device_restore_helper)
   add_test(NAME cucascade_pinned_host_fault_tests
            COMMAND cucascade_pinned_host_fault_tests)
 
