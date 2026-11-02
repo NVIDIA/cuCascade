@@ -170,7 +170,11 @@ TEST_CASE("Pinned allocation rejects a capturing stream without invalidating it"
   auto const before = resource.get_statistics();
   captured_stream capture{stream};
   void* pointer = nullptr;
-  CHECK_THROWS_AS(pointer = resource.allocate(stream, bytes, alignment), cucascade::logic_error);
+  {
+    observed_cuda_work observation;
+    CHECK_THROWS_AS(pointer = resource.allocate(stream, bytes, alignment), cucascade::logic_error);
+    CHECK(observation.get_calls() == 0);
+  }
   auto const status = capture.finish();
   if (pointer != nullptr) { resource.deallocate_sync(pointer, bytes, alignment); }
   REQUIRE(status == cudaSuccess);
@@ -179,6 +183,7 @@ TEST_CASE("Pinned allocation rejects a capturing stream without invalidating it"
   REQUIRE(after.large_requests == before.large_requests);
   REQUIRE(after.large_hits == before.large_hits);
   REQUIRE(after.large_misses == before.large_misses);
+  REQUIRE(after.large_evictions == before.large_evictions);
 }
 
 TEST_CASE("Rejected pinned deallocation withholds storage without CUDA work",
@@ -188,14 +193,18 @@ TEST_CASE("Rejected pinned deallocation withholds storage without CUDA work",
   std::optional<cucascade::memory::small_pinned_host_memory_resource> resource{
     std::in_place, fixture.upstream, 0};
   rmm::cuda_stream stream;
-  bool const reject      = GENERATE(false, true);
+  auto const mode = GENERATE(
+    capture_rejection_mode::none, capture_rejection_mode::active, capture_rejection_mode::unknown);
+  bool const reject      = mode != capture_rejection_mode::none;
   bool const synchronous = GENERATE(false, true);
   auto* pointer          = resource->allocate_sync(100000);
   std::optional<captured_stream> capture;
-  if (reject && !synchronous) { capture.emplace(stream); }
+  std::optional<capture_rejection> query_failure;
+  if (mode == capture_rejection_mode::active && !synchronous) { capture.emplace(stream); }
+  if (mode == capture_rejection_mode::unknown) { query_failure.emplace(stream, mode); }
   {
     std::optional<cucascade::test::scoped_pinned_host_hook> reported_capture;
-    if (reject && synchronous) {
+    if (mode == capture_rejection_mode::active && synchronous) {
       reported_capture.emplace(
         cucascade::test::pinned_host_operation::stream_capture_status, report_capture, nullptr);
     }
@@ -208,6 +217,7 @@ TEST_CASE("Rejected pinned deallocation withholds storage without CUDA work",
     CHECK((observation.get_calls() == 0) == reject);
   }
   if (capture) { CHECK(capture->finish() == cudaSuccess); }
+  if (query_failure) { CHECK(query_failure->finish() == cudaSuccess); }
   CHECK(cudaGetLastError() == cudaSuccess);
   resource.reset();
   auto const type = pointer_type(pointer);
