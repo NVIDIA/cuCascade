@@ -303,7 +303,7 @@ class small_pinned_host_memory_resource {
      *
      * @return An idle event, or `std::nullopt`
      */
-    [[nodiscard]] std::optional<cuda::cuda_event> try_take() noexcept;
+    [[nodiscard]] std::optional<cuda::cuda_event> try_to_take() noexcept;
 
     /**
      * @brief Reserves a return slot before an event is created outside the pool lock
@@ -389,7 +389,7 @@ class small_pinned_host_memory_resource {
   /**
    * @brief Removes a dedicated pointer's record and returns its original base, or nullptr
    */
-  [[nodiscard]] void* try_take_exceptional_locked(void* ptr) noexcept;
+  [[nodiscard]] void* try_to_take_exceptional_locked(void* ptr) noexcept;
   void deallocate_slab(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
   void deallocate_large(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
 
@@ -400,9 +400,9 @@ class small_pinned_host_memory_resource {
   void return_event_locked(pooled_event&& event) noexcept;
   void retire_event_locked(pooled_event&& event) noexcept;
 
-  void* try_take_cached_large(std::size_t bucket,
-                              ::cuda::stream_ref stream,
-                              bool initial_request = false);
+  void* try_to_take_cached_large(std::size_t bucket,
+                                 ::cuda::stream_ref stream,
+                                 bool initial_request = false);
   bool evict_oldest_large_locked(std::list<large_cache_entry>& victims) noexcept;
   /**
    * @brief Releases enough oldest cached capacity when the cache covers `bytes`

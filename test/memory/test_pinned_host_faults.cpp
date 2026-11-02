@@ -4,6 +4,7 @@
  */
 
 #include "pinned_host_test_hooks.hpp"
+#include "pinned_host_test_utils.hpp"
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
@@ -17,19 +18,14 @@
 
 namespace {
 
+using cucascade::test::require_pointer_type;
+
 struct pinned_fixture {
   rmm::mr::pinned_host_memory_resource pinned;
   cucascade::memory::fixed_size_host_memory_resource upstream{
     0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
   cucascade::memory::small_pinned_host_memory_resource resource{upstream, 0};
 };
-
-void require_pointer_type(void* pointer, cudaMemoryType type)
-{
-  cudaPointerAttributes attributes{};
-  REQUIRE(cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess);
-  REQUIRE(attributes.type == type);
-}
 
 }  // namespace
 

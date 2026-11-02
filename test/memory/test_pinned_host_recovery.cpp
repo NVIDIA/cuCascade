@@ -4,6 +4,7 @@
  */
 
 #include "pinned_host_test_hooks.hpp"
+#include "pinned_host_test_utils.hpp"
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
@@ -19,6 +20,8 @@
 #include <tuple>
 
 namespace {
+
+using cucascade::test::require_pointer_type;
 
 struct recovery_fixture {
   rmm::mr::pinned_host_memory_resource pinned;
@@ -47,13 +50,6 @@ struct allocation_trace {
   }
 };
 
-void require_recovery_pointer_type(void* pointer, cudaMemoryType type)
-{
-  cudaPointerAttributes attributes{};
-  REQUIRE(cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess);
-  REQUIRE(attributes.type == type);
-}
-
 }  // namespace
 
 TEST_CASE("Rounded pinned OOM uses uncached exact storage without reclaiming retained buffers",
@@ -75,7 +71,7 @@ TEST_CASE("Rounded pinned OOM uses uncached exact storage without reclaiming ret
   CHECK(fixture.resource.large_cache_bytes() == 16384);
   std::memset(pointer, 0x37, 40000);
   fixture.resource.deallocate_sync(pointer, 40000);
-  require_recovery_pointer_type(pointer, cudaMemoryTypeUnregistered);
+  require_pointer_type(pointer, cudaMemoryTypeUnregistered);
   REQUIRE(fixture.resource.large_cache_bytes() == 16384);
   auto const statistics = fixture.resource.get_statistics();
   REQUIRE(statistics.large_requests == 2);
@@ -113,7 +109,7 @@ TEST_CASE("Exact pinned OOM reclaims only enough oldest retained capacity and re
   REQUIRE(fixture.resource.large_cache_bytes() == 49152);
   REQUIRE(fixture.resource.get_statistics().large_evictions == 2);
   fixture.resource.deallocate_sync(pointer, 50000);
-  require_recovery_pointer_type(pointer, cudaMemoryTypeUnregistered);
+  require_pointer_type(pointer, cudaMemoryTypeUnregistered);
   auto* retained = fixture.resource.allocate_sync(20000);
   REQUIRE(retained == seeds[2]);
   fixture.resource.deallocate_sync(retained, 20000);
@@ -225,7 +221,7 @@ TEST_CASE("Exact recovery distinguishes retained capacity below equal and above 
   REQUIRE(fixture.resource.get_statistics().large_evictions == (succeeds ? 2 : 0));
   if (pointer != nullptr) {
     fixture.resource.deallocate_sync(pointer, 65536);
-    require_recovery_pointer_type(pointer, cudaMemoryTypeUnregistered);
+    require_pointer_type(pointer, cudaMemoryTypeUnregistered);
   }
 }
 
@@ -286,7 +282,7 @@ TEST_CASE("Dedicated OOM reclamation uses the padded backing size",
     REQUIRE(reinterpret_cast<std::uintptr_t>(pointer) % 8192 == 0);
     std::memset(pointer, 0x48, 9000);
     fixture.resource.deallocate_sync(pointer, 9000, 8192);
-    require_recovery_pointer_type(pointer, cudaMemoryTypeUnregistered);
+    require_pointer_type(pointer, cudaMemoryTypeUnregistered);
   } else {
     REQUIRE(fixture.resource.large_cache_bytes() == 16384);
     fixture.resource.deallocate_sync(seeds[1], 9000);
@@ -340,7 +336,7 @@ TEST_CASE("Unconfirmed reclamation withholds its victim without extending the re
   }
   REQUIRE(trace.count == 3);
   REQUIRE(fixture.resource.large_cache_bytes() == 32768);
-  require_recovery_pointer_type(seeds[0], cudaMemoryTypeHost);
+  require_pointer_type(seeds[0], cudaMemoryTypeHost);
   REQUIRE(cudaGetLastError() == cudaSuccess);
   fixture.resource.deallocate_sync(pointer, 50000);
   REQUIRE(cudaFreeHost(seeds[0]) == cudaSuccess);
@@ -374,7 +370,7 @@ TEST_CASE("Uncacheable exact recovery stays untracked and releases its original 
   REQUIRE(statistics.large_uncacheable == 1);
   REQUIRE(statistics.large_evictions == 3);
   fixture.resource.deallocate_sync(pointer, 70000);
-  require_recovery_pointer_type(pointer, cudaMemoryTypeUnregistered);
+  require_pointer_type(pointer, cudaMemoryTypeUnregistered);
 }
 
 TEST_CASE("Deferred OOM reporting preserves an unrelated CUDA error",
