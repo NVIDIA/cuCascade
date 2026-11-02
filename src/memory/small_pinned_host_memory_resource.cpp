@@ -26,6 +26,7 @@
 #include <bit>
 #include <cassert>
 #include <concepts>
+#include <exception>
 #include <limits>
 #include <list>
 #include <optional>
@@ -83,6 +84,7 @@ class event_creation_device_guard {
                                         cudaSetDevice(_previous_device),
                                         {.device = _previous_device}) != cudaSuccess) {
       std::ignore = cudaGetLastError();
+      std::terminate();
     }
   }
 
@@ -100,11 +102,6 @@ int device_of_stream(::cuda::stream_ref stream) noexcept
                                       cudaStreamGetDevice(stream.get(), &device),
                                       {.device_out = &device, .stream = stream.get()}) ==
       cudaSuccess) {
-    return device;
-  }
-  std::ignore = cudaGetLastError();
-  if (CUCASCADE_PINNED_HOST_CUDA_CALL(
-        current_device, cudaGetDevice(&device), {.device_out = &device}) == cudaSuccess) {
     return device;
   }
   std::ignore = cudaGetLastError();
