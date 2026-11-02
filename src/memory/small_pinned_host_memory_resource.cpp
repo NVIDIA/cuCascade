@@ -34,6 +34,7 @@
 #include <optional>
 #include <ranges>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -137,6 +138,12 @@ void free_pinned_no_throw(void* ptr) noexcept
       cudaSuccess) {
     std::ignore = cudaGetLastError();
   }
+}
+
+[[noreturn]] void throw_pinned_out_of_memory(std::size_t bytes)
+{
+  throw rmm::out_of_memory{"Pinned host allocation of " + std::to_string(bytes) +
+                           " bytes failed after permitted recovery"};
 }
 
 // Returns whether completion was confirmed. An unsuccessful free still withholds the buffer.
@@ -254,25 +261,28 @@ void* small_pinned_host_memory_resource::allocate_exceptional(
   pending.emplace(nullptr, nullptr);
   auto node = pending.extract(nullptr);
 
-  void* base  = nullptr;
-  auto status = cudaErrorMemoryAllocation;
+  void* base = nullptr;
   if (!exact_attempt_failed) {
-    status =
+    auto const status =
       CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
                                       cudaHostAlloc(&base, alloc_bytes, pinned_host_alloc_flags),
                                       {.bytes = alloc_bytes, .buffer_out = &base});
-  }
-  if (status == cudaErrorMemoryAllocation) {
-    if (!exact_attempt_failed) { std::ignore = cudaGetLastError(); }
-    if (void* cached = try_cached()) { return cached; }
-    if (reclaim_large_cache(alloc_bytes)) {
-      status =
-        CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
-                                        cudaHostAlloc(&base, alloc_bytes, pinned_host_alloc_flags),
-                                        {.bytes = alloc_bytes, .buffer_out = &base});
+    if (status == cudaErrorMemoryAllocation) {
+      std::ignore          = cudaGetLastError();
+      exact_attempt_failed = true;
+    } else {
+      CUCASCADE_CUDA_TRY_ALLOC(status, alloc_bytes);
     }
   }
-  CUCASCADE_CUDA_TRY_ALLOC(status, alloc_bytes);
+  if (exact_attempt_failed) {
+    if (void* cached = try_cached()) { return cached; }
+    if (!reclaim_large_cache(alloc_bytes)) { throw_pinned_out_of_memory(alloc_bytes); }
+    CUCASCADE_CUDA_TRY_ALLOC(
+      CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
+                                      cudaHostAlloc(&base, alloc_bytes, pinned_host_alloc_flags),
+                                      {.bytes = alloc_bytes, .buffer_out = &base}),
+      alloc_bytes);
+  }
   std::unique_ptr<void, decltype(&free_pinned_no_throw)> allocation{base, free_pinned_no_throw};
   void* ptr  = base;
   auto space = alloc_bytes;
@@ -340,7 +350,7 @@ void* small_pinned_host_memory_resource::allocate_large(::cuda::stream_ref strea
   if (cacheable) {
     return allocate_exceptional(bytes, alignof(std::max_align_t), alloc_bytes == bytes, stream);
   }
-  if (!reclaim_large_cache(bytes)) { CUCASCADE_CUDA_TRY_ALLOC(cudaErrorMemoryAllocation, bytes); }
+  if (!reclaim_large_cache(bytes)) { throw_pinned_out_of_memory(bytes); }
   CUCASCADE_CUDA_TRY_ALLOC(
     CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
                                     cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags),

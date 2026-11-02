@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <thread>
+#include <tuple>
 
 namespace {
 
@@ -374,4 +375,29 @@ TEST_CASE("Uncacheable exact recovery stays untracked and releases its original 
   REQUIRE(statistics.large_evictions == 3);
   fixture.resource.deallocate_sync(pointer, 70000);
   require_recovery_pointer_type(pointer, cudaMemoryTypeUnregistered);
+}
+
+TEST_CASE("Deferred OOM reporting preserves an unrelated CUDA error",
+          "[small_pinned][pinned_recovery][fault_injection]")
+{
+  recovery_fixture fixture;
+  cudaError_t unrelated_status = cudaSuccess;
+  auto unrelated_error         = [](cucascade::test::pinned_host_call const&,
+                            void* context) noexcept -> std::optional<cudaError_t> {
+    cudaDeviceProp properties{};
+    *static_cast<cudaError_t*>(context) = cudaGetDeviceProperties(&properties, -1);
+    return std::nullopt;
+  };
+  {
+    cucascade::test::scoped_pinned_host_hook allocation{
+      cucascade::test::pinned_host_operation::host_alloc, cudaErrorMemoryAllocation};
+    cucascade::test::scoped_pinned_host_hook metadata{
+      cucascade::test::pinned_host_operation::exceptional_allocation,
+      unrelated_error,
+      &unrelated_status};
+    REQUIRE_THROWS_AS(fixture.resource.allocate_sync(65536), rmm::out_of_memory);
+  }
+  REQUIRE(unrelated_status == cudaErrorInvalidDevice);
+  CHECK(cudaPeekAtLastError() == cudaErrorInvalidDevice);
+  std::ignore = cudaGetLastError();
 }
