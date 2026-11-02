@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "../pinned_host_test_hooks.hpp"
+
 #include <cucascade/error.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
@@ -52,12 +54,15 @@ class event_creation_device_guard {
   explicit event_creation_device_guard(int device) noexcept
   {
     int current_device = -1;
-    if (cudaGetDevice(&current_device) != cudaSuccess) {
+    if (CUCASCADE_PINNED_HOST_CUDA_CALL(current_device,
+                                        cudaGetDevice(&current_device),
+                                        {.device_out = &current_device}) != cudaSuccess) {
       std::ignore = cudaGetLastError();
       return;
     }
     if (current_device != device) {
-      if (cudaSetDevice(device) != cudaSuccess) {
+      if (CUCASCADE_PINNED_HOST_CUDA_CALL(set_device, cudaSetDevice(device), {.device = device}) !=
+          cudaSuccess) {
         std::ignore = cudaGetLastError();
         return;
       }
@@ -73,7 +78,10 @@ class event_creation_device_guard {
 
   ~event_creation_device_guard() noexcept
   {
-    if (_previous_device >= 0 && cudaSetDevice(_previous_device) != cudaSuccess) {
+    if (_previous_device >= 0 &&
+        CUCASCADE_PINNED_HOST_CUDA_CALL(set_device,
+                                        cudaSetDevice(_previous_device),
+                                        {.device = _previous_device}) != cudaSuccess) {
       std::ignore = cudaGetLastError();
     }
   }
@@ -88,9 +96,17 @@ class event_creation_device_guard {
 int device_of_stream(::cuda::stream_ref stream) noexcept
 {
   int device = -1;
-  if (cudaStreamGetDevice(stream.get(), &device) == cudaSuccess) { return device; }
+  if (CUCASCADE_PINNED_HOST_CUDA_CALL(stream_device,
+                                      cudaStreamGetDevice(stream.get(), &device),
+                                      {.device_out = &device, .stream = stream.get()}) ==
+      cudaSuccess) {
+    return device;
+  }
   std::ignore = cudaGetLastError();
-  if (cudaGetDevice(&device) == cudaSuccess) { return device; }
+  if (CUCASCADE_PINNED_HOST_CUDA_CALL(
+        current_device, cudaGetDevice(&device), {.device_out = &device}) == cudaSuccess) {
+    return device;
+  }
   std::ignore = cudaGetLastError();
   return -1;
 }
@@ -99,7 +115,11 @@ int device_of_stream(::cuda::stream_ref stream) noexcept
 // withhold storage the work may still use.
 [[nodiscard]] bool wait_no_throw(::cuda::stream_ref stream) noexcept
 {
-  if (cudaStreamSynchronize(stream.get()) == cudaSuccess) { return true; }
+  if (CUCASCADE_PINNED_HOST_CUDA_CALL(stream_synchronize,
+                                      cudaStreamSynchronize(stream.get()),
+                                      {.stream = stream.get()}) == cudaSuccess) {
+    return true;
+  }
   std::ignore = cudaGetLastError();
   return false;
 }
@@ -114,7 +134,10 @@ int device_of_stream(::cuda::stream_ref stream) noexcept
 // A failed free has an unknown effect, so the buffer is leaked.
 void free_pinned_no_throw(void* ptr) noexcept
 {
-  if (cudaFreeHost(ptr) != cudaSuccess) { std::ignore = cudaGetLastError(); }
+  if (CUCASCADE_PINNED_HOST_CUDA_CALL(host_free, cudaFreeHost(ptr), {.buffer = ptr}) !=
+      cudaSuccess) {
+    std::ignore = cudaGetLastError();
+  }
 }
 
 // Frees a direct pinned buffer once `completion` confirms its GPU work is done, and leaks it
@@ -215,7 +238,10 @@ void* small_pinned_host_memory_resource::allocate_large(::cuda::stream_ref strea
   }
 
   void* ptr = nullptr;
-  if (auto const status = cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags);
+  if (auto const status =
+        CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
+                                        cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags),
+                                        {.bytes = alloc_bytes, .buffer_out = &ptr});
       status != cudaErrorMemoryAllocation) {
     // Returns on success. Releasing cached buffers cannot fix any other failure, so it throws.
     CUCASCADE_CUDA_TRY_ALLOC(status, alloc_bytes);
@@ -231,7 +257,11 @@ void* small_pinned_host_memory_resource::allocate_large(::cuda::stream_ref strea
     std::lock_guard lock(_mutex);
     if (void* cached = try_take_cached_large_locked(bucket, stream)) { return cached; }
   }
-  CUCASCADE_CUDA_TRY_ALLOC(cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags), alloc_bytes);
+  CUCASCADE_CUDA_TRY_ALLOC(
+    CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
+                                    cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags),
+                                    {.bytes = alloc_bytes, .buffer_out = &ptr}),
+    alloc_bytes);
   return ptr;
 }
 
@@ -254,6 +284,7 @@ void small_pinned_host_memory_resource::deallocate_slab(::cuda::stream_ref strea
   try {
     // expand_pool_locked reserved room for every slab, so this grows the list only when `bytes`
     // broke the deallocate contract.
+    CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(slab_return);
     _free_lists[idx].emplace_back(ptr, std::move(ready));
   } catch (...) {
     // The growth failed before `ready` was moved. The slab stays backed by _owned_allocations and
@@ -286,6 +317,7 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
              evict_oldest_large_locked(victims)) {}
       assert(bucket <= _large_cache_limit_bytes - _large_cache_bytes);
       try {
+        CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(large_cache_entry);
         _large_cache[large_bucket_index(bucket)].emplace_back(
           ptr, std::move(*ready), _large_cache_sequence);
         ++_large_cache_sequence;
@@ -417,6 +449,7 @@ std::optional<cuda::cuda_event> small_pinned_host_memory_resource::event_pool::a
   }
   try {
     // Reserve the slot this event occupies when it returns, so release cannot allocate.
+    CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(event_pool_reserve);
     _idle.reserve(_created + 1);
     // An event can be recorded only on a stream of the device that was current at its creation.
     event_creation_device_guard const device_guard{device};

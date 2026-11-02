@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "../pinned_host_test_hooks.hpp"
+
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
 
@@ -25,12 +27,16 @@ namespace cuda {
 
 cuda_event::cuda_event(unsigned int flags)
 {
-  CUCASCADE_CUDA_TRY(::cudaEventCreateWithFlags(&event_, flags));
+  CUCASCADE_CUDA_TRY(CUCASCADE_PINNED_HOST_CUDA_CALL(
+    event_create, ::cudaEventCreateWithFlags(&event_, flags), {.event_out = &event_}));
 }
 
 cuda_event::~cuda_event() noexcept
 {
-  if (event_ != nullptr) { CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(event_)); }
+  if (event_ != nullptr) {
+    CUCASCADE_ASSERT_CUDA_SUCCESS(CUCASCADE_PINNED_HOST_CUDA_CALL(
+      event_destroy, ::cudaEventDestroy(event_), {.event = event_}));
+  }
 }
 
 cuda_event::cuda_event(cuda_event&& other) noexcept : event_(std::exchange(other.event_, nullptr))
@@ -40,7 +46,10 @@ cuda_event::cuda_event(cuda_event&& other) noexcept : event_(std::exchange(other
 cuda_event& cuda_event::operator=(cuda_event&& other) noexcept
 {
   if (this != &other) {
-    if (event_ != nullptr) { CUCASCADE_ASSERT_CUDA_SUCCESS(::cudaEventDestroy(event_)); }
+    if (event_ != nullptr) {
+      CUCASCADE_ASSERT_CUDA_SUCCESS(CUCASCADE_PINNED_HOST_CUDA_CALL(
+        event_destroy, ::cudaEventDestroy(event_), {.event = event_}));
+    }
     event_ = std::exchange(other.event_, nullptr);
   }
   return *this;
@@ -76,19 +85,28 @@ cudaError_t cuda_event::query_raw_status() const noexcept { return view().query_
 
 void cuda_event_view::record(::cuda::stream_ref stream)
 {
-  CUCASCADE_CUDA_TRY(::cudaEventRecord(event_, stream.get()));
+  CUCASCADE_CUDA_TRY(CUCASCADE_PINNED_HOST_CUDA_CALL(event_record,
+                                                     ::cudaEventRecord(event_, stream.get()),
+                                                     {.stream = stream.get(), .event = event_}));
 }
 
 void cuda_event_view::wait(::cuda::stream_ref stream) const
 {
-  CUCASCADE_CUDA_TRY(::cudaStreamWaitEvent(stream.get(), event_, 0));
+  CUCASCADE_CUDA_TRY(CUCASCADE_PINNED_HOST_CUDA_CALL(event_wait,
+                                                     ::cudaStreamWaitEvent(stream.get(), event_, 0),
+                                                     {.stream = stream.get(), .event = event_}));
 }
 
-void cuda_event_view::synchronize() const { CUCASCADE_CUDA_TRY(::cudaEventSynchronize(event_)); }
+void cuda_event_view::synchronize() const
+{
+  CUCASCADE_CUDA_TRY(CUCASCADE_PINNED_HOST_CUDA_CALL(
+    event_synchronize, ::cudaEventSynchronize(event_), {.event = event_}));
+}
 
 cudaError_t cuda_event_view::synchronize_no_throw() const noexcept
 {
-  return ::cudaEventSynchronize(event_);
+  return CUCASCADE_PINNED_HOST_CUDA_CALL(
+    event_synchronize, ::cudaEventSynchronize(event_), {.event = event_});
 }
 
 std::chrono::duration<float, std::milli> cuda_event_view::elapsed_time(cuda_event_view start) const

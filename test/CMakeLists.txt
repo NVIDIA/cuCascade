@@ -25,6 +25,39 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
+  # Compile the real core separately so private fault controls cannot affect
+  # production targets.
+  get_target_property(cucascade_pinned_host_test_sources cucascade_objects
+                      SOURCES)
+  add_library(
+    cucascade_pinned_host_test_variant STATIC
+    ${cucascade_pinned_host_test_sources} memory/pinned_host_test_hooks.cpp)
+  target_compile_definitions(cucascade_pinned_host_test_variant
+                             PRIVATE CUCASCADE_ENABLE_PINNED_HOST_TEST_HOOKS)
+  target_compile_features(cucascade_pinned_host_test_variant PUBLIC cxx_std_20)
+  target_compile_options(cucascade_pinned_host_test_variant
+                         PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+  target_include_directories(
+    cucascade_pinned_host_test_variant
+    PUBLIC ${PROJECT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(cucascade_pinned_host_test_variant
+                        PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
+  set_target_properties(cucascade_pinned_host_test_variant
+                        PROPERTIES CXX_EXTENSIONS OFF)
+
+  add_executable(cucascade_pinned_host_fault_tests
+                 memory/test_pinned_host_faults.cpp)
+  target_link_libraries(
+    cucascade_pinned_host_fault_tests PRIVATE cucascade_pinned_host_test_variant
+                                              Catch2::Catch2)
+  target_include_directories(cucascade_pinned_host_fault_tests
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_options(cucascade_pinned_host_fault_tests
+                         PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+  add_test(NAME cucascade_pinned_host_fault_tests
+           COMMAND cucascade_pinned_host_fault_tests)
+
   # Core (cudf-free) test executable - links only the cudf-free cucascade core.
   add_executable(
     cucascade_tests
