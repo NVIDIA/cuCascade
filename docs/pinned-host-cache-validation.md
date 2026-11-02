@@ -6,16 +6,43 @@ This is the validation record for [ticket 11](https://github.com/kevkrist/cuCasc
 
 The local host has one NVIDIA GB10 GPU, Linux aarch64, driver 580.126.09, GNU C++ 15.3.0, and CUDA 13.2.86. The nightly environment provides RMM/cuDF 26.12 and CCCL 3.6; the installed stable environment provides RMM/cuDF 26.10 and CCCL 3.5. Both builds use Release, warnings as errors, and the normal production core, cuDF, and I/O libraries. Local builds target SM 120; external builds must select their own GPU architectures.
 
-Initial full-suite evidence at feature revision `06a3097` plus the two production controls:
+Final full-suite evidence at validation commit `10d9899` (reviewed feature cleanup `b2724f4`, two production controls, and the statistics test/documentation correction below), with fixed seed `218056058`:
 
 | Environment | Production pinned | Private fault/event | Full cuDF |
 | --- | --- | --- | --- |
-| Nightly | 38 passed, 3 skipped; 877 assertions | 54 passed; 939 assertions | 197 passed, 2 skipped; 2,737 assertions |
-| Stable | 38 passed, 3 skipped; 886 assertions | 54 passed; 939 assertions | 197 passed, 2 skipped; 2,738 assertions |
+| Nightly | 38 passed, 3 skipped; 868 assertions | 54 passed; 948 assertions | 197 passed, 2 skipped; 2,736 assertions |
+| Stable | 38 passed, 3 skipped; 958 assertions | 54 passed; 948 assertions | 197 passed, 2 skipped; 2,737 assertions |
 
-Assertion totals in concurrent cases vary with scheduling. Every skip above requires physical multiple GPUs. Both production libraries also passed a dynamic-symbol check for absence of private test hooks. Final revision checks and paired measurements will be recorded after the mechanical integration cleanup. The single-GPU host cannot satisfy the production multi-GPU gate or reproduce the original four-L40S application measurements.
+The concurrent statistics case also passed 20 separate process runs in each environment, seeds `218056058` through `218056077`, including the original failing seed. [Compact reports and summary](validation/pinned-host-cache/final-tests/summary.json) are retained. JUnit case counts include named sections and therefore exceed Catch's test-case totals above. Assertion totals in concurrent cases vary with scheduling. Every skip above requires physical multiple GPUs. Both production libraries also passed a dynamic-symbol check for absence of private test hooks. The single-GPU host cannot satisfy the production multi-GPU gate or reproduce the original four-L40S application measurements.
+
+Owned C++ changes pass clang-format 20.1.4, the runner passes Black 25.1.0, the test source list passes cmake-format 0.6.13, and owned source/docs pass codespell and `git diff --check`. Both baseline and candidate benchmark executables compile/link with warnings as errors. Generated evidence is copied byte for byte from original reports; [SHA256SUMS](validation/pinned-host-cache/SHA256SUMS) covers the checked-in evidence files. Formatting these reports must not rewrite the original metadata.
 
 The fault executable compiles the real allocator and event implementation with private, scoped system-boundary hooks. It is separate from the production test executable and does not replace production-path validation. The two added `[small_pinned][production]` controls exercise over-aligned storage through a real mapped GPU kernel and zero/null synchronous and asynchronous wrappers during active capture. Existing production tests exercise real pending DMA and cross-stream reuse. Failure-path red/green evidence belongs to the implementation tickets; these additional controls verify already implemented production behavior.
+
+### Statistics test correction
+
+A final stable rerun exposed an intermittent test-assumption regression: seed `218056058` observed 58 arriving requests but only 57 classified hits/misses/uncacheable requests. The [original failure](validation/pinned-host-cache/statistics-before-fix.txt) is retained. Cache-hit wait submission now occurs outside the cache mutex, so a snapshot can observe an arriving hit before successful submission classifies it. This is a staged snapshot, not a lost request.
+
+The concurrent nonfault test now bounds the temporary deficit by the number of workers, while retaining monotonicity, cache-cap/peak bounds, and exact conservation after workers finish. The gated progress control also checks literal counts while a hit wait is paused (2 requests, 0 hits, 1 miss), then checks 2 requests, 1 hit, 1 miss and exact conservation after joining. The statistics-scope documentation records this behavior alongside existing failure/retry both/neither semantics. This repair changes tests and documentation only.
+
+### Paired production allocator results
+
+Baseline is exactly `69ef173b10a75363d80aa3a8df833f2858159034`. The controlled measurement candidate is clean commit `5253670034dcb96cd14ebff4ba34a377977f911f`, containing reviewed feature cleanup `b2724f4` and the validation harness. The later statistics repair changes only tests and documentation. Both revision builds use the same compiler, Release flags, SM 120, dependencies, and CUDF/IO/benchmark build options; each executable uses that revision's own headers and production library. [Metadata](validation/pinned-host-cache/controlled/metadata.json) records exact commands, compiler version, implementation/header hashes, benchmark-source hash, and library hashes.
+
+An initial five-pair run used the scheduler's broad inherited CPU affinity. It had bimodal 6/12 ms single-thread trials and large variance: hit/full-control throughput coefficients of variation were 17.6/11.3% and 37.5/38.3% for baseline/candidate. It reported median losses of 18.1% for mixed full-cap traffic, 9.6% for deterministic eviction, and 14.0% for half-cap rounding. These [raw results](validation/pinned-host-cache/exploratory/raw.jsonl) and [summary](validation/pinned-host-cache/exploratory/summary.json) remain available; they were not discarded or normalized by hit mix.
+
+The follow-up uses seven alternating pairs, identical affinity on CPUs 15-18 (each reports capacity 1017), 10x longer mixed full-cap loops, and 100x longer deterministic control loops. CPU and GPU frequencies were not locked. [Hardware inventory](validation/pinned-host-cache/controlled/hardware.json), [raw results](validation/pinned-host-cache/controlled/raw.jsonl), and [summary](validation/pinned-host-cache/controlled/summary.json) are retained. Throughput below is allocation/deallocation pairs per second; CV is sample standard deviation divided by mean across the seven trials.
+
+| Case | Baseline median | Candidate median | Throughput change | Baseline/candidate CV |
+| --- | ---: | ---: | ---: | ---: |
+| Concurrent hits | 943,111 | 2,383,439 | +152.72% | 1.4% / 9.8% |
+| Concurrent full-cap | 196,629 | 230,953 | +17.46% | 0.9% / 2.1% |
+| Deterministic full-cap | 1,024,324 | 942,635 | **-7.98%** | 0.3% / 0.2% |
+| Half-cap rounding | 21.17 | 21.45 | +1.32% | 7.0% / 10.3% |
+
+The deterministic regression is reproducible and exceeds the approved 5% threshold. Every controlled deterministic trial has exactly 300,000 hits, 300,000 misses, and 300,000 evictions in both revisions. Mixed concurrent hit counts differ and remain in the raw record; the mixed improvement does not erase the deterministic regression. Half-cap variability limits claims about small differences. **The performance gate remains open** pending resolution or an explicitly approved plan revision, in addition to the missing original application comparison.
+
+Separate Nsight Systems diagnostics use 10,000 deterministic iterations and are excluded from acceptance timing. Both traces have 10,130 `cudaHostAlloc`, 10,130 `cudaFreeHost`, 20,257 event records, 10,128 stream waits, and 10,129 event synchronizations, including setup/warmup/teardown. The candidate additionally issues 40,514 capture-status queries, four per two-allocation loop plus warmup/setup, while the baseline issues none. [Baseline](validation/pinned-host-cache/api-diagnostics/baseline-api.csv) and [candidate](validation/pinned-host-cache/api-diagnostics/candidate-api.csv) API summaries identify the added capture checks as an overhead contributor; instrumented durations cannot prove that they account for the entire uninstrumented loss. No allocator algorithm or capture guarantee was changed in response to these timings.
 
 ## Build and run on the external host
 
@@ -101,6 +128,8 @@ pixi run -e default python scripts/benchmark_pinned_host_cache.py \
 ```
 
 The baseline checkout does not need the benchmark source backported. The runner uses the same candidate benchmark source for both revisions, rejects differing compiler/configuration settings, alternates baseline/candidate order between pairs, and saves raw JSONL, metadata, and medians/minimum/maximum/sample coefficient of variation. Record hardware and active GPU selection separately. Keep the output directory; a second run must use a fresh directory.
+
+On a heterogeneous CPU, choose the same homogeneous group for both revisions and record it. The local controlled command prefixed the runner with `taskset --cpu-list 15-18` and used `--pairs 7`. Those CPU IDs are specific to this machine. The runner records inherited CPU affinity; defaults are 500,000 hit iterations, 30,000 mixed full-cap iterations, 300,000 deterministic control iterations, and 40 half-cap iterations, each per worker. Override them with `--hit-iterations`, `--full-iterations`, `--control-iterations`, and `--half-iterations` when trials are too short or variable.
 
 Each worker creates its own real nonblocking stream and completes untimed warmup before the timed gate. Timing includes the operation loops, final stream synchronization, and worker teardown. Counters subtract warmup. One operation is one allocation/deallocation pair; a two-allocation iteration counts twice. No buffer contents are initialized or copied inside the timed loops.
 

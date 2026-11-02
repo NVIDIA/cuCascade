@@ -15,6 +15,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <thread>
