@@ -42,14 +42,16 @@ namespace memory {
 /**
  * @brief Provides pooled pinned host memory for small and large allocations
  *
- * Requests up to @ref MAX_SLAB_SIZE use five slab pools: 512 B, 1 KiB, 2 KiB, 4 KiB, and 8 KiB.
- * Each pool grows on demand by carving a block from @ref fixed_size_host_memory_resource into slabs
- * of the corresponding size.
+ * Requests with alignment no greater than `alignof(std::max_align_t)` and size up to @ref
+ * MAX_SLAB_SIZE use five slab pools: 512 B, 1 KiB, 2 KiB, 4 KiB, and 8 KiB. Each pool grows on
+ * demand by carving a block from @ref fixed_size_host_memory_resource into slabs of the
+ * corresponding size.
  *
- * Larger requests are rounded to a power-of-two bucket only when that bucket is representable and
- * fits the configured cache limit; other requests allocate exactly the requested size. Buffers
- * larger than @ref MAX_SLAB_SIZE are portable and mapped. @p large_cache_limit_bytes bounds entries
- * retained for stream-ordered reuse, which may still have GPU work pending.
+ * Larger requests with ordinary alignment are rounded to a power-of-two bucket only when that
+ * bucket is representable and fits the configured cache limit; other requests allocate exactly the
+ * requested size. Stricter alignment uses dedicated allocations with alignment padding, which are
+ * never cached. Direct allocations are portable and mapped. @p large_cache_limit_bytes bounds
+ * entries retained for stream-ordered reuse, which may still have GPU work pending.
  *
  * The cache limit is not a cap on total pinned memory. It excludes live allocations, slab storage,
  * evicted buffers whose GPU work has not finished, and storage withheld after a CUDA error. To
@@ -93,10 +95,10 @@ class small_pinned_host_memory_resource {
   struct statistics {
     std::size_t cached_large_bytes;       ///< Retained cache entry capacity.
     std::size_t peak_cached_large_bytes;  ///< Highest retained capacity; purges do not reset it.
-    std::uint64_t large_requests;         ///< Nonzero requests larger than `MAX_SLAB_SIZE`.
+    std::uint64_t large_requests;         ///< Valid nonzero requests larger than `MAX_SLAB_SIZE`.
     std::uint64_t large_hits;         ///< Successful cache takes after establishing reuse order.
     std::uint64_t large_misses;       ///< Initial cache lookups that found no entry.
-    std::uint64_t large_uncacheable;  ///< Requests whose bucket is not cacheable.
+    std::uint64_t large_uncacheable;  ///< Requests whose size or alignment bypasses caching.
     std::uint64_t large_evictions;    ///< Cached entries detached for cap eviction or purge.
   };
 
@@ -140,19 +142,20 @@ class small_pinned_host_memory_resource {
    * buffers. A freshly allocated large buffer is host-ready on return, but callers must not rely on
    * which case occurred.
    *
-   * When a direct pinned allocation runs out of memory, releases the retained large buffers the way
-   * `deallocate` releases evicted ones, then retries once.
+   * When a normally aligned large allocation runs out of memory, releases the retained large
+   * buffers the way `deallocate` releases evicted ones, then retries once.
    *
    * @throw rmm::out_of_memory If a direct pinned allocation fails with `cudaErrorMemoryAllocation`
-   * after releasing retained large buffers, or the upstream resource cannot supply a block for a
-   * slab pool
-   * @throw rmm::bad_alloc If a direct pinned allocation fails with any other CUDA error; retained
-   * buffers are kept
+   * after permitted recovery, or the upstream resource cannot supply a slab block
+   * @throw rmm::bad_alloc If a direct pinned allocation fails with any other CUDA error, or its
+   * size plus alignment padding overflows; retained buffers are kept
    * @throw cucascade::cuda_error If ordering a reused buffer after its pending GPU work fails
-   * @throw std::invalid_argument If the upstream block size is smaller than the needed slab size
+   * @throw std::bad_alloc If allocation metadata cannot be acquired
+   * @throw std::invalid_argument For a nonzero request, if alignment is not a nonzero power of two,
+   * or the upstream block size is smaller than the needed slab size
    * @param stream Stream on which reuse dependencies are inserted
    * @param bytes Requested size
-   * @param alignment Requested alignment; currently not used to select storage
+   * @param alignment Requested nonzero power-of-two address alignment
    * @return Pointer to at least `bytes` bytes, or `nullptr` for a zero-byte request
    */
   void* allocate(::cuda::stream_ref stream,
@@ -160,7 +163,7 @@ class small_pinned_host_memory_resource {
                  std::size_t alignment = alignof(std::max_align_t));
 
   /**
-   * @brief Returns memory to its pool or releases a noncacheable large buffer
+   * @brief Returns memory to its pool or releases dedicated storage
    *
    * A large buffer that needs room in a full cache evicts the oldest cached entries first. This
    * call may block until GPU work completes on `stream` or on the streams that freed the evicted
@@ -175,9 +178,9 @@ class small_pinned_host_memory_resource {
    * @param stream Every prior GPU access to `ptr` must be ordered before work subsequently enqueued
    * on `stream`; the storage may be reused once that point is reached
    * @param ptr Pointer returned by this resource, or `nullptr` for a no-op
-   * @param bytes Must equal the `bytes` passed to the matching `allocate` call. It selects the slab
-   * pool or bucket the storage returns to; any other value is undefined behavior
-   * @param alignment Original requested alignment
+   * @param bytes Must equal the `bytes` passed to the matching `allocate` call; any other value is
+   * undefined behavior
+   * @param alignment Must equal the alignment passed to the matching `allocate` call
    */
   void deallocate(::cuda::stream_ref stream,
                   void* ptr,
@@ -253,7 +256,7 @@ class small_pinned_host_memory_resource {
   static std::size_t large_bucket_size_for(std::size_t bytes) noexcept;
 
   /**
-   * @brief Computes the storage size for a direct large allocation
+   * @brief Computes the storage size for an ordinarily aligned direct large allocation
    *
    * @param bytes Requested allocation size
    * @return Bucket capacity when the bucket is a power of two no larger than the cache limit,
@@ -318,7 +321,7 @@ class small_pinned_host_memory_resource {
   // slab-pool growth may call the upstream pinned allocator.
 
   /**
-   * @brief Decides whether buffers of `bucket` are cached; the only cacheability policy
+   * @brief Decides whether an ordinarily aligned request's bucket is cacheable
    *
    * Only powers of two no larger than the cache limit are cached, so every cacheable bucket has a
    * list in `_large_cache`.
@@ -334,6 +337,15 @@ class small_pinned_host_memory_resource {
 
   void* allocate_slab(::cuda::stream_ref stream, std::size_t bytes);
   void* allocate_large(::cuda::stream_ref stream, std::size_t bytes);
+  /**
+   * @brief Allocates dedicated storage after reserving its ownership metadata
+   */
+  void* allocate_exceptional(std::size_t bytes, std::size_t alignment);
+  void deallocate_exceptional(::cuda::stream_ref stream, void* ptr) noexcept;
+  /**
+   * @brief Removes a dedicated pointer's record and returns its original base, or nullptr
+   */
+  [[nodiscard]] void* try_take_exceptional_locked(void* ptr) noexcept;
   void deallocate_slab(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
   void deallocate_large(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
 
@@ -354,6 +366,8 @@ class small_pinned_host_memory_resource {
   mutable std::mutex _mutex;
   std::array<std::vector<free_slab>, SLAB_SIZES.size()> _free_lists{};
   std::map<int, event_pool> _event_pools;
+  std::map<void*, void*>
+    _exceptional_allocations;  ///< Dedicated returned pointer to allocation base.
   std::vector<fixed_multiple_blocks_allocation> _owned_allocations;
   bool _has_quarantined_slab{false};  ///< A slab was withheld; destructor keeps backing blocks.
   std::array<std::list<large_cache_entry>, LARGE_BUCKET_COUNT> _large_cache{};
