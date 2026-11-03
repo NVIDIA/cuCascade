@@ -44,11 +44,26 @@ struct gpu_topology_info {
 
 /**
  * @brief Network device information.
+ *
+ * `net_interface` and `mtu` describe the kernel network interface backing the
+ * RDMA device (`/sys/class/infiniband/<name>/device/net/<interface>`): the
+ * Ethernet netdev of a RoCE NIC or the IPoIB interface of an InfiniBand HCA. A
+ * device can back several interfaces (e.g. a multi-port HCA, or IPoIB P_Key
+ * child interfaces); the one reported is the first, by name, that has an IP
+ * address, or the first by name when none has one. A device without a network
+ * interface (InfiniBand without IPoIB) reports an empty `net_interface` and an
+ * `mtu` of 0.
+ *
+ * @note `mtu` is the network-interface (L3) MTU, i.e. the payload size of an
+ *       IP packet on the link. It is not the RDMA path MTU (`ibv_port_attr::active_mtu`),
+ *       which is negotiated per port and only exposed through libibverbs.
  */
 struct network_device_info {
-  std::string name;        ///< Device name (e.g., "mlx5_0").
-  int numa_node;           ///< NUMA node ID (-1 if unknown).
-  std::string pci_bus_id;  ///< PCI bus ID.
+  std::string name;           ///< Device name (e.g., "mlx5_0").
+  int numa_node;              ///< NUMA node ID (-1 if unknown).
+  std::string pci_bus_id;     ///< PCI bus ID.
+  std::string net_interface;  ///< Backing network interface (e.g., "ib0"); empty if none.
+  int mtu{0};                 ///< MTU of `net_interface` in bytes (0 if unknown or none).
 };
 
 enum class StorageDriveType {
@@ -204,7 +219,8 @@ class topology_discovery {
    * @brief Discover system topology.
    *
    * This method performs the actual discovery of GPUs, NUMA nodes, CPU affinity,
-   * and network devices. It must be called before `get_topology()`.
+   * network devices (including their MTU), and storage devices. It must be called
+   * before `get_topology()`.
    *
    * By default this call uses only NVML and Linux sysfs and therefore does not
    * touch the CUDA driver. Set @p with_runtime_attributes to true to also

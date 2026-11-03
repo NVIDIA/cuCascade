@@ -29,22 +29,29 @@
  * - Run all tests: ./test_executable "[memory_space]"
  */
 
+#include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <ifaddrs.h>
 #include <nvml.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
 using namespace cucascade::memory;
+namespace fs = std::filesystem;
 
 namespace {
 struct ScopedEnvVar {
@@ -341,4 +348,118 @@ TEST_CASE("Default Topology Discovery does not initialize CUDA while visibility 
   }
   REQUIRE(WIFEXITED(status));
   REQUIRE(WEXITSTATUS(status) == 0);
+}
+
+namespace {
+/// Interfaces with at least one IPv4/IPv6 address, as reported by getifaddrs().
+std::set<std::string> interfaces_with_ip()
+{
+  std::set<std::string> names;
+  struct ifaddrs* ifa_list = nullptr;
+  if (getifaddrs(&ifa_list) != 0) { return names; }
+  for (struct ifaddrs* ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr) { continue; }
+    int const family = ifa->ifa_addr->sa_family;
+    if (family == AF_INET || family == AF_INET6) { names.insert(ifa->ifa_name); }
+  }
+  freeifaddrs(ifa_list);
+  return names;
+}
+
+/// Interfaces under /sys/class/infiniband/<device>/device/net, sorted by name.
+std::vector<std::string> sysfs_net_interfaces(std::string const& device)
+{
+  std::vector<std::string> names;
+  std::error_code ec;
+  fs::path const net_dir = fs::path("/sys/class/infiniband") / device / "device" / "net";
+  for (auto const& entry : fs::directory_iterator(net_dir, ec)) {
+    if (entry.is_directory()) { names.push_back(entry.path().filename().string()); }
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+/// Contents of /sys/class/net/<iface>/mtu, or -1 if unreadable.
+int sysfs_mtu(std::string const& iface)
+{
+  std::ifstream file(fs::path("/sys/class/net") / iface / "mtu");
+  int mtu = -1;
+  if (!(file >> mtu)) { return -1; }
+  return mtu;
+}
+}  // namespace
+
+TEST_CASE("Topology Discovery reports the MTU of each network device's interface", "[hw_topology]")
+{
+  auto const verification = GENERATE(NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                                     NetworkDeviceVerification::EXISTS_ACTIVE,
+                                     NetworkDeviceVerification::EXISTS);
+  INFO("verification level " << static_cast<int>(verification));
+
+  topology_discovery discovery;
+  REQUIRE(discovery.discover(verification));
+  auto const& topology = discovery.get_topology();
+
+  if (topology.network_devices.empty()) {
+    SUCCEED("Skipped: host has no InfiniBand/RoCE devices at this verification level");
+    return;
+  }
+
+  auto const with_ip = interfaces_with_ip();
+  for (auto const& dev : topology.network_devices) {
+    INFO("network device " << dev.name << " -> '" << dev.net_interface << "' mtu " << dev.mtu);
+    auto const candidates = sysfs_net_interfaces(dev.name);
+
+    if (candidates.empty()) {
+      // InfiniBand without IPoIB: nothing to report.
+      REQUIRE(dev.net_interface.empty());
+      REQUIRE(dev.mtu == 0);
+      continue;
+    }
+
+    // The reported interface is one of the device's own, chosen as the first by name
+    // with an IP address, else the first by name.
+    REQUIRE(std::find(candidates.begin(), candidates.end(), dev.net_interface) != candidates.end());
+    auto const first_with_ip =
+      std::find_if(candidates.begin(), candidates.end(), [&](auto const& name) {
+        return with_ip.contains(name);
+      });
+    std::string const expected =
+      first_with_ip != candidates.end() ? *first_with_ip : candidates.front();
+    REQUIRE(dev.net_interface == expected);
+
+    // An IP is what admitted the device at the strictest level, so the chosen interface
+    // must carry one.
+    if (verification == NetworkDeviceVerification::EXISTS_ACTIVE_IP) {
+      REQUIRE(with_ip.contains(dev.net_interface));
+    }
+
+    // The MTU matches sysfs and the per-interface NIC topology.
+    REQUIRE(dev.mtu > 0);
+    REQUIRE(dev.mtu == sysfs_mtu(dev.net_interface));
+    auto const nic = discover_nic(dev.net_interface);
+    REQUIRE(nic.has_value());
+    REQUIRE(nic->mtu == dev.mtu);
+  }
+}
+
+TEST_CASE("Topology Discovery MTU does not depend on the verification level", "[hw_topology]")
+{
+  topology_discovery disc_ip;
+  topology_discovery disc_exists;
+  REQUIRE(disc_ip.discover(NetworkDeviceVerification::EXISTS_ACTIVE_IP));
+  REQUIRE(disc_exists.discover(NetworkDeviceVerification::EXISTS));
+
+  // A device kept at both levels reports the same interface and MTU at both.
+  for (auto const& strict : disc_ip.get_topology().network_devices) {
+    auto const& permissive = disc_exists.get_topology().network_devices;
+    auto const it =
+      std::find_if(permissive.begin(), permissive.end(), [&](network_device_info const& d) {
+        return d.name == strict.name;
+      });
+    REQUIRE(it != permissive.end());
+    INFO("network device " << strict.name);
+    REQUIRE(it->net_interface == strict.net_interface);
+    REQUIRE(it->mtu == strict.mtu);
+  }
 }
