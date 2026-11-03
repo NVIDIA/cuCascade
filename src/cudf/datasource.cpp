@@ -216,7 +216,8 @@ std::unique_ptr<datasource> datasource::duplicate() const
 }
 
 void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
-                         std::optional<int> dev_id)
+                         std::optional<int> dev_id,
+                         std::uint8_t eviction_priority)
 {
   auto* cache = _io_ctx->cache();
   if (cache == nullptr || !_io_ctx->can_use_fs_cache()) { return; }
@@ -245,7 +246,8 @@ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges
   // Hand the ranges to the cache.  It returns an empty handle when it didn't
   // enqueue any new work (dormant cache, every range coalesced with an existing
   // entry); we only stash a real handle.
-  auto handle = cache->initiate_prefetching_request(*_io_object, converted, dev_id);
+  auto handle =
+    cache->initiate_prefetching_request(*_io_object, converted, dev_id, eviction_priority);
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 
