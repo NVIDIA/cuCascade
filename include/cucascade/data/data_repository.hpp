@@ -157,7 +157,7 @@ class data_repository {
   }
 
   /**
-   * @brief Remove a batch without retaining its logical position.
+   * @brief Remove a batch by ID, discarding its logical position.
    * @return Payload, or nullptr if absent; valid in every ordering mode.
    * @note Use pop_data_batch_by_id_with_position() when the consumer must preserve ordering.
    * @throws std::out_of_range if partition_idx is out of range
@@ -278,11 +278,6 @@ class data_repository {
     if (_data_batches[partition_idx].batches.empty()) { return {}; }
     require_positioned_access();
     return get_positions_unlocked(partition_idx);
-  }
-
-  std::vector<size_t> get_batch_positions(size_t partition_idx = 0) const
-  {
-    return get_positions(partition_idx);
   }
 
   /**
@@ -516,7 +511,7 @@ class data_repository {
   {
     if (_ordering == data_repository_ordering::ORDERED) {
       throw repository_ordering_error(
-        "unpositioned access is not allowed on an ORDERED repository");
+        "encountered ORDERED data_repository_ordering when expecting UNORDERED");
     }
   }
   void require_positioned_access() const

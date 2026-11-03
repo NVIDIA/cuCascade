@@ -555,7 +555,7 @@ Public methods are non-virtual and acquire the repository mutex before calling p
 Overrides must call the base `_unlocked` helper while the lock is held, rather than a public method
 that would acquire the mutex again. Subclasses must preserve the mode and storage-index invariants.
 
-`get_positions()` enumerates sorted positions; `get_batch_positions()` remains a non-virtual alias.
+`get_positions()` enumerates sorted positions.
 The snapshot is only complete after all producers finish, and consumers must coordinate removal.
 
 ### Shared Ownership

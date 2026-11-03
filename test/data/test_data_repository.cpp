@@ -349,34 +349,45 @@ TEST_CASE("concurrent positioned publication and draining retain every payload p
   for (size_t i = 0; i < count; ++i) {
     batches.push_back(make_repository_test_batch(i + 100));
   }
+  std::atomic<size_t> received{0};
   std::vector<std::thread> producers;
   for (size_t worker = 0; worker < workers; ++worker) {
     producers.emplace_back([&, worker] {
       for (size_t i = worker; i < count; i += workers) {
         repository.add_data_batch_at_position(batches[i], i * 3);
+        // Guarantee a consumer drains a payload before any producer can finish publication.
+        if (i == worker) {
+          while (received.load() == 0) {
+            std::this_thread::yield();
+          }
+        }
       }
     });
   }
-  for (auto& producer : producers) {
-    producer.join();
-  }
-  REQUIRE(repository.total_size() == count);
 
   // Assertions run on the test thread after joining; each consumer owns its result vector.
   std::vector<std::vector<positioned_data_batch>> results(workers);
   std::vector<std::thread> consumers;
   for (size_t worker = 0; worker < workers; ++worker) {
     consumers.emplace_back([&, worker] {
-      while (true) {
+      while (received.load() < count) {
         auto entry = repository.pop_next_data_batch_with_position();
-        if (!entry.first) { break; }
+        if (!entry.first) {
+          std::this_thread::yield();
+          continue;
+        }
         results[worker].push_back(std::move(entry));
+        ++received;
       }
     });
+  }
+  for (auto& producer : producers) {
+    producer.join();
   }
   for (auto& consumer : consumers) {
     consumer.join();
   }
+  REQUIRE(received.load() == count);
   std::vector<size_t> seen(count, 0);
   for (const auto& result : results) {
     for (const auto& [batch, position] : result) {
@@ -1201,4 +1212,20 @@ TEST_CASE("allocation-limit rejection is distinct from a repository conflict",
   REQUIRE(repository.all_empty());
   REQUIRE(repository.num_partitions() == 1);
   REQUIRE(repository.get_ordering() == data_repository_ordering::UNKNOWN);
+}
+
+TEST_CASE("DISK mock clones retain metadata and reject I/O", "[data_repository][mock_disk_cpu]")
+{
+  mock_data_representation original(memory::Tier::DISK, 512, 3);
+  auto clone = original.clone(::cuda::stream_ref{cudaStream_t{nullptr}});
+  REQUIRE(clone);
+  CHECK(clone->get_current_tier() == memory::Tier::DISK);
+  CHECK(clone->get_device_id() == 3);
+  CHECK(clone->get_size_in_bytes() == 512);
+  CHECK(clone->get_uncompressed_data_size_in_bytes() == 512);
+  for (auto* representation : {static_cast<idata_representation*>(&original), clone.get()}) {
+    auto& backend = representation->get_memory_space().get_io_backend();
+    REQUIRE_THROWS_AS(backend.read(std::filesystem::path{}, nullptr, 0, 0), std::logic_error);
+    REQUIRE_THROWS_AS(backend.write(std::filesystem::path{}, nullptr, 0, 0), std::logic_error);
+  }
 }

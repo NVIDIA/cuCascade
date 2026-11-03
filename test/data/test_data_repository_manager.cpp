@@ -64,7 +64,7 @@ TEST_CASE("manager discovery retains positioned payloads and their coordinates",
   {
     // Memory management can replace a resident representation without removing its coordinates.
     auto mutable_batch = batch->to_mutable();
-    mutable_batch.set_data(std::make_unique<cucascade::test::repository_test_representation>(512));
+    mutable_batch.set_data(std::make_unique<mock_data_representation>(memory::Tier::DISK, 512));
   }
   REQUIRE(repository.get_data_batch_by_id(batch->get_batch_id(), 2) == batch);
   REQUIRE(repository.get_data_batch_by_id_with_position(batch->get_batch_id(), 2) ==
