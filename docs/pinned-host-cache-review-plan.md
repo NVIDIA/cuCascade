@@ -244,6 +244,12 @@ classify, collect more paired trials rather than declare success. Keep performan
 from ownership/correctness assertions. Node pooling and eviction-policy changes are conditional on
 measured benefit and require updating this plan before expanding scope.
 
+### Accepted revision: deterministic eviction (2026-11-03)
+
+The user explicitly accepted the current implementation's measured `deterministic_full_cap` throughput regressions of 7.98% on ARM GB10 and 7.72% on x86_64 Xeon/RTX PRO 4500. This exception covers the single-thread, single-stream, 64 KiB cache control with repeated 9,000-byte and 40,000-byte allocations, as a tradeoff for correctness and measured concurrent throughput gains. It is limited to that recorded benchmark and validated implementation; future worsening is not covered. The 5% gate remains unchanged for other cases and the original four-GPU application comparison, and further regressions require investigation and resolution or another explicit plan revision.
+
+Two-GPU correctness is satisfied. The original four-GPU application comparison remains required before completing validation ticket 11 and spec 1. The [validation record](pinned-host-cache-validation.md#accepted-performance-tradeoff-2026-11-03) retains the measured losses, acceptance rationale, and original evidence.
+
 ## Review dispositions
 
 | Comment | Planned disposition |
