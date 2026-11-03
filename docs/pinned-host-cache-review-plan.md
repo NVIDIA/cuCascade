@@ -1,6 +1,6 @@
 # Pinned host cache review plan
 
-Status: design decisions accepted; implementation plan complete. No implementation changes made.
+Status: implementation delivered under the accepted revisions below. This document retains the original planning decisions and validation protocol; completed evidence and explicit acceptance exceptions are recorded in the [validation record](pinned-host-cache-validation.md).
 
 Review: [NVIDIA/cuCascade #185, November 2, 2026](https://github.com/NVIDIA/cuCascade/pull/185#pullrequestreview-5740489603).
 Published spec: [kevkrist/cuCascade #1](https://github.com/kevkrist/cuCascade/issues/1), labelled `ready-for-agent`.
@@ -246,9 +246,15 @@ measured benefit and require updating this plan before expanding scope.
 
 ### Accepted revision: deterministic eviction (2026-11-03)
 
-The user explicitly accepted the current implementation's measured `deterministic_full_cap` throughput regressions of 7.98% on ARM GB10 and 7.72% on x86_64 Xeon/RTX PRO 4500. This exception covers the single-thread, single-stream, 64 KiB cache control with repeated 9,000-byte and 40,000-byte allocations, as a tradeoff for correctness and measured concurrent throughput gains. It is limited to that recorded benchmark and validated implementation; future worsening is not covered. The 5% gate remains unchanged for other cases and the original four-GPU application comparison, and further regressions require investigation and resolution or another explicit plan revision.
+The user explicitly accepted the current implementation's measured `deterministic_full_cap` throughput regressions of 7.98% on ARM GB10 and 7.72% on x86_64 Xeon/RTX PRO 4500. This exception covers the single-thread, single-stream, 64 KiB cache control with repeated 9,000-byte and 40,000-byte allocations, as a tradeoff for correctness and measured concurrent throughput gains. It is limited to that recorded benchmark and validated implementation; future worsening is not covered. The 5% gate remains unchanged for other measured cases and future performance changes, and further regressions require investigation and resolution or another explicit plan revision. The subsequent application-comparison waiver below applies only to the unavailable original workload.
 
-Two-GPU correctness is satisfied. The original four-GPU application comparison remains required before completing validation ticket 11 and spec 1. The [validation record](pinned-host-cache-validation.md#accepted-performance-tradeoff-2026-11-03) retains the measured losses, acceptance rationale, and original evidence.
+Two-GPU correctness is satisfied. At this acceptance checkpoint the original four-GPU application comparison remained required; the subsequent revision below waives it. The [validation record](pinned-host-cache-validation.md#accepted-performance-tradeoff-2026-11-03) retains the measured losses, acceptance rationale, and original evidence.
+
+### Accepted revision: application comparison waiver (2026-11-03)
+
+The user explicitly waived the original four-L40S application comparison after accepting the available evidence and reporting loss of access to that machine. The original application workload was not rerun, so application performance remains unmeasured. This waiver removes that comparison from the delivery requirements for validation ticket 11 and spec 1; the original protocol above remains historical guidance for optional future work.
+
+The implementation and recorded validation satisfy the revised criteria. The measured deterministic eviction acceptance remains limited to its recorded case and implementation. Correctness contracts, other measured benchmark gates, and future performance requirements remain in force. The [application comparison waiver](pinned-host-cache-validation.md#application-comparison-waiver-2026-11-03) records the user's decision; final delivery review and issue closure follow separately.
 
 ## Review dispositions
 
@@ -265,7 +271,7 @@ Two-GPU correctness is satisfied. The original four-GPU application comparison r
 | [4445468629](https://github.com/NVIDIA/cuCascade/pull/185#discussion_r4445468629) | Quarantine individual backing owners and handle shared event-wrapper destruction errors. |
 | [4445468638](https://github.com/NVIDIA/cuCascade/pull/185#discussion_r4445468638) | Extract hit wait submission from the mutex and measure contention. Node pooling and changed eviction policy require measured benefit. Existing hit removes a node rather than allocating one. |
 
-## Completion
+## Original planning completion checkpoint
 
 The user accepted every interview decision. The planning task is complete: the implementation
 sequence, all ten review dispositions, failure policies, and validation gates are recorded. Only
