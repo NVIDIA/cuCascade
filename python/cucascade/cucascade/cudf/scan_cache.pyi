@@ -27,6 +27,7 @@ class ScanCacheOptions:
         connections: int = 128,
         stall_seconds: int = 5,
         pinning_threads: int = 8,
+        numa_node: int | None = None,
     ) -> None: ...
 
 class ScanCache:

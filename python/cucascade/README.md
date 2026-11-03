@@ -11,7 +11,7 @@ from cucascade.cudf import ScanCache, ScanCacheOptions
 
 cache = ScanCache(
     ScanCacheOptions(
-        cache_bytes=100 << 30,  # pinned host memory, allocated here (about 0.3 s per GiB)
+        cache_bytes=100 << 30,  # pinned host memory, allocated here (about 0.2 s per GiB)
         endpoint="https://s3.us-east-1.amazonaws.com",
         region="us-east-1",
         access_key=...,
