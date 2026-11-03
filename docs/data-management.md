@@ -25,7 +25,7 @@ A deep dive into cuCascade's data lifecycle, batch read-only and mutable locking
   - [Partitioning](#partitioning)
   - [Batch Positions and Ordering](#batch-positions-and-ordering)
   - [Ordered Consumption](#ordered-consumption)
-  - [API Migration](#api-migration)
+  - [Choosing a Retrieval API](#choosing-a-retrieval-api)
   - [Shared Ownership](#shared-ownership)
 - [Data Repository Manager](#data-repository-manager)
   - [Operator Port Keys](#operator-port-keys)
@@ -494,6 +494,21 @@ including in `UNKNOWN` mode. A nonempty partition requires `ORDERED` mode, other
 `repository_ordering_error` is thrown. Invalid partition indices still throw
 `std::out_of_range`, checked before mode errors. Growing partitions never changes the batch mode.
 
+Use of the API `pop_next_data_batch_with_position()` API as in the example above is intended to be used
+when the retrieval and processing of batches does not care about the order, but the position information
+should be forwarded so that another operator downstream which does care about order can use it.
+For example a Project operator can process batches out of order, but should forward position information.
+
+Repository insertion and retrieval do not synchronize CUDA work. Before publishing an
+asynchronously produced GPU representation, the producer must call
+`record_writer_event(writer_stream)` on that representation after enqueueing its writes.
+A consumer on another stream or device must wait for the recorded event before accessing the
+buffers, for example with `cudaStreamWaitEvent`. A null writer event on a GPU representation
+means the writer is unknown: the reader must synchronize the owning device before reading,
+as specified by `idata_representation::get_writer_event()`. Host or disk representations without
+a GPU writer need no such ordering. Shared ownership and host-side batch accessor locks do not
+replace this CUDA synchronization.
+
 ### Ordered Consumption
 
 The producer asserts the logical meaning of positions and partition order. The repository checks
@@ -510,9 +525,10 @@ After successful completion, one coordinated consumer can enumerate and retrieve
 
 ```cpp
 // Caller has already established successful producer completion and exclusive drain ownership.
-if (!repository.all_empty()) {
+if (!repository.empty(partition_idx)) {
     for (auto position : repository.get_positions(partition_idx)) {
         auto batch = repository.pop_data_batch_by_position(position, partition_idx);
+        assert(batch && "An enumerated position must remain resident under exclusive drain ownership");
         // Consume batch in this logical order.
     }
 }
@@ -603,6 +619,19 @@ non-removing `get_data_batch_by_id()`. These work for positioned repositories wi
 positions. Changing a resident batch's representation during spilling/restoration leaves its
 repository partition and position intact. If a caller removes and republishes a batch, it must
 carry and restore its coordinates explicitly; a new clone ID does not establish a new position.
+
+Both manager lookup APIs return borrowed access, not ownership of a repository:
+
+- `get_repository()` returns a reference to the `unique_ptr` in the manager's map without taking
+  the manager mutex. Callers must externally coordinate lookup with repository registration and
+  cleanup, and keep the manager and the referenced repository alive throughout their use.
+- `get_repositories()` collects a snapshot of raw pointers under the manager mutex. The lock
+  protects snapshot collection, but does not keep those repositories alive after the call returns.
+  Callers must prevent cleanup or manager destruction until all uses of the pointers have ended.
+
+A repository's internal mutex protects its contents; it does not protect the lifetime of the
+repository object. The embedding application must provide the lifecycle coordination described
+above. Neither lookup API by itself makes concurrent lookup and cleanup safe for subsequent use.
 
 ---
 

@@ -76,8 +76,8 @@ struct operator_port_key {
  * The manager abstracts the complexity of multi-pipeline data management and provides
  * a unified interface for higher-level components like the GPU executor and memory manager.
  *
- * @note All operations are thread-safe and can be called concurrently from multiple
- *       pipeline execution threads.
+ * @note See get_repository() and get_repositories() for lookup synchronization and borrowed
+ *       repository lifetime requirements.
  */
 class data_repository_manager {
  public:
@@ -130,8 +130,10 @@ class data_repository_manager {
    * @return std::unique_ptr<repository_type>& Reference to the repository
    *
    * @throws std::out_of_range If no repository exists for the specified operator/port
-   * @note Thread-safe for read access, but modifications should use the repository's own thread
-   * safety
+   * @warning Lookup does not acquire the manager mutex. Callers must externally coordinate it
+   * with repository registration and cleanup, and keep the manager and repository alive for the
+   * entire use of the returned reference or a pointer obtained from it. Repository operations
+   * synchronize access to contents, not the lifetime of the repository object.
    */
   std::unique_ptr<repository_type>& get_repository(size_t operator_id, std::string_view port_id)
   {
@@ -209,6 +211,8 @@ class data_repository_manager {
    *
    * @return std::vector<repository_type*> Snapshot of non-null repository pointers
    * @note Thread-safe — holds the manager mutex for the duration of collection.
+   * @warning The snapshot does not retain ownership of the repositories. Callers must prevent
+   * cleanup or manager destruction until all uses of the returned pointers have ended.
    */
   std::vector<repository_type*> get_repositories()
   {
