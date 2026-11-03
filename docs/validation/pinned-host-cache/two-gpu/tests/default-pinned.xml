@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="cucascade_tests" errors="0" failures="0" skipped="0" tests="921" hostname="tbd" time="0.158" timestamp="2026-11-03T15:23:56Z">
+    <properties>
+      <property name="random-seed" value="218056058"/>
+      <property name="filters" value="[small_pinned]"/>
+    </properties>
+    <testcase classname="cucascade_tests.global" name="Zero-byte allocation returns nullptr" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Allocate and deallocate each slab size" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Allocate and deallocate each slab size/slab size 512" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Allocate and deallocate each slab size/slab size 1024" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Allocate and deallocate each slab size/slab size 2048" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Allocate and deallocate each slab size/slab size 4096" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Allocate and deallocate each slab size/slab size 8192" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Sub-slab sizes round up correctly" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Large allocation is served by the bucketed pinned path" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Multiple allocations return distinct pointers" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Pool expansion provides more slabs" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Freed slabs are reused" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="do_is_equal identity check" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Concurrent allocations are thread-safe" time="0.002" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Mixed slab sizes allocated and freed correctly" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Large allocations do not interfere with slab pool" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="large_bucket_size_for rounds to power-of-two buckets" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="large_allocation_size rounds only cacheable requests" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Large allocations are cached and reused" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Large cache serves within a bucket but not across buckets" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="large_cache_bytes reflects bucket-size accounting" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Large cache respects its cap and evicts oldest entries" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Buffers larger than the whole cap are freed, not cached" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Never-cacheable sizes round trip without polluting the cache" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Slab and large reuse work on a real stream" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Destruction with a populated large cache is safe" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Bucket rounding handles the largest representable sizes" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Disabled large cache preserves host and device accessibility" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Large FIFO eviction orders entries across buckets" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Impossible large allocation preserves insufficient retained capacity" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Non-OOM pinned allocation failure throws bad_alloc and keeps the cache" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Release paths free completed storage and withhold unconfirmed storage" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Release paths free completed storage and withhold unconfirmed storage/uncacheable deallocate" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Release paths free completed storage and withhold unconfirmed storage/deallocate_sync" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Release paths free completed storage and withhold unconfirmed storage/evicting deallocate" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Release paths free completed storage and withhold unconfirmed storage/destructor keeps upstream blocks after an unconfirmed slab wait" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Release paths free completed storage and withhold unconfirmed storage/destructor" time="0.000" status="run"/>
+    <testcase classname="cucascade_tests.global" name="A deallocation evicts every victim it needs in one step" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Slab pool rejects an upstream block smaller than the slab" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Slab pool propagates upstream exhaustion as out_of_memory" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Large allocation statistics remain consistent during mixed concurrent requests" time="0.002" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Concurrent evicting deallocations finish while other threads refill the cache" time="0.009" status="run"/>
+    <testcase classname="cucascade_tests.global" name="A deallocation reserves its room before waiting on the buffers it evicts" time="0.003" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Reuse orders pending DMA across allocation streams" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Synchronous allocation waits for pending DMA before host reuse" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Event ownership follows the freeing stream's device" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Large cache reuse on another GPU waits for pending producer DMA" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Multiple GPUs concurrently reuse one large pinned cache" time="0.012" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Production over-aligned storage is mapped and usable by a GPU" time="0.001" status="run"/>
+    <testcase classname="cucascade_tests.global" name="Production zero and null wrappers preserve an active capture" time="0.001" status="run"/>
+    <system-out/>
+    <system-err/>
+  </testsuite>
+</testsuites>

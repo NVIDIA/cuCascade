@@ -53,6 +53,32 @@ A seven-trial deterministic diagnostic then compared the baseline, an independen
 
 The diagnostic reuses the candidate's other object files, headers, benchmark executable, flags, and static CUDA runtime; only the copied allocator translation unit is recompiled and relinked. It is not a clean-build acceptance comparison. An initial attempt failed to override the executable's `DT_RPATH` with `LD_LIBRARY_PATH`; that [invalid raw run](validation/pinned-host-cache/capture-perf/invalid-rpath-ablation-raw.jsonl) is retained and excluded. The final run uses explicit `LD_PRELOAD`, with loader selections and unique library hashes recorded in [experiment metadata](validation/pinned-host-cache/capture-perf/experiment-metadata.json). [Raw results](validation/pinned-host-cache/capture-perf/ablation-raw.jsonl), [summary](validation/pinned-host-cache/capture-perf/ablation-summary.json), [exact diagnostic patch](validation/pinned-host-cache/capture-perf/noquery.patch), and [reproduction notes](validation/pinned-host-cache/capture-perf/README.md) are retained. The bounded investigation found no simple safe reduction. Production behavior remains unchanged and the 5% performance gate remains open.
 
+## Two-GPU x86_64 validation evidence
+
+A second host with two physical NVIDIA RTX PRO 4500 Blackwell Server Edition GPUs (`0000:37:00.0` and `0000:39:00.0`, single NUMA node, `NODE` PCIe interconnect), Linux x86_64 (`6.8.0-1064-aws`), Intel Xeon 6975P-C (48 vCPUs), driver `595.91.07`, GNU C++ `15.3.0`, and CUDA `13.2.86` completed the multi-GPU correctness gate and paired microbenchmark reproduction at commit `750df4f` (same allocator/event implementation hashes as `10d9899` and `5253670`). The `default` nightly environment built against RMM/cuDF `26.12` (`libcudf 26.12.00a674`, `librmm 26.12.00a38`, `libkvikio 26.12.00a42`, CCCL `3.6.0.0`); the `cuda-13-stable` environment built against RMM/cuDF `26.10` (`libcudf 26.10.00`, CCCL `3.5.0.0`). Both production `libcucascade.so` builds passed the `nm -D` check for absence of private test-hook symbols.
+
+### Multi-GPU correctness suite (`CUDA_VISIBLE_DEVICES=0,1`, seed `218056058`)
+
+| Environment | Production pinned (`[small_pinned]`) | Private fault/event | Full cuDF |
+| --- | --- | --- | --- |
+| Nightly (`default`) | 41 passed, 0 skipped; 921 assertions (50 JUnit sections) | 54 passed, 0 skipped; 948 assertions (60 JUnit sections) | 199 passed, 0 skipped; 2,781 assertions (276 JUnit sections) |
+| Stable (`cuda-13-stable`) | 41 passed, 0 skipped; 931 assertions (50 JUnit sections) | 54 passed, 0 skipped; 948 assertions (60 JUnit sections) | 199 passed, 0 skipped; 2,763 assertions (276 JUnit sections) |
+
+All three required multi-GPU `[small_pinned]` test cases (`Event ownership follows the freeing stream's device`, `Large cache reuse on another GPU waits for pending producer DMA`, and `Multiple GPUs concurrently reuse one large pinned cache`) and both multi-GPU `cucascade_cudf_tests` cases (`gpu_table_representation rejects a stream owned by another device` and `gpu_table_representation works on its own device whichever device is current`) executed and passed with zero skips, failures, or errors. Twenty additional concurrent statistics process runs per environment (seeds `218056058` through `218056077`) also passed. Complete [JUnit XML, compact reports, and summary](validation/pinned-host-cache/two-gpu/tests/summary.json) are retained. **The two-GPU correctness gate is satisfied.**
+
+### Paired production allocator results on x86_64 (Xeon 6975P-C + 2x RTX PRO 4500)
+
+Seven alternating AB/BA pairs were collected on CPUs 0-3 (`taskset --cpu-list 0-3`, `CUDA_VISIBLE_DEVICES=0,1`) comparing baseline `69ef173b10a75363d80aa3a8df833f2858159034` against candidate `750df4f84aa30cd9393913b2cacab6d30dba7491` with identical Release flags (`-O3 -DNDEBUG`), compiler (`x86_64-conda-linux-gnu-c++ 15.3.0`), CUDA architectures (`75-real;80-real;86-real;90a-real;100f-real;120a-real;120`), and dependencies. [Hardware inventory](validation/pinned-host-cache/two-gpu/controlled/hardware.json), [build metadata](validation/pinned-host-cache/two-gpu/controlled/metadata.json), [raw JSONL](validation/pinned-host-cache/two-gpu/controlled/raw.jsonl), and [summary](validation/pinned-host-cache/two-gpu/controlled/summary.json) are retained:
+
+| Case | Baseline median | Candidate median | Throughput change | Paired ratio median | Baseline/candidate CV |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Concurrent hits | 391,455 | 698,695 | +78.49% | 1.7816x (+78.16%) | 5.0% / 8.3% |
+| Concurrent full-cap | 92,227 | 120,798 | +30.98% | 1.2729x (+27.29%) | 2.7% / 2.5% |
+| Deterministic full-cap | 825,566 | 761,800 | **-7.72%** | 0.9230x (**-7.70%**) | 0.3% / 0.5% |
+| Half-cap rounding | 24.58 | 24.51 | -0.25% | 0.9975x (-0.25%) | 0.3% / 1.2% |
+
+The deterministic full-cap regression reproduces on x86_64 + Blackwell at **-7.72%** median throughput (`-7.70%` median paired ratio, CV 0.27% / 0.52%, with all 7 trials recording exactly 300,000 hits, 300,000 misses, and 300,000 evictions), closely matching the `-7.98%` result on the ARM GB10 host. Because this machine has 2 physical GPUs rather than the original 4x L40S GPUs and SF1000 dataset, **the original four-GPU application comparison remains pending**, and **the >5% deterministic eviction performance gate remains open** alongside [spec 1](https://github.com/kevkrist/cuCascade/issues/1) and [ticket 11](https://github.com/kevkrist/cuCascade/issues/11).
+
 ## Build and run on the external host
 
 Start from the final integration commit and use separate build directories for each environment. Use Pixi activation for both configuration and compilation, so NVCC uses the matching host compiler. Do not reuse local ARM binaries or copy the local SM 120 override to L40S hardware.

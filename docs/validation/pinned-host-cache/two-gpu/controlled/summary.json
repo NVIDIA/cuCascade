@@ -1,0 +1,330 @@
+{
+  "concurrent_hits": {
+    "baseline": {
+      "median": 391454.7730282368,
+      "minimum": 372846.85918655625,
+      "maximum": 430457.76462990546,
+      "coefficient_of_variation": 0.050332022425977195
+    },
+    "candidate": {
+      "median": 698694.6957397056,
+      "minimum": 647275.1617546374,
+      "maximum": 830779.567481984,
+      "coefficient_of_variation": 0.08299279609390786
+    },
+    "median_throughput_ratio": 1.7848669728426243,
+    "paired_ratios": {
+      "median": 1.781641887862317,
+      "minimum": 1.6331131012930133,
+      "maximum": 2.1128771645462123,
+      "coefficient_of_variation": 0.09316608931795645
+    },
+    "requires_regression_investigation": false,
+    "counters": {
+      "baseline": {
+        "hits": [
+          2000000,
+          2000000,
+          2000000,
+          2000000,
+          2000000,
+          2000000,
+          2000000
+        ],
+        "misses": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "evictions": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "candidate": {
+        "hits": [
+          2000000,
+          2000000,
+          2000000,
+          2000000,
+          2000000,
+          2000000,
+          2000000
+        ],
+        "misses": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "evictions": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  },
+  "concurrent_full_cap": {
+    "baseline": {
+      "median": 92227.43404362259,
+      "minimum": 91804.05687589676,
+      "maximum": 98121.01670884641,
+      "coefficient_of_variation": 0.027106043382385238
+    },
+    "candidate": {
+      "median": 120797.61882525796,
+      "minimum": 116017.52826075321,
+      "maximum": 125664.69101299522,
+      "coefficient_of_variation": 0.025054761046916223
+    },
+    "median_throughput_ratio": 1.3097796775753512,
+    "paired_ratios": {
+      "median": 1.272891564385962,
+      "minimum": 1.2132093282415255,
+      "maximum": 1.3688359239164365,
+      "coefficient_of_variation": 0.040418113718206417
+    },
+    "requires_regression_investigation": false,
+    "counters": {
+      "baseline": {
+        "hits": [
+          118054,
+          115672,
+          116604,
+          118489,
+          115163,
+          118620,
+          117331
+        ],
+        "misses": [
+          121946,
+          124328,
+          123396,
+          121511,
+          124837,
+          121380,
+          122669
+        ],
+        "evictions": [
+          121946,
+          124328,
+          123396,
+          121511,
+          124837,
+          121380,
+          122669
+        ]
+      },
+      "candidate": {
+        "hits": [
+          98316,
+          96570,
+          95161,
+          96034,
+          94732,
+          96772,
+          96722
+        ],
+        "misses": [
+          141684,
+          143430,
+          144839,
+          143966,
+          145268,
+          143228,
+          143278
+        ],
+        "evictions": [
+          141684,
+          143430,
+          144839,
+          143966,
+          145268,
+          143228,
+          143278
+        ]
+      }
+    }
+  },
+  "deterministic_full_cap": {
+    "baseline": {
+      "median": 825566.0024787289,
+      "minimum": 820613.5161036581,
+      "maximum": 826257.3867169381,
+      "coefficient_of_variation": 0.002735084103867166
+    },
+    "candidate": {
+      "median": 761800.2709611834,
+      "minimum": 754675.06201753,
+      "maximum": 765462.8822174965,
+      "coefficient_of_variation": 0.005155760735709234
+    },
+    "median_throughput_ratio": 0.9227611949546233,
+    "paired_ratios": {
+      "median": 0.9229682829765191,
+      "minimum": 0.9133655857724501,
+      "maximum": 0.9318483974266032,
+      "coefficient_of_variation": 0.0062482985884703265
+    },
+    "requires_regression_investigation": true,
+    "counters": {
+      "baseline": {
+        "hits": [
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000
+        ],
+        "misses": [
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000
+        ],
+        "evictions": [
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000
+        ]
+      },
+      "candidate": {
+        "hits": [
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000
+        ],
+        "misses": [
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000
+        ],
+        "evictions": [
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000,
+          300000
+        ]
+      }
+    }
+  },
+  "half_cap_rounding": {
+    "baseline": {
+      "median": 24.575562064584993,
+      "minimum": 24.433554478441806,
+      "maximum": 24.690211690168415,
+      "coefficient_of_variation": 0.003438067758968588
+    },
+    "candidate": {
+      "median": 24.513162442617908,
+      "minimum": 24.159374963388167,
+      "maximum": 25.01640461677422,
+      "coefficient_of_variation": 0.011781183135014061
+    },
+    "median_throughput_ratio": 0.9974609076364928,
+    "paired_ratios": {
+      "median": 0.9974609076364928,
+      "minimum": 0.9817943804686831,
+      "maximum": 1.0238544964404044,
+      "coefficient_of_variation": 0.014948645792538252
+    },
+    "requires_regression_investigation": false,
+    "counters": {
+      "baseline": {
+        "hits": [
+          40,
+          40,
+          40,
+          40,
+          40,
+          40,
+          40
+        ],
+        "misses": [
+          40,
+          40,
+          40,
+          40,
+          40,
+          40,
+          40
+        ],
+        "evictions": [
+          40,
+          40,
+          40,
+          40,
+          40,
+          40,
+          40
+        ]
+      },
+      "candidate": {
+        "hits": [
+          40,
+          40,
+          40,
+          40,
+          40,
+          40,
+          40
+        ],
+        "misses": [
+          40,
+          40,
+          40,
+          40,
+          40,
+          40,
+          40
+        ],
+        "evictions": [
+          40,
+          40,
+          40,
+          40,
+          40,
+          40,
+          40
+        ]
+      }
+    }
+  }
+}

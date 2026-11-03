@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="cucascade_pinned_host_fault_tests" errors="0" failures="0" skipped="0" tests="948" hostname="tbd" time="0.565" timestamp="2026-11-03T15:23:58Z">
+    <properties>
+      <property name="random-seed" value="218056058"/>
+    </properties>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Uncached pinned storage is released only after confirmed completion" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Uncached pinned storage is released only after confirmed completion/completed work releases its storage" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Uncached pinned storage is released only after confirmed completion/unconfirmed completion withholds its storage" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Pinned allocation failures are scoped to one call and one thread" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Pinned allocation failures are scoped to one call and one thread/one failed call does not reject subsequent allocations" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Pinned allocation failures are scoped to one call and one thread/a hook does not reject another thread's allocation" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Cached pinned storage is released only after its event confirms completion" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Cached pinned storage is released only after its event confirms completion/completed cached work releases its storage" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Cached pinned storage is released only after its event confirms completion/unconfirmed cached work withholds its storage" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Cache-entry metadata exhaustion releases incoming completed storage" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Over-aligned large pinned storage is dedicated and released" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Nonzero pinned requests reject invalid alignment" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Alignment padding overflow fails before acquiring pinned storage" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Exceptional metadata exhaustion acquires no pinned storage" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Dedicated storage uses alignment padding and frees its original allocation" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Over-aligned small storage bypasses an awkward upstream block stride" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Ordinary pooled storage does not require exceptional ownership metadata" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Dedicated storage release withholds unconfirmed backing and recovers cleanly" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Concurrent dedicated allocations preserve alignment and release ownership" time="0.002" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Pinned allocation rejects a capturing stream without invalidating it" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Rejected pinned deallocation withholds storage without CUDA work" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Zero pinned allocations and null deallocations do not disturb capture" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Rejected large deallocation preserves retained entries and withholds its buffer" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Rejected slab deallocation quarantines only its backing owner" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Rejected dedicated deallocation never frees its original base" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Unknown capture status rejects allocation before changing retained capacity" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Rounded pinned OOM uses uncached exact storage without reclaiming retained buffers" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Exact pinned OOM reclaims only enough oldest retained capacity and retries once" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Insufficient retained capacity preserves cached storage without duplicate exact attempts" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Recovery reuses a matching buffer returned during the exact attempt" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Exact recovery distinguishes retained capacity below equal and above the request" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Recovery does not purge on non-OOM failures and stops after its final exact attempt" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Dedicated OOM reclamation uses the padded backing size" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Fallback metadata exhaustion preserves cached capacity before recovery" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Unconfirmed reclamation withholds its victim without extending the retry budget" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Uncacheable exact recovery stays untracked and releases its original storage" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Deferred OOM reporting preserves an unrelated CUDA error" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Failed cache insertion preserves retained large-buffer capacity" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Successful cache insertion releases every required completed victim" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Pinned allocator traffic progresses while a reuse wait is submitted" time="0.003" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Pinned allocator traffic progresses while a cold event is created" time="0.003" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Failed cold event creation keeps its reserved return slot reusable" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Failed cache hit cannot overfill a concurrently refilled cache" time="0.003" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Failed cache hit restores oldest-first reuse when retained capacity permits" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Failed event preparation still removes dedicated exact allocation ownership" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Failed stream device discovery does not publish a cached buffer" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Failed device restoration terminates pinned cleanup" time="0.145" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Successful event creation restores the previous device" time="0.146" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Ordinary device and event failures require confirmed stream completion" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Failed initial device switching does not change the caller's device" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Event destruction clears its own CUDA failure" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Event reset relinquishes ownership even when destruction fails" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="An empty event reset preserves unrelated CUDA error state" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Event move assignment safely replaces its previous ownership" time="0.000" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Eviction retires only events whose completion cannot be confirmed" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Unpublished buffers retire events after unconfirmed completion" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Repeated event retirement reuses reserved return capacity" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Slab destruction retains only backing with unconfirmed completion" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="An unconfirmed slab deallocation retains only its backing owner" time="0.001" status="run"/>
+    <testcase classname="cucascade_pinned_host_fault_tests.global" name="Slab return metadata failure retains only its backing owner" time="0.001" status="run"/>
+    <system-out/>
+    <system-err/>
+  </testsuite>
+</testsuites>

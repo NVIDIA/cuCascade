@@ -13,7 +13,7 @@
 # See https://github.com/pre-commit/pre-commit
 
 # Preserve generated validation reports and their recorded hashes byte for byte.
-exclude: '^docs/validation/pinned-host-cache/(?:.*\.(?:json|jsonl|csv|txt)|SHA256SUMS|capture-perf/noquery\.patch)$'
+exclude: '^docs/validation/pinned-host-cache/(?:.*\.(?:json|jsonl|csv|txt|xml)|SHA256SUMS|capture-perf/noquery\.patch)$'
 
 repos:
   # Standard hooks
