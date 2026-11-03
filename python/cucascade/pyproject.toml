@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+build-backend = "scikit_build_core.build"
+requires = [
+    "cython>=3.0",
+    "cython-cmake>=2.0",
+    "pylibcudf",
+    "scikit-build-core>=0.10",
+]
+
+[project]
+name = "cucascade"
+version = "0.1.0"
+description = "Read remote parquet files through cuCascade's REST backend and host-memory cache"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "pylibcudf",
+]
+authors = [
+    { name = "NVIDIA Corporation" },
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[tool.scikit-build]
+cmake.version = ">=3.26.4"
+wheel.packages = ["cucascade"]
+wheel.py-api = "cp310"
+build-dir = "build/{wheel_tag}"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
