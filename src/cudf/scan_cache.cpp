@@ -23,8 +23,15 @@
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/memory/config.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace cucascade::io {
@@ -32,6 +39,35 @@ namespace cucascade::io {
 namespace {
 
 constexpr std::size_t pool_bytes = 128UL << 20;  // size of one pinned pool
+
+/// "bus:device.function" of a PCI bus id, which NVML and CUDA write with different domain widths.
+std::string pci_location(std::string const& bus_id)
+{
+  auto const colon     = bus_id.find(':');
+  std::string location = colon == std::string::npos ? bus_id : bus_id.substr(colon + 1);
+  std::ranges::transform(
+    location, location.begin(), [](unsigned char c) { return std::tolower(c); });
+  return location;
+}
+
+/// The NUMA node of the current CUDA device, or -1 if it cannot be found.
+int current_device_numa_node()
+{
+  int device = 0;
+  std::array<char, 32> bus_id{};
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetPCIBusId(bus_id.data(), static_cast<int>(bus_id.size()), device) !=
+        cudaSuccess) {
+    return -1;
+  }
+  cucascade::memory::topology_discovery topology;
+  if (!topology.discover()) { return -1; }
+  auto const wanted = pci_location(bus_id.data());
+  for (auto const& gpu : topology.get_topology().gpus) {
+    if (pci_location(gpu.pci_bus_id) == wanted) { return gpu.numa_node; }
+  }
+  return -1;
+}
 
 }  // namespace
 
@@ -43,6 +79,7 @@ scan_cache::scan_cache(scan_cache_options const& options)
   }
 
   cucascade::memory::host_memory_space_config host;
+  host.numa_id         = options.numa_node ? *options.numa_node : current_device_numa_node();
   host.memory_capacity = options.cache_bytes;
   // The default 0.9 would make only 90% of the cache usable.
   host.reservation_limit_fraction = 1.0;

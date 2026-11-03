@@ -3,6 +3,7 @@
 
 from libc.stdint cimport uint32_t, uint64_t
 from libcpp.memory cimport unique_ptr
+from libcpp.optional cimport optional
 from libcpp.span cimport span
 from libcpp.string cimport string
 from libcpp.vector cimport vector
@@ -30,6 +31,7 @@ cdef extern from "cucascade/cudf/scan_cache.hpp" namespace "cucascade::io" nogil
         size_t connections
         long stall_seconds
         size_t pinning_threads
+        optional[int] numa_node
         string endpoint
         string region
         string access_key

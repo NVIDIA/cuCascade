@@ -93,6 +93,16 @@ TEST_CASE("the summary reports the prefetching cache", "[cache][scan-cache]")
   CHECK(cache.summary().starts_with("fs_cache:"));
 }
 
+TEST_CASE("the cache can be placed on a NUMA node or left to the driver", "[cache][scan-cache]")
+{
+  for (int node : {0, -1}) {
+    scan_cache_options options = small_cache();
+    options.numa_node          = node;
+    scan_cache cache(options);
+    CHECK(cache.stats().empty());
+  }
+}
+
 TEST_CASE("a scan cache can be created again after one is destroyed", "[cache][scan-cache]")
 {
   {

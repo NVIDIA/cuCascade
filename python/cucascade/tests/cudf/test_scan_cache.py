@@ -28,6 +28,13 @@ def test_a_scan_cache_needs_a_size(make_options):
         ScanCache(make_options(cache_bytes=0))
 
 
+@pytest.mark.parametrize("numa_node", [None, 0, -1])
+def test_the_cache_can_be_placed_on_a_numa_node(make_options, numa_node):
+    assert (
+        ScanCache(make_options(numa_node=numa_node)).summary().startswith("fs_cache:")
+    )
+
+
 def test_a_scan_cache_needs_options():
     with pytest.raises(TypeError):
         ScanCache(None)

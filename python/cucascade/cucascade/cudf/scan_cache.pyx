@@ -61,6 +61,10 @@ cdef class ScanCacheOptions:
         A request that moves under 64 KiB/s for this long is aborted and retried.
     pinning_threads
         Threads that pin the cache when it is created.
+    numa_node
+        NUMA node to place the cache on. ``None`` (the default) uses the node of the current
+        CUDA device. -1 leaves the placement to the CUDA driver, which pins one pool at a time and
+        is slower.
     """
     def __init__(
         self,
@@ -80,6 +84,7 @@ cdef class ScanCacheOptions:
         size_t connections=128,
         long stall_seconds=5,
         size_t pinning_threads=8,
+        numa_node=None,
     ):
         self.c_obj.cache_bytes = cache_bytes
         self.c_obj.block_bytes = block_bytes
@@ -91,6 +96,8 @@ cdef class ScanCacheOptions:
         self.c_obj.connections = connections
         self.c_obj.stall_seconds = stall_seconds
         self.c_obj.pinning_threads = pinning_threads
+        if numa_node is not None:
+            self.c_obj.numa_node = <int> numa_node
         self.c_obj.endpoint = endpoint.encode()
         self.c_obj.region = region.encode()
         self.c_obj.access_key = access_key.encode()
@@ -105,7 +112,7 @@ cdef class ScanCache:
     Assembles the pinned host cache, the REST io context, the column admission
     policy and a cache of opened objects. :meth:`open` returns a datasource for a
     pylibcudf reader. The cache is pinned when the object is created, which takes
-    about 0.3 s per GiB.
+    about 0.2 s per GiB.
 
     Parameters
     ----------

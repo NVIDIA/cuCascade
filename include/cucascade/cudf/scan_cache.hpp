@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -68,6 +69,12 @@ struct scan_cache_options {
   /// Threads that pin the cache when it is created.
   std::size_t pinning_threads{8};
 
+  /// NUMA node to place the cache on. Unset places it on the node of the current CUDA device, found
+  /// from the system topology, and falls back to -1 if that is not known. -1 leaves the placement
+  /// to the CUDA driver, which pins one pool at a time: about 0.3 s per GiB, against about 0.2 s
+  /// per GiB on a node, and the driver path cannot use more than one thread.
+  std::optional<int> numa_node;
+
   /// Object store endpoint, region and credentials.
   std::string endpoint;
   std::string region;
@@ -84,8 +91,8 @@ struct scan_cache_options {
  * and an @ref object_cache that makes reopening a file free. @ref open returns a datasource that
  * a reader reads through; reads of it are advised to the cache under the admission policy.
  *
- * The cache is pinned when the object is created, which takes about 0.3 s per GiB, so that the
- * first query does not pay for it.
+ * The cache is pinned when the object is created, which takes about 0.2 s per GiB when it is placed
+ * on a NUMA node (the default), so that the first query does not pay for it.
  *
  * Every datasource from @ref open must be destroyed before the cache is.
  *
