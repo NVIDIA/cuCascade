@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <cucascade/memory/net_topology.hpp>
+
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -101,6 +103,43 @@ struct numa_topology_info {
 };
 
 /**
+ * @brief Kernel TLS (kTLS) state of the running kernel.
+ *
+ * kTLS is provided by the kernel's `tls` module, which registers the "tls" TCP
+ * upper-layer protocol (ULP). Once registered, `setsockopt(TCP_ULP, "tls")` succeeds
+ * and record encryption/decryption can be offloaded to the kernel.
+ *
+ * Detection is passive: it reads `/proc/modules` and
+ * `/proc/sys/net/ipv4/tcp_available_ulp` and never loads the module.
+ *
+ * @note `loaded == false` does not mean kTLS can never be used: the kernel loads the
+ *       module on demand when a process holding `CAP_NET_ADMIN` sets the ULP. An
+ *       unprivileged process, however, cannot trigger that load.
+ */
+struct kernel_tls_info {
+  /// The `tls` ULP is registered, i.e. kTLS is usable now: either the `tls` module is
+  /// loaded (and live) or kTLS is built into the kernel (see `built_in`).
+  bool loaded{false};
+  /// kTLS is built into the kernel (`CONFIG_TLS=y`) rather than provided by a loadable
+  /// module. Only reported when `/proc/modules` is readable; false when it is not.
+  bool built_in{false};
+};
+
+/**
+ * @brief Discover the kernel TLS (kTLS) state of the running kernel.
+ *
+ * Reads `/proc/modules` (a `tls` row in the `Live` state means the module is loaded)
+ * and `/proc/sys/net/ipv4/tcp_available_ulp` (a `tls` token means the ULP is
+ * registered). The ULP list is authoritative; the module row distinguishes a loadable
+ * module from a built-in one and stands in for the ULP list when that file is
+ * unreadable.
+ *
+ * @param roots Where procfs is mounted; tests point it at a fake tree.
+ * @return The kTLS state; all fields false when neither file reports kTLS.
+ */
+[[nodiscard]] kernel_tls_info discover_kernel_tls(discovery_roots const& roots = {});
+
+/**
  * @brief System topology information.
  */
 struct system_topology_info {
@@ -112,6 +151,7 @@ struct system_topology_info {
   std::vector<network_device_info> network_devices;  ///< Network device information.
   std::vector<storage_device_info> storage_devices;  ///< Storage device information.
   std::vector<numa_topology_info> numa_nodes;        ///< NUMA node information, sorted by id.
+  kernel_tls_info kernel_tls;                        ///< Kernel TLS (kTLS) state.
 
   /**
    * @brief Find a NUMA node by ID.
@@ -219,8 +259,8 @@ class topology_discovery {
    * @brief Discover system topology.
    *
    * This method performs the actual discovery of GPUs, NUMA nodes, CPU affinity,
-   * network devices (including their MTU), and storage devices. It must be called
-   * before `get_topology()`.
+   * network devices (including their MTU), storage devices, and the kernel TLS
+   * state. It must be called before `get_topology()`.
    *
    * By default this call uses only NVML and Linux sysfs and therefore does not
    * touch the CUDA driver. Set @p with_runtime_attributes to true to also

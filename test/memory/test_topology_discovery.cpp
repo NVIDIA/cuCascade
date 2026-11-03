@@ -43,6 +43,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -462,4 +463,178 @@ TEST_CASE("Topology Discovery MTU does not depend on the verification level", "[
     REQUIRE(it->net_interface == strict.net_interface);
     REQUIRE(it->mtu == strict.mtu);
   }
+}
+
+namespace {
+/// A fake procfs: a temporary directory holding a @c proc/ subtree.
+class fake_procfs {
+ public:
+  fake_procfs()
+  {
+    static std::atomic<int> counter{0};
+    _root = fs::temp_directory_path() / ("cucascade_ktls_" + std::to_string(::getpid()) + "_" +
+                                         std::to_string(counter.fetch_add(1)));
+    fs::remove_all(_root);
+    fs::create_directories(_root / "proc");
+  }
+  ~fake_procfs()
+  {
+    std::error_code ec;
+    fs::remove_all(_root, ec);
+  }
+  fake_procfs(fake_procfs const&)            = delete;
+  fake_procfs& operator=(fake_procfs const&) = delete;
+
+  [[nodiscard]] discovery_roots roots() const { return {_root, _root}; }
+
+  void modules(std::string const& content) const { write("proc/modules", content); }
+  void ulps(std::string const& content) const
+  {
+    write("proc/sys/net/ipv4/tcp_available_ulp", content);
+  }
+
+ private:
+  void write(std::string const& rel, std::string const& content) const
+  {
+    auto const path = _root / rel;
+    fs::create_directories(path.parent_path());
+    std::ofstream(path) << content;
+  }
+
+  fs::path _root;
+};
+
+constexpr char const* other_modules =
+  "nvidia_uvm 2076672 4 - Live 0x0000000000000000 (POE)\n"
+  "ena 155648 0 - Live 0x0000000000000000\n";
+constexpr char const* tls_live = "tls 167936 0 - Live 0x0000000000000000\n";
+}  // namespace
+
+TEST_CASE("kTLS: a live tls module with the ULP registered is loaded, not built in",
+          "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.modules(std::string{other_modules} + tls_live);
+  host.ulps("espintcp mptcp tls\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: a registered ULP without a module row is built in", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.modules(other_modules);
+  host.ulps("tls\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE(ktls.loaded);
+  REQUIRE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: neither a module row nor a registered ULP is not loaded", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.modules(other_modules);
+  host.ulps("espintcp mptcp\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: a module that is still loading or unloading is not loaded", "[hw_topology][ktls]")
+{
+  auto const state = GENERATE(std::string{"Loading"}, std::string{"Unloading"});
+  INFO("module state " << state);
+
+  fake_procfs host;
+  host.modules(std::string{other_modules} + "tls 167936 0 - " + state + " 0x0000000000000000\n");
+  host.ulps("mptcp\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: only exact names count as the tls module and ULP", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.modules(std::string{other_modules} + "tls_foo 4096 0 - Live 0x0\nktls 4096 0 - Live 0x0\n");
+  host.ulps("tlsx ktls mptcp\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: the ULP list is authoritative over the module row", "[hw_topology][ktls]")
+{
+  // A Live row with no registered ULP (e.g. a racing unload): not usable.
+  fake_procfs host;
+  host.modules(tls_live);
+  host.ulps("mptcp\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: an unreadable ULP list falls back to the module row", "[hw_topology][ktls]")
+{
+  SECTION("live module")
+  {
+    fake_procfs host;
+    host.modules(std::string{other_modules} + tls_live);
+    auto const ktls = discover_kernel_tls(host.roots());
+    REQUIRE(ktls.loaded);
+    REQUIRE_FALSE(ktls.built_in);
+  }
+  SECTION("no module row")
+  {
+    fake_procfs host;
+    host.modules(other_modules);
+    auto const ktls = discover_kernel_tls(host.roots());
+    REQUIRE_FALSE(ktls.loaded);
+    REQUIRE_FALSE(ktls.built_in);
+  }
+}
+
+TEST_CASE("kTLS: an unreadable module list cannot report built in", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.ulps("espintcp mptcp tls\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: an empty procfs reports nothing", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: discover() reports this host's kTLS state", "[hw_topology][ktls]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+  auto const& ktls = discovery.get_topology().kernel_tls;
+
+  auto const direct = discover_kernel_tls();
+  REQUIRE(ktls.loaded == direct.loaded);
+  REQUIRE(ktls.built_in == direct.built_in);
+  REQUIRE((!ktls.built_in || ktls.loaded));
+
+  // The tls module creates /proc/net/tls_stat in its init, whether loaded or built in.
+  std::error_code ec;
+  bool const has_tls_stat = fs::exists("/proc/net/tls_stat", ec);
+  INFO("loaded=" << ktls.loaded << " built_in=" << ktls.built_in
+                 << " /proc/net/tls_stat=" << has_tls_stat);
+  REQUIRE(ktls.loaded == has_tls_stat);
 }

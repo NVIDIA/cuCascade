@@ -997,6 +997,46 @@ nvmlReturn_t initialize_nvml_for_current_process()
 
 }  // namespace
 
+kernel_tls_info discover_kernel_tls(discovery_roots const& roots)
+{
+  // /proc/modules rows are "<name> <size> <refcount> <deps> <state> <address>"; the
+  // state is Live, Loading or Unloading. Only a Live module has registered its ULP.
+  std::ifstream modules(roots.procfs_root / "proc" / "modules");
+  bool const modules_readable = modules.is_open();
+  bool module_listed          = false;
+  bool module_live            = false;
+  std::string line;
+  while (modules_readable && std::getline(modules, line)) {
+    std::istringstream fields(line);
+    std::string name, size, refcount, deps, state;
+    if (!(fields >> name) || name != "tls") { continue; }
+    module_listed = true;
+    module_live   = (fields >> size >> refcount >> deps >> state) && state == "Live";
+    break;
+  }
+
+  // Space-separated names of the registered TCP ULPs, e.g. "espintcp mptcp tls". It
+  // lists the ULP whether kTLS is a loaded module or built in.
+  std::ifstream ulps(roots.procfs_root / "proc" / "sys" / "net" / "ipv4" / "tcp_available_ulp");
+  bool const ulps_readable = ulps.is_open();
+  bool ulp_registered      = false;
+  std::string ulp;
+  while (ulps_readable && ulps >> ulp) {
+    if (ulp == "tls") {
+      ulp_registered = true;
+      break;
+    }
+  }
+
+  kernel_tls_info info;
+  // The ULP list is authoritative; a live module row stands in when it is unreadable.
+  info.loaded = ulps_readable ? ulp_registered : module_live;
+  // Registered without any module row (in any state) means compiled in. Without a
+  // readable /proc/modules a module cannot be told apart from a built-in.
+  info.built_in = info.loaded && modules_readable && !module_listed;
+  return info;
+}
+
 bool topology_discovery::discover(NetworkDeviceVerification net_verification,
                                   bool with_runtime_attributes)
 {
@@ -1053,6 +1093,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
   }
 
   topology.storage_devices = discover_storage_devices_with_topology();
+  topology.kernel_tls      = discover_kernel_tls();
 
   topology.gpus.clear();
 
