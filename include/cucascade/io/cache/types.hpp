@@ -930,6 +930,9 @@ struct cached_chunk {
   std::size_t offset{0};
   std::uint8_t* data{nullptr};
   std::int32_t numa_node{-1};
+  /// Eviction priority: the evictor reclaims lower values first. Raised (never lowered) by every
+  /// request that names the chunk.
+  std::atomic<std::uint8_t> eviction_priority{0};
 };
 
 static_assert(sizeof(cached_chunk) == 32, "cached_chunk should stay 4 per cache line");
