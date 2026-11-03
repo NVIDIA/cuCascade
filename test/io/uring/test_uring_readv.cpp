@@ -28,6 +28,7 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -669,6 +670,63 @@ TEST_CASE("io_uring slices_per_pass sets how deep a single request queues",
   CHECK(max_inflight(8) >= 8);
   // No cap: the first pass fills the 64 free slots.
   CHECK(max_inflight(0) >= 32);
+}
+
+TEST_CASE("io_uring slices_per_pass holds while a read outlasts the worker's poll interval",
+          "[io][uring][slices_per_pass]")
+{
+  // The worker's completion wait times out every 20 ms so it can observe stop requests and
+  // cancellation.  A wakeup that completed nothing is not a new pass: with one slice per
+  // pass, a read slower than that (a contended disk) must not let the request add one more
+  // read per timeout.  A pipe makes the slow device deterministic: a read on it completes
+  // only once the test writes the bytes.
+  constexpr std::size_t n_slices = 8;
+  constexpr std::size_t stride   = 4UL << 10;
+  constexpr std::size_t total    = n_slices * stride;
+  static_assert(total <= (64UL << 10), "the bytes must fit a default pipe buffer");
+
+  std::array<int, 2> ends{-1, -1};
+  REQUIRE(::pipe2(ends.data(), O_CLOEXEC) == 0);
+  file_descriptor read_end{ends[0]};
+  file_descriptor write_end{ends[1]};
+
+  // A pipe stats as empty: name the size the slices read.
+  cucascade::io::object_identity identity;
+  identity.kind = cucascade::io::identity_kind::local_stat;
+  identity.size = total;
+  auto object   = std::make_shared<local_io_object>(
+    "pipe", std::move(read_end), file_descriptor{}, total, "", std::move(identity));
+
+  aligned_bytes destination{total};
+  spp_reactor reactor{1};
+  // Closing the write end before the reactor shuts down settles any read still waiting on
+  // the pipe with EOF, so a failing check cannot hang the reactor's drain.
+  struct close_on_exit {
+    file_descriptor& fd;
+    ~close_on_exit() { fd = file_descriptor{}; }
+  } const close_writer{write_end};
+
+  auto future = enqueue_ranges(
+    reactor.get(), std::move(object), slice_ranges(n_slices, stride, false), destination.get());
+
+  // Wait for the first read to reach the pipe, then hold it across about ten timed waits.
+  std::uint32_t depth = 0;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (depth == 0 && std::chrono::steady_clock::now() < deadline) {
+    depth = reactor.get().take_gauges().max_inflight_ops;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(depth == 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK(reactor.get().take_gauges().max_inflight_ops == 1);
+
+  std::vector<std::uint8_t> bytes(total);
+  for (std::size_t i = 0; i < total; ++i) {
+    bytes[i] = pattern_byte(i);
+  }
+  REQUIRE(::write(write_end.get(), bytes.data(), total) == static_cast<ssize_t>(total));
+  CHECK(std::move(future).get(std::chrono::seconds(30)) == total);
+  CHECK(reactor.get().take_gauges().max_inflight_ops <= 2);
 }
 
 TEST_CASE("io_uring queue-delay gauge counts each request once, per priority tier",

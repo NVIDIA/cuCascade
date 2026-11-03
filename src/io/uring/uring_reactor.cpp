@@ -816,6 +816,14 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     // before any further low request is taken.
     std::unique_ptr<grouped_io_request> parked;
     std::size_t inflight = 0;
+    // Whether the next pass may expand the active request (config::slices_per_pass).  Set
+    // by progress -- a read completion reaped, a device copy finished, a request made
+    // active -- and cleared when the worker blocks on the ring.  The ring wait times out
+    // every POLL_INTERVAL so the worker can observe stop requests and cancellation; such a
+    // wakeup completed nothing and must not count as a pass, or a read slower than
+    // POLL_INTERVAL lets the request add one cap of reads per timeout, unbounded by
+    // slices_per_pass.
+    bool may_expand = true;
     // Bounded low service (config::low_service_interval): high requests started
     // while low work waited since the low tier was last served, and how many
     // slices the active request -- when it was granted a turn -- may still
@@ -858,7 +866,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       } else if (low_waiting()) {
         ++high_starts_over_low;
       }
-      active = std::move(next);
+      active     = std::move(next);
+      may_expand = true;
       if (fresh) ++requests_started;
     };
 
@@ -977,6 +986,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           *output++ = *it;
           continue;
         }
+        may_expand = true;
         if (status == cudaSuccess) {
           slot.op->request.finish_success();
           reset_slot(slot);
@@ -1010,6 +1020,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
         auto const index = static_cast<int>(user_data);
         if (inflight != 0) --inflight;
+        may_expand = true;
 
         if (index < 0 || static_cast<std::size_t>(index) >= slots.size()) continue;
         auto& slot = slots[static_cast<std::size_t>(index)];
@@ -1235,9 +1246,14 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         // adding one read per completion wait.  The first expansion is unconditional, as
         // it always was; each further one needs every read planned so far to have found a
         // slot and a slot still free, which bounds the pass by the slot count.  The batch
-        // goes to the kernel in one submit once the pass stops expanding.
+        // goes to the kernel in one submit once the pass stops expanding.  A pass that
+        // follows a wakeup with no progress expands nothing (see may_expand), but still
+        // settles an active request whose coordinator stopped.
+        if (!may_expand && active != nullptr && !active->coordinator->should_continue()) {
+          cancel_active(canceled_error());
+        }
         for (std::size_t expanded = 0;
-             expanded < _slices_per_pass && pending.empty() && active != nullptr &&
+             may_expand && expanded < _slices_per_pass && pending.empty() && active != nullptr &&
              (expanded == 0 || available_slots.approx_free() > 0);
              ++expanded) {
           if (!active->coordinator->should_continue()) {
@@ -1287,6 +1303,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
         publish_gauges();
         if (inflight != 0) {
+          may_expand = false;
           if (auto const error = ring.wait_for(POLL_INTERVAL); error != 0) {
             throw std::system_error(std::error_code{error, std::generic_category()},
                                     "uring_reactor: io_uring_wait_cqe_timeout");
@@ -1297,6 +1314,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           copying.pop_back();
           auto& slot        = slots[static_cast<std::size_t>(index)];
           auto const status = slot.copy_event->synchronize_no_throw();
+          may_expand        = true;
           if (status == cudaSuccess) {
             slot.op->request.finish_success();
             reset_slot(slot);
