@@ -41,8 +41,7 @@ TEST_CASE("manager discovery retains positioned payloads and their coordinates",
           "[data_repository_manager][ordering]")
 {
   data_repository_manager manager;
-  manager.add_new_repository(
-    1, "output", std::make_unique<data_repository>(data_repository_partition_ordering::ORDERED));
+  manager.add_new_repository(1, "output", std::make_unique<data_repository>());
   auto& repository = *manager.get_repository(1, "output");
   auto batch       = cucascade::test::make_repository_test_batch(manager.get_next_data_batch_id());
   repository.add_data_batch_at_position(batch, 42, 2);
@@ -50,7 +49,6 @@ TEST_CASE("manager discovery retains positioned payloads and their coordinates",
   size_t visited = 0;
   manager.for_each_repository([&](data_repository* discovered) {
     REQUIRE(discovered == &repository);
-    REQUIRE(discovered->get_partition_ordering() == data_repository_partition_ordering::ORDERED);
     for (size_t partition_idx = 0; partition_idx < discovered->num_partitions(); ++partition_idx) {
       for (auto id : discovered->get_batch_ids(partition_idx)) {
         REQUIRE(partition_idx == 2);
@@ -72,7 +70,7 @@ TEST_CASE("manager discovery retains positioned payloads and their coordinates",
   REQUIRE(repository.get_data_batch_by_id_with_position(batch->get_batch_id(), 2) ==
           positioned_data_batch{batch, 42});
   REQUIRE(repository.get_positions(2) == std::vector<size_t>{42});
-  REQUIRE_THROWS_AS(manager.add_data_batch(batch, {{1, "output"}}), std::logic_error);
+  REQUIRE_THROWS_AS(repository.add_data_batch(batch), repository_ordering_error);
   REQUIRE(repository.total_size() == 1);
   REQUIRE(repository.pop_data_batch_by_position(42, 2) == batch);
   REQUIRE(manager.clear_all_repositories().empty());
@@ -158,7 +156,7 @@ TEST_CASE("data_repository_manager Monotonic Batch IDs", "[data_repository_manag
 }
 
 // Test adding data batch to single operator
-TEST_CASE("data_repository_manager Add Data Batch Single Operator", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Registered Repository Accepts Data", "[data_repository_manager]")
 {
   data_repository_manager manager;
 
@@ -172,7 +170,9 @@ TEST_CASE("data_repository_manager Add Data Batch Single Operator", "[data_repos
   auto batch        = data_batch::make(batch_id, std::move(data));
 
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
-  manager.add_data_batch(batch, operator_ports);
+  for (const auto& [destination_id, port] : operator_ports) {
+    manager.get_repository(destination_id, port)->add_data_batch(batch);
+  }
 
   // Repository should have the batch
   auto& repo        = manager.get_repository(operator_id, "default");
@@ -182,7 +182,7 @@ TEST_CASE("data_repository_manager Add Data Batch Single Operator", "[data_repos
 }
 
 // Test adding data batch to multiple operators (shared_ptr copies to each)
-TEST_CASE("data_repository_manager Add Data Batch Multiple Operators", "[data_repository_manager]")
+TEST_CASE("data_repository_manager Registered Repositories Share Data", "[data_repository_manager]")
 {
   data_repository_manager manager;
 
@@ -201,7 +201,9 @@ TEST_CASE("data_repository_manager Add Data Batch Multiple Operators", "[data_re
   for (size_t id : operator_ids) {
     operator_ports.push_back({id, "default"});
   }
-  manager.add_data_batch(batch, operator_ports);
+  for (const auto& [destination_id, port] : operator_ports) {
+    manager.get_repository(destination_id, port)->add_data_batch(batch);
+  }
 
   // All repositories should have the batch (same shared_ptr)
   for (size_t id : operator_ids) {
@@ -272,7 +274,9 @@ TEST_CASE("data_repository_manager Thread-Safe Add Batch", "[data_repository_man
         auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
         uint64_t batch_id = manager.get_next_data_batch_id();
         auto batch        = data_batch::make(batch_id, std::move(data));
-        manager.add_data_batch(batch, operator_ports);
+        for (const auto& [destination_id, port] : operator_ports) {
+          manager.get_repository(destination_id, port)->add_data_batch(batch);
+        }
       }
     });
   }
@@ -319,7 +323,9 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
     for (size_t id : operator_ids) {
       all_ports.push_back({id, "default"});
     }
-    manager.add_data_batch(batch, all_ports);
+    for (const auto& [destination_id, port] : all_ports) {
+      manager.get_repository(destination_id, port)->add_data_batch(batch);
+    }
   }
 
   // Batch 1: Operator 0 only
@@ -328,7 +334,9 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
     uint64_t batch_id = manager.get_next_data_batch_id();
     auto batch        = data_batch::make(batch_id, std::move(data));
     std::vector<std::pair<size_t, std::string_view>> p0 = {{0, "default"}};
-    manager.add_data_batch(batch, p0);
+    for (const auto& [destination_id, port] : p0) {
+      manager.get_repository(destination_id, port)->add_data_batch(batch);
+    }
   }
 
   // Batch 2: Operators 1 and 2
@@ -337,7 +345,9 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
     uint64_t batch_id = manager.get_next_data_batch_id();
     auto batch        = data_batch::make(batch_id, std::move(data));
     std::vector<std::pair<size_t, std::string_view>> p12 = {{1, "default"}, {2, "default"}};
-    manager.add_data_batch(batch, p12);
+    for (const auto& [destination_id, port] : p12) {
+      manager.get_repository(destination_id, port)->add_data_batch(batch);
+    }
   }
 
   // Verify: Operator 0 should have 2 batches (batch 0 and 1)
@@ -413,7 +423,9 @@ TEST_CASE("data_repository_manager Large Number of Batches", "[data_repository_m
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
     auto batch        = data_batch::make(batch_id, std::move(data));
-    manager.add_data_batch(batch, operator_ports);
+    for (const auto& [destination_id, port] : operator_ports) {
+      manager.get_repository(destination_id, port)->add_data_batch(batch);
+    }
   }
 
   // Repository should have all batches
@@ -490,7 +502,9 @@ TEST_CASE("data_repository_manager Thread-Safe Mixed Operations", "[data_reposit
         auto batch         = data_batch::make(batch_id, std::move(data));
         std::vector<std::pair<size_t, std::string_view>> operator_ports = {
           {operator_id, "default"}};
-        manager.add_data_batch(batch, operator_ports);
+        for (const auto& [destination_id, port] : operator_ports) {
+          manager.get_repository(destination_id, port)->add_data_batch(batch);
+        }
 
         ++batch_count;
 
@@ -552,7 +566,9 @@ TEST_CASE("data_repository_manager Concurrent Add and Pull", "[data_repository_m
         auto batch         = data_batch::make(batch_id, std::move(data));
         std::vector<std::pair<size_t, std::string_view>> operator_ports = {
           {operator_id, "default"}};
-        manager.add_data_batch(batch, operator_ports);
+        for (const auto& [destination_id, port] : operator_ports) {
+          manager.get_repository(destination_id, port)->add_data_batch(batch);
+        }
 
         ++batches_added;
 
@@ -642,7 +658,9 @@ TEST_CASE("data_repository_manager High Contention Add Pull", "[data_repository_
         uint64_t batch_id = manager.get_next_data_batch_id();
         auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 512);
         auto batch        = data_batch::make(batch_id, std::move(data));
-        manager.add_data_batch(batch, operator_ports);
+        for (const auto& [destination_id, port] : operator_ports) {
+          manager.get_repository(destination_id, port)->add_data_batch(batch);
+        }
         ++total_added;
 
         // Immediately try to pull a batch (might be ours or someone else's)
@@ -697,7 +715,9 @@ TEST_CASE("data_repository_manager Concurrent Add Multiple Operators Per Batch",
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
     auto batch        = data_batch::make(batch_id, std::move(data));
-    manager.add_data_batch(batch, all_operator_ports);
+    for (const auto& [destination_id, port] : all_operator_ports) {
+      manager.get_repository(destination_id, port)->add_data_batch(batch);
+    }
   }
 
   // Now concurrently pull from different operators
@@ -785,7 +805,9 @@ TEST_CASE("data_repository_manager Batches With Different Sizes", "[data_reposit
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, size);
     uint64_t batch_id = manager.get_next_data_batch_id();
     auto batch        = data_batch::make(batch_id, std::move(data));
-    manager.add_data_batch(batch, operator_ports);
+    for (const auto& [destination_id, port] : operator_ports) {
+      manager.get_repository(destination_id, port)->add_data_batch(batch);
+    }
   }
 
   // All batches should be accessible
@@ -816,7 +838,9 @@ TEST_CASE("data_repository_manager Batches With Different Tiers", "[data_reposit
     auto data         = std::make_unique<mock_data_representation>(tier, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
     auto batch        = data_batch::make(batch_id, std::move(data));
-    manager.add_data_batch(batch, operator_ports);
+    for (const auto& [destination_id, port] : operator_ports) {
+      manager.get_repository(destination_id, port)->add_data_batch(batch);
+    }
   }
 
   // All batches should be accessible
@@ -847,7 +871,9 @@ TEST_CASE("data_repository_manager Rapid Add Pull Cycles", "[data_repository_man
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
     auto batch        = data_batch::make(batch_id, std::move(data));
-    manager.add_data_batch(batch, operator_ports);
+    for (const auto& [destination_id, port] : operator_ports) {
+      manager.get_repository(destination_id, port)->add_data_batch(batch);
+    }
 
     // Pull the batch
     auto pulled = repo->pop_next_data_batch();

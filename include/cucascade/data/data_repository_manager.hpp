@@ -61,7 +61,7 @@ struct operator_port_key {
  * with a specific pipeline, and provides centralized services for:
  *
  * - Repository lifecycle management (creation, access, cleanup)
- * - Cross-pipeline data batch coordination
+ * - Repository discovery for pipeline data publication and consumption
  * - Unique batch ID generation
  * - Global eviction and memory management policies
  *
@@ -116,25 +116,6 @@ class data_repository_manager {
       auto it = _repositories.find({operator_id, std::string(port_id)});
       if (it != _repositories.end()) { throw std::runtime_error("Repository already exists"); }
       _repositories[{operator_id, std::string(port_id)}] = std::move(repository);
-    }
-  }
-
-  /**
-   * @brief Add a data_batch to specified operator repositories.
-   *
-   * The shared batch pointer is copied to each repository.
-   *
-   * @param batch The data_batch smart pointer to add
-   * @param ops The operator IDs and ports whose repositories will receive this batch
-   *
-   * @note Thread-safe operation
-   */
-  void add_data_batch(std::shared_ptr<data_batch> batch,
-                      std::vector<std::pair<size_t, std::string_view>> ops)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& op : ops) {
-      _repositories.at({op.first, std::string(op.second)})->add_data_batch(batch);
     }
   }
 

@@ -30,7 +30,7 @@ A deep dive into cuCascade's data lifecycle, batch read-only and mutable locking
 - [Data Repository Manager](#data-repository-manager)
   - [Operator Port Keys](#operator-port-keys)
   - [Batch ID Generation](#batch-id-generation)
-  - [Multi-Repository Distribution](#multi-repository-distribution)
+  - [Publishing Through Repositories](#publishing-through-repositories)
 - [Integration with Memory Module](#integration-with-memory-module)
 - [Key Source Files](#key-source-files)
 
@@ -416,8 +416,10 @@ variants return the pointer and optional position. Both work in every ordering m
 
 ### Partitioning
 
-Repositories use `std::vector<std::vector<positioned_data_batch>>` for partitioned storage.
-Each partition retains arrival order. Insertion grows the partition vector when needed;
+Repositories use a vector of partitions, each with an arrival-order list, a position-keyed map
+and a batch-ID index. Lookups use indexes, and FIFO removal does not shift the remaining entries.
+The indexes contain only resident entries, including separate entries when a batch is shared
+across positions. Each partition retains arrival order. Insertion grows the partition vector when needed;
 `set_num_partitions()` can also grow it explicitly and rejects zero, equal, or smaller counts.
 
 ```cpp
@@ -432,16 +434,8 @@ auto [batch, position] = repository.pop_next_data_batch_with_position(0);
 ```
 
 Partition membership, sequence within a partition, and device placement are independent.
-Declare whether increasing partition indices define logical sequence when constructing a repository:
-
-```cpp
-data_repository ranges(data_repository_partition_ordering::ORDERED);
-auto partition_order = ranges.get_partition_ordering();
-```
-
-Partition ordering is immutable and defaults to `UNORDERED`. It cannot be inferred from insertion:
-an index can identify a hash bucket or a sort range. An entirely empty repository can declare
-ordered partitions while its batch-positioning mode remains `UNKNOWN`.
+Partition indices do not declare or enforce logical sequence. Callers that assign sort-range
+indices must explicitly choose the appropriate partition traversal order.
 
 ### Batch Positions and Ordering
 
@@ -459,15 +453,18 @@ using positioned_data_batch =
 | `ORDERED` | Every stored entry has an explicit partition-local position |
 
 `add_data_batch(batch, partition_idx)` establishes `UNORDERED` from `UNKNOWN` and throws
-`std::logic_error` on an `ORDERED` repository. `add_data_batch_at_position(batch, position,
-partition_idx)` establishes `ORDERED` from `UNKNOWN` and throws `std::logic_error` on an
+`repository_ordering_error` on an `ORDERED` repository. `add_data_batch_at_position(batch, position,
+partition_idx)` establishes `ORDERED` from `UNKNOWN` and throws `repository_ordering_error` on an
 `UNORDERED` repository. Mode checks, insertion, and mode establishment occur under one mutex.
 Failed insertion leaves contents, partition count, and mode unchanged. Draining never resets mode.
+Both insertion APIs reject null batches with `std::invalid_argument` and accept the shared pointer
+by const reference, preserving caller ownership even if a moved argument is rejected. Partition
+growth can also throw `std::length_error` or `std::bad_alloc`; these are not mode/duplicate errors.
 
 Positions may have gaps and arrive in any order. Duplicate resident positions within a partition
-throw `std::logic_error`; the same position may occur in different partitions. A producer must
-never reuse a position in the partition's logical sequence, even after consumption. The repository
-checks resident entries only and keeps no historical position ledger. Empty or filtered-away
+throw `repository_duplicate_error`; the same position may occur in different partitions.
+Removing a batch frees its position for the same batch or another batch to be inserted again.
+The same shared batch may occupy multiple positions without copying its payload. Empty or filtered-away
 outputs do not require renumbering later positions. Positions identify sequence, independently of
 batch IDs and the number of rows in a payload.
 
@@ -492,22 +489,22 @@ on a miss, and `{batch, nullopt}` for an unpositioned batch. FIFO and ID retriev
 `get_data_batch_by_position(position, partition_idx)` and
 `pop_data_batch_by_position(position, partition_idx)` return the payload pointer or `nullptr`
 when absent. `get_positions(partition_idx)` returns a copy of the resident positions in
-increasing order. These three operations require `ORDERED` batch mode: `UNKNOWN` and `UNORDERED`
-throw `std::logic_error`, including on an empty partition. Invalid partition indices still throw
-`std::out_of_range`, checked before mode errors. Growing partitions never changes either ordering
-contract.
+increasing order. These three operations return an empty result for an empty requested partition,
+including in `UNKNOWN` mode. A nonempty partition requires `ORDERED` mode, otherwise
+`repository_ordering_error` is thrown. Invalid partition indices still throw
+`std::out_of_range`, checked before mode errors. Growing partitions never changes the batch mode.
 
 ### Ordered Consumption
 
 The producer asserts the logical meaning of positions and partition order. The repository checks
-structural invariants; it does not validate sortedness or SQL comparators. When both levels are
-ordered, traversal is lexicographic by `(partition_idx, position)`, then by row order inside a batch.
-Ordered partitions alone can contain an unordered collection of runs that still needs merging.
+structural invariants; it does not validate sortedness or SQL comparators. Callers using ordered
+range indices explicitly choose lexicographic `(partition_idx, position)` traversal, then row order.
+A range partition can contain an unordered collection of runs that still needs merging.
 
 Ordered consumers must first establish that all producers have successfully completed publication.
 `UNKNOWN`, emptiness, and a missing position cannot distinguish delayed output from an absent or
 filtered-away output. The repository provides no completion, cancellation, or watermark protocol.
-An entirely empty completed input can remain `UNKNOWN`; handle it before calling ordered-only APIs.
+An entirely empty completed input can remain `UNKNOWN`; position enumeration returns an empty list.
 
 After successful completion, one coordinated consumer can enumerate and retrieve sparse positions:
 
@@ -537,11 +534,12 @@ Use the corresponding `_with_position()` variant when the consumer needs to pres
 position. These return `positioned_data_batch`, or `{nullptr, std::nullopt}` on a miss. FIFO
 retrieval follows arrival order with either API; it does not sort by position.
 
-The plain virtual methods forward to the position-aware virtual methods and select `.first`.
-Subclasses implementing custom storage can override the position-aware methods to support both
-forms; instrumentation that only observes one form should override that form explicitly.
+Public methods are non-virtual and acquire the repository mutex before calling protected virtual
+`_unlocked` implementation hooks. Payload-only and position-aware wrappers share the same hooks.
+Overrides must call the base `_unlocked` helper while the lock is held, rather than a public method
+that would acquire the mutex again. Subclasses must preserve the mode and storage-index invariants.
 
-`get_positions()` enumerates sorted positions; `get_batch_positions()` remains an alias.
+`get_positions()` enumerates sorted positions; `get_batch_positions()` remains a non-virtual alias.
 The snapshot is only complete after all producers finish, and consumers must coordinate removal.
 
 ### Shared Ownership
@@ -581,18 +579,23 @@ The manager provides globally unique, monotonically increasing batch IDs:
 uint64_t id = manager.get_next_data_batch_id();  // atomic increment
 ```
 
-### Multi-Repository Distribution
+### Publishing Through Repositories
 
-The `add_data_batch()` method distributes a batch to one or more repositories:
+The manager registers and exposes repositories; it does not publish batches or coordinate fan-out.
+Publish directly through each destination repository, using the appropriate insertion API:
 
 ```cpp
-// shared_ptr: same batch goes to multiple repositories
-manager.add_data_batch(shared_batch, {{0, "output"}, {1, "input"}});
+auto& repository = *manager.get_repository(0, "output");
+repository.add_data_batch(shared_batch);
+
+// For a separate destination whose batches carry logical positions:
+auto& positioned_repository = *manager.get_repository(1, "input");
+positioned_repository.add_data_batch_at_position(shared_batch, position);
 ```
 
-For positioned publication, obtain the destination repository through `get_repository()` and call
-its `add_data_batch_at_position()` method. The manager's existing `add_data_batch()` fan-out
-publishes unpositioned entries and is subject to each destination's mode checks.
+A caller sending a batch to several repositories performs separate publications and owns any
+coordination or failure policy needed across them. No atomic multi-repository publication is
+provided by the manager.
 
 Memory management discovers the same payloads through `for_each_repository()` or
 `get_repositories()`, followed by each repository's `num_partitions()`, `get_batch_ids()`, and
@@ -624,8 +627,8 @@ Application
     |-- memory_reservation_manager.request_reservation(strategy, size)
     |       |-- memory_space.make_reservation(size)
     |
-    |-- data_repository_manager.add_data_batch(batch, ops)
-    |       |-- data_repository.add_data_batch(batch)   [batch is idle]
+    |-- data_repository_manager.get_repository(operator_id, port_id)
+    |       |-- repository.add_data_batch(batch)        [batch is idle]
     |
     |-- data_repository.pop_next_data_batch(partition_idx)
     |       |-- returns shared_ptr<data_batch> (idle, non-blocking)

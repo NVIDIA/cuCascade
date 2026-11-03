@@ -39,14 +39,11 @@ using cucascade::test::mock_data_representation;
 
 static_assert(std::is_same_v<shared_data_repository, data_repository>);
 
-TEST_CASE("repository batch mode and partition ordering are independent",
+TEST_CASE("repository batch mode is inferred uniformly and retained after draining",
           "[data_repository][ordering]")
 {
-  auto partition_order = GENERATE(data_repository_partition_ordering::ORDERED,
-                                  data_repository_partition_ordering::UNORDERED);
-  data_repository repository(partition_order);
+  data_repository repository;
   REQUIRE(repository.get_ordering() == data_repository_ordering::UNKNOWN);
-  REQUIRE(repository.get_partition_ordering() == partition_order);
   repository.set_num_partitions(3);
   REQUIRE(repository.all_empty());
   REQUIRE(repository.pop_next_data_batch_with_position() == positioned_data_batch{});
@@ -91,7 +88,6 @@ TEST_CASE("repository batch mode and partition ordering are independent",
     repository.add_data_batch_at_position(batch, 9);
     REQUIRE(repository.get_positions() == std::vector<size_t>{9});
   }
-  REQUIRE(repository.get_partition_ordering() == partition_order);
 }
 
 TEST_CASE("positioned repository retains sparse positions and FIFO arrival order",
@@ -175,27 +171,26 @@ TEST_CASE("position-aware reads retain positions in ordered mode", "[data_reposi
   REQUIRE(repository.pop_data_batch_by_id_with_position(1) == positioned_data_batch{});
 }
 
-TEST_CASE("payload APIs discard positions and dispatch through position-aware overrides",
+TEST_CASE("payload and metadata APIs share unlocked implementation hooks",
           "[data_repository][ordering]")
 {
   struct observed_repository : data_repository {
     mutable size_t calls = 0;
-    positioned_data_batch pop_next_data_batch_with_position(size_t partition = 0) override
+    positioned_data_batch pop_next_data_batch_unlocked(size_t partition) override
     {
       ++calls;
-      return data_repository::pop_next_data_batch_with_position(partition);
+      return data_repository::pop_next_data_batch_unlocked(partition);
     }
-    positioned_data_batch pop_data_batch_by_id_with_position(uint64_t id,
-                                                             size_t partition = 0) override
+    positioned_data_batch pop_data_batch_by_id_unlocked(uint64_t id, size_t partition = 0) override
     {
       ++calls;
-      return data_repository::pop_data_batch_by_id_with_position(id, partition);
+      return data_repository::pop_data_batch_by_id_unlocked(id, partition);
     }
-    positioned_data_batch get_data_batch_by_id_with_position(uint64_t id,
-                                                             size_t partition = 0) const override
+    positioned_data_batch get_data_batch_by_id_unlocked(uint64_t id,
+                                                        size_t partition = 0) const override
     {
       ++calls;
-      return data_repository::get_data_batch_by_id_with_position(id, partition);
+      return data_repository::get_data_batch_by_id_unlocked(id, partition);
     }
   } repository;
   auto batch = make_repository_test_batch(1);
@@ -224,7 +219,7 @@ TEST_CASE("position access requires ordered mode and preserves partition excepti
   } else if (mode == data_repository_ordering::ORDERED) {
     repository.add_data_batch_at_position(make_repository_test_batch(1), 1);
   }
-  if (mode != data_repository_ordering::ORDERED) {
+  if (mode == data_repository_ordering::UNORDERED) {
     REQUIRE_THROWS_AS(repository.get_data_batch_by_position(1), std::logic_error);
     REQUIRE_THROWS_AS(repository.pop_data_batch_by_position(1), std::logic_error);
     REQUIRE_THROWS_AS(repository.get_positions(), std::logic_error);
@@ -284,7 +279,7 @@ TEST_CASE("concurrent first insertions establish exactly one batch mode",
       try {
         repository.add_data_batch(batch, 1);
         ++accepted;
-      } catch (const std::logic_error&) {
+      } catch (const repository_ordering_error&) {
         ++rejected;
       }
     });
@@ -293,7 +288,7 @@ TEST_CASE("concurrent first insertions establish exactly one batch mode",
       try {
         repository.add_data_batch_at_position(batch, 17);
         ++accepted;
-      } catch (const std::logic_error&) {
+      } catch (const repository_ordering_error&) {
         ++rejected;
       }
     });
@@ -329,7 +324,7 @@ TEST_CASE("concurrent duplicate publications accept one resident position",
       try {
         repository.add_data_batch_at_position(batch, 5);
         ++accepted;
-      } catch (const std::logic_error&) {
+      } catch (const repository_duplicate_error&) {
         ++rejected;
       }
     });
@@ -405,7 +400,6 @@ TEST_CASE("legacy unordered access remains compatible with position-aware inspec
           "[data_repository][ordering]")
 {
   data_repository repository;
-  REQUIRE(repository.get_partition_ordering() == data_repository_partition_ordering::UNORDERED);
   REQUIRE(repository.pop_data_batch_by_id(1) == nullptr);
   REQUIRE(repository.get_data_batch_by_id(1) == nullptr);
   auto first  = make_repository_test_batch(1);
@@ -1093,4 +1087,118 @@ TEST_CASE("data_repository pop_next_data_batch with partitions", "[data_reposito
 
   REQUIRE(repository.pop_next_data_batch(0) == nullptr);
   REQUIRE(repository.pop_next_data_batch(1) == nullptr);
+}
+
+TEST_CASE("insertion rejection retains ownership of moved arguments", "[data_repository][ordering]")
+{
+  data_repository repository;
+  auto resident  = make_repository_test_batch(1);
+  auto rejected  = make_repository_test_batch(2);
+  auto* original = rejected.get();
+  repository.add_data_batch_at_position(resident, 7);
+  REQUIRE_THROWS_AS(repository.add_data_batch_at_position(std::move(rejected), 7),
+                    repository_duplicate_error);
+  REQUIRE(rejected.get() == original);
+  REQUIRE_THROWS_AS(repository.add_data_batch(std::move(rejected), 9), repository_ordering_error);
+  REQUIRE(rejected.get() == original);
+  REQUIRE(repository.num_partitions() == 1);
+  REQUIRE(repository.total_size() == 1);
+  data_repository unordered;
+  unordered.add_data_batch(resident);
+  REQUIRE_THROWS_AS(unordered.add_data_batch_at_position(std::move(rejected), 7),
+                    repository_ordering_error);
+  REQUIRE(rejected.get() == original);
+}
+
+TEST_CASE("null publication cannot establish a mode or create a partition",
+          "[data_repository][ordering]")
+{
+  data_repository repository;
+  REQUIRE_THROWS_AS(repository.add_data_batch(nullptr, 5), std::invalid_argument);
+  REQUIRE_THROWS_AS(repository.add_data_batch_at_position(nullptr, 7, 5), std::invalid_argument);
+  REQUIRE(repository.get_ordering() == data_repository_ordering::UNKNOWN);
+  REQUIRE(repository.num_partitions() == 1);
+  REQUIRE(repository.all_empty());
+}
+
+TEST_CASE("empty partition position reads do not require a declared mode",
+          "[data_repository][ordering]")
+{
+  data_repository repository;
+  REQUIRE(repository.get_positions().empty());
+  REQUIRE(repository.get_data_batch_by_position(0) == nullptr);
+  REQUIRE(repository.pop_data_batch_by_position(0) == nullptr);
+  REQUIRE(repository.get_ordering() == data_repository_ordering::UNKNOWN);
+  repository.add_data_batch(make_repository_test_batch(1), 2);
+  REQUIRE(repository.get_positions(0).empty());
+  REQUIRE(repository.get_data_batch_by_position(0, 0) == nullptr);
+  REQUIRE(repository.pop_data_batch_by_position(0, 0) == nullptr);
+  REQUIRE_THROWS_AS(repository.get_positions(2), repository_ordering_error);
+  REQUIRE(repository.get_ordering() == data_repository_ordering::UNORDERED);
+}
+
+TEST_CASE("every removal API frees the position for the same or a different batch",
+          "[data_repository][ordering]")
+{
+  data_repository repository;
+  auto batch                 = make_repository_test_batch(1);
+  const bool replace_payload = GENERATE(false, true);
+  repository.add_data_batch_at_position(batch, 7);
+  SECTION("position") { REQUIRE(repository.pop_data_batch_by_position(7) == batch); }
+  SECTION("payload ID") { REQUIRE(repository.pop_data_batch_by_id(1) == batch); }
+  SECTION("metadata ID")
+  {
+    REQUIRE(repository.pop_data_batch_by_id_with_position(1) == positioned_data_batch{batch, 7});
+  }
+  SECTION("payload FIFO") { REQUIRE(repository.pop_next_data_batch() == batch); }
+  SECTION("metadata FIFO")
+  {
+    REQUIRE(repository.pop_next_data_batch_with_position() == positioned_data_batch{batch, 7});
+  }
+  auto replacement = replace_payload ? make_repository_test_batch(2) : batch;
+  REQUIRE_NOTHROW(repository.add_data_batch_at_position(replacement, 7));
+  REQUIRE(repository.get_data_batch_by_position(7) == replacement);
+  REQUIRE_THROWS_AS(repository.add_data_batch_at_position(batch, 7), repository_duplicate_error);
+}
+
+TEST_CASE("shared batch entries keep independent positions and ID index links",
+          "[data_repository][ordering]")
+{
+  data_repository repository;
+  auto batch = make_repository_test_batch(1);
+  repository.add_data_batch_at_position(batch, 20);
+  repository.add_data_batch_at_position(batch, 3);
+  repository.add_data_batch_at_position(batch, 11);
+  REQUIRE(repository.get_positions() == std::vector<size_t>{3, 11, 20});
+  // Removing the middle ID-index entry must leave the earlier and later entries valid.
+  REQUIRE(repository.pop_data_batch_by_position(3) == batch);
+  REQUIRE(repository.pop_data_batch_by_id_with_position(1) == positioned_data_batch{batch, 20});
+  REQUIRE(repository.pop_next_data_batch_with_position() == positioned_data_batch{batch, 11});
+  REQUIRE(repository.all_empty());
+  REQUIRE(repository.get_data_batch_by_id(1) == nullptr);
+  repository.add_data_batch_at_position(batch, 20);
+  repository.set_num_partitions(32);
+  REQUIRE(repository.pop_data_batch_by_position(20) == batch);
+}
+
+TEST_CASE("allocation-limit rejection is distinct from a repository conflict",
+          "[data_repository][ordering]")
+{
+  data_repository repository;
+  auto batch      = make_repository_test_batch(1);
+  auto* original  = batch.get();
+  const auto huge = std::numeric_limits<size_t>::max() - 1;
+  SECTION("positioned")
+  {
+    REQUIRE_THROWS_AS(repository.add_data_batch_at_position(std::move(batch), 7, huge),
+                      std::length_error);
+  }
+  SECTION("unpositioned")
+  {
+    REQUIRE_THROWS_AS(repository.add_data_batch(std::move(batch), huge), std::length_error);
+  }
+  REQUIRE(batch.get() == original);
+  REQUIRE(repository.all_empty());
+  REQUIRE(repository.num_partitions() == 1);
+  REQUIRE(repository.get_ordering() == data_repository_ordering::UNKNOWN);
 }
