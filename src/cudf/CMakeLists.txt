@@ -29,5 +29,6 @@ if(CUCASCADE_BUILD_IO)
   target_sources(
     cucascade_cudf_objects
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/datasource.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/advising_datasource.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/advising_datasource.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/scan_cache.cpp)
 endif()
