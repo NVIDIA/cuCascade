@@ -1,14 +1,20 @@
 # Pinned host cache validation and external handoff
 
-This is the validation record for [ticket 11](https://github.com/kevkrist/cuCascade/issues/11) and [spec 1](https://github.com/kevkrist/cuCascade/issues/1). Two-GPU correctness is satisfied, and the user has accepted the measured deterministic eviction regression. Both issues remain open for the original four-GPU application comparison. No upstream review responses have been posted.
+This is the validation record for [ticket 11](https://github.com/kevkrist/cuCascade/issues/11) and [spec 1](https://github.com/kevkrist/cuCascade/issues/1). Two-GPU correctness is satisfied, and the user has accepted the measured deterministic eviction regression. The user has also waived the original four-GPU application comparison because access to that machine was lost. The implementation satisfies the revised delivery criteria; final review and issue closure follow separately. Application performance remains unmeasured. No upstream review responses have been posted.
 
 ## Accepted performance tradeoff (2026-11-03)
 
 The user explicitly revised the plan with "Let's accept this regression." This accepts the current implementation's measured `deterministic_full_cap` throughput losses of 7.98% on ARM GB10 and 7.72% on x86_64 Xeon/RTX PRO 4500. The exception covers the single-thread, single-stream, 64 KiB cache control with repeated 9,000-byte and 40,000-byte allocations. The tradeoff preserves the correctness guarantees and measured concurrent throughput gains without adding ownership or locking complexity solely for this stress case.
 
-This is acceptance of a measured loss, not a passing result under the original 5% threshold. The exception is limited to this benchmark and validated implementation; it does not cover future worsening. The 5% gate remains unchanged for other cases and the original application comparison, and further regressions require investigation and resolution or another explicit plan revision. Original measurements and hashes are retained unchanged.
+This is acceptance of a measured loss, not a passing result under the original 5% threshold. The exception is limited to this benchmark and validated implementation; it does not cover future worsening. The 5% gate remains unchanged for other measured cases and future performance changes, and further regressions require investigation and resolution or another explicit plan revision. The separate application-comparison waiver below removes only the unavailable original workload from this delivery. Original measurements and hashes are retained unchanged.
 
-The original four-GPU application comparison remains the outstanding validation requirement. Acceptance of this microbenchmark regression does not waive that comparison, establish application performance, or authorize posting the draft upstream review responses.
+At this acceptance checkpoint, the original four-GPU application comparison remained required. The subsequent waiver below resolves that delivery requirement without establishing application performance or authorizing upstream review posts.
+
+## Application comparison waiver (2026-11-03)
+
+After reviewing the available correctness and performance evidence, the user said: "I don't think this is necessary. I think we are in good shape. I have lost that machine and no longer have access to it." This explicitly waives the original four-L40S application comparison for this delivery. The application workload was not rerun, and application performance remains unmeasured rather than passing the original gate.
+
+Together with the accepted deterministic eviction tradeoff, this revision completes the validation requirements for the implemented scope. The measured two-GPU correctness and allocator benchmark evidence remains the basis for acceptance. The waiver does not relax correctness contracts, other measured benchmark gates, or requirements for future performance changes. The original application protocol is retained below as optional historical reproduction guidance.
 
 ## Local evidence
 
@@ -48,7 +54,7 @@ The follow-up uses seven alternating pairs, identical affinity on CPUs 15-18 (ea
 | Deterministic full-cap | 1,024,324 | 942,635 | **-7.98%** | 0.3% / 0.2% |
 | Half-cap rounding | 21.17 | 21.45 | +1.32% | 7.0% / 10.3% |
 
-The deterministic regression is reproducible and exceeds the approved 5% threshold. Every controlled deterministic trial has exactly 300,000 hits, 300,000 misses, and 300,000 evictions in both revisions. Mixed concurrent hit counts differ and remain in the raw record; the mixed improvement does not erase the deterministic regression. Half-cap variability limits claims about small differences. At this measurement checkpoint the performance gate was open; the [2026-11-03 plan revision](#accepted-performance-tradeoff-2026-11-03) subsequently accepted this specific regression. The original application comparison remains pending.
+The deterministic regression is reproducible and exceeds the approved 5% threshold. Every controlled deterministic trial has exactly 300,000 hits, 300,000 misses, and 300,000 evictions in both revisions. Mixed concurrent hit counts differ and remain in the raw record; the mixed improvement does not erase the deterministic regression. Half-cap variability limits claims about small differences. At this measurement checkpoint the performance gate was open; the [2026-11-03 plan revision](#accepted-performance-tradeoff-2026-11-03) subsequently accepted this specific regression. The original application comparison was later waived by the user; see the [application comparison waiver](#application-comparison-waiver-2026-11-03).
 
 Separate Nsight Systems diagnostics use 10,000 deterministic iterations and are excluded from acceptance timing. Both traces have 10,130 `cudaHostAlloc`, 10,130 `cudaFreeHost`, 20,257 event records, 10,128 stream waits, and 10,129 event synchronizations, including setup/warmup/teardown. The candidate additionally issues 40,514 capture-status queries, four per two-allocation loop plus warmup/setup, while the baseline issues none. [Baseline](validation/pinned-host-cache/api-diagnostics/baseline-api.csv) and [candidate](validation/pinned-host-cache/api-diagnostics/candidate-api.csv) API summaries identify the added capture checks as an overhead contributor; instrumented durations cannot prove that they account for the entire uninstrumented loss. No allocator algorithm or capture guarantee was changed in response to these timings.
 
@@ -85,7 +91,7 @@ Seven alternating AB/BA pairs were collected on CPUs 0-3 (`taskset --cpu-list 0-
 | Deterministic full-cap | 825,566 | 761,800 | **-7.72%** | 0.9230x (**-7.70%**) | 0.3% / 0.5% |
 | Half-cap rounding | 24.58 | 24.51 | -0.25% | 0.9975x (-0.25%) | 0.3% / 1.2% |
 
-The deterministic full-cap regression reproduces on x86_64 + Blackwell at **-7.72%** median throughput (`-7.70%` median paired ratio, CV 0.27% / 0.52%, with all 7 trials recording exactly 300,000 hits, 300,000 misses, and 300,000 evictions), closely matching the `-7.98%` result on the ARM GB10 host. The user accepted this measured deterministic eviction regression in the [2026-11-03 plan revision](#accepted-performance-tradeoff-2026-11-03). Because this machine has 2 physical GPUs rather than the original 4x L40S GPUs and SF1000 dataset, **the original four-GPU application comparison remains pending**, keeping [spec 1](https://github.com/kevkrist/cuCascade/issues/1) and [ticket 11](https://github.com/kevkrist/cuCascade/issues/11) open.
+The deterministic full-cap regression reproduces on x86_64 + Blackwell at **-7.72%** median throughput (`-7.70%` median paired ratio, CV 0.27% / 0.52%, with all 7 trials recording exactly 300,000 hits, 300,000 misses, and 300,000 evictions), closely matching the `-7.98%` result on the ARM GB10 host. The user accepted this measured deterministic eviction regression in the [2026-11-03 plan revision](#accepted-performance-tradeoff-2026-11-03). This two-GPU machine does not reproduce the original 4x L40S/SF1000 application workload. The user subsequently [waived that application comparison](#application-comparison-waiver-2026-11-03), so it no longer blocks delivery of [spec 1](https://github.com/kevkrist/cuCascade/issues/1) and [ticket 11](https://github.com/kevkrist/cuCascade/issues/11). Application performance remains unmeasured.
 
 ## Build and run on the external host
 
@@ -185,7 +191,9 @@ Each worker creates its own real nonblocking stream and completes untimed warmup
 
 The mixed concurrent workload remains part of the result even if hit rates differ. Do not divide away misses or report only the deterministic control. A reproducible median throughput loss above 5% requires investigation and resolution or explicit revision of the approved plan. The [2026-11-03 acceptance](#accepted-performance-tradeoff-2026-11-03) is limited to the recorded deterministic control and current implementation. If variability prevents classification, increase iteration counts and collect additional alternating pairs. These allocation-only microbenchmarks cannot establish application performance.
 
-## Original four-GPU application gate
+## Original four-GPU application protocol (archived)
+
+The user waived this comparison on 2026-11-03 after losing access to the machine. The following original protocol is retained for optional future reproduction; it is no longer a delivery requirement and supplies no completed application-performance evidence.
 
 The original four-L40S runner, Sirius commit, configuration, and SF1000 data path have not been recovered. The adjacent single-GB300 `bench/sf1000-repro` recipe describes a different workload and is not a substitute. Reuse the user's original four-GPU setup, including only `lineitem` and `orders` compression, all other tables uncompressed, original NUMA placement, cache preparation, query selection, and host-pinning mode.
 
