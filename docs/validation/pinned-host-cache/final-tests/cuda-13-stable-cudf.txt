@@ -1,7 +1,0 @@
-RNG seed: 218056058
-/tmp/cucascade-spec-worktrees/issue-11/test/cudf/test_release_table_stream.cpp:1380: skipped: 'requires at least two CUDA devices'
-/tmp/cucascade-spec-worktrees/issue-11/test/cudf/test_release_table_stream.cpp:1493: skipped: 'requires at least two CUDA devices'
-test cases:  199 |  197 passed | 2 skipped
-assertions: 2737 | 2737 passed
-
-

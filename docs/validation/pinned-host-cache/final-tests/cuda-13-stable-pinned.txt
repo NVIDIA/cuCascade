@@ -1,9 +1,0 @@
-Filters: [small_pinned]
-RNG seed: 218056058
-/tmp/cucascade-spec-worktrees/issue-11/test/memory/test_small_pinned_host_memory_resource.cpp:1387: skipped: 'requires two CUDA devices'
-/tmp/cucascade-spec-worktrees/issue-11/test/memory/test_small_pinned_host_memory_resource.cpp:1413: skipped: 'requires two CUDA devices'
-/tmp/cucascade-spec-worktrees/issue-11/test/memory/test_small_pinned_host_memory_resource.cpp:1473: skipped: 'requires two CUDA devices'
-test cases:  41 |  38 passed | 3 skipped
-assertions: 958 | 958 passed
-
-

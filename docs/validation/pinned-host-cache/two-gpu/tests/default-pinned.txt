@@ -1,5 +1,0 @@
-Filters: [small_pinned]
-RNG seed: 218056058
-All tests passed (921 assertions in 41 test cases)
-
-
