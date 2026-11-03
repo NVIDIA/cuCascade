@@ -1001,6 +1001,9 @@ struct cached_chunk {
   /// read is only a hint, and only a read after a successful claim names the
   /// node of the buffer taken.  Not reset when the buffer is reclaimed.
   std::atomic<std::int32_t> numa_node{-1};
+  /// Eviction priority: the evictor reclaims lower values first. Raised (never lowered) by every
+  /// request that names the chunk.
+  std::atomic<std::uint8_t> eviction_priority{0};
 };
 
 static_assert(std::atomic<std::int32_t>::is_always_lock_free,

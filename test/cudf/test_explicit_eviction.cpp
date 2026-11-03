@@ -122,6 +122,35 @@ TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would
   CHECK(wait_for_cache([&] { return cache.claimed_bytes() == 0; }, 2s));
 }
 
+TEST_CASE("an explicit evict reclaims the lowest-priority chunks first",
+          "[cache][eviction][explicit]")
+{
+  constexpr std::size_t range_bytes = 16 * mib;
+  cache_test_fixture fixture{allocation_cache_config()};
+  auto& cache      = checked_cache(fixture);
+  auto cache_range = [&](std::size_t offset, std::uint8_t eviction_priority) {
+    auto source = fixture.open(object_path, 4 * range_bytes);
+    REQUIRE(source != nullptr);
+    advise_range(*source, offset, range_bytes, eviction_priority);
+    REQUIRE(source->prepare_prefetch(false) == prepare_result::prepared);
+  };
+  // The high-priority range is cached first, so oldest-first order alone would evict it first.
+  cache_range(0, /*eviction_priority=*/5);
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  auto const claimed = cache.claimed_bytes();
+  REQUIRE(claimed >= 2 * range_bytes);
+
+  cache.evict(range_bytes);
+  REQUIRE(wait_for_cache([&] { return cache.claimed_bytes() <= claimed - range_bytes; }, 2s));
+
+  // Asking for a range again claims staging memory only if its chunks were evicted.
+  auto const after = cache.claimed_bytes();
+  cache_range(0, /*eviction_priority=*/5);
+  CHECK(cache.claimed_bytes() == after);
+  cache_range(range_bytes, /*eviction_priority=*/0);
+  CHECK(cache.claimed_bytes() == after + range_bytes);
+}
+
 TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retrying",
           "[cache][eviction][explicit][prepare]")
 {

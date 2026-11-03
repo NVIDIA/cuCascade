@@ -199,7 +199,9 @@ class datasource : public cudf::io::datasource {
   /// cache is unavailable.  A second inserting call while an active handle is
   /// already stored is a caller bug and only logs a warning: the datasource
   /// lifecycle expects one insert per scan.
-  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges, std::optional<int> dev_id);
+  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
+               std::optional<int> dev_id,
+               std::uint8_t eviction_priority = 0);
 
   /// Drive the stashed handle's consumer stage to @p site.
   void update(cache::scan_stage site);
