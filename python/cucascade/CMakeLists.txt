@@ -25,9 +25,11 @@ project(
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module
+find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module
                                              Development.SABIModule)
 find_package(Cython 3.0 REQUIRED)
+include(UseCython)
+
 # cuCascade's exported io target links kvikio::kvikio, which its package config
 # does not find.
 find_package(kvikio REQUIRED CONFIG)
@@ -35,48 +37,12 @@ find_package(kvikio REQUIRED CONFIG)
 find_package(cuCascade REQUIRED COMPONENTS cudf io)
 find_package(cudf REQUIRED CONFIG)
 
-# pylibcudf's .pxd files, which the extension cimports.
-execute_process(
-  COMMAND
-    ${Python_EXECUTABLE} -c
-    "import os, pylibcudf; print(os.path.dirname(os.path.dirname(pylibcudf.__file__)))"
-  OUTPUT_VARIABLE PYLIBCUDF_PARENT_DIR
-  OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-
-include(UseCython)
-cython_transpile(
-  cucascade/_io.pyx
-  LANGUAGE
-  CXX
-  CYTHON_ARGS
-  -I
-  ${PYLIBCUDF_PARENT_DIR}
-  OUTPUT_VARIABLE
-  io_source)
-
-# pylibcudf is built against Python's limited API, and this extension subclasses
-# its Datasource, so it must be built the same way.
-python_add_library(
-  _io
-  MODULE
-  USE_SABI
-  3.10
-  WITH_SOABI
-  "${io_source}"
-  src/session.cpp)
-target_compile_definitions(_io PRIVATE CYTHON_LIMITED_API=1
-                                       Py_LIMITED_API=0x030A0000)
 # The installed cuCascade io headers include moodycamel's concurrentqueue, which
 # it does not ship.
 find_path(CUCASCADE_MOODYCAMEL_HEADER_DIR NAMES blockingconcurrentqueue.h
                                                 REQUIRED)
-target_include_directories(_io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                                       ${CUCASCADE_MOODYCAMEL_HEADER_DIR})
-target_link_libraries(
-  _io PRIVATE cuCascade::cucascade_cudf cuCascade::cucascade_io
-              cuCascade::cucascade cudf::cudf)
-# Find the libraries it linked against (cuCascade, libcudf, ...) without
-# LD_LIBRARY_PATH. cuCascade_DIR is <prefix>/lib/cmake/cuCascade.
+
+# cuCascade_DIR is <prefix>/lib/cmake/cuCascade.
 cmake_path(
   ABSOLUTE_PATH
   cuCascade_DIR
@@ -84,11 +50,23 @@ cmake_path(
   /
   NORMALIZE
   OUTPUT_VARIABLE
-  cucascade_config_dir)
-cmake_path(GET cucascade_config_dir PARENT_PATH cucascade_cmake_dir)
-cmake_path(GET cucascade_cmake_dir PARENT_PATH cucascade_library_dir)
-set_target_properties(
-  _io PROPERTIES INSTALL_RPATH "$ORIGIN;${cucascade_library_dir}"
-                 INSTALL_RPATH_USE_LINK_PATH ON)
+  config_dir)
+cmake_path(GET config_dir PARENT_PATH cmake_dir)
+cmake_path(GET cmake_dir PARENT_PATH CUCASCADE_LIBRARY_DIR)
 
-install(TARGETS _io DESTINATION cucascade)
+# pylibcudf's .pxd files, which the modules cimport.
+execute_process(
+  COMMAND
+    ${Python_EXECUTABLE} -c
+    "import os, pylibcudf; print(os.path.dirname(os.path.dirname(pylibcudf.__file__)))"
+  OUTPUT_VARIABLE PYLIBCUDF_PARENT_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+
+set(CUCASCADE_PYTHON_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+include(cmake/cucascade_cython.cmake)
+
+set(CUCASCADE_PYTHON_LIBRARIES
+    cuCascade::cucascade_cudf cuCascade::cucascade_io cuCascade::cucascade
+    cudf::cudf)
+
+add_subdirectory(cucascade)
