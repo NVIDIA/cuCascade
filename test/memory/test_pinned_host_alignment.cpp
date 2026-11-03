@@ -23,14 +23,15 @@
 
 namespace {
 
+using cucascade::test::pinned_host_test_fixture;
 using cucascade::test::require_pointer_type;
 
-struct aligned_pinned_fixture {
-  rmm::mr::pinned_host_memory_resource pinned;
-  cucascade::memory::fixed_size_host_memory_resource upstream{
-    0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
-  cucascade::memory::small_pinned_host_memory_resource resource{upstream, 64ULL << 10};
-};
+std::optional<cudaError_t> count_allocations(cucascade::test::pinned_host_call const&,
+                                             void* context) noexcept
+{
+  ++*static_cast<std::size_t*>(context);
+  return std::nullopt;
+}
 
 struct dedicated_allocation_observation {
   void* base{};
@@ -58,25 +59,10 @@ struct dedicated_allocation_observation {
 
 }  // namespace
 
-TEST_CASE("Over-aligned large pinned storage is dedicated and released",
-          "[small_pinned][pinned_alignment][fault_injection]")
-{
-  aligned_pinned_fixture fixture;
-  constexpr std::size_t bytes     = 9000;
-  constexpr std::size_t alignment = 64;
-  auto* pointer                   = fixture.resource.allocate_sync(bytes, alignment);
-  REQUIRE(reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0);
-  std::memset(pointer, 0x35, bytes);
-  require_pointer_type(pointer, cudaMemoryTypeHost);
-  fixture.resource.deallocate_sync(pointer, bytes, alignment);
-  REQUIRE(fixture.resource.large_cache_bytes() == 0);
-  require_pointer_type(pointer, cudaMemoryTypeUnregistered);
-}
-
 TEST_CASE("Nonzero pinned requests reject invalid alignment",
           "[small_pinned][pinned_alignment][fault_injection]")
 {
-  aligned_pinned_fixture fixture;
+  pinned_host_test_fixture fixture;
   auto const alignment = GENERATE(std::size_t{0}, std::size_t{3}, std::size_t{24});
   void* pointer        = nullptr;
   CHECK_THROWS_AS(pointer = fixture.resource.allocate_sync(128, alignment), std::invalid_argument);
@@ -86,13 +72,8 @@ TEST_CASE("Nonzero pinned requests reject invalid alignment",
 TEST_CASE("Alignment padding overflow fails before acquiring pinned storage",
           "[small_pinned][pinned_alignment][fault_injection]")
 {
-  aligned_pinned_fixture fixture;
+  pinned_host_test_fixture fixture;
   std::size_t allocations = 0;
-  auto count_allocations  = [](cucascade::test::pinned_host_call const&,
-                              void* context) noexcept -> std::optional<cudaError_t> {
-    ++*static_cast<std::size_t*>(context);
-    return std::nullopt;
-  };
   cucascade::test::scoped_pinned_host_hook observe{
     cucascade::test::pinned_host_operation::host_alloc, count_allocations, &allocations};
   REQUIRE_THROWS_AS(fixture.resource.allocate_sync(std::numeric_limits<std::size_t>::max(), 64),
@@ -103,13 +84,8 @@ TEST_CASE("Alignment padding overflow fails before acquiring pinned storage",
 TEST_CASE("Exceptional metadata exhaustion acquires no pinned storage",
           "[small_pinned][pinned_alignment][fault_injection]")
 {
-  aligned_pinned_fixture fixture;
+  pinned_host_test_fixture fixture;
   std::size_t allocations = 0;
-  auto count_allocations  = [](cucascade::test::pinned_host_call const&,
-                              void* context) noexcept -> std::optional<cudaError_t> {
-    ++*static_cast<std::size_t*>(context);
-    return std::nullopt;
-  };
   cucascade::test::scoped_pinned_host_hook observe{
     cucascade::test::pinned_host_operation::host_alloc, count_allocations, &allocations};
   void* pointer = nullptr;
@@ -129,7 +105,7 @@ TEST_CASE("Exceptional metadata exhaustion acquires no pinned storage",
 TEST_CASE("Dedicated storage uses alignment padding and frees its original allocation",
           "[small_pinned][pinned_alignment][fault_injection]")
 {
-  aligned_pinned_fixture fixture;
+  pinned_host_test_fixture fixture;
   auto const [alignment, allocation_bytes] =
     GENERATE(Catch::Generators::table<std::size_t, std::size_t>(
       {{64, 9063}, {4096, 13095}, {1048576, 1057575}}));
@@ -146,8 +122,10 @@ TEST_CASE("Dedicated storage uses alignment padding and frees its original alloc
   auto* pointer = fixture.resource.allocate_sync(9000, alignment);
   REQUIRE(reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0);
   REQUIRE(observation.bytes == allocation_bytes);
+  require_pointer_type(pointer, cudaMemoryTypeHost);
   std::memset(pointer, 0x42, 9000);
   fixture.resource.deallocate_sync(pointer, 9000, alignment);
+  REQUIRE(fixture.resource.large_cache_bytes() == 0);
   REQUIRE(observation.freed == observation.base);
   require_pointer_type(observation.base, cudaMemoryTypeUnregistered);
 }
@@ -182,7 +160,7 @@ TEST_CASE("Over-aligned small storage bypasses an awkward upstream block stride"
 TEST_CASE("Ordinary pooled storage does not require exceptional ownership metadata",
           "[small_pinned][pinned_alignment][fault_injection]")
 {
-  aligned_pinned_fixture fixture;
+  pinned_host_test_fixture fixture;
   cucascade::test::scoped_pinned_host_hook failure{
     cucascade::test::pinned_host_operation::exceptional_allocation, cudaErrorMemoryAllocation};
   auto* small = fixture.resource.allocate_sync(513);
@@ -207,7 +185,7 @@ TEST_CASE("Dedicated storage release withholds unconfirmed backing and recovers 
   auto const failure =
     GENERATE(release_failure::none, release_failure::wait, release_failure::free);
   auto const bytes = GENERATE(std::size_t{513}, std::size_t{9000});
-  aligned_pinned_fixture fixture;
+  pinned_host_test_fixture fixture;
   rmm::cuda_stream stream;
   dedicated_allocation_observation observation;
   cucascade::test::scoped_pinned_host_hook allocate{
@@ -243,7 +221,7 @@ TEST_CASE("Dedicated storage release withholds unconfirmed backing and recovers 
 TEST_CASE("Concurrent dedicated allocations preserve alignment and release ownership",
           "[small_pinned][pinned_alignment][fault_injection]")
 {
-  aligned_pinned_fixture fixture;
+  pinned_host_test_fixture fixture;
   constexpr std::size_t num_threads = 4;
   constexpr std::size_t iterations  = 12;
   std::array<std::array<void*, iterations>, num_threads> pointers{};

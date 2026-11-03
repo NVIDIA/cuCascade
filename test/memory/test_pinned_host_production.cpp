@@ -12,6 +12,7 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -45,6 +46,7 @@ TEST_CASE("Production over-aligned storage is mapped and usable by a GPU",
 TEST_CASE("Production zero and null wrappers preserve an active capture",
           "[small_pinned][production][capture]")
 {
+  auto const alignment = GENERATE(std::size_t{0}, alignof(std::max_align_t));
   rmm::mr::pinned_host_memory_resource pinned;
   fixed_size_host_memory_resource upstream{0, pinned, 1ULL << 20, 1ULL << 20, 65536, 4, 1};
   small_pinned_host_memory_resource resource{upstream};
@@ -55,10 +57,12 @@ TEST_CASE("Production zero and null wrappers preserve an active capture",
   void* sync_zero  = nullptr;
   std::exception_ptr error;
   try {
-    async_zero = resource.allocate(stream, 0);
-    sync_zero  = resource.allocate_sync(0);
-    resource.deallocate(stream, nullptr, 42);
-    resource.deallocate_sync(nullptr, 42);
+    async_zero = resource.allocate(stream, 0, alignment);
+    sync_zero  = resource.allocate_sync(0, alignment);
+    for (std::size_t const bytes : std::array<std::size_t, 3>{0, 42, 9000}) {
+      resource.deallocate(stream, nullptr, bytes);
+      resource.deallocate_sync(nullptr, bytes);
+    }
   } catch (...) {
     error = std::current_exception();
   }

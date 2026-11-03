@@ -15,21 +15,15 @@
 
 namespace {
 
+using cucascade::test::pinned_host_test_fixture;
 using cucascade::test::require_pointer_type;
-
-struct insertion_fixture {
-  rmm::mr::pinned_host_memory_resource pinned;
-  cucascade::memory::fixed_size_host_memory_resource upstream{
-    0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
-  cucascade::memory::small_pinned_host_memory_resource resource{upstream, 32ULL << 10};
-};
 
 }  // namespace
 
 TEST_CASE("Failed cache insertion preserves retained large-buffer capacity",
           "[small_pinned][fault_injection][cache_insertion]")
 {
-  insertion_fixture fixture;
+  pinned_host_test_fixture fixture{32ULL << 10};
   rmm::cuda_stream stream;
   constexpr std::size_t small_bytes = 9000;
   constexpr std::size_t large_bytes = 20000;
@@ -77,7 +71,7 @@ TEST_CASE("Failed cache insertion preserves retained large-buffer capacity",
 TEST_CASE("Successful cache insertion releases every required completed victim",
           "[small_pinned][fault_injection][cache_insertion]")
 {
-  insertion_fixture fixture;
+  pinned_host_test_fixture fixture{32ULL << 10};
   rmm::cuda_stream stream;
   constexpr std::size_t small_bytes = 9000;
   constexpr std::size_t large_bytes = 20000;

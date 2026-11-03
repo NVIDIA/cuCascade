@@ -225,22 +225,6 @@ TEST_CASE("Rejected pinned deallocation withholds storage without CUDA work",
   if (type == cudaMemoryTypeHost) { REQUIRE(cudaFreeHost(pointer) == cudaSuccess); }
 }
 
-TEST_CASE("Zero pinned allocations and null deallocations do not disturb capture",
-          "[small_pinned][fault_injection][pinned_capture]")
-{
-  capture_fixture fixture;
-  cucascade::memory::small_pinned_host_memory_resource resource{fixture.upstream};
-  rmm::cuda_stream stream;
-  captured_stream capture{stream};
-  CHECK(resource.allocate(stream, 0, 0) == nullptr);
-  CHECK_NOTHROW(resource.allocate_sync(0));
-  resource.deallocate(stream, nullptr, 0);
-  resource.deallocate_sync(nullptr, 0);
-  resource.deallocate(stream, nullptr, 9000);
-  resource.deallocate_sync(nullptr, 9000);
-  REQUIRE(capture.finish() == cudaSuccess);
-}
-
 TEST_CASE("Rejected large deallocation preserves retained entries and withholds its buffer",
           "[small_pinned][fault_injection][pinned_capture]")
 {

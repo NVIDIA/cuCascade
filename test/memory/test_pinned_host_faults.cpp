@@ -18,21 +18,15 @@
 
 namespace {
 
+using cucascade::test::pinned_host_test_fixture;
 using cucascade::test::require_pointer_type;
-
-struct pinned_fixture {
-  rmm::mr::pinned_host_memory_resource pinned;
-  cucascade::memory::fixed_size_host_memory_resource upstream{
-    0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
-  cucascade::memory::small_pinned_host_memory_resource resource{upstream, 0};
-};
 
 }  // namespace
 
 TEST_CASE("Uncached pinned storage is released only after confirmed completion",
           "[small_pinned][fault_injection]")
 {
-  pinned_fixture fixture;
+  pinned_host_test_fixture fixture{0};
   rmm::cuda_stream stream;
   constexpr std::size_t bytes = 100000;
   void* pointer               = fixture.resource.allocate_sync(bytes);
@@ -65,7 +59,7 @@ TEST_CASE("Uncached pinned storage is released only after confirmed completion",
 TEST_CASE("Pinned allocation failures are scoped to one call and one thread",
           "[small_pinned][fault_injection]")
 {
-  pinned_fixture fixture;
+  pinned_host_test_fixture fixture{0};
   constexpr std::size_t bytes = 100000;
 
   SECTION("one failed call does not reject subsequent allocations")
@@ -105,7 +99,7 @@ TEST_CASE("Pinned allocation failures are scoped to one call and one thread",
 TEST_CASE("Cached pinned storage is released only after its event confirms completion",
           "[small_pinned][fault_injection]")
 {
-  pinned_fixture fixture;
+  pinned_host_test_fixture fixture{0};
   std::optional<cucascade::memory::small_pinned_host_memory_resource> resource{
     std::in_place, fixture.upstream, 64ULL << 10};
   constexpr std::size_t bytes = 9000;
@@ -135,7 +129,7 @@ TEST_CASE("Cached pinned storage is released only after its event confirms compl
 TEST_CASE("Cache-entry metadata exhaustion releases incoming completed storage",
           "[small_pinned][fault_injection]")
 {
-  pinned_fixture fixture;
+  pinned_host_test_fixture fixture{0};
   cucascade::memory::small_pinned_host_memory_resource resource{fixture.upstream, 64ULL << 10};
   constexpr std::size_t bytes = 9000;
   auto* pointer               = resource.allocate_sync(bytes);

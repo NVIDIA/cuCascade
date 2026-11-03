@@ -21,16 +21,8 @@
 
 namespace {
 
+using cucascade::test::pinned_host_test_fixture;
 using cucascade::test::require_pointer_type;
-
-struct recovery_fixture {
-  rmm::mr::pinned_host_memory_resource pinned;
-  cucascade::memory::fixed_size_host_memory_resource upstream{
-    0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
-  cucascade::memory::small_pinned_host_memory_resource resource;
-
-  explicit recovery_fixture(std::size_t limit = 64ULL << 10) : resource{upstream, limit} {}
-};
 
 struct allocation_trace {
   std::array<std::size_t, 8> sizes{};
@@ -55,7 +47,7 @@ struct allocation_trace {
 TEST_CASE("Rounded pinned OOM uses uncached exact storage without reclaiming retained buffers",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
-  recovery_fixture fixture;
+  pinned_host_test_fixture fixture;
   auto* seed = fixture.resource.allocate_sync(9000);
   fixture.resource.deallocate_sync(seed, 9000);
   allocation_trace trace;
@@ -85,7 +77,7 @@ TEST_CASE("Rounded pinned OOM uses uncached exact storage without reclaiming ret
 TEST_CASE("Exact pinned OOM reclaims only enough oldest retained capacity and retries once",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
-  recovery_fixture fixture{128ULL << 10};
+  pinned_host_test_fixture fixture{128ULL << 10};
   std::array<void*, 4> seeds{fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000),
@@ -122,7 +114,7 @@ TEST_CASE(
   auto const [bytes, limit, first_size, attempts] =
     GENERATE(Catch::Generators::table<std::size_t, std::size_t, std::size_t, std::size_t>(
       {{50000, 32768, 50000, 1}, {65536, 65536, 65536, 1}, {50000, 65536, 65536, 2}}));
-  recovery_fixture fixture{limit};
+  pinned_host_test_fixture fixture{limit};
   auto* seed = fixture.resource.allocate_sync(9000);
   fixture.resource.deallocate_sync(seed, 9000);
   allocation_trace trace;
@@ -145,7 +137,7 @@ TEST_CASE(
 TEST_CASE("Recovery reuses a matching buffer returned during the exact attempt",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
-  recovery_fixture fixture{128ULL << 10};
+  pinned_host_test_fixture fixture{128ULL << 10};
   auto* held = fixture.resource.allocate_sync(40000);
   struct returned_buffer {
     allocation_trace trace;
@@ -195,7 +187,7 @@ TEST_CASE("Exact recovery distinguishes retained capacity below equal and above 
   auto const [seed_count, retained_bytes, attempts, succeeds] =
     GENERATE(Catch::Generators::table<std::size_t, std::size_t, std::size_t, bool>(
       {{1, 32768, 1, false}, {2, 0, 2, true}, {3, 32768, 2, true}}));
-  recovery_fixture fixture{128ULL << 10};
+  pinned_host_test_fixture fixture{128ULL << 10};
   std::array<void*, 3> seeds{};
   for (std::size_t index = 0; index < seed_count; ++index) {
     seeds[index] = fixture.resource.allocate_sync(20000);
@@ -228,7 +220,7 @@ TEST_CASE("Exact recovery distinguishes retained capacity below equal and above 
 TEST_CASE("Recovery does not purge on non-OOM failures and stops after its final exact attempt",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
-  recovery_fixture fixture{128ULL << 10};
+  pinned_host_test_fixture fixture{128ULL << 10};
   std::array<void*, 3> seeds{fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000)};
@@ -259,7 +251,7 @@ TEST_CASE("Dedicated OOM reclamation uses the padded backing size",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
   bool const sufficient = GENERATE(false, true);
-  recovery_fixture fixture;
+  pinned_host_test_fixture fixture;
   std::array<void*, 2> seeds{fixture.resource.allocate_sync(9000),
                              fixture.resource.allocate_sync(9000)};
   fixture.resource.deallocate_sync(seeds[0], 9000);
@@ -292,7 +284,7 @@ TEST_CASE("Dedicated OOM reclamation uses the padded backing size",
 TEST_CASE("Fallback metadata exhaustion preserves cached capacity before recovery",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
-  recovery_fixture fixture{128ULL << 10};
+  pinned_host_test_fixture fixture{128ULL << 10};
   std::array<void*, 2> seeds{fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000)};
   for (auto* seed : seeds) {
@@ -317,7 +309,7 @@ TEST_CASE("Fallback metadata exhaustion preserves cached capacity before recover
 TEST_CASE("Unconfirmed reclamation withholds its victim without extending the retry budget",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
-  recovery_fixture fixture{128ULL << 10};
+  pinned_host_test_fixture fixture{128ULL << 10};
   std::array<void*, 3> seeds{fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000)};
@@ -345,7 +337,7 @@ TEST_CASE("Unconfirmed reclamation withholds its victim without extending the re
 TEST_CASE("Uncacheable exact recovery stays untracked and releases its original storage",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
-  recovery_fixture fixture{96ULL << 10};
+  pinned_host_test_fixture fixture{96ULL << 10};
   std::array<void*, 3> seeds{fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000),
                              fixture.resource.allocate_sync(20000)};
@@ -376,7 +368,7 @@ TEST_CASE("Uncacheable exact recovery stays untracked and releases its original 
 TEST_CASE("Deferred OOM reporting preserves an unrelated CUDA error",
           "[small_pinned][pinned_recovery][fault_injection]")
 {
-  recovery_fixture fixture;
+  pinned_host_test_fixture fixture;
   cudaError_t unrelated_status = cudaSuccess;
   auto unrelated_error         = [](cucascade::test::pinned_host_call const&,
                             void* context) noexcept -> std::optional<cudaError_t> {

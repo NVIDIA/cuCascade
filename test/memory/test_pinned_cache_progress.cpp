@@ -4,6 +4,7 @@
  */
 
 #include "pinned_host_test_hooks.hpp"
+#include "pinned_host_test_utils.hpp"
 
 #include <cucascade/error.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
@@ -23,12 +24,7 @@
 
 namespace {
 
-struct progress_fixture {
-  rmm::mr::pinned_host_memory_resource pinned;
-  cucascade::memory::fixed_size_host_memory_resource upstream{
-    0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
-  cucascade::memory::small_pinned_host_memory_resource resource{upstream, 64ULL << 10};
-};
+using cucascade::test::pinned_host_test_fixture;
 
 class call_gate {
  public:
@@ -71,7 +67,7 @@ bool wait_for(std::atomic<bool> const& flag)
 TEST_CASE("Pinned allocator traffic progresses while a reuse wait is submitted",
           "[small_pinned][fault_injection][cache_progress]")
 {
-  progress_fixture fixture;
+  pinned_host_test_fixture fixture;
   rmm::cuda_stream stream;
   auto const bytes = GENERATE(std::size_t{512}, std::size_t{9000});
   auto* seed       = fixture.resource.allocate_sync(bytes);
@@ -126,7 +122,7 @@ TEST_CASE("Pinned allocator traffic progresses while a reuse wait is submitted",
 TEST_CASE("Pinned allocator traffic progresses while a cold event is created",
           "[small_pinned][fault_injection][cache_progress]")
 {
-  progress_fixture fixture;
+  pinned_host_test_fixture fixture;
   rmm::cuda_stream stream;
   auto const bytes = GENERATE(std::size_t{512}, std::size_t{9000});
   auto* pointer    = fixture.resource.allocate_sync(bytes);
@@ -159,7 +155,7 @@ TEST_CASE("Pinned allocator traffic progresses while a cold event is created",
 TEST_CASE("Failed cold event creation keeps its reserved return slot reusable",
           "[small_pinned][fault_injection][cache_progress]")
 {
-  progress_fixture fixture;
+  pinned_host_test_fixture fixture;
   constexpr std::size_t bytes = 9000;
   auto* failed                = fixture.resource.allocate_sync(bytes);
   {
@@ -185,7 +181,7 @@ TEST_CASE("Failed cold event creation keeps its reserved return slot reusable",
 TEST_CASE("Failed cache hit cannot overfill a concurrently refilled cache",
           "[small_pinned][fault_injection][cache_progress]")
 {
-  progress_fixture fixture;
+  pinned_host_test_fixture fixture;
   rmm::cuda_stream stream;
   bool const partial_refill = GENERATE(false, true);
   auto const refill_bytes   = partial_refill ? std::size_t{20000} : std::size_t{40000};
@@ -252,7 +248,7 @@ TEST_CASE("Failed cache hit cannot overfill a concurrently refilled cache",
 TEST_CASE("Failed cache hit restores oldest-first reuse when retained capacity permits",
           "[small_pinned][fault_injection][cache_progress]")
 {
-  progress_fixture fixture;
+  pinned_host_test_fixture fixture;
   auto* oldest = fixture.resource.allocate_sync(9000);
   auto* newer  = fixture.resource.allocate_sync(9000);
   fixture.resource.deallocate_sync(oldest, 9000);
@@ -274,7 +270,7 @@ TEST_CASE("Failed cache hit restores oldest-first reuse when retained capacity p
 TEST_CASE("Failed event preparation still removes dedicated exact allocation ownership",
           "[small_pinned][fault_injection][cache_progress][pinned_recovery]")
 {
-  progress_fixture fixture;
+  pinned_host_test_fixture fixture;
   auto const failed_operation  = GENERATE(cucascade::test::pinned_host_operation::event_create,
                                          cucascade::test::pinned_host_operation::event_record,
                                          cucascade::test::pinned_host_operation::large_cache_entry);

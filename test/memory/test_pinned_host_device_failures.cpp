@@ -21,14 +21,8 @@
 
 namespace {
 
+using cucascade::test::pinned_host_test_fixture;
 using cucascade::test::require_pointer_type;
-
-struct pinned_device_fixture {
-  rmm::mr::pinned_host_memory_resource pinned;
-  cucascade::memory::fixed_size_host_memory_resource upstream{
-    0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
-  cucascade::memory::small_pinned_host_memory_resource resource{upstream, 64ULL << 10};
-};
 
 int run_device_helper(char* mode)
 {
@@ -51,7 +45,7 @@ int run_device_helper(char* mode)
 TEST_CASE("Failed stream device discovery does not publish a cached buffer",
           "[small_pinned][fault_injection][pinned_host_device]")
 {
-  pinned_device_fixture fixture;
+  pinned_host_test_fixture fixture;
   rmm::cuda_stream stream;
   constexpr std::size_t bytes = 9000;
   auto* pointer               = fixture.resource.allocate_sync(bytes);
@@ -90,7 +84,7 @@ TEST_CASE("Ordinary device and event failures require confirmed stream completio
                                   pinned_host_operation::event_record);
   bool const reject_completion = GENERATE(false, true);
   CAPTURE(operation, reject_completion);
-  pinned_device_fixture fixture;
+  pinned_host_test_fixture fixture;
   rmm::cuda_stream stream;
   constexpr std::size_t bytes = 9000;
   auto* pointer               = fixture.resource.allocate_sync(bytes);
@@ -120,7 +114,7 @@ TEST_CASE("Failed initial device switching does not change the caller's device",
 {
   using cucascade::test::pinned_host_operation;
   using cucascade::test::scoped_pinned_host_hook;
-  pinned_device_fixture fixture;
+  pinned_host_test_fixture fixture;
   rmm::cuda_stream stream;
   constexpr std::size_t bytes = 9000;
   auto* pointer               = fixture.resource.allocate_sync(bytes);
