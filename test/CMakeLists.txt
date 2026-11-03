@@ -68,6 +68,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
     io/test_templated_ioctx.cpp
+    io/test_object_cache.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
     io/cache/test_chunk_state.cpp
@@ -123,6 +124,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
+    cudf/test_column_admission.cpp
     cudf/test_release_table_stream.cpp
     # Main test runner
     unittest.cpp)
