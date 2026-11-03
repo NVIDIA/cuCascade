@@ -73,6 +73,17 @@ def test_a_malformed_layout_is_rejected(scan_cache, overrides, match):
         )
 
 
+def test_a_new_cache_has_made_no_requests(make_options):
+    stats = ScanCache(make_options()).request_stats()
+    assert stats.attempts == 0
+    assert stats.bytes == 0
+    edges = stats.latency_edges_ms
+    assert edges == sorted(edges)
+    assert len(stats.total_ms_histogram) == len(edges) + 1
+    assert len(stats.first_byte_ms_histogram) == len(edges) + 1
+    assert sum(stats.total_ms_histogram) == 0
+
+
 def test_the_summary_reports_the_prefetching_cache(scan_cache):
     assert scan_cache.summary().startswith("fs_cache:")
 

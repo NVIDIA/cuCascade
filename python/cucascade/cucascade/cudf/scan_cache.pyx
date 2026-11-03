@@ -12,8 +12,12 @@ from pylibcudf.libcudf.io.datasource cimport datasource
 
 from cucascade.cudf.advising_datasource cimport AdvisingDatasource
 from cucascade.cudf.column_admission cimport ColumnStats
+from cucascade.io.rest.request_stats cimport RequestStats
 from cucascade.libcucascade.cudf.column_admission cimport (
     column_stats as cpp_column_stats,
+)
+from cucascade.libcucascade.io.rest.request_stats cimport (
+    request_stats_snapshot as cpp_request_stats_snapshot,
 )
 from cucascade.libcucascade.cudf.scan_cache cimport (
     const_uint32_t,
@@ -221,3 +225,18 @@ cdef class ScanCache:
         with nogil:
             c_summary = self.c_obj.get().summary()
         return c_summary.decode()
+
+    cpdef RequestStats request_stats(self):
+        """
+        Counters of the ranged GETs made to the object store.
+
+        Returns
+        -------
+        RequestStats
+            Attempts, how they ended, bytes and latency histograms. They only grow; subtract
+            two snapshots to see an interval.
+        """
+        cdef cpp_request_stats_snapshot c_stats
+        with nogil:
+            c_stats = self.c_obj.get().request_stats()
+        return RequestStats.from_libcucascade(c_stats)

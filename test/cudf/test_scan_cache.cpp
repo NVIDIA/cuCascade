@@ -87,6 +87,14 @@ TEST_CASE("a malformed layout is rejected", "[cache][scan-cache]")
   CHECK(cache.stats().empty());
 }
 
+TEST_CASE("a new scan cache has made no requests", "[cache][scan-cache]")
+{
+  scan_cache cache(small_cache());
+  auto const stats = cache.request_stats();
+  CHECK(stats.attempts == 0);
+  CHECK(stats.bytes == 0);
+}
+
 TEST_CASE("the summary reports the prefetching cache", "[cache][scan-cache]")
 {
   scan_cache cache(small_cache());

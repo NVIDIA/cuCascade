@@ -4,6 +4,7 @@
 from libcpp.memory cimport unique_ptr
 
 from cucascade.cudf.advising_datasource cimport AdvisingDatasource
+from cucascade.io.rest.request_stats cimport RequestStats
 from cucascade.libcucascade.cudf.scan_cache cimport (
     scan_cache as cpp_scan_cache,
     scan_cache_options as cpp_scan_cache_options,
@@ -32,3 +33,5 @@ cdef class ScanCache:
     cpdef list column_stats(self)
 
     cpdef str summary(self)
+
+    cpdef RequestStats request_stats(self)

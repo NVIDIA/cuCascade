@@ -261,6 +261,17 @@ bool is_retriable_status(long status) noexcept
          status == 504;
 }
 
+/// How a finished attempt of a ranged GET ended, for the request statistics.
+request_outcome classify_attempt(CURLcode result, long http_status) noexcept
+{
+  if (result == CURLE_OPERATION_TIMEDOUT) { return request_outcome::timed_out; }
+  if (result != CURLE_OK) { return request_outcome::transport_error; }
+  if (http_status == 200 || http_status == 206) { return request_outcome::succeeded; }
+  if (http_status == 429 || http_status == 503) { return request_outcome::throttled; }
+  return http_status >= 500 ? request_outcome::http_server_error
+                            : request_outcome::http_client_error;
+}
+
 /// libcurl error codes worth retrying (transient transport failures).
 bool is_retriable_curl(CURLcode rc) noexcept
 {
@@ -2073,6 +2084,16 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
         long http_status = 0;
         curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_status);
+        {
+          curl_off_t total = 0, first_byte = 0, received = 0;
+          curl_easy_getinfo(handle, CURLINFO_TOTAL_TIME_T, &total);
+          curl_easy_getinfo(handle, CURLINFO_STARTTRANSFER_TIME_T, &first_byte);
+          curl_easy_getinfo(handle, CURLINFO_SIZE_DOWNLOAD_T, &received);
+          _stats.record(classify_attempt(message->data.result, http_status),
+                        static_cast<std::uint64_t>(total) / 1000,
+                        static_cast<std::uint64_t>(first_byte) / 1000,
+                        static_cast<std::uint64_t>(received));
+        }
         auto const index = static_cast<std::size_t>(reinterpret_cast<std::intptr_t>(private_data));
         curl_multi_remove_handle(multi.get(), handle);
         --inflight;

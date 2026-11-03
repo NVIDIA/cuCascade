@@ -22,6 +22,7 @@
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/object_cache.hpp>
+#include <cucascade/io/rest/request_stats.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <cudf/io/datasource.hpp>
@@ -35,6 +36,10 @@
 #include <vector>
 
 namespace cucascade::io {
+
+namespace rest {
+class rest_ioctx;
+}  // namespace rest
 
 /// Settings of a @ref scan_cache.
 struct scan_cache_options {
@@ -132,10 +137,15 @@ class scan_cache {
   /// Counters of the prefetching cache (reads, hits, misses, evictions) as text.
   [[nodiscard]] std::string summary() const;
 
+  /// Counters of the ranged GETs made to the object store: attempts, how they ended, bytes and
+  /// latency histograms. They only grow; subtract two snapshots to see an interval.
+  [[nodiscard]] rest::request_stats_snapshot request_stats() const;
+
  private:
   std::unique_ptr<cucascade::memory::memory_reservation_manager> _memory;
   std::unique_ptr<io_context_registry> _registry;
   std::shared_ptr<ioctx> _context;
+  rest::rest_ioctx* _rest{nullptr};  // _context, as the REST context it is
   std::shared_ptr<column_admission> _admission;
   std::shared_ptr<object_cache> _objects;
   std::size_t _min_advise_bytes;

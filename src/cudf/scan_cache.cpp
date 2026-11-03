@@ -22,6 +22,7 @@
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
@@ -115,6 +116,10 @@ scan_cache::scan_cache(scan_cache_options const& options)
     throw std::runtime_error(
       "scan_cache: could not create the REST io context (check endpoint, region and credentials)");
   }
+  _rest = dynamic_cast<rest::rest_ioctx*>(_context.get());
+  if (_rest == nullptr) {
+    throw std::runtime_error("scan_cache: the REST io context is not a REST context");
+  }
   _context->start();
   if (config.cache.use_fs_cache()) { _context->initialize_cache(*_memory, config.cache, nullptr); }
 
@@ -152,6 +157,8 @@ void scan_cache::register_layout(std::string const& path,
 }
 
 std::vector<column_stats> scan_cache::stats() const { return _admission->stats(); }
+
+rest::request_stats_snapshot scan_cache::request_stats() const { return _rest->request_stats(); }
 
 std::string scan_cache::summary() const
 {

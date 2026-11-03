@@ -24,6 +24,7 @@
 #include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/request_stats.hpp>
 #include <cucascade/io/rest/types.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -320,6 +321,9 @@ class rest_reactor {
   /// in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
+  /// Counters of the ranged GETs this reactor has made.
+  [[nodiscard]] request_stats_snapshot stats() const { return _stats.snapshot(); }
+
   /// Staging block size, taken from the context's host resource (0 when the
   /// context has none).  INVARIANT: when a prefetching cache is present this
   /// MUST equal its chunk size — the worker plans a fragmented fill's extent as
@@ -473,6 +477,8 @@ class rest_reactor {
   // Logical bytes not yet assigned to a curl slot. Retries are already claimed
   // work and therefore never get counted a second time.
   std::atomic<std::size_t> _queued_bytes{0};
+
+  request_stats _stats;
 
   std::jthread _worker;
 };

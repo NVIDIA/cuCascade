@@ -12,6 +12,7 @@ from pylibcudf.libcudf.io.datasource cimport datasource
 
 from cucascade.exception_handler cimport cucascade_exception_handler
 from cucascade.libcucascade.cudf.column_admission cimport column_stats
+from cucascade.libcucascade.io.rest.request_stats cimport request_stats_snapshot
 
 
 ctypedef const uint32_t const_uint32_t
@@ -53,3 +54,4 @@ cdef extern from "cucascade/cudf/scan_cache.hpp" namespace "cucascade::io" nogil
         ) except +cucascade_exception_handler
         vector[column_stats] stats() except +cucascade_exception_handler const
         string summary() except +cucascade_exception_handler const
+        request_stats_snapshot request_stats() except +cucascade_exception_handler const
