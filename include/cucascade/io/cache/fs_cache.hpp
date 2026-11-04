@@ -432,8 +432,9 @@ class fs_cache {
   /// exclusively and no other cache lock, so it may drive the evictor and
   /// prepare an existing request, but not create a request, read, or reclaim
   /// (they take the generation lock).  The sweep is noexcept: the hook must not
-  /// throw.  The last-owner and teardown sweeps do not run it.  Configure only
-  /// while no reclaim can run.
+  /// throw.  The last-owner and teardown sweeps do not run it, nor does the
+  /// sweep of a superseded version when a new version of the object is opened
+  /// (@c reclaim_idle_chunks).  Configure only while no reclaim can run.
   void set_before_reclaim_claim_for_testing(std::function<void(cached_chunk const&)> hook)
   {
     _before_reclaim_claim = std::move(hook);

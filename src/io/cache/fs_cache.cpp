@@ -128,7 +128,10 @@ using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 
 /// What one @ref reclaim_chunk_buffers pass did: chunks whose buffers went back
 /// to the pool, and chunks that hold a buffer it could not take (pinned,
-/// loading, or being evicted by someone else).
+/// loading, or being evicted by someone else).  In a NUMA-scoped pass @c stuck
+/// may also count a chunk that passed a stale node hint but now holds another
+/// node's buffer and is pinned or loading: its claim is refused, so the node
+/// check after the claim never sees it.
 struct reclaim_outcome {
   std::size_t reclaimed{0};
   std::size_t stuck{0};
@@ -156,9 +159,9 @@ reclaim_outcome reclaim_chunk_buffers(
   reclaim_outcome outcome;
   // A chunk's node describes its buffer only to the thread that claimed it:
   // numa_node is stored before mark_allocated() publishes the buffer and does
-  // not change until the claimant's mark_empty(), and a successful
-  // mark_evicting() acquires that publication.  Read before the claim, it may
-  // describe a buffer that has since left the slot.
+  // not change until a preparation after the claimant's mark_empty(), and a
+  // successful mark_evicting() acquires that publication.  Read before the
+  // claim, it may describe a buffer that has since left the slot.
   auto const node_of = [](cached_chunk const* c) {
     return c->numa_node.load(std::memory_order_relaxed);
   };
@@ -189,7 +192,8 @@ reclaim_outcome reclaim_chunk_buffers(
       // is not ours to take: put the chunk back exactly as the claim found it
       // (state, extent, current subscribers).  It is neither reclaimed nor
       // stuck -- it never held a buffer this sweep may take.
-      std::ignore = c->state.cancel_evicting(prior);
+      [[maybe_unused]] bool const restored = c->state.cancel_evicting(prior);
+      assert(restored && "only this claimant can move the chunk out of evicting");
       continue;
     }
     claimed.push_back(c);  // capacity reserved at creation: one per slot
@@ -899,12 +903,16 @@ prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_ev
 
   if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
 
-  // The count above and this walk are not atomic against the evictor: a chunk
-  // still `evicting` when the shortfall was sized is `empty` by the time the
-  // loop reaches it and takes a buffer meant for another, so the request can
-  // come out of the loop short.  Publishing it anyway would promise buffers
-  // this request does not have -- the prefetch would claim nothing, settle
-  // `ready`, and the consumer would pay for every chunk as a miss.
+  // The count above and this walk are not atomic against the evictor or a
+  // reclaim: a chunk still `evicting` when the shortfall was sized may be
+  // `empty` by the time the loop reaches it and take a buffer meant for
+  // another, so the request can come out of the loop short.  It may instead
+  // come back `allocated` or `cached` with its own buffer (a NUMA-scoped
+  // reclaim undid a claim on another node's buffer), or still be `evicting` at
+  // the check below, which then fails the request retryably.  Publishing a
+  // short request anyway would promise buffers it does not have -- the
+  // prefetch would claim nothing, settle `ready`, and the consumer would pay
+  // for every chunk as a miss.
   if (!all_chunks_have_buffers(chunks)) { return prepare_result::allocation_failed; }
 
   // Only now is there something to publish, so only now does the producer enter

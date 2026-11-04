@@ -297,7 +297,8 @@ struct chunk_fill {
 //
 // State machine — each row is the complete set of valid outbound transitions
 // for that state.  Any other transition is rejected by the corresponding
-// method's precondition (return value == false).
+// method's precondition (return value == false), with the one exception
+// marked (*) below.
 //
 //   empty      ──mark_queued()──────────►  queued
 //   queued     ──mark_allocated()───────►  allocated
@@ -310,7 +311,14 @@ struct chunk_fill {
 //   in_use     ──acquire_read()─────────►  in_use(pin += 1)   (rejected at MAX_PINS)
 //   in_use     ──release_read()─────────►  in_use(pin -= 1) | cached (when pin → 0)
 //   evicting   ──mark_empty()───────────►  empty         (clears the extent)
-//   evicting   ──cancel_evicting(prior)─►  prior         (allocated | cached; claim undone)
+//   evicting   ──cancel_evicting(prior)─►  prior (*)     (allocated | cached; claim undone)
+//
+// (*) The word does not record which state the claim left, so the precondition
+// rejects only a chunk that is not `evicting` and a prior other than
+// `allocated` or `cached`.  The caller must pass the prior that this claim's
+// mark_evicting() reported; a wrong one is not rejected (a claim taken from
+// `allocated` restored as `cached` would publish an unloaded buffer as
+// readable).
 //
 // `empty` is the only state with no inbound transitions other than from
 // `evicting` — once a chunk leaves `empty`, it can only return through the
@@ -588,7 +596,13 @@ class chunk_state {
   /// extent is the one the claim saw, and the CAS keeps the subscriber count as
   /// it is now, counting requests that named or released the chunk meanwhile.
   ///
-  /// Returns false, changing nothing, when the chunk is not `evicting` or
+  /// @p prior cannot be verified: the word no longer records the state the
+  /// claim left.  It must be the value this claim's @ref mark_evicting
+  /// reported.  A wrong one is not refused: restoring a claim taken from
+  /// `allocated` as `cached` would publish a buffer that was never loaded as
+  /// readable.
+  ///
+  /// Returns false, changing nothing, only when the chunk is not `evicting` or
   /// @p prior is neither @c allocated nor @c cached.
   [[nodiscard]] bool cancel_evicting(value prior) noexcept
   {

@@ -25,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <latch>
 #include <random>
 #include <thread>
 #include <vector>
@@ -751,6 +752,99 @@ TEST_CASE("concurrent pins and subscriber churn leave a consistent word",
   CHECK(snap.pins() == 0);
   CHECK(snap.subscribers() == 0);
   CHECK(snap.fill() == chunk_fill::whole());
+}
+
+TEST_CASE("undoing eviction claims under subscriber churn loses no subscriber change",
+          "[cache][state][concurrency]")
+{
+  // One claimant claims a cached chunk and puts it back, over and over, while other threads
+  // name and release it and a reader pins it where it can.  Each put-back must keep the
+  // subscriber count as it is at that moment, not as the claim saw it, so after joining the
+  // count is exactly the starting one plus the unpaired names, and the state, pins and extent
+  // are the ones the chunk started with.
+  constexpr int CHURNERS                    = 4;
+  constexpr int PAIRS                       = 4000;  // name/release pairs per churner
+  constexpr int UNPAIRED_EVERY              = 1000;  // and one unpaired name every this many pairs
+  constexpr long MIN_CLAIMS                 = 2000;
+  constexpr std::uint32_t START_SUBSCRIBERS = 1;  // keeps the count off the zero clamp
+  constexpr std::uint32_t EXPECTED_SUBSCRIBERS =
+    START_SUBSCRIBERS + static_cast<std::uint32_t>(CHURNERS * (PAIRS / UNPAIRED_EVERY));
+  constexpr std::uint16_t FILLED = 5;
+  auto const fill                = chunk_fill::prefix_of(FILLED);
+
+  chunk_state s;
+  s.add_subscriber();
+  make_cached(s, fill);
+
+  std::latch start{CHURNERS + 2};
+  std::atomic<int> churning{CHURNERS};
+  std::atomic<bool> claiming{true};
+  std::atomic<long> claims{0};
+  std::atomic<bool> bad_claim{false};  // a claim left another state, or could not be undone
+  std::atomic<bool> bad_pin{false};    // a pin past the extent, or of a changed word
+
+  std::thread claimant([&] {
+    start.arrive_and_wait();
+    while (churning.load() > 0 || claims.load() < MIN_CLAIMS) {
+      auto prior = chunk_state::empty;
+      if (!s.mark_evicting(/*only_unsubscribed=*/false, prior)) { continue; }  // pinned
+      claims.fetch_add(1);
+      if (prior != chunk_state::cached || !s.cancel_evicting(prior)) {
+        bad_claim.store(true);
+        break;
+      }
+    }
+    claiming.store(false);
+  });
+
+  std::thread reader([&] {
+    start.arrive_and_wait();
+    while (claiming.load()) {
+      // Within the extent: a miss (the chunk is claimed) or a pin of the chunk as it was.
+      if (s.try_pin_covering(OFF, CHUNK, OFF, OFF + FILLED * PAGE)) {
+        auto const snap = s.load();
+        if (snap.state() != chunk_state::in_use || snap.pins() != 1 || snap.fill() != fill) {
+          bad_pin.store(true);
+        }
+        std::ignore = s.release_read();
+      }
+      // Past it: never, claimed or not.
+      if (s.try_pin_covering(OFF, CHUNK, OFF, OFF + (FILLED + 1U) * PAGE)) {
+        bad_pin.store(true);
+        std::ignore = s.release_read();
+      }
+    }
+  });
+
+  std::vector<std::thread> churners;
+  for (int t = 0; t < CHURNERS; ++t) {
+    churners.emplace_back([&] {
+      start.arrive_and_wait();
+      for (int i = 0; i < PAIRS; ++i) {
+        s.add_subscriber();
+        if (i % UNPAIRED_EVERY == 0) { s.add_subscriber(); }
+        s.drop_subscriber();
+      }
+      churning.fetch_sub(1);
+    });
+  }
+
+  for (auto& t : churners) {
+    t.join();
+  }
+  claimant.join();
+  reader.join();
+
+  CHECK_FALSE(bad_claim.load());
+  CHECK_FALSE(bad_pin.load());
+  CHECK(claims.load() >= MIN_CLAIMS);
+  auto const snap = s.load();
+  CHECK(snap.state() == chunk_state::cached);
+  CHECK(snap.pins() == 0);
+  CHECK(snap.fill() == fill);
+  CHECK(snap.subscribers() == EXPECTED_SUBSCRIBERS);
+  REQUIRE(s.try_pin_covering(OFF, CHUNK, OFF, OFF + FILLED * PAGE));
+  CHECK(s.release_read());
 }
 
 TEST_CASE("prepared cache completion publishes only its exact physical segment",
