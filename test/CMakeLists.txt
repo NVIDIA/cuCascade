@@ -42,6 +42,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_data_repository_manager.cpp
     data/test_disk_io_backend.cpp
     data/test_io_worker.cpp
+    # Utils
+    # Replaces the global operator new for the whole test binary
+    utils/allocation_counter.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
@@ -67,9 +70,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
+    io/test_io_utils.cpp
+    io/test_object_identity.cpp
     io/test_templated_ioctx.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
+    io/cache/test_buffer_pool.cpp
     io/cache/test_chunk_state.cpp
     io/cache/test_metadata_store.cpp
     io/cache/test_stage_machines.cpp
@@ -82,6 +88,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
     io/uring/test_uring_readv.cpp
+    # Utils
+    # Replaces the global operator new for the whole test binary
+    utils/allocation_counter.cpp
     # Main test runner
     unittest.cpp)
 
@@ -89,11 +98,17 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
+  # Tests of src-private helpers (io/detail/...) include them from src/.
+  target_include_directories(cucascade_io_tests
+                             PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
   if(CUCASCADE_BUILD_CUDF)
-    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp
-                                              io/kvikio/test_kvikio_remote.cpp)
+    target_sources(
+      cucascade_io_tests
+      PRIVATE io/kvikio/test_kvikio_config.cpp
+              io/kvikio/test_kvikio_identity.cpp
+              io/kvikio/test_kvikio_remote.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

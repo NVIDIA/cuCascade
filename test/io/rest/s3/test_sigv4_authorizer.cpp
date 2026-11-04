@@ -496,6 +496,36 @@ TEST_CASE("sigv4_presigned_authorizer rejects malformed construction inputs", "[
     credential_error);
 }
 
+TEST_CASE("SigV4 authorizers reject an endpoint without a host or with user-info",
+          "[s3][authorizer]")
+{
+  // Both signing modes parse the endpoint at construction, as Sirius does: a port-only
+  // authority has no host, and user-info is not part of a service endpoint.
+  using Catch::Matchers::ContainsSubstring;
+  using Catch::Matchers::MessageMatches;
+  auto const creds = example_static_credentials();
+  struct rejected {
+    char const* endpoint;
+    char const* reason;
+  };
+  for (auto const& [endpoint, reason] :
+       {rejected{"http://:9000", "endpoint missing host"},
+        rejected{"https://user@storage.example", "endpoint must not contain user-info"}}) {
+    CAPTURE(endpoint);
+    CHECK_THROWS_MATCHES(sigv4_presigned_authorizer(creds, "us-east-1", endpoint),
+                         credential_error,
+                         MessageMatches(ContainsSubstring(reason)));
+    CHECK_THROWS_MATCHES(sigv4_header_authorizer(creds, "us-east-1", endpoint),
+                         credential_error,
+                         MessageMatches(ContainsSubstring(reason)));
+  }
+  for (auto const* endpoint : {"http://storage.example", "http://storage.example:9000"}) {
+    CAPTURE(endpoint);
+    CHECK_NOTHROW(sigv4_presigned_authorizer(creds, "us-east-1", endpoint));
+    CHECK_NOTHROW(sigv4_header_authorizer(creds, "us-east-1", endpoint));
+  }
+}
+
 TEST_CASE("sigv4_header_authorizer signs with headers and plain path-style URLs",
           "[s3][authorizer]")
 {

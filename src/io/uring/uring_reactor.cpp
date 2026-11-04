@@ -16,11 +16,16 @@
  * limitations under the License.
  */
 
+#include "io/detail/local_descriptor.hpp"
+
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/io_utils.hpp>
+#include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
@@ -69,25 +74,9 @@ constexpr std::chrono::milliseconds POLL_INTERVAL{20};
 constexpr auto POLL_INTERVAL_US =
   std::chrono::duration_cast<std::chrono::microseconds>(POLL_INTERVAL).count();
 
-[[nodiscard]] constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
-{
-  return rhs > std::numeric_limits<std::size_t>::max() - lhs
-           ? std::numeric_limits<std::size_t>::max()
-           : lhs + rhs;
-}
-
-[[nodiscard]] constexpr std::size_t align_down(std::size_t value, std::size_t alignment) noexcept
-{
-  return alignment == 0 ? value : value - value % alignment;
-}
-
-[[nodiscard]] constexpr std::size_t align_up(std::size_t value, std::size_t alignment) noexcept
-{
-  if (alignment == 0) return value;
-  auto const remainder = value % alignment;
-  if (remainder == 0) return value;
-  return saturating_add(value, alignment - remainder);
-}
+using io_utils::align_down;
+using io_utils::align_up;
+using io_utils::saturating_add;
 
 static_assert(max_slices_per_pass == MAX_NUM_SLOTS,
               "max_slices_per_pass must match the reactor's slot cap");
@@ -634,22 +623,46 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
     throw std::runtime_error("uring_reactor::create_io_object: unsupported path: " + path);
   }
 
-  file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
-  if (!buffered) {
-    throw std::system_error(
-      errno, std::generic_category(), "uring_reactor::create_io_object: buffered open");
-  }
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
+    if (!buffered) {
+      int const error = errno;
+      throw std::system_error(
+        error, std::generic_category(), "uring_reactor::create_io_object: buffered open");
+    }
 
-  file_descriptor direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
-  if (!direct) {
-    CUCASCADE_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
-                       path,
-                       strerror(errno));
-  }
+    // Reopen the owned descriptor, not the pathname: a concurrent rename must
+    // not pair the old buffered footer with a different O_DIRECT data file.
+    file_descriptor direct{cucascade::io::detail::reopen_local_descriptor(
+      buffered.get(), path.c_str(), O_RDONLY | O_DIRECT)};
+    if (!direct) {
+      CUCASCADE_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
+                         path,
+                         strerror(errno));
+    }
 
-  auto const file_size = size(buffered.get());
-  return std::make_unique<local_io_object>(
-    std::move(path), std::move(buffered), std::move(direct), file_size);
+    object_identity captured;
+    if (!capture_local_identity(buffered.get(), captured)) {
+      int const error = errno;
+      throw std::system_error(
+        error, std::generic_category(), "uring_reactor::create_io_object: fstat");
+    }
+    if (direct) {
+      object_identity direct_identity;
+      if (!capture_local_identity(direct.get(), direct_identity)) {
+        throw descriptor_mismatch_error(
+          "uring_reactor::create_io_object: identity_descriptor_mismatch");
+      }
+      if (captured.device != direct_identity.device || captured.inode != direct_identity.inode) {
+        // Destroy the entire descriptor set before retrying the open.
+        continue;
+      }
+    }
+    auto const file_size = captured.size;
+    return std::make_unique<local_io_object>(
+      std::move(path), std::move(buffered), std::move(direct), file_size, "", std::move(captured));
+  }
+  throw descriptor_mismatch_error("uring_reactor::create_io_object: identity_descriptor_mismatch");
 }
 
 std::size_t uring_reactor::size(int native_handle)
@@ -701,45 +714,7 @@ std::vector<byte_range> uring_reactor::align_and_coalesce(
 {
   try {
     auto const requested = alignment.value_or(IO_BLOCK_SIZE);
-    auto const effective = std::max<std::size_t>(requested, IO_BLOCK_SIZE);
-
-    std::vector<byte_range> aligned;
-    aligned.reserve(ranges.size());
-    for (auto const& input : ranges) {
-      if (input.offset() < 0 || input.size() <= 0) continue;
-      auto const offset = static_cast<std::size_t>(input.offset());
-      auto const end =
-        align_up(saturating_add(offset, static_cast<std::size_t>(input.size())), effective);
-      auto const begin = align_down(offset, effective);
-      aligned.emplace_back(static_cast<std::int64_t>(begin),
-                           static_cast<std::int64_t>(end - begin));
-    }
-
-    std::sort(aligned.begin(), aligned.end(), [](auto const& lhs, auto const& rhs) {
-      return lhs.offset() < rhs.offset();
-    });
-
-    std::vector<byte_range> merged;
-    merged.reserve(aligned.size());
-    for (auto const& input : aligned) {
-      if (merged.empty()) {
-        merged.push_back(input);
-        continue;
-      }
-      auto& previous            = merged.back();
-      auto const previous_begin = static_cast<std::size_t>(previous.offset());
-      auto const previous_end =
-        saturating_add(previous_begin, static_cast<std::size_t>(previous.size()));
-      auto const input_begin = static_cast<std::size_t>(input.offset());
-      auto const input_end   = saturating_add(input_begin, static_cast<std::size_t>(input.size()));
-      if (input_begin <= previous_end) {
-        previous = {previous.offset(),
-                    static_cast<std::int64_t>(std::max(previous_end, input_end) - previous_begin)};
-      } else {
-        merged.push_back(input);
-      }
-    }
-    return merged;
+    return io_utils::align_and_coalesce(ranges, std::max<std::size_t>(requested, IO_BLOCK_SIZE));
   } catch (...) {
     return {};
   }
@@ -788,6 +763,14 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     // before any further low request is taken.
     std::unique_ptr<grouped_io_request> parked;
     std::size_t inflight = 0;
+    // Whether the next pass may expand the active request (config::slices_per_pass).  Set
+    // by progress -- a read completion reaped, a device copy finished, a request made
+    // active -- and cleared when the worker blocks on the ring.  The ring wait times out
+    // every POLL_INTERVAL so the worker can observe stop requests and cancellation; such a
+    // wakeup completed nothing and must not count as a pass, or a read slower than
+    // POLL_INTERVAL lets the request add one cap of reads per timeout, unbounded by
+    // slices_per_pass.
+    bool may_expand = true;
     // Bounded low service (config::low_service_interval): high requests started
     // while low work waited since the low tier was last served, and how many
     // slices the active request -- when it was granted a turn -- may still
@@ -830,7 +813,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       } else if (low_waiting()) {
         ++high_starts_over_low;
       }
-      active = std::move(next);
+      active     = std::move(next);
+      may_expand = true;
       if (fresh) ++requests_started;
     };
 
@@ -949,6 +933,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           *output++ = *it;
           continue;
         }
+        may_expand = true;
         if (status == cudaSuccess) {
           slot.op->request.finish_success();
           reset_slot(slot);
@@ -982,6 +967,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
         auto const index = static_cast<int>(user_data);
         if (inflight != 0) --inflight;
+        may_expand = true;
 
         if (index < 0 || static_cast<std::size_t>(index) >= slots.size()) continue;
         auto& slot = slots[static_cast<std::size_t>(index)];
@@ -1207,9 +1193,14 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         // adding one read per completion wait.  The first expansion is unconditional, as
         // it always was; each further one needs every read planned so far to have found a
         // slot and a slot still free, which bounds the pass by the slot count.  The batch
-        // goes to the kernel in one submit once the pass stops expanding.
+        // goes to the kernel in one submit once the pass stops expanding.  A pass that
+        // follows a wakeup with no progress expands nothing (see may_expand), but still
+        // settles an active request whose coordinator stopped.
+        if (!may_expand && active != nullptr && !active->coordinator->should_continue()) {
+          cancel_active(canceled_error());
+        }
         for (std::size_t expanded = 0;
-             expanded < _slices_per_pass && pending.empty() && active != nullptr &&
+             may_expand && expanded < _slices_per_pass && pending.empty() && active != nullptr &&
              (expanded == 0 || available_slots.approx_free() > 0);
              ++expanded) {
           if (!active->coordinator->should_continue()) {
@@ -1259,6 +1250,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
         publish_gauges();
         if (inflight != 0) {
+          may_expand = false;
           if (auto const error = ring.wait_for(POLL_INTERVAL); error != 0) {
             throw std::system_error(std::error_code{error, std::generic_category()},
                                     "uring_reactor: io_uring_wait_cqe_timeout");
@@ -1269,6 +1261,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           copying.pop_back();
           auto& slot        = slots[static_cast<std::size_t>(index)];
           auto const status = slot.copy_event->synchronize_no_throw();
+          may_expand        = true;
           if (status == cudaSuccess) {
             slot.op->request.finish_success();
             reset_slot(slot);
