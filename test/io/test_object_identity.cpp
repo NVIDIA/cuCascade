@@ -23,6 +23,9 @@
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
+#ifdef CUCASCADE_HAS_KVIKIO
+#include <cucascade/io/kvikio/kvikio_context.hpp>
+#endif
 
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
@@ -37,9 +40,11 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 using cucascade::io::capture_local_identity;
@@ -138,6 +143,13 @@ object_identity identity_of(int fd)
   return identity;
 }
 
+/// @p time in nanoseconds, encoded as @c capture_local_identity encodes ctime.
+std::uint64_t nanoseconds(timespec const& time)
+{
+  return static_cast<std::uint64_t>(time.tv_sec) * 1'000'000'000ULL +
+         static_cast<std::uint64_t>(time.tv_nsec);
+}
+
 }  // namespace
 
 TEST_CASE("Object identity separates version kinds and unambiguous locators", "[object_identity]")
@@ -199,6 +211,97 @@ TEST_CASE("Local identity separates replacement with preserved mtime", "[object_
   errno = 0;
   CHECK_FALSE(capture_local_identity(-1, held));
   CHECK(errno == EBADF);
+}
+
+TEST_CASE("Local identities that differ only in ctime are different versions", "[object_identity]")
+{
+  object_identity const original{identity_kind::local_stat, 3, "", 7, 11, 1'000'000'000};
+  auto same = original;
+  CHECK(same == original);
+  CHECK(same.cache_key("file") == original.cache_key("file"));
+  auto rewritten = original;
+  rewritten.ctime_ns++;
+  CHECK(rewritten != original);
+  CHECK(rewritten.cache_key("file") != original.cache_key("file"));
+}
+
+TEST_CASE("Local identity separates a same-inode rewrite with preserved mtime by ctime",
+          "[object_identity][uring]")
+{
+  // Rewriting a file in place with as many bytes, then restoring its mtime,
+  // leaves device, inode, size and mtime as they were: only ctime, which no
+  // caller can set, tells the versions apart.  The replacement test above
+  // cannot show this, because its new file also has a new inode.
+  using cucascade::io::uring::uring_reactor;
+  identity_file const file{3, 'a'};
+  file_descriptor const writer{::open(file.path().c_str(), O_RDWR | O_CLOEXEC)};
+  REQUIRE(writer);
+  struct stat original{};
+  REQUIRE(::fstat(writer.get(), &original) == 0);
+  auto const first = identity_of(writer.get());
+  REQUIRE(first.ctime_ns == nanoseconds(original.st_ctim));
+  // Opened through each local datasource before the rewrite.
+  auto const uring_before = uring_reactor::create_io_object(file.path());
+  REQUIRE(uring_before->identity() == first);
+#ifdef CUCASCADE_HAS_KVIKIO
+  auto const kvikio_ctx =
+    std::make_shared<cucascade::io::kvikio_context>(cucascade::io::kvikio_config{});
+  auto const kvikio_before = kvikio_ctx->open_io_object(file.path());
+  REQUIRE(kvikio_before->identity() == first);
+#endif
+
+  // ctime moves in steps of the filesystem's timestamp granularity, so a
+  // rewrite within the same step leaves it unchanged.  Retry the rewrite and
+  // restore until it moves, up to a deadline, and skip if it never does.
+  timespec const times[2]{original.st_atim, original.st_mtim};
+  struct stat rewritten{};
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (true) {
+    REQUIRE(::pwrite(writer.get(), "bbb", 3, 0) == 3);
+    REQUIRE(::futimens(writer.get(), times) == 0);
+    REQUIRE(::fstat(writer.get(), &rewritten) == 0);
+    if (nanoseconds(rewritten.st_ctim) != nanoseconds(original.st_ctim) ||
+        std::chrono::steady_clock::now() >= deadline) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (nanoseconds(rewritten.st_ctim) == nanoseconds(original.st_ctim)) {
+    SKIP("the filesystem did not advance ctime for an in-place rewrite within 2 s");
+  }
+  CHECK(rewritten.st_dev == original.st_dev);
+  CHECK(rewritten.st_ino == original.st_ino);
+  CHECK(rewritten.st_size == original.st_size);
+  CHECK(nanoseconds(rewritten.st_mtim) == nanoseconds(original.st_mtim));
+  CHECK(nanoseconds(rewritten.st_ctim) > nanoseconds(original.st_ctim));
+
+  // A fresh open captures the new ctime, and that alone makes it a new version.
+  file_descriptor const fresh{::open(file.path().c_str(), O_RDONLY | O_CLOEXEC)};
+  REQUIRE(fresh);
+  auto const second = identity_of(fresh.get());
+  struct stat independent{};
+  REQUIRE(::fstat(fresh.get(), &independent) == 0);
+  CHECK(second.ctime_ns == nanoseconds(independent.st_ctim));
+  CHECK(second.ctime_ns == nanoseconds(rewritten.st_ctim));
+  CHECK(second.device == first.device);
+  CHECK(second.inode == first.inode);
+  CHECK(second.size == first.size);
+  CHECK(second != first);
+  CHECK(second.cache_key(file.path()) != first.cache_key(file.path()));
+  char bytes[3]{};
+  REQUIRE(::pread(fresh.get(), bytes, sizeof(bytes), 0) == 3);
+  CHECK(std::string_view(bytes, sizeof(bytes)) == "bbb");
+
+  auto const uring_after = uring_reactor::create_io_object(file.path());
+  CHECK(uring_after->identity() == second);
+  CHECK(uring_after->identity() != uring_before->identity());
+  CHECK(uring_after->identity_cache_key() != uring_before->identity_cache_key());
+#ifdef CUCASCADE_HAS_KVIKIO
+  auto const kvikio_after = kvikio_ctx->open_io_object(file.path());
+  CHECK(kvikio_after->identity() == second);
+  CHECK(kvikio_after->identity() != kvikio_before->identity());
+  CHECK(kvikio_after->identity_cache_key() != kvikio_before->identity_cache_key());
+#endif
 }
 
 TEST_CASE("Reopening a local descriptor reopens the open file, not its path", "[object_identity]")
