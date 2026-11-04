@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <exception>
 #include <format>
+#include <functional>
 #include <latch>
 #include <limits>
 #include <memory>
@@ -129,42 +130,71 @@ struct reclaim_outcome {
   std::size_t stuck{0};
 };
 
+using reclaim_claim_hook = std::function<void(cached_chunk const&)>;
+
 /// Return the buffers of up to @p max_chunks of @p generation's chunks to
 /// @p pool, skipping chunks a live request subscribes to when
-/// @p only_unsubscribed.  The caller holds @c generation.mtx exclusively (the
-/// scratch vectors are the generation's) or is its last owner.
+/// @p only_unsubscribed, and chunks whose buffer came from another node than
+/// @p numa_filter when one is given.  The caller holds @c generation.mtx
+/// exclusively (the scratch vectors are the generation's) or is its last owner.
+/// @p before_claim, when set, runs just before each claim (a test seam).
 reclaim_outcome reclaim_chunk_buffers(
   cache_generation& generation,
   buffer_pool& pool,
   bool only_unsubscribed,
-  std::size_t max_chunks         = std::numeric_limits<std::size_t>::max(),
-  std::optional<int> numa_filter = std::nullopt) noexcept
+  std::size_t max_chunks                 = std::numeric_limits<std::size_t>::max(),
+  std::optional<int> numa_filter         = std::nullopt,
+  reclaim_claim_hook const* before_claim = nullptr) noexcept
 {
   auto& claimed = generation.reclaim_claimed;
   auto& batch   = generation.reclaim_batch;
   claimed.clear();
   reclaim_outcome outcome;
+  // A chunk's node describes its buffer only to the thread that claimed it:
+  // numa_node is stored before mark_allocated() publishes the buffer and does
+  // not change until the claimant's mark_empty(), and a successful
+  // mark_evicting() acquires that publication.  Read before the claim, it may
+  // describe a buffer that has since left the slot.
+  auto const node_of = [](cached_chunk const* c) {
+    return c->numa_node.load(std::memory_order_relaxed);
+  };
   for (cached_chunk* c : generation.slots) {
     if (claimed.size() >= max_chunks) { break; }
     if (c == nullptr) { continue; }
     auto const snap = c->state.load();
     if (snap.state() == chunk_state::empty) { continue; }
-    // numa_node is published by mark_allocated(), not while still queued.
-    if (numa_filter && (snap.state() == chunk_state::queued || c->numa_node != *numa_filter)) {
-      continue;
+    if (numa_filter) {
+      // A queued chunk has no buffer, and so no node, yet.
+      if (snap.state() == chunk_state::queued) { continue; }
+      // Only a hint, not trusted: holding the generation lock does not stop
+      // the evictor from emptying this slot, or a preparation from refilling
+      // it with another node's buffer, before the claim below.  The hint only
+      // spares chunks clearly on another node from being claimed (and hidden
+      // from their readers) for nothing; the check after the claim decides.
+      if (node_of(c) != *numa_filter) { continue; }
     }
     if (only_unsubscribed && snap.subscribers() != 0) { continue; }
-    if (!c->state.mark_evicting(only_unsubscribed)) {
+    if (before_claim != nullptr && *before_claim) { (*before_claim)(*c); }
+    chunk_state::value prior{};
+    if (!c->state.mark_evicting(only_unsubscribed, prior)) {
       ++outcome.stuck;  // pinned, loading, or already being evicted by someone else
+      continue;
+    }
+    if (numa_filter && node_of(c) != *numa_filter) {
+      // The slot was refilled from another node since the hint.  That buffer
+      // is not ours to take: put the chunk back exactly as the claim found it
+      // (state, extent, current subscribers).  It is neither reclaimed nor
+      // stuck -- it never held a buffer this sweep may take.
+      std::ignore = c->state.cancel_evicting(prior);
       continue;
     }
     claimed.push_back(c);  // capacity reserved at creation: one per slot
   }
-  std::ranges::sort(claimed, {}, [](cached_chunk const* c) { return c->numa_node; });
+  std::ranges::sort(claimed, {}, node_of);
   for (auto run = claimed.begin(); run != claimed.end();) {
-    int const numa = (*run)->numa_node;
+    int const numa = node_of(*run);
     batch.clear();
-    for (; run != claimed.end() && (*run)->numa_node == numa; ++run) {
+    for (; run != claimed.end() && node_of(*run) == numa; ++run) {
       cached_chunk* c = *run;
       batch.push_back(reinterpret_cast<std::byte*>(c->data));
       c->data     = nullptr;
@@ -844,14 +874,15 @@ prepare_result fs_cache::prepare_request(prefetch_request& req, bool wait_for_ev
     if (c->state.mark_queued()) {
       auto* buffer = buffers.back();
       buffers.pop_back();
-      c->data      = reinterpret_cast<uint8_t*>(buffer);
-      c->numa_node = numa_allocated;
+      c->data = reinterpret_cast<uint8_t*>(buffer);
+      // Before mark_allocated(): its release publishes the node with the buffer.
+      c->numa_node.store(numa_allocated, std::memory_order_relaxed);
       if (!c->state.mark_allocated()) {
         // Hand the buffer back with the chunk describing itself as holding
         // nothing: `data` is only ever written under `queued`, so a chunk left
         // there pointing at a freed buffer would never be corrected.
-        c->data      = nullptr;
-        c->numa_node = -1;
+        c->data = nullptr;
+        c->numa_node.store(-1, std::memory_order_relaxed);
         buffers.push_back(buffer);
       }
     }
@@ -1498,9 +1529,13 @@ std::size_t fs_cache::reclaim(reclaim_mode mode,
   for (auto const& generation : generations) {
     if (reclaimed >= budget) { break; }
     std::unique_lock elk(generation->mtx);
-    reclaimed +=
-      reclaim_chunk_buffers(*generation, *_pool, only_unsubscribed, budget - reclaimed, numa_node)
-        .reclaimed;
+    reclaimed += reclaim_chunk_buffers(*generation,
+                                       *_pool,
+                                       only_unsubscribed,
+                                       budget - reclaimed,
+                                       numa_node,
+                                       &_before_reclaim_claim)
+                   .reclaimed;
   }
   if (reclaimed > 0) { _counters.evictions.fetch_add(reclaimed, std::memory_order_relaxed); }
   return reclaimed * chunk_bytes;
@@ -1804,7 +1839,9 @@ void fs_cache::evict_loop(const std::stop_token& st)
           if (!snap.is_reclaimable()) { continue; }
           if (respect_subscribers && snap.subscribers() != 0) { continue; }
           if (!c->state.mark_evicting(respect_subscribers)) { continue; }
-          reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
+          // Read after the claim, so it is the node of the buffer just taken.
+          reclaim_by_numa[c->numa_node.load(std::memory_order_relaxed)].push_back(
+            reinterpret_cast<std::byte*>(c->data));
           c->data     = nullptr;
           std::ignore = c->state.mark_empty();  // also clears the populated extent
           ++reclaimed;

@@ -310,10 +310,15 @@ struct chunk_fill {
 //   in_use     ──acquire_read()─────────►  in_use(pin += 1)   (rejected at MAX_PINS)
 //   in_use     ──release_read()─────────►  in_use(pin -= 1) | cached (when pin → 0)
 //   evicting   ──mark_empty()───────────►  empty         (clears the extent)
+//   evicting   ──cancel_evicting(prior)─►  prior         (allocated | cached; claim undone)
 //
 // `empty` is the only state with no inbound transitions other than from
 // `evicting` — once a chunk leaves `empty`, it can only return through the
-// `evicting` reclamation path.  `evicting` is a one-way transit state.
+// `evicting` reclamation path.  `evicting` is a transit state owned by the
+// thread whose mark_evicting() claimed the chunk: it either finishes the
+// reclamation with mark_empty(), or, having found it claimed a buffer it must
+// not take, undoes the claim with cancel_evicting() back to the exact word it
+// left.  While `evicting`, only the subscriber count can change.
 //
 // The subscriber count is orthogonal to the state machine: it is incremented
 // when a request names the chunk and decremented when that request is retired,
@@ -543,6 +548,17 @@ class chunk_state {
   /// when nothing else can be freed — never under dispose_on_idle.
   [[nodiscard]] bool mark_evicting(bool only_unsubscribed = true) noexcept
   {
+    value prior{};
+    return mark_evicting(only_unsubscribed, prior);
+  }
+
+  /// @ref mark_evicting that also reports the state the claim left: @p prior
+  /// is set to @c allocated or @c cached on success (and left alone on
+  /// failure), so the claimant can undo the claim with @ref cancel_evicting.
+  /// It comes out of the claiming CAS: a snapshot taken before the claim may
+  /// describe an earlier tenant of the slot.
+  [[nodiscard]] bool mark_evicting(bool only_unsubscribed, value& prior) noexcept
+  {
     std::uint64_t cur = _w.load(std::memory_order_acquire);
     for (;;) {
       auto const st = static_cast<value>(cur & STATE_MASK);
@@ -552,9 +568,32 @@ class chunk_state {
       std::uint64_t const next = (cur & ~STATE_MASK) | static_cast<std::uint64_t>(evicting);
       if (_w.compare_exchange_weak(
             cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        prior = st;
         return true;
       }
     }
+  }
+
+  /// evicting → @p prior, undoing a claim whose claimant must not take the
+  /// buffer after all (a NUMA-scoped reclaim that finds the claimed buffer came
+  /// from another node).  Only the thread whose @ref mark_evicting reported
+  /// @p prior may call it, and only instead of @ref mark_empty.
+  ///
+  /// The restore is exact.  While a chunk is `evicting`, nothing but
+  /// @ref add_subscriber and @ref drop_subscriber can change its word: a pin
+  /// needs `cached` or `in_use`; the extent changes only in `empty`, `queued`
+  /// and `allocated` (@ref merge_fill, @ref take_loading_merging) and on the
+  /// claimant's own @ref mark_empty; and every other transition starts from
+  /// another state.  So the pins are still the zero the claim required, the
+  /// extent is the one the claim saw, and the CAS keeps the subscriber count as
+  /// it is now, counting requests that named or released the chunk meanwhile.
+  ///
+  /// Returns false, changing nothing, when the chunk is not `evicting` or
+  /// @p prior is neither @c allocated nor @c cached.
+  [[nodiscard]] bool cancel_evicting(value prior) noexcept
+  {
+    if (prior != allocated && prior != cached) { return false; }
+    return transition(evicting, prior);
   }
 
   /// evicting → empty, clearing the populated extent in the same CAS so a
@@ -928,8 +967,10 @@ class consumer_stage {
 // in a file are almost always walked by the same thread (the request that
 // covers that range), so packing them two-per-half-line quarters the lines a
 // range sweep touches; padding each chunk out to 64 bytes would defend against
-// a contention pattern this workload does not produce.  All cross-thread state
-// is in the single word, so there is nothing else to isolate.
+// a contention pattern this workload does not produce.  All cross-thread
+// ordering goes through the single word (the other fields are written only by
+// the thread that owns the chunk's current state), so there is nothing else to
+// isolate.
 
 struct cached_chunk {
   cached_chunk() noexcept = default;
@@ -938,9 +979,18 @@ struct cached_chunk {
   chunk_state state;
   std::size_t offset{0};
   std::uint8_t* data{nullptr};
-  std::int32_t numa_node{-1};
+  /// NUMA node of the arena that supplied @ref data.  Stored while the chunk is
+  /// `queued`, before @c mark_allocated publishes the buffer, and read by
+  /// whoever claims the chunk afterwards: relaxed, because the state word's
+  /// release/acquire orders it.  Atomic because a NUMA-scoped reclaim also
+  /// reads it before claiming, racing a preparation that refills the slot; that
+  /// read is only a hint, and only a read after a successful claim names the
+  /// node of the buffer taken.  Not reset when the buffer is reclaimed.
+  std::atomic<std::int32_t> numa_node{-1};
 };
 
+static_assert(std::atomic<std::int32_t>::is_always_lock_free,
+              "cached_chunk::numa_node must be a plain lock-free word");
 static_assert(sizeof(cached_chunk) == 32, "cached_chunk should stay 4 per cache line");
 
 /// Settle the chunks one physical segment of a cache fill covered: @c cached when

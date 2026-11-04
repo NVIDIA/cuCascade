@@ -34,6 +34,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -297,7 +298,7 @@ struct two_arena_cache_fixture {
   /// non-null: reclaim and eviction leave the field at the last buffer's node.
   [[nodiscard]] static int node_of(io::cache::cached_chunk const& c)
   {
-    return static_cast<int>(c.numa_node);
+    return c.numa_node.load(std::memory_order_relaxed);
   }
 
   std::unique_ptr<cucascade::memory::memory_reservation_manager> memory;

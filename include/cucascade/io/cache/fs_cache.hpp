@@ -413,6 +413,20 @@ class fs_cache {
     _before_request_enqueue = std::move(hook);
   }
 
+  /// Test-only hook run inside @ref reclaim for each chunk the sweep is about to
+  /// claim: after the chunk passed the sweep's filters (for a NUMA-scoped
+  /// reclaim, including the node hint read before the claim) and before
+  /// @c mark_evicting.  It runs with that chunk's generation lock held
+  /// exclusively and no other cache lock, so it may drive the evictor and
+  /// prepare an existing request, but not create a request, read, or reclaim
+  /// (they take the generation lock).  The sweep is noexcept: the hook must not
+  /// throw.  The last-owner and teardown sweeps do not run it.  Configure only
+  /// while no reclaim can run.
+  void set_before_reclaim_claim_for_testing(std::function<void(cached_chunk const&)> hook)
+  {
+    _before_reclaim_claim = std::move(hook);
+  }
+
   /// Bytes of staging memory the cache currently holds: every chunk buffer
   /// handed out by the pool and not yet reclaimed.  This is what an explicit
   /// @ref evict can act on -- the ceiling on how much it could ever free, and
@@ -601,6 +615,7 @@ class fs_cache {
 
   std::function<void()> _before_prefetch_claim;
   std::function<void()> _before_request_enqueue;
+  std::function<void(cached_chunk const&)> _before_reclaim_claim;
   const config _cfg;
   std::shared_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;

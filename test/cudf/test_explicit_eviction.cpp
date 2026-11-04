@@ -484,6 +484,107 @@ TEST_CASE("buffers from the fallback arena are charged to, and reclaimed from, t
   CHECK(cache.claimed_bytes() == 2 * chunk);
 }
 
+// The node check of a node-scoped reclaim must be about the buffer the reclaim claims.  The sweep
+// pauses after it accepted a node-A chunk and before claiming it; meanwhile the real evictor
+// empties the slot and a real preparation refills it with a node-B buffer.  That buffer must
+// survive the A-scoped sweep and must not count toward A's target.
+TEST_CASE("a node-scoped reclaim spares another node's buffer put in a slot before its claim",
+          "[cache][eviction][explicit][reclaim][two_arena]")
+{
+  using fixture_type         = two_arena_cache_fixture;
+  using chunk_state          = cucascade::io::cache::chunk_state;
+  using cached_chunk         = cucascade::io::cache::cached_chunk;
+  using cache_prepare_result = cucascade::io::cache::prepare_result;
+  constexpr auto chunk       = fixture_type::chunk;
+  constexpr auto a           = fixture_type::node_a;
+  constexpr auto b           = fixture_type::node_b;
+  // A's request covers slots s < t: the sweep reaches s first, and t is what lets the evictor
+  // take s at all (see below).
+  constexpr std::size_t s = 0;
+  constexpr std::size_t t = 1;
+  static_assert(s < t);
+  fixture_type fixture;
+  auto& cache = fixture.cache();
+
+  // Fill B's prefetch reservation, so any further buffer from B costs B budget.
+  fixture.hold(b, 20, 2);
+
+  auto a_request = fixture.request(a, s, t - s + 1);
+  REQUIRE(fixture.prepare(a_request) == cache_prepare_result::prepared);
+  auto* const slot = a_request.chunks()->front();
+  REQUIRE(slot->offset == s * chunk);
+  REQUIRE(slot->data != nullptr);
+  REQUIRE(fixture_type::node_of(*slot) == a);
+  // B names s too, but is prepared only once s is empty: prepared now, it would find s holding
+  // A's buffer, attach nothing, and never attach anything later.
+  auto b_request = fixture.request(b, s, 1);
+  REQUIRE(b_request.chunks()->front() == slot);
+  // A's consumer is done with its request; B's still subscribes to s.  The evictor releases A's
+  // subscriptions on its next round, but frees nothing until it is asked to.
+  a_request = {};
+
+  auto const a_available = fixture.available(a);
+  auto const b_available = fixture.available(b);
+  auto const claimed     = cache.claimed_bytes();
+  REQUIRE(claimed == 4 * chunk);
+
+  // Runs while the sweep holds the generation lock, after its node check accepted s and before
+  // its claim.  It must not throw (the sweep is noexcept), so it only records what it saw.
+  struct {
+    bool fired{false};
+    bool threw{false};
+    bool emptied{false};
+    cache_prepare_result prepared{cache_prepare_result::unavailable};
+    chunk_state::value state{chunk_state::empty};
+    int node{-1};
+    std::uint8_t* data{nullptr};
+  } seen;
+  cache.set_before_reclaim_claim_for_testing([&](cached_chunk const& c) {
+    if (&c != slot || seen.fired) { return; }
+    seen.fired = true;
+    try {
+      // The evictor releases A's subscriptions; its subscriber-respecting pass takes t (B names
+      // s), and its last-resort pass takes s.  Without t, every chunk of A would be named by B
+      // once A's subscriptions were released, so the evictor would retire A before its passes
+      // and never evict s.  Exactly 2 chunks: a SIZE_MAX demand overflows the evictor's rounding
+      // and frees nothing.
+      cache.evict_sync(2 * chunk);
+      seen.emptied = slot->state.get_state() == chunk_state::empty && slot->data == nullptr;
+      // B's preparation finds s empty and attaches a buffer from B's arena.
+      seen.prepared = fixture.prepare(b_request);
+      seen.state    = slot->state.get_state();
+      seen.node     = fixture_type::node_of(*slot);
+      seen.data     = slot->data;
+    } catch (...) {
+      seen.threw = true;
+    }
+  });
+  auto const reclaimed = cache.reclaim(reclaim_mode::forced, chunk, a);
+  cache.set_before_reclaim_claim_for_testing({});
+
+  // The interleaving happened: the sweep paused on s, which was emptied and then refilled from B.
+  REQUIRE(seen.fired);
+  REQUIRE_FALSE(seen.threw);
+  REQUIRE(seen.emptied);
+  REQUIRE(seen.prepared == cache_prepare_result::prepared);
+  REQUIRE(seen.state == chunk_state::allocated);
+  REQUIRE(seen.node == b);
+  REQUIRE(seen.data != nullptr);
+
+  // B's buffer survived the A-scoped sweep, in the state B's preparation left it, still named by
+  // B's request, and was not counted toward A's target.
+  CHECK(reclaimed == 0);
+  CHECK(slot->data == seen.data);
+  CHECK(fixture_type::node_of(*slot) == b);
+  CHECK(slot->state.get_state() == chunk_state::allocated);
+  CHECK(slot->state.get_pin_count() == 0);
+  CHECK(slot->state.get_subscribers() == 1);
+  // A's two chunks went back inside A's reservation; B's buffer on s is charged to B and stays so.
+  CHECK(fixture.available(a) == a_available);
+  CHECK(fixture.available(b) == b_available - chunk);
+  CHECK(cache.claimed_bytes() == claimed - chunk);
+}
+
 TEST_CASE("a synchronous reclaim spares subscribed chunks when idle and takes them when forced",
           "[cache][eviction][explicit][reclaim]")
 {

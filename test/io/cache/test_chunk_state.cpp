@@ -479,6 +479,148 @@ TEST_CASE("mark_empty clears the extent but keeps the subscriber count", "[cache
   CHECK_FALSE(s.try_pin_covering(OFF, CHUNK, OFF, OFF + PAGE));
 }
 
+// ===========================================================================
+// undoing an eviction claim
+// ===========================================================================
+
+TEST_CASE("an undone eviction claim restores an allocated chunk exactly", "[cache][state]")
+{
+  chunk_state s;
+  s.add_subscriber();
+  s.add_subscriber();
+  make_allocated(s);
+  REQUIRE(s.merge_fill(chunk_fill::prefix_of(5)));
+
+  auto prior = chunk_state::empty;
+  REQUIRE(s.mark_evicting(/*only_unsubscribed=*/false, prior));
+  CHECK(prior == chunk_state::allocated);
+  // While it is in transit the chunk is neither claimable, readable nor widenable; only its
+  // subscribers move.  One request names it, two others retire.
+  chunk_fill got{};
+  CHECK_FALSE(s.take_loading(got));
+  CHECK_FALSE(s.acquire_read());
+  CHECK_FALSE(s.merge_fill(chunk_fill::whole()));
+  s.add_subscriber();
+  s.drop_subscriber();
+  s.drop_subscriber();
+
+  REQUIRE(s.cancel_evicting(prior));
+  auto const snap = s.load();
+  CHECK(snap.state() == chunk_state::allocated);
+  CHECK(snap.pins() == 0);
+  CHECK(snap.fill() == chunk_fill::prefix_of(5));
+  CHECK(snap.subscribers() == 1);  // the count now, not the one the claim saw
+  CHECK(snap.is_reclaimable());
+
+  // A loader can claim it as before, and is handed the extent the claim preserved.
+  REQUIRE(s.take_loading(got));
+  CHECK(got == chunk_fill::prefix_of(5));
+  REQUIRE(s.mark_cached());
+  CHECK(s.try_pin_covering(OFF, CHUNK, OFF, OFF + 5 * PAGE));
+  CHECK(s.release_read());
+}
+
+TEST_CASE("an undone eviction claim restores a cached chunk exactly", "[cache][state]")
+{
+  chunk_state s;
+  s.add_subscriber();
+  make_cached(s, chunk_fill::suffix_of(3));
+
+  auto prior = chunk_state::empty;
+  REQUIRE(s.mark_evicting(/*only_unsubscribed=*/false, prior));
+  CHECK(prior == chunk_state::cached);
+  CHECK_FALSE(s.try_pin_covering(OFF, CHUNK, OFF + CHUNK - PAGE, OFF + CHUNK));
+  s.add_subscriber();  // a request named it while it was in transit
+
+  REQUIRE(s.cancel_evicting(prior));
+  auto const snap = s.load();
+  CHECK(snap.state() == chunk_state::cached);
+  CHECK(snap.pins() == 0);
+  CHECK(snap.fill() == chunk_fill::suffix_of(3));
+  CHECK(snap.subscribers() == 2);
+
+  // Readable again over exactly the populated suffix, and evictable once more.
+  REQUIRE(s.try_pin_covering(OFF, CHUNK, OFF + CHUNK - 3 * PAGE, OFF + CHUNK));
+  CHECK_FALSE(s.try_pin_covering(OFF, CHUNK, OFF, OFF + PAGE));
+  CHECK_FALSE(s.mark_evicting(/*only_unsubscribed=*/false));  // pinned
+  CHECK(s.release_read());
+  REQUIRE(s.mark_evicting(/*only_unsubscribed=*/false));
+  REQUIRE(s.mark_empty());
+  CHECK(s.get_subscribers() == 2);
+}
+
+TEST_CASE("undoing an eviction claim refuses any other state or prior", "[cache][state]")
+{
+  using value = chunk_state::value;
+  std::array<value, 7> const all_states{chunk_state::empty,
+                                        chunk_state::queued,
+                                        chunk_state::allocated,
+                                        chunk_state::loading,
+                                        chunk_state::cached,
+                                        chunk_state::in_use,
+                                        chunk_state::evicting};
+
+  SECTION("a chunk that is not evicting is left alone")
+  {
+    auto const refuse_all = [&](chunk_state& s) {
+      auto const before = s.load();
+      for (auto const prior : all_states) {
+        CHECK_FALSE(s.cancel_evicting(prior));
+      }
+      auto const after = s.load();
+      CHECK(after.state() == before.state());
+      CHECK(after.pins() == before.pins());
+      CHECK(after.fill() == before.fill());
+    };
+    chunk_state s;
+    refuse_all(s);  // empty
+    REQUIRE(s.mark_queued());
+    refuse_all(s);
+    REQUIRE(s.mark_allocated());
+    refuse_all(s);
+    chunk_fill got{};
+    REQUIRE(s.take_loading_merging(chunk_fill::whole(), got));
+    refuse_all(s);  // loading
+    REQUIRE(s.mark_cached());
+    refuse_all(s);
+    REQUIRE(s.acquire_read());
+    refuse_all(s);  // in_use
+    REQUIRE(s.release_read());
+
+    // A finished reclamation cannot be undone either.
+    REQUIRE(s.mark_evicting());
+    REQUIRE(s.mark_empty());
+    refuse_all(s);
+    CHECK(s.get_state() == chunk_state::empty);
+  }
+
+  SECTION("an evicting chunk returns only to allocated or cached")
+  {
+    chunk_state s;
+    make_cached(s, chunk_fill::whole());
+    REQUIRE(s.mark_evicting());
+    for (auto const prior : all_states) {
+      if (prior == chunk_state::allocated || prior == chunk_state::cached) { continue; }
+      CHECK_FALSE(s.cancel_evicting(prior));
+      CHECK(s.get_state() == chunk_state::evicting);
+    }
+    REQUIRE(s.cancel_evicting(chunk_state::cached));
+    CHECK(s.get_state() == chunk_state::cached);
+    CHECK_FALSE(s.cancel_evicting(chunk_state::cached));  // only once per claim
+  }
+
+  SECTION("a refused claim reports no prior state")
+  {
+    chunk_state s;
+    make_cached(s, chunk_fill::whole());
+    REQUIRE(s.acquire_read());
+    auto prior = chunk_state::in_use;
+    CHECK_FALSE(s.mark_evicting(/*only_unsubscribed=*/false, prior));
+    CHECK(prior == chunk_state::in_use);
+    CHECK(s.release_read());
+  }
+}
+
 TEST_CASE("the subscriber count clamps instead of borrowing into the state", "[cache][state]")
 {
   chunk_state s;
