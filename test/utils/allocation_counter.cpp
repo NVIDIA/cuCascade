@@ -17,6 +17,7 @@
 
 #include "utils/allocation_counter.hpp"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdlib>
 #include <new>
@@ -46,6 +47,7 @@ namespace cucascade::test {
 
 scoped_allocation_counter::scoped_allocation_counter() noexcept
 {
+  assert(!counting && "scopes do not nest");
   counted  = 0;
   counting = true;
 }

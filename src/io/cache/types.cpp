@@ -25,6 +25,7 @@
 #include <rmm/aligned.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -134,7 +135,8 @@ void buffer_pool::deallocate_bulk(std::span<std::byte* const> blocks, int numa) 
 {
   if (blocks.empty()) return;
   auto const it = _numa_to_arena_index.find(numa);
-  if (it == _numa_to_arena_index.end()) return;
+  assert(it != _numa_to_arena_index.end() && "deallocate_bulk: no arena for this NUMA node");
+  if (it == _numa_to_arena_index.end()) return;  // release builds drop the blocks (see header)
   auto const index = it->second;
   auto& arena      = _host_arenas[index];
   // Back to the MR they came from, settled against this arena's reservation

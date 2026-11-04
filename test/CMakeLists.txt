@@ -43,6 +43,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_disk_io_backend.cpp
     data/test_io_worker.cpp
     # Utils
+    # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp
     # Main test runner
     unittest.cpp)
@@ -87,6 +88,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_static_credentials.cpp
     io/uring/test_uring_readv.cpp
     # Utils
+    # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp
     # Main test runner
     unittest.cpp)

@@ -28,6 +28,11 @@ namespace cucascade::test {
  * functions with malloc/free pass-throughs that also count calls made by a thread holding a
  * live scope, so a test can assert that a code path does not allocate.  Other threads are not
  * counted.  Scopes do not nest.
+ *
+ * Only the unaligned scalar `operator new(std::size_t)` is replaced and counted.  The aligned
+ * forms (`std::align_val_t`) are not counted.  The array and nothrow forms are counted only
+ * because libstdc++'s default implementations forward to the replaced scalar form; that does
+ * not hold where another allocator supplies all the forms itself (ASan, valgrind, tcmalloc).
  */
 class scoped_allocation_counter {
  public:

@@ -120,6 +120,8 @@ class buffer_pool {
   /// Hand back chunks allocated from @p numa's arena, from a list the caller
   /// keeps.  They go straight back to that arena's resource, settled against its
   /// prefetch reservation.  Allocation-free, so safe on paths that cannot fail.
+  /// @p numa must name an arena: otherwise debug builds assert, and release
+  /// builds drop the blocks (never returned, counters unchanged).
   void deallocate_bulk(std::span<std::byte* const> blocks, int numa) noexcept;
 
   [[nodiscard]] size_t chunk_size() const noexcept { return _chunk_bytes; }
