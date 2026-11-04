@@ -293,7 +293,8 @@ TEST_CASE("releasable bytes exclude the per-NUMA prefetch reservation",
   CHECK(cache.releasable_bytes(fixture.host->get_device_id()) == 2 * chunk);
 }
 
-TEST_CASE("a NUMA-scoped reclaim leaves other arenas alone", "[cache][eviction][explicit][reclaim]")
+TEST_CASE("a reclaim scoped to a NUMA node with no arena takes nothing",
+          "[cache][eviction][explicit][reclaim]")
 {
   reserved_reclaim_fixture fixture;
   auto& cache        = checked_cache(fixture);
@@ -317,6 +318,153 @@ TEST_CASE("reclaiming the releasable bytes returns only the overflow to the HOST
   CHECK(cache.releasable_bytes(fixture.host->get_device_id()) == 0);
   CHECK(cache.claimed_bytes() == 2 * chunk);
   CHECK(fixture.host->get_available_memory() - available == 2 * chunk);
+}
+
+// Two configured HOST arenas: each one's reservation is its own, and a reclaim
+// scoped to one node leaves the other's buffers and budget alone.  The layout
+// below puts B's chunk first in the sweep, so a reclaim that ignored its node
+// would reach B before any of A's chunks.
+
+TEST_CASE("releasable bytes are summed per HOST arena, not from combined usage",
+          "[cache][eviction][explicit][reclaim][two_arena]")
+{
+  using fixture_type   = two_arena_cache_fixture;
+  constexpr auto chunk = fixture_type::chunk;
+  constexpr auto a     = fixture_type::node_a;
+  constexpr auto b     = fixture_type::node_b;
+  fixture_type fixture;
+  auto& cache = fixture.cache();
+  // Before any request each arena is charged exactly its prefetch reservation.
+  REQUIRE(fixture.arena(a).get_total_allocated_bytes() == 2 * chunk);
+  REQUIRE(fixture.arena(b).get_total_allocated_bytes() == 2 * chunk);
+
+  // B holds one chunk, inside its 2-chunk reservation; A holds four, two past its own.
+  auto const& on_b = fixture.hold(b, 0, 1);
+  auto const& on_a = fixture.hold(a, 1, 4);
+  for (auto const* c : *on_b.chunks()) {
+    CHECK(fixture_type::node_of(*c) == b);
+  }
+  for (auto const* c : *on_a.chunks()) {
+    CHECK(fixture_type::node_of(*c) == a);
+  }
+  CHECK(cache.claimed_bytes() == 5 * chunk);
+
+  CHECK(cache.releasable_bytes(a) == 2 * chunk);
+  CHECK(cache.releasable_bytes(b) == 0);
+  // Subtracting both reservations from combined usage would give 5C - 4C = C.
+  CHECK(cache.releasable_bytes() == 2 * chunk);
+  // The HOST spaces agree: A is charged two chunks past its reservation, B nothing past its own.
+  CHECK(fixture.available(a) == (fixture_type::arena_chunks - 4) * chunk);
+  CHECK(fixture.available(b) == (fixture_type::arena_chunks - 2) * chunk);
+}
+
+TEST_CASE("reclaiming one arena's excess frees only that arena's HOST memory",
+          "[cache][eviction][explicit][reclaim][two_arena]")
+{
+  using fixture_type   = two_arena_cache_fixture;
+  using chunk_state    = cucascade::io::cache::chunk_state;
+  constexpr auto chunk = fixture_type::chunk;
+  constexpr auto a     = fixture_type::node_a;
+  constexpr auto b     = fixture_type::node_b;
+  constexpr auto all   = std::numeric_limits<std::size_t>::max();
+  fixture_type fixture;
+  auto& cache       = fixture.cache();
+  auto const& on_b  = fixture.hold(b, 0, 1);
+  auto const& on_a  = fixture.hold(a, 1, 4);
+  auto* const b_one = on_b.chunks()->front();
+  auto* const b_buf = b_one->data;
+  REQUIRE(b_buf != nullptr);
+  REQUIRE(b_one->state.get_state() == chunk_state::allocated);
+  auto const a_available = fixture.available(a);
+  auto const b_available = fixture.available(b);
+  auto const b_free      = fixture.arena(b).get_free_blocks();
+  auto const held_on_a   = [&] {
+    return std::ranges::count_if(*on_a.chunks(), [&](auto const* c) {
+      return c->data != nullptr && fixture_type::node_of(*c) == a &&
+             c->state.get_state() == chunk_state::allocated;
+    });
+  };
+
+  // A's excess, scoped to A.
+  REQUIRE(cache.releasable_bytes(a) == 2 * chunk);
+  CHECK(cache.reclaim(reclaim_mode::forced, cache.releasable_bytes(a), a) == 2 * chunk);
+  CHECK(fixture.available(a) - a_available == 2 * chunk);
+  CHECK(fixture.available(b) == b_available);
+  CHECK(cache.releasable_bytes(a) == 0);
+  CHECK(cache.releasable_bytes(b) == 0);
+  CHECK(cache.releasable_bytes() == 0);
+  CHECK(cache.claimed_bytes() == 3 * chunk);
+  CHECK(held_on_a() == 2);
+  // B's chunk keeps its buffer, its state and its subscriber; B's pool is untouched.
+  CHECK(b_one->data == b_buf);
+  CHECK(fixture_type::node_of(*b_one) == b);
+  CHECK(b_one->state.get_state() == chunk_state::allocated);
+  CHECK(b_one->state.get_subscribers() == 1);
+  CHECK(fixture.arena(b).get_free_blocks() == b_free);
+
+  // B's chunk sat inside B's reservation: returning it gives B's pool a block back and the
+  // HOST space no budget.  A is not touched by B's reclaim.
+  CHECK(cache.reclaim(reclaim_mode::forced, all, b) == chunk);
+  CHECK(b_one->state.get_state() == chunk_state::empty);
+  CHECK(fixture.arena(b).get_free_blocks() == b_free + 1);
+  CHECK(fixture.available(b) == b_available);
+  CHECK(fixture.available(a) - a_available == 2 * chunk);
+  CHECK(held_on_a() == 2);
+  CHECK(cache.claimed_bytes() == 2 * chunk);
+
+  // A's last two chunks are inside A's reservation as well.
+  CHECK(cache.reclaim(reclaim_mode::forced, all, a) == 2 * chunk);
+  CHECK(fixture.available(a) - a_available == 2 * chunk);
+  CHECK(fixture.available(b) == b_available);
+  CHECK(cache.claimed_bytes() == 0);
+}
+
+TEST_CASE("buffers from the fallback arena are charged to, and reclaimed from, that arena",
+          "[cache][eviction][explicit][reclaim][two_arena]")
+{
+  using fixture_type   = two_arena_cache_fixture;
+  constexpr auto chunk = fixture_type::chunk;
+  constexpr auto a     = fixture_type::node_a;
+  constexpr auto b     = fixture_type::node_b;
+  constexpr auto all   = std::numeric_limits<std::size_t>::max();
+  fixture_type fixture;
+  auto& cache = fixture.cache();
+
+  // B holds one chunk inside its reservation; then everything else B has goes elsewhere.
+  auto const& own = fixture.hold(b, 0, 1);
+  fixture.exhaust(b);
+  auto const a_available = fixture.available(a);
+
+  // Four more chunks for B: its reservation has room for one, so B cannot supply the request
+  // and the pool takes all four from A.
+  auto const& spilled = fixture.hold(b, 1, 4);
+  auto const on_a     = [&] {
+    return std::ranges::count_if(*spilled.chunks(), [&](auto const* c) {
+      return c->data != nullptr && fixture_type::node_of(*c) == a;
+    });
+  };
+  CHECK(on_a() == 4);
+  CHECK(fixture_type::node_of(*own.chunks()->front()) == b);
+  CHECK(a_available - fixture.available(a) == 2 * chunk);
+  CHECK(fixture.available(b) == 0);
+  CHECK(cache.releasable_bytes(a) == 2 * chunk);
+  CHECK(cache.releasable_bytes(b) == 0);
+  CHECK(cache.releasable_bytes() == 2 * chunk);
+
+  // Scoped to B, a reclaim takes only B's own chunk, not the ones a request for B got from A,
+  // and returning it credits B nothing past its reservation.
+  CHECK(cache.reclaim(reclaim_mode::forced, all, b) == chunk);
+  CHECK(fixture.available(b) == 0);
+  CHECK(on_a() == 4);
+  CHECK(cache.releasable_bytes(a) == 2 * chunk);
+
+  // Scoped to A, it takes the fallback buffers and A gets its two excess chunks back.
+  CHECK(cache.reclaim(reclaim_mode::forced, cache.releasable_bytes(a), a) == 2 * chunk);
+  CHECK(fixture.available(a) == a_available);
+  CHECK(fixture.available(b) == 0);
+  CHECK(on_a() == 2);
+  CHECK(cache.releasable_bytes() == 0);
+  CHECK(cache.claimed_bytes() == 2 * chunk);
 }
 
 TEST_CASE("a synchronous reclaim spares subscribed chunks when idle and takes them when forced",

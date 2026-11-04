@@ -16,6 +16,7 @@
  */
 
 #include "utils/allocation_counter.hpp"
+#include "utils/test_memory_resources.hpp"
 
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/memory/config.hpp>
@@ -23,15 +24,10 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <cuda/memory_resource>
-#include <cuda_runtime_api.h>
-
 #include <catch2/catch_all.hpp>
 
 #include <cstddef>
-#include <cstdlib>
 #include <memory>
-#include <new>
 #include <span>
 #include <utility>
 #include <vector>
@@ -40,10 +36,10 @@ namespace {
 
 using cucascade::io::cache::buffer_pool;
 using cucascade::memory::fixed_size_host_memory_resource;
-using cucascade::memory::host_memory_space_config;
 using cucascade::memory::memory_reservation_manager;
 using cucascade::memory::memory_space_config;
 using cucascade::memory::Tier;
+using cucascade::test::malloc_host_space_config;
 using cucascade::test::scoped_allocation_counter;
 
 constexpr std::size_t chunk           = 64UL << 10;
@@ -51,58 +47,12 @@ constexpr std::size_t blocks_per_pool = 4;
 constexpr std::size_t arena_capacity  = 64 * chunk;
 constexpr std::size_t arena_reserved  = 2 * chunk;  ///< Each arena's prefetch reservation
 
-/// Plain malloc upstream: these tests need neither pinned memory nor a NUMA binding.
-class malloc_host_resource {
- public:
-  void* allocate(::cuda::stream_ref, std::size_t bytes, std::size_t = alignof(std::max_align_t))
-  {
-    void* p = std::malloc(bytes);
-    if (p == nullptr) { throw std::bad_alloc{}; }
-    return p;
-  }
-
-  void deallocate(::cuda::stream_ref,
-                  void* p,
-                  std::size_t,
-                  std::size_t = alignof(std::max_align_t)) noexcept
-  {
-    std::free(p);
-  }
-
-  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
-  {
-    return allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
-  }
-
-  void deallocate_sync(void* p,
-                       std::size_t bytes,
-                       std::size_t alignment = alignof(std::max_align_t)) noexcept
-  {
-    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, p, bytes, alignment);
-  }
-
-  bool operator==(malloc_host_resource const&) const noexcept { return true; }
-
-  friend void get_property(malloc_host_resource const&, ::cuda::mr::device_accessible) noexcept {}
-  friend void get_property(malloc_host_resource const&, ::cuda::mr::host_accessible) noexcept {}
-};
-
 /// Two HOST arenas, ids 0 and 1, each starting with one pool of @c blocks_per_pool chunks.
 std::unique_ptr<memory_reservation_manager> two_arena_memory()
 {
   std::vector<memory_space_config> configs;
   for (int const id : {0, 1}) {
-    host_memory_space_config config;
-    config.numa_id                    = id;
-    config.memory_capacity            = arena_capacity;
-    config.reservation_limit_fraction = 1.0;
-    config.block_size                 = chunk;
-    config.pool_size                  = blocks_per_pool;
-    config.initial_number_pools       = 1;
-    config.mr_factory_fn              = [](int, std::size_t) {
-      return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{malloc_host_resource{}};
-    };
-    configs.emplace_back(config);
+    configs.emplace_back(malloc_host_space_config(id, arena_capacity, chunk, blocks_per_pool));
   }
   return std::make_unique<memory_reservation_manager>(std::move(configs));
 }
