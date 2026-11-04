@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -574,6 +575,64 @@ TEST_CASE("io_uring alignment widens and coalesces safely", "[io][uring]")
   REQUIRE(merged.size() == 1);
   CHECK(merged[0].offset() == 0);
   CHECK(merged[0].size() == 12'288);
+}
+
+TEST_CASE("io_uring alignment drops negative offsets and keeps ends within INT64_MAX",
+          "[io][uring]")
+{
+  using range_info     = cucascade::io::byte_range;
+  constexpr auto max   = std::numeric_limits<std::int64_t>::max();
+  constexpr auto min   = std::numeric_limits<std::int64_t>::min();
+  constexpr auto block = static_cast<std::int64_t>(IO_BLOCK_SIZE);
+
+  auto plan = [](std::initializer_list<range_info> input) {
+    std::vector<range_info> ranges{input};
+    return uring_reactor::align_and_coalesce(ranges);
+  };
+
+  SECTION("a negative range that sorts first does not swallow a later one")
+  {
+    auto out = plan({range_info{-10, 5}, range_info{0, 50}});
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].offset() == 0);
+    CHECK(out[0].size() == block);
+  }
+  SECTION("a negative range reaching past zero does not absorb a valid one")
+  {
+    auto out = plan({range_info{-100, 200}, range_info{0, 50}});
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].offset() == 0);
+    CHECK(out[0].size() == block);
+  }
+  SECTION("entirely negative ranges are dropped")
+  {
+    CHECK(plan({range_info{-100, 50}}).empty());
+    CHECK(plan({range_info{min, max}}).empty());
+  }
+  SECTION("non-positive sizes are dropped")
+  {
+    auto out =
+      plan({range_info{10, 0}, range_info{20, -5}, range_info{2 * block, 10}, range_info{50, min}});
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].offset() == 2 * block);
+    CHECK(out[0].size() == block);
+  }
+  SECTION("ends near INT64_MAX are clamped, not wrapped")
+  {
+    // Aligned up, both ends pass INT64_MAX: one range ending exactly there.
+    auto out = plan({range_info{max - 10, 100}, range_info{0, 10}, range_info{max - 100, 50}});
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].offset() == 0);
+    CHECK(out[0].size() == block);
+    CHECK(out[1].offset() == max - (block - 1));
+    CHECK(out[1].size() == block - 1);
+
+    // A whole-file request used to round up to a 2^63 (negative) size.
+    auto whole = plan({range_info{0, max}});
+    REQUIRE(whole.size() == 1);
+    CHECK(whole[0].offset() == 0);
+    CHECK(whole[0].size() == max);
+  }
 }
 
 TEST_CASE("io_uring staging reservation follows the byte budget, not the slot cap", "[io][uring]")

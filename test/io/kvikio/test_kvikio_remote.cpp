@@ -37,6 +37,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -141,6 +142,55 @@ TEST_CASE("kvikio_context clamps local reads past the end of the object", "[io][
   REQUIRE(context->host_read(*object, 4, buffer.size(), buffer.data()) == contents.size() - 4);
   REQUIRE(context->host_read(*object, contents.size(), buffer.size(), buffer.data()) == 0);
   REQUIRE(context->host_read(*object, contents.size() + 100, buffer.size(), buffer.data()) == 0);
+}
+
+TEST_CASE("kvikio_context passes ranges through but drops negative offsets and empty sizes",
+          "[io][kvikio]")
+{
+  using io::byte_range;
+  constexpr auto max = std::numeric_limits<std::int64_t>::max();
+  constexpr auto min = std::numeric_limits<std::int64_t>::min();
+  auto context       = std::make_shared<io::kvikio_context>(io::kvikio_config{});
+
+  auto plan = [&](std::vector<byte_range> const& ranges) {
+    return context->align_and_coalesce(ranges, 4096);
+  };
+
+  SECTION("negative ranges are dropped and do not hide valid ones")
+  {
+    auto out = plan({byte_range{-10, 5}, byte_range{0, 50}, byte_range{-100, 200}});
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].offset() == 0);
+    CHECK(out[0].size() == 50);
+    CHECK(plan({byte_range{-100, 50}, byte_range{min, max}}).empty());
+  }
+  SECTION("non-positive sizes are dropped")
+  {
+    auto out = plan({byte_range{10, 0}, byte_range{30, 10}, byte_range{20, -5}});
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].offset() == 30);
+    CHECK(out[0].size() == 10);
+  }
+  SECTION("ends near INT64_MAX are clamped, not wrapped")
+  {
+    auto out = plan({byte_range{max - 10, 100}, byte_range{0, max}, byte_range{max, 5}});
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].offset() == max - 10);
+    CHECK(out[0].size() == 10);
+    CHECK(out[1].offset() == 0);
+    CHECK(out[1].size() == max);
+  }
+  SECTION("valid ranges pass through unchanged, in input order")
+  {
+    auto out = plan({byte_range{200, 50}, byte_range{0, 50}, byte_range{25, 50}});
+    REQUIRE(out.size() == 3);
+    CHECK(out[0].offset() == 200);
+    CHECK(out[0].size() == 50);
+    CHECK(out[1].offset() == 0);
+    CHECK(out[1].size() == 50);
+    CHECK(out[2].offset() == 25);
+    CHECK(out[2].size() == 50);
+  }
 }
 
 TEST_CASE("kvikio_context orders remote device reads behind the destination stream",

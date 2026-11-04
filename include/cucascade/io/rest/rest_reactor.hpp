@@ -446,9 +446,12 @@ class rest_reactor {
 
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
-  /// bound) into a minimal sorted set — fewer ranges means fewer GETs.
-  static std::vector<byte_range> align_and_coalesce(std::span<const byte_range> ranges,
-                                                    std::optional<size_t> alignment = std::nullopt);
+  /// bound) into a minimal sorted set — fewer ranges means fewer GETs.  Ranges
+  /// with a negative offset or no bytes are dropped and every end stays within
+  /// INT64_MAX (see @c io_utils::align_and_coalesce).  Returns no ranges if
+  /// allocating the result fails.
+  static std::vector<byte_range> align_and_coalesce(
+    std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
   void worker_loop(const std::stop_token& stop_token);

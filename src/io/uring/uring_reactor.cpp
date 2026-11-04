@@ -24,6 +24,7 @@
 #include <cucascade/io/details/slot_pool.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/io_utils.hpp>
 #include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
@@ -73,25 +74,9 @@ constexpr std::chrono::milliseconds POLL_INTERVAL{20};
 constexpr auto POLL_INTERVAL_US =
   std::chrono::duration_cast<std::chrono::microseconds>(POLL_INTERVAL).count();
 
-[[nodiscard]] constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
-{
-  return rhs > std::numeric_limits<std::size_t>::max() - lhs
-           ? std::numeric_limits<std::size_t>::max()
-           : lhs + rhs;
-}
-
-[[nodiscard]] constexpr std::size_t align_down(std::size_t value, std::size_t alignment) noexcept
-{
-  return alignment == 0 ? value : value - value % alignment;
-}
-
-[[nodiscard]] constexpr std::size_t align_up(std::size_t value, std::size_t alignment) noexcept
-{
-  if (alignment == 0) return value;
-  auto const remainder = value % alignment;
-  if (remainder == 0) return value;
-  return saturating_add(value, alignment - remainder);
-}
+using io_utils::align_down;
+using io_utils::align_up;
+using io_utils::saturating_add;
 
 static_assert(max_slices_per_pass == MAX_NUM_SLOTS,
               "max_slices_per_pass must match the reactor's slot cap");
@@ -729,45 +714,7 @@ std::vector<byte_range> uring_reactor::align_and_coalesce(
 {
   try {
     auto const requested = alignment.value_or(IO_BLOCK_SIZE);
-    auto const effective = std::max<std::size_t>(requested, IO_BLOCK_SIZE);
-
-    std::vector<byte_range> aligned;
-    aligned.reserve(ranges.size());
-    for (auto const& input : ranges) {
-      if (input.offset() < 0 || input.size() <= 0) continue;
-      auto const offset = static_cast<std::size_t>(input.offset());
-      auto const end =
-        align_up(saturating_add(offset, static_cast<std::size_t>(input.size())), effective);
-      auto const begin = align_down(offset, effective);
-      aligned.emplace_back(static_cast<std::int64_t>(begin),
-                           static_cast<std::int64_t>(end - begin));
-    }
-
-    std::sort(aligned.begin(), aligned.end(), [](auto const& lhs, auto const& rhs) {
-      return lhs.offset() < rhs.offset();
-    });
-
-    std::vector<byte_range> merged;
-    merged.reserve(aligned.size());
-    for (auto const& input : aligned) {
-      if (merged.empty()) {
-        merged.push_back(input);
-        continue;
-      }
-      auto& previous            = merged.back();
-      auto const previous_begin = static_cast<std::size_t>(previous.offset());
-      auto const previous_end =
-        saturating_add(previous_begin, static_cast<std::size_t>(previous.size()));
-      auto const input_begin = static_cast<std::size_t>(input.offset());
-      auto const input_end   = saturating_add(input_begin, static_cast<std::size_t>(input.size()));
-      if (input_begin <= previous_end) {
-        previous = {previous.offset(),
-                    static_cast<std::int64_t>(std::max(previous_end, input_end) - previous_begin)};
-      } else {
-        merged.push_back(input);
-      }
-    }
-    return merged;
+    return io_utils::align_and_coalesce(ranges, std::max<std::size_t>(requested, IO_BLOCK_SIZE));
   } catch (...) {
     return {};
   }

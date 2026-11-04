@@ -304,7 +304,10 @@ class uring_reactor {
   /// The reactor reads through O_DIRECT, so @c IO_BLOCK_SIZE is the minimum
   /// viable alignment and is used when @p alignment is unset.  A caller-supplied
   /// alignment is honored only when it is at least @c IO_BLOCK_SIZE; a smaller
-  /// value is ignored in favor of the reactor's own alignment.
+  /// value is ignored in favor of the reactor's own alignment.  Ranges with a
+  /// negative offset or no bytes are dropped and every end stays within
+  /// INT64_MAX (see @c io_utils::align_and_coalesce).  Returns no ranges if
+  /// allocating the result fails.
   static std::vector<byte_range> align_and_coalesce(
     std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 

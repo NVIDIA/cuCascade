@@ -278,7 +278,9 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// coalesce overlapping/adjacent results into a minimal set of aligned,
   /// non-overlapping ranges (sorted by offset).  @p alignment is a lower bound:
   /// when unset, or smaller than the backend's optimal alignment, the backend
-  /// uses its own alignment instead.
+  /// uses its own alignment instead.  Input ranges with a negative offset or a
+  /// non-positive size are dropped, and no result ends past INT64_MAX (an end
+  /// clamped there may be unaligned).
   [[nodiscard]] virtual std::vector<byte_range> align_and_coalesce(
     std::span<const byte_range> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept = 0;

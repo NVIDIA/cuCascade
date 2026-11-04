@@ -218,7 +218,8 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept override { return 0; }
 
   /// kvikIO applies no physical block alignment of its own, so ranges pass
-  /// through unchanged.
+  /// through in their input order, except that ranges with a negative offset or
+  /// no bytes are dropped and ends are clamped to INT64_MAX.
   [[nodiscard]] std::vector<byte_range> align_and_coalesce(
     std::span<const byte_range> ranges,
     std::optional<size_t> /*alignment*/) const noexcept override;

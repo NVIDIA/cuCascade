@@ -17,6 +17,7 @@
  */
 
 #include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/io_utils.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/io/object_identity.hpp>
 
@@ -204,7 +205,13 @@ bool kvikio_context::supports(std::string_view /*path*/) const noexcept
 std::vector<byte_range> kvikio_context::align_and_coalesce(
   std::span<const byte_range> ranges, std::optional<size_t> /*alignment*/) const noexcept
 {
-  return {ranges.begin(), ranges.end()};
+  // Alignment 0 leaves the ranges as they are, keeping the input order, but still
+  // drops those no read can serve (negative offset, no bytes) and clamps the ends.
+  try {
+    return io_utils::align_ranges(ranges, 0);
+  } catch (...) {
+    return {};
+  }
 }
 
 size_t kvikio_context::host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst)
