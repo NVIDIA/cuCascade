@@ -413,6 +413,18 @@ class fs_cache {
     _before_request_enqueue = std::move(hook);
   }
 
+  /// Test-only hook run while a new prefetch request acquires its chunks: after
+  /// it has subscribed to every chunk already materialised and before it
+  /// materialises the missing ones, only when some are missing, with no cache
+  /// lock held.  A throw from it takes the path of a failure part-way through
+  /// acquisition (growing the list of missing chunks or allocating one): the
+  /// subscriptions already taken are rolled back.  Configure only while no
+  /// request can be created.
+  void set_before_chunk_materialize_for_testing(std::function<void()> hook)
+  {
+    _before_chunk_materialize = std::move(hook);
+  }
+
   /// Test-only hook run inside @ref reclaim for each chunk the sweep is about to
   /// claim: after the chunk passed the sweep's filters (for a NUMA-scoped
   /// reclaim, including the node hint read before the claim) and before
@@ -615,6 +627,7 @@ class fs_cache {
 
   std::function<void()> _before_prefetch_claim;
   std::function<void()> _before_request_enqueue;
+  std::function<void()> _before_chunk_materialize;
   std::function<void(cached_chunk const&)> _before_reclaim_claim;
   const config _cfg;
   std::shared_ptr<buffer_pool> _pool;

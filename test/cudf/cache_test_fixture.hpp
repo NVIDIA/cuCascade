@@ -171,6 +171,19 @@ struct fs_cache_test_access {
   {
     return cache.prepare(handle, wait_for_eviction);
   }
+
+  /// The chunks @p obj's current generation has materialised over
+  /// [@p offset, @p offset + @p size), in offset order; a slot no request has
+  /// materialised yet is absent.  Empty when the cache has no generation for
+  /// @p obj or the range runs past EOF.
+  static std::vector<cached_chunk*> materialised_chunks(fs_cache& cache,
+                                                        io_object const& obj,
+                                                        std::size_t offset,
+                                                        std::size_t size)
+  {
+    auto const generation = cache.generation_for(obj, nullptr);
+    return cache.ranges_in_cache(generation.get(), offset, size, coverage_policy::partial, nullptr);
+  }
 };
 
 }  // namespace cucascade::io::cache
