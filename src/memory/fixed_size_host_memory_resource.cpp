@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -126,8 +127,9 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
       throw std::runtime_error("cannot make allocation with other reservation type");
     }
   }
-  auto buffers = allocate_multiple_blocks_internal(total_bytes, h_reservation_slot);
-  return multiple_blocks_allocation::create(std::move(buffers), *this, res);
+  auto allocation     = multiple_blocks_allocation::create({}, *this, res);
+  allocation->_blocks = allocate_multiple_blocks_internal(total_bytes, h_reservation_slot);
+  return allocation;
 }
 
 std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_blocks_internal(
@@ -137,8 +139,10 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
 
   if (total_bytes == 0) { return {}; }
 
-  total_bytes                        = rmm::align_up(total_bytes, _block_size);
-  size_t num_blocks                  = total_bytes / _block_size;
+  total_bytes       = rmm::align_up(total_bytes, _block_size);
+  size_t num_blocks = total_bytes / _block_size;
+  std::vector<std::byte*> allocated_blocks;
+  allocated_blocks.reserve(num_blocks);
   std::size_t upstream_tracked_bytes = total_bytes;
   allocation_tracker* tracker        = nullptr;
   std::lock_guard<std::mutex> lock(_mutex);
@@ -162,30 +166,47 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
   auto [success, post_allocation_size] =
     _allocated_bytes.try_add(upstream_tracked_bytes, _memory_capacity);
   if (success) {
-    std::vector<std::byte*> allocated_blocks;
-    allocated_blocks.reserve(num_blocks);
+    auto const initial_pool_count = _allocated_blocks.size();
+    try {
+      for (std::size_t i = 0; i < num_blocks; ++i) {
+        if (_free_blocks.empty()) { expand_pool(); }
 
-    for (std::size_t i = 0; i < num_blocks; ++i) {
-      if (_free_blocks.empty()) { expand_pool(); }
-
-      if (_free_blocks.empty()) {
-        // Cleanup on failure
-        for (std::byte* ptr : allocated_blocks) {
-          _free_blocks.push_back(ptr);
+        if (_free_blocks.empty()) {
+          throw rmm::out_of_memory(
+            "Not enough free blocks available in fixed_size_host_memory_resource and pool "
+            "expansion "
+            "failed. total_bytes: " +
+            std::to_string(total_bytes) +
+            ", upstream_tracked_bytes: " + std::to_string(upstream_tracked_bytes) + ", only " +
+            std::to_string(_free_blocks.size()) + " free blocks available from " +
+            std::to_string(num_blocks) + " requested blocks" + ".");
         }
-        _allocated_bytes.sub(upstream_tracked_bytes);
-        if (tracker) tracker->allocated_bytes.fetch_sub(static_cast<int64_t>(total_bytes));
-        throw rmm::out_of_memory(
-          "Not enough free blocks available in fixed_size_host_memory_resource and pool expansion "
-          "failed. total_bytes: " +
-          std::to_string(total_bytes) + ", upstream_tracked_bytes: " +
-          std::to_string(upstream_tracked_bytes) + ", only " + std::to_string(_free_blocks.size()) +
-          " free blocks available from " + std::to_string(num_blocks) + " requested blocks" + ".");
-      }
 
-      std::byte* ptr = static_cast<std::byte*>(_free_blocks.back());
-      _free_blocks.pop_back();
-      allocated_blocks.push_back(ptr);
+        std::byte* ptr = static_cast<std::byte*>(_free_blocks.back());
+        _free_blocks.pop_back();
+        allocated_blocks.push_back(ptr);
+      }
+    } catch (...) {
+      for (auto it = allocated_blocks.rbegin(); it != allocated_blocks.rend(); ++it) {
+        _free_blocks.push_back(*it);
+      }
+      while (_allocated_blocks.size() > initial_pool_count) {
+        auto* pool       = _allocated_blocks.back();
+        auto const begin = reinterpret_cast<std::uintptr_t>(pool);
+        auto const size  = _block_size * _pool_size;
+        std::erase_if(_free_blocks, [begin, size](void* ptr) {
+          auto const address = reinterpret_cast<std::uintptr_t>(ptr);
+          return address >= begin && address - begin < size;
+        });
+        _upstream_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                                pool,
+                                size,
+                                alignof(std::max_align_t));
+        _allocated_blocks.pop_back();
+      }
+      _allocated_bytes.sub(upstream_tracked_bytes);
+      if (tracker) tracker->allocated_bytes.fetch_sub(static_cast<int64_t>(total_bytes));
+      throw;
     }
     _peak_allocated_bytes.update_peak(post_allocation_size);
     return allocated_blocks;
@@ -290,6 +311,10 @@ std::size_t fixed_size_host_memory_resource::get_peak_total_allocated_bytes() co
 void fixed_size_host_memory_resource::expand_pool()
 {
   const std::size_t total_size = _block_size * _pool_size;
+
+  // All blocks, including checked-out ones, must fit when they are returned.
+  _allocated_blocks.reserve(_allocated_blocks.size() + 1);
+  _free_blocks.reserve((_allocated_blocks.size() + 1) * _pool_size);
 
   // See constructor for explanation of this suppression.
 #pragma GCC diagnostic push

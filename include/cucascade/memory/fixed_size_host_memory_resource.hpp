@@ -158,6 +158,8 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     bool grow_by(std::size_t additional_bytes) noexcept
     {
       try {
+        auto const additional_blocks = rmm::align_up(additional_bytes, _block_size) / _block_size;
+        _blocks.reserve(_blocks.size() + additional_blocks);
         auto blocks = _mr->allocate_multiple_blocks_internal(additional_bytes, _reseved_memory);
         _blocks.insert(_blocks.end(), blocks.begin(), blocks.end());
         return true;
@@ -183,6 +185,7 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     }
 
    private:
+    friend class fixed_size_host_memory_resource;
     explicit multiple_blocks_allocation(std::vector<std::byte*> buffers,
                                         fixed_size_host_memory_resource* m,
                                         reservation* res)
