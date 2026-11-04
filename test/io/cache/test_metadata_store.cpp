@@ -418,6 +418,60 @@ TEST_CASE("Observing a newer identity fences an older in-flight publication",
   CHECK(result == payload);
 }
 
+TEST_CASE("A live clear keeps the newest observed version", "[cache][metadata_store]")
+{
+  // One thread is enough: the loader runs outside the store mutex, so A's load
+  // can observe and publish the newer B and clear the store before it returns.
+  metadata_store store;
+  fake_object const older("file", "locator", tag("a"));
+  fake_object const newer("file", "locator", tag("b"));
+  REQUIRE(older.open_generation() < newer.open_generation());
+  auto const a  = std::make_shared<value>(1);
+  auto const b1 = std::make_shared<value>(2);
+  auto const b2 = std::make_shared<value>(3);
+  std::shared_ptr<io_object_metadata> kept;
+  bool loaded       = false;
+  bool hit          = true;
+  auto const result = store.get_or_load(
+    older,
+    [&] {
+      store.open_observed(newer);
+      store.register_metadata(newer, b1, "p1");
+      store.register_metadata(newer, b2, "p2");
+      REQUIRE(store.statistics().entries == 2);
+      kept = store.get_metadata(newer, "p1");
+      REQUIRE(kept == b1);
+
+      store.clear();
+      CHECK(store.statistics().entries == 0);
+      CHECK_FALSE(store.get_metadata(newer, "p1"));
+      CHECK_FALSE(store.get_metadata(newer, "p2"));
+      CHECK(bytes_of(kept) == 2);
+      loaded = true;
+      return a;
+    },
+    &hit,
+    {},
+    "p1");
+
+  // The caller gets A's value, but A is not installed.
+  REQUIRE(loaded);
+  CHECK_FALSE(hit);
+  CHECK(result == a);
+  CHECK(store.statistics().entries == 0);
+  CHECK_FALSE(store.get_metadata(older, "p1"));
+  CHECK_FALSE(store.get_metadata(older, "p2"));
+  CHECK(store.statistics().stale == 1);
+  CHECK(bytes_of(kept) == 2);
+
+  // B, the newest observed version, can publish again.
+  auto const fresh = std::make_shared<value>(4);
+  store.register_metadata(newer, fresh, "p1");
+  CHECK(store.get_metadata(newer, "p1") == fresh);
+  CHECK(store.statistics().entries == 1);
+  CHECK(store.statistics().stale == 1);
+}
+
 TEST_CASE("Metadata flights do not join a different identity", "[cache][metadata_store]")
 {
   metadata_store store;
