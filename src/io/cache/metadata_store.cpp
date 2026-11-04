@@ -184,37 +184,48 @@ std::string metadata_store::cache_key(std::string_view path, std::string_view pr
 
 void metadata_store::retire(iterator it, entries& retired) noexcept
 {
+  // A slot holds one entry per profile of its path: find `it`, then move the
+  // last one into its place.
+  if (auto const slot = _entries_by_path.find(it->path); slot != _entries_by_path.end()) {
+    auto& listed = slot->second;
+    if (auto const found = std::find(listed.begin(), listed.end(), it); found != listed.end()) {
+      *found = listed.back();
+      listed.pop_back();
+    }
+    if (listed.empty()) _entries_by_path.erase(slot);
+  }
+  unlink(it, retired);
+}
+
+void metadata_store::unlink(iterator it, entries& retired) noexcept
+{
   --_stats.entries;
   _index.erase(it->key);
-  if (auto const counted = _entries_per_path.find(it->path);
-      counted != _entries_per_path.end() && --counted->second == 0) {
-    _entries_per_path.erase(counted);
-  }
   retired.splice(retired.end(), _entries, it);
 }
 
 std::size_t metadata_store::retire_path(std::string_view path, entries& retired) noexcept
 {
-  auto const counted = _entries_per_path.find(path);
-  if (counted == _entries_per_path.end()) return 0;
-  auto const count = counted->second;
-  std::size_t done = 0;
-  for (auto it = _entries.begin(); it != _entries.end() && done < count;) {
-    auto current = it++;
-    if (current->path != path) continue;
-    retire(current, retired);
-    ++done;
+  auto const slot = _entries_by_path.find(path);
+  if (slot == _entries_by_path.end()) return 0;
+  // The slot leaves the map first, so its entries need no removal from it.
+  auto const listed = _entries_by_path.extract(slot);
+  for (auto const it : listed.mapped()) {
+    unlink(it, retired);
   }
-  return done;
+  return listed.mapped().size();
 }
 
 void metadata_store::clear()
 {
   entries retired;
   std::lock_guard lock{_mutex};
-  for (auto it = _entries.begin(); it != _entries.end();) {
-    retire(it++, retired);
-  }
+  // Observed identities stay: a load of an older version that completes after
+  // this must still not publish it.
+  _index.clear();
+  _entries_by_path.clear();
+  _stats.entries = 0;
+  retired.splice(retired.end(), _entries);
 }
 
 bool metadata_store::put_identity(std::string const& path,
@@ -255,8 +266,12 @@ bool metadata_store::put_identity(std::string const& path,
     ++_stats.replacements;
     retire(it, retired);
   }
-  auto const [counted, inserted] = _entries_per_path.try_emplace(path, 0);
+  auto const slot = _entries_by_path.try_emplace(path).first;
+  auto& listed    = slot->second;
   try {
+    // Room for the entry in its path's slot comes before anything moves into
+    // the store, so recording it below cannot throw.
+    if (listed.size() == listed.capacity()) listed.reserve(2 * listed.size() + 1);
     // The node is allocated before anything is moved into it, and `value` is
     // the entry's last member: if building the entry throws, the payload is
     // still the caller's and is not released under _mutex.
@@ -275,10 +290,10 @@ bool metadata_store::put_identity(std::string const& path,
       throw;
     }
   } catch (...) {
-    if (counted->second == 0) { _entries_per_path.erase(counted); }
+    if (listed.empty()) { _entries_by_path.erase(slot); }
     throw;
   }
-  ++counted->second;
+  listed.push_back(_entries.begin());
   ++_stats.entries;
   return true;
 }

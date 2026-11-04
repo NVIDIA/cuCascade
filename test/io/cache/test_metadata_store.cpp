@@ -553,6 +553,97 @@ TEST_CASE("Identity replacement retires every metadata profile for a path",
   CHECK(store.statistics().entries == 0);
 }
 
+TEST_CASE("Interleaved identity replacements retire exactly the replaced path's profiles",
+          "[cache][metadata_store]")
+{
+  // Entries are kept newest first, so replacing the paths in their insertion
+  // order, round after round, always finds the replaced path's entries behind
+  // every other path's.  Before each replacement one profile of the path is
+  // retired and republished, so its entries are also found after a targeted
+  // removal and a later insertion.
+  struct path_state {
+    std::string path;
+    std::vector<std::string> profiles;
+    std::unique_ptr<fake_object> open;
+    std::vector<std::shared_ptr<value>> payloads;
+  };
+  std::vector<path_state> paths;
+  paths.push_back({"A", {"", "p"}, nullptr, {}});
+  paths.push_back({"B", {"", "p", "q"}, nullptr, {}});
+  paths.push_back({"C", {"", "q"}, nullptr, {}});
+  std::size_t const total = 7;
+
+  metadata_store store;
+  std::size_t next_bytes = 0;
+  auto const publish     = [&](path_state& state) {
+    state.payloads.clear();
+    for (auto const& profile : state.profiles) {
+      state.payloads.push_back(std::make_shared<value>(next_bytes++));
+      store.register_metadata(*state.open, state.payloads.back(), profile);
+    }
+  };
+  auto const all_hit = [&](path_state const& state) {
+    for (std::size_t i = 0; i < state.profiles.size(); ++i) {
+      CHECK(store.get_metadata(*state.open, state.profiles[i]) == state.payloads[i]);
+    }
+  };
+  for (auto& state : paths) {
+    state.open = std::make_unique<fake_object>(state.path, "locator", tag("v0"));
+    publish(state);
+  }
+  REQUIRE(store.statistics().entries == total);
+
+  std::uint64_t replaced = 0;
+  for (int round = 1; round <= 4; ++round) {
+    for (auto& state : paths) {
+      CAPTURE(round, state.path);
+      REQUIRE(store.invalidate(state.path, state.profiles.back()));
+      state.payloads.back() = std::make_shared<value>(next_bytes++);
+      store.register_metadata(*state.open, state.payloads.back(), state.profiles.back());
+      REQUIRE(store.statistics().entries == total);
+
+      auto newer =
+        std::make_unique<fake_object>(state.path, "locator", tag("v" + std::to_string(round)));
+      store.open_observed(*newer);
+      replaced += state.profiles.size();
+      auto const stats = store.statistics();
+      CHECK(stats.entries == total - state.profiles.size());
+      CHECK(stats.replacements == replaced);
+      CHECK(stats.stale == 0);
+      for (auto const& profile : state.profiles) {
+        CHECK_FALSE(store.get_metadata(*state.open, profile));
+        CHECK_FALSE(store.get_metadata(*newer, profile));
+      }
+      CHECK_FALSE(store.has_path(state.path));
+      for (auto const& other : paths) {
+        if (&other != &state) all_hit(other);
+      }
+
+      state.open = std::move(newer);
+      publish(state);
+      CHECK(store.statistics().entries == total);
+      CHECK(store.statistics().replacements == replaced);
+      all_hit(state);
+    }
+  }
+  store.clear();
+  CHECK(store.statistics().entries == 0);
+  for (auto const& state : paths) {
+    CHECK_FALSE(store.has_path(state.path));
+    for (auto const& profile : state.profiles) {
+      CHECK_FALSE(store.get_metadata(*state.open, profile));
+    }
+  }
+
+  // After a clear, a republished path is replaced as before.
+  auto& first = paths.front();
+  publish(first);
+  REQUIRE(store.statistics().entries == first.profiles.size());
+  store.open_observed(fake_object(first.path, "locator", tag("after-clear")));
+  CHECK(store.statistics().entries == 0);
+  CHECK(store.statistics().replacements == replaced + first.profiles.size());
+}
+
 TEST_CASE("Metadata store supports concurrent publication", "[cache][metadata_store]")
 {
   metadata_store store;

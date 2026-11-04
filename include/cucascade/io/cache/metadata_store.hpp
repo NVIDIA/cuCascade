@@ -32,6 +32,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace cucascade::io::cache {
 
@@ -206,8 +207,14 @@ class metadata_store {
                       std::string_view locator,
                       object_identity const& identity,
                       entries& retired);
+  /// Move @p it to @p retired, out of @c _index and out of its path's slot in
+  /// @c _entries_by_path (the slot goes when it empties).  Allocates nothing.
   void retire(iterator it, entries& retired) noexcept;
-  /// Retire every entry of @p path, of any profile; returns how many.
+  /// Move @p it to @p retired and out of @c _index only: for a caller that has
+  /// already taken @p it's path slot out of @c _entries_by_path.
+  void unlink(iterator it, entries& retired) noexcept;
+  /// Retire every entry of @p path, of any profile, found through the path's
+  /// slot in @c _entries_by_path; returns how many.
   std::size_t retire_path(std::string_view path, entries& retired) noexcept;
   /// Publish @p value for (@p path, @p profile).  @p value is moved into the
   /// store only when it is published; when it is not, or when publishing
@@ -223,9 +230,12 @@ class metadata_store {
   mutable std::mutex _mutex;
   entries _entries;
   string_map<iterator> _index;
-  /// How many entries each path has, over all profiles: lets a path without
-  /// entries skip the scan of @c _entries when a newer identity retires them.
-  string_map<std::size_t> _entries_per_path;
+  /// Each path's entries, over all profiles: a newer identity retires a path's
+  /// entries through its slot (@ref retire_path) without visiting other
+  /// paths'.  A path without entries has no slot.  @ref put_identity reserves
+  /// an entry's place in its slot before publishing it, so recording it cannot
+  /// throw, and @ref retire removes it without allocating.
+  string_map<std::vector<iterator>> _entries_by_path;
   mutable counters _stats;
   string_map<observation> _observed;
   std::unordered_map<std::string, std::shared_ptr<flight>> _flights;
