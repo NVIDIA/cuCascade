@@ -20,6 +20,7 @@
 
 #include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/rest/object_store_lister.hpp>
+#include <cucascade/io/rest/request_stats.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
@@ -64,6 +65,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
+
+  /// Counters of the ranged GETs of every reactor of this pool, summed.
+  [[nodiscard]] rest::request_stats_snapshot request_stats() const;
 
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
   /// per page (a page holds at most 1000 entries, so peak memory is one page

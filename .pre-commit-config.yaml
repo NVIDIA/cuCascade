@@ -37,6 +37,12 @@ repos:
     rev: 25.1.0
     hooks:
       - id: black
+  - repo: https://github.com/MarcoGorelli/cython-lint
+    rev: v0.21.1
+    hooks:
+      - id: cython-lint
+        args: ["--max-line-length=120"]
+        additional_dependencies: ["cython>=3.2.2,<3.3.0a0"]
   - repo: https://github.com/sirosen/texthooks
     rev: 0.7.1
     hooks:

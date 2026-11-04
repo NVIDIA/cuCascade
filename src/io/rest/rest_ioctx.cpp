@@ -403,4 +403,13 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
                                                                  std::move(probe.etag)));
 }
 
+rest::request_stats_snapshot rest_ioctx::request_stats() const
+{
+  rest::request_stats_snapshot total;
+  for (auto const& reactor : _reactors) {
+    total += reactor->stats();
+  }
+  return total;
+}
+
 }  // namespace cucascade::io::rest
