@@ -426,35 +426,40 @@ TEST_CASE("A live clear keeps the newest observed version", "[cache][metadata_st
   fake_object const older("file", "locator", tag("a"));
   fake_object const newer("file", "locator", tag("b"));
   REQUIRE(older.open_generation() < newer.open_generation());
-  auto const a  = std::make_shared<value>(1);
-  auto const b1 = std::make_shared<value>(2);
-  auto const b2 = std::make_shared<value>(3);
+  auto const a = std::make_shared<value>(1);
   std::shared_ptr<io_object_metadata> kept;
-  bool loaded       = false;
-  bool hit          = true;
-  auto const result = store.get_or_load(
+  std::uint64_t bypasses = 0;
+  bool loaded            = false;
+  bool hit               = true;
+  auto const result      = store.get_or_load(
     older,
     [&] {
       store.open_observed(newer);
-      store.register_metadata(newer, b1, "p1");
-      store.register_metadata(newer, b2, "p2");
+      // The store owns B's payloads: after the clear only `kept` holds p1's.
+      store.register_metadata(newer, std::make_shared<value>(2), "p1");
+      store.register_metadata(newer, std::make_shared<value>(3), "p2");
       REQUIRE(store.statistics().entries == 2);
       kept = store.get_metadata(newer, "p1");
-      REQUIRE(kept == b1);
+      REQUIRE(kept);
+      REQUIRE(kept.use_count() == 2);
 
       store.clear();
       CHECK(store.statistics().entries == 0);
+      CHECK(store.statistics().stale == 0);
+      CHECK(kept.use_count() == 1);
       CHECK_FALSE(store.get_metadata(newer, "p1"));
       CHECK_FALSE(store.get_metadata(newer, "p2"));
       CHECK(bytes_of(kept) == 2);
-      loaded = true;
+      bypasses = store.statistics().bypasses;
+      loaded   = true;
       return a;
     },
     &hit,
     {},
     "p1");
 
-  // The caller gets A's value, but A is not installed.
+  // The caller gets A's value, but A is not installed: its publication is
+  // bypassed as stale.
   REQUIRE(loaded);
   CHECK_FALSE(hit);
   CHECK(result == a);
@@ -462,6 +467,8 @@ TEST_CASE("A live clear keeps the newest observed version", "[cache][metadata_st
   CHECK_FALSE(store.get_metadata(older, "p1"));
   CHECK_FALSE(store.get_metadata(older, "p2"));
   CHECK(store.statistics().stale == 1);
+  CHECK(store.statistics().bypasses == bypasses + 1);
+  CHECK(kept.use_count() == 1);
   CHECK(bytes_of(kept) == 2);
 
   // B, the newest observed version, can publish again.
@@ -611,10 +618,13 @@ TEST_CASE("Interleaved identity replacements retire exactly the replaced path's 
           "[cache][metadata_store]")
 {
   // Entries are kept newest first, so replacing the paths in their insertion
-  // order, round after round, always finds the replaced path's entries behind
+  // order, round after round, finds the replaced path's other entries behind
   // every other path's.  Before each replacement one profile of the path is
-  // retired and republished, so its entries are also found after a targeted
-  // removal and a later insertion.
+  // retired and republished (it is then the newest entry), so the path's
+  // entries are also found after a targeted removal and a later insertion.
+  // The profile rotates with the round, so the targeted removal takes the
+  // first, a middle and the last entry of a path's slot (B has three profiles,
+  // A and C two), not only the last.
   struct path_state {
     std::string path;
     std::vector<std::string> profiles;
@@ -650,11 +660,13 @@ TEST_CASE("Interleaved identity replacements retire exactly the replaced path's 
   std::uint64_t replaced = 0;
   for (int round = 1; round <= 4; ++round) {
     for (auto& state : paths) {
-      CAPTURE(round, state.path);
-      REQUIRE(store.invalidate(state.path, state.profiles.back()));
-      state.payloads.back() = std::make_shared<value>(next_bytes++);
-      store.register_metadata(*state.open, state.payloads.back(), state.profiles.back());
+      auto const retired = static_cast<std::size_t>(round) % state.profiles.size();
+      CAPTURE(round, state.path, retired);
+      REQUIRE(store.invalidate(state.path, state.profiles[retired]));
+      state.payloads[retired] = std::make_shared<value>(next_bytes++);
+      store.register_metadata(*state.open, state.payloads[retired], state.profiles[retired]);
       REQUIRE(store.statistics().entries == total);
+      all_hit(state);
 
       auto newer =
         std::make_unique<fake_object>(state.path, "locator", tag("v" + std::to_string(round)));

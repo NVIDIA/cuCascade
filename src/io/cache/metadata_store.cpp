@@ -19,6 +19,7 @@
 #include <cucascade/io/cache/metadata_store.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <mutex>
 #include <ostream>
@@ -184,20 +185,24 @@ std::string metadata_store::cache_key(std::string_view path, std::string_view pr
 
 void metadata_store::retire(iterator it, entries& retired) noexcept
 {
-  // A slot holds one entry per profile of its path: find `it`, then move the
-  // last one into its place.
-  if (auto const slot = _entries_by_path.find(it->path); slot != _entries_by_path.end()) {
-    auto& listed = slot->second;
-    if (auto const found = std::find(listed.begin(), listed.end(), it); found != listed.end()) {
+  // Each live entry is listed exactly once in its path's slot, which holds one
+  // entry per profile: find `it`, then move the slot's last one into its place.
+  auto const slot = _entries_by_path.find(it->path);
+  assert(slot != _entries_by_path.end() && "a live entry is listed once in its path's slot");
+  if (slot != _entries_by_path.end()) {
+    auto& listed     = slot->second;
+    auto const found = std::find(listed.begin(), listed.end(), it);
+    assert(found != listed.end() && "a live entry is listed once in its path's slot");
+    if (found != listed.end()) {
       *found = listed.back();
       listed.pop_back();
     }
     if (listed.empty()) _entries_by_path.erase(slot);
   }
-  unlink(it, retired);
+  detach(it, retired);
 }
 
-void metadata_store::unlink(iterator it, entries& retired) noexcept
+void metadata_store::detach(iterator it, entries& retired) noexcept
 {
   --_stats.entries;
   _index.erase(it->key);
@@ -211,7 +216,7 @@ std::size_t metadata_store::retire_path(std::string_view path, entries& retired)
   // The slot leaves the map first, so its entries need no removal from it.
   auto const listed = _entries_by_path.extract(slot);
   for (auto const it : listed.mapped()) {
-    unlink(it, retired);
+    detach(it, retired);
   }
   return listed.mapped().size();
 }
@@ -290,7 +295,7 @@ bool metadata_store::put_identity(std::string const& path,
       throw;
     }
   } catch (...) {
-    if (listed.empty()) { _entries_by_path.erase(slot); }
+    if (listed.empty()) _entries_by_path.erase(slot);
     throw;
   }
   listed.push_back(_entries.begin());

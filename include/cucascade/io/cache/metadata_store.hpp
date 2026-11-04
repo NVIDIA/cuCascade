@@ -212,7 +212,7 @@ class metadata_store {
   void retire(iterator it, entries& retired) noexcept;
   /// Move @p it to @p retired and out of @c _index only: for a caller that has
   /// already taken @p it's path slot out of @c _entries_by_path.
-  void unlink(iterator it, entries& retired) noexcept;
+  void detach(iterator it, entries& retired) noexcept;
   /// Retire every entry of @p path, of any profile, found through the path's
   /// slot in @c _entries_by_path; returns how many.
   std::size_t retire_path(std::string_view path, entries& retired) noexcept;
@@ -232,7 +232,8 @@ class metadata_store {
   string_map<iterator> _index;
   /// Each path's entries, over all profiles: a newer identity retires a path's
   /// entries through its slot (@ref retire_path) without visiting other
-  /// paths'.  A path without entries has no slot.  @ref put_identity reserves
+  /// paths'.  Every live entry is listed exactly once, in its path's slot, and
+  /// a path without entries has no slot.  @ref put_identity reserves
   /// an entry's place in its slot before publishing it, so recording it cannot
   /// throw, and @ref retire removes it without allocating.
   string_map<std::vector<iterator>> _entries_by_path;
