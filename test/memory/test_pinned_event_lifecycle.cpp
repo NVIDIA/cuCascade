@@ -3,14 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "pinned_host_test_hooks.hpp"
+#include "fault_injection_hooks.hpp"
 #include "pinned_host_test_utils.hpp"
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -19,6 +18,7 @@
 
 namespace {
 
+using cucascade::test::pinned_upstream_fixture;
 using cucascade::test::require_pointer_type;
 
 struct destruction_failure {
@@ -27,7 +27,7 @@ struct destruction_failure {
   bool owner_was_empty{true};
 };
 
-std::optional<cudaError_t> destroy_then_fail(cucascade::test::pinned_host_call const& call,
+std::optional<cudaError_t> destroy_then_fail(cucascade::test::fault_point_call const& call,
                                              void* context) noexcept
 {
   auto& failure = *static_cast<destruction_failure*>(context);
@@ -40,18 +40,12 @@ std::optional<cudaError_t> destroy_then_fail(cucascade::test::pinned_host_call c
   return cudaSetDevice(-1);
 }
 
-std::optional<cudaError_t> count_destruction(cucascade::test::pinned_host_call const&,
+std::optional<cudaError_t> count_destruction(cucascade::test::fault_point_call const&,
                                              void* context) noexcept
 {
   ++*static_cast<int*>(context);
   return std::nullopt;
 }
-
-struct event_fixture {
-  rmm::mr::pinned_host_memory_resource pinned;
-  cucascade::memory::fixed_size_host_memory_resource upstream{
-    0, pinned, 1ULL << 20, 1ULL << 20, 64ULL << 10, 4, 1};
-};
 
 }  // namespace
 
@@ -59,8 +53,8 @@ TEST_CASE("Event destruction clears its own CUDA failure",
           "[small_pinned][fault_injection][event_lifecycle]")
 {
   destruction_failure failure;
-  cucascade::test::scoped_pinned_host_hook hook{
-    cucascade::test::pinned_host_operation::event_destroy, destroy_then_fail, &failure};
+  cucascade::test::scoped_fault_hook hook{
+    cucascade::test::fault_point::event_destroy, destroy_then_fail, &failure};
   {
     cucascade::cuda::cuda_event event;
     REQUIRE(event.get() != nullptr);
@@ -73,8 +67,8 @@ TEST_CASE("Event reset relinquishes ownership even when destruction fails",
           "[small_pinned][fault_injection][event_lifecycle]")
 {
   destruction_failure failure;
-  cucascade::test::scoped_pinned_host_hook hook{
-    cucascade::test::pinned_host_operation::event_destroy, destroy_then_fail, &failure};
+  cucascade::test::scoped_fault_hook hook{
+    cucascade::test::fault_point::event_destroy, destroy_then_fail, &failure};
   {
     cucascade::cuda::cuda_event event;
     failure.owner = &event;
@@ -91,8 +85,8 @@ TEST_CASE("An empty event reset preserves unrelated CUDA error state",
           "[small_pinned][fault_injection][event_lifecycle]")
 {
   int destructions = 0;
-  cucascade::test::scoped_pinned_host_hook observed{
-    cucascade::test::pinned_host_operation::event_destroy, count_destruction, &destructions};
+  cucascade::test::scoped_fault_hook observed{
+    cucascade::test::fault_point::event_destroy, count_destruction, &destructions};
   {
     cucascade::cuda::cuda_event event;
     REQUIRE(event.reset_no_throw() == cudaSuccess);
@@ -112,8 +106,8 @@ TEST_CASE("Event move assignment safely replaces its previous ownership",
   auto const source_handle = source.get();
   destruction_failure failure{.owner = &destination};
   {
-    cucascade::test::scoped_pinned_host_hook hook{
-      cucascade::test::pinned_host_operation::event_destroy, destroy_then_fail, &failure};
+    cucascade::test::scoped_fault_hook hook{
+      cucascade::test::fault_point::event_destroy, destroy_then_fail, &failure};
     destination = std::move(source);
     REQUIRE(source.get() == nullptr);
     REQUIRE(destination.get() == source_handle);
@@ -127,7 +121,7 @@ TEST_CASE("Event move assignment safely replaces its previous ownership",
 TEST_CASE("Eviction retires only events whose completion cannot be confirmed",
           "[small_pinned][fault_injection][event_lifecycle]")
 {
-  event_fixture fixture;
+  pinned_upstream_fixture fixture;
   cucascade::memory::small_pinned_host_memory_resource resource{fixture.upstream, 16384};
   rmm::cuda_stream stream;
   constexpr std::size_t bytes = 9000;
@@ -137,11 +131,11 @@ TEST_CASE("Eviction retires only events whose completion cannot be confirmed",
   int destructions = 0;
   bool const fail  = GENERATE(false, true);
   {
-    cucascade::test::scoped_pinned_host_hook observed{
-      cucascade::test::pinned_host_operation::event_destroy, count_destruction, &destructions};
-    std::optional<cucascade::test::scoped_pinned_host_hook> failed;
+    cucascade::test::scoped_fault_hook observed{
+      cucascade::test::fault_point::event_destroy, count_destruction, &destructions};
+    std::optional<cucascade::test::scoped_fault_hook> failed;
     if (fail) {
-      failed.emplace(cucascade::test::pinned_host_operation::event_synchronize,
+      failed.emplace(cucascade::test::fault_point::event_synchronize,
                      cudaErrorInvalidResourceHandle);
     }
     resource.deallocate(stream, incoming, bytes);
@@ -159,7 +153,7 @@ TEST_CASE("Eviction retires only events whose completion cannot be confirmed",
 TEST_CASE("Unpublished buffers retire events after unconfirmed completion",
           "[small_pinned][fault_injection][event_lifecycle]")
 {
-  event_fixture fixture;
+  pinned_upstream_fixture fixture;
   cucascade::memory::small_pinned_host_memory_resource resource{fixture.upstream, 16384};
   rmm::cuda_stream stream;
   constexpr std::size_t bytes = 9000;
@@ -167,13 +161,13 @@ TEST_CASE("Unpublished buffers retire events after unconfirmed completion",
   int destructions            = 0;
   bool const fail             = GENERATE(false, true);
   {
-    cucascade::test::scoped_pinned_host_hook observed{
-      cucascade::test::pinned_host_operation::event_destroy, count_destruction, &destructions};
-    cucascade::test::scoped_pinned_host_hook metadata_failure{
-      cucascade::test::pinned_host_operation::large_cache_entry, cudaErrorMemoryAllocation};
-    std::optional<cucascade::test::scoped_pinned_host_hook> failed;
+    cucascade::test::scoped_fault_hook observed{
+      cucascade::test::fault_point::event_destroy, count_destruction, &destructions};
+    cucascade::test::scoped_fault_hook metadata_failure{
+      cucascade::test::fault_point::large_cache_entry, cudaErrorMemoryAllocation};
+    std::optional<cucascade::test::scoped_fault_hook> failed;
     if (fail) {
-      failed.emplace(cucascade::test::pinned_host_operation::event_synchronize,
+      failed.emplace(cucascade::test::fault_point::event_synchronize,
                      cudaErrorInvalidResourceHandle);
     }
     resource.deallocate(stream, pointer, bytes);
@@ -191,7 +185,7 @@ TEST_CASE("Unpublished buffers retire events after unconfirmed completion",
 TEST_CASE("Repeated event retirement reuses reserved return capacity",
           "[small_pinned][fault_injection][event_lifecycle]")
 {
-  event_fixture fixture;
+  pinned_upstream_fixture fixture;
   cucascade::memory::small_pinned_host_memory_resource resource{fixture.upstream, 16384};
   rmm::cuda_stream stream;
   constexpr std::size_t bytes = 9000;
@@ -199,15 +193,15 @@ TEST_CASE("Repeated event retirement reuses reserved return capacity",
   for (int iteration = 0; iteration != 8; ++iteration) {
     auto* pointer = resource.allocate_sync(bytes);
     {
-      cucascade::test::scoped_pinned_host_hook observed{
-        cucascade::test::pinned_host_operation::event_destroy, count_destruction, &destructions};
-      cucascade::test::scoped_pinned_host_hook metadata_failure{
-        cucascade::test::pinned_host_operation::large_cache_entry, cudaErrorMemoryAllocation};
-      cucascade::test::scoped_pinned_host_hook completion_failure{
-        cucascade::test::pinned_host_operation::event_synchronize, cudaErrorInvalidResourceHandle};
-      std::optional<cucascade::test::scoped_pinned_host_hook> growth_failure;
+      cucascade::test::scoped_fault_hook observed{
+        cucascade::test::fault_point::event_destroy, count_destruction, &destructions};
+      cucascade::test::scoped_fault_hook metadata_failure{
+        cucascade::test::fault_point::large_cache_entry, cudaErrorMemoryAllocation};
+      cucascade::test::scoped_fault_hook completion_failure{
+        cucascade::test::fault_point::event_synchronize, cudaErrorInvalidResourceHandle};
+      std::optional<cucascade::test::scoped_fault_hook> growth_failure;
       if (iteration != 0) {
-        growth_failure.emplace(cucascade::test::pinned_host_operation::event_pool_reserve,
+        growth_failure.emplace(cucascade::test::fault_point::event_pool_reserve,
                                cudaErrorMemoryAllocation);
       }
       resource.deallocate(stream, pointer, bytes);

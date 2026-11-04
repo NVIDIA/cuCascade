@@ -3,14 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "pinned_host_test_hooks.hpp"
+#include "fault_injection_hooks.hpp"
 #include "pinned_host_test_utils.hpp"
 
 #include <cucascade/error.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -25,12 +24,13 @@
 namespace {
 
 using cucascade::test::pinned_host_test_fixture;
+using cucascade::test::require_pointer_type;
 
 class call_gate {
  public:
   ~call_gate() { release(); }
 
-  static std::optional<cudaError_t> wait(cucascade::test::pinned_host_call const&,
+  static std::optional<cudaError_t> wait(cucascade::test::fault_point_call const&,
                                          void* context) noexcept
   {
     auto& gate = *static_cast<call_gate*>(context);
@@ -52,7 +52,7 @@ class call_gate {
   std::atomic<bool> _released{false};
 };
 
-bool wait_for(std::atomic<bool> const& flag)
+[[nodiscard]] bool wait_for(std::atomic<bool> const& flag)
 {
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
   while (!flag.load(std::memory_order_acquire)) {
@@ -80,8 +80,8 @@ TEST_CASE("Pinned allocator traffic progresses while a reuse wait is submitted",
   std::jthread borrower{[&](std::stop_token stop) {
     std::stop_callback release_on_stop{stop, [&] { gate.release(); }};
     try {
-      cucascade::test::scoped_pinned_host_hook hook{
-        cucascade::test::pinned_host_operation::event_wait, call_gate::wait, &gate};
+      cucascade::test::scoped_fault_hook hook{
+        cucascade::test::fault_point::event_wait, call_gate::wait, &gate};
       reused = fixture.resource.allocate(stream, bytes);
     } catch (...) {
       error = std::current_exception();
@@ -132,8 +132,8 @@ TEST_CASE("Pinned allocator traffic progresses while a cold event is created",
   std::atomic<bool> observed{false};
   std::jthread releasing{[&](std::stop_token stop) {
     std::stop_callback release_on_stop{stop, [&] { gate.release(); }};
-    cucascade::test::scoped_pinned_host_hook hook{
-      cucascade::test::pinned_host_operation::event_create, call_gate::wait, &gate};
+    cucascade::test::scoped_fault_hook hook{
+      cucascade::test::fault_point::event_create, call_gate::wait, &gate};
     fixture.resource.deallocate(stream, pointer, bytes);
   }};
   bool const entered = wait_for(gate.entered);
@@ -159,17 +159,15 @@ TEST_CASE("Failed cold event creation keeps its reserved return slot reusable",
   constexpr std::size_t bytes = 9000;
   auto* failed                = fixture.resource.allocate_sync(bytes);
   {
-    cucascade::test::scoped_pinned_host_hook failure{
-      cucascade::test::pinned_host_operation::event_create, cudaErrorInvalidValue};
+    cucascade::test::scoped_fault_hook failure{cucascade::test::fault_point::event_create,
+                                               cudaErrorInvalidValue};
     fixture.resource.deallocate_sync(failed, bytes);
   }
-  cudaPointerAttributes attributes{};
-  REQUIRE(cudaPointerGetAttributes(&attributes, failed) == cudaSuccess);
-  REQUIRE(attributes.type == cudaMemoryTypeUnregistered);
+  require_pointer_type(failed, cudaMemoryTypeUnregistered);
   auto* next = fixture.resource.allocate_sync(bytes);
   {
-    cucascade::test::scoped_pinned_host_hook reject_growth{
-      cucascade::test::pinned_host_operation::event_pool_reserve, cudaErrorMemoryAllocation};
+    cucascade::test::scoped_fault_hook reject_growth{
+      cucascade::test::fault_point::event_pool_reserve, cudaErrorMemoryAllocation};
     fixture.resource.deallocate_sync(next, bytes);
     REQUIRE(fixture.resource.large_cache_bytes() == 16384);
     auto* reused = fixture.resource.allocate_sync(bytes);
@@ -198,8 +196,8 @@ TEST_CASE("Failed cache hit cannot overfill a concurrently refilled cache",
   std::jthread borrower{[&](std::stop_token stop) {
     std::stop_callback release_on_stop{stop, [&] { gate.release(); }};
     try {
-      cucascade::test::scoped_pinned_host_hook hook{
-        cucascade::test::pinned_host_operation::event_wait, call_gate::wait, &gate};
+      cucascade::test::scoped_fault_hook hook{
+        cucascade::test::fault_point::event_wait, call_gate::wait, &gate};
       std::ignore = fixture.resource.allocate(stream, 9000);
     } catch (...) {
       error = std::current_exception();
@@ -238,9 +236,7 @@ TEST_CASE("Failed cache hit cannot overfill a concurrently refilled cache",
     fixture.resource.deallocate_sync(second, 9000);
   } else {
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    cudaPointerAttributes attributes{};
-    REQUIRE(cudaPointerGetAttributes(&attributes, seed) == cudaSuccess);
-    REQUIRE(attributes.type == cudaMemoryTypeHost);
+    require_pointer_type(seed, cudaMemoryTypeHost);
     REQUIRE(cudaFreeHost(seed) == cudaSuccess);
   }
 }
@@ -254,8 +250,8 @@ TEST_CASE("Failed cache hit restores oldest-first reuse when retained capacity p
   fixture.resource.deallocate_sync(oldest, 9000);
   fixture.resource.deallocate_sync(newer, 9000);
   {
-    cucascade::test::scoped_pinned_host_hook failure{
-      cucascade::test::pinned_host_operation::event_wait, cudaErrorInvalidResourceHandle};
+    cucascade::test::scoped_fault_hook failure{cucascade::test::fault_point::event_wait,
+                                               cudaErrorInvalidResourceHandle};
     REQUIRE_THROWS_AS(fixture.resource.allocate_sync(9000), cucascade::cuda_error);
   }
   REQUIRE(fixture.resource.large_cache_bytes() == 32768);
@@ -271,39 +267,38 @@ TEST_CASE("Failed event preparation still removes dedicated exact allocation own
           "[small_pinned][fault_injection][cache_progress][pinned_recovery]")
 {
   pinned_host_test_fixture fixture;
-  auto const failed_operation  = GENERATE(cucascade::test::pinned_host_operation::event_create,
-                                         cucascade::test::pinned_host_operation::event_record,
-                                         cucascade::test::pinned_host_operation::large_cache_entry);
+  auto const failed_operation  = GENERATE(cucascade::test::fault_point::event_create,
+                                         cucascade::test::fault_point::event_record,
+                                         cucascade::test::fault_point::large_cache_entry);
   bool const reject_completion = GENERATE(false, true);
   void* pointer                = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook rounded_oom{
-      cucascade::test::pinned_host_operation::host_alloc, cudaErrorMemoryAllocation};
+    cucascade::test::scoped_fault_hook rounded_oom{cucascade::test::fault_point::host_alloc,
+                                                   cudaErrorMemoryAllocation};
     pointer = fixture.resource.allocate_sync(40000);
   }
 
   std::size_t free_calls = 0;
   {
     // Keep the real storage so the next allocation can deterministically return the same address.
-    cucascade::test::scoped_pinned_host_hook keep_storage{
-      cucascade::test::pinned_host_operation::host_free,
-      [](cucascade::test::pinned_host_call const&,
+    cucascade::test::scoped_fault_hook keep_storage{
+      cucascade::test::fault_point::host_free,
+      [](cucascade::test::fault_point_call const&,
          void* context) noexcept -> std::optional<cudaError_t> {
         ++*static_cast<std::size_t*>(context);
         return cudaSuccess;
       },
       &free_calls};
-    cucascade::test::scoped_pinned_host_hook preparation_failure{failed_operation,
-                                                                 cudaErrorMemoryAllocation};
+    cucascade::test::scoped_fault_hook preparation_failure{failed_operation,
+                                                           cudaErrorMemoryAllocation};
     if (reject_completion) {
       auto const wait_operation =
-        failed_operation == cucascade::test::pinned_host_operation::large_cache_entry
-          ? cucascade::test::pinned_host_operation::event_synchronize
-          : cucascade::test::pinned_host_operation::stream_synchronize;
-      cucascade::test::scoped_pinned_host_hook completion_failure{wait_operation,
-                                                                  cudaErrorInvalidResourceHandle};
-      fixture.resource.deallocate(
-        ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, pointer, 40000);
+        failed_operation == cucascade::test::fault_point::large_cache_entry
+          ? cucascade::test::fault_point::event_synchronize
+          : cucascade::test::fault_point::stream_synchronize;
+      cucascade::test::scoped_fault_hook completion_failure{wait_operation,
+                                                            cudaErrorInvalidResourceHandle};
+      fixture.resource.deallocate(cucascade::test::legacy_default_stream, pointer, 40000);
     } else {
       fixture.resource.deallocate_sync(pointer, 40000);
     }
@@ -318,9 +313,9 @@ TEST_CASE("Failed event preparation still removes dedicated exact allocation own
   } reuse{pointer};
   void* next = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook same_address{
-      cucascade::test::pinned_host_operation::host_alloc,
-      [](cucascade::test::pinned_host_call const& call,
+    cucascade::test::scoped_fault_hook same_address{
+      cucascade::test::fault_point::host_alloc,
+      [](cucascade::test::fault_point_call const& call,
          void* context) noexcept -> std::optional<cudaError_t> {
         auto& state = *static_cast<repeated_address*>(context);
         if (++state.attempts == 1) { return cudaErrorMemoryAllocation; }
@@ -333,9 +328,7 @@ TEST_CASE("Failed event preparation still removes dedicated exact allocation own
   REQUIRE(next == pointer);
   REQUIRE(reuse.attempts == 2);
   fixture.resource.deallocate_sync(next, 40000);
-  cudaPointerAttributes attributes{};
-  REQUIRE(cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess);
-  REQUIRE(attributes.type == cudaMemoryTypeUnregistered);
+  require_pointer_type(pointer, cudaMemoryTypeUnregistered);
   REQUIRE(fixture.resource.large_cache_bytes() == 0);
   REQUIRE(fixture.resource.get_statistics().large_requests == 2);
 }

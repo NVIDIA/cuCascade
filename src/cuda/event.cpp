@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "../pinned_host_test_hooks.hpp"
+#include "../fault_injection.hpp"
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
@@ -28,7 +28,7 @@ namespace cuda {
 
 cuda_event::cuda_event(unsigned int flags)
 {
-  CUCASCADE_CUDA_TRY(CUCASCADE_PINNED_HOST_CUDA_CALL(
+  CUCASCADE_CUDA_TRY(CUCASCADE_FAULT_POINT_CUDA_CALL(
     event_create, ::cudaEventCreateWithFlags(&event_, flags), {.event_out = &event_}));
 }
 
@@ -52,7 +52,7 @@ cudaError_t cuda_event::reset_no_throw() noexcept
   cudaEvent_t const event = std::exchange(event_, nullptr);
   if (event == nullptr) { return cudaSuccess; }
   auto const status =
-    CUCASCADE_PINNED_HOST_CUDA_CALL(event_destroy, ::cudaEventDestroy(event), {.event = event});
+    CUCASCADE_FAULT_POINT_CUDA_CALL(event_destroy, ::cudaEventDestroy(event), {.event = event});
   if (status != cudaSuccess) { std::ignore = cudaGetLastError(); }
   return status;
 }
@@ -87,27 +87,27 @@ cudaError_t cuda_event::query_raw_status() const noexcept { return view().query_
 
 void cuda_event_view::record(::cuda::stream_ref stream)
 {
-  CUCASCADE_CUDA_TRY(CUCASCADE_PINNED_HOST_CUDA_CALL(event_record,
+  CUCASCADE_CUDA_TRY(CUCASCADE_FAULT_POINT_CUDA_CALL(event_record,
                                                      ::cudaEventRecord(event_, stream.get()),
                                                      {.stream = stream.get(), .event = event_}));
 }
 
 void cuda_event_view::wait(::cuda::stream_ref stream) const
 {
-  CUCASCADE_CUDA_TRY(CUCASCADE_PINNED_HOST_CUDA_CALL(event_wait,
+  CUCASCADE_CUDA_TRY(CUCASCADE_FAULT_POINT_CUDA_CALL(event_wait,
                                                      ::cudaStreamWaitEvent(stream.get(), event_, 0),
                                                      {.stream = stream.get(), .event = event_}));
 }
 
 void cuda_event_view::synchronize() const
 {
-  CUCASCADE_CUDA_TRY(CUCASCADE_PINNED_HOST_CUDA_CALL(
+  CUCASCADE_CUDA_TRY(CUCASCADE_FAULT_POINT_CUDA_CALL(
     event_synchronize, ::cudaEventSynchronize(event_), {.event = event_}));
 }
 
 cudaError_t cuda_event_view::synchronize_no_throw() const noexcept
 {
-  return CUCASCADE_PINNED_HOST_CUDA_CALL(
+  return CUCASCADE_FAULT_POINT_CUDA_CALL(
     event_synchronize, ::cudaEventSynchronize(event_), {.event = event_});
 }
 

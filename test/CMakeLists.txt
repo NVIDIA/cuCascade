@@ -25,26 +25,27 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
-  # Compile the real core separately so private fault controls cannot affect
-  # production targets.
-  get_target_property(cucascade_pinned_host_test_sources cucascade_objects
+  # Recompile the core with its fault points enabled (src/fault_injection.hpp)
+  # and implemented by the test hooks. Production targets never compile them,
+  # and the hooked and production cores cannot share one binary without
+  # violating the one-definition rule, so fault tests get their own executable.
+  get_target_property(cucascade_fault_injection_sources cucascade_objects
                       SOURCES)
   add_library(
-    cucascade_pinned_host_test_variant STATIC
-    ${cucascade_pinned_host_test_sources} memory/pinned_host_test_hooks.cpp)
-  target_compile_definitions(cucascade_pinned_host_test_variant
-                             PRIVATE CUCASCADE_ENABLE_PINNED_HOST_TEST_HOOKS)
-  target_compile_features(cucascade_pinned_host_test_variant PUBLIC cxx_std_20)
-  target_compile_options(cucascade_pinned_host_test_variant
+    cucascade_fault_injection_core STATIC ${cucascade_fault_injection_sources}
+                                          memory/fault_injection_hooks.cpp)
+  target_compile_definitions(cucascade_fault_injection_core
+                             PUBLIC CUCASCADE_ENABLE_FAULT_INJECTION)
+  target_compile_features(cucascade_fault_injection_core PUBLIC cxx_std_20)
+  target_compile_options(cucascade_fault_injection_core
                          PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
   target_include_directories(
-    cucascade_pinned_host_test_variant
-    PUBLIC ${PROJECT_SOURCE_DIR}/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(cucascade_pinned_host_test_variant
+    cucascade_fault_injection_core PUBLIC ${PROJECT_SOURCE_DIR}/include
+                                          ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(cucascade_fault_injection_core
                         PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
-  set_target_properties(cucascade_pinned_host_test_variant
-                        PROPERTIES CXX_EXTENSIONS OFF)
+  set_target_properties(cucascade_fault_injection_core PROPERTIES CXX_EXTENSIONS
+                                                                  OFF)
 
   add_executable(
     cucascade_pinned_host_fault_tests
@@ -57,17 +58,18 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_pinned_host_device_failures.cpp
     memory/test_pinned_event_lifecycle.cpp
     memory/test_pinned_slab_quarantine.cpp)
-  target_link_libraries(
-    cucascade_pinned_host_fault_tests PRIVATE cucascade_pinned_host_test_variant
-                                              Catch2::Catch2)
+  target_link_libraries(cucascade_pinned_host_fault_tests
+                        PRIVATE cucascade_fault_injection_core Catch2::Catch2)
   target_include_directories(cucascade_pinned_host_fault_tests
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_options(cucascade_pinned_host_fault_tests
                          PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+  # A failed device restore terminates the process, so that case runs in a child
+  # process.
   add_executable(cucascade_pinned_host_device_restore_helper
                  memory/pinned_host_device_restore_helper.cpp)
   target_link_libraries(cucascade_pinned_host_device_restore_helper
-                        PRIVATE cucascade_pinned_host_test_variant)
+                        PRIVATE cucascade_fault_injection_core Catch2::Catch2)
   target_compile_options(cucascade_pinned_host_device_restore_helper
                          PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
   target_compile_definitions(

@@ -3,13 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "pinned_host_test_hooks.hpp"
+#include "fault_injection_hooks.hpp"
+#include "pinned_host_test_utils.hpp"
 
 #include <cucascade/error.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -19,11 +19,8 @@
 
 namespace {
 
-struct capture_fixture {
-  rmm::mr::pinned_host_memory_resource pinned;
-  cucascade::memory::fixed_size_host_memory_resource upstream{
-    0, pinned, 1ULL << 20, 1ULL << 20, 8192, 4, 1};
-};
+using cucascade::test::get_pointer_type;
+using cucascade::test::pinned_upstream_fixture;
 
 class captured_stream {
  public:
@@ -63,14 +60,14 @@ class observed_cuda_work {
  public:
   observed_cuda_work()
   {
-    constexpr std::array operations{cucascade::test::pinned_host_operation::host_alloc,
-                                    cucascade::test::pinned_host_operation::host_free,
-                                    cucascade::test::pinned_host_operation::stream_synchronize,
-                                    cucascade::test::pinned_host_operation::event_create,
-                                    cucascade::test::pinned_host_operation::event_record,
-                                    cucascade::test::pinned_host_operation::event_wait,
-                                    cucascade::test::pinned_host_operation::event_synchronize,
-                                    cucascade::test::pinned_host_operation::event_destroy};
+    constexpr std::array operations{cucascade::test::fault_point::host_alloc,
+                                    cucascade::test::fault_point::host_free,
+                                    cucascade::test::fault_point::stream_synchronize,
+                                    cucascade::test::fault_point::event_create,
+                                    cucascade::test::fault_point::event_record,
+                                    cucascade::test::fault_point::event_wait,
+                                    cucascade::test::fault_point::event_synchronize,
+                                    cucascade::test::fault_point::event_destroy};
     for (std::size_t i = 0; i < operations.size(); ++i) {
       _hooks[i].emplace(operations[i], count, &_calls);
     }
@@ -79,7 +76,7 @@ class observed_cuda_work {
   [[nodiscard]] std::size_t get_calls() const noexcept { return _calls; }
 
  private:
-  static std::optional<cudaError_t> count(cucascade::test::pinned_host_call const&,
+  static std::optional<cudaError_t> count(cucascade::test::fault_point_call const&,
                                           void* context) noexcept
   {
     ++*static_cast<std::size_t*>(context);
@@ -87,21 +84,14 @@ class observed_cuda_work {
   }
 
   std::size_t _calls{};
-  std::array<std::optional<cucascade::test::scoped_pinned_host_hook>, 8> _hooks;
+  std::array<std::optional<cucascade::test::scoped_fault_hook>, 8> _hooks;
 };
 
-std::optional<cudaError_t> report_capture(cucascade::test::pinned_host_call const& call,
+std::optional<cudaError_t> report_capture(cucascade::test::fault_point_call const& call,
                                           void*) noexcept
 {
   *call.capture_status_out = cudaStreamCaptureStatusActive;
   return cudaSuccess;
-}
-
-cudaMemoryType pointer_type(void* pointer)
-{
-  cudaPointerAttributes attributes{};
-  CUCASCADE_CUDA_TRY(cudaPointerGetAttributes(&attributes, pointer));
-  return attributes.type;
 }
 
 enum class capture_rejection_mode { none, active, unknown };
@@ -114,7 +104,7 @@ class capture_rejection {
       _capture.emplace(stream);
     } else if (mode == capture_rejection_mode::unknown) {
       _query_failure.emplace(
-        cucascade::test::pinned_host_operation::stream_capture_status, fail_query, nullptr);
+        cucascade::test::fault_point::stream_capture_status, fail_query, nullptr);
     }
   }
 
@@ -125,7 +115,7 @@ class capture_rejection {
   }
 
  private:
-  static std::optional<cudaError_t> fail_query(cucascade::test::pinned_host_call const& call,
+  static std::optional<cudaError_t> fail_query(cucascade::test::fault_point_call const& call,
                                                void*) noexcept
   {
     *call.capture_status_out = cudaStreamCaptureStatusNone;
@@ -133,13 +123,13 @@ class capture_rejection {
   }
 
   std::optional<captured_stream> _capture;
-  std::optional<cucascade::test::scoped_pinned_host_hook> _query_failure;
+  std::optional<cucascade::test::scoped_fault_hook> _query_failure;
 };
 
 struct dedicated_base {
   void* pointer{};
 
-  static std::optional<cudaError_t> allocate(cucascade::test::pinned_host_call const& call,
+  static std::optional<cudaError_t> allocate(cucascade::test::fault_point_call const& call,
                                              void* context) noexcept
   {
     auto& base = static_cast<dedicated_base*>(context)->pointer;
@@ -152,7 +142,7 @@ struct dedicated_base {
 
 void release_registered_pointer(void* base)
 {
-  if (pointer_type(base) == cudaMemoryTypeHost) { REQUIRE(cudaFreeHost(base) == cudaSuccess); }
+  if (get_pointer_type(base) == cudaMemoryTypeHost) { REQUIRE(cudaFreeHost(base) == cudaSuccess); }
 }
 
 }  // namespace
@@ -160,7 +150,7 @@ void release_registered_pointer(void* base)
 TEST_CASE("Pinned allocation rejects a capturing stream without invalidating it",
           "[small_pinned][fault_injection][pinned_capture]")
 {
-  capture_fixture fixture;
+  pinned_upstream_fixture fixture;
   cucascade::memory::small_pinned_host_memory_resource resource{fixture.upstream, 64ULL << 10};
   rmm::cuda_stream stream;
   auto const bytes     = GENERATE(std::size_t{512}, std::size_t{9000}, std::size_t{100000});
@@ -189,7 +179,7 @@ TEST_CASE("Pinned allocation rejects a capturing stream without invalidating it"
 TEST_CASE("Rejected pinned deallocation withholds storage without CUDA work",
           "[small_pinned][fault_injection][pinned_capture]")
 {
-  capture_fixture fixture;
+  pinned_upstream_fixture fixture;
   std::optional<cucascade::memory::small_pinned_host_memory_resource> resource{
     std::in_place, fixture.upstream, 0};
   rmm::cuda_stream stream;
@@ -203,10 +193,10 @@ TEST_CASE("Rejected pinned deallocation withholds storage without CUDA work",
   if (mode == capture_rejection_mode::active && !synchronous) { capture.emplace(stream); }
   if (mode == capture_rejection_mode::unknown) { query_failure.emplace(stream, mode); }
   {
-    std::optional<cucascade::test::scoped_pinned_host_hook> reported_capture;
+    std::optional<cucascade::test::scoped_fault_hook> reported_capture;
     if (mode == capture_rejection_mode::active && synchronous) {
       reported_capture.emplace(
-        cucascade::test::pinned_host_operation::stream_capture_status, report_capture, nullptr);
+        cucascade::test::fault_point::stream_capture_status, report_capture, nullptr);
     }
     observed_cuda_work observation;
     if (synchronous) {
@@ -220,7 +210,7 @@ TEST_CASE("Rejected pinned deallocation withholds storage without CUDA work",
   if (query_failure) { CHECK(query_failure->finish() == cudaSuccess); }
   CHECK(cudaGetLastError() == cudaSuccess);
   resource.reset();
-  auto const type = pointer_type(pointer);
+  auto const type = get_pointer_type(pointer);
   CHECK(type == (reject ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered));
   if (type == cudaMemoryTypeHost) { REQUIRE(cudaFreeHost(pointer) == cudaSuccess); }
 }
@@ -228,7 +218,7 @@ TEST_CASE("Rejected pinned deallocation withholds storage without CUDA work",
 TEST_CASE("Rejected large deallocation preserves retained entries and withholds its buffer",
           "[small_pinned][fault_injection][pinned_capture]")
 {
-  capture_fixture fixture;
+  pinned_upstream_fixture fixture;
   std::optional<cucascade::memory::small_pinned_host_memory_resource> resource{
     std::in_place, fixture.upstream, 16ULL << 10};
   rmm::cuda_stream stream;
@@ -254,9 +244,9 @@ TEST_CASE("Rejected large deallocation preserves retained entries and withholds 
   CHECK(reused == (mode == capture_rejection_mode::none ? incoming : retained));
   resource->deallocate_sync(reused, 9000);
   resource.reset();
-  CHECK(pointer_type(incoming) ==
+  CHECK(get_pointer_type(incoming) ==
         (mode == capture_rejection_mode::none ? cudaMemoryTypeUnregistered : cudaMemoryTypeHost));
-  CHECK(pointer_type(retained) == cudaMemoryTypeUnregistered);
+  CHECK(get_pointer_type(retained) == cudaMemoryTypeUnregistered);
   release_registered_pointer(incoming);
   release_registered_pointer(retained);
 }
@@ -264,7 +254,7 @@ TEST_CASE("Rejected large deallocation preserves retained entries and withholds 
 TEST_CASE("Rejected slab deallocation quarantines only its backing owner",
           "[small_pinned][fault_injection][pinned_capture]")
 {
-  capture_fixture fixture;
+  pinned_upstream_fixture fixture;
   auto const initial_free = fixture.upstream.get_free_blocks();
   std::optional<cucascade::memory::small_pinned_host_memory_resource> resource{std::in_place,
                                                                                fixture.upstream};
@@ -291,7 +281,7 @@ TEST_CASE("Rejected slab deallocation quarantines only its backing owner",
 TEST_CASE("Rejected dedicated deallocation never frees its original base",
           "[small_pinned][fault_injection][pinned_capture]")
 {
-  capture_fixture fixture;
+  pinned_upstream_fixture fixture;
   std::optional<cucascade::memory::small_pinned_host_memory_resource> resource{std::in_place,
                                                                                fixture.upstream};
   rmm::cuda_stream stream;
@@ -300,8 +290,8 @@ TEST_CASE("Rejected dedicated deallocation never frees its original base",
   dedicated_base base;
   void* pointer = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, dedicated_base::allocate, &base};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, dedicated_base::allocate, &base};
     pointer = resource->allocate_sync(9000, 64);
   }
   capture_rejection rejection{stream, mode};
@@ -313,7 +303,7 @@ TEST_CASE("Rejected dedicated deallocation never frees its original base",
   CHECK(cudaGetLastError() == cudaSuccess);
   REQUIRE(rejection.finish() == cudaSuccess);
   resource.reset();
-  CHECK(pointer_type(base.pointer) ==
+  CHECK(get_pointer_type(base.pointer) ==
         (mode == capture_rejection_mode::none ? cudaMemoryTypeUnregistered : cudaMemoryTypeHost));
   release_registered_pointer(base.pointer);
 }
@@ -321,7 +311,7 @@ TEST_CASE("Rejected dedicated deallocation never frees its original base",
 TEST_CASE("Unknown capture status rejects allocation before changing retained capacity",
           "[small_pinned][fault_injection][pinned_capture]")
 {
-  capture_fixture fixture;
+  pinned_upstream_fixture fixture;
   cucascade::memory::small_pinned_host_memory_resource resource{fixture.upstream};
   rmm::cuda_stream stream;
   resource.deallocate_sync(resource.allocate_sync(9000), 9000);

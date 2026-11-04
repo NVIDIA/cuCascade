@@ -3,12 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "pinned_host_test_hooks.hpp"
+#include "fault_injection_hooks.hpp"
 #include "pinned_host_test_utils.hpp"
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
-
-#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -30,7 +28,7 @@ struct allocation_trace {
   std::size_t failures{1};
   cudaError_t terminal_error{cudaSuccess};
 
-  static std::optional<cudaError_t> call(cucascade::test::pinned_host_call const& call,
+  static std::optional<cudaError_t> call(cucascade::test::fault_point_call const& call,
                                          void* context) noexcept
   {
     auto& trace = *static_cast<allocation_trace*>(context);
@@ -53,8 +51,8 @@ TEST_CASE("Rounded pinned OOM uses uncached exact storage without reclaiming ret
   allocation_trace trace;
   void* pointer = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
     pointer = fixture.resource.allocate_sync(40000);
   }
   REQUIRE(trace.count == 2);
@@ -89,8 +87,8 @@ TEST_CASE("Exact pinned OOM reclaims only enough oldest retained capacity and re
   trace.failures = 2;
   void* pointer  = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
     REQUIRE_NOTHROW(pointer = fixture.resource.allocate_sync(50000));
   }
   REQUIRE(pointer != nullptr);
@@ -120,8 +118,8 @@ TEST_CASE(
   allocation_trace trace;
   trace.failures = std::numeric_limits<std::size_t>::max();
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
     REQUIRE_THROWS_AS(fixture.resource.allocate_sync(bytes), rmm::out_of_memory);
   }
   REQUIRE(trace.count == attempts);
@@ -146,15 +144,14 @@ TEST_CASE("Recovery reuses a matching buffer returned during the exact attempt",
     bool worker_failed{};
   } returned{{}, &fixture.resource, held};
   returned.trace.failures = 2;
-  auto publish            = [](cucascade::test::pinned_host_call const& call,
+  auto publish            = [](cucascade::test::fault_point_call const& call,
                     void* context) noexcept -> std::optional<cudaError_t> {
     auto& state = *static_cast<returned_buffer*>(context);
     auto status = allocation_trace::call(call, &state.trace);
     if (state.trace.count == 2) {
       try {
         std::jthread worker{[&] {
-          state.resource->deallocate(
-            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, state.pointer, 40000);
+          state.resource->deallocate(cucascade::test::legacy_default_stream, state.pointer, 40000);
         }};
       } catch (...) {
         state.worker_failed = true;
@@ -164,8 +161,8 @@ TEST_CASE("Recovery reuses a matching buffer returned during the exact attempt",
   };
   void* pointer = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, publish, &returned};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, publish, &returned};
     REQUIRE_NOTHROW(pointer = fixture.resource.allocate_sync(40000));
   }
   REQUIRE(pointer == held);
@@ -198,8 +195,8 @@ TEST_CASE("Exact recovery distinguishes retained capacity below equal and above 
   allocation_trace trace;
   void* pointer = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
     if (succeeds) {
       REQUIRE_NOTHROW(pointer = fixture.resource.allocate_sync(65536));
     } else {
@@ -233,8 +230,8 @@ TEST_CASE("Recovery does not purge on non-OOM failures and stops after its final
   trace.failures       = failures;
   trace.terminal_error = cudaErrorInvalidValue;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
     if (failures == std::numeric_limits<std::size_t>::max()) {
       REQUIRE_THROWS_AS(fixture.resource.allocate_sync(50000), rmm::out_of_memory);
     } else {
@@ -259,8 +256,8 @@ TEST_CASE("Dedicated OOM reclamation uses the padded backing size",
   allocation_trace trace;
   void* pointer = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
     if (sufficient) {
       REQUIRE_NOTHROW(pointer = fixture.resource.allocate_sync(9000, 8192));
     } else {
@@ -292,10 +289,10 @@ TEST_CASE("Fallback metadata exhaustion preserves cached capacity before recover
   }
   allocation_trace trace;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
-    cucascade::test::scoped_pinned_host_hook metadata{
-      cucascade::test::pinned_host_operation::exceptional_allocation, cudaErrorMemoryAllocation};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook metadata{cucascade::test::fault_point::dedicated_allocation,
+                                                cudaErrorMemoryAllocation};
     REQUIRE_THROWS_AS(fixture.resource.allocate_sync(65536), std::bad_alloc);
   }
   REQUIRE(trace.count == 1);
@@ -320,10 +317,10 @@ TEST_CASE("Unconfirmed reclamation withholds its victim without extending the re
   trace.failures = 2;
   void* pointer  = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
-    cucascade::test::scoped_pinned_host_hook completion{
-      cucascade::test::pinned_host_operation::event_synchronize, cudaErrorInvalidResourceHandle};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook completion{cucascade::test::fault_point::event_synchronize,
+                                                  cudaErrorInvalidResourceHandle};
     REQUIRE_NOTHROW(pointer = fixture.resource.allocate_sync(50000));
   }
   REQUIRE(trace.count == 3);
@@ -347,10 +344,10 @@ TEST_CASE("Uncacheable exact recovery stays untracked and releases its original 
   allocation_trace trace;
   void* pointer = nullptr;
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, allocation_trace::call, &trace};
-    cucascade::test::scoped_pinned_host_hook metadata{
-      cucascade::test::pinned_host_operation::exceptional_allocation, cudaErrorMemoryAllocation};
+    cucascade::test::scoped_fault_hook allocation{
+      cucascade::test::fault_point::host_alloc, allocation_trace::call, &trace};
+    cucascade::test::scoped_fault_hook metadata{cucascade::test::fault_point::dedicated_allocation,
+                                                cudaErrorMemoryAllocation};
     REQUIRE_NOTHROW(pointer = fixture.resource.allocate_sync(70000));
   }
   REQUIRE(trace.count == 2);
@@ -370,19 +367,17 @@ TEST_CASE("Deferred OOM reporting preserves an unrelated CUDA error",
 {
   pinned_host_test_fixture fixture;
   cudaError_t unrelated_status = cudaSuccess;
-  auto unrelated_error         = [](cucascade::test::pinned_host_call const&,
+  auto unrelated_error         = [](cucascade::test::fault_point_call const&,
                             void* context) noexcept -> std::optional<cudaError_t> {
     cudaDeviceProp properties{};
     *static_cast<cudaError_t*>(context) = cudaGetDeviceProperties(&properties, -1);
     return std::nullopt;
   };
   {
-    cucascade::test::scoped_pinned_host_hook allocation{
-      cucascade::test::pinned_host_operation::host_alloc, cudaErrorMemoryAllocation};
-    cucascade::test::scoped_pinned_host_hook metadata{
-      cucascade::test::pinned_host_operation::exceptional_allocation,
-      unrelated_error,
-      &unrelated_status};
+    cucascade::test::scoped_fault_hook allocation{cucascade::test::fault_point::host_alloc,
+                                                  cudaErrorMemoryAllocation};
+    cucascade::test::scoped_fault_hook metadata{
+      cucascade::test::fault_point::dedicated_allocation, unrelated_error, &unrelated_status};
     REQUIRE_THROWS_AS(fixture.resource.allocate_sync(65536), rmm::out_of_memory);
   }
   REQUIRE(unrelated_status == cudaErrorInvalidDevice);

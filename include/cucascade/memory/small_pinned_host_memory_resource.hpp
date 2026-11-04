@@ -141,7 +141,7 @@ class small_pinned_host_memory_resource {
   /**
    * @brief Two resources are equal only if they are the same object
    */
-  bool operator==(small_pinned_host_memory_resource const& other) const noexcept;
+  [[nodiscard]] bool operator==(small_pinned_host_memory_resource const& other) const noexcept;
 
   /**
    * @brief Allocates pinned host memory
@@ -160,23 +160,23 @@ class small_pinned_host_memory_resource {
    * exact-size attempt. Smaller partial reclamation that might otherwise suffice is deliberately
    * skipped. A non-OOM error does not start reclamation.
    *
-   * @throw rmm::out_of_memory If a direct pinned allocation fails with `cudaErrorMemoryAllocation`
+   * @throws rmm::out_of_memory If a direct pinned allocation fails with `cudaErrorMemoryAllocation`
    * after permitted recovery, or the upstream resource cannot supply a slab block
-   * @throw rmm::bad_alloc If a direct pinned allocation fails with any other CUDA error, or its
+   * @throws rmm::bad_alloc If a direct pinned allocation fails with any other CUDA error, or its
    * size plus alignment padding overflows
-   * @throw cucascade::cuda_error If querying capture status or ordering a reused buffer fails
-   * @throw cucascade::logic_error If the supplied stream is capturing
-   * @throw std::bad_alloc If allocation metadata cannot be acquired
-   * @throw std::invalid_argument For a nonzero request, if alignment is not a nonzero power of two,
-   * or the upstream block size is smaller than the needed slab size
+   * @throws cucascade::cuda_error If querying capture status or ordering a reused buffer fails
+   * @throws cucascade::logic_error If the supplied stream is capturing
+   * @throws std::bad_alloc If allocation metadata cannot be acquired
+   * @throws std::invalid_argument For a nonzero request, if alignment is not a nonzero power of
+   * two, or the upstream block size is smaller than the needed slab size
    * @param stream Stream on which reuse dependencies are inserted
    * @param bytes Requested size
    * @param alignment Requested nonzero power-of-two address alignment
    * @return Pointer to at least `bytes` bytes, or `nullptr` for a zero-byte request
    */
-  void* allocate(::cuda::stream_ref stream,
-                 std::size_t bytes,
-                 std::size_t alignment = alignof(std::max_align_t));
+  [[nodiscard]] void* allocate(::cuda::stream_ref stream,
+                               std::size_t bytes,
+                               std::size_t alignment = alignof(std::max_align_t));
 
   /**
    * @brief Returns memory to its pool or releases dedicated storage
@@ -207,14 +207,20 @@ class small_pinned_host_memory_resource {
                   std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
   /**
-   * @brief Allocates on the default stream and synchronizes it before returning
+   * @brief Allocates on the legacy default stream and synchronizes it before returning
+   *
+   * The stream is named explicitly as `cudaStreamLegacy` rather than by the null handle, whose
+   * meaning depends on whether the calling translation unit is compiled with per-thread default
+   * streams. This keeps the stream this inline function synchronizes identical to the stream on
+   * which the library orders reuse.
    *
    * Throws the same exceptions as `allocate`, plus any error from synchronizing the stream.
    */
-  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  [[nodiscard]] void* allocate_sync(std::size_t bytes,
+                                    std::size_t alignment = alignof(std::max_align_t))
   {
     if (bytes == 0) { return nullptr; }
-    ::cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+    ::cuda::stream_ref const stream{cudaStreamLegacy};
     auto* ptr = allocate(stream, bytes, alignment);
     try {
       stream.sync();
@@ -226,7 +232,8 @@ class small_pinned_host_memory_resource {
   }
 
   /**
-   * @brief Deallocates on the default stream and synchronizes an accepted nonempty call
+   * @brief Deallocates on the legacy default stream (`cudaStreamLegacy`) and synchronizes an
+   * accepted nonempty call
    *
    * A failed synchronization is ignored.
    */
@@ -264,7 +271,7 @@ class small_pinned_host_memory_resource {
    * @param bytes Request size no greater than `MAX_SLAB_SIZE`
    * @return Index into `SLAB_SIZES`
    */
-  static std::size_t slab_index_for(std::size_t bytes) noexcept;
+  [[nodiscard]] static std::size_t slab_index_for(std::size_t bytes) noexcept;
 
   /**
    * @brief Computes the bucket for a large request
@@ -273,7 +280,7 @@ class small_pinned_host_memory_resource {
    * @return Smallest representable power of two no less than `bytes` and `MIN_LARGE_BUCKET`, or
    *         `bytes` if the next power of two is not representable
    */
-  static std::size_t large_bucket_size_for(std::size_t bytes) noexcept;
+  [[nodiscard]] static std::size_t large_bucket_size_for(std::size_t bytes) noexcept;
 
   /**
    * @brief Computes the storage size for an ordinarily aligned direct large allocation
@@ -348,9 +355,9 @@ class small_pinned_host_memory_resource {
   static constexpr std::size_t LARGE_BUCKET_COUNT = static_cast<std::size_t>(
     std::numeric_limits<std::size_t>::digits - std::countr_zero(MIN_LARGE_BUCKET));
 
-  // Cache/slab/exceptional bookkeeping uses _mutex. Event-pool bookkeeping and confirmed hit
-  // counting use _event_mutex; their _locked helpers require that mutex. Slab-pool growth may
-  // call the upstream pinned allocator while holding _mutex.
+  // Cache, slab, and dedicated-allocation bookkeeping uses _mutex. Event-pool bookkeeping and
+  // confirmed hit counting use _event_mutex; their _locked helpers require that mutex. Slab-pool
+  // growth may call the upstream pinned allocator while holding _mutex.
 
   /**
    * @brief Decides whether an ordinarily aligned request's bucket is cacheable
@@ -367,8 +374,8 @@ class small_pinned_host_memory_resource {
    */
   [[nodiscard]] static std::size_t large_bucket_index(std::size_t bucket) noexcept;
 
-  void* allocate_slab(::cuda::stream_ref stream, std::size_t bytes);
-  void* allocate_large(::cuda::stream_ref stream, std::size_t bytes);
+  [[nodiscard]] void* allocate_slab(::cuda::stream_ref stream, std::size_t bytes);
+  [[nodiscard]] void* allocate_large(::cuda::stream_ref stream, std::size_t bytes);
   /**
    * @brief Deallocates storage when the stream's capture status permits it
    * @return Whether subsequent stream synchronization is permitted
@@ -377,22 +384,41 @@ class small_pinned_host_memory_resource {
                                        void* ptr,
                                        std::size_t bytes,
                                        std::size_t alignment) noexcept;
+  /// Whether the caller already made, and lost to OOM, the exact-size dedicated attempt.
+  enum class exact_attempt : bool { pending, already_failed };
+
+  /// Whether a large-cache lookup is a request's first attempt, which counts toward statistics.
+  enum class large_cache_lookup : bool { first_attempt, recovery_retry };
+
   /**
-   * @brief Allocates tracked dedicated storage or reuses a matching bucket during recovery
+   * @brief Allocates dedicated storage or reuses a matching bucket during recovery
    *
-   * `exact_attempt_failed` resumes recovery after the caller's exact-size OOM without duplicating
-   * that attempt. `retry_stream` permits ordinary-alignment bucket reuse before dedicated
-   * allocation or reclamation.
+   * Dedicated storage is an individually owned pinned allocation, tracked in
+   * `_dedicated_allocations`, that never enters a slab pool or the large cache.
+   *
+   * `exact_attempt::already_failed` resumes recovery after the caller's exact-size OOM without
+   * duplicating that attempt. `retry_stream` permits ordinary-alignment bucket reuse before
+   * dedicated allocation or reclamation.
    */
-  void* allocate_exceptional(std::size_t bytes,
-                             std::size_t alignment,
-                             bool exact_attempt_failed                      = false,
-                             std::optional<::cuda::stream_ref> retry_stream = std::nullopt);
-  void deallocate_exceptional(::cuda::stream_ref stream, void* ptr) noexcept;
+  [[nodiscard]] void* allocate_dedicated(std::size_t bytes,
+                                         std::size_t alignment,
+                                         exact_attempt exact,
+                                         std::optional<::cuda::stream_ref> retry_stream);
+  /**
+   * @brief Makes the final pinned allocation attempt after an out-of-memory failure
+   *
+   * Reclaims cached capacity first and makes the attempt only if the cache covered `bytes`.
+   *
+   * @throws rmm::out_of_memory If reclamation cannot cover `bytes` or the attempt runs out of
+   * memory
+   * @throws rmm::bad_alloc If the attempt fails with any other CUDA error
+   */
+  [[nodiscard]] void* allocate_pinned_after_reclaim(std::size_t bytes);
+  void deallocate_dedicated(::cuda::stream_ref stream, void* ptr) noexcept;
   /**
    * @brief Removes a dedicated pointer's record and returns its original base, or nullptr
    */
-  [[nodiscard]] void* try_to_take_exceptional_locked(void* ptr) noexcept;
+  [[nodiscard]] void* try_to_take_dedicated_locked(void* ptr) noexcept;
   void deallocate_slab(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
   void deallocate_large(::cuda::stream_ref stream, void* ptr, std::size_t bytes) noexcept;
 
@@ -403,10 +429,10 @@ class small_pinned_host_memory_resource {
   void return_event_locked(pooled_event&& event) noexcept;
   void retire_event_locked(pooled_event&& event) noexcept;
 
-  void* try_to_take_cached_large(std::size_t bucket,
-                                 ::cuda::stream_ref stream,
-                                 bool initial_request = false);
-  bool evict_oldest_large_locked(std::list<large_cache_entry>& victims) noexcept;
+  [[nodiscard]] void* try_to_take_cached_large(std::size_t bucket,
+                                               ::cuda::stream_ref stream,
+                                               large_cache_lookup lookup);
+  [[nodiscard]] bool evict_oldest_large_locked(std::list<large_cache_entry>& victims) noexcept;
   /**
    * @brief Releases enough oldest cached capacity when the cache covers `bytes`
    *
@@ -425,7 +451,7 @@ class small_pinned_host_memory_resource {
   std::array<std::vector<free_slab>, SLAB_SIZES.size()> _free_lists{};
   std::map<int, event_pool> _event_pools;
   std::map<void*, void*>
-    _exceptional_allocations;  ///< Dedicated returned pointer to allocation base.
+    _dedicated_allocations;  ///< Dedicated returned pointer to allocation base.
   std::vector<slab_backing_allocation> _owned_allocations;
   std::array<std::list<large_cache_entry>, LARGE_BUCKET_COUNT> _large_cache{};
   std::size_t _large_cache_bytes{0};  ///< Sum of bucket sizes in `_large_cache`.

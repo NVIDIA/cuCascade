@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "memory/pinned_host_test_utils.hpp"
 #include "memory/test_gpu_kernels.cuh"
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -18,17 +18,14 @@
 #include <exception>
 #include <memory>
 
-using namespace cucascade::memory;
-
 TEST_CASE("Production over-aligned storage is mapped and usable by a GPU",
           "[small_pinned][production][alignment]")
 {
   auto const alignment        = GENERATE(std::size_t{512}, std::size_t{8192}, std::size_t{65536});
   constexpr std::size_t bytes = 32768;
-  rmm::mr::pinned_host_memory_resource pinned;
-  fixed_size_host_memory_resource upstream{0, pinned, 1ULL << 20, 1ULL << 20, 65536, 4, 1};
-  small_pinned_host_memory_resource resource{upstream};
-  auto release = [&](void* ptr) { resource.deallocate_sync(ptr, bytes, alignment); };
+  cucascade::test::pinned_host_test_fixture fixture;
+  auto& resource = fixture.resource;
+  auto release   = [&](void* ptr) { resource.deallocate_sync(ptr, bytes, alignment); };
   std::unique_ptr<void, decltype(release)> allocation{resource.allocate_sync(bytes, alignment),
                                                       release};
   REQUIRE(reinterpret_cast<std::uintptr_t>(allocation.get()) % alignment == 0);
@@ -47,9 +44,8 @@ TEST_CASE("Production zero and null wrappers preserve an active capture",
           "[small_pinned][production][capture]")
 {
   auto const alignment = GENERATE(std::size_t{0}, alignof(std::max_align_t));
-  rmm::mr::pinned_host_memory_resource pinned;
-  fixed_size_host_memory_resource upstream{0, pinned, 1ULL << 20, 1ULL << 20, 65536, 4, 1};
-  small_pinned_host_memory_resource resource{upstream};
+  cucascade::test::pinned_host_test_fixture fixture;
+  auto& resource = fixture.resource;
   rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
   CUCASCADE_CUDA_TRY(::cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeThreadLocal));
   // Save outcomes until capture ends so an assertion cannot strand an active capture.

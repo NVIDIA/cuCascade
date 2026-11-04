@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "../pinned_host_test_hooks.hpp"
+#include "../fault_injection.hpp"
 
 #include <cucascade/error.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
@@ -55,7 +55,7 @@ constexpr unsigned int pinned_host_alloc_flags = cudaHostAllocPortable | cudaHos
 [[nodiscard]] cudaError_t query_capture_status(::cuda::stream_ref stream,
                                                cudaStreamCaptureStatus& status) noexcept
 {
-  return CUCASCADE_PINNED_HOST_CUDA_CALL(stream_capture_status,
+  return CUCASCADE_FAULT_POINT_CUDA_CALL(stream_capture_status,
                                          cudaStreamIsCapturing(stream.get(), &status),
                                          {.stream = stream.get(), .capture_status_out = &status});
 }
@@ -66,14 +66,14 @@ class event_creation_device_guard {
   explicit event_creation_device_guard(int device) noexcept
   {
     int current_device = -1;
-    if (CUCASCADE_PINNED_HOST_CUDA_CALL(current_device,
+    if (CUCASCADE_FAULT_POINT_CUDA_CALL(current_device,
                                         cudaGetDevice(&current_device),
                                         {.device_out = &current_device}) != cudaSuccess) {
       std::ignore = cudaGetLastError();
       return;
     }
     if (current_device != device) {
-      if (CUCASCADE_PINNED_HOST_CUDA_CALL(set_device, cudaSetDevice(device), {.device = device}) !=
+      if (CUCASCADE_FAULT_POINT_CUDA_CALL(set_device, cudaSetDevice(device), {.device = device}) !=
           cudaSuccess) {
         std::ignore = cudaGetLastError();
         return;
@@ -91,7 +91,7 @@ class event_creation_device_guard {
   ~event_creation_device_guard() noexcept
   {
     if (_previous_device >= 0 &&
-        CUCASCADE_PINNED_HOST_CUDA_CALL(set_device,
+        CUCASCADE_FAULT_POINT_CUDA_CALL(set_device,
                                         cudaSetDevice(_previous_device),
                                         {.device = _previous_device}) != cudaSuccess) {
       std::ignore = cudaGetLastError();
@@ -106,10 +106,10 @@ class event_creation_device_guard {
   bool _is_ready{false};
 };
 
-int device_of_stream(::cuda::stream_ref stream) noexcept
+[[nodiscard]] int device_of_stream(::cuda::stream_ref stream) noexcept
 {
   int device = -1;
-  if (CUCASCADE_PINNED_HOST_CUDA_CALL(stream_device,
+  if (CUCASCADE_FAULT_POINT_CUDA_CALL(stream_device,
                                       cudaStreamGetDevice(stream.get(), &device),
                                       {.device_out = &device, .stream = stream.get()}) ==
       cudaSuccess) {
@@ -123,7 +123,7 @@ int device_of_stream(::cuda::stream_ref stream) noexcept
 // withhold storage the work may still use.
 [[nodiscard]] bool wait_no_throw(::cuda::stream_ref stream) noexcept
 {
-  if (CUCASCADE_PINNED_HOST_CUDA_CALL(stream_synchronize,
+  if (CUCASCADE_FAULT_POINT_CUDA_CALL(stream_synchronize,
                                       cudaStreamSynchronize(stream.get()),
                                       {.stream = stream.get()}) == cudaSuccess) {
     return true;
@@ -142,7 +142,7 @@ int device_of_stream(::cuda::stream_ref stream) noexcept
 // A failed free has an unknown effect, so the buffer is leaked.
 void free_pinned_no_throw(void* ptr) noexcept
 {
-  if (CUCASCADE_PINNED_HOST_CUDA_CALL(host_free, cudaFreeHost(ptr), {.buffer = ptr}) !=
+  if (CUCASCADE_FAULT_POINT_CUDA_CALL(host_free, cudaFreeHost(ptr), {.buffer = ptr}) !=
       cudaSuccess) {
     std::ignore = cudaGetLastError();
   }
@@ -154,12 +154,29 @@ void free_pinned_no_throw(void* ptr) noexcept
                            " bytes failed after permitted recovery"};
 }
 
+// Returns nullptr when pinned memory is exhausted, so the caller can try recovery. Releasing cached
+// buffers cannot fix any other failure, so that throws.
+[[nodiscard]] void* try_to_allocate_pinned(std::size_t bytes)
+{
+  void* ptr = nullptr;
+  auto const status =
+    CUCASCADE_FAULT_POINT_CUDA_CALL(host_alloc,
+                                    cudaHostAlloc(&ptr, bytes, pinned_host_alloc_flags),
+                                    {.bytes = bytes, .buffer_out = &ptr});
+  if (status == cudaErrorMemoryAllocation) {
+    std::ignore = cudaGetLastError();
+    return nullptr;
+  }
+  CUCASCADE_CUDA_TRY_ALLOC(status, bytes);
+  return ptr;
+}
+
 // Returns whether completion was confirmed. An unsuccessful free still withholds the buffer.
 template <typename Completion>
   requires requires(Completion const& completion) {
     { wait_no_throw(completion) } noexcept -> std::same_as<bool>;
   }
-bool free_pinned_after(Completion const& completion, void* ptr) noexcept
+[[nodiscard]] bool free_pinned_after(Completion const& completion, void* ptr) noexcept
 {
   if (!wait_no_throw(completion)) { return false; }
   free_pinned_no_throw(ptr);
@@ -180,7 +197,7 @@ small_pinned_host_memory_resource::~small_pinned_host_memory_resource() noexcept
     if (slab.ready && !wait_no_throw(slab.ready->event)) { quarantine_slab_locked(slab.ptr); }
   }
   for (auto const& entry : _large_cache | std::views::join) {
-    free_pinned_after(entry.ready.event, entry.ptr);
+    std::ignore = free_pinned_after(entry.ready.event, entry.ptr);
   }
   for (auto& backing : _owned_allocations) {
     if (backing.quarantined) {
@@ -195,6 +212,7 @@ void* small_pinned_host_memory_resource::allocate(::cuda::stream_ref stream,
                                                   std::size_t bytes,
                                                   std::size_t alignment)
 {
+  CUCASCADE_FUNC_RANGE();
   if (bytes == 0) { return nullptr; }
   if (!std::has_single_bit(alignment)) {
     throw std::invalid_argument{"Pinned allocation alignment must be a nonzero power of two"};
@@ -206,7 +224,7 @@ void* small_pinned_host_memory_resource::allocate(::cuda::stream_ref stream,
   }
   if (alignment > alignof(std::max_align_t)) {
     if (bytes > MAX_SLAB_SIZE) { _large_uncacheable.fetch_add(1, std::memory_order_relaxed); }
-    return allocate_exceptional(bytes, alignment);
+    return allocate_dedicated(bytes, alignment, exact_attempt::pending, std::nullopt);
   }
   return bytes > MAX_SLAB_SIZE ? allocate_large(stream, bytes) : allocate_slab(stream, bytes);
 }
@@ -216,6 +234,7 @@ void small_pinned_host_memory_resource::deallocate(::cuda::stream_ref stream,
                                                    std::size_t bytes,
                                                    std::size_t alignment) noexcept
 {
+  CUCASCADE_FUNC_RANGE();
   std::ignore = try_to_deallocate(stream, ptr, bytes, alignment);
 }
 
@@ -233,12 +252,12 @@ bool small_pinned_host_memory_resource::try_to_deallocate(::cuda::stream_ref str
     if (alignment <= alignof(std::max_align_t) && bytes <= MAX_SLAB_SIZE) {
       quarantine_slab_locked(ptr);
     } else {
-      std::ignore = try_to_take_exceptional_locked(ptr);
+      std::ignore = try_to_take_dedicated_locked(ptr);
     }
     return false;
   }
   if (alignment > alignof(std::max_align_t)) {
-    deallocate_exceptional(stream, ptr);
+    deallocate_dedicated(stream, ptr);
     return true;
   }
   if (bytes > MAX_SLAB_SIZE) {
@@ -253,7 +272,8 @@ void small_pinned_host_memory_resource::deallocate_sync(void* ptr,
                                                         std::size_t bytes,
                                                         std::size_t alignment) noexcept
 {
-  ::cuda::stream_ref const stream{cudaStream_t{cudaStreamDefault}};
+  CUCASCADE_FUNC_RANGE();
+  ::cuda::stream_ref const stream{cudaStreamLegacy};
   if (try_to_deallocate(stream, ptr, bytes, alignment)) { std::ignore = wait_no_throw(stream); }
 }
 
@@ -283,10 +303,10 @@ void* small_pinned_host_memory_resource::allocate_slab(::cuda::stream_ref stream
   return ptr;
 }
 
-void* small_pinned_host_memory_resource::allocate_exceptional(
+void* small_pinned_host_memory_resource::allocate_dedicated(
   std::size_t bytes,
   std::size_t alignment,
-  bool exact_attempt_failed,
+  exact_attempt exact,
   std::optional<::cuda::stream_ref> retry_stream)
 {
   auto const padding = alignment > alignof(std::max_align_t) ? alignment - 1 : 0;
@@ -296,35 +316,20 @@ void* small_pinned_host_memory_resource::allocate_exceptional(
   auto const alloc_bytes = bytes + padding;
   auto try_cached        = [&]() -> void* {
     if (!retry_stream) { return nullptr; }
-    return try_to_take_cached_large(large_bucket_size_for(bytes), *retry_stream);
+    return try_to_take_cached_large(
+      large_bucket_size_for(bytes), *retry_stream, large_cache_lookup::recovery_retry);
   };
   if (void* cached = try_cached()) { return cached; }
   std::map<void*, void*> pending;
-  CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(exceptional_allocation);
+  CUCASCADE_FAULT_POINT_METADATA_ALLOCATION(dedicated_allocation);
   pending.emplace(nullptr, nullptr);
   auto node = pending.extract(nullptr);
 
-  void* base = nullptr;
-  if (!exact_attempt_failed) {
-    auto const status =
-      CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
-                                      cudaHostAlloc(&base, alloc_bytes, pinned_host_alloc_flags),
-                                      {.bytes = alloc_bytes, .buffer_out = &base});
-    if (status == cudaErrorMemoryAllocation) {
-      std::ignore          = cudaGetLastError();
-      exact_attempt_failed = true;
-    } else {
-      CUCASCADE_CUDA_TRY_ALLOC(status, alloc_bytes);
-    }
-  }
-  if (exact_attempt_failed) {
+  void* base =
+    exact == exact_attempt::already_failed ? nullptr : try_to_allocate_pinned(alloc_bytes);
+  if (base == nullptr) {
     if (void* cached = try_cached()) { return cached; }
-    if (!reclaim_large_cache(alloc_bytes)) { throw_pinned_out_of_memory(alloc_bytes); }
-    CUCASCADE_CUDA_TRY_ALLOC(
-      CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
-                                      cudaHostAlloc(&base, alloc_bytes, pinned_host_alloc_flags),
-                                      {.bytes = alloc_bytes, .buffer_out = &base}),
-      alloc_bytes);
+    base = allocate_pinned_after_reclaim(alloc_bytes);
   }
   std::unique_ptr<void, decltype(&free_pinned_no_throw)> allocation{base, free_pinned_no_throw};
   void* ptr  = base;
@@ -336,32 +341,32 @@ void* small_pinned_host_memory_resource::allocate_exceptional(
   node.mapped() = base;
   {
     std::lock_guard lock(_mutex);
-    auto result = _exceptional_allocations.insert(std::move(node));
-    if (!result.inserted) { CUCASCADE_FAIL("Duplicate exceptional pinned allocation"); }
+    auto result = _dedicated_allocations.insert(std::move(node));
+    if (!result.inserted) { CUCASCADE_FAIL("Duplicate dedicated pinned allocation"); }
   }
   std::ignore = allocation.release();
   return ptr;
 }
 
-void* small_pinned_host_memory_resource::try_to_take_exceptional_locked(void* ptr) noexcept
+void* small_pinned_host_memory_resource::try_to_take_dedicated_locked(void* ptr) noexcept
 {
-  auto const found = _exceptional_allocations.find(ptr);
-  if (found == _exceptional_allocations.end()) { return nullptr; }
+  auto const found = _dedicated_allocations.find(ptr);
+  if (found == _dedicated_allocations.end()) { return nullptr; }
   void* base = found->second;
-  _exceptional_allocations.erase(found);
+  _dedicated_allocations.erase(found);
   return base;
 }
 
-void small_pinned_host_memory_resource::deallocate_exceptional(::cuda::stream_ref stream,
-                                                               void* ptr) noexcept
+void small_pinned_host_memory_resource::deallocate_dedicated(::cuda::stream_ref stream,
+                                                             void* ptr) noexcept
 {
   void* base = nullptr;
   {
     std::lock_guard lock(_mutex);
-    base = try_to_take_exceptional_locked(ptr);
+    base = try_to_take_dedicated_locked(ptr);
   }
   assert(base != nullptr);
-  if (base != nullptr) { free_pinned_after(stream, base); }
+  if (base != nullptr) { std::ignore = free_pinned_after(stream, base); }
 }
 
 void* small_pinned_host_memory_resource::allocate_large(::cuda::stream_ref stream,
@@ -371,31 +376,33 @@ void* small_pinned_host_memory_resource::allocate_large(::cuda::stream_ref strea
   bool const cacheable          = is_cacheable(bucket);
   std::size_t const alloc_bytes = large_allocation_size(bytes);
   if (cacheable) {
-    if (void* cached = try_to_take_cached_large(bucket, stream, true)) { return cached; }
+    if (void* cached =
+          try_to_take_cached_large(bucket, stream, large_cache_lookup::first_attempt)) {
+      return cached;
+    }
   } else {
     _large_uncacheable.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void* ptr = nullptr;
-  if (auto const status =
-        CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
-                                        cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags),
-                                        {.bytes = alloc_bytes, .buffer_out = &ptr});
-      status != cudaErrorMemoryAllocation) {
-    // Returns on success. Releasing cached buffers cannot fix any other failure, so it throws.
-    CUCASCADE_CUDA_TRY_ALLOC(status, alloc_bytes);
-    return ptr;
-  }
-  std::ignore = cudaGetLastError();
+  if (void* ptr = try_to_allocate_pinned(alloc_bytes)) { return ptr; }
   if (cacheable) {
-    return allocate_exceptional(bytes, alignof(std::max_align_t), alloc_bytes == bytes, stream);
+    // An unrounded request already made the exact-size attempt above.
+    auto const exact =
+      alloc_bytes == bytes ? exact_attempt::already_failed : exact_attempt::pending;
+    return allocate_dedicated(bytes, alignof(std::max_align_t), exact, stream);
   }
+  return allocate_pinned_after_reclaim(alloc_bytes);
+}
+
+void* small_pinned_host_memory_resource::allocate_pinned_after_reclaim(std::size_t bytes)
+{
   if (!reclaim_large_cache(bytes)) { throw_pinned_out_of_memory(bytes); }
+  void* ptr = nullptr;
   CUCASCADE_CUDA_TRY_ALLOC(
-    CUCASCADE_PINNED_HOST_CUDA_CALL(host_alloc,
-                                    cudaHostAlloc(&ptr, alloc_bytes, pinned_host_alloc_flags),
-                                    {.bytes = alloc_bytes, .buffer_out = &ptr}),
-    alloc_bytes);
+    CUCASCADE_FAULT_POINT_CUDA_CALL(host_alloc,
+                                    cudaHostAlloc(&ptr, bytes, pinned_host_alloc_flags),
+                                    {.bytes = bytes, .buffer_out = &ptr}),
+    bytes);
   return ptr;
 }
 
@@ -413,7 +420,7 @@ void small_pinned_host_memory_resource::deallocate_slab(::cuda::stream_ref strea
   std::unique_lock lock(_mutex);
   try {
     // Pool growth reserves room for every slab, so valid deallocation does not grow this vector.
-    CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(slab_return);
+    CUCASCADE_FAULT_POINT_METADATA_ALLOCATION(slab_return);
     _free_lists[idx].emplace_back(ptr, std::move(ready));
   } catch (...) {
     quarantine_slab_locked(ptr);
@@ -428,7 +435,7 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
 {
   std::size_t const bucket = large_bucket_size_for(bytes);
   if (!is_cacheable(bucket)) {
-    free_pinned_after(stream, ptr);
+    std::ignore = free_pinned_after(stream, ptr);
     return;
   }
   std::list<large_cache_entry> incoming;
@@ -436,7 +443,7 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
   auto ready = record_ready_event(stream);
   if (ready) {
     try {
-      CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(large_cache_entry);
+      CUCASCADE_FAULT_POINT_METADATA_ALLOCATION(large_cache_entry);
       incoming.emplace_back(ptr, std::move(*ready), 0);
       ready.reset();
     } catch (...) {
@@ -446,7 +453,7 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
   bool published = false;
   {
     std::lock_guard lock(_mutex);
-    if (void* base = try_to_take_exceptional_locked(ptr)) {
+    if (void* base = try_to_take_dedicated_locked(ptr)) {
       ptr = base;
       if (!incoming.empty()) { incoming.front().ptr = base; }
     } else if (!incoming.empty() && _large_cache_bytes <= _large_cache_limit_bytes) {
@@ -473,7 +480,7 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
         retire_event(std::move(*ready));
       }
     } else {
-      free_pinned_after(stream, ptr);
+      std::ignore = free_pinned_after(stream, ptr);
     }
   }
   release_detached(std::move(victims));
@@ -620,7 +627,7 @@ small_pinned_host_memory_resource::event_pool::try_to_take() noexcept
 void small_pinned_host_memory_resource::event_pool::reserve()
 {
   if (_idle.capacity() == _live_events) {
-    CUCASCADE_PINNED_HOST_METADATA_ALLOCATION(event_pool_reserve);
+    CUCASCADE_FAULT_POINT_METADATA_ALLOCATION(event_pool_reserve);
     _idle.reserve(_live_events + 1);
   }
   ++_live_events;
@@ -640,15 +647,16 @@ void small_pinned_host_memory_resource::event_pool::release(cuda::cuda_event&& e
 
 void* small_pinned_host_memory_resource::try_to_take_cached_large(std::size_t bucket,
                                                                   ::cuda::stream_ref stream,
-                                                                  bool initial_request)
+                                                                  large_cache_lookup lookup)
 {
+  bool const first_attempt = lookup == large_cache_lookup::first_attempt;
   std::list<large_cache_entry> taken;
   {
     std::lock_guard lock(_mutex);
-    if (initial_request) { ++_large_cacheable_requests; }
+    if (first_attempt) { ++_large_cacheable_requests; }
     auto& entries = _large_cache[large_bucket_index(bucket)];
     if (entries.empty()) {
-      if (initial_request) { ++_large_misses; }
+      if (first_attempt) { ++_large_misses; }
       return nullptr;
     }
     taken.splice(taken.end(), entries, entries.begin());

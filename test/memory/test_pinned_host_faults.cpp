@@ -3,13 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "pinned_host_test_hooks.hpp"
+#include "fault_injection_hooks.hpp"
 #include "pinned_host_test_utils.hpp"
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -19,6 +18,7 @@
 namespace {
 
 using cucascade::test::pinned_host_test_fixture;
+using cucascade::test::pinned_upstream_fixture;
 using cucascade::test::require_pointer_type;
 
 }  // namespace
@@ -41,8 +41,8 @@ TEST_CASE("Uncached pinned storage is released only after confirmed completion",
   SECTION("unconfirmed completion withholds its storage")
   {
     {
-      cucascade::test::scoped_pinned_host_hook failure{
-        cucascade::test::pinned_host_operation::stream_synchronize, cudaErrorInvalidResourceHandle};
+      cucascade::test::scoped_fault_hook failure{cucascade::test::fault_point::stream_synchronize,
+                                                 cudaErrorInvalidResourceHandle};
       fixture.resource.deallocate(stream, pointer, bytes);
     }
     require_pointer_type(pointer, cudaMemoryTypeHost);
@@ -64,8 +64,8 @@ TEST_CASE("Pinned allocation failures are scoped to one call and one thread",
 
   SECTION("one failed call does not reject subsequent allocations")
   {
-    cucascade::test::scoped_pinned_host_hook failure{
-      cucascade::test::pinned_host_operation::host_alloc, cudaErrorInvalidValue};
+    cucascade::test::scoped_fault_hook failure{cucascade::test::fault_point::host_alloc,
+                                               cudaErrorInvalidValue};
     REQUIRE_THROWS_AS(fixture.resource.allocate_sync(bytes), rmm::bad_alloc);
     auto* pointer = fixture.resource.allocate_sync(bytes);
     fixture.resource.deallocate_sync(pointer, bytes);
@@ -77,8 +77,8 @@ TEST_CASE("Pinned allocation failures are scoped to one call and one thread",
     void* pointer = nullptr;
     std::exception_ptr error;
     {
-      cucascade::test::scoped_pinned_host_hook failure{
-        cucascade::test::pinned_host_operation::host_alloc, cudaErrorInvalidValue};
+      cucascade::test::scoped_fault_hook failure{cucascade::test::fault_point::host_alloc,
+                                                 cudaErrorInvalidValue};
       std::jthread worker{[&] {
         try {
           pointer = fixture.resource.allocate_sync(bytes);
@@ -99,7 +99,7 @@ TEST_CASE("Pinned allocation failures are scoped to one call and one thread",
 TEST_CASE("Cached pinned storage is released only after its event confirms completion",
           "[small_pinned][fault_injection]")
 {
-  pinned_host_test_fixture fixture{0};
+  pinned_upstream_fixture fixture;
   std::optional<cucascade::memory::small_pinned_host_memory_resource> resource{
     std::in_place, fixture.upstream, 64ULL << 10};
   constexpr std::size_t bytes = 9000;
@@ -115,8 +115,8 @@ TEST_CASE("Cached pinned storage is released only after its event confirms compl
   SECTION("unconfirmed cached work withholds its storage")
   {
     {
-      cucascade::test::scoped_pinned_host_hook failure{
-        cucascade::test::pinned_host_operation::event_synchronize, cudaErrorInvalidResourceHandle};
+      cucascade::test::scoped_fault_hook failure{cucascade::test::fault_point::event_synchronize,
+                                                 cudaErrorInvalidResourceHandle};
       resource.reset();
     }
     require_pointer_type(pointer, cudaMemoryTypeHost);
@@ -129,13 +129,13 @@ TEST_CASE("Cached pinned storage is released only after its event confirms compl
 TEST_CASE("Cache-entry metadata exhaustion releases incoming completed storage",
           "[small_pinned][fault_injection]")
 {
-  pinned_host_test_fixture fixture{0};
-  cucascade::memory::small_pinned_host_memory_resource resource{fixture.upstream, 64ULL << 10};
+  pinned_host_test_fixture fixture;
+  auto& resource              = fixture.resource;
   constexpr std::size_t bytes = 9000;
   auto* pointer               = resource.allocate_sync(bytes);
   {
-    cucascade::test::scoped_pinned_host_hook failure{
-      cucascade::test::pinned_host_operation::large_cache_entry, cudaErrorMemoryAllocation};
+    cucascade::test::scoped_fault_hook failure{cucascade::test::fault_point::large_cache_entry,
+                                               cudaErrorMemoryAllocation};
     resource.deallocate_sync(pointer, bytes);
     REQUIRE(resource.large_cache_bytes() == 0);
     require_pointer_type(pointer, cudaMemoryTypeUnregistered);

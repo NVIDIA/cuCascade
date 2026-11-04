@@ -3,13 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "pinned_host_test_hooks.hpp"
+#include "fault_injection_hooks.hpp"
 #include "pinned_host_test_utils.hpp"
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -36,11 +35,11 @@ TEST_CASE("Failed cache insertion preserves retained large-buffer capacity",
 
   bool const reject_completion = GENERATE(false, true);
   {
-    cucascade::test::scoped_pinned_host_hook metadata_failure{
-      cucascade::test::pinned_host_operation::large_cache_entry, cudaErrorMemoryAllocation};
+    cucascade::test::scoped_fault_hook metadata_failure{
+      cucascade::test::fault_point::large_cache_entry, cudaErrorMemoryAllocation};
     if (reject_completion) {
-      cucascade::test::scoped_pinned_host_hook completion_failure{
-        cucascade::test::pinned_host_operation::event_synchronize, cudaErrorInvalidResourceHandle};
+      cucascade::test::scoped_fault_hook completion_failure{
+        cucascade::test::fault_point::event_synchronize, cudaErrorInvalidResourceHandle};
       fixture.resource.deallocate(stream, incoming, large_bytes);
     } else {
       fixture.resource.deallocate(stream, incoming, large_bytes);
