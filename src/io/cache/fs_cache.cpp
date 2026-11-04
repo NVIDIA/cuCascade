@@ -1748,7 +1748,12 @@ void fs_cache::evict_loop(const std::stop_token& st)
             // below rather than be skipped past, or the back-pressure signal
             // does nothing and the pool never recovers.
             eviction_requested = true;
-            requested_bytes += r.bytes_to_free;
+            // Saturating: a demand for everything (SIZE_MAX) joined by another one in the same
+            // round must not wrap around to a small demand.
+            requested_bytes =
+              r.bytes_to_free > std::numeric_limits<std::size_t>::max() - requested_bytes
+                ? std::numeric_limits<std::size_t>::max()
+                : requested_bytes + r.bytes_to_free;
             if (r.processed != nullptr) { processed.push_back(std::move(r.processed)); }
           }
         },
@@ -1826,9 +1831,12 @@ void fs_cache::evict_loop(const std::stop_token& st)
         need = static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
       }
       // Rounded up: freeing whole chunks is the only granularity there is, so a
-      // demand for part of one still costs the whole thing.
+      // demand for part of one still costs the whole thing.  Without adding first,
+      // which would wrap a demand for everything (SIZE_MAX) around to none.
       auto const chunk_bytes = std::max<size_t>(_pool->chunk_size(), 1);
-      need                   = std::max(need, (requested_bytes + chunk_bytes - 1) / chunk_bytes);
+      auto const demanded =
+        requested_bytes / chunk_bytes + static_cast<size_t>(requested_bytes % chunk_bytes != 0);
+      need = std::max(need, demanded);
     }
 
     for (auto& [_, buffers] : reclaim_by_numa) {

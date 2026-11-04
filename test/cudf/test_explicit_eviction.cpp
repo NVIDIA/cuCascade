@@ -245,6 +245,50 @@ TEST_CASE("an explicit evict frees at least what was asked for", "[cache][evicti
   CHECK(cache.claimed_bytes() <= claimed - std::min(claimed, 2 * mib));
 }
 
+TEST_CASE("an explicit evict of every byte frees every disposed chunk",
+          "[cache][eviction][explicit]")
+{
+  constexpr auto all = std::numeric_limits<std::size_t>::max();
+  cache_test_fixture fixture{allocation_cache_config()};
+  auto& cache = checked_cache(fixture);
+  // A live request keeps its chunks: the evictor takes only chunks of disposed requests, and the
+  // pressure rule does not fire at this occupancy.
+  auto live = fixture.open(object_path, 8 * mib);
+  REQUIRE(live != nullptr);
+  advise_range(*live, 4 * mib, 2 * mib);
+  REQUIRE(live->prepare_prefetch(false) == prepare_result::prepared);
+  auto const kept = cache.claimed_bytes();
+  REQUIRE(kept == 2 * mib);
+  {
+    auto disposed = fixture.open(object_path, 8 * mib);
+    REQUIRE(disposed != nullptr);
+    advise_range(*disposed, 0, 4 * mib);
+    REQUIRE(disposed->prepare_prefetch(false) == prepare_result::prepared);
+  }
+  REQUIRE(cache.claimed_bytes() == kept + 4 * mib);
+
+  SECTION("synchronously")
+  {
+    cache.evict_sync(all);
+    INFO(cache.summary());
+    CHECK(cache.claimed_bytes() == kept);
+  }
+  SECTION("asynchronously")
+  {
+    cache.evict(all);
+    INFO(cache.summary());
+    CHECK(wait_for_cache([&] { return cache.claimed_bytes() == kept; }, 2s));
+  }
+  SECTION("with another demand that may join it in the same round")
+  {
+    // Taken in one round, the two demands must not add up past SIZE_MAX and wrap to nothing.
+    cache.evict(all);
+    cache.evict_sync(1);
+    INFO(cache.summary());
+    CHECK(cache.claimed_bytes() == kept);
+  }
+}
+
 TEST_CASE("a zero-byte evict is a no-op", "[cache][eviction][explicit]")
 {
   cache_test_fixture fixture{allocation_cache_config()};
@@ -546,8 +590,8 @@ TEST_CASE("a node-scoped reclaim spares another node's buffer put in a slot befo
       // The evictor releases A's subscriptions; its subscriber-respecting pass takes t (B names
       // s), and its last-resort pass takes s.  Without t, every chunk of A would be named by B
       // once A's subscriptions were released, so the evictor would retire A before its passes
-      // and never evict s.  Exactly 2 chunks: a SIZE_MAX demand overflows the evictor's rounding
-      // and frees nothing.
+      // and never evict s.  The last-resort pass runs only for a demand the first pass (t alone)
+      // cannot meet, so 2 chunks is the least that empties s.
       cache.evict_sync(2 * chunk);
       seen.emptied = slot->state.get_state() == chunk_state::empty && slot->data == nullptr;
       // B's preparation finds s empty and attaches a buffer from B's arena.
