@@ -35,7 +35,8 @@ namespace cucascade::io {
 /// Settings of a @ref column_admission policy.
 struct column_admission_config {
   /// Cache footprint, in bytes, that admitted columns may fill. Footprints are counted in whole
-  /// cache chunks, because a column chunk that ends mid-chunk still occupies the whole chunk.
+  /// cache chunks, because a column chunk that ends mid-chunk still occupies the whole chunk. A
+  /// chunk that two admitted columns share is counted once.
   std::size_t budget_bytes{0};
 
   /// Size of one cache chunk (see @c cache::config), used to count footprints and to widen advised
@@ -143,6 +144,8 @@ class column_admission {
   struct layout {
     std::uint32_t file;             // index of the file in registration order
     std::vector<segment> segments;  // sorted by offset
+    /// For each cache chunk of the file, how many admitted pieces cover it.
+    std::vector<std::uint16_t> chunk_refs;
   };
   struct column_state {
     std::string name;
@@ -156,16 +159,23 @@ class column_admission {
 
   [[nodiscard]] static piece_key key_of(std::uint32_t column, std::uint32_t file) noexcept;
   [[nodiscard]] double rank(std::uint32_t column) const;
-  [[nodiscard]] std::uint64_t footprint(std::uint64_t offset, std::uint64_t size) const;
+  /// The cache chunks of @p file that hold @p column, in ascending order.
+  [[nodiscard]] std::vector<std::uint64_t> piece_chunks(layout const& file,
+                                                        std::uint32_t column) const;
+  /// Bytes of @p chunks that no admitted piece of @p file covers yet.
+  [[nodiscard]] std::uint64_t uncovered_bytes(layout const& file,
+                                              std::vector<std::uint64_t> const& chunks) const;
+  /// Stop counting the pieces of @p column against the budget.
+  void release(std::uint32_t column);
   /// Admit the piece (@p column, @p file), evicting a lower-ranked column if the budget needs it.
-  bool admit(std::uint32_t column, std::uint32_t file, std::uint64_t bytes);
+  bool admit(std::uint32_t column, layout& file);
 
   column_admission_config _config;
   mutable std::mutex _mutex;
   std::unordered_map<std::string, layout> _layouts;
   std::unordered_map<std::string, std::uint32_t> _column_ids;
   std::vector<column_state> _columns;
-  std::unordered_map<piece_key, std::uint64_t> _piece_footprint;  // all of one column in one file
+  std::vector<layout*> _layout_of_file;  // by file index; the map's nodes do not move
   std::unordered_set<piece_key> _admitted;
   std::uint64_t _admitted_total{0};
 };

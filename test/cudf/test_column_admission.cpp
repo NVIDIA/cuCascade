@@ -167,6 +167,46 @@ TEST_CASE("the budget counts whole cache chunks", "[cache][admission]")
   CHECK(policy.advise("f1", 950, 100, object_size).ranges.empty());
 }
 
+/// Columns "a" at [0, 2500) and "b" at [2500, 5000): chunk 2 holds the end of a and the start of b.
+void register_sharing_file(column_admission& policy, std::string const& path)
+{
+  std::vector<std::string> const columns{"a", "b"};
+  std::array<std::uint32_t, 2> const column_of_chunk{0, 1};
+  std::array<std::uint64_t, 2> const offsets{0, 2500};
+  std::array<std::uint64_t, 2> const sizes{2500, 2500};
+  policy.register_layout(path, "t", columns, column_of_chunk, offsets, sizes);
+}
+
+TEST_CASE("a chunk shared by two admitted columns is counted once", "[cache][admission]")
+{
+  column_admission policy(config(5000));  // a and b alone are 3000 each, together 5 chunks
+  register_sharing_file(policy, "f1");
+  REQUIRE_FALSE(policy.advise("f1", 0, 2500, object_size).ranges.empty());
+  CHECK_FALSE(policy.advise("f1", 2500, 2500, object_size).ranges.empty());
+  CHECK(stat(policy, "t/a").admitted_footprint == 3000);
+  CHECK(stat(policy, "t/b").admitted_footprint == 2000);  // chunk 2 was already paid for
+}
+
+TEST_CASE("a replaced column frees only the chunks no other column holds", "[cache][admission]")
+{
+  column_admission policy(config(5000));
+  std::vector<std::string> const columns{"a", "b", "c"};
+  std::array<std::uint32_t, 3> const column_of_chunk{0, 1, 2};
+  std::array<std::uint64_t, 3> const offsets{0, 2500, 5000};
+  std::array<std::uint64_t, 3> const sizes{2500, 2500, 4000};
+  policy.register_layout("f1", "t", columns, column_of_chunk, offsets, sizes);
+  REQUIRE_FALSE(policy.advise("f1", 0, 2500, object_size).ranges.empty());     // a: chunks 0 to 2
+  REQUIRE_FALSE(policy.advise("f1", 2500, 2500, object_size).ranges.empty());  // b: chunks 3 and 4
+  // c ranks above a, so a is dropped, but only chunks 0 and 1 are freed (b still holds chunk 2),
+  // which is not enough room for c.
+  policy.advise("f1", 5000, 4000, object_size);
+  CHECK(policy.advise("f1", 5000, 4000, object_size).ranges.empty());
+  CHECK(stat(policy, "t/a").admitted_footprint == 0);
+  // Admitting a again needs only the two chunks it does not share with b.
+  CHECK_FALSE(policy.advise("f1", 0, 2500, object_size).ranges.empty());
+  CHECK(stat(policy, "t/a").admitted_footprint == 2000);
+}
+
 TEST_CASE("columns are ranked across the files of a table", "[cache][admission]")
 {
   column_admission policy(config(1 << 20));

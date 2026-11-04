@@ -53,7 +53,7 @@ struct scan_cache_options {
   double eviction_batch{0.02};
 
   /// Share of the cache that admitted columns may fill, counted in whole cache chunks.
-  double admission_budget{0.9};
+  double admission_budget{0.96};
 
   /// Reads smaller than this are not cached. 0 caches nothing.
   std::size_t min_advise_bytes{256UL << 10};

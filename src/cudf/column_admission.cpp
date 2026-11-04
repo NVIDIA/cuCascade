@@ -52,12 +52,42 @@ double column_admission::rank(std::uint32_t column) const
                            : static_cast<double>(c.requested) / static_cast<double>(c.registered);
 }
 
-std::uint64_t column_admission::footprint(std::uint64_t offset, std::uint64_t size) const
+std::vector<std::uint64_t> column_admission::piece_chunks(layout const& file,
+                                                          std::uint32_t column) const
 {
   auto const chunk = static_cast<std::uint64_t>(_config.chunk_bytes);
-  auto const first = offset / chunk * chunk;
-  auto const last  = (offset + size + chunk - 1) / chunk * chunk;
-  return last - first;
+  std::vector<std::uint64_t> chunks;
+  for (auto const& seg : file.segments) {
+    if (seg.column != column || seg.end == seg.begin) { continue; }
+    auto first = seg.begin / chunk;
+    if (!chunks.empty() && chunks.back() == first) { ++first; }  // shared with the previous segment
+    for (auto c = first; c <= (seg.end - 1) / chunk; ++c) {
+      chunks.push_back(c);
+    }
+  }
+  return chunks;
+}
+
+std::uint64_t column_admission::uncovered_bytes(layout const& file,
+                                                std::vector<std::uint64_t> const& chunks) const
+{
+  auto const uncovered =
+    std::ranges::count_if(chunks, [&](auto c) { return file.chunk_refs[c] == 0; });
+  return static_cast<std::uint64_t>(uncovered) * _config.chunk_bytes;
+}
+
+void column_admission::release(std::uint32_t column)
+{
+  auto& state = _columns[column];
+  for (auto const piece : state.admitted_pieces) {
+    auto& file = *_layout_of_file[piece & 0xffffffffU];
+    for (auto const c : piece_chunks(file, column)) {
+      if (--file.chunk_refs[c] == 0) { _admitted_total -= _config.chunk_bytes; }
+    }
+    _admitted.erase(piece);
+  }
+  state.admitted_footprint = 0;
+  state.admitted_pieces.clear();
 }
 
 void column_admission::register_layout(std::string const& path,
@@ -86,17 +116,22 @@ void column_admission::register_layout(std::string const& path,
     ids[i] = it->second;
   }
 
-  layout entry{.file = file, .segments = {}};
+  layout entry{.file = file, .segments = {}, .chunk_refs = {}};
   entry.segments.reserve(offsets.size());
   for (std::size_t k = 0; k < offsets.size(); ++k) {
     auto const id = ids[column_of_chunk[k]];
     entry.segments.push_back({offsets[k], offsets[k] + sizes[k], id});
-    _piece_footprint[key_of(id, file)] += footprint(offsets[k], sizes[k]);
     _columns[id].registered += sizes[k];
   }
   std::ranges::sort(entry.segments,
                     [](segment const& a, segment const& b) { return a.begin < b.begin; });
-  _layouts.emplace(path, std::move(entry));
+  std::uint64_t last_end = 0;
+  for (auto const& seg : entry.segments) {
+    last_end = std::max(last_end, seg.end);
+  }
+  entry.chunk_refs.assign(last_end == 0 ? 0 : (last_end - 1) / _config.chunk_bytes + 1, 0);
+  auto const [placed, added] = _layouts.emplace(path, std::move(entry));
+  _layout_of_file.push_back(&placed->second);
 }
 
 bool column_admission::has_layout(std::string const& path) const
@@ -105,14 +140,13 @@ bool column_admission::has_layout(std::string const& path) const
   return _layouts.contains(path);
 }
 
-bool column_admission::admit(std::uint32_t column, std::uint32_t file, std::uint64_t bytes)
+bool column_admission::admit(std::uint32_t column, layout& file)
 {
-  auto const key = key_of(column, file);
+  auto const key = key_of(column, file.file);
   if (_admitted.contains(key)) { return true; }
   // A piece is all of one column in one file, however little of it this read touches.
-  if (auto const it = _piece_footprint.find(key); it != _piece_footprint.end()) {
-    bytes = it->second;
-  }
+  auto chunks = piece_chunks(file, column);
+  auto bytes  = uncovered_bytes(file, chunks);
   if (_admitted_total + bytes > _config.budget_bytes) {
     // Replace the lowest-ranked admitted column, but only if this column ranks clearly higher.
     auto lowest      = column;
@@ -125,14 +159,12 @@ bool column_admission::admit(std::uint32_t column, std::uint32_t file, std::uint
       }
     }
     if (lowest == column || rank(column) <= lowest_rank * _config.rank_margin) { return false; }
-    auto& victim = _columns[lowest];
-    for (auto const piece : victim.admitted_pieces) {
-      _admitted.erase(piece);
-    }
-    _admitted_total -= victim.admitted_footprint;
-    victim.admitted_footprint = 0;
-    victim.admitted_pieces.clear();
+    release(lowest);
+    bytes = uncovered_bytes(file, chunks);
     if (_admitted_total + bytes > _config.budget_bytes) { return false; }
+  }
+  for (auto const c : chunks) {
+    ++file.chunk_refs[c];
   }
   _admitted.insert(key);
   _columns[column].admitted_pieces.push_back(key);
@@ -155,7 +187,8 @@ admission_advice column_admission::advise(std::string const& path,
     if (it == _layouts.end()) {
       wanted.emplace_back(static_cast<std::int64_t>(offset), static_cast<std::int64_t>(size));
     } else {
-      auto const& segments = it->second.segments;
+      auto& file           = it->second;
+      auto const& segments = file.segments;
       auto const end       = offset + size;
       auto seg             = std::ranges::upper_bound(
         segments, offset, std::less{}, [](segment const& s) { return s.end; });
@@ -164,7 +197,7 @@ admission_advice column_admission::advise(std::string const& path,
         auto const stop  = std::min(end, seg->end);
         auto& col        = _columns[seg->column];
         col.requested += stop - begin;
-        if (admit(seg->column, it->second.file, stop - begin)) {
+        if (admit(seg->column, file)) {
           wanted.emplace_back(static_cast<std::int64_t>(begin),
                               static_cast<std::int64_t>(stop - begin));
           col.admitted += stop - begin;
