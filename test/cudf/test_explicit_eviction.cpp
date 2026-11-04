@@ -356,6 +356,21 @@ TEST_CASE("releasable bytes are summed per HOST arena, not from combined usage",
   // The HOST spaces agree: A is charged two chunks past its reservation, B nothing past its own.
   CHECK(fixture.available(a) == (fixture_type::arena_chunks - 4) * chunk);
   CHECK(fixture.available(b) == (fixture_type::arena_chunks - 2) * chunk);
+
+  // A reclaim with no node takes the chunks of both arenas and returns each buffer to the arena
+  // that supplied it: all four to A, which gets back the two past its reservation, and B's one to
+  // B, which gets no budget back.
+  auto const a_available = fixture.available(a);
+  auto const b_available = fixture.available(b);
+  auto const a_free      = fixture.arena(a).get_free_blocks();
+  auto const b_free      = fixture.arena(b).get_free_blocks();
+  CHECK(cache.reclaim(reclaim_mode::forced, std::numeric_limits<std::size_t>::max()) == 5 * chunk);
+  CHECK(fixture.available(a) - a_available == 2 * chunk);
+  CHECK(fixture.available(b) == b_available);
+  CHECK(fixture.arena(a).get_free_blocks() == a_free + 4);
+  CHECK(fixture.arena(b).get_free_blocks() == b_free + 1);
+  CHECK(cache.claimed_bytes() == 0);
+  CHECK(cache.releasable_bytes() == 0);
 }
 
 TEST_CASE("reclaiming one arena's excess frees only that arena's HOST memory",
@@ -430,7 +445,8 @@ TEST_CASE("buffers from the fallback arena are charged to, and reclaimed from, t
   fixture_type fixture;
   auto& cache = fixture.cache();
 
-  // B holds one chunk inside its reservation; then everything else B has goes elsewhere.
+  // B holds one chunk inside its reservation; then the rest of B's HOST budget is taken outside
+  // the cache.
   auto const& own = fixture.hold(b, 0, 1);
   fixture.exhaust(b);
   auto const a_available = fixture.available(a);
@@ -445,6 +461,7 @@ TEST_CASE("buffers from the fallback arena are charged to, and reclaimed from, t
   };
   CHECK(on_a() == 4);
   CHECK(fixture_type::node_of(*own.chunks()->front()) == b);
+  // Two of the four fallback chunks fit A's reservation; only the other two cost A budget.
   CHECK(a_available - fixture.available(a) == 2 * chunk);
   CHECK(fixture.available(b) == 0);
   CHECK(cache.releasable_bytes(a) == 2 * chunk);

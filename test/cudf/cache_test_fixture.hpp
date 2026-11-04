@@ -184,8 +184,10 @@ namespace cucascade::test {
 /// @ref reserved_chunks of each for prefetching.  The topology maps GPU g to NUMA node g, so a
 /// request made for node g prefers arena g, as a scan on GPU g does.  The pool takes a whole
 /// request from one arena and falls back to the other only when the preferred one cannot supply
-/// it; @ref exhaust forces that.  @ref default_config evicts on explicit demand only, so the
-/// background evictor does not move the counts a test asserts.
+/// it; @ref exhaust forces that.  Under @ref default_config the pressure rule never fires, and
+/// the evictor only takes chunks of disposed requests, on an explicit demand: @c evict,
+/// @c evict_sync, or the asynchronous one a failed non-blocking @ref prepare enqueues.  So it
+/// does not move the counts a test asserts while the test keeps its requests alive.
 ///
 /// Chunk i of @ref object is bytes [i * chunk, (i + 1) * chunk); the reclaim sweep visits a
 /// generation's chunks in that order.  Handles from @ref hold and allocations from @ref exhaust
@@ -260,12 +262,14 @@ struct two_arena_cache_fixture {
   {
     std::array<io::byte_range, 1> const ranges{io::byte_range{
       static_cast<std::int64_t>(first * chunk), static_cast<std::int64_t>(count * chunk)}};
+    // The node doubles as the GPU id: @ref one_gpu_per_node puts GPU g on NUMA node g.
     auto handle = io::cache::fs_cache_test_access::request(cache(), object(), ranges, node);
     REQUIRE(static_cast<bool>(handle));
     return handle;
   }
 
-  io::cache::prepare_result prepare(io::cache::cache_handle& handle, bool wait_for_eviction = false)
+  [[nodiscard]] io::cache::prepare_result prepare(io::cache::cache_handle& handle,
+                                                  bool wait_for_eviction = false)
   {
     return io::cache::fs_cache_test_access::prepare(cache(), handle, wait_for_eviction);
   }
@@ -289,7 +293,8 @@ struct two_arena_cache_fixture {
     REQUIRE(available(node) == 0);
   }
 
-  /// NUMA node of the arena that supplied @p c's buffer.
+  /// NUMA node of the arena that supplied @p c's buffer.  Meaningful only while @c c.data is
+  /// non-null: reclaim and eviction leave the field at the last buffer's node.
   [[nodiscard]] static int node_of(io::cache::cached_chunk const& c)
   {
     return static_cast<int>(c.numa_node);
@@ -315,6 +320,8 @@ struct two_arena_cache_fixture {
     return std::make_unique<cucascade::memory::memory_reservation_manager>(std::move(configs));
   }
 
+  /// GPU g on NUMA node g for each arena, so a request made for GPU g (see @ref request)
+  /// prefers arena g.
   static std::shared_ptr<const cucascade::memory::topology_index> one_gpu_per_node()
   {
     cucascade::memory::system_topology_info topology{};
