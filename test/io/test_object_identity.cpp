@@ -226,7 +226,7 @@ TEST_CASE("Local identities that differ only in ctime are different versions", "
 }
 
 TEST_CASE("Local identity separates a same-inode rewrite with preserved mtime by ctime",
-          "[object_identity][uring]")
+          "[object_identity][uring][kvikio]")
 {
   // Rewriting a file in place with as many bytes, then restoring its mtime,
   // leaves device, inode, size and mtime as they were: only ctime, which no
@@ -250,9 +250,10 @@ TEST_CASE("Local identity separates a same-inode rewrite with preserved mtime by
   REQUIRE(kvikio_before->identity() == first);
 #endif
 
-  // ctime moves in steps of the filesystem's timestamp granularity, so a
-  // rewrite within the same step leaves it unchanged.  Retry the rewrite and
-  // restore until it moves, up to a deadline, and skip if it never does.
+  // ctime moves in steps of the kernel's timestamp clock and the filesystem's
+  // on-disk resolution, so a rewrite within the same step leaves it unchanged.
+  // Retry the rewrite and restore until it advances, up to a deadline, and skip
+  // if it never does.
   timespec const times[2]{original.st_atim, original.st_mtim};
   struct stat rewritten{};
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -260,13 +261,13 @@ TEST_CASE("Local identity separates a same-inode rewrite with preserved mtime by
     REQUIRE(::pwrite(writer.get(), "bbb", 3, 0) == 3);
     REQUIRE(::futimens(writer.get(), times) == 0);
     REQUIRE(::fstat(writer.get(), &rewritten) == 0);
-    if (nanoseconds(rewritten.st_ctim) != nanoseconds(original.st_ctim) ||
+    if (nanoseconds(rewritten.st_ctim) > nanoseconds(original.st_ctim) ||
         std::chrono::steady_clock::now() >= deadline) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  if (nanoseconds(rewritten.st_ctim) == nanoseconds(original.st_ctim)) {
+  if (nanoseconds(rewritten.st_ctim) <= nanoseconds(original.st_ctim)) {
     SKIP("the filesystem did not advance ctime for an in-place rewrite within 2 s");
   }
   CHECK(rewritten.st_dev == original.st_dev);

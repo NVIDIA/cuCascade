@@ -784,6 +784,7 @@ TEST_CASE("io_uring slices_per_pass holds while a read outlasts the worker's pol
   }
   auto const outcome = settle_within(std::move(future), std::chrono::seconds(30));
   REQUIRE(outcome.ready);
+  INFO("error: " << outcome.error.message() << ", other error: " << outcome.other_error);
   REQUIRE(outcome.bytes == total);
   CHECK(reactor.get().take_gauges().max_inflight_ops <= 2);
 
@@ -791,6 +792,7 @@ TEST_CASE("io_uring slices_per_pass holds while a read outlasts the worker's pol
   // once, in whatever order the pipe served the reads.
   std::vector<std::uint8_t> fills;
   for (std::size_t i = 0; i < n_slices; ++i) {
+    CAPTURE(i);
     auto const* slice = destination.get() + i * stride;
     CHECK(std::all_of(slice, slice + stride, [&](std::uint8_t byte) { return byte == *slice; }));
     fills.push_back(*slice);
