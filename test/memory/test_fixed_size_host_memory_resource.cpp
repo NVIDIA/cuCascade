@@ -16,6 +16,7 @@
  */
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <rmm/error.hpp>
@@ -140,6 +141,95 @@ TEST_CASE("A failed initial pool frees the pools already allocated", "[fixed_siz
     fixed_size_host_memory_resource(
       0, upstream, capacity, capacity, block_size, pool_size, initial_pools, threads),
     rmm::bad_alloc);
+  REQUIRE(state->live.load() == 0);
+}
+
+TEST_CASE("A failed expansion restores blocks and accounting", "[fixed_size_host][rollback]")
+{
+  auto state        = std::make_shared<counting_host_resource::state>();
+  state->fail_after = 1;
+  counting_host_resource upstream(state);
+  constexpr std::size_t capacity = 2 * block_size;
+  {
+    fixed_size_host_memory_resource mr(0, upstream, capacity, capacity, block_size, 1, 1);
+    REQUIRE(mr.get_free_blocks() == 1);
+    REQUIRE(mr.get_available_memory() == capacity);
+    REQUIRE_THROWS_AS(mr.allocate_multiple_blocks(capacity), rmm::bad_alloc);
+    REQUIRE(mr.get_free_blocks() == 1);
+    REQUIRE(mr.get_available_memory() == capacity);
+    REQUIRE(state->live.load() == 1);
+    auto retry = mr.allocate_multiple_blocks(block_size);
+    REQUIRE(retry->size() == 1);
+  }
+  REQUIRE(state->live.load() == 0);
+}
+
+TEST_CASE("A failed grow preserves the original allocation", "[fixed_size_host][rollback]")
+{
+  auto state        = std::make_shared<counting_host_resource::state>();
+  state->fail_after = 1;
+  counting_host_resource upstream(state);
+  constexpr std::size_t capacity = 2 * block_size;
+  {
+    fixed_size_host_memory_resource mr(0, upstream, capacity, capacity, block_size, 1, 1);
+    auto allocation = mr.allocate_multiple_blocks(block_size);
+    REQUIRE_FALSE(allocation->grow_by(block_size));
+    REQUIRE(allocation->size() == 1);
+    REQUIRE(mr.get_available_memory() == block_size);
+    allocation.reset();
+    REQUIRE(mr.get_available_memory() == capacity);
+    REQUIRE(mr.get_free_blocks() == 1);
+  }
+  REQUIRE(state->live.load() == 0);
+}
+
+TEST_CASE("A failed multi-pool expansion releases new pools", "[fixed_size_host][rollback]")
+{
+  auto state        = std::make_shared<counting_host_resource::state>();
+  state->fail_after = 2;
+  counting_host_resource upstream(state);
+  constexpr std::size_t capacity = 3 * block_size;
+  {
+    fixed_size_host_memory_resource mr(0, upstream, capacity, capacity, block_size, 1, 1);
+    REQUIRE_THROWS_AS(mr.allocate_multiple_blocks(capacity), rmm::bad_alloc);
+    REQUIRE(mr.get_free_blocks() == 1);
+    REQUIRE(mr.get_total_blocks() == 1);
+    REQUIRE(mr.get_available_memory() == capacity);
+    REQUIRE(state->live.load() == 1);
+    auto retry = mr.allocate_multiple_blocks(block_size);
+    REQUIRE(retry->size() == 1);
+  }
+  REQUIRE(state->live.load() == 0);
+}
+
+TEST_CASE("A failed expansion restores reservation accounting", "[fixed_size_host][rollback]")
+{
+  auto state        = std::make_shared<counting_host_resource::state>();
+  state->fail_after = 1;
+  host_memory_space_config config;
+  config.numa_id                    = 0;
+  config.memory_capacity            = 2 * block_size;
+  config.reservation_limit_fraction = 1.0;
+  config.block_size                 = block_size;
+  config.pool_size                  = 1;
+  config.initial_number_pools       = 1;
+  config.mr_factory_fn              = [state](int, std::size_t) {
+    return cuda::mr::any_resource<cuda::mr::device_accessible>{counting_host_resource(state)};
+  };
+  {
+    memory_space space(config);
+    auto reservation = space.make_reservation(block_size);
+    auto* mr         = reservation->get_memory_resource_of<Tier::HOST>();
+    REQUIRE(mr->get_available_memory() == block_size);
+    REQUIRE_THROWS_AS(mr->allocate_multiple_blocks(2 * block_size, reservation.get()),
+                      rmm::bad_alloc);
+    REQUIRE(mr->get_available_memory() == block_size);
+    REQUIRE(mr->get_free_blocks() == 1);
+    reservation.reset();
+    REQUIRE(mr->get_available_memory() == 2 * block_size);
+    auto retry = mr->allocate_multiple_blocks(block_size);
+    REQUIRE(retry->size() == 1);
+  }
   REQUIRE(state->live.load() == 0);
 }
 
