@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <concepts>
 #include <cstdint>
@@ -60,20 +61,14 @@ struct atomic_bounded_counter {
   std::atomic<T> const* operator->() const noexcept { return &_value; }
 
   [[nodiscard]] T value(std::memory_order order = std::memory_order_seq_cst) const noexcept
-  {
-    return _value.load(order);
-  }
+  { return _value.load(order); }
 
   [[nodiscard]] T load(std::memory_order order = std::memory_order_seq_cst) const noexcept
-  {
-    return _value.load(order);
-  }
+  { return _value.load(order); }
 
   /// \@brief return updated value
   T add(T diff, std::memory_order order = std::memory_order_seq_cst) noexcept
-  {
-    return _value.fetch_add(diff, order) + diff;
-  }
+  { return _value.fetch_add(diff, order) + diff; }
 
   [[nodiscard]] std::pair<bool, T> try_add(T diff, T upper_bound)
   {
@@ -88,18 +83,19 @@ struct atomic_bounded_counter {
   {
     auto current = _value.load();
     while (current < upper_bound) {
-      T space_left = upper_bound - current;
-      diff         = std::min(diff, space_left);
-      if (_value.compare_exchange_weak(current, current + diff)) { return current + diff; }
+      T space_left         = upper_bound - current;
+      T const bounded_diff = std::min(diff, space_left);
+      if (_value.compare_exchange_weak(current, current + bounded_diff)) {
+        diff = bounded_diff;
+        return current + bounded_diff;
+      }
     }
     diff = 0;
     return current;
   }
 
   T sub(T diff, std::memory_order order = std::memory_order_seq_cst) noexcept
-  {
-    return _value.fetch_sub(diff, order) - diff;
-  }
+  { return _value.fetch_sub(diff, order) - diff; }
 
   [[nodiscard]] std::pair<bool, T> try_sub(T diff, T lower_bound)
   {
@@ -114,10 +110,13 @@ struct atomic_bounded_counter {
   {
     auto current = _value.load();
     while (current > lower_bound) {
-      T space_above = current - lower_bound;
-      diff          = std::min(diff, space_above);
+      T space_above        = current - lower_bound;
+      T const bounded_diff = std::min(diff, space_above);
 
-      if (_value.compare_exchange_weak(current, current - diff)) { return current - diff; }
+      if (_value.compare_exchange_weak(current, current - bounded_diff)) {
+        diff = bounded_diff;
+        return current - bounded_diff;
+      }
     }
     diff = 0;
     return current;
