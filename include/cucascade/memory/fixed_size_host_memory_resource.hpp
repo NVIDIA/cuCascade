@@ -124,9 +124,7 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
 
     ~multiple_blocks_allocation()
     {
-      if (_mr && !_blocks.empty()) {
-        _mr->return_allocated_chunks(std::move(_blocks), _reseved_memory);
-      }
+      if (_mr && !_blocks.empty()) { _mr->return_allocated_chunks(_blocks, _reseved_memory); }
     }
 
     // Disable copy to prevent double deallocation
@@ -174,12 +172,10 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
       if (!_mr || _blocks.empty()) return;
       std::size_t needed_blocks = (needed_bytes + _block_size - 1) / _block_size;
       if (needed_blocks >= _blocks.size()) return;
-      // Extract excess blocks
-      std::vector<std::byte*> excess(_blocks.begin() + static_cast<std::ptrdiff_t>(needed_blocks),
-                                     _blocks.end());
+      // Return the tail in place, then drop it; neither step allocates.
+      _mr->return_allocated_chunks(std::span<std::byte* const>(_blocks).subspan(needed_blocks),
+                                   _reseved_memory);
       _blocks.resize(needed_blocks);
-      // Return them to the memory resource
-      _mr->return_allocated_chunks(std::move(excess), _reseved_memory);
     }
 
    private:
@@ -328,6 +324,19 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     std::size_t total_bytes, reservation* res = nullptr);
 
   /**
+   * @brief Return blocks taken out of an allocation with `release_blocks()`.
+   *
+   * Settles them as the allocation's destructor would: bytes still inside @p res stay charged
+   * to it and only the excess is credited back.  Allocation-free, so it is safe on paths that
+   * must not fail.
+   *
+   * @param blocks Blocks allocated from this resource and not returned since
+   * @param res The reservation they were allocated under.  Null, or anything other than a live
+   *        reservation of this resource, credits all their bytes back.
+   */
+  void return_blocks(std::span<std::byte* const> blocks, reservation* res = nullptr) noexcept;
+
+  /**
    * @brief Gets the peak total allocated bytes across all streams.
    * @return The peak total allocated bytes
    */
@@ -400,8 +409,17 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
    */
   void expand_pools_parallel(std::size_t n_pools, std::size_t n_threads);
 
+  /**
+   * @brief Make room in the bookkeeping for @p n_new_pools more pools.
+   *
+   * Called before their upstream memory is taken, so a failure here leaves nothing behind and
+   * add_pool() cannot fail afterwards.  Keeps the @c _free_blocks capacity invariant.
+   */
+  void reserve_for_pools(std::size_t n_new_pools);
+
   /// Add one upstream allocation of @c _block_size * @c _pool_size bytes to the free list.
-  void add_pool(void* large_allocation);
+  /// The room for it was made by reserve_for_pools().
+  void add_pool(void* large_allocation) noexcept;
 
   /**
    * @brief registers reservation with the memory resource
@@ -416,11 +434,16 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
   void release_reservation(chunked_reserved_area* res);
 
   /**
-   * @brief release reservation and returns the unused bytes to back to the memory resource
-   * @param chunks reserved bytes that is registered with the memory resource
-   * @param res is the reserved memory bytes use to allocate the chunks from
+   * @brief Put allocated blocks back on the free list and credit their bytes.
+   *
+   * Bytes still inside @p res stay charged to it; only the excess is credited back.
+   * Allocation-free: the free list already has room for every block (see @c _free_blocks).
+   *
+   * @param chunks blocks allocated from this resource
+   * @param res the reservation they were allocated under, or null
    */
-  void return_allocated_chunks(std::vector<std::byte*> chunks, chunked_reserved_area* res);
+  void return_allocated_chunks(std::span<std::byte* const> chunks,
+                               chunked_reserved_area* res) noexcept;
 
   /**
    * @brief Allocate multiple blocks to satisfy a large allocation request.
@@ -444,7 +467,10 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
   std::size_t _pool_size;                       ///< Number of blocks in pool
   rmm::device_async_resource_ref _upstream_mr;  ///< Upstream memory resource
   std::vector<void*> _allocated_blocks;         ///< All allocated blocks
-  std::vector<void*> _free_blocks;              ///< Currently free blocks
+  /// Currently free blocks.  Invariant: `capacity() >= _allocated_blocks.size() * _pool_size`,
+  /// room for every block the resource owns, so returning blocks never allocates.
+  /// reserve_for_pools() keeps it before a pool's upstream memory is taken.
+  std::vector<void*> _free_blocks;
   mutable std::mutex _mutex;
   utils::atomic_bounded_counter<size_t> _allocated_bytes{0};
   utils::atomic_peak_tracker<size_t> _peak_allocated_bytes{0};

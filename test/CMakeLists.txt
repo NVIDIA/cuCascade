@@ -42,6 +42,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_data_repository_manager.cpp
     data/test_disk_io_backend.cpp
     data/test_io_worker.cpp
+    # Utils
+    utils/allocation_counter.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
@@ -71,6 +73,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_templated_ioctx.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
+    io/cache/test_buffer_pool.cpp
     io/cache/test_chunk_state.cpp
     io/cache/test_metadata_store.cpp
     io/cache/test_stage_machines.cpp
@@ -83,6 +86,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
     io/uring/test_uring_readv.cpp
+    # Utils
+    utils/allocation_counter.cpp
     # Main test runner
     unittest.cpp)
 

@@ -114,11 +114,12 @@ class buffer_pool {
 
   std::vector<std::byte*> allocate_bulk_from(size_t n, int numa_node);
 
+  /// Same as the span overload; leaves @p out empty.
   void deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexcept;
 
-  /// Same hand-back from a caller-owned list the caller keeps.  The pool copies
-  /// the pointers into the list the allocator's RAII wrapper takes; that copy
-  /// and the wrapper are the only allocations on this path.
+  /// Hand back chunks allocated from @p numa's arena, from a list the caller
+  /// keeps.  They go straight back to that arena's resource, settled against its
+  /// prefetch reservation.  Allocation-free, so safe on paths that cannot fail.
   void deallocate_bulk(std::span<std::byte* const> blocks, int numa) noexcept;
 
   [[nodiscard]] size_t chunk_size() const noexcept { return _chunk_bytes; }

@@ -27,12 +27,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 
 namespace cucascade::io::cache {
-
-using multiple_blocks_allocation =
-  typename cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
 buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservation_manager,
                          double reservation_fraction_for_prefetching,
@@ -128,23 +126,22 @@ std::vector<std::byte*> buffer_pool::allocate_bulk(size_t n, int& numa_node)
 
 void buffer_pool::deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexcept
 {
-  if (out.empty()) return;
-  auto it = _numa_to_arena_index.find(numa);
-  if (it == _numa_to_arena_index.end()) return;
-  auto& arena      = _host_arenas.at(it->second);
-  auto const count = out.size();
-  // Re-wrap the raw blocks in a multiple_blocks_allocation bound to this
-  // arena's MR; its destructor returns them to that exact MR (origin-safe).
-  auto b = multiple_blocks_allocation::create(std::move(out), *arena.mr, arena.reservation.get());
-  b.reset(nullptr);
-  _arena_chunks[it->second].fetch_sub(count, std::memory_order_relaxed);
-  _n_allocated_chunks.fetch_sub(count, std::memory_order_relaxed);
+  deallocate_bulk(std::span<std::byte* const>(out), numa);
+  out.clear();
 }
 
 void buffer_pool::deallocate_bulk(std::span<std::byte* const> blocks, int numa) noexcept
 {
   if (blocks.empty()) return;
-  deallocate_bulk(std::vector<std::byte*>(blocks.begin(), blocks.end()), numa);
+  auto const it = _numa_to_arena_index.find(numa);
+  if (it == _numa_to_arena_index.end()) return;
+  auto const index = it->second;
+  auto& arena      = _host_arenas[index];
+  // Back to the MR they came from, settled against this arena's reservation
+  // (origin-safe).  Nothing on this path allocates.
+  arena.mr->return_blocks(blocks, arena.reservation.get());
+  _arena_chunks[index].fetch_sub(blocks.size(), std::memory_order_relaxed);
+  _n_allocated_chunks.fetch_sub(blocks.size(), std::memory_order_relaxed);
 }
 
 std::size_t buffer_pool::releasable_bytes(int numa) const noexcept
