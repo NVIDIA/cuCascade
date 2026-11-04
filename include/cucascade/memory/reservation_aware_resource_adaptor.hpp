@@ -76,6 +76,7 @@ class reservation_aware_resource_adaptor
    * @param default_oom_policy The default OOM handling policy
    * @param tracking_scope [default: PER_STREAM] The scope of allocation tracking (per-stream,
    * per-thread)
+   * @param pool_handle Optional borrowed handle identifying the actual upstream allocation pool
    */
   explicit reservation_aware_resource_adaptor(
     memory_space_id space_id,
@@ -97,7 +98,7 @@ class reservation_aware_resource_adaptor
    * @param default_oom_policy The default OOM handling policy
    * @param tracking_scope [default: PER_STREAM] The scope of allocation tracking (per-stream,
    * per-thread)
-   * @param pool_handle Optional CUDA memory pool handle for accurate OOM diagnostics
+   * @param pool_handle Optional borrowed handle identifying the actual upstream allocation pool
    */
   explicit reservation_aware_resource_adaptor(
     memory_space_id space_id,
@@ -114,6 +115,18 @@ class reservation_aware_resource_adaptor
    * @return Reference to the upstream resource
    */
   rmm::device_async_resource_ref get_upstream_resource() const noexcept;
+
+  /**
+   * @brief Returns the CUDA memory pool associated with the upstream resource
+   *
+   * The returned nullable handle is borrowed. The adaptor neither owns nor reconfigures the pool,
+   * and the handle must not be used after its owner is destroyed. If a handle was supplied
+   * explicitly at construction, callers using it as access evidence are responsible for ensuring
+   * that it names the pool that actually backs upstream allocations.
+   *
+   * @return The associated CUDA memory pool, or nullptr when it is unknown
+   */
+  [[nodiscard]] cudaMemPool_t pool_handle() const noexcept;
 
   /**
    * @brief Returns the available memory left in the resource

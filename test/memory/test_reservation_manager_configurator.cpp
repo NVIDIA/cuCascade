@@ -342,6 +342,34 @@ TEST_CASE("Configurator honors an absolute capacity on a device-memory NUMA regi
   REQUIRE(hosts.front().memory_capacity == requested);
 }
 
+TEST_CASE("Configurator pins initial host pools concurrently only from the default resource",
+          "[configurator]")
+{
+  system_topology_info topology;
+  if (!make_single_gpu_topology(topology, synthetic_numa_capacity)) {
+    SUCCEED("Skipped: requires at least one GPU");
+    return;
+  }
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({static_cast<int>(topology.gpus.front().id)});
+  builder.use_numa_id_as_host_id();
+  builder.set_per_numa_region_capacity(1ull << 30);
+
+  auto hosts = host_configs(builder.build(topology));
+  REQUIRE(hosts.size() == 1);
+  REQUIRE(hosts.front().initial_pool_threads == default_host_initial_pool_threads);
+
+  // A caller-supplied resource is not known to be thread-safe.
+  builder.set_host_memory_resource_factory(
+    [](int numa_id, std::size_t capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
+      return make_default_host_memory_resource(numa_id, capacity);
+    });
+  hosts = host_configs(builder.build(topology));
+  REQUIRE(hosts.size() == 1);
+  REQUIRE(hosts.front().initial_pool_threads == 1);
+}
+
 // Device-memory nodes are not host memory and must not inflate the host total.
 TEST_CASE("Total NUMA capacity excludes device-memory nodes", "[configurator]")
 {

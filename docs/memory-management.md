@@ -187,6 +187,67 @@ The `reservation_aware_resource_adaptor` wraps an RMM `device_memory_resource` (
 2. **Per-stream reservation enforcement** -- each stream has its own reservation and policy
 3. **Memory limit enforcement** -- hard cap on total allocations
 4. **OOM handling** -- pluggable retry policies
+5. **Pool identity** -- nullable borrowed access to the CUDA pool known to back the upstream resource
+
+### CUDA Pool Peer Access
+
+`reservation_aware_resource_adaptor::pool_handle()` returns the adaptor's borrowed pool handle, or
+`nullptr` when the upstream pool cannot be discovered. The adaptor does not own or reconfigure
+that pool. An explicitly supplied constructor handle must identify the pool that actually backs
+upstream allocations before callers use it as access evidence.
+
+`grant_pool_peer_access(pool, owner_device, accessing_device)` configures one pool for one
+accessing GPU and reports whether access was granted, unsupported, rejected by bidirectional byte
+verification, or failed in the CUDA runtime. The pool must be live, the device IDs must be valid and
+visible, and `owner_device` must identify the pool's allocation device. For distinct devices this
+is not checked, because CUDA exposes no query for a pool's owning device: a wrong `owner_device`
+verifies one device pair and grants access for another. A successful permission
+persists until changed through CUDA or the pool is destroyed. It does not promise bandwidth or
+prove the route of a later copy. A failed grant leaves existing pool permissions unchanged; any
+revocation must be coordinated by the application with other users of that pool. CUDA errors take
+precedence over non-error rejections when the two directional probes disagree. Verified peer
+results are cached process-wide. `grant_pool_peer_access()` and
+the deprecated `disable_peer_access_where_broken()` retry cached CUDA errors;
+`probe_peer_dma_works()` and `peer_access_verified()` report false without retrying. The GPU-to-GPU
+converter uses the directional probe and host-stages while an error is cached.
+
+`peer_access_verified(owner_device, accessing_device)` exposes the same bidirectional verification
+rule without granting access. It returns true for a same-device request or when both directional
+probes pass. Applications can use it to gate their own ordinary peer-access setup. A single
+`probe_peer_dma_works(src_device, dst_device)` result is directional: the copy is issued on
+`dst_device`, verifying that it can pull bytes from `src_device`, not the reverse direction.
+
+Verification copies 64 bytes in each direction between two private memory pools that are granted
+to each other and compares the bytes. Pool grants, not ordinary peer access
+(`cudaDeviceEnablePeerAccess`), select the copy route for pool allocations, so the result applies to
+pools created with the allocation properties of the pool owned by
+`rmm::mr::cuda_async_memory_resource` (pinned device memory, no export handle). Pools with other
+properties, including managed-memory pools such as the one owned by
+`rmm::mr::cuda_async_managed_memory_resource`, are not verified separately. The probe owns every pool, stream, and allocation it uses:
+it leaves ordinary peer access and all caller-visible pool permissions unchanged and waits only for
+its own stream. The first request that needs verification checks every ordered pair of visible
+devices, a few milliseconds per pair, under a process-wide lock. When verification fails,
+GPU-to-GPU conversions stage through pinned host memory instead of copying directly.
+
+cuCascade never enables or disables ordinary peer access. Copies of memory that does not come from a
+pool, such as `cudaMalloc` allocations, follow the application's own `cudaDeviceEnablePeerAccess`
+setting; while it is disabled the CUDA driver uses an indirect route that is correct but may be
+slower. An application may enable ordinary peer access itself, but neither the directional probe
+nor `peer_access_verified()` separately verifies that non-pool route.
+
+`enable_pool_peer_access_for_all_visible_devices()` is deprecated. It visits every visible peer for
+both the supplied pool and the owner's currently selected pool, writes one stderr line per grant
+that fails with a CUDA error, and discards other outcomes. Replace it with explicit
+`grant_pool_peer_access()` calls for each required pool and accessing device, and check each
+returned `pool_peer_access_result`. Only the pools explicitly passed to `grant_pool_peer_access()`
+are configured.
+
+`disable_peer_access_where_broken()` is deprecated. Despite its name, it changes neither ordinary
+peer access nor caller pool permissions; it reports how many directions failed byte verification, or
+-1 when verification could not run, and retries cached CUDA errors. Use `peer_access_verified()` for
+a boolean verification check; that query does not count failed directions or retry cached CUDA
+errors. Applications must coordinate any access revocation with other users and perform it through
+CUDA.
 
 ### Per-Stream vs Per-Thread Tracking
 

@@ -125,7 +125,7 @@ struct config {
   [[nodiscard]] bool enabled() const noexcept { return mode != cache_mode::none; }
 
   /// Whether reads are served through cuCascade's own pinned prefetching cache.
-  [[nodiscard]] bool use_prefetching_cache() const noexcept { return mode == cache_mode::cucs; }
+  [[nodiscard]] bool use_fs_cache() const noexcept { return mode == cache_mode::cucs; }
 
   /// Whether the local backend reads with O_DIRECT: everything but @c os, which
   /// exists precisely to read through the kernel page cache.

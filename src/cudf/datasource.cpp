@@ -21,7 +21,7 @@
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/byte_range.hpp>
-#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -99,7 +99,7 @@ bool datasource::is_device_read_preferred(size_t) const { return _io_ctx->suppor
 
 size_t datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  if (uses_prefetching_cache()) {
+  if (uses_fs_cache()) {
     auto* cache = _io_ctx->cache();
     return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
   }
@@ -117,7 +117,7 @@ std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offse
 std::future<size_t> datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
   return bridge_semi_to_std([&] {
-    if (uses_prefetching_cache()) {
+    if (uses_fs_cache()) {
       auto* cache = _io_ctx->cache();
       return cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
     }
@@ -172,7 +172,7 @@ std::future<size_t> datasource::device_read_async(size_t offset,
 {
   ::cuda::stream_ref stream{stream_arg};
   return bridge_semi_to_std([&] {
-    if (uses_prefetching_cache()) {
+    if (uses_fs_cache()) {
       auto* cache = _io_ctx->cache();
       return cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
     }
@@ -181,25 +181,28 @@ std::future<size_t> datasource::device_read_async(size_t offset,
 }
 
 std::future<size_t> datasource::device_read_ranges_async(std::span<const slice> ranges,
-                                                         ::cuda::stream_ref stream)
+                                                         ::cuda::stream_ref stream,
+                                                         io_priority priority)
 {
   return bridge_semi_to_std([&] {
-    if (uses_prefetching_cache()) {
+    if (uses_fs_cache()) {
       auto* cache = _io_ctx->cache();
-      return cache->device_read_ranges_async(*_io_object, ranges, stream, &_prefetch_handle);
+      return cache->device_read_ranges_async(
+        *_io_object, ranges, stream, &_prefetch_handle, priority);
     }
-    return _io_ctx->device_readv_async_io(*_io_object, ranges, stream);
+    return _io_ctx->device_readv_async_io(*_io_object, ranges, stream, priority);
   });
 }
 
-std::future<size_t> datasource::host_read_ranges_async(std::span<const slice> ranges)
+std::future<size_t> datasource::host_read_ranges_async(std::span<const slice> ranges,
+                                                       io_priority priority)
 {
   return bridge_semi_to_std([&] {
-    if (uses_prefetching_cache()) {
+    if (uses_fs_cache()) {
       auto* cache = _io_ctx->cache();
-      return cache->host_read_ranges_async(*_io_object, ranges, &_prefetch_handle);
+      return cache->host_read_ranges_async(*_io_object, ranges, &_prefetch_handle, priority);
     }
-    return _io_ctx->host_readv_async_io(*_io_object, ranges);
+    return _io_ctx->host_readv_async_io(*_io_object, ranges, priority);
   });
 }
 
@@ -207,7 +210,7 @@ std::unique_ptr<datasource> datasource::duplicate() const
 {
   // Share the io_ctx and io_object — both are shared_ptr-managed and
   // deliberately reused across splits of the same file.  The new
-  // datasource starts with a default-constructed prefetching_handle so
+  // datasource starts with a default-constructed cache_handle so
   // its fadvise() calls can't accidentally cancel the original's work.
   return std::make_unique<datasource>(_io_ctx, _io_object);
 }
@@ -216,7 +219,7 @@ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges
                          std::optional<int> dev_id)
 {
   auto* cache = _io_ctx->cache();
-  if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
+  if (cache == nullptr || !_io_ctx->can_use_fs_cache()) { return; }
 
   // The contract is "one scan, one datasource": a second inserting fadvise on
   // a datasource that already carries an active handle is a caller bug.  Warn
@@ -224,7 +227,7 @@ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges
   // disposed by the move-assignment below.
   if (_prefetch_handle && _prefetch_handle.is_active()) {
     CUCASCADE_LOG_WARN(
-      "datasource::fadvise: a prefetching_handle was already stored on "
+      "datasource::fadvise: a cache_handle was already stored on "
       "this datasource (path={}); cancelling the stale request.  Each scan "
       "should own a unique datasource.",
       _io_object->object_path());
@@ -254,7 +257,7 @@ void datasource::update(cache::scan_stage site)
 
 prepare_result datasource::prepare_prefetch(bool wait_for_eviction)
 {
-  if (!_prefetch_handle || !uses_prefetching_cache()) { return prepare_result::nothing_to_prepare; }
+  if (!_prefetch_handle || !uses_fs_cache()) { return prepare_result::nothing_to_prepare; }
   auto* cache = _io_ctx->cache();
   if (cache == nullptr) { return prepare_result::nothing_to_prepare; }
   switch (cache->prepare(_prefetch_handle, wait_for_eviction)) {
@@ -268,7 +271,7 @@ prepare_result datasource::prepare_prefetch(bool wait_for_eviction)
 
 prefetch_refusal datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
 {
-  if (!_prefetch_handle || !uses_prefetching_cache()) {
+  if (!_prefetch_handle || !uses_fs_cache()) {
     on_done(false);
     return prefetch_refusal::no_cache;
   }
@@ -298,11 +301,12 @@ prefetch_refusal datasource::prefetch_async(exec::invocable<void(bool) noexcept>
                                                 : prefetch_refusal::other;
 }
 
-bool datasource::uses_prefetching_cache()
+std::exception_ptr datasource::prefetch_failure() const noexcept
 {
-  auto* cache = _io_ctx->cache();
-  return cache != nullptr && _io_ctx->can_use_prefetching_cache();
+  return _prefetch_handle ? _prefetch_handle.failure() : nullptr;
 }
+
+bool datasource::uses_fs_cache() const noexcept { return _io_ctx->uses_fs_cache(); }
 
 std::unique_ptr<datasource> open_datasource(std::shared_ptr<ioctx> io_ctx, std::string path)
 {

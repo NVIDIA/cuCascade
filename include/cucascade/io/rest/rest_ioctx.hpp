@@ -187,9 +187,16 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   bool _footer_resolve_active{false};
   std::shared_ptr<exec::admission_control> _footer_budget;
 
+  /// Warn once per path when @p obj has no strong ETag (none, weak or malformed).
+  /// Such an object cannot be revalidated across opens, so its bytes and
+  /// metadata are cached only within this open.  Returns @p obj unchanged.
+  std::shared_ptr<io_object> warn_if_no_strong_etag(std::shared_ptr<io_object> obj);
+
   /// Guards the warm-up rate limiter.  Contended once per query at most, and
   /// never on a read path.
   std::mutex _warm_mtx;
+  std::mutex _weak_etag_mtx;
+  std::vector<std::string> _weak_etag_paths;  ///< paths already warned about, bounded
   /// Bucket the pools were last warmed against, and when.  An unset time means
   /// "never warmed", which no elapsed comparison can express.
   std::string _warmed_bucket;

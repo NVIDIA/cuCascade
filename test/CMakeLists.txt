@@ -84,7 +84,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_executable(
     cucascade_tests
     # Memory tests
+    memory/test_fixed_size_host_memory_resource.cpp
     memory/test_memory_reservation_manager.cpp
+    memory/test_pool_peer_access.cpp
+    memory/test_pool_peer_access_regression.cpp
     memory/test_reservation_aware_resource_adaptor.cpp
     memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
@@ -102,8 +105,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
 
   # Set include directories
   target_include_directories(
-    cucascade_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                            ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+    cucascade_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${PROJECT_SOURCE_DIR}/src)
 
   # Link dependencies
   target_link_libraries(cucascade_tests PRIVATE cucascade Catch2::Catch2
@@ -119,21 +123,33 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
+    io/test_templated_ioctx.cpp
+    io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
+    io/cache/test_chunk_state.cpp
     io/cache/test_metadata_store.cpp
+    io/cache/test_stage_machines.cpp
     io/rest/test_object_store_lister.cpp
+    io/rest/test_rest_cache_identity.cpp
     io/rest/test_rest_footer_resolve.cpp
     io/rest/test_rest_validation_tag.cpp
     io/rest/test_shared_byte_span.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
+    io/uring/test_uring_readv.cpp
     # Main test runner
     unittest.cpp)
 
+  target_sources(
+    cucascade_io_tests
+    PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
+            io/test_io_request.cpp)
+
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
   if(CUCASCADE_BUILD_CUDF)
-    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp)
+    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp
+                                              io/kvikio/test_kvikio_remote.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
@@ -166,6 +182,18 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     cudf/test_release_table_stream.cpp
     # Main test runner
     unittest.cpp)
+
+  # The datasource bridge and its cache-level tests exist only in an io build.
+  if(CUCASCADE_BUILD_IO)
+    target_sources(
+      cucascade_cudf_tests
+      PRIVATE cudf/test_cache_object_identity.cpp
+              cudf/test_rest_datasource_contracts.cpp
+              cudf/test_cache_read_arbitration.cpp
+              cudf/test_dispose_eviction.cpp
+              cudf/test_explicit_eviction.cpp)
+  endif()
+
   set_target_properties(cucascade_cudf_tests
                         PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 

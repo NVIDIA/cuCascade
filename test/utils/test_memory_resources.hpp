@@ -57,16 +57,16 @@ class shared_device_resource {
 
   bool operator==(shared_device_resource const&) const noexcept { return false; }
 
-  friend void get_property(shared_device_resource const&, cuda::mr::device_accessible) noexcept {}
+  friend void get_property(shared_device_resource const&, ::cuda::mr::device_accessible) noexcept {}
 
  private:
   rmm::device_async_resource_ref upstream_;
 };
 
-inline cuda::mr::any_resource<cuda::mr::device_accessible> make_shared_current_device_resource(
+inline ::cuda::mr::any_resource<::cuda::mr::device_accessible> make_shared_current_device_resource(
   int, size_t)
 {
-  return cuda::mr::any_resource<cuda::mr::device_accessible>{
+  return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
     shared_device_resource{rmm::mr::get_current_device_resource_ref()}};
 }
 
