@@ -69,14 +69,14 @@ struct cache_generation {
   /// @p incoming.  Records each acquired subscription in @p result (which
   /// must be empty), in @p incoming order, as it is acquired; an offset past
   /// EOF stays null.  The caller owns the rollback of what was recorded, even
-  /// when acquisition throws part-way.  @p before_materialize, when set, runs
+  /// when acquisition throws part-way.  @p before_materialise, when set, runs
   /// once the chunks already materialised are subscribed and recorded and
   /// before any missing one is materialised, only when some are missing, with
   /// no lock held (a test seam).
   void subscribe_chunks(std::span<const size_t> incoming,
                         std::span<const chunk_fill> desired,
                         std::vector<cached_chunk*>& result,
-                        std::function<void()> const* before_materialize = nullptr);
+                        std::function<void()> const* before_materialise = nullptr);
 
   std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                           std::size_t size,
@@ -380,7 +380,7 @@ cache_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
 void cache_generation::subscribe_chunks(std::span<const size_t> incoming,
                                         std::span<const chunk_fill> desired,
                                         std::vector<cached_chunk*>& result,
-                                        std::function<void()> const* before_materialize)
+                                        std::function<void()> const* before_materialise)
 {
   assert(incoming.size() == desired.size());
   assert(result.empty());
@@ -414,9 +414,11 @@ void cache_generation::subscribe_chunks(std::span<const size_t> incoming,
     if (missing_indices.empty()) { return; }
   }
 
-  // A throw here stands for growing `missing_indices` or `arena.emplace`
-  // failing: the existing chunks are subscribed and recorded, no missing one is.
-  if (before_materialize != nullptr && *before_materialize) { (*before_materialize)(); }
+  // A throw here stands for growing `missing_indices` or the first
+  // `arena.emplace` failing: the existing chunks are subscribed and recorded,
+  // and no missing one is materialised.  It does not model a phase-2 failure
+  // after some missing chunk was already materialised, subscribed and recorded.
+  if (before_materialise != nullptr && *before_materialise) { (*before_materialise)(); }
 
   // Phase 2: materialise the missing chunks.  Another writer may have filled
   // some of our slots between unlocking and re-locking, so re-check each one.
@@ -775,7 +777,7 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
     }
   } rollback{*subscribed};
   auto& chunks_to_fetch = *subscribed;
-  file.subscribe_chunks(chunk_offsets, desired, chunks_to_fetch, &_before_chunk_materialize);
+  file.subscribe_chunks(chunk_offsets, desired, chunks_to_fetch, &_before_chunk_materialise);
   // Offsets past EOF have no slot.  Drop them while keeping the requested
   // extents index-parallel, reusing the normalized extents instead of
   // allocating a second per-chunk vector.

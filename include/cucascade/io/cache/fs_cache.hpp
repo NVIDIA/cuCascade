@@ -417,12 +417,13 @@ class fs_cache {
   /// it has subscribed to every chunk already materialised and before it
   /// materialises the missing ones, only when some are missing, with no cache
   /// lock held.  A throw from it takes the path of a failure part-way through
-  /// acquisition (growing the list of missing chunks or allocating one): the
-  /// subscriptions already taken are rolled back.  Configure only while no
-  /// request can be created.
-  void set_before_chunk_materialize_for_testing(std::function<void()> hook)
+  /// acquisition (growing the list of missing chunks or allocating the first
+  /// of them): the subscriptions already taken are rolled back.  It cannot
+  /// fail the request after a missing chunk was materialised.  Configure only
+  /// while no request can be created.
+  void set_before_chunk_materialise_for_testing(std::function<void()> hook)
   {
-    _before_chunk_materialize = std::move(hook);
+    _before_chunk_materialise = std::move(hook);
   }
 
   /// Test-only hook run inside @ref reclaim for each chunk the sweep is about to
@@ -628,7 +629,7 @@ class fs_cache {
 
   std::function<void()> _before_prefetch_claim;
   std::function<void()> _before_request_enqueue;
-  std::function<void()> _before_chunk_materialize;
+  std::function<void()> _before_chunk_materialise;
   std::function<void(cached_chunk const&)> _before_reclaim_claim;
   const config _cfg;
   std::shared_ptr<buffer_pool> _pool;

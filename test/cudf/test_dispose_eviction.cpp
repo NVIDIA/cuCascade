@@ -167,8 +167,8 @@ TEST_CASE("a prefetch request failing mid-acquisition rolls back only its own su
   // NVIDIA/cuCascade#218 review: a request for chunks A, B and C, where only A
   // exists (shared with a live request), fails after subscribing to A and
   // before materialising B -- where growing the list of missing chunks or
-  // allocating one would throw.  The rollback guard must drop the failed
-  // request's subscription to A and leave nothing on B or C.
+  // allocating the first of them would throw.  The rollback guard must drop
+  // the failed request's subscription to A and leave nothing on B or C.
   using access = cucascade::io::cache::fs_cache_test_access;
   using cucascade::io::cache::cache_handle;
   using cucascade::io::cache::cached_chunk;
@@ -194,11 +194,11 @@ TEST_CASE("a prefetch request failing mid-acquisition rolls back only its own su
 
   struct hook_reset {
     cucascade::io::cache::fs_cache& cache;
-    ~hook_reset() { cache.set_before_chunk_materialize_for_testing({}); }
+    ~hook_reset() { cache.set_before_chunk_materialise_for_testing({}); }
   } reset{*cache};
   int failures                           = 0;
   std::uint32_t a_subscribers_at_failure = 0;
-  cache->set_before_chunk_materialize_for_testing([&] {
+  cache->set_before_chunk_materialise_for_testing([&] {
     ++failures;
     a_subscribers_at_failure = a->state.get_subscribers();
     throw std::bad_alloc();
@@ -206,7 +206,7 @@ TEST_CASE("a prefetch request failing mid-acquisition rolls back only its own su
   std::optional<cache_handle> rejected;
   CHECK_THROWS_AS(rejected.emplace(access::request(*cache, object, all)), std::bad_alloc);
   CHECK_FALSE(rejected.has_value());
-  cache->set_before_chunk_materialize_for_testing({});
+  cache->set_before_chunk_materialise_for_testing({});
   // The failure point was reached once, with A subscribed by both requests.
   CHECK(failures == 1);
   CHECK(a_subscribers_at_failure == 2);
