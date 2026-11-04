@@ -418,7 +418,8 @@ class fs_cache {
 
   [[nodiscard]] cache_handle initiate_prefetching_request(const io_object& obj,
                                                           std::span<const byte_range> ranges,
-                                                          std::optional<int> gpu_id = {});
+                                                          std::optional<int> gpu_id      = {},
+                                                          std::uint8_t eviction_priority = 0);
 
   /// Attach staging buffers to @p handle's request, so a following @ref prefetch
   /// has chunks it can claim: a chunk without a buffer cannot be taken for

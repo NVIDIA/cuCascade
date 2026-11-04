@@ -116,6 +116,11 @@ struct config {
   /// Start evicting once the pool fills to this fraction of its capacity.
   double eviction_threshold_fraction{0.8};
 
+  /// Share of the pool's allocated chunks the evictor frees in one pass once it starts evicting
+  /// (the default 0.25 frees a quarter of the cache at a time; a smaller value evicts just enough
+  /// to stay under the threshold).
+  double eviction_batch_fraction{0.25};
+
   /// Derived from @ref eviction by @ref apply_mode; not settable on its own.
   bool dispose_on_idle{false};
 
