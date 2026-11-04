@@ -21,7 +21,7 @@ class ScanCacheOptions:
         block_bytes: int = 262144,
         eviction_threshold: float = 0.97,
         eviction_batch: float = 0.02,
-        admission_budget: float = 0.9,
+        admission_budget: float = 0.96,
         min_advise_bytes: int = 262144,
         reactors: int = 16,
         connections: int = 128,

@@ -78,7 +78,7 @@ cdef class ScanCacheOptions:
         size_t block_bytes=262144,
         double eviction_threshold=0.97,
         double eviction_batch=0.02,
-        double admission_budget=0.9,
+        double admission_budget=0.96,
         size_t min_advise_bytes=262144,
         size_t reactors=16,
         size_t connections=128,
