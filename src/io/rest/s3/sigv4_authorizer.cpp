@@ -42,7 +42,8 @@ std::string to_lower(std::string_view s)
 
 /// Split @p endpoint into (scheme, host_with_optional_port). Trailing path /
 /// query / fragment is rejected — the endpoint identifies the S3 service, not
-/// a specific bucket or object.
+/// a specific bucket or object — and so are a missing host (including a
+/// port-only "scheme://:port") and user-info.
 std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
 {
   if (endpoint.empty()) { throw credential_error("sigv4_presigned_authorizer: empty endpoint"); }
@@ -66,8 +67,12 @@ std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
       "trailing '" +
       remainder.substr(bad) + "')");
   }
-  if (remainder.empty()) {
+  // "scheme://:port" is a port-only authority: no host. User-info is not part of an endpoint.
+  if (remainder.empty() || remainder.front() == ':') {
     throw credential_error("sigv4_presigned_authorizer: endpoint missing host");
+  }
+  if (remainder.find('@') != std::string::npos) {
+    throw credential_error("sigv4_presigned_authorizer: endpoint must not contain user-info");
   }
   return {std::move(scheme), to_lower(remainder)};
 }
