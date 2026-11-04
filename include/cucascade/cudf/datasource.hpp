@@ -220,7 +220,8 @@ class datasource : public cudf::io::datasource {
   /// claimable — every requested chunk already resident or loading for another
   /// reader — the cache settles @c {ok = true, covered}, and this still returns
   /// @c other (or @c consumer_ahead if the consumer started reading meanwhile).
-  /// @c covered then says whether the requested bytes are already resident.
+  /// @c covered then says whether this call found the requested bytes
+  /// resident; it pins nothing (see @c cache::prefetch_result::covered).
   prefetch_refusal prefetch_async(exec::invocable<void(cache::prefetch_result) noexcept> on_done);
 
   /// Why this datasource's prefetch failed, if it did: null otherwise, and

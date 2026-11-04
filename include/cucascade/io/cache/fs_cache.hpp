@@ -106,8 +106,12 @@ struct prefetch_failure_slot {
 /// imply coverage: another loader may own some of the requested chunks.
 struct prefetch_result {
   bool ok{false};  ///< the IO this prefetch submitted (if any) succeeded
-  /// Every requested extent is resident (cached or pinned) as on_done runs,
-  /// re-checked at IO completion. Residency is not pinned against later reclaim.
+  /// Conservative residency evidence: true only when every requested extent
+  /// was resident (cached or pinned) when this call sampled it and, if it
+  /// submitted IO, again when that IO completed. It holds no pins, so
+  /// reclaim, eviction or the release of a retired generation can drop
+  /// residency before or after on_done runs. Readers take their own pins and
+  /// may fall back to the backend.
   bool covered{false};
 };
 
@@ -382,13 +386,15 @@ class fs_cache {
 
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
-  /// completion. The outcome is @c covered only when every requested extent
-  /// is resident (cached or pinned) as @p on_done runs. Coverage is re-checked
-  /// when the submitted IO completes: a resident chunk reclaimed meanwhile is
-  /// uncovered. A chunk another loader (a demand read) claimed first is not
-  /// covered, even when this prefetch's own IO succeeded. Residency is not
-  /// pinned afterwards: later reclaim may take it, and readers fall back to
-  /// the backend. Returns whether IO was issued.
+  /// completion. @c covered is conservative residency evidence (see
+  /// @ref prefetch_result::covered): true only when every requested extent
+  /// was resident (cached or pinned) when this call sampled it, and again
+  /// when the submitted IO completed, so a resident chunk reclaimed meanwhile
+  /// is uncovered. A chunk another loader (a demand read) claimed first is not
+  /// covered, even when this prefetch's own IO succeeded. The evidence holds
+  /// no pins: reclaim, eviction or the release of a retired generation can
+  /// drop residency before or after @p on_done runs, so readers take their
+  /// own pins and may fall back to the backend. Returns whether IO was issued.
   /// Without IO the outcome is @c {false, false} when the request is refused
   /// (empty, fallen behind, cancelled, already loading, a backend without
   /// vectored host reads, or a failed setup), and @c {true, covered} when
