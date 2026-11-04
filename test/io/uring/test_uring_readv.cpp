@@ -29,12 +29,16 @@
 
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -335,6 +339,32 @@ struct settle_outcome {
   while (reactor.take_gauges().preemptions == 0) {
     if (std::chrono::steady_clock::now() >= deadline) return false;
     std::this_thread::yield();
+  }
+  return true;
+}
+
+/**
+ * Write all of @p bytes to the nonblocking descriptor @p fd, waiting for room with
+ * poll(POLLOUT).  Returns false once @p deadline passes or a call fails, so a reader
+ * that stops draining fails the caller instead of blocking it.
+ */
+[[nodiscard]] bool write_by(int fd,
+                            std::span<std::uint8_t const> bytes,
+                            std::chrono::steady_clock::time_point deadline)
+{
+  while (!bytes.empty()) {
+    auto const written = ::write(fd, bytes.data(), bytes.size());
+    if (written > 0) {
+      bytes = bytes.subspan(static_cast<std::size_t>(written));
+      continue;
+    }
+    if (written < 0 && errno == EINTR) continue;
+    if (written == 0 || errno != EAGAIN) return false;
+    auto const now = std::chrono::steady_clock::now();
+    if (now >= deadline) return false;
+    auto const wait = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
+    pollfd entry{fd, POLLOUT, 0};
+    if (::poll(&entry, 1, static_cast<int>(wait.count())) < 0 && errno != EINTR) return false;
   }
   return true;
 }
@@ -683,12 +713,23 @@ TEST_CASE("io_uring slices_per_pass holds while a read outlasts the worker's pol
   constexpr std::size_t n_slices = 8;
   constexpr std::size_t stride   = 4UL << 10;
   constexpr std::size_t total    = n_slices * stride;
-  static_assert(total <= (64UL << 10), "the bytes must fit a default pipe buffer");
+  // One slice is one write, which a pipe performs atomically up to PIPE_BUF bytes.
+  static_assert(stride <= PIPE_BUF, "a slice must be one atomic pipe write");
 
   std::array<int, 2> ends{-1, -1};
   REQUIRE(::pipe2(ends.data(), O_CLOEXEC) == 0);
-  file_descriptor read_end{ends[0]};
+  file_descriptor const reader{ends[0]};
   file_descriptor write_end{ends[1]};
+  // The reactor reads through a descriptor of its own.  The test keeps `reader` open, so a
+  // write after the reactor let go of its descriptor waits for the deadline below instead
+  // of raising SIGPIPE.
+  file_descriptor read_end{::fcntl(reader.get(), F_DUPFD_CLOEXEC, 0)};
+  REQUIRE(read_end);
+  // Only the write end is nonblocking: io_uring completes reads of an O_NONBLOCK pipe with
+  // EAGAIN instead of waiting for data.
+  int const write_flags = ::fcntl(write_end.get(), F_GETFL);
+  REQUIRE(write_flags >= 0);
+  REQUIRE(::fcntl(write_end.get(), F_SETFL, write_flags | O_NONBLOCK) == 0);
 
   // A pipe stats as empty: name the size the slices read.
   cucascade::io::object_identity identity;
@@ -706,8 +747,20 @@ TEST_CASE("io_uring slices_per_pass holds while a read outlasts the worker's pol
     ~close_on_exit() { fd = file_descriptor{}; }
   } const close_writer{write_end};
 
-  auto future = enqueue_ranges(
-    reactor.get(), std::move(object), slice_ranges(n_slices, stride, false), destination.get());
+  // A pipe is not seekable, and io_uring takes only offset 0 (or -1) for such a file: every
+  // slice reads file range {0, stride}, each into its own part of the destination.  The
+  // reactor plans each contiguous host slice as its own read and never merges or rejects
+  // equal file ranges.
+  std::vector<prepared_io_slice> slices;
+  slices.reserve(n_slices);
+  for (std::size_t i = 0; i < n_slices; ++i) {
+    slices.emplace_back(range{0, stride}, host_buffer{destination.get() + i * stride});
+    slices.back().priority = cucascade::io::io_priority::high;
+  }
+  auto coordinator = std::make_shared<grouped_coordinator>(total, n_slices);
+  auto future      = coordinator->get_future();
+  reactor.get().enqueue(
+    grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
 
   // Wait for the first read to reach the pipe, then hold it across about ten timed waits.
   std::uint32_t depth = 0;
@@ -720,13 +773,32 @@ TEST_CASE("io_uring slices_per_pass holds while a read outlasts the worker's pol
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   CHECK(reactor.get().take_gauges().max_inflight_ops == 1);
 
-  std::vector<std::uint8_t> bytes(total);
-  for (std::size_t i = 0; i < total; ++i) {
-    bytes[i] = pattern_byte(i);
+  // Write whole slices, slice i filled with i + 1.  Each is one atomic write and each read
+  // asks for one slice, so every read returns a full slice: a short read would resume at
+  // offset bytes_read > 0, which is not valid on a pipe.  The writer gives up at its
+  // deadline, so a reactor that stops reading fails the test instead of hanging it.
+  auto const write_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  for (std::size_t i = 0; i < n_slices; ++i) {
+    std::vector<std::uint8_t> const slice(stride, static_cast<std::uint8_t>(i + 1));
+    REQUIRE(write_by(write_end.get(), slice, write_deadline));
   }
-  REQUIRE(::write(write_end.get(), bytes.data(), total) == static_cast<ssize_t>(total));
-  CHECK(std::move(future).get(std::chrono::seconds(30)) == total);
+  auto const outcome = settle_within(std::move(future), std::chrono::seconds(30));
+  REQUIRE(outcome.ready);
+  REQUIRE(outcome.bytes == total);
   CHECK(reactor.get().take_gauges().max_inflight_ops <= 2);
+
+  // Every destination slice holds one whole written slice, and each written slice landed
+  // once, in whatever order the pipe served the reads.
+  std::vector<std::uint8_t> fills;
+  for (std::size_t i = 0; i < n_slices; ++i) {
+    auto const* slice = destination.get() + i * stride;
+    CHECK(std::all_of(slice, slice + stride, [&](std::uint8_t byte) { return byte == *slice; }));
+    fills.push_back(*slice);
+  }
+  std::sort(fills.begin(), fills.end());
+  for (std::size_t i = 0; i < n_slices; ++i) {
+    CHECK(fills[i] == static_cast<std::uint8_t>(i + 1));
+  }
 }
 
 TEST_CASE("io_uring queue-delay gauge counts each request once, per priority tier",
