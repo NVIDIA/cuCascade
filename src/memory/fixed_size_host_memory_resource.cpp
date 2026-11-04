@@ -128,7 +128,14 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
     }
   }
   auto buffers = allocate_multiple_blocks_internal(total_bytes, h_reservation_slot);
-  return multiple_blocks_allocation::create(std::move(buffers), *this, res);
+  try {
+    return multiple_blocks_allocation::create(std::move(buffers), *this, res);
+  } catch (...) {
+    // create() takes the blocks only once it cannot fail, so they are still ours here (the
+    // wrapper's allocation threw): give them back with their byte and reservation accounting.
+    return_allocated_chunks(buffers, h_reservation_slot);
+    throw;
+  }
 }
 
 std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_blocks_internal(

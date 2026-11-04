@@ -111,15 +111,35 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     static std::unique_ptr<multiple_blocks_allocation> empty()
     {
       return std::unique_ptr<multiple_blocks_allocation>(
-        new multiple_blocks_allocation({}, nullptr, nullptr));
+        new multiple_blocks_allocation(nullptr, nullptr));
     }
 
-    static std::unique_ptr<multiple_blocks_allocation> create(std::vector<std::byte*> b,
+    /**
+     * @brief Wrap blocks allocated from @p m, so they are given back when the wrapper goes.
+     *
+     * Takes the blocks only once nothing can fail: if it throws, @p b is left as it was and the
+     * caller still owns the blocks (it can give them back with return_blocks()).
+     *
+     * @param b Blocks allocated from @p m and not returned since
+     * @param m The resource the blocks came from
+     * @param res The reservation they were allocated under, or null
+     * @throws std::invalid_argument if @p res is not a reservation of a host resource
+     * @throws std::bad_alloc if the wrapper cannot be allocated
+     */
+    static std::unique_ptr<multiple_blocks_allocation> create(std::vector<std::byte*>&& b,
                                                               fixed_size_host_memory_resource& m,
                                                               reservation* res = nullptr)
     {
-      return std::unique_ptr<multiple_blocks_allocation>(
-        new multiple_blocks_allocation(std::move(b), std::addressof(m), res));
+      chunked_reserved_area* arena = nullptr;
+      if (res) {
+        arena = dynamic_cast<chunked_reserved_area*>(res->_arena.get());
+        if (!arena)
+          throw std::invalid_argument("need host reservation for allocation multiple blocks");
+      }
+      std::unique_ptr<multiple_blocks_allocation> allocation(
+        new multiple_blocks_allocation(std::addressof(m), arena));
+      allocation->_blocks = std::move(b);  // cannot throw
+      return allocation;
     }
 
     ~multiple_blocks_allocation()
@@ -183,20 +203,10 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     }
 
    private:
-    explicit multiple_blocks_allocation(std::vector<std::byte*> buffers,
-                                        fixed_size_host_memory_resource* m,
-                                        reservation* res)
-      : _blocks(std::move(buffers)),
-        _mr(m),
-        _block_size(m ? m->get_block_size() : 0),
-        _reseved_memory(nullptr)
+    multiple_blocks_allocation(fixed_size_host_memory_resource* m,
+                               chunked_reserved_area* res) noexcept
+      : _mr(m), _block_size(m ? m->get_block_size() : 0), _reseved_memory(res)
     {
-      if (res) {
-        auto* h_res = dynamic_cast<chunked_reserved_area*>(res->_arena.get());
-        if (!h_res)
-          throw std::invalid_argument("need host reservation for allocation multiple blocks");
-        _reseved_memory = h_res;
-      }
     }
 
     std::vector<std::byte*> _blocks;
@@ -325,8 +335,10 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
    * @throws rmm::out_of_memory if the request does not fit in the resource's capacity or the
    *         pool cannot supply the blocks
    * @throws std::runtime_error if @p res is not a live reservation of this resource
-   * @throws std::bad_alloc if the bookkeeping cannot grow.  Whatever the upstream resource
-   *         throws when a pool expansion fails propagates unchanged (e.g. rmm::bad_alloc).
+   * @throws std::bad_alloc if the bookkeeping or the wrapper cannot be allocated.  Whatever the
+   *         upstream resource throws when a pool expansion fails propagates unchanged (e.g.
+   *         rmm::bad_alloc).  On any throw the blocks and accounting this call took are given
+   *         back.
    */
   [[nodiscard]] fixed_multiple_blocks_allocation allocate_multiple_blocks(
     std::size_t total_bytes, reservation* res = nullptr);

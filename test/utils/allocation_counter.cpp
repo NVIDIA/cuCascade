@@ -25,16 +25,18 @@
 namespace {
 
 // Constant-initialised, so reading them needs no TLS initialisation from inside operator new.
-thread_local bool counting       = false;
-thread_local std::size_t counted = 0;
+thread_local bool counting        = false;
+thread_local std::size_t counted  = 0;
+thread_local std::size_t fault_at = 0;  ///< The counted call that throws; 0 for none.
 
 }  // namespace
 
 // Replacements for the global allocation functions (the unaligned forms; the array and
-// nothrow forms forward to these).  Same malloc/free behaviour as the defaults, plus the count.
+// nothrow forms forward to these).  Same malloc/free behaviour as the defaults, plus the count
+// and the armed fault.
 void* operator new(std::size_t size)
 {
-  if (counting) { ++counted; }
+  if (counting && ++counted == fault_at) { throw std::bad_alloc{}; }
   if (void* p = std::malloc(size == 0 ? 1 : size)) { return p; }
   throw std::bad_alloc{};
 }
@@ -49,11 +51,18 @@ scoped_allocation_counter::scoped_allocation_counter() noexcept
 {
   assert(!counting && "scopes do not nest");
   counted  = 0;
+  fault_at = 0;
   counting = true;
 }
 
-scoped_allocation_counter::~scoped_allocation_counter() noexcept { counting = false; }
+scoped_allocation_counter::~scoped_allocation_counter() noexcept
+{
+  counting = false;
+  fault_at = 0;
+}
 
 std::size_t scoped_allocation_counter::count() const noexcept { return counted; }
+
+void scoped_allocation_counter::fail_at(std::size_t n) noexcept { fault_at = n; }
 
 }  // namespace cucascade::test
