@@ -632,7 +632,7 @@ Buffer peer_copy_into_async(Buffer buf,
       // "A memory copy will succeed even if it is issued to a stream that is not associated to
       // the current device."
       // https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html#multi-device-stream-event-and-memory-copy-behavior
-      // And blocks below only call copy APIs on explicitly passed streams and no current-device
+      // And scopes below only call copy APIs on explicitly passed streams and no current-device
       // sensitive APIs.
 
       // Pass 1: device-to-host, chunked across blocks. Issued on target_stream
@@ -683,7 +683,7 @@ Buffer peer_copy_into_async(Buffer buf,
           }
         }
       }
-      // stream synced by submit_and_sync
+      // stream synced by submit_and_sync, before the allocations are freed below.
     });
     // allocation's destructor returns blocks to the host pool — no cudaFreeHost.
   }

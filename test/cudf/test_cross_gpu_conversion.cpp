@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "utils/cuda_test_utils.hpp"
 #include "utils/cudf_test_utils.hpp"
 
 #include <cucascade/cudf/builtin_converters.hpp>
@@ -11,6 +12,7 @@
 #include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+#include <cucascade/utils/cleanup_utils.hpp>
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
@@ -28,7 +30,6 @@
 #include <chrono>
 #include <future>
 #include <memory>
-#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -40,14 +41,6 @@ using namespace cucascade::memory;
 
 constexpr std::size_t capacity = 64ull << 20;
 enum class null_pattern { alternating, all_null };
-
-void require_two_gpus()
-{
-  int devices = 0;
-  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
-    SKIP("requires two CUDA devices");
-  }
-}
 
 std::shared_ptr<memory_space> make_space(gpu_memory_space_config config)
 {
@@ -79,17 +72,17 @@ auto make_mask(cudf::size_type rows,
   auto mask = cudf::create_null_mask(rows, cudf::mask_state::ALL_NULL, stream, mr);
   if (mask.size() > 0 && pattern == null_pattern::alternating) {
     // Even rows valid, odd rows null; 65 rows also exercises a partial final mask word.
-    CUCASCADE_CUDA_TRY(cudaMemsetAsync(
-      mask.data(), 0x55, cudf::bitmask_allocation_size_bytes(rows), stream.get()));
+    CUCASCADE_CUDA_TRY(
+      cudaMemsetAsync(mask.data(), 0x55, cudf::bitmask_allocation_size_bytes(rows), stream.get()));
   }
   return mask;
 }
 
 // Keep test masks compatible with the installed cuDF null-mask type.
 static_assert(std::is_same_v<decltype(make_mask(0,
-                                              null_pattern::all_null,
-                                              std::declval<::cuda::stream_ref>(),
-                                              std::declval<rmm::device_async_resource_ref>())),
+                                                null_pattern::all_null,
+                                                std::declval<::cuda::stream_ref>(),
+                                                std::declval<rmm::device_async_resource_ref>())),
                              decltype(cudf::create_null_mask(0, cudf::mask_state::ALL_NULL))>);
 
 cudf::size_type null_count(cudf::size_type rows, null_pattern pattern)
@@ -215,16 +208,10 @@ void fill_masks(cudf::mutable_column_view column, int value, ::cuda::stream_ref 
   }
 }
 
-void CUDART_CB delay_producer(void*)
-{
-  // No CUDA calls inside callbacks. The byte checks, not elapsed time, are the assertion.
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
-}
-
 TEST_CASE("cross-GPU conversion preserves nullable nested contents after source release",
           "[gpu-converter][.multi-device][cross-gpu-nullable]")
 {
-  require_two_gpus();
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
   auto const source_device = GENERATE(0, 1);
   auto const rows          = GENERATE(cudf::size_type{0}, cudf::size_type{65});
   auto const pattern       = GENERATE(null_pattern::alternating, null_pattern::all_null);
@@ -240,6 +227,7 @@ TEST_CASE("cross-GPU conversion preserves nullable nested contents after source 
 
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{source_device}};
   rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  test::stream_gate producer_gate{producer.value()};
   auto table = make_table(rows, pattern, producer, source_space->get_default_allocator());
   auto source =
     std::make_unique<gpu_table_representation>(std::move(table), *source_space, producer);
@@ -260,7 +248,10 @@ TEST_CASE("cross-GPU conversion preserves nullable nested contents after source 
         fill_masks(column, 0, producer);
       }
       producer.synchronize();
-      CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(producer.value(), delay_producer, nullptr));
+      producer_gate.arm();
+      REQUIRE(producer_gate.wait_entered(std::chrono::seconds{5}));
+      // Release on a separate thread because conversion waits for this producer.
+      producer_gate.release_after(std::chrono::milliseconds{100});
       for (auto column : owned->mutable_view()) {
         fill_masks(column, 0x55, producer);
       }
@@ -289,9 +280,9 @@ TEST_CASE("cross-GPU conversion preserves nullable nested contents after source 
     auto reused =
       make_table(rows, null_pattern::all_null, producer, source_space->get_default_allocator());
   }
-  cucascade::test::expect_cudf_tables_equal_on_stream(
+  test::expect_cudf_tables_equal_on_stream(
     expected->view(), left->get_table_view(), consumer);
-  cucascade::test::expect_cudf_tables_equal_on_stream(
+  test::expect_cudf_tables_equal_on_stream(
     expected->view(), right->get_table_view(), consumer);
 }
 
@@ -299,6 +290,7 @@ TEST_CASE("cross-GPU conversion preserves nullable nested contents after source 
 // interfaces. The event is queued after the first column's peer copy and queried before cleanup.
 struct failure_state {
   std::unique_ptr<rmm::mr::cuda_async_memory_resource> upstream;
+  std::unique_ptr<test::stream_gate> copy_gate;
   int allocations{0};
   bool armed{false};
   cudaEvent_t submitted{};
@@ -319,7 +311,9 @@ class failing_resource {
     auto* ptr =
       rmm::device_async_resource_ref{*_state->upstream}.allocate(stream, bytes, alignment);
     if (_state->armed && _state->allocations == 1) {
-      CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(stream.get(), delay_producer, nullptr));
+      _state->copy_gate = std::make_unique<test::stream_gate>(stream.get());
+      _state->copy_gate->arm();
+      _state->copy_gate->release_after(std::chrono::milliseconds{100});
     }
     return ptr;
   }
@@ -350,19 +344,21 @@ class failing_resource {
 TEST_CASE("cross-GPU conversion drains submitted copies before propagating allocation failure",
           "[gpu-converter][.multi-device][cross-gpu-nullable]")
 {
-  require_two_gpus();
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
   rmm::cuda_set_device_raii destination_guard{rmm::cuda_device_id{1}};
   auto state      = std::make_shared<failure_state>();
   state->upstream = std::make_unique<rmm::mr::cuda_async_memory_resource>(capacity);
   CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&state->submitted, cudaEventDisableTiming));
   // Create the event before the spaces so it outlives all resource users.
-  auto event_cleanup = std::shared_ptr<void>{
-    nullptr, [state](void*) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(state->submitted)); }};
+  utils::on_scope_exit event_cleanup{
+    [&]() noexcept { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(state->submitted)); }};
   auto source_space      = make_space({.device_id = 0, .memory_capacity = capacity});
   auto destination_space = make_space(
     {.device_id = 1, .memory_capacity = capacity, .mr_factory_fn = [state](int, std::size_t) {
        return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{failing_resource{state}};
      }});
+  // The gate must drain before its borrowed copy stream is destroyed with destination_space.
+  utils::on_scope_exit gate_cleanup{[&]() noexcept { state->copy_gate.reset(); }};
   auto const source_pool = source_space->get_memory_resource_of<Tier::GPU>()->pool_handle();
   if (!grant_pool_peer_access(source_pool, 0, 1).granted() ||
       !grant_pool_peer_access(state->upstream->pool_handle(), 1, 0).granted() ||
