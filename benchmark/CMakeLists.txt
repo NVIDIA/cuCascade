@@ -49,7 +49,8 @@ FetchContent_MakeAvailable(benchmark)
 # Collect all benchmark sources
 set(BENCHMARK_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_representation_converter.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_disk_converter.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_disk_converter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_gpu_to_gpu_converter.cpp)
 
 # Create benchmark executable
 add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})
@@ -57,6 +58,7 @@ add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})
 # Set include directories
 target_include_directories(
   cucascade_benchmarks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/../test
                                ${benchmark_SOURCE_DIR}/include)
 
 # Apply warning flags to benchmark executable. Suppress -Wnull-dereference:
@@ -72,7 +74,8 @@ target_compile_options(
 # Link dependencies
 target_link_libraries(
   cucascade_benchmarks PRIVATE cucascade_cudf benchmark::benchmark
-                               benchmark::benchmark_main CUDA::cudart_static)
+                               benchmark::benchmark_main CUDA::cudart_static
+                               cudf::cudftest_default_stream)
 
 # Add custom target to run benchmarks
 add_custom_target(
