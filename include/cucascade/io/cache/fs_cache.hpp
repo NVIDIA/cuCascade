@@ -1,0 +1,724 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cucascade/exec/completion_controller.hpp>
+#include <cucascade/exec/cuda_event_completion_poll.hpp>
+#include <cucascade/exec/invocable.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/exec/thread_pool.hpp>
+#include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/cache/metadata_store.hpp>
+#include <cucascade/io/cache/types.hpp>
+#include <cucascade/io/concurrent_queue.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <latch>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
+#include <stop_token>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+namespace cucascade::io {
+class ioctx;
+class datasource;
+}  // namespace cucascade::io
+
+namespace cucascade::cuda {
+class device_copy_batch;
+}  // namespace cucascade::cuda
+
+namespace cucascade::memory {
+class topology_index;
+}  // namespace cucascade::memory
+
+namespace cucascade::memory {
+class memory_reservation_manager;
+}  // namespace cucascade::memory
+
+namespace cucascade::io::cache {
+
+/// Which resident chunks @ref fs_cache::reclaim may take.
+enum class reclaim_mode : std::uint8_t {
+  /// Only chunks no live prefetch request subscribes to -- what the background
+  /// evictor reclaims first.  Safe under ordinary memory pressure: it costs
+  /// only future hits on data nobody has asked for.
+  idle,
+  /// Also chunks a live request still subscribes to (their request falls back
+  /// to reading from the backend).  A last resort for an embedder that still
+  /// owes memory after everything else.
+  forced,
+};
+
+/// True when every chunk of @p chunks owns a staging buffer, i.e. its
+/// @c chunk_state has reached @c allocated and has not been reclaimed since.
+/// This is the precondition of the producer's @c prepared stage.  One relaxed
+/// load per chunk, so the sweep is cheap enough not to need a summary counter.
+[[nodiscard]] inline bool all_chunks_have_buffers(const std::vector<cached_chunk*>& chunks) noexcept
+{
+  return std::ranges::all_of(chunks, [](const cached_chunk* c) {
+    auto const s = c->state.get_state();
+    return s >= chunk_state::allocated && s != chunk_state::evicting;
+  });
+}
+
+/// One version of a cached object; defined in fs_cache.cpp.
+struct cache_generation;
+
+/// The last failure of an issued prefetch attempt, kept by the request so its
+/// consumer can ask after the terminal notification.  Stored before the
+/// producer leaves @c loading; a later successful attempt does not clear it.
+struct prefetch_failure_slot {
+  std::mutex mtx;
+  std::exception_ptr failure;
+};
+
+/// Completion of the IO submitted by one prefetch. Success alone does not
+/// imply coverage: another loader may own some of the requested chunks.
+struct prefetch_result {
+  bool ok{false};  ///< the IO this prefetch submitted (if any) succeeded
+  /// Conservative residency evidence, holding no pins.  Without IO: true only
+  /// when every requested extent was resident (cached or pinned) when the
+  /// prefetch sampled it.  With IO: true only when the fill of each chunk the
+  /// prefetch claimed covers that chunk's requested extent, each other extent
+  /// was resident when sampled, and every requested extent was resident again
+  /// when that IO completed.  A chunk another loader (a demand read) claimed
+  /// first is not covered, even when this prefetch's own IO succeeded.
+  /// Reclaim, eviction or the release of a retired generation can drop
+  /// residency before or after on_done runs, so readers take their own pins
+  /// and may fall back to the backend.
+  bool covered{false};
+};
+
+/// One prefetch request: the two stage machines plus the chunk set they cover.
+/// Held by value — the cache's queues and the owning @ref cache_handle
+/// each carry a copy, so the stages outlive whichever side finishes first.
+/// The copies do not own the generation whose chunks they name: @c generation
+/// is a weak reference, and the handle carries the owner separately.  The copy
+/// handed to the evictor also drops @c obj.  A request parked in the evictor's
+/// queue therefore keeps neither a retired generation nor its object alive;
+/// what it does retain is its own chunk-pointer vector and stage machines.
+struct prefetch_request {
+  std::shared_ptr<const io_object> obj;
+  std::shared_ptr<producer_stage> producer;
+  std::shared_ptr<consumer_stage> consumer;
+  std::shared_ptr<const std::vector<cached_chunk*>> chunks;
+  /// Immutable requested extents, index-parallel with @c chunks. A resident
+  /// chunk can have a narrower fill than this request needs.
+  std::shared_ptr<const std::vector<chunk_fill>> required_fills;
+  std::weak_ptr<cache_generation> generation;
+  std::shared_ptr<prefetch_failure_slot> failure;
+  std::uint32_t timestamp{0};
+  /// Preferred NUMA node for the staging buffers, derived from the requesting
+  /// GPU's topology.  -1 means "no preference" (allocate from any arena).
+  int preferred_numa{-1};
+  /// Eviction started by a failed nonblocking prepare. A later blocking retry
+  /// waits for this pass rather than requesting the same shortfall twice.
+  std::shared_ptr<std::latch> pending_eviction;
+
+  /// False for the empty request the queues use as a wakeup sentinel.
+  [[nodiscard]] explicit operator bool() const noexcept { return producer != nullptr; }
+
+  /// True once the consumer has queued the scan and has not been disposed.
+  [[nodiscard]] bool is_active() const noexcept
+  {
+    if (!consumer) { return false; }
+    auto const s = consumer->get();
+    return s >= consumer_stage::queued && s != consumer_stage::disposed;
+  }
+
+  /// True once the consumer is gone: no consumer machine, or it is disposed.
+  /// This is the disposal check, and it stays meaningful after the IO has been
+  /// issued -- which is what the evictor needs to hand a subscriber reference
+  /// back, and what a request re-checks once it clears the rate limiter.
+  [[nodiscard]] bool is_cancelled() const noexcept
+  {
+    return !consumer || consumer->get() == consumer_stage::disposed;
+  }
+
+  /// True when the readahead lost the race: the consumer has reached
+  /// @c preparing or beyond -- so the executor is already pulling this split's
+  /// bytes through itself -- while this request's IO has not started.  Issuing
+  /// the prefetch now would only duplicate the read that is already happening,
+  /// so the gates that decide whether to begin one turn it away here.
+  ///
+  /// Deliberately false once the producer reaches @c loading: at that point the
+  /// IO is in flight and there is nothing left to call off, so the question
+  /// stops being "is this worth starting" and becomes "is the consumer still
+  /// there" -- which is @ref is_cancelled.
+  [[nodiscard]] bool has_fallen_behind() const noexcept
+  {
+    if (!consumer || !producer) { return true; }
+    return consumer->get() >= consumer_stage::preparing &&
+           producer->get() < producer_stage::loading;
+  }
+};
+
+/// How an attempt to attach staging buffers to a prefetch request resolved.
+/// Allocation pressure is deliberately non-terminal: the request stays queued
+/// so a caller can evict and retry it later.
+enum class prepare_result : std::uint8_t {
+  prepared,
+  allocation_failed,
+  fallen_behind,
+  unavailable,
+};
+
+/// A standing demand on the evictor: free at least @p bytes_to_free bytes of
+/// staging memory, whether or not the pool has crossed its own pressure
+/// threshold.
+///
+/// The evictor's own trigger is a fraction of what the pool holds, which is the
+/// right rule when the cache is the only thing under pressure and the wrong one
+/// when it is not: a caller that needs a specific amount back -- because its own
+/// allocation just failed, or because it is about to make a large one -- knows a
+/// number the cache cannot derive.  This carries that number.
+///
+/// A demand, not a guarantee: the evictor frees what it can reclaim. A
+/// synchronous caller learns that the pass finished, not how much it freed.
+/// Chunks a reader has pinned stay put, so a request for more than is reclaimable
+/// simply frees everything reclaimable.
+struct eviction_request {
+  std::size_t bytes_to_free{0};
+  /// Present when a caller may wait for this pass (including after an async
+  /// prepare failure). Counted down even when nothing was reclaimable.
+  std::shared_ptr<std::latch> processed;
+};
+
+/// What the evictor's queue carries.  Two things reach it: prefetch requests,
+/// handed over at creation so their chunks become eviction candidates once the
+/// consumer is done, and explicit demands for memory back.  They are different
+/// enough that a single struct would have to encode "which kind am I" in a
+/// field, so the queue carries the variant and the loop visits it.
+///
+/// A default-constructed value holds an empty @ref prefetch_request, which is
+/// the queue's wakeup sentinel -- see @ref fs_cache::evict_loop.
+using cache_request = std::variant<prefetch_request, eviction_request>;
+
+using request_queue_type = blocking_concurrent_queue<cache_request>;
+
+class cache_handle {
+ public:
+  cache_handle() noexcept = default;
+  /// Marks the consumer disposed so the evictor can reclaim the request.
+  ~cache_handle();
+  cache_handle(cache_handle const&)            = delete;
+  cache_handle& operator=(cache_handle const&) = delete;
+
+  cache_handle(cache_handle&& o) noexcept;
+  cache_handle& operator=(cache_handle&& o) noexcept;
+
+  /// Drive the consumer-side stage machine.
+  void update(scan_stage stage) noexcept;
+
+  [[nodiscard]] bool is_active() const noexcept;
+
+  /// Producer-side state of this request, for the prefetch census.
+  [[nodiscard]] producer_stage::value producer_state() const noexcept;
+
+  /// True while this request's prefetch IO is in flight.  Cache reads consult
+  /// this only after finding a loading chunk from this handle that overlaps the
+  /// specific read; unrelated ranges must not inherit the dependency.
+  [[nodiscard]] bool is_prefetch_in_flight() const noexcept;
+
+  /// True once the consumer reached @c scan_stage::reading — the executor is
+  /// pulling this split's bytes through itself, so a prefetch started now would
+  /// only duplicate that IO.
+  [[nodiscard]] bool has_started_reading() const noexcept;
+
+  /// Block until the prefetch IO settles.  Returns true iff it completed
+  /// successfully (the chunks are now cache-resident); false if it failed or
+  /// the request was abandoned.  No-op and returns false on an empty handle.
+  [[nodiscard]] bool wait_until_ready() noexcept;
+
+  /// Block until staging buffers have been allocated for every chunk in this
+  /// request (producer state >= prepared).  Returns true iff preparation
+  /// succeeded; false means the request was abandoned because the consumer
+  /// overtook it or the cache shut down.  No-op and returns false on an empty
+  /// handle.
+  [[nodiscard]] bool wait_until_prepared() noexcept;
+
+  /// The exception a failed prefetch ended with; null when none has failed.
+  /// Available once @ref wait_until_ready returns or the prefetch's completion
+  /// callback runs.
+  [[nodiscard]] std::exception_ptr failure() const noexcept;
+
+  /// The chunks of the underlying request.  Null when the handle is empty.
+  [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
+
+  /// Total time demand reads through this handle spent parked on its in-flight
+  /// prefetch (see @c fs_cache::await_inflight_prefetch).  Concurrent
+  /// waiters each contribute their own wait.
+  [[nodiscard]] std::uint64_t demand_wait_ns() const noexcept
+  {
+    return _demand_wait_ns.load(std::memory_order_relaxed);
+  }
+
+  explicit operator bool() const noexcept;
+
+ private:
+  friend class fs_cache;
+
+  cache_handle(prefetch_request req, std::shared_ptr<cache_generation> generation) noexcept;
+
+  std::shared_ptr<cache_generation> _generation;
+  prefetch_request _req;
+  std::atomic<std::uint64_t> _demand_wait_ns{0};
+};
+
+// ---------------------------------------------------------------------------
+// fs_cache
+// ---------------------------------------------------------------------------
+//
+// Locking hierarchy:
+//   Level 0: _map_mtx                — protects _file_cache and _generations_by_path
+//   Level 1: _retire_mtx             — shared by readers of a generation's chunks
+//                                      (the evictor); exclusive while a generation's
+//                                      buffers are reclaimed and it is destroyed
+//   Level 2: cache_generation::mtx   — protects one generation's slot table
+//   (independent): chunk_state atomics — lock-free
+
+class fs_cache {
+  // The cache only accepts new prefetch requests through
+  // datasource::fadvise — that's the single entry point for the
+  // fadvise(scan_stage) protocol.  Friending the
+  // datasource keeps insert() out of the public API while still letting
+  // fadvise dispatch through it.
+  friend class cucascade::io::datasource;
+  friend class cache_handle;
+  friend struct fs_cache_test_access;
+
+ public:
+  using byte_range = cucascade::io::byte_range;
+
+  fs_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
+           ioctx* io_ctx,
+           const config& cfg,
+           std::shared_ptr<const cucascade::memory::topology_index> topology_index);
+  ~fs_cache();
+
+  fs_cache(fs_cache const&)            = delete;
+  fs_cache& operator=(fs_cache const&) = delete;
+
+  [[nodiscard]] bool is_armed() const noexcept { return _armed; }
+
+  /// Bytes per cached chunk, taken from the buffer pool at construction.  A
+  /// reactor that fills chunks must plan its physical ranges with exactly this
+  /// value (see @c ioctx::staging_block_size), so it has to be readable from
+  /// outside the cache.
+  [[nodiscard]] std::size_t chunk_size() const noexcept { return _chunk_size; }
+
+  // @p priority on the reads below is the reactor queue tier for whatever the
+  // cache cannot serve itself (see @ref io_priority); @c automatic resolves to
+  // high for every form (these are demand reads).  Only the cache's own
+  // prefetch runs low.
+
+  [[nodiscard]] std::size_t host_read(const io_object& obj,
+                                      size_t offset,
+                                      size_t size,
+                                      uint8_t* dst,
+                                      cache_handle* handle = nullptr,
+                                      io_priority priority = io_priority::automatic);
+
+  [[nodiscard]] exec::semi_future<std::size_t> host_read_async(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    cache_handle* handle = nullptr,
+    io_priority priority = io_priority::automatic);
+
+  [[nodiscard]] exec::semi_future<std::size_t> device_read_async(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* device_ptr,
+    ::cuda::stream_ref stream,
+    cache_handle* handle = nullptr,
+    io_priority priority = io_priority::automatic);
+
+  /// Vectored form of @ref device_read_async: each range is served from the
+  /// cache where it is populated, loaded through the cache where it can be, and
+  /// bounced through the backend otherwise — all in one dispatch. Reports the
+  /// clamped logical byte count once both backend work and cache-resident H2D
+  /// copies have passed their CUDA completion points.
+  [[nodiscard]] exec::semi_future<std::size_t> device_read_ranges_async(
+    const io_object& obj,
+    std::span<const slice> slices,
+    ::cuda::stream_ref stream,
+    cache_handle* handle = nullptr,
+    io_priority priority = io_priority::automatic);
+
+  /// Vectored form of @ref host_read_async: each range is served from the cache
+  /// where populated, claimed and populated when possible, and read directly
+  /// into the caller buffer otherwise. Reports the clamped logical byte count
+  /// once every physical operation has settled.
+  [[nodiscard]] exec::semi_future<std::size_t> host_read_ranges_async(
+    const io_object& obj,
+    std::span<const slice> slices,
+    cache_handle* handle = nullptr,
+    io_priority priority = io_priority::automatic);
+
+  /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
+  /// with the outcome — inline when no IO is issued, otherwise from the IO
+  /// completion. @c covered is the conservative, unpinned residency evidence
+  /// defined at @ref prefetch_result::covered. Returns whether IO was issued.
+  /// Without IO the outcome is @c {false, false} when the request is refused
+  /// (empty, fallen behind, cancelled, already loading, a backend without
+  /// vectored host reads, or a failed setup), and @c {true, covered} when
+  /// nothing was claimable (every chunk already resident or loading for
+  /// another reader).
+  bool prefetch(cache_handle& handle, exec::invocable<void(prefetch_result) noexcept> on_done);
+
+  /// Test-only hook run inside @ref prefetch after the producer is published
+  /// as loading and before any chunk is claimed, with no cache lock held.
+  /// Configure only while no prefetch can run.
+  void set_before_prefetch_claim_for_testing(std::function<void()> hook)
+  {
+    _before_prefetch_claim = std::move(hook);
+  }
+
+  /// Test-only hook run when a new prefetch request has subscribed to its
+  /// chunks and is about to be handed to the evictor; a throw from it takes
+  /// the path of a failed hand-off (the request's subscriptions are rolled
+  /// back).  Configure only while no request can be created.
+  void set_before_request_enqueue_for_testing(std::function<void()> hook)
+  {
+    _before_request_enqueue = std::move(hook);
+  }
+
+  /// Test-only hook run while a new prefetch request acquires its chunks: after
+  /// it has subscribed to every chunk already materialised and before it
+  /// materialises the missing ones, only when some are missing, with no cache
+  /// lock held.  A throw from it takes the path of a failure part-way through
+  /// acquisition (growing the list of missing chunks or allocating the first
+  /// of them): the subscriptions already taken are rolled back.  It cannot
+  /// fail the request after a missing chunk was materialised.  Configure only
+  /// while no request can be created.
+  void set_before_chunk_materialise_for_testing(std::function<void()> hook)
+  {
+    _before_chunk_materialise = std::move(hook);
+  }
+
+  /// Test-only hook run inside @ref reclaim for each chunk the sweep is about to
+  /// claim: after the chunk passed the sweep's filters (for a NUMA-scoped
+  /// reclaim, including the node hint read before the claim) and before
+  /// @c mark_evicting.  It runs with that chunk's generation lock held
+  /// exclusively and no other cache lock, so it may drive the evictor and
+  /// prepare an existing request, but not create a request, read, or reclaim
+  /// (they take the generation lock).  The sweep is noexcept: the hook must not
+  /// throw.  The last-owner and teardown sweeps do not run it, nor does the
+  /// sweep of a superseded version when a new version of the object is opened
+  /// (@c reclaim_idle_chunks).  Configure only while no reclaim can run.
+  void set_before_reclaim_claim_for_testing(std::function<void(cached_chunk const&)> hook)
+  {
+    _before_reclaim_claim = std::move(hook);
+  }
+
+  /// Bytes of staging memory the cache currently holds: every chunk buffer
+  /// handed out by the pool and not yet reclaimed.  This is what an explicit
+  /// @ref evict can act on -- the ceiling on how much it could ever free, and
+  /// the number to re-read afterwards to see how much it did.
+  ///
+  /// A relaxed read of a counter other threads are moving, so it is a snapshot
+  /// rather than a value to compute an exact target from.
+  [[nodiscard]] std::size_t claimed_bytes() const noexcept;
+
+  /// Bytes that returning chunks would give back to the HOST space(s) right now.
+  /// Chunks inside each space's prefetch reservation do not count. Optionally
+  /// restrict to one NUMA node. This is a relaxed snapshot, not a guarantee that
+  /// the chunks are currently reclaimable (readers or IO may hold them).
+  [[nodiscard]] std::size_t releasable_bytes(
+    std::optional<int> numa_node = std::nullopt) const noexcept;
+
+  /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
+  ///
+  /// Asynchronous and best-effort: this enqueues the demand and returns.  The
+  /// evictor gets to it on its next round and frees what it can -- chunks a
+  /// reader has pinned are not reclaimable, so a demand larger than what is
+  /// reclaimable frees everything reclaimable and no more.  Poll
+  /// @ref claimed_bytes to see the result.
+  ///
+  /// The point of it is that memory pressure is not always the cache's own: the
+  /// evictor's built-in trigger fires on the pool's occupancy, which says
+  /// nothing about a GPU allocation failing elsewhere.  This is how something
+  /// that knows it needs host memory back says so.
+  ///
+  /// A zero request is a no-op, as is one on a cache that is not armed or is
+  /// already shutting down.
+  void evict(std::size_t bytes_to_free);
+
+  /// Synchronously return resident chunk buffers to the cache's pool, on the
+  /// calling thread, independent of the evictor and its queue: an embedder
+  /// under host memory pressure (for example a HOST downgrade executor) frees
+  /// cache memory before it spills anything else.
+  ///
+  /// Sweeps every live generation (retired ones first) and stops once
+  /// @p target_bytes worth of chunks were reclaimed -- whole chunks, so up to
+  /// one chunk more than asked -- or every chunk was visited.  A chunk pinned
+  /// by a reader or still loading is never taken; @ref reclaim_mode::idle also
+  /// spares chunks a live request subscribes to.  Each reclaimed chunk counts
+  /// as an eviction in @ref summary.
+  ///
+  /// A zero target, an unarmed cache and a cache shutting down return 0.
+  /// Takes the map lock shared and each generation's lock exclusively, so it
+  /// must not be called with a cache lock held.
+  ///
+  /// @param numa_node Only reclaim chunks from this NUMA node, if specified.
+  /// @return bytes returned to the pool (including bytes inside the reservation).
+  std::size_t reclaim(reclaim_mode mode,
+                      std::size_t target_bytes     = std::numeric_limits<std::size_t>::max(),
+                      std::optional<int> numa_node = std::nullopt);
+
+  /// Ask the evictor to free at least @p bytes_to_free and wait until that
+  /// request has been processed. This acknowledges an eviction pass, not that
+  /// the requested number of bytes could necessarily be reclaimed.
+  void evict_sync(std::size_t bytes_to_free);
+
+  /// Observe totals and activity since the last refresh without advancing the baseline.
+  [[nodiscard]] std::string summary() const;
+
+  /// Advance the query epoch and close one cache-wide reporting interval. Returns
+  /// the report for that exact sample; concurrent queries may contribute to it.
+  std::string prepare_for_query();
+
+  [[nodiscard]] uint32_t query_epoch() const noexcept
+  {
+    return _ticker.load(std::memory_order_relaxed);
+  }
+
+  /// Test-only: how many generations are reachable by key (live, not retired).
+  [[nodiscard]] std::size_t file_entry_count_for_testing() const noexcept
+  {
+    std::shared_lock lock(_map_mtx);
+    return _file_cache.size();
+  }
+
+  /// Test-only: how many prefetch requests @ref evict_loop was tracking at the
+  /// start of its last round, once that round's new arrivals were absorbed.
+  [[nodiscard]] std::size_t eviction_batch_size_for_testing() const noexcept
+  {
+    return _eviction_batch_size.load(std::memory_order_relaxed);
+  }
+
+  /// Generations of exactly @p object_path that are still alive: the current
+  /// one in the map plus any retired one some operation still owns.
+  [[nodiscard]] std::size_t generation_count(std::string_view object_path) const noexcept;
+
+  /// Alive generations that are no longer in the map, over all paths.  Zero
+  /// means every retired generation has been reclaimed.
+  [[nodiscard]] std::size_t retired_generation_count() const noexcept;
+
+ private:
+  struct cached_copy_retirement;
+
+  [[nodiscard]] cache_handle initiate_prefetching_request(const io_object& obj,
+                                                          std::span<const byte_range> ranges,
+                                                          std::optional<int> gpu_id = {});
+
+  /// Attach staging buffers to @p handle's request, so a following @ref prefetch
+  /// has chunks it can claim: a chunk without a buffer cannot be taken for
+  /// loading, and a prefetch over one issues no IO and settles `ready` having
+  /// done nothing.
+  ///
+  /// @p wait_for_eviction lets the call wait for the evictor to hand chunks back
+  /// rather than fail on a momentarily empty pool.  Callers that can afford to
+  /// stall -- the readahead, whose whole job is to be ahead -- should; callers
+  /// on a read path should not.
+  ///
+  /// Private, and reached only through @c datasource (which the readahead
+  /// drives via @c scan_info::prepare_for_prefetching): preparing is part of the
+  /// fadvise-owned request lifecycle, not something an arbitrary caller starts.
+  ///
+  /// @return why the request was or was not prepared. Allocation failure leaves
+  ///         the request queued and retryable; a nonblocking failure also
+  ///         requests asynchronous eviction. Falling behind abandons it.
+  prepare_result prepare(cache_handle& handle, bool wait_for_eviction);
+
+  [[nodiscard]] prepare_result prepare_request(prefetch_request& req,
+                                               bool wait_for_eviction = false);
+
+  [[nodiscard]] std::shared_ptr<cache_generation> generation_for(const io_object& obj,
+                                                                 cache_handle* handle) const;
+
+  /// Resolve cache positions handle-first, then against @p generation.
+  /// A partial lookup preserves every materialised position so the read planner
+  /// can mix resident, loadable, and backend-staged pieces in one dispatch.
+  [[nodiscard]] std::vector<cached_chunk*> ranges_in_cache(cache_generation const* generation,
+                                                           size_t offset,
+                                                           size_t size,
+                                                           coverage_policy policy,
+                                                           cache_handle* handle) const;
+
+  /// Return only the chunks named by @p handle that overlap one logical read.
+  /// Unlike @ref ranges_in_cache this never falls back to the file-wide cache:
+  /// the producer stage belongs to this handle, so it may only be used to wait
+  /// for work that this handle actually names.
+  [[nodiscard]] std::vector<cached_chunk*> ranges_in_handle(std::size_t offset,
+                                                            std::size_t size,
+                                                            coverage_policy policy,
+                                                            cache_handle* handle) const;
+
+  /// Wait for an active prefetch only when one of this read call's handle chunks
+  /// is currently loading. Loading chunks owned by demand IO are left alone;
+  /// the normal planner will route those pieces through backend-owned bounce
+  /// staging instead of serialising two executor reads.
+  void await_inflight_prefetch(const io_object& obj,
+                               std::span<const slice> requests,
+                               cache_handle* handle) const;
+
+  /// Enqueue @p copies and keep their cache-hit pins alive until @p stream has
+  /// passed them. The preallocated retirement also settles the cache-copy
+  /// credit in the caller's grouped coordinator, so even an all-hit read's
+  /// future waits for the asynchronous H2D work.
+  void retire_pins_after_stream(::cuda::stream_ref stream,
+                                cucascade::cuda::device_copy_batch const& copies,
+                                std::shared_ptr<cached_copy_retirement> retirement) noexcept;
+
+  /// Pop every request still sitting in @p queue and retire its producer on
+  /// @c producer_stage::abandoned, so a shutdown never leaves a request parked
+  /// in a transient stage with waiters asleep on it.
+  static void drain_and_abandon(request_queue_type& queue) noexcept;
+
+  void evict_loop(const std::stop_token& st);
+
+  /// Teardown-only final sweep: hand every still-resident chunk buffer back to
+  /// @c _pool before it is destroyed. @c evict_loop breaks out on the stop
+  /// signal without reclaiming (see its shutdown check), so without this every
+  /// chunk that was cached/allocated at reset/destruction time would leak its
+  /// block out of the underlying @c fixed_size_host_memory_resource for the
+  /// rest of the process's life -- @c buffer_pool's destructor only releases
+  /// its reservation (a budget claim), not blocks the resource was never told
+  /// to free. Must run after @c drain_inflight_io() and joining the evictor,
+  /// so nothing else can be racing chunk state. Ignores subscriber counts (no
+  /// query can be concurrently executing while a cache is reset/torn down) but
+  /// never reclaims a chunk with an active pin -- @c mark_evicting refuses
+  /// those unconditionally, so this can never pull a buffer out from under a
+  /// live reader; any such chunk is left alone and logged instead.
+  void reclaim_all_chunks() noexcept;
+
+  std::shared_ptr<cache_generation> get_or_create_generation(const io_object& obj);
+
+  void reclaim_idle_chunks(cache_generation& generation) noexcept;
+
+  std::function<void()> _before_prefetch_claim;
+  std::function<void()> _before_request_enqueue;
+  std::function<void()> _before_chunk_materialise;
+  std::function<void(cached_chunk const&)> _before_reclaim_claim;
+  const config _cfg;
+  std::shared_ptr<buffer_pool> _pool;
+  size_t _chunk_size = 1;
+
+  ioctx* const _io_ctx;
+
+  // Hardware GPU/NUMA topology index, shared by the embedding engine.  Used to
+  // place prefetch staging buffers on the NUMA node closest to the target GPU.
+  std::shared_ptr<const cucascade::memory::topology_index> const _topology_index;
+
+  bool const _armed;
+
+  std::atomic<bool> _shutting_down{false};
+
+  std::atomic<uint32_t> _ticker{0};  // see prefetch_stats::snapshot for layout
+
+  // ---- Telemetry counters --------------------------------------------------
+  // Global cumulative counts.  @c _last_reported snapshots them on every cache
+  // refresh (prepare_for_query). Intervals are cache-wide, not attributed to a query.
+  struct counters {
+    std::atomic<uint64_t> n_reads{0};    // device read requests served by the cache
+    std::atomic<uint64_t> hits{0};       // chunks served from cache (read pin acquired, in_use)
+    std::atomic<uint64_t> h2d{0};        // chunks (re)loaded via host->device IO (mark_loading)
+    std::atomic<uint64_t> misses{0};     // chunks read fresh (missing / not yet usable)
+    std::atomic<uint64_t> evictions{0};  // chunks evicted back to the pool
+  };
+  struct counters_snapshot {
+    uint64_t n_reads{0};
+    uint64_t hits{0};
+    uint64_t h2d{0};
+    uint64_t misses{0};
+    uint64_t evictions{0};
+  };
+
+  [[nodiscard]] counters_snapshot sample_counters() const noexcept;
+  [[nodiscard]] static std::string format_summary(counters_snapshot const& sample,
+                                                  counters_snapshot const& baseline);
+
+  counters _counters;
+  /// Serializes sampling the counters against the @c _last_reported baseline:
+  /// summary() samples and reads it, prepare_for_query() samples, reads and
+  /// advances it as one step, and an embedder may call both from concurrent
+  /// queries.  The counters themselves are atomics and need no lock.
+  mutable std::mutex _summary_mutex;
+  counters_snapshot _last_reported;
+
+  /// One slot per issued cache-backed IO, retained by its physical completion
+  /// callback until no reactor can touch cache-owned chunk state. This is NOT
+  /// a rate limit -- @c acquire
+  /// never blocks, and how much read-ahead is in flight is the readahead
+  /// manager's budget to set.  It exists because the completion writes through
+  /// raw @c cached_chunk pointers into file entries this cache owns, so the
+  /// destructor has to wait those completions out before letting them go.
+  exec::completion_controller _inflight_io;
+  std::mutex _inflight_io_mtx;
+
+  [[nodiscard]] exec::completion_controller::slot acquire_inflight_io() noexcept;
+
+  /// Block until every issued prefetch IO has run its completion.  Closes
+  /// @ref _inflight_io, so it is a teardown step and not repeatable.
+  void drain_inflight_io() noexcept;
+
+  std::jthread _evictor_thread;
+  request_queue_type _eviction_queue;
+  /// Size of @ref evict_loop's tracked-request batch at the start of its last
+  /// round.  Written only by the evictor thread; read only by tests.
+  std::atomic<std::size_t> _eviction_batch_size{0};
+  std::stop_source _evictor_stop_source;
+  bool _dispose_on_idle{false};
+
+  mutable std::shared_mutex _map_mtx;
+  std::unordered_map<std::string, std::shared_ptr<cache_generation>> _file_cache;
+  std::unordered_map<std::string,
+                     std::vector<std::weak_ptr<cache_generation>>,
+                     detail::string_hash,
+                     std::equal_to<>>
+    _generations_by_path;
+  std::shared_ptr<std::shared_mutex> _retire_mtx;
+
+  /// One stream-ordered ticket frontier replaces a CUDA event per cached-copy
+  /// batch. The bounded waiter pool drives that frontier so an all-hit read
+  /// future can settle even when no later cache operation arrives to drain it.
+  /// Declared before the waiters so their threads stop before its destructor.
+  exec::cuda_event_completion_poll _completion_poll;
+  exec::static_thread_pool _completion_waiters{2, "cache_complete"};
+};
+
+}  // namespace cucascade::io::cache

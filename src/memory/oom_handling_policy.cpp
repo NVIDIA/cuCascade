@@ -24,7 +24,7 @@ namespace cucascade {
 namespace memory {
 
 void* throw_on_oom_policy::do_handle_oom([[maybe_unused]] std::size_t bytes,
-                                         [[maybe_unused]] rmm::cuda_stream_view stream,
+                                         [[maybe_unused]] ::cuda::stream_ref stream,
                                          std::exception_ptr eptr,
                                          [[maybe_unused]] RetryFunc retry_function)
 {

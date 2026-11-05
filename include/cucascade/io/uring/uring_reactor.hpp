@@ -22,10 +22,13 @@
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
+#include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/io/uring/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+
+#include <cudf/io/text/byte_range_info.hpp>
 
 #include <cuda_runtime.h>
 
@@ -33,7 +36,9 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -42,32 +47,7 @@
 #include <thread>
 #include <vector>
 
-namespace {
-inline void cuda_check(cudaError_t e, char const* file, int line)
-{
-  if (e != cudaSuccess)
-    throw std::runtime_error(std::string("CUDA error ") + file + ":" + std::to_string(line) +
-                             " – " + cudaGetErrorString(e));
-}
-}  // namespace
-
-#define CUDA_CHECK(call) cuda_check((call), __FILE__, __LINE__)
-
 namespace cucascade::io::uring {
-
-// ---- bounce_slot -----------------------------------------------------------
-
-/**
- * @brief One pinned-memory staging buffer.
- *
- * The buffer is a non-owning pointer into a block owned by the reactor's
- * @c fixed_size_host_memory_resource allocation — the resource frees the
- * memory when the reactor is destroyed.  Used only by managed device reads;
- * host and BYO device reads supply their own destination buffer.
- */
-struct bounce_slot {
-  void* buf{nullptr};
-};
 
 // ---------------------------------------------------------------------------
 // local_io_object
@@ -76,33 +56,48 @@ struct bounce_slot {
 /**
  * @brief Concrete @c io_object backed by a filesystem path.
  *
- * Passive bag of native handles.  The buffered @c O_RDONLY fd
- * (for @c pread / host_read) and the @c O_DIRECT fd (for reactor-driven
- * device reads) are produced by @c uring_reactor::create_io_object — this
- * class does no I/O of its own.
+ * Passive bag of native handles. The buffered @c O_RDONLY fd and, when the
+ * filesystem supports it, an optional @c O_DIRECT fd are produced by
+ * @c uring_reactor::create_io_object. This class does no I/O of its own.
+ *
+ * The object carries the @c local_stat identity of its buffered fd (captured
+ * by the reactor, or from the fd here) and takes its size from it; when the fd
+ * cannot be stat'ed, the object keeps the given size and the base class's
+ * open-local identity.
  */
 class local_io_object : public io_object {
  public:
+  /// @p captured is the identity the reactor took from @p fd; when it is not a
+  /// @c local_stat identity, it is captured from @p fd here.
   local_io_object(std::string path,
                   file_descriptor fd,
                   file_descriptor fd_direct,
                   size_t file_size,
-                  std::string_view hash = "")
+                  std::string_view hash    = "",
+                  object_identity captured = {})
     : _path(std::move(path)),
+      _hash(hash.empty() ? std::string_view{_path} : hash),
       _fd(std::move(fd)),
       _fd_direct(std::move(fd_direct)),
       _file_size(file_size)
   {
-    if (hash.empty()) {
-      _hash = _path;
+    _has_identity = captured.kind == identity_kind::local_stat;
+    if (_has_identity) {
+      _identity = std::move(captured);
     } else {
-      _hash = hash;
+      _has_identity = capture_local_identity(_fd.get(), _identity);
     }
+    if (_has_identity) { _file_size = _identity.size; }
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+
+  [[nodiscard]] object_identity identity() const override
+  {
+    return _has_identity ? _identity : io_object::identity();
+  }
 
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
   [[nodiscard]] int fd_direct() const noexcept { return _fd_direct.get(); }
@@ -117,6 +112,8 @@ class local_io_object : public io_object {
   file_descriptor _fd;
   file_descriptor _fd_direct;
   size_t _file_size{0};
+  object_identity _identity;
+  bool _has_identity{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -124,14 +121,28 @@ class local_io_object : public io_object {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Single-threaded I/O reactor for O_DIRECT device reads.
+ * @brief Single-threaded local-file I/O reactor.
  *
- * Owns one @c io_uring (O_DIRECT), one worker thread, @c NUM_CHUNKS pinned
- * bounce slots, and an MPSC request queue.  Models the reactor concept
- * consumed by @c templated_ioctx.
+ * Owns one @c io_uring, one worker thread, a fixed pool of pinned staging
+ * blocks, and a two-tier request queue (see @ref io_priority). The worker
+ * takes a high-priority request before a low one, and parks an active low
+ * request at a slice boundary while high requests are waiting, so a demand
+ * read does not wait behind a whole-split readahead.  Priority is bounded,
+ * not strict: after @c config::low_service_interval high requests have
+ * started while low work waited, the low tier gets one turn of at least one
+ * quantum (@c config::slices_per_pass slices) even if high work is waiting, so
+ * a demand read blocked on an in-flight prefetch is not starved by a stream of
+ * other high requests (0 restores strict priority). Physical operations use
+ * O_DIRECT only when the worker determines that the complete transfer is
+ * compatible. Models the reactor concept consumed by @c templated_ioctx.
  */
 class uring_reactor {
  public:
+  /// A read here is a syscall against page cache or NVMe, cheap enough that
+  /// batching buys little -- and demanding the whole range set up front forces
+  /// the caller to materialise ranges it might never read.
+  static constexpr bool prefers_bulk_io = false;
+
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c uring_ioctx and shared (via shared_ptr) across every reactor in the
   /// pool — the natural home for things shared rather than per-reactor: the
@@ -156,20 +167,17 @@ class uring_reactor {
     cucascade::memory::fixed_size_host_memory_resource* _mr{nullptr};
   };
 
-  using native_handle_type        = int;
-  using io_object_type            = local_io_object;
-  using request_type              = rx_request;
-  using request_type_ptr          = std::unique_ptr<rx_request>;
-  using chunk_io_request_type     = chunked_rx_request;
-  using chunk_io_request_type_ptr = std::unique_ptr<chunked_rx_request>;
-  using reactor_config_type       = config;
-  using reactor_context_type      = reactor_context;
+  using native_handle_type   = int;
+  using io_object_type       = local_io_object;
+  using reactor_config_type  = config;
+  using reactor_context_type = reactor_context;
 
-  /// Bounce slots are allocated from the context's host_memory_resource (which
-  /// must be non-null); their size is taken from its @c get_block_size().  The
-  /// reactor keeps the @c multiple_blocks_allocation alive for its lifetime —
-  /// blocks return to the resource on destruction — and holds the shared
-  /// @p ctx so it (and the resource) outlive the reactor.
+  /// Bounce slots are allocated by @c start() from the context's
+  /// host_memory_resource (which must be non-null); their size is taken from its
+  /// @c get_block_size() and their count from a fixed 64 MiB staging budget.  The
+  /// reactor keeps the @c multiple_blocks_allocation alive until it is destroyed —
+  /// blocks return to the resource then — and holds the shared @p ctx so it (and
+  /// the resource) outlive the reactor.
   explicit uring_reactor(std::shared_ptr<reactor_context> ctx,
                          std::string_view tname = "uring_reactor");
 
@@ -183,38 +191,22 @@ class uring_reactor {
   /// place — the context — rather than being passed in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
-                                               const io_object_type& file,
-                                               const io_object_segment& segment);
-
-  static request_type_ptr prep_device_rx_request(const reactor_config_type& cfg,
-                                                 const io_object_type& file,
-                                                 uint8_t* dst,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 rmm::cuda_stream_view stream,
-                                                 int device_id);
-
-  static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
-                                                         const io_object_type& file,
-                                                         std::span<io_object_segment> bounce,
-                                                         uint8_t* dst,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         rmm::cuda_stream_view stream,
-                                                         int device_id);
-
-  /// Build a host-read request that fuses runs of contiguous segments sharing
-  /// the same backing fd into vectored (readv) submissions of at most
-  /// @c cfg.max_n_chunks buffers each; non-contiguous boundaries / fd changes
-  /// start a new group.  A 1-buffer group degrades to a plain read.
-  ///
-  /// request_manager::total_chunks is set to the number of emitted GROUPS (each
-  /// group calls chunk_complete exactly once); bytes_requested is the clamped
-  /// sum over input segments.
-  static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
-                                                const io_object_type& file,
-                                                std::span<io_object_segment> segments);
+  /// Bounce-slot size, read from the context's host resource (0 when the
+  /// context has none) rather than from @c _bounce_slot_size, which start()
+  /// derives from the same resource: the default ioctx initializes its cache
+  /// before it starts its reactors, so the check below must not depend on
+  /// start() having run.  INVARIANT: when a prefetching cache is present this
+  /// MUST equal its chunk size — a fragmented fill's extent is computed as
+  /// @c cache::fill_span(fill, chunk->offset, this value), so a larger staging
+  /// block writes past the end of the pinned chunk and a smaller one marks a
+  /// chunk cached while only part of it was read.  Checked once in
+  /// @c ioctx::initialize_cache, which is the only place both sizes are known.
+  [[nodiscard]] std::size_t staging_block_size() const noexcept
+  {
+    return _ctx == nullptr || _ctx->host_memory_resource() == nullptr
+             ? std::size_t{0}
+             : _ctx->host_memory_resource()->get_block_size();
+  }
 
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out
   /// of the constructor so a reactor can be built cheaply (it only copies its
@@ -228,53 +220,78 @@ class uring_reactor {
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  void enqueue(request_type_ptr req);
+  void enqueue(std::unique_ptr<grouped_io_request> request) noexcept;
+
+  /// Approximate bytes not yet converted from logical slices to physical ops.
+  [[nodiscard]] std::size_t queued_bytes() const noexcept
+  {
+    return _queued_bytes.load(std::memory_order_relaxed);
+  }
+
+  /// Log2 histogram of queue delays: bucket b counts delays d (microseconds) with
+  /// std::bit_width(d) == b, i.e. [2^(b-1), 2^b) us; the last bucket is open-ended.
+  static constexpr std::size_t queue_delay_buckets = 26;
+
+  /// One io_priority tier's queue-delay window (see @ref gauges::queue_delay_for).
+  struct queue_delay_stats {
+    std::uint64_t count{0};
+    std::uint64_t sum_ns{0};
+    std::uint64_t max_ns{0};
+    std::array<std::uint32_t, queue_delay_buckets> histogram{};
+  };
+
+  /// Diagnostic view of the worker's depth and queueing.  The worker publishes
+  /// these with relaxed stores once per loop pass (right before it waits for a
+  /// completion), so every field is approximate and may be one pass stale.
+  struct gauges {
+    std::uint32_t inflight_ops{0};      ///< physical ops owned by the kernel
+    std::uint32_t max_inflight_ops{0};  ///< peak since the previous take_gauges()
+    std::uint32_t pending_ops{0};       ///< planned ops waiting for a staging slot
+    /// Slices of the active request not yet expanded into physical ops.
+    std::uint32_t active_remaining_slices{0};
+    std::size_t queued_requests{0};      ///< requests queued behind the active one
+    std::size_t queued_low_requests{0};  ///< of which on the low-priority tier
+    std::size_t queued_bytes{0};         ///< see @ref queued_bytes
+    std::uint64_t requests_started{0};   ///< cumulative requests taken off the queue
+    std::uint64_t bytes_submitted{0};    ///< cumulative physical bytes submitted
+    /// Cumulative times an active low request was parked for a high one.
+    std::uint64_t preemptions{0};
+    /// Cumulative times the low tier was served ahead of waiting high work by
+    /// the bounded-service rule (see @c config::low_service_interval).
+    std::uint64_t low_service_grants{0};
+    /// Queue delay (enqueue -> first slice expanded) of requests whose first slice
+    /// was expanded since the previous take_gauges(), per priority tier.
+    queue_delay_stats queue_delay_high{};
+    queue_delay_stats queue_delay_low{};
+
+    /// The queue-delay window of @p priority's tier (@c automatic counts as high,
+    /// as requests are resolved before they are queued).
+    [[nodiscard]] queue_delay_stats const& queue_delay_for(io_priority priority) const noexcept
+    {
+      return priority == io_priority::low ? queue_delay_low : queue_delay_high;
+    }
+  };
+
+  /// Snapshot the gauges and restart the @c max_inflight_ops window.
+  [[nodiscard]] gauges take_gauges() noexcept;
 
   /// Whether @p path can be served by this reactor.  Local-disk only:
   /// returns true iff the path refers to an existing, accessible file.
   [[nodiscard]] static bool supports(std::string_view path);
 
-  /// Open the buffered + O_DIRECT fds for @p path and return them
-  /// packaged in a @c local_io_object.  Throws on unsupported paths or
-  /// open() failure.
+  /// Open the buffered fd and opportunistically open an O_DIRECT fd for
+  /// @p path. The buffered handle is always required; an unsupported direct
+  /// handle simply makes worker-planned operations use buffered I/O.  The
+  /// O_DIRECT fd reopens the buffered one through @c /proc/self/fd (the path
+  /// only where procfs is not mounted), and the object carries the buffered
+  /// fd's @c local_stat identity and size.
+  /// @throws descriptor_mismatch_error when, on two attempts, the two fds do
+  ///         not name the same file (the path is being replaced concurrently),
+  ///         or when the O_DIRECT fd cannot be stat'ed.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
   /// fstat the open fd to get the file's current size.
   static size_t size(int native_handle);
-
-  // ---- Backend capabilities --------------------------------------------
-  //
-  // io_uring + O_DIRECT serves device reads through the reactor's bounce
-  // slots, supports batched host reads via @c host_enqueue_bulk, and pairs
-  // well with eager prefill since local-disk latencies are low and we want
-  // to keep the device fed.
-  //
-  // supports_device_read / supports_vector_host_read are no longer declared
-  // here: they are derived structurally by reactor_traits from the presence of
-  // the corresponding create_*_rx_request overloads (both of which this
-  // reactor provides).
-
-  static constexpr cache::prefetching_stage preferred_prefetching_stage() noexcept
-  {
-    return cache::prefetching_stage::none;
-  }
-
- private:
-  /// Enqueue a whole batch of device read chunks with a single wake
-  /// notification.  Preferred over single-op enqueues when a caller
-  /// produces several chunks destined for this reactor — amortises the
-  /// wait-atomic notify and uses moodycamel's enqueue_bulk path.
-  /// The span's elements are moved out; the caller's backing storage
-  /// must outlive this call but the contents are left in moved-from state.
-  void enqueue_chunks(std::span<chunk_io_request_type_ptr> batch);
-
-  /// Enqueue a whole batch of device read chunks with a single wake
-  /// notification.  Preferred over single-op enqueues when a caller
-  /// produces several chunks destined for this reactor — amortises the
-  /// wait-atomic notify and uses moodycamel's enqueue_bulk path.
-  /// The span's elements are moved out; the caller's backing storage
-  /// must outlive this call but the contents are left in moved-from state.
-  void enqueue_chunk(chunk_io_request_type_ptr request);
 
  public:
   /// O_DIRECT requires 4 KiB alignment of both file offset and length.
@@ -287,9 +304,12 @@ class uring_reactor {
   /// The reactor reads through O_DIRECT, so @c IO_BLOCK_SIZE is the minimum
   /// viable alignment and is used when @p alignment is unset.  A caller-supplied
   /// alignment is honored only when it is at least @c IO_BLOCK_SIZE; a smaller
-  /// value is ignored in favor of the reactor's own alignment.
-  static std::vector<byte_range> align_and_coalesce(std::span<const byte_range> ranges,
-                                                    std::optional<size_t> alignment = std::nullopt);
+  /// value is ignored in favor of the reactor's own alignment.  Ranges with a
+  /// negative offset or no bytes are dropped and every end stays within
+  /// INT64_MAX (see @c io_utils::align_and_coalesce).  Returns no ranges if
+  /// allocating the result fails.
+  static std::vector<byte_range> align_and_coalesce(
+    std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
   void worker_loop(const std::stop_token& stop_token);
@@ -298,17 +318,49 @@ class uring_reactor {
   // reactor's lifetime (so the bounce-staging resource outlives _bounce_storage).
   std::shared_ptr<reactor_context> _ctx;
 
-  // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
-  // multiple_blocks_allocation destructor returns the blocks to the upstream
-  // resource when the reactor is destroyed.
   reactor_config_type _config;
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
+  // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
+  // multiple_blocks_allocation destructor returns the blocks to the upstream
+  // resource when the reactor is destroyed.
   cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
   std::size_t _bounce_slot_size;
   std::stop_source _stop_source;
   std::jthread _worker;
-  blocking_concurrent_queue<chunk_io_request_type_ptr> _requests;
+  tiered_blocking_queue<std::unique_ptr<grouped_io_request>> _requests;
+  mutable std::mutex _enqueue_mutex;
+  std::atomic<std::size_t> _queued_bytes{0};
+  std::atomic<bool> _accepting{false};
+
+  // Gauges (see @ref gauges): written only by the worker, read by take_gauges().
+  std::atomic<std::uint32_t> _gauge_inflight{0};
+  std::atomic<std::uint32_t> _gauge_max_inflight{0};
+  std::atomic<std::uint32_t> _gauge_pending{0};
+  std::atomic<std::uint32_t> _gauge_active_slices{0};
+  std::atomic<std::uint64_t> _gauge_requests_started{0};
+  std::atomic<std::uint64_t> _gauge_bytes_submitted{0};
+  std::atomic<std::uint64_t> _gauge_preemptions{0};
+  std::atomic<std::uint64_t> _gauge_low_service_grants{0};
+
+  /// Worker-side accumulators behind gauges::queue_delay; take_gauges() swaps them out.
+  struct queue_delay_atomics {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> sum_ns{0};
+    std::atomic<std::uint64_t> max_ns{0};
+    std::array<std::atomic<std::uint32_t>, queue_delay_buckets> histogram{};
+  };
+  queue_delay_atomics _gauge_queue_delay_high;
+  queue_delay_atomics _gauge_queue_delay_low;
+  /// Record one request's queue delay (worker thread only).
+  void record_queue_delay(grouped_io_request const& request) noexcept;
+
+  /// config::slices_per_pass with 0 (no cap) mapped to SIZE_MAX; read once at
+  /// construction.
+  std::size_t _slices_per_pass{1};
+  /// Slices a low request granted service must expand before it can be parked
+  /// again: _slices_per_pass, capped at max_slices_per_pass.
+  std::size_t _low_service_quantum{1};
 };
 
 }  // namespace cucascade::io::uring

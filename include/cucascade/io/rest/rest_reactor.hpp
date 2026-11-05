@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
+#include <cucascade/exec/admission_control.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/concurrent_queue.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
@@ -26,12 +28,13 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
-
-#include <chrono>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -103,6 +106,40 @@ struct footer_probe {
   std::size_t object_size{0};
   std::size_t window_lo{0};
   shared_byte_span bytes;
+  /// ETag from the verified 206, quotes preserved; empty otherwise.
+  std::string etag;
+};
+
+/// Result of a blocking HEAD: the object's size plus its ETag when the server
+/// sent one (quotes preserved, empty otherwise).
+struct head_object_result {
+  std::size_t object_size{0};
+  std::string etag;
+};
+
+// ---------------------------------------------------------------------------
+// footer_resolve_result
+// ---------------------------------------------------------------------------
+
+/// One resolved entry of a batched footer resolve
+/// (@c rest_ioctx::resolve_footer_objects).  Exactly one of {object, error}
+/// is set.
+///
+/// @c object is stashless — identity, size and validation tag only.  The
+/// suffix window bytes arrive in @c footer instead, whose buffer is the byte
+/// lease: it is allocated against the ioctx-wide footer budget
+/// (@c config::footer_resolve_stash_budget) and the bytes return to that
+/// budget when the buffer is freed, so the intended lifetime is parse-only.
+/// Reads on @c object inside the window re-GET over the network.  @c footer
+/// is null on the HEAD-fallback path (probe unusable), where @c window_lo
+/// stays 0.
+struct footer_resolve_result {
+  std::size_t index{0};               ///< position in the submitted span
+  std::string path;                   ///< the submitted path, verbatim
+  std::shared_ptr<io_object> object;  ///< stashless: size + validation tag
+  shared_byte_span footer;            ///< suffix window bytes (the lease)
+  std::size_t window_lo{0};           ///< file offset of footer->front()
+  std::exception_ptr error;           ///< per-entry failure, isolated
 };
 
 // ---------------------------------------------------------------------------
@@ -112,14 +149,48 @@ struct footer_probe {
 /**
  * @brief Concrete @c io_object backed by a RESTful object-store key.
  *
- * Passive bag of identity: the original URL/path (also the cache id), the
- * bucket + key the reactor authorizes against, and the object size discovered
- * by a one-time HEAD at construction.  Does no I/O of its own.
+ * Stores the object identity and metadata captured when it was opened: the
+ * path, the bucket + key the reactor authorizes against, the size, and the ETag
+ * the opening response carried.  The cache id is the path plus that ETag when
+ * it is a strong entity-tag, so a new version of a key is a new cache identity;
+ * an open without a usable strong ETag gets a unique per-open id instead.
+ * Does no I/O of its own.
  */
 class rest_io_object : public io_object {
  public:
-  rest_io_object(std::string path, std::string bucket, std::string key, size_t size)
-    : _path(std::move(path)), _bucket(std::move(bucket)), _key(std::move(key)), _file_size(size)
+  /// The cache id of an open with a strong validator.  Public so a caller that
+  /// knows a path and tag can derive the key without opening the object.
+  [[nodiscard]] static std::string generation_key(std::string_view path,
+                                                  std::string_view strong_tag)
+  {
+    std::string key;
+    key.reserve(path.size() + 1 + strong_tag.size());
+    key.append(path).push_back('\x1f');
+    key.append(strong_tag);
+    return key;
+  }
+
+  /// True iff @p etag is one strong entity-tag as RFC 7232 §2.3 defines it:
+  /// `"` etagc* `"`, with etagc = %x21 / %x23-7E / obs-text.  Rejects the weak
+  /// form, `*`, lists, unquoted tokens and anything with control characters.
+  [[nodiscard]] static bool is_strong_tag(std::string_view etag) noexcept
+  {
+    if (etag.size() < 2 || etag.front() != '"' || etag.back() != '"') { return false; }
+    for (char const ch : etag.substr(1, etag.size() - 2)) {
+      auto const c = static_cast<unsigned char>(ch);
+      if (c == '"' || c < 0x21 || c == 0x7F) { return false; }
+    }
+    return true;
+  }
+
+  rest_io_object(
+    std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
+    : _path(std::move(path)),
+      _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _file_size(size),
+      _etag(std::move(etag)),
+      _cache_id(make_cache_id(_path, _etag))
   {
   }
 
@@ -131,19 +202,31 @@ class rest_io_object : public io_object {
                  std::string key,
                  size_t object_size,
                  size_t window_lo,
-                 shared_byte_span stash)
+                 shared_byte_span stash,
+                 std::string etag = {})
     : _path(std::move(path)),
       _bucket(std::move(bucket)),
       _key(std::move(key)),
       _file_size(object_size),
       _window_lo(window_lo),
-      _stash(std::move(stash))
+      _stash(std::move(stash)),
+      _etag(std::move(etag)),
+      _cache_id(make_cache_id(_path, _etag))
   {
   }
 
-  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _cache_id; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
+
+  /// A strong ETag is the object's version (@c object_tag); a weak, malformed
+  /// or absent one scopes the identity to this open (@c opened_handle), exactly
+  /// as @ref raw_file_cache_id scopes the cache id.
+  [[nodiscard]] bool validation_tag_is_strong() const noexcept override
+  {
+    return is_strong_tag(validation_tag());
+  }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
@@ -156,12 +239,21 @@ class rest_io_object : public io_object {
   [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
 
  private:
+  [[nodiscard]] static std::string make_cache_id(std::string const& path, std::string const& etag)
+  {
+    if (is_strong_tag(etag)) { return generation_key(path, etag); }
+    static std::atomic<std::uint64_t> next_open{0};
+    return generation_key(path, "open#" + std::to_string(next_open.fetch_add(1)));
+  }
+
   std::string _path;
   std::string _bucket;
   std::string _key;
   size_t _file_size{0};
   size_t _window_lo{0};
   shared_byte_span _stash;
+  std::string _etag;
+  std::string _cache_id;
 };
 
 // ---------------------------------------------------------------------------
@@ -172,14 +264,20 @@ class rest_io_object : public io_object {
  * @brief Single-threaded I/O reactor for RESTful object storage (s3://...).
  *
  * Owns one worker thread driving a libcurl multi handle over an epoll event
- * loop (curl_multi_socket_action), a pool of reusable easy handles, optional
- * pinned bounce slots for device staging, a timerfd + min-heap retry
+ * loop (curl_multi_socket_action), a pool of reusable easy handles, dynamic
+ * CuCascade staging for device reads, a timerfd + min-heap retry
  * scheduler, and an MPSC request queue.  Models the reactor concept consumed
  * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
  * @c s3_request_authorizer, re-issued on every attempt.
  */
 class rest_reactor {
  public:
+  /// Every read is an HTTP round trip, so what a request costs is dominated by
+  /// the fact that it IS a request.  Given the whole range set at once the
+  /// reactor can fuse adjacent ranges and keep every connection busy, which it
+  /// cannot do when ranges arrive one at a time as a reader walks the file.
+  static constexpr bool prefers_bulk_io = true;
+
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c rest_ioctx and shared (via shared_ptr) across every reactor in the
   /// pool, so it is the natural home for things that are shared rather than
@@ -214,8 +312,6 @@ class rest_reactor {
   };
 
   using io_object_type       = rest_io_object;
-  using request_type         = rest_rx_request;
-  using request_type_ptr     = std::unique_ptr<rest_rx_request>;
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
 
@@ -232,67 +328,109 @@ class rest_reactor {
   /// in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  // -- request preparation (static: build chunk descriptions) --------------
-
-  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
-                                               const io_object_type& file,
-                                               const io_object_segment& segment);
-
-  static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
-                                                const io_object_type& file,
-                                                std::span<io_object_segment> segments);
-
-  static request_type_ptr prep_device_rx_request(const reactor_config_type& cfg,
-                                                 const io_object_type& file,
-                                                 uint8_t* dst,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 rmm::cuda_stream_view stream,
-                                                 int device_id);
-
-  static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
-                                                         const io_object_type& file,
-                                                         std::span<io_object_segment> bounce,
-                                                         uint8_t* dst,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         rmm::cuda_stream_view stream,
-                                                         int device_id);
+  /// Staging block size, taken from the context's host resource (0 when the
+  /// context has none).  INVARIANT: when a prefetching cache is present this
+  /// MUST equal its chunk size — the worker plans a fragmented fill's extent as
+  /// @c cache::fill_span(fill, chunk->offset, this value), so a larger staging
+  /// block writes past the end of the pinned chunk and a smaller one marks a
+  /// chunk cached while only part of it was fetched.  Checked once in
+  /// @c ioctx::initialize_cache, which is the only place both sizes are known
+  /// (the reactor is built, and may already be started, before the cache
+  /// exists).
+  [[nodiscard]] std::size_t staging_block_size() const noexcept
+  {
+    return _ctx == nullptr || _ctx->host_memory_resource() == nullptr
+             ? std::size_t{0}
+             : _ctx->host_memory_resource()->get_block_size();
+  }
 
   // -- dispatch / lifecycle ------------------------------------------------
 
-  /// Allocate the pinned bounce slots and launch the worker thread.  Split out
-  /// of the constructor so a reactor can be built cheaply (it only copies its
-  /// config and creates its wakeup fd) and parked until it is actually needed —
-  /// see @c ioctx::start.  Idempotent: a second call (while the worker is
-  /// already running) is a no-op.
+  /// Launch the worker thread. Split out of the constructor so a reactor can be
+  /// built cheaply and parked until it is actually needed. Idempotent while
+  /// running; shutdown is terminal and a later start is ignored.
   void start();
 
-  void enqueue(request_type_ptr req);
+  void enqueue(std::unique_ptr<grouped_io_request> req) noexcept;
   void interrupt();
-  void shutdown();
+  void shutdown() noexcept;
+
+  /// Bytes of queued-but-not-yet-submitted work — the reactor's backlog, and the
+  /// signal @c rest_ioctx::next_reactor balances dispatch against.  Counts only
+  /// what is waiting: a chunk stops counting the moment a connection picks it up,
+  /// because in-flight work is already bounded by @c max_connections and is
+  /// therefore the same ceiling on every reactor, while the queue is where an
+  /// unevenly-loaded pool actually diverges.
+  ///
+  /// A hint, not a synchronization point: it is read without ordering against
+  /// the queue itself, so a concurrent enqueue or dequeue may not be reflected
+  /// yet.  Dispatch only needs to be right on average.
+  [[nodiscard]] std::size_t queued_bytes() const noexcept
+  {
+    return _queued_bytes.load(std::memory_order_relaxed);
+  }
 
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  /// Blocking HEAD to discover an object's size.  Used by the ioctx to build
-  /// an @c rest_io_object.  @p bucket / @p key identify the object.
+  /// Ask the worker to open its connection pool against @p bucket before any
+  /// read needs it.  Returns immediately: the worker does the HEADs on its own
+  /// thread at the top of its next pass, because the connection cache it fills
+  /// is thread-confined (see the @c curl_share warning) and is reachable from
+  /// nowhere else.  Coalescing is the caller's job -- a second call before the
+  /// first is serviced simply replaces the target.
+  ///
+  /// The request is a bucket-scoped @c ListObjectsV2 capped at zero keys, not a
+  /// HEAD: a HEAD is signed per object and @c sigv4_authorizer refuses an empty
+  /// key, whereas @c authorize_list already signs a bucket-only URI, so this
+  /// keeps warm-up traffic off the query's data files without touching the
+  /// signing path.  The response is discarded and never inspected -- the
+  /// handshake is what is being bought, so even a 403 is a success.
+  void warmup(std::string bucket);
+
+  /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
+  /// build an @c rest_io_object.  @p bucket / @p key identify the object.
+  head_object_result head_object(std::string_view bucket, std::string_view key);
+
+  /// Size-only convenience wrapper around @c head_object.
   size_t head_object_size(std::string_view bucket, std::string_view key);
 
   /// Blocking suffix-range GET of the last @p n bytes of an object, resolving
   /// the size and stashing the parquet footer in a single round-trip.  On a
   /// well-formed 206 the returned @c footer_probe carries the object size, the
-  /// window origin, and the trailing bytes; on any unusable response (200 full
-  /// body, missing / unsatisfied Content-Range) @c bytes is null so the caller
-  /// falls back to a HEAD.  @p bucket / @p key identify the object.
+  /// window origin, the trailing bytes, and the ETag; on any unusable response
+  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so
+  /// the caller falls back to a HEAD.  @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
+
+  /// Batched footer resolve engine: every entry gets the same per-attempt
+  /// semantics as @c fetch_footer_suffix plus the HEAD fallback, but all
+  /// entries share one curl multi driven on the caller's thread, so
+  /// connections are reused across entries (at most @p max_inflight pooled)
+  /// and at most @p max_inflight transfers are on the wire at once.
+  /// @p paths / @p objects / @p indices are parallel: @p indices carries each
+  /// entry's position in the caller's original batch.  Each probe reserves
+  /// @c footer_probe_bytes from @p budget before its GET is issued
+  /// (non-blocking while any transfer is active; a blocking, stop-aware wait
+  /// only when none is) and the delivered payload buffer carries the
+  /// reservation until it is freed.  @p on_result runs on the caller's
+  /// thread, serially, as entries land; see
+  /// @c rest_ioctx::resolve_footer_objects for the delivery contract.
+  /// Assumes non-empty input and max_inflight >= 1; concurrent-batch
+  /// serialization is the ioctx's job, not this method's.
+  void resolve_footer_batch(std::span<std::string const> paths,
+                            std::span<object_ref const> objects,
+                            std::span<std::size_t const> indices,
+                            std::size_t max_inflight,
+                            std::shared_ptr<exec::admission_control> budget,
+                            std::function<void(footer_resolve_result)> const& on_result,
+                            std::stop_token stop);
 
   /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML
   /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
   /// request query (no auth params — authorization is added via
   /// @c authorize_list).  @p prefix is only for retry-log / error text.
-  /// Control-plane op: retries are WARN-logged like every retry loop here, but
-  /// the XML body is never treated as object-read payload.
+  /// Control-plane op: transient failures are retried and WARN-logged.
   std::string list_page(std::string_view bucket,
                         std::string_view prefix,
                         std::string_view canonical_query);
@@ -306,24 +444,17 @@ class rest_reactor {
   /// @c rest_ioctx::create_io_object.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
-  static constexpr cache::prefetching_stage preferred_prefetching_stage() noexcept
-  {
-    // Network round-trips are high-latency; read ahead on demand rather than
-    // eagerly prefilling the whole working set.
-    return cache::prefetching_stage::just_in_time;
-  }
-
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
-  /// bound) into a minimal sorted set — fewer ranges means fewer GETs.
-  static std::vector<byte_range> align_and_coalesce(std::span<const byte_range> ranges,
-                                                    std::optional<size_t> alignment = std::nullopt);
+  /// bound) into a minimal sorted set — fewer ranges means fewer GETs.  Ranges
+  /// with a negative offset or no bytes are dropped and every end stays within
+  /// INT64_MAX (see @c io_utils::align_and_coalesce).  Returns no ranges if
+  /// allocating the result fails.
+  static std::vector<byte_range> align_and_coalesce(
+    std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
   void worker_loop(const std::stop_token& stop_token);
-
-  /// Enqueue a batch of chunks with a single wake notification.
-  void enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_request>> batch);
 
   // Shared services + tunables for the whole reactor pool; kept alive for this
   // reactor's lifetime (the authorizer is used on every request).
@@ -331,19 +462,29 @@ class rest_reactor {
   config _config;  // copy of _ctx->cfg() for hot-path access
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
-  std::size_t _bounce_slot_size{0};
 
-  // Keeps the bounce-slot blocks alive for the reactor's lifetime; the
-  // allocation handle returns the blocks to the upstream resource when the
-  // reactor is destroyed.  Null when no host_memory_resource is set.
-  cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
+  // Set by warmup() on a caller thread, consumed by the worker at the top of a
+  // pass.  The bucket is guarded because a std::string is not atomically
+  // publishable; the flag is what the worker actually polls.
+  std::atomic<bool> _warm_requested{false};
+  std::mutex _warm_mtx;
+  std::string _warm_bucket;
 
-  // Cross-thread wakeup: written by enqueue()/interrupt() and the CUDA
-  // copy-completion callback to break the worker out of epoll_wait.
+  // Cross-thread wakeup: written by enqueue()/interrupt() to break the worker
+  // out of epoll_wait.
   file_descriptor _wakeup_fd;
 
   std::stop_source _stop_source;
-  blocking_concurrent_queue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+  blocking_concurrent_queue<std::unique_ptr<grouped_io_request>> _requests;
+  mutable std::mutex _enqueue_mutex;
+  bool _running{false};
+  bool _accepting{false};
+  bool _stopped{false};
+
+  // Logical bytes not yet assigned to a curl slot. Retries are already claimed
+  // work and therefore never get counted a second time.
+  std::atomic<std::size_t> _queued_bytes{0};
+
   std::jthread _worker;
 };
 

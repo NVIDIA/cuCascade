@@ -16,19 +16,32 @@
  * limitations under the License.
  */
 
+#include <cucascade/error.hpp>
 #include <cucascade/io/cache/config.hpp>
-#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/types.hpp>
 #include <cucascade/log/logging.hpp>
 
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace cucascade::io {
+namespace {
+
+using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
+
+struct io_read_to_host_message {
+  static constexpr char const* message{"io:read_to_host"};
+};
+
+}  // namespace
 
 ioctx::ioctx()  = default;
 ioctx::~ioctx() = default;
@@ -41,22 +54,39 @@ void ioctx::initialize_cache(
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
   if (_cache) {
-    CUCASCADE_LOG_WARN("ioctx::initialize_cache() called but prefetching_cache already present");
+    CUCASCADE_LOG_WARN("ioctx::initialize_cache() called but fs_cache already present");
     return;
   }
-  if (!can_use_prefetching_cache()) {
+  if (!can_use_fs_cache()) {
     CUCASCADE_LOG_WARN(
       "ioctx::initialize_cache() called but backend does not support vector host read");
     return;
   }
   try {
-    _cache = std::make_unique<cache::prefetching_cache>(
+    _cache = std::make_unique<cache::fs_cache>(
       reservation_manager, this, cache_config, std::move(topology_index));
   } catch (const std::exception& e) {
-    CUCASCADE_LOG_ERROR("prefetching_cache construction failed: {}", e.what());
+    CUCASCADE_LOG_ERROR("fs_cache construction failed: {}", e.what());
     _cache.reset();
   } catch (...) {
-    CUCASCADE_LOG_ERROR("prefetching_cache construction failed: unknown error");
+    CUCASCADE_LOG_ERROR("fs_cache construction failed: unknown error");
+    _cache.reset();
+  }
+  // The reactors plan a fragmented fill's extent with
+  // cache::fill_span(fill, chunk->offset, their own staging block size).  A
+  // cache whose chunks are a different size makes every partial fill compute
+  // the wrong extent -- with the larger staging block that is an out-of-bounds
+  // write past the end of a pinned chunk.  The two are equal today only because
+  // both read the same front HOST arena; refuse the cache rather than let a
+  // future split of those resources corrupt the heap silently.
+  if (_cache && staging_block_size() != 0 && staging_block_size() != _cache->chunk_size()) {
+    CUCASCADE_LOG_ERROR(
+      "ioctx::initialize_cache: backend {} stages in {}-byte blocks but the prefetching cache "
+      "chunk is {} bytes; the two must match because fragmented fills are planned with the "
+      "staging block size -- running without a cache",
+      static_cast<int>(type()),
+      staging_block_size(),
+      _cache->chunk_size());
     _cache.reset();
   }
 }
@@ -73,31 +103,123 @@ std::shared_ptr<io_object> ioctx::create_io_object(std::string path, std::uint64
   return create_io_object(std::move(path));
 }
 
-size_t ioctx::host_read(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache::prefetching_handle* handle)
+size_t ioctx::host_read(const io_object& obj,
+                        size_t offset,
+                        size_t size,
+                        uint8_t* dst,
+                        cache::cache_handle* handle,
+                        io_priority priority)
 {
-  if (uses_prefetching_cache()) { return _cache->host_read(obj, offset, size, dst, handle); }
+  auto const& message =
+    nvtx3::registered_string_in<libcucascade_domain>::get<io_read_to_host_message>();
+  nvtx_range const read_range{message, nvtx3::payload{static_cast<std::uint64_t>(size)}};
+  // Without a cache the backend reads synchronously on this thread, bypassing
+  // the reactor queues, so the priority only matters on the cache path.
+  if (uses_fs_cache()) { return _cache->host_read(obj, offset, size, dst, handle, priority); }
   return host_read_io(obj, offset, size, dst);
 }
 
-exec::semi_future<size_t> ioctx::host_read_async(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache::prefetching_handle* handle)
+exec::semi_future<size_t> ioctx::host_read_async(const io_object& obj,
+                                                 size_t offset,
+                                                 size_t size,
+                                                 uint8_t* dst,
+                                                 cache::cache_handle* handle,
+                                                 io_priority priority)
 {
-  if (uses_prefetching_cache()) { return _cache->host_read_async(obj, offset, size, dst, handle); }
-  return host_read_async_io(obj, offset, size, dst);
+  if (uses_fs_cache()) { return _cache->host_read_async(obj, offset, size, dst, handle, priority); }
+  return host_read_async_io(obj, offset, size, dst, priority);
 }
 
 exec::semi_future<size_t> ioctx::device_read_async(const io_object& obj,
                                                    size_t offset,
                                                    size_t size,
                                                    uint8_t* dst,
-                                                   rmm::cuda_stream_view stream,
-                                                   cache::prefetching_handle* handle)
+                                                   ::cuda::stream_ref stream,
+                                                   cache::cache_handle* handle,
+                                                   io_priority priority)
 {
-  if (uses_prefetching_cache()) {
-    return _cache->device_read_async(obj, offset, size, dst, stream, handle);
+  if (uses_fs_cache()) {
+    return _cache->device_read_async(obj, offset, size, dst, stream, handle, priority);
   }
-  return device_read_async_io(obj, offset, size, dst, stream);
+  return device_read_async_io(obj, offset, size, dst, stream, priority);
+}
+
+exec::semi_future<size_t> ioctx::host_read_async_io(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, io_priority priority) noexcept
+{
+  if (size == 0) return exec::make_semi_future<size_t>(0);
+  try {
+    if (dst == nullptr) throw std::invalid_argument("host read destination is null");
+    std::vector<prepared_io_slice> slices{prepared_io_slice{range{offset, size}, host_buffer{dst}}};
+    slices.front().priority = resolve_priority(priority, io_priority::high);
+    return host_device_readv_async_io(obj, std::move(slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
+}
+
+exec::semi_future<size_t> ioctx::device_read_async_io(const io_object& obj,
+                                                      size_t offset,
+                                                      size_t size,
+                                                      uint8_t* dst,
+                                                      ::cuda::stream_ref stream,
+                                                      io_priority priority) noexcept
+{
+  if (size == 0) return exec::make_semi_future<size_t>(0);
+  try {
+    if (dst == nullptr) throw std::invalid_argument("device read destination is null");
+    std::vector<prepared_io_slice> slices{
+      prepared_io_slice{range{offset, size}, device_buffer{dst, stream}}};
+    slices.front().priority = resolve_priority(priority, io_priority::high);
+    return host_device_readv_async_io(obj, std::move(slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
+}
+
+exec::semi_future<size_t> ioctx::host_readv_async_io(const io_object& obj,
+                                                     std::span<const slice> slices,
+                                                     io_priority priority) noexcept
+{
+  if (slices.empty()) return exec::make_semi_future<size_t>(0);
+  try {
+    auto const resolved = resolve_priority(priority, io_priority::high);
+    std::vector<prepared_io_slice> prepared_slices;
+    prepared_slices.reserve(slices.size());
+    for (auto const& current : slices) {
+      if (current.size() == 0) continue;
+      if (current.dst == nullptr) throw std::invalid_argument("host readv destination is null");
+      prepared_slices.emplace_back(range{current.offset(), current.size()},
+                                   host_buffer{current.dst});
+      prepared_slices.back().priority = resolved;
+    }
+    return host_device_readv_async_io(obj, std::move(prepared_slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
+}
+
+exec::semi_future<size_t> ioctx::device_readv_async_io(const io_object& obj,
+                                                       std::span<const slice> slices,
+                                                       ::cuda::stream_ref stream,
+                                                       io_priority priority) noexcept
+{
+  if (slices.empty()) return exec::make_semi_future<size_t>(0);
+  try {
+    auto const resolved = resolve_priority(priority, io_priority::high);
+    std::vector<prepared_io_slice> prepared_slices;
+    prepared_slices.reserve(slices.size());
+    for (auto const& current : slices) {
+      if (current.size() == 0) continue;
+      if (current.dst == nullptr) throw std::invalid_argument("device readv destination is null");
+      prepared_slices.emplace_back(range{current.offset(), current.size()},
+                                   device_buffer{current.dst, stream});
+      prepared_slices.back().priority = resolved;
+    }
+    return host_device_readv_async_io(obj, std::move(prepared_slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
 }
 
 }  // namespace cucascade::io

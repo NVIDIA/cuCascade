@@ -61,9 +61,9 @@ std::unique_ptr<memory_reservation_manager> createSingleDeviceMemoryManager()
   builder.set_gpu_usage_limit(expected_gpu_capacity);  // 2 GB
   builder.set_gpu_memory_resource_factory(cucascade::test::make_shared_current_device_resource);
   builder.set_reservation_fraction_per_gpu(limit_ratio);
-  builder.set_per_host_capacity(expected_host_capacity);  //  4 GB
-  builder.use_host_per_gpu();
-  builder.set_reservation_fraction_per_host(limit_ratio);
+  builder.set_per_numa_region_capacity(expected_host_capacity);  //  4 GB
+  builder.use_gpu_id_as_host_id();
+  builder.set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   return std::make_unique<memory_reservation_manager>(std::move(space_configs));
@@ -75,10 +75,10 @@ std::unique_ptr<memory_reservation_manager> createDualGpuMemoryManager()
   builder.set_gpu_usage_limit(expected_gpu_capacity);  // 2 GB
   builder.set_gpu_memory_resource_factory(cucascade::test::make_shared_current_device_resource);
   builder.set_reservation_fraction_per_gpu(limit_ratio);
-  builder.set_per_host_capacity(expected_host_capacity);  //  4 GB
+  builder.set_per_numa_region_capacity(expected_host_capacity);  //  4 GB
   builder.set_number_of_gpus(2);
-  builder.use_host_per_gpu();
-  builder.set_reservation_fraction_per_host(limit_ratio);
+  builder.use_gpu_id_as_host_id();
+  builder.set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   return std::make_unique<memory_reservation_manager>(std::move(space_configs));

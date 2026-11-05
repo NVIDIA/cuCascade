@@ -80,6 +80,11 @@ class admission_control {
   /// If @p stop fires during the wait, returns a disengaged slot.
   [[nodiscard]] slot acquire(size_t size, std::stop_token stop = {});
 
+  /// Non-blocking acquire: reserve exactly @p size units if they fit within
+  /// the remaining budget right now, else return a disengaged slot.  The
+  /// oversized-request fallback of acquire() does not apply here.
+  [[nodiscard]] slot try_acquire(size_t size);
+
   /// Block until every outstanding slot has been released (i.e. all issued
   /// tokens are freed and the in-use budget drops back to zero).  Returns
   /// immediately if nothing is currently reserved.  If @p stop fires first,
@@ -93,13 +98,20 @@ class admission_control {
 
   [[nodiscard]] size_t budget() const noexcept { return _budget; }
 
+  /// Bytes currently reserved by live slots.
+  [[nodiscard]] size_t reserved() const;
+
+  /// High-water mark of @ref reserved over this controller's lifetime.
+  [[nodiscard]] size_t peak_reserved() const;
+
  private:
   void release(size_t reserved) noexcept;
 
   const size_t _budget;
   size_t _in_use{0};
+  size_t _peak{0};
   size_t _active_slots{0};
-  std::mutex _mtx;
+  mutable std::mutex _mtx;
   std::condition_variable_any _cv;
 };
 

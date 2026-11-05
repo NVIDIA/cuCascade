@@ -42,7 +42,8 @@ namespace cucascade::io::rest::s3 {
 class sigv4_authorizer_base : public request_authorizer {
  protected:
   /// @param region    Signing region (e.g. @c "us-east-1").
-  /// @param endpoint  scheme://host[:port], no path / query / fragment.
+  /// @param endpoint  scheme://host[:port] with a host, no user-info, and no
+  ///                  path / query / fragment.
   /// @throw cucascade::io::credential_error on empty creds, empty region, or
   ///        malformed endpoint.
   sigv4_authorizer_base(static_credentials creds, std::string region, std::string endpoint);

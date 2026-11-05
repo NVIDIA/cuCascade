@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cucascade/cuda/stream.hpp>
 
 #include <exception>
 #include <functional>
@@ -31,10 +31,10 @@ class oom_handling_policy {
  public:
   virtual ~oom_handling_policy() = default;
 
-  using RetryFunc = std::function<void*(std::size_t, rmm::cuda_stream_view)>;
+  using RetryFunc = std::function<void*(std::size_t, ::cuda::stream_ref)>;
 
   void* handle_oom(std::size_t bytes,
-                   rmm::cuda_stream_view stream,
+                   ::cuda::stream_ref stream,
                    std::exception_ptr eptr,
                    RetryFunc retry_function)
   {
@@ -45,7 +45,7 @@ class oom_handling_policy {
 
  protected:
   virtual void* do_handle_oom(std::size_t bytes,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               std::exception_ptr eptr,
                               RetryFunc retry_function) = 0;
 };
@@ -53,7 +53,7 @@ class oom_handling_policy {
 class throw_on_oom_policy final : public oom_handling_policy {
  protected:
   void* do_handle_oom(std::size_t bytes,
-                      rmm::cuda_stream_view stream,
+                      ::cuda::stream_ref stream,
                       std::exception_ptr eptr,
                       RetryFunc retry_function) final;
 

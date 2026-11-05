@@ -19,7 +19,9 @@
 
 #include "utils/test_memory_resources.hpp"
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/common.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
@@ -29,7 +31,6 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
@@ -38,20 +39,45 @@
 #include <cuda_runtime_api.h>
 
 #include <memory>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace cucascade {
 namespace test {
+
+/** @brief Reject I/O for mock representations that only need a DISK memory-space descriptor. */
+class mock_no_io_backend : public idisk_io_backend {
+ public:
+  void write(const std::filesystem::path&, const void*, size_t, size_t, ::cuda::stream_ref) override
+  {
+    throw std::logic_error("mock representation attempted disk I/O");
+  }
+  void read(const std::filesystem::path&, void*, size_t, size_t, ::cuda::stream_ref) override
+  {
+    throw std::logic_error("mock representation attempted disk I/O");
+  }
+  void write(const std::filesystem::path&, const void*, size_t, size_t) override
+  {
+    throw std::logic_error("mock representation attempted disk I/O");
+  }
+  void read(const std::filesystem::path&, void*, size_t, size_t) override
+  {
+    throw std::logic_error("mock representation attempted disk I/O");
+  }
+};
 
 /**
  * @brief Mock memory_space for testing - provides a simple memory_space without real allocators.
  *
  * This is a lightweight memory space that can be used in tests that don't need
  * actual memory allocation functionality.
+ * @param disk_backend Optional DISK backend override. By default, DISK spaces retain their real
+ * pipeline backend for converter and profiler tests; mock representations provide a no-I/O backend.
  */
 
-inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier tier,
-                                                                    size_t device_id = 0)
+inline std::shared_ptr<memory::memory_space> make_mock_memory_space(
+  memory::Tier tier, size_t device_id = 0, std::shared_ptr<idisk_io_backend> disk_backend = nullptr)
 {
   if (tier == memory::Tier::GPU) {
     memory::gpu_memory_space_config config;
@@ -72,8 +98,12 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier
     };
     return std::make_shared<memory::memory_space>(config);
   } else if (tier == memory::Tier::DISK) {
-    return std::make_shared<memory::memory_space>(
-      memory::disk_memory_space_config{static_cast<int>(device_id), 1024 * 1024 * 1024, "/tmp"});
+    memory::disk_memory_space_config config{
+      static_cast<int>(device_id), 1024 * 1024 * 1024, "/tmp"};
+    if (disk_backend) {
+      return std::make_shared<memory::memory_space>(config, std::move(disk_backend));
+    }
+    return std::make_shared<memory::memory_space>(config);
   } else {
     throw std::invalid_argument("Unsupported tier for mock memory space");
   }
@@ -89,7 +119,10 @@ struct mock_memory_space_holder {
   std::shared_ptr<memory::memory_space> space;
 
   mock_memory_space_holder(memory::Tier tier, size_t device_id)
-    : space{make_mock_memory_space(tier, device_id)}
+    : space{make_mock_memory_space(
+        tier,
+        device_id,
+        tier == memory::Tier::DISK ? std::make_shared<mock_no_io_backend>() : nullptr)}
   {
   }
 };
@@ -116,7 +149,7 @@ class mock_data_representation : private mock_memory_space_holder, public idata_
   std::size_t get_uncompressed_data_size_in_bytes() const override { return _size; }
 
   std::unique_ptr<idata_representation> clone(
-    [[maybe_unused]] rmm::cuda_stream_view stream) override
+    [[maybe_unused]] ::cuda::stream_ref stream) const override
   {
     return std::make_unique<mock_data_representation>(get_current_tier(), _size, get_device_id());
   }
@@ -137,8 +170,8 @@ inline std::vector<memory::memory_space_config> create_conversion_test_configs()
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
     // Use shared pooled allocator initialized once for all tests.
     .set_gpu_memory_resource_factory(make_shared_current_device_resource)
-    .use_host_per_gpu()
-    .set_per_host_capacity(4096ull * 1024 * 1024);
+    .use_gpu_id_as_host_id()
+    .set_per_numa_region_capacity(4096ull * 1024 * 1024);
   return builder.build();
 }
 

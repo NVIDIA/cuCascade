@@ -57,20 +57,35 @@ class static_thread_pool {
     auto* init_fn_ptr = per_thread_init ? &per_thread_init : nullptr;
     auto* latch_ptr   = init_latch.get();
 
-    for (int i = 0; i < num_threads; ++i) {
-      auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
-        if (init_fn_ptr) {
-          (*init_fn_ptr)();
-          latch_ptr->count_down();
+    // A failure after the first worker started (std::thread throwing
+    // std::system_error, an allocation in the naming below) must not unwind
+    // past a joinable std::thread: that calls std::terminate, and the
+    // destructor does not run for a constructor that threw. Stop and join the
+    // workers already started, then propagate the original exception. The
+    // latch and per_thread_init outlive the join, so a worker still in its
+    // init callback finds them intact.
+    try {
+      for (int i = 0; i < num_threads; ++i) {
+        auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
+          if (init_fn_ptr) {
+            (*init_fn_ptr)();
+            latch_ptr->count_down();
+          }
+          work_loop();
+        });
+        if (!name.empty()) {
+          pthread_setname_np(t.native_handle(), (name + "_" + std::to_string(i)).c_str());
         }
-        work_loop();
-      });
-      if (!name.empty()) {
-        pthread_setname_np(t.native_handle(), (name + "_" + std::to_string(i)).c_str());
+        if (!cpu_ids.empty()) {
+          pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
+        }
       }
-      if (!cpu_ids.empty()) {
-        pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
+    } catch (...) {
+      stop();
+      for (auto& t : threads_) {
+        if (t.joinable()) { t.join(); }
       }
+      throw;
     }
 
     if (init_latch) { init_latch->wait(); }

@@ -18,13 +18,12 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/metadata_store.hpp>
-#include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/types.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
+#include <cucascade/io/uri_parser.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -33,11 +32,12 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace cucascade::io {
 
-enum class io_context_type { uring, restful, kvikio };
+enum class io_context_type { uring, restful, kvikio, s3rdma };
 
 /// Hint passed to @c open_io_object so a backend can tailor how it resolves an
 /// object's metadata.  @c generic resolves the size however is cheapest for the
@@ -48,8 +48,8 @@ enum class io_context_type { uring, restful, kvikio };
 enum class open_hint { generic, parquet_footer_probe };
 
 namespace cache {
-class prefetching_cache;
-class prefetching_handle;
+class fs_cache;
+class cache_handle;
 }  // namespace cache
 
 class datasource;
@@ -77,13 +77,6 @@ namespace cucascade::io {
  * threads, ...). Extend this class to provide a concrete I/O backend.
  */
 class ioctx : public std::enable_shared_from_this<ioctx> {
-  // prefetching_cache's worker_loop is the only caller of the protected
-  // host_read_ranges_async_io entry point through a ioctx* base
-  // pointer.  Friending the cache lets that single call site reach in
-  // without forcing the vector-read primitive (which most callers never
-  // touch) into the public API.
-  friend class cache::prefetching_cache;
-
  public:
   ioctx();
   virtual ~ioctx();
@@ -106,16 +99,22 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// The cudf-coupled datasource layer wraps the result in a
   /// @c cucascade::io::datasource; cudf-free callers drive the read APIs
   /// below directly.
+  ///
+  /// A leading @c file: URI scheme is stripped HERE, at the single funnel above
+  /// the @c create_io_object virtual, rather than at each call site (see
+  /// @c strip_file_scheme): an un-stripped URI would reach a local backend's
+  /// "unsupported path" throw, which surfaces as a runtime fallback rather than
+  /// a clean decline.
   [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path)
   {
-    return create_io_object(std::move(path));
+    return create_io_object(strip_file_scheme(path));
   }
 
   /// As above, forwarding @p hint to the backend's io_object resolution so it
   /// can, e.g., prefetch a parquet footer in the same round-trip as the size.
   [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path, open_hint hint)
   {
-    return create_io_object(std::move(path), hint);
+    return create_io_object(strip_file_scheme(path), hint);
   }
 
   /// As above, with the object's size already known (e.g. from an S3
@@ -124,8 +123,28 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   [[nodiscard]] std::shared_ptr<io_object> open_io_object(std::string path,
                                                           std::uint64_t known_size)
   {
-    return create_io_object(std::move(path), known_size);
+    return create_io_object(strip_file_scheme(path), known_size);
   }
+
+  /// Open the backend's connections to whatever serves @p bucket_url, ahead of
+  /// the first read, so a query does not pay connection setup on its hot path.
+  ///
+  /// @p bucket_url names a container, not an object -- @c "s3://my-bucket".  A
+  /// full object URL is accepted and its key ignored, since connections are per
+  /// endpoint and the object adds nothing to the identity.  Deliberately not an
+  /// @c io_object: opening one is itself a round trip over the connection being
+  /// warmed, which would leave the warm-up nothing left to hide, and it would
+  /// tie warm-up traffic to individual data files.
+  ///
+  /// Best-effort by contract: it must not throw and must not block the caller,
+  /// and a failed warm-up is never a reason to fail a read.  For a transport
+  /// that is what warms, even a rejected request is a success -- a 403 still
+  /// completed the DNS lookup, the TCP connect and the TLS handshake, which is
+  /// all that was being bought.
+  ///
+  /// The default is a no-op, which is the right answer for every backend whose
+  /// "connection" is a file descriptor it already holds.
+  virtual void warmup(std::string_view /*bucket_url*/) noexcept {}
 
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
@@ -142,17 +161,64 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   [[nodiscard]] virtual bool supports_host_to_device_read() const noexcept = 0;
 
   /// Whether the backend can serve a batch of host reads in a single dispatch
-  /// (cf. @c host_read_ranges_async_io).  When false, the prefetching layer
+  /// (cf. @c host_readv_async_io).  When false, the prefetching layer
   /// cannot amortise per-request overhead and must fall back to
-  /// @c prefetching_stage::none.
+  /// @c scan_stage::none.
   [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
 
-  /// Prefetching strategy the prefetching layer should use against this
-  /// backend.  Returns @c prefetching_stage::none whenever
-  /// @c supports_vector_host_read() is false; otherwise the backend picks
-  /// between eager prefill and on-demand read-ahead based on its IO
-  /// characteristics.
-  [[nodiscard]] virtual cache::prefetching_stage preferred_prefetching_stage() const noexcept = 0;
+  /// Whether the backend can efficiently serve a batch of device reads.
+  /// Backends may still process mixed slices serially when this is false.
+  [[nodiscard]] virtual bool supports_device_range_read() const noexcept = 0;
+
+  /// Whether this backend would rather be handed one batched request covering
+  /// everything a reader needs than a stream of small reads as the reader walks
+  /// the file.
+  ///
+  /// Unlike the supports_* flags this is a preference, not a capability: a
+  /// backend that says no can still serve a batch, and one that says yes can
+  /// still serve small reads.  It reflects what the request itself costs.  For
+  /// an object store a read is a round trip, so the shape of the request set
+  /// dominates and knowing all of it up front is worth a great deal; for a local
+  /// file a read is a syscall against page cache or NVMe, and batching buys
+  /// little while forcing the caller to materialise ranges it may not need.
+  ///
+  /// Conservatively false: a backend opts in.
+  [[nodiscard]] virtual bool prefers_bulk_io() const noexcept { return false; }
+
+  /// The smallest unit this backend can address, in bytes.  A read is widened
+  /// out to a multiple of it before being issued: a local file opened O_DIRECT
+  /// can only transfer whole pages, while an object store addresses single
+  /// bytes and pays nothing for an odd offset.
+  ///
+  /// Conservatively 1 -- a backend that has not opted in is never widened.
+  [[nodiscard]] virtual std::size_t min_alignment_requirement() const noexcept { return 1; }
+
+  /// The largest gap between two ranges still worth bridging into one request,
+  /// in bytes.  The bridged bytes are fetched and discarded, traded against the
+  /// cost of a second request: a page for a local file, a whole round trip for
+  /// an object store, which is why the two want very different answers.
+  ///
+  /// Conservatively 0 -- only adjacent ranges are fused.
+  [[nodiscard]] virtual std::size_t merge_gap_size() const noexcept { return 0; }
+
+  /// How many scan tasks the readahead manager may keep in flight against this
+  /// backend at once, as configured on its reactors.  Zero means this backend
+  /// opts out of readahead scheduling entirely.
+  ///
+  /// The bound is a property of the backend, not of the query: it reflects the
+  /// queue depth the device is worth driving at (see the per-backend defaults
+  /// on each reactor config).  The base returns 0 so a backend that has not
+  /// opted in is never scheduled against.
+  [[nodiscard]] virtual std::size_t n_max_concurrent_scans() const noexcept { return 0; }
+
+  /// Size of one staging block on this backend's reactors, in bytes.  A reactor
+  /// that fills cache chunks computes each fragmented fill's extent with
+  /// @c cache::fill_span(fill, chunk->offset, staging_block_size), so this MUST
+  /// equal @c fs_cache::chunk_size() — @ref initialize_cache checks it.
+  ///
+  /// Conservatively 0 — a backend that has not opted in does not stage through
+  /// cache chunks and is not checked.
+  [[nodiscard]] virtual std::size_t staging_block_size() const noexcept { return 0; }
 
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw
@@ -188,15 +254,12 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// fine.  Cheap when no cache was ever initialised.
   void pre_destroy() noexcept { shutdown_cache(); }
 
-  [[nodiscard]] cache::prefetching_cache* cache() noexcept { return _cache.get(); }
+  [[nodiscard]] cache::fs_cache* cache() noexcept { return _cache.get(); }
 
   /// True iff @c host_read / @c device_read should consult the cache
   /// before falling through to the backend.  Computed live so it tracks
   /// @ref initialize_cache / @ref shutdown_cache transitions.
-  [[nodiscard]] inline bool uses_prefetching_cache() const noexcept
-  {
-    return can_use_prefetching_cache() && _cache;
-  }
+  [[nodiscard]] inline bool uses_fs_cache() const noexcept { return can_use_fs_cache() && _cache; }
 
   /// Per-file metadata cache that lives independently of the prefetching
   /// cache.  Always available — callers that have parsed file metadata
@@ -215,7 +278,9 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// coalesce overlapping/adjacent results into a minimal set of aligned,
   /// non-overlapping ranges (sorted by offset).  @p alignment is a lower bound:
   /// when unset, or smaller than the backend's optimal alignment, the backend
-  /// uses its own alignment instead.
+  /// uses its own alignment instead.  Input ranges with a negative offset or a
+  /// non-positive size are dropped, and no result ends past INT64_MAX (an end
+  /// clamped there may be unaligned).
   [[nodiscard]] virtual std::vector<byte_range> align_and_coalesce(
     std::span<const byte_range> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept = 0;
@@ -225,58 +290,81 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   // The read entry points callers should use: when the prefetching cache is
   // armed they serve (and account) the read through it, otherwise they fall
   // through to the backend primitives (*_io below).  @p handle is the scan's
-  // prefetching_handle (from a prior fadvise/insert), passed as a raw pointer
+  // cache_handle (from a prior fadvise/insert), passed as a raw pointer
   // so the cache can consume/observe it; it may be null when the caller made
   // no prefetch reservation.  All async variants return @c exec::semi_future.
+  //
+  // @p priority picks the reactor queue tier (see @ref io_priority).  Left at
+  // @c automatic, every read goes high (demand); only an explicit @c low
+  // goes low.  A backend without tiered queues ignores it.
 
   size_t host_read(const io_object& obj,
                    size_t offset,
                    size_t size,
                    uint8_t* dst,
-                   cache::prefetching_handle* handle = nullptr);
+                   cache::cache_handle* handle = nullptr,
+                   io_priority priority        = io_priority::automatic);
 
   [[nodiscard]] exec::semi_future<size_t> host_read_async(
     const io_object& obj,
     size_t offset,
     size_t size,
     uint8_t* dst,
-    cache::prefetching_handle* handle = nullptr);
+    cache::cache_handle* handle = nullptr,
+    io_priority priority        = io_priority::automatic);
 
   [[nodiscard]] exec::semi_future<size_t> device_read_async(
     const io_object& obj,
     size_t offset,
     size_t size,
     uint8_t* dst,
-    rmm::cuda_stream_view stream,
-    cache::prefetching_handle* handle = nullptr);
+    ::cuda::stream_ref stream,
+    cache::cache_handle* handle = nullptr,
+    io_priority priority        = io_priority::automatic);
 
   // -- Backend primitives (cache-unaware) ----------------------------------------
 
   virtual size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
 
-  virtual exec::semi_future<size_t> host_read_async_io(const io_object& obj,
-                                                       size_t offset,
-                                                       size_t size,
-                                                       uint8_t* dst) noexcept = 0;
-
-  virtual exec::semi_future<size_t> device_read_async_io(const io_object& obj,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         uint8_t* dst,
-                                                         rmm::cuda_stream_view stream) noexcept = 0;
-
-  virtual exec::semi_future<size_t> host_to_device_read_async_io(
+  virtual exec::semi_future<size_t> host_read_async_io(
     const io_object& obj,
-    std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
-    uint8_t* device_dst,
-    rmm::cuda_stream_view stream) noexcept = 0;
+    uint8_t* dst,
+    io_priority priority = io_priority::automatic) noexcept;
 
-  virtual exec::semi_future<size_t> host_read_ranges_async_io(
-    const io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
+  virtual exec::semi_future<size_t> device_read_async_io(
+    const io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    ::cuda::stream_ref stream,
+    io_priority priority = io_priority::automatic) noexcept;
 
-  bool can_use_prefetching_cache() const noexcept
+  virtual exec::semi_future<size_t> host_readv_async_io(
+    const io_object& obj,
+    std::span<const slice> slices,
+    io_priority priority = io_priority::automatic) noexcept;
+
+  virtual exec::semi_future<size_t> device_readv_async_io(
+    const io_object& obj,
+    std::span<const slice> slices,
+    ::cuda::stream_ref stream,
+    io_priority priority = io_priority::automatic) noexcept;
+
+  /// The sole asynchronous backend hook. All scalar/vector host/device APIs
+  /// construct prepared slices and forward here; reactors perform physical
+  /// chunking only after queue and slot pressure are known.
+  virtual exec::semi_future<size_t> mixed_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept = 0;
+
+  exec::semi_future<size_t> host_device_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept
+  {
+    return mixed_readv_async_io(obj, std::move(slices));
+  }
+
+  bool can_use_fs_cache() const noexcept
   {
     return supports_vector_host_read() || supports_host_to_device_read();
   }
@@ -306,7 +394,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
   /// though callers are expected to drive the lifecycle explicitly so
   /// reactors stay alive while workers drain).
-  std::unique_ptr<cache::prefetching_cache> _cache;
+  std::unique_ptr<cache::fs_cache> _cache;
 
   /// Independent of the prefetching machinery — exposed via @c metadata_store().
   cache::metadata_store _metadata_store;

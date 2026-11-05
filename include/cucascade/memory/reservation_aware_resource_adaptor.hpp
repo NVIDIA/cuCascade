@@ -17,9 +17,9 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
@@ -76,6 +76,7 @@ class reservation_aware_resource_adaptor
    * @param default_oom_policy The default OOM handling policy
    * @param tracking_scope [default: PER_STREAM] The scope of allocation tracking (per-stream,
    * per-thread)
+   * @param pool_handle Optional borrowed handle identifying the actual upstream allocation pool
    */
   explicit reservation_aware_resource_adaptor(
     memory_space_id space_id,
@@ -97,7 +98,7 @@ class reservation_aware_resource_adaptor
    * @param default_oom_policy The default OOM handling policy
    * @param tracking_scope [default: PER_STREAM] The scope of allocation tracking (per-stream,
    * per-thread)
-   * @param pool_handle Optional CUDA memory pool handle for accurate OOM diagnostics
+   * @param pool_handle Optional borrowed handle identifying the actual upstream allocation pool
    */
   explicit reservation_aware_resource_adaptor(
     memory_space_id space_id,
@@ -116,6 +117,18 @@ class reservation_aware_resource_adaptor
   rmm::device_async_resource_ref get_upstream_resource() const noexcept;
 
   /**
+   * @brief Returns the CUDA memory pool associated with the upstream resource
+   *
+   * The returned nullable handle is borrowed. The adaptor neither owns nor reconfigures the pool,
+   * and the handle must not be used after its owner is destroyed. If a handle was supplied
+   * explicitly at construction, callers using it as access evidence are responsible for ensuring
+   * that it names the pool that actually backs upstream allocations.
+   *
+   * @return The associated CUDA memory pool, or nullptr when it is unknown
+   */
+  [[nodiscard]] cudaMemPool_t pool_handle() const noexcept;
+
+  /**
    * @brief Returns the available memory left in the resource
    */
   std::size_t get_available_memory() const noexcept;
@@ -123,23 +136,23 @@ class reservation_aware_resource_adaptor
   /**
    * @brief Returns the available memory left in the resource
    */
-  std::size_t get_available_memory(rmm::cuda_stream_view stream) const noexcept;
+  std::size_t get_available_memory(::cuda::stream_ref stream) const noexcept;
 
-  std::size_t get_available_memory_print(rmm::cuda_stream_view stream) const noexcept;
+  std::size_t get_available_memory_print(::cuda::stream_ref stream) const noexcept;
 
   /**
    * @brief Gets the currently allocated bytes for a specific stream.
    * @param stream The CUDA stream to query
    * @return The allocated bytes for the stream
    */
-  std::size_t get_allocated_bytes(rmm::cuda_stream_view stream) const;
+  std::size_t get_allocated_bytes(::cuda::stream_ref stream) const;
 
   /**
    * @brief Gets the peak allocated bytes observed for a specific stream.
    * @param stream The CUDA stream to query
    * @return The peak allocated bytes for the stream
    */
-  std::size_t get_peak_allocated_bytes(rmm::cuda_stream_view stream) const;
+  std::size_t get_peak_allocated_bytes(::cuda::stream_ref stream) const;
 
   /**
    * @brief Gets the total currently allocated bytes across all streams.
@@ -157,7 +170,7 @@ class reservation_aware_resource_adaptor
    * @brief Resets the peak allocated bytes for a specific stream to 0.
    * @param stream The CUDA stream to reset
    */
-  void reset_peak_allocated_bytes(rmm::cuda_stream_view stream);
+  void reset_peak_allocated_bytes(::cuda::stream_ref stream);
 
   /**
    * @brief Gets the total reserved bytes across all streams.
@@ -170,7 +183,7 @@ class reservation_aware_resource_adaptor
    * @param stream The CUDA stream to check
    * @return true if the stream is tracked, false otherwise
    */
-  bool is_stream_tracked(rmm::cuda_stream_view stream) const;
+  bool is_stream_tracked(::cuda::stream_ref stream) const;
 
   //===----------------------------------------------------------------------===//
   // Reservation Management
@@ -206,7 +219,7 @@ class reservation_aware_resource_adaptor
    * @return true if reservation was successfully set, false otherwise
    */
   bool attach_reservation_to_tracker(
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     std::unique_ptr<reservation> reserved_bytes,
     std::unique_ptr<reservation_limit_policy> stream_reservation_policy = nullptr,
     std::unique_ptr<oom_handling_policy> stream_oom_policy              = nullptr);
@@ -215,7 +228,7 @@ class reservation_aware_resource_adaptor
    * @brief Rests the reservation object for a specific stream.
    * @param stream The CUDA stream to query
    */
-  void reset_stream_reservation(rmm::cuda_stream_view stream);
+  void reset_stream_reservation(::cuda::stream_ref stream);
 
   /**
    * @brief Sets the default reservation policy for new streams.

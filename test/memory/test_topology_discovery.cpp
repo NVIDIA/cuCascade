@@ -31,7 +31,13 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+
 #include <catch2/catch_all.hpp>
+#include <nvml.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -206,6 +212,74 @@ TEST_CASE("Topology Discovery resolves GPU NUMA node on NUMA-aware hosts", "[hw_
   }
 }
 
+TEST_CASE("Topology Discovery reports NUMA node capacities", "[hw_topology]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto const& topology = discovery.get_topology();
+
+  // num_numa_nodes is derived from the discovered node list.
+  REQUIRE(topology.numa_nodes.size() == static_cast<size_t>(topology.num_numa_nodes));
+
+  if (topology.numa_nodes.empty()) {
+    SUCCEED("Skipped: host does not expose NUMA topology");
+    return;
+  }
+
+  size_t summed_host_capacity = 0;
+  int previous_id             = -1;
+  for (auto const& node : topology.numa_nodes) {
+    INFO("NUMA node " << node.id);
+    REQUIRE(node.id >= 0);
+    // Nodes are reported sorted by id and each id appears once.
+    REQUIRE(node.id > previous_id);
+    previous_id = node.id;
+
+    // /sys/devices/system/node/node<id>/meminfo always reports MemTotal and MemFree.
+    REQUIRE(node.memory_capacity > 0);
+    REQUIRE(node.free_memory <= node.memory_capacity);
+
+    // A node with memory but no CPUs is device memory (GPU HBM, CXL), not host memory.
+    REQUIRE(node.is_device_memory == !node.has_cpus);
+
+    REQUIRE(topology.find_numa_node(node.id) != nullptr);
+    REQUIRE(topology.get_numa_memory_capacity(node.id).value() == node.memory_capacity);
+    REQUIRE(topology.get_numa_free_memory(node.id).value_or(0) == node.free_memory);
+    if (!node.is_device_memory) { summed_host_capacity += node.memory_capacity; }
+  }
+
+  REQUIRE(topology.get_total_numa_memory_capacity() == summed_host_capacity);
+
+  // Unknown node ids are reported as such rather than silently resolving to 0.
+  REQUIRE_FALSE(topology.get_numa_memory_capacity(-1).has_value());
+  REQUIRE_FALSE(topology.get_numa_memory_capacity(topology.numa_nodes.back().id + 1).has_value());
+  REQUIRE_FALSE(topology.get_numa_free_memory(-1).has_value());
+  REQUIRE(topology.find_numa_node(-1) == nullptr);
+}
+
+// Every GPU's NUMA node must be one of the discovered NUMA nodes with a known capacity,
+// so host memory spaces can be sized from it.
+TEST_CASE("Topology Discovery maps GPUs to NUMA nodes with known capacity", "[hw_topology]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto const& topology = discovery.get_topology();
+
+  if (topology.num_gpus == 0 || topology.numa_nodes.empty()) {
+    SUCCEED("Skipped: requires at least one GPU and NUMA node");
+    return;
+  }
+
+  for (auto const& gpu : topology.gpus) {
+    INFO("GPU " << gpu.id << " on NUMA node " << gpu.numa_node);
+    auto const capacity = topology.get_numa_memory_capacity(gpu.numa_node);
+    REQUIRE(capacity.has_value());
+    REQUIRE(*capacity > 0);
+  }
+}
+
 TEST_CASE("Topology Discovery rejects out-of-range CUDA_VISIBLE_DEVICES", "[hw_topology]")
 {
   ScopedEnvVar env("CUDA_VISIBLE_DEVICES", "99999999");
@@ -221,4 +295,50 @@ TEST_CASE("Topology Discovery rejects overflow CUDA_VISIBLE_DEVICES", "[hw_topol
   topology_discovery discovery;
   REQUIRE_THROWS_WITH(discovery.discover(),
                       "Invalid numeric CUDA_VISIBLE_DEVICES entry: 999999999999999999999999999999");
+}
+
+TEST_CASE("Default Topology Discovery does not initialize CUDA while visibility is widened",
+          "[hw_topology][cuda-context]")
+{
+  auto const child = fork();
+  REQUIRE(child >= 0);
+
+  if (child == 0) {
+    // NVML is used only to make this test meaningful on a multi-GPU host. It
+    // does not create a CUDA context or initialize the CUDA runtime.
+    if (nvmlInit_v2() != NVML_SUCCESS) { _exit(77); }
+    unsigned int device_count = 0;
+    auto const count_status   = nvmlDeviceGetCount_v2(&device_count);
+    if (count_status != NVML_SUCCESS || device_count < 2) { _exit(77); }
+
+    // This mirrors callers that temporarily widen visibility to collect
+    // physical topology, then restore the process's assigned GPU. If
+    // default discover() initializes the CUDA runtime while CVD is unset, the
+    // runtime permanently sees all GPUs and the final cudaGetDeviceCount() is wrong.
+    setenv("CUDA_VISIBLE_DEVICES", "1", 1);
+    unsetenv("CUDA_VISIBLE_DEVICES");
+    topology_discovery discovery;
+    bool const discovered = discovery.discover();
+    setenv("CUDA_VISIBLE_DEVICES", "1", 1);
+    if (!discovered) { _exit(1); }
+
+    CUcontext context = nullptr;
+    if (cuInit(0) != CUDA_SUCCESS || cuCtxGetCurrent(&context) != CUDA_SUCCESS ||
+        context != nullptr) {
+      _exit(1);
+    }
+
+    int visible_count = 0;
+    if (cudaGetDeviceCount(&visible_count) != cudaSuccess || visible_count != 1) { _exit(1); }
+    _exit(0);
+  }
+
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
+    SUCCEED("Skipped: requires NVML and at least two visible GPUs");
+    return;
+  }
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
 }

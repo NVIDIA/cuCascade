@@ -17,9 +17,8 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
@@ -74,14 +73,10 @@ class idata_representation {
    *
    * @return memory_space& Reference to the memory space
    */
-  cucascade::memory::memory_space& get_memory_space() noexcept { return _memory_space; }
-
-  /**
-   * @brief Get the memory space where the data resides (const version)
-   *
-   * @return const memory_space& Const reference to the memory space
-   */
-  const cucascade::memory::memory_space& get_memory_space() const noexcept { return _memory_space; }
+  [[nodiscard]] cucascade::memory::memory_space& get_memory_space() const noexcept
+  {
+    return _memory_space;
+  }
 
   /**
    * @brief Get the size of the data representation in bytes
@@ -110,7 +105,7 @@ class idata_representation {
    * @param stream CUDA stream for memory operations
    * @return std::unique_ptr<idata_representation> A new data representation with copied data
    */
-  virtual std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) = 0;
+  virtual std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) const = 0;
 
   /**
    * @brief Record a CUDA event marking completion of the most recent writes to this
@@ -122,14 +117,19 @@ class idata_representation {
    *
    * @param writer_stream The stream on which the most recent writes were enqueued.
    */
-  virtual void record_writer_event([[maybe_unused]] rmm::cuda_stream_view writer_stream) {}
+  virtual void record_writer_event([[maybe_unused]] ::cuda::stream_ref writer_stream) {}
 
   /**
    * @brief Get the writer event recorded by record_writer_event(), or nullptr if none.
    *
-   * Readers that cross stream / device boundaries should call cudaStreamWaitEvent on the
-   * returned event (when non-null) before reading this representation's memory. The default
-   * implementation returns nullptr; representations that record writer events override this.
+   * A reader on another stream or device must wait for a non-null event (e.g. with
+   * cudaStreamWaitEvent) before reading this representation's memory. What nullptr means depends on
+   * the representation: one whose memory is written asynchronously on a GPU (e.g. a GPU
+   * representation) returns nullptr when its writer is unknown, and the reader must then
+   * synchronize the device returned by get_device_id() before reading; one with no GPU writer (e.g.
+   * a host or disk representation) returns nullptr because its memory needs no ordering. The
+   * default implementation returns nullptr; representations that record writer events override
+   * this.
    *
    * @return cudaEvent_t The writer event, or nullptr if none has been recorded.
    */
@@ -146,7 +146,7 @@ class idata_representation {
    *
    * @param stream Stream used for future asynchronous deallocation of the data's buffers.
    */
-  virtual void rebind_stream([[maybe_unused]] rmm::cuda_stream_view stream) {}
+  virtual void rebind_stream([[maybe_unused]] ::cuda::stream_ref stream) {}
 
   /**
    * @brief Casts this interface to a specific derived type.

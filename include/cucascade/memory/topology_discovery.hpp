@@ -5,11 +5,24 @@
 
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace cucascade::memory {
+
+/**
+ * @brief GPU runtime attributes.
+ *
+ * Attributes whose discovery requires initializing a CUDA context (via the CUDA
+ * driver API). Populated only when `discover()` / `discover_runtime_attributes()`
+ * are explicitly asked to. Kept separate so passive topology discovery via NVML
+ * and sysfs never has to spin up a CUDA context.
+ */
+struct gpu_runtime_attributes {
+  bool hw_decomp{false};  ///< Hardware-accelerated decompression engine present.
+};
 
 /**
  * @brief GPU information.
@@ -24,7 +37,9 @@ struct gpu_topology_info {
   std::vector<int> cpu_cores;                ///< List of CPU core IDs.
   std::vector<int> memory_binding;           ///< NUMA nodes for memory binding.
   std::vector<std::string> network_devices;  ///< Network devices (NICs) optimal for this GPU.
-  bool hw_decompression_available{false};    ///< Hardware-accelerated decompression engine present.
+  std::optional<gpu_runtime_attributes>
+    runtime_attributes;  ///< Runtime attributes (populated only when explicitly requested; empty
+                         ///< means "not queried", not "unsupported").
 };
 
 /**
@@ -51,6 +66,26 @@ struct storage_device_info {
 };
 
 /**
+ * @brief NUMA node memory information.
+ *
+ * Capacities are reported in bytes and are read from
+ * `/sys/devices/system/node/node<id>/meminfo`. They are 0 when the kernel does not
+ * expose the corresponding entry.
+ *
+ * @note Not every NUMA node backs host memory. Systems such as DGX Station and
+ *       Grace-Hopper expose device memory (GPU HBM) as its own CPU-less NUMA node, and
+ *       CXL memory expanders do the same. Those nodes are flagged with
+ *       `is_device_memory` and must not be used to size a host memory space.
+ */
+struct numa_topology_info {
+  int id{-1};                      ///< NUMA node ID.
+  std::size_t memory_capacity{0};  ///< Total memory of the node in bytes (0 if unknown).
+  std::size_t free_memory{0};      ///< Currently free memory of the node in bytes (0 if unknown).
+  bool has_cpus{false};            ///< Whether any CPU is assigned to this node.
+  bool is_device_memory{false};    ///< Whether this node is device memory rather than host memory.
+};
+
+/**
  * @brief System topology information.
  */
 struct system_topology_info {
@@ -61,6 +96,67 @@ struct system_topology_info {
   std::vector<gpu_topology_info> gpus;               ///< GPU topology information.
   std::vector<network_device_info> network_devices;  ///< Network device information.
   std::vector<storage_device_info> storage_devices;  ///< Storage device information.
+  std::vector<numa_topology_info> numa_nodes;        ///< NUMA node information, sorted by id.
+
+  /**
+   * @brief Find a NUMA node by ID.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Pointer to the node, or `nullptr` if no such node was discovered.
+   */
+  [[nodiscard]] numa_topology_info const* find_numa_node(int numa_id) const
+  {
+    for (auto const& node : numa_nodes) {
+      if (node.id == numa_id) { return &node; }
+    }
+    return nullptr;
+  }
+
+  /**
+   * @brief Get the memory capacity of a NUMA node.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Capacity of the node in bytes, or `std::nullopt` if the node was not
+   *         discovered or the kernel did not report its capacity. The two cases are
+   *         distinguishable via `find_numa_node()`.
+   */
+  [[nodiscard]] std::optional<std::size_t> get_numa_memory_capacity(int numa_id) const
+  {
+    auto const* node = find_numa_node(numa_id);
+    if (node == nullptr || node->memory_capacity == 0) { return std::nullopt; }
+    return node->memory_capacity;
+  }
+
+  /**
+   * @brief Get the free memory of a NUMA node.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Free memory of the node in bytes, or `std::nullopt` if the node was not
+   *         discovered or the kernel did not report its free memory.
+   */
+  [[nodiscard]] std::optional<std::size_t> get_numa_free_memory(int numa_id) const
+  {
+    auto const* node = find_numa_node(numa_id);
+    if (node == nullptr || node->free_memory == 0) { return std::nullopt; }
+    return node->free_memory;
+  }
+
+  /**
+   * @brief Get the summed memory capacity of all host-backing NUMA nodes.
+   *
+   * Nodes flagged as device memory are excluded, so the result is usable host memory.
+   *
+   * @return Total host memory capacity in bytes.
+   */
+  [[nodiscard]] std::size_t get_total_numa_memory_capacity() const
+  {
+    std::size_t total = 0;
+    for (auto const& node : numa_nodes) {
+      if (node.is_device_memory) { continue; }
+      total += node.memory_capacity;
+    }
+    return total;
+  }
 };
 
 /**
@@ -110,11 +206,45 @@ class topology_discovery {
    * This method performs the actual discovery of GPUs, NUMA nodes, CPU affinity,
    * and network devices. It must be called before `get_topology()`.
    *
+   * By default this call uses only NVML and Linux sysfs and therefore does not
+   * touch the CUDA driver. Set @p with_runtime_attributes to true to also
+   * populate per-hardware runtime attributes (e.g. `gpu_runtime_attributes`),
+   * which queries CUDA driver device attributes.
+   *
    * @param net_verification Controls how strictly network devices are validated.
+   * @param with_runtime_attributes If true, also discover runtime attributes for
+   * each hardware class (see `discover_runtime_attributes`). Defaults to false so
+   * that discovery does not touch the CUDA driver. When true, the caller must
+   * have already initialized the CUDA driver API (see
+   * `discover_runtime_attributes` for the exact precondition).
    * @return true if discovery was successful, false otherwise.
    */
   [[nodiscard]] bool discover(
-    NetworkDeviceVerification net_verification = NetworkDeviceVerification::EXISTS_ACTIVE_IP);
+    NetworkDeviceVerification net_verification = NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+    bool with_runtime_attributes               = false);
+
+  /**
+   * @brief Discover runtime attributes for each hardware class in @p topology.
+   *
+   * Populates the `runtime_attributes` field of each entry in `topology.gpus`
+   * (and, in the future, other hardware classes). This is the only path in this
+   * component that issues CUDA driver calls — every other discovery step relies
+   * solely on NVML and sysfs. The CUDA driver library is loaded dynamically,
+   * therefore, systems without it remain able to use passive topology discovery.
+   *
+   * Safe to call multiple times; existing runtime attribute values are
+   * overwritten.
+   *
+   * @pre The CUDA driver API has already been initialized by the caller —
+   * either via an explicit `cuInit(0)` or via any prior CUDA runtime call that
+   * transitively initializes the driver. This function does not call `cuInit`
+   * and does not create a CUDA context; per-GPU queries that fail (e.g.
+   * because the driver library is unavailable or uninitialized) leave
+   * `hw_decomp` as `false`.
+   *
+   * @param topology Topology to enrich in place.
+   */
+  static void discover_runtime_attributes(system_topology_info& topology);
 
   /**
    * @brief Get the discovered topology information.

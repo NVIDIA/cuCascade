@@ -57,10 +57,10 @@ auto& shared_disk_space()
   static auto s = test::make_mock_memory_space(memory::Tier::DISK, 0);
   return s;
 }
-rmm::cuda_stream_view shared_stream()
+::cuda::stream_ref shared_stream()
 {
   static rmm::cuda_stream s;
-  return s.view();
+  return s;
 }
 
 /// Round-trip test helper: GPU -> disk -> GPU (direct 3-step), compare tables.
@@ -75,7 +75,7 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
 
   // Create GPU representation from the original table
   auto gpu_rep = std::make_unique<gpu_table_representation>(
-    std::move(original_table), *gpu_space, rmm::cuda_stream_view{});
+    std::move(original_table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   // GPU -> disk (direct via write/write_batch)
   auto disk_rep =
@@ -234,22 +234,25 @@ TEST_CASE("gpu disk round-trip no-null column", "[disk][gpu-converter][null]")
 
 TEST_CASE("gpu disk round-trip mixed-null column", "[disk][gpu-converter][null]")
 {
-  // Create a column with alternating nulls
+  // Exercise masks beyond the first quarter of the allocation, including a partial word.
+  auto const num_rows = GENERATE(100, 4097);
 
   auto col = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT32}, 100, cudf::mask_state::ALL_VALID, shared_stream());
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_VALID, shared_stream());
 
   // Set every other bit to null using cudf utilities
-  auto const num_rows = 100;
-  std::vector<uint8_t> host_mask(cudf::bitmask_allocation_size_bytes(num_rows), 0xFF);
+  std::vector<cudf::bitmask_type> host_mask(
+    cudf::bitmask_allocation_size_bytes(num_rows) / sizeof(cudf::bitmask_type),
+    ~cudf::bitmask_type{0});
   // Clear every other bit (set elements 0, 2, 4, ... to null)
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
   for (int i = 0; i < num_rows; i += 2) {
-    auto byte_idx = static_cast<std::size_t>(i / 8);
-    auto bit_idx  = static_cast<unsigned>(i % 8);
-    host_mask[byte_idx] &= static_cast<uint8_t>(~(1u << bit_idx));
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
   }
-  rmm::device_buffer dev_mask(host_mask.data(), host_mask.size(), shared_stream());
-  col->set_null_mask(std::move(dev_mask), 50);  // 50 nulls out of 100
+  auto dev_mask = test::make_null_mask_from_host(num_rows, host_mask, shared_stream());
+  col->set_null_mask(std::move(dev_mask), (num_rows + 1) / 2);
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
@@ -290,11 +293,15 @@ TEST_CASE("gpu disk round-trip string column", "[disk][gpu-converter][string]")
                                      host_offsets.data(),
                                      host_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     shared_stream().value()));
-  shared_stream().synchronize();
+                                     shared_stream().get()));
+  shared_stream().sync();
 
-  auto str_col = cudf::make_strings_column(
-    num_strings, std::move(offsets_col), std::move(dev_chars), 0, rmm::device_buffer{});
+  auto str_col =
+    cudf::make_strings_column(num_strings,
+                              std::move(offsets_col),
+                              std::move(dev_chars),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(str_col));
@@ -345,15 +352,16 @@ TEST_CASE("gpu disk round-trip string column with nulls", "[disk][gpu-converter]
                                      host_offsets.data(),
                                      host_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     shared_stream().value()));
+                                     shared_stream().get()));
 
   // Create null mask: elements 1 and 3 are null
   auto null_mask_size = cudf::bitmask_allocation_size_bytes(num_strings);
-  std::vector<uint8_t> host_mask(null_mask_size, 0xFF);
-  host_mask[0] &= static_cast<uint8_t>(~(1u << 1));  // null at index 1
-  host_mask[0] &= static_cast<uint8_t>(~(1u << 3));  // null at index 3
-  rmm::device_buffer dev_mask(host_mask.data(), host_mask.size(), shared_stream());
-  shared_stream().synchronize();
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  host_mask[0] &= ~(cudf::bitmask_type{1} << 1);  // null at index 1
+  host_mask[0] &= ~(cudf::bitmask_type{1} << 3);  // null at index 3
+  auto dev_mask = test::make_null_mask_from_host(num_strings, host_mask, shared_stream());
+  shared_stream().sync();
 
   auto str_col = cudf::make_strings_column(
     num_strings, std::move(offsets_col), std::move(dev_chars), 2, std::move(dev_mask));
@@ -383,16 +391,19 @@ TEST_CASE("gpu disk round-trip list column", "[disk][gpu-converter][list]")
                                      host_offsets.data(),
                                      host_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     shared_stream().value()));
+                                     shared_stream().get()));
 
   // Create values child: 8 INT32 values
   auto values_col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, 8, cudf::mask_state::UNALLOCATED, shared_stream());
 
-  shared_stream().synchronize();
+  shared_stream().sync();
 
-  auto list_col = cudf::make_lists_column(
-    num_lists, std::move(offsets_col), std::move(values_col), 0, rmm::device_buffer{});
+  auto list_col = cudf::make_lists_column(num_lists,
+                                          std::move(offsets_col),
+                                          std::move(values_col),
+                                          0,
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(list_col));
@@ -411,13 +422,17 @@ TEST_CASE("gpu disk round-trip nested list column", "[disk][gpu-converter][list]
                                      inner_offsets.data(),
                                      inner_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     shared_stream().value()));
+                                     shared_stream().get()));
 
   auto inner_values = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
 
-  auto inner_list = cudf::make_lists_column(
-    2, std::move(inner_offsets_col), std::move(inner_values), 0, rmm::device_buffer{});
+  auto inner_list =
+    cudf::make_lists_column(2,
+                            std::move(inner_offsets_col),
+                            std::move(inner_values),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   // Outer lists: offsets [0, 1, 2] -> 2 outer lists, each containing 1 inner list
   std::vector<int32_t> outer_offsets = {0, 1, 2};
@@ -427,12 +442,16 @@ TEST_CASE("gpu disk round-trip nested list column", "[disk][gpu-converter][list]
                                      outer_offsets.data(),
                                      outer_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     shared_stream().value()));
+                                     shared_stream().get()));
 
-  shared_stream().synchronize();
+  shared_stream().sync();
 
-  auto outer_list = cudf::make_lists_column(
-    2, std::move(outer_offsets_col), std::move(inner_list), 0, rmm::device_buffer{});
+  auto outer_list =
+    cudf::make_lists_column(2,
+                            std::move(outer_offsets_col),
+                            std::move(inner_list),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(outer_list));
@@ -455,7 +474,7 @@ TEST_CASE("gpu disk round-trip nullable list column", "[disk][gpu-converter][lis
                                      host_offsets.data(),
                                      host_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     shared_stream().value()));
+                                     shared_stream().get()));
 
   auto values_col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, 8, cudf::mask_state::UNALLOCATED, shared_stream());
@@ -463,9 +482,9 @@ TEST_CASE("gpu disk round-trip nullable list column", "[disk][gpu-converter][lis
   // Null mask: all lists valid except index 2.
   auto null_mask = cudf::create_null_mask(num_lists, cudf::mask_state::ALL_VALID, shared_stream());
   cudf::set_null_mask(
-    static_cast<cudf::bitmask_type*>(null_mask.data()), 2, 3, false, shared_stream());
+    reinterpret_cast<cudf::bitmask_type*>(null_mask.data()), 2, 3, false, shared_stream());
 
-  shared_stream().synchronize();
+  shared_stream().sync();
 
   auto list_col = cudf::make_lists_column(
     num_lists, std::move(offsets_col), std::move(values_col), 1, std::move(null_mask));
@@ -489,13 +508,17 @@ TEST_CASE("gpu disk round-trip nullable nested list column",
                                      inner_offsets.data(),
                                      inner_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     shared_stream().value()));
+                                     shared_stream().get()));
 
   auto inner_values = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
 
-  auto inner_list = cudf::make_lists_column(
-    2, std::move(inner_offsets_col), std::move(inner_values), 0, rmm::device_buffer{});
+  auto inner_list =
+    cudf::make_lists_column(2,
+                            std::move(inner_offsets_col),
+                            std::move(inner_values),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   // Outer lists: offsets [0, 2, 2] -> list 0 holds both inner lists, list 1 is empty (and null).
   std::vector<int32_t> outer_offsets = {0, 2, 2};
@@ -505,14 +528,14 @@ TEST_CASE("gpu disk round-trip nullable nested list column",
                                      outer_offsets.data(),
                                      outer_offsets.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice,
-                                     shared_stream().value()));
+                                     shared_stream().get()));
 
   // Outer null mask: outer list index 1 is null.
   auto outer_null_mask = cudf::create_null_mask(2, cudf::mask_state::ALL_VALID, shared_stream());
   cudf::set_null_mask(
-    static_cast<cudf::bitmask_type*>(outer_null_mask.data()), 1, 2, false, shared_stream());
+    reinterpret_cast<cudf::bitmask_type*>(outer_null_mask.data()), 1, 2, false, shared_stream());
 
-  shared_stream().synchronize();
+  shared_stream().sync();
 
   auto outer_list = cudf::make_lists_column(
     2, std::move(outer_offsets_col), std::move(inner_list), 1, std::move(outer_null_mask));
@@ -545,8 +568,8 @@ TEST_CASE("gpu disk round-trip struct column", "[disk][gpu-converter][struct]")
   children.push_back(std::move(int_child));
   children.push_back(std::move(float_child));
 
-  auto struct_col =
-    cudf::make_structs_column(num_rows, std::move(children), 0, rmm::device_buffer{});
+  auto struct_col = cudf::make_structs_column(
+    num_rows, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(struct_col));
@@ -567,12 +590,18 @@ TEST_CASE("gpu disk round-trip nested struct column", "[disk][gpu-converter][str
   std::vector<std::unique_ptr<cudf::column>> inner_children;
   inner_children.push_back(std::move(inner_child));
   auto inner_struct =
-    cudf::make_structs_column(num_rows, std::move(inner_children), 0, rmm::device_buffer{});
+    cudf::make_structs_column(num_rows,
+                              std::move(inner_children),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   std::vector<std::unique_ptr<cudf::column>> outer_children;
   outer_children.push_back(std::move(inner_struct));
   auto outer_struct =
-    cudf::make_structs_column(num_rows, std::move(outer_children), 0, rmm::device_buffer{});
+    cudf::make_structs_column(num_rows,
+                              std::move(outer_children),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(outer_struct));
@@ -592,20 +621,22 @@ TEST_CASE("gpu disk round-trip struct with null mask", "[disk][gpu-converter][st
 
   // Create struct-level null mask (every 3rd element is null)
   auto null_mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
-  std::vector<uint8_t> host_mask(null_mask_size, 0xFF);
-  cudf::size_type null_count = 0;
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  cudf::size_type null_count   = 0;
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
   for (int i = 0; i < num_rows; i += 3) {
-    auto byte_idx = static_cast<std::size_t>(i / 8);
-    auto bit_idx  = static_cast<unsigned>(i % 8);
-    host_mask[byte_idx] &= static_cast<uint8_t>(~(1u << bit_idx));
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
     null_count++;
   }
-  rmm::device_buffer dev_mask(host_mask.data(), host_mask.size(), shared_stream());
+  auto dev_mask = test::make_null_mask_from_host(num_rows, host_mask, shared_stream());
 
   std::vector<std::unique_ptr<cudf::column>> children;
   children.push_back(std::move(child));
 
-  shared_stream().synchronize();
+  shared_stream().sync();
   auto struct_col =
     cudf::make_structs_column(num_rows, std::move(children), null_count, std::move(dev_mask));
 
@@ -637,7 +668,7 @@ TEST_CASE("gpu disk round-trip dictionary column", "[disk][gpu-converter][dictio
                                            cudf::mask_state::UNALLOCATED,
                                            shared_stream());
 
-  shared_stream().synchronize();
+  shared_stream().sync();
 
   auto dict_col = cudf::make_dictionary_column(std::move(keys), std::move(indices));
 
@@ -690,13 +721,17 @@ TEST_CASE("gpu disk round-trip sliced column with nulls", "[disk][gpu-converter]
 
   // Set some nulls
   auto null_mask_size = cudf::bitmask_allocation_size_bytes(total_rows);
-  std::vector<uint8_t> host_mask(null_mask_size, 0xFF);
-  cudf::size_type null_count = 0;
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  cudf::size_type null_count   = 0;
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
   for (int i = 0; i < total_rows; i += 5) {
-    host_mask[static_cast<std::size_t>(i / 8)] &= static_cast<uint8_t>(~(1u << (i % 8)));
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
     null_count++;
   }
-  rmm::device_buffer dev_mask(host_mask.data(), host_mask.size(), shared_stream());
+  auto dev_mask = test::make_null_mask_from_host(total_rows, host_mask, shared_stream());
   col->set_null_mask(std::move(dev_mask), null_count);
 
   std::vector<std::unique_ptr<cudf::column>> table_cols;
@@ -705,7 +740,7 @@ TEST_CASE("gpu disk round-trip sliced column with nulls", "[disk][gpu-converter]
 
   // Slice middle portion
   auto sliced_views = cudf::slice(table->view(), {cudf::size_type{50}, cudf::size_type{150}});
-  shared_stream().synchronize();
+  shared_stream().sync();
   auto compacted = std::make_unique<cudf::table>(sliced_views[0], shared_stream());
 
   gpu_disk_round_trip_test(std::move(compacted));
@@ -727,7 +762,7 @@ TEST_CASE("gpu disk round-trip with explicit pipeline backend",
   // Simple INT32 column, 100 rows
   auto table   = make_typed_table(cudf::type_id::INT32, 100);
   auto gpu_rep = std::make_unique<gpu_table_representation>(
-    std::move(table), *gpu_space, rmm::cuda_stream_view{});
+    std::move(table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   auto disk_rep =
     registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
@@ -751,7 +786,7 @@ TEST_CASE("gpu disk round-trip pipeline with multiple types",
   auto type_id = GENERATE(cudf::type_id::INT32, cudf::type_id::INT64, cudf::type_id::FLOAT64);
   auto table   = make_typed_table(type_id, 1000);
   auto gpu_rep = std::make_unique<gpu_table_representation>(
-    std::move(table), *gpu_space, rmm::cuda_stream_view{});
+    std::move(table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   auto disk_rep =
     registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
@@ -776,7 +811,7 @@ TEST_CASE("disk_data_representation get_uncompressed_data_size_in_bytes", "[disk
 
   auto table   = make_typed_table(cudf::type_id::INT64, 1000);
   auto gpu_rep = std::make_unique<gpu_table_representation>(
-    std::move(table), *gpu_space, rmm::cuda_stream_view{});
+    std::move(table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
   auto disk_rep =
     registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());

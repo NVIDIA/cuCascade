@@ -53,6 +53,28 @@ cudaError_t performGpuMemoryWork(void* gpu_ptr, size_t size_bytes, uint64_t* res
  */
 cudaError_t verifyGpuMemoryWork(void* gpu_ptr, size_t size_bytes, uint64_t* verification_checksum);
 
+/**
+ * @brief Copy bytes with GPU loads and stores, including pointers into a peer GPU's memory pool
+ *
+ * @return The kernel launch error
+ */
+cudaError_t copy_peer_bytes(void* destination,
+                            void const* source,
+                            std::size_t bytes,
+                            cudaStream_t stream);
+
+/**
+ * @brief Launch one thread that spins until @p release is nonzero or @p timeout_ns elapses
+ *
+ * @p release must be host memory mapped into the device address space, so that the host can end the
+ * kernel early by writing to it.
+ *
+ * @return The kernel launch error
+ */
+cudaError_t spin_until_released(int const* release,
+                                unsigned long long timeout_ns,
+                                cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

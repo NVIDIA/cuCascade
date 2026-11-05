@@ -28,6 +28,9 @@ static constexpr std::size_t default_block_size = 1 << 20;  ///< Default block s
 static constexpr std::size_t default_pool_size  = 128;      ///< Default number of blocks in pool
 static constexpr std::size_t default_initial_number_pools =
   4;  ///< Default number of pools to pre-allocate
+/// Threads that pin the initial host pools when the upstream is the default
+/// numa_region_pinned_host_memory_resource. Concurrent page faulting stops scaling at about 16.
+static constexpr std::size_t default_host_initial_pool_threads = 16;
 
 struct gpu_memory_space_config {
   int device_id{-1};
@@ -67,6 +70,9 @@ struct host_memory_space_config {
   std::size_t block_size           = default_block_size;
   std::size_t pool_size            = default_pool_size;
   std::size_t initial_number_pools = default_initial_number_pools;
+  /// Threads that allocate the initial pools. Above 1, the upstream resource (from
+  /// @c mr_factory_fn, or the default one) is called concurrently, so it must be thread-safe.
+  std::size_t initial_pool_threads = 1;
   bool make_portable               = false;
 
   DeviceMemoryResourceFactoryFn mr_factory_fn{nullptr};

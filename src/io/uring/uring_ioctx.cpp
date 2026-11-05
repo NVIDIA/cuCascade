@@ -20,6 +20,8 @@
 #include <cucascade/io/uring/uring_reactor.hpp>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace cucascade::io::uring {
 
@@ -28,6 +30,20 @@ uring_ioctx::uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::react
       return std::make_unique<uring_reactor>(ctx, "reactor-" + std::to_string(i++));
     })
 {
+}
+
+std::vector<uring_reactor::gauges> uring_ioctx::reactor_gauges() noexcept
+{
+  std::vector<uring_reactor::gauges> out;
+  try {
+    out.reserve(_reactors.size());
+    for (auto& reactor : _reactors) {
+      out.push_back(reactor->take_gauges());
+    }
+  } catch (...) {
+    out.clear();
+  }
+  return out;
 }
 
 }  // namespace cucascade::io::uring

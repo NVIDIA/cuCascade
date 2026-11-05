@@ -25,9 +25,15 @@
 #include <rmm/error.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace cucascade {
 namespace memory {
@@ -43,7 +49,8 @@ fixed_size_host_memory_resource::fixed_size_host_memory_resource(
   std::size_t memory_capacity,
   std::size_t block_size,
   std::size_t pool_size,
-  std::size_t initial_pools)
+  std::size_t initial_pools,
+  std::size_t initial_pool_threads)
   : _space_id(Tier::HOST, device_id),
     _memory_limit(memory_limit),
     _memory_capacity(memory_capacity),
@@ -51,9 +58,7 @@ fixed_size_host_memory_resource::fixed_size_host_memory_resource(
     _pool_size(pool_size),
     _upstream_mr(upstream_mr)
 {
-  for (std::size_t i = 0; i < initial_pools; ++i) {
-    expand_pool();
-  }
+  expand_pools_parallel(initial_pools, initial_pool_threads);
 }
 #pragma GCC diagnostic pop
 
@@ -65,8 +70,10 @@ fixed_size_host_memory_resource::~fixed_size_host_memory_resource()
 #pragma GCC diagnostic ignored "-Wnull-dereference"
   for (auto& block : _allocated_blocks) {
     const std::size_t dealloc_size = _block_size * _pool_size;
-    _upstream_mr.deallocate(
-      rmm::cuda_stream_view{}, block, dealloc_size, alignof(std::max_align_t));
+    _upstream_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                            block,
+                            dealloc_size,
+                            alignof(std::max_align_t));
   }
 #pragma GCC diagnostic pop
   _allocated_blocks.clear();
@@ -121,7 +128,14 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
     }
   }
   auto buffers = allocate_multiple_blocks_internal(total_bytes, h_reservation_slot);
-  return multiple_blocks_allocation::create(std::move(buffers), *this, res);
+  try {
+    return multiple_blocks_allocation::create(std::move(buffers), *this, res);
+  } catch (...) {
+    // create() takes the blocks only once it cannot fail, so they are still ours here (the
+    // wrapper's allocation threw): give them back with their byte and reservation accounting.
+    return_allocated_chunks(buffers, h_reservation_slot);
+    throw;
+  }
 }
 
 std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_blocks_internal(
@@ -157,29 +171,37 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
     _allocated_bytes.try_add(upstream_tracked_bytes, _memory_capacity);
   if (success) {
     std::vector<std::byte*> allocated_blocks;
-    allocated_blocks.reserve(num_blocks);
-
-    for (std::size_t i = 0; i < num_blocks; ++i) {
-      if (_free_blocks.empty()) { expand_pool(); }
-
-      if (_free_blocks.empty()) {
-        // Cleanup on failure
-        for (std::byte* ptr : allocated_blocks) {
-          _free_blocks.push_back(ptr);
-        }
-        _allocated_bytes.sub(upstream_tracked_bytes);
-        if (tracker) tracker->allocated_bytes.fetch_sub(static_cast<int64_t>(total_bytes));
-        throw rmm::out_of_memory(
-          "Not enough free blocks available in fixed_size_host_memory_resource and pool expansion "
-          "failed. total_bytes: " +
-          std::to_string(total_bytes) + ", upstream_tracked_bytes: " +
-          std::to_string(upstream_tracked_bytes) + ", only " + std::to_string(_free_blocks.size()) +
-          " free blocks available from " + std::to_string(num_blocks) + " requested blocks" + ".");
+    // Give back what this call took.  The free list has room for every block the resource
+    // owns, so putting the taken blocks back cannot allocate.
+    auto const undo = [&]() noexcept {
+      for (std::byte* ptr : allocated_blocks) {
+        _free_blocks.push_back(ptr);
       }
+      _allocated_bytes.sub(upstream_tracked_bytes);
+      if (tracker) tracker->allocated_bytes.fetch_sub(static_cast<int64_t>(total_bytes));
+    };
 
-      std::byte* ptr = static_cast<std::byte*>(_free_blocks.back());
-      _free_blocks.pop_back();
-      allocated_blocks.push_back(ptr);
+    try {
+      allocated_blocks.reserve(num_blocks);
+      for (std::size_t i = 0; i < num_blocks; ++i) {
+        if (_free_blocks.empty()) { expand_pool(); }
+        if (_free_blocks.empty()) { break; }
+        allocated_blocks.push_back(static_cast<std::byte*>(_free_blocks.back()));
+        _free_blocks.pop_back();
+      }
+    } catch (...) {
+      undo();  // a failed pool expansion must not strand the blocks taken so far
+      throw;
+    }
+
+    if (allocated_blocks.size() < num_blocks) {
+      undo();
+      throw rmm::out_of_memory(
+        "Not enough free blocks available in fixed_size_host_memory_resource and pool expansion "
+        "failed. total_bytes: " +
+        std::to_string(total_bytes) + ", upstream_tracked_bytes: " +
+        std::to_string(upstream_tracked_bytes) + ", only " + std::to_string(_free_blocks.size()) +
+        " free blocks available from " + std::to_string(num_blocks) + " requested blocks" + ".");
     }
     _peak_allocated_bytes.update_peak(post_allocation_size);
     return allocated_blocks;
@@ -195,7 +217,7 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
   return {};
 }
 
-void* fixed_size_host_memory_resource::allocate([[maybe_unused]] cuda::stream_ref stream,
+void* fixed_size_host_memory_resource::allocate([[maybe_unused]] ::cuda::stream_ref stream,
                                                 [[maybe_unused]] std::size_t bytes,
                                                 [[maybe_unused]] std::size_t alignment)
 {
@@ -203,7 +225,7 @@ void* fixed_size_host_memory_resource::allocate([[maybe_unused]] cuda::stream_re
     "fixed_size_host_memory_resource doesn't support allocate, use allocate_multiple_blocks");
 }
 
-void fixed_size_host_memory_resource::deallocate([[maybe_unused]] cuda::stream_ref stream,
+void fixed_size_host_memory_resource::deallocate([[maybe_unused]] ::cuda::stream_ref stream,
                                                  [[maybe_unused]] void* ptr,
                                                  [[maybe_unused]] std::size_t bytes,
                                                  [[maybe_unused]] std::size_t alignment) noexcept
@@ -284,14 +306,98 @@ std::size_t fixed_size_host_memory_resource::get_peak_total_allocated_bytes() co
 void fixed_size_host_memory_resource::expand_pool()
 {
   const std::size_t total_size = _block_size * _pool_size;
+  reserve_for_pools(1);  // first: once the upstream memory is taken, nothing may fail
 
   // See constructor for explanation of this suppression.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
-  void* large_allocation =
-    _upstream_mr.allocate(rmm::cuda_stream_view{}, total_size, alignof(std::max_align_t));
+  void* large_allocation = _upstream_mr.allocate(
+    ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, total_size, alignof(std::max_align_t));
 #pragma GCC diagnostic pop
 
+  add_pool(large_allocation);
+}
+
+void fixed_size_host_memory_resource::expand_pools_parallel(std::size_t n_pools,
+                                                            std::size_t n_threads)
+{
+  if (n_pools == 0) { return; }
+  const std::size_t total_size = _block_size * _pool_size;
+  n_threads                    = std::clamp<std::size_t>(n_threads, 1, n_pools);
+  reserve_for_pools(n_pools);
+
+  std::vector<void*> allocations(n_pools, nullptr);
+  std::atomic<std::size_t> next{0};
+  std::exception_ptr error;
+  std::mutex error_mutex;
+  // device < 0: allocate on the calling thread, whose device is already current.
+  auto allocate_pools = [&](int device) {
+    try {
+      if (device >= 0) { CUCASCADE_CUDA_TRY(cudaSetDevice(device)); }
+      for (std::size_t i; (i = next.fetch_add(1)) < n_pools;) {
+        allocations[i] = _upstream_mr.allocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                                               total_size,
+                                               alignof(std::max_align_t));
+      }
+    } catch (...) {
+      next.store(n_pools);  // stop the other threads
+      std::lock_guard lock(error_mutex);
+      if (!error) { error = std::current_exception(); }
+    }
+  };
+
+  if (n_threads == 1) {
+    allocate_pools(-1);
+  } else {
+    int device = 0;
+    CUCASCADE_CUDA_TRY(cudaGetDevice(&device));
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    try {
+      for (std::size_t t = 0; t < n_threads; ++t) {
+        threads.emplace_back(allocate_pools, device);
+      }
+    } catch (...) {  // could not start a thread: join the ones running, then clean up below
+      next.store(n_pools);
+      std::lock_guard lock(error_mutex);
+      if (!error) { error = std::current_exception(); }
+    }
+    for (auto& t : threads) {
+      t.join();
+    }
+  }
+  if (error) {
+    for (void* p : allocations) {
+      if (p != nullptr) {
+        _upstream_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                                p,
+                                total_size,
+                                alignof(std::max_align_t));
+      }
+    }
+    std::rethrow_exception(error);
+  }
+  for (void* p : allocations) {
+    add_pool(p);
+  }
+}
+
+void fixed_size_host_memory_resource::reserve_for_pools(std::size_t n_new_pools)
+{
+  // Grow geometrically, as push_back would, so expanding one pool at a time stays amortised
+  // O(1) per block instead of copying the whole free list on every expansion.
+  auto const make_room = [](std::vector<void*>& v, std::size_t n) {
+    if (v.capacity() < n) { v.reserve(std::max(n, 2 * v.capacity())); }
+  };
+  auto const pools = _allocated_blocks.size() + n_new_pools;
+  make_room(_allocated_blocks, pools);
+  make_room(_free_blocks, pools * _pool_size);
+}
+
+void fixed_size_host_memory_resource::add_pool(void* large_allocation) noexcept
+{
+  assert(_allocated_blocks.size() < _allocated_blocks.capacity());
+  assert(_free_blocks.capacity() >= (_allocated_blocks.size() + 1) * _pool_size);
   _allocated_blocks.push_back(large_allocation);
 
   for (std::size_t i = 0; i < _pool_size; ++i) {
@@ -325,13 +431,24 @@ void fixed_size_host_memory_resource::release_reservation(chunked_reserved_area*
   _active_reservations.erase(iter);
 }
 
-void fixed_size_host_memory_resource::return_allocated_chunks(std::vector<std::byte*> chunks,
-                                                              chunked_reserved_area* arena)
+void fixed_size_host_memory_resource::return_blocks(std::span<std::byte* const> blocks,
+                                                    reservation* res) noexcept
+{
+  if (blocks.empty()) { return; }
+  // A pointer dynamic_cast neither throws nor allocates.
+  auto* arena = res != nullptr ? dynamic_cast<chunked_reserved_area*>(res->_arena.get()) : nullptr;
+  return_allocated_chunks(blocks, arena);
+}
+
+void fixed_size_host_memory_resource::return_allocated_chunks(std::span<std::byte* const> chunks,
+                                                              chunked_reserved_area* arena) noexcept
 {
   size_t reclaimed_bytes = chunks.size() * _block_size;
   std::lock_guard lock(_mutex);
-  if (arena != nullptr && _active_reservations.contains(arena)) {
-    auto& tracker         = _active_reservations.at(arena);
+  auto const iter =
+    arena != nullptr ? _active_reservations.find(arena) : _active_reservations.end();
+  if (iter != _active_reservations.end()) {
+    auto& tracker         = iter->second;
     auto reservation_size = static_cast<int64_t>(arena->size());
     int64_t pre_reclaimation_size =
       tracker.allocated_bytes.fetch_sub(static_cast<int64_t>(reclaimed_bytes));
@@ -344,7 +461,9 @@ void fixed_size_host_memory_resource::return_allocated_chunks(std::vector<std::b
       reclaimed_bytes = static_cast<std::size_t>(pre_reclaimation_size - reservation_size);
     }
   }
-  // Return blocks to the free list so they can be reused
+  // Return blocks to the free list so they can be reused.  It has room for every block the
+  // resource owns, so this does not allocate.
+  assert(_free_blocks.size() + chunks.size() <= _free_blocks.capacity());
   for (auto* block : chunks) {
     _free_blocks.push_back(block);
   }
