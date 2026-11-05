@@ -28,6 +28,11 @@ Building, testing, benchmarking, and contributing to cuCascade.
 - [Documentation](#documentation)
 - [CI Pipeline](#ci-pipeline)
 - [Using cuCascade as a Dependency](#using-cucascade-as-a-dependency)
+- [Logging](#logging)
+  - [Installing a Sink](#installing-a-sink)
+  - [Standalone Use](#standalone-use)
+  - [Catching Exceptions](#catching-exceptions)
+  - [Compile-Time Floor](#compile-time-floor)
 - [Key Commands Reference](#key-commands-reference)
 
 ---
@@ -412,6 +417,79 @@ Available targets:
 - `cuCascade::cucascade_static` -- static library explicitly
 
 Transitive dependencies (cuDF, RMM, CUDA Toolkit, Threads) are automatically found.
+
+---
+
+## Logging
+
+cuCascade ships no logging backend. The `CUCASCADE_LOG_TRACE` through `CUCASCADE_LOG_FATAL` macros
+(from `<cucascade/log/logging.hpp>`) format their arguments with `std::format` and deliver each
+record to a sink that the embedding host installs.
+
+```cpp
+CUCASCADE_LOG_WARN("pinned pool at {}% of capacity", percent);
+```
+
+With no sink installed, a call site costs one relaxed atomic load and its arguments are never
+evaluated, so logging is silent and free until a host opts in.
+
+### Installing a Sink
+
+Subclass `cucascade::log::sink`. Its `write` is called concurrently from any logging thread, so it
+must be thread-safe:
+
+```cpp
+class host_sink final : public cucascade::log::sink {
+ public:
+  void write(const cucascade::log::record& rec) override
+  {
+    my_logger.log(rec.lvl, rec.location.file_name(), rec.location.line(), rec.message);
+  }
+};
+cucascade::log::set_sink(std::make_shared<host_sink>(), cucascade::log::level::info);
+```
+
+Or wrap a lambda with `make_sink`. Captures must own what they use:
+
+```cpp
+auto logger = std::make_shared<my_logger>();
+cucascade::log::set_sink(cucascade::log::make_sink([logger](const cucascade::log::record& rec) {
+  logger->log(rec.lvl, rec.message);
+}));
+```
+
+The second argument to `set_sink` sets the threshold. Omit it to keep the current one, which starts
+at `level::info`. Mirror the host logger's own level there, or call `set_min_level()` later.
+Filtering happens in `enabled()` before formatting, so records the host would drop are never built.
+
+`set_sink` and `clear_sink` return the replaced sink. cuCascade keeps it alive until in-flight
+`write` calls return, so a sink must own, or outlive, everything it touches. Before destroying a
+host object that a sink uses, uninstall the sink and wait for the returned pointer's `use_count()`
+to reach one.
+
+### Standalone Use
+
+`cucascade::log::use_stderr_sink(level)` installs a built-in sink (`info` by default) that writes
+`<UTC timestamp> [LEVEL] <tid> file:line: message` lines to stderr.
+
+### Catching Exceptions
+
+`CUCASCADE_TRY_AND_LOG_EXCEPTION` (`<cucascade/utils/error_utils.hpp>`) runs an expression,
+swallows any exception, and logs it at error level with `what()` appended. Optional format
+arguments prefix the message: `CUCASCADE_TRY_AND_LOG_EXCEPTION(close(), "fd {}", fd)`.
+
+### Compile-Time Floor
+
+`CUCASCADE_MIN_LOG_LEVEL` (0 = trace through 6 = off) removes call sites below it during
+preprocessing; their arguments are type-checked but never run. The floor is per translation unit.
+cuCascade's own sources take it from the CMake cache variable of the same name; consumers do not
+inherit it. A consumer keeps every call site unless it defines the macro
+before including the header:
+
+```cpp
+#define CUCASCADE_MIN_LOG_LEVEL 2  // this translation unit: info and above
+#include <cucascade/log/logging.hpp>
+```
 
 ---
 
