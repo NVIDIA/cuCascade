@@ -72,7 +72,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_dispatch_failure_hook.cpp
     io/test_io_utils.cpp
     io/test_object_identity.cpp
+    io/test_semi_future_callback.cpp
     io/test_templated_ioctx.cpp
+    io/test_thread_pool_construction.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
     io/cache/test_buffer_pool.cpp
