@@ -57,9 +57,9 @@ add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})
 
 # Set include directories
 target_include_directories(
-  cucascade_benchmarks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/../test
-                               ${benchmark_SOURCE_DIR}/include)
+  cucascade_benchmarks
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../test
+          ${benchmark_SOURCE_DIR}/include)
 
 # Apply warning flags to benchmark executable. Suppress -Wnull-dereference:
 # triggered by RAPIDS/CCCL system headers
@@ -73,9 +73,9 @@ target_compile_options(
 
 # Link dependencies
 target_link_libraries(
-  cucascade_benchmarks PRIVATE cucascade_cudf benchmark::benchmark
-                               benchmark::benchmark_main CUDA::cudart_static
-                               cudf::cudftest_default_stream)
+  cucascade_benchmarks
+  PRIVATE cucascade_cudf benchmark::benchmark benchmark::benchmark_main
+          CUDA::cudart_static cudf::cudftest_default_stream)
 
 # Add custom target to run benchmarks
 add_custom_target(
