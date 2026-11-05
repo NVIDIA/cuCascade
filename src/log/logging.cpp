@@ -55,6 +55,11 @@ registry& state()
   return instance;
 }
 
+/// Set while this thread is inside a sink's write(). A sink that logs through cuCascade, or calls
+/// a cuCascade component that does, would otherwise recurse until the stack overflows, which no
+/// catch can contain.
+thread_local bool in_write = false;
+
 /// Cached: the id is fixed for the thread's lifetime and `gettid` is a syscall.
 [[nodiscard]] std::uint64_t current_thread_id() noexcept
 {
@@ -85,23 +90,35 @@ class stderr_sink final : public sink {
 
 namespace detail {
 
+void deliver(level lvl, const std::source_location& location, std::string_view message) noexcept
+{
+  if (in_write) { return; }
+  in_write = true;
+  try {
+    // Holding the shared_ptr keeps the sink alive for the whole write, even if another thread
+    // replaces or clears it meanwhile.
+    const auto target = state().slot.load(std::memory_order_acquire);
+    if (target != nullptr) {
+      target->write(record{.lvl = lvl, .location = location, .message = message});
+    }
+  } catch (...) {
+    // write() is host code and may not escape into a destructor or a noexcept caller. Reporting
+    // the failure would need the sink that just failed, so the record is dropped.
+  }
+  in_write = false;
+}
+
 void vemit(level lvl,
            const std::source_location& location,
            std::string_view fmt,
            std::format_args args) noexcept
 {
+  if (in_write) { return; }  // deliver() would drop it; skip the formatting too.
   try {
-    // Holding the shared_ptr keeps the sink alive for the whole write, even if another thread
-    // replaces or clears it meanwhile.
-    const auto target = state().slot.load(std::memory_order_acquire);
-    if (target == nullptr) { return; }
-
     const auto message = std::vformat(fmt, args);
-    target->write(record{.lvl = lvl, .location = location, .message = message});
+    deliver(lvl, location, message);
   } catch (...) {
-    // std::vformat allocates and write() is host code; neither may escape into a destructor or a
-    // noexcept caller. Reporting the failure would need the sink that just failed, so the record
-    // is dropped.
+    // std::vformat allocates; a failure here has nowhere to go.
   }
 }
 
@@ -119,9 +136,15 @@ std::shared_ptr<sink> set_sink(std::shared_ptr<sink> new_sink,
     detail::threshold.store(level::off, std::memory_order_release);
     return st.slot.exchange(nullptr);
   }
-  // Publish the sink before opening the gate, so a call site that passes the gate finds it.
+
+  // Raise the gate before the swap when the new threshold is stricter, so a call site that
+  // passed the old, looser gate cannot hand the new sink a record below its level; lower it only
+  // after the sink is in place. Either way a call site that passes the gate finds a sink.
+  const auto target  = st.configured.load(std::memory_order_relaxed);
+  const auto current = detail::threshold.load(std::memory_order_relaxed);
+  if (current < target) { detail::threshold.store(target, std::memory_order_release); }
   auto previous = st.slot.exchange(std::move(new_sink));
-  detail::threshold.store(st.configured.load(std::memory_order_relaxed), std::memory_order_release);
+  detail::threshold.store(target, std::memory_order_release);
   return previous;
 }
 
@@ -137,9 +160,9 @@ void set_min_level(level min_level) noexcept
   }
 }
 
-level min_level() noexcept { return state().configured.load(std::memory_order_relaxed); }
+level get_min_level() noexcept { return state().configured.load(std::memory_order_relaxed); }
 
-std::shared_ptr<sink> current_sink() noexcept
+std::shared_ptr<sink> get_current_sink() noexcept
 {
   return state().slot.load(std::memory_order_acquire);
 }

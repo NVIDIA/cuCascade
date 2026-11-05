@@ -24,31 +24,29 @@
 #include <format>
 #include <source_location>
 #include <string>
-#include <string_view>
 #include <utility>
 
 namespace cucascade::log::detail {
 
-/// Logs the exception currently being handled at @ref level::error, prefixed with the formatted
-/// @p fmt. Must be called from inside a catch handler. Never throws. The macro below guards the
-/// call with @ref enabled so the arguments are not even evaluated for a filtered record.
+/// Logs the exception currently being handled at @ref level::error as `<prefix>: <what()>`,
+/// where the prefix is @p fmt formatted with @p args. Must be called from inside a catch
+/// handler. Never throws. Formats once and hands the finished message to @ref deliver.
 template <typename... Args>
 void log_current_exception(const std::source_location& location,
                            std::format_string<Args...> fmt,
                            Args&&... args) noexcept
 {
-  if (!enabled(level::error)) { return; }
   try {
-    const auto prefix = std::format(fmt, std::forward<Args>(args)...);
-    std::string what;
+    auto message = std::format(fmt, std::forward<Args>(args)...);
+    message += ": ";
     try {
       throw;
     } catch (const std::exception& e) {
-      what = e.what();
+      message += e.what();
     } catch (...) {
-      what = "unknown exception";
+      message += "unknown exception";
     }
-    vemit(level::error, location, "{}: {}", std::make_format_args(prefix, what));
+    deliver(level::error, location, message);
   } catch (...) {  // Formatting may fail to allocate; the caller's outcome stands without it.
   }
 }
@@ -67,16 +65,20 @@ inline void log_current_exception(const std::source_location& location) noexcept
 /// optional format string and arguments prefix the exception's message; e.g.
 /// `CUCASCADE_TRY_AND_LOG_EXCEPTION(reactor->shutdown(), "shutting down reactor {}", id)` logs
 /// `shutting down reactor 3: <what()>`. The arguments are evaluated only when an error record
-/// would be delivered, and below the compile-time floor they are only type-checked.
+/// would be delivered, an exception they throw is swallowed as well, and below the compile-time
+/// floor they are only type-checked.
 #if CUCASCADE_MIN_LOG_LEVEL <= 4
-#define CUCASCADE_TRY_AND_LOG_EXCEPTION(expression, ...)                                 \
-  try {                                                                                  \
-    expression;                                                                          \
-  } catch (...) {                                                                        \
-    if (::cucascade::log::enabled(::cucascade::log::level::error)) {                     \
-      ::cucascade::log::detail::log_current_exception(std::source_location::current()    \
-                                                        __VA_OPT__(, ) __VA_ARGS__);     \
-    }                                                                                    \
+#define CUCASCADE_TRY_AND_LOG_EXCEPTION(expression, ...)                                   \
+  try {                                                                                    \
+    expression;                                                                            \
+  } catch (...) {                                                                          \
+    if (::cucascade::log::is_enabled(::cucascade::log::level::error)) {                    \
+      try {                                                                                \
+        ::cucascade::log::detail::log_current_exception(std::source_location::current()    \
+                                                          __VA_OPT__(, ) __VA_ARGS__);     \
+      } catch (...) { /* a throwing message argument must not escape the swallow */        \
+      }                                                                                    \
+    }                                                                                      \
   }
 #else
 #define CUCASCADE_TRY_AND_LOG_EXCEPTION(expression, ...) \

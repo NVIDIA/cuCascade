@@ -16,10 +16,16 @@
  * limitations under the License.
  */
 
-// This translation unit is compiled with CUCASCADE_MIN_LOG_LEVEL=4 (see test/CMakeLists.txt) to
-// exercise the compile-time floor through the real mechanism: the preprocessor, not a runtime
-// knob. Everything below error must vanish from the binary, arguments included, while the
-// sink and threshold set by other tests are irrelevant to the outcome.
+// White-box test of the preprocessor floor. The floor is one value for the whole program (it is
+// generated into <cucascade/log/config.hpp>); this translation unit overrides it locally, which
+// is safe only because it instantiates no inline function from a shared header that contains a
+// log call site. Everything below error must vanish from the binary, arguments included, while
+// the sink and threshold set at runtime are irrelevant to the outcome.
+
+#include <cucascade/log/config.hpp>
+
+#undef CUCASCADE_MIN_LOG_LEVEL
+#define CUCASCADE_MIN_LOG_LEVEL 4  // level::error, for this translation unit only
 
 #include "log_test_utils.hpp"
 
@@ -33,8 +39,7 @@
 #include <string>
 #include <vector>
 
-static_assert(CUCASCADE_MIN_LOG_LEVEL == 4,
-              "test_logging_pruned.cpp must be compiled with CUCASCADE_MIN_LOG_LEVEL=4");
+static_assert(CUCASCADE_MIN_LOG_LEVEL == 4);
 
 namespace {
 

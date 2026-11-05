@@ -481,15 +481,11 @@ arguments prefix the message: `CUCASCADE_TRY_AND_LOG_EXCEPTION(close(), "fd {}",
 ### Compile-Time Floor
 
 `CUCASCADE_MIN_LOG_LEVEL` (0 = trace through 6 = off) removes call sites below it during
-preprocessing; their arguments are type-checked but never run. The floor is per translation unit.
-cuCascade's own sources take it from the CMake cache variable of the same name; consumers do not
-inherit it. A consumer keeps every call site unless it defines the macro
-before including the header:
-
-```cpp
-#define CUCASCADE_MIN_LOG_LEVEL 2  // this translation unit: info and above
-#include <cucascade/log/logging.hpp>
-```
+preprocessing; their arguments are type-checked but never run. Set it through the CMake cache
+variable of the same name. The value is generated into `<cucascade/log/config.hpp>`, which
+`logging.hpp` includes, so cuCascade's own sources and every consumer see the same floor. Do not
+define the macro yourself: the macros expand inside inline and template functions of installed
+headers, so two translation units with different floors would violate the one-definition rule.
 
 ---
 

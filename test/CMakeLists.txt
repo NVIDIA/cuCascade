@@ -52,11 +52,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
                                                    CUDA_STANDARD_REQUIRED ON)
-  # Exercises the compile-time floor: this one translation unit is built with
-  # everything below error pruned.
-  set_source_files_properties(
-    log/test_logging_pruned.cpp PROPERTIES COMPILE_DEFINITIONS
-                                           CUCASCADE_MIN_LOG_LEVEL=4)
 
   # Set include directories
   target_include_directories(

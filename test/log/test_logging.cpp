@@ -100,6 +100,21 @@ class blocking_sink final : public cucascade::log::sink {
   std::atomic<bool> _completed{false};
 };
 
+/// Logs through cuCascade from inside write(), as a host sink built on a logging component might.
+class reentrant_sink final : public cucascade::log::sink {
+ public:
+  void write(const record& rec) override
+  {
+    _messages.emplace_back(rec.message);
+    CUCASCADE_LOG_INFO("nested from inside write");
+  }
+
+  [[nodiscard]] const std::vector<std::string>& messages() const { return _messages; }
+
+ private:
+  std::vector<std::string> _messages;
+};
+
 /// Redirects fd 2 into a pipe for the scope, then hands back what was written.
 class captured_stderr {
  public:
@@ -157,9 +172,9 @@ TEST_CASE("logging is silent and free until a sink is installed", "[log]")
 {
   const scoped_sink guard{nullptr, level::info};
 
-  CHECK(cucascade::log::current_sink() == nullptr);
+  CHECK(cucascade::log::get_current_sink() == nullptr);
   // Even the most severe level is disabled: "no sink" is the gate, not the level.
-  CHECK_FALSE(cucascade::log::enabled(level::fatal));
+  CHECK_FALSE(cucascade::log::is_enabled(level::fatal));
   CHECK_NOTHROW(CUCASCADE_LOG_FATAL("dropped {}", 1));
 
   int evaluations    = 0;
@@ -195,13 +210,13 @@ TEST_CASE("set_sink swaps sinks and hands back the previous one", "[log]")
   const scoped_sink guard{first, level::trace};
 
   CUCASCADE_LOG_INFO("to first");
-  CHECK(cucascade::log::current_sink() == first);
+  CHECK(cucascade::log::get_current_sink() == first);
 
   auto previous = cucascade::log::set_sink(second);
   CHECK(previous == first);
-  CHECK(cucascade::log::current_sink() == second);
+  CHECK(cucascade::log::get_current_sink() == second);
   // Without a level, set_sink leaves the threshold alone.
-  CHECK(cucascade::log::min_level() == level::trace);
+  CHECK(cucascade::log::get_min_level() == level::trace);
   CUCASCADE_LOG_INFO("to second");
 
   CHECK(first->messages() == std::vector<std::string>{"to first"});
@@ -213,8 +228,8 @@ TEST_CASE("records below the threshold are dropped", "[log]")
   auto captured = std::make_shared<recording_sink>();
   const scoped_sink guard{captured, level::warn};
 
-  CHECK_FALSE(cucascade::log::enabled(level::info));
-  CHECK(cucascade::log::enabled(level::warn));
+  CHECK_FALSE(cucascade::log::is_enabled(level::info));
+  CHECK(cucascade::log::is_enabled(level::warn));
 
   CUCASCADE_LOG_DEBUG("hidden");
   CUCASCADE_LOG_INFO("hidden");
@@ -230,8 +245,8 @@ TEST_CASE("set_min_level retunes the threshold without disturbing the sink", "[l
   const scoped_sink guard{captured, level::trace};
 
   cucascade::log::set_min_level(level::error);
-  CHECK(cucascade::log::min_level() == level::error);
-  CHECK(cucascade::log::current_sink() == captured);
+  CHECK(cucascade::log::get_min_level() == level::error);
+  CHECK(cucascade::log::get_current_sink() == captured);
 
   CUCASCADE_LOG_WARN("hidden");
   CUCASCADE_LOG_ERROR("shown");
@@ -243,14 +258,14 @@ TEST_CASE("set_min_level without a sink is remembered but opens nothing", "[log]
   const scoped_sink guard{nullptr, level::info};
 
   cucascade::log::set_min_level(level::trace);
-  CHECK(cucascade::log::min_level() == level::trace);
-  CHECK_FALSE(cucascade::log::enabled(level::trace));
-  CHECK_FALSE(cucascade::log::enabled(level::fatal));
+  CHECK(cucascade::log::get_min_level() == level::trace);
+  CHECK_FALSE(cucascade::log::is_enabled(level::trace));
+  CHECK_FALSE(cucascade::log::is_enabled(level::fatal));
 
   // The remembered level applies as soon as a sink arrives without one of its own.
   auto captured = std::make_shared<recording_sink>();
   cucascade::log::set_sink(captured);
-  CHECK(cucascade::log::enabled(level::trace));
+  CHECK(cucascade::log::is_enabled(level::trace));
   CUCASCADE_LOG_TRACE("now visible");
   CHECK(captured->messages() == std::vector<std::string>{"now visible"});
 }
@@ -263,7 +278,7 @@ TEST_CASE("level::off mutes every severity", "[log]")
   CUCASCADE_LOG_TRACE("hidden");
   CUCASCADE_LOG_FATAL("hidden");
 
-  CHECK_FALSE(cucascade::log::enabled(level::fatal));
+  CHECK_FALSE(cucascade::log::is_enabled(level::fatal));
   CHECK(captured->count() == 0);
 }
 
@@ -351,8 +366,8 @@ TEST_CASE("clear_sink stops delivery and hands back the sink", "[log]")
 
   auto previous = cucascade::log::clear_sink();
   CHECK(previous == captured);
-  CHECK(cucascade::log::current_sink() == nullptr);
-  CHECK_FALSE(cucascade::log::enabled(level::fatal));
+  CHECK(cucascade::log::get_current_sink() == nullptr);
+  CHECK_FALSE(cucascade::log::is_enabled(level::fatal));
   CUCASCADE_LOG_INFO("after clear");
 
   CHECK(captured->messages() == std::vector<std::string>{"delivered"});
@@ -466,15 +481,36 @@ TEST_CASE("swapping sinks under concurrent logging loses nothing and frees both"
   CHECK(destroyed_b.load());
 }
 
+TEST_CASE("is_enabled never admits level::off", "[log]")
+{
+  auto captured = std::make_shared<recording_sink>();
+  const scoped_sink guard{captured, level::trace};
+
+  CHECK(cucascade::log::is_enabled(level::trace));
+  CHECK(cucascade::log::is_enabled(level::fatal));
+  CHECK_FALSE(cucascade::log::is_enabled(level::off));
+}
+
+TEST_CASE("a sink that logs from inside write does not recurse", "[log]")
+{
+  auto nested = std::make_shared<reentrant_sink>();
+  const scoped_sink guard{nested, level::trace};
+
+  CUCASCADE_LOG_INFO("outer");
+
+  // The nested record is dropped on the emitting thread instead of re-entering the sink.
+  CHECK(nested->messages() == std::vector<std::string>{"outer"});
+}
+
 TEST_CASE("use_stderr_sink installs the built-in sink at the given level", "[log]")
 {
   const scoped_sink guard{nullptr, level::info};
   cucascade::log::use_stderr_sink(level::error);
 
-  CHECK(cucascade::log::current_sink() != nullptr);
-  CHECK(cucascade::log::min_level() == level::error);
-  CHECK(cucascade::log::enabled(level::error));
-  CHECK_FALSE(cucascade::log::enabled(level::warn));
+  CHECK(cucascade::log::get_current_sink() != nullptr);
+  CHECK(cucascade::log::get_min_level() == level::error);
+  CHECK(cucascade::log::is_enabled(level::error));
+  CHECK_FALSE(cucascade::log::is_enabled(level::warn));
 }
 
 TEST_CASE("the stderr sink writes one parseable line per record", "[log]")
@@ -539,6 +575,16 @@ TEST_CASE("CUCASCADE_TRY_AND_LOG_EXCEPTION swallows and reports the exception", 
     int ran = 0;
     CUCASCADE_TRY_AND_LOG_EXCEPTION(++ran, "never {}", "logged");
     CHECK(ran == 1);
+    CHECK(captured->count() == 0);
+  }
+
+  SECTION("a throwing message argument is swallowed as well")
+  {
+    const auto throwing_argument = []() -> int { throw std::runtime_error{"argument"}; };
+    const auto body              = [&] {
+      CUCASCADE_TRY_AND_LOG_EXCEPTION(throw std::runtime_error{"boom"}, "{}", throwing_argument());
+    };
+    CHECK_NOTHROW(body());
     CHECK(captured->count() == 0);
   }
 

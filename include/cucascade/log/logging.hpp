@@ -48,6 +48,8 @@
  * @endcode
  */
 
+#include <cucascade/log/config.hpp>
+
 #include <atomic>
 #include <concepts>
 #include <cstdint>
@@ -57,6 +59,9 @@
 #include <source_location>
 #include <string_view>
 #include <utility>
+
+static_assert(CUCASCADE_MIN_LOG_LEVEL >= 0 && CUCASCADE_MIN_LOG_LEVEL <= 6,
+              "CUCASCADE_MIN_LOG_LEVEL must be 0 (trace) .. 6 (off); set the CMake cache variable");
 
 namespace cucascade::log {
 
@@ -100,9 +105,11 @@ struct record {
 /// Destination of cuCascade's log records, implemented by the embedding host.
 ///
 /// @ref write is called concurrently from any thread that logs and must be thread-safe. It may
-/// throw: the caller catches and drops that record. A sink is shared with every in-flight
-/// @ref write, so after @ref set_sink or @ref clear_sink replaces it, it stays alive until the
-/// last of those returns. A sink must therefore own, or outlive, everything @ref write touches.
+/// throw: the caller catches and drops that record. A record that @ref write itself emits through
+/// cuCascade, on the same thread, is dropped rather than delivered recursively. A sink is shared
+/// with every in-flight @ref write, so after @ref set_sink or @ref clear_sink replaces it, it
+/// stays alive until the last of those returns. A sink must therefore own, or outlive, everything
+/// @ref write touches.
 class sink {
  public:
   virtual ~sink() = default;
@@ -116,6 +123,10 @@ namespace detail {
 /// The gate read by every call site: the configured threshold while a sink is installed,
 /// `level::off` otherwise. Defined once, in the library, so every image shares a single gate.
 extern std::atomic<level> threshold;
+
+/// Delivers an already formatted message to the installed sink. Never throws, and drops a record
+/// emitted from inside a sink's @ref sink::write on the same thread.
+void deliver(level lvl, const std::source_location& location, std::string_view message) noexcept;
 
 /// Formats and delivers one record. Never throws: call sites run in destructors and noexcept
 /// paths, where an escaping exception is `std::terminate`.
@@ -154,10 +165,11 @@ class invocable_sink final : public sink {
 }  // namespace detail
 
 /// @return Whether a record at @p lvl would currently reach a sink: false whenever no sink is
-///         installed. One relaxed load and a compare; the guard on every call site.
-[[nodiscard]] inline bool enabled(level lvl) noexcept
+///         installed, and always false for @ref level::off, which is not a message level. One
+///         relaxed load and two compares; the guard on every call site.
+[[nodiscard]] inline bool is_enabled(level lvl) noexcept
 {
-  return lvl >= detail::threshold.load(std::memory_order_relaxed);
+  return lvl < level::off && lvl >= detail::threshold.load(std::memory_order_relaxed);
 }
 
 /// Wraps any `void(const record&)` invocable, such as a lambda forwarding to a host logger, in a
@@ -170,31 +182,35 @@ template <std::invocable<const record&> Fn>
 
 /// Installs @p new_sink as the process-wide sink and, when given, sets the severity threshold.
 ///
-/// Intended for host start-up, but safe at any time: a record racing with the swap reaches either
-/// sink, or neither, never a destroyed one. A null @p new_sink uninstalls logging, as
-/// @ref clear_sink does. Without @p min_level the threshold is left as it was (initially
-/// `level::info`).
+/// Intended for host start-up, but safe at any time: a record racing with the swap reaches
+/// either sink, or neither, never a destroyed one, and never a sink below the threshold it was
+/// installed with. A null @p new_sink uninstalls logging, as @ref clear_sink does. Without
+/// @p min_level the threshold is left as it was (initially `level::info`).
+///
+/// The installed sink is deliberately never destroyed at process exit, so that a record emitted
+/// from a static destructor still finds consistent state. A sink that buffers must be removed
+/// with @ref clear_sink, or flushed, before shutdown.
 ///
 /// @return The previously installed sink, or null. Drop it, or wait for its use count to reach
 ///         one before tearing down anything it references.
 std::shared_ptr<sink> set_sink(std::shared_ptr<sink> new_sink,
                                std::optional<level> min_level = std::nullopt) noexcept;
 
-/// Uninstalls the sink; @ref enabled is false for every level afterwards.
+/// Uninstalls the sink; @ref is_enabled is false for every level afterwards.
 /// @return The previously installed sink, or null; see @ref set_sink.
 std::shared_ptr<sink> clear_sink() noexcept;
 
 /// Sets the severity threshold without touching the installed sink.
 ///
-/// Mirror the host logger's own level here so filtering happens once, in @ref enabled, rather
+/// Mirror the host logger's own level here so filtering happens once, in @ref is_enabled, rather
 /// than after formatting a record the backend will discard.
 void set_min_level(level min_level) noexcept;
 
 /// @return The configured severity threshold, whether or not a sink is installed.
-[[nodiscard]] level min_level() noexcept;
+[[nodiscard]] level get_min_level() noexcept;
 
 /// @return The installed sink, or null if none.
-[[nodiscard]] std::shared_ptr<sink> current_sink() noexcept;
+[[nodiscard]] std::shared_ptr<sink> get_current_sink() noexcept;
 
 /// @return A sink writing `<UTC timestamp> [LEVEL] <tid> file:line: message` lines to stderr,
 ///         for running cuCascade standalone. An embedding host installs its own sink instead.
@@ -210,21 +226,16 @@ inline void use_stderr_sink(level min_level = level::info)
 
 // clang-format off
 
-/// Compile-time severity floor, as the underlying value of a cucascade::log::level (0 = trace
-/// ... 6 = off). Call sites below it are removed by the preprocessor; their arguments are still
-/// type-checked and count as used, but are never evaluated. cuCascade's own translation units
-/// take it from the CUCASCADE_MIN_LOG_LEVEL CMake cache variable; a consumer defines it before
-/// including this header, or not at all to keep every call site.
-#ifndef CUCASCADE_MIN_LOG_LEVEL
-#define CUCASCADE_MIN_LOG_LEVEL 0
-#endif
+// CUCASCADE_MIN_LOG_LEVEL comes from <cucascade/log/config.hpp>: call sites below it are removed
+// by the preprocessor; their arguments are still type-checked and count as used, but are never
+// evaluated.
 
 /// Discards the arguments in an unevaluated context: still type-checked and "used", never run.
 #define CUCASCADE_LOG_NOOP(...) static_cast<void>(sizeof(::cucascade::log::detail::ignore(__VA_ARGS__)))
 
 /// An expression, so it composes wherever a statement would not (ternaries, comma sequences).
 #define CUCASCADE_LOG_IMPL(lvl, ...)                                                        \
-  (::cucascade::log::enabled(lvl)                                                           \
+  (::cucascade::log::is_enabled(lvl)                                                        \
      ? ::cucascade::log::detail::emit((lvl), std::source_location::current(), __VA_ARGS__)  \
      : static_cast<void>(0))
 

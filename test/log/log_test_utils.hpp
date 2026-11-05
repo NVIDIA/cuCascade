@@ -82,7 +82,7 @@ class recording_sink final : public cucascade::log::sink {
 class scoped_sink {
  public:
   scoped_sink(std::shared_ptr<cucascade::log::sink> sink, cucascade::log::level lvl)
-    : _previous_level(cucascade::log::min_level()),
+    : _previous_level(cucascade::log::get_min_level()),
       _previous(cucascade::log::set_sink(std::move(sink), lvl))
   {
   }

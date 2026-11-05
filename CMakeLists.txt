@@ -45,18 +45,39 @@ option(
   "Build the S3 parquet benchmark (requires aws-sdk-cpp; NOT a cuCascade dependency)"
   OFF)
 
-# Compile-time floor for the CUCASCADE_LOG_* macros in cuCascade's own
-# translation units, as the underlying value of a cucascade::log::level (0 =
-# trace ... 6 = off). The default keeps every call site and leaves filtering to
-# the runtime threshold; raising it strips the cheaper levels from the binary.
-# Consumers compile the macros from the installed header and choose their own
-# floor by defining CUCASCADE_MIN_LOG_LEVEL before including it.
+# Compile-time floor for the CUCASCADE_LOG_* macros, as the underlying value of
+# a cucascade::log::level (0 = trace ... 6 = off). The default keeps every call
+# site and leaves filtering to the runtime threshold; raising it strips the
+# cheaper levels from the binary. The value is generated into
+# <cucascade/log/config.hpp>, which the logging header includes, so cuCascade's
+# own sources and every consumer see one floor: the macros expand inside inline
+# and template functions of installed headers, where differing values across
+# translation units would violate the ODR.
 set(CUCASCADE_MIN_LOG_LEVEL
     "0"
     CACHE
       STRING
       "Compile out CUCASCADE_LOG_* call sites below this level (0=trace, 1=debug, 2=info, 3=warn, 4=error, 5=fatal, 6=off)"
 )
+set_property(
+  CACHE CUCASCADE_MIN_LOG_LEVEL
+  PROPERTY STRINGS
+           0
+           1
+           2
+           3
+           4
+           5
+           6)
+if(NOT CUCASCADE_MIN_LOG_LEVEL MATCHES "^[0-6]$")
+  message(
+    FATAL_ERROR
+      "CUCASCADE_MIN_LOG_LEVEL must be an integer from 0 (trace) to 6 (off); got '${CUCASCADE_MIN_LOG_LEVEL}'"
+  )
+endif()
+configure_file(
+  cmake/log_config.hpp.in
+  "${CMAKE_CURRENT_BINARY_DIR}/include/cucascade/log/config.hpp" @ONLY)
 
 # Swappable third-party backends for the io layer. The io code was ported from a
 # codebase with its own vendored dependencies. These knobs let an embedding host
@@ -367,18 +388,10 @@ if(CUCASCADE_BUILD_IO)
   add_subdirectory(src/io)
 endif()
 
-# cuCascade's own call sites honour the configured floor; consumers choose
-# theirs when they include include/cucascade/log/logging.hpp.
-foreach(_target cucascade_objects cucascade_cudf_objects cucascade_io_objects)
-  if(TARGET ${_target})
-    target_compile_definitions(
-      ${_target} PRIVATE CUCASCADE_MIN_LOG_LEVEL=${CUCASCADE_MIN_LOG_LEVEL})
-  endif()
-endforeach()
-
 # Common usage requirements shared by the object library and installable targets
 set(CUCASCADE_PUBLIC_INCLUDE_DIRS
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
@@ -681,6 +694,9 @@ else()
     PATTERN "*.h"
     PATTERN "cucascade/cudf" EXCLUDE)
 endif()
+# The generated compile-time log floor travels with the headers.
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/cucascade/log/config.hpp
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/log)
 
 # Collect targets to install
 set(CUCASCADE_INSTALL_TARGETS)
