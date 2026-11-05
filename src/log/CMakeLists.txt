@@ -15,10 +15,10 @@
 # the License.
 # =============================================================================
 
-# Record delivery (vemit), sink publication and the built-in stderr sink. Only
-# the level check and the sink slot stay inline in
-# include/cucascade/log/logging.hpp, so the hot path remains header-only while
-# <format>, <chrono> and <ctime> stay out of every translation unit that logs.
+# Sink publication, record delivery (vemit) and the built-in stderr sink. Only
+# the level gate stays inline in include/cucascade/log/logging.hpp, so the hot
+# path is a relaxed load while <format>, <chrono> and <mutex> stay out of every
+# translation unit that merely logs.
 #
 # Logging therefore requires linking cuCascade, and is unavailable in a
 # topology-only build, which does not produce cucascade_objects.

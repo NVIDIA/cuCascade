@@ -22,52 +22,57 @@
  * @file
  * @brief std::format-based logging delivered to a host-installed sink.
  *
- * cuCascade ships no logging backend; an embedding host installs a @ref cucascade::log::sink_fn
- * via @ref cucascade::log::set_sink. With no sink installed a call site costs one relaxed atomic
- * load and a never-taken branch, so logging is silent and free by default.
+ * cuCascade ships no logging backend of its own. An embedding host installs a
+ * @ref cucascade::log::sink via @ref cucascade::log::set_sink and receives every record cuCascade
+ * emits at or above the configured threshold, attributed to the originating call site. With no
+ * sink installed a call site costs one relaxed atomic load and a never-taken branch, and its
+ * arguments are not evaluated, so logging is silent and free by default.
  *
  * @code
- * void to_host_logger(void* user_data, cucascade::log::record const& rec) noexcept
- * {
- *   static_cast<my_logger*>(user_data)->write(rec.file, rec.line,
- *                                             std::string_view{rec.message, rec.message_len});
- * }
- * cucascade::log::set_sink(&to_host_logger, &my_logger, cucascade::log::level::debug);
+ * // Forward into the host's logger through the sink interface ...
+ * class host_sink final : public cucascade::log::sink {
+ *  public:
+ *   void write(const cucascade::log::record& rec) override
+ *   {
+ *     my_logger.log(to_my_level(rec.lvl), rec.location.file_name(), rec.location.line(),
+ *                   rec.message);
+ *   }
+ * };
+ * cucascade::log::set_sink(std::make_shared<host_sink>(), cucascade::log::level::debug);
+ *
+ * // ... or through any invocable.
+ * cucascade::log::set_sink(cucascade::log::make_sink([](const cucascade::log::record& rec) {
+ *   std::clog << rec.location.file_name() << ':' << rec.location.line() << ": " << rec.message
+ *             << '\n';
+ * }));
  * @endcode
  */
 
 #include <atomic>
-#include <cstddef>
+#include <concepts>
 #include <cstdint>
 #include <format>
+#include <memory>
+#include <optional>
 #include <source_location>
 #include <string_view>
-
-/// Forces default visibility on the process-wide sink state. Without it a `-fvisibility=hidden`
-/// build gives each shared object its own sink slot, so a host's @ref cucascade::log::set_sink
-/// would be invisible to cuCascade's own call sites.
-#if defined(__GNUC__) || defined(__clang__)
-#define CUCASCADE_LOG_SHARED_STATE __attribute__((visibility("default")))
-#else
-#define CUCASCADE_LOG_SHARED_STATE
-#endif
+#include <utility>
 
 namespace cucascade::log {
-inline namespace v1 {
 
 /// Record severity, ordered ascending.
-enum class level : int {
+enum class level : std::uint8_t {
   trace = 0,
   debug,
   info,
   warn,
   error,
-  fatal,  ///< Severity only; cuCascade never aborts on its own behalf.
+  fatal,  ///< Severity only; cuCascade never terminates the process on its own behalf.
   off,    ///< Not a message level; pass to @ref set_min_level to mute everything.
 };
 
-/// @return Static, human-readable name of @p lvl, e.g. `"WARN"`.
-[[nodiscard]] inline char const* to_string(level lvl) noexcept
+/// @return Static upper-case name of @p lvl, e.g. `"WARN"`.
+[[nodiscard]] constexpr std::string_view to_string(level lvl) noexcept
 {
   switch (lvl) {
     case level::trace: return "TRACE";
@@ -81,65 +86,41 @@ enum class level : int {
   return "?";
 }
 
-/// A formatted log record as passed to a sink.
+/// One log record, as delivered to a sink.
 ///
-/// A POD of pointers and integers, so it can cross into separately-compiled host code without
-/// depending on standard library layout choices. All pointers are borrowed for the duration of
-/// the sink call; @ref file and @ref function have static storage duration, @ref message does not.
-///
-/// @note Fields are only ever appended. @ref struct_size is the producer's `sizeof(record)`; a
-///       sink must check that it covers a field before reading one it was not compiled against.
+/// Every view is borrowed for the duration of @ref sink::write; a sink that keeps a record must
+/// copy @ref message. Records are delivered synchronously on the emitting thread, so a sink that
+/// wants a timestamp or thread id takes them itself, as the host's own logger would.
 struct record {
-  std::size_t struct_size;  ///< `sizeof(record)` as seen by the producer.
-  level lvl;
-  std::uint_least32_t line;
-  std::uint_least32_t column;
-  char const* message;  ///< Not NUL-terminated; pair with @ref message_len.
-  std::size_t message_len;
-  char const* file;  ///< Originating call site, not the sink.
-  char const* function;
-  std::uint64_t thread_id;    ///< Linux `gettid()`; 0 where unavailable.
-  std::int64_t unix_time_ns;  ///< Stamped when formatted, not when delivered.
+  level lvl;                      ///< Severity of this record.
+  std::source_location location;  ///< The `CUCASCADE_LOG_*` call site, not the sink.
+  std::string_view message;       ///< Fully formatted; not NUL-terminated.
 };
 
-/// Host-installed destination for a log record.
+/// Destination of cuCascade's log records, implemented by the embedding host.
 ///
-/// @param user_data Whatever was passed to @ref set_sink; must outlive the last log call.
-/// @note May throw — the caller catches and drops the record — but a throwing sink formats
-///       messages nobody sees.
-using sink_fn = void (*)(void* user_data, record const&);
+/// @ref write is called concurrently from any thread that logs and must be thread-safe. It may
+/// throw: the caller catches and drops that record. A sink is shared with every in-flight
+/// @ref write, so after @ref set_sink or @ref clear_sink replaces it, it stays alive until the
+/// last of those returns. A sink must therefore own, or outlive, everything @ref write touches.
+class sink {
+ public:
+  virtual ~sink() = default;
+
+  /// Delivers one record. Only called for levels at or above the threshold.
+  virtual void write(const record& rec) = 0;
+};
 
 namespace detail {
 
-/// Immutable once published, so a reader never sees a mismatched fn/user_data pair.
-struct sink_state {
-  sink_fn fn;
-  void* user_data;
-};
+/// The gate read by every call site: the configured threshold while a sink is installed,
+/// `level::off` otherwise. Defined once, in the library, so every image shares a single gate.
+extern std::atomic<level> threshold;
 
-CUCASCADE_LOG_SHARED_STATE inline std::atomic<sink_state const*>& sink_slot() noexcept
-{
-  static std::atomic<sink_state const*> slot{nullptr};
-  return slot;
-}
-
-CUCASCADE_LOG_SHARED_STATE inline std::atomic<level>& min_level_slot() noexcept
-{
-  static std::atomic<level> slot{level::info};
-  return slot;
-}
-
-/// Publishes a sink pair, or null for a null @p fn.
-///
-/// @note The result is never freed: a concurrent @ref vemit may still hold the previous pointer.
-///       The first install is served from a static, so the usual single-install case neither
-///       allocates nor reports a leak.
-sink_state const* publish_sink(sink_fn fn, void* user_data) noexcept;
-
-/// Formats and delivers one record. Never throws: these macros run in destructors and noexcept
+/// Formats and delivers one record. Never throws: call sites run in destructors and noexcept
 /// paths, where an escaping exception is `std::terminate`.
 void vemit(level lvl,
-           std::source_location const& location,
+           const std::source_location& location,
            std::string_view fmt,
            std::format_args args) noexcept;
 
@@ -147,7 +128,7 @@ void vemit(level lvl,
 /// non-template call rather than a fresh instantiation per argument pack.
 template <typename... Args>
 void emit(level lvl,
-          std::source_location const& location,
+          const std::source_location& location,
           std::format_string<Args...> fmt,
           Args&&... args) noexcept
 {
@@ -158,81 +139,82 @@ void emit(level lvl,
 template <typename... Args>
 int ignore(Args&&...) noexcept;
 
+/// Adapts an invocable to the @ref sink interface.
+template <std::invocable<const record&> Fn>
+class invocable_sink final : public sink {
+ public:
+  explicit invocable_sink(Fn fn) : _fn(std::move(fn)) {}
+
+  void write(const record& rec) override { _fn(rec); }
+
+ private:
+  Fn _fn;
+};
+
 }  // namespace detail
 
-/// Installs the process-wide sink and sets the severity threshold.
-///
-/// Intended to be called once during host start-up. @p fn and whatever @p user_data points at
-/// must stay valid while any cuCascade thread can log; see @ref clear_sink for teardown.
-///
-/// @note Always writes the threshold, so it overrides an earlier @ref set_min_level.
-inline void set_sink(sink_fn fn, void* user_data = nullptr, level min_level = level::info) noexcept
+/// @return Whether a record at @p lvl would currently reach a sink: false whenever no sink is
+///         installed. One relaxed load and a compare; the guard on every call site.
+[[nodiscard]] inline bool enabled(level lvl) noexcept
 {
-  auto const* const state = detail::publish_sink(fn, user_data);
-  detail::min_level_slot().store(min_level, std::memory_order_relaxed);
-  detail::sink_slot().store(state, std::memory_order_release);
+  return lvl >= detail::threshold.load(std::memory_order_relaxed);
 }
 
-/// Removes the installed sink. Call before destroying whatever `user_data` pointed at.
-inline void clear_sink() noexcept { detail::sink_slot().store(nullptr, std::memory_order_release); }
+/// Wraps any `void(const record&)` invocable, such as a lambda forwarding to a host logger, in a
+/// sink. The invocable is called concurrently and must be thread-safe.
+template <std::invocable<const record&> Fn>
+[[nodiscard]] std::shared_ptr<sink> make_sink(Fn fn)
+{
+  return std::make_shared<detail::invocable_sink<Fn>>(std::move(fn));
+}
+
+/// Installs @p new_sink as the process-wide sink and, when given, sets the severity threshold.
+///
+/// Intended for host start-up, but safe at any time: a record racing with the swap reaches either
+/// sink, or neither, never a destroyed one. A null @p new_sink uninstalls logging, as
+/// @ref clear_sink does. Without @p min_level the threshold is left as it was (initially
+/// `level::info`).
+///
+/// @return The previously installed sink, or null. Drop it, or wait for its use count to reach
+///         one before tearing down anything it references.
+std::shared_ptr<sink> set_sink(std::shared_ptr<sink> new_sink,
+                               std::optional<level> min_level = std::nullopt) noexcept;
+
+/// Uninstalls the sink; @ref enabled is false for every level afterwards.
+/// @return The previously installed sink, or null; see @ref set_sink.
+std::shared_ptr<sink> clear_sink() noexcept;
 
 /// Sets the severity threshold without touching the installed sink.
 ///
 /// Mirror the host logger's own level here so filtering happens once, in @ref enabled, rather
-/// than formatting records the backend will discard.
-inline void set_min_level(level min_level) noexcept
-{
-  detail::min_level_slot().store(min_level, std::memory_order_relaxed);
-}
+/// than after formatting a record the backend will discard.
+void set_min_level(level min_level) noexcept;
+
+/// @return The configured severity threshold, whether or not a sink is installed.
+[[nodiscard]] level min_level() noexcept;
 
 /// @return The installed sink, or null if none.
-[[nodiscard]] inline sink_fn sink() noexcept
+[[nodiscard]] std::shared_ptr<sink> current_sink() noexcept;
+
+/// @return A sink writing `<UTC timestamp> [LEVEL] <tid> file:line: message` lines to stderr,
+///         for running cuCascade standalone. An embedding host installs its own sink instead.
+[[nodiscard]] std::shared_ptr<sink> make_stderr_sink();
+
+/// Installs the sink from @ref make_stderr_sink at @p min_level.
+inline void use_stderr_sink(level min_level = level::info)
 {
-  auto const* const state = detail::sink_slot().load(std::memory_order_acquire);
-  return state != nullptr ? state->fn : nullptr;
+  set_sink(make_stderr_sink(), min_level);
 }
 
-/// @return The `user_data` passed to @ref set_sink, or null if no sink is installed.
-[[nodiscard]] inline void* sink_user_data() noexcept
-{
-  auto const* const state = detail::sink_slot().load(std::memory_order_acquire);
-  return state != nullptr ? state->user_data : nullptr;
-}
-
-/// @return The current severity threshold.
-[[nodiscard]] inline level min_level() noexcept
-{
-  return detail::min_level_slot().load(std::memory_order_relaxed);
-}
-
-/// @return Whether a record at @p lvl would reach a sink.
-/// @note The guard on every call site, so it stays one relaxed load and two integer compares.
-[[nodiscard]] inline bool enabled(level lvl) noexcept
-{
-  return detail::sink_slot().load(std::memory_order_relaxed) != nullptr && lvl >= min_level();
-}
-
-/// Built-in sink writing `<timestamp> [LEVEL] <tid> file:line: message` to stderr. Ignores
-/// @p user_data. Not installed by default; see @ref use_stderr_sink.
-void stderr_sink(void* user_data, record const& rec) noexcept;
-
-/// Routes records to @ref stderr_sink, for debugging cuCascade standalone. An embedding host
-/// should install its own sink instead.
-inline void use_stderr_sink(level min_level = level::info) noexcept
-{
-  set_sink(&stderr_sink, nullptr, min_level);
-}
-
-}  // namespace v1
 }  // namespace cucascade::log
 
 // clang-format off
 
 /// Compile-time severity floor, as the underlying value of a cucascade::log::level (0 = trace
-/// ... 6 = off). Call sites below it are removed by the preprocessor, arguments included.
-///
-/// @note Read only inside the macros below, never in an inline function body or a type, so the
-///       library and a consumer may define it differently without an ODR violation.
+/// ... 6 = off). Call sites below it are removed by the preprocessor; their arguments are still
+/// type-checked and count as used, but are never evaluated. cuCascade's own translation units
+/// take it from the CUCASCADE_MIN_LOG_LEVEL CMake cache variable; a consumer defines it before
+/// including this header, or not at all to keep every call site.
 #ifndef CUCASCADE_MIN_LOG_LEVEL
 #define CUCASCADE_MIN_LOG_LEVEL 0
 #endif
@@ -240,22 +222,45 @@ inline void use_stderr_sink(level min_level = level::info) noexcept
 /// Discards the arguments in an unevaluated context: still type-checked and "used", never run.
 #define CUCASCADE_LOG_NOOP(...) static_cast<void>(sizeof(::cucascade::log::detail::ignore(__VA_ARGS__)))
 
+/// An expression, so it composes wherever a statement would not (ternaries, comma sequences).
 #define CUCASCADE_LOG_IMPL(lvl, ...)                                                        \
-  do {                                                                                      \
-    if constexpr (static_cast<int>(lvl) >= (CUCASCADE_MIN_LOG_LEVEL)) {                     \
-      if (::cucascade::log::enabled(lvl)) {                                                 \
-        ::cucascade::log::detail::emit(                                                     \
-          (lvl), std::source_location::current(), __VA_ARGS__);                             \
-      }                                                                                     \
-    } else {                                                                                \
-      CUCASCADE_LOG_NOOP(__VA_ARGS__);                                                      \
-    }                                                                                       \
-  } while (false)
+  (::cucascade::log::enabled(lvl)                                                           \
+     ? ::cucascade::log::detail::emit((lvl), std::source_location::current(), __VA_ARGS__)  \
+     : static_cast<void>(0))
 
+#if CUCASCADE_MIN_LOG_LEVEL <= 0
 #define CUCASCADE_LOG_TRACE(...) CUCASCADE_LOG_IMPL(::cucascade::log::level::trace, __VA_ARGS__)
+#else
+#define CUCASCADE_LOG_TRACE(...) CUCASCADE_LOG_NOOP(__VA_ARGS__)
+#endif
+
+#if CUCASCADE_MIN_LOG_LEVEL <= 1
 #define CUCASCADE_LOG_DEBUG(...) CUCASCADE_LOG_IMPL(::cucascade::log::level::debug, __VA_ARGS__)
-#define CUCASCADE_LOG_INFO(...)  CUCASCADE_LOG_IMPL(::cucascade::log::level::info,  __VA_ARGS__)
-#define CUCASCADE_LOG_WARN(...)  CUCASCADE_LOG_IMPL(::cucascade::log::level::warn,  __VA_ARGS__)
+#else
+#define CUCASCADE_LOG_DEBUG(...) CUCASCADE_LOG_NOOP(__VA_ARGS__)
+#endif
+
+#if CUCASCADE_MIN_LOG_LEVEL <= 2
+#define CUCASCADE_LOG_INFO(...)  CUCASCADE_LOG_IMPL(::cucascade::log::level::info, __VA_ARGS__)
+#else
+#define CUCASCADE_LOG_INFO(...)  CUCASCADE_LOG_NOOP(__VA_ARGS__)
+#endif
+
+#if CUCASCADE_MIN_LOG_LEVEL <= 3
+#define CUCASCADE_LOG_WARN(...)  CUCASCADE_LOG_IMPL(::cucascade::log::level::warn, __VA_ARGS__)
+#else
+#define CUCASCADE_LOG_WARN(...)  CUCASCADE_LOG_NOOP(__VA_ARGS__)
+#endif
+
+#if CUCASCADE_MIN_LOG_LEVEL <= 4
 #define CUCASCADE_LOG_ERROR(...) CUCASCADE_LOG_IMPL(::cucascade::log::level::error, __VA_ARGS__)
+#else
+#define CUCASCADE_LOG_ERROR(...) CUCASCADE_LOG_NOOP(__VA_ARGS__)
+#endif
+
+#if CUCASCADE_MIN_LOG_LEVEL <= 5
 #define CUCASCADE_LOG_FATAL(...) CUCASCADE_LOG_IMPL(::cucascade::log::level::fatal, __VA_ARGS__)
+#else
+#define CUCASCADE_LOG_FATAL(...) CUCASCADE_LOG_NOOP(__VA_ARGS__)
+#endif
 // clang-format on

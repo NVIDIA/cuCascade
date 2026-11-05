@@ -21,85 +21,85 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
-#include <ctime>
 #include <format>
-#include <new>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace cucascade::log {
-inline namespace v1 {
+
+namespace detail {
+
+std::atomic<level> threshold{level::off};
+
+}  // namespace detail
 
 namespace {
 
-/// Cached: `gettid` is a syscall and the id is fixed for the thread's lifetime.
+/// Writer-side state. Call sites read only `slot`, and `detail::threshold` before that.
+struct registry {
+  std::mutex mutex;  ///< Serializes set_sink, clear_sink and set_min_level against each other.
+  std::atomic<std::shared_ptr<sink>> slot;     ///< The installed sink, or null.
+  std::atomic<level> configured{level::info};  ///< Threshold applied while a sink is installed.
+};
+
+/// Never destroyed, so a record emitted from a static destructor still finds a valid slot.
+registry& state()
+{
+  static auto& instance = *new registry{};
+  return instance;
+}
+
+/// Cached: the id is fixed for the thread's lifetime and `gettid` is a syscall.
 [[nodiscard]] std::uint64_t current_thread_id() noexcept
 {
-  static thread_local std::uint64_t const tid{static_cast<std::uint64_t>(::syscall(SYS_gettid))};
+  static thread_local const auto tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
   return tid;
 }
 
-[[nodiscard]] std::int64_t current_unix_time_ns() noexcept
-{
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-           std::chrono::system_clock::now().time_since_epoch())
-    .count();
-}
+/// Built-in sink for standalone use.
+class stderr_sink final : public sink {
+ public:
+  void write(const record& rec) override
+  {
+    const auto now =
+      std::chrono::floor<std::chrono::microseconds>(std::chrono::system_clock::now());
+    const auto line = std::format("{:%FT%T}Z [{:<5}] {} {}:{}: {}\n",
+                                  now,
+                                  to_string(rec.lvl),
+                                  current_thread_id(),
+                                  rec.location.file_name(),
+                                  rec.location.line(),
+                                  rec.message);
+    // One fwrite per record so concurrent writers interleave by line rather than mid-line.
+    [[maybe_unused]] const auto written = std::fwrite(line.data(), 1, line.size(), stderr);
+  }
+};
 
 }  // namespace
 
 namespace detail {
 
-sink_state const* publish_sink(sink_fn fn, void* user_data) noexcept
-{
-  if (fn == nullptr) { return nullptr; }
-
-  static sink_state first{};
-  static std::atomic<bool> first_taken{false};
-
-  bool expected = false;
-  if (first_taken.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
-    // Not yet reachable by any reader: set_sink publishes the pointer afterwards.
-    first = sink_state{fn, user_data};
-    return &first;
-  }
-  // Failing to allocate a logger is not worth throwing from a noexcept path; the caller stores
-  // null and logging stays silent.
-  return new (std::nothrow) sink_state{fn, user_data};
-}
-
 void vemit(level lvl,
-           std::source_location const& location,
+           const std::source_location& location,
            std::string_view fmt,
            std::format_args args) noexcept
 {
-  // Re-read rather than trusting enabled(): set_sink may have raced in between. Formatting
-  // happens after the check, so losing that race costs nothing.
-  auto const* const state = sink_slot().load(std::memory_order_acquire);
-  if (state == nullptr) { return; }
-
   try {
-    auto const message = std::vformat(fmt, args);
+    // Holding the shared_ptr keeps the sink alive for the whole write, even if another thread
+    // replaces or clears it meanwhile.
+    const auto target = state().slot.load(std::memory_order_acquire);
+    if (target == nullptr) { return; }
 
-    record const rec{
-      .struct_size  = sizeof(record),
-      .lvl          = lvl,
-      .line         = location.line(),
-      .column       = location.column(),
-      .message      = message.data(),
-      .message_len  = message.size(),
-      .file         = location.file_name(),
-      .function     = location.function_name(),
-      .thread_id    = current_thread_id(),
-      .unix_time_ns = current_unix_time_ns(),
-    };
-
-    state->fn(state->user_data, rec);
+    const auto message = std::vformat(fmt, args);
+    target->write(record{.lvl = lvl, .location = location, .message = message});
   } catch (...) {
-    // std::vformat allocates and the sink is host code; neither may escape into a destructor or
+    // std::vformat allocates and write() is host code; neither may escape into a destructor or a
     // noexcept caller. Reporting the failure would need the sink that just failed, so the record
     // is dropped.
   }
@@ -107,36 +107,43 @@ void vemit(level lvl,
 
 }  // namespace detail
 
-void stderr_sink(void*, record const& rec) noexcept
+std::shared_ptr<sink> set_sink(std::shared_ptr<sink> new_sink,
+                               std::optional<level> min_level) noexcept
 {
-  try {
-    auto const secs  = static_cast<std::time_t>(rec.unix_time_ns / 1'000'000'000);
-    auto const usecs = static_cast<long>((rec.unix_time_ns % 1'000'000'000) / 1'000);
+  auto& st = state();
+  const std::lock_guard lock{st.mutex};
+  if (min_level) { st.configured.store(*min_level, std::memory_order_relaxed); }
 
-    std::array<char, 32> stamp{};
-    std::tm utc{};
-    bool formatted = false;
-    if (::gmtime_r(&secs, &utc) != nullptr) {
-      formatted = std::strftime(stamp.data(), stamp.size(), "%Y-%m-%dT%H:%M:%S", &utc) != 0;
-    }
-    // Keep the line shape stable when the clock is unrepresentable, so a parser sees a bogus
-    // timestamp rather than a missing column.
-    char const* const stamp_text = formatted ? stamp.data() : "0000-00-00T00:00:00";
+  if (new_sink == nullptr) {
+    // Close the gate first, so no call site starts formatting for a sink that is going away.
+    detail::threshold.store(level::off, std::memory_order_release);
+    return st.slot.exchange(nullptr);
+  }
+  // Publish the sink before opening the gate, so a call site that passes the gate finds it.
+  auto previous = st.slot.exchange(std::move(new_sink));
+  detail::threshold.store(st.configured.load(std::memory_order_relaxed), std::memory_order_release);
+  return previous;
+}
 
-    auto const line = std::format("{}.{:06}Z [{:<5}] {} {}:{}: {}\n",
-                                  stamp_text,
-                                  usecs,
-                                  to_string(rec.lvl),
-                                  rec.thread_id,
-                                  rec.file,
-                                  rec.line,
-                                  std::string_view{rec.message, rec.message_len});
+std::shared_ptr<sink> clear_sink() noexcept { return set_sink(nullptr); }
 
-    // One fwrite so concurrent loggers interleave by line rather than mid-line.
-    [[maybe_unused]] auto const written = std::fwrite(line.data(), 1, line.size(), stderr);
-  } catch (...) {  // A sink that throws is worse than a lost line.
+void set_min_level(level min_level) noexcept
+{
+  auto& st = state();
+  const std::lock_guard lock{st.mutex};
+  st.configured.store(min_level, std::memory_order_relaxed);
+  if (st.slot.load(std::memory_order_relaxed) != nullptr) {
+    detail::threshold.store(min_level, std::memory_order_release);
   }
 }
 
-}  // namespace v1
+level min_level() noexcept { return state().configured.load(std::memory_order_relaxed); }
+
+std::shared_ptr<sink> current_sink() noexcept
+{
+  return state().slot.load(std::memory_order_acquire);
+}
+
+std::shared_ptr<sink> make_stderr_sink() { return std::make_shared<stderr_sink>(); }
+
 }  // namespace cucascade::log
