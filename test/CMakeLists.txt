@@ -111,6 +111,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
 endif()
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
+  # cudf_test column wrappers call cudf::test::get_default_stream(), defined in
+  # cudf's optional "testing" component (libcudftest_default_stream.so).
+  find_package(cudf REQUIRED CONFIG COMPONENTS testing)
+
   # cudf-coupled test executable - links the cucascade-cudf library.
   add_executable(
     cucascade_cudf_tests
@@ -149,8 +153,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Link dependencies
   target_link_libraries(
-    cucascade_cudf_tests PRIVATE cucascade_cudf Catch2::Catch2
-                                 CUDA::cudart_static)
+    cucascade_cudf_tests
+    PRIVATE cucascade_cudf Catch2::Catch2 CUDA::cudart_static
+            cudf::cudftest_default_stream)
 
   # Register tests with CTest
   add_test(NAME cucascade_cudf_tests COMMAND cucascade_cudf_tests)

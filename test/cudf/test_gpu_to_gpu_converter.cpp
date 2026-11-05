@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "cucascade/cuda/event.hpp"
 #include "cucascade/cudf/builtin_converters.hpp"
 #include "cucascade/cudf/gpu_data_representation.hpp"
 #include "cucascade/data/data_batch.hpp"
@@ -17,6 +18,7 @@
 #include "utils/cudf_test_utils.hpp"
 
 #include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/default_stream.hpp>
 
 #include <cudf/copying.hpp>
 
@@ -75,6 +77,38 @@ void grant_two_way_pool_access(memory_space const* source, memory_space const* d
   }
 }
 
+/**
+ * @brief Build 16 mixed columns by round-robin repetition of ten readable sample rows.
+ *
+ * Layout: 6 numeric, 6 STRING, LIST<INT32>, LIST<STRING>, STRUCT<INT64, STRING>,
+ * DICTIONARY<STRING>. Includes nullable/non-nullable data, all-null strings,
+ * empty strings and empty lists. Sample row i is used for output row i % 10.
+ *
+ * Conservative retained device-buffer budget: 512 bytes per row + 32 KiB per
+ * table, including masks/offsets (text <= 24 bytes, lists <= 3 elements, offsets
+ * up to INT64). For 1024 rows, budget 544 KiB per table. This is NOT a peak-memory
+ * bound: exclude allocator pool reservation, gather/construction workspace and
+ * CUDA overhead. Two converted outputs plus expected occupy three target tables.
+ *
+ * Host gather-map payload: 4 bytes per row (4 KiB for 1024), plus ten-row wrapper
+ * temporaries and container overhead. cuDF internal workspace is additional.
+ *
+ * All output buffers are written on @p stream. cudf_test wrappers may enqueue work on
+ * cudf::test::get_default_stream() regardless of the stream passed, so @p stream is ordered after
+ * that work with an event before the final gather.
+ *
+ * Setup synchronizes before returning: call BEFORE arming a producer gate and
+ * outside benchmark timing.
+ *
+ * @note The caller must set the current device to the device @p stream belongs to: the ordering
+ * event is created on the current device, and recording requires it to match the device of both
+ * @p stream and cudf::test::get_default_stream().
+ *
+ * @param rows Number of output rows
+ * @param stream Stream that writes the returned table; synchronized before returning
+ * @param mr Resource for the returned table's device memory
+ * @return The generated table
+ */
 std::unique_ptr<cudf::table> make_mixed_table(cudf::size_type rows,
                                               cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr);
@@ -191,25 +225,6 @@ TEST_CASE("gpu_to_gpu conversion copies content correctly across GPUs",
 
 namespace {
 
-/**
- * @brief Build 16 mixed columns by round-robin repetition of ten readable sample rows.
- *
- * Layout: 6 numeric, 6 STRING, LIST<INT32>, LIST<STRING>, STRUCT<INT64, STRING>,
- * DICTIONARY<STRING>. Includes nullable/non-nullable data, all-null strings,
- * empty strings and empty lists. Sample row i is used for output row i % 10.
- *
- * Conservative retained device-buffer budget: 512 bytes per row + 32 KiB per
- * table, including masks/offsets (text <= 24 bytes, lists <= 3 elements, offsets
- * up to INT64). For 1024 rows, budget 544 KiB per table. This is NOT a peak-memory
- * bound: exclude allocator pool reservation, gather/construction workspace and
- * CUDA overhead. Two converted outputs plus expected occupy three target tables.
- *
- * Host gather-map payload: 4 bytes per row (4 KiB for 1024), plus ten-row wrapper
- * temporaries and container overhead. cuDF internal workspace is additional.
- *
- * Setup synchronizes before returning: call BEFORE arming a producer gate and
- * outside benchmark timing. Uses the supplied stream and memory resource.
- */
 std::unique_ptr<cudf::table> make_mixed_table(cudf::size_type rows,
                                               cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr)
@@ -341,6 +356,13 @@ std::unique_ptr<cudf::table> make_mixed_table(cudf::size_type rows,
     row_indices[static_cast<std::size_t>(row)] = row % 10;
   }
   fixed_width_column_wrapper<int32_t> row_map(row_indices.begin(), row_indices.end(), stream, mr);
+
+  // cudf_test wrappers may enqueue work on cudf::test::get_default_stream() regardless of the
+  // stream passed (e.g. older cudf releases). Order the gather after it without blocking the host.
+  cucascade::cuda::cuda_event wrappers_done;
+  wrappers_done.record(cudf::test::get_default_stream());
+  wrappers_done.wait(stream);
+
   auto table =
     cudf::gather(samples.view(), row_map, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
   // Complete use of temporary samples and row map before destroying them.
