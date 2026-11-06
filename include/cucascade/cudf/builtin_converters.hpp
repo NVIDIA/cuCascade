@@ -30,6 +30,13 @@ namespace cucascade {
  *
  * This is provided by the cucascade-cudf library; the cudf-free core registry ships empty.
  *
+ * Ordering: a converter reading a GPU source orders its reads after the source's writer event
+ * (idata_representation::get_writer_event()); callers must not rely on the caller's stream for
+ * that ordering. Writes enqueued after the last record_writer_event() are not covered, on any
+ * stream, so a writer must record before converting. Without a writer event the converter
+ * synchronizes the source device. A GPU result carries its own writer event, which readers on
+ * other streams wait on.
+ *
  * @param registry The converter registry to register converters with.
  */
 void register_builtin_converters(representation_converter_registry& registry);
