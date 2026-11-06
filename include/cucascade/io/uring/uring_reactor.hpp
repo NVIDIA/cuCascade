@@ -246,7 +246,11 @@ class uring_reactor {
   struct gauges {
     std::uint32_t inflight_ops{0};      ///< physical ops owned by the kernel
     std::uint32_t max_inflight_ops{0};  ///< peak since the previous take_gauges()
-    std::uint32_t pending_ops{0};       ///< planned ops waiting for a staging slot
+    /// Reads smaller than config::small_read_bytes in flight, counted whether or
+    /// not config::max_inflight_small_reads caps them.
+    std::uint32_t small_inflight_ops{0};
+    std::uint32_t max_small_inflight_ops{0};  ///< peak since the previous take_gauges()
+    std::uint32_t pending_ops{0};             ///< planned ops waiting for a staging slot
     /// Slices of the active request not yet expanded into physical ops.
     std::uint32_t active_remaining_slices{0};
     std::size_t queued_requests{0};      ///< requests queued behind the active one
@@ -272,7 +276,8 @@ class uring_reactor {
     }
   };
 
-  /// Snapshot the gauges and restart the @c max_inflight_ops window.
+  /// Snapshot the gauges and restart the @c max_inflight_ops and
+  /// @c max_small_inflight_ops windows.
   [[nodiscard]] gauges take_gauges() noexcept;
 
   /// Whether @p path can be served by this reactor.  Local-disk only:
@@ -336,6 +341,8 @@ class uring_reactor {
   // Gauges (see @ref gauges): written only by the worker, read by take_gauges().
   std::atomic<std::uint32_t> _gauge_inflight{0};
   std::atomic<std::uint32_t> _gauge_max_inflight{0};
+  std::atomic<std::uint32_t> _gauge_small_inflight{0};
+  std::atomic<std::uint32_t> _gauge_max_small_inflight{0};
   std::atomic<std::uint32_t> _gauge_pending{0};
   std::atomic<std::uint32_t> _gauge_active_slices{0};
   std::atomic<std::uint64_t> _gauge_requests_started{0};
