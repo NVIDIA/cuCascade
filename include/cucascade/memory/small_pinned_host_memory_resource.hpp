@@ -40,6 +40,7 @@ namespace cucascade {
 namespace memory {
 
 /**
+ * @file small_pinned_host_memory_resource.hpp
  * @brief Provides pooled pinned host memory for small and large allocations
  *
  * Requests with alignment no greater than `alignof(std::max_align_t)` and size up to @ref
