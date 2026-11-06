@@ -87,6 +87,20 @@ struct config {
   /// is waiting).
   std::size_t low_service_interval{4};
 
+  /// Most reads smaller than @ref small_read_bytes one reactor keeps in flight; 0
+  /// means no cap.
+  ///
+  /// Dozens of concurrent small O_DIRECT reads into neighbouring blocks of a file
+  /// contend on storage that has not cached them, as on GPFS.  Larger reads do not
+  /// count against the cap.  The reactor dispatches its planned reads in order, so
+  /// a small read waiting for the cap also holds back the reads queued behind it,
+  /// large ones included; reads already in flight are unaffected.
+  std::size_t max_inflight_small_reads{0};
+
+  /// Physical read size below which a read counts against
+  /// @ref max_inflight_small_reads.
+  std::size_t small_read_bytes{1UL << 20};
+
   /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
   /// either way -- naming it lets the caller align once, up front, instead of
   /// every layer rediscovering it.  Reported even when @ref use_odirect is
