@@ -19,7 +19,6 @@
 #pragma once
 
 #include <cucascade/exec/invocable.hpp>
-#include <cucascade/log/logging.hpp>
 
 #include <algorithm>
 #include <concepts>
