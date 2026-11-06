@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cucascade::memory {
@@ -63,6 +64,96 @@ struct storage_device_info {
   std::string name;                                   ///< Device name (e.g., "nvme0n1").
   int numa_node{-1};                                  ///< NUMA node ID (-1 if unknown).
   std::string pci_bus_id;                             ///< PCI bus ID.
+};
+
+/**
+ * @brief Outcome of a per-path storage discovery (see
+ *        @ref topology_discovery::discover_storage_for_path).
+ *
+ * @c unknown is not a negative answer: it means the mount or device stack
+ * could not be determined (sysfs or procfs unreadable, an overlay / container
+ * mount, a filesystem without a block-device mapping, ...).
+ */
+enum class path_storage_status {
+  ok,                ///< The file, its mount and its backing were resolved.
+  not_found,         ///< The path does not exist.
+  not_regular_file,  ///< The path exists but is not a regular file.
+  inaccessible,      ///< The path could not be opened or stat'ed (e.g. EACCES).
+  unknown,           ///< The file was opened, but its mount or backing is unknown.
+};
+
+/**
+ * @brief What backs the filesystem holding a file.
+ */
+enum class storage_kind {
+  local_block,  ///< A local block-device stack (see @c path_storage_info::devices).
+  network,      ///< A network / distributed filesystem (NFS, Lustre, GPFS, ...).
+  memory,       ///< A memory filesystem (tmpfs, ramfs, ...).
+  unknown,      ///< Not determined (overlay, FUSE, pseudo or unresolved filesystems).
+};
+
+/**
+ * @brief A leaf block device under a file's filesystem.
+ *
+ * Leaves are whole disks reached from the filesystem's device through partition
+ * parents and device-mapper / md @c slaves; a stack spanning several disks has
+ * several leaves.
+ */
+struct block_device_info {
+  std::string name;                                   ///< Kernel name, e.g. "nvme0n1".
+  unsigned int major{0};                              ///< Device major number.
+  unsigned int minor{0};                              ///< Device minor number.
+  StorageDriveType type = StorageDriveType::UNKNOWN;  ///< Drive class, when recognized.
+  int numa_node{-1};                                  ///< NUMA node (-1 if unknown).
+  std::string pci_bus_id;  ///< PCI bus ID of the controller; empty when not on PCI.
+};
+
+/**
+ * @brief Passive snapshot of where a file is stored: its mount, filesystem and
+ *        backing block devices.
+ *
+ * Produced from @c fstat / @c statx, @c /proc/self/mountinfo and
+ * @c /sys/dev/block only: discovery never initializes CUDA, loads cuFile, creates
+ * files or changes mounts.  It is a snapshot -- the answer is not cached, and a
+ * file can move, or a mount change, right after it was taken.
+ */
+struct path_storage_info {
+  path_storage_status status = path_storage_status::unknown;  ///< Overall outcome.
+  storage_kind kind          = storage_kind::unknown;         ///< What backs the filesystem.
+  /// Human-readable notes: why the status is not @c ok, or caveats of a
+  /// resolved answer (fallback mount match, mixed device stack, ...).
+  std::string reason;
+  std::string path;              ///< The path as given.
+  std::string resolved_path;     ///< Absolute path of the opened file, symlinks resolved.
+  unsigned int device_major{0};  ///< Major number of the file's @c st_dev.
+  unsigned int device_minor{0};  ///< Minor number of the file's @c st_dev.
+  std::optional<int> mount_id;   ///< Mount ID, when the kernel reports it (@c statx).
+  std::string mount_point;       ///< Where the filesystem is mounted.
+  std::string mount_root;        ///< Root of the mount within its filesystem (bind mounts).
+  std::string filesystem_type;   ///< e.g. "ext4", "xfs", "nfs4", "tmpfs".
+  std::string mount_source;      ///< e.g. "/dev/nvme0n1p2", "server:/export".
+  std::string mount_options;     ///< Per-mount options.
+  std::string super_options;     ///< Per-superblock options.
+  std::vector<block_device_info> devices;  ///< Leaf block devices (local_block only).
+
+  /// Whether at least one leaf device was found and every leaf is NVMe.
+  [[nodiscard]] bool all_devices_nvme() const noexcept
+  {
+    if (devices.empty()) { return false; }
+    for (auto const& device : devices) {
+      if (device.type != StorageDriveType::NVME) { return false; }
+    }
+    return true;
+  }
+
+  /// Whether the leaf devices are of more than one drive class.
+  [[nodiscard]] bool mixed_devices() const noexcept
+  {
+    for (auto const& device : devices) {
+      if (device.type != devices.front().type) { return true; }
+    }
+    return false;
+  }
 };
 
 /**
@@ -245,6 +336,42 @@ class topology_discovery {
    * @param topology Topology to enrich in place.
    */
   static void discover_runtime_attributes(system_topology_info& topology);
+
+  /**
+   * @brief Discover where the file at @p path is stored.
+   *
+   * Opens @p path read-only (following symlinks) and resolves the opened file's
+   * mount from its @c statx mount ID when the kernel reports one, otherwise
+   * by the longest covering mount point of the file's device. A mount ID that
+   * mountinfo no longer lists leaves the storage unknown unless such a
+   * same-device mount covers the path. Only when no mount ID is known may a
+   * path-only match be used. For a block filesystem the
+   * device is followed through @c /sys/dev/block, partition parents and
+   * device-mapper / md @c slaves (with cycle protection) down to its leaf
+   * disks, recording each leaf's drive class, PCI bus ID and NUMA node.
+   *
+   * Passive: uses procfs and sysfs only, no CUDA, no cuFile, no writes.  Never
+   * throws; failures are reported through @c path_storage_info::status and
+   * @c reason.  The result is not cached.
+   *
+   * @param path Path of a regular file.
+   * @return The storage snapshot.
+   */
+  [[nodiscard]] static path_storage_info discover_storage_for_path(std::string_view path);
+
+  /**
+   * @brief As @ref discover_storage_for_path, for an already-open descriptor.
+   *
+   * Describes the file @p fd refers to, so a caller that opened the file can
+   * learn about exactly the file it will read, without a second, race-prone
+   * path lookup.  @p path is only reported back (and used for the resolved
+   * path when procfs cannot name the descriptor).
+   *
+   * @param fd   Open descriptor of a regular file; not closed.
+   * @param path The path it was opened from, for reporting.
+   */
+  [[nodiscard]] static path_storage_info discover_storage_for_descriptor(
+    int fd, std::string_view path = {});
 
   /**
    * @brief Get the discovered topology information.

@@ -167,6 +167,12 @@ class datasource : public cudf::io::datasource {
   ///
   /// \p priority is the reactor queue tier (see @c io_priority); @c automatic
   /// resolves to high, as for every device read.
+  ///
+  /// The future settles only once every range has stopped touching its
+  /// destination (failed and cancelled siblings included); on success the bytes
+  /// are in place without further synchronization of \p stream.  The caller
+  /// keeps every destination alive until then (see
+  /// @c ioctx::device_readv_async_io).
   std::future<size_t> device_read_ranges_async(std::span<const slice> slices,
                                                ::cuda::stream_ref stream,
                                                io_priority priority = io_priority::automatic);

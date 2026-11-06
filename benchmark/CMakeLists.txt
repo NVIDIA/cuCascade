@@ -15,16 +15,6 @@
 # the License.
 # =============================================================================
 
-# The benchmarks exercise the cudf-backed representation converters, so they
-# require the cucascade-cudf library. Skip them when it is not being built.
-if(NOT CUCASCADE_BUILD_CUDF)
-  message(
-    STATUS
-      "cuCascade benchmarks require CUCASCADE_BUILD_CUDF=ON (cudf-backed converters); skipping"
-  )
-  return()
-endif()
-
 # Fetch Google Benchmark
 include(FetchContent)
 FetchContent_Declare(
@@ -45,6 +35,31 @@ set(BENCHMARK_ENABLE_INSTALL
     CACHE BOOL "Disable install" FORCE)
 
 FetchContent_MakeAvailable(benchmark)
+
+# =============================================================================
+# IoBufFragmentedSink micro-benchmark: header-only and cudf-free, so it is built
+# ahead of the cudf gate below (it needs only the public include directory).
+# =============================================================================
+add_executable(cucascade_iobuf_sink_benchmark
+               ${CMAKE_CURRENT_SOURCE_DIR}/iobuf_fragmented_sink_bench.cpp)
+target_include_directories(cucascade_iobuf_sink_benchmark
+                           PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(cucascade_iobuf_sink_benchmark PRIVATE cxx_std_20)
+target_compile_options(
+  cucascade_iobuf_sink_benchmark
+  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>)
+target_link_libraries(cucascade_iobuf_sink_benchmark
+                      PRIVATE benchmark::benchmark)
+
+# The remaining benchmarks exercise the cudf-backed representation converters,
+# so they require the cucascade-cudf library. Skip them when it is not built.
+if(NOT CUCASCADE_BUILD_CUDF)
+  message(
+    STATUS
+      "cuCascade benchmarks require CUCASCADE_BUILD_CUDF=ON (cudf-backed converters); skipping"
+  )
+  return()
+endif()
 
 # Collect all benchmark sources
 set(BENCHMARK_SOURCES
@@ -116,13 +131,12 @@ endif()
 
 # =============================================================================
 # S3 parquet benchmark (CLI): cucascade-io REST datasource (AWS-SDK presigned
-# URLs) vs kvikIO's remote S3 handle. Opt-in via CUCASCADE_BUILD_S3_BENCHMARK so
-# aws-sdk-cpp never becomes a dependency of cuCascade itself (use the `s3-bench`
-# pixi environment, which provides it).
+# URLs). Opt-in via CUCASCADE_BUILD_S3_BENCHMARK so aws-sdk-cpp never becomes a
+# dependency of cuCascade itself (use the `s3-bench` pixi environment, which
+# provides it).
 # =============================================================================
 if(CUCASCADE_BUILD_S3_BENCHMARK)
   find_package(AWSSDK REQUIRED COMPONENTS s3)
-  find_package(kvikio REQUIRED CONFIG)
 
   add_executable(cucascade_s3_parquet_benchmark
                  ${CMAKE_CURRENT_SOURCE_DIR}/s3_parquet_benchmark.cpp)
@@ -135,11 +149,11 @@ if(CUCASCADE_BUILD_S3_BENCHMARK)
 
   target_link_libraries(
     cucascade_s3_parquet_benchmark
-    PRIVATE cucascade_cudf cucascade_io kvikio::kvikio ${AWSSDK_LINK_LIBRARIES}
+    PRIVATE cucascade_cudf cucascade_io ${AWSSDK_LINK_LIBRARIES}
             CUDA::cudart_static)
 
   # S3 range-read I/O benchmark: raw column-chunk range reads (rest vector-io /
-  # host->device vs kvikIO datasource) into host/device, without parquet decode.
+  # host->device) into host/device, without parquet decode.
   add_executable(cucascade_s3_parquet_io_benchmark
                  ${CMAKE_CURRENT_SOURCE_DIR}/parquet_s3_io_benchmark.cpp)
 
@@ -151,6 +165,6 @@ if(CUCASCADE_BUILD_S3_BENCHMARK)
 
   target_link_libraries(
     cucascade_s3_parquet_io_benchmark
-    PRIVATE cucascade_cudf cucascade_io kvikio::kvikio ${AWSSDK_LINK_LIBRARIES}
+    PRIVATE cucascade_cudf cucascade_io ${AWSSDK_LINK_LIBRARIES}
             CUDA::cudart_static)
 endif()
