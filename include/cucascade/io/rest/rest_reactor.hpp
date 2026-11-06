@@ -220,6 +220,14 @@ class rest_io_object : public io_object {
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
 
+  /// A strong ETag is the object's version (@c object_tag); a weak, malformed
+  /// or absent one scopes the identity to this open (@c opened_handle), exactly
+  /// as @ref raw_file_cache_id scopes the cache id.
+  [[nodiscard]] bool validation_tag_is_strong() const noexcept override
+  {
+    return is_strong_tag(validation_tag());
+  }
+
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
   [[nodiscard]] object_ref get_object_ref() const { return object_ref{_bucket, _key}; }
@@ -438,9 +446,12 @@ class rest_reactor {
 
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
-  /// bound) into a minimal sorted set — fewer ranges means fewer GETs.
-  static std::vector<byte_range> align_and_coalesce(std::span<const byte_range> ranges,
-                                                    std::optional<size_t> alignment = std::nullopt);
+  /// bound) into a minimal sorted set — fewer ranges means fewer GETs.  Ranges
+  /// with a negative offset or no bytes are dropped and every end stays within
+  /// INT64_MAX (see @c io_utils::align_and_coalesce).  Returns no ranges if
+  /// allocating the result fails.
+  static std::vector<byte_range> align_and_coalesce(
+    std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
   void worker_loop(const std::stop_token& stop_token);

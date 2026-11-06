@@ -21,6 +21,7 @@
 
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/common.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
@@ -38,20 +39,45 @@
 #include <cuda_runtime_api.h>
 
 #include <memory>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace cucascade {
 namespace test {
+
+/** @brief Reject I/O for mock representations that only need a DISK memory-space descriptor. */
+class mock_no_io_backend : public idisk_io_backend {
+ public:
+  void write(const std::filesystem::path&, const void*, size_t, size_t, ::cuda::stream_ref) override
+  {
+    throw std::logic_error("mock representation attempted disk I/O");
+  }
+  void read(const std::filesystem::path&, void*, size_t, size_t, ::cuda::stream_ref) override
+  {
+    throw std::logic_error("mock representation attempted disk I/O");
+  }
+  void write(const std::filesystem::path&, const void*, size_t, size_t) override
+  {
+    throw std::logic_error("mock representation attempted disk I/O");
+  }
+  void read(const std::filesystem::path&, void*, size_t, size_t) override
+  {
+    throw std::logic_error("mock representation attempted disk I/O");
+  }
+};
 
 /**
  * @brief Mock memory_space for testing - provides a simple memory_space without real allocators.
  *
  * This is a lightweight memory space that can be used in tests that don't need
  * actual memory allocation functionality.
+ * @param disk_backend Optional DISK backend override. By default, DISK spaces retain their real
+ * pipeline backend for converter and profiler tests; mock representations provide a no-I/O backend.
  */
 
-inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier tier,
-                                                                    size_t device_id = 0)
+inline std::shared_ptr<memory::memory_space> make_mock_memory_space(
+  memory::Tier tier, size_t device_id = 0, std::shared_ptr<idisk_io_backend> disk_backend = nullptr)
 {
   if (tier == memory::Tier::GPU) {
     memory::gpu_memory_space_config config;
@@ -72,8 +98,12 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(memory::Tier
     };
     return std::make_shared<memory::memory_space>(config);
   } else if (tier == memory::Tier::DISK) {
-    return std::make_shared<memory::memory_space>(
-      memory::disk_memory_space_config{static_cast<int>(device_id), 1024 * 1024 * 1024, "/tmp"});
+    memory::disk_memory_space_config config{
+      static_cast<int>(device_id), 1024 * 1024 * 1024, "/tmp"};
+    if (disk_backend) {
+      return std::make_shared<memory::memory_space>(config, std::move(disk_backend));
+    }
+    return std::make_shared<memory::memory_space>(config);
   } else {
     throw std::invalid_argument("Unsupported tier for mock memory space");
   }
@@ -89,7 +119,10 @@ struct mock_memory_space_holder {
   std::shared_ptr<memory::memory_space> space;
 
   mock_memory_space_holder(memory::Tier tier, size_t device_id)
-    : space{make_mock_memory_space(tier, device_id)}
+    : space{make_mock_memory_space(
+        tier,
+        device_id,
+        tier == memory::Tier::DISK ? std::make_shared<mock_no_io_backend>() : nullptr)}
   {
   }
 };
