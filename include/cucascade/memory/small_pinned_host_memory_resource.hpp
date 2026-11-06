@@ -17,6 +17,11 @@
 
 #pragma once
 
+/**
+ * @file small_pinned_host_memory_resource.hpp
+ * @brief Pooled pinned host memory resource for slab and large allocations.
+ */
+
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -40,7 +45,6 @@ namespace cucascade {
 namespace memory {
 
 /**
- * @file small_pinned_host_memory_resource.hpp
  * @brief Provides pooled pinned host memory for small and large allocations
  *
  * Requests with alignment no greater than `alignof(std::max_align_t)` and size up to @ref

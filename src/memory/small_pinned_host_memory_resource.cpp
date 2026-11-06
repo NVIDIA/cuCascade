@@ -487,7 +487,9 @@ void small_pinned_host_memory_resource::deallocate_large(::cuda::stream_ref stre
 
 bool small_pinned_host_memory_resource::operator==(
   small_pinned_host_memory_resource const& other) const noexcept
-{ return this == &other; }
+{
+  return this == &other;
+}
 
 std::size_t small_pinned_host_memory_resource::slab_index_for(std::size_t bytes) noexcept
 {
@@ -534,7 +536,9 @@ small_pinned_host_memory_resource::statistics small_pinned_host_memory_resource:
 }
 
 bool small_pinned_host_memory_resource::is_cacheable(std::size_t bucket) const noexcept
-{ return std::has_single_bit(bucket) && bucket <= _large_cache_limit_bytes; }
+{
+  return std::has_single_bit(bucket) && bucket <= _large_cache_limit_bytes;
+}
 
 std::size_t small_pinned_host_memory_resource::large_bucket_index(std::size_t bucket) noexcept
 {
