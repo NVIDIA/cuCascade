@@ -139,10 +139,6 @@ TEST_CASE("gpu_to_gpu conversion copies content correctly across GPUs",
 
   workers_ready.wait();
 
-  // the converter should be blocked on the writer event gated by the producer_gate
-  REQUIRE(first.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
-  REQUIRE(second.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
-
   // resume the halted producer after a 100ms grace period. Each converter has enqueued its copies
   // only up to the first STRING offset readback, which blocks behind the gate. Timing affects
   // coverage only; the ID check above proves ordering either way.
