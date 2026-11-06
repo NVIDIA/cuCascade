@@ -431,6 +431,14 @@ target_include_directories(cucascade_topology_discovery_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
 target_link_libraries(cucascade_topology_discovery_objects
                       PUBLIC CUDA::nvml_static CUDA::nvtx3 ${CMAKE_DL_LIBS})
+# CUDA::nvtx3 only covers the toolkit include directory. Split toolkits (e.g.
+# conda) install the NVTX headers elsewhere.
+find_path(CUCASCADE_NVTX3_INCLUDE_DIR nvtx3/nvtx3.hpp
+          HINTS ${CUDAToolkit_INCLUDE_DIRS})
+if(CUCASCADE_NVTX3_INCLUDE_DIR)
+  target_include_directories(cucascade_topology_discovery_objects SYSTEM
+                             PRIVATE "${CUCASCADE_NVTX3_INCLUDE_DIR}")
+endif()
 target_compile_features(cucascade_topology_discovery_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_topology_discovery_objects
                         PRIVATE cuda_std_20)
