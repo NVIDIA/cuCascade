@@ -37,6 +37,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -213,6 +214,38 @@ TEST_CASE("Deallocate nullptr is safe", "[small_pinned]")
   // Should not crash
   f.slab_mr.deallocate(legacy_default_stream, nullptr, 0);
   f.slab_mr.deallocate(legacy_default_stream, nullptr, 512);
+}
+
+TEST_CASE("Zero-byte and null requests preserve an active capture", "[small_pinned][capture]")
+{
+  auto const alignment = GENERATE(std::size_t{0}, alignof(std::max_align_t));
+  cucascade::test::pinned_host_test_fixture fixture;
+  auto& resource = fixture.resource;
+  rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+  CUCASCADE_CUDA_TRY(::cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeThreadLocal));
+  // Save outcomes until capture ends so an assertion cannot strand an active capture.
+  void* async_zero = nullptr;
+  void* sync_zero  = nullptr;
+  std::exception_ptr error;
+  try {
+    async_zero = resource.allocate(stream, 0, alignment);
+    sync_zero  = resource.allocate_sync(0, alignment);
+    for (std::size_t const bytes : std::array<std::size_t, 3>{0, 42, 9000}) {
+      resource.deallocate(stream, nullptr, bytes);
+      resource.deallocate_sync(nullptr, bytes);
+    }
+  } catch (...) {
+    error = std::current_exception();
+  }
+  cudaGraph_t graph = nullptr;
+  auto const status = ::cudaStreamEndCapture(stream.value(), &graph);
+  if (graph != nullptr) { CUCASCADE_CUDA_TRY(::cudaGraphDestroy(graph)); }
+  if (error) { std::rethrow_exception(error); }
+  REQUIRE(status == cudaSuccess);
+  REQUIRE(async_zero == nullptr);
+  REQUIRE(sync_zero == nullptr);
+  REQUIRE(resource.get_statistics().large_requests == 0);
+  REQUIRE(::cudaGetLastError() == cudaSuccess);
 }
 
 TEST_CASE("Multiple allocations return distinct pointers", "[small_pinned]")
@@ -708,6 +741,27 @@ TEST_CASE("Disabled large cache preserves host and device accessibility",
   REQUIRE(stats.large_evictions == 0);
   REQUIRE(stats.cached_large_bytes == 0);
   REQUIRE(stats.peak_cached_large_bytes == 0);
+}
+
+TEST_CASE("Over-aligned storage is mapped and usable by a GPU", "[small_pinned][alignment]")
+{
+  auto const alignment        = GENERATE(std::size_t{512}, std::size_t{8192}, std::size_t{65536});
+  constexpr std::size_t bytes = 32768;
+  cucascade::test::pinned_host_test_fixture fixture;
+  auto& resource = fixture.resource;
+  auto release   = [&](void* ptr) { resource.deallocate_sync(ptr, bytes, alignment); };
+  std::unique_ptr<void, decltype(release)> allocation{resource.allocate_sync(bytes, alignment),
+                                                      release};
+  REQUIRE(reinterpret_cast<std::uintptr_t>(allocation.get()) % alignment == 0);
+  void* mapped = nullptr;
+  CUCASCADE_CUDA_TRY(::cudaHostGetDevicePointer(&mapped, allocation.get(), 0));
+  std::uint64_t checksum = 0;
+  CUCASCADE_CUDA_TRY(performGpuMemoryWork(mapped, bytes, &checksum));
+  REQUIRE(checksum != 0);
+  REQUIRE(resource.get_statistics().large_uncacheable == 1);
+  allocation.reset();
+  REQUIRE(resource.large_cache_bytes() == 0);
+  REQUIRE(::cudaGetLastError() == cudaSuccess);
 }
 
 TEST_CASE("Large FIFO eviction orders entries across buckets", "[small_pinned][statistics]")

@@ -47,17 +47,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   set_target_properties(cucascade_fault_injection_core PROPERTIES CXX_EXTENSIONS
                                                                   OFF)
 
-  add_executable(
-    cucascade_pinned_host_fault_tests
-    memory/test_pinned_host_faults.cpp
-    memory/test_pinned_host_alignment.cpp
-    memory/test_pinned_host_capture.cpp
-    memory/test_pinned_host_recovery.cpp
-    memory/test_pinned_cache_insertion.cpp
-    memory/test_pinned_cache_progress.cpp
-    memory/test_pinned_host_device_failures.cpp
-    memory/test_pinned_event_lifecycle.cpp
-    memory/test_pinned_slab_quarantine.cpp)
+  add_executable(cucascade_pinned_host_fault_tests
+                 memory/test_small_pinned_host_memory_resource_faults.cpp)
   target_link_libraries(cucascade_pinned_host_fault_tests
                         PRIVATE cucascade_fault_injection_core Catch2::Catch2)
   target_include_directories(cucascade_pinned_host_fault_tests
@@ -93,7 +84,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_reservation_aware_resource_adaptor.cpp
     memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
-    memory/test_pinned_host_production.cpp
     memory/test_gpu_kernels.cu
     # Data tests
     data/test_data_repository.cpp
