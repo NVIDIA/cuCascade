@@ -927,8 +927,11 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
     new_table = std::make_unique<cudf::table>(std::move(target_columns));
 
-    // Sync so all peer copies and any cudf::cast launches complete before the new
-    // table is observed by another stream.
+    // Sync for the source's lifetime, not for readers of the result (the writer event recorded
+    // below covers those). The peer reads on target_stream are not ordered with the source's
+    // deallocation stream, so a caller freeing the source right after convert (e.g.
+    // mutable_data_batch::convert_to, which syncs only the caller's stream) would race them.
+    // TODO: explore establishing ordering for source's lifetime via events.
     target_stream.sync();
   } catch (...) {
     // best-effort drain; a second failure must not replace the original exception or stay pending.

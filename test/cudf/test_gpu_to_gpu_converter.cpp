@@ -143,8 +143,11 @@ TEST_CASE("gpu_to_gpu conversion copies content correctly across GPUs",
   REQUIRE(first.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
   REQUIRE(second.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
 
-  // now resume the halted source producer stream, presumably after the async copies have
-  // been submitted (given this 100ms delay after last countdown)
+  // resume the halted producer after a 100ms grace period. Each converter has enqueued its copies
+  // only up to the first STRING offset readback, which blocks behind the gate. Timing affects
+  // coverage only; the ID check above proves ordering either way.
+  // TODO: make this fully deterministic, eg by using a custom allocator of the test that
+  // notifies on first allocation signalling the copies have been enqueued.
   producer_gate.release_after(std::chrono::milliseconds{100});
   auto left  = first.get();
   auto right = second.get();

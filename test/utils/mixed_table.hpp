@@ -70,7 +70,7 @@ constexpr std::size_t kMixedTableFixedBytes = 32 * 1024;
 /**
  * @brief Build 16 mixed columns by round-robin repetition of ten readable sample rows.
  *
- * Layout: 6 numeric, 6 STRING, LIST<INT32>, LIST<STRING>, STRUCT<INT64, STRING>,
+ * Layout: 6 numeric, 6 STRING, nullable LIST<INT32>, LIST<STRING>, STRUCT<INT64, STRING>,
  * DICTIONARY<STRING>. Includes nullable/non-nullable data, all-null strings,
  * empty strings and empty lists. Two STRING columns (7, 9) use INT64 offsets, the
  * rest INT32. Sample row i is used for output row i % 10.
@@ -187,8 +187,10 @@ inline std::unique_ptr<cudf::table> make_mixed_table(cudf::size_type rows,
   strings_column_wrapper empty_col(kEmpty.begin(), kEmpty.end(), stream, mr);
 
   // Ten host-side list samples. The outer wrapper propagates stream/mr to every child.
-  int_list item_col(
-    {{1, 2}, {3}, {}, {4, 5, 6}, {7}, {8, 9}, {10}, {11, 12, 13}, {14}, {15, 16}}, stream, mr);
+  int_list item_col({{1, 2}, {3}, {}, {4, 5, 6}, {7}, {8, 9}, {10}, {11, 12, 13}, {14}, {15, 16}},
+                    kValid.begin(),
+                    stream,
+                    mr);
   text_list tag_col({{kNames[0], kRegions[0]},
                      {kNames[1], kRegions[1]},
                      {kNames[2], kRegions[2]},
@@ -219,7 +221,7 @@ inline std::unique_ptr<cudf::table> make_mixed_table(cudf::size_type rows,
   columns.push_back(note_col.release());
   columns.push_back(null_col.release());
   columns.push_back(empty_col.release());
-  columns.push_back(item_col.release());    // 12: LIST<INT32>
+  columns.push_back(item_col.release());    // 12: nullable LIST<INT32>
   columns.push_back(tag_col.release());     // 13: LIST<STRING>
   columns.push_back(detail_col.release());  // 14: nullable STRUCT
   columns.push_back(region_col.release());  // 15: nullable DICTIONARY<STRING>
