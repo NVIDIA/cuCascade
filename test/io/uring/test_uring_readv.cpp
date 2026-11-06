@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
@@ -1607,4 +1608,46 @@ TEST_CASE("io_uring shutdown cancels a parked low request", "[io][uring][priorit
   // The high request either beat the shutdown or was canceled; never another error.
   CHECK(outcome->high_settled_cleanly);
   CHECK(outcome->queued_bytes == 0);
+}
+
+TEST_CASE("io_uring reactor started from a pinned thread runs on the process's CPUs",
+          "[io][uring][affinity]")
+{
+  namespace thread_util = cucascade::exec::thread_util;
+
+  // io_uring's own workers inherit the reactor thread's mask, so the reactor must not keep the
+  // one core of a pinned thread that started it.
+  auto const process = thread_util::get_process_affinity();
+  REQUIRE_FALSE(process.empty());
+  if (process.size() < 2) { SKIP("needs at least two CPUs in the process affinity"); }
+
+  bool pinned = false;
+  std::unique_ptr<spp_reactor> reactor;
+  std::thread creator([&] {
+    std::array<int, 1> one{process.front()};
+    pinned = thread_util::set_current_thread_affinity(one) &&
+             thread_util::get_current_thread_affinity().size() == 1;
+    reactor = std::make_unique<spp_reactor>(1);
+  });
+  creator.join();
+  REQUIRE(pinned);
+
+  pattern_file file(IO_BLOCK_SIZE);
+  aligned_bytes destination(IO_BLOCK_SIZE);
+  std::vector<int> seen;
+  std::vector<prepared_io_slice> slices;
+  slices.emplace_back(range{0, IO_BLOCK_SIZE}, host_buffer{destination.get()});
+  slices.back().priority = cucascade::io::io_priority::high;
+  // A read's completion runs on the reactor's worker.
+  slices.back().on_complete = std::make_shared<prepared_io_completion>(
+    [&seen](std::span<cached_chunk* const>, bool) noexcept {
+      seen = thread_util::get_current_thread_affinity();
+    });
+  auto coordinator = std::make_shared<grouped_coordinator>(IO_BLOCK_SIZE, 1);
+  auto future      = coordinator->get_future();
+  reactor->get().enqueue(
+    grouped_io_request::create(file.open(), std::move(slices), std::move(coordinator)));
+
+  CHECK(std::move(future).get(std::chrono::seconds(30)) == IO_BLOCK_SIZE);
+  CHECK(seen == process);
 }

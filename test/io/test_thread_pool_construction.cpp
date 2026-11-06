@@ -25,12 +25,17 @@
 #include "utils/allocation_counter.hpp"
 
 #include <cucascade/exec/thread_pool.hpp>
+#include <cucascade/exec/thread_util.hpp>
 
 #include <catch2/catch_all.hpp>
 
+#include <array>
 #include <cstddef>
+#include <future>
 #include <new>
 #include <string>
+#include <thread>
+#include <vector>
 
 TEST_CASE("static_thread_pool construction failure stops and joins the started workers",
           "[exec][thread_pool]")
@@ -66,4 +71,33 @@ TEST_CASE("static_thread_pool construction failure stops and joins the started w
   }
   // The sweep failed at least the reserve and one allocation made after a worker started.
   CHECK(failures >= 2);
+}
+
+TEST_CASE("static_thread_pool given no CPUs runs on the process's CPUs, not its creator's",
+          "[exec][thread_pool]")
+{
+  namespace thread_util = cucascade::exec::thread_util;
+
+  // DuckDB pins each worker to one core on hosts with more than 64 cores; a pool started from such
+  // a worker must not inherit that one core for all its threads.
+  auto const process = thread_util::get_process_affinity();
+  REQUIRE_FALSE(process.empty());
+  if (process.size() < 2) { SKIP("needs at least two CPUs in the process affinity"); }
+
+  bool pinned = false;
+  std::vector<int> seen;
+  std::thread creator([&] {
+    std::array<int, 1> one{process.front()};
+    pinned = thread_util::set_current_thread_affinity(one) &&
+             thread_util::get_current_thread_affinity().size() == 1;
+    cucascade::exec::static_thread_pool pool(1, "affinity");
+    std::promise<std::vector<int>> affinity;
+    auto future = affinity.get_future();
+    pool.schedule([&affinity] { affinity.set_value(thread_util::get_current_thread_affinity()); });
+    seen = future.get();
+  });
+  creator.join();
+
+  REQUIRE(pinned);
+  CHECK(seen == process);
 }
