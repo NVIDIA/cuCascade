@@ -593,6 +593,7 @@ Buffer peer_copy_into_async(Buffer buf,
   }
 
   // Peer DMA broken — stage through the pre-pinned HOST pool.
+  // TODO: these paths currently remain untested. Add tests to cover these.
   //
   // Block layout: the host pool allocates non-contiguous fixed-size blocks
   // (1 MB by default). We chunk the D2H and H2D legs across blocks just like

@@ -64,7 +64,7 @@ void require_peer_pools(memory_space const* source, memory_space const* destinat
 namespace cucascade {
 
 TEST_CASE("gpu_to_gpu conversion copies content correctly across GPUs",
-          "[gpu-to-gpu-converter][.multi-device][cross-gpu-correctness]")
+          "[gpu-to-gpu-converter][multi-device][cross-gpu-correctness]")
 {
   if (test::cuda_device_count() < 2) { SKIP("requires at least two GPUs"); }
 
