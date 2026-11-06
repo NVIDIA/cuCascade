@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <initializer_list>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -267,53 +268,91 @@ peer_dma_probe_cache::peer_dma_probe_cache(peer_dma_probe_operations operations)
 {
 }
 
+namespace {
+
+// Runs after the cache lock is released: sink::write executes on this thread and may take the
+// host's logger lock or call back into the probe (e.g. to print the broken-direction count).
+void report_broken_directions(std::optional<int> const& broken) noexcept
+{
+  if (!broken) { return; }
+  CUCASCADE_LOG_WARN(
+    "direct GPU-to-GPU byte verification failed on {} direction(s); pool peer access will not be "
+    "granted",
+    *broken);
+}
+
+}  // namespace
+
 peer_dma_probe_result peer_dma_probe_cache::result(int source_device,
                                                    int destination_device,
                                                    bool retry_errors) noexcept
 {
-  try {
-    std::lock_guard lock(_mutex);
-    auto const was_initialized = _initialized;
-    if (!_initialized && _initialization_attempted && !retry_errors) {
-      return make_probe_error(_initialization_error);
+  std::optional<int> broken_to_report;
+  auto const outcome = [&]() noexcept {
+    try {
+      std::lock_guard lock(_mutex);
+      return result_locked(source_device, destination_device, retry_errors, broken_to_report);
+    } catch (...) {
+      return make_probe_error(cudaErrorUnknown);
     }
-    auto const error = initialize_locked();
-    if (error != cudaSuccess) { return make_probe_error(error); }
-    if (source_device < 0 || destination_device < 0 || source_device >= _device_count ||
-        destination_device >= _device_count) {
-      return make_probe_error(cudaErrorInvalidDevice);
-    }
-    auto& cached = entry(source_device, destination_device);
-    if (was_initialized && retry_errors && cached.status == peer_dma_probe_status::CUDA_ERROR) {
-      cached = probe_direction(source_device, destination_device);
-    }
-    return cached;
-  } catch (...) {
-    return make_probe_error(cudaErrorUnknown);
+  }();
+  report_broken_directions(broken_to_report);
+  return outcome;
+}
+
+peer_dma_probe_result peer_dma_probe_cache::result_locked(int source_device,
+                                                          int destination_device,
+                                                          bool retry_errors,
+                                                          std::optional<int>& broken_to_report)
+{
+  auto const was_initialized = _initialized;
+  if (!_initialized && _initialization_attempted && !retry_errors) {
+    return make_probe_error(_initialization_error);
   }
+  auto const error = initialize_locked(broken_to_report);
+  if (error != cudaSuccess) { return make_probe_error(error); }
+  if (source_device < 0 || destination_device < 0 || source_device >= _device_count ||
+      destination_device >= _device_count) {
+    return make_probe_error(cudaErrorInvalidDevice);
+  }
+  auto& cached = entry(source_device, destination_device);
+  if (was_initialized && retry_errors && cached.status == peer_dma_probe_status::CUDA_ERROR) {
+    cached = probe_direction(source_device, destination_device);
+  }
+  return cached;
 }
 
 int peer_dma_probe_cache::broken_direction_count() noexcept
 {
-  try {
-    std::lock_guard lock(_mutex);
-    auto const was_initialized = _initialized;
-    // A failed device restoration after a complete scan still leaves valid cached results.
-    if (initialize_locked() != cudaSuccess && !_initialized) { return -1; }
-    int broken = 0;
-    for (int source = 0; source < _device_count; ++source) {
-      for (int destination = 0; destination < _device_count; ++destination) {
-        auto& cached = entry(source, destination);
-        if (was_initialized && cached.status == peer_dma_probe_status::CUDA_ERROR) {
-          cached = probe_direction(source, destination);
-        }
-        if (cached.status == peer_dma_probe_status::VERIFICATION_FAILED) { ++broken; }
-      }
+  std::optional<int> broken_to_report;
+  auto const outcome = [&]() noexcept {
+    try {
+      std::lock_guard lock(_mutex);
+      return broken_direction_count_locked(broken_to_report);
+    } catch (...) {
+      return -1;
     }
-    return broken;
-  } catch (...) {
-    return -1;
+  }();
+  report_broken_directions(broken_to_report);
+  return outcome;
+}
+
+int peer_dma_probe_cache::broken_direction_count_locked(std::optional<int>& broken_to_report)
+{
+  auto const was_initialized = _initialized;
+  // A failed device restoration after a complete scan still leaves valid cached results.
+  if (initialize_locked(broken_to_report) != cudaSuccess && !_initialized) { return -1; }
+  int broken = 0;
+  for (int source = 0; source < _device_count; ++source) {
+    for (int destination = 0; destination < _device_count; ++destination) {
+      auto& cached = entry(source, destination);
+      if (was_initialized && cached.status == peer_dma_probe_status::CUDA_ERROR) {
+        cached = probe_direction(source, destination);
+      }
+      if (cached.status == peer_dma_probe_status::VERIFICATION_FAILED) { ++broken; }
+    }
   }
+  return broken;
 }
 
 peer_dma_probe_result& peer_dma_probe_cache::entry(int source_device,
@@ -325,7 +364,7 @@ peer_dma_probe_result& peer_dma_probe_cache::entry(int source_device,
   return _results[index];
 }
 
-cudaError_t peer_dma_probe_cache::initialize_locked()
+cudaError_t peer_dma_probe_cache::initialize_locked(std::optional<int>& broken_to_report)
 {
   if (_initialized) { return cudaSuccess; }
   _initialization_attempted = true;
@@ -355,12 +394,8 @@ cudaError_t peer_dma_probe_cache::initialize_locked()
   }
   _initialized      = true;
   auto const broken = count_broken_locked();
-  if (broken > 0) {
-    CUCASCADE_LOG_WARN(
-      "direct GPU-to-GPU byte verification failed on {} direction(s); pool peer access will not "
-      "be granted",
-      broken);
-  }
+  // Logged by the caller once _mutex is released, so a sink may re-enter this cache.
+  if (broken > 0) { broken_to_report = broken; }
   // The scan is complete and cached even if restoring the caller's device fails; only the
   // request that triggered the scan reports that failure.
   auto const restoration_error = _operations.set_device(original_device);

@@ -28,6 +28,9 @@
  * cases in this file must not run concurrently.
  */
 
+#include "log/log_test_utils.hpp"
+
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/common.hpp>
 
 #include <cuda_runtime_api.h>
@@ -36,7 +39,11 @@
 #include <memory/pool_peer_access_detail.hpp>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <future>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -389,6 +396,38 @@ TEST_CASE("Verification failures are cached without a retry", "[pool_peer_access
   }
   CHECK(cache_state.probe_calls[0][1] == 1);
   CHECK(cache_state.current_device == 0);
+}
+
+TEST_CASE("The broken-direction warning is logged with the probe cache unlocked",
+          "[pool_peer_access][log]")
+{
+  cache_state             = fake_cache_state{};
+  cache_state.first_probe = {peer_dma_probe_status::VERIFICATION_FAILED, cudaSuccess};
+  peer_dma_probe_cache cache{cache_operations};
+
+  // A sink commonly holds the host logger's lock while writing, and that same lock may be held by
+  // another thread that is entering the probe. Model it: from inside write, another thread must
+  // be able to get through the cache before write returns.
+  std::atomic<int> warnings{0};
+  std::atomic<bool> cache_was_free{false};
+  std::atomic<int> reentrant_broken{-2};
+  auto sink = cucascade::log::make_sink([&](cucascade::log::record const& rec) {
+    if (std::string{rec.message}.find("byte verification failed") == std::string::npos) { return; }
+    ++warnings;
+    auto other_thread = std::async(std::launch::async, [&] { return cache.result(1, 0).status; });
+    cache_was_free = other_thread.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+    // And the writing thread itself may call back into the cache.
+    reentrant_broken = cache.broken_direction_count();
+  });
+  cucascade::test::scoped_sink guard{sink, cucascade::log::level::warn};
+
+  CHECK(cache.result(0, 1).status == peer_dma_probe_status::VERIFICATION_FAILED);
+  CHECK(warnings.load() == 1);
+  CHECK(cache_was_free.load());
+  CHECK(reentrant_broken.load() == 1);
+  // The warning belongs to the scan, not to every lookup.
+  CHECK(cache.broken_direction_count() == 1);
+  CHECK(warnings.load() == 1);
 }
 
 TEST_CASE("Peer capability queries gate the probe", "[pool_peer_access]")

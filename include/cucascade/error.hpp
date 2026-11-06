@@ -136,17 +136,11 @@ struct logic_error : public std::logic_error {
   (__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// CUCASCADE_ASSERT_CUDA_SUCCESS – assert-based CUDA error check for use in
-// noexcept / destructor contexts. In release builds the call is still
-// executed but the error code is discarded.
+// CUCASCADE_ASSERT_CUDA_SUCCESS – CUDA error check for noexcept / destructor
+// contexts. A failure is reported through the log sink at error level in every
+// build; debug builds additionally assert. The call is always executed.
 // ---------------------------------------------------------------------------
 
-#ifdef NDEBUG
-#define CUCASCADE_ASSERT_CUDA_SUCCESS(_call) \
-  do {                                       \
-    (_call);                                 \
-  } while (0)
-#else
 #define CUCASCADE_ASSERT_CUDA_SUCCESS(_call)                                            \
   do {                                                                                  \
     cudaError_t const status__ = (_call);                                               \
@@ -157,7 +151,6 @@ struct logic_error : public std::logic_error {
     }                                                                                   \
     assert(status__ == cudaSuccess);                                                    \
   } while (0)
-#endif
 
 // ---------------------------------------------------------------------------
 // CUCASCADE_FUNC_RANGE – NVTX function-level range in the libcucascade domain.

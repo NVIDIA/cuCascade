@@ -24,8 +24,11 @@
 
 #include "log_test_utils.hpp"
 
+#include <cucascade/error.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/utils/error_utils.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
 #include <fcntl.h>
@@ -634,6 +637,23 @@ TEST_CASE("the stderr sink writes one parseable line per record", "[log]")
   INFO("stderr sink wrote: " << output);
   CHECK(std::regex_match(output, line_shape));
 }
+
+#ifdef NDEBUG
+TEST_CASE("CUCASCADE_ASSERT_CUDA_SUCCESS reports a failure in a release build", "[log]")
+{
+  auto sink = std::make_shared<recording_sink>();
+  scoped_sink guard{sink, level::error};
+
+  CUCASCADE_ASSERT_CUDA_SUCCESS(cudaSetDevice(-1));
+  static_cast<void>(cudaGetLastError());
+
+  REQUIRE(sink->count() == 1);
+  const auto entry = sink->entries().front();
+  CHECK(entry.lvl == level::error);
+  CHECK(entry.message.find("cudaErrorInvalidDevice") != std::string::npos);
+  CHECK(entry.line == __LINE__ - 7);
+}
+#endif
 
 TEST_CASE("to_string names every level", "[log]")
 {

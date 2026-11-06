@@ -188,29 +188,32 @@ void report_cuda_error(const char* error_name,
 
 }  // namespace detail
 
-std::shared_ptr<sink> set_sink(std::shared_ptr<sink> new_sink,
-                               std::optional<level> min_level) noexcept
+std::shared_ptr<sink> set_sink(std::shared_ptr<sink> new_sink, std::optional<level> min_level)
 {
   auto& st = state();
   const std::lock_guard lock{st.mutex};
-  if (min_level) { st.configured.store(*min_level, std::memory_order_relaxed); }
 
   if (new_sink == nullptr) {
+    if (min_level) { st.configured.store(*min_level, std::memory_order_relaxed); }
     // Close the gate first, so no call site starts formatting for a sink that is going away.
     detail::threshold.store(level::off, std::memory_order_release);
     const auto previous = st.slot.exchange(nullptr);
     return previous != nullptr ? previous->target : nullptr;
   }
 
+  // Allocate before touching any published state: if this throws, the gate, the threshold and the
+  // installed sink are exactly as the caller found them.
+  const auto target = min_level.value_or(st.configured.load(std::memory_order_relaxed));
+  auto next         = std::make_shared<installation>(std::move(new_sink), target);
+  st.configured.store(target, std::memory_order_relaxed);
+
   // Raise the gate before the swap when the new threshold is stricter, and lower it only after
   // the sink is in place, so a call site that passes the gate finds a sink. The level a delivery
   // checks against travels with the sink itself (see deliver), so a record that passed an older,
   // looser gate never lands in the stricter sink.
-  const auto target  = st.configured.load(std::memory_order_relaxed);
   const auto current = detail::threshold.load(std::memory_order_relaxed);
   if (current < target) { detail::threshold.store(target, std::memory_order_release); }
-  const auto previous =
-    st.slot.exchange(std::make_shared<installation>(std::move(new_sink), target));
+  const auto previous = st.slot.exchange(std::move(next));
   detail::threshold.store(target, std::memory_order_release);
   return previous != nullptr ? previous->target : nullptr;
 }

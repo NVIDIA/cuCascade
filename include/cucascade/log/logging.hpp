@@ -229,8 +229,10 @@ template <std::invocable<const record&> Fn>
 ///
 /// @return The previously installed sink, or null. Drop it; in-flight writes keep it alive as
 ///         long as they need it (see @ref sink).
+/// @throws std::bad_alloc if the installation record cannot be allocated; nothing has changed
+///         then. Uninstalling (a null @p new_sink) never throws.
 std::shared_ptr<sink> set_sink(std::shared_ptr<sink> new_sink,
-                               std::optional<level> min_level = std::nullopt) noexcept;
+                               std::optional<level> min_level = std::nullopt);
 
 /// Uninstalls the sink; @ref is_enabled is false for every level afterwards.
 /// @return The previously installed sink, or null; see @ref set_sink.

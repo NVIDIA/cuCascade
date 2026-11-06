@@ -140,10 +140,10 @@ struct NetworkDeviceWithTopology {
 /**
  * @brief Emit a standardized warning for a failed NVML call.
  *
- * Formats the message as "Warning: <context>: <nvmlErrorString(result)>" and writes
- * it to stderr. Callers retain control of flow (skip, continue, use defaults) — this
- * helper only standardizes message formatting so every NVML failure surfaces the same
- * way and always includes the decoded NVML error string.
+ * Logs "<context>: <nvmlErrorString(result)>" at warn level through the installed log
+ * sink. Callers retain control of flow (skip, continue, use defaults) — this helper only
+ * standardizes message formatting so every NVML failure surfaces the same way and always
+ * includes the decoded NVML error string.
  *
  * @param result NVML return code that did not equal NVML_SUCCESS.
  * @param context Description of the operation that failed (e.g. "Failed to get

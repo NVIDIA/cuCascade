@@ -461,7 +461,7 @@ cucascade::log::set_sink(cucascade::log::make_sink([logger](const cucascade::log
 ```
 
 The second argument to `set_sink` sets the threshold. Omit it to keep the current one, which starts
-at `level::info`. Mirror the host logger's own level there, or call `set_min_level()` later.
+at `level::warn`. Mirror the host logger's own level there, or call `set_min_level()` later.
 Filtering happens in `is_enabled()` before formatting, so records the host would drop are never built.
 
 `set_sink` and `clear_sink` return the replaced sink. Every in-flight `write` shares ownership of
