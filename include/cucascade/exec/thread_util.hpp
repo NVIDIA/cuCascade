@@ -93,6 +93,13 @@ inline constexpr std::size_t max_thread_name_len = 15;
 [[nodiscard]] std::vector<int> get_thread_affinity(pthread_t handle) noexcept;
 [[nodiscard]] std::vector<int> get_current_thread_affinity() noexcept;
 
+/// The CPUs the process may run on: the main thread's mask, whichever thread asks.  A thread
+/// inherits the mask of the thread that starts it, and a host may pin its own workers to one
+/// core each (DuckDB does on hosts with more than 64 cores), so threads started without a CPU
+/// list take this mask instead.  Returns an empty vector if the mask cannot be read.  Not
+/// @c noexcept: a pool constructor calls it, and its allocation failure must propagate from there.
+[[nodiscard]] std::vector<int> get_process_affinity();
+
 // ---------------------------------------------------------------------------
 // scheduling policy and priority
 // ---------------------------------------------------------------------------
