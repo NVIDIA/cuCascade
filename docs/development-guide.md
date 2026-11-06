@@ -207,7 +207,7 @@ target_sources(
 
 ### Test Framework
 
-cuCascade uses [Catch2](https://github.com/catchorg/Catch2) v2.13.10 (fetched from GitHub at build time).
+cuCascade uses [Catch2](https://github.com/catchorg/Catch2) v3.8.1 (fetched from GitHub at build time).
 
 Tests use BDD-style assertions:
 ```cpp
@@ -223,7 +223,28 @@ TEST_CASE("data batch acquires read-only access", "[data_batch]") {
 
 ### Test Organization
 
-All tests compile into a single executable `cucascade_tests`:
+Tests compile into these executables under `build/<preset>/test/`, all registered with CTest:
+
+| Executable | Contents |
+|------------|----------|
+| `cucascade_tests` | Core (cudf-free) tests linked against the production `cucascade` library |
+| `cucascade_cudf_tests` | cudf-coupled representation, converter, and profiler tests (`CUCASCADE_BUILD_CUDF=ON`) |
+| `cucascade_io_tests` | Datasource and I/O tests (`CUCASCADE_BUILD_IO=ON`) |
+| `cucascade_topology_discovery_tests` | Topology discovery tests |
+| `cucascade_pinned_host_fault_tests` | Fault-injection tests for `small_pinned_host_memory_resource` |
+| `cucascade_cuda_driver_loading_test` | CUDA driver loading checks, run once per mode against fake driver libraries |
+
+CTest also runs `readelf` checks that the topology discovery libraries have no CUDA driver dependency; `cucascade_topology_discovery_link_probe` exists only so the static library can be inspected.
+
+#### Fault-injection tests
+
+Library sources mark fault-prone CUDA calls and metadata allocations with the macros in `src/fault_injection.hpp`. In production builds the macros expand to the plain call, so no fault point reaches an installed library. `test/CMakeLists.txt` recompiles the core as the test-only static library `cucascade_fault_injection_core` with `CUCASCADE_ENABLE_FAULT_INJECTION` defined, which routes every fault point to the thread-local hooks in `test/memory/fault_injection_hooks.cpp`; tests install a hook with `cucascade::test::scoped_fault_hook`. The fault tests live in `test/memory/test_small_pinned_host_memory_resource_faults.cpp`, next to the production tests in `test/memory/test_small_pinned_host_memory_resource.cpp`.
+
+The fault tests need their own executable: linking the hooked core and the production core into one binary would give two different definitions of the same library code, which violates the one-definition rule. A failure to restore the caller's CUDA device terminates the process by design, so that case runs in the separate `cucascade_pinned_host_device_restore_helper` process, which the fault-test executable launches.
+
+Shared fixtures and checks for both pinned-host executables live in `test/memory/pinned_host_test_utils.hpp`, which has no fault-injection dependency.
+
+Selected test files:
 
 | Directory | Tests | Coverage |
 |-----------|-------|----------|
@@ -272,6 +293,10 @@ pixi run test
 cd build/release && ./test/cucascade_tests "[data_batch]"
 cd build/release && ./test/cucascade_tests "reservation"
 cd build/release && ./test/cucascade_tests -c "specific test name"
+
+# Run the pinned host memory resource tests in both executables
+cd build/release && ./test/cucascade_tests "[small_pinned]"
+cd build/release && ./test/cucascade_pinned_host_fault_tests
 ```
 
 ---

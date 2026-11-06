@@ -188,11 +188,15 @@ void BM_ConvertGpuToHost(benchmark::State& state)
   std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
+    // The table is written on the legacy default stream, so name `cudaStreamLegacy` as its writer.
+    // The null handle would mean an unknown writer, making every timed conversion synchronize the
+    // whole device; `cudaStreamDefault` is a stream-creation flag, not a handle, and only happens
+    // to equal the null handle.
     auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-    thread_gpu_reprs.push_back(std::make_unique<gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(table)),
-      *const_cast<memory_space*>(gpu_space),
-      ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}));
+    thread_gpu_reprs.push_back(
+      std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                                 *const_cast<memory_space*>(gpu_space),
+                                                 ::cuda::stream_ref{cudaStreamLegacy}));
   }
 
   // Warm-up
@@ -340,11 +344,15 @@ void BM_ConvertGpuToHostFast(benchmark::State& state)
   std::vector<rmm::cuda_stream> streams(thread_count);
 
   for (uint64_t t = 0; t < thread_count; ++t) {
+    // The table is written on the legacy default stream, so name `cudaStreamLegacy` as its writer.
+    // The null handle would mean an unknown writer, making every timed conversion synchronize the
+    // whole device; `cudaStreamDefault` is a stream-creation flag, not a handle, and only happens
+    // to equal the null handle.
     auto table = create_benchmark_table_from_bytes(total_bytes, num_columns);
-    thread_gpu_reprs.push_back(std::make_unique<gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(table)),
-      *const_cast<memory_space*>(gpu_space),
-      ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}));
+    thread_gpu_reprs.push_back(
+      std::make_unique<gpu_table_representation>(std::make_unique<cudf::table>(std::move(table)),
+                                                 *const_cast<memory_space*>(gpu_space),
+                                                 ::cuda::stream_ref{cudaStreamLegacy}));
   }
 
   // Warm-up: small transfer to prime CUDA driver

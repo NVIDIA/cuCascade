@@ -36,7 +36,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 ## Frameworks
 - RMM (RAPIDS Memory Manager) - GPU/host memory resource abstraction; provides `rmm::mr::device_memory_resource`, `::cuda::stream_ref`, `rmm::out_of_memory`, `rmm::bad_alloc`; pulled in via `find_package(rmm REQUIRED CONFIG)` from libcudf installation
 - libcudf 26.12 (nightly) / 26.08 (stable) - Columnar data representation for the **`cucascade-cudf` layer only** (not the core); provides `cudf::table`, `cudf::column`, `cudf::type_id`, `cudf::pack`/`unpack`; pulled in via `find_package(cudf REQUIRED CONFIG)`, gated on `CUCASCADE_BUILD_CUDF`
-- Catch2 v2.13.10 - Unit test framework; fetched via `FetchContent` in `test/CMakeLists.txt`; test executable: `cucascade_tests`
+- Catch2 v3.8.1 - Unit test framework; fetched via `FetchContent` in `test/CMakeLists.txt`; test executables listed under Library Outputs
 - Google Benchmark v1.8.3 - Microbenchmark framework; fetched via `FetchContent` in `benchmark/CMakeLists.txt`; benchmark executable: `cucascade_benchmarks`
 - Ninja - Build generator (configured in `CMakePresets.json`)
 - sccache - Compiler cache for C, CXX, and CUDA compilers (`CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`, `CMAKE_CUDA_COMPILER_LAUNCHER` in `CMakePresets.json`)
@@ -75,6 +75,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `cucascade_cudf_shared`/`cucascade_cudf_static` (`libcucascade_cudf.{so,a}`) - aliases `cuCascade::cucascade_cudf[_shared|_static]`, default alias `cuCascade::cucascade_cudf`; the cudf-coupled layer (links `cudf::cudf` + the core), built only when `CUCASCADE_BUILD_CUDF=ON`. Headers under `include/cucascade/cudf/`
 - `cucascade_tests` - Core (cudf-free) test executable linked against Catch2 and `cucascade`
 - `cucascade_cudf_tests` - cudf-coupled test executable linked against `cucascade_cudf` (built only when `CUCASCADE_BUILD_CUDF=ON`)
+- `cucascade_pinned_host_fault_tests` - `small_pinned_host_memory_resource` fault-injection tests linked against `cucascade_fault_injection_core`, a test-only core built with `CUCASCADE_ENABLE_FAULT_INJECTION`; separate so hooks never reach production builds (see `docs/development-guide.md`)
 - `cucascade_benchmarks` - Benchmark executable linked against Google Benchmark and `cucascade_cudf` (cudf-coupled; built only when `CUCASCADE_BUILD_CUDF=ON`)
 - Headers installed to `include/`; CMake package config at `cmake/cuCascadeConfig.cmake.in`
 - Consumers: `find_package(cuCascade)` + link `cuCascade::cucascade` (cudf-free core); for the cudf representations + built-in converters use `find_package(cuCascade COMPONENTS cudf)` + link `cuCascade::cucascade_cudf`. cudf is a package *component* (resolved lazily via `find_dependency(cudf)` only when requested), so core consumers never need cudf installed even against a full (cudf-ON) install
