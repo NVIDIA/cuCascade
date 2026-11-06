@@ -161,7 +161,7 @@ class plain_ioctx final : public stub_ioctx {
  public:
   [[nodiscard]] cucascade::io::io_context_type type() const noexcept override
   {
-    return cucascade::io::io_context_type::kvikio;
+    return cucascade::io::io_context_type::uring;
   }
 };
 

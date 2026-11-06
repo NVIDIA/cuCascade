@@ -7,11 +7,13 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | Document | Description |
 |----------|-------------|
 | [Architecture Overview](ARCHITECTURE.md) | High-level system design, component relationships, and data flow |
-| [Memory Management](memory-management.md) | Deep dive into the three-tier memory system, reservations, and allocators |
+| [Memory Management](memory-management.md) | Deep dive into the tiered memory system (GPU, HOST, DISK, REMOTE), reservations, and allocators |
 | [Data Management](data-management.md) | Data batch lifecycle, repositories, and representation conversion |
 | [Topology & Configuration](topology-and-configuration.md) | Hardware discovery, NUMA awareness, and system configuration |
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
+| [GDS reads](io/gpuio-gds-practices.md) | The cuFile / GPUDirect Storage read backend: configuration, fallbacks, capability probe, measurements |
+| [REMOTE tier](io/remote-tier-design.md) | Spilling batches to an S3 object store: configuration, object naming, failure handling, lifecycle-rule requirement |
 
 ## Reading Paths
 
@@ -34,7 +36,7 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 
 cuCascade is organized into two core modules:
 
-- **Memory Module** (`include/cucascade/memory/`, `src/memory/`): Manages a three-tier memory hierarchy (GPU, HOST, DISK) with reservation-based allocation, per-stream tracking, NUMA-aware host allocation, and pluggable OOM/limit policies.
+- **Memory Module** (`include/cucascade/memory/`, `src/memory/`): Manages a tiered memory hierarchy (GPU, HOST, DISK, REMOTE object store) with reservation-based allocation, per-stream tracking, NUMA-aware host allocation, and pluggable OOM/limit policies.
 
 - **Data Module** (`include/cucascade/data/`, `src/data/`): Manages data lifecycle across memory tiers with a state machine for batch processing, type-indexed representation converters, and partitioned repository storage for multi-pipeline coordination.
 

@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "cucascade/data/disk_io_backend.hpp"
 #include "pool_peer_access_detail.hpp"
 
 #include <cucascade/memory/common.hpp>
