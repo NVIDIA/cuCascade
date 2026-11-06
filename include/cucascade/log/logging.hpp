@@ -120,6 +120,12 @@ struct record {
 /// catches and drops that record. A record that @ref write itself emits through cuCascade, on the
 /// same thread, is dropped rather than delivered recursively.
 ///
+/// @ref write may run while cuCascade holds one of its internal locks, for example when a CUDA
+/// call fails inside a deallocation or a destructor. It must therefore not call back into
+/// cuCascade, and a lock it takes must not be one that another thread holds while calling into
+/// cuCascade. Handing the record to a logger that only locks for the duration of the write, as
+/// spdlog's sinks do, satisfies both.
+///
 /// Every in-flight @ref write shares ownership of the sink, so after @ref set_sink or
 /// @ref clear_sink replaces it, it stays alive until the last of those returns and is then
 /// destroyed on whichever thread held the last reference. A sink must therefore own, through
@@ -225,7 +231,8 @@ template <std::invocable<const record&> Fn>
 ///
 /// The installed sink is deliberately never destroyed at process exit, so that a record emitted
 /// from a static destructor still finds consistent state. A sink that buffers must be removed
-/// with @ref clear_sink, or flushed, before shutdown.
+/// with @ref clear_sink before shutdown and flush in its destructor: clear_sink does not wait for
+/// writes already in flight, so a flush right after it can miss their records.
 ///
 /// @return The previously installed sink, or null. Drop it; in-flight writes keep it alive as
 ///         long as they need it (see @ref sink).

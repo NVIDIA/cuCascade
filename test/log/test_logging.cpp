@@ -23,6 +23,7 @@
 // discovering months later that nothing was ever logged.
 
 #include "log_test_utils.hpp"
+#include "utils/allocation_counter.hpp"
 
 #include <cucascade/error.hpp>
 #include <cucascade/log/logging.hpp>
@@ -273,6 +274,32 @@ TEST_CASE("set_sink swaps sinks and hands back the previous one", "[log]")
 
   CHECK(first->messages() == std::vector<std::string>{"to first"});
   CHECK(second->messages() == std::vector<std::string>{"to second"});
+}
+
+TEST_CASE("set_sink leaves the logger untouched when its allocation fails", "[log]")
+{
+  auto first = std::make_shared<recording_sink>();
+  auto other = std::make_shared<recording_sink>();
+  const scoped_sink guard{first, level::trace};
+
+  bool threw = false;
+  {
+    cucascade::test::scoped_allocation_counter allocations;
+    allocations.fail_at(1);  // the installation record is set_sink's only allocation
+    try {
+      cucascade::log::set_sink(other, level::error);
+    } catch (const std::bad_alloc&) {
+      threw = true;
+    }
+  }
+  CHECK(threw);
+
+  CHECK(cucascade::log::get_current_sink() == first);
+  CHECK(cucascade::log::get_min_level() == level::trace);
+  CHECK(cucascade::log::is_enabled(level::trace));
+  CUCASCADE_LOG_TRACE("still {}", "here");
+  CHECK(first->messages() == std::vector<std::string>{"still here"});
+  CHECK(other->count() == 0);
 }
 
 TEST_CASE("records below the threshold are dropped", "[log]")
@@ -618,6 +645,16 @@ TEST_CASE("use_stderr_sink installs the built-in sink at the given level", "[log
   CHECK(cucascade::log::get_min_level() == level::error);
   CHECK(cucascade::log::is_enabled(level::error));
   CHECK_FALSE(cucascade::log::is_enabled(level::warn));
+
+  std::string output;
+  {
+    captured_stderr capture;
+    CUCASCADE_LOG_ERROR("via use_stderr_sink");
+    output = capture.release();
+  }
+  INFO("stderr received: " << output);
+  CHECK(output.find("[ERROR] ") != std::string::npos);
+  CHECK(output.find("via use_stderr_sink") != std::string::npos);
 }
 
 TEST_CASE("the stderr sink writes one parseable line per record", "[log]")
@@ -644,14 +681,14 @@ TEST_CASE("CUCASCADE_ASSERT_CUDA_SUCCESS reports a failure in a release build", 
   auto sink = std::make_shared<recording_sink>();
   scoped_sink guard{sink, level::error};
 
-  CUCASCADE_ASSERT_CUDA_SUCCESS(cudaSetDevice(-1));
-  static_cast<void>(cudaGetLastError());
+  // The macro takes any cudaError_t expression; a literal keeps the test independent of the GPU.
+  CUCASCADE_ASSERT_CUDA_SUCCESS(cudaErrorInvalidDevice);
 
   REQUIRE(sink->count() == 1);
   const auto entry = sink->entries().front();
   CHECK(entry.lvl == level::error);
   CHECK(entry.message.find("cudaErrorInvalidDevice") != std::string::npos);
-  CHECK(entry.line == __LINE__ - 7);
+  CHECK(entry.line == __LINE__ - 6);
 }
 #endif
 

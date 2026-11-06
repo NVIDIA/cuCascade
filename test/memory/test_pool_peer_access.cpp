@@ -411,13 +411,18 @@ TEST_CASE("The broken-direction warning is logged with the probe cache unlocked"
   std::atomic<int> warnings{0};
   std::atomic<bool> cache_was_free{false};
   std::atomic<int> reentrant_broken{-2};
+  // Declared after `cache` and outside the sink, so that if the warning is ever logged under the
+  // lock again, the blocked task is joined only after result() has returned and released it: the
+  // test then fails on `cache_was_free` instead of hanging.
+  std::future<peer_dma_probe_status> other_thread;
   auto sink = cucascade::log::make_sink([&](cucascade::log::record const& rec) {
     if (std::string{rec.message}.find("byte verification failed") == std::string::npos) { return; }
     ++warnings;
-    auto other_thread = std::async(std::launch::async, [&] { return cache.result(1, 0).status; });
+    other_thread   = std::async(std::launch::async, [&] { return cache.result(1, 0).status; });
     cache_was_free = other_thread.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
-    // And the writing thread itself may call back into the cache.
-    reentrant_broken = cache.broken_direction_count();
+    // The writing thread itself may call back into the cache, which is only safe to try here once
+    // the other thread has shown the lock to be free (a non-recursive mutex would deadlock).
+    if (cache_was_free) { reentrant_broken = cache.broken_direction_count(); }
   });
   cucascade::test::scoped_sink guard{sink, cucascade::log::level::warn};
 

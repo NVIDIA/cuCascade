@@ -438,7 +438,10 @@ silences everything.
 ### Installing a Sink
 
 Subclass `cucascade::log::sink`. Its `write` is called concurrently from any logging thread, so it
-must be thread-safe:
+must be thread-safe. It may also run while cuCascade holds an internal lock (a failed CUDA call in
+a deallocation or destructor is reported from there), so it must not call back into cuCascade, and
+any lock it takes must not be held by other threads while they call into cuCascade. Forwarding to a
+logger that locks only for the duration of the write, as spdlog does, is fine:
 
 ```cpp
 class host_sink final : public cucascade::log::sink {

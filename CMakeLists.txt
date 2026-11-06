@@ -697,6 +697,10 @@ if(CUCASCADE_TOPOLOGY_ONLY)
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
   install(FILES include/cucascade/nvtx.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade)
+  # Topology discovery logs through the sink, so a topology-only consumer must
+  # be able to install one.
+  install(FILES include/cucascade/log/logging.hpp
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/log)
 elseif(CUCASCADE_BUILD_CUDF)
   install(
     DIRECTORY include/
