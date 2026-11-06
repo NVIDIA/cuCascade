@@ -49,7 +49,7 @@ pixi run benchmarks
 - **Dependencies**: RMM (core); libcudf 25.10+ (only for the optional `cucascade-cudf` library)
 
 > **Library layout:** the core `cuCascade::cucascade` target is cudf-free and depends only on
-> RMM + CUDA (plus libnuma and kvikIO/cuFile for the disk tier). The cudf-backed representations,
+> RMM + CUDA (plus libnuma and cuFile for the disk tier). The cudf-backed representations,
 > converters, and bandwidth profiler live in a separate `cuCascade::cucascade_cudf` target (headers
 > under `include/cucascade/cudf/`). The cudf library can be turned off at configure time with
 > `-DCUCASCADE_BUILD_CUDF=OFF`.

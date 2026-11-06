@@ -114,6 +114,38 @@ bool eventually(Predicate predicate)
 }
 }  // namespace
 
+TEST_CASE("device dispatch canonicalizes default stream handles before enqueue",
+          "[io][templated_ioctx][cache][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    SKIP("requires a CUDA device");
+  }
+  auto const caller_stream = GENERATE(cudaStream_t{nullptr}, cudaStreamPerThread);
+  controlled_ioctx context;
+  context.start();
+  auto object = std::make_shared<controlled_object>("controlled://default-stream", read_size);
+  rmm::cuda_stream allocation_stream;
+  rmm::device_buffer destination{read_size, allocation_stream};
+  allocation_stream.synchronize();
+  std::array<cucascade::io::slice, 1> slices{
+    cucascade::io::slice{0, read_size, static_cast<std::uint8_t*>(destination.data())}};
+  auto future = context.device_readv_async_io(*object, slices, ::cuda::stream_ref{caller_stream});
+  held_request held;
+  held.request = context.backend().wait_take(2s);
+  REQUIRE(held.request != nullptr);
+  REQUIRE_FALSE(held.request->slices.empty());
+  for (auto const& slice : held.request->slices) {
+    REQUIRE(slice.has_device_request());
+    CHECK(slice.d_buffer.stream.get() != nullptr);
+    CHECK(slice.d_buffer.stream.get() != cudaStreamPerThread);
+    if (caller_stream == nullptr) { CHECK(slice.d_buffer.stream.get() == cudaStreamLegacy); }
+  }
+  held.complete(0x5a);
+  CHECK(std::move(future).get() == read_size);
+  context.shutdown();
+}
+
 TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
           "[cache][cache_handle][read-arbitration]")
 {
@@ -196,6 +228,86 @@ TEST_CASE("a cached device read retires its pin through the stream completion po
       return cache.claimed_bytes() == 0;
     },
     2s));
+}
+
+TEST_CASE("cached device reads on two threads' per-thread default streams retire separately",
+          "[cache][cache_handle][completion-poll][gpu_execution]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  // cudaStreamPerThread has one handle but names a different stream on every
+  // thread.  A cache-hit read on a held per-thread stream must not be retired
+  // (its pins released, its future resolved) by another thread's read on its
+  // own per-thread stream, and must not hold that read back either.
+  arbitration_fixture fixture;
+  fixture.advise(0);
+  std::atomic<bool> prefetched{false};
+  held_request prefetch;
+  read_cleanup cleanup{*fixture.context, {&prefetch, nullptr}};
+  REQUIRE(fixture.datasource->prefetch_async([&](prefetch_result result) noexcept {
+    prefetched.store(result.ok, std::memory_order_release);
+  }) == prefetch_refusal::issued);
+  prefetch.request = fixture.context->backend().wait_take(2s);
+  REQUIRE(prefetch.request != nullptr);
+  prefetch.complete(0x6c);
+  REQUIRE(prefetched.load(std::memory_order_acquire));
+
+  rmm::cuda_stream allocation_stream;
+  rmm::device_buffer slow_destination(read_size, allocation_stream);
+  rmm::device_buffer fast_destination(read_size, allocation_stream);
+  allocation_stream.synchronize();
+  auto const per_thread = ::cuda::stream_ref{cudaStreamPerThread};
+  REQUIRE(cudaMemset(slow_destination.data(), 0, read_size) == cudaSuccess);
+  REQUIRE(cudaMemset(fast_destination.data(), 0, read_size) == cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  struct gate {
+    std::atomic<bool> released{false};
+  } blocked;
+  std::promise<std::future<std::size_t>> slow_submitted;
+  std::thread slow_thread{[&] {
+    // Hold THIS thread's per-thread stream, then read behind it.
+    REQUIRE(cudaLaunchHostFunc(
+              cudaStreamPerThread,
+              [](void* ptr) {
+                auto& ready = static_cast<gate*>(ptr)->released;
+                while (!ready.load()) {
+                  std::this_thread::sleep_for(1ms);
+                }
+              },
+              &blocked) == cudaSuccess);
+    slow_submitted.set_value(fixture.datasource->device_read_async(
+      0, read_size, static_cast<std::uint8_t*>(slow_destination.data()), per_thread));
+    std::ignore = cudaStreamSynchronize(cudaStreamPerThread);
+  }};
+  struct release_on_exit {
+    gate& g;
+    std::thread& t;
+    ~release_on_exit()
+    {
+      g.released.store(true);
+      if (t.joinable()) t.join();
+    }
+  } release{blocked, slow_thread};
+
+  auto slow = slow_submitted.get_future().get();
+  // The main thread's per-thread stream is idle: its read completes at once.
+  auto fast = fixture.datasource->device_read_async(
+    0, read_size, static_cast<std::uint8_t*>(fast_destination.data()), per_thread);
+  REQUIRE(fast.wait_for(2s) == std::future_status::ready);
+  CHECK(fast.get() == read_size);
+  // ... and its completion does not retire the read still held on the other thread.
+  std::this_thread::sleep_for(250ms);
+  CHECK(slow.wait_for(0ms) != std::future_status::ready);
+
+  blocked.released.store(true);
+  REQUIRE(slow.wait_for(2s) == std::future_status::ready);
+  CHECK(slow.get() == read_size);
+  for (auto const* destination : {&slow_destination, &fast_destination}) {
+    std::array<std::uint8_t, read_size> host{};
+    REQUIRE(cudaMemcpy(host.data(), destination->data(), host.size(), cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
+    CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x6c; }));
+  }
 }
 
 TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
