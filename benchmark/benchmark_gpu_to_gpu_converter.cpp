@@ -105,7 +105,9 @@ static std::unique_ptr<representation_converter_registry> g_registry;
  */
 void DoSetup([[maybe_unused]] const benchmark::State& state)
 {
-  if (g_manager) { return; }
+  // can't skip in setup (requires mutable state)
+  // simply exit early, and skip in the benchmark
+  if (test::cuda_device_count() < 2) { return; }
 
   reservation_manager_configurator builder;
   builder.set_gpu_ids({kDstDeviceId, kSrcDeviceId})

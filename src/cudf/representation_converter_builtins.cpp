@@ -66,6 +66,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -615,21 +616,23 @@ Buffer peer_copy_into_async(Buffer buf,
                                                        /*make_portable=*/true);
     void* host_buf = mr.allocate_sync(size_in_bytes);
 
-    std::exception_ptr copy_error;
     try {
       CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
         host_buf, src_ptr, size_in_bytes, cudaMemcpyDeviceToHost, target_stream.get()));
       // no sync needed, the async copies are on the same stream, and are hence ordered.
       CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
         buf.data(), host_buf, size_in_bytes, cudaMemcpyHostToDevice, target_stream.get()));
+      target_stream.sync();
     } catch (...) {
-      copy_error = std::current_exception();
+      // best-effort drain before deallocating host side resources; a second failure must not
+      // replace the original exception or stay pending.
+      if (cudaStreamSynchronize(target_stream.get()) != cudaSuccess) {
+        std::ignore = cudaGetLastError();
+      }
+      mr.deallocate_sync(host_buf, size_in_bytes);
+      throw;
     }
-    // sync before deallocating host side resources, even if there was an exception while submitting
-    // the work, so any partial in-flight operations / allocations are wrapped-up properly.
-    target_stream.sync();
     mr.deallocate_sync(host_buf, size_in_bytes);
-    if (copy_error) { std::rethrow_exception(copy_error); }
     return buf;
   }
 
@@ -637,7 +640,6 @@ Buffer peer_copy_into_async(Buffer buf,
     auto allocation            = host_pool->allocate_multiple_blocks(size_in_bytes);
     const std::size_t block_sz = allocation->block_size();
 
-    std::exception_ptr copy_error;
     try {
       // Pass 1: device-to-host, chunked across blocks. Issued on target_stream
       {
@@ -688,14 +690,15 @@ Buffer peer_copy_into_async(Buffer buf,
         }
       }
 
+      target_stream.sync();
     } catch (...) {
-      copy_error = std::current_exception();
+      // best-effort drain before the blocks return to the pool; a second failure must not
+      // replace the original exception or stay pending.
+      if (cudaStreamSynchronize(target_stream.get()) != cudaSuccess) {
+        std::ignore = cudaGetLastError();
+      }
+      throw;
     }
-
-    // Always attempt completion, even if there was an exception while submitting
-    // the work, so any partial in-flight operations / allocations are wrapped-up properly.
-    target_stream.sync();
-    if (copy_error) { std::rethrow_exception(copy_error); }
 
     // allocation's destructor returns blocks to the host pool — no cudaFreeHost.
   }
@@ -906,7 +909,6 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   std::unique_ptr<cudf::table> new_table{nullptr};
 
-  std::exception_ptr submission_error;
   try {
     // Order the peer copies below after the most recent writer of gpu_source. With an unknown
     // writer this synchronizes the whole source device, which is correct but invisible to
@@ -925,16 +927,16 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
     new_table = std::make_unique<cudf::table>(std::move(target_columns));
 
+    // Sync so all peer copies and any cudf::cast launches complete before the new
+    // table is observed by another stream.
+    target_stream.sync();
   } catch (...) {
-    submission_error = std::current_exception();
+    // best-effort drain; a second failure must not replace the original exception or stay pending.
+    if (cudaStreamSynchronize(target_stream.get()) != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+    }
+    throw;
   }
-
-  // Sync so all peer copies and any cudf::cast launches complete before the new
-  // table is observed by another stream.
-  // Always attempt completion, even if there was an exception while submitting
-  // the work, so any partial in-flight operations / allocations are wrapped-up properly.
-  target_stream.sync();
-  if (submission_error) { std::rethrow_exception(submission_error); }
 
   // STREAM-LINEAGE: the resulting representation was written by target_stream;
   // the constructor records an event on it so any subsequent cross-device
