@@ -21,9 +21,8 @@
 # <chrono>, <mutex> and the sink registry stay out of every translation unit
 # that merely logs.
 #
-# Logging therefore requires linking cuCascade, and is unavailable in a
-# topology-only build, which does not produce cucascade_objects.
-if(TARGET cucascade_objects)
-  target_sources(cucascade_objects
-                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/logging.cpp)
-endif()
+# Carried by the topology discovery objects, which every cuCascade library
+# links, so the memory, topology, cudf and io layers all log alike and a
+# topology-only build keeps its warnings.
+target_sources(cucascade_topology_discovery_objects
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/logging.cpp)

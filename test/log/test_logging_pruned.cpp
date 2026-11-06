@@ -16,13 +16,11 @@
  * limitations under the License.
  */
 
-// White-box test of the preprocessor floor. The floor is one value for the whole program (it is
-// generated into <cucascade/log/config.hpp>); this translation unit overrides it locally, which
-// is safe only because it instantiates no inline function from a shared header that contains a
-// log call site. Everything below error must vanish from the binary, arguments included, while
-// the sink and threshold set at runtime are irrelevant to the outcome.
-
-#include <cucascade/log/config.hpp>
+// White-box test of the preprocessor floor. The floor is one value for the whole program (the
+// cuCascade targets propagate it as a compile definition); this translation unit overrides it
+// locally, which is safe only because it instantiates no inline function from a shared header
+// that contains a log call site. Everything below error must vanish from the binary, arguments
+// included, while the sink and threshold set at runtime are irrelevant to the outcome.
 
 #undef CUCASCADE_MIN_LOG_LEVEL
 #define CUCASCADE_MIN_LOG_LEVEL 4  // level::error, for this translation unit only

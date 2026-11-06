@@ -40,6 +40,7 @@
 #include <latch>
 #include <memory>
 #include <regex>
+#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -115,6 +116,35 @@ class reentrant_sink final : public cucascade::log::sink {
   std::vector<std::string> _messages;
 };
 
+/// Counts records delivered below warn, to check the install-level guarantee under swaps.
+class strict_sink final : public cucascade::log::sink {
+ public:
+  void write(const record& rec) override
+  {
+    if (rec.lvl < level::warn) { _below_warn.fetch_add(1, std::memory_order_relaxed); }
+  }
+
+  [[nodiscard]] std::size_t below_warn() const { return _below_warn.load(); }
+
+ private:
+  std::atomic<std::size_t> _below_warn{0};
+};
+
+/// Replaces itself from inside write() and logs from its destructor, as a sink that flushes on
+/// teardown might.
+class self_replacing_sink final : public cucascade::log::sink {
+ public:
+  explicit self_replacing_sink(std::shared_ptr<cucascade::log::sink> next) : _next(std::move(next))
+  {
+  }
+  ~self_replacing_sink() override { CUCASCADE_LOG_ERROR("self_replacing torn down"); }
+
+  void write(const record&) override { cucascade::log::set_sink(_next, level::trace); }
+
+ private:
+  std::shared_ptr<cucascade::log::sink> _next;
+};
+
 /// Redirects fd 2 into a pipe for the scope, then hands back what was written.
 class captured_stderr {
  public:
@@ -168,7 +198,26 @@ class captured_stderr {
 
 }  // namespace
 
-TEST_CASE("logging is silent and free until a sink is installed", "[log]")
+TEST_CASE("warnings reach stderr until a host installs a sink", "[log]")
+{
+  // Every other test restores what it found, so this observes the pristine default.
+  CHECK(cucascade::log::get_current_sink() != nullptr);
+  CHECK(cucascade::log::get_min_level() == level::warn);
+
+  std::string output;
+  {
+    captured_stderr capture;
+    CUCASCADE_LOG_INFO("below the default threshold");
+    CUCASCADE_LOG_WARN("default sink {}", 7);
+    output = capture.release();
+  }
+  INFO("stderr received: " << output);
+  CHECK(output.find("below the default threshold") == std::string::npos);
+  CHECK(std::regex_search(
+    output, std::regex{R"(\[WARN \] \d+ \S*test_logging\.cpp:\d+: default sink 7\n)"}));
+}
+
+TEST_CASE("clear_sink leaves no sink and silences every level", "[log]")
 {
   const scoped_sink guard{nullptr, level::info};
 
@@ -500,6 +549,61 @@ TEST_CASE("a sink that logs from inside write does not recurse", "[log]")
 
   // The nested record is dropped on the emitting thread instead of re-entering the sink.
   CHECK(nested->messages() == std::vector<std::string>{"outer"});
+}
+
+TEST_CASE("a record never reaches a sink below the level it was installed with", "[log]")
+{
+  std::atomic<bool> destroyed{false};
+  auto loose  = std::make_shared<tracked_sink>(destroyed);
+  auto strict = std::make_shared<strict_sink>();
+  std::atomic<bool> stop{false};
+  const scoped_sink guard{loose, level::trace};
+
+  std::vector<std::thread> workers;
+  for (int t = 0; t < 4; ++t) {
+    workers.emplace_back([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        CUCASCADE_LOG_INFO("info under swaps");
+      }
+    });
+  }
+
+  // Alternate a WARN-only sink with a TRACE sink while INFO records are in flight: an emitter
+  // that passed the loose gate must not land in the strict sink.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
+  while (std::chrono::steady_clock::now() < deadline) {
+    cucascade::log::set_sink(strict, level::warn);
+    cucascade::log::set_sink(loose, level::trace);
+  }
+  stop.store(true);
+  for (auto& worker : workers) {
+    worker.join();
+  }
+
+  CHECK(strict->below_warn() == 0);
+  CHECK(loose->writes() > 0);
+}
+
+TEST_CASE("a sink released by its own write may log from its destructor", "[log]")
+{
+  auto collector = std::make_shared<recording_sink>();
+  const scoped_sink guard{std::make_shared<self_replacing_sink>(collector), level::trace};
+
+  // write() swaps in `collector`; the in-flight delivery held the last reference, so the sink is
+  // destroyed as the delivery unwinds, after the reentrancy flag is cleared.
+  CUCASCADE_LOG_INFO("trigger");
+
+  CHECK(collector->messages() == std::vector<std::string>{"self_replacing torn down"});
+}
+
+TEST_CASE("log_current_exception outside a handler reports that instead of terminating", "[log]")
+{
+  auto captured = std::make_shared<recording_sink>();
+  const scoped_sink guard{captured, level::trace};
+
+  cucascade::log::detail::log_current_exception(std::source_location::current(), "outside {}", 1);
+
+  CHECK(captured->messages() == std::vector<std::string>{"outside 1: no active exception"});
 }
 
 TEST_CASE("use_stderr_sink installs the built-in sink at the given level", "[log]")

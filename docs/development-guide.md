@@ -430,8 +430,10 @@ record to a sink that the embedding host installs.
 CUCASCADE_LOG_WARN("pinned pool at {}% of capacity", percent);
 ```
 
-With no sink installed, a call site costs one relaxed atomic load and its arguments are never
-evaluated, so logging is silent and free until a host opts in.
+Until a host installs a sink, warnings and errors go to stderr (the built-in sink from
+`make_stderr_sink()`, at `level::warn`) and everything below is dropped. A call site below the
+threshold costs one relaxed atomic load and its arguments are never evaluated; `clear_sink()`
+silences everything.
 
 ### Installing a Sink
 
@@ -460,12 +462,13 @@ cucascade::log::set_sink(cucascade::log::make_sink([logger](const cucascade::log
 
 The second argument to `set_sink` sets the threshold. Omit it to keep the current one, which starts
 at `level::info`. Mirror the host logger's own level there, or call `set_min_level()` later.
-Filtering happens in `enabled()` before formatting, so records the host would drop are never built.
+Filtering happens in `is_enabled()` before formatting, so records the host would drop are never built.
 
-`set_sink` and `clear_sink` return the replaced sink. cuCascade keeps it alive until in-flight
-`write` calls return, so a sink must own, or outlive, everything it touches. Before destroying a
-host object that a sink uses, uninstall the sink and wait for the returned pointer's `use_count()`
-to reach one.
+`set_sink` and `clear_sink` return the replaced sink. Every in-flight `write` shares ownership of
+it, so it is destroyed, on whichever thread held the last reference, only after the last delivered
+record. Give the sink shared ownership of everything it touches (capture a `shared_ptr`, as above);
+that release orders the teardown. Do not poll `use_count()`, which is a relaxed load and
+synchronizes nothing.
 
 ### Standalone Use
 
@@ -481,11 +484,12 @@ arguments prefix the message: `CUCASCADE_TRY_AND_LOG_EXCEPTION(close(), "fd {}",
 ### Compile-Time Floor
 
 `CUCASCADE_MIN_LOG_LEVEL` (0 = trace through 6 = off) removes call sites below it during
-preprocessing; their arguments are type-checked but never run. Set it through the CMake cache
-variable of the same name. The value is generated into `<cucascade/log/config.hpp>`, which
-`logging.hpp` includes, so cuCascade's own sources and every consumer see the same floor. Do not
-define the macro yourself: the macros expand inside inline and template functions of installed
-headers, so two translation units with different floors would violate the one-definition rule.
+preprocessing; their format strings and arguments are still checked, but never evaluated. Set it
+through the CMake cache variable of the same name. Every cuCascade target propagates it as a
+PUBLIC compile definition, so cuCascade's own sources and CMake consumers compile the macros with
+the same floor. It must be one value for the whole program: the macros expand inside inline and
+template functions of installed headers, so two translation units with different floors would
+violate the one-definition rule. Including the headers without the CMake targets yields 0.
 
 ---
 

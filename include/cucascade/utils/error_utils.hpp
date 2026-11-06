@@ -20,35 +20,20 @@
 
 #include <cucascade/log/logging.hpp>
 
-#include <exception>
 #include <format>
 #include <source_location>
-#include <string>
-#include <utility>
 
 namespace cucascade::log::detail {
 
 /// Logs the exception currently being handled at @ref level::error as `<prefix>: <what()>`,
-/// where the prefix is @p fmt formatted with @p args. Must be called from inside a catch
-/// handler. Never throws. Formats once and hands the finished message to @ref deliver.
+/// where the prefix is @p fmt formatted with @p args. Type-erases the arguments like
+/// @ref emit does; see @ref vlog_current_exception. Never throws.
 template <typename... Args>
 void log_current_exception(const std::source_location& location,
                            std::format_string<Args...> fmt,
                            Args&&... args) noexcept
 {
-  try {
-    auto message = std::format(fmt, std::forward<Args>(args)...);
-    message += ": ";
-    try {
-      throw;
-    } catch (const std::exception& e) {
-      message += e.what();
-    } catch (...) {
-      message += "unknown exception";
-    }
-    deliver(level::error, location, message);
-  } catch (...) {  // Formatting may fail to allocate; the caller's outcome stands without it.
-  }
+  vlog_current_exception(location, fmt.get(), std::make_format_args(args...));
 }
 
 /// Overload for the message-less form of CUCASCADE_TRY_AND_LOG_EXCEPTION.
@@ -66,7 +51,7 @@ inline void log_current_exception(const std::source_location& location) noexcept
 /// `CUCASCADE_TRY_AND_LOG_EXCEPTION(reactor->shutdown(), "shutting down reactor {}", id)` logs
 /// `shutting down reactor 3: <what()>`. The arguments are evaluated only when an error record
 /// would be delivered, an exception they throw is swallowed as well, and below the compile-time
-/// floor they are only type-checked.
+/// floor they are only checked.
 #if CUCASCADE_MIN_LOG_LEVEL <= 4
 #define CUCASCADE_TRY_AND_LOG_EXCEPTION(expression, ...)                                   \
   try {                                                                                    \

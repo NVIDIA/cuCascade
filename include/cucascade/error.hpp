@@ -25,9 +25,20 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <cassert>
-#include <iostream>
+#include <source_location>
 #include <stdexcept>
 #include <string>
+
+namespace cucascade::log::detail {
+
+/// Reports a failed CUDA call at error level through the installed log sink (see
+/// <cucascade/log/logging.hpp>); declared here so this header stays free of <format>, defined in
+/// src/log/logging.cpp. Never throws.
+void report_cuda_error(const char* error_name,
+                       const char* error_string,
+                       const std::source_location& location) noexcept;
+
+}  // namespace cucascade::log::detail
 
 namespace cucascade {
 
@@ -140,8 +151,9 @@ struct logic_error : public std::logic_error {
   do {                                                                                  \
     cudaError_t const status__ = (_call);                                               \
     if (status__ != cudaSuccess) {                                                      \
-      std::cerr << "CUDA Error detected. " << cudaGetErrorName(status__) << " "         \
-                << cudaGetErrorString(status__) << std::endl;                           \
+      ::cucascade::log::detail::report_cuda_error(cudaGetErrorName(status__),           \
+                                                  cudaGetErrorString(status__),         \
+                                                  std::source_location::current());     \
     }                                                                                   \
     assert(status__ == cudaSuccess);                                                    \
   } while (0)

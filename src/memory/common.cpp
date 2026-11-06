@@ -18,6 +18,7 @@
 #include "cucascade/data/disk_io_backend.hpp"
 #include "pool_peer_access_detail.hpp"
 
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/null_device_memory_resource.hpp>
@@ -28,7 +29,6 @@
 
 #include <array>
 #include <cstddef>
-#include <cstdio>
 #include <initializer_list>
 #include <mutex>
 #include <span>
@@ -356,10 +356,10 @@ cudaError_t peer_dma_probe_cache::initialize_locked()
   _initialized      = true;
   auto const broken = count_broken_locked();
   if (broken > 0) {
-    fprintf(stderr,
-            "[cucascade] direct GPU-to-GPU byte verification failed on %d direction(s); "
-            "pool peer access will not be granted.\n",
-            broken);
+    CUCASCADE_LOG_WARN(
+      "direct GPU-to-GPU byte verification failed on {} direction(s); pool peer access will not "
+      "be granted",
+      broken);
   }
   // The scan is complete and cached even if restoring the caller's device fails; only the
   // request that triggered the scan reports that failure.
@@ -529,11 +529,10 @@ void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int own
       if (peer == owner_device_id) { continue; }
       auto const result = grant_pool_peer_access(target_pool, owner_device_id, peer);
       if (result.status() == pool_peer_access_status::CUDA_ERROR) {
-        fprintf(stderr,
-                "[cucascade] pool peer access from device %d to device %d's pool failed: %s\n",
-                peer,
-                owner_device_id,
-                cudaGetErrorName(result.error()));
+        CUCASCADE_LOG_WARN("pool peer access from device {} to device {}'s pool failed: {}",
+                           peer,
+                           owner_device_id,
+                           cudaGetErrorName(result.error()));
       }
     }
   };

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <cucascade/nvtx.hpp>
 
@@ -23,7 +24,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -84,8 +84,9 @@ class cuda_driver_api {
     void* symbol      = dlsym(library, name);
     char const* error = dlerror();
     if (error != nullptr || symbol == nullptr) {
-      std::cerr << "Warning: Failed to load CUDA driver symbol " << name << ": "
-                << (error != nullptr ? error : "symbol resolved to null") << std::endl;
+      CUCASCADE_LOG_WARN("failed to load CUDA driver symbol {}: {}",
+                         name,
+                         error != nullptr ? error : "symbol resolved to null");
       return {};
     }
     Function function{};
@@ -98,8 +99,8 @@ class cuda_driver_api {
   {
     if (_library == nullptr) {
       char const* const error = dlerror();
-      std::cerr << "Warning: Failed to load CUDA driver library libcuda.so.1: "
-                << (error != nullptr ? error : "unknown error") << std::endl;
+      CUCASCADE_LOG_WARN("failed to load CUDA driver library libcuda.so.1: {}",
+                         error != nullptr ? error : "unknown error");
       return;
     }
 
@@ -150,7 +151,7 @@ struct NetworkDeviceWithTopology {
  */
 void report_nvml_error(nvmlReturn_t result, std::string const& context)
 {
-  std::cerr << "Warning: " << context << ": " << nvmlErrorString(result) << std::endl;
+  CUCASCADE_LOG_WARN("{}: {}", context, nvmlErrorString(result));
 }
 
 /**
@@ -381,8 +382,7 @@ std::vector<size_t> resolve_visible_gpu_indices(
     }
 
     if (!matched) {
-      std::cerr << "Warning: CUDA_VISIBLE_DEVICES entry '" << token
-                << "' does not map to an NVML device" << std::endl;
+      CUCASCADE_LOG_WARN("CUDA_VISIBLE_DEVICES entry '{}' does not map to an NVML device", token);
     }
   }
 
@@ -682,7 +682,7 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
       devices.push_back(dev);
     }
   } catch (std::exception const& e) {
-    std::cerr << "Warning: Error discovering network devices: " << e.what() << std::endl;
+    CUCASCADE_LOG_WARN("error discovering network devices: {}", e.what());
   }
 
   return devices;
@@ -711,7 +711,7 @@ std::vector<storage_device_info> discover_storage_devices_with_topology()
       devices.push_back(dev);
     }
   } catch (std::exception const& e) {
-    std::cerr << "Warning: Error discovering NVMe devices: " << e.what() << std::endl;
+    CUCASCADE_LOG_WARN("error discovering NVMe devices: {}", e.what());
   }
 
   return devices;
@@ -1082,8 +1082,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
       }
 
       if (emitted == 0) {
-        std::cerr << "Warning: MIG enabled on GPU " << i << " but no MIG instances were enumerated"
-                  << std::endl;
+        CUCASCADE_LOG_WARN("MIG enabled on GPU {} but no MIG instances were enumerated", i);
       }
     }
   }
