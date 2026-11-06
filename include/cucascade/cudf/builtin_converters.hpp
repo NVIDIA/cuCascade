@@ -24,9 +24,16 @@ namespace cucascade {
 /**
  * @brief Initialize the cudf-backed built-in representation converters.
  *
- * Registers converters between all supported cudf-backed representation types (GPU, HOST, DISK).
- * Disk converters resolve the I/O backend from the disk memory_space at conversion time, so each
- * disk memory_space can use a different backend.
+ * Registers converters between all supported cudf-backed representation types (GPU, HOST, DISK,
+ * REMOTE). Disk converters perform their I/O through the io context of the DISK memory_space
+ * (memory_space::get_io_context()), resolved at conversion time, so each disk memory_space can use
+ * a different io stack; a space without one adopts default_disk_io_context()
+ * (see cucascade/cudf/disk_io_context.hpp).
+ *
+ * REMOTE converters (HOST/GPU <-> remote_data_representation) write through the io context of
+ * the target REMOTE memory_space, which must have one (std::logic_error otherwise; see
+ * cucascade/cudf/remote_io_context.hpp), and read back through the context that wrote the object.
+ * See docs/io/remote-tier-design.md.
  *
  * This is provided by the cucascade-cudf library; the cudf-free core registry ships empty.
  *

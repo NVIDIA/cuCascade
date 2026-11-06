@@ -1277,8 +1277,8 @@ struct local_cache_fixture {
   local_cache_fixture() : memory(identity_memory())
   {
     cucascade::io::io_config config;
-    config.uring_n_reactors = 1;
-    context                 = cucascade::io::make_uring_ioctx_factory(*memory)(config);
+    config.uring_reactors_per_gpu = 1;
+    context                       = cucascade::io::make_uring_ioctx_factory(*memory)(config);
     REQUIRE(context != nullptr);
     context->start();
     context->initialize_cache(*memory, identity_cache_config(), nullptr);

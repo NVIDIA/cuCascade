@@ -16,7 +16,6 @@
  */
 
 #include <cucascade/cuda/stream.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/disk_access_limiter.hpp>
@@ -37,13 +36,10 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 namespace cucascade {
-
-// Forward declaration — defined in src/data/pipeline_io_backend.cpp
-std::unique_ptr<idisk_io_backend> make_pipeline_io_backend(bool direct_io    = false,
-                                                           int target_device = -1);
 
 namespace memory {
 namespace {
@@ -178,7 +174,7 @@ memory_space::memory_space(const disk_memory_space_config& config)
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
     _allocator(null_device_memory_resource{}),
-    _io_backend(cucascade::make_pipeline_io_backend())
+    _io_context(config.io_context)
 {
   if (config.mount_paths.empty()) {
     throw std::invalid_argument("Mount path must be provided for disk memory space");
@@ -187,24 +183,19 @@ memory_space::memory_space(const disk_memory_space_config& config)
     std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
 }
 
-memory_space::memory_space(const disk_memory_space_config& config,
-                           std::shared_ptr<idisk_io_backend> io_backend)
-  : _id(config.tier(), config.disk_id),
+memory_space::memory_space(const remote_memory_space_config& config)
+  : _id(config.tier(), config.remote_id),
     _capacity(config.memory_capacity),
     _memory_limit(config.reservation_limit()),
     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
     _allocator(null_device_memory_resource{}),
-    _io_backend(std::move(io_backend))
+    _io_context(config.io_context)
 {
-  if (config.mount_paths.empty()) {
-    throw std::invalid_argument("Mount path must be provided for disk memory space");
-  }
-  if (!_io_backend) {
-    throw std::invalid_argument("I/O backend must not be null for disk memory space");
-  }
-  _reservation_allocator =
-    std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity, config.mount_paths);
+  // Like DISK, the limiter only counts the bytes of reservations in flight; its "mount path"
+  // holds the object prefix.
+  _reservation_allocator = std::make_unique<disk_access_limiter>(
+    _id, _memory_limit, _capacity, validate_remote_uri_prefix(config.uri_prefix));
 }
 
 memory_space::~memory_space()
@@ -413,12 +404,68 @@ std::string_view memory_space::get_disk_mount_path() const
   return limiter->get_mount_path();
 }
 
-idisk_io_backend& memory_space::get_io_backend() const
+std::string_view memory_space::get_remote_uri_prefix() const
 {
-  if (_id.tier != Tier::DISK) {
-    throw std::logic_error("get_io_backend called on non-DISK memory space");
+  if (_id.tier != Tier::REMOTE) {
+    throw std::logic_error("get_remote_uri_prefix called on non-REMOTE memory space");
   }
-  return *_io_backend;
+  auto& limiter = std::get<std::unique_ptr<disk_access_limiter>>(_reservation_allocator);
+  return limiter->get_mount_path();
+}
+
+namespace {
+
+/// The tiers whose spaces are served by an io context.
+[[nodiscard]] bool has_io_context(Tier tier) noexcept
+{
+  return tier == Tier::DISK || tier == Tier::REMOTE;
+}
+
+}  // namespace
+
+std::shared_ptr<io::ioctx> memory_space::get_io_context() const
+{
+  if (!has_io_context(_id.tier)) {
+    throw std::logic_error(
+      "get_io_context called on a memory space that is neither DISK nor REMOTE");
+  }
+  std::lock_guard<std::mutex> lock(_io_context_mutex);
+  return _io_context;
+}
+
+void memory_space::set_io_context(std::shared_ptr<io::ioctx> context)
+{
+  if (!has_io_context(_id.tier)) {
+    throw std::logic_error(
+      "set_io_context called on a memory space that is neither DISK nor REMOTE");
+  }
+  if (!context) { throw std::invalid_argument("io context must not be null"); }
+  std::shared_ptr<io::ioctx> previous;
+  {
+    std::lock_guard<std::mutex> lock(_io_context_mutex);
+    previous = std::exchange(_io_context, std::move(context));
+  }
+  // `previous` is released here, outside the lock: if this was its last reference, tearing it
+  // down joins its reactor threads, which must not happen while holding the space's lock.
+}
+
+std::shared_ptr<io::ioctx> memory_space::get_or_init_io_context(
+  const std::function<std::shared_ptr<io::ioctx>()>& make_default) const
+{
+  if (!has_io_context(_id.tier)) {
+    throw std::logic_error(
+      "get_or_init_io_context called on a memory space that is neither DISK nor REMOTE");
+  }
+  std::lock_guard<std::mutex> lock(_io_context_mutex);
+  if (!_io_context) {
+    auto context = make_default ? make_default() : nullptr;
+    if (!context) {
+      throw std::runtime_error(
+        "get_or_init_io_context: the default io context factory returned null");
+    }
+    _io_context = std::move(context);
+  }
+  return _io_context;
 }
 
 std::string memory_space::to_string() const
@@ -429,6 +476,7 @@ std::string memory_space::to_string() const
     case Tier::GPU: oss << "GPU"; break;
     case Tier::HOST: oss << "HOST"; break;
     case Tier::DISK: oss << "DISK"; break;
+    case Tier::REMOTE: oss << "REMOTE"; break;
     default: oss << "UNKNOWN"; break;
   }
   oss << ", device_id=" << _id.device_id << ", limit=" << _memory_limit << ")";

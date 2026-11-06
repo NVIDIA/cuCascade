@@ -46,9 +46,54 @@ struct object_ref {
 /// HTTP method (a presigned-GET URL != a presigned-HEAD URL; a signed header
 /// also covers the method) — passing the wrong method to the underlying HTTP
 /// client results in a signature-mismatch error from the store.
-/// cuCascade needs only read-only operations; PUT / DELETE etc. are
-/// intentionally absent.
-enum class request_method : std::uint8_t { GET, HEAD };
+///
+/// GET and HEAD are the read path (@ref request_authorizer::authorize). PUT,
+/// POST and DELETE are the S3 write path (single PUT, multipart upload:
+/// CreateMultipartUpload = POST @c ?uploads, UploadPart = PUT
+/// @c ?partNumber=N&uploadId=U, CompleteMultipartUpload = POST @c ?uploadId=U,
+/// AbortMultipartUpload = DELETE @c ?uploadId=U); they are authorized through
+/// @ref request_authorizer::authorize_request only.
+enum class request_method : std::uint8_t { GET, HEAD, PUT, POST, DELETE };
+
+/// @return the HTTP method token of @p method ("GET", "HEAD", "PUT", "POST", "DELETE").
+[[nodiscard]] constexpr std::string_view to_string(request_method method) noexcept
+{
+  switch (method) {
+    case request_method::GET: return "GET";
+    case request_method::HEAD: return "HEAD";
+    case request_method::PUT: return "PUT";
+    case request_method::POST: return "POST";
+    case request_method::DELETE: return "DELETE";
+  }
+  return "GET";  // unreachable; all enumerators handled
+}
+
+/**
+ * @brief Description of one object-level request for @ref request_authorizer::authorize_request.
+ *
+ * The superset of @ref request_authorizer::authorize's arguments that the S3 write path needs:
+ * the method, an optional sub-resource query and whether the request carries a body.
+ *
+ * @c query is the request's sub-resource query WITHOUT the leading @c '?': already
+ * percent-encoded (RFC 3986, @c '/' encoded), @c '&'-joined and sorted by encoded key (SigV4
+ * canonical order). A parameter without a value may be written bare (@c "uploads") or with an
+ * empty value (@c "uploads="); signers canonicalize it to @c "uploads=". Examples:
+ * @c "uploads", @c "partNumber=3&uploadId=abc%2Bdef", @c "uploadId=abc%2Bdef". It must not carry
+ * any @c X-Amz-* key (signers reject it: signing-parameter smuggling). Empty for plain object
+ * requests.
+ *
+ * @c has_body tells a header signer how to sign the payload: S3 bodies (PUT object or part,
+ * the CompleteMultipartUpload XML) are signed as @c UNSIGNED-PAYLOAD; a request without a body
+ * signs @c sha256(""). Presigned URLs always use @c UNSIGNED-PAYLOAD.
+ *
+ * @c object and @c query are borrowed for the duration of the call.
+ */
+struct request_spec {
+  object_ref const& object;                    ///< bucket + key (RFC 3986-decoded)
+  request_method method{request_method::GET};  ///< HTTP method
+  std::string_view query{};                    ///< pre-encoded canonical sub-resource query
+  bool has_body{false};                        ///< the request carries a body
+};
 
 /// Result of authorizing one request: the URL to fetch plus headers to attach
 /// verbatim. Query-authorized schemes (S3 presigned URLs, Azure SAS, GCS
@@ -118,6 +163,41 @@ class request_authorizer {
   [[nodiscard]] virtual authorized_request authorize(object_ref const& obj,
                                                      request_method method,
                                                      std::chrono::seconds timeout) = 0;
+
+  /**
+   * @brief Authorize one object-level request described by @p spec (any method, optional
+   *        sub-resource query, optional body): the S3 write path.
+   *
+   * Same result shape as @ref authorize: a query-signing authorizer returns the URL with the
+   * sub-resource query and the auth parameters merged (all signed) and empty headers; a
+   * header-signing authorizer returns @c "scheme://host/bucket/key[?query]" plus the signed
+   * headers (@c x-amz-content-sha256 is @c UNSIGNED-PAYLOAD when @c spec.has_body, else
+   * @c sha256("")). Headers the caller adds afterwards (@c Content-Length, @c Range,
+   * @c If-Match, @c If-None-Match, @c Expect) are not signed.
+   *
+   * Default: delegates to @ref authorize for a GET or HEAD with an empty query, so an
+   * authorizer written for the read path keeps working unchanged; throws for anything else.
+   *
+   * @param spec     The request (borrowed for the call).
+   * @param timeout  Per-call URL lifetime, as for @ref authorize.
+   * @throw cucascade::io::credential_error when the request kind is not supported by this
+   *        authorizer, or on credential / signing failure.
+   */
+  [[nodiscard]] virtual authorized_request authorize_request(request_spec const& spec,
+                                                             std::chrono::seconds timeout)
+  {
+    if ((spec.method == request_method::GET || spec.method == request_method::HEAD) &&
+        spec.query.empty()) {
+      return authorize(spec.object, spec.method, timeout);
+    }
+    std::string what{to_string(spec.method)};
+    if (!spec.query.empty()) {
+      what += " ?";
+      what += spec.query;
+    }
+    throw cucascade::io::credential_error("request_authorizer: " + what +
+                                          " is not supported by this authorizer");
+  }
 
   /**
    * @brief Authorize a bucket-level ListObjectsV2 GET.

@@ -192,10 +192,30 @@ builder_reference& reservation_manager_configurator::set_host_portability(bool m
 }
 
 builder_reference& reservation_manager_configurator::set_disk_mounting_point(
-  int uuid, std::size_t capacity, std::string mounting_point)
+  int uuid, std::size_t capacity, std::string mounting_point, std::shared_ptr<io::ioctx> io_context)
 {
   assert(!mounting_point.empty() && "Mounting point cannot be empty");
-  _disk_mounting_points.emplace_back(uuid, capacity, std::move(mounting_point));
+  disk_memory_space_config config;
+  config.disk_id         = uuid;
+  config.memory_capacity = capacity;
+  config.mount_paths     = std::move(mounting_point);
+  config.io_context      = std::move(io_context);
+  _disk_mounting_points.push_back(std::move(config));
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::add_remote_space(
+  int remote_id,
+  std::string uri_prefix,
+  std::size_t capacity,
+  std::shared_ptr<io::ioctx> io_context)
+{
+  remote_memory_space_config config;
+  config.remote_id       = remote_id;
+  config.memory_capacity = capacity;
+  config.uri_prefix      = validate_remote_uri_prefix(uri_prefix);
+  config.io_context      = std::move(io_context);
+  _remote_spaces.push_back(std::move(config));
   return *this;
 }
 
@@ -284,12 +304,13 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
     configs.emplace_back(config);
   }
 
-  for (auto dinfo : _disk_mounting_points) {
-    disk_memory_space_config config;
-    config.disk_id         = std::get<int>(dinfo);
-    config.mount_paths     = std::get<std::string>(dinfo);
-    config.memory_capacity = std::get<std::size_t>(dinfo);
-    configs.emplace_back(config);
+  for (const auto& disk_config : _disk_mounting_points) {
+    configs.emplace_back(disk_config);
+  }
+
+  // REMOTE spaces last: the tiers are emitted fastest to slowest.
+  for (const auto& remote_config : _remote_spaces) {
+    configs.emplace_back(remote_config);
   }
 
   return configs;
