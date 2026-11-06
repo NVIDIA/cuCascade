@@ -381,12 +381,19 @@ read_only_data_batch::~read_only_data_batch()
   }
 }
 
+std::shared_ptr<data_batch> data_batch::clone(
+  uint64_t new_batch_id, ::cuda::stream_ref stream, std::unique_ptr<idata_batch_probe> probe) const
+{
+  if (_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
+  return clone_impl(new_batch_id, get_memory_space(), std::move(probe), [&] {
+    return _data->clone(stream);
+  });
+}
+
 std::shared_ptr<data_batch> read_only_data_batch::clone(
   uint64_t new_batch_id, ::cuda::stream_ref stream, std::unique_ptr<idata_batch_probe> probe) const
 {
-  if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
-  auto cloned_data = _batch->_data->clone(stream);
-  return data_batch::make(new_batch_id, std::move(cloned_data), std::move(probe));
+  return _batch->clone(new_batch_id, stream, std::move(probe));
 }
 
 // ========== mutable_data_batch ==========
@@ -435,9 +442,7 @@ void mutable_data_batch::rebind_stream(::cuda::stream_ref stream)
 std::shared_ptr<data_batch> mutable_data_batch::clone(
   uint64_t new_batch_id, ::cuda::stream_ref stream, std::unique_ptr<idata_batch_probe> probe) const
 {
-  if (_batch->_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
-  auto cloned_data = _batch->_data->clone(stream);
-  return data_batch::make(new_batch_id, std::move(cloned_data), std::move(probe));
+  return _batch->clone(new_batch_id, stream, std::move(probe));
 }
 
 }  // namespace cucascade

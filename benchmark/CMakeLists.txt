@@ -49,6 +49,7 @@ FetchContent_MakeAvailable(benchmark)
 # Collect all benchmark sources
 set(BENCHMARK_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_representation_converter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_gpu_to_gpu_converter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_disk_converter.cpp)
 
 # Create benchmark executable
