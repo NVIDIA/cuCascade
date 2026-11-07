@@ -30,6 +30,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     cucascade_tests
     # Memory tests
     memory/test_fixed_size_host_memory_resource.cpp
+    memory/test_fixed_size_host_memory_resource_reservation_reuse.cpp
     memory/test_memory_reservation_manager.cpp
     memory/test_pool_peer_access.cpp
     memory/test_pool_peer_access_regression.cpp
