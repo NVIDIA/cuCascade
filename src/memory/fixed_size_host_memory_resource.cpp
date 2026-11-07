@@ -127,19 +127,22 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
       throw std::runtime_error("cannot make allocation with other reservation type");
     }
   }
-  auto buffers = allocate_multiple_blocks_internal(total_bytes, h_reservation_slot);
+  auto const reservation_uuid = h_reservation_slot ? h_reservation_slot->uuid() : 0;
+
+  auto buffers =
+    allocate_multiple_blocks_internal(total_bytes, h_reservation_slot, reservation_uuid);
   try {
     return multiple_blocks_allocation::create(std::move(buffers), *this, res);
   } catch (...) {
     // create() takes the blocks only once it cannot fail, so they are still ours here (the
     // wrapper's allocation threw): give them back with their byte and reservation accounting.
-    return_allocated_chunks(buffers, h_reservation_slot);
+    return_allocated_chunks(buffers, h_reservation_slot, reservation_uuid);
     throw;
   }
 }
 
 std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_blocks_internal(
-  std::size_t total_bytes, chunked_reserved_area* h_reservation_slot)
+  std::size_t total_bytes, chunked_reserved_area* h_reservation_slot, std::size_t reservation_uuid)
 {
   CUCASCADE_FUNC_RANGE();
 
@@ -152,7 +155,8 @@ std::vector<std::byte*> fixed_size_host_memory_resource::allocate_multiple_block
   std::lock_guard<std::mutex> lock(_mutex);
   if (h_reservation_slot) {
     auto iter = _active_reservations.find(h_reservation_slot);
-    if (iter == _active_reservations.end()) {
+    // gone, or its address now belongs to another reservation
+    if (iter == _active_reservations.end() || iter->second.uuid != reservation_uuid) {
       throw std::runtime_error("reservation has been freed already");
     }
     tracker               = std::addressof(iter->second);
@@ -437,17 +441,21 @@ void fixed_size_host_memory_resource::return_blocks(std::span<std::byte* const> 
   if (blocks.empty()) { return; }
   // A pointer dynamic_cast neither throws nor allocates.
   auto* arena = res != nullptr ? dynamic_cast<chunked_reserved_area*>(res->_arena.get()) : nullptr;
-  return_allocated_chunks(blocks, arena);
+  // res is alive for this call, so the reservation at its address is the one it names
+  return_allocated_chunks(blocks, arena, arena != nullptr ? arena->uuid() : 0);
 }
 
 void fixed_size_host_memory_resource::return_allocated_chunks(std::span<std::byte* const> chunks,
-                                                              chunked_reserved_area* arena) noexcept
+                                                              chunked_reserved_area* arena,
+                                                              std::size_t reservation_uuid) noexcept
 {
   size_t reclaimed_bytes = chunks.size() * _block_size;
   std::lock_guard lock(_mutex);
+  // Credit the reservation only if it is still the one the chunks were allocated against; otherwise
+  // (released, or its address reused by another reservation) the chunks go back to the pool.
   auto const iter =
     arena != nullptr ? _active_reservations.find(arena) : _active_reservations.end();
-  if (iter != _active_reservations.end()) {
+  if (iter != _active_reservations.end() && iter->second.uuid == reservation_uuid) {
     auto& tracker         = iter->second;
     auto reservation_size = static_cast<int64_t>(arena->size());
     int64_t pre_reclaimation_size =
