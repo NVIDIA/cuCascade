@@ -29,22 +29,30 @@
  * - Run all tests: ./test_executable "[memory_space]"
  */
 
+#include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <ifaddrs.h>
 #include <nvml.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
 using namespace cucascade::memory;
+namespace fs = std::filesystem;
 
 namespace {
 struct ScopedEnvVar {
@@ -341,4 +349,292 @@ TEST_CASE("Default Topology Discovery does not initialize CUDA while visibility 
   }
   REQUIRE(WIFEXITED(status));
   REQUIRE(WEXITSTATUS(status) == 0);
+}
+
+namespace {
+/// Interfaces with at least one IPv4/IPv6 address, as reported by getifaddrs().
+std::set<std::string> interfaces_with_ip()
+{
+  std::set<std::string> names;
+  struct ifaddrs* ifa_list = nullptr;
+  if (getifaddrs(&ifa_list) != 0) { return names; }
+  for (struct ifaddrs* ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr) { continue; }
+    int const family = ifa->ifa_addr->sa_family;
+    if (family == AF_INET || family == AF_INET6) { names.insert(ifa->ifa_name); }
+  }
+  freeifaddrs(ifa_list);
+  return names;
+}
+
+/// Interfaces under /sys/class/infiniband/<device>/device/net, sorted by name.
+std::vector<std::string> sysfs_net_interfaces(std::string const& device)
+{
+  std::vector<std::string> names;
+  std::error_code ec;
+  fs::path const net_dir = fs::path("/sys/class/infiniband") / device / "device" / "net";
+  for (auto const& entry : fs::directory_iterator(net_dir, ec)) {
+    if (entry.is_directory()) { names.push_back(entry.path().filename().string()); }
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+/// Contents of /sys/class/net/<iface>/mtu, or -1 if unreadable.
+int sysfs_mtu(std::string const& iface)
+{
+  std::ifstream file(fs::path("/sys/class/net") / iface / "mtu");
+  int mtu = -1;
+  if (!(file >> mtu)) { return -1; }
+  return mtu;
+}
+}  // namespace
+
+TEST_CASE("Topology Discovery reports the MTU of each network device's interface", "[hw_topology]")
+{
+  auto const verification = GENERATE(NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                                     NetworkDeviceVerification::EXISTS_ACTIVE,
+                                     NetworkDeviceVerification::EXISTS);
+  INFO("verification level " << static_cast<int>(verification));
+
+  topology_discovery discovery;
+  REQUIRE(discovery.discover(verification));
+  auto const& topology = discovery.get_topology();
+
+  if (topology.network_devices.empty()) {
+    SUCCEED("Skipped: host has no InfiniBand/RoCE devices at this verification level");
+    return;
+  }
+
+  auto const with_ip = interfaces_with_ip();
+  for (auto const& dev : topology.network_devices) {
+    INFO("network device " << dev.name << " -> '" << dev.net_interface << "' mtu " << dev.mtu);
+    auto const candidates = sysfs_net_interfaces(dev.name);
+
+    if (candidates.empty()) {
+      // InfiniBand without IPoIB: nothing to report.
+      REQUIRE(dev.net_interface.empty());
+      REQUIRE(dev.mtu == 0);
+      continue;
+    }
+
+    // The reported interface is one of the device's own, chosen as the first by name
+    // with an IP address, else the first by name.
+    REQUIRE(std::find(candidates.begin(), candidates.end(), dev.net_interface) != candidates.end());
+    auto const first_with_ip =
+      std::find_if(candidates.begin(), candidates.end(), [&](auto const& name) {
+        return with_ip.contains(name);
+      });
+    std::string const expected =
+      first_with_ip != candidates.end() ? *first_with_ip : candidates.front();
+    REQUIRE(dev.net_interface == expected);
+
+    // An IP is what admitted the device at the strictest level, so the chosen interface
+    // must carry one.
+    if (verification == NetworkDeviceVerification::EXISTS_ACTIVE_IP) {
+      REQUIRE(with_ip.contains(dev.net_interface));
+    }
+
+    // The MTU matches sysfs and the per-interface NIC topology.
+    REQUIRE(dev.mtu > 0);
+    REQUIRE(dev.mtu == sysfs_mtu(dev.net_interface));
+    auto const nic = discover_nic(dev.net_interface);
+    REQUIRE(nic.has_value());
+    REQUIRE(nic->mtu == dev.mtu);
+  }
+}
+
+TEST_CASE("Topology Discovery MTU does not depend on the verification level", "[hw_topology]")
+{
+  topology_discovery disc_ip;
+  topology_discovery disc_exists;
+  REQUIRE(disc_ip.discover(NetworkDeviceVerification::EXISTS_ACTIVE_IP));
+  REQUIRE(disc_exists.discover(NetworkDeviceVerification::EXISTS));
+
+  // A device kept at both levels reports the same interface and MTU at both.
+  for (auto const& strict : disc_ip.get_topology().network_devices) {
+    auto const& permissive = disc_exists.get_topology().network_devices;
+    auto const it =
+      std::find_if(permissive.begin(), permissive.end(), [&](network_device_info const& d) {
+        return d.name == strict.name;
+      });
+    REQUIRE(it != permissive.end());
+    INFO("network device " << strict.name);
+    REQUIRE(it->net_interface == strict.net_interface);
+    REQUIRE(it->mtu == strict.mtu);
+  }
+}
+
+namespace {
+/// A fake procfs: a temporary directory holding a @c proc/ subtree.
+class fake_procfs {
+ public:
+  fake_procfs()
+  {
+    static std::atomic<int> counter{0};
+    _root = fs::temp_directory_path() / ("cucascade_ktls_" + std::to_string(::getpid()) + "_" +
+                                         std::to_string(counter.fetch_add(1)));
+    fs::remove_all(_root);
+    fs::create_directories(_root / "proc");
+  }
+  ~fake_procfs()
+  {
+    std::error_code ec;
+    fs::remove_all(_root, ec);
+  }
+  fake_procfs(fake_procfs const&)            = delete;
+  fake_procfs& operator=(fake_procfs const&) = delete;
+
+  [[nodiscard]] discovery_roots roots() const { return {_root, _root}; }
+
+  void modules(std::string const& content) const { write("proc/modules", content); }
+  void ulps(std::string const& content) const
+  {
+    write("proc/sys/net/ipv4/tcp_available_ulp", content);
+  }
+
+ private:
+  void write(std::string const& rel, std::string const& content) const
+  {
+    auto const path = _root / rel;
+    fs::create_directories(path.parent_path());
+    std::ofstream(path) << content;
+  }
+
+  fs::path _root;
+};
+
+constexpr char const* other_modules =
+  "nvidia_uvm 2076672 4 - Live 0x0000000000000000 (POE)\n"
+  "ena 155648 0 - Live 0x0000000000000000\n";
+constexpr char const* tls_live = "tls 167936 0 - Live 0x0000000000000000\n";
+}  // namespace
+
+TEST_CASE("kTLS: a live tls module with the ULP registered is loaded, not built in",
+          "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.modules(std::string{other_modules} + tls_live);
+  host.ulps("espintcp mptcp tls\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: a registered ULP without a module row is built in", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.modules(other_modules);
+  host.ulps("tls\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE(ktls.loaded);
+  REQUIRE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: neither a module row nor a registered ULP is not loaded", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.modules(other_modules);
+  host.ulps("espintcp mptcp\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: a module that is still loading or unloading is not loaded", "[hw_topology][ktls]")
+{
+  auto const state = GENERATE(std::string{"Loading"}, std::string{"Unloading"});
+  INFO("module state " << state);
+
+  fake_procfs host;
+  host.modules(std::string{other_modules} + "tls 167936 0 - " + state + " 0x0000000000000000\n");
+  host.ulps("mptcp\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: only exact names count as the tls module and ULP", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.modules(std::string{other_modules} + "tls_foo 4096 0 - Live 0x0\nktls 4096 0 - Live 0x0\n");
+  host.ulps("tlsx ktls mptcp\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: the ULP list is authoritative over the module row", "[hw_topology][ktls]")
+{
+  // A Live row with no registered ULP (e.g. a racing unload): not usable.
+  fake_procfs host;
+  host.modules(tls_live);
+  host.ulps("mptcp\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: an unreadable ULP list falls back to the module row", "[hw_topology][ktls]")
+{
+  SECTION("live module")
+  {
+    fake_procfs host;
+    host.modules(std::string{other_modules} + tls_live);
+    auto const ktls = discover_kernel_tls(host.roots());
+    REQUIRE(ktls.loaded);
+    REQUIRE_FALSE(ktls.built_in);
+  }
+  SECTION("no module row")
+  {
+    fake_procfs host;
+    host.modules(other_modules);
+    auto const ktls = discover_kernel_tls(host.roots());
+    REQUIRE_FALSE(ktls.loaded);
+    REQUIRE_FALSE(ktls.built_in);
+  }
+}
+
+TEST_CASE("kTLS: an unreadable module list cannot report built in", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+  host.ulps("espintcp mptcp tls\n");
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: an empty procfs reports nothing", "[hw_topology][ktls]")
+{
+  fake_procfs host;
+
+  auto const ktls = discover_kernel_tls(host.roots());
+  REQUIRE_FALSE(ktls.loaded);
+  REQUIRE_FALSE(ktls.built_in);
+}
+
+TEST_CASE("kTLS: discover() reports this host's kTLS state", "[hw_topology][ktls]")
+{
+  topology_discovery discovery;
+  REQUIRE(discovery.discover());
+  auto const& ktls = discovery.get_topology().kernel_tls;
+
+  auto const direct = discover_kernel_tls();
+  REQUIRE(ktls.loaded == direct.loaded);
+  REQUIRE(ktls.built_in == direct.built_in);
+  REQUIRE((!ktls.built_in || ktls.loaded));
+
+  // The tls module creates /proc/net/tls_stat in its init, whether loaded or built in.
+  std::error_code ec;
+  bool const has_tls_stat = fs::exists("/proc/net/tls_stat", ec);
+  INFO("loaded=" << ktls.loaded << " built_in=" << ktls.built_in
+                 << " /proc/net/tls_stat=" << has_tls_stat);
+  REQUIRE(ktls.loaded == has_tls_stat);
 }

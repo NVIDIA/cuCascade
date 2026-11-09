@@ -502,7 +502,7 @@ TEST_CASE("sigv4_presigned_authorizer rejects malformed construction inputs", "[
 TEST_CASE("SigV4 authorizers reject an endpoint without a host or with user-info",
           "[s3][authorizer]")
 {
-  // Both signing modes parse the endpoint at construction, as Sirius does: a port-only
+  // Both signing modes parse the endpoint at construction: a port-only
   // authority has no host, and user-info is not part of a service endpoint.
   using Catch::Matchers::ContainsSubstring;
   using Catch::Matchers::MessageMatches;
