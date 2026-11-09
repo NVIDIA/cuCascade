@@ -20,7 +20,6 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_data_representation.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/host_data_representation.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/bandwidth_profiler.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/column_admission.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter_builtins.cpp)
 
 # The cudf::io::datasource bridge over the cudf-free io core — only built when
@@ -28,7 +27,5 @@ target_sources(
 if(CUCASCADE_BUILD_IO)
   target_sources(
     cucascade_cudf_objects
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/datasource.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/advising_datasource.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/scan_cache.cpp)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/datasource.cpp)
 endif()

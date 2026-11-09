@@ -18,13 +18,11 @@
 
 #pragma once
 
-#include <cucascade/cudf/column_admission.hpp>
+#include <cucascade/io/column_admission.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/object_cache.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
-
-#include <cudf/io/datasource.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -110,12 +108,22 @@ class scan_cache {
   scan_cache& operator=(scan_cache&&)      = delete;
 
   /**
-   * @brief Open an object-store object for reading.
+   * @brief Open an object-store object and return its handle.
    *
    * The first open of a path resolves its size, version tag and footer with one request; later
-   * opens of it need none.
+   * opens of it need none. A reader (for example a @c cudf::io::datasource) reads the object
+   * through @ref context.
    */
-  [[nodiscard]] std::unique_ptr<cudf::io::datasource> open(std::string const& path);
+  [[nodiscard]] std::shared_ptr<io_object> open_object(std::string const& path);
+
+  /// The io context that serves reads, and owns the prefetching cache.
+  [[nodiscard]] std::shared_ptr<ioctx> context() const { return _context; }
+
+  /// The admission policy, shared by every file of a scan.
+  [[nodiscard]] std::shared_ptr<column_admission> admission() const { return _admission; }
+
+  /// Reads smaller than this are not cached (see @ref scan_cache_options::min_advise_bytes).
+  [[nodiscard]] std::size_t min_advise_bytes() const noexcept { return _min_advise_bytes; }
 
   /// Register the column chunks of one file with the admission policy (see
   /// @ref column_admission::register_layout).

@@ -16,12 +16,10 @@
  * limitations under the License.
  */
 
-#include <cucascade/cudf/advising_datasource.hpp>
-#include <cucascade/cudf/datasource.hpp>
-#include <cucascade/cudf/scan_cache.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/scan_cache.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
@@ -127,7 +125,7 @@ scan_cache::scan_cache(scan_cache_options const& options)
 
 scan_cache::~scan_cache() { _context->shutdown_cache(); }
 
-std::unique_ptr<cudf::io::datasource> scan_cache::open(std::string const& path)
+std::shared_ptr<io_object> scan_cache::open_object(std::string const& path)
 {
   // The first open of a file resolves its size, version tag and footer with one request. Reopening
   // the kept handle needs none, and keeps the version tag the cache shares chunks by.
@@ -136,9 +134,7 @@ std::unique_ptr<cudf::io::datasource> scan_cache::open(std::string const& path)
     object =
       _objects->insert(path, _context->open_io_object(path, open_hint::parquet_footer_probe));
   }
-  auto base = std::make_unique<datasource>(_context, std::move(object));
-  return std::make_unique<advising_datasource>(
-    std::move(base), _admission, path, _min_advise_bytes);
+  return object;
 }
 
 void scan_cache::register_layout(std::string const& path,

@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cudf/column_admission.hpp>
+#include <cucascade/io/column_admission.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -199,7 +199,7 @@ TEST_CASE("a replaced column frees only the chunks no other column holds", "[cac
   REQUIRE_FALSE(policy.advise("f1", 2500, 2500, object_size).ranges.empty());  // b: chunks 3 and 4
   // c ranks above a, so a is dropped, but only chunks 0 and 1 are freed (b still holds chunk 2),
   // which is not enough room for c.
-  policy.advise("f1", 5000, 4000, object_size);
+  static_cast<void>(policy.advise("f1", 5000, 4000, object_size));
   CHECK(policy.advise("f1", 5000, 4000, object_size).ranges.empty());
   CHECK(stat(policy, "t/a").admitted_footprint == 0);
   // Admitting a again needs only the two chunks it does not share with b.

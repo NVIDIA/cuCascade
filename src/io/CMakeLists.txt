@@ -33,7 +33,9 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/list_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/column_admission.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/scan_cache.cpp)
 
 # Sources include src-private headers (io/detail/...) from src/.
 target_include_directories(cucascade_io_objects

@@ -76,6 +76,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_templated_ioctx.cpp
     io/test_thread_pool_construction.cpp
     io/test_object_cache.cpp
+    io/test_column_admission.cpp
+    io/test_scan_cache.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
     io/cache/test_buffer_pool.cpp
@@ -141,7 +143,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
-    cudf/test_column_admission.cpp
     cudf/test_release_table_stream.cpp
     # Main test runner
     unittest.cpp)
@@ -154,8 +155,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
               cudf/test_rest_datasource_contracts.cpp
               cudf/test_cache_read_arbitration.cpp
               cudf/test_dispose_eviction.cpp
-              cudf/test_explicit_eviction.cpp
-              cudf/test_scan_cache.cpp)
+              cudf/test_explicit_eviction.cpp)
   endif()
 
   set_target_properties(cucascade_cudf_tests

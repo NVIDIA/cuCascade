@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cudf/scan_cache.hpp>
+#include <cucascade/io/scan_cache.hpp>
 
 #include <catch2/catch_all.hpp>
 

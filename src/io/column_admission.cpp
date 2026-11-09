@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include <cucascade/cudf/column_admission.hpp>
+#include <cucascade/io/column_admission.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -179,7 +179,7 @@ admission_advice column_admission::advise(std::string const& path,
                                           std::uint64_t object_bytes)
 {
   admission_advice advice;
-  std::vector<cudf::io::text::byte_range_info> wanted;
+  std::vector<byte_range> wanted;
 
   {
     std::lock_guard lock(_mutex);

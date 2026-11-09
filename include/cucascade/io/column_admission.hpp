@@ -18,7 +18,7 @@
 
 #pragma once
 
-#include <cudf/io/text/byte_range_info.hpp>
+#include <cucascade/io/byte_range.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -52,7 +52,7 @@ struct column_admission_config {
 /// What the cache should keep of one read.
 struct admission_advice {
   /// Chunk-aligned ranges to advise to the cache. Empty if the read should bypass the cache.
-  std::vector<cudf::io::text::byte_range_info> ranges;
+  std::vector<byte_range> ranges;
 
   /// Eviction priority of the chunks in @ref ranges (see @c
   /// cache::cached_chunk::eviction_priority).
