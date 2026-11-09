@@ -20,9 +20,11 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -43,7 +45,7 @@ class fake_object : public io_object {
 
 }  // namespace
 
-TEST_CASE("an object that was kept is found again", "[io][object-cache]")
+TEST_CASE("an object that was kept is found again", "[io][object_cache]")
 {
   object_cache cache;
   CHECK(cache.find("s3://b/a") == nullptr);
@@ -53,7 +55,7 @@ TEST_CASE("an object that was kept is found again", "[io][object-cache]")
   CHECK(cache.size() == 1);
 }
 
-TEST_CASE("the first object kept for a path stays", "[io][object-cache]")
+TEST_CASE("the first object kept for a path stays", "[io][object_cache]")
 {
   object_cache cache;
   auto const first  = std::make_shared<fake_object>("s3://b/a");
@@ -64,7 +66,7 @@ TEST_CASE("the first object kept for a path stays", "[io][object-cache]")
   CHECK(cache.size() == 1);
 }
 
-TEST_CASE("paths are kept separately and concurrent inserts agree", "[io][object-cache]")
+TEST_CASE("paths are kept separately and concurrent inserts agree", "[io][object_cache]")
 {
   object_cache cache;
   std::vector<std::thread> threads;

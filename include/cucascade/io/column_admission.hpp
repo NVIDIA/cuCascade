@@ -32,6 +32,10 @@
 
 namespace cucascade::io {
 
+/// Default size of one cache chunk, in bytes. 256 KiB measured best on S3: smaller chunks cost more
+/// in per-chunk bookkeeping than they save in padding.
+inline constexpr std::size_t default_cache_chunk_bytes = 256UL << 10;
+
 /// Settings of a @ref column_admission policy.
 struct column_admission_config {
   /// Cache footprint, in bytes, that admitted columns may fill. Footprints are counted in whole
@@ -42,7 +46,7 @@ struct column_admission_config {
   /// Size of one cache chunk (see @c cache::config), used to count footprints and to widen advised
   /// ranges to whole chunks: a cached chunk cannot be widened later, so a partly filled one makes
   /// the neighbouring range miss on every repeat.
-  std::size_t chunk_bytes{256UL << 10};
+  std::size_t chunk_bytes{default_cache_chunk_bytes};
 
   /// A column replaces the lowest-ranked admitted column only if its rank exceeds that column's
   /// rank by this factor, so near-equal columns do not displace each other.

@@ -2,11 +2,12 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,9 +16,8 @@
  * limitations under the License.
  */
 
-#include <cucascade/exec/semi_future.hpp>
-#include <cucascade/exec/try.hpp>
 #include <cucascade/io/advising_reader.hpp>
+#include <cucascade/io/details/std_future.hpp>
 
 #include <memory>
 #include <optional>
@@ -25,31 +25,6 @@
 #include <utility>
 
 namespace cucascade::io {
-
-namespace {
-
-// Bridge a semi_future into a real (promise-backed) std::future. Promise, std::future, and the
-// type-erased terminal are all built before producer() may publish IO, so callback installation is
-// a move-only, non-allocating handoff.
-template <typename Producer>
-std::future<std::size_t> bridge_semi_to_std(Producer&& producer)
-{
-  auto p              = std::make_shared<std::promise<std::size_t>>();
-  auto fut            = p->get_future();
-  using terminal_type = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
-  terminal_type terminal{[p = std::move(p)](exec::try_t<std::size_t>&& t) mutable {
-    if (t.has_exception()) {
-      p->set_exception(std::move(t).exception());
-    } else {
-      p->set_value(std::move(t).value());
-    }
-  }};
-  auto sf = std::forward<Producer>(producer)();
-  std::move(sf).install_callback(std::move(terminal));
-  return fut;
-}
-
-}  // namespace
 
 advising_reader::advising_reader(std::shared_ptr<ioctx> context,
                                  std::shared_ptr<io_object> object,

@@ -36,13 +36,12 @@
 namespace cucascade::io {
 
 /// Settings of a @ref scan_cache.
-struct scan_cache_options {
+struct scan_cache_config {
   /// Size of the pinned host cache, in bytes. All of it is allocated when the cache is created.
   std::size_t cache_bytes{0};
 
-  /// Cache chunk size, in bytes. 256 KiB measured best on S3: smaller chunks cost more in
-  /// per-chunk bookkeeping than they save in padding.
-  std::size_t block_bytes{256UL << 10};
+  /// Cache chunk size, in bytes (see @ref default_cache_chunk_bytes).
+  std::size_t block_bytes{default_cache_chunk_bytes};
 
   /// Share of the pool in use at which the evictor starts. Leave headroom below 1.0 for the pinned
   /// staging blocks of reads that are not cached, which come from the same pool.
@@ -55,10 +54,12 @@ struct scan_cache_options {
   double admission_budget{0.96};
 
   /// Reads smaller than this are not cached. 0 caches nothing.
-  std::size_t min_advise_bytes{256UL << 10};
+  std::size_t min_advise_bytes{default_cache_chunk_bytes};
 
-  /// REST reactor threads, and the connections each one drives.
+  /// REST reactor threads.
   std::size_t reactors{16};
+
+  /// Connections each REST reactor drives.
   std::size_t connections{128};
 
   /// A GET that moves under 64 KiB/s for this many seconds is aborted and retried, so a request
@@ -99,8 +100,8 @@ struct scan_cache_options {
  */
 class scan_cache {
  public:
-  /// @throws std::invalid_argument If @c options.cache_bytes is 0.
-  explicit scan_cache(scan_cache_options const& options);
+  /// @throws std::invalid_argument If @c config.cache_bytes is 0.
+  explicit scan_cache(scan_cache_config const& config);
   ~scan_cache();
 
   scan_cache(scan_cache const&)            = delete;

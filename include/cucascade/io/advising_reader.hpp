@@ -2,11 +2,12 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,6 +21,8 @@
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/column_admission.hpp>
 #include <cucascade/io/io_context.hpp>
+
+#include <cuda/stream_ref>
 
 #include <cstddef>
 #include <cstdint>
@@ -74,7 +77,7 @@ class advising_reader {
   [[nodiscard]] bool supports_device_read() const;
 
   /// Read [offset, offset + size) into host memory and wait for it.
-  std::size_t host_read(std::size_t offset, std::size_t size, std::uint8_t* dst);
+  [[nodiscard]] std::size_t host_read(std::size_t offset, std::size_t size, std::uint8_t* dst);
 
   /// Start reading [offset, offset + size) into host memory.
   [[nodiscard]] std::future<std::size_t> host_read_async(std::size_t offset,

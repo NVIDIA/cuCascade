@@ -29,11 +29,11 @@
 namespace {
 
 using cucascade::io::scan_cache;
-using cucascade::io::scan_cache_options;
+using cucascade::io::scan_cache_config;
 
 /// A small cache against an endpoint that nothing listens on: creating it pins host memory but
 /// makes no request.
-scan_cache_options small_cache()
+scan_cache_config small_cache()
 {
   return {.cache_bytes = 256UL << 20,
           .endpoint    = "http://127.0.0.1:9",
@@ -53,14 +53,14 @@ void register_two_columns(scan_cache& cache, std::string const& path)
 
 }  // namespace
 
-TEST_CASE("a scan cache needs a size", "[cache][scan-cache]")
+TEST_CASE("a scan cache needs a size", "[cache][scan_cache]")
 {
-  scan_cache_options options = small_cache();
-  options.cache_bytes        = 0;
+  scan_cache_config options = small_cache();
+  options.cache_bytes       = 0;
   CHECK_THROWS_AS(scan_cache(options), std::invalid_argument);
 }
 
-TEST_CASE("a registered layout shows up in the column statistics", "[cache][scan-cache]")
+TEST_CASE("a registered layout shows up in the column statistics", "[cache][scan_cache]")
 {
   scan_cache cache(small_cache());
   CHECK(cache.stats().empty());
@@ -74,7 +74,7 @@ TEST_CASE("a registered layout shows up in the column statistics", "[cache][scan
   CHECK(stats[1].name == "s3://bucket/t/b");
 }
 
-TEST_CASE("a malformed layout is rejected", "[cache][scan-cache]")
+TEST_CASE("a malformed layout is rejected", "[cache][scan_cache]")
 {
   scan_cache cache(small_cache());
   std::vector<std::string> const columns{"a"};
@@ -87,23 +87,23 @@ TEST_CASE("a malformed layout is rejected", "[cache][scan-cache]")
   CHECK(cache.stats().empty());
 }
 
-TEST_CASE("the summary reports the prefetching cache", "[cache][scan-cache]")
+TEST_CASE("the summary reports the prefetching cache", "[cache][scan_cache]")
 {
   scan_cache cache(small_cache());
   CHECK(cache.summary().starts_with("fs_cache:"));
 }
 
-TEST_CASE("the cache can be placed on a NUMA node or left to the driver", "[cache][scan-cache]")
+TEST_CASE("the cache can be placed on a NUMA node or left to the driver", "[cache][scan_cache]")
 {
   for (int node : {0, -1}) {
-    scan_cache_options options = small_cache();
-    options.numa_node          = node;
+    scan_cache_config options = small_cache();
+    options.numa_node         = node;
     scan_cache cache(options);
     CHECK(cache.stats().empty());
   }
 }
 
-TEST_CASE("a scan cache can be created again after one is destroyed", "[cache][scan-cache]")
+TEST_CASE("a scan cache can be created again after one is destroyed", "[cache][scan_cache]")
 {
   {
     scan_cache first(small_cache());

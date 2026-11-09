@@ -28,9 +28,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io {
 
@@ -69,41 +74,40 @@ int current_device_numa_node()
 
 }  // namespace
 
-scan_cache::scan_cache(scan_cache_options const& options)
-  : _min_advise_bytes(options.min_advise_bytes)
+scan_cache::scan_cache(scan_cache_config const& cfg) : _min_advise_bytes(cfg.min_advise_bytes)
 {
-  if (options.cache_bytes == 0) {
+  if (cfg.cache_bytes == 0) {
     throw std::invalid_argument("scan_cache: cache_bytes must be positive");
   }
 
   cucascade::memory::host_memory_space_config host;
-  host.numa_id         = options.numa_node ? *options.numa_node : current_device_numa_node();
-  host.memory_capacity = options.cache_bytes;
+  host.numa_id         = cfg.numa_node ? *cfg.numa_node : current_device_numa_node();
+  host.memory_capacity = cfg.cache_bytes;
   // The default 0.9 would make only 90% of the cache usable.
   host.reservation_limit_fraction = 1.0;
-  host.block_size                 = options.block_bytes;
-  host.pool_size                  = pool_bytes / options.block_bytes;
+  host.block_size                 = cfg.block_bytes;
+  host.pool_size                  = pool_bytes / cfg.block_bytes;
   // Pin the whole cache now. A pool that grows on demand makes every cached read wait for it.
-  host.initial_number_pools = (options.cache_bytes + pool_bytes - 1) / pool_bytes;
-  host.initial_pool_threads = options.pinning_threads;
+  host.initial_number_pools = (cfg.cache_bytes + pool_bytes - 1) / pool_bytes;
+  host.initial_pool_threads = cfg.pinning_threads;
   std::vector<cucascade::memory::memory_space_config> spaces;
   spaces.emplace_back(host);
   _memory = std::make_unique<cucascade::memory::memory_reservation_manager>(std::move(spaces));
 
   io_config config;
   config.backend                           = io_backend::native;
-  config.rest_n_reactors                   = options.reactors;
-  config.rest.max_connections              = options.connections;
-  config.rest.stall_time_s                 = options.stall_seconds;
+  config.rest_n_reactors                   = cfg.reactors;
+  config.rest.max_connections              = cfg.connections;
+  config.rest.stall_time_s                 = cfg.stall_seconds;
   config.cache.mode                        = cache::cache_mode::cucs;
   config.cache.eviction                    = cache::eviction_policy::lru;
-  config.cache.eviction_threshold_fraction = options.eviction_threshold;
-  config.cache.eviction_batch_fraction     = options.eviction_batch;
-  config.object_store.endpoint             = options.endpoint;
-  config.object_store.region               = options.region;
-  config.object_store.access_key           = options.access_key;
-  config.object_store.secret_key           = options.secret_key;
-  config.object_store.session_token        = options.session_token;
+  config.cache.eviction_threshold_fraction = cfg.eviction_threshold;
+  config.cache.eviction_batch_fraction     = cfg.eviction_batch;
+  config.object_store.endpoint             = cfg.endpoint;
+  config.object_store.region               = cfg.region;
+  config.object_store.access_key           = cfg.access_key;
+  config.object_store.secret_key           = cfg.secret_key;
+  config.object_store.session_token        = cfg.session_token;
   config.object_store.s3_signing_mode      = object_store_config::signing_mode::header;
   config.apply_cache_mode();
 
@@ -118,8 +122,8 @@ scan_cache::scan_cache(scan_cache_options const& options)
 
   _admission = std::make_shared<column_admission>(column_admission_config{
     .budget_bytes =
-      static_cast<std::size_t>(static_cast<double>(options.cache_bytes) * options.admission_budget),
-    .chunk_bytes = options.block_bytes});
+      static_cast<std::size_t>(static_cast<double>(cfg.cache_bytes) * cfg.admission_budget),
+    .chunk_bytes = cfg.block_bytes});
   _objects   = std::make_shared<object_cache>();
 }
 
