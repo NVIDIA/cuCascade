@@ -16,10 +16,6 @@ CMakeFiles/
 cmake_install.cmake
 compile_commands.json
 
-# Python bytecode
-__pycache__/
-*.pyc
-
 # Compiled files
 *.o
 *.a
