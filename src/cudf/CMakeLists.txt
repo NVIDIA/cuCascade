@@ -25,7 +25,6 @@ target_sources(
 # The cudf::io::datasource bridge over the cudf-free io core — only built when
 # the io library is enabled (the io core itself carries no cudf dependency).
 if(CUCASCADE_BUILD_IO)
-  target_sources(
-    cucascade_cudf_objects
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/datasource.cpp)
+  target_sources(cucascade_cudf_objects
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/datasource.cpp)
 endif()
