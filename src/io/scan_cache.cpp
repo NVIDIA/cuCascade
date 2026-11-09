@@ -125,7 +125,7 @@ scan_cache::scan_cache(scan_cache_options const& options)
 
 scan_cache::~scan_cache() { _context->shutdown_cache(); }
 
-std::shared_ptr<io_object> scan_cache::open_object(std::string const& path)
+std::unique_ptr<advising_reader> scan_cache::open(std::string const& path)
 {
   // The first open of a file resolves its size, version tag and footer with one request. Reopening
   // the kept handle needs none, and keeps the version tag the cache shares chunks by.
@@ -134,7 +134,8 @@ std::shared_ptr<io_object> scan_cache::open_object(std::string const& path)
     object =
       _objects->insert(path, _context->open_io_object(path, open_hint::parquet_footer_probe));
   }
-  return object;
+  return std::make_unique<advising_reader>(
+    _context, std::move(object), _admission, path, _min_advise_bytes);
 }
 
 void scan_cache::register_layout(std::string const& path,

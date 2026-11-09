@@ -34,6 +34,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/advising_reader.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/column_admission.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/scan_cache.cpp)
 
