@@ -18,6 +18,7 @@
 /**
  * Test Tags:
  * [memory_space] - Basic memory space functionality tests
+ * [blocking_reservation] - Blocking reservation tests
  * [threading] - Multi-threaded tests
  * [gpu] - GPU-specific tests requiring CUDA
  * [.multi-device] - Tests requiring multiple GPU devices (hidden by default)
@@ -29,6 +30,7 @@
  * - Run all tests: ./test_executable "[memory_space]"
  */
 
+#include "utils/detached_task.hpp"
 #include "utils/test_memory_resources.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -46,7 +48,9 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <cstddef>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -648,4 +652,231 @@ SCENARIO("Host Reservation", "[memory_space][host_reservation]")
       }
     }
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Blocking reservations
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+using cucascade::test::becomes_ready;
+using cucascade::test::eventually;
+using cucascade::test::run_detached;
+using cucascade::test::stays_blocked;
+
+constexpr std::size_t wait_block_size = 1UL << 20;
+constexpr std::size_t wait_capacity   = 8 * wait_block_size;
+
+host_memory_space_config make_wait_host_config()
+{
+  return cucascade::test::malloc_host_space_config(0, wait_capacity, wait_block_size, 4);
+}
+
+std::shared_ptr<memory_reservation_manager> make_host_only_manager()
+{
+  std::vector<memory_space_config> configs;
+  configs.emplace_back(make_wait_host_config());
+  return std::make_shared<memory_reservation_manager>(std::move(configs));
+}
+
+/**
+ * A reservation made on a detached thread, with shared ownership of the manager or memory space
+ * it came from, so that it is released before its memory space is destroyed even if the test
+ * gives up on the thread.
+ */
+struct held_reservation {
+  std::shared_ptr<void> owner;
+  std::unique_ptr<reservation> res;  // Declared after owner so that it is destroyed first.
+};
+
+template <typename Strategy>
+std::future<held_reservation> request_detached(std::shared_ptr<memory_reservation_manager> manager,
+                                               Strategy strategy,
+                                               std::size_t size)
+{
+  return run_detached([manager = std::move(manager), strategy = std::move(strategy), size] {
+    return held_reservation{manager, manager->request_reservation(strategy, size)};
+  });
+}
+
+/// A memory_space that exposes whether a caller is blocked in make_reservation.
+class probed_memory_space : public memory_space {
+ public:
+  using memory_space::memory_space;
+
+  [[nodiscard]] bool has_waiters() const { return _notification_channel->has_waiters(); }
+};
+
+std::future<held_reservation> make_reservation_detached(std::shared_ptr<probed_memory_space> space,
+                                                        std::size_t size)
+{
+  return run_detached([space = std::move(space), size] {
+    return held_reservation{space, space->make_reservation(size)};
+  });
+}
+
+}  // namespace
+
+TEST_CASE("request_reservation returns nullptr when no memory space is a candidate",
+          "[memory_space][blocking_reservation]")
+{
+  auto manager = make_host_only_manager();
+  memory_space_id const host_id{Tier::HOST, 0};
+  std::future<held_reservation> result;
+
+  SECTION("downgrade")
+  {
+    result = request_detached(
+      manager, any_memory_space_to_downgrade{host_id, Tier::DISK}, wait_block_size);
+  }
+  SECTION("upgrade")
+  {
+    result =
+      request_detached(manager, any_memory_space_to_upgrade{host_id, Tier::GPU}, wait_block_size);
+  }
+  SECTION("unknown specific memory space")
+  {
+    result = request_detached(manager, specific_memory_space{Tier::HOST, 1}, wait_block_size);
+  }
+  SECTION("tier without memory spaces")
+  {
+    result = request_detached(manager, any_memory_space_in_tier{Tier::DISK}, wait_block_size);
+  }
+  SECTION("preferred tier without memory spaces")
+  {
+    result = request_detached(manager,
+                              any_memory_space_in_tier_with_preference{Tier::GPU, std::size_t{0}},
+                              wait_block_size);
+  }
+  SECTION("tiers without memory spaces")
+  {
+    result = request_detached(manager,
+                              any_memory_space_in_tiers{std::vector<Tier>{Tier::GPU, Tier::DISK}},
+                              wait_block_size);
+  }
+
+  REQUIRE(becomes_ready(result));
+  CHECK(result.get().res == nullptr);
+}
+
+TEST_CASE("request_reservation grants a reservation that fits immediately",
+          "[memory_space][blocking_reservation]")
+{
+  auto manager = make_host_only_manager();
+
+  auto specific = request_detached(manager, specific_memory_space{Tier::HOST, 0}, wait_block_size);
+  REQUIRE(becomes_ready(specific));
+  auto specific_res = specific.get().res;
+  REQUIRE(specific_res != nullptr);
+  CHECK(specific_res->tier() == Tier::HOST);
+  CHECK(specific_res->size() == wait_block_size);
+
+  auto any = request_detached(manager, any_memory_space_in_tier{Tier::HOST}, 2 * wait_block_size);
+  REQUIRE(becomes_ready(any));
+  auto any_res = any.get().res;
+  REQUIRE(any_res != nullptr);
+  CHECK(any_res->tier() == Tier::HOST);
+  CHECK(any_res->size() == 2 * wait_block_size);
+
+  CHECK(manager->get_memory_space(Tier::HOST, 0)->get_available_memory() ==
+        wait_capacity - 3 * wait_block_size);
+}
+
+TEST_CASE("manager shutdown wakes every blocked request_reservation",
+          "[memory_space][blocking_reservation][threading]")
+{
+  constexpr int num_waiters = 4;
+  auto manager              = make_host_only_manager();
+  auto full = manager->get_memory_space(Tier::HOST, 0)->make_reservation_or_null(wait_capacity);
+  REQUIRE(full != nullptr);
+
+  std::vector<std::future<held_reservation>> results;
+  for (int i = 0; i < num_waiters; ++i) {
+    if (i % 2 == 0) {
+      results.push_back(
+        request_detached(manager, specific_memory_space{Tier::HOST, 0}, wait_block_size));
+    } else {
+      results.push_back(
+        request_detached(manager, any_memory_space_in_tier{Tier::HOST}, wait_block_size));
+    }
+  }
+  for (auto& result : results) {
+    CHECK(stays_blocked(result));
+  }
+
+  manager->shutdown();
+  for (auto& result : results) {
+    REQUIRE(becomes_ready(result));
+    CHECK(result.get().res == nullptr);
+  }
+}
+
+TEST_CASE("make_reservation serves blocked callers in FIFO order",
+          "[memory_space][blocking_reservation][threading]")
+{
+  constexpr std::size_t request_size = wait_capacity - wait_block_size;
+  auto space = std::make_shared<probed_memory_space>(make_wait_host_config());
+  // Held throughout so that waiters are woken by releases rather than by having no
+  // outstanding reservation to wait for.
+  auto anchor = space->make_reservation_or_null(wait_block_size);
+  auto full   = space->make_reservation_or_null(request_size);
+  REQUIRE(anchor != nullptr);
+  REQUIRE(full != nullptr);
+
+  auto first = make_reservation_detached(space, request_size);
+  REQUIRE(eventually([&] { return space->has_waiters(); }));
+  auto second = make_reservation_detached(space, request_size);
+  CHECK(stays_blocked(first));
+  CHECK(stays_blocked(second));
+
+  full.reset();
+  REQUIRE(becomes_ready(first));
+  auto first_res = first.get().res;
+  REQUIRE(first_res != nullptr);
+  CHECK(first_res->size() == request_size);
+  CHECK(stays_blocked(second));
+
+  first_res.reset();
+  REQUIRE(becomes_ready(second));
+  auto second_res = second.get().res;
+  REQUIRE(second_res != nullptr);
+  CHECK(second_res->size() == request_size);
+}
+
+TEST_CASE("make_reservation does not let a new caller bypass a blocked caller",
+          "[memory_space][blocking_reservation][threading]")
+{
+  constexpr std::size_t large_size = wait_capacity - wait_block_size;
+  auto space                       = std::make_shared<probed_memory_space>(make_wait_host_config());
+  auto anchor                      = space->make_reservation_or_null(wait_block_size);
+  auto large                       = space->make_reservation_or_null(large_size - wait_block_size);
+  auto small                       = space->make_reservation_or_null(wait_block_size);
+  REQUIRE(anchor != nullptr);
+  REQUIRE(large != nullptr);
+  REQUIRE(small != nullptr);
+
+  auto blocked = make_reservation_detached(space, large_size);
+  REQUIRE(eventually([&] { return space->has_waiters(); }));
+
+  // Frees enough for a new small request, but not for the blocked one.
+  small.reset();
+  CHECK(stays_blocked(blocked));
+  REQUIRE(space->get_available_memory() == wait_block_size);
+
+  auto newcomer = make_reservation_detached(space, wait_block_size);
+  CHECK(stays_blocked(newcomer));
+
+  large.reset();
+  REQUIRE(becomes_ready(blocked));
+  auto blocked_res = blocked.get().res;
+  REQUIRE(blocked_res != nullptr);
+  CHECK(blocked_res->size() == large_size);
+  CHECK(stays_blocked(newcomer));
+
+  blocked_res.reset();
+  REQUIRE(becomes_ready(newcomer));
+  auto newcomer_res = newcomer.get().res;
+  REQUIRE(newcomer_res != nullptr);
+  CHECK(newcomer_res->size() == wait_block_size);
 }
