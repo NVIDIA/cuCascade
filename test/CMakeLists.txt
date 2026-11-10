@@ -140,6 +140,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
+    cudf/test_gpu_to_gpu_converter.cpp
     cudf/test_release_table_stream.cpp
     # Main test runner
     unittest.cpp)
@@ -165,8 +166,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Link dependencies
   target_link_libraries(
-    cucascade_cudf_tests PRIVATE cucascade_cudf Catch2::Catch2
-                                 CUDA::cudart_static)
+    cucascade_cudf_tests
+    PRIVATE cucascade_cudf Catch2::Catch2 CUDA::cudart_static
+            cudf::cudftest_default_stream)
 
   # Register tests with CTest
   add_test(NAME cucascade_cudf_tests COMMAND cucascade_cudf_tests)

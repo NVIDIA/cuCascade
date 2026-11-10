@@ -150,6 +150,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   # Find cudf only when building the cudf-coupled cucascade-cudf library
   if(CUCASCADE_BUILD_CUDF)
     find_package(cudf REQUIRED CONFIG)
+    # test/utils/mixed_table.hpp (tests and benchmarks) uses cudf_test column
+    # wrappers, which call cudf::test::get_default_stream() from cudf's optional
+    # "testing" component. Found once here so both subdirectories see the same
+    # imported targets.
+    if(CUCASCADE_BUILD_TESTS OR CUCASCADE_BUILD_BENCHMARKS)
+      find_package(cudf REQUIRED CONFIG COMPONENTS testing)
+    endif()
   endif()
 
   # Third-party dependencies of the cucascade-io library (datasource layer)
