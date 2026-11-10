@@ -99,8 +99,8 @@ Key methods:
 | `make_reservation_upto(size)` | Create reservation for as much as available (up to `size`) |
 | `acquire_stream()` | Get a CUDA stream from the pool (GPU only; throws otherwise) |
 | `get_io_backend()` | The DISK space's `idisk_io_backend` (DISK only; throws otherwise) |
-| `should_downgrade_memory()` | True if `reservation_limit - get_available_memory()` is at least the downgrade trigger threshold |
-| `should_stop_downgrading_memory()` | True if `reservation_limit - get_available_memory()` is at most the downgrade stop threshold |
+| `should_downgrade_memory()` | True if the bytes in use (`capacity - get_available_memory()`) are at least the downgrade trigger threshold |
+| `should_stop_downgrading_memory()` | True if the bytes in use are at most the downgrade stop threshold |
 | `get_available_memory()` | Remaining allocatable memory |
 
 ---
@@ -393,15 +393,12 @@ config.downgrade_trigger_fraction = 0.85;
 config.downgrade_stop_fraction = 0.65;
 ```
 
-Both fractions are multiplied by `memory_capacity` and compared against
-`reservation_limit - get_available_memory()`, where `reservation_limit` is
-`reservation_limit_fraction * memory_capacity` and `get_available_memory()` is `memory_capacity`
-minus the bytes reserved or allocated in the space. `should_downgrade_memory()` is true when that
-value is at least `downgrade_trigger_fraction * memory_capacity`, and
-`should_stop_downgrading_memory()` is true when it is at most
-`downgrade_stop_fraction * memory_capacity`. Because the value equals the bytes in use minus
-`(1 - reservation_limit_fraction) * memory_capacity`, both thresholds apply to usage offset by that
-amount, not to raw usage.
+Both fractions are multiplied by `memory_capacity` and compared against the bytes in use,
+`memory_capacity - get_available_memory()` (the bytes reserved or allocated in the space).
+`should_downgrade_memory()` is true when usage is at least `downgrade_trigger_fraction *
+memory_capacity`, `should_stop_downgrading_memory()` is true when it is at most
+`downgrade_stop_fraction * memory_capacity`, and `get_amount_to_downgrade()` returns how far usage
+is above the stop threshold.
 
 The application queries these thresholds:
 
