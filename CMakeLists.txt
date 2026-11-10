@@ -215,10 +215,14 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
         INTERFACE $<BUILD_INTERFACE:${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}>)
     else()
       include(FetchContent)
+      # EXCLUDE_FROM_ALL keeps upstream's install() rules out of cuCascade's
+      # install: the headers are a build-time dependency only, and installed
+      # consumers provide their own copy (see cuCascadeConfig.cmake).
       FetchContent_Declare(
         concurrentqueue
         GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
-        GIT_TAG v1.0.4)
+        GIT_TAG v1.0.4
+        EXCLUDE_FROM_ALL)
       FetchContent_MakeAvailable(concurrentqueue)
       target_include_directories(
         cucascade_io_thirdparty
