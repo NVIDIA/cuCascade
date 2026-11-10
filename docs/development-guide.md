@@ -44,7 +44,6 @@ Building, testing, benchmarking, and contributing to cuCascade.
 | NVIDIA Driver | Compatible with CUDA 13 |
 | libcudf | 25.10+ |
 | RMM | Via cuDF dependency |
-| numactl | Development headers |
 
 The easiest way to get all dependencies is via [Pixi](https://pixi.sh/), which manages the full environment.
 
@@ -152,7 +151,7 @@ cucascade_objects (OBJECT library)
     └── src/memory/*.cpp
          │
          ├── cucascade_static (STATIC library)
-         │     Links: RMM, cuDF, CUDA runtime, CUDA NVML, pthreads, numa
+         │     Links: RMM, cuDF, CUDA runtime, CUDA NVML, pthreads
          │
          └── cucascade_shared (SHARED library)
                Same links, SOVERSION 0

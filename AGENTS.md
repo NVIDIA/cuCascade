@@ -28,7 +28,6 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - Linux only: `linux-64` and `linux-aarch64` (enforced via `pixi.toml` line 4)
 - NVIDIA GPU required; compute capability >= 7.5 (Turing or newer)
 - CUDA Toolkit 12.9+ (cuda-12 track) or 13+ (cuda-13 track)
-- NUMA-aware host: requires `libnuma` (installed via `numactl` pixi dependency)
 - Pixi >= 0.59
 - Config: `pixi.toml`
 - Lockfile: `pixi.lock` (committed)
@@ -52,7 +51,6 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `CUDA::nvml` - GPU topology discovery via NVML in `src/memory/topology_discovery.cpp`
 - `kvikio` 26.12 / 26.08 - Async disk I/O with automatic GDS/POSIX fallback; used in `src/data/kvikio_io_backend.cpp` via `kvikio::FileHandle`; linked PRIVATE via `kvikio::kvikio`
 - `libcufile` (cuFile / GDS) - NVIDIA GPUDirect Storage for direct GPU↔NVMe transfers; `<cufile.h>` used in `src/data/gds_io_backend.cpp`; found via `find_library(CUFILE_LIB cufile ...)` — optional at configure time, required at runtime for GDS backend
-- `libnuma` - NUMA-aware pinned host memory allocation in `src/memory/numa_region_pinned_host_allocator.cpp`; found via `find_library(NUMA_LIB numa REQUIRED)`
 - `Threads::Threads` (pthreads) - Thread support; `std::mutex`, `std::condition_variable`, `std::async` throughout
 - `fmt` - Format library (pixi dependency; available in environment)
 - `CUDA::nvtx3` - Header-only NVIDIA NVTX profiling annotations; ranges use the `libcucascade` domain and become active when a profiler injects NVTX tooling
@@ -69,7 +67,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `release` → `build/release/`
 - `relwithdebinfo` → `build/relwithdebinfo/`
 ## Library Outputs
-- `cucascade_shared` (`libcucascade.so`, versioned) - alias `cuCascade::cucascade_shared`; **cudf-free core** (RMM + CUDA + numa + kvikIO/cuFile)
+- `cucascade_shared` (`libcucascade.so`, versioned) - alias `cuCascade::cucascade_shared`; **cudf-free core** (RMM + CUDA + kvikIO/cuFile)
 - `cucascade_static` (`libcucascade.a`) - alias `cuCascade::cucascade_static`
 - `cuCascade::cucascade` - Default alias pointing to shared if available, else static
 - `cucascade_cudf_shared`/`cucascade_cudf_static` (`libcucascade_cudf.{so,a}`) - aliases `cuCascade::cucascade_cudf[_shared|_static]`, default alias `cuCascade::cucascade_cudf`; the cudf-coupled layer (links `cudf::cudf` + the core), built only when `CUCASCADE_BUILD_CUDF=ON`. Headers under `include/cucascade/cudf/`

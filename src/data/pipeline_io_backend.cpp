@@ -146,7 +146,7 @@ class pipeline_io_backend : public idisk_io_backend {
     // Allocate as portable+mapped so the buffers are usable from any CUDA context
     // (required for multi-GPU correctness — without Portable, only the context active
     // at allocation time gets the fast-path pinned mapping). When target_device is
-    // valid and its NUMA node is known, page-bind to that node via libnuma so D2H/H2D
+    // valid and its NUMA node is known, bind the pages to that node so D2H/H2D
     // doesn't cross the inter-socket interconnect. numa_node==-1 falls back to plain
     // cudaHostAlloc(Portable|Mapped) inside numa_region_pinned_host_memory_resource.
     _buf[0] = _pinned_mr.allocate_sync(PIPELINE_BUF_SIZE);
@@ -177,7 +177,7 @@ class pipeline_io_backend : public idisk_io_backend {
       it = _per_device.erase(it);
     }
     // Free via the same allocator that produced the buffers — for NUMA-bound buffers
-    // this dispatches cudaHostUnregister + numa_free; for the -1 fallback path it
+    // this dispatches cudaHostUnregister + munmap; for the -1 fallback path it
     // dispatches cudaFreeHost.
     if (_buf[0]) { _pinned_mr.deallocate_sync(_buf[0], PIPELINE_BUF_SIZE); }
     if (_buf[1]) { _pinned_mr.deallocate_sync(_buf[1], PIPELINE_BUF_SIZE); }

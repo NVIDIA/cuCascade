@@ -28,17 +28,26 @@
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
+#include <linux/mempolicy.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
+#include <array>
 #include <atomic>
+#include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <set>
 #include <span>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using namespace cucascade::memory;
@@ -205,6 +214,118 @@ TEST_CASE("NUMA pinned allocation restores the caller's CPU affinity", "[fixed_s
   REQUIRE(sched_setaffinity(0, sizeof(original), &original) == 0);
 
   REQUIRE(CPU_EQUAL(&after, &one_cpu));
+}
+
+namespace {
+
+/// The memory policy of the page at an address, as get_mempolicy reports it.
+struct page_policy {
+  static constexpr std::size_t bits_per_word = sizeof(unsigned long) * CHAR_BIT;
+
+  int mode{-1};
+  std::array<unsigned long, 16> nodes{};
+
+  static page_policy of(void* ptr)
+  {
+    page_policy policy;
+    REQUIRE(syscall(SYS_get_mempolicy,
+                    &policy.mode,
+                    policy.nodes.data(),
+                    static_cast<unsigned long>(policy.nodes.size() * bits_per_word),
+                    ptr,
+                    static_cast<unsigned long>(MPOL_F_ADDR)) == 0);
+    return policy;
+  }
+
+  /// The lowest node this process may allocate on. Skips the test where seccomp (e.g. Docker's
+  /// default profile) blocks get_mempolicy.
+  static int first_allowed_node()
+  {
+    page_policy allowed;
+    if (syscall(SYS_get_mempolicy,
+                nullptr,
+                allowed.nodes.data(),
+                static_cast<unsigned long>(allowed.nodes.size() * bits_per_word),
+                nullptr,
+                static_cast<unsigned long>(MPOL_F_MEMS_ALLOWED)) != 0) {
+      skip_if_blocked(errno);
+      FAIL("get_mempolicy failed: " << std::strerror(errno));
+    }
+    for (std::size_t i = 0; i < allowed.nodes.size() * bits_per_word; ++i) {
+      if ((allowed.nodes[i / bits_per_word] >> (i % bits_per_word)) & 1UL) {
+        return static_cast<int>(i);
+      }
+    }
+    FAIL("no NUMA node is allowed");
+    return -1;
+  }
+
+  /// Skips the test where seccomp blocks mbind.
+  static void require_mbind()
+  {
+    auto const page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    void* ptr = mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(ptr != MAP_FAILED);
+    long const status = syscall(SYS_mbind,
+                                ptr,
+                                static_cast<unsigned long>(page),
+                                static_cast<unsigned long>(MPOL_DEFAULT),
+                                nullptr,
+                                0UL,
+                                0UL);
+    int const error   = errno;
+    munmap(ptr, page);
+    if (status != 0) {
+      skip_if_blocked(error);
+      FAIL("mbind failed: " << std::strerror(error));
+    }
+  }
+
+ private:
+  static void skip_if_blocked(int error)
+  {
+    if (error == EPERM || error == ENOSYS) { SKIP("memory policy syscalls are not permitted"); }
+  }
+};
+
+}  // namespace
+
+TEST_CASE("NUMA pinned allocation binds its pages to the node", "[fixed_size_host]")
+{
+  page_policy::require_mbind();
+  int const node = page_policy::first_allowed_node();
+  numa_region_pinned_host_memory_resource upstream(node);
+  void* p                = upstream.allocate_sync(block_size);
+  auto const policy      = page_policy::of(p);
+  int page_node          = -1;
+  long const node_status = syscall(SYS_get_mempolicy,
+                                   &page_node,
+                                   nullptr,
+                                   0UL,
+                                   p,
+                                   static_cast<unsigned long>(MPOL_F_NODE | MPOL_F_ADDR));
+  upstream.deallocate_sync(p, block_size);
+
+  page_policy expected;
+  expected.nodes[static_cast<std::size_t>(node) / page_policy::bits_per_word] =
+    1UL << (static_cast<std::size_t>(node) % page_policy::bits_per_word);
+  REQUIRE(policy.mode == MPOL_BIND);
+  REQUIRE(policy.nodes == expected.nodes);
+  REQUIRE(node_status == 0);
+  REQUIRE(page_node == node);
+}
+
+TEST_CASE("NUMA pinned allocation on an unknown node uses the default policy", "[fixed_size_host]")
+{
+  // 1023 passes the node range check but is not online here; 1 << 20 does not.
+  int const node = GENERATE(1023, 1 << 20);
+  std::ignore    = page_policy::first_allowed_node();
+  numa_region_pinned_host_memory_resource upstream(node);
+  void* p           = upstream.allocate_sync(block_size);
+  auto const policy = page_policy::of(p);
+  upstream.deallocate_sync(p, block_size);
+
+  REQUIRE(policy.mode == MPOL_DEFAULT);
 }
 
 TEST_CASE("Returning every block after several pool expansions does not allocate",

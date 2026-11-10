@@ -255,12 +255,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
                                  INTERFACE CUCASCADE_HAS_KVIKIO)
     endif()
   endif()
-
-  # Find numa (provided by numactl-devel or libnuma-dev depending on the package
-  # manager). Uses the bundled FindNuma module, which produces the Numa::Numa
-  # imported target. The same module is installed with the package so consumers
-  # resolve libnuma on their own system rather than inheriting a hardcoded path.
-  find_package(Numa REQUIRED)
 endif()
 
 # Set CUDA architectures
@@ -360,7 +354,7 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static CUDA::nvtx3
-                                 Threads::Threads Numa::Numa)
+                                 Threads::Threads)
 
   # Set include directories for the object library
   target_include_directories(cucascade_objects
@@ -382,8 +376,7 @@ endif()
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   # The cudf object library inherits the core usage requirements (include dirs,
-  # rmm/cuda/numa, C++20, NVTX) by linking the core object library, and adds
-  # cudf.
+  # rmm/cuda, C++20, NVTX) by linking the core object library, and adds cudf.
   target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_objects
                                                       cudf::cudf)
   target_include_directories(cucascade_cudf_objects
@@ -406,8 +399,7 @@ endif()
 if(CUCASCADE_BUILD_IO)
   # Link libraries shared by the io object library and the installable io
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
-  # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
-  # approach.
+  # side by cuCascadeConfig.cmake (same names).
   set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
                              OpenSSL::Crypto)
   if(CUCASCADE_BUILD_CUDF)
@@ -734,14 +726,6 @@ write_basic_package_version_file(
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfig.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfigVersion.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade)
-
-# Bundle the FindNuma module so consumers can rerun the same find logic (the
-# full library links the Numa::Numa target it produces). Not needed for
-# topology-only builds, which do not depend on libnuma.
-if(NOT CUCASCADE_TOPOLOGY_ONLY)
-  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules/FindNuma.cmake
-          DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade/Modules)
-endif()
 
 # =============================================================================
 # Tests
