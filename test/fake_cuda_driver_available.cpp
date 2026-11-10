@@ -23,10 +23,22 @@ extern "C" CUresult CUDAAPI cuDeviceGetAttribute(int* value,
                                                  CUdevice_attribute attribute,
                                                  CUdevice device)
 {
-  if (value == nullptr || attribute != CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK ||
-      device != 7) {
-    return CUDA_ERROR_INVALID_VALUE;
+  if (value == nullptr || device != 7) { return CUDA_ERROR_INVALID_VALUE; }
+  switch (attribute) {
+    // The fake GPU has a decompression engine and a coherent C2C host link.
+    case CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK: *value = 1; return CUDA_SUCCESS;
+    case CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED:
+    case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES: {
+      // CUCASCADE_FAKE_CUDA_FAILING_ATTRIBUTE ("host_native_atomics" or "host_page_tables") makes
+      // that attribute query fail, after writing a nonzero value the caller must not trust.
+      *value                = 1;
+      char const* failing   = std::getenv("CUCASCADE_FAKE_CUDA_FAILING_ATTRIBUTE");
+      char const* this_name = attribute == CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED
+                                ? "host_native_atomics"
+                                : "host_page_tables";
+      return failing != nullptr && std::strcmp(failing, this_name) == 0 ? CUDA_ERROR_INVALID_VALUE
+                                                                        : CUDA_SUCCESS;
+    }
+    default: return CUDA_ERROR_INVALID_VALUE;
   }
-  *value = 1;
-  return CUDA_SUCCESS;
 }

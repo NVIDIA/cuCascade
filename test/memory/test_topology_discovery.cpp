@@ -40,8 +40,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace cucascade::memory;
@@ -337,6 +341,149 @@ TEST_CASE("Default Topology Discovery does not initialize CUDA while visibility 
   REQUIRE(waitpid(child, &status, 0) == child);
   if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
     SUCCEED("Skipped: requires NVML and at least two visible GPUs");
+    return;
+  }
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+
+TEST_CASE("c2c_from trusts NVML and otherwise needs both driver attributes", "[hw_topology][c2c]")
+{
+  using detail::c2c_from;
+  for (int atomics : {0, 1}) {
+    for (int page_tables : {0, 1}) {
+      CAPTURE(atomics, page_tables);
+      REQUIRE(c2c_from(true, atomics, page_tables));
+      REQUIRE_FALSE(c2c_from(false, atomics, page_tables));
+    }
+  }
+  REQUIRE_FALSE(c2c_from(std::nullopt, 0, 0));
+  REQUIRE_FALSE(c2c_from(std::nullopt, 1, 0));
+  REQUIRE_FALSE(c2c_from(std::nullopt, 0, 1));
+  REQUIRE(c2c_from(std::nullopt, 1, 1));
+  // Driver attributes are counts/flags; any non-zero value is "supported".
+  REQUIRE(c2c_from(std::nullopt, 2, 3));
+}
+
+TEST_CASE("c2c_decision falls back to the driver attributes only when NVML has no answer",
+          "[hw_topology][c2c]")
+{
+  std::string const pci = "0000:01:00.0";
+  std::vector<std::string> nvml_queries;
+  std::vector<std::string> attribute_queries;
+
+  auto nvml_returning = [&](std::optional<bool> answer) {
+    return [&nvml_queries, answer](std::string const& bus_id) {
+      nvml_queries.push_back(bus_id);
+      return answer;
+    };
+  };
+  auto attributes_returning = [&](int atomics, int page_tables) {
+    return [&attribute_queries, atomics, page_tables](std::string const& bus_id) {
+      attribute_queries.push_back(bus_id);
+      return std::pair<int, int>{atomics, page_tables};
+    };
+  };
+
+  SECTION("NVML answer is final and the driver is not queried")
+  {
+    REQUIRE(detail::c2c_decision(pci, nvml_returning(true), attributes_returning(0, 0)));
+    REQUIRE_FALSE(detail::c2c_decision(pci, nvml_returning(false), attributes_returning(1, 1)));
+    REQUIRE(nvml_queries == std::vector<std::string>{pci, pci});
+    REQUIRE(attribute_queries.empty());
+  }
+
+  SECTION("No NVML answer: the driver attributes decide")
+  {
+    REQUIRE(detail::c2c_decision(pci, nvml_returning(std::nullopt), attributes_returning(1, 1)));
+    REQUIRE_FALSE(
+      detail::c2c_decision(pci, nvml_returning(std::nullopt), attributes_returning(1, 0)));
+    REQUIRE_FALSE(
+      detail::c2c_decision(pci, nvml_returning(std::nullopt), attributes_returning(0, 1)));
+    REQUIRE_FALSE(
+      detail::c2c_decision(pci, nvml_returning(std::nullopt), attributes_returning(0, 0)));
+    REQUIRE(nvml_queries == std::vector<std::string>(4, pci));
+    REQUIRE(attribute_queries == std::vector<std::string>(4, pci));
+  }
+}
+
+TEST_CASE("Runtime attributes report each GPU's C2C link", "[hw_topology][c2c]")
+{
+  // Runs in a child so this process never initializes CUDA: a later forked test must still be
+  // able to use CUDA in its own child.
+  auto const child = fork();
+  REQUIRE(child >= 0);
+
+  if (child == 0) {
+    if (cuInit(0) != CUDA_SUCCESS) { _exit(77); }
+    topology_discovery discovery;
+    if (!discovery.discover(NetworkDeviceVerification::EXISTS, /*with_runtime_attributes=*/true)) {
+      _exit(1);
+    }
+    auto const& gpus = discovery.get_topology().gpus;
+    if (gpus.empty()) { _exit(77); }
+    if (nvmlInit_v2() != NVML_SUCCESS) {
+      std::fprintf(stderr, "nvmlInit_v2 failed\n");
+      _exit(2);
+    }
+
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+      auto const& gpu = gpus[i];
+      if (!gpu.runtime_attributes.has_value()) {
+        std::fprintf(
+          stderr, "GPU %zu (%s): runtime attributes missing\n", i, gpu.pci_bus_id.c_str());
+        _exit(3);
+      }
+
+      // Gather the evidence directly from NVML and the driver, independently of the discovery code.
+      std::optional<bool> nvml;
+#if defined(nvmlC2cModeInfo_v1)
+      nvmlDevice_t handle{};
+      nvmlC2cModeInfo_v1_t info{};
+      if (nvmlDeviceGetHandleByPciBusId_v2(gpu.pci_bus_id.c_str(), &handle) == NVML_SUCCESS &&
+          nvmlDeviceGetC2cModeInfoV(handle, &info) == NVML_SUCCESS) {
+        nvml = info.isC2cEnabled != 0;
+      }
+#endif
+      int atomics     = 0;
+      int page_tables = 0;
+      CUdevice device = 0;
+      if (cuDeviceGetByPCIBusId(&device, gpu.pci_bus_id.c_str()) == CUDA_SUCCESS) {
+        if (cuDeviceGetAttribute(
+              &atomics, CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED, device) != CUDA_SUCCESS) {
+          atomics = 0;
+        }
+        if (cuDeviceGetAttribute(&page_tables,
+                                 CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES,
+                                 device) != CUDA_SUCCESS) {
+          page_tables = 0;
+        }
+      }
+
+      // NVML's answer is final; without one, both driver attributes are required.
+      bool const expected = nvml.has_value() ? *nvml : (atomics != 0 && page_tables != 0);
+      bool const c2c      = gpu.runtime_attributes->c2c;
+      if (c2c != expected) {
+        std::fprintf(stderr,
+                     "GPU %zu (%s): c2c=%d, expected %d (nvml=%s, host_native_atomics=%d, "
+                     "host_page_tables=%d)\n",
+                     i,
+                     gpu.pci_bus_id.c_str(),
+                     static_cast<int>(c2c),
+                     static_cast<int>(expected),
+                     nvml.has_value() ? (*nvml ? "true" : "false") : "none",
+                     atomics,
+                     page_tables);
+        _exit(4);
+      }
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
+    SUCCEED("Skipped: requires the CUDA driver and at least one GPU");
     return;
   }
   REQUIRE(WIFEXITED(status));
