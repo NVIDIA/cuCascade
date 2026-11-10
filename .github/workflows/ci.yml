@@ -43,6 +43,9 @@ jobs:
 
       - run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} build
 
+      - name: Build against the installed package
+        run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} test-install
+
       - name: Package build artifacts
         run: tar -cf build-release.tar build/release/
 
