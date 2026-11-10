@@ -152,6 +152,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
       PRIVATE cudf/test_cache_object_identity.cpp
               cudf/test_rest_datasource_contracts.cpp
               cudf/test_cache_read_arbitration.cpp
+              cudf/test_datasource_read_lifetime.cpp
               cudf/test_dispose_eviction.cpp
               cudf/test_explicit_eviction.cpp)
   endif()
