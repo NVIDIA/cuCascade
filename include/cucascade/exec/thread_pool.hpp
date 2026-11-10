@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/exec/invocable.hpp>
+#include <cucascade/exec/thread_util.hpp>
 #include <cucascade/log/logging.hpp>
 
 #include <algorithm>
@@ -44,6 +45,7 @@ class static_thread_pool {
                               std::function<void()> per_thread_init = nullptr)
   {
     threads_.reserve(static_cast<std::size_t>(num_threads));
+    if (cpu_ids.empty()) { cpu_ids = thread_util::get_process_affinity(); }
 
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
