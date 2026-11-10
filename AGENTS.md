@@ -164,7 +164,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 - `CUCASCADE_CUDA_TRY(call, exception_type)` — two-arg form throws custom exception type
 - `CUCASCADE_CUDA_TRY_ALLOC(call)` — throws `rmm::out_of_memory` for OOM, `rmm::bad_alloc` otherwise
 - `CUCASCADE_CUDA_TRY_ALLOC(call, num_bytes)` — two-arg form includes requested bytes in message
-- `CUCASCADE_ASSERT_CUDA_SUCCESS(call)` — assert-based check for noexcept/destructor contexts; in release builds the call executes but the error is discarded
+- `CUCASCADE_ASSERT_CUDA_SUCCESS(call)` — check for noexcept/destructor contexts; a failure is reported through the log sink at error level in every build, and debug builds also assert
 - `CUCASCADE_FAIL(message)` — throws `cucascade::logic_error` with file/line context
 - `CUCASCADE_FAIL(message, exception_type)` — throws custom exception type
 - `cucascade::cuda_error` — inherits `std::runtime_error`; for CUDA runtime failures
@@ -344,7 +344,7 @@ Performance optimization of cuCascade's disk I/O backends (GDS and kvikIO) to ap
 ## Error Handling
 - `CUCASCADE_CUDA_TRY(call)` — throws `cucascade::cuda_error` on CUDA runtime failure (defined in `include/cucascade/error.hpp`)
 - `CUCASCADE_CUDA_TRY_ALLOC(call, bytes)` — throws `rmm::out_of_memory` for `cudaErrorMemoryAllocation`, `rmm::bad_alloc` otherwise
-- `CUCASCADE_ASSERT_CUDA_SUCCESS(call)` — assert in debug builds; no-op in release; used in destructors and `noexcept` paths
+- `CUCASCADE_ASSERT_CUDA_SUCCESS(call)` — reports a failure through the log sink in every build and asserts in debug builds; used in destructors and `noexcept` paths
 - `CUCASCADE_FAIL(msg)` / `CUCASCADE_FAIL(msg, exception_type)` — throws `cucascade::logic_error` or custom type with file/line context
 - `cucascade::memory::cucascade_out_of_memory` extends `rmm::out_of_memory` with `error_kind`, `requested_bytes`, `global_usage`, `pool_handle`
 - `oom_handling_policy` interface (`include/cucascade/memory/oom_handling_policy.hpp`) allows pluggable OOM recovery; default `throw_on_oom_policy`
