@@ -236,7 +236,7 @@ int main(int argc, char** argv)
     }
 
     cudf::io::parquet::experimental::hybrid_scan_reader scanner{
-      cudf::host_span<uint8_t const>{footer_buf.data(), footer_buf.size()}, scan_opts};
+      {footer_buf.data(), footer_buf.size()}, scan_opts};
     auto file_metadata = scanner.parquet_metadata();
 
     std::vector<cudf::size_type> selected_row_groups;
