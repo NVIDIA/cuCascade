@@ -44,7 +44,8 @@ cuCascade automatically discovers the hardware topology and uses it to:
 
 ```cpp
 topology_discovery discovery;
-if (discovery.discover()) {
+[[maybe_unused]] bool discovered = discovery.discover();
+{
     auto const& topo = discovery.get_topology();
 
     topo.hostname;           // System hostname
@@ -87,7 +88,7 @@ used, `build()` throws rather than sizing a host space from device memory.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | `unsigned int` | Position in the visible GPU list: NVML (PCI bus) order after `CUDA_VISIBLE_DEVICES` filtering and MIG expansion. Matches the CUDA device ordinal only when CUDA enumerates in the same order (e.g. `CUDA_DEVICE_ORDER=PCI_BUS_ID`) |
+| `id` | `unsigned int` | Position in the visible GPU list: the order of the `CUDA_VISIBLE_DEVICES` entries when set, otherwise NVML (PCI bus) order, after MIG expansion. Matches the CUDA device ordinal only when CUDA enumerates in the same order (e.g. `CUDA_DEVICE_ORDER=PCI_BUS_ID`) |
 | `name` | `string` | Device name (e.g., "NVIDIA A100") |
 | `pci_bus_id` | `string` | PCIe bus address |
 | `uuid` | `string` | Unique GPU identifier |
