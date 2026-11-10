@@ -31,14 +31,15 @@ namespace memory {
  * @brief Disk-resident allocation containing per-column metadata and a file path.
  *
  * Describes a table serialized to a single file on disk: the file path, the per-column
- * buffer-layout metadata, and the total data size. The column_metadata descriptors are the
- * same generic layout descriptors used for in-memory column buffers, enabling straightforward
- * conversion between tiers.
+ * buffer-layout metadata, and the size of the file's data region (including alignment padding).
+ * The column_metadata descriptors use the same generic type as in-memory column buffers, but
+ * their null_mask_offset and data_offset fields are byte offsets into the file, aligned to
+ * 4 KiB (DISK_FILE_ALIGNMENT); converters recompute offsets when moving data to another tier.
  */
 struct disk_table_allocation {
-  std::string file_path;                 ///< Absolute path to the batch file on disk
+  std::string file_path;                 ///< Path to the batch file on disk
   std::vector<column_metadata> columns;  ///< Per-column metadata (reuses existing column_metadata)
-  std::size_t data_size;                 ///< Total bytes of data written to the file
+  std::size_t data_size;                 ///< File data extent in bytes, including alignment padding
 
   disk_table_allocation(std::string path, std::vector<column_metadata> cols, std::size_t data_sz)
     : file_path(std::move(path)), columns(std::move(cols)), data_size(data_sz)
@@ -47,12 +48,16 @@ struct disk_table_allocation {
 };
 
 /**
- * @brief Generate a unique file path under the given base directory.
+ * @brief Create a uniquely named empty file under the given base directory.
  *
- * Thread-safe via atomic counter. Returns e.g. "{base_path}/batch_42.cucascade".
+ * Uses mkstemps to atomically create "{base_path}/batch_XXXXXX.cucascade", where XXXXXX is
+ * replaced by a unique suffix, so concurrent callers (including other processes sharing the
+ * same directory) never receive the same path. The file is created and closed; the caller
+ * owns it and is responsible for removing it.
  *
  * @param base_path The directory under which the file will be created.
- * @return A unique file path string.
+ * @return The path of the created file.
+ * @throws std::runtime_error if the file cannot be created.
  */
 std::string generate_disk_file_path(std::string_view base_path);
 

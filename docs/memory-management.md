@@ -83,9 +83,10 @@ memory_space gpu_space(gpu_memory_space_config{
 
 Each memory space holds:
 
-- **Default allocator** (`rmm::mr::device_memory_resource*`) -- the underlying memory resource
+- **Default allocator** (`cuda::mr::any_resource<cuda::mr::device_accessible>`) -- the underlying memory resource
 - **Reservation allocator** (variant of GPU/HOST/DISK types) -- wraps the default allocator with reservation tracking
-- **Stream pool** (`exclusive_stream_pool`) -- pre-allocated CUDA streams for async operations
+- **Stream pool** (`rmm::cuda_stream_pool`, GPU spaces only) -- pre-allocated CUDA streams for async operations
+- **I/O backend** (`shared_ptr<idisk_io_backend>`, DISK spaces only) -- reads and writes the tier's files
 - **Notification channel** (`shared_ptr<notification_channel>`) -- signals when reservations are freed
 - **Thresholds** -- capacity, reservation limit, downgrade trigger, downgrade stop
 
@@ -93,12 +94,13 @@ Key methods:
 
 | Method | Description |
 |--------|-------------|
-| `make_reservation(size)` | Create exact-size reservation, blocks if at limit |
+| `make_reservation(size)` | Reserve `size` bytes, blocking until a reservation in this space is released; returns `nullptr` on shutdown, or a possibly smaller `make_reservation_upto(size)` result when no reservations remain to wait for |
 | `make_reservation_or_null(size)` | Create reservation or return null if unavailable |
 | `make_reservation_upto(size)` | Create reservation for as much as available (up to `size`) |
-| `acquire_stream()` | Borrow a CUDA stream from the pool |
-| `should_downgrade_memory()` | True if usage exceeds downgrade trigger threshold |
-| `should_stop_downgrading_memory()` | True if usage is below downgrade stop threshold |
+| `acquire_stream()` | Get a CUDA stream from the pool (GPU only; throws otherwise) |
+| `get_io_backend()` | The DISK space's `idisk_io_backend` (DISK only; throws otherwise) |
+| `should_downgrade_memory()` | True if `reservation_limit - get_available_memory()` is at least the downgrade trigger threshold |
+| `should_stop_downgrading_memory()` | True if `reservation_limit - get_available_memory()` is at most the downgrade stop threshold |
 | `get_available_memory()` | Remaining allocatable memory |
 
 ---
@@ -107,7 +109,7 @@ Key methods:
 
 ### Requesting Reservations
 
-All reservations flow through `memory_reservation_manager::request_reservation()`, which uses the **Strategy pattern** to select a target memory space:
+`memory_reservation_manager::request_reservation()` selects a target memory space using the **Strategy pattern** (reservations can also be made directly on a `memory_space`):
 
 ```cpp
 auto manager = memory_reservation_manager(configs);
@@ -121,13 +123,11 @@ auto res = manager.request_reservation(specific_memory_space(Tier::HOST, 0), 2UL
 // Strategy 3: Try GPU first, fall back to HOST
 auto res = manager.request_reservation(
     any_memory_space_in_tiers({Tier::GPU, Tier::HOST}), 512ULL << 20);
-
-// Strategy 4: Downgrade from GPU to HOST
-auto res = manager.request_reservation(
-    any_memory_space_to_downgrade(gpu_space_id, Tier::HOST), data_size);
 ```
 
-If no space can satisfy the request, the manager waits on a condition variable until a reservation is released somewhere in the system.
+Most strategies probe every candidate with the non-blocking `make_reservation_or_null()` first. If none can reserve right away, or if the strategy is strongly ordered (`specific_memory_space`, `any_memory_space_in_tier_with_preference`), the manager calls the blocking `memory_space::make_reservation()` on the first candidate (later candidates are reached only if an earlier one is shut down). It waits on that space's `notification_channel` until a reservation in the same space is released; a reservation released in a different memory space does not wake it.
+
+`any_memory_space_to_downgrade` and `any_memory_space_to_upgrade` are currently stubs that return no candidates, so `request_reservation()` with either of them never returns. Likewise, after `shutdown()` a request that cannot be satisfied immediately never returns: `memory_space::make_reservation()` returns `nullptr` instead of waiting, and `request_reservation()` then waits on a condition variable that is never signalled.
 
 ### Reserved Arenas
 
@@ -144,16 +144,16 @@ Each tier has its own `reserved_arena` subclass:
 When an allocation within a stream exceeds its reservation, a `reservation_limit_policy` decides what happens:
 
 ```cpp
-// Default: throw on over-reservation
-auto policy = std::make_unique<fail_reservation_limit_policy>();
-
-// Soft limits: allow over-reservation silently
+// Default (make_default_reservation_limit_policy()): allow over-reservation silently
 auto policy = std::make_unique<ignore_reservation_limit_policy>();
 
-// Auto-grow: increase reservation by 1.25x
+// Strict limits: throw on over-reservation
+auto policy = std::make_unique<fail_reservation_limit_policy>();
+
+// Auto-grow: grow the reservation by the shortfall times padding_factor
 auto policy = std::make_unique<increase_reservation_limit_policy>(
     1.25,   // padding_factor
-    false   // allow_beyond_limit
+    false   // allow_beyond_limit (currently ignored: growth is always bounded by the reservation limit)
 );
 ```
 
@@ -172,7 +172,7 @@ auto policy = std::make_unique<increase_reservation_limit_policy>(
 3. RELEASE    reservation goes out of scope (RAII)
                  └─> arena destructor frees reserved bytes
                  └─> notification_channel signals waiters
-                 └─> blocked request_reservation() calls unblock
+                 └─> blocked memory_space::make_reservation() calls retry
 ```
 
 ---
@@ -181,7 +181,7 @@ auto policy = std::make_unique<increase_reservation_limit_policy>(
 
 **File**: `include/cucascade/memory/reservation_aware_resource_adaptor.hpp`
 
-The `reservation_aware_resource_adaptor` wraps an RMM `device_memory_resource` (typically `cuda_async_memory_resource`) and adds:
+The `reservation_aware_resource_adaptor` wraps an upstream `rmm::device_async_resource_ref` (by default an `rmm::mr::cuda_async_memory_resource`) and adds:
 
 1. **Global allocation tracking** -- total allocated bytes across all streams
 2. **Per-stream reservation enforcement** -- each stream has its own reservation and policy
@@ -268,7 +268,7 @@ Each tracked stream has a `stream_ordered_tracker_state` containing:
 ```mermaid
 flowchart TD
     A[do_allocate called] --> B{Stream tracked?}
-    B -->|No| C[Allocate unmanaged from upstream]
+    B -->|No| K
     B -->|Yes| D[Get tracker_state for stream]
     D --> E{Allocation within reservation?}
     E -->|Yes| F[Track bytes in arena counter]
@@ -276,8 +276,9 @@ flowchart TD
     G --> H{Policy action}
     H -->|Fail| I[Throw out_of_memory]
     H -->|Ignore| F
-    H -->|Increase| J[Grow reservation by 1.25x]
-    J --> F
+    H -->|Increase| J[Grow by shortfall x padding_factor, else by shortfall]
+    J -->|Grown| F
+    J -->|Cannot grow| I
     F --> K[Allocate from upstream RMM resource]
     K --> L{Success?}
     L -->|Yes| M[Update global counters, return ptr]
@@ -292,15 +293,23 @@ flowchart TD
 The `oom_handling_policy` interface provides a hook for custom recovery:
 
 ```cpp
-struct oom_handling_policy {
+class oom_handling_policy {
+ public:
     using RetryFunc = std::function<void*(std::size_t, ::cuda::stream_ref)>;
 
+    // Non-virtual; forwards to do_handle_oom()
     void* handle_oom(std::size_t bytes, ::cuda::stream_ref stream,
                      std::exception_ptr eptr, RetryFunc retry_function);
+
+    virtual std::string get_policy_name() const noexcept = 0;
+
+ protected:
+    virtual void* do_handle_oom(std::size_t bytes, ::cuda::stream_ref stream,
+                                std::exception_ptr eptr, RetryFunc retry_function) = 0;
 };
 ```
 
-The default `throw_on_oom_policy` simply rethrows the exception. Custom policies could spill data to a lower tier and retry.
+Custom policies override `do_handle_oom()` and `get_policy_name()`. The default `throw_on_oom_policy` simply rethrows the exception. Custom policies could spill data to a lower tier and retry.
 
 cuCascade also provides a custom exception `cucascade_out_of_memory` (extending `rmm::out_of_memory`) that includes `requested_bytes` and `global_usage` for diagnostics.
 
@@ -317,7 +326,7 @@ The `fixed_size_host_memory_resource` manages pinned host memory using fixed-siz
 - All allocations are in fixed-size blocks (default: **1 MB**)
 - Blocks are pre-allocated in pools from a NUMA-pinned upstream allocator
 - A free list tracks available blocks
-- Allocations that need more than one block use `multiple_blocks_allocation`
+- All allocations go through `allocate_multiple_blocks()`, which returns a RAII `multiple_blocks_allocation`; the plain `allocate()` throws `rmm::logic_error`
 
 ```
 Pool 0: [block][block][block]...[block]  (128 blocks = 128 MB)
@@ -366,7 +375,11 @@ The disk tier uses `disk_access_limiter` for **reservation tracking only** -- it
 - `disk_reserved_arena` stores a mount path (base filename) for the reservation
 - No `grow_by()` or `shrink_to_fit()` support (reservations are fixed-size)
 - Uses `null_device_memory_resource` as the "allocator" (returns `nullptr`)
-- Actual file I/O is handled by the application layer
+- File I/O goes through the DISK `memory_space`'s `idisk_io_backend` (`get_io_backend()`). Spaces
+  created by `memory_reservation_manager` always use the pipeline backend; a different backend can
+  be chosen only by constructing a `memory_space` directly with
+  `memory_space(disk_memory_space_config, shared_ptr<idisk_io_backend>)`. The built-in
+  GPU/HOST <-> DISK converters use it to write and read files under the space's mount path.
 
 ---
 
@@ -376,9 +389,19 @@ Each memory space has configurable thresholds that control when data should move
 
 ```cpp
 gpu_memory_space_config config;
-config.downgrade_trigger_fraction = 0.85;  // Start downgrading at 85% usage
-config.downgrade_stop_fraction = 0.65;     // Stop downgrading at 65% usage
+config.downgrade_trigger_fraction = 0.85;
+config.downgrade_stop_fraction = 0.65;
 ```
+
+Both fractions are multiplied by `memory_capacity` and compared against
+`reservation_limit - get_available_memory()`, where `reservation_limit` is
+`reservation_limit_fraction * memory_capacity` and `get_available_memory()` is `memory_capacity`
+minus the bytes reserved or allocated in the space. `should_downgrade_memory()` is true when that
+value is at least `downgrade_trigger_fraction * memory_capacity`, and
+`should_stop_downgrading_memory()` is true when it is at most
+`downgrade_stop_fraction * memory_capacity`. Because the value equals the bytes in use minus
+`(1 - reservation_limit_fraction) * memory_capacity`, both thresholds apply to usage offset by that
+amount, not to raw usage.
 
 The application queries these thresholds:
 
@@ -393,7 +416,7 @@ if (!gpu_space.should_stop_downgrading_memory()) {
 }
 ```
 
-The gap between trigger (85%) and stop (65%) creates a **hysteresis band** that prevents thrashing -- data isn't immediately moved back when usage briefly drops below the trigger.
+The gap between the trigger and stop thresholds creates a **hysteresis band** that prevents thrashing -- data isn't immediately moved back when usage briefly drops below the trigger.
 
 ---
 
@@ -404,37 +427,44 @@ The gap between trigger (85%) and stop (65%) creates a **hysteresis band** that 
 The `notification_channel` enables efficient waiting for memory to become available:
 
 ```
-reservation_aware_resource_adaptor          memory_reservation_manager
+tier allocator (GPU/HOST/DISK)              memory_space
          |                                            |
          | reserve() creates arena with               |
-         | event_notifier attached                     |
+         | event_notifier attached                    |
          |                                            |
-         | ... time passes ...                        | request_reservation()
-         |                                            | blocks on condition_variable
+         | ... time passes ...                        | make_reservation()
+         |                                            | blocks in notification_channel::wait()
          | reservation released                       |
          | -> arena destructor                        |
-         | -> event_notifier::~event_notifier()       |
-         | -> notification_channel::notify()           |
-         |                                  --------> | condition_variable wakes up
+         | -> notify_on_exit::~notify_on_exit()       |
+         | -> event_notifier::post()                  |
+         | -> notification_channel::notify()          |
+         |                                  --------> | wait() returns NOTIFIED
          |                                            | retries reservation request
 ```
 
 Key types:
 - `notification_channel` -- shared channel with mutex/CV, supports `wait()` and `shutdown()`
-- `event_notifier` -- lightweight handle that calls `notify()` on the channel when destroyed
-- `notify_on_exit` -- RAII wrapper that invokes the notifier in its destructor
-- `wait_status` -- `IDLE` (spurious), `NOTIFIED` (reservation freed), `SHUTDOWN` (system stopping)
+- `event_notifier` -- lightweight handle whose `post()` calls `notify()` on the channel; it counts as an active notifier until destroyed
+- `notify_on_exit` -- RAII wrapper that calls the notifier's `post()` in its destructor
+- `wait_status` -- `IDLE` (no active notifiers left), `NOTIFIED` (reservation freed), `SHUTDOWN` (system stopping)
 
 ---
 
 ## Stream Pool
 
+Each GPU `memory_space` owns an `rmm::cuda_stream_pool` of **16 non-blocking streams**.
+`memory_space::acquire_stream()` returns a `cuda::stream_ref` from that pool. The streams are
+shared, not lent exclusively, and nothing is returned to the pool. HOST and DISK spaces have no
+stream pool, and `acquire_stream()` throws for them.
+
 **File**: `include/cucascade/memory/stream_pool.hpp`
 
-The `exclusive_stream_pool` pre-allocates CUDA streams and lends them via RAII `borrowed_stream` handles:
+For exclusive use, the standalone `exclusive_stream_pool` pre-allocates CUDA streams (default:
+16) and lends them via RAII `borrowed_stream` handles. `memory_space` does not use it:
 
 ```cpp
-auto stream = pool.acquire_stream(stream_acquire_policy::BLOCK);
+auto stream = pool.acquire_stream(exclusive_stream_pool::stream_acquire_policy::BLOCK);
 // Use stream for GPU operations
 // stream auto-returned to pool when handle goes out of scope
 ```
@@ -443,8 +473,6 @@ auto stream = pool.acquire_stream(stream_acquire_policy::BLOCK);
 |--------|----------|
 | `BLOCK` | Wait on condition variable until a stream is available |
 | `GROW` | Create a new stream if the pool is empty |
-
-Default pool size: **16 streams** per memory space.
 
 ---
 
@@ -461,11 +489,13 @@ Default pool size: **16 streams** per memory space.
 | `include/cucascade/memory/fixed_size_host_memory_resource.hpp` | Block-based pinned host allocator |
 | `include/cucascade/memory/disk_access_limiter.hpp` | Disk tier reservation tracker |
 | `include/cucascade/memory/notification_channel.hpp` | Cross-reservation signaling |
-| `include/cucascade/memory/stream_pool.hpp` | CUDA stream pool with RAII borrowing |
+| `include/cucascade/memory/stream_pool.hpp` | `exclusive_stream_pool` with RAII borrowing |
 | `include/cucascade/memory/oom_handling_policy.hpp` | OOM handling strategies |
 | `include/cucascade/memory/error.hpp` | `MemoryError` enum, `cucascade_out_of_memory` exception |
 | `include/cucascade/memory/numa_region_pinned_host_allocator.hpp` | NUMA-aware pinned host allocation |
-| `include/cucascade/memory/host_table.hpp` | `host_table_allocation` + `column_metadata` for direct-copy host representations |
-| `include/cucascade/memory/host_table_packed.hpp` | `host_table_packed_allocation` for packed (cudf::pack) host representations |
+| `include/cucascade/memory/column_metadata.hpp` | `column_metadata` shared by host and disk table layouts |
+| `include/cucascade/cudf/host_table.hpp` | `host_table_allocation` for direct-copy host representations |
+| `include/cucascade/cudf/host_table_packed.hpp` | `host_table_packed_allocation` for packed (cudf::pack) host representations |
 | `include/cucascade/memory/null_device_memory_resource.hpp` | No-op resource for disk tier |
+| `include/cucascade/data/disk_io_backend.hpp` | `idisk_io_backend` interface used by DISK memory spaces |
 | `include/cucascade/utils/atomics.hpp` | `atomic_peak_tracker`, `atomic_bounded_counter` |
