@@ -38,7 +38,12 @@ struct notification_channel : std::enable_shared_from_this<notification_channel>
     std::shared_ptr<notification_channel> _channel;
   };
 
-  enum class wait_status { IDLE, NOTIFIED, SHUTDOWN };
+  /// @brief Why scoped_waiter::wait() returned.
+  enum class wait_status {
+    IDLE,      ///< No notifier is active, so no notification can arrive
+    NOTIFIED,  ///< A notifier posted while this waiter was at the head of the list
+    SHUTDOWN   ///< The channel was shut down
+  };
 
   /**
    * @brief RAII registration in the channel's FIFO wait list.
@@ -89,6 +94,7 @@ struct notification_channel : std::enable_shared_from_this<notification_channel>
 
   std::unique_ptr<event_notifier> get_notifier();
 
+  /// @brief Stop the channel; every current and future wait() returns SHUTDOWN.
   void shutdown();
 
  private:
