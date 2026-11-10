@@ -652,6 +652,40 @@ std::size_t fs_cache::generation_count(std::string_view object_path) const noexc
     std::ranges::count_if(it->second, [](auto const& weak) { return !weak.expired(); }));
 }
 
+fs_cache::object_residency fs_cache::residency(std::string_view object_path) const
+{
+  // The family is copied under the map lock and inspected after it: dropping the last
+  // reference to a retired generation runs its deleter, which must not run under the map.
+  std::vector<std::shared_ptr<cache_generation>> family;
+  {
+    std::shared_lock lk(_map_mtx);
+    auto const it = _generations_by_path.find(object_path);
+    if (it == _generations_by_path.end()) { return {}; }
+    for (auto const& weak : it->second) {
+      family.push_back(weak.lock());
+    }
+  }
+  std::shared_ptr<cache_generation> current;
+  for (auto& generation : family) {
+    if (generation && !generation->retired.load(std::memory_order_acquire)) {
+      current = std::move(generation);
+    }
+  }
+  if (!current) { return {}; }
+
+  object_residency out{0, current->file_size};
+  std::shared_lock lock(current->mtx);
+  for (std::size_t slot = 0; slot < current->slots.size(); ++slot) {
+    auto const* c = current->slots[slot];
+    if (c == nullptr) { continue; }
+    auto const state = c->state.get_state();
+    if (state < chunk_state::allocated || state == chunk_state::evicting) { continue; }
+    out.resident_bytes +=
+      std::min(current->chunk_size, current->file_size - slot * current->chunk_size);
+  }
+  return out;
+}
+
 std::size_t fs_cache::retired_generation_count() const noexcept
 {
   std::shared_lock lk(_map_mtx);

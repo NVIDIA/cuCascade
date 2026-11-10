@@ -534,6 +534,19 @@ class fs_cache {
   /// one in the map plus any retired one some operation still owns.
   [[nodiscard]] std::size_t generation_count(std::string_view object_path) const noexcept;
 
+  /// How much of one object the cache holds.
+  struct object_residency {
+    std::size_t resident_bytes = 0;  ///< bytes of chunks that own a staging buffer
+    std::size_t object_bytes   = 0;  ///< the object's size; 0 when the cache has not seen it
+  };
+
+  /// What the cache holds of the object at @p object_path in its current
+  /// generation. Takes a path rather than an @c io_object so it can be asked
+  /// before the file is opened. Read-only: subscribes, pins and reorders
+  /// nothing. Chunks count whole, so this is an estimate meant for choosing
+  /// what to read first.
+  [[nodiscard]] object_residency residency(std::string_view object_path) const;
+
   /// Alive generations that are no longer in the map, over all paths.  Zero
   /// means every retired generation has been reclaimed.
   [[nodiscard]] std::size_t retired_generation_count() const noexcept;
