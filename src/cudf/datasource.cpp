@@ -22,6 +22,7 @@
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/details/std_future.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -42,28 +43,6 @@ using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
 struct io_read_to_gpu_message {
   static constexpr char const* message{"io:read_to_gpu"};
 };
-
-// Bridge a semi_future into a real (promise-backed) std::future. Promise,
-// std::future, and the exact type-erased terminal are all built before
-// producer() may publish IO, so callback installation is a move-only,
-// non-allocating handoff.
-template <typename Producer>
-std::future<size_t> bridge_semi_to_std(Producer&& producer)
-{
-  auto p              = std::make_shared<std::promise<size_t>>();
-  auto fut            = p->get_future();
-  using terminal_type = exec::invocable<void(exec::try_t<size_t>&&) &&>;
-  terminal_type terminal{[p = std::move(p)](exec::try_t<size_t>&& t) mutable {
-    if (t.has_exception()) {
-      p->set_exception(std::move(t).exception());
-    } else {
-      p->set_value(std::move(t).value());
-    }
-  }};
-  auto sf = std::forward<Producer>(producer)();
-  std::move(sf).install_callback(std::move(terminal));
-  return fut;
-}
 
 }  // namespace
 
@@ -218,7 +197,8 @@ std::unique_ptr<datasource> datasource::duplicate() const
 }
 
 void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
-                         std::optional<int> dev_id)
+                         std::optional<int> dev_id,
+                         std::uint8_t eviction_priority)
 {
   auto* cache = _io_ctx->cache();
   if (cache == nullptr || !_io_ctx->can_use_fs_cache()) { return; }
@@ -247,7 +227,8 @@ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges
   // Hand the ranges to the cache.  It returns an empty handle when it didn't
   // enqueue any new work (dormant cache, every range coalesced with an existing
   // entry); we only stash a real handle.
-  auto handle = cache->initiate_prefetching_request(*_io_object, converted, dev_id);
+  auto handle =
+    cache->initiate_prefetching_request(*_io_object, converted, dev_id, eviction_priority);
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 

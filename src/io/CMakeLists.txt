@@ -21,6 +21,9 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/object_identity.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/advising_reader.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/column_admission.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/scan_cache.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
