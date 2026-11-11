@@ -21,9 +21,9 @@
  * @brief Kernel TLS installed by cuCascade from exported keys, and its control records
  * (ktls.hpp; docs/io/rest-uring-design.md section 4.3).
  *
- * Other designs let OpenSSL push the keys (SSL_OP_ENABLE_KTLS through the socket BIO) and replayed the
- * drained control records into OpenSSL (replay BIO).  conda-forge's OpenSSL is built
- * with OPENSSL_NO_KTLS, so here the same kernel state is produced by hand:
+ * Other designs let OpenSSL push the keys (SSL_OP_ENABLE_KTLS through the socket BIO) and replayed
+ * the drained control records into OpenSSL (replay BIO).  conda-forge's OpenSSL is built with
+ * OPENSSL_NO_KTLS, so here the same kernel state is produced by hand:
  *  - `TCP_ULP "tls"`, then `TLS_TX` and `TLS_RX` with `tls12_crypto_info_aes_gcm_{128,256}`:
  *    salt = the 4-byte implicit part of the nonce (TLS 1.3: the first 4 bytes of the 12-byte
  *    write IV; TLS 1.2: the client/server write IV of RFC 5288), iv = the remaining 8 bytes of
@@ -43,10 +43,12 @@
  * cannot be undone).  TLS 1.3 kTLS RX needs Linux 6.0, so a TLS 1.3 install on an older kernel
  * is refused before the socket is touched (the automatic policy at TLS 1.2 there).
  *
- * Control records (handled without OpenSSL): NewSessionTicket skipped; KeyUpdate re-keys
+ * Control records (handled without OpenSSL): NewSessionTicket skipped, also when it spans
+ * records (every TLS 1.3 connection keeps the handshake message framing); KeyUpdate re-keys
  * RX (`HKDF-Expand-Label(secret, "traffic upd")`, new `TLS_RX`, Linux >= 6.14 pauses RX with
  * -EKEYEXPIRED until then) and, when requested, owes our KeyUpdate(update_not_requested), sent as
- * a kTLS handshake record (`TLS_SET_RECORD_TYPE` cmsg) and followed by the TX re-key.
+ * a kTLS handshake record (`TLS_SET_RECORD_TYPE` cmsg) and followed by the TX re-key.  On older
+ * kernels a KeyUpdate ends the connection.
  */
 
 #include "io/tls/ktls.hpp"
@@ -265,7 +267,10 @@ install_result install(int fd,
 
 class rekey_state {
  public:
-  rekey_state(suite_info s, tls::kdf const& k) noexcept : suite(s), kdf(&k) {}
+  rekey_state(suite_info s, tls::kdf const& k, bool rekey) noexcept
+    : suite(s), kdf(&k), can_rekey(rekey)
+  {
+  }
   ~rekey_state()
   {
     OPENSSL_cleanse(rx_secret.data(), rx_secret.size());
@@ -276,6 +281,9 @@ class rekey_state {
 
   suite_info suite;
   tls::kdf const* kdf;
+  /// The kernel takes a new TLS_RX (Linux >= 6.14) and the secrets are held: KeyUpdates are
+  /// followed.  Otherwise the state only frames handshake messages and a KeyUpdate fails.
+  bool can_rekey;
   std::array<std::uint8_t, max_secret_bytes> rx_secret{};  ///< server application secret N
   std::array<std::uint8_t, max_secret_bytes> tx_secret{};  ///< client application secret N
   bool reply_owed{false};  ///< KeyUpdate(update_requested) received; coalesced
@@ -294,18 +302,20 @@ rekey_state_ptr make_rekey_state(traffic_keys const& rx,
                                  tls::kdf const& kdf) noexcept
 {
   if (rx.version != protocol_version::tls1_3 || tx.version != protocol_version::tls1_3) {
-    return nullptr;  // TLS 1.2 has no KeyUpdate
+    return nullptr;  // TLS 1.2: no post-handshake messages to follow (HelloRequest is ignored)
   }
-  if (!probe().tls13_rekey) { return nullptr; }  // a KeyUpdate is then a protocol error
   suite_info const s = suite_of(rx.version, rx.cipher_suite);
-  if (!s.supported() || rx.cipher_suite != tx.cipher_suite || rx.secret_len != s.hash_len ||
-      tx.secret_len != s.hash_len) {
-    return nullptr;
-  }
-  rekey_state_ptr st(new (std::nothrow) rekey_state(s, kdf));
+  if (!s.supported() || rx.cipher_suite != tx.cipher_suite) { return nullptr; }
+  // Every TLS 1.3 connection keeps the handshake framing (a ticket may span records); the
+  // secrets only when the kernel can re-key, else a KeyUpdate is a protocol error.
+  bool const rekey =
+    probe().tls13_rekey && rx.secret_len == s.hash_len && tx.secret_len == s.hash_len;
+  rekey_state_ptr st(new (std::nothrow) rekey_state(s, kdf, rekey));
   if (!st) { return nullptr; }
-  std::copy_n(rx.secret.begin(), s.hash_len, st->rx_secret.begin());
-  std::copy_n(tx.secret.begin(), s.hash_len, st->tx_secret.begin());
+  if (rekey) {
+    std::copy_n(rx.secret.begin(), s.hash_len, st->rx_secret.begin());
+    std::copy_n(tx.secret.begin(), s.hash_len, st->tx_secret.begin());
+  }
   return st;
 }
 
@@ -342,8 +352,8 @@ std::error_code next_keys(rekey_state& st,
                             std::span<std::uint8_t, aead_nonce_bytes>(out.iv));
 }
 
-/// Handshake records without re-key state: TLS 1.2 (HelloRequest ignored) or TLS 1.3 on a kernel
-/// that cannot re-key (tickets skipped when they fit the record; a KeyUpdate is fatal).
+/// Handshake records without state: TLS 1.2 (HelloRequest ignored), or TLS 1.3 when the state
+/// could not be allocated (tickets skipped when they fit the record).  A KeyUpdate is fatal.
 control_action stateless_handshake(std::uint8_t const* p, std::size_t n, std::error_code& ec)
 {
   if (n == 0) { return fail(ec); }
@@ -369,7 +379,7 @@ control_action stateless_handshake(std::uint8_t const* p, std::size_t n, std::er
   return control_action::consumed;
 }
 
-/// TLS 1.3 post-handshake messages with re-key state.
+/// TLS 1.3 post-handshake messages: framed across records; KeyUpdate needs `can_rekey`.
 control_action stateful_handshake(
   int fd, rekey_state& st, std::uint8_t const* p, std::size_t n, std::error_code& ec)
 {
@@ -388,7 +398,8 @@ control_action stateful_handshake(
       if (t == hs_new_session_ticket) {
         if (m == 0 || m > max_handshake_message) { return fail(ec); }
       } else if (t == hs_key_update) {
-        if (m != 1) { return fail(ec); }
+        // Without a re-key-capable kernel (< 6.14) a KeyUpdate cannot be followed: reconnect.
+        if (m != 1 || !st.can_rekey) { return fail(ec); }
       } else {
         return fail(ec);  // nothing else is legal post-handshake for a client
       }

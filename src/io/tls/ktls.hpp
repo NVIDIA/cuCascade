@@ -30,10 +30,10 @@
  * @file ktls.hpp
  * @brief Kernel TLS: cuCascade installs the keys itself and handles the control records.
  *
- * Other designs let OpenSSL install kTLS keys through its socket BIO and fed drained control records back
- * into OpenSSL (replay BIO).  That needs an OpenSSL built with kTLS, which conda-forge's is not
- * (`OPENSSL_NO_KTLS`), and ties kTLS to one library.  Here the keys come from
- * `tls::session::export_keys`, and this module installs them and follows the connection's
+ * Other designs let OpenSSL install kTLS keys through its socket BIO and fed drained control
+ * records back into OpenSSL (replay BIO).  That needs an OpenSSL built with kTLS, which
+ * conda-forge's is not (`OPENSSL_NO_KTLS`), and ties kTLS to one library.  Here the keys come
+ * from `tls::session::export_keys`, and this module installs them and follows the connection's
  * control records itself (docs/io/rest-uring-design.md section 4.3).
  *
  * Socket I/O here is limited to `setsockopt` and, for a KeyUpdate reply, one non-blocking
@@ -84,11 +84,12 @@ struct install_result {
                                      bool expect_no_pad) noexcept;
 
 /**
- * @brief TLS 1.3 state needed to follow KeyUpdates on a kTLS connection.
+ * @brief TLS 1.3 state needed to follow post-handshake messages on a kTLS connection.
  *
- * Holds both application traffic secrets (wiped on destruction).  Allocated separately so the
- * transport's kTLS stream stays small; only TLS 1.3 connections on a re-key-capable kernel have
- * one.
+ * The handshake message framing across records (a NewSessionTicket may span several) and, on a
+ * re-key-capable kernel, both application traffic secrets for KeyUpdates (wiped on
+ * destruction).  Allocated separately so the transport's kTLS stream stays small; every TLS 1.3
+ * connection has one.
  */
 class rekey_state;
 
@@ -98,11 +99,14 @@ struct rekey_state_deleter {
 using rekey_state_ptr = std::unique_ptr<rekey_state, rekey_state_deleter>;
 
 /**
- * @brief Keep what a later KeyUpdate needs.
+ * @brief Keep what later post-handshake messages need.
+ *
+ * On a kernel that cannot re-key (< 6.14) the state only frames handshake messages: tickets are
+ * skipped, and a KeyUpdate is a protocol error (the connection is replaced).
  *
  * @param kdf  the provider's KDF; must outlive the state
- * @return null for TLS 1.2 (no KeyUpdate), or when the kernel cannot re-key (a KeyUpdate is then
- *         a protocol error and the connection is replaced)
+ * @return null for TLS 1.2 (no post-handshake messages to follow), a suite kTLS does not serve,
+ *         or when out of memory
  */
 [[nodiscard]] rekey_state_ptr make_rekey_state(traffic_keys const& rx,
                                                traffic_keys const& tx,
@@ -127,12 +131,12 @@ enum class control_action : std::uint8_t {
  * TLS 1.3 handshake records carry NewSessionTicket (skipped) and KeyUpdate (RX re-keyed with
  * `HKDF-Expand-Label(secret, "traffic upd")`; a reply is owed when the peer requested one).  A
  * TLS 1.2 HelloRequest is ignored.  Alerts: close_notify is @c closed; any other alert fails.
- * A malformed record, application data, a KeyUpdate without @p state, or a KeyUpdate that does
- * not end its record fail.  The transport caps control records in a row (32) itself: TLS 1.2
- * connections have no state to count in.
+ * A malformed record, application data, a KeyUpdate on a kernel that cannot re-key (or without
+ * @p state), or a KeyUpdate that does not end its record fail.  The transport caps control
+ * records in a row (32) itself: TLS 1.2 connections have no state to count in.
  *
  * @param fd         the kTLS socket (for the RX re-key)
- * @param state      the connection's re-key state, or null
+ * @param state      the connection's state (@ref make_rekey_state), null for TLS 1.2
  * @param type       content type from `TLS_GET_RECORD_TYPE`
  * @param plaintext  the record's plaintext
  */

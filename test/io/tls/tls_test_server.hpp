@@ -71,7 +71,8 @@
  * threads block SIGPIPE for themselves, so a client that hangs up never kills the test process.
  * Record framing a peer may legally choose but an OpenSSL server does not by default is
  * produced on request: a TLS 1.2 Finished split across records
- * (`loopback_server::split_tls12_finished`).
+ * (`loopback_server::split_tls12_finished`), a TLS 1.3 ticket spanning records
+ * (`server_conn::new_session_ticket_spanning`).
  */
 namespace cucascade::test::tls {
 
@@ -220,6 +221,18 @@ inline std::size_t record_body_length(std::span<std::byte const> wire, std::size
 {
   return (std::to_integer<std::size_t>(wire[off + 3]) << 8) |
          std::to_integer<std::size_t>(wire[off + 4]);
+}
+
+/// Complete TLS records in @p wire (a trailing partial record is not counted).
+inline std::size_t count_records(std::span<std::byte const> wire)
+{
+  std::size_t n   = 0;
+  std::size_t off = 0;
+  while (wire.size() - off >= 5 && wire.size() - off - 5 >= record_body_length(wire, off)) {
+    off += 5 + record_body_length(wire, off);
+    ++n;
+  }
+  return n;
 }
 
 namespace detail {
@@ -492,6 +505,19 @@ class server_conn {
   bool new_session_ticket()
   {
     return SSL_new_session_ticket(_ssl) == 1 && SSL_do_handshake(_ssl) == 1 && flush();
+  }
+  /// Send one TLS 1.3 NewSessionTicket that spans records: @p app_data bytes of ticket app data
+  /// make it large, records of at most 512 bytes split it.  @return the records sent, 0 on error.
+  std::size_t new_session_ticket_spanning(std::size_t app_data = 4096)
+  {
+    std::vector<unsigned char> const data(app_data, 0x5A);
+    SSL_SESSION* const s = SSL_get_session(_ssl);
+    bool ok = s != nullptr && SSL_SESSION_set1_ticket_appdata(s, data.data(), data.size()) == 1;
+    ok      = ok && SSL_set_max_send_fragment(_ssl, 512) == 1;
+    ok      = ok && SSL_new_session_ticket(_ssl) == 1 && SSL_do_handshake(_ssl) == 1;
+    (void)SSL_set_max_send_fragment(_ssl, SSL3_RT_MAX_PLAIN_LENGTH);
+    std::vector<std::byte> const ct = take();
+    return ok && send_all(_fd, ct) ? count_records(ct) : 0;
   }
   /// Send close_notify.
   bool close_notify()
