@@ -467,6 +467,39 @@ TEST_CASE("sigv4_presigned_authorizer preserves HTTP endpoint ports", "[s3][auth
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
 }
 
+TEST_CASE("SigV4 authorizers drop the scheme's default endpoint port", "[s3][authorizer]")
+{
+  // The transport sends the URL authority without a default port, so the signed host must not
+  // carry one either; any other port stays.
+  struct endpoint_case {
+    char const* endpoint;
+    char const* host;
+  };
+  for (auto const [endpoint, host] :
+       {endpoint_case{"https://store.example:443", "store.example"},
+        endpoint_case{"http://store.example:80", "store.example"},
+        endpoint_case{"HTTPS://[::1]:443", "[::1]"},
+        endpoint_case{"http://store.example:443", "store.example:443"},
+        endpoint_case{"https://store.example:80", "store.example:80"},
+        endpoint_case{"https://store.example:4430", "store.example:4430"}}) {
+    INFO(endpoint);
+    std::string const scheme = std::string(endpoint).starts_with("http:") ? "http" : "https";
+    sigv4_presigned_authorizer presigned(example_static_credentials(), "us-east-1", endpoint);
+    auto const url =
+      presigned.authorize({"bucket", "key"}, request_method::GET, k_presign_timeout).url;
+    CHECK(starts_with(url, scheme + "://" + host + "/bucket/key?"));
+
+    sigv4_header_authorizer header(example_static_credentials(), "us-east-1", endpoint);
+    auto const req = header.authorize({"bucket", "key"}, request_method::GET, k_presign_timeout);
+    CHECK(req.url == scheme + "://" + host + "/bucket/key");
+    std::string signed_host;
+    for (auto const& [name, value] : req.headers) {
+      if (name == "Host") { signed_host = value; }
+    }
+    CHECK(signed_host == host);
+  }
+}
+
 TEST_CASE("sigv4_presigned_authorizer rejects malformed construction inputs", "[s3][authorizer]")
 {
   auto creds = example_static_credentials();

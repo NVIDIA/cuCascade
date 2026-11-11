@@ -778,7 +778,8 @@ TEST_CASE("net: the caller's Host is sent verbatim and once, in place of the URL
       for (auto const& [name, value] : req.headers) {
         if (name == "Host") { signed_host = value; }
       }
-      CHECK(signed_host == std::string(endpoint).substr(std::string(endpoint).find("//") + 2));
+      // An explicit default port is not part of the signed (or sent) authority.
+      CHECK(signed_host == "store.example");
       auto const lines = get(req.headers);
       REQUIRE(lines.size() == 1);
       CHECK(lines[0] == "Host: " + signed_host);
