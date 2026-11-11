@@ -1,6 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ * SPDX-License-Identifier: Apache-2.0 AND BSL-1.0
  *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +17,18 @@
  * limitations under the License.
  */
 
-// Response head parser.
+/*
+ * Portions of this file are derived from Boost.Beast (https://github.com/boostorg/beast):
+ *
+ * Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ *
+ * Distributed under the Boost Software License, Version 1.0. (See accompanying
+ * file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+ */
+
+// Response head parser. Framing and connection rules are ported from Boost.Beast
+// `boost/beast/http/impl/basic_parser.ipp` (`put`, `parse_start_line`, `parse_fields`,
+// `finish_header` for responses, `do_field`, `keep_alive`); see the notice above.
 
 #include "io/rest/http/response_parser.hpp"
 
@@ -36,7 +48,7 @@ namespace {
 
 using detail::rc;
 
-// Parser flags.
+// Parser flags (Beast `flag*`).
 constexpr std::uint16_t f_http11            = 1U << 0;
 constexpr std::uint16_t f_close             = 1U << 1;
 constexpr std::uint16_t f_keep_alive        = 1U << 2;
@@ -102,12 +114,12 @@ parse_status response_parser::parse_header_impl(std::span<char const> in,
   char const* const begin = in.data();
   char const* const end   = begin + in.size();
   char const* p           = begin;
-  char fold_buf[detail::max_obs_fold];  // obs-fold join space (cold)
+  char fold_buf[detail::max_obs_fold];  // obs-fold join space (cold; Beast keeps 4 KiB as well)
   parse_status result = parse_status::need_more;
 
   // The header limit window. Consuming n bytes lowers the remaining limit by n, so its end is
   // invariant within a call: compute it once (keeps the per-field critical path free of the
-  // byte accounting). Incomplete although the whole remaining limit is
+  // byte accounting). Beast `parse_fields`: incomplete although the whole remaining limit is
   // available => header_limit.
   std::size_t const limit_left  = _opts.header_limit - _header_bytes;
   bool const limited            = in.size() >= limit_left;
@@ -196,7 +208,7 @@ parse_status response_parser::parse_header_impl(std::span<char const> in,
   return result;
 }
 
-// Field handling (Connection, Content-Length, Transfer-Encoding) plus the S3 captures, for the
+// Beast `do_field` (Connection, Content-Length, Transfer-Encoding) plus the S3 captures, for the
 // fields `response_meta` decodes.
 bool response_parser::apply_field(known_field id,
                                   std::string_view value,
@@ -245,7 +257,7 @@ bool response_parser::apply_field(known_field id,
           return true;
         }
       }
-      // A comma list of equal values is allowed (RFC 9110 §8.6). Order: validate the whole
+      // A comma list of equal values is allowed (RFC 9110 §8.6). Beast order: validate the whole
       // list, then require every element to be a number equal to any value seen before.
       std::size_t tokens = 0;
       {
@@ -299,7 +311,7 @@ bool response_parser::apply_field(known_field id,
         return false;
       }
       _flags |= f_transfer_encoding;
-      // Token list: iteration stops at the first malformed element; the body is chunked
+      // Beast `token_list`: iteration stops at the first malformed element; the body is chunked
       // only if the first `chunked` token is also the last one.
       char const* it  = value.data();
       bool need_comma = false;
@@ -360,13 +372,13 @@ bool response_parser::apply_field(known_field id,
   return true;
 }
 
-// Finish-header handling plus `keep_alive()`. @return true for a skipped interim head.
+// Beast `finish_header` (response) plus `keep_alive()`. @return true for a skipped interim head.
 bool response_parser::finish_header(response_meta& meta) noexcept
 {
   unsigned const st = meta.status;
   if (st / 100 == 1 && st != 101) {
     // 1xx other than 101 is an interim response: skip it and parse the final head that follows
-    // in the same buffer.
+    // in the same buffer (Beast completes the parser here and needs a new one).
     if (_interim != UINT16_MAX) ++_interim;
     _state          = state::start_line;
     _flags          = 0;

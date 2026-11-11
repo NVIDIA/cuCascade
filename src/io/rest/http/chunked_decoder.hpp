@@ -1,6 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ * SPDX-License-Identifier: Apache-2.0 AND BSL-1.0
  *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,9 +17,19 @@
  * limitations under the License.
  */
 
+/*
+ * Portions of this file are derived from Boost.Beast (https://github.com/boostorg/beast):
+ *
+ * Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ *
+ * Distributed under the Boost Software License, Version 1.0. (See accompanying
+ * file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+ */
+
 /// @file chunked_decoder.hpp
 /// @brief `Transfer-Encoding: chunked` body decoder (cold path: error bodies, listings).
-/// Resume offset for partial chunk lines,
+/// Port of Beast `parse_chunk_header` / `parse_chunk_body` / trailer handling (see the notice
+/// above): resume offset for partial chunk lines,
 /// 8 KiB chunk-line cap (on the size and extensions before the CRLF, whether the line arrives
 /// whole or in pieces), full chunk-extension grammar, trailers parsed and ignored (RFC 9112
 /// §7.1.2: framing fields in a trailer must not affect the message).

@@ -1,6 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ * SPDX-License-Identifier: Apache-2.0 AND BSL-1.0
  *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,11 +17,22 @@
  * limitations under the License.
  */
 
+/*
+ * Portions of this file are derived from Boost.Beast (https://github.com/boostorg/beast):
+ *
+ * Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ *
+ * Distributed under the Boost Software License, Version 1.0. (See accompanying
+ * file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+ */
+
 /// @file response_parser.hpp
-/// @brief Header-only HTTP/1.1 response parser: RFC 9112 rules,
-/// concrete, allocation-free, stopping exactly at the body start.
-/// Use in the remote read: header RECV into the 16 KiB buffer,
-/// `parse_header`, leftover memcpy into the destination, then `consume_direct` per body RECV.
+/// @brief Header-only HTTP/1.1 response parser: Beast `basic_parser<false>` rules with
+/// `eager(false)`, concrete, allocation-free, stopping exactly at the body start.
+/// Algorithm and framing rules ported from Boost.Beast `boost/beast/http/impl/basic_parser.ipp`
+/// and `detail/basic_parser.ipp` (see the notice above). Use in the remote read: header RECV into
+/// the 16 KiB buffer, `parse_header`, leftover memcpy into the destination, then
+/// `consume_direct` per body RECV.
 
 #pragma once
 
@@ -37,7 +49,7 @@
 
 namespace cucascade::io::http {
 
-/// Header-only parser (concrete, no allocation). parse_header consumes
+/// Header-only parser (Beast basic_parser rules, concrete, no allocation). parse_header consumes
 /// complete lines; on `ok`, `consumed` == body offset; 1xx (except 101) are skipped internally.
 ///
 /// Incremental protocol: `consumed` counts the bytes of *this call's* `in` that the parser took
@@ -45,7 +57,7 @@ namespace cucascade::io::http {
 /// keeps `in[consumed, size)`, appends newly received bytes and calls again with that span. On
 /// `ok`, `in[consumed, size)` is body (or the next message for bodiless responses).
 ///
-/// Framing (RFC 9112 §6): Content-Length lists must agree;
+/// Framing (Beast `do_field` / `finish_header`, RFC 9112 §6): Content-Length lists must agree;
 /// Content-Length together with Transfer-Encoding is rejected in either order; `chunked` counts
 /// only as the final coding and only once; HEAD, 1xx, 204 and 304 have no body; otherwise the body
 /// runs to EOF and the connection is not reusable.
@@ -93,7 +105,7 @@ class response_parser {
   /// @return true when the head is complete and the body is absent or fully consumed
   /// (`framing::length`). Chunked and EOF-delimited bodies are finished by their consumer.
   [[nodiscard]] bool done() const noexcept { return _state == state::done; }
-  /// Prepare for the next exchange on the connection (the parser is reusable).
+  /// Prepare for the next exchange on the connection (the parser is reusable, unlike Beast's).
   void reset(parse_options opts = {}) noexcept { *this = response_parser(opts); }
 
   /// @return true once the final head has been parsed.

@@ -1,6 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ * SPDX-License-Identifier: Apache-2.0 AND BSL-1.0
  *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +16,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+/*
+ * Portions of this file are derived from Boost.Beast (https://github.com/boostorg/beast):
+ *
+ * Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ *
+ * Distributed under the Boost Software License, Version 1.0. (See accompanying
+ * file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+ */
+
+// Chunked body decoder. Ported from Boost.Beast `boost/beast/http/impl/basic_parser.ipp`
+// (`parse_chunk_header`, `parse_chunk_body`, trailer-field handling); see the notice above.
 
 #include "io/rest/http/chunked_decoder.hpp"
 
@@ -91,7 +104,7 @@ parse_status chunked_decoder::feed_impl(std::span<char const> in,
     switch (_state) {
       case state::size_line: {
         // chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF; the previous chunk's trailing
-        // CRLF is consumed together with the next size line.
+        // CRLF is consumed together with the next size line (Beast `flagExpectCRLF`).
         char const* q = p;
         if (_expect_crlf) {
           if (end - q < 2) {

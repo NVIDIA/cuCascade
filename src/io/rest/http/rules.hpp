@@ -1,6 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ * SPDX-License-Identifier: Apache-2.0 AND BSL-1.0
  *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +17,26 @@
  * limitations under the License.
  */
 
+/*
+ * Portions of this file are derived from Boost.Beast (https://github.com/boostorg/beast):
+ *
+ * Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ *
+ * Distributed under the Boost Software License, Version 1.0. (See accompanying
+ * file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+ */
+
 /// @file rules.hpp
 /// @brief RFC 9110/9112 grammar pieces shared by the response parser and the chunked decoder.
 ///
-/// Concrete functions
+/// Ported from Boost.Beast:
+/// `boost/beast/http/detail/basic_parser.ipp` (`parse_field`, `parse_token_to_eol`, `find_eol`,
+/// `parse_dec`, `parse_hex`, `parse_chunk_extensions`, status-line rules) and
+/// `boost/beast/http/detail/rfc7230.ipp` / `impl/rfc7230.ipp` (character tables, `token_list`,
+/// `opt_token_list`); see the notice above. Changes from Beast: concrete functions
 /// (no virtual callbacks), `std::error_code`-free internal results, 16-byte (SSE2) / 8-byte (SWAR)
 /// control-byte and field-name scans in place of the per-byte loops, a single-scan fast path for
-/// well-formed field lines that defers every other line to the exact path, and obs-fold handled
+/// well-formed field lines that defers every other line to the exact port, and obs-fold handled
 /// zero-copy (the raw folded span is joined into a stack buffer only when a folded value is used).
 
 #pragma once
@@ -45,11 +59,11 @@ namespace cucascade::io::http::detail {
 
 enum class rc : std::uint8_t { ok, need_more, error };
 
-/// Longest obs-folded value the parser joins; longer ones are a header-limit
-/// error.
+/// Longest obs-folded value the parser joins (Beast `max_obs_fold`); longer ones are a header-limit
+/// error, as in Beast.
 inline constexpr std::size_t max_obs_fold = 4096;
 
-/// Chunk-size lines (with extensions) longer than this are rejected.
+/// Chunk-size lines (with extensions) longer than this are rejected (Beast `parse_chunk_header`).
 inline constexpr std::size_t max_chunk_line = 8192;
 
 // ------------------------------------------------------------------------------------------------
@@ -252,7 +266,7 @@ inline char const* skip_common_name_chars(char const* p, char const* last) noexc
   return p;
 }
 
-/// Scan a reason phrase or field value up to CRLF. HTAB and obs-text
+/// Beast `parse_token_to_eol`: scan a reason phrase or field value up to CRLF. HTAB and obs-text
 /// are allowed; any other control byte is an error (`bad_char`); CR must be followed by LF.
 /// @param p [in,out] start; on `ok` one past the LF.
 /// @param token_last [out] on `ok`, the position of the CR.
@@ -285,7 +299,7 @@ inline rc scan_to_eol(char const*& p,
   }
 }
 
-/// One past the next CRLF in [p, last), or nullptr (need more, or
+/// Beast `find_eol`: one past the next CRLF in [p, last), or nullptr (need more, or
 /// `bad_line_ending` in `err` when a CR is followed by something other than LF).
 inline char const* find_eol(char const* p, char const* last, parse_error& err) noexcept
 {
@@ -300,7 +314,7 @@ inline char const* find_eol(char const* p, char const* last, parse_error& err) n
 }
 
 // ------------------------------------------------------------------------------------------------
-// Status line (response start line)
+// Status line (Beast `parse_version`, `parse_status`, `parse_reason`, response start line)
 
 /// status-line = HTTP-version SP 3DIGIT SP reason-phrase CRLF; only HTTP/1.0 and HTTP/1.1.
 inline rc parse_status_line(
@@ -339,7 +353,7 @@ inline rc parse_status_line(
 }
 
 // ------------------------------------------------------------------------------------------------
-// Fields
+// Fields (Beast `parse_field`)
 
 /// One parsed `name: value` line. When `folded`, [`first`, `last`) spans several physical lines
 /// (obs-fold) and must be joined with `join_folded`; otherwise it is the trimmed value.
@@ -351,8 +365,8 @@ struct raw_field {
 };
 
 /// header-field = field-name ":" OWS field-value OWS, with obs-fold (CRLF 1*(SP/HTAB)).
-/// Parses a field line (every error case, folding, need_more points).
-/// Needs one byte past the line's CRLF to rule out a continuation line.
+/// Exact port of Beast `parse_field` (every error case, folding, need_more points).
+/// Needs one byte past the line's CRLF to rule out a continuation line (as Beast does).
 /// @param p [in,out] line start; on `ok` the start of the next line.
 inline rc parse_field_exact(char const*& p,
                             char const* last,
@@ -436,7 +450,7 @@ inline rc parse_field(char const*& p, char const* last, raw_field& out, parse_er
 }
 
 /// Join an obs-folded value: non-empty physical segments, each trimmed, separated by one SP
-/// @return false when it exceeds `max_obs_fold`.
+/// (Beast's `char_buffer<max_obs_fold>` result). @return false when it exceeds `max_obs_fold`.
 inline bool join_folded(char const* first,
                         char const* last,
                         char (&buf)[max_obs_fold],
@@ -469,9 +483,9 @@ inline bool join_folded(char const* first,
 }
 
 // ------------------------------------------------------------------------------------------------
-// Lists and numbers (rfc7230 `opt_token_list`, `token_list`)
+// Lists and numbers (rfc7230 `opt_token_list`, `token_list`; Beast `parse_dec`, `parse_hex`)
 
-/// `#token` list iteration with (empty elements allowed,
+/// `#token` list iteration with Beast's `opt_token_list_policy` semantics (empty elements allowed,
 /// tokens must be comma separated).
 /// @return 1 with `tok` set, 0 at the end, -1 on a malformed list.
 inline int next_opt_token(char const*& it,
@@ -498,7 +512,7 @@ inline int next_opt_token(char const*& it,
   }
 }
 
-/// 1*DIGIT into a uint64 with overflow detection.
+/// Beast `parse_dec`: 1*DIGIT into a uint64 with overflow detection.
 inline bool parse_dec(std::string_view s, std::uint64_t& v) noexcept
 {
   if (s.empty()) return false;
@@ -531,7 +545,7 @@ inline char const* parse_dec_short(char const* p, char const* last, std::uint64_
   return it;
 }
 
-/// 1*HEXDIG with overflow detection; `it` must be followed by a non-hex byte
+/// Beast `parse_hex`: 1*HEXDIG with overflow detection; `it` must be followed by a non-hex byte
 /// inside the buffer (the chunk line's CR guarantees one).
 inline bool parse_hex(char const*& it, std::uint64_t& v) noexcept
 {
@@ -548,7 +562,7 @@ inline bool parse_hex(char const*& it, std::uint64_t& v) noexcept
   return true;
 }
 
-/// Chunk extensions:
+/// Beast `parse_chunk_extensions`:
 ///   chunk-ext      = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
 ///   chunk-ext-name = token;  chunk-ext-val = token / quoted-string
 /// Stops at the first byte that cannot continue an extension (normally the CR). `last` must lie
@@ -592,7 +606,7 @@ inline rc parse_chunk_extensions(char const*& it, char const* last, parse_error&
       }
       if (*it != '=') {
         if (bws) return bad();
-        return rc::ok;  // name without value ends the extensions
+        return rc::ok;  // name without value ends the extensions (Beast returns here)
       }
       ++it;       // '='
       for (;;) {  // BWS

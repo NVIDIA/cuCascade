@@ -1,6 +1,7 @@
 # Sources of the src/io/rest/http module; included by src/io/CMakeLists.txt.
 # HTTP/1.1 codec (parser, S3 error-body helpers): pure CPU, no I/O, no
-# allocation.
+# allocation. The parser and chunked decoder are derived in part from
+# Boost.Beast (Boost Software License 1.0, see LICENSE_1_0.txt).
 target_sources(
   cucascade_io_objects
   PRIVATE ${CMAKE_CURRENT_LIST_DIR}/chunked_decoder.cpp

@@ -1,6 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ * SPDX-License-Identifier: Apache-2.0 AND BSL-1.0
  *
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +17,20 @@
  * limitations under the License.
  */
 
+/*
+ * Portions of this file are derived from Boost.Beast (https://github.com/boostorg/beast):
+ *
+ * Copyright (c) 2016-2019 Vinnie Falco (vinnie dot falco at gmail dot com)
+ *
+ * Distributed under the Boost Software License, Version 1.0. (See accompanying
+ * file src/io/rest/http/LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+ */
+
+// Conformance vectors ported from the Boost.Beast test suite (`test/beast/http/basic_parser.cpp`,
+// `test/beast/http/parser.cpp`, `test/beast/http/message_fuzz.hpp`); see the notice above.
+// Responses only: Beast's request-line vectors are not ported, and its `parsegrind` /
+// `failgrind` checks become `grind` / `failgrind` (http_test_support.hpp).
+//
 // HTTP/1.1 response conformance vectors (RFC 9110 / RFC 9112): status line, field syntax and
 // obs-fold, Connection, Content-Length (lists, conflicts, overflow), Transfer-Encoding, chunk
 // sizes, extensions and trailers, header and body limits, and regression cases. Field vectors use
