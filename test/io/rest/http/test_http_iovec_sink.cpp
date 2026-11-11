@@ -22,7 +22,11 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <new>
+#include <span>
 #include <string>
+#include <string_view>
+#include <system_error>
 
 using namespace cucascade::io::http;
 
@@ -111,4 +115,51 @@ TEST_CASE("http.iovec_sink.chunked_error_body", "[rest][http][sink]")
   std::string const body = (x + y + z).substr(0, sink.written());
   CHECK(extract_error_code(body, meta));
   CHECK(meta.amz_error_code.view() == "AccessDenied");
+}
+
+TEST_CASE("http.chunked.a_throwing_sink_fails_the_body_with_its_reason", "[rest][http][chunked]")
+{
+  std::string_view const body = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+  std::string out;
+  int calls = 0;
+  auto feed = [&](chunked_decoder& dec, auto&& thrower, std::error_code& ec) {
+    std::size_t used = 0;
+    auto const st    = dec.feed(
+      body,
+      used,
+      [&](std::span<char const> s) {
+        if (++calls == 2) { thrower(); }
+        out.append(s.data(), s.size());
+      },
+      ec);
+    CHECK(used == 13);  // up to the data of the chunk the sink failed on
+    return st;
+  };
+  chunked_decoder dec;
+  std::error_code ec;
+  SECTION("std::bad_alloc: not_enough_memory")
+  {
+    CHECK(feed(dec, [] { throw std::bad_alloc{}; }, ec) == parse_status::error);
+    CHECK(ec == std::errc::not_enough_memory);
+  }
+  SECTION("std::system_error: its code")
+  {
+    auto const code = std::make_error_code(std::errc::no_buffer_space);
+    CHECK(feed(dec, [&] { throw std::system_error(code); }, ec) == parse_status::error);
+    CHECK(ec == code);
+  }
+  SECTION("anything else: unhandled_exception")
+  {
+    CHECK(feed(dec, [] { throw 42; }, ec) == parse_status::error);
+    CHECK(ec == cucascade::io::rest::errc::unhandled_exception);
+  }
+  CHECK(dec.last_error() == parse_error::sink_failed);
+  CHECK(out == "hello");
+  CHECK(dec.body_bytes() == 5);
+  // Sticky, with the same reason.
+  std::error_code again;
+  std::size_t used = 0;
+  CHECK(dec.feed(body, used, [](std::span<char const>) {}, again) == parse_status::error);
+  CHECK(again == ec);
+  CHECK(used == 0);
 }

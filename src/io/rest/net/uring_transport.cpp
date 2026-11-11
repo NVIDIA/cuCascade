@@ -646,6 +646,10 @@ std::vector<uring_transport::completion>& uring_transport::poll()
       advance(index, result, flags);
     } catch (transport_fatal_error const&) {
       throw;
+    } catch (std::bad_alloc const&) {  // e.g. growing a buffered body
+      if (!c.pending && !c.cancel_pending && c.has_request) {
+        finish(index, make_error_code(std::errc::not_enough_memory));
+      }
     } catch (std::exception const&) {
       if (!c.pending && !c.cancel_pending && c.has_request) {
         finish(index, make_error_code(errc::http_bad_message));

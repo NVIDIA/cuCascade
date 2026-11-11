@@ -63,6 +63,7 @@ enum class parse_error : std::uint8_t {
   bad_chunk_extension,
   header_limit,
   body_limit,
+  sink_failed,  ///< the body sink threw (chunked_decoder; the error code says why)
 };
 
 /// Sentinel for "length not known" (`Content-Range: bytes a-b/*`, chunked/EOF-delimited bodies).

@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <new>
+#include <system_error>
 
 namespace cucascade::io::http {
 
@@ -34,6 +36,22 @@ using detail::rc;
 
 /// Trailer section cap (the response parser's default header limit).
 constexpr std::size_t max_trailer_bytes = std::size_t{16} * 1024;
+
+/// Hand @p data to @p sink. @return why the sink threw, or no error.
+template <class DataSink>
+std::error_code deliver(DataSink const& sink, std::span<char const> data) noexcept
+{
+  try {
+    sink.fn(sink.ctx, data);
+    return {};
+  } catch (std::bad_alloc const&) {
+    return std::make_error_code(std::errc::not_enough_memory);
+  } catch (std::system_error const& e) {
+    return e.code() ? e.code() : make_error_code(errc::unhandled_exception);
+  } catch (...) {
+    return make_error_code(errc::unhandled_exception);
+  }
+}
 
 std::error_code to_error_code(parse_error e) noexcept
 {
@@ -55,7 +73,7 @@ parse_status chunked_decoder::feed_impl(std::span<char const> in,
   ec.clear();
   if (_state == state::done) return parse_status::ok;
   if (_state == state::failed) {
-    ec = to_error_code(_error);
+    ec = _error == parse_error::sink_failed ? _sink_ec : to_error_code(_error);
     return parse_status::error;
   }
 
@@ -135,7 +153,12 @@ parse_status chunked_decoder::feed_impl(std::span<char const> in,
         auto const n = static_cast<std::size_t>(
           std::min<std::uint64_t>(_remaining, static_cast<std::uint64_t>(end - p)));
         if (n != 0) {
-          sink.fn(sink.ctx, std::span<char const>{p, n});
+          _sink_ec = deliver(sink, std::span<char const>{p, n});
+          if (_sink_ec) {
+            fail(parse_error::sink_failed);
+            running = false;
+            break;
+          }
           p += n;
           _remaining -= n;
           _total += n;
@@ -199,7 +222,7 @@ parse_status chunked_decoder::feed_impl(std::span<char const> in,
   consumed = static_cast<std::size_t>(p - begin);
   if (result == parse_status::error) {
     _state = state::failed;
-    ec     = to_error_code(_error);
+    ec     = _error == parse_error::sink_failed ? _sink_ec : to_error_code(_error);
   }
   return result;
 }
