@@ -174,6 +174,49 @@ TEST_CASE("net: resolver round-robin, accumulation (cap 32, max age), TTL refres
   }
 }
 
+TEST_CASE("net: resolver keeps max_addresses of a long answer, also across accumulating refreshes",
+          "[rest][net][dns]")
+{
+  fake_dns f;
+  f.per = 200;  // far more distinct addresses per answer than the cap
+  dns_resolver::options o;
+  o.ttl             = 50ms;
+  o.refresh_ahead   = 0.5;
+  o.max_addresses   = 3;
+  o.address_max_age = 60s;
+  o.lookup          = &fake_dns::lookup;
+  o.lookup_ctx      = &f;
+  dns_resolver r(o);
+  std::uint32_t const h = r.intern("long.test", 443);
+  sockaddr_storage a{};
+  REQUIRE(pick_wait(r, h, a) == dns_resolver::status::ok);
+  CHECK(r.address_count(h) == 3);
+  auto const first = r.get("long.test", 443);
+  REQUIRE(first != nullptr);
+  REQUIRE(first->addrs.size() == 3);
+  CHECK(ip_of(first->addrs[0]) == "10.0.0.1:443");  // the head of the answer, in order
+  CHECK(ip_of(first->addrs[2]) == "10.0.0.3:443");
+  // Keep the host in use until two refreshes (a new set of 200 each) landed: still capped, and
+  // the kept addresses are the newest answer's.
+  auto const lookups = r.lookups_of(h);
+  auto const end     = std::chrono::steady_clock::now() + 2s;
+  while (r.lookups_of(h) < lookups + 2 && std::chrono::steady_clock::now() < end) {
+    socklen_t len = 0;
+    (void)r.pick(h, a, len, mono_ns());
+    std::this_thread::sleep_for(5ms);
+  }
+  REQUIRE(r.lookups_of(h) >= lookups + 2);
+  auto const l = r.get("long.test", 443);
+  REQUIRE(l != nullptr);
+  REQUIRE(l->addrs.size() == 3);
+  auto const set_of = [](sockaddr_storage const& s) {
+    return ntohl(reinterpret_cast<sockaddr_in const&>(s).sin_addr.s_addr) & 0xffffff00u;
+  };
+  CHECK(set_of(l->addrs[0]) != set_of(first->addrs[0]));
+  CHECK(set_of(l->addrs[1]) == set_of(l->addrs[0]));
+  CHECK(set_of(l->addrs[2]) == set_of(l->addrs[0]));
+}
+
 TEST_CASE("net: resolver max address age drops addresses no longer returned", "[rest][net][dns]")
 {
   fake_dns f;

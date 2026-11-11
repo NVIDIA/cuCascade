@@ -211,7 +211,6 @@ std::uint32_t dns_resolver::intern(std::string_view host, std::uint16_t port) no
   entry& e = _entries[n];
   try {
     e.host.assign(host);
-    e.accum.reserve(_opts.max_addresses);
   } catch (...) {
     return invalid;
   }
@@ -400,46 +399,59 @@ void dns_resolver::resolve(std::uint32_t h) noexcept
   e.lookups.fetch_add(1, std::memory_order_relaxed);
   std::uint64_t const now = mono_ns();
   std::lock_guard g(_m);
-  if (rc != 0 || found.empty()) {
+  if (rc == 0 && found.empty()) rc = EAI_NODATA;
+  // Accumulate into a copy: refresh last_seen for re-seen addresses, add new ones, age out those
+  // not seen for address_max_age, keep the max_addresses most recently seen.  Without
+  // accumulation the answer replaces the list (new addresses serve new connections only).  At
+  // most max_addresses new ones are added: they are all seen now, so any further one would be
+  // trimmed.  The accumulator and the published answer change only once all of it (and the new
+  // list) is allocated; an allocation failure is a failed lookup that keeps both.
+  std::vector<accum_addr> accum;
+  std::shared_ptr<address_list> next;
+  if (rc == 0) {
+    try {
+      std::size_t const max  = _opts.max_addresses;
+      std::size_t const kept = _opts.accumulate ? e.accum.size() : 0;
+      accum.reserve(kept + std::min(found.size(), max));
+      if (_opts.accumulate) accum.assign(e.accum.begin(), e.accum.end());
+      std::size_t added = 0;
+      for (auto const& a : found) {
+        auto it = std::find_if(
+          accum.begin(), accum.end(), [&](accum_addr const& x) { return same_address(x.addr, a); });
+        if (it != accum.end()) {
+          it->last_seen_ns = now;
+        } else if (added < max) {
+          accum.push_back(accum_addr{a, now});
+          ++added;
+        }
+      }
+      std::uint64_t const max_age = ms_to_ns(_opts.address_max_age);
+      std::erase_if(accum, [&](accum_addr const& x) { return now - x.last_seen_ns > max_age; });
+      if (accum.size() > max) {
+        std::stable_sort(accum.begin(), accum.end(), [](accum_addr const& x, accum_addr const& y) {
+          return x.last_seen_ns > y.last_seen_ns;
+        });
+        accum.resize(max);
+      }
+      next = std::make_shared<address_list>();
+      next->addrs.reserve(accum.size());
+      for (auto const& x : accum)
+        next->addrs.push_back(x.addr);
+      next->resolved_at_ns = now;
+    } catch (...) {
+      rc = EAI_MEMORY;
+    }
+  }
+  if (rc != 0) {
     _failures.fetch_add(1, std::memory_order_relaxed);
-    e.error.store(rc != 0 ? rc : EAI_NODATA, std::memory_order_relaxed);
+    e.error.store(rc, std::memory_order_relaxed);
     e.retry_at_ns = now + ms_to_ns(_opts.failure_retry);
     // Stale-while-error: keep the previous answer; only a host with none reports failure.
     if (e.current.load(std::memory_order_relaxed) == nullptr)
       e.failed.store(true, std::memory_order_release);
     return;
   }
-  // Accumulate: refresh last_seen for re-seen addresses, add new ones, age
-  // out those not seen for address_max_age, keep the max_addresses most recently seen.  Without
-  // accumulation the answer replaces the list (new addresses serve new connections only).
-  if (!_opts.accumulate) e.accum.clear();
-  for (auto const& a : found) {
-    auto it = std::find_if(
-      e.accum.begin(), e.accum.end(), [&](accum_addr const& x) { return same_address(x.addr, a); });
-    if (it != e.accum.end())
-      it->last_seen_ns = now;
-    else
-      e.accum.push_back(accum_addr{a, now});
-  }
-  std::uint64_t const max_age = ms_to_ns(_opts.address_max_age);
-  std::erase_if(e.accum, [&](accum_addr const& x) { return now - x.last_seen_ns > max_age; });
-  if (e.accum.size() > _opts.max_addresses) {
-    std::stable_sort(e.accum.begin(), e.accum.end(), [](accum_addr const& x, accum_addr const& y) {
-      return x.last_seen_ns > y.last_seen_ns;
-    });
-    e.accum.resize(_opts.max_addresses);
-  }
-  std::shared_ptr<address_list> next;
-  try {
-    next = std::make_shared<address_list>();
-    next->addrs.reserve(e.accum.size());
-    for (auto const& x : e.accum)
-      next->addrs.push_back(x.addr);
-    next->resolved_at_ns = now;
-  } catch (...) {
-    e.retry_at_ns = now + ms_to_ns(_opts.failure_retry);
-    return;
-  }
+  e.accum.swap(accum);
   e.current.store(std::move(next), std::memory_order_release);
   e.resolved_ns.store(now, std::memory_order_release);
   e.error.store(0, std::memory_order_relaxed);
@@ -449,30 +461,26 @@ void dns_resolver::resolve(std::uint32_t h) noexcept
 
 void dns_resolver::run() noexcept
 {
-  std::vector<std::uint32_t> work;
-  try {
-    work.reserve(max_hosts);
-  } catch (...) {  // NOLINT(bugprone-empty-catch): noexcept boundary: reserve is only a
-                   // pre-allocation; the loop grows work on demand
-  }
+  // The hosts due in one pass: fixed storage (at most max_hosts), so the loop never allocates.
+  std::array<std::uint32_t, max_hosts> work{};
   std::unique_lock lk(_m);
   while (!_stop) {
     std::uint64_t const now = mono_ns();
     std::uint64_t next =
       now + std::uint64_t{1'000'000'000};  // re-evaluate at least once per second
-    work.clear();
-    std::uint32_t const n = _count.load(std::memory_order_relaxed);
+    std::uint32_t due_count = 0;
+    std::uint32_t const n   = std::min(_count.load(std::memory_order_relaxed), max_hosts);
     for (std::uint32_t i = 0; i < n; ++i) {
       std::uint64_t const due = due_ns(_entries[i], now);
       if (due <= now)
-        work.push_back(i);
+        work[due_count++] = i;
       else
         next = std::min(next, due);
     }
-    if (!work.empty()) {
+    if (due_count != 0) {
       lk.unlock();
-      for (std::uint32_t h : work)
-        resolve(h);  // getaddrinfo without the lock
+      for (std::uint32_t k = 0; k < due_count; ++k)
+        resolve(work[k]);  // getaddrinfo without the lock
       lk.lock();
       continue;
     }
