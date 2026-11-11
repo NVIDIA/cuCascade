@@ -223,6 +223,35 @@ inline std::size_t record_body_length(std::span<std::byte const> wire, std::size
          std::to_integer<std::size_t>(wire[off + 4]);
 }
 
+/// Record size of `server_conn::new_session_ticket_spanning`.
+inline constexpr std::size_t spanning_ticket_record = 512;
+
+/**
+ * @brief First byte of every record after the first of a ticket from
+ * `server_conn::new_session_ticket_spanning(fill)` on a `fixed_ticket_key` server.
+ *
+ * The NewSessionTicket message carries the encrypted session from byte 39 on (header 4,
+ * lifetime 4, age_add 4, nonce 1 + 8, ticket length 2, key name 16; ECB has no IV).  Each
+ * boundary 512 k falls inside a 16-byte block made of app data only, at offset
+ * (512 k - 39) mod 16 = 9 in it, so the record starts with byte 9 of `ticket_block(fill)`.
+ * Tests compare this with the bytes they actually received.
+ */
+inline unsigned char spanning_ticket_continuation_start(unsigned char fill)
+{
+  return ticket_block(fill)[(spanning_ticket_record - 39) % 16];
+}
+
+/// The first fill byte whose ticket continuation records start (or, @p match false, never
+/// start) with @p first; nullopt when no fill byte does.
+inline std::optional<unsigned char> spanning_ticket_fill(unsigned char first, bool match)
+{
+  for (unsigned f = 0; f < 256; ++f) {
+    auto const fill = static_cast<unsigned char>(f);
+    if ((spanning_ticket_continuation_start(fill) == first) == match) { return fill; }
+  }
+  return std::nullopt;
+}
+
 /// Complete TLS records in @p wire (a trailing partial record is not counted).
 inline std::size_t count_records(std::span<std::byte const> wire)
 {
@@ -506,14 +535,17 @@ class server_conn {
   {
     return SSL_new_session_ticket(_ssl) == 1 && SSL_do_handshake(_ssl) == 1 && flush();
   }
-  /// Send one TLS 1.3 NewSessionTicket that spans records: @p app_data bytes of ticket app data
-  /// make it large, records of at most 512 bytes split it.  @return the records sent, 0 on error.
-  std::size_t new_session_ticket_spanning(std::size_t app_data = 4096)
+  /// Send one TLS 1.3 NewSessionTicket that spans records: @p app_data bytes (4096) of ticket
+  /// app data, all @p fill, make it large; records of `spanning_ticket_record` bytes split it.
+  /// Every record boundary then falls inside the app data, so with `fixed_ticket_key` the first
+  /// byte of each record after the first is known (`spanning_ticket_continuation_start`).
+  /// @return the records sent, 0 on error.
+  std::size_t new_session_ticket_spanning(unsigned char fill, std::size_t app_data = 4096)
   {
-    std::vector<unsigned char> const data(app_data, 0x5A);
+    std::vector<unsigned char> const data(app_data, fill);
     SSL_SESSION* const s = SSL_get_session(_ssl);
     bool ok = s != nullptr && SSL_SESSION_set1_ticket_appdata(s, data.data(), data.size()) == 1;
-    ok      = ok && SSL_set_max_send_fragment(_ssl, 512) == 1;
+    ok      = ok && SSL_set_max_send_fragment(_ssl, static_cast<long>(spanning_ticket_record)) == 1;
     ok      = ok && SSL_new_session_ticket(_ssl) == 1 && SSL_do_handshake(_ssl) == 1;
     (void)SSL_set_max_send_fragment(_ssl, SSL3_RT_MAX_PLAIN_LENGTH);
     std::vector<std::byte> const ct = take();

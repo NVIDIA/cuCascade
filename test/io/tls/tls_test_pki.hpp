@@ -18,14 +18,18 @@
 
 #pragma once
 
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/params.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <stdlib.h>
 
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -263,7 +267,37 @@ struct server_ctx_options {
   std::string cipher_list{};   ///< TLS 1.2 ciphers; empty = OpenSSL default
   bool alpn_http11{true};      ///< select "http/1.1" when the client offers it
   int num_tickets{-1};         ///< TLS 1.3 tickets after the handshake; -1 = OpenSSL default (2)
+  /// Tickets are sealed with AES-256-ECB under a fixed key (`ticket_block`), so the ciphertext
+  /// of known session content (16-byte blocks of ticket app data) is known; never resumed.
+  bool fixed_ticket_key{false};
 };
+
+namespace detail {
+
+/// Chosen so that a fill byte exists for each wanted continuation start (`spanning_ticket_fill`
+/// finds one making it 24, KeyUpdate's type, and ones avoiding it).
+inline constexpr std::array<unsigned char, 32> ticket_aes_key{0x54, 0x49, 0x43, 0x4B, 0x01};
+
+}  // namespace detail
+
+/// The `fixed_ticket_key` ciphertext of a 16-byte block of @p fill bytes (AES-256-ECB).
+inline std::array<unsigned char, 16> ticket_block(unsigned char fill)
+{
+  std::array<unsigned char, 16> in{};
+  std::array<unsigned char, 16> out{};
+  in.fill(fill);
+  EVP_CIPHER_CTX* const c = EVP_CIPHER_CTX_new();
+  int len                 = 0;
+  bool const ok =
+    c != nullptr &&
+    EVP_EncryptInit_ex(c, EVP_aes_256_ecb(), nullptr, detail::ticket_aes_key.data(), nullptr) ==
+      1 &&
+    EVP_CIPHER_CTX_set_padding(c, 0) == 1 &&
+    EVP_EncryptUpdate(c, out.data(), &len, in.data(), static_cast<int>(in.size())) == 1;
+  EVP_CIPHER_CTX_free(c);
+  if (!ok) { throw std::runtime_error("ticket_block"); }
+  return out;
+}
 
 namespace detail {
 
@@ -281,6 +315,30 @@ inline int select_http11(SSL*,
     return SSL_TLSEXT_ERR_OK;
   }
   return SSL_TLSEXT_ERR_NOACK;
+}
+
+/// Ticket key callback of `fixed_ticket_key`.  A padded block mode: OpenSSL 3.6 fails ticket
+/// construction (internal error) with the NULL cipher and with CTR.
+inline int fixed_ticket_key(SSL*,
+                            unsigned char key_name[16],
+                            unsigned char* iv,
+                            EVP_CIPHER_CTX* cipher,
+                            EVP_MAC_CTX* mac,
+                            int enc)
+{
+  (void)iv;                    // ECB: no IV in the ticket
+  if (enc == 0) { return 0; }  // never resumed: a presented ticket is not recognised
+  static unsigned char mac_key[32] = {0x7E};
+  static char digest[]             = "SHA256";
+  OSSL_PARAM params[]              = {
+    OSSL_PARAM_construct_octet_string(OSSL_MAC_PARAM_KEY, mac_key, sizeof mac_key),
+    OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
+    OSSL_PARAM_construct_end()};
+  std::memset(key_name, 0x6B, 16);
+  EVP_CIPHER const* const aes = EVP_aes_256_ecb();
+  bool const ok = EVP_EncryptInit_ex(cipher, aes, nullptr, ticket_aes_key.data(), nullptr) == 1 &&
+                  EVP_MAC_CTX_set_params(mac, params) == 1;
+  return ok ? 1 : -1;
 }
 
 }  // namespace detail
@@ -303,6 +361,10 @@ inline SSL_CTX* make_server_ctx(test_pki const& pki, server_ctx_options const& o
   }
   if (opts.num_tickets >= 0) {
     SSL_CTX_set_num_tickets(ctx, static_cast<std::size_t>(opts.num_tickets));
+  }
+  if (opts.fixed_ticket_key) {
+    detail::check(SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx, detail::fixed_ticket_key) == 1,
+                  "SSL_CTX_set_tlsext_ticket_key_evp_cb");
   }
   detail::x509_ptr leaf = detail::parse_cert(pki.server.cert_pem);
   detail::x509_ptr ca   = detail::parse_cert(pki.ca.cert_pem);

@@ -113,6 +113,7 @@ struct ktls_client {
   bool closed{false};
   int last_errno{0};
   std::error_code error{};
+  std::vector<std::uint8_t> handshake_starts{};  ///< first plaintext byte of each handshake record
 
   bool drain_control(int timeout_ms)
   {
@@ -142,6 +143,9 @@ struct ktls_client {
       }
       if ((msg.msg_flags & MSG_EOR) == 0) { return false; }  // larger than the buffer
       ++controls;
+      if (type == ktls::record_handshake) {
+        handshake_starts.push_back(std::to_integer<std::uint8_t>(buf[0]));
+      }
       auto const a =
         ktls::on_control_record(fd,
                                 state,
@@ -273,6 +277,9 @@ std::span<std::byte const> as_bytes(std::vector<std::uint8_t> const& v)
   return {reinterpret_cast<std::byte const*>(v.data()), v.size()};
 }
 
+/// Handshake message type of KeyUpdate (RFC 8446 §4), the byte Linux >= 6.14 checks.
+constexpr std::uint8_t key_update_type = 24;
+
 /// Pretend the kernel is @p major.@p minor for the scope; the real one is restored after.
 struct kernel_override {
   kernel_override(unsigned major, unsigned minor)
@@ -395,21 +402,29 @@ TEST_CASE("ktls: TLS 1.3 ticket spanning records without kernel re-key, then app
 {
   // Linux 6.0-6.13 serve TLS 1.3 kTLS but cannot re-key: the connection still keeps the
   // handshake message framing, so a ticket split across records is skipped; a KeyUpdate is not
-  // followed and ends the connection.
+  // followed and ends the connection.  Only the version is pretended: a kernel >= 6.14 running
+  // this test pauses RX after any handshake record whose first byte is 24 (KeyUpdate's type),
+  // blind to message boundaries, and a connection set up as on 6.13 does not resume it.  A
+  // random ticket starts a continuation record with 24 once in 256, so the ticket key is fixed
+  // and the app data chosen to keep 24 off every record start.
+  auto const fill = t::spanning_ticket_fill(key_update_type, false);
+  REQUIRE(fill.has_value());
   std::atomic<bool> request_ok{false};
   std::atomic<std::size_t> ticket_records{0};
-  auto o        = server_options(TLS1_3_VERSION, "TLS_AES_128_GCM_SHA256");
-  o.num_tickets = 0;  // only the scripted ticket
+  auto o             = server_options(TLS1_3_VERSION, "TLS_AES_128_GCM_SHA256");
+  o.num_tickets      = 0;  // only the scripted ticket
+  o.fixed_ticket_key = true;
   t::loopback_server srv(t::make_server_ctx(t::default_pki(), o), [&](t::server_conn& c) {
     request_ok = c.expect_pattern(1000, 1);
     c.send_pattern(20'000, 2);
-    ticket_records = c.new_session_ticket_spanning();
+    ticket_records = c.new_session_ticket_spanning(*fill);
     c.send_pattern(50'000, 3);
     c.key_update(false);
     c.send_pattern(1000, 4);
     c.wait_peer_close();
   });
   unsigned controls_after_ticket = 0;
+  std::vector<std::uint8_t> ticket_starts;
   {
     kernel_override const k613(6, 13);
     auto const p = make_openssl_provider(trusting());
@@ -425,6 +440,7 @@ TEST_CASE("ktls: TLS 1.3 ticket spanning records without kernel re-key, then app
     REQUIRE(k.c.receive(b));  // the ticket's records are drained and skipped on the way
     CHECK(t::check_pattern(b, 3) == std::string_view::npos);
     controls_after_ticket = k.c.controls;
+    ticket_starts         = k.c.handshake_starts;
     std::vector<std::byte> c4(1000);
     CHECK_FALSE(k.c.receive(c4));  // KeyUpdate: protocol error, the connection is replaced
     CHECK(k.c.error == make_error_code(errc::protocol_error));
@@ -433,6 +449,13 @@ TEST_CASE("ktls: TLS 1.3 ticket spanning records without kernel re-key, then app
   CHECK(request_ok);
   CHECK(ticket_records.load() >= 2);
   CHECK(controls_after_ticket == ticket_records.load());
+  REQUIRE(ticket_starts.size() == ticket_records.load());
+  CHECK(ticket_starts[0] == 4);  // NewSessionTicket
+  for (std::size_t r = 1; r < ticket_starts.size(); ++r) {
+    INFO("ticket record " << r);
+    CHECK(ticket_starts[r] == t::spanning_ticket_continuation_start(*fill));  // layout assumed
+    CHECK(ticket_starts[r] != key_update_type);
+  }
 }
 
 TEST_CASE("ktls: TLS 1.2 Finished split across two records, then application data", "[tls]")
