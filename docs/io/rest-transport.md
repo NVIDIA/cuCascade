@@ -6,6 +6,50 @@ transport; libcurl is gone. The design is a dedicated HTTPS transport plus an S3
 (`include/cucascade/io/tls`, `src/io/tls`), HTTP codec (`src/io/rest/http`), authorizers and
 reactor contract.
 
+## Migrating from the libcurl reactor and kvikIO
+
+Check these before upgrading a deployment that used the removed paths. `rest.*` below is
+`io_config::rest` (`rest::config`).
+
+- **io_uring is mandatory.** There is no fallback transport. Each reactor creates its ring when
+  its worker starts; when `io_uring_queue_init` fails (no io_uring in the kernel,
+  `kernel.io_uring_disabled`, a seccomp profile that blocks `io_uring_setup`, as some container
+  runtimes' defaults do) the reactor logs `rest_reactor rest-<i>: cannot start: rest transport:
+  io_uring_queue_init: <errno>` and stops accepting work: queued reads fail with that error, later
+  reads are cancelled, and blocking control-plane calls (the HEAD of an open, LIST) run on a private
+  helper whose ring fails the same way, so they throw. The local-file path (`uring_ioctx`) already
+  required io_uring.
+- **No proxies.** Connections go straight to the endpoint's resolved addresses. The proxy
+  environment variables libcurl honoured by default (`http_proxy`, `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY`, ...) are ignored, there is no HTTP `CONNECT` tunnelling and no proxy setting. A
+  deployment behind an egress proxy needs a direct route to the object store (e.g. a VPC endpoint).
+- **kvikIO is removed.** `io_backend::kvikio`, `io_config::kvikio`, `io_context_type::kvikio` and
+  the kvikIO link dependency are gone. `io_backend::native` is the only backend: local files go
+  to `uring_ioctx` (device reads through pinned bounce staging; there is no GDS path in this
+  backend), `s3://` objects to `rest_ioctx`. The datasource registry has no catch-all any more: a
+  path neither claims (not a regular local file, not `s3://`) resolves to no backend
+  (`io_context_registry::lookup_path` returns `std::nullopt`) instead of falling back to kvikIO.
+- **AES-GCM cipher suites only by default.** `rest.tls.ciphersuites` (TLS 1.3,
+  `TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384`) and `rest.tls.cipher_list` (TLS 1.2, ECDHE
+  with AES-128/256-GCM) are set explicitly, where the libcurl stack set no cipher list and took
+  libcurl's broader defaults; `rest.tls.min_version` is TLS 1.2. An endpoint that offers only
+  ChaCha20-Poly1305, CBC or non-ECDHE suites fails the handshake. Both strings take OpenSSL
+  syntax and can be widened, but only AES-GCM runs on kTLS or the built-in record layer: any other
+  suite runs on OpenSSL's own record layer (`rest.tls.ktls = prefer`, counted in
+  `ktls_fallbacks`) or fails with `ktls_unavailable` (`require`).
+- **Generic TLS handshake failures are retried.** Any handshake failure other than certificate or
+  host-name verification is `tls_handshake_failed`, retried like libcurl's `SSL_CONNECT_ERROR` was:
+  a fresh connection per attempt with backoff, up to `rest.max_retry_attempts` (10). That includes
+  deterministic failures (no shared cipher suite or protocol version), so with the narrower
+  defaults above a mismatched endpoint fails only after the whole retry budget, with a warning
+  per attempt and a final `exhausted retries (TLS handshake failed)`. Verification failures
+  (`tls_verify_failed`) and `ktls_unavailable` are final.
+- **Data GETs need `Content-Length`.** A 2xx data or footer-probe GET whose body is chunked or
+  close-delimited fails at once with `http_unsupported_framing` and is not retried; libcurl
+  decoded such bodies. S3, MinIO and Ceph always send `Content-Length`; CloudFront, S3 Object
+  Lambda and some gateways or proxies may not. There is no setting to accept them. LIST pages may
+  still be chunked.
+
 ## Layers
 
 | Layer | Where | Role |
