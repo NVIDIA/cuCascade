@@ -28,6 +28,9 @@
 #include "io/rest/net/tls_stream.hpp"
 #include "io/rest/net/uring_transport.hpp"
 
+#include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
+#include <cucascade/io/rest/s3/static_credentials.hpp>
+
 #include <arpa/inet.h>
 #include <catch2/catch_all.hpp>
 #include <netinet/in.h>
@@ -35,6 +38,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +50,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace cucascade::io;
@@ -272,6 +277,12 @@ class echo_server {
     return "http://127.0.0.1:" + std::to_string(_port) + std::string(path);
   }
   [[nodiscard]] std::size_t continues() const noexcept { return _continues.load(); }
+  /// The head (request line and fields) of the last request received.
+  [[nodiscard]] std::string last_head()
+  {
+    std::lock_guard lock{_mutex};
+    return _last_head;
+  }
   /// Respond with this raw response instead of an echo (one request), after @p delay.
   void answer_next_with(std::string response, std::chrono::milliseconds delay = {})
   {
@@ -324,6 +335,10 @@ class echo_server {
       auto const end  = pending.find("\r\n\r\n") + 4;
       auto const head = pending.substr(0, end);
       pending.erase(0, end);
+      {
+        std::lock_guard lock{_mutex};
+        _last_head = head;
+      }
       std::string lower = head;
       for (auto& ch : lower) {
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
@@ -369,6 +384,7 @@ class echo_server {
   std::mutex _mutex;
   std::string _canned;
   std::chrono::milliseconds _canned_delay{};
+  std::string _last_head;
   std::vector<int> _open;
   std::vector<std::thread> _connections;
   std::thread _thread;
@@ -698,6 +714,75 @@ TEST_CASE("net: buffered exchanges decode chunked bodies; data GETs refuse them"
     auto const r     = run_exchange(t, std::move(x));
     CHECK(r.ec == make_error_code(rest::errc::http_unsupported_framing));
     CHECK(r.meta.status == 200);
+  }
+  t.shutdown();
+}
+
+TEST_CASE("net: the caller's Host is sent verbatim and once, in place of the URL authority",
+          "[rest][net][transport][host]")
+{
+  echo_server server;
+  net::transport_options opts;
+  opts.max_connections = 1;
+  opts.queue_depth     = 8;
+  net::uring_transport t{opts, net::transport_services{}};
+  using header_list = std::vector<std::pair<std::string, std::string>>;
+  // Every Host line of the last request head, whatever the letter case of its name.
+  auto host_lines = [&server]() {
+    auto const head = server.last_head();
+    std::vector<std::string> out;
+    for (std::size_t at = head.find("\r\n"); at != std::string::npos && at + 2 < head.size();) {
+      auto const next  = head.find("\r\n", at + 2);
+      auto const line  = head.substr(at + 2, next - at - 2);
+      std::string name = line.substr(0, 5);
+      for (auto& ch : name) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      }
+      if (name == "host:") { out.push_back(line); }
+      at = next;
+    }
+    return out;
+  };
+  auto get = [&](header_list headers) {
+    net::exchange x;
+    x.url        = server.url("/bucket/key");
+    x.headers    = std::move(headers);
+    auto const r = run_exchange(t, std::move(x));
+    REQUIRE_FALSE(r.ec);
+    CHECK(r.meta.status == 200);
+    return host_lines();
+  };
+  SECTION("no Host header: the URL's authority")
+  {
+    auto const lines = get({});
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "Host: " + net::parse_url(server.url()).authority);
+  }
+  SECTION("a Host header in any letter case, with an explicit default port")
+  {
+    for (char const* name : {"Host", "host", "HOST", "hOST"}) {
+      auto const lines = get({{name, "store.example:443"}, {"x-amz-date", "20260101T000000Z"}});
+      REQUIRE(lines.size() == 1);
+      CHECK(lines[0] == "Host: store.example:443");
+    }
+  }
+  SECTION("the SigV4 header authorizer: the signed Host is the one on the wire")
+  {
+    rest::s3::static_credentials creds;
+    creds.access_key_id     = "AKIAIOSFODNN7EXAMPLE";
+    creds.secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    for (char const* endpoint : {"https://store.example:443", "http://store.example:80"}) {
+      rest::s3::sigv4_header_authorizer auth{creds, "us-east-1", endpoint};
+      auto const req = auth.authorize({"bucket", "key"}, rest::request_method::GET, 60s);
+      std::string signed_host;
+      for (auto const& [name, value] : req.headers) {
+        if (name == "Host") { signed_host = value; }
+      }
+      CHECK(signed_host == std::string(endpoint).substr(std::string(endpoint).find("//") + 2));
+      auto const lines = get(req.headers);
+      REQUIRE(lines.size() == 1);
+      CHECK(lines[0] == "Host: " + signed_host);
+    }
   }
   t.shutdown();
 }

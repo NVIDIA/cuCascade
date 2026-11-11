@@ -109,8 +109,10 @@ struct url_parts {
   bool tls{true};
   std::string host;  ///< without IPv6 brackets
   std::uint16_t port{443};
-  std::string authority;  ///< Host header value (port only when not the scheme default)
-  std::string target;     ///< path and query, never empty
+  /// Host header value (port only when not the scheme default), unless the exchange's headers
+  /// carry a Host of their own.
+  std::string authority;
+  std::string target;  ///< path and query, never empty
   /// Pool key: scheme, host and port.
   [[nodiscard]] std::string origin() const;
 };
@@ -234,7 +236,9 @@ enum class body_target : std::uint8_t {
 struct exchange {
   http::method method{http::method::get};
   std::string url;
-  std::vector<std::pair<std::string, std::string>> headers;  ///< authorizer headers, verbatim
+  /// Authorizer headers, verbatim.  A `Host` among them (any letter case) is sent instead of the
+  /// URL's authority (a header signature covers it); only the first one is sent.
+  std::vector<std::pair<std::string, std::string>> headers;
   /// `Range: bytes=first-last` when set.
   std::optional<std::pair<std::uint64_t, std::uint64_t>> range;
   /// `Range: bytes=-N` when > 0 (footer probe).

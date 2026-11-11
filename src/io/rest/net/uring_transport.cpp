@@ -81,6 +81,25 @@ std::string read_small(std::string const& path)
   return line;
 }
 
+/// @return true when @p name is `Host` in any letter case.
+bool is_host_field(std::string_view name) noexcept
+{
+  return name.size() == 4 && (name[0] | 0x20) == 'h' && (name[1] | 0x20) == 'o' &&
+         (name[2] | 0x20) == 's' && (name[3] | 0x20) == 't';
+}
+
+/// @return @p v without leading and trailing SP / HTAB (not part of a field value).
+std::string_view trim_ows(std::string_view v) noexcept
+{
+  while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) {
+    v.remove_prefix(1);
+  }
+  while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) {
+    v.remove_suffix(1);
+  }
+  return v;
+}
+
 }  // namespace
 
 // ================================================================================================
@@ -972,16 +991,21 @@ void uring_transport::start_exchange(std::size_t index)
     c.scratch.resize(_opts.receive_buffer_bytes);
   }
 
-  // Request head.
+  // Request head.  Host is the caller's (authorizer's) value when it has one: it is what a
+  // header signature covers, and may keep a port the URL authority drops (an explicit default
+  // port).  Otherwise the URL's authority.  Exactly one Host line either way.
   if (c.head.size() != head_bytes) { c.head.resize(head_bytes); }
   http::request_head h{std::span<char>{c.head.data(), c.head.size()}};
-  h.start(c.x.method, c.remote.target).host(c.remote.authority);
+  std::string_view host = c.remote.authority;
   for (auto const& [name, value] : c.x.headers) {
-    if (name.size() == 4 && (name[0] == 'H' || name[0] == 'h') &&
-        (name == "Host" || name == "host" || name == "HOST")) {
-      continue;
+    if (is_host_field(name)) {
+      host = trim_ows(value);
+      break;
     }
-    h.field(name, value);
+  }
+  h.start(c.x.method, c.remote.target).host(host);
+  for (auto const& [name, value] : c.x.headers) {
+    if (!is_host_field(name)) { h.field(name, value); }
   }
   if (c.x.range) {
     h.range(c.x.range->first, c.x.range->second);
