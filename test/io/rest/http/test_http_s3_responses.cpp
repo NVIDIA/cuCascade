@@ -16,8 +16,9 @@
  * limitations under the License.
  */
 
-// S3 fixtures end to end: head parse (every split point), body framing, XML <Code> scan,
-// classification.
+// S3 fixtures end to end: head parse (every split point), body framing, XML <Code> scan.
+// Retry and connection-reuse decisions belong to the transport and the REST reactor and are
+// tested there; these cases check the parsed `response_meta` those decisions read.
 
 #include "http_s3_fixtures.hpp"
 #include "http_test_support.hpp"
@@ -29,7 +30,6 @@
 
 using namespace cucascade::io::http;
 using namespace http_test;
-using rclass = outcome::retry_class;
 
 namespace {
 
@@ -87,11 +87,8 @@ TEST_CASE("http.s3.206_partial_content", "[rest][http][s3]")
   CHECK(field_value(r.head, "x-amz-server-side-encryption") == "AES256");
   CHECK(field_value(r.head, "Content-Type") == "binary/octet-stream");
   CHECK(field_value(r.head, "Server") == "AmazonS3");
-
-  auto const o = classify(m, {}, method::get, 0, 1048575, object_size, 0, true);
-  CHECK_FALSE(o.ec);
-  CHECK(o.reuse_connection);
-  CHECK_FALSE(o.retryable);
+  // Content-Length agrees with the Content-Range span.
+  CHECK(m.content_length == m.range->last - m.range->first + 1);
 }
 
 TEST_CASE("http.s3.206_body_into_destination", "[rest][http][s3]")
@@ -152,7 +149,6 @@ TEST_CASE("http.s3.200_full_object_and_head", "[rest][http][s3]")
   CHECK(r.head.meta.content_length == object_size);
   CHECK(r.head.done);
   CHECK(r.head.body_remaining == 0);
-  CHECK(classify(r.head.meta, {}, method::head, 0, 0, 0, 0, false).ec == std::error_code{});
 }
 
 TEST_CASE("http.s3.403_access_denied_chunked_xml", "[rest][http][s3]")
@@ -162,10 +158,7 @@ TEST_CASE("http.s3.403_access_denied_chunked_xml", "[rest][http][s3]")
   CHECK(r.head.meta.body == framing::chunked);
   CHECK(r.head.meta.request_id.view() == "0B4RH6A1QX7C2M8D");
   CHECK(r.head.meta.amz_error_code.view() == "AccessDenied");
-  auto const o = classify(r.head.meta, {}, method::get, 0, 99, object_size, 0, true);
-  CHECK(o.ec == cucascade::io::rest::make_http_error(403));
-  CHECK_FALSE(o.retryable);
-  CHECK(o.reuse_connection);  // drained chunked body, keep-alive
+  CHECK(r.head.meta.keep_alive);  // the drained chunked body leaves the connection reusable
 }
 
 TEST_CASE("http.s3.403_request_time_too_skewed", "[rest][http][s3]")
@@ -173,9 +166,6 @@ TEST_CASE("http.s3.403_request_time_too_skewed", "[rest][http][s3]")
   auto const r = parse_error_response(s3_fixtures::resp_403_skewed);
   CHECK(r.head.meta.amz_error_code.view() == "RequestTimeTooSkewed");
   CHECK(r.head.meta.date.view() == "Mon, 12 Oct 2026 17:21:05 GMT");  // clock offset source
-  auto const o = classify(r.head.meta, {}, method::get, 0, 99, object_size, 0, true);
-  CHECK(o.retryable);
-  CHECK(o.cls == rclass::auth);
 }
 
 TEST_CASE("http.s3.503_slowdown_retry_after", "[rest][http][s3]")
@@ -184,19 +174,13 @@ TEST_CASE("http.s3.503_slowdown_retry_after", "[rest][http][s3]")
   CHECK(r.head.meta.status == 503);
   CHECK(r.head.meta.retry_after_ms == 2000);
   CHECK(r.head.meta.amz_error_code.view() == "SlowDown");
-  auto const o = classify(r.head.meta, {}, method::get, 0, 99, object_size, 0, true);
-  CHECK(o.retryable);
-  CHECK(o.cls == rclass::throttle);
-  CHECK(o.ec == cucascade::io::rest::make_http_error(503));
 }
 
 TEST_CASE("http.s3.412_precondition_failed", "[rest][http][s3]")
 {
   auto const r = parse_error_response(s3_fixtures::resp_412);
+  CHECK(r.head.meta.status == 412);
   CHECK(r.head.meta.amz_error_code.view() == "PreconditionFailed");
-  auto const o = classify(r.head.meta, {}, method::get, 0, 99, object_size, 0, true);
-  CHECK(o.ec == cucascade::io::rest::errc::object_changed);
-  CHECK_FALSE(o.retryable);
 }
 
 TEST_CASE("http.s3.416_range_not_satisfiable", "[rest][http][s3]")
@@ -205,21 +189,17 @@ TEST_CASE("http.s3.416_range_not_satisfiable", "[rest][http][s3]")
   REQUIRE(r.head.meta.range.has_value());
   CHECK(r.head.meta.range->unsatisfied);
   CHECK(r.head.meta.range->complete == object_size);
+  CHECK(r.head.meta.status == 416);
   CHECK(r.head.meta.amz_error_code.view() == "InvalidRange");
-  auto const o =
-    classify(r.head.meta, {}, method::get, object_size, object_size + 46, object_size, 0, true);
-  CHECK(o.ec == cucascade::io::rest::make_http_error(416));
-  CHECK_FALSE(o.retryable);
 }
 
 TEST_CASE("http.s3.404_no_such_key", "[rest][http][s3]")
 {
   auto const r = parse_error_response(s3_fixtures::resp_404);
   CHECK(r.head.meta.amz_error_code.view() == "NoSuchKey");
+  CHECK(r.head.meta.status == 404);
   CHECK(r.head.meta.body == framing::chunked);
-  auto const o = classify(r.head.meta, {}, method::get, 0, 99, object_size, 0, true);
-  CHECK(o.ec == cucascade::io::rest::make_http_error(404));
-  CHECK_FALSE(o.retryable);
+  CHECK(r.head.meta.keep_alive);
 }
 
 TEST_CASE("http.s3.interim_responses_skipped", "[rest][http][s3]")
@@ -246,10 +226,9 @@ TEST_CASE("http.s3.connection_close_and_truncation", "[rest][http][s3]")
   std::string msg{s3_fixtures::head_206};
   msg.insert(msg.size() - 2, "Connection: close\r\n");
   auto const r = grind(msg);
-  CHECK_FALSE(r.head.meta.keep_alive);
-  auto const o = classify(r.head.meta, {}, method::get, 0, 1048575, object_size, 0, true);
-  CHECK_FALSE(o.ec);
-  CHECK_FALSE(o.reuse_connection);
+  REQUIRE(r.head.status == parse_status::ok);
+  CHECK(r.head.meta.status == 206);
+  CHECK_FALSE(r.head.meta.keep_alive);  // the connection is retired after this exchange
 
   // Captured values longer than their inline storage are truncated and flagged.
   std::string const long_etag = "\"" + std::string(100, 'e') + "\"";
@@ -288,4 +267,17 @@ TEST_CASE("http.s3.extract_error_code", "[rest][http][s3]")
   std::string big(max_error_body, ' ');
   big += "<Code>Late</Code>";
   CHECK_FALSE(extract_error_code(big, n));
+}
+
+TEST_CASE("http.s3.unsupported_framing_error_is_named", "[rest][http][s3]")
+{
+  namespace rest = cucascade::io::rest;
+  // Appended after unhandled_exception, so every earlier value stays stable.
+  CHECK(static_cast<int>(rest::errc::http_unsupported_framing) ==
+        static_cast<int>(rest::errc::unhandled_exception) + 1);
+  auto const ec = rest::make_error_code(rest::errc::http_unsupported_framing);
+  CHECK(&ec.category() == &rest::error_category());
+  // The message names the cause instead of reporting a malformed message.
+  CHECK(ec.message().find("chunked or close-delimited") != std::string::npos);
+  CHECK(ec.message() != rest::make_error_code(rest::errc::http_bad_message).message());
 }

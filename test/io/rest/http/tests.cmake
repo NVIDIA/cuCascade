@@ -4,7 +4,6 @@
 target_sources(
   cucascade_io_tests
   PRIVATE ${CMAKE_CURRENT_LIST_DIR}/http_test_support.cpp
-          ${CMAKE_CURRENT_LIST_DIR}/test_http_classify.cpp
           ${CMAKE_CURRENT_LIST_DIR}/test_http_conformance_vectors.cpp
           ${CMAKE_CURRENT_LIST_DIR}/test_http_content_range.cpp
           ${CMAKE_CURRENT_LIST_DIR}/test_http_iovec_sink.cpp

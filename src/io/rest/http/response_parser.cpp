@@ -324,7 +324,8 @@ bool response_parser::apply_field(known_field id,
 
     case known_field::content_range: {
       content_range cr;
-      if (!parse_content_range(value, cr)) meta.range = cr;  // malformed: left unset (classify)
+      // Malformed: left unset; the caller treats a 206 without a range as a mismatch.
+      if (!parse_content_range(value, cr)) meta.range = cr;
       return true;
     }
     case known_field::etag: capture(meta.etag, value, meta); return true;
