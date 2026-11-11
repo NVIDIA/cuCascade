@@ -20,9 +20,10 @@
  * @file test_tls_session.cpp
  * @brief The OpenSSL `tls::session` against a loopback TLS server: handshakes (TLS 1.2 / 1.3,
  * AES-128/256-GCM), verification (CA file and blob, wrong host, unknown CA, IP literals, verify
- * off), key export against the server's view, user-space tiers 2 (built-in opener + library
- * sealer) and 1 (library opener and sealer after `detach_from_socket`) with KeyUpdates, tickets,
- * close_notify and tampered records, the SIGPIPE guard, session resumption and SSLKEYLOGFILE.
+ * off), key export against the server's view (and after a TLS 1.2 Finished split across
+ * records), user-space tiers 2 (built-in opener + library sealer) and 1 (library opener and
+ * sealer after `detach_from_socket`) with KeyUpdates, tickets, close_notify and tampered records,
+ * the SIGPIPE guard, session resumption and SSLKEYLOGFILE.
  */
 
 #include "io/tls/key_schedule.hpp"
@@ -384,6 +385,47 @@ TEST_CASE("tls session: exported keys match the server's view", "[tls]")
     CHECK(again.key == rx.key);
     REQUIRE_FALSE(c.s->detach_from_socket());
     CHECK(c.s->export_keys(direction::receive, again) == make_error_code(errc::not_supported));
+  }
+}
+
+TEST_CASE("tls session: TLS 1.2 Finished split across records, then application data", "[tls]")
+{
+  // RFC 5246 §6.2.1 lets the server split its Finished: the records it took carry sequence
+  // numbers 0 .. n-1 under the new keys, so the receive sequence handed on is n, not 1.
+  for (std::size_t const piece : {std::size_t{8}, std::size_t{5}}) {  // 2 and 4 records
+    std::uint64_t const records = (16 + piece - 1) / piece;
+    for (bool const tier2 : {true, false}) {
+      INFO((tier2 ? "tier 2, " : "tier 1, ") << "Finished in " << records << " records");
+      std::atomic<bool> request_ok{false};
+      t::loopback_server srv(t::make_server_ctx(t::default_pki(), server_version(TLS1_2_VERSION)),
+                             [&](t::server_conn& c) {
+                               request_ok = c.expect_pattern(1000, 1);
+                               c.send_pattern(100'000, 2);
+                               c.close_notify();
+                               c.wait_peer_close();
+                             });
+      srv.split_tls12_finished(piece);
+      auto const p = make_openssl_provider(trusting(ktls_mode::disable));
+      {
+        client c(*p, srv.port());
+        REQUIRE_FALSE(c.handshake());
+        traffic_keys rx;
+        traffic_keys tx;
+        REQUIRE_FALSE(c.s->export_keys(direction::receive, rx));
+        REQUIRE_FALSE(c.s->export_keys(direction::send, tx));
+        CHECK(rx.sequence == records);
+        CHECK(tx.sequence == 1);  // our Finished went in one record
+        user_tls u(*p, c, tier2);
+        REQUIRE(t::send_sealed(c.fd.get(), *u.sealer, t::pattern(1000, 1)));
+        std::vector<std::byte> got(100'000);
+        REQUIRE(u.rx.receive(got));  // tier 2 decrypts with the exported sequence number
+        CHECK(t::check_pattern(got, 2) == std::string_view::npos);
+        CHECK(u.rx.wait_closed());
+      }
+      srv.join();
+      CHECK(request_ok);
+      CHECK(srv.finished_records() == records);
+    }
   }
 }
 

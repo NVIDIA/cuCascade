@@ -22,9 +22,9 @@
  * a loopback OpenSSL server: plaintext `send`/`recv` after `install` (TLS 1.2 and 1.3,
  * AES-128/256-GCM, NO_PAD), control records drained with `recvmsg` + `TLS_GET_RECORD_TYPE` and
  * handled by `on_control_record` (tickets skipped, KeyUpdate re-key of RX and, when requested,
- * our reply + TX re-key through `flush_reply`, close_notify), a tampered record, and the control
- * record rules in isolation.  Tests that need the kernel module SKIP when `install` reports the
- * kernel refused (tls.ko missing, TCP_ULP blocked).
+ * our reply + TX re-key through `flush_reply`, close_notify), a TLS 1.2 Finished split across
+ * records, a tampered record, and the control record rules in isolation.  Tests that need the
+ * kernel module SKIP when `install` reports the kernel refused (tls.ko missing, TCP_ULP blocked).
  */
 
 #include "io/tls/key_schedule.hpp"
@@ -376,6 +376,38 @@ TEST_CASE("ktls: KeyUpdate requested mid-stream re-keys both directions (Linux >
     CHECK(delta(before, after, "TlsRxRekeyOk") >= 2);
     CHECK(delta(before, after, "TlsTxRekeyOk") >= 1);
   }
+}
+
+TEST_CASE("ktls: TLS 1.2 Finished split across two records, then application data", "[tls]")
+{
+  // The server's Finished takes sequence numbers 0 and 1: the kernel must start RX at 2 (it
+  // fails the first application record with EBADMSG at 1).
+  std::atomic<bool> request_ok{false};
+  t::loopback_server srv(
+    t::make_server_ctx(t::default_pki(),
+                       server_options(TLS1_2_VERSION, "ECDHE-ECDSA-AES128-GCM-SHA256")),
+    [&](t::server_conn& c) {
+      request_ok = c.expect_pattern(20'000, 1);
+      c.send_pattern(300'000, 2);
+      c.close_notify();
+      c.wait_peer_close();
+    });
+  srv.split_tls12_finished(8);  // 16-byte Finished: 8 + 8
+  auto const p = make_openssl_provider(trusting());
+  {
+    ktls_connection k(*p, srv.port());
+    REQUIRE_KTLS(k);
+    REQUIRE(t::send_all(k.fd.get(), t::pattern(20'000, 1)));
+    std::vector<std::byte> got(300'000);
+    REQUIRE(k.c.receive(got));
+    CHECK(t::check_pattern(got, 2) == std::string_view::npos);
+    std::vector<std::byte> none;
+    CHECK(k.c.receive(none));  // close_notify
+    CHECK(k.c.closed);
+  }
+  srv.join();
+  CHECK(request_ok);
+  CHECK(srv.finished_records() == 2);
 }
 
 TEST_CASE("ktls: a tampered record fails the receive (EBADMSG)", "[tls]")

@@ -239,6 +239,10 @@ class openssl_session final : public session {
   std::size_t _ctl_len{0};
   std::array<std::byte, control_capacity> _ctl{};
   // Control plane.
+  /// TLS 1.2 key export: records read ([0]) and written ([1]) under the new keys during the
+  /// handshake, i.e. after that direction's ChangeCipherSpec record (`on_handshake_msg`).
+  std::array<std::uint64_t, 2> _ccs_records{};
+  std::array<bool, 2> _ccs_seen{};
   captured_secrets _capture{};
   std::array<char, 256> _error_text{};
   library_opener _opener{*this};
@@ -374,6 +378,34 @@ struct session_access {
     }
   }
 
+  /// Handshake only: counts the records each direction protects with its new TLS 1.2 keys (those
+  /// after its ChangeCipherSpec record), the first sequence number `export_keys` hands on.  That
+  /// is 1 when the Finished came in one record, more when the peer split it (RFC 5246 §6.2.1 lets
+  /// any handshake message span records).  The record layer reports every record header read or
+  /// written (SSL3_RT_HEADER) once; OpenSSL 3.6 reports no message for a received TLS 1.2
+  /// ChangeCipherSpec, so its record header marks the key change.  Removed when the handshake is
+  /// done.
+  static void on_handshake_msg(int write_p,
+                               int version,
+                               int content_type,
+                               void const* buf,
+                               std::size_t len,
+                               SSL* ssl,
+                               void* arg) noexcept
+  {
+    (void)version;
+    (void)ssl;
+    auto* s = static_cast<openssl_session*>(arg);
+    if (s == nullptr || content_type != SSL3_RT_HEADER || len < record_header) { return; }
+    std::size_t const d = write_p != 0 ? 1 : 0;
+    if (*static_cast<unsigned char const*>(buf) == SSL3_RT_CHANGE_CIPHER_SPEC) {
+      s->_ccs_seen[d]    = true;
+      s->_ccs_records[d] = 0;
+    } else if (s->_ccs_seen[d]) {
+      ++s->_ccs_records[d];
+    }
+  }
+
   static BIO_METHOD const* method() noexcept
   {
     static BIO_METHOD* const m = [] {
@@ -428,6 +460,9 @@ std::error_code openssl_session::start(int fd, server_identity const& server) no
   // the handshake only; the transport waits for the readiness handshake() asks for.
   if (SSL_set_fd(_ssl, fd) != 1) { return make_error_code(errc::handshake_failed); }
   SSL_set_connect_state(_ssl);
+  // Record counts for the TLS 1.2 key export; removed when the handshake is done.
+  SSL_set_msg_callback(_ssl, &session_access::on_handshake_msg);
+  SSL_set_msg_callback_arg(_ssl, this);
   if (!is_ip && SSL_set_tlsext_host_name(_ssl, name.data()) != 1) {  // no SNI for IP literals
     return invalid();
   }
@@ -504,6 +539,7 @@ handshake_status openssl_session::handshake(std::error_code& ec) noexcept
   ERR_clear_error();
   int const r = SSL_do_handshake(_ssl);
   if (r == 1) {
+    SSL_set_msg_callback(_ssl, nullptr);  // the record counts are final (opener() sets on_msg)
     ec.clear();
     return handshake_status::done;
   }
@@ -612,6 +648,15 @@ std::error_code openssl_session::export_keys(direction dir, traffic_keys& out) n
   }
 
   // TLS 1.2: master secret + hello randoms -> key block (RFC 5246 §6.3, RFC 5288).
+  bool const rx = dir == direction::receive;
+  // The first record after the handshake follows those the new keys already protected: the
+  // Finished of this direction, in one record or (a peer may split it) several.
+  std::size_t const d       = rx ? 0 : 1;
+  std::uint64_t const first = _ccs_records[d];
+  if (!_ccs_seen[d] || first == 0) {
+    out.wipe();
+    return make_error_code(errc::not_supported);
+  }
   std::array<std::uint8_t, tls12_master_secret_bytes> master{};
   SSL_SESSION const* sess = SSL_get_session(_ssl);
   std::size_t const n =
@@ -628,13 +673,12 @@ std::error_code openssl_session::export_keys(direction dir, traffic_keys& out) n
     out.wipe();
     return e;
   }
-  bool const rx = dir == direction::receive;
   std::copy_n((rx ? kb.server_write_key : kb.client_write_key).begin(), s.key_len, out.key.begin());
   std::copy_n(
     (rx ? kb.server_write_iv : kb.client_write_iv).begin(), tls12_salt_bytes, out.iv.begin());
   out.iv_len     = static_cast<std::uint8_t>(tls12_salt_bytes);
   out.secret_len = 0;
-  out.sequence   = 1;  // the Finished message of this direction used sequence number 0
+  out.sequence   = first;  // the Finished used sequence numbers 0 .. first - 1
   return {};
 }
 

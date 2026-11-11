@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "io/tls/key_schedule.hpp"
 #include "tls_test_pki.hpp"
 
 #include <cucascade/io/tls/tls.hpp>
@@ -26,6 +27,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -45,6 +47,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -66,6 +69,9 @@
  * (`write`, `key_update`, `new_session_ticket`, `close_notify`, `send_tampered`) produces
  * ciphertext that the script then sends with one `send(2)` (or tampers with first).  Server
  * threads block SIGPIPE for themselves, so a client that hangs up never kills the test process.
+ * Record framing a peer may legally choose but an OpenSSL server does not by default is
+ * produced on request: a TLS 1.2 Finished split across records
+ * (`loopback_server::split_tls12_finished`).
  */
 namespace cucascade::test::tls {
 
@@ -204,6 +210,222 @@ inline bool send_all(int fd, std::span<std::byte const> data, int timeout_ms = 1
   }
   return true;
 }
+
+//===----------------------------------------------------------------------===//
+// Records
+//===----------------------------------------------------------------------===//
+
+/// Body length of the record whose header starts at @p off (the header must be in @p wire).
+inline std::size_t record_body_length(std::span<std::byte const> wire, std::size_t off)
+{
+  return (std::to_integer<std::size_t>(wire[off + 3]) << 8) |
+         std::to_integer<std::size_t>(wire[off + 4]);
+}
+
+namespace detail {
+
+/// TLS 1.2 AES-GCM (RFC 5288) of one record's content: seal @p in into @p out and @p tag, or
+/// open it and check @p tag.  @return false on a tag mismatch or an EVP failure.
+inline bool tls12_gcm(bool seal,
+                      std::span<std::uint8_t const> key,
+                      std::span<std::uint8_t const, 4> salt,
+                      std::uint64_t seq,
+                      std::uint8_t type,
+                      std::array<std::uint8_t, 8> const& explicit_nonce,
+                      std::span<std::uint8_t const> in,
+                      std::uint8_t* out,
+                      std::array<std::uint8_t, 16>& tag)
+{
+  std::array<std::uint8_t, 12> nonce{};
+  std::copy(salt.begin(), salt.end(), nonce.begin());
+  std::copy(explicit_nonce.begin(), explicit_nonce.end(), nonce.begin() + 4);
+  // additional_data = seq_num || type || version || length (RFC 5246 §6.2.3.3)
+  std::array<std::uint8_t, 13> aad{};
+  for (std::size_t i = 0; i < 8; ++i) {
+    aad[i] = static_cast<std::uint8_t>(seq >> (56 - 8 * i));
+  }
+  aad[8]                    = type;
+  aad[9]                    = 3;
+  aad[10]                   = 3;
+  aad[11]                   = static_cast<std::uint8_t>(in.size() >> 8);
+  aad[12]                   = static_cast<std::uint8_t>(in.size());
+  EVP_CIPHER_CTX* const ctx = EVP_CIPHER_CTX_new();
+  int outl                  = 0;
+  bool const ok =
+    ctx != nullptr &&
+    EVP_CipherInit_ex(ctx,
+                      key.size() == 16 ? EVP_aes_128_gcm() : EVP_aes_256_gcm(),
+                      nullptr,
+                      key.data(),
+                      nonce.data(),
+                      seal ? 1 : 0) == 1 &&
+    EVP_CipherUpdate(ctx, nullptr, &outl, aad.data(), static_cast<int>(aad.size())) == 1 &&
+    EVP_CipherUpdate(ctx, out, &outl, in.data(), static_cast<int>(in.size())) == 1 &&
+    (seal || EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag.data()) == 1) &&
+    EVP_CipherFinal_ex(ctx, out + in.size(), &outl) == 1 &&
+    (!seal || EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag.data()) == 1);
+  EVP_CIPHER_CTX_free(ctx);
+  return ok;
+}
+
+}  // namespace detail
+
+/**
+ * @brief Server write BIO that sends the TLS 1.2 Finished in several records.
+ *
+ * RFC 5246 §6.2.1 lets any handshake message span records; OpenSSL always sends its 16-byte
+ * Finished in one.  This BIO forwards the server's records to the socket unchanged, except the
+ * first handshake record after the server's ChangeCipherSpec (the encrypted Finished): it is
+ * opened with the server write key at sequence number 0 and sealed again as records of at most
+ * `piece` plaintext bytes, sequence numbers 0, 1, ...  The server's OpenSSL counted one record
+ * for it: `loopback_server` then seals `extra_records()` records that are never sent, so the
+ * server's next record carries the sequence number the client expects.
+ */
+class tls12_finished_splitter {
+ public:
+  tls12_finished_splitter(SSL* ssl, int fd, std::size_t piece) noexcept
+    : _ssl(ssl), _fd(fd), _piece(std::max<std::size_t>(piece, 1))
+  {
+  }
+  tls12_finished_splitter(tls12_finished_splitter const&)            = delete;
+  tls12_finished_splitter& operator=(tls12_finished_splitter const&) = delete;
+
+  /// A write BIO over this splitter; the SSL owns it, the splitter must outlive it.
+  [[nodiscard]] BIO* make_bio()
+  {
+    BIO* const b = BIO_new(method());
+    if (b != nullptr) {
+      BIO_set_data(b, this);
+      BIO_set_init(b, 1);
+    }
+    return b;
+  }
+  /// Records the Finished was sent in (0 until it was).
+  [[nodiscard]] unsigned finished_records() const noexcept { return _records; }
+  /// Records the split added to the wire (records - 1).
+  [[nodiscard]] unsigned extra_records() const noexcept { return _records > 0 ? _records - 1 : 0; }
+
+ private:
+  static BIO_METHOD const* method()
+  {
+    static BIO_METHOD* const m = [] {
+      BIO_METHOD* bm =
+        BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "test finished splitter");
+      if (bm != nullptr) {
+        (void)BIO_meth_set_write_ex(bm, &bio_write);
+        (void)BIO_meth_set_ctrl(bm, &bio_ctrl);
+      }
+      return bm;
+    }();
+    return m;
+  }
+  static int bio_write(BIO* b, char const* in, std::size_t inl, std::size_t* written)
+  {
+    *written   = 0;
+    auto* self = static_cast<tls12_finished_splitter*>(BIO_get_data(b));
+    if (self == nullptr) { return 0; }
+    auto const* p = reinterpret_cast<std::byte const*>(in);
+    self->_pending.insert(self->_pending.end(), p, p + inl);
+    if (!self->forward()) { return 0; }  // no retry flag: the handshake fails
+    *written = inl;
+    return 1;
+  }
+  static long bio_ctrl(BIO*, int cmd, long, void*) { return cmd == BIO_CTRL_FLUSH ? 1 : 0; }
+
+  /// Send the complete records written so far, the Finished split.
+  bool forward()
+  {
+    std::span<std::byte const> const w(_pending);
+    std::size_t off = 0;
+    bool ok         = true;
+    while (ok && w.size() - off >= 5 && w.size() - off - 5 >= record_body_length(w, off)) {
+      auto const rec  = w.subspan(off, 5 + record_body_length(w, off));
+      auto const type = std::to_integer<std::uint8_t>(rec[0]);
+      if (type == 22 && _ccs && _records == 0) {
+        ok = split(rec);
+      } else {
+        _ccs = _ccs || type == 20;
+        ok   = send_all(_fd, rec);
+      }
+      off += rec.size();
+    }
+    _pending.erase(_pending.begin(), _pending.begin() + static_cast<std::ptrdiff_t>(off));
+    return ok;
+  }
+
+  bool split(std::span<std::byte const> rec)
+  {
+    SSL_SESSION* const sess   = SSL_get_session(_ssl);
+    SSL_CIPHER const* const c = sess != nullptr ? SSL_SESSION_get0_cipher(sess) : nullptr;
+    if (c == nullptr || rec.size() < 5 + 8 + 1 + 16) { return false; }
+    // The server write key and salt: the key block of the master secret (RFC 5246 §6.3).
+    io::tls::suite_info const s =
+      io::tls::suite_of(io::tls::protocol_version::tls1_2, SSL_CIPHER_get_protocol_id(c));
+    std::array<std::uint8_t, 48> master{};
+    std::array<std::uint8_t, 32> cr{};
+    std::array<std::uint8_t, 32> sr{};
+    if (!s.supported() ||
+        SSL_SESSION_get_master_key(sess, master.data(), master.size()) != master.size()) {
+      return false;
+    }
+    (void)SSL_get_client_random(_ssl, cr.data(), cr.size());
+    (void)SSL_get_server_random(_ssl, sr.data(), sr.size());
+    io::tls::openssl_kdf const kdf;
+    io::tls::tls12_key_block kb;
+    if (io::tls::tls12_derive_key_block(kdf, s, master, cr, sr, kb)) { return false; }
+    std::span<std::uint8_t const> const key(kb.server_write_key.data(), s.key_len);
+    std::span<std::uint8_t const, 4> const salt(kb.server_write_iv);
+    // body = explicit nonce (8) || ciphertext || tag (16)
+    auto const* body    = reinterpret_cast<std::uint8_t const*>(rec.data()) + 5;
+    std::size_t const n = rec.size() - 5 - 8 - 16;
+    std::array<std::uint8_t, 8> xn{};
+    std::array<std::uint8_t, 16> tag{};
+    std::copy_n(body, 8, xn.begin());
+    std::copy_n(body + 8 + n, 16, tag.begin());
+    std::vector<std::uint8_t> plain(n);
+    if (!detail::tls12_gcm(false, key, salt, 0, 22, xn, {body + 8, n}, plain.data(), tag)) {
+      return false;
+    }
+    std::vector<std::byte> out;
+    auto append = [&out](std::span<std::uint8_t const> part) {
+      auto const* q = reinterpret_cast<std::byte const*>(part.data());
+      out.insert(out.end(), q, q + part.size());
+    };
+    std::uint64_t seq = 0;
+    for (std::size_t o = 0; o < n; o += _piece, ++seq) {
+      std::size_t const k = std::min(_piece, n - o);
+      // A nonce of its own per record (OpenSSL counts up from the one it used).
+      std::array<std::uint8_t, 8> x = xn;
+      if (seq != 0) {
+        x[0] ^= 0x80;
+        x[7] ^= static_cast<std::uint8_t>(seq);
+      }
+      std::vector<std::uint8_t> ct(k);
+      if (!detail::tls12_gcm(true, key, salt, seq, 22, x, {plain.data() + o, k}, ct.data(), tag)) {
+        return false;
+      }
+      std::size_t const len = 8 + k + 16;
+      std::array<std::uint8_t, 5> const h{22,
+                                          std::to_integer<std::uint8_t>(rec[1]),
+                                          std::to_integer<std::uint8_t>(rec[2]),
+                                          static_cast<std::uint8_t>(len >> 8),
+                                          static_cast<std::uint8_t>(len)};
+      append(h);
+      append(x);
+      append(ct);
+      append(tag);
+    }
+    _records = static_cast<unsigned>(seq);
+    return send_all(_fd, out);
+  }
+
+  SSL* _ssl;
+  int _fd;
+  std::size_t _piece;
+  bool _ccs{false};
+  unsigned _records{0};
+  std::vector<std::byte> _pending;
+};
 
 //===----------------------------------------------------------------------===//
 // Server
@@ -373,6 +595,12 @@ class loopback_server {
   [[nodiscard]] unsigned accepted() const noexcept { return _accepted.load(); }
   [[nodiscard]] unsigned handshake_failures() const noexcept { return _failed.load(); }
 
+  /// TLS 1.2: send the Finished of the connections accepted from now on in records of at most
+  /// @p piece plaintext bytes (`tls12_finished_splitter`); 0 sends it in one record (default).
+  void split_tls12_finished(std::size_t piece) noexcept { _finished_piece.store(piece); }
+  /// Records the last split Finished took (0 when none was split).
+  [[nodiscard]] unsigned finished_records() const noexcept { return _finished_records.load(); }
+
   /// Wait for every connection thread started so far (their scripts finished).
   void join()
   {
@@ -462,6 +690,11 @@ class loopback_server {
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     SSL* ssl = SSL_new(_ctx);
     SSL_set_fd(ssl, fd);
+    std::optional<tls12_finished_splitter> splitter;  // outlives its BIO (freed with the SSL)
+    if (std::size_t const piece = _finished_piece.load(); piece != 0) {
+      splitter.emplace(ssl, fd, piece);
+      SSL_set0_wbio(ssl, splitter->make_bio());  // the socket BIO stays the read BIO
+    }
     server_conn conn(ssl, fd);
     SSL_set_msg_callback(ssl, &loopback_server::on_msg);
     SSL_set_msg_callback_arg(ssl, &conn);
@@ -478,8 +711,19 @@ class loopback_server {
         _client_random = cr;
         _server_random = sr;
       }
-      ++_accepted;
       SSL_set0_wbio(ssl, BIO_new(BIO_s_mem()));  // writes: memory BIO, then one send(2)
+      if (splitter) {
+        // The split Finished took records the server's OpenSSL did not count: seal as many
+        // records, never sent, so that its next one has the sequence number the client expects.
+        _finished_records.store(splitter->finished_records());
+        for (unsigned i = 0; i < splitter->extra_records(); ++i) {
+          char const x  = 0;
+          std::size_t w = 0;
+          (void)SSL_write_ex(ssl, &x, 1, &w);
+        }
+        (void)conn.take();
+      }
+      ++_accepted;
       if (_script) { _script(conn); }
     } else {
       ++_failed;
@@ -498,6 +742,8 @@ class loopback_server {
   std::atomic<bool> _stop{false};
   std::atomic<unsigned> _accepted{0};
   std::atomic<unsigned> _failed{0};
+  std::atomic<std::size_t> _finished_piece{0};
+  std::atomic<unsigned> _finished_records{0};
   std::thread _acceptor;
   mutable std::mutex _mu;
   std::vector<std::thread> _workers;
