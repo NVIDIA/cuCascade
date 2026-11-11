@@ -271,7 +271,7 @@ inline void futex_wake_all(std::atomic<std::uint32_t>& atom)
 template <class value_t>
 class core {
  public:
-  using callback = invocable<void(try_t<value_t>&&)>;
+  using callback = invocable<void(try_t<value_t>&&) &&>;
 
   core()                       = default;
   core(core const&)            = delete;
@@ -389,7 +389,7 @@ class core {
 
 template <class value_t>
 struct state {
-  using callback = invocable<void(try_t<value_t>&&)>;
+  using callback = invocable<void(try_t<value_t>&&) &&>;
 
   virtual ~state()                                                         = default;
   virtual void await()                                                     = 0;
@@ -782,22 +782,20 @@ class semi_future {
   // Any executor dispatch must be baked into cb by the caller.
   // Used by future<value_t, exec_t>::thenX and flat_map_state's flattening.
   //
-  // `cb` may also be a one-shot (`&&`-qualified) callable such as
-  // `invocable<void(try_t<value_t>&&) &&>`; it cannot be stored as-is (the slot
-  // is invoked as an lvalue), so it is adapted by a forwarding wrapper.
+  // The slot is one-shot (`invocable<void(try_t<value_t>&&) &&>`, invoked as an
+  // rvalue), so a prepared `invocable<void(try_t<value_t>&&) &&>` terminal moves
+  // in without a wrapper or an allocation. Callers that must not fail after
+  // publishing I/O (the cache and the datasource bridge) rely on that: they
+  // build the terminal first and install it after dispatch.
   template <class cb_t>
   void install_callback(cb_t&& cb) &&
   {
     throw_if_invalid();
     using callback_t = typename detail::state<value_t>::callback;
-    if constexpr (std::is_constructible_v<callback_t, cb_t&&>) {
-      _state->set_callback(callback_t(std::forward<cb_t>(cb)));
-    } else {
-      _state->set_callback(
-        callback_t([inner = std::forward<cb_t>(cb)](try_t<value_t>&& result) mutable {
-          std::move(inner)(std::move(result));
-        }));
-    }
+    static_assert(std::is_constructible_v<callback_t, cb_t&&>,
+                  "install_callback: the callable must be invocable as an rvalue with "
+                  "try_t<value_t>&&");
+    _state->set_callback(callback_t(std::forward<cb_t>(cb)));
     _state.reset();
   }
 

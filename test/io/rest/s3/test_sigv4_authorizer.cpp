@@ -149,7 +149,8 @@ TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "
     R"(<?xml version="1.0" encoding="UTF-8"?>)"
     R"(<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">)"
     R"(<Name>bucket</Name><Prefix>lake/</Prefix>)"
-    R"(<Contents><Key>lake/a&amp;b.parquet</Key><Size>12</Size></Contents>)"
+    R"(<Contents><Key>lake/a&amp;b.parquet</Key><Size>12</Size>)"
+    R"(<ETag>&quot;9b2cf535f27731c974343645a3985328&quot;</ETag></Contents>)"
     R"(<Contents><Key>lake/year=2024/file.parquet</Key><Size>0</Size></Contents>)"
     R"(<IsTruncated>true</IsTruncated>)"
     R"(<NextContinuationToken>token/with+chars=</NextContinuationToken>)"
@@ -158,8 +159,10 @@ TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "
   REQUIRE(page.entries.size() == 2);
   CHECK(page.entries[0].key == "lake/a&b.parquet");
   CHECK(page.entries[0].size == 12);
+  CHECK(page.entries[0].etag == "\"9b2cf535f27731c974343645a3985328\"");
   CHECK(page.entries[1].key == "lake/year=2024/file.parquet");
   CHECK(page.entries[1].size == 0);
+  CHECK(page.entries[1].etag.empty());
   CHECK(page.is_truncated);
   CHECK(page.next_continuation_token == "token/with+chars=");
 }
@@ -494,6 +497,36 @@ TEST_CASE("sigv4_presigned_authorizer rejects malformed construction inputs", "[
   CHECK_THROWS_AS(
     sigv4_presigned_authorizer(creds, "us-east-1", "https://example.com", std::chrono::seconds{0}),
     credential_error);
+}
+
+TEST_CASE("SigV4 authorizers reject an endpoint without a host or with user-info",
+          "[s3][authorizer]")
+{
+  // Both signing modes parse the endpoint at construction, as Sirius does: a port-only
+  // authority has no host, and user-info is not part of a service endpoint.
+  using Catch::Matchers::ContainsSubstring;
+  using Catch::Matchers::MessageMatches;
+  auto const creds = example_static_credentials();
+  struct rejected {
+    char const* endpoint;
+    char const* reason;
+  };
+  for (auto const& [endpoint, reason] :
+       {rejected{"http://:9000", "endpoint missing host"},
+        rejected{"https://user@storage.example", "endpoint must not contain user-info"}}) {
+    CAPTURE(endpoint);
+    CHECK_THROWS_MATCHES(sigv4_presigned_authorizer(creds, "us-east-1", endpoint),
+                         credential_error,
+                         MessageMatches(ContainsSubstring(reason)));
+    CHECK_THROWS_MATCHES(sigv4_header_authorizer(creds, "us-east-1", endpoint),
+                         credential_error,
+                         MessageMatches(ContainsSubstring(reason)));
+  }
+  for (auto const* endpoint : {"http://storage.example", "http://storage.example:9000"}) {
+    CAPTURE(endpoint);
+    CHECK_NOTHROW(sigv4_presigned_authorizer(creds, "us-east-1", endpoint));
+    CHECK_NOTHROW(sigv4_header_authorizer(creds, "us-east-1", endpoint));
+  }
 }
 
 TEST_CASE("sigv4_header_authorizer signs with headers and plain path-style URLs",

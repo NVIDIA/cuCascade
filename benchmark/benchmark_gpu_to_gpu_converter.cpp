@@ -34,17 +34,14 @@
 #include "cucascade/cudf/gpu_data_representation.hpp"
 #include "cucascade/data/representation_converter.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
-#include "cucascade/memory/reservation_aware_resource_adaptor.hpp"
 #include "cucascade/memory/reservation_manager_configurator.hpp"
+#include "utils/cuda_device_utils.hpp"
+#include "utils/mixed_table.hpp"
+#include "utils/peer_access_utils.hpp"
 
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 
-#include <cudf/column/column_factories.hpp>
-#include <cudf/dictionary/dictionary_factories.hpp>
-#include <cudf/filling.hpp>
-#include <cudf/null_mask.hpp>
-#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
@@ -56,7 +53,10 @@
 
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
+#include <iterator>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -66,22 +66,36 @@ namespace {
 using namespace cucascade;
 using namespace cucascade::memory;
 
-constexpr uint64_t KiB = 1024ULL;
-constexpr uint64_t MiB = 1024ULL * KiB;
-constexpr uint64_t GiB = 1024ULL * MiB;
+constexpr uint64_t kKiB = 1024ULL;
+constexpr uint64_t kMiB = 1024ULL * kKiB;
+constexpr uint64_t kGiB = 1024ULL * kMiB;
 
-constexpr int src_device_id = 1;
-constexpr int dst_device_id = 0;
-
-constexpr std::size_t gpu_capacity_per_device  = 32 * GiB;
-constexpr std::size_t host_capacity_per_region = 4 * GiB;
+constexpr int kSrcDeviceId = 1;
+constexpr int kDstDeviceId = 0;
 
 // Keep the consumer fan-in fixed; only rows per partition vary.
-constexpr std::size_t num_inputs        = 8;
-constexpr std::size_t columns_per_table = 32;
+constexpr std::size_t kNumInputs = 8;
 
-// Every generated string has this many bytes; both offset widths are exercised.
-constexpr cudf::size_type string_length = 16;
+// Mixed tables concatenated per input: 2 x 16 columns to have 32 columns per partition.
+constexpr int kMixedTablesPerInput = 2;
+
+// Rows per input swept by every benchmark.
+constexpr std::array<int64_t, 5> kRowCounts{1024, 4096, 16384, 65536, 262144};
+constexpr std::size_t kMaxRows = static_cast<std::size_t>(std::ranges::max(kRowCounts));
+
+// Per-GPU memory estimate at kMaxRows, from make_mixed_table's conservative budget:
+//   input  = 2 tables x (262144 rows x 512 B + 32 KiB) ≈ 256 MiB
+//   peak   = (8 resident inputs or outputs + 1 table set under construction) x input ≈ 2.25 GiB
+//   pool   = peak + 25% for gather workspace and the 90% reservation limit ≈ 2.8 GiB
+constexpr std::size_t kInputBytes =
+  static_cast<std::size_t>(kMixedTablesPerInput) *
+  (kMaxRows * test::kMixedTableBytesPerRow + test::kMixedTableFixedBytes);
+constexpr std::size_t kPeakBytesPerGpu      = (kNumInputs + 1) * kInputBytes;
+constexpr std::size_t kGpuCapacityPerDevice = kPeakBytesPerGpu + kPeakBytesPerGpu / 4;
+
+// Host staging is unused (benchmarks skip without peer access); the host space still pins
+// 4 x 128 x 1 MiB = 512 MiB at startup, so cap just above that.
+constexpr std::size_t kHostCapacityPerRegion = 1 * kGiB;
 
 static std::unique_ptr<memory_reservation_manager> g_manager;
 static std::unique_ptr<representation_converter_registry> g_registry;
@@ -91,13 +105,15 @@ static std::unique_ptr<representation_converter_registry> g_registry;
  */
 void DoSetup([[maybe_unused]] const benchmark::State& state)
 {
-  if (g_manager) { return; }
+  // can't skip in setup (requires mutable state)
+  // simply exit early, and skip in the benchmark
+  if (test::cuda_device_count() < 2) { return; }
 
   reservation_manager_configurator builder;
-  builder.set_gpu_ids({dst_device_id, src_device_id})
-    .set_gpu_usage_limit(gpu_capacity_per_device)
+  builder.set_gpu_ids({kDstDeviceId, kSrcDeviceId})
+    .set_gpu_usage_limit(kGpuCapacityPerDevice)
     .use_numa_id_as_host_id()
-    .set_per_numa_region_capacity(host_capacity_per_region);
+    .set_per_numa_region_capacity(kHostCapacityPerRegion);
   g_manager = std::make_unique<memory_reservation_manager>(builder.build());
 
   g_registry = std::make_unique<representation_converter_registry>();
@@ -110,136 +126,47 @@ void DoTeardown([[maybe_unused]] const benchmark::State& state)
   g_manager.reset();
 }
 
-bool has_two_devices()
-{
-  int device_count = 0;
-  return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count >= 2;
-}
-
-const memory_space* gpu_space(int device_id)
-{
-  return g_manager->get_memory_space(Tier::GPU, device_id);
-}
-
 /**
- * @brief Grant each GPU pool read/write access to the other GPU, as Sirius does at startup.
- *        Without the grant the converter may stage through host memory instead of peer DMA.
- * @return False if the hardware or driver refuses the grant.
- */
-bool grant_peer_pools()
-{
-  for (auto const [owner, accessor] :
-       {std::pair{src_device_id, dst_device_id}, std::pair{dst_device_id, src_device_id}}) {
-    auto const pool = gpu_space(owner)->get_memory_resource_of<Tier::GPU>()->pool_handle();
-    if (pool == nullptr) { return false; }
-    if (!grant_pool_peer_access(pool, owner, accessor).granted()) { return false; }
-  }
-  return true;
-}
-
-std::unique_ptr<cudf::column> make_fixed_column(cudf::size_type rows,
-                                                cudf::mask_state mask,
-                                                ::cuda::stream_ref stream,
-                                                rmm::device_async_resource_ref mr)
-{
-  auto const type  = cudf::data_type{cudf::type_id::INT64};
-  auto col         = cudf::make_fixed_width_column(type, rows, mask, stream, mr);
-  auto const bytes = static_cast<std::size_t>(rows) * cudf::size_of(type);
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(col->mutable_view().head(), 0, bytes, stream.get()));
-  return col;
-}
-
-template <typename Offset = int32_t>
-std::unique_ptr<cudf::column> make_string_column(cudf::size_type rows,
-                                                 ::cuda::stream_ref stream,
-                                                 rmm::device_async_resource_ref mr)
-{
-  // offsets = [0, L, 2L, ..., rows * L]
-  cudf::numeric_scalar<Offset> const init{0, true, stream};
-  cudf::numeric_scalar<Offset> const step{string_length, true, stream};
-  auto offsets = cudf::sequence(rows + 1, init, step, stream, mr);
-
-  auto const chars_bytes = static_cast<std::size_t>(rows) * string_length;
-  rmm::device_buffer chars(chars_bytes, stream, mr);
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(chars.data(), 'a', chars_bytes, stream.get()));
-
-  return cudf::make_strings_column(
-    rows,
-    std::move(offsets),
-    std::move(chars),
-    0,
-    cudf::create_null_mask(rows, cudf::mask_state::ALL_VALID, stream, mr));
-}
-
-/**
- * @brief Build 32 columns weighted toward per-column synchronization, not type coverage.
+ * @brief Build one partition by concatenating the columns of kMixedTablesPerInput mixed tables.
  *
- * All-valid masks deliberately exercise nullable copies without changing nested values.
- * Both string offset widths are present. Error paths, empty/degenerate columns, same-device
- * clones and hardware-dependent copy routes are not dimensions of this row-count sweep.
+ * Doubling the mixed table keeps 32 columns, weighting the run toward per-column
+ * synchronization (string chars-size readbacks, INT32 and INT64 offsets) over raw bytes.
  */
 std::unique_ptr<cudf::table> make_table(cudf::size_type rows,
                                         const memory_space& space,
                                         ::cuda::stream_ref stream)
 {
+  // make_mixed_table records an event on the current device, which must own @p stream.
   rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{space.get_device_id()}};
-  auto const mr = space.get_default_allocator();
+  rmm::device_async_resource_ref const mr = space.get_default_allocator();
 
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(columns_per_table);
-  constexpr int nullable_fixed_columns = 4;
-  constexpr int string_pairs           = 12;
-  constexpr int list_columns           = 2;
-  static_assert(nullable_fixed_columns + 2 * string_pairs + list_columns + 2 == columns_per_table);
-  for (int i = 0; i < nullable_fixed_columns; ++i) {
-    columns.push_back(make_fixed_column(rows, cudf::mask_state::ALL_VALID, stream, mr));
+  for (int i = 0; i < kMixedTablesPerInput; ++i) {
+    std::vector<std::unique_ptr<cudf::column>> part =
+      test::make_mixed_table(rows, stream, mr)->release();
+    columns.insert(
+      columns.end(), std::make_move_iterator(part.begin()), std::make_move_iterator(part.end()));
   }
-
-  // Strings add chars-size readback waits on top of nullable-mask synchronization.
-  for (int i = 0; i < string_pairs; ++i) {
-    columns.push_back(make_string_column<int32_t>(rows, stream, mr));
-    columns.push_back(make_string_column<int64_t>(rows, stream, mr));
-  }
-
-  constexpr cudf::size_type elements_per_list = 4;
-  cudf::numeric_scalar<int32_t> const init{0, true, stream};
-  cudf::numeric_scalar<int32_t> const step{elements_per_list, true, stream};
-  for (int i = 0; i < list_columns; ++i) {
-    columns.push_back(cudf::make_lists_column(
-      rows,
-      cudf::sequence(rows + 1, init, step, stream, mr),
-      make_string_column(rows * elements_per_list, stream, mr),
-      0,
-      cudf::create_null_mask(rows, cudf::mask_state::ALL_VALID, stream, mr)));
-  }
-
-  std::vector<std::unique_ptr<cudf::column>> fields;
-  fields.push_back(make_fixed_column(rows, cudf::mask_state::ALL_VALID, stream, mr));
-  fields.push_back(make_string_column(rows, stream, mr));
-  columns.push_back(std::make_unique<cudf::column>(
-    cudf::data_type{cudf::type_id::STRUCT},
-    rows,
-    rmm::device_buffer{},
-    cudf::create_null_mask(rows, cudf::mask_state::ALL_VALID, stream, mr),
-    0,
-    std::move(fields)));
-
-  // A single key makes zero-filled indices valid at every row count.
-  auto indices = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT32}, rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(indices->mutable_view().head(),
-                                     0,
-                                     static_cast<std::size_t>(rows) * sizeof(int32_t),
-                                     stream.get()));
-  columns.push_back(cudf::make_dictionary_column(
-    make_fixed_column(1, cudf::mask_state::UNALLOCATED, stream, mr),
-    std::move(indices),
-    cudf::create_null_mask(rows, cudf::mask_state::ALL_VALID, stream, mr),
-    0));
-
-  // Some factories use the default stream; finish setup before recording the writer event.
-  CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
   return std::make_unique<cudf::table>(std::move(columns));
+}
+
+/**
+ * @brief Skip @p state unless two devices exist and their pools accept peer access.
+ * @return True if the benchmark was skipped.
+ */
+bool skip_without_peers(benchmark::State& state)
+{
+  if (test::cuda_device_count() < 2) {
+    state.SkipWithError("requires two CUDA devices");
+    return true;
+  }
+  if (!test::grant_two_way_pool_access(*g_manager->get_memory_space(Tier::GPU, kSrcDeviceId),
+                                       *g_manager->get_memory_space(Tier::GPU, kDstDeviceId))
+         .granted()) {
+    state.SkipWithError("peer pool access not granted on this hardware");
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -250,7 +177,7 @@ std::vector<std::unique_ptr<gpu_table_representation>> make_inputs(std::size_t c
                                                                    cudf::size_type rows,
                                                                    ::cuda::stream_ref producer)
 {
-  auto* src_space = const_cast<memory_space*>(gpu_space(src_device_id));
+  memory_space* src_space = g_manager->get_memory_space(Tier::GPU, kSrcDeviceId);
 
   std::vector<std::unique_ptr<gpu_table_representation>> inputs;
   inputs.reserve(count);
@@ -261,15 +188,18 @@ std::vector<std::unique_ptr<gpu_table_representation>> make_inputs(std::size_t c
   return inputs;
 }
 
-void set_counters(benchmark::State& state, std::size_t bytes_per_iteration, std::size_t inputs)
+void set_counters(benchmark::State& state,
+                  std::size_t bytes_per_iteration,
+                  std::size_t inputs,
+                  cudf::size_type columns)
 {
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
                           static_cast<int64_t>(bytes_per_iteration));
-  state.counters["inputs"]    = static_cast<double>(inputs);
-  state.counters["columns"]   = static_cast<double>(columns_per_table);
-  state.counters["MiB"]       = static_cast<double>(bytes_per_iteration) / MiB;
-  auto const conversions      = static_cast<std::size_t>(state.iterations()) * inputs;
-  state.counters["per_input"] = benchmark::Counter(
+  state.counters["inputs"]      = static_cast<double>(inputs);
+  state.counters["columns"]     = static_cast<double>(columns);
+  state.counters["MiB"]         = static_cast<double>(bytes_per_iteration) / kMiB;
+  std::size_t const conversions = static_cast<std::size_t>(state.iterations()) * inputs;
+  state.counters["per_input"]   = benchmark::Counter(
     static_cast<double>(conversions), benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
 }
 
@@ -279,26 +209,19 @@ void set_counters(benchmark::State& state, std::size_t bytes_per_iteration, std:
  */
 void BM_ConvertGpuToGpu(benchmark::State& state)
 {
-  if (!has_two_devices()) {
-    state.SkipWithError("requires two CUDA devices");
-    return;
-  }
-  if (!grant_peer_pools()) {
-    state.SkipWithError("peer pool access not granted on this hardware");
-    return;
-  }
+  if (skip_without_peers(state)) { return; }
 
-  auto const rows = static_cast<cudf::size_type>(state.range(0));
+  cudf::size_type const rows = static_cast<cudf::size_type>(state.range(0));
 
   rmm::cuda_stream producer = [] {
-    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{src_device_id}};
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kSrcDeviceId}};
     return rmm::cuda_stream{};
   }();
-  auto const inputs = make_inputs(num_inputs, rows, producer);
+  auto const inputs = make_inputs(kNumInputs, rows, producer);
   producer.synchronize();
 
-  const memory_space* dst_space = gpu_space(dst_device_id);
-  rmm::cuda_set_device_raii const dst_guard{rmm::cuda_device_id{dst_device_id}};
+  const memory_space* dst_space = g_manager->get_memory_space(Tier::GPU, kDstDeviceId);
+  rmm::cuda_set_device_raii const dst_guard{rmm::cuda_device_id{kDstDeviceId}};
   rmm::cuda_stream consumer;
 
   std::size_t bytes_per_iteration = 0;
@@ -314,7 +237,7 @@ void BM_ConvertGpuToGpu(benchmark::State& state)
   }
 
   std::vector<std::unique_ptr<gpu_table_representation>> outputs;
-  outputs.reserve(num_inputs);
+  outputs.reserve(kNumInputs);
   for (auto _ : state) {
     for (auto const& input : inputs) {
       outputs.push_back(g_registry->convert<gpu_table_representation>(*input, dst_space, consumer));
@@ -333,7 +256,8 @@ void BM_ConvertGpuToGpu(benchmark::State& state)
     state.ResumeTiming();
   }
 
-  set_counters(state, bytes_per_iteration, num_inputs);
+  set_counters(
+    state, bytes_per_iteration, kNumInputs, inputs.front()->get_table_view().num_columns());
   state.counters["rows"] = rows;
 }
 
@@ -343,60 +267,58 @@ void BM_ConvertGpuToGpu(benchmark::State& state)
  */
 void BM_RawPeerCopy(benchmark::State& state)
 {
-  if (!has_two_devices()) {
-    state.SkipWithError("requires two CUDA devices");
-    return;
-  }
-  if (!grant_peer_pools()) {
-    state.SkipWithError("peer pool access not granted on this hardware");
-    return;
-  }
+  if (skip_without_peers(state)) { return; }
 
-  auto const rows = static_cast<cudf::size_type>(state.range(0));
+  cudf::size_type const rows = static_cast<cudf::size_type>(state.range(0));
   // Use the same schema's measured size, including masks and offsets, not a byte estimate.
-  auto const bytes_per_input = [&] {
-    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{src_device_id}};
+  auto const [bytes_per_input, columns] = [&] {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kSrcDeviceId}};
     rmm::cuda_stream producer;
     auto const inputs = make_inputs(1, rows, producer);
     producer.synchronize();
-    return inputs.front()->get_size_in_bytes();
+    return std::pair{inputs.front()->get_size_in_bytes(),
+                     inputs.front()->get_table_view().num_columns()};
   }();
-  auto const total_bytes = bytes_per_input * num_inputs;
+  std::size_t const total_bytes = bytes_per_input * kNumInputs;
 
   rmm::device_buffer src = [&] {
-    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{src_device_id}};
-    rmm::device_buffer buf(total_bytes,
-                           ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
-                           gpu_space(src_device_id)->get_default_allocator());
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kSrcDeviceId}};
+    rmm::device_buffer buf(
+      total_bytes,
+      ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+      g_manager->get_memory_space(Tier::GPU, kSrcDeviceId)->get_default_allocator());
     CUCASCADE_CUDA_TRY(cudaMemset(buf.data(), 0x22, total_bytes));
     return buf;
   }();
 
-  rmm::cuda_set_device_raii const dst_guard{rmm::cuda_device_id{dst_device_id}};
+  rmm::cuda_set_device_raii const dst_guard{rmm::cuda_device_id{kDstDeviceId}};
   rmm::cuda_stream consumer;
-  rmm::device_buffer dst(total_bytes, consumer, gpu_space(dst_device_id)->get_default_allocator());
+  rmm::device_buffer dst(
+    total_bytes,
+    consumer,
+    g_manager->get_memory_space(Tier::GPU, kDstDeviceId)->get_default_allocator());
   consumer.synchronize();
 
   for (auto _ : state) {
-    for (std::size_t i = 0; i < num_inputs; ++i) {
-      auto const offset = i * bytes_per_input;
+    for (std::size_t i = 0; i < kNumInputs; ++i) {
+      std::size_t const offset = i * bytes_per_input;
       CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(static_cast<std::byte*>(dst.data()) + offset,
-                                             dst_device_id,
+                                             kDstDeviceId,
                                              static_cast<const std::byte*>(src.data()) + offset,
-                                             src_device_id,
+                                             kSrcDeviceId,
                                              bytes_per_input,
                                              consumer.value()));
     }
     consumer.synchronize();
   }
 
-  set_counters(state, total_bytes, num_inputs);
+  set_counters(state, total_bytes, kNumInputs, columns);
   state.counters["rows"] = rows;
 }
 
 void gpu_to_gpu_args(benchmark::internal::Benchmark* b)
 {
-  for (int64_t rows : {1024, 4096, 16384, 65536, 262144, 1048576}) {
+  for (int64_t rows : kRowCounts) {
     b->Arg(rows);
   }
   b->ArgName("rows");

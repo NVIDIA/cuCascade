@@ -15,7 +15,12 @@
  * limitations under the License.
  */
 
+#include "utils/allocation_counter.hpp"
+
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <rmm/error.hpp>
@@ -30,11 +35,14 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
+#include <span>
 #include <thread>
 #include <vector>
 
 using namespace cucascade::memory;
+using cucascade::test::scoped_allocation_counter;
 
 namespace {
 
@@ -99,6 +107,27 @@ class counting_host_resource {
  private:
   std::shared_ptr<state> _s;
 };
+
+/// One HOST space (id 0) over a counting upstream, so a test can reserve from it and count pools.
+std::unique_ptr<memory_reservation_manager> make_counting_host_memory(
+  std::shared_ptr<counting_host_resource::state> state,
+  std::size_t capacity,
+  std::size_t initial_pools)
+{
+  host_memory_space_config config;
+  config.numa_id                    = 0;
+  config.memory_capacity            = capacity;
+  config.reservation_limit_fraction = 1.0;
+  config.block_size                 = block_size;
+  config.pool_size                  = pool_size;
+  config.initial_number_pools       = initial_pools;
+  config.mr_factory_fn              = [state](int, std::size_t) {
+    return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{counting_host_resource{state}};
+  };
+  std::vector<memory_space_config> configs;
+  configs.emplace_back(config);
+  return std::make_unique<memory_reservation_manager>(std::move(configs));
+}
 
 }  // namespace
 
@@ -176,4 +205,226 @@ TEST_CASE("NUMA pinned allocation restores the caller's CPU affinity", "[fixed_s
   REQUIRE(sched_setaffinity(0, sizeof(original), &original) == 0);
 
   REQUIRE(CPU_EQUAL(&after, &one_cpu));
+}
+
+TEST_CASE("Returning every block after several pool expansions does not allocate",
+          "[fixed_size_host]")
+{
+  constexpr std::size_t n_pools  = 5;  // the initial pool and four expansions
+  constexpr std::size_t n_blocks = n_pools * pool_size;
+  constexpr std::size_t reserved = 2 * block_size;
+  auto state                     = std::make_shared<counting_host_resource::state>();
+  auto memory                    = make_counting_host_memory(state, 2 * n_blocks * block_size, 1);
+  auto res = memory->request_reservation(specific_memory_space{Tier::HOST, 0}, reserved);
+  REQUIRE(res != nullptr);
+  REQUIRE(res->size() == reserved);
+  auto* mr = res->get_memory_resource_of<Tier::HOST>();
+  REQUIRE(mr != nullptr);
+
+  // One pool per allocation, each taken while every earlier block is still out, so the free
+  // list is empty at every expansion and only its reserved capacity can hold the returns.
+  std::vector<std::byte*> blocks;
+  for (std::size_t p = 0; p < n_pools; ++p) {
+    auto taken = mr->allocate_multiple_blocks(pool_size * block_size, res.get())->release_blocks();
+    blocks.insert(blocks.end(), taken.begin(), taken.end());
+  }
+  REQUIRE(state->live.load() == static_cast<int>(n_pools));
+  REQUIRE(mr->get_total_blocks() == n_blocks);
+  REQUIRE(mr->get_free_blocks() == 0);
+  REQUIRE(mr->get_total_reserved_bytes() == reserved);
+  REQUIRE(mr->get_total_allocated_bytes() == n_blocks * block_size);  // reservation included
+
+  // The first half lies wholly above the reservation, the second half ends inside it.
+  std::span<std::byte* const> const all{blocks};
+  std::size_t allocations      = 0;
+  std::size_t after_first_half = 0;
+  {
+    scoped_allocation_counter counter;
+    mr->return_blocks(all.first(n_blocks / 2), res.get());
+    after_first_half = mr->get_total_allocated_bytes();
+    mr->return_blocks(all.subspan(n_blocks / 2), res.get());
+    allocations = counter.count();
+  }
+  CHECK(allocations == 0);
+  CHECK(after_first_half == (n_blocks - n_blocks / 2) * block_size);
+  CHECK(mr->get_free_blocks() == n_blocks);
+  CHECK(mr->get_total_blocks() == n_blocks);
+  CHECK(mr->get_total_reserved_bytes() == reserved);
+  CHECK(mr->get_total_allocated_bytes() == reserved);  // the reservation stays charged
+
+  // The returned blocks are reusable without growing the pool.
+  auto again = mr->allocate_multiple_blocks(n_blocks * block_size);
+  CHECK(again->size() == n_blocks);
+  CHECK(state->live.load() == static_cast<int>(n_pools));
+  again.reset();
+
+  res.reset();
+  CHECK(mr->get_free_blocks() == n_blocks);
+  CHECK(mr->get_total_allocated_bytes() == 0);
+}
+
+TEST_CASE("trim_to returns the tail blocks without allocating", "[fixed_size_host]")
+{
+  constexpr std::size_t reserved = 2 * block_size;
+  auto state                     = std::make_shared<counting_host_resource::state>();
+  auto memory                    = make_counting_host_memory(state, 4 * pool_size * block_size, 2);
+  auto res = memory->request_reservation(specific_memory_space{Tier::HOST, 0}, reserved);
+  REQUIRE(res != nullptr);
+  auto* mr = res->get_memory_resource_of<Tier::HOST>();
+  REQUIRE(mr != nullptr);
+
+  auto allocation = mr->allocate_multiple_blocks(6 * block_size, res.get());
+  REQUIRE(mr->get_free_blocks() == 2 * pool_size - 6);
+  REQUIRE(mr->get_total_allocated_bytes() == 6 * block_size);
+
+  std::size_t allocations = 0;
+  {
+    scoped_allocation_counter counter;
+    allocation->trim_to(block_size + 1);  // still needs two blocks
+    allocations = counter.count();
+  }
+  CHECK(allocations == 0);
+  CHECK(allocation->size() == 2);
+  CHECK(mr->get_free_blocks() == 2 * pool_size - 2);
+  CHECK(mr->get_total_allocated_bytes() == reserved);  // the two kept fill the reservation
+
+  allocation.reset();
+  CHECK(mr->get_free_blocks() == 2 * pool_size);
+  CHECK(mr->get_total_allocated_bytes() == reserved);
+}
+
+TEST_CASE("A failed pool expansion gives back the blocks the allocation already took",
+          "[fixed_size_host]")
+{
+  constexpr std::size_t reserved = 2 * block_size;
+  auto state                     = std::make_shared<counting_host_resource::state>();
+  state->fail_after              = 1;  // the initial pool succeeds, the first expansion fails
+  auto memory                    = make_counting_host_memory(state, 4 * pool_size * block_size, 1);
+  auto res = memory->request_reservation(specific_memory_space{Tier::HOST, 0}, reserved);
+  REQUIRE(res != nullptr);
+  auto* mr = res->get_memory_resource_of<Tier::HOST>();
+  REQUIRE(mr != nullptr);
+
+  // Takes the whole first pool, then needs a second one.
+  REQUIRE_THROWS_AS(mr->allocate_multiple_blocks((pool_size + 2) * block_size, res.get()),
+                    rmm::bad_alloc);
+  CHECK(mr->get_free_blocks() == pool_size);
+  CHECK(mr->get_total_blocks() == pool_size);
+  CHECK(mr->get_total_allocated_bytes() == reserved);
+
+  // The reservation's own count was rolled back too: this fits inside it again.
+  auto allocation = mr->allocate_multiple_blocks(reserved, res.get());
+  CHECK(allocation->size() == 2);
+  CHECK(mr->get_total_allocated_bytes() == reserved);
+}
+
+TEST_CASE("Blocks are given back when wrapping them in an allocation fails", "[fixed_size_host]")
+{
+  constexpr std::size_t reserved = 2 * block_size;
+  // Filling the reservation, or one block past it, so a leaked count shows in either charge.
+  auto const n_blocks = GENERATE(std::size_t{2}, std::size_t{3});
+  auto state          = std::make_shared<counting_host_resource::state>();
+  auto memory         = make_counting_host_memory(state, 4 * pool_size * block_size, 1);
+  auto res            = memory->request_reservation(specific_memory_space{Tier::HOST, 0}, reserved);
+  REQUIRE(res != nullptr);
+  auto* mr = res->get_memory_resource_of<Tier::HOST>();
+  REQUIRE(mr != nullptr);
+  auto const free_before      = mr->get_free_blocks();
+  auto const allocated_before = mr->get_total_allocated_bytes();
+  REQUIRE(allocated_before == reserved);
+
+  // Fail each allocation the call makes in turn (its block list, then the wrapper) until a call
+  // makes them all.  A failed call must leave the blocks, the bytes and the reservation's count
+  // as they were.
+  fixed_multiple_blocks_allocation allocation;
+  std::size_t faults = 0;
+  for (std::size_t n = 1;; ++n) {
+    bool injected = false;  // the fault armed at n, not an exhaustion (rmm::bad_alloc)
+    bool other    = false;
+    std::size_t made{};
+    {
+      scoped_allocation_counter counter;
+      counter.fail_at(n);
+      try {
+        allocation = mr->allocate_multiple_blocks(n_blocks * block_size, res.get());
+      } catch (rmm::bad_alloc const&) {
+        other = true;
+      } catch (std::bad_alloc const&) {
+        injected = true;
+      }
+      made = counter.count();
+    }
+    INFO("fault armed at allocation " << n << " of the call");
+    REQUIRE_FALSE(other);
+    if (made < n) {  // never reached the fault: the call completed
+      REQUIRE_FALSE(injected);
+      break;
+    }
+    ++faults;
+    REQUIRE(injected);
+    REQUIRE(allocation == nullptr);
+    CHECK(mr->get_free_blocks() == free_before);
+    CHECK(mr->get_total_allocated_bytes() == allocated_before);
+  }
+  CHECK(faults >= 2);  // the block list and the wrapper
+
+  // The reservation's count was rolled back every time: the same allocation fits it as before.
+  REQUIRE(allocation != nullptr);
+  CHECK(allocation->size() == n_blocks);
+  CHECK(mr->get_free_blocks() == free_before - n_blocks);
+  CHECK(mr->get_total_allocated_bytes() == reserved + (n_blocks - 2) * block_size);
+  allocation.reset();
+  CHECK(mr->get_free_blocks() == free_before);
+  CHECK(mr->get_total_allocated_bytes() == reserved);
+}
+
+TEST_CASE("A failed grow_by gives back the blocks it took", "[fixed_size_host]")
+{
+  constexpr std::size_t reserved = 2 * block_size;
+  auto state                     = std::make_shared<counting_host_resource::state>();
+  auto memory                    = make_counting_host_memory(state, 4 * pool_size * block_size, 1);
+  auto res = memory->request_reservation(specific_memory_space{Tier::HOST, 0}, reserved);
+  REQUIRE(res != nullptr);
+  auto* mr = res->get_memory_resource_of<Tier::HOST>();
+  REQUIRE(mr != nullptr);
+  // One block, whose list has room for no more, so growing it must allocate.
+  auto allocation = mr->allocate_multiple_blocks(block_size, res.get());
+  REQUIRE(allocation->size() == 1);
+  auto const free_before      = mr->get_free_blocks();
+  auto const allocated_before = mr->get_total_allocated_bytes();
+  REQUIRE(allocated_before == reserved);
+
+  // Grow by two blocks, one inside the reservation and one past it.  Fail each allocation
+  // grow_by makes in turn (the new blocks' list, then growing the allocation's own list) until
+  // a call makes them all; a failed call must leave everything as it was.
+  std::size_t faults = 0;
+  for (std::size_t n = 1;; ++n) {
+    bool grown = false;
+    std::size_t made{};
+    {
+      scoped_allocation_counter counter;
+      counter.fail_at(n);
+      grown = allocation->grow_by(2 * block_size);
+      made  = counter.count();
+    }
+    INFO("fault armed at allocation " << n << " of grow_by");
+    if (made < n) {  // never reached the fault: the call completed
+      REQUIRE(grown);
+      break;
+    }
+    ++faults;
+    REQUIRE_FALSE(grown);
+    CHECK(allocation->size() == 1);
+    CHECK(mr->get_free_blocks() == free_before);
+    CHECK(mr->get_total_allocated_bytes() == allocated_before);
+  }
+  CHECK(faults >= 2);  // the new blocks' list and the allocation's list
+
+  // The reservation's count was rolled back every time: one new block still fits it.
+  CHECK(allocation->size() == 3);
+  CHECK(mr->get_free_blocks() == free_before - 2);
+  CHECK(mr->get_total_allocated_bytes() == reserved + block_size);
+  allocation.reset();
+  CHECK(mr->get_free_blocks() == free_before + 1);
+  CHECK(mr->get_total_allocated_bytes() == reserved);
 }

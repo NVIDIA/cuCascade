@@ -20,6 +20,7 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uri_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/object_identity.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/curl_handle.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
@@ -33,6 +34,10 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
+
+# Sources include src-private headers (io/detail/...) from src/.
+target_include_directories(cucascade_io_objects
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # kvikIO reaches the environment only via libcudf's dependency closure, so the
 # fallback ioctx is built only alongside the cudf layer.

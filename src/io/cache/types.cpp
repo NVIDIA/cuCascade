@@ -25,14 +25,13 @@
 #include <rmm/aligned.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 
 namespace cucascade::io::cache {
-
-using multiple_blocks_allocation =
-  typename cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
 buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservation_manager,
                          double reservation_fraction_for_prefetching,
@@ -63,11 +62,13 @@ buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservat
       host_arena{mr->get_device_id(),
                  std::move(reservation),
                  mmr->get_memory_resource_of<cucascade::memory::Tier::HOST>()});
+    _arena_reserved.push_back(max_reservation);
     _reserved_size += max_reservation;
     _max_allowed_budget_for_prefetching += rmm::align_down(
       std::size_t(static_cast<double>(mmr->get_max_memory()) * max_prefetching_budget_fraction),
       std::size_t(_chunk_bytes));
   });
+  _arena_chunks = std::make_unique<std::atomic<std::size_t>[]>(_host_arenas.size());
 }
 
 buffer_pool::~buffer_pool() = default;
@@ -85,6 +86,7 @@ std::vector<std::byte*> buffer_pool::allocate_bulk_from(size_t n, int numa_node)
     auto blocks = arena.mr->allocate_multiple_blocks(n * _chunk_bytes, arena.reservation.get());
     if (!blocks) return {};
     auto out = blocks->release_blocks();
+    _arena_chunks[it->second].fetch_add(out.size(), std::memory_order_relaxed);
     _n_allocated_chunks.fetch_add(out.size(), std::memory_order_relaxed);
     return out;
   } catch (std::exception const&) {
@@ -105,12 +107,14 @@ std::vector<std::byte*> buffer_pool::allocate_bulk(size_t n, int& numa_node)
   }
 
   for (size_t i = 0; i < _host_arenas.size(); ++i) {
-    auto& arena = _host_arenas.at((start + i) % _host_arenas.size());
+    auto const index = (start + i) % _host_arenas.size();
+    auto& arena      = _host_arenas.at(index);
     try {
       auto blocks = arena.mr->allocate_multiple_blocks(n * _chunk_bytes, arena.reservation.get());
       if (!blocks) continue;
       numa_node = arena.numa_id;
       auto out  = blocks->release_blocks();
+      _arena_chunks[index].fetch_add(out.size(), std::memory_order_relaxed);
       _n_allocated_chunks.fetch_add(out.size(), std::memory_order_relaxed);
       return out;
     } catch (std::exception const&) {
@@ -123,22 +127,41 @@ std::vector<std::byte*> buffer_pool::allocate_bulk(size_t n, int& numa_node)
 
 void buffer_pool::deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexcept
 {
-  if (out.empty()) return;
-  auto it = _numa_to_arena_index.find(numa);
-  if (it == _numa_to_arena_index.end()) return;
-  auto& arena      = _host_arenas.at(it->second);
-  auto const count = out.size();
-  // Re-wrap the raw blocks in a multiple_blocks_allocation bound to this
-  // arena's MR; its destructor returns them to that exact MR (origin-safe).
-  auto b = multiple_blocks_allocation::create(std::move(out), *arena.mr, arena.reservation.get());
-  b.reset(nullptr);
-  _n_allocated_chunks.fetch_sub(count, std::memory_order_relaxed);
+  deallocate_bulk(std::span<std::byte* const>(out), numa);
+  out.clear();
 }
 
 void buffer_pool::deallocate_bulk(std::span<std::byte* const> blocks, int numa) noexcept
 {
   if (blocks.empty()) return;
-  deallocate_bulk(std::vector<std::byte*>(blocks.begin(), blocks.end()), numa);
+  auto const it = _numa_to_arena_index.find(numa);
+  assert(it != _numa_to_arena_index.end() && "deallocate_bulk: no arena for this NUMA node");
+  if (it == _numa_to_arena_index.end()) return;  // release builds drop the blocks (see header)
+  auto const index = it->second;
+  auto& arena      = _host_arenas[index];
+  // Back to the MR they came from, settled against this arena's reservation
+  // (origin-safe).  Nothing on this path allocates.
+  arena.mr->return_blocks(blocks, arena.reservation.get());
+  _arena_chunks[index].fetch_sub(blocks.size(), std::memory_order_relaxed);
+  _n_allocated_chunks.fetch_sub(blocks.size(), std::memory_order_relaxed);
+}
+
+std::size_t buffer_pool::releasable_bytes(int numa) const noexcept
+{
+  auto const it = _numa_to_arena_index.find(numa);
+  if (it == _numa_to_arena_index.end()) { return 0; }
+  auto const index = it->second;
+  auto const held  = _arena_chunks[index].load(std::memory_order_relaxed) * _chunk_bytes;
+  return held > _arena_reserved[index] ? held - _arena_reserved[index] : 0;
+}
+
+std::size_t buffer_pool::releasable_bytes() const noexcept
+{
+  std::size_t total = 0;
+  for (auto const& arena : _host_arenas) {
+    total += releasable_bytes(arena.numa_id);
+  }
+  return total;
 }
 
 size_t buffer_pool::reservation_size_for_prefetching() const noexcept { return _reserved_size; }

@@ -26,7 +26,9 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -120,6 +122,79 @@ TEST_CASE("align_and_coalesce honors a caller alignment as a lower bound", "[res
   REQUIRE(merged.size() == 1);
   CHECK(merged[0].offset() == 0);
   CHECK(merged[0].size() == 4096);
+}
+
+TEST_CASE("align_and_coalesce drops negative offsets and keeps ends within INT64_MAX",
+          "[rest][reactor]")
+{
+  constexpr auto max = std::numeric_limits<std::int64_t>::max();
+  constexpr auto min = std::numeric_limits<std::int64_t>::min();
+
+  SECTION("a negative range that sorts first does not swallow a later one")
+  {
+    // Cast to size_t, (-10, 5) ends near 2^64, so (0, 50) used to merge into it.
+    auto out = coalesce({byte_range{-10, 5}, byte_range{0, 50}});
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].offset() == 0);
+    CHECK(out[0].size() == 50);
+  }
+  SECTION("a negative range reaching past zero does not absorb a valid one")
+  {
+    auto out = coalesce({byte_range{-100, 200}, byte_range{0, 50}});
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].offset() == 0);
+    CHECK(out[0].size() == 50);
+  }
+  SECTION("entirely negative ranges are dropped")
+  {
+    CHECK(coalesce({byte_range{-100, 50}}).empty());
+    CHECK(coalesce({byte_range{min, max}}).empty());
+  }
+  SECTION("non-positive sizes are dropped")
+  {
+    auto out =
+      coalesce({byte_range{10, 0}, byte_range{20, -5}, byte_range{30, 10}, byte_range{50, min}});
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].offset() == 30);
+    CHECK(out[0].size() == 10);
+  }
+  SECTION("ends near INT64_MAX are clamped, not wrapped")
+  {
+    auto out = coalesce({byte_range{max - 10, 100},
+                         byte_range{max - 100, 50},
+                         byte_range{0, 10},
+                         byte_range{max, 5}});
+    REQUIRE(out.size() == 3);
+    CHECK(out[0].offset() == 0);
+    CHECK(out[0].size() == 10);
+    CHECK(out[1].offset() == max - 100);
+    CHECK(out[1].size() == 50);
+    CHECK(out[2].offset() == max - 10);
+    CHECK(out[2].size() == 10);
+
+    // Aligned up, both ends pass INT64_MAX: one range ending exactly there.
+    auto aligned = coalesce({byte_range{max - 100, 50}, byte_range{max - 10, 100}}, 4096);
+    REQUIRE(aligned.size() == 1);
+    CHECK(aligned[0].offset() == max - 4095);
+    CHECK(aligned[0].size() == 4095);
+
+    // A whole-file request used to round up to a 2^63 (negative) size.
+    auto whole = coalesce({byte_range{0, max}}, 4096);
+    REQUIRE(whole.size() == 1);
+    CHECK(whole[0].offset() == 0);
+    CHECK(whole[0].size() == max);
+  }
+  SECTION("valid ranges plan as before")
+  {
+    auto out = coalesce(
+      {byte_range{9000, 100}, byte_range{100, 100}, byte_range{3000, 100}, byte_range{8192, 1}},
+      4096);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].offset() == 0);
+    CHECK(out[0].size() == 4096);
+    CHECK(out[1].offset() == 8192);
+    CHECK(out[1].size() == 4096);
+  }
 }
 
 TEST_CASE("rest_reactor rejects work outside its running lifetime", "[rest][reactor]")

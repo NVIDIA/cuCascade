@@ -111,22 +111,40 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     static std::unique_ptr<multiple_blocks_allocation> empty()
     {
       return std::unique_ptr<multiple_blocks_allocation>(
-        new multiple_blocks_allocation({}, nullptr, nullptr));
+        new multiple_blocks_allocation(nullptr, nullptr));
     }
 
-    static std::unique_ptr<multiple_blocks_allocation> create(std::vector<std::byte*> b,
+    /**
+     * @brief Wrap blocks allocated from @p m, so they are given back when the wrapper goes.
+     *
+     * Takes the blocks only once nothing can fail: if it throws, @p b is left as it was and the
+     * caller still owns the blocks (it can give them back with return_blocks()).
+     *
+     * @param b Blocks allocated from @p m and not returned since
+     * @param m The resource the blocks came from
+     * @param res The reservation they were allocated under, or null
+     * @throws std::invalid_argument if @p res is not a reservation of a host resource
+     * @throws std::bad_alloc if the wrapper cannot be allocated
+     */
+    static std::unique_ptr<multiple_blocks_allocation> create(std::vector<std::byte*>&& b,
                                                               fixed_size_host_memory_resource& m,
                                                               reservation* res = nullptr)
     {
-      return std::unique_ptr<multiple_blocks_allocation>(
-        new multiple_blocks_allocation(std::move(b), std::addressof(m), res));
+      chunked_reserved_area* arena = nullptr;
+      if (res) {
+        arena = dynamic_cast<chunked_reserved_area*>(res->_arena.get());
+        if (!arena)
+          throw std::invalid_argument("need host reservation for allocation multiple blocks");
+      }
+      std::unique_ptr<multiple_blocks_allocation> allocation(
+        new multiple_blocks_allocation(std::addressof(m), arena));
+      allocation->_blocks = std::move(b);  // cannot throw
+      return allocation;
     }
 
     ~multiple_blocks_allocation()
     {
-      if (_mr && !_blocks.empty()) {
-        _mr->return_allocated_chunks(std::move(_blocks), _reseved_memory);
-      }
+      if (_mr && !_blocks.empty()) { _mr->return_allocated_chunks(_blocks, _reseved_memory); }
     }
 
     // Disable copy to prevent double deallocation
@@ -157,11 +175,15 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
 
     bool grow_by(std::size_t additional_bytes) noexcept
     {
+      std::vector<std::byte*> blocks;
       try {
-        auto blocks = _mr->allocate_multiple_blocks_internal(additional_bytes, _reseved_memory);
+        blocks = _mr->allocate_multiple_blocks_internal(additional_bytes, _reseved_memory);
         _blocks.insert(_blocks.end(), blocks.begin(), blocks.end());
         return true;
-      } catch (const std::exception& e) {
+      } catch (const std::exception&) {
+        // A failed insert leaves _blocks unchanged: give back what this call took, with its
+        // byte and reservation accounting (nothing to give back if the allocation threw).
+        if (!blocks.empty()) { _mr->return_allocated_chunks(blocks, _reseved_memory); }
         return false;
       }
     }
@@ -169,34 +191,22 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     /// Return excess blocks beyond `needed_bytes`, freeing them back to the memory pool.
     /// This allows the scan to pre-allocate for the worst case but release unused blocks
     /// after the actual data size is known.
-    void trim_to(std::size_t needed_bytes)
+    void trim_to(std::size_t needed_bytes) noexcept
     {
       if (!_mr || _blocks.empty()) return;
       std::size_t needed_blocks = (needed_bytes + _block_size - 1) / _block_size;
       if (needed_blocks >= _blocks.size()) return;
-      // Extract excess blocks
-      std::vector<std::byte*> excess(_blocks.begin() + static_cast<std::ptrdiff_t>(needed_blocks),
-                                     _blocks.end());
+      // Return the tail in place, then drop it; neither step allocates.
+      _mr->return_allocated_chunks(std::span<std::byte* const>(_blocks).subspan(needed_blocks),
+                                   _reseved_memory);
       _blocks.resize(needed_blocks);
-      // Return them to the memory resource
-      _mr->return_allocated_chunks(std::move(excess), _reseved_memory);
     }
 
    private:
-    explicit multiple_blocks_allocation(std::vector<std::byte*> buffers,
-                                        fixed_size_host_memory_resource* m,
-                                        reservation* res)
-      : _blocks(std::move(buffers)),
-        _mr(m),
-        _block_size(m ? m->get_block_size() : 0),
-        _reseved_memory(nullptr)
+    multiple_blocks_allocation(fixed_size_host_memory_resource* m,
+                               chunked_reserved_area* res) noexcept
+      : _mr(m), _block_size(m ? m->get_block_size() : 0), _reseved_memory(res)
     {
-      if (res) {
-        auto* h_res = dynamic_cast<chunked_reserved_area*>(res->_arena.get());
-        if (!h_res)
-          throw std::invalid_argument("need host reservation for allocation multiple blocks");
-        _reseved_memory = h_res;
-      }
     }
 
     std::vector<std::byte*> _blocks;
@@ -322,10 +332,29 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
    * @param total_bytes Total size in bytes to allocate across multiple blocks
    * @param res Optional reservation to allocate from
    * @return multiple_blocks_allocation RAII wrapper for the allocated blocks
-   * @throws rmm::out_of_memory if insufficient blocks are available or upstream allocation fails
+   * @throws rmm::out_of_memory if the request does not fit in the resource's capacity or the
+   *         pool cannot supply the blocks
+   * @throws std::runtime_error if @p res is not a live reservation of this resource
+   * @throws std::bad_alloc if the bookkeeping or the wrapper cannot be allocated.  Whatever the
+   *         upstream resource throws when a pool expansion fails propagates unchanged (e.g.
+   *         rmm::bad_alloc).  On any throw the blocks and accounting this call took are given
+   *         back.
    */
   [[nodiscard]] fixed_multiple_blocks_allocation allocate_multiple_blocks(
     std::size_t total_bytes, reservation* res = nullptr);
+
+  /**
+   * @brief Return blocks taken out of an allocation with `release_blocks()`.
+   *
+   * Settles them as the allocation's destructor would: bytes still inside @p res stay charged
+   * to it and only the excess is credited back.  Allocation-free, so it is safe on paths that
+   * must not fail.
+   *
+   * @param blocks Blocks allocated from this resource and not returned since
+   * @param res The reservation they were allocated under.  Null, or anything other than a live
+   *        reservation of this resource, credits all their bytes back.
+   */
+  void return_blocks(std::span<std::byte* const> blocks, reservation* res = nullptr) noexcept;
 
   /**
    * @brief Gets the peak total allocated bytes across all streams.
@@ -400,8 +429,20 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
    */
   void expand_pools_parallel(std::size_t n_pools, std::size_t n_threads);
 
+  /**
+   * @brief Make room in the bookkeeping for @p n_new_pools more pools.
+   *
+   * Called before their upstream memory is taken, so a failure here leaves nothing behind and
+   * add_pool() cannot fail afterwards.  Keeps the @c _free_blocks capacity invariant.
+   *
+   * @throws std::bad_alloc if the bookkeeping vectors cannot grow
+   * @throws std::length_error if the new capacity exceeds their maximum size
+   */
+  void reserve_for_pools(std::size_t n_new_pools);
+
   /// Add one upstream allocation of @c _block_size * @c _pool_size bytes to the free list.
-  void add_pool(void* large_allocation);
+  /// The room for it was made by reserve_for_pools().
+  void add_pool(void* large_allocation) noexcept;
 
   /**
    * @brief registers reservation with the memory resource
@@ -416,23 +457,33 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
   void release_reservation(chunked_reserved_area* res);
 
   /**
-   * @brief release reservation and returns the unused bytes to back to the memory resource
-   * @param chunks reserved bytes that is registered with the memory resource
-   * @param res is the reserved memory bytes use to allocate the chunks from
+   * @brief Put allocated blocks back on the free list and credit their bytes.
+   *
+   * Bytes still inside @p res stay charged to it; only the excess is credited back.
+   * Allocation-free: the free list already has room for every block (see @c _free_blocks).
+   *
+   * @param chunks blocks allocated from this resource
+   * @param res the reservation they were allocated under, or null
    */
-  void return_allocated_chunks(std::vector<std::byte*> chunks, chunked_reserved_area* res);
+  void return_allocated_chunks(std::span<std::byte* const> chunks,
+                               chunked_reserved_area* res) noexcept;
 
   /**
    * @brief Allocate multiple blocks to satisfy a large allocation request.
    *
    * This method allocates the minimum number of blocks needed to satisfy the requested size.
-   * The blocks are returned as a RAII wrapper that automatically deallocates all blocks
-   * when it goes out of scope, preventing memory leaks.
+   * The caller owns the returned blocks and must give them back with
+   * return_allocated_chunks() under the same reservation.
    *
    * @param total_bytes Total size in bytes to allocate across multiple blocks
-   * @param res Optional reservation to allocate from
-   * @return multiple_blocks_allocation RAII wrapper for the allocated blocks
-   * @throws rmm::out_of_memory if insufficient blocks are available or upstream allocation fails
+   * @param h_reservation_slot Optional reservation to allocate from
+   * @return The allocated blocks
+   * @throws rmm::out_of_memory if the request does not fit in the resource's capacity or the
+   *         pool cannot supply the blocks
+   * @throws std::runtime_error if @p h_reservation_slot is not a live reservation
+   * @throws std::bad_alloc if the bookkeeping cannot grow.  Whatever the upstream resource
+   *         throws when a pool expansion fails propagates unchanged (e.g. rmm::bad_alloc).
+   *         On any throw the blocks and accounting this call took are given back.
    */
   [[nodiscard]] std::vector<std::byte*> allocate_multiple_blocks_internal(
     std::size_t total_bytes, chunked_reserved_area* h_reservation_slot);
@@ -444,7 +495,10 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
   std::size_t _pool_size;                       ///< Number of blocks in pool
   rmm::device_async_resource_ref _upstream_mr;  ///< Upstream memory resource
   std::vector<void*> _allocated_blocks;         ///< All allocated blocks
-  std::vector<void*> _free_blocks;              ///< Currently free blocks
+  /// Currently free blocks.  Invariant: `capacity() >= _allocated_blocks.size() * _pool_size`,
+  /// room for every block the resource owns, so returning blocks never allocates.
+  /// reserve_for_pools() keeps it before a pool's upstream memory is taken.
+  std::vector<void*> _free_blocks;
   mutable std::mutex _mutex;
   utils::atomic_bounded_counter<size_t> _allocated_bytes{0};
   utils::atomic_peak_tracker<size_t> _peak_allocated_bytes{0};

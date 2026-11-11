@@ -20,6 +20,7 @@
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/details/slot_pool.hpp>
 #include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/io_utils.hpp>
 #include <cucascade/io/rest/curl_handle.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 #include <cucascade/io/uri_parser.hpp>
@@ -1388,45 +1389,18 @@ std::unique_ptr<rest_reactor::io_object_type> rest_reactor::create_io_object(std
 }
 
 std::vector<byte_range> rest_reactor::align_and_coalesce(std::span<const byte_range> ranges,
-                                                         std::optional<size_t> alignment)
+                                                         std::optional<size_t> alignment) noexcept
 {
   // No physical block alignment for REST: honor a caller alignment >= 1 as a
   // lower bound, otherwise treat alignment as 1 (byte) — i.e. pure coalescing.
-  size_t const align = std::max<size_t>(alignment.value_or(1), 1);
-
-  std::vector<byte_range> aligned;
-  aligned.reserve(ranges.size());
-  for (auto const& r : ranges) {
-    if (r.size() <= 0) { continue; }
-    auto const offset  = static_cast<size_t>(r.offset());
-    auto const end     = offset + static_cast<size_t>(r.size());
-    size_t const start = (offset / align) * align;
-    size_t const stop  = ((end + align - 1) / align) * align;
-    aligned.emplace_back(static_cast<int64_t>(start), static_cast<int64_t>(stop - start));
+  // io_utils drops ranges with a negative offset or no bytes (cast to size_t, a
+  // negative offset would sort first, end near 2^64 and swallow later ranges) and
+  // keeps every end within INT64_MAX.
+  try {
+    return io_utils::align_and_coalesce(ranges, std::max<size_t>(alignment.value_or(1), 1));
+  } catch (...) {
+    return {};  // only allocation can fail; plan nothing, as uring_reactor does
   }
-  if (aligned.empty()) { return aligned; }
-
-  std::sort(aligned.begin(), aligned.end(), [](auto const& a, auto const& b) {
-    return a.offset() < b.offset();
-  });
-
-  std::vector<byte_range> coalesced;
-  coalesced.reserve(aligned.size());
-  coalesced.push_back(aligned.front());
-  for (size_t i = 1; i < aligned.size(); ++i) {
-    auto& last            = coalesced.back();
-    auto const last_start = static_cast<size_t>(last.offset());
-    auto const last_end   = last_start + static_cast<size_t>(last.size());
-    auto const cur_start  = static_cast<size_t>(aligned[i].offset());
-    auto const cur_end    = cur_start + static_cast<size_t>(aligned[i].size());
-    if (cur_start <= last_end) {  // overlap or adjacency
-      size_t const new_end = std::max(last_end, cur_end);
-      last                 = {last.offset(), static_cast<int64_t>(new_end - last_start)};
-    } else {
-      coalesced.push_back(aligned[i]);
-    }
-  }
-  return coalesced;
 }
 
 // ---------------------------------------------------------------------------

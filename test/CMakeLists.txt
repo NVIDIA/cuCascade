@@ -42,10 +42,32 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_data_repository_manager.cpp
     data/test_disk_io_backend.cpp
     data/test_io_worker.cpp
+    # Logging tests
+    log/test_logging.cpp
+    log/test_logging_pruned.cpp
+    log/test_logging_pruned_all.cpp
+    # Utils
+    # Replaces the global operator new for the whole test binary
+    utils/allocation_counter.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
                                                    CUDA_STANDARD_REQUIRED ON)
+
+  # Negative compile test: a call site pruned by CUCASCADE_MIN_LOG_LEVEL must
+  # still have its format string checked. The object target is excluded from the
+  # default build and the test passes only when its compilation fails on the
+  # format string.
+  add_library(cucascade_log_pruned_ill_formed OBJECT EXCLUDE_FROM_ALL
+                                                     log/pruned_ill_formed.cpp)
+  target_link_libraries(cucascade_log_pruned_ill_formed PRIVATE cucascade)
+  add_test(NAME cucascade_log_pruned_site_checks_format
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target
+                   cucascade_log_pruned_ill_formed)
+  set_tests_properties(
+    cucascade_log_pruned_site_checks_format
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "basic_format_string.*is not a constant expression")
 
   # Set include directories
   target_include_directories(
@@ -67,9 +89,14 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
+    io/test_io_utils.cpp
+    io/test_object_identity.cpp
+    io/test_semi_future_callback.cpp
     io/test_templated_ioctx.cpp
+    io/test_thread_pool_construction.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
+    io/cache/test_buffer_pool.cpp
     io/cache/test_chunk_state.cpp
     io/cache/test_metadata_store.cpp
     io/cache/test_stage_machines.cpp
@@ -82,6 +109,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
     io/uring/test_uring_readv.cpp
+    # Utils
+    # Replaces the global operator new for the whole test binary
+    utils/allocation_counter.cpp
     # Main test runner
     unittest.cpp)
 
@@ -89,11 +119,17 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
+  # Tests of src-private helpers (io/detail/...) include them from src/.
+  target_include_directories(cucascade_io_tests
+                             PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
   # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
   if(CUCASCADE_BUILD_CUDF)
-    target_sources(cucascade_io_tests PRIVATE io/kvikio/test_kvikio_config.cpp
-                                              io/kvikio/test_kvikio_remote.cpp)
+    target_sources(
+      cucascade_io_tests
+      PRIVATE io/kvikio/test_kvikio_config.cpp
+              io/kvikio/test_kvikio_identity.cpp
+              io/kvikio/test_kvikio_remote.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
@@ -150,8 +186,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Link dependencies
   target_link_libraries(
-    cucascade_cudf_tests PRIVATE cucascade_cudf Catch2::Catch2
-                                 CUDA::cudart_static)
+    cucascade_cudf_tests
+    PRIVATE cucascade_cudf Catch2::Catch2 CUDA::cudart_static
+            cudf::cudftest_default_stream)
 
   # Register tests with CTest
   add_test(NAME cucascade_cudf_tests COMMAND cucascade_cudf_tests)

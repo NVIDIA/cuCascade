@@ -33,7 +33,6 @@
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
-#include <cucascade/utils/cleanup_utils.hpp>
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -67,6 +66,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -84,7 +84,9 @@ using nvtx_scope = nvtx3::scoped_range_in<libcucascade_domain>;
 // memory::column_metadata::type_id is a generic int32_t type tag; the cudf layer interprets it
 // as the numeric value of a cudf::type_id. These helpers convert across that boundary.
 inline cudf::type_id as_cudf_type_id(int32_t type_id)
-{ return static_cast<cudf::type_id>(type_id); }
+{
+  return static_cast<cudf::type_id>(type_id);
+}
 
 /**
  * @brief Convert gpu_table_representation to host_data_packed_representation
@@ -251,7 +253,9 @@ std::unique_ptr<idata_representation> convert_host_to_host(
  * @brief Align a byte offset up to the given alignment (must be a power of two).
  */
 static std::size_t align_up_fast(std::size_t offset, std::size_t alignment) noexcept
-{ return (offset + alignment - 1u) & ~(alignment - 1u); }
+{
+  return (offset + alignment - 1u) & ~(alignment - 1u);
+}
 
 /**
  * @brief Returns true for column types that store element data in a flat device buffer.
@@ -278,7 +282,9 @@ static bool column_has_data_buffer(const cudf::column_view& col) noexcept
  * For all other types with a data buffer, delegates to cudf::size_of.
  */
 static std::size_t element_size_bytes(const cudf::column_view& col)
-{ return cudf::size_of(col.type()); }
+{
+  return cudf::size_of(col.type());
+}
 
 /**
  * @brief Accumulates (dst, src, size) copy operations for a single cudaMemcpyBatchAsync call.
@@ -587,11 +593,7 @@ Buffer peer_copy_into_async(Buffer buf,
   }
 
   // Peer DMA broken — stage through the pre-pinned HOST pool.
-  //
-  // (snmg-syncs) Host-staged fallback syncs target_stream twice per buffer (after D2H and H2D),
-  // so every leaf buffer of every column serializes on the host. The D2H sync is needed only
-  // because the H2D leg runs under another device context; the H2D sync only to free staging.
-  // Use events between legs and tie staging-block release to a completion event instead.
+  // TODO: these paths currently remain untested. Add tests to cover these.
   //
   // Block layout: the host pool allocates non-contiguous fixed-size blocks
   // (1 MB by default). We chunk the D2H and H2D legs across blocks just like
@@ -599,6 +601,13 @@ Buffer peer_copy_into_async(Buffer buf,
   // same-stream invariant the original implementation relied on.
   memory::fixed_size_host_memory_resource* host_pool =
     memory::find_host_pool(resolve_gpu_numa_node(dst_device));
+  // No device switching needed via guards, CUDA guide explicitly states:
+  // "A memory copy will succeed even if it is issued to a stream that is not associated to
+  // the current device."
+  // https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html#multi-device-stream-event-and-memory-copy-behavior
+  // And scopes below only call copy APIs on explicitly passed streams and no current-device
+  // sensitive APIs.
+
   if (host_pool == nullptr) {
     // No HOST memory_space has been registered. This should only happen in
     // standalone test builds that exercise the converter without constructing
@@ -607,17 +616,22 @@ Buffer peer_copy_into_async(Buffer buf,
     memory::numa_region_pinned_host_memory_resource mr(resolve_gpu_numa_node(dst_device),
                                                        /*make_portable=*/true);
     void* host_buf = mr.allocate_sync(size_in_bytes);
-    {
-      rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
+
+    try {
       CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
         host_buf, src_ptr, size_in_bytes, cudaMemcpyDeviceToHost, target_stream.get()));
-      target_stream.sync();
-    }
-    {
-      rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
+      // no sync needed, the async copies are on the same stream, and are hence ordered.
       CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
         buf.data(), host_buf, size_in_bytes, cudaMemcpyHostToDevice, target_stream.get()));
       target_stream.sync();
+    } catch (...) {
+      // best-effort drain before deallocating host side resources; a second failure must not
+      // replace the original exception or stay pending.
+      if (cudaStreamSynchronize(target_stream.get()) != cudaSuccess) {
+        std::ignore = cudaGetLastError();
+      }
+      mr.deallocate_sync(host_buf, size_in_bytes);
+      throw;
     }
     mr.deallocate_sync(host_buf, size_in_bytes);
     return buf;
@@ -627,14 +641,7 @@ Buffer peer_copy_into_async(Buffer buf,
     auto allocation            = host_pool->allocate_multiple_blocks(size_in_bytes);
     const std::size_t block_sz = allocation->block_size();
 
-    utils::submit_and_sync(target_stream, [&] {
-      // No device switching needed via guards, CUDA guide explicitly states:
-      // "A memory copy will succeed even if it is issued to a stream that is not associated to
-      // the current device."
-      // https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html#multi-device-stream-event-and-memory-copy-behavior
-      // And scopes below only call copy APIs on explicitly passed streams and no current-device
-      // sensitive APIs.
-
+    try {
       // Pass 1: device-to-host, chunked across blocks. Issued on target_stream
       {
         std::size_t block_index  = 0;
@@ -683,8 +690,17 @@ Buffer peer_copy_into_async(Buffer buf,
           }
         }
       }
-      // stream synced by submit_and_sync, before the allocations are freed below.
-    });
+
+      target_stream.sync();
+    } catch (...) {
+      // best-effort drain before the blocks return to the pool; a second failure must not
+      // replace the original exception or stay pending.
+      if (cudaStreamSynchronize(target_stream.get()) != cudaSuccess) {
+        std::ignore = cudaGetLastError();
+      }
+      throw;
+    }
+
     // allocation's destructor returns blocks to the host pool — no cudaFreeHost.
   }
 
@@ -698,10 +714,8 @@ Buffer peer_copy_into_async(Buffer buf,
  * peer device using cudaMemcpyPeerAsync.
  *
  * Asynchronously reconstructs on the supplied stream, but may block internally:
- * Null masks are copied synchronously because cudf factories may read them during
- * column construction. Data and offset buffers are issued asynchronously on
- * @p target_stream; the caller must sync that stream before the resulting cudf::table
- * is observed by another stream.
+ * Data and offset buffers are issued asynchronously on @p target_stream; the caller
+ * must sync that stream before the resulting cudf::table is observed by another stream.
  *
  * @note Assumes the source column_view has offset == 0 (no slicing), matching the
  *       same constraint imposed by plan_column_copy() on the GPU↔Host fast path.
@@ -722,7 +736,8 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
       null_mask = peer_copy_into_async(
         std::move(null_mask), src.null_mask(), src_device, size_in_bytes, dst_device, stream);
     }
-    // no sync needed here since cudf calls are ordered on the explicitly passed stream.
+    // no sync needed here since cudf calls are ordered on the explicitly passed stream, and cudf
+    // factories that do not take a stream do no GPU side work.
   }
   cudf::size_type const null_count = src.nullable() ? src.null_count() : 0;
 
@@ -752,10 +767,6 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
       const cudf::column_view offsets_view = offsets_col->view();
       const int last_idx                   = offsets_view.size() - 1;
       int64_t chars_bytes                  = 0;
-      // (snmg-syncs) Two host syncs per STRING column to read the chars size. Could read all
-      // string columns' last offsets in one batched D2H (or from the source device before the
-      // walk) and sync once per table.
-      // stream.sync();
       if (offsets_view.type().id() == cudf::type_id::INT32) {
         int32_t value = 0;
         CUCASCADE_CUDA_TRY(cudaMemcpyAsync(&value,
@@ -868,16 +879,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   [[maybe_unused]] memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:gpu_to_gpu"};
-  // Sync the caller's stream so the source table's buffers are stable on the source
-  // device before we issue peer copies. The caller's stream is the one that produced
-  // (or last touched) the source representation.
-  // (snmg-syncs) Host blocks on the caller's stream. On the cross-GPU prepare path the caller is
-  // the consumer task, not the source's producer, so this wait orders nothing useful; the real
-  // dependency is wait_for_writer() below. Drop it for the cross-device branch.
-
-  // stream.sync(); // This sync is not needed since we wait on the source's writer event down
-  // below anyways, which is the real dependency. (or sync the whole source device to preserve
-  // correctness in case of the writer event being missing).
+  // no sync on the caller's stream needed here: wait_for_writer() below, which is the real
+  // dependency, orders on the source's writer event, or syncs the source device if none was
+  // recorded (to preserve correctness)
 
   auto& gpu_source = source.cast<gpu_table_representation>();
 
@@ -905,22 +909,12 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto mr            = target_memory_space->get_default_allocator();
 
   std::unique_ptr<cudf::table> new_table{nullptr};
-  // Sync so all peer copies and any cudf::cast launches complete before the new
-  // table is observed by another stream. Do this is a scope exit callback to also handle
-  // exceptions.
 
-  // (snmg-syncs) Host blocks until the whole table copy completes. The writer event recorded by
-  // the constructor below already orders readers, so this wait only exists because callers
-  // (lock_and_prepare_batch) drop the source read lock on return. Replace with an async result:
-  // destination + ready event + ownership keeping the source readable/unspillable until done.
-  utils::submit_and_sync(target_stream, [&] {
+  try {
     // Order the peer copies below after the most recent writer of gpu_source. With an unknown
     // writer this synchronizes the whole source device, which is correct but invisible to
     // compute-sanitizer: its stream-ordered race tracking ignores host-side synchronization, so it
     // may report races here that a recorded writer event avoids.
-    // (snmg-syncs) No writer event ->
-    // cudaDeviceSynchronize() on the whole source device. Stalls every stream on that GPU.
-    // Producers feeding exchanges must always record a writer event so this stays a stream wait.
     gpu_source.wait_for_writer(target_stream);
 
     cudf::table_view const src_view = gpu_source.get_table_view();
@@ -934,8 +928,19 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
     new_table = std::make_unique<cudf::table>(std::move(target_columns));
 
-    // sync under submit_and_sync
-  });
+    // Sync for the source's lifetime, not for readers of the result (the writer event recorded
+    // below covers those). The peer reads on target_stream are not ordered with the source's
+    // deallocation stream, so a caller freeing the source right after convert (e.g.
+    // mutable_data_batch::convert_to, which syncs only the caller's stream) would race them.
+    // TODO: explore establishing ordering for source's lifetime via events.
+    target_stream.sync();
+  } catch (...) {
+    // best-effort drain; a second failure must not replace the original exception or stay pending.
+    if (cudaStreamSynchronize(target_stream.get()) != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+    }
+    throw;
+  }
 
   // STREAM-LINEAGE: the resulting representation was written by target_stream;
   // the constructor records an event on it so any subsequent cross-device

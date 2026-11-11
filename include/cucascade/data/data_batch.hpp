@@ -245,6 +245,8 @@ class data_batch : public std::enable_shared_from_this<data_batch> {
   /**
    * @brief Replace the data representation.
    * @param data New data representation (takes ownership).
+   * @warning Requires the exclusive lock held by mutable_data_batch. This setter performs no
+   * CUDA synchronization; see mutable_data_batch::set_data() for lifetime requirements.
    */
   void set_data(std::unique_ptr<idata_representation> data);
 
@@ -537,6 +539,16 @@ class mutable_data_batch {
   /**
    * @brief Replace the data representation.
    * @param data New data representation (takes ownership).
+   * @warning Immediately destroys the old representation. The accessor provides exclusive host
+   * access, but this setter does not wait for GPU writers, synchronize CUDA streams, rebind
+   * buffer deallocation streams, or record a writer event for the replacement. The caller must
+   * ensure destruction is ordered after all asynchronous uses of the old buffers and establish
+   * the replacement's writer-event contract before publishing it. Do not access this mutable
+   * accessor concurrently from multiple host threads.
+   *
+   * Prefer convert_to() for GPU/host/disk conversions, which synchronizes GPU conversions before
+   * destroying the source. A valid low-level use is installing an empty placeholder after the
+   * original table's ownership has already been transferred elsewhere.
    */
   void set_data(std::unique_ptr<idata_representation> data) { _batch->set_data(std::move(data)); }
 
@@ -697,7 +709,7 @@ class mutable_data_batch {
  *
  * @note Clone callbacks may run concurrently on the same probe.
  * Implementations must synchronize shared mutable state for clone callbacks, but
- * preferrably not do any mutating ops in the clone callbacks. clone_id pairs
+ * preferably not do any mutating ops in the clone callbacks. clone_id pairs
  * callbacks as completion order may differ from start order.
  *
  * All other callbacks are invoked either during batch construction (created) or while
