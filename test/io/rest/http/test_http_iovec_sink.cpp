@@ -19,14 +19,17 @@
 #include "http_s3_fixtures.hpp"
 #include "http_test_support.hpp"
 #include "io/rest/errc.hpp"
+#include "io/rest/http/rules.hpp"
 
 #include <catch2/catch_all.hpp>
 
+#include <cstddef>
 #include <new>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 using namespace cucascade::io::http;
 
@@ -162,4 +165,44 @@ TEST_CASE("http.chunked.a_throwing_sink_fails_the_body_with_its_reason", "[rest]
   CHECK(dec.feed(body, used, [](std::span<char const>) {}, again) == parse_status::error);
   CHECK(again == ec);
   CHECK(used == 0);
+}
+
+TEST_CASE("http.chunked.chunk_line_cap_holds_for_whole_and_fragmented_lines",
+          "[rest][http][chunked]")
+{
+  constexpr std::size_t cap = detail::max_chunk_line;
+  // A first chunk (so the cap also holds after a chunk's CRLF), then a chunk whose line is
+  // "1;aaa...a" of `line` bytes before its CRLF, then the last chunk.
+  std::string const lead = "1\r\nA\r\n";
+  auto body              = [&](std::size_t line) {
+    return lead + "1;" + std::string(line - 2, 'a') + "\r\nB\r\n0\r\n\r\n";
+  };
+  // Cut points relative to the start of the long line: the whole body in one piece, the line's
+  // bytes in two pieces, all of its bytes without the CRLF, with only the CR, a byte short.
+  auto layouts = [&](std::size_t line) {
+    std::size_t const at = lead.size();
+    return std::vector<std::vector<std::size_t>>{
+      {}, {at + line / 2}, {at + line}, {at + line + 1}, {at + line - 1}, {at, at + cap}};
+  };
+  SECTION("a line of exactly the cap is accepted")
+  {
+    auto const msg = body(cap);
+    for (auto const& cuts : layouts(cap)) {
+      auto const r = http_test::decode_chunked(msg, cuts);
+      CHECK(r.status == parse_status::ok);
+      CHECK(r.body == "AB");
+      CHECK(r.consumed == msg.size());
+    }
+  }
+  SECTION("a line one byte over the cap is rejected")
+  {
+    auto const msg = body(cap + 1);
+    for (auto const& cuts : layouts(cap + 1)) {
+      auto const r = http_test::decode_chunked(msg, cuts);
+      CHECK(r.status == parse_status::error);
+      CHECK(r.detail == parse_error::bad_chunk_extension);
+      CHECK(r.ec == cucascade::io::rest::errc::http_bad_message);
+      CHECK(r.body == "A");
+    }
+  }
 }

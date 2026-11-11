@@ -19,7 +19,8 @@
 /// @file chunked_decoder.hpp
 /// @brief `Transfer-Encoding: chunked` body decoder (cold path: error bodies, listings).
 /// Resume offset for partial chunk lines,
-/// 8 KiB chunk-line cap, full chunk-extension grammar, trailers parsed and ignored (RFC 9112
+/// 8 KiB chunk-line cap (on the size and extensions before the CRLF, whether the line arrives
+/// whole or in pieces), full chunk-extension grammar, trailers parsed and ignored (RFC 9112
 /// §7.1.2: framing fields in a trailer must not affect the message).
 
 #pragma once

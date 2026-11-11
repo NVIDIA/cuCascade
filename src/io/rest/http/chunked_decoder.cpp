@@ -105,17 +105,27 @@ parse_status chunked_decoder::feed_impl(std::span<char const> in,
           }
           q += 2;
         }
+        // The chunk-line cap applies to the line's bytes before its CRLF, however the line is
+        // split across calls: a complete line is checked as a whole, an incomplete one as soon
+        // as the bytes it already has exceed the cap (a final CR may start the CRLF).
         parse_error eol_err         = parse_error::none;
         char const* const scan_from = q + std::min(_skip, static_cast<std::size_t>(end - q));
         char const* const eol       = detail::find_eol(scan_from, end, eol_err);
         if (eol == nullptr) {
+          auto const have              = static_cast<std::size_t>(end - q);
+          std::size_t const line_bytes = have != 0 && end[-1] == '\r' ? have - 1 : have;
           if (eol_err != parse_error::none) {
             fail(eol_err);
-          } else if (static_cast<std::size_t>(end - q) >= detail::max_chunk_line) {
+          } else if (line_bytes > detail::max_chunk_line) {
             fail(parse_error::bad_chunk_extension);
-          } else if (end > q) {
-            _skip = static_cast<std::size_t>(end - q) - 1;  // rescan only the last byte (a CR)
+          } else if (have != 0) {
+            _skip = have - 1;  // rescan only the last byte (a CR)
           }
+          running = false;
+          break;
+        }
+        if (static_cast<std::size_t>(eol - 2 - q) > detail::max_chunk_line) {
+          fail(parse_error::bad_chunk_extension);
           running = false;
           break;
         }
