@@ -130,9 +130,14 @@ Retry-After, up to `max_retry_attempts`; 403 re-signs up to `max_auth_retry_atte
 stage through the context's host memory resource in fixed-size blocks, copied per block on the
 slice's stream (`cudaStreamLegacy` when the handle is null) with the destination device
 current; the slot is held until the copy lands (`hold_slot_during_copy`). Staging exhaustion
-parks the operation while copies of the reactor still hold blocks, and fails it with
-`rmm::out_of_memory` otherwise. Work queued during a loop pass (a retry due now, a control job, a
-request that arrived meanwhile) starts in the same pass; the loop blocks only when nothing is
+parks the operation while operations of the reactor still hold blocks (GETs in flight, retries,
+parked copies), and fails it with `rmm::out_of_memory` otherwise. Later operations that need
+staging queue behind a parked one (FIFO) and no fresh read is expanded meanwhile, but ready work
+that already holds its staging (a retry) keeps starting. Control-plane jobs go ahead of fresh
+reads, but while reads wait they hold at most half of the connections and take at most that many
+free slots in a row (on one connection the two alternate). Work queued during a loop pass (a
+retry due now, a control job, a request that arrived meanwhile) starts in the same pass; the
+loop blocks only when nothing is
 runnable (`epoll_pwait2` over the wake-up eventfd, the retry timerfd and the ring fd, or
 `io_uring_submit_and_wait_timeout` with `wait_mode = uring`).
 
