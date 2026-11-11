@@ -523,9 +523,10 @@ TEST_CASE("http.conformance.limits", "[rest][http][conformance]")
     CHECK(r.body.empty());
   }
   {
-    // A chunk line (with extensions) of 8 KiB is rejected.
+    // A chunk line (with extensions) of more than 8 KiB before its CRLF is rejected as soon as
+    // that many bytes arrived, whether or not the CRLF follows.
     chunked_decoder d;
-    std::string b    = "1;" + std::string(8192 - 3, 'x');
+    std::string b    = "1;" + std::string(8192 - 2, 'x');
     std::size_t used = 0;
     std::error_code ec;
     auto sink = [](std::span<char const>) noexcept {};
