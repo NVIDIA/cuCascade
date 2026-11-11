@@ -21,8 +21,11 @@
 // ranges into a destination tier (host or device) — no parquet decode.
 //
 // Read path:
-//   rest   – the native cucascade::io REST reactor (libcurl scatter GETs
-//            authorized via AWS-SDK presigned URLs).  host reads go through the
+//   rest   – the native cucascade::io REST backend: rest_ioctx's rest_reactor
+//            workers, each driving one io_uring HTTP/1.1 transport
+//            (uring_transport; kTLS when the kernel accepts the keys, else the
+//            built-in user-space TLS record layer) whose ranged GETs are
+//            authorized via AWS-SDK presigned URLs.  host reads go through the
 //            vector-I/O primitive (host_read_ranges_async_io); device reads
 //            through device_read_async (reactor-staged: the reactor streams
 //            each range network->pinned-bounce->device on its own slots).

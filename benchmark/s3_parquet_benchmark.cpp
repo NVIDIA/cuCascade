@@ -15,8 +15,11 @@
  * limitations under the License.
  */
 
-// Standalone S3 parquet read benchmark: the cucascade::io REST datasource
-// (libcurl scatter GETs authorized via AWS-SDK presigned URLs).
+// Standalone S3 parquet read benchmark: the cucascade::io REST datasource.
+// rest_ioctx runs a pool of rest_reactor workers, each driving one io_uring
+// HTTP/1.1 transport (uring_transport: keep-alive connections, kTLS when the
+// kernel accepts the keys, else the built-in user-space TLS record layer) that
+// issues the ranged GETs, each authorized via an AWS-SDK presigned URL.
 //
 // The AWS SDK is used for (a) listing the parquet objects under the given
 // bucket/prefix and (b) presigning each GET/HEAD the REST reactor issues.
