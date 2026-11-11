@@ -275,13 +275,14 @@ TEST_CASE("place_current_reactor_thread pins within the plan", "[rest_pool_plan]
   reactor_placement placed;
   std::vector<int> affinity_after;
   std::thread([&] {
-    placed         = place_current_reactor_thread(plan, 1);
+    placed         = place_current_reactor_thread(plan, 1, /*raise_priority=*/true);
     affinity_after = tu::get_current_thread_affinity();
   }).join();
   CHECK(placed.pinned);
   CHECK(placed.cpu == mine.back());
   CHECK(affinity_after == std::vector<int>{mine.back()});
   CHECK_FALSE(placed.priority.description.empty());
+  CHECK(placed.priority.description != "default (raise_reactor_priority off)");
   // io-wq (where kTLS decryption is punted) gets the inherited mask minus every pinned CPU of
   // the pool, not the reactor's single CPU.
   std::vector<int> expected_iowq;
@@ -290,16 +291,56 @@ TEST_CASE("place_current_reactor_thread pins within the plan", "[rest_pool_plan]
   }
   CHECK(placed.iowq_cpus == expected_iowq);
 
+  // Unpinned: never raised, even when opted in.
   rest_pool_plan const unpinned{2, {}, false, false, "test"};
   std::thread([&] {
-    placed         = place_current_reactor_thread(unpinned, 0);
+    placed         = place_current_reactor_thread(unpinned, 0, /*raise_priority=*/true);
     affinity_after = tu::get_current_thread_affinity();
   }).join();
   CHECK_FALSE(placed.pinned);
   CHECK(placed.cpu == -1);
   CHECK(placed.priority.achieved == reactor_priority::kind::unchanged);
+  CHECK(placed.priority.description == "default (unpinned)");
   CHECK(affinity_after == mine);
   CHECK(placed.iowq_cpus.empty());  // unpinned: io-wq keeps the thread's own mask
+}
+
+TEST_CASE("place_current_reactor_thread raises priority only when opted in", "[rest_pool_plan]")
+{
+  // The default config leaves the pinned reactors' priority alone (opt-in elevation).
+  CHECK_FALSE(cucascade::io::rest::config{}.raise_reactor_priority);
+
+  auto const mine = tu::get_current_thread_affinity();
+  REQUIRE_FALSE(mine.empty());
+  rest_pool_plan plan;
+  plan.n_reactors = 1;
+  plan.pin_cpus   = {mine.front()};
+
+  reactor_placement placed;
+  std::optional<tu::scheduling_info> sched_before;
+  std::optional<tu::scheduling_info> sched_after;
+  std::optional<int> nice_before;
+  std::optional<int> nice_after;
+  std::vector<int> affinity_after;
+  std::thread([&] {
+    sched_before   = tu::get_current_thread_scheduling();
+    nice_before    = tu::get_current_thread_niceness();
+    placed         = place_current_reactor_thread(plan, 0, /*raise_priority=*/false);
+    sched_after    = tu::get_current_thread_scheduling();
+    nice_after     = tu::get_current_thread_niceness();
+    affinity_after = tu::get_current_thread_affinity();
+  }).join();
+  CHECK(placed.pinned);
+  CHECK(placed.cpu == mine.front());
+  CHECK(affinity_after == std::vector<int>{mine.front()});
+  CHECK(placed.priority.achieved == reactor_priority::kind::unchanged);
+  CHECK(placed.priority.value == 0);
+  CHECK(placed.priority.description == "default (raise_reactor_priority off)");
+  REQUIRE(sched_before.has_value());
+  REQUIRE(sched_after.has_value());
+  CHECK(sched_after->policy == sched_before->policy);
+  CHECK(sched_after->priority == sched_before->priority);
+  CHECK(nice_after == nice_before);
 }
 
 TEST_CASE("place_current_reactor_thread never widens the worker's own affinity", "[rest_pool_plan]")
@@ -317,7 +358,7 @@ TEST_CASE("place_current_reactor_thread never widens the worker's own affinity",
   std::thread([&] {
     std::array<int, 1> const narrow{mine.front()};
     narrowed       = tu::set_current_thread_affinity(std::span<int const>{narrow});
-    placed         = place_current_reactor_thread(plan, 0);
+    placed         = place_current_reactor_thread(plan, 0, /*raise_priority=*/true);
     affinity_after = tu::get_current_thread_affinity();
   }).join();
   REQUIRE(narrowed);
@@ -370,7 +411,10 @@ TEST_CASE("pool plan on this host (informational)", "[rest_pool_plan]")
   auto const nic   = iface ? mem::discover_nic(*iface) : std::nullopt;
   auto const plan  = plan_rest_pool(0, true, nic);
   reactor_placement placed;
-  std::thread([&] { placed = place_current_reactor_thread(plan, 0); }).join();
+  std::thread([&] {
+    placed =
+      place_current_reactor_thread(plan, 0, cucascade::io::rest::config{}.raise_reactor_priority);
+  }).join();
   std::cout << "[rest_pool_plan] " << describe_rest_pool(plan, nic, placed.priority) << "\n";
   CHECK(plan.n_reactors >= 1);
 }

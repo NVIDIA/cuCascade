@@ -2156,8 +2156,9 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
   try {
     // Placement first, before the ring exists, so its memory lands on the pinned CPU's node.
     if (_placement != nullptr) {
-      auto const placed = place_current_reactor_thread(_placement->plan, _pool_index);
-      _iowq_cpus        = placed.iowq_cpus;
+      auto const placed =
+        place_current_reactor_thread(_placement->plan, _pool_index, _config.raise_reactor_priority);
+      _iowq_cpus = placed.iowq_cpus;
       if (_pool_index == 0) {
         CUCASCADE_LOG_INFO("{}",
                            describe_rest_pool(_placement->plan, _placement->nic, placed.priority));

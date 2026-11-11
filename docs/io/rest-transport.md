@@ -94,16 +94,23 @@ runnable (`epoll_pwait2` over the wake-up eventfd, the retry timerfd and the rin
 
 `rest_n_reactors` is a total. `0` sizes the pool from the egress NIC (`rest.interface`, else the
 default route): when its queue IRQs are steered to a strict subset of its NUMA node's cores, one
-reactor per IRQ CPU, each pinned to it (`pin_to_irq_cpus`) and raised to the highest priority the
-process may set before it creates its ring; otherwise 2, unpinned. `fan_out` (2) is the number of
-least-backlogged reactors one read is split across.
+reactor per IRQ CPU, each pinned to it (`pin_to_irq_cpus`) before it creates its ring; otherwise 2,
+unpinned. `fan_out` (2) is the number of least-backlogged reactors one read is split across.
+
+Pinning does not change a reactor's priority. `raise_reactor_priority` (off by default) opts in to
+raising each pinned reactor to the highest priority the process may set: `SCHED_FIFO` at the top
+priority `CAP_SYS_NICE` or `RLIMIT_RTPRIO` permits, else the lowest nice value `CAP_SYS_NICE` or
+`RLIMIT_NICE` permits; unpinned reactors are never raised. It is opt-in because a `SCHED_FIFO`
+thread preempts every normal-class thread on its CPU with no starvation bound beyond the kernel's
+RT throttling (`sched_rt_runtime_us`). The startup line reports what was applied (`prio ...`).
 
 A pinned reactor registers its ring's io-wq affinity (`io_uring_register_iowq_aff`) as its
 inherited mask minus every CPU the pool pins to. io-wq workers otherwise inherit the reactor's
 single CPU, and with `recv_placement` `iowq` (`automatic` on EC2) they do the kTLS decryption, so
 the whole pool would decrypt on the IRQ CPUs: on a g7e.12xlarge (8 IRQ CPUs of 48) a raw S3 read
 ran at 12 GiB/s pinned without this, 32 GiB/s with it and 35 GiB/s unpinned. Raising the
-reactors' priority (nice -20 or `SCHED_FIFO`) measured within noise there.
+reactors' priority (nice -20 or `SCHED_FIFO`, `raise_reactor_priority`) measured within noise
+there.
 
 `planned_reactor_cpus(n_reactors, rest_config)` returns the CPUs a pool built now would pin to,
 without starting it, so an embedder can keep its own thread pools off them.

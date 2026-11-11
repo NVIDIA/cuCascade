@@ -227,9 +227,18 @@ struct config {
   /// Egress interface whose queue IRQs size and place the reactor pool when
   /// @c io_config::rest_n_reactors is 0; empty = the default route's interface.
   std::string interface{};
-  /// Pin reactors to the NIC's IRQ CPUs (and raise their priority) when the IRQs are steered
-  /// to a strict subset of the NIC node's cores.
+  /// Pin reactors to the NIC's IRQ CPUs when the IRQs are steered to a strict subset of the NIC
+  /// node's cores.  Pinning alone leaves the reactors' scheduling class and nice value as
+  /// inherited; see @c raise_reactor_priority.
   bool pin_to_irq_cpus{true};
+  /// Opt-in: raise each pinned reactor thread to the highest priority the process may set,
+  /// i.e. @c SCHED_FIFO (at the top priority @c CAP_SYS_NICE or @c RLIMIT_RTPRIO permits) or,
+  /// failing that, the lowest nice value @c CAP_SYS_NICE or @c RLIMIT_NICE permits.  Unpinned
+  /// reactors are never raised.  Off by default: a @c SCHED_FIFO thread preempts every
+  /// normal-class thread on its CPU and has no starvation bound beyond the kernel's RT
+  /// throttling (@c sched_rt_runtime_us), so a busy reactor could starve other work pinned to the
+  /// same IRQ CPU.  The throughput gain measured within noise (docs/io/rest-transport.md).
+  bool raise_reactor_priority{false};
 
   // -- retry policy ------------------------------------------------------
   std::size_t max_retry_attempts{10};

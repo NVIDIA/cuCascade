@@ -50,7 +50,7 @@
  *   auto const plan  = plan_rest_pool(io_cfg.rest_n_reactors, rest_cfg.pin_to_irq_cpus, nic);
  *   // start plan.n_reactors reactors; reactor i's thread, first thing (before
  *   // it creates its ring, so the ring's memory and SQ/CQ land on the right CPU):
- *   auto const placed = place_current_reactor_thread(plan, i);
+ *   auto const placed = place_current_reactor_thread(plan, i, rest_cfg.raise_reactor_priority);
  *   // after all reactors started, one startup line:
  *   CUCASCADE_LOG_INFO("{}", describe_rest_pool(plan, nic, placed.priority));
  * @endcode
@@ -112,7 +112,8 @@ struct reactor_priority {
   /// SCHED_FIFO priority for @c realtime_fifo, the nice value for @c nice,
   /// 0 for @c unchanged.
   int value{0};
-  /// @c "SCHED_FIFO 99", @c "nice -20", or @c "default (<why>)".
+  /// @c "SCHED_FIFO 99", @c "nice -20", or @c "default (<why>)"; empty (read as
+  /// @c "default") after a failed placement.
   std::string description;
 };
 
@@ -125,10 +126,11 @@ struct reactor_priority {
  * else @c 20 - RLIMIT_NICE) when it is below the current one; else leaves the
  * thread alone.  Never fails: the result says what happened.
  *
- * A reactor spends its idle time blocked in @c io_uring_enter, so a real-time
- * class does not starve its CPU; the kernel's RT throttling still bounds a
- * runaway.  Applied only to pinned reactors: an unpinned FIFO thread could
- * migrate onto a CPU another latency-critical thread owns.
+ * Opt-in (@c config::raise_reactor_priority, off by default): a reactor spends
+ * its idle time blocked in its wait, but a busy one at @c SCHED_FIFO preempts
+ * every normal-class thread on its CPU, with no starvation bound beyond the
+ * kernel's RT throttling.  Applied only to pinned reactors: an unpinned FIFO
+ * thread could migrate onto a CPU another latency-critical thread owns.
  */
 [[nodiscard]] reactor_priority raise_reactor_priority() noexcept;
 
@@ -146,14 +148,26 @@ struct reactor_placement {
 
 /**
  * @brief Apply @p plan to the calling thread as reactor @p reactor_index: pin it
- *        to @c plan.pin_cpus[reactor_index] and, when pinned, raise its
- *        priority.  An unpinned plan (or a failed pin) leaves the thread as is, and
- *        so does a planned CPU outside the calling thread's own affinity: the
- *        thread may have inherited a narrower mask than the planning thread's, and
- *        a pin never widens it.
+ *        to @c plan.pin_cpus[reactor_index] and, when pinned and
+ *        @p raise_priority is set, raise its priority (@ref raise_reactor_priority).
+ *
+ * An unpinned plan (or a failed pin) leaves the thread as is, and so does a
+ * planned CPU outside the calling thread's own affinity: the thread may have
+ * inherited a narrower mask than the planning thread's, and a pin never widens
+ * it.  A pinned thread with @p raise_priority off keeps its inherited priority
+ * (@c kind::unchanged, described as @c "default (raise_reactor_priority off)").
+ *
+ * Never throws.  Should a host allocation fail part-way (the affinity query, the
+ * io-wq mask or a description), the pin that already took effect is kept, the
+ * io-wq mask is left empty (io-wq keeps the thread's own mask) and the priority is
+ * left unchanged with an empty description (@ref describe_rest_pool prints it as
+ * @c "default").
+ *
+ * @param raise_priority @c config::raise_reactor_priority (opt-in).
  */
 [[nodiscard]] reactor_placement place_current_reactor_thread(rest_pool_plan const& plan,
-                                                             std::size_t reactor_index) noexcept;
+                                                             std::size_t reactor_index,
+                                                             bool raise_priority) noexcept;
 
 /**
  * @brief The startup log line:

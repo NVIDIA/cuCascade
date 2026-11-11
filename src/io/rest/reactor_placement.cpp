@@ -211,30 +211,43 @@ reactor_priority raise_reactor_priority() noexcept
 }
 
 reactor_placement place_current_reactor_thread(rest_pool_plan const& plan,
-                                               std::size_t reactor_index) noexcept
+                                               std::size_t reactor_index,
+                                               bool raise_priority) noexcept
 {
   reactor_placement placed;
-  if (reactor_index < plan.pin_cpus.size()) {
-    std::array<int, 1> const cpu{plan.pin_cpus[reactor_index]};
-    // The plan was intersected with the planning thread's affinity; this thread may have
-    // inherited a narrower one (started from another thread).  Never widen it: a CPU outside
-    // this thread's own mask leaves it unpinned.
-    auto const inherited = tu::get_current_thread_affinity();
-    bool const allowed   = std::find(inherited.begin(), inherited.end(), cpu[0]) != inherited.end();
-    if (allowed && tu::set_current_thread_affinity(std::span<int const>{cpu})) {
-      placed.cpu    = cpu[0];
-      placed.pinned = true;
-      for (int const c : inherited) {
-        if (std::find(plan.pin_cpus.begin(), plan.pin_cpus.end(), c) == plan.pin_cpus.end()) {
-          placed.iowq_cpus.push_back(c);
+  try {
+    if (reactor_index < plan.pin_cpus.size()) {
+      std::array<int, 1> const cpu{plan.pin_cpus[reactor_index]};
+      // The plan was intersected with the planning thread's affinity; this thread may have
+      // inherited a narrower one (started from another thread).  Never widen it: a CPU outside
+      // this thread's own mask leaves it unpinned.
+      auto const inherited = tu::get_current_thread_affinity();
+      bool const allowed = std::find(inherited.begin(), inherited.end(), cpu[0]) != inherited.end();
+      if (allowed && tu::set_current_thread_affinity(std::span<int const>{cpu})) {
+        placed.cpu    = cpu[0];
+        placed.pinned = true;
+        for (int const c : inherited) {
+          if (std::find(plan.pin_cpus.begin(), plan.pin_cpus.end(), c) == plan.pin_cpus.end()) {
+            placed.iowq_cpus.push_back(c);
+          }
         }
       }
     }
-  }
-  if (placed.pinned) {
-    placed.priority = raise_reactor_priority();
-  } else {
-    placed.priority.description = "default (unpinned)";
+    if (!placed.pinned) {
+      placed.priority.description = "default (unpinned)";
+    } else if (raise_priority) {
+      placed.priority = raise_reactor_priority();
+    } else {
+      placed.priority.description = "default (raise_reactor_priority off)";
+    }
+  } catch (...) {
+    // A host allocation failed (the affinity query, the io-wq mask or a description).  Keep
+    // whatever pin already took effect, leave io-wq on the thread's own mask and the priority
+    // unchanged; nothing here allocates (an empty description reads "default").
+    placed.iowq_cpus.clear();
+    placed.priority.achieved = reactor_priority::kind::unchanged;
+    placed.priority.value    = 0;
+    placed.priority.description.clear();
   }
   return placed;
 }
