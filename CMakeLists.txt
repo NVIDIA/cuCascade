@@ -79,8 +79,7 @@ set(CUCASCADE_PUBLIC_COMPILE_DEFS
 
 # Swappable third-party backends for the io layer. The io code was ported from a
 # codebase with its own vendored dependencies. These knobs let an embedding host
-# reuse the copies it already links instead of the
-# standalone-build defaults.
+# reuse the copies it already links instead of the standalone-build defaults.
 
 # cucascade::exec::invocable backing: OFF -> in-tree move-only callable; ON ->
 # absl::AnyInvocable (reuses a host project's abseil).
@@ -104,8 +103,8 @@ set(CUCASCADE_ABSEIL_INVOCABLE_TARGET
 # CUCASCADE_MOODYCAMEL_TARGET  - link an existing CMake target that carries the
 # include dirs (e.g. a host-provided interface target). 2.
 # CUCASCADE_MOODYCAMEL_INCLUDE_DIR - a directory already holding
-# blockingconcurrentqueue.h / concurrentqueue.h (e.g. duckdb/third_party/concurrentqueue).
-# Nothing is fetched. 3. neither set -
+# blockingconcurrentqueue.h / concurrentqueue.h (e.g.
+# duckdb/third_party/concurrentqueue). Nothing is fetched. 3. neither set -
 # fetch cameron314/concurrentqueue.
 set(CUCASCADE_MOODYCAMEL_TARGET
     ""
@@ -121,8 +120,8 @@ set(CUCASCADE_MOODYCAMEL_INCLUDE_DIR
       "Directory containing moodycamel concurrentqueue headers (skips fetching; ignored if CUCASCADE_MOODYCAMEL_TARGET is set)"
 )
 
-# C++ namespace of the moodycamel headers. duckdb's fork
-# renames it to duckdb_moodycamel; upstream cameron314 uses moodycamel.
+# C++ namespace of the moodycamel headers. duckdb's fork renames it to
+# duckdb_moodycamel; upstream cameron314 uses moodycamel.
 set(CUCASCADE_MOODYCAMEL_NAMESPACE
     "moodycamel"
     CACHE STRING "C++ namespace of the moodycamel concurrentqueue headers")
@@ -686,7 +685,10 @@ include(CMakePackageConfigHelpers)
 
 # Install headers
 if(CUCASCADE_TOPOLOGY_ONLY)
+  # topology_discovery.hpp includes net_topology.hpp (NIC discovery, built into
+  # this library), so both are part of the installed API.
   install(FILES include/cucascade/memory/topology_discovery.hpp
+                include/cucascade/memory/net_topology.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
   install(FILES include/cucascade/nvtx.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade)
