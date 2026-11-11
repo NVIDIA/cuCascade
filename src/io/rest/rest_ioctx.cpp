@@ -351,8 +351,9 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
   }
   if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
-  // A blocking HEAD (a one-time metadata round-trip): on the first reactor's connections when
-  // it runs, else on a private helper transport.
+  // A blocking HEAD (a one-time metadata round-trip) on the least-backlogged reactor (ties
+  // rotated): on its connections while its worker accepts work; before start, after shutdown or
+  // from a reactor thread, on a private helper transport.
   auto head = control_reactor().head_object(parsed.host, parsed.path);
   return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
                                                                  std::move(parsed.host),

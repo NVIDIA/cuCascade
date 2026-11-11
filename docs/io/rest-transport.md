@@ -17,8 +17,10 @@ reactor contract.
 | `dns_resolver` | `src/io/rest/net/dns_resolver.{hpp,cpp}` | resolver thread shared by the pool: TTL, refresh-ahead, round robin, benching |
 
 Blocking control-plane calls (`head_object`, `fetch_footer_suffix`, `list_page`,
-`resolve_footer_batch`) run on the reactor's own connections while it runs, else on a private
-transport on a short-lived helper thread; io_uring never runs on the caller's thread.
+`resolve_footer_batch`) go to the least-backlogged reactor of the pool, ties rotated across calls
+(`rest_ioctx::control_reactor`). They run on that reactor's own connections while its worker
+accepts work; before the pool is started, after it stopped, or when called from a reactor thread,
+on a private transport on a short-lived helper thread. io_uring never runs on the caller's thread.
 
 ## Transport
 

@@ -54,6 +54,18 @@ namespace cucascade::io::rest {
  * one @p authorizer.  Overrides @c create_io_object to resolve an object's size
  * via a blocking HEAD before constructing the @c rest_io_object — the static
  * reactor factory cannot do this since it needs the authorizer + a round-trip.
+ *
+ * Control-plane calls (the HEAD or footer probe of an open, LIST pages, a
+ * @ref resolve_footer_objects batch) block the caller and run on one reactor
+ * picked per call: the least backlogged (@c rest_reactor::queued_bytes), ties
+ * rotated across calls, so any reactor of a multi-reactor pool may serve one.
+ * The exchanges use that reactor's connections while its worker accepts work.
+ * Before the pool is started (@c start), after it stopped, or when the call is
+ * made from a reactor thread (e.g. a completion callback, which must not wait on
+ * a reactor loop that may be its own), they run instead on a short-lived
+ * private helper thread with its own io_uring ring and new connections — far
+ * heavier, so start the pool before issuing control-plane calls.  io_uring
+ * never runs on the caller's thread.
  */
 class rest_ioctx : public templated_ioctx<rest_reactor> {
  public:
@@ -112,10 +124,14 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// IDENTICAL to @c open_io_object(path, parquet_footer_probe): one verified
   /// suffix GET; 200/416/unverifiable-206 fall back to a HEAD supplying
   /// size+tag; the same retry policy per entry, never stalling siblings.  The
-  /// exchanges run on the first reactor's connections (on a private helper
-  /// transport when the pool is not running), and @p on_result is invoked ON
-  /// THE CALLER'S THREAD, SERIALLY, as each entry lands — completion order, no
-  /// all-entries barrier.
+  /// whole batch runs on one reactor, picked like every control-plane call: the
+  /// least-backlogged reactor of the pool, ties rotated across calls (not
+  /// necessarily reactor 0).  Its exchanges use that reactor's connections
+  /// while its worker accepts work; before the pool is started, after it
+  /// stopped, or when called from a reactor thread, they run on a short-lived
+  /// private helper thread with its own io_uring ring and connections (see the
+  /// class notes).  @p on_result is invoked ON THE CALLER'S THREAD, SERIALLY,
+  /// as each entry lands — completion order, no all-entries barrier.
   ///
   /// Every input occurrence is delivered exactly once (duplicates delivered
   /// per occurrence, disambiguated by index); no callback runs after the
@@ -198,7 +214,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   [[nodiscard]] std::size_t footer_resolve_inflight_cap() const;
 
   /// The reactor a control-plane call (HEAD, footer probe, LIST, footer batch) runs on: the
-  /// least backlogged, ties rotated, so control traffic does not pile onto reactor 0.
+  /// least backlogged, ties rotated, so control traffic does not pile onto reactor 0.  The call
+  /// itself then runs on that reactor's worker, or on a private helper when the worker does not
+  /// accept work or the caller is a reactor thread.
   [[nodiscard]] rest_reactor& control_reactor();
 
   // Batched-footer-resolve coordination: one active batch per ioctx, later
