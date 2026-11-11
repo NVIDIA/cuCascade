@@ -174,6 +174,27 @@ TEST_CASE("net: resolver round-robin, accumulation (cap 32, max age), TTL refres
   }
 }
 
+TEST_CASE("net: a failed resolver-thread start is retried by the next intern of the same host",
+          "[rest][net][dns]")
+{
+  fake_dns f;
+  dns_resolver::options o;
+  o.lookup     = &fake_dns::lookup;
+  o.lookup_ctx = &f;
+  dns_resolver r(o);
+  dns_resolver::fail_thread_starts_for_testing(1);
+  std::uint32_t const h = r.intern("retry.test", 443);
+  dns_resolver::fail_thread_starts_for_testing(0);
+  REQUIRE(h != dns_resolver::invalid);
+  CHECK_FALSE(r.thread_started());
+  sockaddr_storage a{};
+  socklen_t len = 0;
+  CHECK(r.pick(h, a, len, mono_ns()) == dns_resolver::status::pending);
+  CHECK(r.intern("retry.test", 443) == h);  // already interned: starts the thread now
+  CHECK(r.thread_started());
+  CHECK(pick_wait(r, h, a) == dns_resolver::status::ok);
+}
+
 TEST_CASE("net: resolver keeps max_addresses of a long answer, also across accumulating refreshes",
           "[rest][net][dns]")
 {

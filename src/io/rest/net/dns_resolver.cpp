@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <system_error>
 
 namespace cucascade::io::net {
 
@@ -151,6 +152,17 @@ constexpr std::uint64_t ms_to_ns(std::chrono::milliseconds d) noexcept
   return d.count() <= 0 ? 0 : static_cast<std::uint64_t>(d.count()) * 1'000'000ULL;
 }
 
+/// Resolver-thread starts still to fail (dns_resolver::fail_thread_starts_for_testing).
+std::atomic<unsigned> g_failed_thread_starts{0};
+
+bool take_injected_start_failure() noexcept
+{
+  unsigned n = g_failed_thread_starts.load(std::memory_order_relaxed);
+  while (n != 0 &&
+         !g_failed_thread_starts.compare_exchange_weak(n, n - 1, std::memory_order_relaxed)) {}
+  return n != 0;
+}
+
 }  // namespace
 
 dns_resolver::dns_resolver(options opts) noexcept : _opts(opts)
@@ -206,7 +218,12 @@ std::uint32_t dns_resolver::intern(std::string_view host, std::uint16_t port) no
   std::lock_guard g(_m);
   std::uint32_t const n = _count.load(std::memory_order_relaxed);
   for (std::uint32_t i = 0; i < n; ++i)
-    if (_entries[i].port == port && _entries[i].host == host) return i;
+    if (_entries[i].port == port && _entries[i].host == host) {
+      // The thread may have failed to start when the host was added: retry, or the host stays
+      // pending (a started thread resolves every due host on its first pass).
+      start_thread_locked();
+      return i;
+    }
   if (n >= max_hosts) return invalid;
   entry& e = _entries[n];
   try {
@@ -226,11 +243,18 @@ void dns_resolver::start_thread_locked() noexcept
 {
   if (_started.load(std::memory_order_relaxed)) return;
   try {
+    if (take_injected_start_failure())
+      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
     _thread = std::thread([this] { run(); });
     _started.store(true, std::memory_order_release);
   } catch (...) {  // NOLINT(bugprone-empty-catch): noexcept boundary: no thread
-                   // (std::system_error): _started stays false and the next add retries the start
+                   // (std::system_error): _started stays false and the next intern retries
   }
+}
+
+void dns_resolver::fail_thread_starts_for_testing(unsigned n) noexcept
+{
+  g_failed_thread_starts.store(n, std::memory_order_relaxed);
 }
 
 dns_resolver::status dns_resolver::pick(std::uint32_t h,

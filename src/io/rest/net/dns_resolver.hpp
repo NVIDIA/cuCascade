@@ -173,6 +173,9 @@ class dns_resolver {
   {
     return _started.load(std::memory_order_acquire);
   }
+  /// Test seam: the next @p n resolver-thread starts (of any resolver) fail as if `std::thread`
+  /// threw; 0 clears it.
+  static void fail_thread_starts_for_testing(unsigned n) noexcept;
 
  private:
   struct bench_slot {
