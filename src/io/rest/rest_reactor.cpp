@@ -853,6 +853,7 @@ class reactor_worker {
 
   // ---- waiting ----
   void wait();
+  [[nodiscard]] bool runnable() const;
   [[nodiscard]] bool idle() const noexcept;
   void publish_stats() noexcept;
   void count_status(unsigned status) noexcept;
@@ -1186,6 +1187,11 @@ reactor_worker::work reactor_worker::next_work(std::size_t free_connections)
 void reactor_worker::submit()
 {
   requeue_staging_waiters();
+  // Once an operation parks on staging, every later one that still needs staging parks behind
+  // it without trying (FIFO: a large read is not overtaken forever by smaller ones), but ready
+  // work that already holds its staging (a retry) or needs none keeps starting: it may be what
+  // returns the blocks the parked operation waits for.
+  bool parked = !_staging_wait.empty();
   for (;;) {
     int slot = pick_slot();
     if (slot < 0) { break; }
@@ -1207,13 +1213,14 @@ void reactor_worker::submit()
       continue;
     }
     if (op->needs_staging && op->op->staging_owner == nullptr) {
-      auto const staged = allocate_staging(*op);
+      auto const staged = parked ? staging::park : allocate_staging(*op);
       if (staged == staging::park) {
         // Pinned staging is exhausted while operations of this reactor still hold blocks: park
-        // until one returns them, and stop here so the backlog stays queued.
-        ++_s.staging_waits;
-        _staging_wait.push_back(std::move(op));
-        break;
+        // until one returns them.  No fresh data is expanded meanwhile (next_work), so the
+        // backlog stays queued.
+        park_staging(op);
+        parked = true;
+        continue;
       }
       if (staged == staging::failed) {
         op.reset();
@@ -1835,11 +1842,19 @@ void reactor_worker::collect_due_retries()
 
 // ---- waiting ----------------------------------------------------------------------------------
 
+bool reactor_worker::runnable() const
+{
+  // Parked operations whose staging came back after this pass's submit() re-queued the earlier
+  // ones (a release inside submit itself), or ready work with a free slot to run on.
+  return (_staging->released && !_staging_wait.empty()) || (!_ready.empty() && pick_slot() >= 0);
+}
+
 void reactor_worker::wait()
 {
   // Block only when nothing is runnable: work queued during the pass (a retry due now, a
   // control job, a request that arrived while submitting) was started by submit() already, or
-  // its producer wrote the wake-up eventfd.
+  // its producer wrote the wake-up eventfd.  What submit() could not start for want of a slot
+  // waits for a completion, which wakes the loop; anything else runnable is polled for at once.
   std::int64_t timeout_us = _copying.empty() ? -1 : _cfg.copy_poll_interval.count();
   auto const net_ms       = _transport->timeout_ms();
   if (net_ms >= 0) {
@@ -1861,6 +1876,7 @@ void reactor_worker::wait()
                                               .count());
     timeout_us     = timeout_us < 0 ? due : std::min(timeout_us, due);
   }
+  if (runnable()) { timeout_us = 0; }
   ++_s.waits;
   if (_uring_wait) {
     _transport->wait(timeout_us < 0 ? -1 : static_cast<int>((timeout_us + 999) / 1000));

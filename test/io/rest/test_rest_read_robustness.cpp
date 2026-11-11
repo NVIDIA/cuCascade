@@ -550,6 +550,86 @@ TEST_CASE("rest device reads park on exhausted pinned staging until this reactor
   }
 }
 
+TEST_CASE("rest device reads: a parked read does not strand a staged retry behind it",
+          "[rest][e2e][staging][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  // Two 1 MiB staging blocks.  R holds one through a delayed 503 (Retry-After: 0, so its retry is
+  // ready in the pass that sees it), C holds the other in a parked copy, and W (one 2 MiB GET)
+  // parks on both.  C's copy ends unobserved (a long copy poll interval) before R's 503 arrives,
+  // so one pass both returns C's block and makes R ready: W, re-queued ahead of R, parks again on
+  // the block R holds.  R must still start; nothing else is left to wake the worker.
+  constexpr std::size_t block_size = 1UL << 20;
+  constexpr std::size_t capacity   = 2 * block_size;
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr{
+    0, upstream, capacity, capacity, block_size, 4, 1};
+  auto payload = rest_test_payload(4 * block_size);
+  std::unordered_map<std::string, key_response_script> scripts;
+  scripts["retry.bin"].gets = {scripted_response{.status = 503, .delay = 1s, .retry_after = "0"},
+                               scripted_response{}};
+  loopback_range_server server(payload, {}, {}, scripts);
+  auto cfg                    = rest_contract_config();
+  cfg.max_connections         = 2;
+  cfg.max_retry_attempts      = 3;
+  cfg.honor_retry_after       = true;
+  cfg.hold_slot_during_copy   = false;
+  cfg.copy_poll_interval      = 2s;
+  cfg.stall_speed_limit_bytes = 0;
+  cfg.min_segment_bytes       = block_size;
+  cfg.max_segment_bytes       = 2 * block_size;
+  auto fx                     = make_ioctx(server, cfg, &mr);
+  rest_shutdown_guard cleanup{*fx.ioctx};
+  auto retry = fx.ioctx->open_io_object("s3://staging-bucket/retry.bin", payload.size());
+  auto copy  = fx.ioctx->open_io_object("s3://staging-bucket/copy.bin", payload.size());
+  auto wide  = fx.ioctx->open_io_object("s3://staging-bucket/wide.bin", payload.size());
+  rmm::cuda_stream stream;
+  rmm::cuda_stream held;
+  rmm::device_buffer destination(payload.size(), stream);
+  auto* const dst = static_cast<std::uint8_t*>(destination.data());
+
+  auto r =
+    fx.ioctx->device_read_async_io(*retry, 0, block_size, dst, ::cuda::stream_ref{stream.value()});
+  auto const deadline = std::chrono::steady_clock::now() + 5s;
+  while (server.get_count("retry.bin") == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(server.get_count("retry.bin") == 1);
+
+  auto* const hold = new std::chrono::milliseconds{300ms};
+  REQUIRE(cudaLaunchHostFunc(
+            held.value(),
+            [](void* arg) {
+              std::unique_ptr<std::chrono::milliseconds> const t{
+                static_cast<std::chrono::milliseconds*>(arg)};
+              std::this_thread::sleep_for(*t);
+            },
+            hold) == cudaSuccess);
+  auto c = fx.ioctx->device_read_async_io(
+    *copy, block_size, block_size, dst + block_size, ::cuda::stream_ref{held.value()});
+  REQUIRE(wait_for_stats(*fx.ioctx, [](transport_stats const& s) {
+            return s.h2d_copies >= 1;
+          }).h2d_copies == 1);
+
+  auto w = fx.ioctx->device_read_async_io(*wide,
+                                          2 * block_size,
+                                          2 * block_size,
+                                          dst + 2 * block_size,
+                                          ::cuda::stream_ref{stream.value()});
+  REQUIRE(wait_for_stats(*fx.ioctx, [](transport_stats const& s) {
+            return s.staging_waits >= 1;
+          }).staging_waits >= 1);
+
+  CHECK(std::move(r).get(20s) == block_size);
+  CHECK(std::move(c).get(20s) == block_size);
+  CHECK(std::move(w).get(20s) == 2 * block_size);
+  require_rest_bytes_equal(rest_device_bytes(destination.data(), payload.size(), stream.value()),
+                           payload);
+  CHECK(server.get_count("retry.bin") == 2);
+  CHECK(fx.ioctx->reactor_stats().failures == 0);
+  CHECK(available_after_release(mr, capacity) == capacity);
+}
+
 TEST_CASE("rest reactor counters follow the reads and survive shutdown", "[rest][e2e][stats]")
 {
   auto payload = rest_test_payload(3UL << 20);
