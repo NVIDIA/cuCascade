@@ -30,6 +30,7 @@
 #include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <atomic>
 #include <exception>
 #include <memory>
@@ -198,6 +199,10 @@ std::size_t impl_type::stream_ordered_tracker_state::check_reservation_and_handl
                                                   static_cast<std::size_t>(post_allocation_inc),
                                                   memory_reservation.get());
     }
+    // The allocation crosses the end of the reservation. Count it against the current size (the
+    // policy may just have grown it) while the size cannot change, see grow_reservation_by.
+    std::lock_guard lock(memory_reservation->_boundary_mutex);
+    reservation_size    = memory_reservation->size();
     post_allocation_inc = memory_reservation->allocated_bytes.add(stream_tracking_size);
   }
   memory_reservation->peak_allocated_bytes.update_peak(post_allocation_inc);
@@ -384,7 +389,15 @@ std::unique_ptr<reserved_arena> impl_type::reserve_upto(
 
 bool impl_type::grow_reservation_by(device_reserved_arena& arena, std::size_t bytes)
 {
-  if (do_reserve(bytes, _memory_limit)) {
+  std::lock_guard lock(arena._boundary_mutex);
+  // Bytes allocated past the end of the reservation are already charged to
+  // _total_allocated_bytes; growing the reservation over them must not charge them again.
+  std::size_t already_charged = 0;
+  auto const over             = arena.allocated_bytes.load() - arena.size();
+  if (over > 0) { already_charged = std::min(bytes, static_cast<std::size_t>(over)); }
+  auto const new_bytes = bytes - already_charged;
+  if (new_bytes == 0 || do_reserve(new_bytes, _memory_limit)) {
+    _total_reserved_bytes.fetch_add(already_charged);
     arena._size += static_cast<int64_t>(bytes);
     return true;
   }
@@ -393,6 +406,7 @@ bool impl_type::grow_reservation_by(device_reserved_arena& arena, std::size_t by
 
 void impl_type::shrink_reservation_to_fit(device_reserved_arena& arena)
 {
+  std::lock_guard lock(arena._boundary_mutex);
   auto current_bytes = std::max(int64_t{0}, arena.allocated_bytes.load());
   if (current_bytes < arena.size()) {
     auto reclaimed_bytes = std::exchange(arena._size, current_bytes) - current_bytes;
@@ -453,7 +467,15 @@ void* impl_type::do_allocate_managed(std::size_t bytes,
                                                      tracking_size,
                                                      std::placeholders::_2));
     } catch (...) {
-      state->memory_reservation->allocated_bytes.sub(static_cast<int64_t>(padded_bytes));
+      // Undo the allocation as a deallocation would. Its upstream charge is not held (it was never
+      // made, or was given back when the upstream allocation failed), so settle the difference: a
+      // concurrent grow may have counted these bytes as already charged.
+      auto const reclaimed = untrack_allocation(*state->memory_reservation, padded_bytes);
+      if (tracking_size > reclaimed) {
+        _total_allocated_bytes.add(tracking_size - reclaimed);
+      } else {
+        _total_allocated_bytes.sub(reclaimed - tracking_size);
+      }
       throw;
     }
   }
@@ -485,6 +507,38 @@ void* impl_type::do_allocate_unmanaged(std::size_t allocation_bytes,
   }
 }
 
+std::size_t impl_type::untrack_allocation(device_reserved_arena& arena, std::size_t bytes) noexcept
+{
+  auto const tracking_bytes = static_cast<int64_t>(bytes);
+  // Fast path: the bytes lie inside the reservation, so none of them were charged upstream. A
+  // concurrent grow only enlarges the reservation, so this stays true.
+  auto reservation_size = arena.size();
+  auto current          = arena.allocated_bytes.load();
+  while (current <= reservation_size) {
+    if (arena.allocated_bytes->compare_exchange_weak(current, current - tracking_bytes)) {
+      return 0;
+    }
+  }
+  // Some of the bytes lie past the end of the reservation. Count them against the current size
+  // while the size cannot change, see grow_reservation_by.
+  int64_t post_deallocation_size = 0;
+  {
+    std::lock_guard lock(arena._boundary_mutex);
+    reservation_size       = arena.size();
+    post_deallocation_size = arena.allocated_bytes.sub(tracking_bytes);
+  }
+  int64_t pre_deallocation_size = post_deallocation_size + tracking_bytes;
+  if (pre_deallocation_size <= reservation_size) {
+    // if it was made using the reserved space
+    return 0;
+  }
+  if (post_deallocation_size < reservation_size) {
+    // if it was partially made using the reserved space
+    return static_cast<std::size_t>(pre_deallocation_size - reservation_size);
+  }
+  return bytes;
+}
+
 void impl_type::deallocate(::cuda::stream_ref stream,
                            void* ptr,
                            std::size_t bytes,
@@ -494,18 +548,8 @@ void impl_type::deallocate(::cuda::stream_ref stream,
   auto upstream_reclaimed_bytes = tracking_bytes;
   auto* reservation_state       = _allocation_tracker->get_tracker_state(stream);
   if (reservation_state != nullptr) {
-    auto* reservation     = reservation_state->memory_reservation.get();
-    auto reservation_size = static_cast<int64_t>(reservation->size());
-    int64_t post_deallocation_size =
-      reservation->allocated_bytes.sub(static_cast<int64_t>(tracking_bytes));
-    int64_t pre_deallocation_size = post_deallocation_size + static_cast<int64_t>(tracking_bytes);
-    if (pre_deallocation_size <= reservation_size) {
-      // if it was made using the reserved space
-      upstream_reclaimed_bytes = 0;
-    } else if (post_deallocation_size < reservation_size) {
-      // if it was partially made using the reserved space
-      upstream_reclaimed_bytes = static_cast<std::size_t>(pre_deallocation_size - reservation_size);
-    }
+    upstream_reclaimed_bytes =
+      untrack_allocation(*reservation_state->memory_reservation, tracking_bytes);
   }
 // Suppress false-positive null-dereference warnings from CCCL library code
 #pragma GCC diagnostic push
