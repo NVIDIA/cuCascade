@@ -1027,6 +1027,46 @@ TEST_CASE("batched footer resolve stop unblocks a zero-active-transfer budget wa
   results->clear();
 }
 
+TEST_CASE("batched footer resolve keeps a canceled probe's reservation until its exchange retires",
+          "[rest][footer_resolve]")
+{
+  // On the running pool's worker (a private helper retires its exchanges before the call
+  // returns).  The probe's response is held back, so the GET is still receiving when the batch is
+  // canceled: the canceled call returns at once, but the probe's budget stays reserved until the
+  // worker has retired the exchange (and dropped the bytes it was filling).
+  std::unordered_map<std::string, key_response_script> scripts;
+  scripts["slow.parquet"].gets = {scripted_response{.delay = 800ms}};
+  auto server                  = std::make_shared<loopback_range_server>(
+    test_payload(), range_fault_policy{}, std::vector<cucascade::test::listed_object>{}, scripts);
+  auto fixture = make_ioctx(*server, test_config(1, probe_size));
+  fixture.ioctx->start();
+  auto results = std::make_shared<std::vector<footer_resolve_result>>();
+  auto mutex   = std::make_shared<std::mutex>();
+  std::stop_source stop;
+  std::vector<std::string> paths{object_uri("slow.parquet")};
+  async_call call([ioctx = fixture.ioctx, results, mutex, paths, token = stop.get_token()] {
+    ioctx->resolve_footer_objects(
+      paths,
+      [&](footer_resolve_result result) {
+        std::scoped_lock lock{*mutex};
+        results->push_back(std::move(result));
+      },
+      token);
+  });
+
+  REQUIRE(wait_until([&] { return server->get_count("slow.parquet") == 1; }, 2s));
+  CHECK(fixture.ioctx->footer_stash_reserved_bytes() == probe_size);
+  stop.request_stop();
+  require_ready(call, 250ms);
+  {
+    std::scoped_lock lock{*mutex};
+    REQUIRE(results->size() == 1);
+    CHECK(is_operation_canceled(results->front().error));
+  }
+  CHECK(fixture.ioctx->footer_stash_reserved_bytes() == probe_size);
+  CHECK(wait_until([&] { return fixture.ioctx->footer_stash_reserved_bytes() == 0; }, 3s));
+}
+
 TEST_CASE("batched footer payload lease can outlive its rest ioctx", "[rest][footer_resolve]")
 {
   loopback_range_server server(test_payload());

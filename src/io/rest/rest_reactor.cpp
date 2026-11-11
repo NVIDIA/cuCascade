@@ -538,6 +538,10 @@ struct rest_reactor::control_job {
   /// Called on the worker thread once the job is done (after `done` is published).
   std::function<void(std::shared_ptr<control_job> const&)> on_done;
 
+  /// Released with the job: a canceled footer probe's budget reservation, which must outlive the
+  /// exchange still filling `result` (set by the caller, never touched by the worker).
+  std::shared_ptr<void> retained;
+
   std::mutex m;
   std::condition_variable cv;
   bool done{false};
@@ -2439,11 +2443,14 @@ struct footer_entry {
   std::shared_ptr<rest_reactor::control_job> job;
 };
 
-/// Completions handed from the worker to the coordinating caller thread.
+/// Completions handed from the worker to the coordinating caller thread.  Jobs reach it through
+/// a weak reference: the box owns the finished jobs it holds, so a job owning the box back would
+/// keep both (and their response bodies) alive once a canceled batch stops reading it.
 struct footer_mailbox {
   std::mutex m;
   std::condition_variable_any cv;
   std::deque<std::shared_ptr<rest_reactor::control_job>> done;
+  std::exception_ptr failure;  ///< a completion that could not be queued (allocation)
 };
 
 }  // namespace
@@ -2498,7 +2505,19 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
   auto cancel_remaining = [&] {
     for (auto& e : entries) {
       if (e.stage == footer_stage::done) { continue; }
-      if (e.job) { e.job->canceled.store(true, std::memory_order_release); }
+      if (e.job) {
+        e.job->canceled.store(true, std::memory_order_release);
+        // A probe in flight keeps receiving into its job until the worker retires the
+        // exchange: its reservation goes with the job, so the budget is not handed to another
+        // batch while those bytes are still held.
+        if (e.lease) {
+          try {
+            e.job->retained = std::make_shared<leased_byte_storage>(
+              budget, std::move(e.lease), std::vector<std::uint8_t>{});
+          } catch (...) {  // NOLINT(bugprone-empty-catch): released below instead
+          }
+        }
+      }
       if (e.stage == footer_stage::active) { --active; }
       e.lease = {};
       deliver(e,
@@ -2531,13 +2550,22 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
     job->object = objects[e.pos];
     job->probe_bytes = window;
     job->tag         = e.pos;
-    job->on_done     = [mailbox](std::shared_ptr<control_job> const& done) {
-      {
-        std::lock_guard lock{mailbox->m};
-        mailbox->done.push_back(done);
-      }
-      mailbox->cv.notify_all();
-    };
+    job->on_done =
+      [box = std::weak_ptr<footer_mailbox>{mailbox}](std::shared_ptr<control_job> const& done) {
+        auto const target = box.lock();
+        if (target == nullptr) { return; }  // the batch is over: nobody reads this result
+        {
+          std::lock_guard lock{target->m};
+          try {
+            target->done.push_back(done);
+          } catch (...) {
+            // The batch cannot learn which entry finished: fail the whole batch rather than
+            // leave it waiting for a completion that was dropped.
+            if (!target->failure) { target->failure = std::current_exception(); }
+          }
+        }
+        target->cv.notify_all();
+      };
     e.job   = job;
     e.stage = footer_stage::active;
     ++active;
@@ -2655,7 +2683,8 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
       std::shared_ptr<control_job> job;
       {
         std::unique_lock lock{mailbox->m};
-        mailbox->cv.wait(lock, stop, [&] { return !mailbox->done.empty(); });
+        mailbox->cv.wait(lock, stop, [&] { return !mailbox->done.empty() || mailbox->failure; });
+        if (mailbox->failure) { std::rethrow_exception(mailbox->failure); }
         if (mailbox->done.empty()) { continue; }
         job = std::move(mailbox->done.front());
         mailbox->done.pop_front();
