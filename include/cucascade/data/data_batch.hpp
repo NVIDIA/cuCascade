@@ -21,7 +21,7 @@
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/common.hpp>
-#include <cucascade/utils/on_scope_exit.hpp>
+#include <cucascade/utils/cleanup_utils.hpp>
 
 #include <cuda_runtime.h>
 
