@@ -877,6 +877,8 @@ class reactor_worker {
   std::vector<parked_copy> _copying;
   std::unordered_map<int, std::vector<std::unique_ptr<cuda::cuda_event>>> _events;
   std::size_t _inflight{0};
+  /// Control jobs admitted in a row while fresh data waited (next_work).
+  std::size_t _control_streak{0};
   std::string _upkeep_bucket;
   clock_type::time_point _next_upkeep{};
   std::size_t _upkeep_cursor{0};
@@ -1162,19 +1164,28 @@ reactor_worker::work reactor_worker::next_work(std::size_t free_connections)
   // (and counted in queued_bytes()) until staging returns.
   bool const fresh_allowed = _staging_wait.empty();
   // Control-plane jobs (blocking callers) go first, but while data is waiting they may hold at
-  // most half of the connections, so a footer batch cannot starve demand reads.
+  // most half of the connections and take at most that many free slots in a row, so neither a
+  // footer batch nor a stream of metadata calls can starve demand reads (on a one-connection
+  // worker the two alternate).
   bool const data_waiting =
     fresh_allowed && (!_pending.empty() || _active != nullptr || _in.requests.size_approx() != 0);
+  if (!data_waiting) { _control_streak = 0; }
   std::size_t const control_cap =
     data_waiting ? std::max<std::size_t>(1, _slots.size() / 2) : _slots.size();
-  if (control_slots() < control_cap) {
+  if (control_slots() < control_cap && _control_streak < control_cap) {
     while (_in.take_control(w.ctl)) {
-      if (w.ctl != nullptr) { return w; }
+      if (w.ctl != nullptr) {
+        if (data_waiting) { ++_control_streak; }
+        return w;
+      }
     }
   }
   if (fresh_allowed) {
     w.data = next_fresh(free_connections);
-    if (w.data != nullptr) { return w; }
+    if (w.data != nullptr) {
+      _control_streak = 0;
+      return w;
+    }
   }
   while (_in.take_control(w.ctl)) {
     if (w.ctl != nullptr) { return w; }

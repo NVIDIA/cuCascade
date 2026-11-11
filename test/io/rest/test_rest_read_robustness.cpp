@@ -630,6 +630,62 @@ TEST_CASE("rest device reads: a parked read does not strand a staged retry behin
   CHECK(available_after_release(mr, capacity) == capacity);
 }
 
+TEST_CASE("rest demand reads alternate with a stream of metadata calls on one connection",
+          "[rest][e2e][priority]")
+{
+  // One connection and three callers HEADing in a loop, so a control job is queued at every
+  // free-slot decision.  Control jobs go first, but while data waits they take at most the
+  // control cap of free slots in a row: the read runs after about one more HEAD, not after the
+  // whole stream.
+  auto payload = rest_test_payload(256UL << 10);
+  range_fault_policy fault{};
+  fault.response_delay = 20ms;
+  loopback_range_server server(payload, fault);
+  auto cfg            = rest_contract_config();
+  cfg.max_connections = 1;
+  auto fx             = make_ioctx(server, cfg);
+  rest_shutdown_guard cleanup{*fx.ioctx};
+  auto object = fx.ioctx->open_io_object("s3://meta-bucket/data.bin", payload.size());
+
+  struct metadata_stream {
+    std::atomic<bool> stop{false};
+    std::vector<std::jthread> callers;
+    metadata_stream()                                  = default;
+    metadata_stream(metadata_stream const&)            = delete;
+    metadata_stream& operator=(metadata_stream const&) = delete;
+    ~metadata_stream()
+    {
+      stop = true;
+      callers.clear();
+    }
+  } heads;
+  for (int i = 0; i < 3; ++i) {
+    heads.callers.emplace_back([&heads, ioctx = fx.ioctx, i] {
+      auto const path = "s3://meta-bucket/meta" + std::to_string(i) + ".bin";
+      while (!heads.stop.load()) {
+        try {
+          std::ignore = ioctx->open_io_object(path);
+        } catch (...) {  // NOLINT(bugprone-empty-catch): only the read's latency is under test
+        }
+      }
+    });
+  }
+  auto const saturated = std::chrono::steady_clock::now() + 5s;
+  while (server.head_count() < 6 && std::chrono::steady_clock::now() < saturated) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(server.head_count() >= 6);
+
+  std::vector<std::uint8_t> out(4096);
+  auto const started = std::chrono::steady_clock::now();
+  auto read          = fx.ioctx->host_read_async_io(*object, 0, out.size(), out.data());
+  REQUIRE(std::move(read).get(5s) == out.size());
+  auto const elapsed = std::chrono::steady_clock::now() - started;
+  require_rest_bytes_equal(out, {payload.data(), out.size()});
+  // A HEAD takes ~20 ms here; strict control-first would hold the read until the callers stop.
+  CHECK(elapsed < 1s);
+}
+
 TEST_CASE("rest reactor counters follow the reads and survive shutdown", "[rest][e2e][stats]")
 {
   auto payload = rest_test_payload(3UL << 20);
