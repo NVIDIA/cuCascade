@@ -46,10 +46,11 @@
  * After `tls::session::handshake` returned `done`, with `ktls != disable` and nothing buffered by
  * the library: both directions' keys are exported and installed by `tls::ktls::install`
  * (TCP_ULP, TLS_TX, TLS_RX, TLS_RX_EXPECT_NO_PAD for TLS 1.3). Both installed: a
- * kTLS connection (`ktls_stream`, <= 64 B) plus, for TLS 1.3 on a re-key-capable kernel, the
- * `rekey_state` the slot keeps for KeyUpdates. Nothing installed: user space (counted in
- * `ktls_fallbacks` unless kTLS is disabled; `require` fails with errc::ktls_unavailable). One
- * direction only: errc::ktls_unavailable (kernel state cannot be undone).
+ * kTLS connection (`ktls_stream`, <= 64 B) plus, for TLS 1.3, the `rekey_state` the slot keeps
+ * for post-handshake messages (tickets spanning records; KeyUpdates on a re-key-capable kernel).
+ * Nothing installed: user space (counted in `ktls_fallbacks` unless kTLS is disabled; `require`
+ * fails with errc::ktls_unavailable). One direction only: errc::ktls_unavailable (kernel state
+ * cannot be undone).
  *
  * ## The user-space stream (`tls_stream`; tier 1 and tier 2)
  * The shell owns the socket I/O; the TLS objects never submit I/O for data (sans-I/O):
@@ -284,7 +285,7 @@ struct tls_support {
     bool fallback{false};                    ///< user space although kTLS was allowed (prefer)
     bool record_layer{false};                ///< user space through the built-in record layer
     tls_stream* stream{nullptr};             ///< path == user_space (owned by the caller)
-    tls::ktls::rekey_state* rekey{nullptr};  ///< path == ktls, TLS 1.3 on a re-key kernel
+    tls::ktls::rekey_state* rekey{nullptr};  ///< path == ktls, TLS 1.3
     std::error_code ec{};
   };
 
