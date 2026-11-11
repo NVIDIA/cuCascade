@@ -275,11 +275,10 @@ bool fixed_size_host_memory_resource::grow_reservation_by(reserved_arena& arena,
   // Bytes allocated past the end of the reservation are already charged to _allocated_bytes;
   // growing the reservation over them must not charge them again.
   std::size_t already_charged = 0;
-  if (auto iter = _active_reservations.find(h_reservation_slot);
-      iter != _active_reservations.end()) {
-    auto const over = iter->second.allocated_bytes.load() - arena.size();
-    if (over > 0) { already_charged = std::min(bytes, static_cast<std::size_t>(over)); }
-  }
+  auto iter                   = _active_reservations.find(h_reservation_slot);
+  assert(iter != _active_reservations.end());
+  auto const over = iter->second.allocated_bytes.load() - arena.size();
+  if (over > 0) { already_charged = std::min(bytes, static_cast<std::size_t>(over)); }
   auto const new_bytes = bytes - already_charged;
   if (new_bytes == 0 || do_reserve(new_bytes, _memory_limit)) {
     arena._size += static_cast<int64_t>(bytes);
