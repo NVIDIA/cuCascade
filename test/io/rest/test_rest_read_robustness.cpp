@@ -287,6 +287,36 @@ TEST_CASE("rest data GET fails a 206 whose Content-Range does not match without 
   CHECK(server.get_count("shifted.bin") == 1);
 }
 
+TEST_CASE("rest data GET fails a 206 whose Content-Range ends elsewhere without retrying",
+          "[rest][e2e][content_range]")
+{
+  // The start and the total match and the body has the requested length, but the range the
+  // server names is not the requested one: those bytes are not known to be the requested bytes.
+  auto payload = rest_test_payload(256UL << 10);
+  std::unordered_map<std::string, key_response_script> scripts;
+  SECTION("a shorter range")
+  {
+    scripts["short.bin"].gets = {
+      scripted_response{.content_range = "bytes 8192-9215/" + std::to_string(payload.size())}};
+  }
+  SECTION("a longer range")
+  {
+    scripts["short.bin"].gets = {
+      scripted_response{.content_range = "bytes 8192-20479/" + std::to_string(payload.size())}};
+  }
+  loopback_range_server server(payload, {}, {}, scripts);
+  auto cfg               = rest_contract_config();
+  cfg.max_retry_attempts = 4;
+  auto fx                = make_ioctx(server, cfg);
+  rest_shutdown_guard cleanup{*fx.ioctx};
+  auto object = fx.ioctx->open_io_object("s3://range-bucket/short.bin", payload.size());
+  std::vector<std::uint8_t> out(4096);
+  CHECK_THROWS_WITH(fx.ioctx->host_read(*object, 8192, out.size(), out.data()),
+                    Catch::Matchers::ContainsSubstring("Content-Range mismatch") &&
+                      Catch::Matchers::ContainsSubstring("requested bytes 8192-12287"));
+  CHECK(server.get_count("short.bin") == 1);
+}
+
 TEST_CASE("rest data GET with a chunked 206 body fails as unsupported framing without retrying",
           "[rest][e2e][framing]")
 {

@@ -1621,13 +1621,19 @@ bool reactor_worker::finish_data(std::size_t index, net::exchange_result& r)
   bool const full_object = io_rng.offset == 0 && op.obj != nullptr && io_rng.size == op.obj->size();
   bool const range_status = status == 206 || (status == 200 && full_object);
   if (!ec && status == 206) {
-    auto const& cr = r.meta.range;
-    if (!cr || cr->unsatisfied || cr->first != io_rng.offset ||
+    // The range must be exactly the one requested (start, end and object size): a body of the
+    // requested length under a different range is not the requested bytes.  io_rng is never
+    // empty and lies within the object (expand_active), so the server cannot shorten it.
+    auto const& cr        = r.meta.range;
+    auto const want_first = static_cast<std::uint64_t>(io_rng.offset);
+    auto const want_last  = want_first + io_rng.size - 1;
+    if (!cr || cr->unsatisfied || cr->first != want_first || cr->last != want_last ||
         (op.obj != nullptr && cr->complete != op.obj->size())) {
       fail_data(slot.data,
                 std::make_exception_ptr(std::runtime_error(
                   "rest_reactor: 206 Content-Range mismatch (got '" + describe_range(r.meta) +
-                  "', requested offset " + std::to_string(io_rng.offset) + ") for " + where)));
+                  "', requested bytes " + std::to_string(want_first) + "-" +
+                  std::to_string(want_last) + ") for " + where)));
       return false;
     }
   }
