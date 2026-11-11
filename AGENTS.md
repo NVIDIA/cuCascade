@@ -10,7 +10,7 @@ cache). Each library is built as `<name>_shared` and `<name>_static`, with stric
 | `cucascade_cudf` (`CUCASCADE_BUILD_CUDF`) | `src/cudf`, `include/cucascade/cudf` | io (if enabled), core, libcudf |
 | `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/{io,exec}`, `include/cucascade/{io,exec}` | core, system I/O libraries; kvikIO parts only with `CUCASCADE_BUILD_CUDF` |
 | `cucascade` (core) | `src/{memory,data,cuda}`, `include/cucascade/{memory,data,cuda,utils,log}`, `include/cucascade/*.hpp` | topology, RMM, CUDA runtime, libnuma |
-| `cucascade_topology_discovery` | `src/memory/topology_discovery.cpp` | NVML; never a link-time `libcuda` dependency |
+| `cucascade_topology_discovery` | `src/memory/topology_discovery.cpp`, `src/log` | NVML; never a link-time `libcuda` dependency |
 
 Keep cudf types and headers out of core and io. The disk tier stores an opaque `int32_t` type id
 that the cudf converters translate.
@@ -61,8 +61,8 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
 
 - Source, test and benchmark files are listed explicitly (no globs) in `src/*/CMakeLists.txt`,
   `test/CMakeLists.txt` and `benchmark/CMakeLists.txt`. The directory does not decide the
-  library: `topology_discovery.cpp` builds into `cucascade_topology_discovery`, `src/exec` into
-  `cucascade_io`.
+  library: `topology_discovery.cpp` and `src/log` build into `cucascade_topology_discovery` (so
+  every library links the logger), `src/exec` into `cucascade_io`.
 - Tests go in the binary whose dependencies they need, regardless of directory:
   `cucascade_tests` (core), `cucascade_io_tests`, `cucascade_cudf_tests` (anything using cudf),
   `cucascade_topology_discovery_tests`. Tests needing an optional layer go in the matching
@@ -107,11 +107,12 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
 - Don't allocate in destructors or other `noexcept` paths, and allocate before submitting async
   GPU or I/O work so a `bad_alloc` cannot strand it. Test such paths with
   `test/utils/allocation_counter.hpp`.
-- In destructors and `noexcept` paths use `CUCASCADE_ASSERT_CUDA_SUCCESS` (in release the call
-  still runs but errors are ignored) and swallow filesystem errors; elsewhere use
+- In destructors and `noexcept` paths use `CUCASCADE_ASSERT_CUDA_SUCCESS` (reports failures to
+  the log sink; debug builds also assert) and swallow filesystem errors; elsewhere use
   `CUCASCADE_CUDA_TRY` / `CUCASCADE_FAIL` from `include/cucascade/error.hpp`.
-- Check `include/cucascade/log/logging.hpp` before relying on `CUCASCADE_LOG_*` output; logging
-  may be compiled out, with arguments unevaluated.
+- `CUCASCADE_LOG_*` arguments are not evaluated below the runtime threshold (`warn` until a host
+  installs a sink) or `CUCASCADE_MIN_LOG_LEVEL`, so keep side effects out of them. A host sink
+  may call back into cuCascade, so log after releasing internal locks where possible.
 
 ## Tests
 
