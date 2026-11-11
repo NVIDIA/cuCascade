@@ -69,6 +69,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -339,10 +340,35 @@ shared_byte_span make_leased_byte_span(std::shared_ptr<exec::admission_control> 
   return shared_byte_span{owner, &owner->view};
 }
 
-std::exception_ptr canceled_exception(std::string const& what)
+/// Never throws: when building the exception itself fails (allocation), that failure is the
+/// error delivered, so completion paths cannot lose the job they are completing.
+std::exception_ptr canceled_exception(char const* what) noexcept
 {
-  return std::make_exception_ptr(
-    std::system_error(std::make_error_code(std::errc::operation_canceled), what));
+  try {
+    return std::make_exception_ptr(
+      std::system_error(std::make_error_code(std::errc::operation_canceled), what));
+  } catch (...) {
+    return std::current_exception();
+  }
+}
+
+/// A std::runtime_error, or the allocation failure that prevented building it.
+std::exception_ptr runtime_error_ptr(char const* what) noexcept
+{
+  try {
+    return std::make_exception_ptr(std::runtime_error(what));
+  } catch (...) {
+    return std::current_exception();
+  }
+}
+
+/// Grow @p v ahead of a push_back that must not fail: the growth throws while the caller still
+/// owns the element, and the push itself then cannot (no reallocation, nothrow move).
+template <typename T>
+void reserve_one_more(std::vector<T>& v)
+{
+  static_assert(std::is_nothrow_move_constructible_v<T>);
+  if (v.size() == v.capacity()) { v.reserve(std::max<std::size_t>(8, v.capacity() * 2)); }
 }
 
 file_descriptor make_event_fd()
@@ -582,16 +608,23 @@ struct rest_reactor::intake {
     return true;
   }
 
-  /// Refuse further control jobs and fail the queued ones with @p error.
+  /// Refuse further control jobs and fail the queued ones with @p error.  Takes them one at a
+  /// time (completed outside the lock) rather than swapping into a temporary deque, whose
+  /// construction allocates: this runs on cleanup paths, including after an allocation failure.
   void close(std::exception_ptr const& error) noexcept
   {
-    std::deque<std::shared_ptr<control_job>> orphans;
     {
       std::lock_guard lock{control_mtx};
       closed = true;
-      orphans.swap(controls);
     }
-    for (auto& job : orphans) {
+    for (;;) {
+      std::shared_ptr<control_job> job;
+      {
+        std::lock_guard lock{control_mtx};
+        if (controls.empty()) { return; }
+        job = std::move(controls.front());
+        controls.pop_front();
+      }
       if (job == nullptr) { continue; }
       job->error = error;
       complete_job(job);
@@ -792,23 +825,31 @@ class reactor_worker {
   // ---- completion ----
   void process_completions();
   bool finish_data(std::size_t index, net::exchange_result& r);
-  void finish_control(std::size_t index, net::exchange_result& r);
+  void finish_control(std::size_t index, net::exchange_result& r) noexcept;
   void complete_control(std::shared_ptr<control_job> const& job) noexcept;
   bool start_copy(std::size_t index);
   void poll_copies();
   void fail_data(std::unique_ptr<data_op>& op,
                  grouped_coordinator::error_type const& error,
                  bool host_data_valid = false) noexcept;
-  void schedule_retry(work w, clock_type::duration delay);
+  void fail_work(work& w,
+                 grouped_coordinator::error_type const& data_error,
+                 std::exception_ptr const& control_error) noexcept;
+  // Ownership hand-offs: each one either queues the work or, when the queue cannot grow, fails
+  // it with that error; none can drop an operation whose caller is waiting.
+  void push_ready(work w, bool front) noexcept;
+  void park_staging(std::unique_ptr<data_op>& op) noexcept;
+  void schedule_retry(work& w, clock_type::duration delay);
   void retry_data(std::unique_ptr<data_op> op,
                   http::response_meta const& meta,
                   bool is_auth,
-                  std::string const& reason);
+                  std::string const& reason) noexcept;
   void arm_retry_timer();
   void collect_due_retries();
   enum class staging : std::uint8_t { ok, park, failed };
-  staging allocate_staging(data_op& op);
+  staging allocate_staging(data_op& op) noexcept;
   std::unique_ptr<cuda::cuda_event> take_event(int device);
+  void recycle_event(int device, std::unique_ptr<cuda::cuda_event> event) noexcept;
 
   // ---- waiting ----
   void wait();
@@ -850,6 +891,8 @@ reactor_worker::reactor_worker(rest_reactor& r, rest_reactor::intake& in, bool p
                                                    return ctx->services().tls();
                                                  }});
   _slots.resize(_cfg.max_connections);
+  _retry_heap.reserve(_cfg.max_connections);
+  _copying.reserve(_cfg.max_connections);
   if (_uring_wait) {
     _transport->watch_fd(_in.wakeup.get());
   } else {
@@ -950,8 +993,9 @@ void reactor_worker::requeue_staging_waiters()
   if (!_staging->released) { return; }
   _staging->released = false;
   while (!_staging_wait.empty()) {
-    _ready.push_front(work{std::move(_staging_wait.back()), nullptr});
+    work w{std::move(_staging_wait.back()), nullptr};
     _staging_wait.pop_back();
+    push_ready(std::move(w), /*front=*/true);
   }
 }
 
@@ -1047,10 +1091,21 @@ void reactor_worker::expand_active(std::size_t free_connections)
     if (logical_bytes != slice_size) {
       throw std::runtime_error("rest_reactor: physical plan does not cover logical slice");
     }
-    _active->coordinator->add_tasks(expanded.size() - 1);
-    for (auto& request : expanded) {
-      _pending.push_back(std::move(request));
+    // All or nothing: a failed append rolls the queue back and the catch below settles the
+    // slice's one credit.  The extra credits are added only once every operation is queued (none
+    // can run before this thread's next submit()), so no credit is ever left without an owner.
+    auto const pending_before = _pending.size();
+    try {
+      for (auto& request : expanded) {
+        _pending.push_back(std::move(request));
+      }
+    } catch (...) {
+      while (_pending.size() != pending_before) {
+        _pending.pop_back();
+      }
+      throw;
     }
+    _active->coordinator->add_tasks(expanded.size() - 1);
   } catch (...) {
     _r._queued_bytes.fetch_sub(slice_size, std::memory_order_relaxed);
     if (slice.on_complete != nullptr) { (*slice.on_complete)(slice.h_buffer.fragments(), false); }
@@ -1170,7 +1225,7 @@ void reactor_worker::submit()
   if (!_uring_wait) { _transport->flush(); }
 }
 
-reactor_worker::staging reactor_worker::allocate_staging(data_op& request)
+reactor_worker::staging reactor_worker::allocate_staging(data_op& request) noexcept
 {
   auto* resource = _r._ctx->host_memory_resource();
   try {
@@ -1203,11 +1258,17 @@ reactor_worker::staging reactor_worker::allocate_staging(data_op& request)
     if (_staging->holders > 0) { return staging::park; }
     // Nothing of this reactor will free a block: fail rather than wait.  It stays an
     // rmm::out_of_memory, which the engine retries (a runtime_error is fatal there).
-    auto const what = "rest_reactor: pinned staging exhausted for " + request.object.bucket + "/" +
-                      request.object.key + " (" + std::to_string(request.op->io_rng.size) +
-                      " bytes): " + e.what();
-    CUCASCADE_LOG_ERROR("{}", what);
-    request.op->finish_error(std::make_exception_ptr(rmm::out_of_memory(what.c_str())));
+    std::exception_ptr error;
+    try {
+      auto const what = "rest_reactor: pinned staging exhausted for " + request.object.bucket +
+                        "/" + request.object.key + " (" + std::to_string(request.op->io_rng.size) +
+                        " bytes): " + e.what();
+      CUCASCADE_LOG_ERROR("{}", what);
+      error = std::make_exception_ptr(rmm::out_of_memory(what.c_str()));
+    } catch (...) {
+      error = std::current_exception();
+    }
+    request.op->finish_error(error);
     ++_s.failures;
     return staging::failed;
   } catch (...) {
@@ -1402,7 +1463,15 @@ void reactor_worker::process_completions()
     count_status(c.result.meta.status);
     if (s.data != nullptr) {
       --_inflight;
-      if (!finish_data(c.slot, c.result)) { release_slot(c.slot); }
+      bool held = false;
+      try {
+        held = finish_data(c.slot, c.result);
+      } catch (...) {
+        // An allocation failure while judging the response (its diagnostics): every hand-off
+        // out of the slot is nothrow, so the operation is still here; fail just this one.
+        fail_data(s.data, std::current_exception());
+      }
+      if (!held) { release_slot(c.slot); }
     } else if (s.ctl != nullptr) {
       finish_control(c.slot, c.result);
     }
@@ -1419,8 +1488,47 @@ void reactor_worker::fail_data(std::unique_ptr<data_op>& op,
   op.reset();
 }
 
-void reactor_worker::schedule_retry(work w, clock_type::duration delay)
+void reactor_worker::fail_work(work& w,
+                               grouped_coordinator::error_type const& data_error,
+                               std::exception_ptr const& control_error) noexcept
 {
+  if (w.data != nullptr) { fail_data(w.data, data_error); }
+  if (w.ctl != nullptr) {
+    w.ctl->error = control_error;
+    complete_control(w.ctl);
+    w.ctl.reset();
+  }
+}
+
+void reactor_worker::push_ready(work w, bool front) noexcept
+{
+  try {
+    // Strong guarantee: a failed growth leaves `w` untouched.
+    if (front) {
+      _ready.push_front(std::move(w));
+    } else {
+      _ready.push_back(std::move(w));
+    }
+  } catch (...) {
+    auto const error = std::current_exception();
+    fail_work(w, error, error);
+  }
+}
+
+void reactor_worker::park_staging(std::unique_ptr<data_op>& op) noexcept
+{
+  ++_s.staging_waits;
+  try {
+    _staging_wait.push_back(std::move(op));
+  } catch (...) {
+    fail_data(op, std::current_exception());
+  }
+}
+
+/// Throws (a failed heap growth) with @p w untouched, so the caller can still fail it.
+void reactor_worker::schedule_retry(work& w, clock_type::duration delay)
+{
+  reserve_one_more(_retry_heap);
   ++_s.retries;
   _retry_heap.push_back(retry_entry{clock_type::now() + delay, std::move(w)});
   std::push_heap(_retry_heap.begin(), _retry_heap.end(), retry_later);
@@ -1430,27 +1538,36 @@ void reactor_worker::schedule_retry(work w, clock_type::duration delay)
 void reactor_worker::retry_data(std::unique_ptr<data_op> op,
                                 http::response_meta const& meta,
                                 bool is_auth,
-                                std::string const& reason)
+                                std::string const& reason) noexcept
 {
-  auto& attempt    = is_auth ? op->auth_attempt : op->attempt;
-  auto const limit = is_auth ? _cfg.max_auth_retry_attempts : _cfg.max_retry_attempts;
-  if (attempt + 1 >= limit) {
-    fail_data(op,
-              std::make_exception_ptr(std::runtime_error("rest_reactor: exhausted retries (" +
-                                                         reason + ") for " + op->object.bucket +
-                                                         "/" + op->object.key)));
-    return;
+  // The operation stays owned by `w` until the heap holds it: a failure anywhere in between
+  // (the diagnostic text, the backoff, the heap growth) fails it instead of dropping it.
+  work w{std::move(op), nullptr};
+  try {
+    auto& d          = *w.data;
+    auto& attempt    = is_auth ? d.auth_attempt : d.attempt;
+    auto const limit = is_auth ? _cfg.max_auth_retry_attempts : _cfg.max_retry_attempts;
+    if (attempt + 1 >= limit) {
+      fail_data(w.data,
+                std::make_exception_ptr(std::runtime_error("rest_reactor: exhausted retries (" +
+                                                           reason + ") for " + d.object.bucket +
+                                                           "/" + d.object.key)));
+      return;
+    }
+    auto const delay = compute_backoff(d.attempt, meta, _cfg);
+    CUCASCADE_LOG_WARN("rest_reactor: retrying {}/{} after {} (attempt {}/{})",
+                       d.object.bucket,
+                       d.object.key,
+                       reason,
+                       attempt + 1,
+                       limit);
+    ++attempt;
+    if (is_auth) { ++_s.auth_retries; }
+    schedule_retry(w, delay);
+  } catch (...) {
+    auto const error = std::current_exception();
+    fail_work(w, error, error);
   }
-  auto const delay = compute_backoff(op->attempt, meta, _cfg);
-  CUCASCADE_LOG_WARN("rest_reactor: retrying {}/{} after {} (attempt {}/{})",
-                     op->object.bucket,
-                     op->object.key,
-                     reason,
-                     attempt + 1,
-                     limit);
-  ++attempt;
-  if (is_auth) { ++_s.auth_retries; }
-  schedule_retry(work{std::move(op), nullptr}, delay);
 }
 
 /// @return true when the slot stays occupied (a held device copy).
@@ -1475,7 +1592,7 @@ bool reactor_worker::finish_data(std::size_t index, net::exchange_result& r)
     request.stale_retried = true;
     request.fresh         = true;
     ++_s.stale_retries;
-    _ready.push_front(work{std::move(slot.data), nullptr});
+    push_ready(work{std::move(slot.data), nullptr}, /*front=*/true);
     return false;
   }
 
@@ -1548,49 +1665,58 @@ void reactor_worker::complete_control(std::shared_ptr<control_job> const& job) n
   complete_job(job);
 }
 
-void reactor_worker::finish_control(std::size_t index, net::exchange_result& r)
+void reactor_worker::finish_control(std::size_t index, net::exchange_result& r) noexcept
 {
-  auto job = std::move(_slots[index].ctl);
+  // `w` owns the job until it is completed or handed to a queue: a failure in between (the
+  // diagnostic text, the backoff, the heap growth) completes it with that error, so its waiting
+  // caller is never left without an answer.
+  work w{nullptr, std::move(_slots[index].ctl)};
   release_slot(index);
-  using kind = control_job::kind;
-  if (job->k == kind::warm) {
-    // Warm-up / upkeep: the exchange is what was bought; failures never fail a read.
-    if (r.ec) {
-      CUCASCADE_LOG_DEBUG(
-        "rest_reactor: warm-up exchange to {} failed: {}", job->bucket, r.ec.message());
-    }
-    job->result = std::move(r);
-    complete_control(job);
-    return;
-  }
-  if (r.ec == make_error_code(errc::stale_connection) && !job->stale_retried) {
-    job->stale_retried    = true;
-    job->fresh_connection = true;
-    ++_s.stale_retries;
-    _ready.push_front(work{nullptr, std::move(job)});
-    return;
-  }
-  auto const status    = static_cast<unsigned>(r.meta.status);
-  bool const retriable = (r.ec && is_retriable(r.ec)) || (!r.ec && is_retriable_status(status));
-  if (retriable && !job->canceled.load(std::memory_order_acquire)) {
-    job->last_error = r.ec ? r.ec.message() : "HTTP " + std::to_string(status);
-    if (job->attempt + 1 < _cfg.max_retry_attempts) {
-      CUCASCADE_LOG_WARN("rest_reactor: retrying control request after {} (attempt {}/{})",
-                         job->last_error,
-                         job->attempt + 1,
-                         _cfg.max_retry_attempts);
-      auto const delay = compute_backoff(job->attempt, r.meta, _cfg);
-      ++job->attempt;
-      schedule_retry(work{nullptr, std::move(job)}, delay);
+  try {
+    auto& job  = *w.ctl;
+    using kind = control_job::kind;
+    if (job.k == kind::warm) {
+      // Warm-up / upkeep: the exchange is what was bought; failures never fail a read.
+      if (r.ec) {
+        CUCASCADE_LOG_DEBUG(
+          "rest_reactor: warm-up exchange to {} failed: {}", job.bucket, r.ec.message());
+      }
+      job.result = std::move(r);
+      complete_control(w.ctl);
       return;
     }
-    job->exhausted = true;
+    if (r.ec == make_error_code(errc::stale_connection) && !job.stale_retried) {
+      job.stale_retried    = true;
+      job.fresh_connection = true;
+      ++_s.stale_retries;
+      push_ready(std::move(w), /*front=*/true);
+      return;
+    }
+    auto const status    = static_cast<unsigned>(r.meta.status);
+    bool const retriable = (r.ec && is_retriable(r.ec)) || (!r.ec && is_retriable_status(status));
+    if (retriable && !job.canceled.load(std::memory_order_acquire)) {
+      job.last_error = r.ec ? r.ec.message() : "HTTP " + std::to_string(status);
+      if (job.attempt + 1 < _cfg.max_retry_attempts) {
+        CUCASCADE_LOG_WARN("rest_reactor: retrying control request after {} (attempt {}/{})",
+                           job.last_error,
+                           job.attempt + 1,
+                           _cfg.max_retry_attempts);
+        auto const delay = compute_backoff(job.attempt, r.meta, _cfg);
+        ++job.attempt;
+        schedule_retry(w, delay);
+        return;
+      }
+      job.exhausted = true;
+    }
+    if (!r.ec && job.k == kind::head && status == 200) { ++_s.heads; }
+    if (!r.ec) { ++_s.control_requests; }
+    job.ec     = r.ec;
+    job.result = std::move(r);
+    complete_control(w.ctl);
+  } catch (...) {
+    auto const error = std::current_exception();
+    fail_work(w, error, error);
   }
-  if (!r.ec && job->k == kind::head && status == 200) { ++_s.heads; }
-  if (!r.ec) { ++_s.control_requests; }
-  job->ec     = r.ec;
-  job->result = std::move(r);
-  complete_control(job);
 }
 
 std::unique_ptr<cuda::cuda_event> reactor_worker::take_event(int device)
@@ -1605,32 +1731,52 @@ std::unique_ptr<cuda::cuda_event> reactor_worker::take_event(int device)
   return std::make_unique<cuda::cuda_event>(cudaEventDisableTiming);
 }
 
+void reactor_worker::recycle_event(int device, std::unique_ptr<cuda::cuda_event> event) noexcept
+{
+  if (event == nullptr) { return; }
+  try {
+    _events[device].push_back(std::move(event));
+  } catch (...) {  // NOLINT(bugprone-empty-catch): the pool is a cache; the event is destroyed
+  }
+}
+
 bool reactor_worker::start_copy(std::size_t index)
 {
   auto& slot       = _slots[index];
   auto& op         = *slot.data;
-  int const device = op.op->device_copy->device_id >= 0 ? op.op->device_copy->device_id
-                                                        : op.op->device_copy->d_buffer.device_id;
+  auto& copy       = *op.op->device_copy;
+  int const device = copy.device_id >= 0 ? copy.device_id : copy.d_buffer.device_id;
+  std::unique_ptr<cuda::cuda_event> event;
   try {
     if (device < 0) { throw std::runtime_error("rest_reactor: device copy has no CUDA device id"); }
-    auto event = take_event(device);
-    auto const copy_status =
-      op.op->device_copy->copy_async(op.op->io_rng, op.op->iovecs, event->get());
-    if (copy_status != cudaSuccess) {
-      _events[device].push_back(std::move(event));
-      fail_data(slot.data, copy_status, true);
-      return false;
-    }
-    ++_s.h2d_copies;
-    bool const hold = _cfg.hold_slot_during_copy;
-    _copying.push_back(
-      parked_copy{hold ? index : SIZE_MAX, device, std::move(event), std::move(slot.data)});
-    slot.held = hold;
-    return hold;
+    event = take_event(device);
+    // Room for the parked copy before the DMA starts: once it reads the staging, parking it
+    // must not fail, or the blocks would go back to the pool under the copy.
+    reserve_one_more(_copying);
   } catch (...) {
+    recycle_event(device, std::move(event));
     fail_data(slot.data, std::current_exception(), true);
     return false;
   }
+  auto const copy_status = copy.copy_async(op.op->io_rng, op.op->iovecs, event->get());
+  if (copy_status != cudaSuccess) {
+    // Part of the batch may be queued already: let it finish reading the staging first.
+    try {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+      std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
+    } catch (...) {  // NOLINT(bugprone-empty-catch): best effort; the copy already failed
+    }
+    recycle_event(device, std::move(event));
+    fail_data(slot.data, copy_status, true);
+    return false;
+  }
+  ++_s.h2d_copies;
+  bool const hold = _cfg.hold_slot_during_copy;
+  // Capacity reserved above and parked_copy moves without throwing: this cannot fail.
+  _copying.push_back(
+    parked_copy{hold ? index : SIZE_MAX, device, std::move(event), std::move(slot.data)});
+  slot.held = hold;
+  return hold;
 }
 
 void reactor_worker::poll_copies()
@@ -1645,11 +1791,9 @@ void reactor_worker::poll_copies()
     if (result == query_result::success) {
       it->op->op->finish_success();
     } else {
-      fail_data(it->op,
-                std::make_exception_ptr(std::runtime_error("rest_reactor: device H2D copy failed")),
-                true);
+      fail_data(it->op, runtime_error_ptr("rest_reactor: device H2D copy failed"), true);
     }
-    _events[it->device].push_back(std::move(it->event));
+    recycle_event(it->device, std::move(it->event));
     if (it->slot != SIZE_MAX) { release_slot(it->slot); }
     it->op.reset();  // returns the staging blocks
     it = _copying.erase(it);
@@ -1681,8 +1825,9 @@ void reactor_worker::collect_due_retries()
   bool popped    = false;
   while (!_retry_heap.empty() && _retry_heap.front().due <= now) {
     std::pop_heap(_retry_heap.begin(), _retry_heap.end(), retry_later);
-    _ready.push_back(std::move(_retry_heap.back().w));
+    work w = std::move(_retry_heap.back().w);
     _retry_heap.pop_back();
+    push_ready(std::move(w), /*front=*/false);
     popped = true;
   }
   if (popped) { arm_retry_timer(); }
@@ -1832,14 +1977,6 @@ void reactor_worker::drain(std::exception_ptr failure) noexcept
     }
   }
   _copying.clear();
-  auto fail_work = [&](work& w) {
-    if (w.data != nullptr) { fail_data(w.data, error); }
-    if (w.ctl != nullptr) {
-      w.ctl->error = control_error;
-      complete_control(w.ctl);
-      w.ctl.reset();
-    }
-  };
   for (auto& s : _slots) {
     if (s.data != nullptr) { fail_data(s.data, error); }
     if (s.ctl != nullptr) {
@@ -1850,11 +1987,11 @@ void reactor_worker::drain(std::exception_ptr failure) noexcept
     s.held = false;
   }
   for (auto& entry : _retry_heap) {
-    fail_work(entry.w);
+    fail_work(entry.w, error, control_error);
   }
   _retry_heap.clear();
   for (auto& w : _ready) {
-    fail_work(w);
+    fail_work(w, error, control_error);
   }
   _ready.clear();
   for (auto& op : _staging_wait) {
