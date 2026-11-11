@@ -42,6 +42,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_data_repository_manager.cpp
     data/test_disk_io_backend.cpp
     data/test_io_worker.cpp
+    # Logging tests
+    log/test_logging.cpp
+    log/test_logging_pruned.cpp
+    log/test_logging_pruned_all.cpp
     # Utils
     # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp
@@ -49,6 +53,21 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
                                                    CUDA_STANDARD_REQUIRED ON)
+
+  # Negative compile test: a call site pruned by CUCASCADE_MIN_LOG_LEVEL must
+  # still have its format string checked. The object target is excluded from the
+  # default build and the test passes only when its compilation fails on the
+  # format string.
+  add_library(cucascade_log_pruned_ill_formed OBJECT EXCLUDE_FROM_ALL
+                                                     log/pruned_ill_formed.cpp)
+  target_link_libraries(cucascade_log_pruned_ill_formed PRIVATE cucascade)
+  add_test(NAME cucascade_log_pruned_site_checks_format
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target
+                   cucascade_log_pruned_ill_formed)
+  set_tests_properties(
+    cucascade_log_pruned_site_checks_format
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "basic_format_string.*is not a constant expression")
 
   # Set include directories
   target_include_directories(
@@ -140,6 +159,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
+    cudf/test_gpu_to_gpu_converter.cpp
     cudf/test_release_table_stream.cpp
     # Main test runner
     unittest.cpp)
@@ -165,8 +185,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Link dependencies
   target_link_libraries(
-    cucascade_cudf_tests PRIVATE cucascade_cudf Catch2::Catch2
-                                 CUDA::cudart_static)
+    cucascade_cudf_tests
+    PRIVATE cucascade_cudf Catch2::Catch2 CUDA::cudart_static
+            cudf::cudftest_default_stream)
 
   # Register tests with CTest
   add_test(NAME cucascade_cudf_tests COMMAND cucascade_cudf_tests)

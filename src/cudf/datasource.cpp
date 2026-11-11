@@ -22,6 +22,7 @@
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/device_buffer.hpp>
 
