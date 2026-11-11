@@ -36,8 +36,9 @@
  * from `tls::session::export_keys`, and this module installs them and follows the connection's
  * control records itself (docs/io/rest-uring-design.md section 4.3).
  *
- * Socket I/O here is limited to `setsockopt` and, for a KeyUpdate reply, one non-blocking
- * `sendmsg` of a 5-byte handshake record.  Data receives and sends stay with the transport.
+ * Socket I/O here is limited to `setsockopt`, a `getsockopt` of `TLS_RX` (to resume a paused
+ * RX) and, for a KeyUpdate reply, one non-blocking `sendmsg` of a 5-byte handshake record.  Data
+ * receives and sends stay with the transport.
  * Everything is reactor-thread confined and allocation-free except @ref make_rekey_state.
  */
 namespace cucascade::io::tls::ktls {
@@ -135,7 +136,12 @@ enum class control_action : std::uint8_t {
  * @p state), or a KeyUpdate that does not end its record fail.  The transport caps control
  * records in a row (32) itself: TLS 1.2 connections have no state to count in.
  *
- * @param fd         the kTLS socket (for the RX re-key)
+ * Linux >= 6.14 pauses RX (-EKEYEXPIRED) after any handshake record whose first byte is 24,
+ * KeyUpdate's type, until `TLS_RX` is set again.  When that byte starts a ticket continuation or
+ * a KeyUpdate that continues in the next record, no new key follows: RX is resumed by setting
+ * `TLS_RX` again to the kernel's current key and sequence number (read back with getsockopt).
+ *
+ * @param fd         the kTLS socket (for the RX re-key and resume)
  * @param state      the connection's state (@ref make_rekey_state), null for TLS 1.2
  * @param type       content type from `TLS_GET_RECORD_TYPE`
  * @param plaintext  the record's plaintext

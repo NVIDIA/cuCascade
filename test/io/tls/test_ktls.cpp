@@ -22,8 +22,9 @@
  * a loopback OpenSSL server: plaintext `send`/`recv` after `install` (TLS 1.2 and 1.3,
  * AES-128/256-GCM, NO_PAD), control records drained with `recvmsg` + `TLS_GET_RECORD_TYPE` and
  * handled by `on_control_record` (tickets skipped, also when they span records on a kernel that
- * cannot re-key; KeyUpdate re-key of RX and, when requested, our reply + TX re-key through
- * `flush_reply`, close_notify), a TLS 1.2 Finished split across records, a tampered record, and
+ * cannot re-key; RX resumed after records that only start like a KeyUpdate; KeyUpdate re-key of
+ * RX and, when requested, our reply + TX re-key through `flush_reply`, close_notify), a TLS 1.2
+ * Finished split across records, a tampered record, and
  * the control record rules in isolation.  Tests that need the kernel module SKIP when `install`
  * reports the kernel refused (tls.ko missing, TCP_ULP blocked).
  */
@@ -458,6 +459,71 @@ TEST_CASE("ktls: TLS 1.3 ticket spanning records without kernel re-key, then app
   }
 }
 
+TEST_CASE("ktls: ticket records that start with KeyUpdate's type do not stall RX (Linux >= 6.14)",
+          "[tls]")
+{
+  // The kernel pauses RX after each handshake record whose first byte is 24, blind to message
+  // boundaries.  Here every continuation record of a ticket starts with 24: each pause is
+  // resumed with the current key, data follows, and a real KeyUpdate still re-keys both ways.
+  if (!ktls::probe().tls13_rekey) { SKIP("the kernel cannot re-key TLS 1.3 kTLS"); }
+  auto const fill = t::spanning_ticket_fill(key_update_type, true);
+  REQUIRE(fill.has_value());
+  std::atomic<bool> request_ok{false};
+  std::atomic<bool> after_update_ok{false};
+  std::atomic<std::size_t> ticket_records{0};
+  auto o             = server_options(TLS1_3_VERSION, "TLS_AES_256_GCM_SHA384");
+  o.num_tickets      = 0;  // only the scripted ticket
+  o.fixed_ticket_key = true;
+  t::loopback_server srv(t::make_server_ctx(t::default_pki(), o), [&](t::server_conn& c) {
+    request_ok = c.expect_pattern(1000, 1);
+    c.send_pattern(20'000, 2);
+    ticket_records = c.new_session_ticket_spanning(*fill);
+    c.send_pattern(50'000, 3);
+    c.key_update(true);
+    c.send_pattern(30'000, 4);
+    after_update_ok = c.expect_pattern(5000, 5);  // under the client's new key
+    c.close_notify();
+    c.wait_peer_close();
+  });
+  std::vector<std::uint8_t> starts;
+  unsigned controls = 0;
+  {
+    auto const p = make_openssl_provider(trusting());
+    ktls_connection k(*p, srv.port());
+    REQUIRE_KTLS(k);
+    REQUIRE(k.rekey != nullptr);
+    REQUIRE(t::send_all(k.fd.get(), t::pattern(1000, 1)));
+    std::vector<std::byte> a(20'000);
+    REQUIRE(k.c.receive(a));
+    CHECK(t::check_pattern(a, 2) == std::string_view::npos);
+    std::vector<std::byte> b(50'000);
+    CHECK(k.c.receive(b));  // without the resume: EKEYEXPIRED after the first continuation
+    CHECK(k.c.last_errno == 0);
+    CHECK(t::check_pattern(b, 3) == std::string_view::npos);
+    std::vector<std::byte> c4(30'000);
+    REQUIRE(k.c.receive(c4));
+    CHECK(t::check_pattern(c4, 4) == std::string_view::npos);
+    CHECK(k.c.replies == 1);
+    REQUIRE(t::send_all(k.fd.get(), t::pattern(5000, 5)));
+    std::vector<std::byte> none;
+    CHECK(k.c.receive(none));  // close_notify
+    starts   = k.c.handshake_starts;
+    controls = k.c.controls;
+  }
+  srv.join();
+  CHECK(request_ok);
+  CHECK(after_update_ok);
+  REQUIRE(ticket_records.load() >= 2);
+  CHECK(controls == ticket_records.load() + 2);  // the ticket, the KeyUpdate, close_notify
+  REQUIRE(starts.size() == ticket_records.load() + 1);
+  CHECK(starts[0] == 4);
+  for (std::size_t r = 1; r < ticket_records.load(); ++r) {
+    INFO("ticket record " << r);
+    CHECK(starts[r] == key_update_type);
+  }
+  CHECK(starts.back() == key_update_type);  // the real KeyUpdate
+}
+
 TEST_CASE("ktls: TLS 1.2 Finished split across two records, then application data", "[tls]")
 {
   // The server's Finished takes sequence numbers 0 and 1: the kernel must start RX at 2 (it
@@ -645,6 +711,34 @@ TEST_CASE("ktls: control record rules (tickets, KeyUpdate framing, alerts, data)
     CHECK(ktls::on_control_record(
             -1, ku_after_ticket.get(), 22, rec({4, 0, 0, 1, 9, 24, 0, 0, 1, 0}), ec) == A::failed);
     CHECK(ec == make_error_code(errc::protocol_error));
+  }
+  SECTION("Linux >= 6.14 pauses RX on a record starting with 24: resumed unless a KeyUpdate ends")
+  {
+    using A         = ktls::control_action;
+    traffic_keys rx = made_up_keys13(0x1301, 1);
+    traffic_keys tx = made_up_keys13(0x1301, 2);
+    auto const make = [&](unsigned minor) {
+      kernel_override const k(6, minor);
+      return ktls::make_rekey_state(rx, tx, kdf);
+    };
+    // A ticket continuation starting with 24: TLS_RX is read back and set again.  Without a
+    // socket the getsockopt fails (EBADF), which shows the resume was attempted.
+    auto st = make(14);
+    CHECK(ktls::on_control_record(-1, st.get(), 22, rec({4, 0, 0, 9, 1}), ec) == A::consumed);
+    CHECK(ktls::on_control_record(-1, st.get(), 22, rec({24, 3, 4}), ec) == A::failed);
+    CHECK(ec == std::errc::bad_file_descriptor);
+    // The first part of a KeyUpdate that continues in the next record: likewise.
+    auto ku = make(14);
+    CHECK(ktls::on_control_record(-1, ku.get(), 22, rec({24, 0, 0, 1}), ec) == A::failed);
+    CHECK(ec == std::errc::bad_file_descriptor);
+    // A continuation not starting with 24 (24 later in it is ticket content): no socket call.
+    auto other = make(14);
+    CHECK(ktls::on_control_record(-1, other.get(), 22, rec({4, 0, 0, 9, 1}), ec) == A::consumed);
+    CHECK(ktls::on_control_record(-1, other.get(), 22, rec({2, 24, 4}), ec) == A::consumed);
+    // Linux 6.13 never pauses: nothing to resume.
+    auto old = make(13);
+    CHECK(ktls::on_control_record(-1, old.get(), 22, rec({4, 0, 0, 9, 1}), ec) == A::consumed);
+    CHECK(ktls::on_control_record(-1, old.get(), 22, rec({24, 3, 4}), ec) == A::consumed);
   }
   SECTION("with re-key state: tickets across records, KeyUpdate rules")
   {

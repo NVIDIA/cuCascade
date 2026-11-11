@@ -48,7 +48,9 @@
  * RX (`HKDF-Expand-Label(secret, "traffic upd")`, new `TLS_RX`, Linux >= 6.14 pauses RX with
  * -EKEYEXPIRED until then) and, when requested, owes our KeyUpdate(update_not_requested), sent as
  * a kTLS handshake record (`TLS_SET_RECORD_TYPE` cmsg) and followed by the TX re-key.  On older
- * kernels a KeyUpdate ends the connection.
+ * kernels a KeyUpdate ends the connection.  Linux >= 6.14 pauses RX on the first byte of a
+ * handshake record alone (24, KeyUpdate's type); a record that starts so without ending a
+ * KeyUpdate (a ticket continuation, a split KeyUpdate) gets RX resumed with the current key.
  */
 
 #include "io/tls/ktls.hpp"
@@ -267,8 +269,8 @@ install_result install(int fd,
 
 class rekey_state {
  public:
-  rekey_state(suite_info s, tls::kdf const& k, bool rekey) noexcept
-    : suite(s), kdf(&k), can_rekey(rekey)
+  rekey_state(suite_info s, tls::kdf const& k, bool pauses, bool rekey) noexcept
+    : suite(s), kdf(&k), pauses_rx(pauses), can_rekey(rekey)
   {
   }
   ~rekey_state()
@@ -281,6 +283,9 @@ class rekey_state {
 
   suite_info suite;
   tls::kdf const* kdf;
+  /// Linux >= 6.14: RX pauses (-EKEYEXPIRED) after a handshake record whose first byte is 24
+  /// (KeyUpdate's type) until TLS_RX is set again, whatever message the record continues.
+  bool pauses_rx;
   /// The kernel takes a new TLS_RX (Linux >= 6.14) and the secrets are held: KeyUpdates are
   /// followed.  Otherwise the state only frames handshake messages and a KeyUpdate fails.
   bool can_rekey;
@@ -308,9 +313,9 @@ rekey_state_ptr make_rekey_state(traffic_keys const& rx,
   if (!s.supported() || rx.cipher_suite != tx.cipher_suite) { return nullptr; }
   // Every TLS 1.3 connection keeps the handshake framing (a ticket may span records); the
   // secrets only when the kernel can re-key, else a KeyUpdate is a protocol error.
-  bool const rekey =
-    probe().tls13_rekey && rx.secret_len == s.hash_len && tx.secret_len == s.hash_len;
-  rekey_state_ptr st(new (std::nothrow) rekey_state(s, kdf, rekey));
+  bool const kernel_rekey = probe().tls13_rekey;
+  bool const rekey = kernel_rekey && rx.secret_len == s.hash_len && tx.secret_len == s.hash_len;
+  rekey_state_ptr st(new (std::nothrow) rekey_state(s, kdf, kernel_rekey, rekey));
   if (!st) { return nullptr; }
   if (rekey) {
     std::copy_n(rx.secret.begin(), s.hash_len, st->rx_secret.begin());
@@ -379,11 +384,30 @@ control_action stateless_handshake(std::uint8_t const* p, std::size_t n, std::er
   return control_action::consumed;
 }
 
+/**
+ * Set TLS_RX again to the state the kernel holds (its key and next sequence number), read back
+ * with getsockopt: the kernel's re-key path then clears the RX pause and changes nothing else.
+ * The local copy of the key is cleansed.
+ */
+bool resume_rx(int fd, suite_info const& s) noexcept
+{
+  crypto_info ci{};
+  socklen_t const len = s.cipher == aead_cipher::aes_128_gcm ? sizeof ci.gcm128 : sizeof ci.gcm256;
+  socklen_t got       = len;
+  bool ok             = ::getsockopt(fd, SOL_TLS, TLS_RX, &ci, &got) == 0 && got == len;
+  ok                  = ok && ::setsockopt(fd, SOL_TLS, TLS_RX, &ci, len) == 0;
+  int const saved     = errno;
+  OPENSSL_cleanse(&ci, sizeof ci);
+  errno = saved;
+  return ok;
+}
+
 /// TLS 1.3 post-handshake messages: framed across records; KeyUpdate needs `can_rekey`.
 control_action stateful_handshake(
   int fd, rekey_state& st, std::uint8_t const* p, std::size_t n, std::error_code& ec)
 {
   if (n == 0) { return fail(ec); }  // RFC 8446 §5.1: no zero-length handshake fragments
+  bool rekeyed  = false;
   std::size_t i = 0;
   while (i < n) {
     if (st.hs_left == 0) {  // message header (may continue in the next record)
@@ -419,7 +443,13 @@ control_action stateful_handshake(
     if (auto e = next_keys(st, st.rx_secret, keys)) { return fail(ec, e); }
     // Linux >= 6.14 holds RX (-EKEYEXPIRED) until the new key arrives.
     if (!set_keys(fd, TLS_RX, keys)) { return fail(ec, last_errno()); }
+    rekeyed = true;
     if (st.ku_value == 1) { st.reply_owed = true; }  // coalesced: one reply answers them all
+  }
+  // The kernel paused RX on the record's first byte alone: when 24 starts a ticket continuation
+  // or a KeyUpdate that continues in the next record, no new key comes; resume with the current.
+  if (st.pauses_rx && p[0] == hs_key_update && !rekeyed && !resume_rx(fd, st.suite)) {
+    return fail(ec, last_errno());
   }
   return st.reply_owed ? control_action::reply_owed : control_action::consumed;
 }
