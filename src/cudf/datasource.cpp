@@ -44,18 +44,18 @@ struct io_read_to_gpu_message {
 };
 
 // Deferred call that owns a read: destroying it waits for the read, so a future returned by
-// std::async(std::launch::deferred, joined_read{...}) joins its read when it is dropped.
+// std::async(std::launch::deferred, joining_future{...}) joins its read when it is dropped.
 template <typename T>
-class joined_read {
+class joining_future {
  public:
-  explicit joined_read(std::future<T> read) noexcept : _read(std::move(read)) {}
+  explicit joining_future(std::future<T> read) noexcept : _read(std::move(read)) {}
 
-  joined_read(joined_read&&) noexcept            = default;
-  joined_read& operator=(joined_read&&) noexcept = delete;
-  joined_read(joined_read const&)                = delete;
-  joined_read& operator=(joined_read const&)     = delete;
+  joining_future(joining_future&&) noexcept            = default;
+  joining_future& operator=(joining_future&&) noexcept = delete;
+  joining_future(joining_future const&)                = delete;
+  joining_future& operator=(joining_future const&)     = delete;
 
-  ~joined_read()
+  ~joining_future()
   {
     if (_read.valid()) { _read.wait(); }
   }
@@ -68,9 +68,9 @@ class joined_read {
 
 // A host read into a buffer that the returned future owns.  The read is declared after the buffer
 // so that it is joined before the buffer is freed.
-class owned_host_read {
+class owning_host_read {
  public:
-  owned_host_read(std::vector<uint8_t> buffer, std::future<size_t> read) noexcept
+  owning_host_read(std::vector<uint8_t> buffer, std::future<size_t> read) noexcept
     : _buffer(std::move(buffer)), _read(std::move(read))
   {
   }
@@ -105,7 +105,7 @@ std::future<size_t> bridge_semi_to_std(Producer&& producer)
   }};
   auto sf = std::forward<Producer>(producer)();
   std::move(sf).install_callback(std::move(terminal));
-  return std::async(std::launch::deferred, joined_read<size_t>{std::move(fut)});
+  return std::async(std::launch::deferred, joining_future<size_t>{std::move(fut)});
 }
 
 }  // namespace
@@ -177,7 +177,7 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
   auto buf       = std::vector<uint8_t>(size);
   auto fut       = host_read_async(offset, size, buf.data());
-  return std::async(std::launch::deferred, owned_host_read{std::move(buf), std::move(fut)});
+  return std::async(std::launch::deferred, owning_host_read{std::move(buf), std::move(fut)});
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(size_t offset,
