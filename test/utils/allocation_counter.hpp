@@ -55,6 +55,16 @@ class scoped_allocation_counter {
    * allocation of a path in turn.
    */
   void fail_at(std::size_t n) noexcept;
+
+  /**
+   * @brief Make every allocation of this thread from the @p n-th on throw `std::bad_alloc`.
+   *
+   * A sustained shortage, for paths that must recover without allocating: unlike fail_at(),
+   * the recovery's own allocations fail too.  Counted as fail_at() is.  With @p count, only
+   * that many allocations fail (a shortage that ends); 0 = every one until the scope ends.
+   * @p n 0 disarms it, and the fault ends with the scope.
+   */
+  void fail_from(std::size_t n, std::size_t count = 0) noexcept;
 };
 
 }  // namespace cucascade::test
