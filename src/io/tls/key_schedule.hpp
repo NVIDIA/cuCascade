@@ -29,9 +29,9 @@
 
 /**
  * @file key_schedule.hpp
- * @brief TLS key schedule of the built-in record layer and the kTLS re-key: TLS 1.3 traffic keys and the KeyUpdate step from an application traffic secret
- * (RFC 8446 §7.1-§7.3), the TLS 1.2 key block from the master secret and the hello randoms
- * (RFC 5246 §6.3, RFC 5288 §3).
+ * @brief TLS key schedule of the built-in record layer and the kTLS re-key: TLS 1.3 traffic keys
+ * and the KeyUpdate step from an application traffic secret (RFC 8446 §7.1-§7.3), the TLS 1.2 key
+ * block from the master secret and the hello randoms (RFC 5246 §6.3, RFC 5288 §3).
  *
  * The derivations run through a `tls::kdf` (RFC 8446 HKDF-Expand-Label, the TLS 1.2 PRF), so the
  * TLS library's FIPS policy applies.  The OpenSSL implementation of that interface

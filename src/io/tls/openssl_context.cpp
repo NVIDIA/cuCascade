@@ -23,9 +23,9 @@
  * Note: `SSL_OP_ENABLE_KTLS` is never set (cuCascade installs kTLS itself from
  * exported keys, ktls.cpp; conda-forge's OpenSSL is built with OPENSSL_NO_KTLS anyway), and the
  * keylog capture keeps BOTH TLS 1.3 application traffic secrets when kTLS may be installed: the
- * client secret keys kTLS TX (OpenSSL installing TX itself needs only the server secret).  The capture stays narrow otherwise: no hook for
- * `ktls == disable && fallback_rx == library`, the server secret only for
- * `ktls == disable && fallback_rx == record_layer`.
+ * client secret keys kTLS TX (OpenSSL installing TX itself needs only the server secret).  The
+ * capture stays narrow otherwise: no hook for `ktls == disable && fallback_rx == library`, the
+ * server secret only for `ktls == disable && fallback_rx == record_layer`.
  */
 
 #include "io/tls/evp_aead.hpp"

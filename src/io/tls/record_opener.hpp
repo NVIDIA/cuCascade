@@ -143,7 +143,8 @@ class builtin_record_opener final : public record_opener {
   /// NewSessionTicket size limit (OpenSSL's NEW_SESSION_TICKET_MAX_LENGTH_TLS13).
   static constexpr std::uint32_t max_handshake_message = 131338;
   /// Post-handshake messages (KeyUpdate, NewSessionTicket, TLS 1.2 HelloRequest) accepted without
-  /// an intervening non-empty data record; one more is unexpected_message (cf. BoringSSL's kMaxKeyUpdates). Bounds one decrypt pass and a peer's control storm.
+  /// an intervening non-empty data record; one more is unexpected_message (cf. BoringSSL's
+  /// kMaxKeyUpdates). Bounds one decrypt pass and a peer's control storm.
   static constexpr std::uint32_t max_control_run = 32;
   /// Zero-length data records accepted without an intervening non-empty one (BoringSSL's
   /// kMaxEmptyRecords).

@@ -18,8 +18,9 @@
 
 /**
  * @file openssl_session_cache.cpp
- * @brief Opt-in client session cache per (verified identity, port): store SSL_SESSION references, TLS 1.3 single use, TLS 1.2
- * reuse, capacity per endpoint >= the reconnect burst (curl's 2 is too small for S3 fan-out).
+ * @brief Opt-in client session cache per (verified identity, port): store SSL_SESSION references,
+ * TLS 1.3 single use, TLS 1.2 reuse, capacity per endpoint >= the reconnect burst (curl's 2 is too
+ * small for S3 fan-out).
  */
 
 #include "io/tls/openssl_internal.hpp"

@@ -36,8 +36,8 @@ set(BENCHMARK_ENABLE_INSTALL
 
 FetchContent_MakeAvailable(benchmark)
 
-# The benchmarks exercise the cudf-backed representation converters,
-# so they require the cucascade-cudf library. Skip them when it is not built.
+# The benchmarks exercise the cudf-backed representation converters, so they
+# require the cucascade-cudf library. Skip them when it is not built.
 if(NOT CUCASCADE_BUILD_CUDF)
   message(
     STATUS
