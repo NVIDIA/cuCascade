@@ -32,7 +32,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -61,19 +60,12 @@ struct string_offsets {
   /// Rows whose begin and end offsets are both on the host.
   [[nodiscard]] std::size_t rows() const { return host.empty() ? 0 : host.size() / width - 1; }
 
-  /// Source offset (bytes) of absolute source row @p row.
+  /// Source offset (bytes) of absolute source row @p row. The row must be within the fetched
+  /// range [row_begin, row_begin + rows()]; any other row throws std::out_of_range.
   [[nodiscard]] std::int64_t at(std::size_t row) const
   {
-    const std::size_t pos = (row - row_begin) * width;
-    if (pos + width > host.size()) { return 0; }
-    if (width == 4) {
-      std::int32_t value{};
-      std::memcpy(&value, host.data() + pos, sizeof(value));
-      return value;
-    }
-    std::int64_t value{};
-    std::memcpy(&value, host.data() + pos, sizeof(value));
-    return value;
+    // A row below row_begin wraps to an index past the end, which load_offset refuses too.
+    return load_offset(std::as_bytes(std::span{host}), width, row - row_begin);
   }
 
   /// Extend the host copy to the offsets of rows [row_begin, row_begin + rows]; synchronizes
@@ -115,6 +107,7 @@ string_offsets locate_string_offsets(const cudf::column_view& col, std::size_t r
  *
  * Reads in geometrically growing chunks and stops at the first chunk whose chars overflow the
  * data slot, so the bytes copied to the host are proportional to the rows that fit, not to @p k.
+ * The column must have an offsets child, and rows [row_begin, row_begin + k] must exist.
  *
  * @return Rows covered by the host copy: @p k if all of them fit, else an upper bound of the rows
  *         that fit.
@@ -124,7 +117,6 @@ std::size_t fetch_offsets_for_fit(string_offsets& off,
                                   std::size_t k,
                                   ::cuda::stream_ref stream)
 {
-  if (off.device == nullptr) { return k; }
   const std::size_t avail = dst.data.capacity_bytes > dst.dst_byte_offset
                               ? dst.data.capacity_bytes - dst.dst_byte_offset
                               : 0;
@@ -136,6 +128,23 @@ std::size_t fetch_offsets_for_fit(string_offsets& off,
     if (bytes > 0 && static_cast<std::uint64_t>(bytes) > avail) { break; }
   }
   return rows;
+}
+
+/// Write @p count offsets of @p width bytes, all equal to @p value, to the device array @p dst.
+void fill_offsets(
+  void* dst, std::uint8_t width, std::size_t count, std::int64_t value, ::cuda::stream_ref stream)
+{
+  // The source is pageable, so the copy is staged before cudaMemcpyAsync returns and the host
+  // vector may go out of scope right after.
+  if (width == 4) {
+    const std::vector<std::int32_t> host(count, static_cast<std::int32_t>(value));
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+      dst, host.data(), count * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream.get()));
+  } else {
+    const std::vector<std::int64_t> host(count, value);
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+      dst, host.data(), count * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream.get()));
+  }
 }
 
 /// Refuse a source that lives on another GPU than @p stream: the copies and kernels enqueued on
@@ -212,8 +221,10 @@ row_range_result read_rows_gpu(const idata_representation& source,
   std::size_t k_bound = fit_rows(fit, request.row_begin, request.max_rows, num_rows);
 
   // Pass 2: bring to the host only the offsets needed to fit the chars slots, then fit again.
+  // A STRING column without an offsets child holds no chars (all its rows are null), so its
+  // pass-1 stub already describes it.
   for (std::size_t i = 0; i < requested && k_bound > 0; ++i) {
-    if (!fit[i].is_string) { continue; }
+    if (!fit[i].is_string || offsets[i].device == nullptr) { continue; }
     k_bound          = fetch_offsets_for_fit(offsets[i], dst[i], k_bound, stream);
     fit[i].offset_at = [&off = offsets[i]](std::size_t row) { return off.at(row); };
   }
@@ -230,7 +241,15 @@ row_range_result read_rows_gpu(const idata_representation& source,
     const auto& out      = dst[i];
     const auto first_row = static_cast<std::size_t>(col.offset()) + request.row_begin;
 
-    if (fit[i].is_string) {
+    if (fit[i].is_string && offsets[i].device == nullptr) {
+      // No chars to copy: every destination offset is the append position.
+      fill_offsets(
+        static_cast<std::uint8_t*>(out.offsets.data) + out.dst_row_offset * out.offset_width,
+        out.offset_width,
+        k + 1,
+        static_cast<std::int64_t>(out.dst_byte_offset),
+        stream);
+    } else if (fit[i].is_string) {
       const auto& off        = offsets[i];
       const auto chars_begin = off.at(request.row_begin);
       const auto chars_bytes =

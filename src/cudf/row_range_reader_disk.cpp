@@ -18,6 +18,7 @@
 #include "row_range_detail.hpp"
 
 #include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/data/disk_file_format.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/disk_table.hpp>
@@ -32,7 +33,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -44,30 +44,56 @@ namespace cucascade::detail {
 
 namespace {
 
-/// Buffers start on this boundary in the file (recompute_file_offsets). Device reads are issued
-/// only at file offsets that are a multiple of it, because an O_DIRECT / GDS backend cannot read
-/// from an arbitrary file offset.
-constexpr std::size_t disk_file_alignment = 4096;
+/// Rows whose offsets the first host read of a STRING column covers.
+constexpr std::size_t first_offset_chunk_rows = 1024;
 
-/// A STRING column's source offsets for a run of rows, in host memory.
-struct host_offsets {
-  std::vector<std::byte> bytes;  ///< The offsets, `width` bytes each
-  std::uint8_t width{4};         ///< 4 (INT32) or 8 (INT64)
+/// A STRING column's source offsets for a run of rows starting at the request's row_begin, read
+/// from the file into host memory on demand.
+/// Synchronizes the stream on scope exit when a copy out of pageable host memory was enqueued on
+/// it. CUDA may stage such a copy on a worker thread after cudaMemcpyAsync returns, so the host
+/// bytes must stay alive until the stream has run it. Rule 6 allows this reader the wait.
+struct host_copy_guard {
+  ::cuda::stream_ref stream;
+  bool pending{false};
 
-  [[nodiscard]] std::int64_t at(std::size_t index) const
+  explicit host_copy_guard(::cuda::stream_ref s) : stream(s) {}
+  host_copy_guard(const host_copy_guard&)            = delete;
+  host_copy_guard& operator=(const host_copy_guard&) = delete;
+  ~host_copy_guard()
   {
-    if (width == 8) {
-      std::int64_t value{};
-      std::memcpy(&value, bytes.data() + index * 8, sizeof(value));
-      return value;
-    }
-    std::int32_t value{};
-    std::memcpy(&value, bytes.data() + index * 4, sizeof(value));
-    return value;
+    if (pending) { static_cast<void>(cudaStreamSynchronize(stream.get())); }
   }
 };
 
-/// Reads byte ranges of one batch file into device memory, hiding the alignment rule above.
+struct host_offsets {
+  std::vector<std::byte> bytes;  ///< The offsets read so far, `width` bytes each
+  std::uint8_t width{4};         ///< 4 (INT32) or 8 (INT64)
+  std::size_t file_offset{0};    ///< File offset of the offset of row_begin
+
+  /// Offset number @p index of the run (0 is the offset of row_begin); throws past the read ones.
+  [[nodiscard]] std::int64_t at(std::size_t index) const
+  {
+    return load_offset(bytes, width, index);
+  }
+
+  /// Extend the host copy to the offsets of the first @p rows rows (`rows + 1` offsets).
+  void fetch_up_to(std::size_t rows, idisk_io_backend& backend, const std::filesystem::path& path)
+  {
+    const std::size_t have = bytes.size();
+    const std::size_t want = (rows + 1) * width;
+    if (want <= have) { return; }
+    bytes.resize(want);
+    backend.read(path, bytes.data() + have, want - have, file_offset + have);
+  }
+};
+
+/**
+ * @brief Reads byte ranges of one batch file into device memory.
+ *
+ * Buffers start on a DISK_FILE_ALIGNMENT boundary in the file. Device reads are issued only at
+ * file offsets that are a multiple of it, because an O_DIRECT / GDS backend cannot read from an
+ * arbitrary file offset. The reads are queued and issued together by submit().
+ */
 class range_reader {
  public:
   range_reader(idisk_io_backend& backend,
@@ -78,34 +104,45 @@ class range_reader {
   {
   }
 
-  /// Read file bytes [file_offset, file_offset + size) into `dst`.
+  /// Queue a read of file bytes [file_offset, file_offset + size) into `dst`.
   void read_into(void* dst, std::size_t size, std::size_t file_offset)
   {
     if (size == 0) { return; }
     auto* out                = static_cast<std::byte*>(dst);
-    const std::size_t prefix = file_offset % disk_file_alignment;
+    const std::size_t prefix = file_offset % DISK_FILE_ALIGNMENT;
     if (prefix != 0) {
       // The first (partial) block goes through scratch; the rest starts on a block boundary and is
       // read straight into the destination.
-      const std::size_t head = std::min(size, disk_file_alignment - prefix);
-      const auto* block      = read_aligned_superset(head, file_offset);
-      CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(out, block, head, cudaMemcpyDeviceToDevice, _stream.get()));
+      const std::size_t head = std::min(size, DISK_FILE_ALIGNMENT - prefix);
+      _head_copies.push_back({out, read_aligned_superset(head, file_offset), head});
       out += head;
       size -= head;
       file_offset += head;
     }
-    if (size > 0) { _backend.read(_path, out, size, file_offset, _stream); }
+    if (size > 0) { _reads.push_back({out, size, file_offset}); }
   }
 
-  /// Read file bytes [file_offset, file_offset + size) into a scratch buffer owned by this reader
-  /// and return a pointer to the first requested byte. The pointer is as aligned as `file_offset`.
+  /// Queue a read of file bytes [file_offset, file_offset + size) into a scratch buffer owned by
+  /// this reader and return a pointer to the first requested byte, valid once submit() has run.
+  /// The pointer is as aligned as `file_offset`.
   [[nodiscard]] const std::byte* read_aligned_superset(std::size_t size, std::size_t file_offset)
   {
-    const std::size_t prefix = file_offset % disk_file_alignment;
+    const std::size_t prefix = file_offset % DISK_FILE_ALIGNMENT;
     auto& buffer             = allocate(prefix + size);
-    _backend.read(_path, buffer.data(), prefix + size, file_offset - prefix, _stream);
+    _reads.push_back({buffer.data(), prefix + size, file_offset - prefix});
     return static_cast<const std::byte*>(buffer.data()) + prefix;
+  }
+
+  /// Issue the queued reads as one batch, then move the partial first blocks into place.
+  void submit()
+  {
+    if (!_reads.empty()) { _backend.read_batch(_path, _reads, _stream); }
+    _reads.clear();
+    for (const auto& copy : _head_copies) {
+      CUCASCADE_CUDA_TRY(
+        cudaMemcpyAsync(copy.dst, copy.src, copy.size, cudaMemcpyDeviceToDevice, _stream.get()));
+    }
+    _head_copies.clear();
   }
 
   /// Allocate a temporary that lives as long as this reader.
@@ -115,12 +152,29 @@ class range_reader {
   }
 
  private:
+  /// A partial first block read into scratch, to copy to its destination after the read.
+  struct head_copy {
+    std::byte* dst;
+    const std::byte* src;
+    std::size_t size;
+  };
+
   idisk_io_backend& _backend;
   const std::filesystem::path& _path;
   memory::reservation* _scratch;
   ::cuda::stream_ref _stream;
   // Freed on `_stream` (rmm::device_buffer remembers its stream), after the work that uses them.
   std::vector<rmm::device_buffer> _temporaries;
+  std::vector<io_batch_entry> _reads;
+  std::vector<head_copy> _head_copies;
+};
+
+/// Null bits of one column to copy out of a mask read queued on a range_reader.
+struct mask_copy {
+  std::uint32_t* dst;
+  std::size_t dst_bit;
+  const std::uint32_t* src;
+  std::size_t src_bit;
 };
 
 [[nodiscard]] bool is_string(const memory::column_metadata& meta)
@@ -198,13 +252,16 @@ row_range_result read_rows_disk(const idata_representation& source,
         cudf::size_of(cudf::data_type{static_cast<cudf::type_id>(metas[i]->type_id)});
     }
   }
-  // First pass with chars that always fit: an upper bound from the closed-form terms alone, so the
-  // host offset reads below cover no more rows than can be delivered.
-  const std::size_t k_bound = fit_rows(fit, request.row_begin, request.max_rows, num_rows);
+  // First pass with chars that always fit: an upper bound from the closed-form terms alone, read
+  // from the slot capacities without touching the file.
+  std::size_t k_bound = fit_rows(fit, request.row_begin, request.max_rows, num_rows);
 
-  // One small synchronous host read per STRING column: offsets [row_begin, row_begin + k_bound].
+  // Second pass: small synchronous host reads of the STRING offsets, in chunks that double in size
+  // and stop at the first one whose chars overflow a data slot, so the offsets read are
+  // proportional to the rows delivered and not to k_bound.
   std::vector<host_offsets> offsets(num_columns);
   if (k_bound > 0) {
+    bool any_string = false;
     for (std::size_t i = 0; i < num_columns; ++i) {
       if (!fit[i].is_string) { continue; }
       const auto& meta = *metas[i];
@@ -213,28 +270,50 @@ row_range_result read_rows_disk(const idata_representation& source,
       auto& host        = offsets[i];
       host.width        = static_cast<cudf::type_id>(child.type_id) == cudf::type_id::INT64 ? 8 : 4;
       const std::size_t first = request.row_begin * host.width;
-      const std::size_t bytes = (k_bound + 1) * host.width;
-      if (!child.has_data || first + bytes > child.data_size) {
+      if (!child.has_data || first + (k_bound + 1) * host.width > child.data_size) {
         fail_layout(i, "STRING offsets buffer is shorter than the requested rows");
       }
-      host.bytes.resize(bytes);
-      backend.read(path, host.bytes.data(), bytes, child.data_offset + first);
+      host.file_offset = child.data_offset + first;
       fit[i].offset_at = [&host, row_begin = request.row_begin](std::size_t row) {
         return host.at(row - row_begin);
       };
+      any_string = true;
     }
+    std::size_t rows = any_string ? 0 : k_bound;
+    bool overflow    = false;
+    while (rows < k_bound && !overflow) {
+      rows = std::min(k_bound, std::max(first_offset_chunk_rows, rows * 2));
+      // Every STRING column is read up to `rows`, also after one overflows: the fit below indexes
+      // all of them.
+      for (std::size_t i = 0; i < num_columns; ++i) {
+        if (!fit[i].is_string) { continue; }
+        auto& host = offsets[i];
+        host.fetch_up_to(rows, backend, path);
+        const auto& out          = dst[i];
+        const std::size_t avail  = out.data.capacity_bytes > out.dst_byte_offset
+                                     ? out.data.capacity_bytes - out.dst_byte_offset
+                                     : 0;
+        const std::int64_t chars = host.at(rows) - host.at(0);
+        if (chars > 0 && static_cast<std::uint64_t>(chars) > avail) { overflow = true; }
+      }
+    }
+    k_bound = rows;
   }
-  const std::size_t k =
-    k_bound == 0 ? 0 : fit_rows(fit, request.row_begin, request.max_rows, num_rows);
+  // Only the offsets of rows [row_begin, row_begin + k_bound] are on the host.
+  const std::size_t k = k_bound == 0 ? 0 : fit_rows(fit, request.row_begin, k_bound, num_rows);
 
   result.rows_written     = k;
   result.source_exhausted = request.row_begin + k == num_rows;
   if (k == 0) { return result; }
 
   // ---- device reads, all ordered on `stream` ----
+  // The file reads of all columns are queued, then issued as one batch; the copies out of scratch
+  // follow it.
+  // Declared before anything is enqueued, so it also runs when a later column throws.
+  host_copy_guard host_copies{stream};
   range_reader reader(backend, path, scratch, stream);
-  bool pending_host_copy = false;
-  auto read_column       = [&](std::size_t i) {
+  std::vector<mask_copy> mask_copies;
+  for (std::size_t i = 0; i < num_columns; ++i) {
     const auto& meta = *metas[i];
     const auto& out  = dst[i];
 
@@ -256,12 +335,12 @@ row_range_result read_rows_disk(const idata_representation& source,
 
       // Offsets: the host vector already holds the source values; copy the k + 1 of them to the
       // device and rebase there (rule 3). The copy is asynchronous, so `offsets` must outlive it:
-      // the stream is synchronized once, at the end of this call.
+      // `host_copies` synchronizes the stream once, when this call ends.
       const std::size_t bytes = (k + 1) * host.width;
       auto& staged            = reader.allocate(bytes);
       CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
         staged.data(), host.bytes.data(), bytes, cudaMemcpyHostToDevice, stream.get()));
-      pending_host_copy = true;
+      host_copies.pending = true;
       rebase_offsets(
         static_cast<std::byte*>(out.offsets.data) + out.dst_row_offset * out.offset_width,
         out.offset_width,
@@ -284,11 +363,11 @@ row_range_result read_rows_disk(const idata_representation& source,
     }
 
     // Null bits (rule 4).
-    if (out.null_mask.data == nullptr) { return; }
+    if (out.null_mask.data == nullptr) { continue; }
     auto* dst_mask = static_cast<std::uint32_t*>(out.null_mask.data);
     if (!may_have_nulls(meta)) {
       copy_bits(dst_mask, out.dst_row_offset, nullptr, 0, k, stream);
-      return;
+      continue;
     }
     const std::size_t word_size  = sizeof(std::uint32_t);
     const std::size_t first_word = request.row_begin / 32;
@@ -300,28 +379,16 @@ row_range_result read_rows_disk(const idata_representation& source,
     }
     // `first` is a multiple of 4 and the mask starts on a block boundary, so the words are aligned.
     const auto* src_mask = reader.read_aligned_superset(bytes, meta.null_mask_offset + first);
-    copy_bits(dst_mask,
-              out.dst_row_offset,
-              reinterpret_cast<const std::uint32_t*>(src_mask),
-              request.row_begin % 32,
-              k,
-              stream);
-  };
-
-  try {
-    for (std::size_t i = 0; i < num_columns; ++i) {
-      read_column(i);
-    }
-  } catch (...) {
-    // Same wait as below on the way out of a failed read; the read's own error is the one to
-    // report.
-    if (pending_host_copy) { static_cast<void>(cudaStreamSynchronize(stream.get())); }
-    throw;
+    mask_copies.push_back({dst_mask,
+                           out.dst_row_offset,
+                           reinterpret_cast<const std::uint32_t*>(src_mask),
+                           request.row_begin % 32});
   }
 
-  // Rule 6 lets this reader synchronize for the host-side offsets: wait for the host-to-device
-  // offset copies before `offsets` goes out of scope.
-  if (pending_host_copy) { stream.sync(); }
+  reader.submit();
+  for (const auto& copy : mask_copies) {
+    copy_bits(copy.dst, copy.dst_bit, copy.src, copy.src_bit, k, stream);
+  }
   return result;
 }
 

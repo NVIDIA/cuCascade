@@ -84,7 +84,8 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(
     config.device_id       = static_cast<int>(device_id);
     config.memory_capacity = 1024 * 1024 * 1024;
     config.mr_factory_fn   = [](int, size_t) {
-      return cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}};
+      return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+        rmm::mr::cuda_memory_resource{}};
     };
     return std::make_shared<memory::memory_space>(config);
   } else if (tier == memory::Tier::HOST) {
@@ -93,7 +94,7 @@ inline std::shared_ptr<memory::memory_space> make_mock_memory_space(
     config.memory_capacity      = 1024 * 1024 * 1024;
     config.initial_number_pools = 0;
     config.mr_factory_fn        = [](int, size_t) {
-      return cuda::mr::any_resource<cuda::mr::device_accessible>{
+      return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
         cucascade::memory::numa_region_pinned_host_memory_resource{-1}};
     };
     return std::make_shared<memory::memory_space>(config);

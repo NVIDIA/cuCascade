@@ -27,6 +27,7 @@
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <typeinfo>
 
 namespace cucascade {
@@ -127,8 +128,21 @@ row_range_result read_rows_into(const row_range_reader_registry& registry,
   const idata_representation* source = batch.get_data();
   if (source == nullptr) { throw std::logic_error("read_rows_into: the batch has no data"); }
 
-  auto result = registry.read(*source, request, dst, stream, scratch, state);
-  // Only a read that was dispatched is recorded; a throwing read propagates without an event.
+  row_range_result result;
+  try {
+    result = registry.read(*source, request, dst, stream, scratch, state);
+  } catch (...) {
+    // A throwing read is recorded too: a reader may have enqueued copies that read the source
+    // before it failed on a later column, and without an event a later writer of the batch could
+    // free the source under them. If recording fails, wait for the stream instead (best effort)
+    // and propagate the reader's error.
+    try {
+      batch.record_reader_event(stream);
+    } catch (...) {
+      std::ignore = ::cudaStreamSynchronize(stream.get());
+    }
+    throw;
+  }
   batch.record_reader_event(stream);
   return result;
 }

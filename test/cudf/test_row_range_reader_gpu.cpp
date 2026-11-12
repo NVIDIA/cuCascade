@@ -17,6 +17,7 @@
 
 #include "cudf/row_range_detail.hpp"
 #include "utils/mixed_table.hpp"
+#include "utils/mock_test_utils.hpp"
 
 #include <cudf_test/column_wrapper.hpp>
 
@@ -28,15 +29,14 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
-#include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
-#include <cuda/memory_resource>
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
@@ -63,19 +63,6 @@ constexpr std::size_t kDoubleCol = 2;
 constexpr std::size_t kStringCol = 3;
 
 ::cuda::stream_ref default_stream() { return ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}; }
-
-/// A GPU memory space on device @p device_id. mock_test_utils.hpp cannot be included next to
-/// mixed_table.hpp (its unqualified `cuda::mr` then resolves to cucascade::cuda).
-std::shared_ptr<memory::memory_space> make_gpu_space(int device_id = 0)
-{
-  memory::gpu_memory_space_config config;
-  config.device_id       = device_id;
-  config.memory_capacity = 1024 * 1024 * 1024;
-  config.mr_factory_fn   = [](int, std::size_t) {
-    return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}};
-  };
-  return std::make_shared<memory::memory_space>(config);
-}
 
 std::int32_t type_tag(cudf::type_id id) { return static_cast<std::int32_t>(id); }
 
@@ -309,7 +296,7 @@ TEST_CASE("read_rows_gpu reads a mixed table window by window", "[row_range_read
   const bool nullable           = GENERATE(false, true);
   CAPTURE(nullable);
 
-  auto space      = make_gpu_space();
+  auto space      = make_mock_memory_space(memory::Tier::GPU);
   const auto data = make_source_data(kRows);
   gpu_table_representation source(make_table(data, nullable), *space, default_stream());
 
@@ -358,7 +345,7 @@ TEST_CASE("read_rows_gpu reads a mixed table window by window", "[row_range_read
 TEST_CASE("read_rows_gpu truncates to the destination budget", "[row_range_reader_gpu]")
 {
   constexpr std::size_t kRows = 200;
-  auto space                  = make_gpu_space();
+  auto space                  = make_mock_memory_space(memory::Tier::GPU);
   const auto data             = make_source_data(kRows);
   gpu_table_representation source(make_table(data, false), *space, default_stream());
 
@@ -445,7 +432,7 @@ TEST_CASE("read_rows_gpu rebases STRING offsets", "[row_range_reader_gpu]")
   const std::uint8_t offset_width = GENERATE(std::uint8_t{4}, std::uint8_t{8});
   CAPTURE(wide_source, static_cast<int>(offset_width));
 
-  auto space      = make_gpu_space();
+  auto space      = make_mock_memory_space(memory::Tier::GPU);
   const auto data = make_source_data(kRows);
   auto table      = make_table(data, false, wide_source);
   REQUIRE(table->view().column(kStringCol).child(0).type().id() ==
@@ -488,7 +475,7 @@ TEST_CASE("read_rows_gpu writes null bits at unaligned offsets", "[row_range_rea
   const std::size_t dst_row       = GENERATE(std::size_t{0}, std::size_t{5}, std::size_t{33});
   CAPTURE(dst_row);
 
-  auto space      = make_gpu_space();
+  auto space      = make_mock_memory_space(memory::Tier::GPU);
   const auto data = make_source_data(kRows);
   gpu_table_representation source(make_table(data, true), *space, default_stream());
 
@@ -515,7 +502,7 @@ TEST_CASE("read_rows_gpu writes null bits at unaligned offsets", "[row_range_rea
 TEST_CASE("read_rows_gpu null-mask slot rules", "[row_range_reader_gpu]")
 {
   constexpr std::size_t kRows = 100;
-  auto space                  = make_gpu_space();
+  auto space                  = make_mock_memory_space(memory::Tier::GPU);
   const auto data             = make_source_data(kRows);
   const std::vector<std::size_t> columns{kInt32Col};
 
@@ -563,7 +550,7 @@ TEST_CASE("read_rows_gpu null-mask slot rules", "[row_range_reader_gpu]")
 TEST_CASE("read_rows_gpu on an exhausted source", "[row_range_reader_gpu]")
 {
   constexpr std::size_t kRows = 64;
-  auto space                  = make_gpu_space();
+  auto space                  = make_mock_memory_space(memory::Tier::GPU);
   const auto data             = make_source_data(kRows);
   gpu_table_representation source(make_table(data, true), *space, default_stream());
 
@@ -617,7 +604,7 @@ TEST_CASE("read_rows_gpu reads a sliced source table", "[row_range_reader_gpu]")
   const bool wide_source            = GENERATE(false, true);
   CAPTURE(wide_source);
 
-  auto space                         = make_gpu_space();
+  auto space                         = make_mock_memory_space(memory::Tier::GPU);
   const auto data                    = make_source_data(kRows);
   std::shared_ptr<cudf::table> owner = make_table(data, true, wide_source);
   const auto sliced                  = cudf::slice(owner->view(),
@@ -673,7 +660,7 @@ TEST_CASE("read_rows_gpu reads a sliced source table", "[row_range_reader_gpu]")
 
 TEST_CASE("read_rows_gpu refuses unsupported requests", "[row_range_reader_gpu]")
 {
-  auto space = make_gpu_space();
+  auto space = make_mock_memory_space(memory::Tier::GPU);
 
   std::vector<std::unique_ptr<cudf::column>> table_columns;
   table_columns.push_back(cudf::test::fixed_width_column_wrapper<std::int32_t>{1, 2, 3}.release());
@@ -730,7 +717,7 @@ TEST_CASE("read_rows_gpu refuses unsupported requests", "[row_range_reader_gpu]"
 
 TEST_CASE("read_rows_gpu edge cases", "[row_range_reader_gpu]")
 {
-  auto space = make_gpu_space();
+  auto space = make_mock_memory_space(memory::Tier::GPU);
 
   SECTION("an empty table is exhausted at row 0")
   {
@@ -772,6 +759,51 @@ TEST_CASE("read_rows_gpu edge cases", "[row_range_reader_gpu]")
     }
     REQUIRE(offsets[kDstRow + 36] == 0x01010101U * kFill);
     REQUIRE(offsets[0] == 0x01010101U * kFill);
+  }
+
+  SECTION("an all-null STRING column without children writes flat offsets")
+  {
+    constexpr std::size_t kRows    = 40;
+    constexpr std::size_t kDstRow  = 2;
+    constexpr std::size_t kDstByte = 6;
+    const std::uint8_t width       = GENERATE(std::uint8_t{4}, std::uint8_t{8});
+    CAPTURE(static_cast<int>(width));
+    std::vector<std::unique_ptr<cudf::column>> table_columns;
+    table_columns.push_back(std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::STRING},
+      static_cast<cudf::size_type>(kRows),
+      rmm::device_buffer{},
+      cudf::create_null_mask(static_cast<cudf::size_type>(kRows), cudf::mask_state::ALL_NULL),
+      static_cast<cudf::size_type>(kRows)));
+    default_stream().sync();
+    REQUIRE(table_columns.front()->num_children() == 0);
+    gpu_table_representation source(
+      std::make_unique<cudf::table>(std::move(table_columns)), *space, default_stream());
+
+    dest_buffers str{filled_buffer(kDstByte, kFill),
+                     filled_buffer(mask_bytes(kDstRow + kRows), kFill),
+                     filled_buffer((kDstRow + kRows + 2) * width, kFill)};
+    const std::vector<std::size_t> columns{0};
+    std::vector<column_destination> dst{str.slot(cudf::type_id::STRING, kDstRow, kDstByte, width)};
+    const auto result = read(source, columns, 5, 100, dst);
+    REQUIRE(result.rows_written == 35);
+    REQUIRE(result.source_exhausted);
+    REQUIRE(result.data_bytes_written == std::vector<std::size_t>{0});
+
+    const auto offsets = host_offsets(str.offsets, width);
+    for (std::size_t i = 0; i <= 35; ++i) {
+      INFO("offset " << i);
+      REQUIRE(offsets[kDstRow + i] == static_cast<std::int64_t>(kDstByte));
+    }
+    // Offsets outside the k + 1 written ones are untouched, and every delivered row is null.
+    const auto raw = to_host<std::uint8_t>(str.offsets);
+    REQUIRE(raw[kDstRow * width - 1] == kFill);
+    REQUIRE(raw[(kDstRow + 36) * width] == kFill);
+    const auto words = to_host<std::uint32_t>(str.mask);
+    for (std::size_t bit = kDstRow; bit < kDstRow + 35; ++bit) {
+      INFO("bit " << bit);
+      REQUIRE_FALSE(bit_at(words, bit));
+    }
   }
 
   SECTION("a nullable column with no nulls needs no null_mask slot")
@@ -817,7 +849,7 @@ TEST_CASE("read_rows_gpu reads only the offsets it needs", "[row_range_reader_gp
 {
   // More rows than the first offsets chunk (1024), so the chunked host read grows several times.
   constexpr std::size_t kRows = 20000;
-  auto space                  = make_gpu_space();
+  auto space                  = make_mock_memory_space(memory::Tier::GPU);
   const auto data             = make_source_data(kRows);
   const bool wide_source      = GENERATE(false, true);
   CAPTURE(wide_source);
@@ -883,10 +915,13 @@ TEST_CASE("read_rows_gpu reads only the offsets it needs", "[row_range_reader_gp
 TEST_CASE("read_rows_gpu refuses a source on another device than the stream",
           "[row_range_reader_gpu]")
 {
-  // The table's memory is on device 0 (this test needs one GPU), but its memory space claims
-  // device 1. A null writer stream leaves the writer unknown, so the constructor accepts it.
-  auto other_space = make_gpu_space(1);
-  const auto data  = make_source_data(16);
+  // The reader compares the id of the source's memory space with the device of the stream. A
+  // DISK space with id 1 reports another id without touching a CUDA device, so one GPU is enough;
+  // the table's memory stays on device 0. A null writer stream leaves the writer unknown, so the
+  // constructor accepts the space.
+  auto other_space =
+    make_mock_memory_space(memory::Tier::DISK, 1, std::make_shared<mock_no_io_backend>());
+  const auto data = make_source_data(16);
   gpu_table_representation source(
     make_table(data, false), *other_space, ::cuda::stream_ref{cudaStream_t{nullptr}});
   REQUIRE(source.get_device_id() == 1);

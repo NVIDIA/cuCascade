@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "utils/cuda_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
 #include <cucascade/cuda/event.hpp>
@@ -22,16 +23,22 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/row_range_read.hpp>
 
+#include <rmm/cuda_stream.hpp>
+
 #include <catch2/catch_all.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <tuple>
 #include <typeindex>
+#include <utility>
 #include <vector>
 
 using namespace cucascade;
@@ -117,6 +124,40 @@ row_range_read_fn make_recording_reader(reader_call_log& log)
 }
 
 ::cuda::stream_ref default_stream() { return ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}; }
+
+/// One of many distinct representation types, for the concurrent registration test.
+template <std::size_t N>
+class stress_row_range_representation : public mock_data_representation {
+ public:
+  using mock_data_representation::mock_data_representation;
+};
+
+/// A stress representation type, erased to what the concurrent test needs: an instance to read and
+/// the registry calls that name the type statically.
+struct stress_type {
+  std::unique_ptr<mock_data_representation> source;
+  bool (*has_reader)(const row_range_reader_registry&);
+  void (*register_reader)(row_range_reader_registry&, row_range_read_fn);
+};
+
+template <std::size_t N>
+stress_type make_stress_type()
+{
+  using rep = stress_row_range_representation<N>;
+  return {std::make_unique<rep>(memory::Tier::HOST),
+          [](const row_range_reader_registry& registry) { return registry.has_reader<rep>(); },
+          [](row_range_reader_registry& registry, row_range_read_fn fn) {
+            registry.register_reader<rep>(std::move(fn));
+          }};
+}
+
+template <std::size_t... Ns>
+std::vector<stress_type> make_stress_types(std::index_sequence<Ns...>)
+{
+  std::vector<stress_type> types;
+  (types.push_back(make_stress_type<Ns>()), ...);
+  return types;
+}
 
 }  // namespace
 
@@ -451,8 +492,200 @@ TEST_CASE("read_rows_into reports a batch without a registered reader", "[row_ra
     REQUIRE_THROWS_AS(read_rows_into(registry, read_lock, {columns, 0, 4}, dst, default_stream()),
                       row_range_unsupported_error);
   }
-  // Nothing was recorded for the failed read, so an exclusive lock is free at once.
+  // The failed read is recorded as well, but it enqueued nothing: once the stream is drained the
+  // exclusive lock is free.
+  REQUIRE(cudaStreamSynchronize(default_stream().get()) == cudaSuccess);
   REQUIRE(batch->try_to_mutable().has_value());
+}
+
+TEST_CASE("read_rows_into records the reader event of a GPU read that throws", "[row_range_read]")
+{
+  // A GPU reader may enqueue copies that read the source and then fail on a later column. The
+  // batch must still get a reader event, so a later writer waits for those copies. The fake reader
+  // parks the stream behind a gate, enqueues work on it and throws.
+  constexpr std::size_t buffer_bytes = std::size_t{1} << 20;
+
+  rmm::cuda_stream reader_stream;
+  const cudaStream_t raw_stream = reader_stream.value();
+  void* device_buffer{};
+  REQUIRE(cudaMalloc(&device_buffer, buffer_bytes) == cudaSuccess);
+  cucascade::cuda::cuda_event copies_done;
+  // Declared after the stream: its destructor releases the gate and drains the stream.
+  cucascade::test::stream_gate gate{raw_stream};
+
+  row_range_reader_registry registry;
+  int calls = 0;
+  registry.register_reader<fake_row_range_representation>(
+    [&](const idata_representation&,
+        const row_range_request&,
+        std::span<column_destination>,
+        ::cuda::stream_ref stream,
+        memory::reservation*,
+        std::unique_ptr<row_range_reader_state>*) -> row_range_result {
+      ++calls;
+      gate.arm();
+      REQUIRE(cudaMemsetAsync(device_buffer, 0xAB, buffer_bytes, stream.get()) == cudaSuccess);
+      copies_done.record(stream);
+      throw std::out_of_range("fake reader failure after enqueueing work");
+    });
+
+  auto batch =
+    data_batch::make(1, std::make_unique<fake_row_range_representation>(memory::Tier::GPU));
+  std::vector<std::size_t> columns{0};
+  std::vector<column_destination> dst(1);
+
+  {
+    auto read_lock = batch->to_read_only();
+    try {
+      std::ignore =
+        read_rows_into(registry, read_lock, {columns, 0, 4}, dst, ::cuda::stream_ref{raw_stream});
+      FAIL("read_rows_into did not rethrow the reader's exception");
+    } catch (const std::out_of_range& error) {
+      REQUIRE(std::string{error.what()} == "fake reader failure after enqueueing work");
+    }
+    REQUIRE(calls == 1);
+  }
+
+  // The read lock is gone, but the work the reader enqueued is still parked behind the gate: the
+  // recorded reader event keeps a writer out.
+  REQUIRE(copies_done.query() == cucascade::cuda::event::query_result::in_progress);
+  REQUIRE_FALSE(batch->try_to_mutable().has_value());
+
+  gate.release();
+  {
+    // to_mutable() waits for the reader event, so the enqueued work has run when it returns.
+    auto write_lock = batch->to_mutable();
+    REQUIRE(copies_done.query() == cucascade::cuda::event::query_result::success);
+  }
+
+  REQUIRE(cudaStreamSynchronize(raw_stream) == cudaSuccess);
+  REQUIRE(cudaFree(device_buffer) == cudaSuccess);
+}
+
+TEST_CASE("row-range reader registry serves lookups and reads during concurrent registration",
+          "[row_range_read]")
+{
+  constexpr std::size_t num_types          = 16;
+  constexpr std::size_t num_reader_threads = 8;
+  constexpr std::size_t num_registrars     = 2;
+  constexpr int min_reader_passes          = 200;
+
+  row_range_reader_registry registry;
+  const auto types = make_stress_types(std::make_index_sequence<num_types>{});
+
+  // Reader `i` reports `i + 1` rows, so a read shows which type's reader served it.
+  auto make_tagged_reader = [](std::size_t tag) -> row_range_read_fn {
+    return [tag](const idata_representation&,
+                 const row_range_request&,
+                 std::span<column_destination>,
+                 ::cuda::stream_ref,
+                 memory::reservation*,
+                 std::unique_ptr<row_range_reader_state>*) {
+      row_range_result result;
+      result.rows_written = tag + 1;
+      return result;
+    };
+  };
+
+  std::atomic<bool> start{false};
+  std::atomic<std::size_t> registrars_done{0};
+  // Catch2 assertions are not thread-safe: the threads count, the main thread asserts.
+  std::atomic<std::size_t> successful_reads{0};
+  std::atomic<std::size_t> misdispatched_reads{0};
+  std::atomic<std::size_t> unexpected_errors{0};
+  std::atomic<std::size_t> readers_lost{0};
+  std::atomic<std::size_t> readers_missing_at_end{0};
+  std::atomic<std::size_t> registrations{0};
+  std::atomic<std::size_t> duplicates_refused{0};
+  std::atomic<std::size_t> shared_type_wins{0};
+
+  auto read_loop = [&] {
+    std::vector<std::size_t> columns{0};
+    std::vector<column_destination> dst(1);
+    std::array<bool, num_types> seen{};
+    start.wait(false, std::memory_order_acquire);
+
+    bool final_pass = false;
+    for (int pass = 0; !final_pass; ++pass) {
+      // The last pass starts after every registration, so it must find every reader.
+      final_pass = pass >= min_reader_passes &&
+                   registrars_done.load(std::memory_order_acquire) == num_registrars;
+      for (std::size_t i = 0; i < num_types; ++i) {
+        const bool registered = types[i].has_reader(registry);
+        if (seen[i] && !registered) { ++readers_lost; }
+        if (final_pass && !registered) { ++readers_missing_at_end; }
+        seen[i] = seen[i] || registered;
+        try {
+          const auto result =
+            registry.read(*types[i].source, {columns, 0, 1}, dst, default_stream());
+          ++successful_reads;
+          if (result.rows_written != i + 1) { ++misdispatched_reads; }
+          seen[i] = true;
+        } catch (const row_range_unsupported_error&) {
+          // Not registered yet; an error only if the lookup had already found the reader.
+          if (registered) { ++unexpected_errors; }
+        } catch (...) {
+          ++unexpected_errors;
+        }
+      }
+    }
+  };
+
+  // Registrar `r` owns the types with `i % 2 == r`; both race for the last type.
+  auto register_loop = [&](std::size_t registrar) {
+    start.wait(false, std::memory_order_acquire);
+    auto try_register = [&](std::size_t i) {
+      try {
+        types[i].register_reader(registry, make_tagged_reader(i));
+        ++registrations;
+        return true;
+      } catch (const std::invalid_argument&) {
+        ++duplicates_refused;
+      } catch (...) {
+        ++unexpected_errors;
+      }
+      return false;
+    };
+
+    for (std::size_t i = registrar; i + 1 < num_types; i += num_registrars) {
+      try_register(i);
+      std::this_thread::yield();
+    }
+    if (try_register(num_types - 1)) { ++shared_type_wins; }
+    // Every type this registrar owns is registered now: a second registration must be refused.
+    for (std::size_t i = registrar; i + 1 < num_types; i += num_registrars) {
+      try_register(i);
+    }
+    try_register(num_types - 1);
+    ++registrars_done;
+  };
+
+  {
+    std::vector<std::jthread> threads;
+    for (std::size_t t = 0; t < num_reader_threads; ++t) {
+      threads.emplace_back(read_loop);
+    }
+    for (std::size_t r = 0; r < num_registrars; ++r) {
+      threads.emplace_back(register_loop, r);
+    }
+    start.store(true, std::memory_order_release);
+    start.notify_all();
+  }
+
+  // Every type was registered exactly once. Refused: the second attempt on each owned type, and
+  // three of the four attempts on the shared type.
+  REQUIRE(registrations.load() == num_types);
+  REQUIRE(shared_type_wins.load() == 1);
+  REQUIRE(duplicates_refused.load() == (num_types - 1) + 3);
+  REQUIRE(unexpected_errors.load() == 0);
+  REQUIRE(misdispatched_reads.load() == 0);
+  REQUIRE(readers_lost.load() == 0);
+  REQUIRE(readers_missing_at_end.load() == 0);
+  // At least the final pass of every reader thread read every type.
+  REQUIRE(successful_reads.load() >= num_reader_threads * num_types);
+  for (std::size_t i = 0; i < num_types; ++i) {
+    REQUIRE(types[i].has_reader(registry));
+  }
 }
 
 TEST_CASE("row-range read waits on the source's writer event", "[row_range_read]")

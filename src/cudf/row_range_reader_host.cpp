@@ -31,6 +31,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -117,14 +118,11 @@ std::int64_t read_offset(const blocks_allocation& alloc,
                          std::uint8_t width,
                          std::size_t row)
 {
-  if (width == 4) {
-    std::int32_t value{};
-    copy_h2h(alloc, data_offset + row * sizeof(value), &value, sizeof(value));
-    return value;
-  }
-  std::int64_t value{};
-  copy_h2h(alloc, data_offset + row * sizeof(value), &value, sizeof(value));
-  return value;
+  // The offset may straddle a block boundary: assemble it before decoding.
+  std::array<std::byte, sizeof(std::int64_t)> raw{};
+  const std::size_t bytes = std::min<std::size_t>(width, raw.size());
+  copy_h2h(alloc, data_offset + row * width, raw.data(), bytes);
+  return load_offset(std::span<const std::byte>{raw.data(), bytes}, width, 0);
 }
 
 /// Host callback: drops the reference a blocks_keepalive took. Makes no CUDA calls.
@@ -146,6 +144,14 @@ void CUDART_CB release_blocks_reference(void* reference)
  * behind every copy enqueued while it was alive, that drops the reference. This does not
  * synchronize the stream. The host memory resource must outlive the work on the stream, since the
  * callback may be what returns the blocks to it.
+ *
+ * The callback runs on the CUDA callback thread and, when it drops the last reference, returns
+ * the blocks to fixed_size_host_memory_resource under that resource's mutex. Two consequences:
+ * - Every stream that carried a host row-range read must be synchronized before the host memory
+ *   space is destroyed. Its destructor frees the pinned memory while holding that mutex, which
+ *   would deadlock against a callback still queued on a stream.
+ * - A caller that frees a HOST batch to make room sees its blocks back in the pool only once the
+ *   stream has reached the callback.
  */
 class blocks_keepalive {
  public:

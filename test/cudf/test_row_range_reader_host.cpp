@@ -48,6 +48,7 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -1010,29 +1011,69 @@ TEST_CASE("host row-range reader: source freed and its blocks reused before the 
     host->get_host_table()->allocation;
   const std::size_t source_bytes = blocks.lock()->size_bytes();
 
-  // Fixed-width columns without nulls and without a null-mask slot: the read is then only H2D
-  // copies. A read that launches a kernel (null bits, STRING offsets) cannot be held behind the
-  // gate, because the driver blocks a kernel launch on a stream parked in a host callback.
-  const std::size_t columns[] = {kInt32, kFloat64, kDecimal64};
+  // Copy-only columns (fixed-width, no mask slot) and columns whose read launches kernels: null
+  // bits read from a source mask, null bits set for a source without one, and STRING offsets
+  // rebased from 4- and 8-byte source offsets.
+  struct column_case {
+    std::size_t column;
+    bool with_mask;
+    std::uint8_t offset_width;
+  };
+  const column_case cases[] = {{kInt32, false, 4},
+                               {kFloat64, false, 4},
+                               {kDecimal64, false, 4},
+                               {kInt64Nulls, true, 4},
+                               {kString32Nulls, true, 4},
+                               {kString64, true, 8}};
+  std::vector<std::size_t> columns;
+  for (const auto& c : cases) {
+    columns.push_back(c.column);
+  }
   const std::size_t row_begin = 100;
   const std::size_t rows      = 800;
-  std::vector<dst_column> dsts;
-  std::vector<column_destination> dests;
-  for (const auto c : columns) {
-    dsts.push_back(make_roomy_dst(src.columns[c], rows, false));
-    dests.push_back(dsts.back().dest);
+  auto make_dsts              = [&] {
+    std::vector<dst_column> dsts;
+    for (const auto& c : cases) {
+      dsts.push_back(make_roomy_dst(src.columns[c.column], rows, c.with_mask, c.offset_width));
+    }
+    return dsts;
+  };
+  auto read_into = [&](std::vector<dst_column>& dsts) {
+    std::vector<column_destination> dests;
+    for (const auto& d : dsts) {
+      dests.push_back(d.dest);
+    }
+    row_range_request request;
+    request.columns   = columns;
+    request.row_begin = row_begin;
+    request.max_rows  = rows;
+    return detail::read_rows_host(*host, request, dests, stream, nullptr, nullptr);
+  };
+
+  // Warm-up: the first launch of a kernel loads its CUDA module, which synchronizes the context
+  // and would wait forever on a parked stream. Launch every kernel the gated read uses once.
+  {
+    auto warm_up = make_dsts();
+    REQUIRE(read_into(warm_up).rows_written == rows);
+    stream.sync();
   }
+
+  auto dsts = make_dsts();
   stream.sync();
 
   {
     // Nothing enqueued on the stream from here on runs until the gate opens.
     stream_gate gate{stream};
 
-    row_range_request request;
-    request.columns   = columns;
-    request.row_begin = row_begin;
-    request.max_rows  = rows;
-    const auto result = detail::read_rows_host(*host, request, dests, stream, nullptr, nullptr);
+    // The read must only enqueue work. Run it on another thread, so that a read that waits for
+    // the parked stream fails the test instead of hanging it.
+    auto pending = std::async(std::launch::async, [&] { return read_into(dsts); });
+    if (pending.wait_for(std::chrono::seconds{60}) != std::future_status::ready) {
+      gate.open();
+      pending.wait();
+      FAIL("read_rows_host waited for the parked stream");
+    }
+    const auto result = pending.get();
     REQUIRE(result.rows_written == rows);
 
     // The reader is done and the caller drops the source, as after releasing a read lock on a
@@ -1057,6 +1098,6 @@ TEST_CASE("host row-range reader: source freed and its blocks reused before the 
   // The blocks were released once the stream had run the copies.
   REQUIRE(blocks.expired());
   for (std::size_t i = 0; i < dsts.size(); ++i) {
-    verify_read(src.columns[columns[i]], dsts[i], row_begin, rows, 0, 0);
+    verify_read(src.columns[cases[i].column], dsts[i], row_begin, rows, 0, 0);
   }
 }

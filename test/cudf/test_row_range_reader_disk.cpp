@@ -171,6 +171,7 @@ class recording_io_backend : public idisk_io_backend {
     {
       std::lock_guard<std::mutex> lock(_mutex);
       ++_host_reads;
+      _host_read_bytes += size;
     }
     _inner->read(path, host_ptr, size, file_offset);
   }
@@ -187,11 +188,18 @@ class recording_io_backend : public idisk_io_backend {
     return _host_reads;
   }
 
+  [[nodiscard]] std::size_t host_read_bytes() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _host_read_bytes;
+  }
+
  private:
   std::shared_ptr<idisk_io_backend> _inner;
   mutable std::mutex _mutex;
   std::vector<std::size_t> _device_read_offsets;
   std::size_t _host_reads{0};
+  std::size_t _host_read_bytes{0};
 };
 
 std::shared_ptr<recording_io_backend> make_recording_backend()
@@ -323,6 +331,23 @@ host_column make_string_column(std::size_t num_rows, bool nullable, std::uint32_
   return col;
 }
 
+/// A non-nullable STRING column of 90..110-byte strings.
+host_column make_long_string_column(std::size_t num_rows, std::uint32_t seed)
+{
+  host_column col;
+  col.type = cudf::type_id::STRING;
+  col.offsets.reserve(num_rows + 1);
+  col.offsets.push_back(0);
+  for (std::size_t row = 0; row < num_rows; ++row) {
+    const std::size_t length = 90 + mix(row, 1, seed) % 21;
+    for (std::size_t c = 0; c < length; ++c) {
+      col.data.push_back(static_cast<std::uint8_t>('a' + (col.data.size() + seed) % 26));
+    }
+    col.offsets.push_back(static_cast<std::int32_t>(col.data.size()));
+  }
+  return col;
+}
+
 std::unique_ptr<cudf::column> to_cudf_column(const host_column& col, std::size_t num_rows)
 {
   const auto stream = shared_stream();
@@ -367,20 +392,12 @@ struct disk_source {
   std::unique_ptr<disk_data_representation> rep;
 };
 
-disk_source make_source(std::size_t num_rows)
+/// Spill @p columns (each of @p num_rows rows) to disk as one table.
+disk_source make_source_from(std::vector<host_column> columns, std::size_t num_rows)
 {
   disk_source src;
   src.num_rows = num_rows;
-  src.columns.push_back(make_fixed_column(cudf::type_id::INT8, 1, num_rows, false, 11));
-  src.columns.push_back(make_fixed_column(cudf::type_id::INT16, 2, num_rows, true, 22));
-  src.columns.push_back(make_fixed_column(cudf::type_id::INT32, 4, num_rows, true, 33));
-  src.columns.push_back(make_fixed_column(cudf::type_id::INT64, 8, num_rows, false, 44));
-  src.columns.push_back(make_fixed_column(cudf::type_id::FLOAT64, 8, num_rows, true, 55));
-  src.columns.push_back(make_fixed_column(cudf::type_id::BOOL8, 1, num_rows, false, 66));
-  src.columns.push_back(
-    make_fixed_column(cudf::type_id::TIMESTAMP_MILLISECONDS, 8, num_rows, false, 77));
-  src.columns.push_back(make_string_column(num_rows, true, 88));
-  src.columns.push_back(make_string_column(num_rows, false, 99));
+  src.columns  = std::move(columns);
 
   std::vector<std::unique_ptr<cudf::column>> cudf_columns;
   cudf_columns.reserve(src.columns.size());
@@ -397,6 +414,22 @@ disk_source make_source(std::size_t num_rows)
     *gpu_rep, shared_disk_space().get(), shared_stream());
   shared_stream().sync();
   return src;
+}
+
+disk_source make_source(std::size_t num_rows)
+{
+  std::vector<host_column> columns;
+  columns.push_back(make_fixed_column(cudf::type_id::INT8, 1, num_rows, false, 11));
+  columns.push_back(make_fixed_column(cudf::type_id::INT16, 2, num_rows, true, 22));
+  columns.push_back(make_fixed_column(cudf::type_id::INT32, 4, num_rows, true, 33));
+  columns.push_back(make_fixed_column(cudf::type_id::INT64, 8, num_rows, false, 44));
+  columns.push_back(make_fixed_column(cudf::type_id::FLOAT64, 8, num_rows, true, 55));
+  columns.push_back(make_fixed_column(cudf::type_id::BOOL8, 1, num_rows, false, 66));
+  columns.push_back(
+    make_fixed_column(cudf::type_id::TIMESTAMP_MILLISECONDS, 8, num_rows, false, 77));
+  columns.push_back(make_string_column(num_rows, true, 88));
+  columns.push_back(make_string_column(num_rows, false, 99));
+  return make_source_from(std::move(columns), num_rows);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1115,4 +1148,60 @@ TEST_CASE("disk row-range reader edge cases", "[row_range_reader_disk]")
                                              nullptr),
                       std::invalid_argument);
   }
+}
+
+//===----------------------------------------------------------------------===//
+// 9. STRING offsets read from disk are proportional to the rows delivered
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("disk row-range reader reads only the STRING offsets it needs", "[row_range_reader_disk]")
+{
+  constexpr std::size_t num_rows     = 20000;
+  constexpr std::size_t offset_width = 4;
+  std::vector<host_column> source_columns;
+  source_columns.push_back(make_long_string_column(num_rows, 7));
+  source_columns.push_back(make_fixed_column(cudf::type_id::INT32, 4, num_rows, false, 8));
+  const auto src  = make_source_from(std::move(source_columns), num_rows);
+  const auto& str = src.columns[0];
+  const std::vector<std::size_t> columns{0, 1};
+
+  // Chars slots for about 100 rows (inside the first offsets chunk), about 3000 rows (several
+  // chunks) and all rows; the offsets slot always has room for the whole table.
+  const auto chars_capacity =
+    GENERATE(std::size_t{10} << 10, std::size_t{300} << 10, std::size_t{4} << 20);
+  CAPTURE(chars_capacity);
+
+  std::size_t row_begin = 0;
+  for (std::size_t window = 0; window < 4 && row_begin < num_rows; ++window) {
+    CAPTURE(window, row_begin);
+    // Brute-force rule 1 for the chars slot; nothing else limits the rows.
+    std::size_t expected = 0;
+    while (row_begin + expected < num_rows &&
+           str.chars_bytes(row_begin, expected + 1) <= chars_capacity) {
+      ++expected;
+    }
+    REQUIRE(expected > 0);
+
+    slot_spec spec;
+    spec.data_bytes    = chars_capacity;
+    spec.offsets_bytes = (num_rows + 1) * offset_width;
+    std::vector<slot> slots;
+    slots.push_back(make_slot(str, spec));
+    slots.push_back(make_roomy_slot(src.columns[1], row_begin, num_rows, 0, 0, 4, false));
+
+    const auto backend = make_recording_backend();
+    const auto result  = read_rows(src, columns, slots, row_begin, num_rows, backend);
+    check_read(src, columns, slots, result, row_begin, expected);
+
+    // Chunks double from 1024 rows and stop at the first one that overflows the chars slot, so at
+    // most max(1024, 2 * delivered) rows' offsets (plus one) are read, whatever the offsets slot
+    // and max_rows allow.
+    const std::size_t read_bound = (std::max<std::size_t>(1024, 2 * expected) + 1) * offset_width;
+    CHECK(backend->host_read_bytes() >= (expected + 1) * offset_width);
+    CHECK(backend->host_read_bytes() <= read_bound);
+    if (expected < 4096) { CHECK(backend->host_read_bytes() < spec.offsets_bytes / 4); }
+
+    row_begin += expected;
+  }
+  REQUIRE(row_begin > 0);
 }

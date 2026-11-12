@@ -27,9 +27,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <span>
+#include <stdexcept>
 
 /**
  * @file row_range_detail.hpp
@@ -46,7 +48,8 @@ namespace cucascade::detail {
  * @brief Row-range reader for gpu_table_representation (row_range_reader_gpu.cpp).
  *
  * Implements the reader contract of row_range_read.hpp. May synchronize @p stream only for the
- * device-to-host read of STRING offsets.
+ * device-to-host read of STRING offsets, once per offsets chunk. The source must live on the
+ * device of @p stream, else row_range_unsupported_error.
  */
 row_range_result read_rows_gpu(const idata_representation& source,
                                const row_range_request& request,
@@ -124,6 +127,38 @@ void rebase_offsets(void* dst,
 rmm::device_buffer allocate_scratch(memory::reservation* scratch,
                                     std::size_t bytes,
                                     ::cuda::stream_ref stream);
+
+// ---- host-side offset decoding ----
+
+/**
+ * @brief Decode offset @p index of a host array of 4- or 8-byte signed offsets.
+ *
+ * @param bytes The raw offsets, `width` bytes each.
+ * @param width Bytes per offset: 4 or 8.
+ * @param index Which offset of @p bytes to decode.
+ * @throws std::invalid_argument if @p width is neither 4 nor 8
+ * @throws std::out_of_range if offset @p index is not fully inside @p bytes
+ */
+inline std::int64_t load_offset(std::span<const std::byte> bytes,
+                                std::uint8_t width,
+                                std::size_t index)
+{
+  if (width != 4 && width != 8) {
+    throw std::invalid_argument("load_offset: width must be 4 or 8");
+  }
+  if (index >= bytes.size() / width) {
+    throw std::out_of_range("load_offset: offset index past the end of the host offsets");
+  }
+  const std::byte* p = bytes.data() + index * width;
+  if (width == 4) {
+    std::int32_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+  }
+  std::int64_t v;
+  std::memcpy(&v, p, sizeof(v));
+  return v;
+}
 
 // ---- CPU budget fitting (row_range_fit.cpp) ----
 

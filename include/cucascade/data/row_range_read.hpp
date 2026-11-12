@@ -65,17 +65,25 @@
  *    for `i in [0, k]` — i.e. `k + 1` offsets are written, converting width if needed. When
  *    `k == 0` nothing is written.
  * 4. **Null bits** go at bit `dst_row_offset + i`. Bits below `dst_row_offset` and at/after
- *    `dst_row_offset + k` are left untouched (read-modify-write the partial words). An all-valid
+ *    `dst_row_offset + k` are left untouched (read-modify-write the partial words). Because a
+ *    partial word is read back, successive reads that append to the same destination must be
+ *    ordered on the device: use one stream, or make the later stream wait for the earlier. An
+ *    all-valid
  *    source (no source mask, or null_count == 0) writes 1s without reading a source mask. If the
  *    null_mask slot is absent and the source range may contain nulls (source null_count > 0) →
  *    `row_range_unsupported_error`.
  * 5. Types: all fixed-width cudf types and STRING (INT32/INT64 offsets). LIST/STRUCT/DICTIONARY32
  *    in the requested columns → `row_range_unsupported_error`. `dst.type_id` must equal the source
  *    column's type id, else `std::invalid_argument`.
- * 6. **Stream ordering:** all device work is enqueued on `stream`. The registry has already made
- *    `stream` wait on the representation's writer event; the caller records the reader event
- *    (`read_rows_into` does). Readers may synchronize `stream` only where the spec of that reader
- *    allows it (GPU reader: offsets D2H; disk reader: host-side offset read).
+ * 6. **Stream ordering:** all device work is enqueued on `stream`. The registry has already
+ *    ordered `stream` after the source's writer: it waits on the representation's writer event
+ *    when there is one, and synchronizes the source's device when a GPU-tier source has none
+ *    (unknown writer). The caller records the reader event (`read_rows_into` does). Readers may
+ *    synchronize `stream` only where the spec of that reader allows it (GPU reader: offsets D2H,
+ *    once per offsets chunk; disk reader: host-side offset read). The GPU reader requires the
+ *    source to live on the device of `stream` and throws `row_range_unsupported_error` otherwise.
+ *    The host reader never synchronizes; it keeps the source's pinned blocks alive until `stream`
+ *    has run its copies, so the host memory resource must outlive the work on `stream`.
  * 7. `scratch`: optional reservation on the destination GPU memory space for temporaries; allocate
  *    through `detail::allocate_scratch`. It may be nullptr.
  */
@@ -182,8 +190,8 @@ struct row_range_reader_state {
  * @param source The representation to read from; its dynamic type is the registered type.
  * @param request The columns and row range to read.
  * @param dst One destination per requested column (`dst.size() == request.columns.size()`).
- * @param stream CUDA stream all device work is enqueued on. The registry has already made it wait
- *        on the source's writer event (rule 6).
+ * @param stream CUDA stream all device work is enqueued on. The registry has already ordered it
+ *        after the source's writer (rule 6).
  * @param scratch Optional reservation on the destination GPU memory space for temporaries
  *        (rule 7). May be nullptr.
  * @param state Optional slot for reader state kept between calls. May be nullptr.
@@ -274,9 +282,14 @@ class row_range_reader_registry {
    * @brief Read a row range of @p source into @p dst.
    *
    * Dispatches on typeid(source). Before dispatch it validates
-   * `dst.size() == request.columns.size()` and, if `source.get_writer_event() != nullptr`, makes
-   * @p stream wait on that event. The reader then follows the reader contract in this file's
-   * header comment. The caller records the reader event (read_rows_into() does).
+   * `dst.size() == request.columns.size()` and orders @p stream after the source's writer: if
+   * `source.get_writer_event() != nullptr` it makes @p stream wait on that event; otherwise, for a
+   * GPU-tier source (unknown writer), it calls cudaDeviceSynchronize on the source's device. That
+   * call blocks the calling thread until every stream on the device is idle, so a caller that
+   * holds up work on the device (for example a stream parked behind a host callback it controls)
+   * deadlocks. Host and disk sources without a writer event are read without a wait. The reader
+   * then follows the reader contract in this file's header comment. The caller records the reader
+   * event (read_rows_into() does).
    *
    * @param source The representation to read from
    * @param request The columns and row range to read
@@ -305,7 +318,10 @@ class row_range_reader_registry {
  * @brief Read a row range of a locked batch into @p dst.
  *
  * Reads through a read lock the CALLER holds (@p batch), then calls
- * `batch.record_reader_event(stream)` so a later writer of the batch waits for this read.
+ * `batch.record_reader_event(stream)`, also when the read throws, so a later writer of a GPU-tier
+ * batch waits for whatever this read enqueued. The reader event does not cover HOST sources
+ * (record_reader_event is a no-op for them): there the host reader keeps the source's pinned
+ * blocks alive until @p stream has run the copies.
  *
  * @param registry The reader registry to dispatch through
  * @param batch Read lock on the source batch, held by the caller for the duration of the call
