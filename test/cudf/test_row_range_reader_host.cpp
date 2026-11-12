@@ -1010,14 +1010,16 @@ TEST_CASE("host row-range reader: source freed and its blocks reused before the 
     host->get_host_table()->allocation;
   const std::size_t source_bytes = blocks.lock()->size_bytes();
 
-  // Fixed-width, STRING chars + offsets, and a source null mask.
-  const std::size_t columns[] = {kInt64Nulls, kFloat64, kString32Nulls, kString64};
+  // Fixed-width columns without nulls and without a null-mask slot: the read is then only H2D
+  // copies. A read that launches a kernel (null bits, STRING offsets) cannot be held behind the
+  // gate, because the driver blocks a kernel launch on a stream parked in a host callback.
+  const std::size_t columns[] = {kInt32, kFloat64, kDecimal64};
   const std::size_t row_begin = 100;
   const std::size_t rows      = 800;
   std::vector<dst_column> dsts;
   std::vector<column_destination> dests;
   for (const auto c : columns) {
-    dsts.push_back(make_roomy_dst(src.columns[c], rows, true, c == kString64 ? 8 : 4));
+    dsts.push_back(make_roomy_dst(src.columns[c], rows, false));
     dests.push_back(dsts.back().dest);
   }
   stream.sync();
