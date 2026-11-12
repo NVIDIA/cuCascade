@@ -144,7 +144,9 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
 
     ~multiple_blocks_allocation()
     {
-      if (_mr && !_blocks.empty()) { _mr->return_allocated_chunks(_blocks, _reseved_memory); }
+      if (_mr && !_blocks.empty()) {
+        _mr->return_allocated_chunks(_blocks, _reseved_memory, _reserved_uuid);
+      }
     }
 
     // Disable copy to prevent double deallocation
@@ -177,13 +179,16 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
     {
       std::vector<std::byte*> blocks;
       try {
-        blocks = _mr->allocate_multiple_blocks_internal(additional_bytes, _reseved_memory);
+        blocks =
+          _mr->allocate_multiple_blocks_internal(additional_bytes, _reseved_memory, _reserved_uuid);
         _blocks.insert(_blocks.end(), blocks.begin(), blocks.end());
         return true;
       } catch (const std::exception&) {
         // A failed insert leaves _blocks unchanged: give back what this call took, with its
         // byte and reservation accounting (nothing to give back if the allocation threw).
-        if (!blocks.empty()) { _mr->return_allocated_chunks(blocks, _reseved_memory); }
+        if (!blocks.empty()) {
+          _mr->return_allocated_chunks(blocks, _reseved_memory, _reserved_uuid);
+        }
         return false;
       }
     }
@@ -198,21 +203,28 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
       if (needed_blocks >= _blocks.size()) return;
       // Return the tail in place, then drop it; neither step allocates.
       _mr->return_allocated_chunks(std::span<std::byte* const>(_blocks).subspan(needed_blocks),
-                                   _reseved_memory);
+                                   _reseved_memory,
+                                   _reserved_uuid);
       _blocks.resize(needed_blocks);
     }
 
    private:
     multiple_blocks_allocation(fixed_size_host_memory_resource* m,
                                chunked_reserved_area* res) noexcept
-      : _mr(m), _block_size(m ? m->get_block_size() : 0), _reseved_memory(res)
+      : _mr(m),
+        _block_size(m ? m->get_block_size() : 0),
+        _reseved_memory(res),
+        _reserved_uuid(res ? res->uuid() : 0)
     {
     }
 
     std::vector<std::byte*> _blocks;
     fixed_size_host_memory_resource* _mr;
     std::size_t _block_size;
+    // The reservation may be released before this allocation and a new one allocated at the same
+    // address; the uuid tells whether the reservation registered at that address is still ours.
     chunked_reserved_area* _reseved_memory;
+    std::size_t _reserved_uuid;
   };
 
   using fixed_multiple_blocks_allocation = std::unique_ptr<multiple_blocks_allocation>;
@@ -464,9 +476,13 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
    *
    * @param chunks blocks allocated from this resource
    * @param res the reservation they were allocated under, or null
+   * @param reservation_uuid uuid of that reservation.  @p res is only used if the reservation
+   *        registered at its address still has this uuid: the reservation may have been released
+   *        and a new one allocated at the same address, whose accounting must not be touched.
    */
   void return_allocated_chunks(std::span<std::byte* const> chunks,
-                               chunked_reserved_area* res) noexcept;
+                               chunked_reserved_area* res,
+                               std::size_t reservation_uuid) noexcept;
 
   /**
    * @brief Allocate multiple blocks to satisfy a large allocation request.
@@ -486,7 +502,9 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
    *         On any throw the blocks and accounting this call took are given back.
    */
   [[nodiscard]] std::vector<std::byte*> allocate_multiple_blocks_internal(
-    std::size_t total_bytes, chunked_reserved_area* h_reservation_slot);
+    std::size_t total_bytes,
+    chunked_reserved_area* h_reservation_slot,
+    std::size_t reservation_uuid);
 
   memory_space_id _space_id;
   std::size_t _memory_limit;
