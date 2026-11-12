@@ -88,7 +88,36 @@ jobs:
       - name: Extract build artifacts
         run: tar -xf build-release.tar
 
-      - run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} test
+      - name: Run tests
+        id: test
+        run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} test --output-junit test-results.xml
+
+      - name: Upload test diagnostics
+        id: diagnostics
+        if: ${{ !cancelled() && steps.test.outcome != 'skipped' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: test-results-cuda-${{ matrix.cuda }}-${{ matrix.rapids }}
+          path: |
+            build/release/test-results.xml
+            build/release/Testing/Temporary/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Summarize test results
+        if: ${{ !cancelled() && steps.diagnostics.outputs.artifact-url != '' }}
+        env:
+          CUDA_VERSION: ${{ matrix.cuda }}
+          RAPIDS_CHANNEL: ${{ matrix.rapids }}
+          TEST_RESULT: ${{ steps.test.outcome }}
+          ARTIFACT_URL: ${{ steps.diagnostics.outputs.artifact-url }}
+        run: |
+          {
+            echo "## Tests: CUDA ${CUDA_VERSION}, RAPIDS ${RAPIDS_CHANNEL}"
+            echo "CTest result: **${TEST_RESULT}**"
+            echo
+            echo "[Download JUnit results and CTest logs](${ARTIFACT_URL})"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   check:
     runs-on: ubuntu-slim
