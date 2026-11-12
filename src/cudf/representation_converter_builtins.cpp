@@ -609,7 +609,7 @@ Buffer peer_copy_into_async(Buffer buf,
     // No HOST memory_space has been registered. This should only happen in
     // standalone test builds that exercise the converter without constructing
     // a memory_reservation_manager. Fall back to a one-shot pinned allocation
-    // (slow path — preserves correctness, never reached in production Sirius).
+    // (slow path — preserves correctness).
     memory::numa_region_pinned_host_memory_resource mr(resolve_gpu_numa_node(dst_device),
                                                        /*make_portable=*/true);
     void* host_buf = mr.allocate_sync(size_in_bytes);
@@ -870,7 +870,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
  *
  * Replaces the previous cudf::pack-based path. cudf::pack's compute_splits internally
  * launches kernels that read scratch buffers allocated through the current_device
- * resource ref; under sirius's multi-GPU setup the cucascade resource adapter created
+ * resource ref; under a multi-GPU setup the cucascade resource adapter created
  * a stream-ordered race that materialized as uninitialized dst_buf_info reads (caught
  * by compute-sanitizer) and silently produced garbage packed bytes. This path mirrors
  * convert_gpu_to_host_fast / convert_host_fast_to_gpu: walk the source column tree,
