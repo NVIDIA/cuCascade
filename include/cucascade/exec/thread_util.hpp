@@ -89,7 +89,7 @@ inline constexpr std::size_t max_thread_name_len = 15;
 [[nodiscard]] bool set_current_thread_affinity(std::span<int const> cpu_ids) noexcept;
 
 /// Read the affinity mask of @p handle as the list of allowed CPU ids.
-/// Returns an empty vector on failure.
+/// Returns an empty vector on failure (including a failed allocation of the list).
 [[nodiscard]] std::vector<int> get_thread_affinity(pthread_t handle) noexcept;
 [[nodiscard]] std::vector<int> get_current_thread_affinity() noexcept;
 

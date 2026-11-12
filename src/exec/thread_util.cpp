@@ -165,9 +165,12 @@ std::vector<int> get_thread_affinity(pthread_t handle) noexcept
   cpu_set_t mask{};
   if (::pthread_getaffinity_np(handle, sizeof(mask), &mask) != 0) { return {}; }
   std::vector<int> ids;
-  // A conservative upper bound so the vector never reallocates on the caller's
-  // hot path; the actual count is capped by CPU_SETSIZE anyway.
-  ids.reserve(static_cast<std::size_t>(CPU_COUNT(&mask)));
+  try {
+    // Sized once: the pushes below never reallocate.
+    ids.reserve(static_cast<std::size_t>(CPU_COUNT(&mask)));
+  } catch (...) {
+    return {};  // allocation failed: the documented failure value, not std::terminate
+  }
   for (int i = 0; i < CPU_SETSIZE; ++i) {
     if (CPU_ISSET(static_cast<std::size_t>(i), &mask)) { ids.push_back(i); }
   }
