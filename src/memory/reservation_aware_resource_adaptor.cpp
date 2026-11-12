@@ -188,10 +188,13 @@ std::size_t impl_type::stream_ordered_tracker_state::check_reservation_and_handl
   int64_t stream_tracking_size       = static_cast<int64_t>(allocation_size);
   std::size_t upstream_tracking_size = allocation_size;
 
+  // Count the allocation while the size cannot change, see _boundary_mutex.
+  std::unique_lock boundary_lock(memory_reservation->_boundary_mutex);
   auto reservation_size = static_cast<int64_t>(memory_reservation->size());
   auto [success, post_allocation_inc] =
     memory_reservation->allocated_bytes.try_add(stream_tracking_size, reservation_size);
   if (!success) {
+    boundary_lock.unlock();  // the policy may grow the reservation, which takes the lock
     if (reservation_policy) {
       std::lock_guard lock(_arbitration_mutex);
       reservation_policy->handle_over_reservation(stream,
@@ -200,11 +203,12 @@ std::size_t impl_type::stream_ordered_tracker_state::check_reservation_and_handl
                                                   memory_reservation.get());
     }
     // The allocation crosses the end of the reservation. Count it against the current size (the
-    // policy may just have grown it) while the size cannot change, see grow_reservation_by.
-    std::lock_guard lock(memory_reservation->_boundary_mutex);
+    // policy may just have grown it).
+    boundary_lock.lock();
     reservation_size    = memory_reservation->size();
     post_allocation_inc = memory_reservation->allocated_bytes.add(stream_tracking_size);
   }
+  boundary_lock.unlock();
   memory_reservation->peak_allocated_bytes.update_peak(post_allocation_inc);
 
   int64_t pre_allocation_inc = post_allocation_inc - stream_tracking_size;
@@ -509,20 +513,11 @@ void* impl_type::do_allocate_unmanaged(std::size_t allocation_bytes,
 
 std::size_t impl_type::untrack_allocation(device_reserved_arena& arena, std::size_t bytes) noexcept
 {
-  auto const tracking_bytes = static_cast<int64_t>(bytes);
-  // Fast path: the bytes lie inside the reservation, so none of them were charged upstream. A
-  // concurrent grow only enlarges the reservation, so this stays true.
-  auto reservation_size = arena.size();
-  auto current          = arena.allocated_bytes.load();
-  while (current <= reservation_size) {
-    if (arena.allocated_bytes->compare_exchange_weak(current, current - tracking_bytes)) {
-      return 0;
-    }
-  }
-  // Some of the bytes lie past the end of the reservation. Count them against the current size
-  // while the size cannot change, see grow_reservation_by.
+  auto const tracking_bytes      = static_cast<int64_t>(bytes);
+  int64_t reservation_size       = 0;
   int64_t post_deallocation_size = 0;
   {
+    // Count the deallocation while the size cannot change, see _boundary_mutex.
     std::lock_guard lock(arena._boundary_mutex);
     reservation_size       = arena.size();
     post_deallocation_size = arena.allocated_bytes.sub(tracking_bytes);

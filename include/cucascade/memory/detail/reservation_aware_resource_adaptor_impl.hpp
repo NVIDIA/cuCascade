@@ -73,8 +73,10 @@ class reservation_aware_resource_adaptor_impl {
 
    private:
     reservation_aware_resource_adaptor_impl* _impl;
-    /// Held while the size changes and while allocated bytes cross the end of the reservation,
-    /// so the bytes charged past the end agree with the size they were charged against.
+    /// Held while the size changes and while allocated_bytes changes in allocate and deallocate,
+    /// so each allocation and deallocation is charged against a size that cannot change under it.
+    /// A shrink would otherwise leave bytes counted inside the reservation past its new end,
+    /// uncharged.
     std::mutex _boundary_mutex;
   };
 
