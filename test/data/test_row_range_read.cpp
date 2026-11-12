@@ -488,3 +488,75 @@ TEST_CASE("row-range read waits on the source's writer event", "[row_range_read]
     std::ignore = batch->to_mutable();
   }
 }
+
+TEST_CASE("row-range read of a GPU source with an unknown writer waits for the device",
+          "[row_range_read]")
+{
+  // A GPU representation without a writer event has an unknown writer, so the registry must wait
+  // for the whole device before the reader runs. Work is queued on another stream, followed by an
+  // event: the reader must find that event complete.
+  constexpr std::size_t buffer_bytes = std::size_t{256} << 20;
+  constexpr int num_copies           = 8;
+
+  cudaStream_t writer_stream{};
+  REQUIRE(cudaStreamCreate(&writer_stream) == cudaSuccess);
+  void* src_buffer{};
+  void* dst_buffer{};
+  REQUIRE(cudaMalloc(&src_buffer, buffer_bytes) == cudaSuccess);
+  REQUIRE(cudaMalloc(&dst_buffer, buffer_bytes) == cudaSuccess);
+  cucascade::cuda::cuda_event writer_done;
+
+  row_range_reader_registry registry;
+  int calls                      = 0;
+  cudaError_t writer_status_seen = cudaErrorUnknown;
+  registry.register_reader<fake_row_range_representation>(
+    [&](const idata_representation&,
+        const row_range_request&,
+        std::span<column_destination>,
+        ::cuda::stream_ref,
+        memory::reservation*,
+        std::unique_ptr<row_range_reader_state>*) {
+      ++calls;
+      writer_status_seen = cudaEventQuery(writer_done.get());
+      return row_range_result{};
+    });
+
+  std::vector<std::size_t> columns{0};
+  std::vector<column_destination> dst(1);
+
+  auto enqueue_writer_work = [&] {
+    for (int i = 0; i < num_copies; ++i) {
+      REQUIRE(cudaMemsetAsync(src_buffer, i, buffer_bytes, writer_stream) == cudaSuccess);
+      REQUIRE(cudaMemcpyAsync(
+                dst_buffer, src_buffer, buffer_bytes, cudaMemcpyDeviceToDevice, writer_stream) ==
+              cudaSuccess);
+    }
+    writer_done.record(::cuda::stream_ref{writer_stream});
+  };
+
+  SECTION("through the registry")
+  {
+    fake_row_range_representation fake(memory::Tier::GPU);
+    REQUIRE(fake.get_writer_event() == nullptr);
+    enqueue_writer_work();
+    std::ignore = registry.read(fake, {columns, 0, 1}, dst, default_stream());
+    REQUIRE(calls == 1);
+    REQUIRE(writer_status_seen == cudaSuccess);
+  }
+
+  SECTION("through read_rows_into")
+  {
+    auto batch =
+      data_batch::make(1, std::make_unique<fake_row_range_representation>(memory::Tier::GPU));
+    auto read_lock = batch->to_read_only();
+    enqueue_writer_work();
+    std::ignore = read_rows_into(registry, read_lock, {columns, 0, 1}, dst, default_stream());
+    REQUIRE(calls == 1);
+    REQUIRE(writer_status_seen == cudaSuccess);
+  }
+
+  REQUIRE(cudaStreamSynchronize(writer_stream) == cudaSuccess);
+  REQUIRE(cudaFree(src_buffer) == cudaSuccess);
+  REQUIRE(cudaFree(dst_buffer) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(writer_stream) == cudaSuccess);
+}

@@ -127,6 +127,51 @@ std::int64_t read_offset(const blocks_allocation& alloc,
   return value;
 }
 
+/// Host callback: drops the reference a blocks_keepalive took. Makes no CUDA calls.
+void CUDART_CB release_blocks_reference(void* reference)
+{
+  delete static_cast<memory::host_table_allocation::buffers_ptr*>(reference);
+}
+
+/**
+ * @brief Keeps the source's pinned blocks allocated until the copies enqueued on a stream have
+ * read them.
+ *
+ * The H2D copies read the pinned blocks when the stream reaches them, which can be after the
+ * caller has released its read lock on the batch: a HOST-tier batch records no reader event, so a
+ * later writer (downgrade, upgrade, the batch being dropped) does not wait for them. Without this
+ * the blocks would go back to the pool and be overwritten while the copies still read them.
+ *
+ * Holds a reference to the shared blocks; its destructor enqueues a host callback on the stream,
+ * behind every copy enqueued while it was alive, that drops the reference. This does not
+ * synchronize the stream. The host memory resource must outlive the work on the stream, since the
+ * callback may be what returns the blocks to it.
+ */
+class blocks_keepalive {
+ public:
+  blocks_keepalive(const memory::host_table_allocation::buffers_ptr& blocks,
+                   ::cuda::stream_ref stream)
+    : _reference(std::make_unique<memory::host_table_allocation::buffers_ptr>(blocks)),
+      _stream(stream)
+  {
+  }
+
+  blocks_keepalive(const blocks_keepalive&)            = delete;
+  blocks_keepalive& operator=(const blocks_keepalive&) = delete;
+
+  ~blocks_keepalive()
+  {
+    auto* reference = _reference.release();
+    // If the callback cannot be enqueued the reference is leaked on purpose: the blocks are
+    // never reused, which is safe; releasing them here could free them under a pending copy.
+    (void)cudaLaunchHostFunc(_stream.get(), release_blocks_reference, reference);
+  }
+
+ private:
+  std::unique_ptr<memory::host_table_allocation::buffers_ptr> _reference;
+  ::cuda::stream_ref _stream;
+};
+
 /// What the reader needs to know about one requested source column.
 struct column_plan {
   const memory::column_metadata* meta{nullptr};
@@ -298,6 +343,10 @@ row_range_result read_rows_host(const idata_representation& source,
   // has run: rmm deallocation is stream-ordered on `stream`, so the memory is not reused before
   // that work is done.
   std::vector<rmm::device_buffer> temporaries;
+
+  // The copies below read the source's pinned blocks when `stream` reaches them. Keep the blocks
+  // allocated until then, whatever happens to the source representation in the meantime.
+  const blocks_keepalive keepalive{table->allocation, stream};
 
   for (std::size_t i = 0; i < num_requested; ++i) {
     const auto& plan = plans[i];

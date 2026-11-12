@@ -17,6 +17,9 @@
 
 #include <cucascade/data/row_range_read.hpp>
 #include <cucascade/error.hpp>
+#include <cucascade/log/logging.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -97,6 +100,17 @@ row_range_result row_range_reader_registry::read(
 
   if (cudaEvent_t writer_event = source.get_writer_event(); writer_event != nullptr) {
     CUCASCADE_CUDA_TRY(::cudaStreamWaitEvent(stream.get(), writer_event, 0));
+  } else if (source.get_current_tier() == memory::Tier::GPU) {
+    // A GPU representation without a writer event has an unknown writer (see
+    // idata_representation::get_writer_event()): its producing work may still be running on
+    // another stream, so the only safe ordering is to wait for the whole device.
+    const int device_id = source.get_device_id();
+    CUCASCADE_LOG_WARN(
+      "No writer event found for the GPU source of a row-range read on device {};"
+      " syncing the entire device, stalling all streams.",
+      device_id);
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{device_id}};
+    CUCASCADE_CUDA_TRY(::cudaDeviceSynchronize());
   }
 
   return reader(source, request, dst, stream, scratch, state);
