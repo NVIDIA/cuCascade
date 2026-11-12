@@ -6,6 +6,12 @@ on:
       - "main"
       - "pull-request/[0-9]+"
 
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'push' &&
+    startsWith(github.ref, 'refs/heads/pull-request/') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/') }}
+
 jobs:
   lint:
     runs-on: linux-amd64-cpu4
