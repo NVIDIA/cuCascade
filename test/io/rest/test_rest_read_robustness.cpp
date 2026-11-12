@@ -44,6 +44,7 @@
 
 #include "io/rest/errc.hpp"
 #include "rest_contract_test_utils.hpp"
+#include "utils/allocation_counter.hpp"
 
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -71,6 +72,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -714,6 +716,144 @@ TEST_CASE("rest demand reads alternate with a stream of metadata calls on one co
   require_rest_bytes_equal(out, {payload.data(), out.size()});
   // A HEAD takes ~20 ms here; strict control-first would hold the read until the callers stop.
   CHECK(elapsed < 1s);
+}
+
+namespace {
+
+/// Arms one allocation fault on the thread that authorizes, i.e. the reactor's worker: the
+/// first authorize() call starts a counting scope there that fails the worker's `fail_at`-th
+/// allocation after it (in the reactor, the transport or the HTTP codec, wherever it falls).
+/// After disarm(), the next call clears the fault and records how many the worker had made.
+class faulting_authorizer final : public cucascade::io::rest::request_authorizer {
+ public:
+  faulting_authorizer(std::string endpoint, std::size_t fail_at)
+    : _inner(std::move(endpoint)), _fail_at(fail_at)
+  {
+  }
+
+  cucascade::io::rest::authorized_request authorize(cucascade::io::rest::object_ref const& obj,
+                                                    cucascade::io::rest::request_method method,
+                                                    std::chrono::seconds timeout) override
+  {
+    auto& scope = t_scope;
+    if (!scope) {
+      scope.emplace();
+      scope->fail_at(_fail_at);
+    }
+    if (_disarm.load() && !_disarmed) {
+      scope->fail_at(0);
+      _seen.store(scope->count());
+      _disarmed = true;
+    }
+    return _inner.authorize(obj, method, timeout);
+  }
+
+  /// The next authorize() call ends the armed window.
+  void disarm() noexcept { _disarm.store(true); }
+  /// Worker allocations counted in the armed window (valid once a call after disarm() ran).
+  [[nodiscard]] std::size_t seen() const noexcept { return _seen.load(); }
+
+ private:
+  static thread_local std::optional<cucascade::test::scoped_allocation_counter> t_scope;
+  list_capable_mock_authorizer _inner;
+  std::size_t _fail_at;
+  std::atomic<bool> _disarm{false};
+  bool _disarmed{false};  ///< worker thread only
+  std::atomic<std::size_t> _seen{0};
+};
+
+thread_local std::optional<cucascade::test::scoped_allocation_counter> faulting_authorizer::t_scope;
+
+/// Wait for @p f to settle; @return true when it delivered @p expected bytes, false when it
+/// failed.  Fails the test when it never settles.
+bool settles(cucascade::exec::semi_future<std::size_t>&& f,
+             std::size_t expected,
+             std::string* error = nullptr)
+{
+  auto const deadline = std::chrono::steady_clock::now() + 10s;
+  while (!f.is_ready() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(f.is_ready());
+  try {
+    return std::move(f).get() == expected;
+  } catch (std::exception const& e) {
+    if (error != nullptr) { *error = e.what(); }
+    return false;
+  } catch (...) {
+    return false;
+  }
+}
+
+}  // namespace
+
+TEST_CASE("rest reactor worker survives an allocation failure anywhere in a read",
+          "[rest][e2e][alloc]")
+{
+  // For each n until the workload runs without reaching it, the worker's n-th allocation after
+  // its first authorize() fails.  Whatever it hits (a read's setup, its exchange, a retry, a
+  // HEAD), every request settles, the failure stays with the request it belongs to, and the
+  // same worker serves the next read and HEAD in full.
+  auto payload = rest_test_payload(3UL << 20);
+  loopback_range_server server(payload);
+  auto cfg              = rest_contract_config();
+  cfg.max_connections   = 2;
+  cfg.min_segment_bytes = 1UL << 20;
+  cfg.max_segment_bytes = 1UL << 20;
+  std::size_t faults    = 0;
+  bool clean            = false;
+  for (std::size_t n = 1; n < 5000 && !clean; ++n) {
+    INFO("worker allocation " << n);
+    auto authorizer = std::make_shared<faulting_authorizer>(server.endpoint(), n);
+    auto context    = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr);
+    auto ioctx      = std::make_shared<probed_ioctx>(1, std::move(context));
+    ioctx->start();
+    rest_shutdown_guard cleanup{*ioctx};
+    auto object = ioctx->open_io_object("s3://alloc-bucket/object.bin", payload.size());
+
+    // Workload: three 1 MiB GETs on two connections, then a HEAD.
+    std::vector<std::uint8_t> out(payload.size());
+    std::vector<slice> slices{slice{0, 1UL << 20, out.data()},
+                              slice{1UL << 20, 1UL << 20, out.data() + (1UL << 20)},
+                              slice{2UL << 20, 1UL << 20, out.data() + (2UL << 20)}};
+    bool const read_ok = settles(ioctx->host_readv_async_io(*object, slices), payload.size());
+    if (read_ok) { require_rest_bytes_equal(out, payload); }
+    bool head_ok = true;
+    try {
+      std::ignore = ioctx->open_io_object("s3://alloc-bucket/object.bin");
+    } catch (...) {
+      head_ok = false;
+    }
+
+    // Close the window: this HEAD's authorize() clears the fault (it may still land in the
+    // worker's few allocations before that call, so the HEAD may fail).
+    authorizer->disarm();
+    try {
+      std::ignore = ioctx->open_io_object("s3://alloc-bucket/object.bin");
+    } catch (...) {
+      head_ok = false;
+    }
+
+    // The same worker serves what comes next, in full.
+    std::vector<std::uint8_t> again(payload.size());
+    std::vector<slice> whole{slice{0, payload.size(), again.data()}};
+    std::string error;
+    bool const again_ok =
+      settles(ioctx->host_readv_async_io(*object, whole), payload.size(), &error);
+    INFO("the read after it: " << error);
+    REQUIRE(again_ok);
+    require_rest_bytes_equal(again, payload);
+    REQUIRE(ioctx->open_io_object("s3://alloc-bucket/object.bin")->size() == payload.size());
+    clean = authorizer->seen() < n;
+    if (!read_ok || !head_ok) { ++faults; }
+    if (clean) {
+      CHECK(read_ok);
+      CHECK(head_ok);
+    }
+  }
+  CHECK(clean);
+  // Some faults are absorbed (a retry, a fallback); some must have reached a request.
+  CHECK(faults > 0);
 }
 
 TEST_CASE("rest reactor counters follow the reads and survive shutdown", "[rest][e2e][stats]")

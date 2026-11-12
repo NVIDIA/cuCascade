@@ -23,6 +23,7 @@
 /// threads (TSAN), real getaddrinfo("localhost").
 
 #include "io/rest/net/dns_resolver.hpp"
+#include "utils/allocation_counter.hpp"
 
 #include <arpa/inet.h>
 #include <catch2/catch_all.hpp>
@@ -31,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -409,4 +411,96 @@ TEST_CASE("net: resolver without accumulation replaces the list with each answer
   }
   REQUIRE(r.lookups_of(h) >= first + 2);
   CHECK(r.address_count(h) == f.per);
+}
+
+namespace {
+
+/// Arms a shortage on the resolver thread itself: lookup number `arm_on` returns its answer,
+/// then that thread's allocations from the `fail_from`-th on fail, `shortage` of them in a row
+/// (the merge, age-out and publish of that answer, the resolver loop, and the retries' own
+/// allocations while it lasts).  The next lookup disarms what is left.
+struct faulting_dns {
+  fake_dns inner;
+  unsigned arm_on{1};
+  std::size_t fail_from{0};
+  static constexpr std::size_t shortage = 8;
+  std::atomic<bool> fired{false};
+  static int lookup(void* ctx,
+                    char const* host,
+                    std::uint16_t port,
+                    std::vector<sockaddr_storage>& out) noexcept
+  {
+    thread_local std::optional<cucascade::test::scoped_allocation_counter> scope;
+    thread_local std::size_t armed = 0;
+    auto* f                        = static_cast<faulting_dns*>(ctx);
+    if (scope) {
+      if (scope->count() >= armed) { f->fired.store(true); }
+      scope.reset();
+    }
+    int const rc = fake_dns::lookup(&f->inner, host, port, out);
+    if (f->inner.calls.load() == f->arm_on) {
+      scope.emplace();
+      scope->fail_from(f->fail_from, shortage);
+      armed = f->fail_from;
+    }
+    return rc;
+  }
+};
+
+bool wait_for_ok(dns_resolver& r, std::uint32_t h, std::chrono::milliseconds timeout)
+{
+  sockaddr_storage a{};
+  socklen_t len  = 0;
+  auto const end = std::chrono::steady_clock::now() + timeout;
+  while (r.pick(h, a, len, mono_ns()) != dns_resolver::status::ok) {
+    if (std::chrono::steady_clock::now() > end) { return false; }
+    std::this_thread::sleep_for(1ms);
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST_CASE("net: resolver recovers from allocation failures on its own thread",
+          "[rest][net][dns][alloc]")
+{
+  // For each n until the answer is handled without reaching the fault: the resolver thread
+  // must not terminate, a lookup cut short counts as failed (EAI_MEMORY) and is retried, and
+  // the next answer is published.  First the initial answer, then a refresh of a published one
+  // (which must keep serving the previous answer meanwhile).
+  for (unsigned const arm_on : {1U, 2U}) {
+    bool clean = false;
+    for (std::size_t n = 1; n < 500 && !clean; ++n) {
+      INFO("lookup " << arm_on << ", fail from allocation " << n);
+      faulting_dns f;
+      f.arm_on    = arm_on;
+      f.fail_from = n;
+      dns_resolver::options o;
+      o.lookup        = &faulting_dns::lookup;
+      o.lookup_ctx    = &f;
+      o.failure_retry = 20ms;
+      o.ttl           = arm_on == 1 ? 10'000ms : 100ms;
+      o.refresh_ahead = 0.5;
+      dns_resolver r(o);
+      std::uint32_t const h = r.intern("alloc.test", 443);
+      REQUIRE(h != dns_resolver::invalid);
+      REQUIRE(wait_for_ok(r, h, 2s));
+      if (arm_on == 1) {
+        clean = r.lookup_failures() == 0;
+        if (!clean) { CHECK(r.lookups_of(h) >= 2); }
+      } else {
+        // Through the armed refresh and the lookup after it, the published answer stays.
+        auto const end = std::chrono::steady_clock::now() + 2s;
+        while (f.inner.calls.load() < 3 && std::chrono::steady_clock::now() < end) {
+          REQUIRE(wait_for_ok(r, h, 0ms));
+          std::this_thread::sleep_for(2ms);
+        }
+        REQUIRE(f.inner.calls.load() >= 3);
+        REQUIRE(wait_for_ok(r, h, 2s));
+        clean = !f.fired.load();
+      }
+      CHECK(r.address_count(h) > 0);
+    }
+    CHECK(clean);
+  }
 }

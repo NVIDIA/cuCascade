@@ -16,6 +16,7 @@
  */
 
 #include "io/rest/reactor_placement.hpp"
+#include "utils/allocation_counter.hpp"
 
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
@@ -341,6 +342,63 @@ TEST_CASE("place_current_reactor_thread raises priority only when opted in", "[r
   CHECK(sched_after->policy == sched_before->policy);
   CHECK(sched_after->priority == sched_before->priority);
   CHECK(nice_after == nice_before);
+}
+
+TEST_CASE("place_current_reactor_thread leaves a usable thread whichever allocation fails",
+          "[rest_pool_plan][alloc]")
+{
+  // Placement runs on the reactor thread before its loop and is noexcept.  Each of its
+  // allocations fails in turn: once (fail_at), and from there on (fail_from), so the recovery's
+  // own allocations fail too.  It must return, report a pin only when the thread is pinned, and
+  // otherwise leave the thread's affinity as it was; io-wq keeps the thread's mask unless the
+  // whole placement succeeded.  Both priority settings (elevation may be refused here; the
+  // fault paths must not depend on it).
+  auto const mine = tu::get_current_thread_affinity();
+  REQUIRE_FALSE(mine.empty());
+  rest_pool_plan plan;
+  plan.n_reactors = 1;
+  plan.pin_cpus   = {mine.front()};
+  for (bool const sustained : {false, true}) {
+    for (bool const raise : {false, true}) {
+      bool clean = false;
+      for (std::size_t n = 1; n < 1000 && !clean; ++n) {
+        reactor_placement placed;
+        std::vector<int> before;
+        std::vector<int> after;
+        std::size_t made = 0;
+        std::thread([&] {
+          before = tu::get_current_thread_affinity();
+          {
+            cucascade::test::scoped_allocation_counter scope;
+            if (sustained) {
+              scope.fail_from(n);
+            } else {
+              scope.fail_at(n);
+            }
+            placed = place_current_reactor_thread(plan, 0, raise);
+            made   = scope.count();
+          }
+          after = tu::get_current_thread_affinity();
+        }).join();
+        clean = made < n;
+        INFO("fail " << (sustained ? "from" : "at") << " allocation " << n << " of " << made
+                     << (raise ? ", raise priority" : ""));
+        if (placed.pinned) {
+          CHECK(placed.cpu == mine.front());
+          CHECK(after == std::vector<int>{mine.front()});
+        } else {
+          CHECK(placed.cpu == -1);
+          CHECK(after == before);
+          CHECK(placed.iowq_cpus.empty());
+        }
+        if (clean) {
+          CHECK(placed.pinned);
+          CHECK_FALSE(placed.priority.description.empty());
+        }
+      }
+      CHECK(clean);
+    }
+  }
 }
 
 TEST_CASE("place_current_reactor_thread never widens the worker's own affinity", "[rest_pool_plan]")
