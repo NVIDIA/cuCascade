@@ -515,6 +515,11 @@ detail::shared_services& rest_reactor::reactor_context::services() const
 // =================================================================================================
 
 struct rest_reactor::control_job {
+  /// Released with the job: a footer probe's budget reservation, set by the caller before the
+  /// job is posted (never touched by the worker).  Declared first, so it is destroyed last:
+  /// the response storage it accounts for (`result`) is freed before the credit returns.
+  std::shared_ptr<void> retained;
+
   enum class kind : std::uint8_t { head, probe, list, warm };
   kind k{kind::head};
   object_ref object;
@@ -537,10 +542,6 @@ struct rest_reactor::control_job {
 
   /// Called on the worker thread once the job is done (after `done` is published).
   std::function<void(std::shared_ptr<control_job> const&)> on_done;
-
-  /// Released with the job: a canceled footer probe's budget reservation, which must outlive the
-  /// exchange still filling `result` (set by the caller, never touched by the worker).
-  std::shared_ptr<void> retained;
 
   std::mutex m;
   std::condition_variable cv;
@@ -580,6 +581,8 @@ struct rest_reactor::intake {
   std::mutex control_mtx;
   std::deque<std::shared_ptr<control_job>> controls;
   std::atomic<bool> warm_requested{false};
+  /// A caller canceled control jobs that may be in flight: the worker aborts their exchanges.
+  std::atomic<bool> abort_requested{false};
   std::mutex warm_mtx;
   std::string warm_bucket;
 
@@ -590,6 +593,13 @@ struct rest_reactor::intake {
   }
 
   bool closed{false};  ///< guarded by control_mtx: no more control jobs are accepted
+
+  /// Ask the worker to abort the exchanges of canceled control jobs.  Never allocates.
+  void request_abort() noexcept
+  {
+    abort_requested.store(true, std::memory_order_release);
+    interrupt();
+  }
 
   bool take_control(std::shared_ptr<control_job>& out)
   {
@@ -825,6 +835,7 @@ class reactor_worker {
   void start_control(std::size_t index, std::shared_ptr<control_job> job);
   void maybe_warm();
   void maybe_upkeep();
+  void abort_canceled() noexcept;
 
   // ---- completion ----
   void process_completions();
@@ -1392,6 +1403,17 @@ void reactor_worker::start_control(std::size_t index, std::shared_ptr<control_jo
     job->error = std::current_exception();
     release_slot(index);
     complete_control(job);
+  }
+}
+
+void reactor_worker::abort_canceled() noexcept
+{
+  // A canceled control job still holds its slot (and, for a footer probe, its budget) until its
+  // exchange retires.  Without a request timeout that could be never: cut it short instead.
+  if (!_in.abort_requested.exchange(false, std::memory_order_acq_rel)) { return; }
+  for (std::size_t i = 0; i < _slots.size(); ++i) {
+    auto const& job = _slots[i].ctl;
+    if (job != nullptr && job->canceled.load(std::memory_order_acquire)) { _transport->abort(i); }
   }
 }
 
@@ -1967,6 +1989,7 @@ void reactor_worker::run(std::stop_token const& stop)
       wait();
       process_completions();
       if (_uring_wait && _transport->take_watch_events()) { drain_fd(_in.wakeup.get()); }
+      abort_canceled();
       collect_due_retries();
       poll_copies();
       maybe_warm();
@@ -2446,7 +2469,12 @@ struct footer_entry {
   std::size_t pos{0};
   footer_stage stage{footer_stage::pending};
   footer_kind kind{footer_kind::probe};
-  exec::admission_control::slot lease;
+  std::string path;  ///< the result's path, copied up front: delivery (recovery too) moves it
+  exec::admission_control::slot lease;  ///< acquired, not yet handed to `owner`
+  /// A posted probe's reservation, shared with its job (`control_job::retained`) before the job
+  /// is posted: a canceled entry drops its reference without allocating, and the job keeps the
+  /// bytes reserved until the exchange retires.
+  std::shared_ptr<leased_byte_storage> owner;
   std::shared_ptr<rest_reactor::control_job> job;
 };
 
@@ -2471,21 +2499,28 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
                                         std::stop_token stop)
 {
   std::size_t const window = _config.footer_probe_bytes;
+  // Everything a failed or canceled delivery needs is allocated here, before any work is
+  // issued, so recovery (after an allocation failure too) delivers every entry without
+  // allocating.
   std::vector<footer_entry> entries(paths.size());
   for (std::size_t i = 0; i < entries.size(); ++i) {
-    entries[i].pos = i;
+    entries[i].pos  = i;
+    entries[i].path = paths[i];
     // Single-probe parity: a zero window skips the suffix GET (no GET, no lease).
     if (window == 0) { entries[i].kind = footer_kind::head; }
   }
+  auto const canceled = canceled_exception("rest_reactor::resolve_footer_batch: canceled");
+  bool on_worker      = false;
 
   std::size_t undelivered = entries.size();
   std::size_t active      = 0;
   std::size_t next        = 0;
   std::exception_ptr callback_error;
 
-  auto deliver = [&](footer_entry& e, footer_resolve_result&& r) {
+  auto deliver = [&](footer_entry& e, footer_resolve_result&& r) noexcept {
     e.stage = footer_stage::done;
     e.job.reset();
+    e.owner.reset();
     --undelivered;
     try {
       on_result(std::move(r));
@@ -2494,48 +2529,52 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
       if (!callback_error) { callback_error = std::current_exception(); }
     }
   };
-  auto error_result = [&](footer_entry const& e, std::exception_ptr err) {
+  auto error_result = [&](footer_entry& e, std::exception_ptr err) noexcept {
     footer_resolve_result r;
     r.index = indices[e.pos];
-    r.path  = paths[e.pos];
+    r.path  = std::move(e.path);
     r.error = std::move(err);
     return r;
   };
-  auto fail_entry = [&](footer_entry& e, std::string const& what) {
+  // A finished job's reservation: its response storage is freed first, then the credit
+  // returns.  Only for a job the worker is done with.
+  auto release_finished = [](footer_entry& e, rest_reactor::control_job& job) noexcept {
+    std::vector<char>{}.swap(job.result.body);
+    if (e.owner != nullptr) { e.owner->lease = {}; }
+    e.owner.reset();
     e.lease = {};
+  };
+  auto fail_entry = [&](footer_entry& e, std::string const& what) {
     deliver(e,
             error_result(e,
                          std::make_exception_ptr(std::runtime_error(
                            "rest_reactor::resolve_footer_batch: " + what + " for " +
                            objects[e.pos].bucket + "/" + objects[e.pos].key))));
   };
-  auto cancel_remaining = [&] {
+  // Never allocates: every entry gets its callback even while allocation keeps failing.
+  auto cancel_remaining = [&]() noexcept {
+    bool in_flight = false;
     for (auto& e : entries) {
       if (e.stage == footer_stage::done) { continue; }
       if (e.job) {
+        // A posted probe keeps receiving into its job until the worker retires the exchange:
+        // the job holds the reservation (`retained`), so dropping the entry's reference does
+        // not hand the budget to another batch while those bytes are still held.
         e.job->canceled.store(true, std::memory_order_release);
-        // A probe in flight keeps receiving into its job until the worker retires the
-        // exchange: its reservation goes with the job, so the budget is not handed to another
-        // batch while those bytes are still held.
-        if (e.lease) {
-          try {
-            e.job->retained = std::make_shared<leased_byte_storage>(
-              budget, std::move(e.lease), std::vector<std::uint8_t>{});
-          } catch (...) {  // NOLINT(bugprone-empty-catch): released below instead
-          }
-        }
+        in_flight = true;
       }
       if (e.stage == footer_stage::active) { --active; }
       e.lease = {};
-      deliver(e,
-              error_result(e, canceled_exception("rest_reactor::resolve_footer_batch: canceled")));
+      deliver(e, error_result(e, canceled));
     }
+    // The worker aborts the canceled exchanges rather than wait for their timeout, which may be
+    // off (request_timeout_s = 0).  A private helper reaps them when it is destroyed.
+    if (in_flight && on_worker) { _intake->request_abort(); }
   };
 
   // Where the exchanges run: this reactor's worker when it runs, else a private helper (never
   // the caller's thread).  A helper that cannot start fails the batch cleanly.
   std::optional<private_driver> helper;
-  bool on_worker = false;
   if (!t_reactor_thread) {
     std::lock_guard lock(_enqueue_mutex);
     on_worker = _accepting;
@@ -2552,7 +2591,13 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
 
   auto mailbox = std::make_shared<footer_mailbox>();
   auto submit  = [&](footer_entry& e) {
-    auto job    = std::make_shared<control_job>();
+    auto job = std::make_shared<control_job>();
+    if (e.lease) {
+      // The job owns the reservation from before it is posted (see footer_entry::owner).
+      e.owner = std::make_shared<leased_byte_storage>(
+        budget, std::move(e.lease), std::vector<std::uint8_t>{});
+      job->retained = e.owner;
+    }
     job->k      = e.kind == footer_kind::probe ? control_job::kind::probe : control_job::kind::head;
     job->object = objects[e.pos];
     job->probe_bytes = window;
@@ -2586,11 +2631,12 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
   auto finish_probe = [&](footer_entry& e, control_job& job) {
     auto const failure = job.error ? std::string{} : control_failure(job);
     if (job.error) {
-      e.lease = {};
+      release_finished(e, job);
       deliver(e, error_result(e, job.error));
       return;
     }
     if (!failure.empty()) {
+      release_finished(e, job);
       fail_entry(e, failure);
       return;
     }
@@ -2598,7 +2644,6 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
     if (r.meta.status == 206 && verified_probe(r)) {
       footer_resolve_result out;
       out.index     = indices[e.pos];
-      out.path      = paths[e.pos];
       out.window_lo = static_cast<std::size_t>(r.meta.range->first);
       out.object =
         std::make_shared<rest_io_object>(paths[e.pos],
@@ -2606,20 +2651,26 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
                                          objects[e.pos].key,
                                          static_cast<std::size_t>(r.meta.range->complete),
                                          std::string(r.meta.etag.view()));
-      out.footer = make_leased_byte_span(
-        budget, std::move(e.lease), std::vector<std::uint8_t>(r.body.begin(), r.body.end()));
+      std::vector<std::uint8_t> bytes(r.body.begin(), r.body.end());
+      // The copy holds the reservation from here; the job's response is freed before that.
+      std::vector<char>{}.swap(r.body);
+      exec::admission_control::slot lease;
+      if (e.owner != nullptr) { lease = std::move(e.owner->lease); }
+      e.owner.reset();
+      out.footer = make_leased_byte_span(budget, std::move(lease), std::move(bytes));
+      out.path   = std::move(e.path);
       deliver(e, std::move(out));
       return;
     }
     if (r.meta.status == 206 || r.meta.status == 200 || r.meta.status == 416) {
       // Unusable probe: like the blocking path, fall back to a HEAD.  The body and the lease
       // are both returned first: a HEAD delivers no payload.
-      r.body  = {};
-      e.lease = {};
-      e.kind  = footer_kind::head;
+      release_finished(e, job);
+      e.kind = footer_kind::head;
       submit(e);
       return;
     }
+    release_finished(e, job);
     fail_entry(e, "HTTP " + std::to_string(r.meta.status));
   };
 
@@ -2640,13 +2691,13 @@ void rest_reactor::resolve_footer_batch(std::span<std::string const> paths,
       }
       footer_resolve_result out;
       out.index = indices[e.pos];
-      out.path  = paths[e.pos];
       out.object =
         std::make_shared<rest_io_object>(paths[e.pos],
                                          objects[e.pos].bucket,
                                          objects[e.pos].key,
                                          static_cast<std::size_t>(*r.meta.content_length),
                                          std::string(r.meta.etag.view()));
+      out.path = std::move(e.path);
       deliver(e, std::move(out));
       return;
     }

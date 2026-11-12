@@ -205,14 +205,22 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
   }
 
   // Parse up front; a bad scheme is a per-entry error (isolation), not a
-  // batch error.
+  // batch error.  Every path is copied here, once (into `valid_paths` or its parse error), and
+  // the cancellation error is built once: a cancel sweep then delivers each entry by moving,
+  // without allocating, so it completes even while allocation keeps failing.
+  struct parse_error {
+    std::size_t index;
+    std::string path;
+    std::exception_ptr error;
+  };
   std::vector<std::string> valid_paths;
   std::vector<object_ref> valid_objects;
   std::vector<std::size_t> valid_indices;
-  std::vector<std::pair<std::size_t, std::exception_ptr>> parse_errors;
+  std::vector<parse_error> parse_errors;
   valid_paths.reserve(paths.size());
   valid_objects.reserve(paths.size());
   valid_indices.reserve(paths.size());
+  parse_errors.reserve(paths.size());
   for (std::size_t i = 0; i < paths.size(); ++i) {
     try {
       auto parsed = cucascade::io::parse(paths[i]);
@@ -226,12 +234,17 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
     } catch (...) {
       // A malformed path joins bad-scheme paths as a per-entry error —
       // parsing must never cost the batch its exactly-once delivery.
-      parse_errors.emplace_back(i, std::current_exception());
+      parse_errors.push_back(parse_error{i, {}, std::current_exception()});
+      parse_errors.back().path = paths[i];
     }
   }
 
   std::exception_ptr callback_error;
-  auto deliver_guarded = [&](footer_resolve_result&& r) {
+  auto deliver_guarded = [&](std::size_t index, std::string&& path, std::exception_ptr error) {
+    footer_resolve_result r;
+    r.index = index;
+    r.path  = std::move(path);
+    r.error = std::move(error);
     try {
       on_result(std::move(r));
     } catch (...) {
@@ -240,10 +253,22 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
       if (!callback_error) { callback_error = std::current_exception(); }
     }
   };
-  auto canceled = [] {
-    return std::make_exception_ptr(
-      std::system_error(std::make_error_code(std::errc::operation_canceled),
-                        "rest_ioctx::resolve_footer_objects: canceled"));
+  std::exception_ptr canceled;
+  try {
+    canceled =
+      std::make_exception_ptr(std::system_error(std::make_error_code(std::errc::operation_canceled),
+                                                "rest_ioctx::resolve_footer_objects: canceled"));
+  } catch (...) {
+    canceled = std::current_exception();  // the allocation failure is the error delivered
+  }
+  // Every entry not yet delivered, as canceled (allocation-free).
+  auto cancel_from = [&](std::size_t parse_pos) {
+    for (std::size_t p = parse_pos; p < parse_errors.size(); ++p) {
+      deliver_guarded(parse_errors[p].index, std::move(parse_errors[p].path), canceled);
+    }
+    for (std::size_t v = 0; v < valid_indices.size(); ++v) {
+      deliver_guarded(valid_indices[v], std::move(valid_paths[v]), canceled);
+    }
   };
 
   // FIFO admission: one active batch per ioctx; the wait is stop-aware, so a
@@ -260,13 +285,7 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
       std::erase(_footer_resolve_queue, ticket);
       lk.unlock();
       _footer_resolve_cv.notify_all();
-      for (std::size_t i = 0; i < paths.size(); ++i) {
-        footer_resolve_result r;
-        r.index = i;
-        r.path  = paths[i];
-        r.error = canceled();
-        deliver_guarded(std::move(r));
-      }
+      cancel_from(0);
       if (callback_error) { std::rethrow_exception(callback_error); }
       return;
     }
@@ -291,27 +310,11 @@ void rest_ioctx::resolve_footer_objects(std::span<std::string const> paths,
   // exception is rethrown — same rule as the engine.
   std::size_t parse_pos = 0;
   for (; parse_pos < parse_errors.size() && !callback_error; ++parse_pos) {
-    footer_resolve_result r;
-    r.index = parse_errors[parse_pos].first;
-    r.path  = paths[parse_errors[parse_pos].first];
-    r.error = std::move(parse_errors[parse_pos].second);
-    deliver_guarded(std::move(r));
+    auto& e = parse_errors[parse_pos];
+    deliver_guarded(e.index, std::move(e.path), std::move(e.error));
   }
   if (callback_error) {
-    for (std::size_t p = parse_pos; p < parse_errors.size(); ++p) {
-      footer_resolve_result r;
-      r.index = parse_errors[p].first;
-      r.path  = paths[parse_errors[p].first];
-      r.error = canceled();
-      deliver_guarded(std::move(r));
-    }
-    for (std::size_t v = 0; v < valid_indices.size(); ++v) {
-      footer_resolve_result r;
-      r.index = valid_indices[v];
-      r.path  = valid_paths[v];
-      r.error = canceled();
-      deliver_guarded(std::move(r));
-    }
+    cancel_from(parse_pos);
     std::rethrow_exception(callback_error);
   }
 

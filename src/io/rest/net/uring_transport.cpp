@@ -263,6 +263,7 @@ struct uring_transport::connection {
   op cur{op::none};
   phase ph{phase::idle};
   std::error_code timeout_ec{};
+  bool abort_requested{false};  ///< abort(): fail the exchange with operation_canceled
 
   // ---- time ----
   clock_type::time_point idle_since{};
@@ -428,6 +429,7 @@ int uring_transport::timeout_ms() const noexcept
   auto const now = clock_type::now();
   for (auto const& p : _slots) {
     auto const& c = *p;
+    if (c.abort_requested && (c.ph == phase::dns || (c.pending && !c.canceling))) { return 0; }
     if (c.ph == phase::dns && !c.pending) {
       consider(now + std::chrono::milliseconds{1});  // the first answer is on its way
       continue;
@@ -568,6 +570,10 @@ void uring_transport::check_deadlines()
   auto const now = clock_type::now();
   for (std::size_t i = 0; i < _slots.size(); ++i) {
     auto& c = *_slots[i];
+    if (c.abort_requested && c.ph == phase::dns && !c.pending) {
+      finish(i, std::make_error_code(std::errc::operation_canceled));
+      continue;
+    }
     if (c.ph == phase::dns && !c.pending) {
       if ((c.connect_deadline && now >= *c.connect_deadline) ||
           (c.exchange_deadline && now >= *c.exchange_deadline)) {
@@ -579,6 +585,11 @@ void uring_transport::check_deadlines()
       continue;
     }
     if (!c.pending || c.canceling) { continue; }
+    if (c.abort_requested) {
+      c.timeout_ec = std::make_error_code(std::errc::operation_canceled);
+      cancel(i);
+      continue;
+    }
     if (c.connect_deadline && now >= *c.connect_deadline) {
       ++_ctr.timeouts;
       c.timeout_ec = make_error_code(errc::connect_timeout);
@@ -681,6 +692,12 @@ io_uring_sqe* uring_transport::sqe(std::uint64_t id)
   }
   io_uring_sqe_set_data64(entry, id);
   return entry;
+}
+
+void uring_transport::abort(std::size_t slot) noexcept
+{
+  if (slot >= _slots.size() || !busy(slot)) { return; }
+  _slots[slot]->abort_requested = true;
 }
 
 void uring_transport::cancel(std::size_t index)
@@ -1581,8 +1598,9 @@ void uring_transport::finish(std::size_t index, std::error_code ec)
   c.idle_since = clock_type::now();
   c.connect_deadline.reset();
   c.exchange_deadline.reset();
-  c.stall_on  = false;
-  c.canceling = false;
+  c.stall_on        = false;
+  c.canceling       = false;
+  c.abort_requested = false;
   c.timeout_ec.clear();
   c.ph  = phase::idle;
   c.cur = op::none;

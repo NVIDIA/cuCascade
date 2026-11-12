@@ -348,6 +348,10 @@ class uring_transport {
   void warmup(std::string const& url);
   /// Close the idle connection of @p slot now (no-op while busy).
   void close_idle(std::size_t slot) noexcept;
+  /// Fail @p slot's exchange with `std::errc::operation_canceled` on the next poll(): its
+  /// in-flight operation is cancelled as on a deadline, and the connection is closed.  For an
+  /// exchange whose caller gave up, whatever its timeout (none, or a long one).  No-op when idle.
+  void abort(std::size_t slot) noexcept;
   /// When @p slot's idle connection was last used (time_point{} = never).
   [[nodiscard]] std::chrono::steady_clock::time_point idle_since(std::size_t slot) const noexcept;
 
