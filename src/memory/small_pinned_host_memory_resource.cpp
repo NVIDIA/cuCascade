@@ -20,6 +20,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdlib>
+#include <iterator>
 #include <stdexcept>
 
 namespace cucascade {
@@ -164,9 +165,16 @@ void* small_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda::strea
 
   std::size_t idx = slab_index_for(bytes);
   std::lock_guard<std::mutex> lock(mutex_);
-  if (free_lists_[idx].empty()) { expand_pool_locked(idx); }
-  free_slab slab = free_lists_[idx].back();
-  free_lists_[idx].pop_back();
+  auto& free_list = free_lists_[idx];
+  if (free_list.empty()) { expand_pool_locked(idx); }
+  // Prefer a slab with no pending GPU use. Always taking the most recently
+  // freed slab makes this stream wait on whatever the freeing stream still has
+  // queued, possibly on another GPU, while older free slabs sit idle.
+  auto const chosen = select_slab_locked(free_list);
+  free_slab slab    = *chosen;
+  // Erasing keeps the list in the order slabs were freed, and shifts only the
+  // pending slabs the search already passed.
+  free_list.erase(chosen);
   // If this slab was recently deallocated, its ready_event captures the freeing
   // stream's last use (e.g. an in-flight async H2D copy still reading the slab).
   // Make the reusing stream wait for it so we cannot overwrite the slab before
@@ -179,7 +187,7 @@ void* small_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda::strea
     if (wait_status != cudaSuccess) {
       // The wait was not established, so returning this pointer would recreate
       // the unordered-reuse race. Keep the slab tracked and propagate the error.
-      free_lists_[idx].push_back(slab);
+      free_list.push_back(slab);
       CUCASCADE_CUDA_TRY(wait_status);
     }
     release_event_locked(slab.ready_event, slab.event_device);
@@ -241,6 +249,32 @@ std::size_t small_pinned_host_memory_resource::slab_index_for(std::size_t bytes)
     if (bytes <= SLAB_SIZES[i]) { return i; }
   }
   return SLAB_SIZES.size() - 1;
+}
+
+std::vector<small_pinned_host_memory_resource::free_slab>::iterator
+small_pinned_host_memory_resource::select_slab_locked(std::vector<free_slab>& free_list)
+{
+  // Search newest first, so the slab found is the most recently used one whose
+  // work has finished. Slabs a pool expansion just added sit at the back and
+  // carry no event to query.
+  std::size_t queries = 0;
+  for (auto candidate = free_list.end(); candidate != free_list.begin();) {
+    --candidate;
+    if (candidate->ready_event == nullptr) { return candidate; }
+    // Each query is a driver call made under the mutex every device shares, and
+    // a stream stalled behind long GPU work can leave a long run of pending
+    // slabs that each allocation would otherwise search past.
+    if (queries == MAX_READINESS_QUERIES) { break; }
+    ++queries;
+    cudaError_t const status = ::cudaEventQuery(candidate->ready_event);
+    if (status == cudaSuccess) { return candidate; }
+    // Nothing has left the list, so a failed query loses neither the slab nor
+    // its event. cudaErrorNotReady only means the slab is still in use.
+    if (status != cudaErrorNotReady) { CUCASCADE_CUDA_TRY(status); }
+  }
+  // No slab within reach is ready: fall back to the most recently freed one,
+  // which the caller orders behind its event.
+  return std::prev(free_list.end());
 }
 
 void small_pinned_host_memory_resource::expand_pool_locked(std::size_t slab_idx)
