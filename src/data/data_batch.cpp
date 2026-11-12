@@ -381,13 +381,13 @@ read_only_data_batch::~read_only_data_batch()
   }
 }
 
-std::shared_ptr<data_batch> data_batch::clone(
-  uint64_t new_batch_id, ::cuda::stream_ref stream, std::unique_ptr<idata_batch_probe> probe) const
+std::shared_ptr<data_batch> data_batch::clone(uint64_t new_batch_id,
+                                              ::cuda::stream_ref stream,
+                                              std::unique_ptr<idata_batch_probe> probe) const
 {
   if (_data == nullptr) { throw std::runtime_error("Cannot clone: data is null"); }
-  return clone_impl(new_batch_id, get_memory_space(), std::move(probe), [&] {
-    return _data->clone(stream);
-  });
+  return clone_impl(
+    new_batch_id, get_memory_space(), std::move(probe), [&] { return _data->clone(stream); });
 }
 
 std::shared_ptr<data_batch> read_only_data_batch::clone(
