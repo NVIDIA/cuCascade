@@ -50,6 +50,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <random>
 #include <span>
@@ -771,4 +772,185 @@ TEST_CASE("host row-range reader: exhausted source and bad requests", "[row_rang
       detail::read_rows_host(*src.gpu, request, dests, shared_stream(), nullptr, nullptr),
       std::invalid_argument);
   }
+}
+
+TEST_CASE("host row-range reader: the tightest column sets the window", "[row_range_reader_host]")
+{
+  const auto& src             = source();
+  const std::size_t columns[] = {kInt64Nulls, kString32Nulls};
+  const std::size_t row_begin = 123;
+
+  SECTION("fixed-width data budget limits the STRING column too")
+  {
+    dst_spec spec;
+    spec.data_bytes = 40 * 8;
+    spec.mask_bytes = 64;
+    auto fixed      = make_dst(src.columns[kInt64Nulls], spec);
+    auto str        = make_roomy_dst(src.columns[kString32Nulls], 200, true);
+    std::vector<column_destination> dests{fixed.dest, str.dest};
+
+    const auto result = read(columns, row_begin, 200, dests);
+    REQUIRE(result.rows_written == 40);
+    REQUIRE(
+      result.data_bytes_written ==
+      std::vector<std::size_t>{40 * 8, src.columns[kString32Nulls].chars_bytes(row_begin, 40)});
+    verify_read(src.columns[kInt64Nulls], fixed, row_begin, 40, 0, 0);
+    verify_read(src.columns[kString32Nulls], str, row_begin, 40, 0, 0);
+  }
+
+  SECTION("STRING chars budget limits the fixed-width column too")
+  {
+    const auto& col = src.columns[kString32Nulls];
+    // Rows that fit in 300 chars bytes.
+    std::size_t fit = 0;
+    while (col.chars_bytes(row_begin, fit + 1) <= 300) {
+      ++fit;
+    }
+    REQUIRE(fit > 0);
+    REQUIRE(fit < 200);
+    auto fixed = make_roomy_dst(src.columns[kInt64Nulls], 200, true);
+    dst_spec spec;
+    spec.data_bytes    = 300;
+    spec.offsets_bytes = 4 * 300;
+    spec.mask_bytes    = 64;
+    auto str           = make_dst(col, spec);
+    std::vector<column_destination> dests{fixed.dest, str.dest};
+
+    const auto result = read(columns, row_begin, 200, dests);
+    REQUIRE(result.rows_written == fit);
+    REQUIRE_FALSE(result.source_exhausted);
+    verify_read(src.columns[kInt64Nulls], fixed, row_begin, fit, 0, 0);
+    verify_read(col, str, row_begin, fit, 0, 0);
+  }
+}
+
+TEST_CASE("host row-range reader: STRING range with no chars", "[row_range_reader_host]")
+{
+  const auto& src = source();
+  const auto& col = src.columns[kString32Nulls];
+  // A null row: its string is empty, so the range carries no chars bytes.
+  std::size_t row_begin = 0;
+  while (!col.strings[row_begin].empty()) {
+    ++row_begin;
+  }
+
+  // The chars buffer is already full at dst_byte_offset; an empty row still fits.
+  dst_spec spec;
+  spec.dst_row_offset  = 4;
+  spec.dst_byte_offset = 5;
+  spec.data_bytes      = 5;
+  spec.offsets_bytes   = (4 + 1 + 1) * 4;
+  spec.mask_bytes      = 4;
+  auto d               = make_dst(col, spec);
+
+  const auto result = read_one(kString32Nulls, row_begin, 1, d);
+  REQUIRE(result.rows_written == 1);
+  REQUIRE(result.data_bytes_written.at(0) == 0);
+  verify_read(col, d, row_begin, 1, 4, 5);
+}
+
+TEST_CASE("host row-range reader: 4-byte destination offsets overflow", "[row_range_reader_host]")
+{
+  const auto& src = source();
+  const auto& col = src.columns[kString64];
+  // Rebased offsets start just below INT32_MAX; the range's chars push them past it.
+  const std::size_t dst_byte_offset =
+    static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) - 10;
+  const std::size_t rows = 50;
+  REQUIRE(col.chars_bytes(0, rows) > 10);
+
+  rmm::device_buffer data(dst_byte_offset + rows * kMaxStringBytes, shared_stream());
+  const std::uint8_t offset_width = GENERATE(std::uint8_t{4}, std::uint8_t{8});
+  auto offsets                    = filled_buffer((rows + 1) * offset_width);
+
+  column_destination dest;
+  dest.type_id                = static_cast<std::int32_t>(cudf::type_id::STRING);
+  dest.data                   = {data.data(), data.size()};
+  dest.offsets                = {offsets.data(), offsets.size()};
+  dest.offset_width           = offset_width;
+  dest.dst_byte_offset        = dst_byte_offset;
+  const std::size_t columns[] = {kString64};
+
+  if (offset_width == 4) {
+    REQUIRE_THROWS_AS(read(columns, 0, rows, std::span<column_destination>{&dest, 1}),
+                      std::overflow_error);
+    shared_stream().sync();
+    const auto host_offsets = to_host(offsets);
+    REQUIRE(all_fill(host_offsets, 0, host_offsets.size()));
+  } else {
+    const auto result = read(columns, 0, rows, std::span<column_destination>{&dest, 1});
+    REQUIRE(result.rows_written == rows);
+    shared_stream().sync();
+    const auto host_offsets = to_host(offsets);
+    std::vector<std::int64_t> values(rows + 1);
+    std::memcpy(values.data(), host_offsets.data(), values.size() * sizeof(std::int64_t));
+    std::size_t byte = dst_byte_offset;
+    for (std::size_t i = 0; i <= rows; ++i) {
+      REQUIRE(values[i] == static_cast<std::int64_t>(byte));
+      if (i < rows) { byte += col.strings[i].size(); }
+    }
+    std::string chars(col.chars_bytes(0, rows), '\0');
+    CUCASCADE_CUDA_TRY(cudaMemcpy(chars.data(),
+                                  static_cast<const std::uint8_t*>(data.data()) + dst_byte_offset,
+                                  chars.size(),
+                                  cudaMemcpyDeviceToHost));
+    std::string expected;
+    for (std::size_t i = 0; i < rows; ++i) {
+      expected += col.strings[i];
+    }
+    REQUIRE(chars == expected);
+  }
+}
+
+TEST_CASE("host row-range reader: temporaries from a scratch reservation",
+          "[row_range_reader_host]")
+{
+  const auto& src             = source();
+  auto reservation            = shared_gpu_space()->make_reservation(std::size_t{1} << 20);
+  const std::size_t columns[] = {kInt8Nulls, kString32Nulls, kString64};
+  std::vector<dst_column> dsts;
+  dsts.push_back(make_roomy_dst(src.columns[kInt8Nulls], 333, true, 4, 7));
+  dsts.push_back(make_roomy_dst(src.columns[kString32Nulls], 333, true, 8, 7, 3));
+  dsts.push_back(make_roomy_dst(src.columns[kString64], 333, true, 4, 7, 3));
+  std::vector<column_destination> dests{dsts[0].dest, dsts[1].dest, dsts[2].dest};
+
+  row_range_request request;
+  request.columns   = columns;
+  request.row_begin = 600;
+  request.max_rows  = 333;
+  const auto result =
+    detail::read_rows_host(*src.host, request, dests, shared_stream(), reservation.get(), nullptr);
+  REQUIRE(result.rows_written == 333);
+  verify_read(src.columns[kInt8Nulls], dsts[0], 600, 333, 7, 0);
+  verify_read(src.columns[kString32Nulls], dsts[1], 600, 333, 7, 3);
+  verify_read(src.columns[kString64], dsts[2], 600, 333, 7, 3);
+}
+
+TEST_CASE("host row-range reader: empty source", "[row_range_reader_host]")
+{
+  auto stream = shared_stream();
+  std::vector<std::unique_ptr<cudf::column>> cudf_columns;
+  cudf_columns.push_back(cudf::test::fixed_width_column_wrapper<std::int32_t>{}.release());
+  cudf_columns.push_back(cudf::test::strings_column_wrapper{}.release());
+  CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
+  gpu_table_representation gpu(
+    std::make_unique<cudf::table>(std::move(cudf_columns)), *shared_gpu_space(), stream);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  auto host = registry.convert<host_data_representation>(gpu, shared_host_space().get(), stream);
+  stream.sync();
+
+  const auto& src = source();
+  auto fixed      = make_roomy_dst(src.columns[kInt32], 4, true);
+  auto str        = make_roomy_dst(src.columns[kString32Nulls], 4, true);
+  std::vector<column_destination> dests{fixed.dest, str.dest};
+  const std::size_t columns[] = {0, 1};
+  row_range_request request;
+  request.columns   = columns;
+  request.max_rows  = 4;
+  const auto result = detail::read_rows_host(*host, request, dests, stream, nullptr, nullptr);
+  REQUIRE(result.rows_written == 0);
+  REQUIRE(result.source_exhausted);
+  verify_read(src.columns[kInt32], fixed, 0, 0, 0, 0);
+  verify_read(src.columns[kString32Nulls], str, 0, 0, 0, 0);
 }
