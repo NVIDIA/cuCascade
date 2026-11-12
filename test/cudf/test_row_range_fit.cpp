@@ -496,8 +496,11 @@ TEST_CASE("fit_rows matches a brute-force reference on random inputs", "[row_ran
           len = static_cast<std::int64_t>(uniform(0, 1) == 1 ? 0 : uniform(0, 20));
         }
         s.offsets = make_offsets(lengths, static_cast<std::int64_t>(uniform(0, 50)));
-        s.dst     = make_string_dst(uniform(0, 600), uniform(0, 100 * s.width), uniform(0, 40),
-                                    uniform(0, 60), static_cast<std::uint8_t>(s.width));
+        s.dst     = make_string_dst(uniform(0, 600),
+                                uniform(0, 100 * s.width),
+                                uniform(0, 40),
+                                uniform(0, 60),
+                                static_cast<std::uint8_t>(s.width));
       } else {
         s.dst = make_fixed_dst(uniform(0, 100 * s.width), uniform(0, 40));
       }
