@@ -179,7 +179,8 @@ row_range_result read_rows_gpu(const idata_representation& source,
     if (fit[i].is_string) {
       const auto& off        = offsets[i];
       const auto chars_begin = off.at(request.row_begin);
-      const auto chars_bytes = static_cast<std::size_t>(off.at(request.row_begin + k) - chars_begin);
+      const auto chars_bytes =
+        static_cast<std::size_t>(off.at(request.row_begin + k) - chars_begin);
       if (chars_bytes > 0) {
         CUCASCADE_CUDA_TRY(
           cudaMemcpyAsync(static_cast<std::uint8_t*>(out.data.data) + out.dst_byte_offset,
