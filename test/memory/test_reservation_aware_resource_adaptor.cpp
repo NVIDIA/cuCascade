@@ -51,10 +51,12 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace cucascade::memory;
@@ -425,4 +427,64 @@ TEST_CASE("A failed allocation past a device reservation leaves the charged byte
   mr->deallocate(stream, ptr, chunk, 256);
   mr->reset_stream_reservation(stream);
   CHECK(mr->get_total_allocated_bytes() == baseline);
+}
+
+TEST_CASE("Growing a device reservation while another thread allocates past it keeps the charges",
+          "[reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t reserved   = chunk;
+  constexpr std::size_t alloc_size = 32 * chunk;
+  constexpr std::size_t grow_step  = 4096;
+  constexpr int max_grows          = 12288;  // 48 chunks, less than the two allocations
+  constexpr int rounds             = 500;
+  auto memory                      = make_gpu_memory(256 * chunk);
+  auto* mr                         = gpu_adaptor(*memory);
+  REQUIRE(mr != nullptr);
+  auto const baseline = mr->get_total_allocated_bytes();
+
+  rmm::cuda_stream stream;
+  reserved_arena* arena = nullptr;
+  REQUIRE(mr->attach_reservation_to_tracker(
+    stream,
+    memory->request_reservation(specific_memory_space{Tier::GPU, 0}, reserved),
+    std::make_unique<capture_arena_policy>(&arena)));
+
+  // Hand the test the arena before the threads start.
+  mr->deallocate(stream, mr->allocate(stream, 2 * chunk, 256), 2 * chunk, 256);
+  REQUIRE(arena != nullptr);
+
+  // The two allocations together always end past the reservation, and the first one crosses its
+  // end until the reservation has grown past it.
+  std::atomic<bool> allocator_done{false};
+  int grows = 0;
+  // A copy, since the policy writes arena again on every allocation past the end.
+  std::thread grower([&, target = arena]() {
+    while (!allocator_done.load() && grows < max_grows) {
+      if (target->grow_by(grow_step)) { ++grows; }
+      std::this_thread::yield();
+    }
+  });
+  std::thread allocator([&]() {
+    for (int i = 0; i < rounds; ++i) {
+      void* first  = mr->allocate(stream, alloc_size, 256);
+      void* second = mr->allocate(stream, alloc_size, 256);
+      mr->deallocate(stream, first, alloc_size, 256);
+      mr->deallocate(stream, second, alloc_size, 256);
+    }
+    allocator_done.store(true);
+  });
+  allocator.join();
+  grower.join();
+  stream.synchronize();
+
+  REQUIRE(grows > 0);
+  auto const grown = reserved + static_cast<std::size_t>(grows) * grow_step;
+  CHECK(arena->size() == static_cast<std::int64_t>(grown));
+  CHECK(mr->get_total_allocated_bytes() == baseline + grown);  // the reservation stays charged
+
+  mr->reset_stream_reservation(stream);
+  CHECK(mr->get_total_allocated_bytes() == baseline);
+  CHECK(mr->get_total_reserved_bytes() == 0);
 }
