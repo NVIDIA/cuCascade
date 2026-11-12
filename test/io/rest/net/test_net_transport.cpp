@@ -438,6 +438,17 @@ TEST_CASE("net: parse_url splits scheme, authority, port and target", "[rest][ne
   CHECK(c.target == "/b?list-type=2");
   auto const d = net::parse_url("http://host?q=1");
   CHECK(d.target == "/?q=1");
+  // The authority is kept as written (it is the Host fallback); the port is parsed for the
+  // connection only.
+  auto const e = net::parse_url("https://h.example:0443/k");
+  CHECK(e.port == 443);
+  CHECK(e.authority == "h.example:0443");
+  CHECK(e.origin() == net::parse_url("https://h.example/k").origin());
+  auto const f = net::parse_url("https://h.example:443/k");
+  CHECK(f.authority == "h.example:443");
+  auto const g = net::parse_url("http://[::1]:08443/k");
+  CHECK(g.port == 8443);
+  CHECK(g.authority == "[::1]:08443");
   CHECK(a.origin() != net::parse_url("http://bucket.s3.amazonaws.com/").origin());
   CHECK_THROWS_AS(net::parse_url("s3://bucket/key"), std::invalid_argument);
   CHECK_THROWS_AS(net::parse_url("http://user@host/"), std::invalid_argument);
@@ -783,6 +794,41 @@ TEST_CASE("net: the caller's Host is sent verbatim and once, in place of the URL
       auto const lines = get(req.headers);
       REQUIRE(lines.size() == 1);
       CHECK(lines[0] == "Host: " + signed_host);
+    }
+  }
+  SECTION("the SigV4 presigned authorizer: the Host sent is the URL authority it signed")
+  {
+    rest::s3::static_credentials creds;
+    creds.access_key_id     = "AKIAIOSFODNN7EXAMPLE";
+    creds.secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    // The presigned URL is the endpoint authority (the signed host) plus the signed path and
+    // query, and it carries no Host header: the transport's fallback must keep that spelling.
+    auto const port = net::parse_url(server.url()).port;
+    for (auto const& authority :
+         {"127.0.0.1:0" + std::to_string(port), "127.0.0.1:00" + std::to_string(port)}) {
+      rest::s3::sigv4_presigned_authorizer auth{creds, "us-east-1", "http://" + authority};
+      auto const req = auth.authorize({"bucket", "key"}, rest::request_method::GET, 60s);
+      REQUIRE(req.url.starts_with("http://" + authority + "/"));
+      for (auto const& [name, value] : req.headers) {
+        CHECK_FALSE(name == "Host");
+      }
+      net::exchange x;
+      x.url        = req.url;
+      auto const r = run_exchange(t, std::move(x));
+      REQUIRE_FALSE(r.ec);
+      auto const lines = host_lines();
+      REQUIRE(lines.size() == 1);
+      CHECK(lines[0] == "Host: " + authority);
+    }
+    // A zero-prefixed default port is not the default-port spelling the parser drops: it stays
+    // in the signed URL, and the Host fallback keeps it (no server listens on 443 here).
+    for (char const* endpoint : {"https://store.example:0443", "http://store.example:080"}) {
+      rest::s3::sigv4_presigned_authorizer auth{creds, "us-east-1", endpoint};
+      auto const req    = auth.authorize({"bucket", "key"}, rest::request_method::GET, 60s);
+      auto const parsed = net::parse_url(req.url);
+      CHECK(req.url.starts_with(std::string(endpoint) + "/"));
+      CHECK(parsed.port == (parsed.tls ? 443 : 80));
+      CHECK(parsed.authority == std::string(endpoint).substr(std::string(endpoint).find("//") + 2));
     }
   }
   t.shutdown();

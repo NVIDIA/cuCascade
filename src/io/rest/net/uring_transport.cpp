@@ -163,10 +163,10 @@ url_parts parse_url(std::string_view url)
   if (out.host.empty() || target.find_first_of("\r\n ") != std::string::npos) {
     throw std::invalid_argument("rest transport: invalid HTTP authority or target");
   }
-  bool const v6 = out.host.find(':') != std::string::npos;
-  out.authority = v6 ? "[" + out.host + "]" : out.host;
-  if (out.port != default_port) { out.authority += ":" + std::to_string(out.port); }
-  out.target = std::move(target);
+  // The Host fallback is the authority as written, never re-spelled from the parsed port: a
+  // presigned URL signs its own spelling (`:0443`, `:08443`), and only that one verifies.
+  out.authority = std::string(authority);
+  out.target    = std::move(target);
   return out;
 }
 
@@ -996,8 +996,8 @@ void uring_transport::start_exchange(std::size_t index)
   }
 
   // Request head.  Host is the caller's (authorizer's) value when it has one: it is what a
-  // header signature covers, and may keep a port the URL authority drops (an explicit default
-  // port).  Otherwise the URL's authority.  Exactly one Host line either way.
+  // header signature covers.  Otherwise the URL's authority as written, which is what a
+  // presigned URL signs.  Exactly one Host line either way.
   if (c.head.size() != head_bytes) { c.head.resize(head_bytes); }
   http::request_head h{std::span<char>{c.head.data(), c.head.size()}};
   std::string_view host = c.remote.authority;

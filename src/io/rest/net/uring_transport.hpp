@@ -109,8 +109,9 @@ struct url_parts {
   bool tls{true};
   std::string host;  ///< without IPv6 brackets
   std::uint16_t port{443};
-  /// Host header value (port only when not the scheme default), unless the exchange's headers
-  /// carry a Host of their own.
+  /// Host header value, unless the exchange's headers carry a Host of their own: the URL's
+  /// authority exactly as written (a port is kept as spelled, default or zero-prefixed), so a
+  /// presigned URL's signed host is the one sent.  `host` / `port` only select the connection.
   std::string authority;
   std::string target;  ///< path and query, never empty
   /// Pool key: scheme, host and port.
