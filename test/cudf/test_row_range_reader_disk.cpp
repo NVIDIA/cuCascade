@@ -1015,3 +1015,104 @@ TEST_CASE("disk row-range reader gives the same result with an explicit io backe
     CHECK(same_offsets);
   }
 }
+
+//===----------------------------------------------------------------------===//
+// 8. Edge cases: null-mask budget, empty windows, wrong source
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("disk row-range reader edge cases", "[row_range_reader_disk]")
+{
+  constexpr std::size_t num_rows = 700;
+  const auto src                 = make_source(num_rows);
+
+  SECTION("null-mask capacity limits the rows")
+  {
+    // One mask word with the append position at bit 5: 27 rows fit (rule 1, null-mask term).
+    constexpr std::size_t row_begin      = 19;
+    constexpr std::size_t dst_row_offset = 5;
+    const auto c                         = GENERATE(col_int32, col_string);
+    CAPTURE(c);
+    const std::vector<std::size_t> columns{c};
+    auto s          = make_roomy_slot(src.columns[c], row_begin, 200, dst_row_offset);
+    s.mask          = device_filled(sizeof(std::uint32_t), default_fill);
+    s.dst.null_mask = device_buffer_slot{s.mask.data(), s.mask.size()};
+    std::vector<slot> slots;
+    slots.push_back(std::move(s));
+
+    const auto result = read_rows(src, columns, slots, row_begin, 200);
+    REQUIRE(result.rows_written == 32 - dst_row_offset);
+    REQUIRE_FALSE(result.source_exhausted);
+    check_read(src, columns, slots, result, row_begin, 32 - dst_row_offset);
+  }
+
+  SECTION("a window of empty strings writes offsets but no chars")
+  {
+    // Row 5 is empty in every STRING column (every fifth row is).
+    constexpr std::size_t row_begin       = 5;
+    constexpr std::size_t dst_row_offset  = 3;
+    constexpr std::size_t dst_byte_offset = 13;
+    const std::vector<std::size_t> columns{col_string, col_string_all};
+    REQUIRE(src.columns[col_string].chars_bytes(row_begin, 1) == 0);
+    REQUIRE(src.columns[col_string_all].chars_bytes(row_begin, 1) == 0);
+    std::vector<slot> slots;
+    for (const auto c : columns) {
+      slots.push_back(
+        make_roomy_slot(src.columns[c], row_begin, 1, dst_row_offset, dst_byte_offset, 8));
+    }
+    const auto result = read_rows(src, columns, slots, row_begin, 1);
+    REQUIRE(result.rows_written == 1);
+    CHECK(result.data_bytes_written == std::vector<std::size_t>{0, 0});
+    check_read(src, columns, slots, result, row_begin, 1);
+  }
+
+  SECTION("max_rows == 0 delivers nothing and does not exhaust the source")
+  {
+    const std::vector<std::size_t> columns{col_int16, col_string, col_int64};
+    std::vector<slot> slots;
+    for (const auto c : columns) {
+      slots.push_back(make_roomy_slot(src.columns[c], 50, 10));
+    }
+    const auto result = read_rows(src, columns, slots, 50, 0);
+    REQUIRE(result.rows_written == 0);
+    REQUIRE_FALSE(result.source_exhausted);
+    check_read(src, columns, slots, result, 50, 0);
+  }
+
+  SECTION("a fixed-width-only read of the whole table")
+  {
+    const std::vector<std::size_t> columns{col_int8, col_int16, col_int32, col_int64, col_bool8};
+    std::vector<slot> slots;
+    for (const auto c : columns) {
+      slots.push_back(make_roomy_slot(src.columns[c], 0, num_rows));
+    }
+    const auto result = read_rows(src, columns, slots, 0, num_rows + 50);
+    REQUIRE(result.source_exhausted);
+    check_read(src, columns, slots, result, 0, num_rows);
+  }
+
+  SECTION("a source that is not a disk representation is refused")
+  {
+    const auto col = make_fixed_column(cudf::type_id::INT32, 4, 10, false, 5);
+    std::vector<std::unique_ptr<cudf::column>> cudf_columns;
+    cudf_columns.push_back(to_cudf_column(col, 10));
+    gpu_table_representation gpu_rep(
+      std::make_unique<cudf::table>(std::move(cudf_columns)), *shared_gpu_space(), shared_stream());
+
+    std::vector<slot> slots;
+    slots.push_back(make_roomy_slot(col, 0, 10));
+    std::vector<column_destination> dst{slots[0].dst};
+    const std::vector<std::size_t> columns{0};
+    row_range_request request;
+    request.columns   = std::span<const std::size_t>(columns);
+    request.row_begin = 0;
+    request.max_rows  = 10;
+    REQUIRE_THROWS_AS(detail::read_rows_disk(gpu_rep,
+                                             request,
+                                             std::span<column_destination>(dst),
+                                             shared_stream(),
+                                             nullptr,
+                                             nullptr,
+                                             nullptr),
+                      std::invalid_argument);
+  }
+}
