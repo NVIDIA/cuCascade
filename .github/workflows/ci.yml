@@ -83,3 +83,16 @@ jobs:
         run: tar -xf build-release.tar
 
       - run: pixi run -e ${{ format('cuda-{0}-{1}', matrix.cuda, matrix.rapids) }} test
+
+  check:
+    runs-on: ubuntu-slim
+    needs: [lint, build, test]
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: All checks ok
+        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' && needs.test.result == 'success' }}
+        run: exit 0
+      - name: Some checks failed
+        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success' && needs.test.result == 'success') }}
+        run: exit 1
