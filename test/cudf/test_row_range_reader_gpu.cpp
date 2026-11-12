@@ -64,12 +64,12 @@ constexpr std::size_t kStringCol = 3;
 
 ::cuda::stream_ref default_stream() { return ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}; }
 
-/// A GPU memory space on device 0. mock_test_utils.hpp cannot be included next to
+/// A GPU memory space on device @p device_id. mock_test_utils.hpp cannot be included next to
 /// mixed_table.hpp (its unqualified `cuda::mr` then resolves to cucascade::cuda).
-std::shared_ptr<memory::memory_space> make_gpu_space()
+std::shared_ptr<memory::memory_space> make_gpu_space(int device_id = 0)
 {
   memory::gpu_memory_space_config config;
-  config.device_id       = 0;
+  config.device_id       = device_id;
   config.memory_capacity = 1024 * 1024 * 1024;
   config.mr_factory_fn   = [](int, std::size_t) {
     return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}};
@@ -811,4 +811,89 @@ TEST_CASE("read_rows_gpu edge cases", "[row_range_reader_gpu]")
     REQUIRE(to_host<std::uint32_t>(str.offsets)[0] == 0x01010101U * kFill);
     REQUIRE(to_host<std::uint32_t>(str.mask)[0] == 0x01010101U * kFill);
   }
+}
+
+TEST_CASE("read_rows_gpu reads only the offsets it needs", "[row_range_reader_gpu]")
+{
+  // More rows than the first offsets chunk (1024), so the chunked host read grows several times.
+  constexpr std::size_t kRows = 20000;
+  auto space                  = make_gpu_space();
+  const auto data             = make_source_data(kRows);
+  const bool wide_source      = GENERATE(false, true);
+  CAPTURE(wide_source);
+  gpu_table_representation source(make_table(data, false, wide_source), *space, default_stream());
+  const std::vector<std::size_t> columns{kStringCol};
+
+  SECTION("a huge max_rows with a chars slot that binds past the first chunk")
+  {
+    constexpr std::size_t kRowBegin = 100;
+    constexpr std::size_t kFit      = 5000;
+    REQUIRE(!data.str[kRowBegin + kFit].empty());
+    const std::size_t capacity = chars_bytes(data, kRowBegin, kRowBegin + kFit + 1, false) - 1;
+    dest_buffers str{filled_buffer(capacity, kFill), {}, filled_buffer((kRows + 1) * 4, kFill)};
+    std::vector<column_destination> dst{str.slot(cudf::type_id::STRING)};
+    const auto result = read(source, columns, kRowBegin, std::size_t{1} << 40, dst);
+    REQUIRE(result.rows_written == kFit);
+    REQUIRE_FALSE(result.source_exhausted);
+    REQUIRE(result.data_bytes_written ==
+            std::vector<std::size_t>{chars_bytes(data, kRowBegin, kRowBegin + kFit, false)});
+    expect_strings(str, 4, 0, 0, data, kRowBegin, kFit, false);
+  }
+
+  SECTION("a chars slot that binds inside the first chunk")
+  {
+    const std::size_t capacity = chars_bytes(data, 0, 10, false);
+    dest_buffers str{filled_buffer(capacity, kFill), {}, filled_buffer((kRows + 1) * 4, kFill)};
+    std::vector<column_destination> dst{str.slot(cudf::type_id::STRING)};
+    const auto result = read(source, columns, 0, kRows, dst);
+    // Row 10 is "kkk10": it does not fit after rows [0, 10).
+    REQUIRE(result.rows_written == 10);
+    expect_strings(str, 4, 0, 0, data, 0, 10, false);
+  }
+
+  SECTION("everything fits: all rows across several chunks")
+  {
+    const std::size_t capacity = chars_bytes(data, 0, kRows, false);
+    dest_buffers str{filled_buffer(capacity, kFill), {}, filled_buffer((kRows + 1) * 4, kFill)};
+    std::vector<column_destination> dst{str.slot(cudf::type_id::STRING)};
+    const auto result = read(source, columns, 0, kRows, dst);
+    REQUIRE(result.rows_written == kRows);
+    REQUIRE(result.source_exhausted);
+    expect_strings(str, 4, 0, 0, data, 0, kRows, false);
+  }
+
+  SECTION("two STRING requests with different chars capacities take the smaller fit")
+  {
+    const std::size_t small = chars_bytes(data, 0, 3000, false);
+    const std::size_t large = chars_bytes(data, 0, 9000, false);
+    dest_buffers a{filled_buffer(large, kFill), {}, filled_buffer((kRows + 1) * 4, kFill)};
+    dest_buffers b{filled_buffer(small, kFill), {}, filled_buffer((kRows + 1) * 4, kFill)};
+    const std::vector<std::size_t> both{kStringCol, kStringCol};
+    std::vector<column_destination> dst{a.slot(cudf::type_id::STRING),
+                                        b.slot(cudf::type_id::STRING)};
+    const auto result = read(source, both, 0, kRows, dst);
+    // Row 3000 is not empty, so exactly 3000 rows fit the smaller slot.
+    REQUIRE(!data.str[3000].empty());
+    REQUIRE(result.rows_written == 3000);
+    expect_strings(a, 4, 0, 0, data, 0, 3000, false);
+    expect_strings(b, 4, 0, 0, data, 0, 3000, false);
+  }
+}
+
+TEST_CASE("read_rows_gpu refuses a source on another device than the stream",
+          "[row_range_reader_gpu]")
+{
+  // The table's memory is on device 0 (this test needs one GPU), but its memory space claims
+  // device 1. A null writer stream leaves the writer unknown, so the constructor accepts it.
+  auto other_space = make_gpu_space(1);
+  const auto data  = make_source_data(16);
+  gpu_table_representation source(
+    make_table(data, false), *other_space, ::cuda::stream_ref{cudaStream_t{nullptr}});
+  REQUIRE(source.get_device_id() == 1);
+
+  dest_buffers i32{filled_buffer(64, kFill), {}, {}};
+  const std::vector<std::size_t> columns{kInt32Col};
+  std::vector<column_destination> dst{i32.slot(cudf::type_id::INT32)};
+  REQUIRE_THROWS_AS(read(source, columns, 0, 16, dst), row_range_unsupported_error);
+  REQUIRE(to_host<std::uint32_t>(i32.data)[0] == 0x01010101U * kFill);
 }

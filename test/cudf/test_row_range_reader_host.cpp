@@ -28,6 +28,7 @@
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/data/row_range_read.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
@@ -50,6 +51,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <random>
@@ -953,4 +955,106 @@ TEST_CASE("host row-range reader: empty source", "[row_range_reader_host]")
   REQUIRE(result.source_exhausted);
   verify_read(src.columns[kInt32], fixed, 0, 0, 0, 0);
   verify_read(src.columns[kString32Nulls], str, 0, 0, 0, 0);
+}
+
+namespace {
+
+/// Host callback that parks the stream until the gate's future is ready.
+void CUDART_CB wait_for_gate(void* gate) { static_cast<std::shared_future<void>*>(gate)->wait(); }
+
+/// Holds `stream` behind a blocked host callback until open() or destruction.
+class stream_gate {
+ public:
+  explicit stream_gate(::cuda::stream_ref stream) : _stream(stream), _future(_promise.get_future())
+  {
+    CUCASCADE_CUDA_TRY(cudaLaunchHostFunc(_stream.get(), wait_for_gate, &_future));
+  }
+  stream_gate(const stream_gate&)            = delete;
+  stream_gate& operator=(const stream_gate&) = delete;
+  ~stream_gate()
+  {
+    open();
+    _stream.sync();  // the callback reads _future: let it finish before the gate goes away
+  }
+
+  void open()
+  {
+    if (!_open) {
+      _open = true;
+      _promise.set_value();
+    }
+  }
+
+ private:
+  ::cuda::stream_ref _stream;
+  std::promise<void> _promise;
+  std::shared_future<void> _future;
+  bool _open{false};
+};
+
+}  // namespace
+
+TEST_CASE("host row-range reader: source freed and its blocks reused before the copies run",
+          "[row_range_reader_host]")
+{
+  const auto& src = source();
+  auto stream     = shared_stream();
+
+  // A source of its own, so the test can destroy it.
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  auto host =
+    registry.convert<host_data_representation>(*src.gpu, shared_host_space().get(), stream);
+  stream.sync();
+  const std::weak_ptr<memory::fixed_size_host_memory_resource::multiple_blocks_allocation> blocks =
+    host->get_host_table()->allocation;
+  const std::size_t source_bytes = blocks.lock()->size_bytes();
+
+  // Fixed-width, STRING chars + offsets, and a source null mask.
+  const std::size_t columns[] = {kInt64Nulls, kFloat64, kString32Nulls, kString64};
+  const std::size_t row_begin = 100;
+  const std::size_t rows      = 800;
+  std::vector<dst_column> dsts;
+  std::vector<column_destination> dests;
+  for (const auto c : columns) {
+    dsts.push_back(make_roomy_dst(src.columns[c], rows, true, c == kString64 ? 8 : 4));
+    dests.push_back(dsts.back().dest);
+  }
+  stream.sync();
+
+  {
+    // Nothing enqueued on the stream from here on runs until the gate opens.
+    stream_gate gate{stream};
+
+    row_range_request request;
+    request.columns   = columns;
+    request.row_begin = row_begin;
+    request.max_rows  = rows;
+    const auto result = detail::read_rows_host(*host, request, dests, stream, nullptr, nullptr);
+    REQUIRE(result.rows_written == rows);
+
+    // The reader is done and the caller drops the source, as after releasing a read lock on a
+    // HOST batch (which records no reader event). The pending copies must keep the blocks.
+    host.reset();
+    REQUIRE_FALSE(blocks.expired());
+
+    // Take what the pool hands out next and overwrite it. Had the source's blocks been returned,
+    // these would be the same blocks and the pending copies would read this garbage.
+    auto* host_mr =
+      shared_host_space()->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
+    REQUIRE(host_mr != nullptr);
+    auto garbage = host_mr->allocate_multiple_blocks(source_bytes);
+    for (std::size_t b = 0; b < garbage->size(); ++b) {
+      std::memset(garbage->at(b).data(), 0x5A, garbage->block_size());
+    }
+
+    gate.open();
+    stream.sync();
+  }
+
+  // The blocks were released once the stream had run the copies.
+  REQUIRE(blocks.expired());
+  for (std::size_t i = 0; i < dsts.size(); ++i) {
+    verify_read(src.columns[columns[i]], dsts[i], row_begin, rows, 0, 0);
+  }
 }
