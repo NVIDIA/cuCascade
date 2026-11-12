@@ -21,4 +21,5 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/io_backend_registry.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_io_backend.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/data_batch.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/row_range_read.cpp)

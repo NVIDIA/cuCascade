@@ -25,6 +25,8 @@
 
 #include <atomic>
 #include <barrier>
+#include <chrono>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1228,4 +1230,132 @@ TEST_CASE("DISK mock clones retain metadata and reject I/O", "[data_repository][
     REQUIRE_THROWS_AS(backend.read(std::filesystem::path{}, nullptr, 0, 0), std::logic_error);
     REQUIRE_THROWS_AS(backend.write(std::filesystem::path{}, nullptr, 0, 0), std::logic_error);
   }
+}
+
+TEST_CASE("a new repository reports downgrade priority 0", "[data_repository][downgrade_priority]")
+{
+  data_repository repository;
+  REQUIRE(repository.get_downgrade_priority() == 0);
+  static_assert(noexcept(repository.set_downgrade_priority(0)));
+  static_assert(noexcept(repository.get_downgrade_priority()));
+}
+
+TEST_CASE("downgrade priority round-trips", "[data_repository][downgrade_priority]")
+{
+  data_repository repository;
+  const auto priority = GENERATE(int32_t{7},
+                                 int32_t{-3},
+                                 std::numeric_limits<int32_t>::max(),
+                                 std::numeric_limits<int32_t>::min());
+  repository.set_downgrade_priority(priority);
+  REQUIRE(repository.get_downgrade_priority() == priority);
+  repository.set_downgrade_priority(0);
+  REQUIRE(repository.get_downgrade_priority() == 0);
+}
+
+TEST_CASE("downgrade priority does not affect batch storage or ordering",
+          "[data_repository][downgrade_priority]")
+{
+  data_repository baseline;
+  data_repository prioritized;
+  std::vector<std::shared_ptr<data_batch>> batches;
+  for (uint64_t id = 1; id <= 4; ++id) {
+    batches.push_back(make_repository_test_batch(id));
+  }
+
+  SECTION("unordered")
+  {
+    prioritized.set_downgrade_priority(5);
+    for (auto* repository : {&baseline, &prioritized}) {
+      repository->add_data_batch(batches[0]);
+      repository->add_data_batch(batches[1], 1);
+      repository->add_data_batch(batches[2]);
+    }
+    prioritized.set_downgrade_priority(-9);
+    for (auto* repository : {&baseline, &prioritized}) {
+      repository->add_data_batch(batches[3]);
+    }
+    REQUIRE(prioritized.get_ordering() == baseline.get_ordering());
+    REQUIRE(prioritized.num_partitions() == baseline.num_partitions());
+    REQUIRE(prioritized.total_size() == baseline.total_size());
+    for (size_t partition = 0; partition < baseline.num_partitions(); ++partition) {
+      REQUIRE(prioritized.get_batch_ids(partition) == baseline.get_batch_ids(partition));
+    }
+    for (auto* expected : {batches[0].get(), batches[2].get(), batches[3].get()}) {
+      REQUIRE(baseline.pop_next_data_batch().get() == expected);
+      REQUIRE(prioritized.pop_next_data_batch().get() == expected);
+    }
+    REQUIRE(prioritized.pop_next_data_batch(1) == batches[1]);
+    REQUIRE(prioritized.pop_next_data_batch() == nullptr);
+    REQUIRE(prioritized.all_empty());
+  }
+
+  SECTION("ordered")
+  {
+    for (auto* repository : {&baseline, &prioritized}) {
+      repository->add_data_batch_at_position(batches[0], 30);
+      repository->add_data_batch_at_position(batches[1], 10);
+    }
+    prioritized.set_downgrade_priority(std::numeric_limits<int32_t>::max());
+    for (auto* repository : {&baseline, &prioritized}) {
+      repository->add_data_batch_at_position(batches[2], 20);
+    }
+    REQUIRE(prioritized.get_ordering() == data_repository_ordering::ORDERED);
+    REQUIRE(prioritized.get_positions() == baseline.get_positions());
+    REQUIRE(prioritized.get_data_batch_by_position(20) == batches[2]);
+    REQUIRE(prioritized.pop_next_data_batch_with_position() ==
+            baseline.pop_next_data_batch_with_position());
+    REQUIRE(prioritized.pop_data_batch_by_position(10) == batches[1]);
+    REQUIRE(prioritized.pop_next_data_batch_with_position() ==
+            positioned_data_batch{batches[2], size_t{20}});
+    REQUIRE(prioritized.all_empty());
+  }
+
+  REQUIRE(baseline.get_downgrade_priority() == 0);
+}
+
+namespace {
+struct lockable_repository : data_repository {
+  std::unique_lock<std::mutex> lock_repository() { return std::unique_lock{_mutex}; }
+};
+}  // namespace
+
+TEST_CASE("downgrade priority is usable while the repository mutex is held",
+          "[data_repository][downgrade_priority]")
+{
+  lockable_repository repository;
+  auto lock         = repository.lock_repository();
+  auto access       = std::async(std::launch::async, [&repository] {
+    repository.set_downgrade_priority(11);
+    return repository.get_downgrade_priority();
+  });
+  const auto status = access.wait_for(std::chrono::seconds{5});
+  lock.unlock();
+  REQUIRE(status == std::future_status::ready);
+  REQUIRE(access.get() == 11);
+}
+
+TEST_CASE("concurrent downgrade priority writes leave one of the written values",
+          "[data_repository][downgrade_priority]")
+{
+  data_repository repository;
+  constexpr int32_t num_threads = 8;
+  std::barrier start{num_threads};
+  std::vector<std::thread> threads;
+  for (int32_t t = 0; t < num_threads; ++t) {
+    threads.emplace_back([&repository, &start, t] {
+      start.arrive_and_wait();
+      for (int32_t i = 0; i < 1000; ++i) {
+        repository.set_downgrade_priority(t + 1);
+        const auto seen = repository.get_downgrade_priority();
+        if (seen < 1 || seen > num_threads) { repository.set_downgrade_priority(-1); }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  const auto final_priority = repository.get_downgrade_priority();
+  REQUIRE(final_priority >= 1);
+  REQUIRE(final_priority <= num_threads);
 }

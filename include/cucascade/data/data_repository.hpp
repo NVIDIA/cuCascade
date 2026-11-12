@@ -20,6 +20,8 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <limits>
 #include <list>
 #include <map>
@@ -403,6 +405,33 @@ class data_repository {
     _data_batches.resize(new_num_partitions);
   }
 
+  /**
+   * @brief Set the downgrade priority of this repository.
+   *
+   * The value is opaque to cuCascade, which only stores it and never reads it. Consumers order
+   * their downgrade sweeps by it; higher means downgraded earlier. Defaults to 0.
+   *
+   * @param priority The priority to store
+   *
+   * @note Thread-safe; does not acquire the internal mutex
+   */
+  void set_downgrade_priority(int32_t priority) noexcept
+  {
+    _downgrade_priority.store(priority, std::memory_order_relaxed);
+  }
+
+  /**
+   * @brief Get the downgrade priority of this repository.
+   *
+   * @return int32_t The last priority set, or 0 if none was set. Not used by cuCascade itself.
+   *
+   * @note Thread-safe; does not acquire the internal mutex
+   */
+  [[nodiscard]] int32_t get_downgrade_priority() const noexcept
+  {
+    return _downgrade_priority.load(std::memory_order_relaxed);
+  }
+
  protected:
   struct repository_entry;
   using batch_list = std::list<repository_entry>;
@@ -501,6 +530,8 @@ class data_repository {
   }
 
  private:
+  std::atomic<int32_t> _downgrade_priority{0};
+
   void require_partition(size_t partition_idx) const
   {
     if (partition_idx >= _data_batches.size()) {

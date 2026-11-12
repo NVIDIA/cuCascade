@@ -42,6 +42,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_data_repository_manager.cpp
     data/test_disk_io_backend.cpp
     data/test_io_worker.cpp
+    data/test_row_range_read.cpp
     # Logging tests
     log/test_logging.cpp
     log/test_logging_pruned.cpp
@@ -161,6 +162,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_representation_converter.cpp
     cudf/test_gpu_to_gpu_converter.cpp
     cudf/test_release_table_stream.cpp
+    cudf/test_row_range_copy_kernels.cu
+    cudf/test_row_range_fit.cpp
+    cudf/test_row_range_reader_gpu.cpp
+    cudf/test_row_range_reader_host.cpp
+    cudf/test_row_range_reader_disk.cpp
     # Main test runner
     unittest.cpp)
 
@@ -181,8 +187,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Set include directories
   target_include_directories(
-    cucascade_cudf_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                                 ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+    cucascade_cudf_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${PROJECT_SOURCE_DIR}/src)
 
   # Link dependencies
   target_link_libraries(
