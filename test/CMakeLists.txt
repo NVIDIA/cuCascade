@@ -29,6 +29,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_executable(
     cucascade_tests
     # Memory tests
+    memory/test_atomic_bounded_counter.cpp
     memory/test_fixed_size_host_memory_resource.cpp
     memory/test_numa_affinity.cpp
     memory/test_memory_reservation_manager.cpp
