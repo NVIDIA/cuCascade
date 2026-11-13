@@ -18,6 +18,7 @@
 #include "numa_affinity.hpp"
 
 #include <cucascade/error.hpp>
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <linux/mempolicy.h>
@@ -73,13 +74,16 @@ class node_mapping {
     nodes[id / detail::kernel_bitmask::bits_per_word] |=
       1UL << (id % detail::kernel_bitmask::bits_per_word);
     // The kernel reads maxnode - 1 bits.
-    std::ignore = syscall(SYS_mbind,
-                          _ptr,
-                          static_cast<unsigned long>(bytes),
-                          static_cast<unsigned long>(MPOL_BIND),
-                          nodes.data(),
-                          static_cast<unsigned long>(max_nodes + 1),
-                          0UL);
+    if (syscall(SYS_mbind,
+                _ptr,
+                static_cast<unsigned long>(bytes),
+                static_cast<unsigned long>(MPOL_BIND),
+                nodes.data(),
+                static_cast<unsigned long>(max_nodes + 1),
+                0UL) != 0) {
+      int const bind_error = errno;
+      CUCASCADE_LOG_WARN("mbind to NUMA node {} failed: {}", node, std::strerror(bind_error));
+    }
   }
   ~node_mapping()
   {
