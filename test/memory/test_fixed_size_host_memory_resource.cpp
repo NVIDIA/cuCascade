@@ -549,3 +549,53 @@ TEST_CASE("A failed grow_by gives back the blocks it took", "[fixed_size_host]")
   CHECK(mr->get_free_blocks() == free_before + 1);
   CHECK(mr->get_total_allocated_bytes() == reserved);
 }
+
+TEST_CASE("Growing a reservation over blocks allocated past it does not charge them again",
+          "[fixed_size_host]")
+{
+  constexpr std::size_t reserved = 2 * block_size;
+  auto state                     = std::make_shared<counting_host_resource::state>();
+  auto memory                    = make_counting_host_memory(state, 4 * pool_size * block_size, 1);
+  auto res = memory->request_reservation(specific_memory_space{Tier::HOST, 0}, reserved);
+  REQUIRE(res != nullptr);
+  auto* mr = res->get_memory_resource_of<Tier::HOST>();
+  REQUIRE(mr != nullptr);
+
+  // Two blocks inside the reservation and two past it, already charged.
+  auto allocation = mr->allocate_multiple_blocks(4 * block_size, res.get());
+  REQUIRE(mr->get_total_allocated_bytes() == 4 * block_size);
+
+  // The grown reservation covers exactly the four blocks in use: nothing new is charged.
+  REQUIRE(res->grow_by(2 * block_size));
+  REQUIRE(res->size() == 4 * block_size);
+  CHECK(mr->get_total_allocated_bytes() == 4 * block_size);
+
+  allocation.reset();
+  CHECK(mr->get_total_allocated_bytes() == 4 * block_size);  // the reservation stays charged
+
+  res.reset();
+  CHECK(mr->get_total_allocated_bytes() == 0);
+  CHECK(mr->get_available_memory() == 4 * pool_size * block_size);
+}
+
+TEST_CASE("Growing a reservation partly over blocks allocated past it charges only the rest",
+          "[fixed_size_host]")
+{
+  constexpr std::size_t reserved = 2 * block_size;
+  auto state                     = std::make_shared<counting_host_resource::state>();
+  auto memory                    = make_counting_host_memory(state, 4 * pool_size * block_size, 1);
+  auto res = memory->request_reservation(specific_memory_space{Tier::HOST, 0}, reserved);
+  REQUIRE(res != nullptr);
+  auto* mr = res->get_memory_resource_of<Tier::HOST>();
+  REQUIRE(mr != nullptr);
+
+  // One block past the reservation; growing by two covers it and reserves one new block.
+  auto allocation = mr->allocate_multiple_blocks(3 * block_size, res.get());
+  REQUIRE(mr->get_total_allocated_bytes() == 3 * block_size);
+  REQUIRE(res->grow_by(2 * block_size));
+  CHECK(mr->get_total_allocated_bytes() == 4 * block_size);
+
+  allocation.reset();
+  res.reset();
+  CHECK(mr->get_total_allocated_bytes() == 0);
+}

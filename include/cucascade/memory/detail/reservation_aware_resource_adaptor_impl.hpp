@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <set>
 
 namespace cucascade {
@@ -72,6 +73,11 @@ class reservation_aware_resource_adaptor_impl {
 
    private:
     reservation_aware_resource_adaptor_impl* _impl;
+    /// Held while the size changes and while allocated_bytes changes in allocate and deallocate,
+    /// so each allocation and deallocation is charged against a size that cannot change under it.
+    /// A shrink would otherwise leave bytes counted inside the reservation past its new end,
+    /// uncharged.
+    std::mutex _boundary_mutex;
   };
 
   /**
@@ -226,6 +232,7 @@ class reservation_aware_resource_adaptor_impl {
  private:
   bool grow_reservation_by(device_reserved_arena& arena, std::size_t bytes);
   void shrink_reservation_to_fit(device_reserved_arena& arena);
+  std::size_t untrack_allocation(device_reserved_arena& arena, std::size_t bytes) noexcept;
   void* do_allocate_managed(std::size_t bytes, ::cuda::stream_ref stream);
   void* do_allocate_managed(std::size_t bytes,
                             stream_ordered_tracker_state* state,

@@ -92,8 +92,9 @@ TEST_CASE("replace rejects an already registered new backend", "[io][registry]")
 {
   registry_fixture fixture;
 
+  // uring is registered in every build.
   CHECK_THROWS_AS(fixture.registry.replace_ioctx(
-                    io_context_type::restful, io_context_type::kvikio, &s3_checker, &null_factory),
+                    io_context_type::restful, io_context_type::uring, &s3_checker, &null_factory),
                   std::invalid_argument);
   CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::restful);
 }
@@ -126,7 +127,9 @@ TEST_CASE("replace is forbidden after the first path lookup", "[io][registry]")
 {
   registry_fixture fixture;
 
-  REQUIRE(fixture.registry.lookup_path("unmatched-before-bootstrap") == io_context_type::kvikio);
+  // Any lookup latches the registry, even one no backend claims (there is no
+  // catch-all backend).
+  REQUIRE_FALSE(fixture.registry.lookup_path("unmatched-before-bootstrap").has_value());
   CHECK_THROWS_AS(fixture.registry.replace_ioctx(
                     io_context_type::restful, io_context_type::s3rdma, &s3_checker, &null_factory),
                   std::logic_error);
@@ -146,4 +149,21 @@ TEST_CASE("register remains legal after path lookup", "[io][registry]")
 TEST_CASE("s3 rdma has a distinct context type", "[io][registry]")
 {
   CHECK(io_context_type::s3rdma != io_context_type::restful);
+}
+
+TEST_CASE("native routing keeps local files on uring and s3 on rest", "[io][registry]")
+{
+  registry_fixture fixture;
+  // /proc/self/exe is a regular file every backend that claims local paths accepts.
+  CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::uring);
+  CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::restful);
+}
+
+TEST_CASE("a path no backend claims resolves to nothing", "[io][registry]")
+{
+  // There is no catch-all backend: a scheme neither uring nor REST serves is
+  // unrouted rather than handed to a fallback.
+  registry_fixture fixture;
+  CHECK_FALSE(fixture.registry.lookup_path("https://example.com/bucket/key").has_value());
+  CHECK_FALSE(fixture.registry.lookup_path("gs://bucket/key").has_value());
 }

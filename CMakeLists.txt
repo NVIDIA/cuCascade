@@ -79,8 +79,7 @@ set(CUCASCADE_PUBLIC_COMPILE_DEFS
 
 # Swappable third-party backends for the io layer. The io code was ported from a
 # codebase with its own vendored dependencies. These knobs let an embedding host
-# (e.g. sirius) reuse the copies it already links instead of the
-# standalone-build defaults.
+# reuse the copies it already links instead of the standalone-build defaults.
 
 # cucascade::exec::invocable backing: OFF -> in-tree move-only callable; ON ->
 # absl::AnyInvocable (reuses a host project's abseil).
@@ -104,7 +103,7 @@ set(CUCASCADE_ABSEIL_INVOCABLE_TARGET
 # CUCASCADE_MOODYCAMEL_TARGET  - link an existing CMake target that carries the
 # include dirs (e.g. a host-provided interface target). 2.
 # CUCASCADE_MOODYCAMEL_INCLUDE_DIR - a directory already holding
-# blockingconcurrentqueue.h / concurrentqueue.h (e.g. sirius's
+# blockingconcurrentqueue.h / concurrentqueue.h (e.g.
 # duckdb/third_party/concurrentqueue). Nothing is fetched. 3. neither set -
 # fetch cameron314/concurrentqueue.
 set(CUCASCADE_MOODYCAMEL_TARGET
@@ -121,8 +120,8 @@ set(CUCASCADE_MOODYCAMEL_INCLUDE_DIR
       "Directory containing moodycamel concurrentqueue headers (skips fetching; ignored if CUCASCADE_MOODYCAMEL_TARGET is set)"
 )
 
-# C++ namespace of the moodycamel headers. duckdb's fork (used by sirius)
-# renames it to duckdb_moodycamel; upstream cameron314 uses moodycamel.
+# C++ namespace of the moodycamel headers. duckdb's fork renames it to
+# duckdb_moodycamel; upstream cameron314 uses moodycamel.
 set(CUCASCADE_MOODYCAMEL_NAMESPACE
     "moodycamel"
     CACHE STRING "C++ namespace of the moodycamel concurrentqueue headers")
@@ -145,7 +144,7 @@ if(CUCASCADE_BUILD_S3_BENCHMARK
         OR NOT CUCASCADE_BUILD_CUDF))
   message(
     STATUS
-      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf and kvikIO)"
+      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf)"
   )
   set(CUCASCADE_BUILD_S3_BENCHMARK
       OFF
@@ -195,18 +194,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   if(CUCASCADE_BUILD_IO)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+    # OpenSSL: TLS for the REST transport (handshakes, the user-space record
+    # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
     find_package(OpenSSL REQUIRED)
-
-    # kvikIO — backs the local-file fallback ioctx (kvikio_context). It reaches
-    # the environment only through libcudf's dependency closure (libkvikio is
-    # not a direct dependency), so it is tied to CUCASCADE_BUILD_CUDF: a
-    # cudf-free build drops kvikio_context and its catch-all registry entry,
-    # leaving uring/restful to claim paths. Consumers see the difference via the
-    # CUCASCADE_HAS_KVIKIO definition propagated by cucascade_io_thirdparty.
-    if(CUCASCADE_BUILD_CUDF)
-      find_package(kvikio REQUIRED CONFIG)
-    endif()
 
     # cucascade_io_thirdparty carries the swappable moodycamel + invocable
     # (abseil) usage requirements from a single place; the io object library,
@@ -283,15 +273,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
         INTERFACE $<BUILD_INTERFACE:${_cucascade_absl_target}>)
       target_compile_definitions(cucascade_io_thirdparty
                                  INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
-    endif()
-
-    # Gates the kvikIO fallback ioctx in io_config and the datasource registry.
-    # Carried on the same INTERFACE target as the definitions above so the io
-    # object library, its installable variants, and installed consumers all
-    # agree on the layout of io_config.
-    if(CUCASCADE_BUILD_CUDF)
-      target_compile_definitions(cucascade_io_thirdparty
-                                 INTERFACE CUCASCADE_HAS_KVIKIO)
     endif()
   endif()
 endif()
@@ -434,7 +415,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # The datasource bridge (src/cudf/datasource.cpp) compiles against the io
   # core's headers, which need the io usage requirements (concurrentqueue
-  # include dir, curl/uring types, ...).
+  # include dir, uring types, ...).
   if(CUCASCADE_BUILD_IO)
     target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_io_objects)
   endif()
@@ -444,11 +425,7 @@ if(CUCASCADE_BUILD_IO)
   # Link libraries shared by the io object library and the installable io
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
   # side by cuCascadeConfig.cmake (same names).
-  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
-                             OpenSSL::Crypto)
-  if(CUCASCADE_BUILD_CUDF)
-    list(APPEND CUCASCADE_IO_LINK_LIBS kvikio::kvikio)
-  endif()
+  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING OpenSSL::SSL OpenSSL::Crypto)
 
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
@@ -700,7 +677,10 @@ include(CMakePackageConfigHelpers)
 
 # Install headers
 if(CUCASCADE_TOPOLOGY_ONLY)
+  # topology_discovery.hpp includes net_topology.hpp (NIC discovery, built into
+  # this library), so both are part of the installed API.
   install(FILES include/cucascade/memory/topology_discovery.hpp
+                include/cucascade/memory/net_topology.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
   install(FILES include/cucascade/nvtx.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade)

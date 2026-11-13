@@ -324,7 +324,7 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
 }
 
 // ===========================================================================
-// Synchronous reclaim (the cache side of sirius-db/sirius#1933)
+// Synchronous reclaim
 // ===========================================================================
 
 TEST_CASE("releasable bytes exclude the per-NUMA prefetch reservation",

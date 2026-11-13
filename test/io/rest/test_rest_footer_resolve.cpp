@@ -17,6 +17,7 @@
  */
 
 #include "loopback_range_server.hpp"
+#include "utils/allocation_counter.hpp"
 
 #include <cucascade/exec/scoped_dispatcher.hpp>
 #include <cucascade/exec/thread_pool.hpp>
@@ -32,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -1025,6 +1027,117 @@ TEST_CASE("batched footer resolve stop unblocks a zero-active-transfer budget wa
   CHECK(is_operation_canceled(result_at(*results, 1).error));
   held->clear();
   results->clear();
+}
+
+TEST_CASE("batched footer resolve aborts a canceled probe's exchange, also without a timeout",
+          "[rest][footer_resolve]")
+{
+  // On the running pool's worker (a private helper reaps its exchanges before the call
+  // returns).  The probe's response is held back 60 s and requests have no timeout
+  // (request_timeout_s = 0), so only an abort retires the canceled GET.  The probe's job owns
+  // its budget reservation until the worker retires the exchange; the abort makes that prompt.
+  std::unordered_map<std::string, key_response_script> scripts;
+  scripts["slow.parquet"].gets = {scripted_response{.delay = 60s}};
+  auto server                  = std::make_shared<loopback_range_server>(
+    test_payload(), range_fault_policy{}, std::vector<cucascade::test::listed_object>{}, scripts);
+  auto cfg              = test_config(1, probe_size);
+  cfg.request_timeout_s = 0;
+  auto fixture          = make_ioctx(*server, cfg);
+  fixture.ioctx->start();
+  auto results = std::make_shared<std::vector<footer_resolve_result>>();
+  auto mutex   = std::make_shared<std::mutex>();
+  std::stop_source stop;
+  std::vector<std::string> paths{object_uri("slow.parquet")};
+  async_call call([ioctx = fixture.ioctx, results, mutex, paths, token = stop.get_token()] {
+    ioctx->resolve_footer_objects(
+      paths,
+      [&](footer_resolve_result result) {
+        std::scoped_lock lock{*mutex};
+        results->push_back(std::move(result));
+      },
+      token);
+  });
+
+  REQUIRE(wait_until([&] { return server->get_count("slow.parquet") == 1; }, 2s));
+  CHECK(fixture.ioctx->footer_stash_reserved_bytes() == probe_size);
+  stop.request_stop();
+  require_ready(call, 250ms);
+  {
+    std::scoped_lock lock{*mutex};
+    REQUIRE(results->size() == 1);
+    CHECK(is_operation_canceled(results->front().error));
+  }
+  // Long before the response would arrive.
+  CHECK(wait_until([&] { return fixture.ioctx->footer_stash_reserved_bytes() == 0; }, 2s));
+  CHECK(wait_until([&] { return fixture.ioctx->stats().closed >= 1; }, 2s));  // aborted
+
+  // The worker keeps serving: a later batch resolves on the same pool.
+  {
+    auto const later = resolve(*fixture.ioctx, {object_uri("fast.parquet")});
+    REQUIRE(later.size() == 1);
+    CHECK_FALSE(later.front().error);
+    CHECK(later.front().object != nullptr);
+  }
+  CHECK(fixture.ioctx->footer_stash_reserved_bytes() == 0);  // the delivered payload is gone
+}
+
+TEST_CASE("batched footer resolve delivers every input once while allocation keeps failing",
+          "[rest][footer_resolve][alloc]")
+{
+  // Every allocation of the calling thread from the n-th on fails (the reactor threads' are not
+  // counted), for each n until the batch completes without reaching the fault.  Wherever it is
+  // cut, each input gets exactly one callback (or none, when the call fails before issuing
+  // anything), the budget returns once the exchanges retire, and the next batch succeeds.
+  auto server = std::make_shared<loopback_range_server>(test_payload());
+  std::vector<std::string> const paths{
+    object_uri("a.parquet"), object_uri("b.parquet"), object_uri("c.parquet"), object_uri("d")};
+  std::array<int, 4> calls{};
+  std::array<bool, 4> failed{};
+  // Built before any scope: converting the callback must not count.
+  std::function<void(footer_resolve_result)> const on_result = [&](footer_resolve_result r) {
+    ++calls.at(r.index);
+    failed.at(r.index) = r.error != nullptr;
+  };
+  auto sweep = [&](bool running) {
+    auto fixture = make_ioctx(*server, test_config(2, 4 * probe_size));
+    if (running) { fixture.ioctx->start(); }
+    bool clean = false;
+    for (std::size_t n = 1; n < 20000 && !clean; ++n) {
+      calls.fill(0);
+      failed.fill(false);
+      bool threw       = false;
+      std::size_t made = 0;
+      {
+        cucascade::test::scoped_allocation_counter scope;
+        scope.fail_from(n);
+        try {
+          fixture.ioctx->resolve_footer_objects(paths, on_result, {});
+        } catch (...) {
+          threw = true;
+        }
+        made = scope.count();
+      }
+      clean = made < n;
+      INFO("fail from allocation " << n << " of " << made << (running ? " (pool)" : " (helper)"));
+      auto const once = std::count(calls.begin(), calls.end(), 1);
+      auto const none = std::count(calls.begin(), calls.end(), 0);
+      REQUIRE((once == 4 || none == 4));
+      if (none == 4) { CHECK(threw); }
+      if (clean) {
+        CHECK_FALSE(threw);
+        CHECK(std::none_of(failed.begin(), failed.end(), [](bool f) { return f; }));
+      }
+      REQUIRE(wait_until([&] { return fixture.ioctx->footer_stash_reserved_bytes() == 0; }, 3s));
+    }
+    REQUIRE(clean);
+    auto const later = resolve(*fixture.ioctx, paths);
+    REQUIRE(later.size() == paths.size());
+    for (auto const& r : later) {
+      CHECK_FALSE(r.error);
+    }
+  };
+  SECTION("on the running pool's worker") { sweep(true); }
+  SECTION("on a private helper") { sweep(false); }
 }
 
 TEST_CASE("batched footer payload lease can outlive its rest ioctx", "[rest][footer_resolve]")

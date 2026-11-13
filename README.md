@@ -49,7 +49,7 @@ pixi run benchmarks
 - **Dependencies**: RMM (core); libcudf 25.10+ (only for the optional `cucascade-cudf` library)
 
 > **Library layout:** the core `cuCascade::cucascade` target is cudf-free and depends only on
-> RMM + CUDA (plus kvikIO/cuFile for the disk tier). The cudf-backed representations,
+> RMM + CUDA (plus cuFile for the disk tier). The cudf-backed representations,
 > converters, and bandwidth profiler live in a separate `cuCascade::cucascade_cudf` target (headers
 > under `include/cucascade/cudf/`). The cudf library can be turned off at configure time with
 > `-DCUCASCADE_BUILD_CUDF=OFF`.
@@ -208,3 +208,8 @@ cuCascade/
 # License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE.md](LICENSE.md) file for details.
+
+Parts of the HTTP/1.1 parser in `src/io/rest/http` (and its conformance test vectors) are derived
+from [Boost.Beast](https://github.com/boostorg/beast), Copyright (c) 2016-2019 Vinnie Falco, and
+are distributed under the Boost Software License 1.0 - see
+[src/io/rest/http/LICENSE_1_0.txt](src/io/rest/http/LICENSE_1_0.txt).
