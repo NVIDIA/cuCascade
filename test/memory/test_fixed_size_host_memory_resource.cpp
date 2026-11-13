@@ -22,6 +22,7 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <cucascade/utils/cleanup_utils.hpp>
 
 #include <rmm/error.hpp>
 
@@ -201,6 +202,8 @@ TEST_CASE("NUMA pinned allocation restores the caller's CPU affinity", "[fixed_s
 {
   cpu_set_t original;
   REQUIRE(sched_getaffinity(0, sizeof(original), &original) == 0);
+  auto restore_affinity = cucascade::utils::on_scope_exit(
+    [&]() noexcept { std::ignore = sched_setaffinity(0, sizeof(original), &original); });
   cpu_set_t one_cpu;
   CPU_ZERO(&one_cpu);
   CPU_SET(sched_getcpu(), &one_cpu);
@@ -208,9 +211,10 @@ TEST_CASE("NUMA pinned allocation restores the caller's CPU affinity", "[fixed_s
 
   numa_region_pinned_host_memory_resource upstream(0);
   void* p = upstream.allocate_sync(block_size);
+  auto release =
+    cucascade::utils::on_scope_exit([&]() noexcept { upstream.deallocate_sync(p, block_size); });
   cpu_set_t after;
   REQUIRE(sched_getaffinity(0, sizeof(after), &after) == 0);
-  upstream.deallocate_sync(p, block_size);
   REQUIRE(sched_setaffinity(0, sizeof(original), &original) == 0);
 
   REQUIRE(CPU_EQUAL(&after, &one_cpu));
@@ -295,7 +299,9 @@ TEST_CASE("NUMA pinned allocation binds its pages to the node", "[fixed_size_hos
   page_policy::require_mbind();
   int const node = page_policy::first_allowed_node();
   numa_region_pinned_host_memory_resource upstream(node);
-  void* p                = upstream.allocate_sync(block_size);
+  void* p = upstream.allocate_sync(block_size);
+  auto release =
+    cucascade::utils::on_scope_exit([&]() noexcept { upstream.deallocate_sync(p, block_size); });
   auto const policy      = page_policy::of(p);
   int page_node          = -1;
   long const node_status = syscall(SYS_get_mempolicy,
@@ -304,7 +310,6 @@ TEST_CASE("NUMA pinned allocation binds its pages to the node", "[fixed_size_hos
                                    0UL,
                                    p,
                                    static_cast<unsigned long>(MPOL_F_NODE | MPOL_F_ADDR));
-  upstream.deallocate_sync(p, block_size);
 
   page_policy expected;
   expected.nodes[static_cast<std::size_t>(node) / page_policy::bits_per_word] =
@@ -321,9 +326,10 @@ TEST_CASE("NUMA pinned allocation on an unknown node uses the default policy", "
   int const node = GENERATE(1023, 1 << 20);
   std::ignore    = page_policy::first_allowed_node();
   numa_region_pinned_host_memory_resource upstream(node);
-  void* p           = upstream.allocate_sync(block_size);
+  void* p = upstream.allocate_sync(block_size);
+  auto release =
+    cucascade::utils::on_scope_exit([&]() noexcept { upstream.deallocate_sync(p, block_size); });
   auto const policy = page_policy::of(p);
-  upstream.deallocate_sync(p, block_size);
 
   REQUIRE(policy.mode == MPOL_DEFAULT);
 }

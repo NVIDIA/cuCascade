@@ -15,28 +15,22 @@
  * limitations under the License.
  */
 
+#include "numa_affinity.hpp"
+
 #include <cucascade/error.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <linux/mempolicy.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <array>
 #include <cerrno>
-#include <charconv>
 #include <climits>
 #include <cstring>
-#include <fstream>
-#include <optional>
-#include <string>
-#include <string_view>
 #include <tuple>
 #include <utility>
-#include <vector>
 
 namespace cucascade {
 namespace memory {
@@ -60,92 +54,6 @@ int prefault(void* ptr, std::size_t bytes)
   return 0;
 }
 
-/// A set of CPU or node ids in the kernel's bitmask layout: an array of unsigned longs.
-class kernel_bitmask {
- public:
-  /// The calling thread's CPU affinity, or nullopt if it cannot be read.
-  static std::optional<kernel_bitmask> thread_affinity()
-  {
-    // The kernel rejects masks smaller than its CPU count with EINVAL.
-    for (std::size_t bits = 1024; bits <= (std::size_t{1} << 22); bits *= 2) {
-      kernel_bitmask mask;
-      mask._words.resize(bits / bits_per_word);
-      if (sched_getaffinity(0, mask.bytes(), mask.cpu_set()) == 0) { return mask; }
-      if (errno != EINVAL) { break; }
-    }
-    return std::nullopt;
-  }
-
-  /// The CPUs of NUMA node @p node, or nullopt if they cannot be read.
-  static std::optional<kernel_bitmask> node_cpus(int node)
-  {
-    std::ifstream file("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
-    std::string list;
-    if (!std::getline(file, list)) { return std::nullopt; }
-    return parse_list(list);
-  }
-
-  /// Parses a kernel id list such as "0-3,8,10-11".
-  static std::optional<kernel_bitmask> parse_list(std::string_view list)
-  {
-    kernel_bitmask mask;
-    while (!list.empty() && (list.back() == '\n' || list.back() == ' ')) {
-      list.remove_suffix(1);
-    }
-    while (!list.empty()) {
-      auto const comma = list.find(',');
-      auto const item  = list.substr(0, comma);
-      list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
-      auto const dash  = item.find('-');
-      auto const first = parse_id(item.substr(0, dash));
-      auto const last  = dash == std::string_view::npos ? first : parse_id(item.substr(dash + 1));
-      if (!first || !last || *last < *first) { return std::nullopt; }
-      for (auto id = *first; id <= *last; ++id) {
-        mask.set(id);
-      }
-    }
-    return mask;
-  }
-
-  void set(std::size_t id)
-  {
-    if (id / bits_per_word >= _words.size()) { _words.resize(id / bits_per_word + 1); }
-    _words[id / bits_per_word] |= 1UL << (id % bits_per_word);
-  }
-
-  [[nodiscard]] bool empty() const
-  {
-    return std::all_of(_words.begin(), _words.end(), [](unsigned long w) { return w == 0; });
-  }
-
-  /// Restricts the calling thread to these CPUs. Returns false on failure.
-  [[nodiscard]] bool apply_to_thread()
-  {
-    return !empty() && sched_setaffinity(0, bytes(), cpu_set()) == 0;
-  }
-
-  static constexpr std::size_t bits_per_word = sizeof(unsigned long) * CHAR_BIT;
-
- private:
-  // Ids beyond this are not CPUs or nodes this kernel can have.
-  static constexpr std::size_t max_id = std::size_t{1} << 22;
-
-  static std::optional<std::size_t> parse_id(std::string_view text)
-  {
-    std::size_t id{};
-    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), id);
-    if (error != std::errc{} || end != text.data() + text.size() || id >= max_id) {
-      return std::nullopt;
-    }
-    return id;
-  }
-
-  [[nodiscard]] std::size_t bytes() const { return _words.size() * sizeof(unsigned long); }
-  [[nodiscard]] cpu_set_t* cpu_set() { return reinterpret_cast<cpu_set_t*>(_words.data()); }
-
-  std::vector<unsigned long> _words;
-};
-
 /// Owns an anonymous private mapping whose pages are bound to one NUMA node.
 class node_mapping {
  public:
@@ -160,9 +68,10 @@ class node_mapping {
       throw rmm::bad_alloc(std::strerror(errno));
     }
     if (node < 0 || node >= max_nodes) { return; }
-    std::array<unsigned long, max_nodes / kernel_bitmask::bits_per_word> nodes{};
+    std::array<unsigned long, max_nodes / detail::kernel_bitmask::bits_per_word> nodes{};
     auto const id = static_cast<std::size_t>(node);
-    nodes[id / kernel_bitmask::bits_per_word] |= 1UL << (id % kernel_bitmask::bits_per_word);
+    nodes[id / detail::kernel_bitmask::bits_per_word] |=
+      1UL << (id % detail::kernel_bitmask::bits_per_word);
     // The kernel reads maxnode - 1 bits.
     std::ignore = syscall(SYS_mbind,
                           _ptr,
@@ -190,26 +99,6 @@ class node_mapping {
 
   void* _ptr;
   std::size_t _bytes;
-};
-
-/// Runs the calling thread on the CPUs of @p node for the guard's lifetime, then restores its
-/// affinity. Best effort: the affinity is left alone if the thread may not run on that node.
-class scoped_run_on_node {
- public:
-  explicit scoped_run_on_node(int node) : _saved(kernel_bitmask::thread_affinity())
-  {
-    auto cpus = kernel_bitmask::node_cpus(node);
-    if (!_saved || !cpus || !cpus->apply_to_thread()) { _saved.reset(); }
-  }
-  ~scoped_run_on_node()
-  {
-    if (_saved) { std::ignore = _saved->apply_to_thread(); }
-  }
-  scoped_run_on_node(scoped_run_on_node const&)            = delete;
-  scoped_run_on_node& operator=(scoped_run_on_node const&) = delete;
-
- private:
-  std::optional<kernel_bitmask> _saved;
 };
 
 }  // namespace
@@ -255,7 +144,7 @@ void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda:
     std::ignore = madvise(mapping.get(), bytes, MADV_HUGEPAGE);
     int err     = 0;
     {
-      scoped_run_on_node const local_cpus(_numa_node);
+      detail::scoped_run_on_node const local_cpus(_numa_node);
       err = prefault(mapping.get(), bytes);
     }
     if (err == ENOMEM) { throw rmm::out_of_memory(std::strerror(err)); }
