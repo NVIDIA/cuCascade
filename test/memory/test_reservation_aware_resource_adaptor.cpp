@@ -25,13 +25,22 @@
  * These tests cover the adaptor's borrowed pool accessor and its OOM diagnostics. The adaptor
  * recovers a handle from supported upstream resources via cuda::mr::resource_cast, accepts an
  * explicit handle for resources that cannot expose one, and otherwise reports a null handle.
+ *
+ * They also cover how growing a reservation is charged to the adaptor's allocated bytes.
  */
+
+#include "utils/test_memory_resources.hpp"
 
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/error.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/mr/cuda_async_managed_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
@@ -42,7 +51,13 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace cucascade::memory;
 
@@ -94,6 +109,48 @@ cudaMemPool_t oom_pool_handle_for(rmm::device_async_resource_ref upstream)
   FAIL("expected the oversized allocation to throw cucascade_out_of_memory");
   return nullptr;
 }
+
+constexpr std::size_t chunk = 1 << 20;
+
+/// One GPU space (device 0) over the current device resource, so a test can reserve from it and
+/// attach the reservation to a stream.
+std::unique_ptr<memory_reservation_manager> make_gpu_memory(std::size_t capacity)
+{
+  gpu_memory_space_config config;
+  config.device_id                  = 0;
+  config.memory_capacity            = capacity;
+  config.reservation_limit_fraction = 1.0;
+  config.mr_factory_fn              = cucascade::test::make_shared_current_device_resource;
+  std::vector<memory_space_config> configs;
+  configs.emplace_back(config);
+  return std::make_unique<memory_reservation_manager>(std::move(configs));
+}
+
+reservation_aware_resource_adaptor* gpu_adaptor(memory_reservation_manager& memory)
+{
+  return memory.get_memory_space(Tier::GPU, 0)
+    ->get_memory_resource_as<reservation_aware_resource_adaptor>();
+}
+
+/// Lets allocations run past the reservation, like the ignore policy, and hands the test the
+/// reservation's arena, which only the stream's tracker holds once the reservation is attached.
+class capture_arena_policy : public reservation_limit_policy {
+ public:
+  explicit capture_arena_policy(reserved_arena** arena) : _arena(arena) {}
+
+  void handle_over_reservation([[maybe_unused]] ::cuda::stream_ref stream,
+                               [[maybe_unused]] std::size_t requested_bytes,
+                               [[maybe_unused]] std::size_t current_allocated,
+                               reserved_arena* reserved_bytes) override
+  {
+    *_arena = reserved_bytes;
+  }
+
+  std::string get_policy_name() const override { return "capture_arena"; }
+
+ private:
+  reserved_arena** _arena;
+};
 
 }  // namespace
 
@@ -245,4 +302,189 @@ TEST_CASE("An explicitly supplied pool handle overrides upstream introspection",
     CHECK(e.pool_handle == explicit_pool);
     CHECK(e.pool_handle != async_mr.pool_handle());
   }
+}
+
+TEST_CASE("Growing a device reservation over bytes allocated past it does not charge them again",
+          "[reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t reserved = 2 * chunk;
+  auto memory                    = make_gpu_memory(64 * chunk);
+  auto* mr                       = gpu_adaptor(*memory);
+  REQUIRE(mr != nullptr);
+  auto const baseline = mr->get_total_allocated_bytes();
+
+  rmm::cuda_stream stream;
+  reserved_arena* arena = nullptr;
+  REQUIRE(mr->attach_reservation_to_tracker(
+    stream,
+    memory->request_reservation(specific_memory_space{Tier::GPU, 0}, reserved),
+    std::make_unique<capture_arena_policy>(&arena)));
+
+  // Two chunks inside the reservation and two past it, already charged.
+  void* ptr = mr->allocate(stream, 4 * chunk, 256);
+  REQUIRE(arena != nullptr);
+  REQUIRE(mr->get_total_allocated_bytes() == baseline + 4 * chunk);
+
+  // The grown reservation covers exactly the four chunks in use: nothing new is charged.
+  REQUIRE(arena->grow_by(2 * chunk));
+  REQUIRE(arena->size() == static_cast<std::int64_t>(4 * chunk));
+  CHECK(mr->get_total_allocated_bytes() == baseline + 4 * chunk);
+
+  mr->deallocate(stream, ptr, 4 * chunk, 256);
+  CHECK(mr->get_total_allocated_bytes() == baseline + 4 * chunk);  // the reservation stays charged
+
+  mr->reset_stream_reservation(stream);  // releases the reservation
+  CHECK(mr->get_total_allocated_bytes() == baseline);
+  CHECK(mr->get_total_reserved_bytes() == 0);
+}
+
+TEST_CASE("Growing a device reservation partly over bytes allocated past it charges only the rest",
+          "[reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t reserved = 2 * chunk;
+  auto memory                    = make_gpu_memory(64 * chunk);
+  auto* mr                       = gpu_adaptor(*memory);
+  REQUIRE(mr != nullptr);
+  auto const baseline = mr->get_total_allocated_bytes();
+
+  rmm::cuda_stream stream;
+  reserved_arena* arena = nullptr;
+  REQUIRE(mr->attach_reservation_to_tracker(
+    stream,
+    memory->request_reservation(specific_memory_space{Tier::GPU, 0}, reserved),
+    std::make_unique<capture_arena_policy>(&arena)));
+
+  // One chunk past the reservation; growing by two covers it and reserves one new chunk.
+  void* ptr = mr->allocate(stream, 3 * chunk, 256);
+  REQUIRE(arena != nullptr);
+  REQUIRE(mr->get_total_allocated_bytes() == baseline + 3 * chunk);
+  REQUIRE(arena->grow_by(2 * chunk));
+  CHECK(mr->get_total_allocated_bytes() == baseline + 4 * chunk);
+
+  mr->deallocate(stream, ptr, 3 * chunk, 256);
+  mr->reset_stream_reservation(stream);
+  CHECK(mr->get_total_allocated_bytes() == baseline);
+  CHECK(mr->get_total_reserved_bytes() == 0);
+}
+
+TEST_CASE("A policy that grows a device reservation charges the triggering allocation once",
+          "[reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t reserved = 2 * chunk;
+  auto memory                    = make_gpu_memory(64 * chunk);
+  auto* mr                       = gpu_adaptor(*memory);
+  REQUIRE(mr != nullptr);
+  auto const baseline = mr->get_total_allocated_bytes();
+
+  rmm::cuda_stream stream;
+  REQUIRE(mr->attach_reservation_to_tracker(
+    stream,
+    memory->request_reservation(specific_memory_space{Tier::GPU, 0}, reserved),
+    std::make_unique<increase_reservation_limit_policy>(1.0)));
+
+  // The policy grows the reservation to exactly the allocation, so the allocation is covered by
+  // the reservation and charges nothing on top of it.
+  void* ptr = mr->allocate(stream, 4 * chunk, 256);
+  REQUIRE(mr->get_total_reserved_bytes() == 4 * chunk);
+  CHECK(mr->get_total_allocated_bytes() == baseline + 4 * chunk);
+
+  mr->deallocate(stream, ptr, 4 * chunk, 256);
+  CHECK(mr->get_total_allocated_bytes() == baseline + 4 * chunk);  // the reservation stays charged
+
+  mr->reset_stream_reservation(stream);
+  CHECK(mr->get_total_allocated_bytes() == baseline);
+  CHECK(mr->get_total_reserved_bytes() == 0);
+}
+
+TEST_CASE("A failed allocation past a device reservation leaves the charged bytes unchanged",
+          "[reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t reserved = 2 * chunk;
+  auto memory                    = make_gpu_memory(64 * chunk);
+  auto* mr                       = gpu_adaptor(*memory);
+  REQUIRE(mr != nullptr);
+  auto const baseline = mr->get_total_allocated_bytes();
+
+  rmm::cuda_stream stream;  // the default policy lets allocations run past the reservation
+  REQUIRE(mr->attach_reservation_to_tracker(
+    stream, memory->request_reservation(specific_memory_space{Tier::GPU, 0}, reserved)));
+
+  void* ptr = mr->allocate(stream, chunk, 256);  // inside the reservation
+
+  // Crosses the end of the reservation and exceeds the capacity, so it is undone.
+  REQUIRE_THROWS_AS(mr->allocate(stream, 128 * chunk, 256), cucascade_out_of_memory);
+  CHECK(mr->get_total_allocated_bytes() == baseline + reserved);
+  CHECK(mr->get_allocated_bytes(stream) == chunk);
+
+  mr->deallocate(stream, ptr, chunk, 256);
+  mr->reset_stream_reservation(stream);
+  CHECK(mr->get_total_allocated_bytes() == baseline);
+}
+
+TEST_CASE("Growing a device reservation while another thread allocates past it keeps the charges",
+          "[reservation_aware][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+
+  constexpr std::size_t reserved   = chunk;
+  constexpr std::size_t alloc_size = 32 * chunk;
+  constexpr std::size_t grow_step  = 4096;
+  constexpr int max_grows          = 12288;  // 48 chunks, less than the two allocations
+  constexpr int rounds             = 500;
+  auto memory                      = make_gpu_memory(256 * chunk);
+  auto* mr                         = gpu_adaptor(*memory);
+  REQUIRE(mr != nullptr);
+  auto const baseline = mr->get_total_allocated_bytes();
+
+  rmm::cuda_stream stream;
+  reserved_arena* arena = nullptr;
+  REQUIRE(mr->attach_reservation_to_tracker(
+    stream,
+    memory->request_reservation(specific_memory_space{Tier::GPU, 0}, reserved),
+    std::make_unique<capture_arena_policy>(&arena)));
+
+  // Hand the test the arena before the threads start.
+  mr->deallocate(stream, mr->allocate(stream, 2 * chunk, 256), 2 * chunk, 256);
+  REQUIRE(arena != nullptr);
+
+  // The two allocations together always end past the reservation, and the first one crosses its
+  // end until the reservation has grown past it.
+  std::atomic<bool> allocator_done{false};
+  int grows = 0;
+  // A copy, since the policy writes arena again on every allocation past the end.
+  std::thread grower([&, target = arena]() {
+    while (!allocator_done.load() && grows < max_grows) {
+      if (target->grow_by(grow_step)) { ++grows; }
+      std::this_thread::yield();
+    }
+  });
+  std::thread allocator([&]() {
+    for (int i = 0; i < rounds; ++i) {
+      void* first  = mr->allocate(stream, alloc_size, 256);
+      void* second = mr->allocate(stream, alloc_size, 256);
+      mr->deallocate(stream, first, alloc_size, 256);
+      mr->deallocate(stream, second, alloc_size, 256);
+    }
+    allocator_done.store(true);
+  });
+  allocator.join();
+  grower.join();
+  stream.synchronize();
+
+  REQUIRE(grows > 0);
+  auto const grown = reserved + static_cast<std::size_t>(grows) * grow_step;
+  CHECK(arena->size() == static_cast<std::int64_t>(grown));
+  CHECK(mr->get_total_allocated_bytes() == baseline + grown);  // the reservation stays charged
+
+  mr->reset_stream_reservation(stream);
+  CHECK(mr->get_total_allocated_bytes() == baseline);
+  CHECK(mr->get_total_reserved_bytes() == 0);
 }

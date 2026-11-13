@@ -8,7 +8,7 @@ cache). Each library is built as `<name>_shared` and `<name>_static`, with stric
 | Library | Sources | Depends on |
 | --- | --- | --- |
 | `cucascade_cudf` (`CUCASCADE_BUILD_CUDF`) | `src/cudf`, `include/cucascade/cudf` | io (if enabled), core, libcudf |
-| `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/{io,exec}`, `include/cucascade/{io,exec}` | core, system I/O libraries; kvikIO parts only with `CUCASCADE_BUILD_CUDF` |
+| `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/{io,exec}`, `include/cucascade/{io,exec}` | core, liburing, OpenSSL |
 | `cucascade` (core) | `src/{memory,data,cuda}`, `include/cucascade/{memory,data,cuda,utils,log}`, `include/cucascade/*.hpp` | topology, RMM, CUDA runtime, libnuma |
 | `cucascade_topology_discovery` | `src/memory/topology_discovery.cpp`, `src/log` | NVML; never a link-time `libcuda` dependency |
 

@@ -103,11 +103,17 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_object_store_lister.cpp
     io/rest/test_rest_cache_identity.cpp
     io/rest/test_rest_footer_resolve.cpp
+    io/rest/test_rest_https.cpp
+    io/rest/test_rest_pool_parity.cpp
+    io/rest/test_rest_pool_plan.cpp
+    io/rest/test_rest_read_robustness.cpp
     io/rest/test_rest_validation_tag.cpp
     io/rest/test_shared_byte_span.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
     io/rest/s3/test_static_credentials.cpp
+    io/rest/net/test_net_dns.cpp
+    io/rest/net/test_net_transport.cpp
     io/uring/test_uring_readv.cpp
     # Utils
     # Replaces the global operator new for the whole test binary
@@ -119,18 +125,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
-  # Tests of src-private helpers (io/detail/...) include them from src/.
+  # Tests of the io_uring REST transport modules.
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)
+  # Tests of src-private helpers (io/detail/..., the transport modules) include
+  # them from src/.
   target_include_directories(cucascade_io_tests
                              PRIVATE ${PROJECT_SOURCE_DIR}/src)
-
-  # kvikIO-backed sources exist only in a cudf build; see src/io/CMakeLists.txt.
-  if(CUCASCADE_BUILD_CUDF)
-    target_sources(
-      cucascade_io_tests
-      PRIVATE io/kvikio/test_kvikio_config.cpp
-              io/kvikio/test_kvikio_identity.cpp
-              io/kvikio/test_kvikio_remote.cpp)
-  endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
                                                       CUDA_STANDARD_REQUIRED ON)
@@ -171,6 +172,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
       PRIVATE cudf/test_cache_object_identity.cpp
               cudf/test_rest_datasource_contracts.cpp
               cudf/test_cache_read_arbitration.cpp
+              cudf/test_datasource_read_lifetime.cpp
               cudf/test_dispose_eviction.cpp
               cudf/test_explicit_eviction.cpp)
   endif()
@@ -195,8 +197,9 @@ endif()
 
 # Create topology discovery test executable
 add_executable(
-  cucascade_topology_discovery_tests memory/test_topology_discovery.cpp
-                                     unittest_topology_discovery.cpp)
+  cucascade_topology_discovery_tests
+  memory/test_topology_discovery.cpp memory/test_net_topology.cpp
+  unittest_topology_discovery.cpp)
 set_target_properties(cucascade_topology_discovery_tests
                       PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 

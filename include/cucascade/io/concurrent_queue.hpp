@@ -26,8 +26,7 @@
  * `BlockingConcurrentQueue`. This header decouples that code from *which*
  * moodycamel it links against: standalone builds fetch cameron314's upstream
  * (namespace `moodycamel`), while an embedding host may provide its own vendored
- * copy under a different namespace (e.g. duckdb's fork is `duckdb_moodycamel`,
- * used by sirius).
+ * copy under a different namespace (e.g. duckdb's fork is `duckdb_moodycamel`).
  *
  * `CUCASCADE_MOODYCAMEL_NAMESPACE` selects the namespace and defaults to
  * `moodycamel`; the CMake build propagates it as a public compile definition so
