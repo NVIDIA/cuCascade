@@ -103,8 +103,9 @@ class io_backend_registry {
   /**
    * @brief Set the default backend name.
    *
-   * When creating disk memory spaces without specifying a backend, the default
-   * is used. The named backend must already be registered.
+   * Used by create_default_backend(). Disk memory spaces do not consult the
+   * registry; they default to the pipeline backend. The named backend must
+   * already be registered.
    *
    * @param name The name of a registered backend to use as default.
    * @throws std::runtime_error if no backend is registered under this name.

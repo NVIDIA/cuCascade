@@ -11,8 +11,9 @@ A high-performance GPU memory management library for data-intensive applications
 - **Memory Reservation System**: Avoid oversubscribing your GPU by making reservations and using allocators that respect reservations
 - **Hardware Topology Discovery**: Automatic detection of NUMA regions and GPU-CPU affinity for optimal memory placement
 - **Stream-Aware Tracking**: Per-stream memory usage tracking and reservation enforcement
-- **cuDF Integration**: Native support for GPU DataFrames with batch processing capabilities and spilling to Host or Disk
-- **Pluggable Policies**: Control what happens when you OOM, try to allocate more than a reservation, how you pick what data to spill, by creating policies that plug into the system.
+- **cuDF Integration**: Optional `cucascade-cudf` library with cuDF table representations and converters for spilling batches to Host or Disk
+- **Data Source I/O**: Optional `cucascade-io` library with io_uring and REST/S3 readers and a prefetching cache
+- **Pluggable Policies**: Control what happens when you OOM or try to allocate more than a reservation by creating policies that plug into the system.
 
 # Getting Started
 
@@ -44,48 +45,57 @@ pixi run benchmarks
 
 - **OS/Arch**: Linux (x86_64, aarch64)
 - **Compiler**: C++20 compatible compiler
-- **Build Tools**: CMake 4.1+, Ninja
-- **GPU/Drivers**: CUDA 13+, compatible NVIDIA driver
-- **Dependencies**: RMM (core); libcudf 25.10+ (only for the optional `cucascade-cudf` library)
+- **Build Tools**: CMake 4.0+, Ninja, sccache (used by the CMake presets)
+- **GPU/Drivers**: CUDA 12.9+ or 13+, compatible NVIDIA driver
+- **Dependencies**: RMM and libnuma (core); libcudf (only for the optional `cucascade-cudf` library); liburing and OpenSSL (only for the optional `cucascade-io` library)
 
 > **Library layout:** the core `cuCascade::cucascade` target is cudf-free and depends only on
-> RMM + CUDA (plus libnuma and cuFile for the disk tier). The cudf-backed representations,
-> converters, and bandwidth profiler live in a separate `cuCascade::cucascade_cudf` target (headers
-> under `include/cucascade/cudf/`). The cudf library can be turned off at configure time with
-> `-DCUCASCADE_BUILD_CUDF=OFF`.
+> RMM, CUDA, libnuma and Threads. The cudf-backed representations, converters, and bandwidth profiler
+> live in a separate `cuCascade::cucascade_cudf` target (headers under `include/cucascade/cudf/`).
+> The io layer (headers under `include/cucascade/io/` and `include/cucascade/exec/`) lives in the
+> cudf-free `cuCascade::cucascade_io` target. These libraries can be turned off at configure time
+> with `-DCUCASCADE_BUILD_CUDF=OFF` and `-DCUCASCADE_BUILD_IO=OFF`.
 >
-> cudf is exposed as a package *component*, so core consumers never need cudf installed:
+> cudf and io are exposed as package *components*, so core consumers never need cudf or the io
+> dependencies installed:
 >
 > ```cmake
 > find_package(cuCascade REQUIRED)                  # cudf-free core
 > target_link_libraries(my_app PRIVATE cuCascade::cucascade)
 >
-> find_package(cuCascade REQUIRED COMPONENTS cudf)  # also resolves cudf
+> find_package(cuCascade REQUIRED COMPONENTS cudf)  # also resolves cudf (and the io dependencies if io was built)
 > target_link_libraries(my_app PRIVATE cuCascade::cucascade_cudf)
+>
+> find_package(cuCascade REQUIRED COMPONENTS io)    # also resolves liburing, OpenSSL
+> target_link_libraries(my_app PRIVATE cuCascade::cucascade_io)
 > ```
+>
+> See [Using cuCascade as a Dependency](docs/development-guide.md#using-cucascade-as-a-dependency)
+> for dependencies the io layer's consumers must provide themselves.
 
 # Usage
 
 ```cpp
-#include <memory/memory_reservation_manager.hpp>
-#include <memory/reservation_manager_configurator.hpp>
-#include <memory/topology_discovery.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 using namespace cucascade::memory;
 
 // 1. Discover hardware topology
 topology_discovery discovery;
-if (!discovery.discover()) {
-    // Handle discovery failure
-}
+[[maybe_unused]] bool discovered = discovery.discover();
 auto const& topology = discovery.get_topology();
+if (topology.gpus.empty()) {
+    throw std::runtime_error("No GPUs discovered");
+}
 
 // 2. Configure the memory reservation manager
 reservation_manager_configurator configurator;
 configurator.set_gpu_usage_limit(4ULL << 30)                // 4GB per GPU
-            .set_reservation_limit_ratio_per_gpu(0.8)       // Reserve up to 80%
-            .set_capacity_per_numa_node(16ULL << 30)        // 16GB per NUMA node
-            .bind_cpu_tier_to_gpus();                       // Bind CPU tiers to GPUs
+            .set_reservation_fraction_per_gpu(0.8)          // Reserve up to 80%
+            .set_per_numa_region_capacity(16ULL << 30)      // 16GB per NUMA region
+            .use_numa_id_as_host_id();                      // One host space per NUMA node
 
 // 3. Create the manager with the discovered topology
 auto configs = configurator.build(topology);
@@ -95,8 +105,8 @@ memory_reservation_manager manager(std::move(configs));
 // Request 1GB on any available GPU
 auto gpu_res = manager.request_reservation(any_memory_space_in_tier(Tier::GPU), 1ULL << 30);
 
-// Request 2GB on a specific host NUMA node
-auto host_res = manager.request_reservation(specific_memory_space(Tier::HOST, 0), 2ULL << 30);
+// Request 2GB on any host memory space
+auto host_res = manager.request_reservation(any_memory_space_in_tier(Tier::HOST), 2ULL << 30);
 ```
 
 - More examples: See `test/` directory for comprehensive usage examples
@@ -106,17 +116,17 @@ auto host_res = manager.request_reservation(specific_memory_space(Tier::HOST, 0)
 Comprehensive documentation is available in the `docs/` directory:
 
 - **[Architecture Overview](docs/ARCHITECTURE.md)**: High-level description of the library's design, core components, and intended usage flows with Mermaid diagrams.
-- **[API Reference](docs/API_REFERENCE.md)**: Detailed API documentation and class hierarchies automatically generated from code comments.
+- **[Documentation Index](docs/README.md)**: All design documents (memory and data management, topology and configuration, development guide) with suggested reading paths.
+- **API Reference** (`docs/API_REFERENCE.md`): Detailed API documentation and class hierarchies automatically generated from code comments. It is not checked in.
 
-To regenerate the documentation:
+To generate the API reference:
 ```bash
 pixi run docs
 ```
 
 # Contribution Guidelines
 
-- Start here: `CONTRIBUTING.md`
-- Code of Conduct: `CODE_OF_CONDUCT.md`
+- Start here: [Development Guide](docs/development-guide.md)
 - Development quickstart:
 
 ```bash
@@ -143,7 +153,7 @@ pixi run lint
 pixi run lint-install
 
 # Update hook versions
-pre-commit autoupdate
+pixi run pre-commit autoupdate
 ```
 
 ## Security
@@ -162,37 +172,49 @@ pre-commit autoupdate
 
 ```
 cuCascade/
-├── include/
-│   ├── data/                      # Data representation headers
-│   │   ├── common.hpp             # Common data utilities
+├── include/cucascade/
+│   ├── error.hpp, nvtx.hpp        # Error macros and NVTX ranges (core)
+│   ├── data/                      # Data batches, repositories, disk tier (core; key headers)
+│   │   ├── common.hpp             # idata_representation base class
 │   │   ├── data_batch.hpp         # Batch processing for data
 │   │   ├── data_repository.hpp    # Data storage abstraction
 │   │   ├── data_repository_manager.hpp
-│   │   ├── cpu_data_representation.hpp
-│   │   └── gpu_data_representation.hpp
-│   └── memory/                    # Memory management headers
-│       ├── common.hpp             # Tier enum, memory_space_id, utilities
-│       ├── memory_reservation_manager.hpp  # Central reservation coordinator
-│       ├── memory_reservation.hpp # Reservation types and policies
-│       ├── memory_space.hpp       # Memory space abstraction
-│       ├── reservation_aware_resource_adaptor.hpp  # GPU memory resource
-│       ├── fixed_size_host_memory_resource.hpp     # Host memory resource
-│       ├── disk_access_limiter.hpp                 # Disk tier limiter
-│       ├── reservation_manager_configurator.hpp    # Builder for config
-│       ├── topology_discovery.hpp # Hardware topology detection
-│       ├── numa_region_pinned_host_allocator.hpp   # NUMA-aware allocator
-│       ├── notification_channel.hpp   # Cross-reservation signaling
-│       ├── stream_pool.hpp        # CUDA stream management
-│       └── oom_handling_policy.hpp    # OOM handling strategies
+│   │   ├── disk_data_representation.hpp  # Disk-tier representation
+│   │   ├── disk_io_backend.hpp    # Pluggable disk I/O backend interface
+│   │   └── representation_converter.hpp  # Converter registry
+│   ├── memory/                    # Memory management headers (core; key headers)
+│   │   ├── common.hpp             # Tier enum, memory_space_id, utilities
+│   │   ├── memory_reservation_manager.hpp  # Central reservation coordinator
+│   │   ├── memory_reservation.hpp # Reservation types and policies
+│   │   ├── memory_space.hpp       # Memory space abstraction
+│   │   ├── reservation_aware_resource_adaptor.hpp  # GPU memory resource
+│   │   ├── fixed_size_host_memory_resource.hpp     # Host memory resource
+│   │   ├── disk_access_limiter.hpp                 # Disk tier limiter
+│   │   ├── reservation_manager_configurator.hpp    # Builder for config
+│   │   ├── topology_discovery.hpp # Hardware topology detection
+│   │   ├── numa_region_pinned_host_allocator.hpp   # NUMA-aware allocator
+│   │   ├── notification_channel.hpp   # Cross-reservation signaling
+│   │   ├── stream_pool.hpp        # CUDA stream management
+│   │   └── oom_handling_policy.hpp    # OOM handling strategies
+│   ├── cuda/                      # CUDA stream, event and copy helpers (core)
+│   ├── utils/                     # Atomics, cleanup and exception-logging helpers (core)
+│   ├── log/                       # Logging macros (core)
+│   ├── cudf/                      # cudf representations and converters (cucascade-cudf)
+│   ├── io/                        # Data sources and cache (cucascade-io)
+│   └── exec/                      # Thread pool and futures (cucascade-io)
 ├── src/
-│   ├── data/                      # Data representation implementation
-│   └── memory/                    # Memory management implementation
+│   ├── cuda/, data/, memory/      # Core library implementation
+│   ├── cudf/                      # cucascade-cudf implementation
+│   └── exec/, io/                 # cucascade-io implementation
 ├── test/
-│   ├── data/                      # Data module tests
+│   ├── data/                      # Data tests (core and cudf-layer converters)
 │   ├── memory/                    # Memory module tests
+│   ├── cudf/                      # cudf converter and cudf datasource/cache tests
+│   ├── io/                        # io layer tests
 │   └── utils/                     # Test utilities (cuDF helpers)
 ├── benchmark/                     # Performance benchmarks
-│   ├── benchmark_representation_converter.cpp  # Converter benchmarks
+│   ├── benchmark_*.cpp            # Converter benchmarks (cucascade_benchmarks)
+│   ├── *parquet*_benchmark.cpp    # Parquet/io datasource benchmarks (cucascade-io)
 │   └── README.md                  # Benchmark documentation
 ├── cmake/                         # CMake configuration modules
 ├── CMakeLists.txt                 # Main CMake configuration

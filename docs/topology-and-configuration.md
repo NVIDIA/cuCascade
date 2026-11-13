@@ -16,7 +16,7 @@ Hardware topology discovery, NUMA-aware memory placement, and system configurati
   - [GPU Configuration](#gpu-configuration)
   - [Host Configuration](#host-configuration)
   - [Disk Configuration](#disk-configuration)
-  - [Topology-Aware vs Manual Configuration](#topology-aware-vs-manual-configuration)
+  - [Building from Topology](#building-from-topology)
 - [Configuration Examples](#configuration-examples)
   - [Single GPU Setup](#single-gpu-setup)
   - [Multi-GPU with NUMA Awareness](#multi-gpu-with-numa-awareness)
@@ -34,7 +34,7 @@ Optimal memory performance in multi-GPU systems requires understanding the hardw
 cuCascade automatically discovers the hardware topology and uses it to:
 - Bind host memory spaces to the correct NUMA nodes for each GPU
 - Identify optimal network devices for GPU-direct communication
-- Map storage devices to NUMA nodes for disk-tier placement
+- Report NVMe storage devices with their NUMA affinity (disk spaces themselves are configured explicitly)
 
 ## Hardware Topology Discovery
 
@@ -44,16 +44,17 @@ cuCascade automatically discovers the hardware topology and uses it to:
 
 ```cpp
 topology_discovery discovery;
-if (discovery.discover()) {
+[[maybe_unused]] bool discovered = discovery.discover();
+{
     auto const& topo = discovery.get_topology();
 
     topo.hostname;           // System hostname
-    topo.num_gpus;           // Total GPU count
+    topo.num_gpus;           // Number of entries in topo.gpus (one per MIG instance)
     topo.num_numa_nodes;     // Total NUMA node count
     topo.numa_nodes;         // Per-NUMA-node capacity and memory kind
     topo.gpus;               // Per-GPU topology info
     topo.network_devices;    // NICs with NUMA affinity
-    topo.storage_devices;    // NVMe/SATA drives with NUMA affinity
+    topo.storage_devices;    // NVMe drives with NUMA affinity
 
     // Lookups return nullopt for an unknown node rather than a silent 0.
     topo.get_numa_memory_capacity(0);      // std::optional<std::size_t>
@@ -62,6 +63,10 @@ if (discovery.discover()) {
     topo.find_numa_node(0);                // numa_topology_info const*
 }
 ```
+
+`discover()` currently always returns `true`: when NVML is unavailable it succeeds with an empty
+`gpus` list, so check `topo.gpus.empty()` to detect a GPU-less discovery. It throws
+`std::invalid_argument` for an out-of-range numeric `CUDA_VISIBLE_DEVICES` entry.
 
 **Per-NUMA-node information** (`numa_topology_info`), read from
 `/sys/devices/system/node/node<id>/`:
@@ -76,14 +81,14 @@ if (discovery.discover()) {
 
 A node with memory and no CPUs is not host memory. DGX Station and Grace-Hopper expose GPU
 HBM as its own CPU-less node, and CXL memory expanders do the same. Such nodes are excluded
-from `get_total_numa_memory_capacity()`, and `set_usage_limit_ratio_per_numa_region()`
-throws rather than sizing a host space from device memory.
+from `get_total_numa_memory_capacity()`, and when `set_usage_limit_ratio_per_numa_region()` is
+used, `build()` throws rather than sizing a host space from device memory.
 
 **Per-GPU information** (`gpu_topology_info`):
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | `unsigned int` | GPU device ID |
+| `id` | `unsigned int` | Position in the visible GPU list: the order of the `CUDA_VISIBLE_DEVICES` entries when set, otherwise NVML (PCI bus) order, after MIG expansion. Matches the CUDA device ordinal only when CUDA enumerates in the same order (e.g. `CUDA_DEVICE_ORDER=PCI_BUS_ID`) |
 | `name` | `string` | Device name (e.g., "NVIDIA A100") |
 | `pci_bus_id` | `string` | PCIe bus address |
 | `uuid` | `string` | Unique GPU identifier |
@@ -92,19 +97,21 @@ throws rather than sizing a host space from device memory.
 | `cpu_cores` | `vector<int>` | List of optimal CPU core IDs |
 | `memory_binding` | `vector<int>` | NUMA nodes for memory binding |
 | `network_devices` | `vector<string>` | NICs optimal for this GPU |
+| `runtime_attributes` | `optional<gpu_runtime_attributes>` | Runtime attributes such as `hw_decomp`; empty unless requested (see [CUDA Context Independence](#cuda-context-independence)) |
 
 **Network devices** (`network_device_info`): name, NUMA node, PCIe bus ID
 
-**Storage devices** (`storage_device_info`): type (NVMe/SATA_SSD/SATA_HDD/UNKNOWN), name, NUMA node, PCIe bus ID
+**Storage devices** (`storage_device_info`): type (`StorageDriveType`: NVME/SATA_SSD/SATA_HDD/UNKNOWN), name, NUMA node, PCIe bus ID. Only NVMe controllers are currently detected.
 
 ### How Detection Works
 
-1. **NVML loading** -- `libnvidia-ml.so` is loaded at runtime via `dlopen()` (no build-time dependency)
-2. **GPU enumeration** -- NVML queries device count, names, UUIDs, PCIe bus IDs
-3. **NUMA mapping** -- reads `/sys/bus/pci/devices/<bus_id>/numa_node` for each GPU
+1. **NVML initialization** -- the CUDA toolkit's static NVML loader (`CUDA::nvml_static`) is linked in and loads the driver's `libnvidia-ml.so.1` at runtime; NVML is initialized once per process (again in a `fork()`ed child), and if initialization fails, discovery continues without GPUs
+2. **GPU enumeration** -- NVML queries device count, names, UUIDs, PCIe bus IDs; a MIG-enabled GPU contributes one entry per MIG instance, and `CUDA_VISIBLE_DEVICES` filters and orders the list
+3. **NUMA mapping** -- `nvmlDeviceGetMemoryAffinity()` gives the NUMA node of each GPU
 4. **CPU affinity** -- reads `/sys/bus/pci/devices/<bus_id>/local_cpulist`
-5. **Network devices** -- scans `/sys/class/infiniband/` for NICs with NUMA info, with configurable verification (see [Network Device Verification](#network-device-verification))
-6. **Storage devices** -- scans `/sys/block/` for NVMe and SATA devices with NUMA info
+5. **NUMA nodes** -- reads `meminfo` and `cpulist` under `/sys/devices/system/node/node<id>/`
+6. **Network devices** -- scans `/sys/class/infiniband/` for NICs with NUMA info, with configurable verification (see [Network Device Verification](#network-device-verification))
+7. **Storage devices** -- scans `/sys/class/nvme/` for NVMe controllers with NUMA info
 
 ### CUDA Context Independence
 
@@ -118,6 +125,11 @@ initialized it first. The driver library is loaded dynamically only when runtime
 requested, so passive topology discovery remains available when `libcuda.so.1` is absent. These
 queries do not initialize the driver or create a CUDA context, therefore, unavailable drivers and
 failed queries leave the corresponding runtime attributes unsupported.
+
+Topology discovery is compiled into its own library, `cuCascade::cucascade_topology_discovery`,
+which links only NVML, NVTX and `libdl` (no CUDA runtime, RMM or cudf). Configuring with
+`-DCUCASCADE_TOPOLOGY_ONLY=ON` builds only that library (plus its tests when
+`CUCASCADE_BUILD_TESTS` is ON), without RMM or cudf.
 
 ### Network Device Verification
 
@@ -133,13 +145,13 @@ The `discover()` method accepts a `NetworkDeviceVerification` parameter that con
 topology_discovery discovery;
 
 // Default: strictest (requires active port + IP address)
-discovery.discover();
+[[maybe_unused]] bool discovered = discovery.discover();
 
 // Only require active port (skip IP check)
-discovery.discover(NetworkDeviceVerification::EXISTS_ACTIVE);
+discovered = discovery.discover(NetworkDeviceVerification::EXISTS_ACTIVE);
 
 // Include all devices regardless of state
-discovery.discover(NetworkDeviceVerification::EXISTS);
+discovered = discovery.discover(NetworkDeviceVerification::EXISTS);
 ```
 
 Port state is read from `/sys/class/infiniband/<device>/ports/<N>/state`. The uverbs device node check verifies that `/dev/infiniband/uverbsN` exists for the device (in containerized environments sysfs may be mounted from the host while the device nodes are not passed through). IP address presence is checked via `getifaddrs()` on the net interface found under `/sys/class/infiniband/<device>/device/net/`.
@@ -162,7 +174,12 @@ cuCascade uses this mapping to ensure that when GPU 0 spills data to host memory
 
 ### PCIe Path Types
 
-The `PciePathType` enum describes the connection quality between devices:
+The `PciePathType` enum describes the connection quality between devices. Discovery estimates
+the path type between each GPU and NIC from their NUMA nodes and PCI bus numbers, and assigns
+each GPU the NICs with the best path type (`gpu_topology_info::network_devices`). This is a
+heuristic: NICs on a different NUMA node are `SYS`; otherwise a PCI bus-number distance of at
+most 2 is `PIX`, at most 10 (or an unparsable bus) is `PHB`, and anything larger is `NODE`. It
+never yields `PXB`, and the path type itself is not stored in the topology structs.
 
 | Type | Value | Meaning | Relative Performance |
 |------|-------|---------|---------------------|
@@ -193,11 +210,11 @@ configurator
 
 // With topology
 topology_discovery discovery;
-discovery.discover();
+[[maybe_unused]] bool discovered = discovery.discover();
 auto configs = configurator.build(discovery.get_topology());
 
-// Without topology (uses defaults)
-auto configs = configurator.build();
+// Or let build() run topology_discovery::discover() itself:
+// auto configs = configurator.build();
 
 // Create the manager
 memory_reservation_manager manager(std::move(configs));
@@ -217,7 +234,7 @@ memory_reservation_manager manager(std::move(configs));
 | `track_reservation_per_stream(true)` | Enable per-stream reservation tracking | `true` |
 | `set_gpu_memory_resource_factory(fn)` | Custom GPU allocator factory | RMM async pool |
 
-Note: `set_gpu_usage_limit()` and `set_usage_limit_ratio_per_gpu()` are mutually exclusive -- use one or the other. The `fraction_or_size` type handles this internally.
+Note: `set_gpu_usage_limit()` and `set_usage_limit_ratio_per_gpu()` are mutually exclusive -- use one or the other; the last call wins. The `fraction_or_size` type handles this internally.
 
 ### Host Configuration
 
@@ -225,13 +242,14 @@ Note: `set_gpu_usage_limit()` and `set_usage_limit_ratio_per_gpu()` are mutually
 |--------|-------------|---------|
 | `use_gpu_id_as_host_id()` | One host space per GPU (testing) | N/A |
 | `use_numa_id_as_host_id()` | One host space per NUMA node (production) | `use_numa_id_as_host_id()` |
-| `set_total_host_capacity(bytes)` | Total host memory across all spaces | 4 GB |
-| `set_per_numa_region_capacity(bytes)` | Memory per host space | 4 GB |
+| `set_total_host_capacity(bytes)` | Total host memory across all spaces | N/A |
+| `set_per_numa_region_capacity(bytes)` | Memory per host space | 4 GB per space |
 | `set_usage_limit_ratio_per_numa_region(0.25)` | Memory per host space as a fraction of its NUMA region's capacity | N/A |
 | `set_reservation_fraction_per_numa_region(0.85)` | Fraction reservable | 0.85 |
 | `set_reservation_limit_per_numa_region(bytes)` | Absolute reservation limit | N/A |
 | `set_downgrade_fractions_per_numa_region(0.85, 0.65)` | (trigger, stop) fractions | (0.85, 0.65) |
-| `set_host_pool_features(chunk, block, count)` | Block allocator settings | (1MB, 128, 4) |
+| `set_host_pool_features(chunk, block, count)` | Block allocator settings: block size in bytes, blocks per pool, initial pools | (1MB, 128, 4) |
+| `set_host_portability(bool)` | Whether default pinned host allocations are portable across GPUs | `true` with more than one GPU |
 | `set_host_memory_resource_factory(fn)` | Custom host allocator factory | NUMA-pinned |
 
 Host creation policies:
@@ -250,17 +268,19 @@ configurator.set_disk_mounting_point(
 );
 ```
 
-### Topology-Aware vs Manual Configuration
+### Building from Topology
 
-**With topology** (`build(topology)`):
-- GPU capacities are queried from the hardware
-- NUMA nodes are automatically mapped to GPUs
-- Host spaces are created for the correct NUMA nodes
-
-**Without topology** (`build()`):
-- Uses the configured GPU count/IDs
-- GPU capacity must be set explicitly via `set_gpu_usage_limit()`
-- Host spaces are created with sequential IDs (0, 1, ...)
+`build(topology)` uses the topology passed in. `build()` runs `topology_discovery::discover()`
+with default settings and then does the same. In both cases:
+- The configured GPU IDs (or GPUs `0..n-1` for `set_number_of_gpus(n)`) must be present in the
+  topology, otherwise `build()` throws
+- The total memory of every GPU in the topology (not only the configured ones) is queried through
+  the CUDA runtime (`rmm::available_device_memory()`), using the topology `id` as the CUDA device
+  ordinal. Unlike `discover()`, this initializes CUDA and creates a context on each visible GPU.
+  `set_usage_limit_ratio_per_gpu()` is applied to that total
+- Each GPU's NUMA node comes from the topology, and host spaces are created for those NUMA nodes
+- `set_usage_limit_ratio_per_numa_region()` sizes each host space from its NUMA node's capacity in
+  the topology
 
 ---
 
@@ -284,7 +304,7 @@ memory_reservation_manager manager(std::move(configs));
 
 ```cpp
 topology_discovery discovery;
-discovery.discover();
+[[maybe_unused]] bool discovered = discovery.discover();
 
 reservation_manager_configurator configurator;
 configurator
@@ -307,11 +327,11 @@ memory_reservation_manager manager(std::move(configs));
 ### Custom Memory Resources
 
 ```cpp
-// Custom GPU allocator factory
-auto custom_gpu_factory = [](int device_id, size_t capacity)
-    -> std::unique_ptr<rmm::mr::device_memory_resource> {
+// Custom GPU allocator factory (a DeviceMemoryResourceFactoryFn)
+auto custom_gpu_factory = [](int device_id, std::size_t capacity)
+    -> ::cuda::mr::any_resource<::cuda::mr::device_accessible> {
     // Use your own pool or allocator
-    return std::make_unique<my_custom_gpu_allocator>(device_id, capacity);
+    return my_custom_gpu_allocator{device_id, capacity};
 };
 
 reservation_manager_configurator configurator;
@@ -326,8 +346,9 @@ auto configs = configurator.build();
 
 ```cpp
 topology_discovery discovery;
-if (!discovery.discover()) {
-    throw std::runtime_error("Failed to discover hardware topology");
+[[maybe_unused]] bool discovered = discovery.discover();
+if (discovery.get_topology().gpus.empty()) {
+    throw std::runtime_error("No GPUs discovered");
 }
 
 reservation_manager_configurator configurator;
@@ -367,7 +388,7 @@ memory_reservation_manager manager(std::move(configs));
 | GPU downgrade trigger | 0.85 (85%) |
 | GPU downgrade stop | 0.65 (65%) |
 | Per-stream tracking | `true` |
-| Host capacity | 4 GB |
+| Host capacity | 4 GB per host space |
 | Host reservation fraction | 0.85 (85%) |
 | Host downgrade trigger | 0.85 (85%) |
 | Host downgrade stop | 0.65 (65%) |
@@ -375,7 +396,8 @@ memory_reservation_manager manager(std::move(configs));
 | Host pool size | 128 blocks per pool |
 | Host initial pools | 4 |
 | Host creation policy | `use_numa_id_as_host_id()` |
-| GPU allocator | `rmm::cuda_async_memory_resource` |
+| Host portability | Portable when more than one GPU is configured |
+| GPU allocator | `rmm::mr::cuda_async_memory_resource` |
 | Host allocator | `numa_region_pinned_host_memory_resource` |
 | Stream pool size | 16 streams |
 
@@ -390,5 +412,5 @@ memory_reservation_manager manager(std::move(configs));
 | `include/cucascade/memory/config.hpp` | `gpu_memory_space_config`, `host_memory_space_config`, `disk_memory_space_config` |
 | `include/cucascade/memory/common.hpp` | `Tier` enum, `memory_space_id`, `DeviceMemoryResourceFactoryFn` |
 | `include/cucascade/memory/numa_region_pinned_host_allocator.hpp` | NUMA-aware pinned host allocation |
-| `src/memory/topology_discovery.cpp` | NVML loading and `/sys` queries |
+| `src/memory/topology_discovery.cpp` | NVML and `/sys` queries, lazily loaded CUDA driver for runtime attributes |
 | `src/memory/reservation_manager_configurator.cpp` | Builder implementation |
