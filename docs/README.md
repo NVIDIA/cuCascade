@@ -43,7 +43,7 @@ Optional layers (built by default; disable with the options below) build on the 
 
 - **cuDF Layer** (`include/cucascade/cudf/`, `src/cudf/`; library `cucascade_cudf`, option `CUCASCADE_BUILD_CUDF`): cuDF-backed GPU and host representations, the built-in GPU/host/disk converters, the bandwidth profiler, and (when `CUCASCADE_BUILD_IO` is on) the `cudf::io::datasource` bridge to the I/O layer.
 
-- **I/O and Execution Layer** (`include/cucascade/io/`, `include/cucascade/exec/`, `src/io/`, `src/exec/`; library `cucascade_io`, option `CUCASCADE_BUILD_IO`): Async I/O backends (`ioctx`: io_uring for local files, REST/S3 and S3-over-RDMA for object stores, plus a kvikIO fallback when built with `CUCASCADE_BUILD_CUDF`) selected per path by `io_context_registry`, a prefetching cache, and the thread pool, futures and admission control they run on. The `cudf::io::datasource` built on these lives in the cuDF layer. No design doc covers this layer; see its headers.
+- **I/O and Execution Layer** (`include/cucascade/io/`, `include/cucascade/exec/`, `src/io/`, `src/exec/`; library `cucascade_io`, option `CUCASCADE_BUILD_IO`): Async I/O contexts (`ioctx`: io_uring for local files, REST/S3 and S3-over-RDMA for object stores) selected per path by `io_context_registry`, a prefetching cache, and the thread pool, futures and admission control they run on. The `cudf::io::datasource` built on these lives in the cuDF layer. See the [REST transport design](io/rest-transport.md) and the I/O headers.
 
 ## Related Resources
 

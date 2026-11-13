@@ -127,8 +127,7 @@ Built only with `CUCASCADE_BUILD_S3_BENCHMARK=ON`, which needs aws-sdk-cpp. aws-
 cuCascade dependency; use the `s3-bench` pixi environment and the `s3-bench` CMake preset, which
 builds into `build/s3-bench`:
 
-- `cucascade_s3_parquet_benchmark`: S3 parquet read using the cucascade-io REST datasource or
-  kvikIO's remote S3 handle
+- `cucascade_s3_parquet_benchmark`: S3 parquet read using the cucascade-io REST datasource
 - `cucascade_s3_parquet_io_benchmark`: the S3 analogue of `cucascade_parquet_io_benchmark`
 
 ```bash

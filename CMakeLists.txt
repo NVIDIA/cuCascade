@@ -45,10 +45,41 @@ option(
   "Build the S3 parquet benchmark (requires aws-sdk-cpp; NOT a cuCascade dependency)"
   OFF)
 
+# Compile-time floor for the CUCASCADE_LOG_* macros, as the underlying value of
+# a cucascade::log::level (0 = trace ... 6 = off). The default keeps every call
+# site and leaves filtering to the runtime threshold; raising it strips the
+# cheaper levels from the binary. Propagated PUBLIC by every cuCascade target,
+# like the other ODR-relevant knobs below, so cuCascade's own sources and its
+# CMake consumers compile the macros with one floor: they expand inside inline
+# and template functions of installed headers.
+set(CUCASCADE_MIN_LOG_LEVEL
+    "0"
+    CACHE
+      STRING
+      "Compile out CUCASCADE_LOG_* call sites below this level (0=trace, 1=debug, 2=info, 3=warn, 4=error, 5=fatal, 6=off)"
+)
+set_property(
+  CACHE CUCASCADE_MIN_LOG_LEVEL
+  PROPERTY STRINGS
+           0
+           1
+           2
+           3
+           4
+           5
+           6)
+if(NOT CUCASCADE_MIN_LOG_LEVEL MATCHES "^[0-6]$")
+  message(
+    FATAL_ERROR
+      "CUCASCADE_MIN_LOG_LEVEL must be an integer from 0 (trace) to 6 (off); got '${CUCASCADE_MIN_LOG_LEVEL}'"
+  )
+endif()
+set(CUCASCADE_PUBLIC_COMPILE_DEFS
+    CUCASCADE_MIN_LOG_LEVEL=${CUCASCADE_MIN_LOG_LEVEL})
+
 # Swappable third-party backends for the io layer. The io code was ported from a
 # codebase with its own vendored dependencies. These knobs let an embedding host
-# (e.g. sirius) reuse the copies it already links instead of the
-# standalone-build defaults.
+# reuse the copies it already links instead of the standalone-build defaults.
 
 # cucascade::exec::invocable backing: OFF -> in-tree move-only callable; ON ->
 # absl::AnyInvocable (reuses a host project's abseil).
@@ -72,7 +103,7 @@ set(CUCASCADE_ABSEIL_INVOCABLE_TARGET
 # CUCASCADE_MOODYCAMEL_TARGET  - link an existing CMake target that carries the
 # include dirs (e.g. a host-provided interface target). 2.
 # CUCASCADE_MOODYCAMEL_INCLUDE_DIR - a directory already holding
-# blockingconcurrentqueue.h / concurrentqueue.h (e.g. sirius's
+# blockingconcurrentqueue.h / concurrentqueue.h (e.g.
 # duckdb/third_party/concurrentqueue). Nothing is fetched. 3. neither set -
 # fetch cameron314/concurrentqueue.
 set(CUCASCADE_MOODYCAMEL_TARGET
@@ -89,8 +120,8 @@ set(CUCASCADE_MOODYCAMEL_INCLUDE_DIR
       "Directory containing moodycamel concurrentqueue headers (skips fetching; ignored if CUCASCADE_MOODYCAMEL_TARGET is set)"
 )
 
-# C++ namespace of the moodycamel headers. duckdb's fork (used by sirius)
-# renames it to duckdb_moodycamel; upstream cameron314 uses moodycamel.
+# C++ namespace of the moodycamel headers. duckdb's fork renames it to
+# duckdb_moodycamel; upstream cameron314 uses moodycamel.
 set(CUCASCADE_MOODYCAMEL_NAMESPACE
     "moodycamel"
     CACHE STRING "C++ namespace of the moodycamel concurrentqueue headers")
@@ -113,7 +144,7 @@ if(CUCASCADE_BUILD_S3_BENCHMARK
         OR NOT CUCASCADE_BUILD_CUDF))
   message(
     STATUS
-      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf and kvikIO)"
+      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf)"
   )
   set(CUCASCADE_BUILD_S3_BENCHMARK
       OFF
@@ -163,18 +194,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   if(CUCASCADE_BUILD_IO)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+    # OpenSSL: TLS for the REST transport (handshakes, the user-space record
+    # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
     find_package(OpenSSL REQUIRED)
-
-    # kvikIO — backs the local-file fallback ioctx (kvikio_context). It reaches
-    # the environment only through libcudf's dependency closure (libkvikio is
-    # not a direct dependency), so it is tied to CUCASCADE_BUILD_CUDF: a
-    # cudf-free build drops kvikio_context and its catch-all registry entry,
-    # leaving uring/restful to claim paths. Consumers see the difference via the
-    # CUCASCADE_HAS_KVIKIO definition propagated by cucascade_io_thirdparty.
-    if(CUCASCADE_BUILD_CUDF)
-      find_package(kvikio REQUIRED CONFIG)
-    endif()
 
     # cucascade_io_thirdparty carries the swappable moodycamel + invocable
     # (abseil) usage requirements from a single place; the io object library,
@@ -251,15 +273,6 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
         INTERFACE $<BUILD_INTERFACE:${_cucascade_absl_target}>)
       target_compile_definitions(cucascade_io_thirdparty
                                  INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
-    endif()
-
-    # Gates the kvikIO fallback ioctx in io_config and the datasource registry.
-    # Carried on the same INTERFACE target as the definitions above so the io
-    # object library, its installable variants, and installed consumers all
-    # agree on the layout of io_config.
-    if(CUCASCADE_BUILD_CUDF)
-      target_compile_definitions(cucascade_io_thirdparty
-                                 INTERFACE CUCASCADE_HAS_KVIKIO)
     endif()
   endif()
 
@@ -349,6 +362,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_subdirectory(src/cuda)
 endif()
 add_subdirectory(src/memory)
+add_subdirectory(src/log)
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   add_subdirectory(src/data)
 endif()
@@ -372,6 +386,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   # Set include directories for the object library
   target_include_directories(cucascade_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_definitions(cucascade_objects
+                             PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
 
   # Link dependencies to object library
   target_link_libraries(cucascade_objects PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS})
@@ -395,6 +411,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
                                                       cudf::cudf)
   target_include_directories(cucascade_cudf_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_definitions(cucascade_cudf_objects
+                             PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
   target_compile_features(cucascade_cudf_objects PUBLIC cxx_std_20)
   target_compile_features(cucascade_cudf_objects PRIVATE cuda_std_20)
 
@@ -404,7 +422,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # The datasource bridge (src/cudf/datasource.cpp) compiles against the io
   # core's headers, which need the io usage requirements (concurrentqueue
-  # include dir, curl/uring types, ...).
+  # include dir, uring types, ...).
   if(CUCASCADE_BUILD_IO)
     target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_io_objects)
   endif()
@@ -415,17 +433,15 @@ if(CUCASCADE_BUILD_IO)
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
   # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
   # approach.
-  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
-                             OpenSSL::Crypto)
-  if(CUCASCADE_BUILD_CUDF)
-    list(APPEND CUCASCADE_IO_LINK_LIBS kvikio::kvikio)
-  endif()
+  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING OpenSSL::SSL OpenSSL::Crypto)
 
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
                                 cucascade_io_thirdparty)
   target_include_directories(cucascade_io_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_definitions(cucascade_io_objects
+                             PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
   target_compile_features(cucascade_io_objects PUBLIC cxx_std_20)
   target_compile_features(cucascade_io_objects PRIVATE cuda_std_20)
 
@@ -436,8 +452,18 @@ endif()
 
 target_include_directories(cucascade_topology_discovery_objects
                            PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+target_compile_definitions(cucascade_topology_discovery_objects
+                           PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
 target_link_libraries(cucascade_topology_discovery_objects
                       PUBLIC CUDA::nvml_static CUDA::nvtx3 ${CMAKE_DL_LIBS})
+# CUDA::nvtx3 only covers the toolkit include directory. Split toolkits (e.g.
+# conda) install the NVTX headers elsewhere.
+find_path(CUCASCADE_NVTX3_INCLUDE_DIR nvtx3/nvtx3.hpp
+          HINTS ${CUDAToolkit_INCLUDE_DIRS})
+if(CUCASCADE_NVTX3_INCLUDE_DIR)
+  target_include_directories(cucascade_topology_discovery_objects SYSTEM
+                             PRIVATE "${CUCASCADE_NVTX3_INCLUDE_DIR}")
+endif()
 target_compile_features(cucascade_topology_discovery_objects PUBLIC cxx_std_20)
 target_compile_features(cucascade_topology_discovery_objects
                         PRIVATE cuda_std_20)
@@ -458,6 +484,8 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
                         PRIVATE CUDA::nvml_static CUDA::nvtx3 ${CMAKE_DL_LIBS})
   target_include_directories(cucascade_topology_discovery_static
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_definitions(cucascade_topology_discovery_static
+                             PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
   target_compile_features(cucascade_topology_discovery_static PUBLIC cxx_std_20)
   # Work around a bug in libnvidia-ml.so - it attempts to call back into the
   # stub library (https://nvbugspro.nvidia.com/bug/6174166)
@@ -475,6 +503,8 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
 
     target_include_directories(cucascade_static
                                PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+    target_compile_definitions(cucascade_static
+                               PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
     target_link_libraries(
       cucascade_static PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
                               cucascade_topology_discovery_static)
@@ -491,6 +521,8 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
 
       target_include_directories(cucascade_cudf_static
                                  PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_compile_definitions(cucascade_cudf_static
+                                 PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
       target_link_libraries(cucascade_cudf_static PUBLIC cudf::cudf
                                                          cucascade_static)
       if(CUCASCADE_BUILD_IO)
@@ -511,6 +543,8 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
 
       target_include_directories(cucascade_io_static
                                  PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_compile_definitions(cucascade_io_static
+                                 PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
       target_link_libraries(
         cucascade_io_static PUBLIC ${CUCASCADE_IO_LINK_LIBS} cucascade_static
                                    cucascade_io_thirdparty)
@@ -536,6 +570,8 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
                         PRIVATE CUDA::nvml_static CUDA::nvtx3 ${CMAKE_DL_LIBS})
   target_include_directories(cucascade_topology_discovery_shared
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_definitions(cucascade_topology_discovery_shared
+                             PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
   target_compile_features(cucascade_topology_discovery_shared PUBLIC cxx_std_20)
   # Work around a bug in libnvidia-ml.so - it attempts to call back into the
   # stub library (https://nvbugspro.nvidia.com/bug/6174166)
@@ -551,6 +587,8 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
 
     target_include_directories(cucascade_shared
                                PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+    target_compile_definitions(cucascade_shared
+                               PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
     target_link_libraries(
       cucascade_shared PUBLIC ${CUCASCADE_PUBLIC_LINK_LIBS}
                               cucascade_topology_discovery_shared)
@@ -565,6 +603,8 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
 
       target_include_directories(cucascade_cudf_shared
                                  PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_compile_definitions(cucascade_cudf_shared
+                                 PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
       target_link_libraries(cucascade_cudf_shared PUBLIC cudf::cudf
                                                          cucascade_shared)
       if(CUCASCADE_BUILD_IO)
@@ -584,6 +624,8 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
 
       target_include_directories(cucascade_io_shared
                                  PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_compile_definitions(cucascade_io_shared
+                                 PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
       target_link_libraries(
         cucascade_io_shared PUBLIC ${CUCASCADE_IO_LINK_LIBS} cucascade_shared
                                    cucascade_io_thirdparty)
@@ -643,10 +685,17 @@ include(CMakePackageConfigHelpers)
 
 # Install headers
 if(CUCASCADE_TOPOLOGY_ONLY)
+  # topology_discovery.hpp includes net_topology.hpp (NIC discovery, built into
+  # this library), so both are part of the installed API.
   install(FILES include/cucascade/memory/topology_discovery.hpp
+                include/cucascade/memory/net_topology.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
   install(FILES include/cucascade/nvtx.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade)
+  # Topology discovery logs through the sink, so a topology-only consumer must
+  # be able to install one.
+  install(FILES include/cucascade/log/logging.hpp
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/log)
 elseif(CUCASCADE_BUILD_CUDF)
   install(
     DIRECTORY include/

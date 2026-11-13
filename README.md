@@ -47,7 +47,7 @@ pixi run benchmarks
 - **Compiler**: C++20 compatible compiler
 - **Build Tools**: CMake 4.0+, Ninja, sccache (used by the CMake presets)
 - **GPU/Drivers**: CUDA 12.9+ or 13+, compatible NVIDIA driver
-- **Dependencies**: RMM and libnuma (core); libcudf (only for the optional `cucascade-cudf` library); liburing, libcurl and OpenSSL (only for the optional `cucascade-io` library, which also needs kvikIO when built with `CUCASCADE_BUILD_CUDF=ON`)
+- **Dependencies**: RMM and libnuma (core); libcudf (only for the optional `cucascade-cudf` library); liburing and OpenSSL (only for the optional `cucascade-io` library)
 
 > **Library layout:** the core `cuCascade::cucascade` target is cudf-free and depends only on
 > RMM, CUDA, libnuma and Threads. The cudf-backed representations, converters, and bandwidth profiler
@@ -66,7 +66,7 @@ pixi run benchmarks
 > find_package(cuCascade REQUIRED COMPONENTS cudf)  # also resolves cudf (and the io dependencies if io was built)
 > target_link_libraries(my_app PRIVATE cuCascade::cucascade_cudf)
 >
-> find_package(cuCascade REQUIRED COMPONENTS io)    # also resolves liburing, libcurl, OpenSSL
+> find_package(cuCascade REQUIRED COMPONENTS io)    # also resolves liburing, OpenSSL
 > target_link_libraries(my_app PRIVATE cuCascade::cucascade_io)
 > ```
 >
@@ -230,3 +230,8 @@ cuCascade/
 # License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE.md](LICENSE.md) file for details.
+
+Parts of the HTTP/1.1 parser in `src/io/rest/http` (and its conformance test vectors) are derived
+from [Boost.Beast](https://github.com/boostorg/beast), Copyright (c) 2016-2019 Vinnie Falco, and
+are distributed under the Boost Software License 1.0 - see
+[src/io/rest/http/LICENSE_1_0.txt](src/io/rest/http/LICENSE_1_0.txt).

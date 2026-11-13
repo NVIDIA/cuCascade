@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <cucascade/nvtx.hpp>
 
@@ -23,7 +24,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -84,8 +84,9 @@ class cuda_driver_api {
     void* symbol      = dlsym(library, name);
     char const* error = dlerror();
     if (error != nullptr || symbol == nullptr) {
-      std::cerr << "Warning: Failed to load CUDA driver symbol " << name << ": "
-                << (error != nullptr ? error : "symbol resolved to null") << std::endl;
+      CUCASCADE_LOG_WARN("failed to load CUDA driver symbol {}: {}",
+                         name,
+                         error != nullptr ? error : "symbol resolved to null");
       return {};
     }
     Function function{};
@@ -98,8 +99,8 @@ class cuda_driver_api {
   {
     if (_library == nullptr) {
       char const* const error = dlerror();
-      std::cerr << "Warning: Failed to load CUDA driver library libcuda.so.1: "
-                << (error != nullptr ? error : "unknown error") << std::endl;
+      CUCASCADE_LOG_WARN("failed to load CUDA driver library libcuda.so.1: {}",
+                         error != nullptr ? error : "unknown error");
       return;
     }
 
@@ -134,15 +135,17 @@ struct NetworkDeviceWithTopology {
   std::string name;
   int numa_node;
   std::string pci_bus_id;
+  std::string net_interface;  ///< Backing network interface; empty if none.
+  int mtu{0};                 ///< MTU of net_interface; 0 if unknown or none.
 };
 
 /**
  * @brief Emit a standardized warning for a failed NVML call.
  *
- * Formats the message as "Warning: <context>: <nvmlErrorString(result)>" and writes
- * it to stderr. Callers retain control of flow (skip, continue, use defaults) — this
- * helper only standardizes message formatting so every NVML failure surfaces the same
- * way and always includes the decoded NVML error string.
+ * Logs "<context>: <nvmlErrorString(result)>" at warn level through the installed log
+ * sink. Callers retain control of flow (skip, continue, use defaults) — this helper only
+ * standardizes message formatting so every NVML failure surfaces the same way and always
+ * includes the decoded NVML error string.
  *
  * @param result NVML return code that did not equal NVML_SUCCESS.
  * @param context Description of the operation that failed (e.g. "Failed to get
@@ -150,7 +153,7 @@ struct NetworkDeviceWithTopology {
  */
 void report_nvml_error(nvmlReturn_t result, std::string const& context)
 {
-  std::cerr << "Warning: " << context << ": " << nvmlErrorString(result) << std::endl;
+  CUCASCADE_LOG_WARN("{}: {}", context, nvmlErrorString(result));
 }
 
 /**
@@ -381,8 +384,7 @@ std::vector<size_t> resolve_visible_gpu_indices(
     }
 
     if (!matched) {
-      std::cerr << "Warning: CUDA_VISIBLE_DEVICES entry '" << token
-                << "' does not map to an NVML device" << std::endl;
+      CUCASCADE_LOG_WARN("CUDA_VISIBLE_DEVICES entry '{}' does not map to an NVML device", token);
     }
   }
 
@@ -612,28 +614,88 @@ bool interface_has_ip(std::string const& iface_name)
 }
 
 /**
- * @brief Check whether an InfiniBand device's associated net interface has an IP address.
+ * @brief List the network interfaces backing an InfiniBand/RoCE device.
  *
- * Looks up the net interface name from /sys/class/infiniband/<dev>/device/net/ and
- * then checks for a configured IP address via getifaddrs().  Devices without IPoIB
- * or RoCE networking configured (no IP) are unusable for IP-based transports.
+ * Reads the entries of /sys/class/infiniband/<dev>/device/net/, which name the
+ * kernel network interfaces (RoCE netdevs, IPoIB interfaces) of the device's PCI
+ * function.
  *
  * @param device_path Sysfs path to the InfiniBand device directory.
- * @return true if the device has a net interface with at least one IP address.
+ * @return Interface names sorted ascending; empty if the device has none or the
+ *         directory cannot be read.
  */
-bool has_net_interface_with_ip(std::string const& device_path)
+std::vector<std::string> list_net_interfaces(std::string const& device_path)
 {
+  std::vector<std::string> interfaces;
   fs::path net_dir = fs::path(device_path) / "device" / "net";
-  if (!fs::exists(net_dir)) { return false; }
+  if (!fs::exists(net_dir)) { return interfaces; }
 
   try {
     for (auto const& entry : fs::directory_iterator(net_dir)) {
       if (!entry.is_directory()) { continue; }
-      if (interface_has_ip(entry.path().filename().string())) { return true; }
+      interfaces.push_back(entry.path().filename().string());
     }
   } catch (...) {
+    // Best-effort: keep whatever was listed before the error.
   }
-  return false;
+  std::ranges::sort(interfaces);
+  return interfaces;
+}
+
+/**
+ * @brief Pick the network interface that represents an InfiniBand/RoCE device.
+ *
+ * Prefers the first interface (by name) that has an IP address, since that is the
+ * interface IP-based transports use; otherwise falls back to the first interface by
+ * name so the choice is deterministic.
+ *
+ * @param interfaces Interface names, sorted ascending (see list_net_interfaces).
+ * @return The selected interface; std::nullopt if @p interfaces is empty.
+ */
+std::optional<std::string> select_net_interface(std::vector<std::string> const& interfaces)
+{
+  if (interfaces.empty()) { return std::nullopt; }
+  for (auto const& iface : interfaces) {
+    if (interface_has_ip(iface)) { return iface; }
+  }
+  return interfaces.front();
+}
+
+/**
+ * @brief Read the MTU of a network interface backing an InfiniBand/RoCE device.
+ *
+ * Reads /sys/class/infiniband/<dev>/device/net/<iface>/mtu (the same attribute as
+ * /sys/class/net/<iface>/mtu).
+ *
+ * @param device_path Sysfs path to the InfiniBand device directory.
+ * @param iface Name of the network interface.
+ * @return The MTU in bytes; 0 if the attribute is missing, unreadable or malformed.
+ */
+int read_net_interface_mtu(std::string const& device_path, std::string const& iface)
+{
+  std::string const mtu_str = trim_copy(
+    read_file_content((fs::path(device_path) / "device" / "net" / iface / "mtu").string()));
+  if (!is_numeric_token(mtu_str)) { return 0; }
+  try {
+    return std::stoi(mtu_str);
+  } catch (...) {
+    return 0;
+  }
+}
+
+/**
+ * @brief Check whether an InfiniBand device's associated net interface has an IP address.
+ *
+ * Looks up the net interface names from /sys/class/infiniband/<dev>/device/net/ and
+ * then checks for a configured IP address via getifaddrs().  Devices without IPoIB
+ * or RoCE networking configured (no IP) are unusable for IP-based transports.
+ *
+ * @param interfaces Interface names backing the device (see list_net_interfaces).
+ * @return true if at least one of @p interfaces has an IP address.
+ */
+bool has_net_interface_with_ip(std::vector<std::string> const& interfaces)
+{
+  return std::ranges::any_of(interfaces, interface_has_ip);
 }
 
 /**
@@ -667,8 +729,9 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
         if (!has_active_port(entry.path().string())) { continue; }
         if (!has_uverbs_device(entry.path().string())) { continue; }
       }
+      std::vector<std::string> const interfaces = list_net_interfaces(entry.path().string());
       if (verification <= NetworkDeviceVerification::EXISTS_ACTIVE_IP) {
-        if (!has_net_interface_with_ip(entry.path().string())) { continue; }
+        if (!has_net_interface_with_ip(interfaces)) { continue; }
       }
 
       NetworkDeviceWithTopology dev;
@@ -679,10 +742,15 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
       dev.numa_node         = numa_str.empty() ? -1 : std::stoi(numa_str);
       dev.pci_bus_id        = get_pci_bus_id_from_device(entry.path().string());
 
+      if (auto iface = select_net_interface(interfaces)) {
+        dev.mtu           = read_net_interface_mtu(entry.path().string(), *iface);
+        dev.net_interface = std::move(*iface);
+      }
+
       devices.push_back(dev);
     }
   } catch (std::exception const& e) {
-    std::cerr << "Warning: Error discovering network devices: " << e.what() << std::endl;
+    CUCASCADE_LOG_WARN("error discovering network devices: {}", e.what());
   }
 
   return devices;
@@ -711,7 +779,7 @@ std::vector<storage_device_info> discover_storage_devices_with_topology()
       devices.push_back(dev);
     }
   } catch (std::exception const& e) {
-    std::cerr << "Warning: Error discovering NVMe devices: " << e.what() << std::endl;
+    CUCASCADE_LOG_WARN("error discovering NVMe devices: {}", e.what());
   }
 
   return devices;
@@ -929,6 +997,46 @@ nvmlReturn_t initialize_nvml_for_current_process()
 
 }  // namespace
 
+kernel_tls_info discover_kernel_tls(discovery_roots const& roots)
+{
+  // /proc/modules rows are "<name> <size> <refcount> <deps> <state> <address>"; the
+  // state is Live, Loading or Unloading. Only a Live module has registered its ULP.
+  std::ifstream modules(roots.procfs_root / "proc" / "modules");
+  bool const modules_readable = modules.is_open();
+  bool module_listed          = false;
+  bool module_live            = false;
+  std::string line;
+  while (modules_readable && std::getline(modules, line)) {
+    std::istringstream fields(line);
+    std::string name, size, refcount, deps, state;
+    if (!(fields >> name) || name != "tls") { continue; }
+    module_listed = true;
+    module_live   = (fields >> size >> refcount >> deps >> state) && state == "Live";
+    break;
+  }
+
+  // Space-separated names of the registered TCP ULPs, e.g. "espintcp mptcp tls". It
+  // lists the ULP whether kTLS is a loaded module or built in.
+  std::ifstream ulps(roots.procfs_root / "proc" / "sys" / "net" / "ipv4" / "tcp_available_ulp");
+  bool const ulps_readable = ulps.is_open();
+  bool ulp_registered      = false;
+  std::string ulp;
+  while (ulps_readable && ulps >> ulp) {
+    if (ulp == "tls") {
+      ulp_registered = true;
+      break;
+    }
+  }
+
+  kernel_tls_info info;
+  // The ULP list is authoritative; a live module row stands in when it is unreadable.
+  info.loaded = ulps_readable ? ulp_registered : module_live;
+  // Registered without any module row (in any state) means compiled in. Without a
+  // readable /proc/modules a module cannot be told apart from a built-in.
+  info.built_in = info.loaded && modules_readable && !module_listed;
+  return info;
+}
+
 bool topology_discovery::discover(NetworkDeviceVerification net_verification,
                                   bool with_runtime_attributes)
 {
@@ -976,13 +1084,16 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
   topology.network_devices.clear();
   for (auto const& dev : network_devices_with_topology) {
     network_device_info info;
-    info.name       = dev.name;
-    info.numa_node  = dev.numa_node;
-    info.pci_bus_id = dev.pci_bus_id;
+    info.name          = dev.name;
+    info.numa_node     = dev.numa_node;
+    info.pci_bus_id    = dev.pci_bus_id;
+    info.net_interface = dev.net_interface;
+    info.mtu           = dev.mtu;
     topology.network_devices.push_back(info);
   }
 
   topology.storage_devices = discover_storage_devices_with_topology();
+  topology.kernel_tls      = discover_kernel_tls();
 
   topology.gpus.clear();
 
@@ -1082,8 +1193,7 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
       }
 
       if (emitted == 0) {
-        std::cerr << "Warning: MIG enabled on GPU " << i << " but no MIG instances were enumerated"
-                  << std::endl;
+        CUCASCADE_LOG_WARN("MIG enabled on GPU {} but no MIG instances were enumerated", i);
       }
     }
   }
