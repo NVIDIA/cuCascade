@@ -24,6 +24,7 @@
 #include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -53,6 +54,18 @@ namespace cucascade::io::rest {
  * one @p authorizer.  Overrides @c create_io_object to resolve an object's size
  * via a blocking HEAD before constructing the @c rest_io_object — the static
  * reactor factory cannot do this since it needs the authorizer + a round-trip.
+ *
+ * Control-plane calls (the HEAD or footer probe of an open, LIST pages, a
+ * @ref resolve_footer_objects batch) block the caller and run on one reactor
+ * picked per call: the least backlogged (@c rest_reactor::queued_bytes), ties
+ * rotated across calls, so any reactor of a multi-reactor pool may serve one.
+ * The exchanges use that reactor's connections while its worker accepts work.
+ * Before the pool is started (@c start), after it stopped, or when the call is
+ * made from a reactor thread (e.g. a completion callback, which must not wait on
+ * a reactor loop that may be its own), they run instead on a short-lived
+ * private helper thread with its own io_uring ring and new connections — far
+ * heavier, so start the pool before issuing control-plane calls.  io_uring
+ * never runs on the caller's thread.
  */
 class rest_ioctx : public templated_ioctx<rest_reactor> {
  public:
@@ -61,7 +74,19 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// the pinned bounce-staging resource — all of which must outlive this ioctx).
   /// The ioctx config is sourced from the reactors themselves — see
   /// @c templated_ioctx.
+  ///
+  /// @p n_reactors is a total; 0 sizes the pool from the egress NIC (one reactor per IRQ CPU,
+  /// pinned to it, when the NIC's queue IRQs are steered to a strict subset of its NUMA node's
+  /// cores; the default 2 otherwise).  A pinned reactor's priority is raised only with
+  /// @c config::raise_reactor_priority (off by default).
+  /// @throws std::invalid_argument when the config is invalid (@c config::validate) or
+  /// @c rest.fan_out exceeds a positive @p n_reactors (the default fan-out of 2 is clamped to a
+  /// one-reactor pool instead, as the former hard-coded fan-out was).
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
+
+  /// Counters of the whole pool: the reactors' @c transport_stats summed (extremes for the MSS
+  /// and in-flight peaks).  A snapshot; safe while the pool runs.
+  [[nodiscard]] transport_stats stats() const noexcept;
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
@@ -99,8 +124,13 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// IDENTICAL to @c open_io_object(path, parquet_footer_probe): one verified
   /// suffix GET; 200/416/unverifiable-206 fall back to a HEAD supplying
   /// size+tag; the same retry policy per entry, never stalling siblings.  The
-  /// caller's thread drives one curl multi with connection reuse across
-  /// entries, and @p on_result is invoked ON THE CALLER'S THREAD, SERIALLY,
+  /// whole batch runs on one reactor, picked like every control-plane call: the
+  /// least-backlogged reactor of the pool, ties rotated across calls (not
+  /// necessarily reactor 0).  Its exchanges use that reactor's connections
+  /// while its worker accepts work; before the pool is started, after it
+  /// stopped, or when called from a reactor thread, they run on a short-lived
+  /// private helper thread with its own io_uring ring and connections (see the
+  /// class notes).  @p on_result is invoked ON THE CALLER'S THREAD, SERIALLY,
   /// as each entry lands — completion order, no all-entries barrier.
   ///
   /// Every input occurrence is delivered exactly once (duplicates delivered
@@ -116,10 +146,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @c config::footer_resolve_max_inflight == 0, or an explicit
   /// @c footer_resolve_stash_budget smaller than @c footer_probe_bytes.  An
   /// unparsable or non-s3 path is a per-entry error, not a batch error.
-  /// Should the transfer driver itself fail mid-batch (a curl multi error),
-  /// every undelivered entry is delivered as canceled before that failure
-  /// is rethrown — exactly-once holds on every exit path.  This ioctx must
-  /// outlive the call.
+  /// Should the transfer driver itself fail (its helper thread cannot be
+  /// started, or it fails mid-batch), every undelivered entry is delivered as
+  /// canceled before that failure is rethrown — exactly-once holds on every
+  /// exit path.  This ioctx must outlive the call.
   void resolve_footer_objects(std::span<std::string const> paths,
                               std::function<void(footer_resolve_result)> const& on_result,
                               std::stop_token stop = {});
@@ -138,7 +168,7 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   ///
   /// Rate-limited rather than run once, because what goes stale is the
   /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
-  /// pooled connection (@c CURLOPT_MAXAGE_CONN), so a pool warmed before an idle
+  /// pooled connection (its idle cutoff), so a pool warmed before an idle
   /// gap longer than that is cold again by the next query -- a warm-once flag
   /// would serve the first query and no other.  Re-warms when the endpoint
   /// changes or the last warm-up is at least @c conn_max_age old, which is free
@@ -146,6 +176,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   void warmup(std::string_view bucket_url) noexcept override;
 
  protected:
+  /// This pool's placement (plan and NIC), computed at construction and shared with its
+  /// reactors; never stored on the reactor_context, which several pools may share.
+  std::shared_ptr<detail::pool_placement const> _placement;
+
   /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
@@ -162,6 +196,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size) override;
 
  private:
+  rest_ioctx(std::shared_ptr<detail::pool_placement const> placement,
+             std::shared_ptr<rest_reactor::reactor_context> ctx);
+
   /// Resolve @p path with a single suffix-range GET: it discovers the size and
   /// stashes the object's trailing bytes on the returned io_object so cuDF's
   /// footer reads are served locally.  Falls back to a plain HEAD (no stash)
@@ -169,11 +206,18 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
 
   object_store_lister _lister;
+  std::atomic<std::size_t> _control_next{0};
 
-  /// The effective resolve_footer_objects concurrency cap: the configured
-  /// knob, or n_reactors * max_connections under footer_resolve_auto.  0 =
+  /// The effective resolve_footer_objects concurrency cap: the configured knob, or one
+  /// reactor's max_connections under footer_resolve_auto (a batch runs on one reactor).  0 =
   /// the API is disabled.
   [[nodiscard]] std::size_t footer_resolve_inflight_cap() const;
+
+  /// The reactor a control-plane call (HEAD, footer probe, LIST, footer batch) runs on: the
+  /// least backlogged, ties rotated, so control traffic does not pile onto reactor 0.  The call
+  /// itself then runs on that reactor's worker, or on a private helper when the worker does not
+  /// accept work or the caller is a reactor thread.
+  [[nodiscard]] rest_reactor& control_reactor();
 
   // Batched-footer-resolve coordination: one active batch per ioctx, later
   // calls FIFO-parked on the ticket queue (stop-aware — a queued batch whose
@@ -202,5 +246,18 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::string _warmed_bucket;
   std::optional<std::chrono::steady_clock::time_point> _warmed_at;
 };
+
+/**
+ * @brief The CPUs a REST pool built now from the calling thread would pin its reactors to.
+ *
+ * Runs the planning a @ref rest_ioctx constructor runs (the egress NIC from
+ * @c cfg.interface, its queue-IRQ steering, @c cfg.pin_to_irq_cpus, @p n_reactors with 0 =
+ * sized from the NIC) without starting anything.  Sorted and unique; empty when the pool would
+ * run unpinned.  An embedder that sizes its own thread pools before the REST pool exists uses
+ * it to keep them off these CPUs, which then carry only the NIC's interrupts and the reactors.
+ * Call it from a thread with the affinity the pool will be built from: pins are restricted to
+ * it, exactly as for the pool.
+ */
+[[nodiscard]] std::vector<int> planned_reactor_cpus(std::size_t n_reactors, config const& cfg);
 
 }  // namespace cucascade::io::rest

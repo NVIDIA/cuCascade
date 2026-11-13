@@ -28,6 +28,11 @@ Building, testing, benchmarking, and contributing to cuCascade.
 - [Documentation](#documentation)
 - [CI Pipeline](#ci-pipeline)
 - [Using cuCascade as a Dependency](#using-cucascade-as-a-dependency)
+- [Logging](#logging)
+  - [Installing a Sink](#installing-a-sink)
+  - [Standalone Use](#standalone-use)
+  - [Catching Exceptions](#catching-exceptions)
+  - [Compile-Time Floor](#compile-time-floor)
 - [Key Commands Reference](#key-commands-reference)
 
 ---
@@ -44,7 +49,6 @@ Building, testing, benchmarking, and contributing to cuCascade.
 | NVIDIA Driver | Compatible with CUDA 13 |
 | libcudf | 25.10+ |
 | RMM | Via cuDF dependency |
-| numactl | Development headers |
 
 The easiest way to get all dependencies is via [Pixi](https://pixi.sh/), which manages the full environment.
 
@@ -152,7 +156,7 @@ cucascade_objects (OBJECT library)
     └── src/memory/*.cpp
          │
          ├── cucascade_static (STATIC library)
-         │     Links: RMM, cuDF, CUDA runtime, CUDA NVML, pthreads, numa
+         │     Links: RMM, cuDF, CUDA runtime, CUDA NVML, pthreads
          │
          └── cucascade_shared (SHARED library)
                Same links, SOVERSION 0
@@ -412,6 +416,82 @@ Available targets:
 - `cuCascade::cucascade_static` -- static library explicitly
 
 Transitive dependencies (cuDF, RMM, CUDA Toolkit, Threads) are automatically found.
+
+---
+
+## Logging
+
+cuCascade ships no logging backend. The `CUCASCADE_LOG_TRACE` through `CUCASCADE_LOG_FATAL` macros
+(from `<cucascade/log/logging.hpp>`) format their arguments with `std::format` and deliver each
+record to a sink that the embedding host installs.
+
+```cpp
+CUCASCADE_LOG_WARN("pinned pool at {}% of capacity", percent);
+```
+
+Until a host installs a sink, warnings and errors go to stderr (the built-in sink from
+`make_stderr_sink()`, at `level::warn`) and everything below is dropped. A call site below the
+threshold costs one relaxed atomic load and its arguments are never evaluated; `clear_sink()`
+silences everything.
+
+### Installing a Sink
+
+Subclass `cucascade::log::sink`. Its `write` is called concurrently from any logging thread, so it
+must be thread-safe. It may also run while cuCascade holds an internal lock (a failed CUDA call in
+a deallocation or destructor is reported from there), so it must not call back into cuCascade, and
+any lock it takes must not be held by other threads while they call into cuCascade. Forwarding to a
+logger that locks only for the duration of the write, as spdlog does, is fine:
+
+```cpp
+class host_sink final : public cucascade::log::sink {
+ public:
+  void write(const cucascade::log::record& rec) override
+  {
+    my_logger.log(rec.lvl, rec.location.file_name(), rec.location.line(), rec.message);
+  }
+};
+cucascade::log::set_sink(std::make_shared<host_sink>(), cucascade::log::level::info);
+```
+
+Or wrap a lambda with `make_sink`. Captures must own what they use:
+
+```cpp
+auto logger = std::make_shared<my_logger>();
+cucascade::log::set_sink(cucascade::log::make_sink([logger](const cucascade::log::record& rec) {
+  logger->log(rec.lvl, rec.message);
+}));
+```
+
+The second argument to `set_sink` sets the threshold. Omit it to keep the current one, which starts
+at `level::warn`. Mirror the host logger's own level there, or call `set_min_level()` later.
+Filtering happens in `is_enabled()` before formatting, so records the host would drop are never built.
+
+`set_sink` and `clear_sink` return the replaced sink. Every in-flight `write` shares ownership of
+it, so it is destroyed, on whichever thread held the last reference, only after the last delivered
+record. Give the sink shared ownership of everything it touches (capture a `shared_ptr`, as above);
+that release orders the teardown. Do not poll `use_count()`, which is a relaxed load and
+synchronizes nothing.
+
+### Standalone Use
+
+`cucascade::log::use_stderr_sink(level)` installs a built-in sink (`info` by default) that writes
+`<UTC timestamp> [LEVEL] <tid> file:line: message` lines to stderr.
+
+### Catching Exceptions
+
+`CUCASCADE_TRY_AND_LOG_EXCEPTION` (`<cucascade/utils/error_utils.hpp>`) runs an expression,
+swallows any exception, and logs it at error level with `what()` appended. Optional format
+arguments prefix the message: `CUCASCADE_TRY_AND_LOG_EXCEPTION(close(), "fd {}", fd)`.
+
+### Compile-Time Floor
+
+`CUCASCADE_MIN_LOG_LEVEL` (0 = trace through 6 = off) removes call sites below it during
+preprocessing; their format strings and arguments are still checked, but never evaluated. Set it
+through the CMake cache variable of the same name. Every cuCascade target propagates it as a
+PUBLIC compile definition, so cuCascade's own sources and CMake consumers compile the macros with
+the same floor. It must be one value for the whole program: the macros expand inside inline and
+template functions of installed headers, so two translation units with different floors would
+violate the one-definition rule. Including the headers without the CMake targets yields 0.
 
 ---
 

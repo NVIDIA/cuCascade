@@ -48,8 +48,9 @@ namespace cucascade::io::rest {
  * Default behavior: every call to @c authorize returns the
  * @c authorized_request passed to the constructor verbatim (independent of
  * @p obj / @p method) so tests can verify "the reactor passed our URL +
- * headers to libcurl unchanged". To exercise error paths, call @c set_throw to
- * make subsequent calls throw @c cucascade::io::credential_error.
+ * headers to the io_uring HTTP transport unchanged". To exercise error
+ * paths, call @c set_throw to make subsequent calls throw
+ * @c cucascade::io::credential_error.
  *
  * Thread safety: counters are atomic; @c last_bucket / @c last_key are
  * guarded by an internal mutex. Safe to share across threads when tests

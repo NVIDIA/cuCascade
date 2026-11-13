@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <cucascade/memory/net_topology.hpp>
+
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -44,11 +46,26 @@ struct gpu_topology_info {
 
 /**
  * @brief Network device information.
+ *
+ * `net_interface` and `mtu` describe the kernel network interface backing the
+ * RDMA device (`/sys/class/infiniband/<name>/device/net/<interface>`): the
+ * Ethernet netdev of a RoCE NIC or the IPoIB interface of an InfiniBand HCA. A
+ * device can back several interfaces (e.g. a multi-port HCA, or IPoIB P_Key
+ * child interfaces); the one reported is the first, by name, that has an IP
+ * address, or the first by name when none has one. A device without a network
+ * interface (InfiniBand without IPoIB) reports an empty `net_interface` and an
+ * `mtu` of 0.
+ *
+ * @note `mtu` is the network-interface (L3) MTU, i.e. the payload size of an
+ *       IP packet on the link. It is not the RDMA path MTU (`ibv_port_attr::active_mtu`),
+ *       which is negotiated per port and only exposed through libibverbs.
  */
 struct network_device_info {
-  std::string name;        ///< Device name (e.g., "mlx5_0").
-  int numa_node;           ///< NUMA node ID (-1 if unknown).
-  std::string pci_bus_id;  ///< PCI bus ID.
+  std::string name;           ///< Device name (e.g., "mlx5_0").
+  int numa_node;              ///< NUMA node ID (-1 if unknown).
+  std::string pci_bus_id;     ///< PCI bus ID.
+  std::string net_interface;  ///< Backing network interface (e.g., "ib0"); empty if none.
+  int mtu{0};                 ///< MTU of `net_interface` in bytes (0 if unknown or none).
 };
 
 enum class StorageDriveType {
@@ -86,6 +103,43 @@ struct numa_topology_info {
 };
 
 /**
+ * @brief Kernel TLS (kTLS) state of the running kernel.
+ *
+ * kTLS is provided by the kernel's `tls` module, which registers the "tls" TCP
+ * upper-layer protocol (ULP). Once registered, `setsockopt(TCP_ULP, "tls")` succeeds
+ * and record encryption/decryption can be offloaded to the kernel.
+ *
+ * Detection is passive: it reads `/proc/modules` and
+ * `/proc/sys/net/ipv4/tcp_available_ulp` and never loads the module.
+ *
+ * @note `loaded == false` does not mean kTLS can never be used: the kernel loads the
+ *       module on demand when a process holding `CAP_NET_ADMIN` sets the ULP. An
+ *       unprivileged process, however, cannot trigger that load.
+ */
+struct kernel_tls_info {
+  /// The `tls` ULP is registered, i.e. kTLS is usable now: either the `tls` module is
+  /// loaded (and live) or kTLS is built into the kernel (see `built_in`).
+  bool loaded{false};
+  /// kTLS is built into the kernel (`CONFIG_TLS=y`) rather than provided by a loadable
+  /// module. Only reported when `/proc/modules` is readable; false when it is not.
+  bool built_in{false};
+};
+
+/**
+ * @brief Discover the kernel TLS (kTLS) state of the running kernel.
+ *
+ * Reads `/proc/modules` (a `tls` row in the `Live` state means the module is loaded)
+ * and `/proc/sys/net/ipv4/tcp_available_ulp` (a `tls` token means the ULP is
+ * registered). The ULP list is authoritative; the module row distinguishes a loadable
+ * module from a built-in one and stands in for the ULP list when that file is
+ * unreadable.
+ *
+ * @param roots Where procfs is mounted; tests point it at a fake tree.
+ * @return The kTLS state; all fields false when neither file reports kTLS.
+ */
+[[nodiscard]] kernel_tls_info discover_kernel_tls(discovery_roots const& roots = {});
+
+/**
  * @brief System topology information.
  */
 struct system_topology_info {
@@ -97,6 +151,7 @@ struct system_topology_info {
   std::vector<network_device_info> network_devices;  ///< Network device information.
   std::vector<storage_device_info> storage_devices;  ///< Storage device information.
   std::vector<numa_topology_info> numa_nodes;        ///< NUMA node information, sorted by id.
+  kernel_tls_info kernel_tls;                        ///< Kernel TLS (kTLS) state.
 
   /**
    * @brief Find a NUMA node by ID.
@@ -204,7 +259,8 @@ class topology_discovery {
    * @brief Discover system topology.
    *
    * This method performs the actual discovery of GPUs, NUMA nodes, CPU affinity,
-   * and network devices. It must be called before `get_topology()`.
+   * network devices (including their MTU), storage devices, and the kernel TLS
+   * state. It must be called before `get_topology()`.
    *
    * By default this call uses only NVML and Linux sysfs and therefore does not
    * touch the CUDA driver. Set @p with_runtime_attributes to true to also
