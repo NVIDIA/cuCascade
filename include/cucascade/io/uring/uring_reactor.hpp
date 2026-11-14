@@ -37,6 +37,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -208,10 +209,14 @@ class uring_reactor {
              : _ctx->host_memory_resource()->get_block_size();
   }
 
+  /// Actionable message for an @c io_uring_queue_init failure with errno @p errc.
+  [[nodiscard]] static std::string init_error_hint(int errc);
+
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out
   /// of the constructor so a reactor can be built cheaply (it only copies its
   /// config) and parked until it is actually needed — see @c ioctx::start.
   /// Idempotent: a second call (while the worker is already running) is a no-op.
+  /// Throws @c std::runtime_error with @c init_error_hint when the ring cannot be created.
   void start();
 
   void interrupt();
@@ -312,7 +317,7 @@ class uring_reactor {
     std::span<const byte_range> ranges, std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
-  void worker_loop(const std::stop_token& stop_token);
+  void worker_loop(const std::stop_token& stop_token, std::promise<void>& ready);
 
   // Shared services + tunables for the whole reactor pool, kept alive for this
   // reactor's lifetime (so the bounce-staging resource outlives _bounce_storage).
