@@ -17,10 +17,13 @@
  */
 
 #include <cucascade/io/cufile/cufile_api.hpp>
+#include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/log/logging.hpp>
 
 #include <dlfcn.h>
 
+#include <atomic>
+#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -76,6 +79,18 @@ struct loaded_library {
   need(api.read, "cuFileRead");
   if (!complete) { return loaded; }
 
+  // Optional entry points: a library without them still serves reads.  Buffer registration is
+  // usable only as a pair, so a library exporting one without the other gets neither.
+  bool const has_register   = resolve(api.buf_register, library, "cuFileBufRegister");
+  bool const has_deregister = resolve(api.buf_deregister, library, "cuFileBufDeregister");
+  if (!has_register || !has_deregister) {
+    api.buf_register   = nullptr;
+    api.buf_deregister = nullptr;
+  }
+  std::ignore = resolve(api.get_size_parameter, library, "cuFileGetParameterSizeT");
+  std::ignore = resolve(api.get_bool_parameter, library, "cuFileGetParameterBool");
+  std::ignore = resolve(api.get_string_parameter, library, "cuFileGetParameterString");
+
   loaded.api  = api;
   std::ignore = resolve(loaded.get_version, library, "cuFileGetVersion");
   return loaded;
@@ -87,18 +102,58 @@ struct loaded_library {
   return loaded;
 }
 
+/// The table tests substitute for libcufile (see detail::set_cufile_api_for_testing).
+std::atomic<cufile_api const*> api_for_testing{nullptr};
+/// The substitute's generation (0 while libcufile serves); see cufile_api::generation.
+std::atomic<std::uint64_t> api_generation{0};
+std::atomic<std::uint64_t> next_generation{1};
+
 }  // namespace
+
+namespace detail {
+
+void set_cufile_api_for_testing(cufile_api const* api) noexcept
+{
+  api_generation.store(api == nullptr ? 0 : next_generation.fetch_add(1),
+                       std::memory_order_release);
+  api_for_testing.store(api, std::memory_order_release);
+}
+
+}  // namespace detail
 
 cufile_api const* cufile_api::get() noexcept
 {
-  auto const& loaded = library();
-  return loaded.api.has_value() ? &*loaded.api : nullptr;
+  if (auto const* substitute = api_for_testing.load(std::memory_order_acquire);
+      substitute != nullptr) {
+    return substitute;
+  }
+  return loaded();
+}
+
+std::uint64_t cufile_api::generation() noexcept
+{
+  return api_generation.load(std::memory_order_acquire);
+}
+
+cufile_api const* cufile_api::loaded() noexcept
+{
+  auto const& library_state = library();
+  return library_state.api.has_value() ? &*library_state.api : nullptr;
 }
 
 bool cufile_api::open_driver() noexcept
 {
+  if (auto const* substitute = api_for_testing.load(std::memory_order_acquire);
+      substitute != nullptr) {
+    return substitute->driver_open != nullptr && substitute->driver_open().err == CU_FILE_SUCCESS;
+  }
+  return open_loaded_driver();
+}
+
+bool cufile_api::open_loaded_driver() noexcept
+{
   static bool const opened = [] {
-    auto const* api = get();
+    auto const* api = loaded();
     if (api == nullptr) { return false; }
     auto const status = api->driver_open();
     if (status.err != CU_FILE_SUCCESS) {

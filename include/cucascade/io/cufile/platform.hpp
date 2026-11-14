@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace cucascade::io::cufile {
@@ -59,6 +60,52 @@ struct platform_info {
   int version{0};                        ///< @c cuFileGetVersion, e.g. 1170; 0 when unknown.
   unsigned dstatusflags{0};              ///< Bit per storage class with a real GDS mode.
   std::size_t max_direct_io_size_kb{0};  ///< cuFile's largest single DMA, in KiB.
+
+  // -- the rest of cuFileDriverGetProperties (meaningful with properties_available) --
+  unsigned nvfs_major_version{0};         ///< nvidia-fs driver version cuFile talks to (0 = none).
+  unsigned nvfs_minor_version{0};         ///< Its minor version.
+  std::size_t poll_threshold_size_kb{0};  ///< Reads up to this size are polled (poll mode).
+  /// @c CUfileDriverControlFlags: bit 0 poll mode, bit 1 compatibility mode allowed.
+  unsigned dcontrolflags{0};
+  /// @c CUfileFeatureFlags: bit 0 dynamic routing, 1 batch I/O, 2 streams,
+  /// 3 parallel I/O, 4 PCI P2PDMA.
+  unsigned fflags{0};
+  /// GPU bounce-buffer pool per GPU, in KiB: what unregistered or unaligned reads
+  /// are staged through by cuFile (128 MiB by default).  Bytes in flight through
+  /// it cannot exceed this, so at 50 GB/s it covers only this / 50 GB/s of
+  /// latency.
+  std::size_t max_device_cache_size_kb{0};
+  /// One such bounce buffer, in KiB (1 MiB by default): an unregistered read is
+  /// moved in pieces of this size.
+  std::size_t per_buffer_cache_size_kb{0};
+  /// Most device memory a process may register (@c cuFileBufRegister) per GPU, in KiB.
+  std::size_t max_device_pinned_mem_size_kb{0};
+  unsigned max_batch_io_size{0};           ///< Most entries per cuFile batch.
+  unsigned max_batch_io_timeout_msecs{0};  ///< Batch completion timeout.
+
+  /**
+   * @brief cuFile's effective configuration, as @c cuFileGetParameter* reports it
+   *        once the driver is open (cufile.json, environment and defaults
+   *        combined).  Unset values could not be read; @c available is false when
+   *        the library predates the parameter API.
+   */
+  struct parameters_info {
+    bool available{false};                          ///< The library has @c cuFileGetParameter*.
+    std::optional<bool> parallel_io;                ///< execution.parallel_io
+    std::optional<std::size_t> max_io_threads;      ///< execution.max_io_threads
+    std::optional<std::size_t> max_io_queue_depth;  ///< execution.max_io_queue_depth
+    std::optional<std::size_t> min_io_threshold_size_kb;  ///< execution.min_io_threshold_size_kb
+    std::optional<std::size_t> max_request_parallelism;   ///< execution.max_request_parallelism
+    std::optional<bool> use_poll_mode;                    ///< properties.use_poll_mode
+    std::optional<bool> allow_compat_mode;                ///< properties.allow_compat_mode
+    std::optional<bool> force_compat_mode;                ///< forced compatibility mode
+    std::optional<bool> use_pci_p2pdma;                   ///< properties.use_pci_p2pdma
+    std::optional<std::size_t> io_batch_size;             ///< properties.io_batchsize
+    std::optional<std::size_t> profile_stats;             ///< profile.cufile_stats level
+    std::optional<std::string> rdma_transport;            ///< RDMA transport cuFile uses
+    std::optional<std::string> logging_level;             ///< logging.level
+  };
+  parameters_info parameters;  ///< Effective configuration (see @ref parameters_info).
 };
 
 /**
@@ -142,7 +189,11 @@ struct path_info {
   platform_info platform;  ///< The process-wide cuFile snapshot.
 
   // -- storage --------------------------------------------------------------
-  memory::path_storage_info storage;                  ///< Passive mount / device discovery.
+  memory::path_storage_info storage;  ///< Passive mount / device discovery.
+  /// The host's GDS setup (nvidia-fs, peer memory, cufile.json), passively
+  /// discovered; its cufile.json denylist and Storage Scale RDMA addresses
+  /// feed the verdict.  Left default (nothing parsed) when not discovered.
+  memory::gds_setup_info gds;
   storage_class matched_class = storage_class::none;  ///< Class the verdict checked.
   /// Whether the driver reports a real GDS mode for @c matched_class (its
   /// @c dstatusflags bit is set).  Never inferred from any other bit.

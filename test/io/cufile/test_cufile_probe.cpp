@@ -167,14 +167,22 @@ TEST_CASE("cufile path capability: only the matching storage-class bit counts", 
   CHECK(fabrics.matched_class == storage_class::nvmeof);
   CHECK(fabrics.capability == path_capability::direct_candidate);
 
-  // NFS: the network filesystem is its own class.
+  // NFS: the network filesystem is its own class, served by GDS over RDMA only.
   auto nfs                    = passing();
   nfs.platform.dstatusflags   = nfs_bit;
   nfs.storage.kind            = storage_kind::network;
   nfs.storage.filesystem_type = "nfs4";
+  nfs.storage.super_options   = "rw,vers=4.2,proto=rdma,port=20049";
   nfs.storage.devices.clear();
   CHECK(decided(nfs).capability == path_capability::direct_candidate);
   CHECK(decided(nfs).matched_class == storage_class::nfs);
+  auto rdma6                  = nfs;
+  rdma6.storage.super_options = "rw,vers=4.2,proto=rdma6";
+  CHECK(decided(rdma6).capability == path_capability::direct_candidate);
+  auto tcp                  = nfs;
+  tcp.storage.super_options = "rw,vers=4.2,proto=tcp";
+  CHECK(decided(tcp).capability == path_capability::compatibility_only);
+  CHECK(decided(tcp).reason.find("RDMA") != std::string::npos);
   nfs.platform.dstatusflags = nvme_bit;
   CHECK(decided(nfs).capability == path_capability::compatibility_only);
 
@@ -344,4 +352,41 @@ TEST_CASE("cufile ioctx reports the capability of the object it opened", "[io][c
   };
   CHECK_THROWS_AS(ioctx.path_capability(foreign_object{}), std::invalid_argument);
   ioctx.shutdown();
+}
+
+TEST_CASE("cufile path capability: Storage Scale needs its class bit and RDMA addresses",
+          "[io][cufile]")
+{
+  constexpr unsigned gpfs_bit  = status_bit(CU_FILE_GPFS_SUPPORTED);
+  auto gpfs                    = passing();
+  gpfs.platform.dstatusflags   = gpfs_bit;
+  gpfs.storage.kind            = storage_kind::network;
+  gpfs.storage.filesystem_type = "gpfs";
+  gpfs.storage.mount_point     = "/gpfs/fs1";
+  gpfs.storage.devices.clear();
+  CHECK(decided(gpfs).capability == path_capability::direct_candidate);
+  CHECK(decided(gpfs).matched_class == storage_class::gpfs);
+
+  // cufile.json without client RDMA addresses: Storage Scale GDS falls back.
+  auto no_rdma                   = gpfs;
+  no_rdma.gds.cufile_json.parsed = true;
+  no_rdma.gds.cufile_json.path   = "/etc/cufile.json";
+  CHECK(decided(no_rdma).capability == path_capability::compatibility_only);
+  CHECK(decided(no_rdma).reason.find("rdma_dev_addr_list") != std::string::npos);
+  auto with_rdma                                        = no_rdma;
+  with_rdma.gds.cufile_json.settings.rdma_dev_addr_list = {"10.0.0.11"};
+  CHECK(decided(with_rdma).capability == path_capability::direct_candidate);
+
+  // A denylisted mount or filesystem is never served by GDS.
+  auto denied_mount                                   = with_rdma;
+  denied_mount.gds.cufile_json.settings.denied_mounts = {"/gpfs/fs1"};
+  CHECK(decided(denied_mount).capability == path_capability::compatibility_only);
+  auto denied_fs                                        = with_rdma;
+  denied_fs.gds.cufile_json.settings.denied_filesystems = {"gpfs"};
+  CHECK(decided(denied_fs).capability == path_capability::compatibility_only);
+
+  // Without the GPFS bit (e.g. a client architecture Storage Scale GDS does not
+  // support), the file is compatibility-only.
+  gpfs.platform.dstatusflags = status_bit(CU_FILE_NVME_SUPPORTED);
+  CHECK(decided(gpfs).capability == path_capability::compatibility_only);
 }
