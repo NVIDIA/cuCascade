@@ -99,9 +99,32 @@ class memory_space {
   [[nodiscard]] Tier get_tier() const noexcept;
   [[nodiscard]] int get_device_id() const noexcept;
 
-  // Reservation management - these are the core methods that do the actual work
+  /**
+   * @brief Reserve `size` bytes if they are available now, without blocking.
+   *
+   * @return The reservation, or nullptr if the space cannot satisfy the request now.
+   */
   std::unique_ptr<reservation> make_reservation_or_null(size_t size);
+
+  /**
+   * @brief Reserve up to `size` bytes without blocking.
+   *
+   * @return A reservation of at most `size` bytes, possibly empty.
+   */
   std::unique_ptr<reservation> make_reservation_upto(size_t size);
+
+  /**
+   * @brief Reserve `size` bytes, blocking until they are available.
+   *
+   * Blocked callers are served in FIFO order, and a new caller does not bypass callers that are
+   * already waiting.
+   *
+   * @return The reservation, or nullptr if the space shuts down while the caller waits. If the
+   * space runs out of outstanding reservations whose release could free memory, the caller gets
+   * make_reservation_upto(size) instead, which may be smaller than `size`.
+   * @note A caller that already holds a reservation on this space can deadlock: it queues behind
+   * waiters that may need the memory it holds.
+   */
   std::unique_ptr<reservation> make_reservation(size_t size);
   [[nodiscard]] ::cuda::stream_ref acquire_stream() const;
 
@@ -157,6 +180,7 @@ class memory_space {
   // Utility methods
   std::string to_string() const;
 
+  /** @brief Wake every caller blocked in make_reservation; each returns nullptr. */
   void shutdown();
 
  protected:

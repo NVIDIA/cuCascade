@@ -24,10 +24,8 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <condition_variable>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -200,8 +198,21 @@ class memory_reservation_manager {
   //===----------------------------------------------------------------------===//
 
   /**
-   * Main reservation interface using strategy pattern.
-   * Supports different reservation strategies through the reservation_request variant.
+   * @brief Reserve `size` bytes in a memory space selected by `request`.
+   *
+   * Strategies without strong ordering first try every candidate without blocking. If that
+   * fails, or the strategy has strong ordering, the request blocks in
+   * memory_space::make_reservation on each candidate in turn, moving to the next candidate only
+   * when the current one shuts down. Each memory space serves its blocked callers in FIFO order,
+   * but the non-blocking first pass can still take memory ahead of them.
+   *
+   * @param request Strategy that selects the candidate memory spaces
+   * @param size Number of bytes to reserve
+   * @return The reservation, or nullptr if the strategy yields no candidate (e.g. an unknown
+   * specific_memory_space id, a tier without memory spaces, any_memory_space_to_downgrade or
+   * any_memory_space_to_upgrade) or every candidate shuts down before it can satisfy the request.
+   * @note A reservation granted after waiting may be smaller than `size`; see
+   * memory_space::make_reservation.
    */
   std::unique_ptr<reservation> request_reservation(const reservation_request_strategy& request,
                                                    size_t size);
@@ -247,6 +258,15 @@ class memory_reservation_manager {
   size_t get_total_reserved_memory() const;
   size_t get_active_reservation_count() const;
 
+  /**
+   * @brief Shut down every memory space.
+   *
+   * Wakes all callers blocked in request_reservation; those whose candidates are all shut down
+   * return nullptr.
+   *
+   * @note The destructor calls shutdown(), but callers must have returned from
+   * request_reservation before the manager is destroyed.
+   */
   void shutdown();
 
  private:
@@ -271,10 +291,6 @@ class memory_reservation_manager {
     const reservation_request_strategy& request, size_t size);
 
   void build_lookup_tables();
-
-  // Synchronization for cross-space waiting when no memory_space can currently satisfy a request
-  mutable std::mutex _wait_mutex;
-  std::condition_variable _wait_cv;
 };
 
 }  // namespace memory
