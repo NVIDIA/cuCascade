@@ -58,5 +58,7 @@ if(CUCASCADE_CUFILE_INCLUDE_DIR)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_api.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_ioctx.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_reactor.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/platform.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/placement.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/platform.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/staging_pool.cpp)
 endif()

@@ -45,6 +45,10 @@ namespace cucascade::io::cache {
 struct cached_chunk;
 }
 
+namespace cucascade::cuda {
+class cuda_event;
+}  // namespace cucascade::cuda
+
 namespace cucascade::io {
 
 inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
@@ -257,6 +261,17 @@ struct device_buffer {
   // to preserve the same null-stream semantics without the warning.
   ::cuda::stream_ref stream{cudaStream_t{nullptr}};
   int device_id{-1};
+  /// Set by a backend's submission path on the submitting thread: an event
+  /// recorded on @c stream there, marking the work queued before the read that
+  /// the read must not overtake, or null when that work had already finished.
+  /// A worker that writes the destination outside @c stream (cuFile DMA, a copy
+  /// on its own stream) waits on it instead of resolving @c stream itself: a
+  /// thread-relative handle (the per-thread default stream, or the null stream in
+  /// a per-thread-default build) names a different stream on another thread.
+  /// Meaningful only when @c ready_gate_set.
+  std::shared_ptr<cucascade::cuda::cuda_event> ready_gate;
+  /// Whether the submission path resolved @c ready_gate (see there).
+  bool ready_gate_set{false};
 };
 
 class prepared_io_completion final {

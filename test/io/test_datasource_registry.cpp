@@ -17,11 +17,14 @@
 
 #include <cucascade/io/config.hpp>
 #ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
 
@@ -30,6 +33,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -238,6 +242,43 @@ TEST_CASE("native routing never picks cufile", "[io][registry][cufile]")
 {
   registry_fixture fixture{config_for(io_backend::native)};
   CHECK(fixture.registry.lookup_path("/proc/self/exe") != io_context_type::cufile);
+}
+
+TEST_CASE("cufile routing leaves local files its checker declines to uring",
+          "[io][registry][cufile]")
+{
+  registry_fixture fixture{config_for(io_backend::cufile)};
+  // A narrowed cufile checker (say, GDS-capable mounts only) keeps the files it
+  // declines on uring instead of leaving them unrouted.
+  fixture.registry.register_ioctx(
+    io_context_type::cufile,
+    [](std::string_view path) { return path.starts_with("/gds/"); },
+    null_factory);
+  CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::uring);
+  CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::restful);
+  fixture.registry.register_ioctx(
+    io_context_type::cufile, [](std::string_view) { return true; }, null_factory);
+  CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::cufile);
+}
+
+TEST_CASE("cufile factory plans a pinned per-GPU pool by default", "[io][registry][cufile]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::ignore = cudaGetLastError();
+    SKIP("no CUDA device");
+  }
+  auto config = config_for(io_backend::cufile);
+  REQUIRE(config.cufile_n_reactors == 0);  // planned from the topology
+  config.cufile.reactors_per_device = 2;
+  config.cufile.staging_mode        = cucascade::io::cufile::staging::never;
+  registry_fixture fixture{config};
+  auto ctx = fixture.registry.make_ioctx(io_context_type::cufile);
+  REQUIRE(ctx != nullptr);
+  auto const& typed = dynamic_cast<cucascade::io::cufile::cufile_ioctx const&>(*ctx);
+  CHECK(typed.plan().groups.size() == static_cast<std::size_t>(devices));
+  CHECK(typed.plan().total_reactors() == 2 * static_cast<std::size_t>(devices));
+  ctx->shutdown();
 }
 #else
 TEST_CASE("cufile backend is refused by a build without cuFile", "[io][registry][cufile]")

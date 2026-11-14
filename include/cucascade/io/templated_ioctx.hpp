@@ -321,6 +321,7 @@ class templated_ioctx : public ioctx {
       slices.reserve(input_slices.size());
       std::size_t total_bytes = 0;
       int device_id           = -1;
+      int current_device      = -1;
 
       for (auto& slice : input_slices) {
         // A dropped slice reads nothing, so its completion always reports failure: reporting
@@ -350,8 +351,14 @@ class templated_ioctx : public ioctx {
 
         if (slice.has_device_request()) {
           has_device_slice = true;
-          if (device_id < 0) device_id = detail::current_cuda_device();
-          if (slice.d_buffer.device_id < 0) slice.d_buffer.device_id = device_id;
+          // A slice whose GPU the backend already resolved (from the destination)
+          // keeps it; others take the calling thread's device.  The request is
+          // routed by its first device slice's GPU, not by the caller's device.
+          if (slice.d_buffer.device_id < 0) {
+            if (current_device < 0) current_device = detail::current_cuda_device();
+            slice.d_buffer.device_id = current_device;
+          }
+          if (device_id < 0) device_id = slice.d_buffer.device_id;
         }
         slices.push_back(std::move(slice));
       }
