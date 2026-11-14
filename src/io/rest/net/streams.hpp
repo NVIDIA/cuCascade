@@ -62,6 +62,10 @@ struct stream_options {
   /// tls::config::fallback_rx == record_layer: user-space TLS connections receive through the
   /// built-in record layer (`tls_stream` tier 2).
   bool rx_record_layer{true};
+  /// TLS records sealed per ciphertext SEND (1..`tls_stream::max_tx_batch_records`).  A request
+  /// body goes out in batches of this many 16 KiB records: 16 cuts a 16 MiB part to ~64 SEND
+  /// round trips instead of ~340 with 3 (each SEND waits for the previous one: record order).
+  unsigned tx_batch_records{16};
 };
 
 /// MSG_NOSIGNAL on every send (SIGPIPE is never ignored process-wide).

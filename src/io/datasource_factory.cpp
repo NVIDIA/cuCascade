@@ -17,6 +17,10 @@
  */
 
 #include <cucascade/io/config.hpp>
+#ifdef CUCASCADE_HAS_CUFILE
+#include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/cufile_reactor.hpp>
+#endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/object_store_config.hpp>
@@ -52,30 +56,25 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
   return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 }
 
-/// Build a SigV4 authorizer from the object-store credentials, or nullptr when
-/// the store is not configured (empty endpoint / credentials / region — which
-/// disables the REST backend).  The signing form follows @c s3_signing_mode.
-std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_config& os)
-{
-  if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
-    return nullptr;
-  }
-  auto creds = rest::s3::static_credentials_from(os);
-  switch (os.s3_signing_mode) {
-    case object_store_config::signing_mode::header:
-      return std::make_shared<rest::s3::sigv4_header_authorizer>(
-        std::move(creds), os.region, os.endpoint);
-    case object_store_config::signing_mode::presigned:
-      return std::make_shared<rest::s3::sigv4_presigned_authorizer>(
-        std::move(creds), os.region, os.endpoint);
-  }
-  return nullptr;
-}
-
 }  // namespace
 
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
+
+#ifdef CUCASCADE_HAS_CUFILE
+factory_type make_cufile_ioctx_factory()
+{
+  return [](const io_config& config) -> std::shared_ptr<ioctx> {
+    try {
+      auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile);
+      return std::make_shared<cufile::cufile_ioctx>(config.cufile_n_reactors, std::move(ctx));
+    } catch (const std::exception& e) {
+      CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
+#endif
 
 factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
@@ -103,7 +102,7 @@ factory_type make_rest_ioctx_factory(
 {
   return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      auto authorizer = make_s3_authorizer(config.object_store);
+      auto authorizer = rest::s3::make_authorizer(config.object_store);
       if (!authorizer) {
         CUCASCADE_LOG_WARN(
           "make_rest_ioctx_factory: object store not configured (endpoint / credentials / "
@@ -133,11 +132,27 @@ factory_type make_rest_ioctx_factory(
 
 io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
-  : _config(std::move(config)), _reservation_manager(reservation_manager)
+  : _config(std::move(config)),
+    _reservation_manager(reservation_manager),
+    _prefer_cufile(_config.backend == io_backend::cufile)
 {
+#ifndef CUCASCADE_HAS_CUFILE
+  if (_prefer_cufile) {
+    throw std::invalid_argument(
+      "io_context_registry: io_backend::cufile requested, but this cuCascade build has no cuFile "
+      "backend (cufile.h was not found at configure time)");
+  }
+#endif
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  There is no catch-all: a path no
-  // backend claims resolves to nothing.
+  // backend claims resolves to nothing.  cufile claims local regular files like
+  // uring; lookup_path decides between them by the configured backend, never by
+  // iteration order.
+#ifdef CUCASCADE_HAS_CUFILE
+  _entries.emplace(
+    io_context_type::cufile,
+    entry{io_context_type::cufile, &cufile::cufile_reactor::supports, make_cufile_ioctx_factory()});
+#endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
@@ -189,10 +204,17 @@ std::optional<io_context_type> io_context_registry::lookup_path(
 {
   std::shared_lock lk{_mtx};
   _lookup_latched.store(true, std::memory_order_release);
-  // uring and rest claim disjoint paths (local files vs s3:// URLs), so
-  // iteration order does not decide between them.
+  // uring and rest claim disjoint paths (local files vs s3:// URLs), but both
+  // cufile and uring answer true for a local file, and iteration order must not
+  // decide between them: cufile is considered only when the config asked for
+  // it, and then it displaces uring.  The rules, per configured backend:
+  //   * cufile -- skip uring for local files (cufile wins); rest keeps s3://.
+  //   * native -- skip cufile for local files (uring wins); rest keeps s3://.
   for (const auto& [type, entry] : _entries) {
-    if (entry.checker(path)) { return type; }
+    if (!entry.checker(path)) continue;
+    if (_prefer_cufile && type == io_context_type::uring) { continue; }
+    if (!_prefer_cufile && type == io_context_type::cufile) { continue; }
+    return type;
   }
   return std::nullopt;
 }
