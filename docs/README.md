@@ -10,6 +10,8 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | [Memory Management](memory-management.md) | Deep dive into the three-tier memory system, reservations, and allocators |
 | [Data Management](data-management.md) | Data batch lifecycle, repositories, and representation conversion |
 | [Topology & Configuration](topology-and-configuration.md) | Hardware discovery, NUMA awareness, and system configuration |
+| [cuFile / GPUDirect Storage backend](io/cufile-gds.md) | GDS read paths, per-GPU pool planning, registered staging, Storage Scale checklist |
+| [REST transport](io/rest-transport.md) | The io_uring S3 / REST read reactor |
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
 
