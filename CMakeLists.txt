@@ -136,6 +136,17 @@ if(CUCASCADE_BUILD_IO AND CUCASCADE_TOPOLOGY_ONLY)
       CACHE BOOL "Build the cucascade-io library" FORCE)
 endif()
 
+# The cudf layer's DISK-tier converters read and write spill files through the
+# io library's io_context, so a cudf build needs the io library.
+if(CUCASCADE_BUILD_CUDF
+   AND NOT CUCASCADE_TOPOLOGY_ONLY
+   AND NOT CUCASCADE_BUILD_IO)
+  message(
+    FATAL_ERROR
+      "CUCASCADE_BUILD_CUDF=ON requires CUCASCADE_BUILD_IO=ON: the DISK-tier converters in cucascade-cudf perform their I/O through cucascade-io. Enable CUCASCADE_BUILD_IO or disable CUCASCADE_BUILD_CUDF."
+  )
+endif()
+
 # The S3 benchmark needs the io library (rest backend) and the benchmark tree.
 # Checked after the io gating above so a force-disabled io also disables it.
 if(CUCASCADE_BUILD_S3_BENCHMARK
@@ -197,6 +208,22 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # OpenSSL: TLS for the REST transport (handshakes, the user-space record
     # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
     find_package(OpenSSL REQUIRED)
+
+    # cuFile / GPUDirect Storage — the cufile reactor dlopen()s libcufile at run
+    # time and needs only cufile.h to build (it ships with the CUDA toolkit;
+    # libcufile-dev in conda). It does not depend on cudf, so it is built in a
+    # cudf-free build too. Without the header the cufile backend is left out and
+    # CUCASCADE_HAS_CUFILE stays undefined.
+    find_path(CUCASCADE_CUFILE_INCLUDE_DIR cufile.h
+              HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    if(CUCASCADE_CUFILE_INCLUDE_DIR)
+      message(
+        STATUS
+          "cufile.h found in ${CUCASCADE_CUFILE_INCLUDE_DIR}: cufile io backend enabled"
+      )
+    else()
+      message(STATUS "cufile.h not found: cufile io backend disabled")
+    endif()
 
     # cucascade_io_thirdparty carries the swappable moodycamel + invocable
     # (abseil) usage requirements from a single place; the io object library,
@@ -273,6 +300,19 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
         INTERFACE $<BUILD_INTERFACE:${_cucascade_absl_target}>)
       target_compile_definitions(cucascade_io_thirdparty
                                  INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
+    endif()
+
+    # Gates the cufile backend in io_config and the datasource registry. Carried
+    # on the same INTERFACE target as the definitions above so the io object
+    # library, its installable variants, and installed consumers all agree on
+    # the layout of io_config. libcufile itself is never linked (see
+    # src/io/cufile/cufile_api).
+    if(CUCASCADE_CUFILE_INCLUDE_DIR)
+      target_compile_definitions(cucascade_io_thirdparty
+                                 INTERFACE CUCASCADE_HAS_CUFILE)
+      target_include_directories(
+        cucascade_io_thirdparty
+        INTERFACE $<BUILD_INTERFACE:${CUCASCADE_CUFILE_INCLUDE_DIR}>)
     endif()
   endif()
 endif()
