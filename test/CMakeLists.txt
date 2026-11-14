@@ -134,6 +134,16 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   target_include_directories(cucascade_io_tests
                              PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+  # The cuFile backend exists only when cufile.h was found
+  # (CUCASCADE_HAS_CUFILE); see src/io/CMakeLists.txt.  It does not depend on
+  # cudf.
+  if(CUCASCADE_CUFILE_INCLUDE_DIR)
+    target_sources(
+      cucascade_io_tests
+      PRIVATE io/cufile/test_cufile_platform.cpp
+              io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp)
+  endif()
+
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
                                                       CUDA_STANDARD_REQUIRED ON)
 
@@ -199,15 +209,19 @@ endif()
 # Create topology discovery test executable
 add_executable(
   cucascade_topology_discovery_tests
-  memory/test_topology_discovery.cpp memory/test_net_topology.cpp
-  unittest_topology_discovery.cpp)
+  memory/test_path_storage.cpp memory/test_topology_discovery.cpp
+  memory/test_net_topology.cpp unittest_topology_discovery.cpp)
 set_target_properties(cucascade_topology_discovery_tests
                       PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
 # Set include directories
 target_include_directories(
-  cucascade_topology_discovery_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                                             ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  cucascade_topology_discovery_tests
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+          ${CMAKE_CURRENT_SOURCE_DIR}/utils
+          # Tests of src-private helpers (memory/detail/...) include them from
+          # src/.
+          ${PROJECT_SOURCE_DIR}/src)
 
 # Link dependencies
 target_link_libraries(
