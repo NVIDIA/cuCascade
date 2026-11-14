@@ -80,6 +80,21 @@ void decide_path_capability(path_info& info) noexcept;
                                      std::size_t file_size,
                                      std::size_t max_op) noexcept;
 
+/**
+ * @brief How many @c cuFileRead calls a staged read of [@p begin, @p end) makes
+ *        into a slot of @p slot_bytes, absent short reads.
+ *
+ * Each call widens its piece to 4 KiB boundaries and covers at most
+ * @p slot_bytes; a piece reaching into the file's partial last block reads the
+ * aligned body and the tail separately, never past @p file_size.
+ *
+ * @pre end <= file_size; @p slot_bytes a multiple of 4 KiB.
+ */
+[[nodiscard]] std::size_t staged_calls(std::size_t begin,
+                                       std::size_t end,
+                                       std::size_t file_size,
+                                       std::size_t slot_bytes) noexcept;
+
 /// Hold every reactor's staging-copy stream on the host for @p delay before each
 /// staging copy (0 = off), so tests can catch a scratch slot reused, or a request
 /// settled, before its copy landed.  Process-wide.
