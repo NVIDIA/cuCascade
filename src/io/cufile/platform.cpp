@@ -25,15 +25,20 @@
 
 #include <cufile.h>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io::cufile {
 
@@ -54,26 +59,82 @@ bool force_compat_env_on(char const* value) noexcept
 
 namespace {
 
+/// Fill @p out from cuFile's parameter getters, when the library has them.
+void read_parameters(cufile_api const& api, platform_info::parameters_info& out) noexcept
+{
+  out.available = api.get_size_parameter != nullptr && api.get_bool_parameter != nullptr;
+  if (!out.available) return;
+  auto size = [&api](size_parameter param) -> std::optional<std::size_t> {
+    std::size_t value = 0;
+    if (api.get_size_parameter(param, &value).err != CU_FILE_SUCCESS) return std::nullopt;
+    return value;
+  };
+  auto flag = [&api](bool_parameter param) -> std::optional<bool> {
+    bool value = false;
+    if (api.get_bool_parameter(param, &value).err != CU_FILE_SUCCESS) return std::nullopt;
+    return value;
+  };
+  auto text = [&api](string_parameter param) -> std::optional<std::string> {
+    if (api.get_string_parameter == nullptr) return std::nullopt;
+    std::array<char, 256> buffer{};
+    if (api.get_string_parameter(param, buffer.data(), static_cast<int>(buffer.size())).err !=
+        CU_FILE_SUCCESS) {
+      return std::nullopt;
+    }
+    buffer.back() = '\0';
+    return std::string{buffer.data()};
+  };
+  try {
+    out.parallel_io              = flag(bool_parameter::execution_parallel_io);
+    out.max_io_threads           = size(size_parameter::execution_max_io_threads);
+    out.max_io_queue_depth       = size(size_parameter::execution_max_io_queue_depth);
+    out.min_io_threshold_size_kb = size(size_parameter::execution_min_io_threshold_kb);
+    out.max_request_parallelism  = size(size_parameter::execution_max_request_parallelism);
+    out.use_poll_mode            = flag(bool_parameter::use_poll_mode);
+    out.allow_compat_mode        = flag(bool_parameter::allow_compat_mode);
+    out.force_compat_mode        = flag(bool_parameter::force_compat_mode);
+    out.use_pci_p2pdma           = flag(bool_parameter::use_pci_p2pdma);
+    out.io_batch_size            = size(size_parameter::io_batch_size);
+    out.profile_stats            = size(size_parameter::profile_stats);
+    out.rdma_transport           = text(string_parameter::rdma_transport);
+    out.logging_level            = text(string_parameter::logging_level);
+  } catch (...) {
+    // Best effort: keep what was read.
+  }
+}
+
 [[nodiscard]] platform_info compute_platform() noexcept
 {
   platform_info info{};
   info.forced_compat = detail::force_compat_env_on(std::getenv("CUFILE_FORCE_COMPAT_MODE"));
   try {
-    auto const* api        = cufile_api::get();
+    auto const* api        = cufile_api::loaded();
     info.library_available = api != nullptr;
     if (!info.library_available) return info;
     info.version = cufile_api::version();
-    if (!cufile_api::open_driver()) return info;
+    if (!cufile_api::open_loaded_driver()) return info;
     info.driver_opened = true;
     CUfileDrvProps_t props{};
     if (api->driver_get_properties(&props).err != CU_FILE_SUCCESS) {
       CUCASCADE_LOG_WARN("cufile: cuFileDriverGetProperties failed; the GDS mode is unknown");
       return info;
     }
-    info.properties_available  = true;
-    info.dstatusflags          = props.nvfs.dstatusflags;
-    info.compat_only           = info.dstatusflags == 0;
-    info.max_direct_io_size_kb = props.nvfs.max_direct_io_size;
+    info.properties_available          = true;
+    info.dstatusflags                  = props.nvfs.dstatusflags;
+    info.compat_only                   = info.dstatusflags == 0;
+    info.max_direct_io_size_kb         = props.nvfs.max_direct_io_size;
+    info.nvfs_major_version            = props.nvfs.major_version;
+    info.nvfs_minor_version            = props.nvfs.minor_version;
+    info.poll_threshold_size_kb        = props.nvfs.poll_thresh_size;
+    info.dcontrolflags                 = props.nvfs.dcontrolflags;
+    info.fflags                        = props.fflags;
+    info.max_device_cache_size_kb      = props.max_device_cache_size;
+    info.per_buffer_cache_size_kb      = props.per_buffer_cache_size;
+    info.max_device_pinned_mem_size_kb = props.max_device_pinned_mem_size;
+    info.max_batch_io_size             = props.max_batch_io_size;
+    info.max_batch_io_timeout_msecs    = props.max_batch_io_timeout_msecs;
+    read_parameters(*api, info.parameters);
+    if (info.parameters.force_compat_mode.value_or(false)) info.forced_compat = true;
   } catch (std::exception const& e) {
     CUCASCADE_LOG_WARN("cufile: probing the cuFile library failed: {}", e.what());
   } catch (...) {
@@ -105,13 +166,46 @@ platform_info const& probe_platform() noexcept
                          result.version,
                          result.dstatusflags);
     }
+    if (result.properties_available) {
+      auto const& p = result.parameters;
+      CUCASCADE_LOG_INFO(
+        "cufile: nvidia-fs {}.{}, max direct I/O {} KiB, bounce cache {} KiB/GPU in {} KiB "
+        "buffers, pinned limit {} KiB/GPU, poll mode {}, parallel_io {}, max_io_threads {}, "
+        "max_request_parallelism {}",
+        result.nvfs_major_version,
+        result.nvfs_minor_version,
+        result.max_direct_io_size_kb,
+        result.max_device_cache_size_kb,
+        result.per_buffer_cache_size_kb,
+        result.max_device_pinned_mem_size_kb,
+        (result.dcontrolflags & 1U) != 0 ? "on" : "off",
+        p.parallel_io ? (*p.parallel_io ? "on" : "off") : "unknown",
+        p.max_io_threads ? std::to_string(*p.max_io_threads) : std::string{"unknown"},
+        p.max_request_parallelism ? std::to_string(*p.max_request_parallelism)
+                                  : std::string{"unknown"});
+    }
     return result;
   }();
   return info;
 }
 
+namespace {
+/// -1: no override; 0 / 1: what gds_available() reports (tests only).
+std::atomic<int> gds_available_override{-1};
+}  // namespace
+
+namespace detail {
+void set_gds_available_for_testing(std::optional<bool> value) noexcept
+{
+  gds_available_override.store(value ? (*value ? 1 : 0) : -1, std::memory_order_release);
+}
+}  // namespace detail
+
 bool gds_available() noexcept
 {
+  if (auto const forced = gds_available_override.load(std::memory_order_acquire); forced >= 0) {
+    return forced == 1;
+  }
   auto const& info = probe_platform();
   return info.driver_opened && info.properties_available && !info.compat_only &&
          !info.forced_compat;
@@ -221,6 +315,24 @@ void fill_policy(path_info& info, config const& cfg)
   info.compat_mode = cfg.compat_mode.value_or(compat::automatic);
   info.use_odirect = cfg.use_odirect;
   info.platform    = probe_platform();
+  info.gds         = memory::discover_gds_setup();
+}
+
+/// Whether @p options (a comma-separated mount option list) holds @p option.
+[[nodiscard]] bool has_option(std::string const& options, std::string_view option) noexcept
+{
+  std::size_t start = 0;
+  while (start <= options.size()) {
+    auto const comma = std::min(options.find(',', start), options.size());
+    if (std::string_view{options}.substr(start, comma - start) == option) return true;
+    start = comma + 1;
+  }
+  return false;
+}
+
+[[nodiscard]] bool listed(std::vector<std::string> const& list, std::string const& value) noexcept
+{
+  return !value.empty() && std::find(list.begin(), list.end(), value) != list.end();
 }
 
 void fill_from_object(path_info& info, cufile_io_object const& object)
@@ -337,6 +449,14 @@ void decide_path_capability(path_info& info) noexcept
             "network filesystem " + storage.filesystem_type + " has no GDS storage class");
           return;
         }
+        // GDS serves NFS only over RDMA.
+        if (info.matched_class == storage_class::nfs &&
+            !has_option(storage.super_options, "proto=rdma") &&
+            !has_option(storage.super_options, "proto=rdma6") &&
+            !has_option(storage.mount_options, "proto=rdma") &&
+            !has_option(storage.mount_options, "proto=rdma6")) {
+          info.filesystem_supported = false;
+        }
         break;
       case storage_kind::memory:
         set_verdict(info,
@@ -369,8 +489,43 @@ void decide_path_capability(path_info& info) noexcept
     if (!info.filesystem_supported) {
       set_verdict(info,
                   path_capability::compatibility_only,
-                  "filesystem " + storage.filesystem_type + " is not served by GDS on " + cls);
+                  info.matched_class == storage_class::nfs
+                    ? "NFS mount " + storage.mount_point +
+                        " is not over RDMA (no proto=rdma): GDS serves NFS over RDMA only"
+                    : "filesystem " + storage.filesystem_type + " is not served by GDS on " + cls);
       return;
+    }
+    // Without any cuFile configuration file, cuFile runs on its built-in defaults,
+    // whose RDMA address list is empty.
+    if (auto const& json = info.gds.cufile_json;
+        info.matched_class == storage_class::gpfs && json.examined && !json.found) {
+      set_verdict(info,
+                  path_capability::compatibility_only,
+                  "no cuFile configuration file (" + json.path +
+                    "): Storage Scale GDS reads need rdma_dev_addr_list and fall back to "
+                    "compatibility mode without it");
+      return;
+    }
+    if (auto const& json = info.gds.cufile_json; json.parsed) {
+      if (listed(json.settings.denied_filesystems, storage.filesystem_type) ||
+          listed(json.settings.denied_mounts, storage.mount_point)) {
+        set_verdict(info,
+                    path_capability::compatibility_only,
+                    json.path + " denylists " +
+                      (listed(json.settings.denied_mounts, storage.mount_point)
+                         ? "mount " + storage.mount_point
+                         : "filesystem " + storage.filesystem_type) +
+                      ": cuFile does not use GDS for it");
+        return;
+      }
+      if (info.matched_class == storage_class::gpfs && json.settings.rdma_dev_addr_list.empty()) {
+        set_verdict(info,
+                    path_capability::compatibility_only,
+                    json.path +
+                      " lists no rdma_dev_addr_list: Storage Scale GDS reads need the client's "
+                      "RDMA addresses and fall back to compatibility mode without them");
+        return;
+      }
     }
     if (!info.direct_open) {
       set_verdict(info,

@@ -29,8 +29,26 @@
 
 #include <chrono>
 #include <cstddef>
+#include <optional>
+
+namespace cucascade::io::cufile {
+struct cufile_api;
+}  // namespace cucascade::io::cufile
 
 namespace cucascade::io::cufile::detail {
+
+/// Serve every cuFile call of the process from @p api instead of libcufile
+/// (null restores libcufile), so tests can script reads, failures and short
+/// returns.  Process-wide; install it before opening the objects it should
+/// serve and remove it after they are closed, since handles registered by one
+/// table mean nothing to the other.  @c cufile_api::open_driver() then reports
+/// @p api's @c driver_open outcome.
+void set_cufile_api_for_testing(cufile_api const* api) noexcept;
+
+/// Make @c gds_available() report @p value (unset restores the platform probe),
+/// so tests can run automatic staging on a host without a GDS stack.
+/// Process-wide.
+void set_gds_available_for_testing(std::optional<bool> value) noexcept;
 
 /**
  * @brief The verdict of @ref probe_path from the evidence already in @p info.
