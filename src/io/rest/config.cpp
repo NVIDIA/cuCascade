@@ -44,6 +44,14 @@ void config::validate() const
   }
   if (upkeep_interval.count() < 0) { invalid("upkeep_interval", "must be >= 0"); }
   if (conn_max_age.count() < 0) { invalid("conn_max_age", "must be >= 0"); }
+  if (write_split_bytes < 5 * mib || write_split_bytes > std::size_t{5} * 1024 * mib) {
+    invalid("write_split_bytes", "must be in [5 MiB, 5 GiB]");
+  }
+  if (continue_timeout.count() < 0) { invalid("continue_timeout", "must be >= 0"); }
+  if (complete_timeout_s < 0) { invalid("complete_timeout_s", "must be >= 0"); }
+  if (max_write_connections > max_connections) {
+    invalid("max_write_connections", "must be <= max_connections (0 = all)");
+  }
   if (max_retry_attempts == 0) { invalid("max_retry_attempts", "must be >= 1"); }
   if (max_auth_retry_attempts == 0) { invalid("max_auth_retry_attempts", "must be >= 1"); }
   if (retry_backoff_base.count() < 0) { invalid("retry_backoff_base", "must be >= 0"); }
