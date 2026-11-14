@@ -24,6 +24,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -283,6 +284,11 @@ class block_stack_walker {
   facts.minor       = minor(st.st_dev);
   info.device_major = facts.major;
   info.device_minor = facts.minor;
+  if (st.st_blksize > 0) { info.preferred_io_size = static_cast<std::size_t>(st.st_blksize); }
+  struct statvfs vfs{};
+  if (::fstatvfs(fd, &vfs) == 0 && vfs.f_bsize > 0) {
+    info.filesystem_block_size = static_cast<std::size_t>(vfs.f_bsize);
+  }
 
 #if defined(STATX_MNT_ID)
   struct statx stx{};

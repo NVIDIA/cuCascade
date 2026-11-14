@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cucascade/memory/gds_topology.hpp>
 #include <cucascade/memory/net_topology.hpp>
 
 #include <cstddef>
@@ -14,6 +15,17 @@
 #include <vector>
 
 namespace cucascade::memory {
+
+/**
+ * @brief PCIe topology path types.
+ */
+enum class PciePathType {
+  PIX  = 0,  ///< Connection traversing at most a single PCIe bridge (best).
+  PXB  = 1,  ///< Connection traversing multiple PCIe bridges.
+  PHB  = 2,  ///< Connection traversing PCIe Host Bridge.
+  NODE = 3,  ///< Connection traversing PCIe and interconnect within NUMA node.
+  SYS  = 4   ///< Connection traversing NUMA interconnect (worst).
+};
 
 /**
  * @brief GPU runtime attributes.
@@ -40,6 +52,20 @@ struct gpu_topology_info {
   std::vector<int> cpu_cores;                ///< List of CPU core IDs.
   std::vector<int> memory_binding;           ///< NUMA nodes for memory binding.
   std::vector<std::string> network_devices;  ///< Network devices (NICs) optimal for this GPU.
+  /// PCIe path between this GPU and @c network_devices (all share the best one
+  /// found); unset when no NIC with a PCI address was discovered.  @c PIX / @c PXB
+  /// let RDMA land in GPU memory without crossing a root port; @c SYS crosses
+  /// the inter-socket link.
+  std::optional<PciePathType> network_device_path;
+  std::size_t memory_total_bytes{0};  ///< Device memory (NVML), 0 if unknown.
+  /// BAR1 aperture (NVML), 0 if unknown.  GPUDirect DMA reaches GPU memory
+  /// through BAR1: memory registered with @c cuFileBufRegister (or pinned for
+  /// GPUDirect RDMA) is mapped into it, so it bounds how much can be registered
+  /// (256 MiB on a T4; as large as device memory on data-center GPUs).
+  /// For a MIG instance: the physical GPU's BAR1, which all its instances share
+  /// (0 when NVML refuses the query without privileges).
+  std::size_t bar1_total_bytes{0};
+  std::size_t bar1_free_bytes{0};  ///< BAR1 free when discovered (NVML), 0 if unknown.
   std::optional<gpu_runtime_attributes>
     runtime_attributes;  ///< Runtime attributes (populated only when explicitly requested; empty
                          ///< means "not queried", not "unsupported").
@@ -67,6 +93,15 @@ struct network_device_info {
   std::string pci_bus_id;     ///< PCI bus ID.
   std::string net_interface;  ///< Backing network interface (e.g., "ib0"); empty if none.
   int mtu{0};                 ///< MTU of `net_interface` in bytes (0 if unknown or none).
+  /// Ports in the ACTIVE state (@c /sys/class/infiniband/<name>/ports/<n>/state).
+  unsigned int active_ports{0};
+  /// Link layer of the fastest active port: "InfiniBand" or "Ethernet" (RoCE);
+  /// empty if no port is active or the attribute is unreadable.
+  std::string link_layer;
+  /// Signalling rate of the fastest active port in Gb/s (e.g. 400 for NDR), 0 if
+  /// unknown.  Bounds what GPUDirect RDMA reads through this NIC can reach: a
+  /// 400 Gb/s port carries at most about 50 GB/s.
+  unsigned int rate_gbps{0};
 };
 
 enum class StorageDriveType {
@@ -152,6 +187,12 @@ struct path_storage_info {
   std::string mount_options;     ///< Per-mount options.
   std::string super_options;     ///< Per-superblock options.
   std::vector<block_device_info> devices;  ///< Leaf block devices (local_block only).
+  /// The file's preferred I/O size (@c st_blksize), 0 if unknown.  IBM Storage
+  /// Scale reports its filesystem block size here (e.g. 16 MiB), which is the
+  /// granularity its servers read in.
+  std::size_t preferred_io_size{0};
+  /// The filesystem's block size (@c fstatvfs @c f_bsize), 0 if unknown.
+  std::size_t filesystem_block_size{0};
 
   /// Whether at least one leaf device was found and every leaf is NVMe.
   [[nodiscard]] bool all_devices_nvme() const noexcept
@@ -243,6 +284,7 @@ struct system_topology_info {
   std::vector<storage_device_info> storage_devices;  ///< Storage device information.
   std::vector<numa_topology_info> numa_nodes;        ///< NUMA node information, sorted by id.
   kernel_tls_info kernel_tls;                        ///< Kernel TLS (kTLS) state.
+  gds_setup_info gds;  ///< GPUDirect Storage setup (nvidia-fs, peer memory, cufile.json).
 
   /**
    * @brief Find a NUMA node by ID.
@@ -316,17 +358,6 @@ enum class NetworkDeviceVerification {
                          ///< address (default).
   EXISTS_ACTIVE = 1,     ///< Device exists, port is active, and uverbs device node is accessible.
   EXISTS        = 2      ///< Device exists only (no port, uverbs, or IP checks).
-};
-
-/**
- * @brief PCIe topology path types.
- */
-enum class PciePathType {
-  PIX  = 0,  ///< Connection traversing at most a single PCIe bridge (best).
-  PXB  = 1,  ///< Connection traversing multiple PCIe bridges.
-  PHB  = 2,  ///< Connection traversing PCIe Host Bridge.
-  NODE = 3,  ///< Connection traversing PCIe and interconnect within NUMA node.
-  SYS  = 4   ///< Connection traversing NUMA interconnect (worst).
 };
 
 /**

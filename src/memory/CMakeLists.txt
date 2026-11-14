@@ -37,5 +37,6 @@ endif()
 target_sources(
   cucascade_topology_discovery_objects
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/topology_discovery.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/gds_discovery.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/net_topology.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/path_storage_discovery.cpp)
