@@ -39,6 +39,8 @@
  * equally gates the pinning of an auto-sized pool).  A pin is
  * always one CPU taken from the thread's inherited affinity: placement narrows
  * what the process was given, it never widens it.
+ * (Not to be confused with @c io::reactor_placement in
+ * include/cucascade/io/reactor_placement.hpp, the per-GPU placement of uring/cuFile reactors.)
  *
  * Wiring (the REST ioctx / reactor pool; kept out of this unit so the helper
  * can land before the reactor that uses it):

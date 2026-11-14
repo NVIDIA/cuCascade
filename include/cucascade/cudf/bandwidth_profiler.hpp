@@ -88,6 +88,9 @@ struct bandwidth_profile_config {
   std::size_t timed_iterations = 10;
   /// Skip disk pairs (useful when you only care about GPU/HOST cells).
   bool measure_disk_pairs = true;
+  /// Measure REMOTE pairs (GPU/HOST <-> REMOTE). Off by default: every iteration uploads,
+  /// downloads and deletes objects in the store.
+  bool measure_remote_pairs = false;
   /// When true, call `posix_fadvise(POSIX_FADV_DONTNEED)` on disk source files between timed
   /// iterations so every read hits the disk instead of the Linux page cache. Process-local;
   /// no sudo required. Disable to measure warm-cache behavior.
@@ -131,19 +134,23 @@ struct bandwidth_profile {
  *   - GPU and HOST spaces are measured against each other in both directions, including
  *     self-to-self across distinct device ids.
  *   - DISK spaces are measured against each GPU and HOST space only (no disk-to-disk).
+ *   - REMOTE spaces likewise (no REMOTE <-> DISK / REMOTE), and only when
+ *     `bandwidth_profile_config::measure_remote_pairs` is set.
  *   - Pairs that reduce to the same memory space id are skipped.
  *
  * Transfers flow through the converter registry, using the built-in canonical
  * representation for each tier (GPU -> gpu_table_representation,
- * HOST -> host_data_representation, DISK -> disk_data_representation). Pairs without a
+ * HOST -> host_data_representation, DISK -> disk_data_representation,
+ * REMOTE -> remote_data_representation). Pairs without a
  * registered converter are marked `converter_available == false`.
  *
  * This function is pure and synchronous. It does not reserve through
  * `memory_reservation_manager`; callers are expected to run it at init time when the
  * target memory spaces are otherwise idle.
  *
- * Each DISK `memory_space` owns its own I/O backend, so the profile reflects whichever
- * backend each disk space was constructed with — no separate backend parameter is needed.
+ * Each DISK `memory_space` carries its own io context (`memory_space::get_io_context()`), so the
+ * profile reflects whichever context each disk space uses — no separate backend parameter is
+ * needed.
  * At least one GPU space must be present: it is used to materialize the canonical source
  * cudf table that seeds every pairwise transfer.
  *

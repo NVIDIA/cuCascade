@@ -240,12 +240,37 @@ struct config {
   /// same IRQ CPU.  The throughput gain measured within noise (docs/io/rest-transport.md).
   bool raise_reactor_priority{false};
 
+  // -- writes (S3 PUT / multipart upload) -------------------------------------
+  /// S3 multipart part size of writes, in [5 MiB, 5 GiB]; rounded down to the write granule.
+  /// @c templated_ioctx cuts every write slice at its multiples (and @c rest_ioctx cuts slices
+  /// that straddle one), so one write operation never spans two parts.  An open whose
+  /// @c write_open_options::size_hint needs more than 10000 parts of it uses a multiple of it.
+  /// A part being assembled pins one part buffer of this size from the context's host memory
+  /// resource until it is uploaded (or, when partly written, until the flush).
+  std::size_t write_split_bytes{16UL << 20};
+  /// Send PUT / UploadPart / CompleteMultipartUpload bodies only after `100 Continue`: an early
+  /// 4xx / 5xx then costs no body bytes and keeps its Retry-After, at one round trip per
+  /// request.  Off by default.
+  bool expect_continue{false};
+  /// With @c expect_continue: send the body anyway when the server answered nothing for this
+  /// long (a server that ignores `Expect`; curl's 1 s default).  0 = wait for the answer.
+  std::chrono::milliseconds continue_timeout{1000};
+  /// Whole-request bound of CompleteMultipartUpload (seconds; 0 = none).  S3 may assemble a
+  /// large object for minutes while it trickles whitespace, so neither the stall detector nor
+  /// @c request_timeout_s fits.
+  long complete_timeout_s{300};
+  /// Connections of one reactor that S3 write requests may hold at once (0 = all of
+  /// @c max_connections): the rest stays free for reads sharing the pool.
+  std::size_t max_write_connections{0};
+
   // -- retry policy ------------------------------------------------------
   std::size_t max_retry_attempts{10};
-  /// Bounded retries for an HTTP 403.  A presigned URL that expired while the
-  /// request waited in the queue comes back as 403; since every attempt
-  /// re-authorizes (a fresh presigned URL), a small number of retries can
-  /// recover from expiry.  Kept low so a genuine AccessDenied fails fast.
+  /// Bounded retries for an HTTP 403 of a data request (GET, PUT, UploadPart).  A presigned
+  /// URL that expired while the request waited in the queue comes back as 403; since every
+  /// attempt re-authorizes (a fresh presigned URL), a small number of retries can recover from
+  /// expiry.  Kept low so a genuine AccessDenied fails fast (a part's body is re-sent each
+  /// time).  Control-plane requests (HEAD, LIST, CreateMultipartUpload, Complete, Abort) never
+  /// re-sign: their 403 is final.
   std::size_t max_auth_retry_attempts{3};
   std::chrono::milliseconds retry_backoff_base{50};
   std::chrono::milliseconds retry_jitter{50};
@@ -308,5 +333,16 @@ struct config {
   /// @throws std::invalid_argument naming the first invalid field.
   void validate() const;
 };
+
+/**
+ * @brief The most GETs the REST reactor cuts one contiguous read of @p bytes into under @p cfg.
+ *
+ * The adaptive segment planner cuts a read at a target between @c min_segment_bytes and
+ * @c max_segment_bytes that follows the backlog; the worst case is the smallest target:
+ * max(1, bytes / min_segment_bytes, ceil(bytes / max_segment_bytes)).  GETs are not cut at an
+ * object's multipart part boundaries.  A device read stages every GET in whole blocks of the
+ * context's pinned staging, so this is what a caller budgeting that staging needs.  At least 1.
+ */
+[[nodiscard]] std::size_t max_read_gets(config const& cfg, std::uint64_t bytes) noexcept;
 
 }  // namespace cucascade::io::rest

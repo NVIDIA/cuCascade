@@ -56,20 +56,25 @@ using cucascade::io::object_identity;
 
 namespace {
 
-/// An io_object with only the base class's identity: a validation tag, no
-/// backend override.
+/// An io_object with only the base class's identity: a validation tag and a
+/// writable flag, no backend override.
 class plain_object : public io_object {
  public:
-  plain_object(std::string path, std::string tag) : _path(std::move(path)), _tag(std::move(tag)) {}
+  plain_object(std::string path, std::string tag, bool writable = false)
+    : _path(std::move(path)), _tag(std::move(tag)), _writable(writable)
+  {
+  }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] std::size_t size() const noexcept override { return 7; }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return _tag; }
+  [[nodiscard]] bool writable() const noexcept override { return _writable; }
 
  private:
   std::string _path;
   std::string _tag;
+  bool _writable;
 };
 
 class strong_object final : public plain_object {
@@ -433,6 +438,16 @@ TEST_CASE("A backend that declares its tag strong shares an object_tag identity"
   CHECK(empty.identity().kind == identity_kind::opened_handle);
 }
 
+TEST_CASE("A writable object never carries a reusable identity", "[object_identity]")
+{
+  strong_object const writer("file", "\"t\"", /*writable=*/true);
+  auto const identity = writer.identity();
+  CHECK(identity.kind == identity_kind::opened_handle);
+  CHECK(identity.size == 0);
+  CHECK(identity.version == std::to_string(writer.open_generation()));
+  CHECK(identity != plain_object("file", "\"t\"").identity());
+}
+
 TEST_CASE("uring opens carry the stat identity of their descriptors", "[object_identity][uring]")
 {
   using cucascade::io::uring::uring_reactor;
@@ -470,9 +485,26 @@ TEST_CASE("uring opens carry the stat identity of their descriptors", "[object_i
   CHECK(first->identity() == identity);
 }
 
-TEST_CASE("uring unstatable objects have no reusable identity", "[object_identity][uring]")
+TEST_CASE("uring writable and unstatable objects have no reusable identity",
+          "[object_identity][uring]")
 {
+  using cucascade::io::file_descriptor;
   using cucascade::io::uring::local_io_object;
+  using cucascade::io::uring::uring_reactor;
+  identity_file const file{4096};
+
+  auto const writer = uring_reactor::create_io_object_for_write(
+    file.path(), {.mode = cucascade::io::write_mode::open_existing});
+  REQUIRE(writer->writable());
+  CHECK(writer->identity().kind == identity_kind::opened_handle);
+  CHECK(writer->identity().size == 0);
+  CHECK(writer->size() == file.bytes());
+  auto const writer_key = writer->identity_cache_key();
+  writer->note_written(2 * file.bytes());
+  CHECK(writer->size() == 2 * file.bytes());
+  CHECK(writer->identity_cache_key() == writer_key);
+  CHECK(writer->identity_cache_key() !=
+        uring_reactor::create_io_object(file.path())->identity_cache_key());
 
   // Without a descriptor to stat, an object keeps its given size and falls back
   // to the open-local identity.
