@@ -221,6 +221,8 @@ struct io_slot {
   int index;
   bool fixed_supported;
   bool used_fixed{false};
+  // Counted in the worker's small-read tally (config::max_inflight_small_reads) while reading.
+  bool small_read{false};
   std::size_t bytes_read{0};
   slot_state state{slot_state::idle};
   std::unique_ptr<uring_io_op> op;
@@ -479,6 +481,9 @@ uring_reactor::gauges uring_reactor::take_gauges() noexcept
   // lose one pass's peak; the window is diagnostic, not an exact accounting.
   out.max_inflight_ops =
     std::max(_gauge_max_inflight.exchange(0, std::memory_order_relaxed), out.inflight_ops);
+  out.small_inflight_ops     = _gauge_small_inflight.load(std::memory_order_relaxed);
+  out.max_small_inflight_ops = std::max(
+    _gauge_max_small_inflight.exchange(0, std::memory_order_relaxed), out.small_inflight_ops);
   out.pending_ops             = _gauge_pending.load(std::memory_order_relaxed);
   out.active_remaining_slices = _gauge_active_slices.load(std::memory_order_relaxed);
   out.queued_requests         = _requests.size_approx();
@@ -783,12 +788,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     std::uint64_t bytes_submitted    = 0;
     std::uint64_t preemptions        = 0;
     std::uint64_t low_service_grants = 0;
+    std::size_t const small_read_cap = _config.max_inflight_small_reads;
+    // Reads below config::small_read_bytes in the reading state.
+    std::size_t small_inflight = 0;
 
     auto publish_gauges = [&]() noexcept {
       constexpr auto relaxed = std::memory_order_relaxed;
       auto const depth       = static_cast<std::uint32_t>(inflight);
       _gauge_inflight.store(depth, relaxed);
       if (depth > _gauge_max_inflight.load(relaxed)) { _gauge_max_inflight.store(depth, relaxed); }
+      _gauge_small_inflight.store(static_cast<std::uint32_t>(small_inflight), relaxed);
       _gauge_pending.store(static_cast<std::uint32_t>(pending.size()), relaxed);
       _gauge_active_slices.store(
         active != nullptr ? static_cast<std::uint32_t>(active->remaining_slices()) : 0U, relaxed);
@@ -872,7 +881,25 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
       ++preemptions;
     };
 
-    auto reset_slot = [&](io_slot& slot) noexcept { slot.reset(); };
+    // The peak is raised here rather than in publish_gauges(): a pass can reap a small
+    // read before it publishes, so the published count alone could miss the peak.
+    auto begin_small_read = [&](io_slot& slot) noexcept {
+      slot.small_read  = true;
+      auto const count = static_cast<std::uint32_t>(++small_inflight);
+      if (count > _gauge_max_small_inflight.load(std::memory_order_relaxed)) {
+        _gauge_max_small_inflight.store(count, std::memory_order_relaxed);
+      }
+    };
+    auto end_small_read = [&](io_slot& slot) noexcept {
+      if (!slot.small_read) return;
+      slot.small_read = false;
+      --small_inflight;
+    };
+
+    auto reset_slot = [&](io_slot& slot) noexcept {
+      end_small_read(slot);
+      slot.reset();
+    };
 
     auto settle_slot_error = [&](io_slot& slot,
                                  grouped_coordinator::error_type const& error,
@@ -904,6 +931,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           settle_slot_error(slot, status, true);
           return;
         }
+        end_small_read(slot);
         slot.state = slot_state::copying;
         copying.push_back(slot.index);
       } catch (...) {
@@ -1084,6 +1112,9 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
         auto const needed = std::max<std::size_t>(1, candidate->staging_blocks);
         if (available_slots.approx_free() < needed) break;
+        // A break, not a skip: dispatch stays in order (see config::max_inflight_small_reads).
+        bool const small = candidate->request.io_rng.size < _config.small_read_bytes;
+        if (small && small_read_cap != 0 && small_inflight >= small_read_cap) break;
 
         auto lease = std::make_shared<staging_lease>();
         lease->tokens.reserve(needed);
@@ -1119,6 +1150,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           slot.op         = std::move(op);
           slot.state      = slot_state::reading;
           slot.bytes_read = 0;
+          if (small) begin_small_read(slot);
 
           slot.prepare_remaining_iovecs();
           auto* sqe = ring.get_sqe();
