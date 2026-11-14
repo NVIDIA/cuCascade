@@ -220,6 +220,10 @@ namespace {
 using memory::path_storage_status;
 using memory::storage_kind;
 
+/// @c CU_FILE_VIRTIOFS_SUPPORTED, which CUDA 12.9's cufile.h (cuFile 1.14) does
+/// not declare; the driver reports the bit whatever header this was built with.
+constexpr int virtiofs_supported_bit = 13;
+
 /// The @c CUfileDriverStatusFlags bit of @p cls, or -1 for @c storage_class::none.
 [[nodiscard]] int status_bit(storage_class cls) noexcept
 {
@@ -231,7 +235,7 @@ using memory::storage_kind;
     case storage_class::wekafs: return CU_FILE_WEKAFS_SUPPORTED;
     case storage_class::gpfs: return CU_FILE_GPFS_SUPPORTED;
     case storage_class::beegfs: return CU_FILE_BEEGFS_SUPPORTED;
-    case storage_class::virtiofs: return CU_FILE_VIRTIOFS_SUPPORTED;
+    case storage_class::virtiofs: return virtiofs_supported_bit;
     case storage_class::none: break;
   }
   return -1;
