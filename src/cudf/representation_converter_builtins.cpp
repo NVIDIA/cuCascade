@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "builtin_converters_detail.hpp"
 #include "cudf_compat.hpp"
 
 #include <cucascade/cuda/event.hpp>
@@ -558,13 +559,22 @@ int resolve_gpu_numa_node(int device_id) noexcept
 }
 
 /**
- * @brief Copy @p size bytes from @p src_ptr
- * (on @p src_device) into a buffer.
+ * @brief How convert_gpu_to_gpu() moves bytes between two devices.
  *
- * Routing is decided per direction by cucascade::memory::probe_peer_dma_works(), which verifies a
- * peer copy between two mutually granted private memory pools:
- *   - verified: cudaMemcpyPeerAsync (direct only when the pools are granted peer access)
- *   - wrong bytes or a CUDA error during verification: explicit host-staged copy
+ * convert_gpu_to_gpu() picks the route once per conversion and every buffer of the table follows
+ * it. Without a test override the choice comes from cucascade::memory::probe_peer_dma_works(),
+ * which verifies a peer copy between two mutually granted private memory pools:
+ *   - verified: PEER
+ *   - wrong bytes or a CUDA error during verification: STAGED
+ */
+enum class gpu_to_gpu_route {
+  PEER,   ///< cudaMemcpyPeerAsync (direct only when the pools are granted peer access)
+  STAGED  ///< Explicit two-leg copy through pinned host memory
+};
+
+/**
+ * @brief Copy @p size bytes from @p src_ptr
+ * (on @p src_device) into a buffer, by @p route.
  *
  * The host-staged copy goes through the pre-pinned HOST memory_space pool (registered by
  * memory_space's HOST constructor in register_host_pool) and chunks across the pool's fixed block
@@ -581,11 +591,12 @@ Buffer peer_copy_into_async(Buffer buf,
                             int src_device,
                             std::size_t size_in_bytes,
                             int dst_device,
-                            ::cuda::stream_ref target_stream)
+                            ::cuda::stream_ref target_stream,
+                            gpu_to_gpu_route route)
 {
   if (size_in_bytes == 0 || src_ptr == nullptr) { return buf; }
 
-  if (memory::probe_peer_dma_works(src_device, dst_device)) {
+  if (route == gpu_to_gpu_route::PEER) {
     // Real peer DMA works on this hardware — direct path.
     CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
       buf.data(), dst_device, src_ptr, src_device, size_in_bytes, target_stream.get()));
@@ -593,7 +604,6 @@ Buffer peer_copy_into_async(Buffer buf,
   }
 
   // Peer DMA broken — stage through the pre-pinned HOST pool.
-  // TODO: these paths currently remain untested. Add tests to cover these.
   //
   // Block layout: the host pool allocates non-contiguous fixed-size blocks
   // (1 MB by default). We chunk the D2H and H2D legs across blocks just like
@@ -728,7 +738,8 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
                                                            int src_device,
                                                            int dst_device,
                                                            ::cuda::stream_ref stream,
-                                                           rmm::device_async_resource_ref mr)
+                                                           rmm::device_async_resource_ref mr,
+                                                           gpu_to_gpu_route route)
 {
   assert(src.offset() == 0 && "column_view with non-zero offset is not supported");
 
@@ -737,8 +748,13 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     null_mask = cudf::create_null_mask(src.size(), cudf::mask_state::UNINITIALIZED, stream, mr);
     if (std::size_t const size_in_bytes = cudf_compat::get_null_mask_size_bytes(null_mask);
         size_in_bytes > 0) {
-      null_mask = peer_copy_into_async(
-        std::move(null_mask), src.null_mask(), src_device, size_in_bytes, dst_device, stream);
+      null_mask = peer_copy_into_async(std::move(null_mask),
+                                       src.null_mask(),
+                                       src_device,
+                                       size_in_bytes,
+                                       dst_device,
+                                       stream,
+                                       route);
     }
     // no sync needed here since cudf calls are ordered on the explicitly passed stream, and cudf
     // factories that do not take a stream do no GPU side work.
@@ -756,7 +772,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     // Copy offsets as-is (preserve source's INT32 vs INT64 type). make_strings_column
     // accepts either offset type.
     auto offsets_col =
-      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr);
+      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr, route);
 
     rmm::device_buffer chars_buf{};
     if (src.size() > 0 && src.data<char>() != nullptr) {
@@ -797,7 +813,8 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
                                          src_device,
                                          data_size_in_bytes,
                                          dst_device,
-                                         stream);
+                                         stream,
+                                         route);
       }
     }
     return cudf::make_strings_column(
@@ -811,9 +828,9 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     }
     // Preserve source's offsets type — make_lists_column accepts INT32 or INT64.
     auto offsets_col =
-      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr);
+      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr, route);
     auto values_col =
-      reconstruct_column_p2p_async(src.child(1), src_device, dst_device, stream, mr);
+      reconstruct_column_p2p_async(src.child(1), src_device, dst_device, stream, mr, route);
     return cudf::make_lists_column(
       src.size(), std::move(offsets_col), std::move(values_col), null_count, std::move(null_mask));
   }
@@ -823,7 +840,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     fields.reserve(static_cast<std::size_t>(src.num_children()));
     for (cudf::size_type i = 0; i < src.num_children(); ++i) {
       fields.push_back(
-        reconstruct_column_p2p_async(src.child(i), src_device, dst_device, stream, mr));
+        reconstruct_column_p2p_async(src.child(i), src_device, dst_device, stream, mr, route));
     }
     // Construct directly to skip make_structs_column's superimpose_nulls kernel —
     // our peer-copied null masks are already consistent (mirrors reconstruct_column()).
@@ -844,8 +861,9 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     // cudf DICTIONARY32 child order: [0]=indices, [1]=keys.
     // make_dictionary_column parameter order: (keys, indices, ...).
     auto indices_col =
-      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr);
-    auto keys_col = reconstruct_column_p2p_async(src.child(1), src_device, dst_device, stream, mr);
+      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr, route);
+    auto keys_col =
+      reconstruct_column_p2p_async(src.child(1), src_device, dst_device, stream, mr, route);
     return cudf::make_dictionary_column(
       std::move(keys_col), std::move(indices_col), std::move(null_mask), null_count);
   }
@@ -859,7 +877,8 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
                                     src_device,
                                     data_size,
                                     dst_device,
-                                    stream);
+                                    stream,
+                                    route);
   }
   return std::make_unique<cudf::column>(
     src.type(), src.size(), std::move(data_buf), std::move(null_mask), null_count);
@@ -880,7 +899,8 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   const idata_representation& source,
   const memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
-  [[maybe_unused]] memory::reservation* reservation)
+  [[maybe_unused]] memory::reservation* reservation,
+  detail::gpu_to_gpu_converter_options const& options)
 {
   nvtx_scope convert_range{"convert:gpu_to_gpu"};
   // no sync on the caller's stream needed here: wait_for_writer() below, which is the real
@@ -890,7 +910,8 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
   auto& gpu_source = source.cast<gpu_table_representation>();
 
   // Same-device case: clone via source's own clone() method.
-  if (source.get_device_id() == target_memory_space->get_device_id()) {
+  if (source.get_device_id() == target_memory_space->get_device_id() &&
+      !options.force_staged_route) {
     // A null stream handle represents the default stream of the current device: ensure it's the
     // device attached to the representation, or clone() will throw.
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target_memory_space->get_device_id()}};
@@ -899,9 +920,12 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   auto const src_device_id = gpu_source.get_device_id();
   auto const dst_device_id = target_memory_space->get_device_id();
-  auto const copy_path     = memory::probe_peer_dma_works(src_device_id, dst_device_id)
-                               ? "convert:gpu_to_gpu:peer_copy"
-                               : "convert:gpu_to_gpu:host_staging";
+  auto const route =
+    !options.force_staged_route && memory::probe_peer_dma_works(src_device_id, dst_device_id)
+      ? gpu_to_gpu_route::PEER
+      : gpu_to_gpu_route::STAGED;
+  auto const copy_path = route == gpu_to_gpu_route::PEER ? "convert:gpu_to_gpu:peer_copy"
+                                                         : "convert:gpu_to_gpu:host_staging";
   nvtx_scope copy_path_range{copy_path};
 
   rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
@@ -927,7 +951,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
     target_columns.reserve(static_cast<std::size_t>(src_view.num_columns()));
     for (const cudf::column_view& col : src_view) {
       target_columns.push_back(
-        reconstruct_column_p2p_async(col, src_device_id, dst_device_id, target_stream, mr));
+        reconstruct_column_p2p_async(col, src_device_id, dst_device_id, target_stream, mr, route));
     }
 
     new_table = std::make_unique<cudf::table>(std::move(target_columns));
@@ -1883,13 +1907,27 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 
 void register_builtin_converters(representation_converter_registry& registry)
 {
+  detail::register_builtin_converters(registry, detail::gpu_to_gpu_converter_options{});
+}
+
+namespace detail {
+
+void register_builtin_converters(representation_converter_registry& registry,
+                                 gpu_to_gpu_converter_options const& gpu_to_gpu_options)
+{
   // GPU -> GPU (cross-device copy). convert_gpu_to_gpu copies each column buffer with
   // cudaMemcpyPeerAsync when cucascade::memory::probe_peer_dma_works() verifies the direction, and
   // stages through pinned host memory otherwise. The cached probe copies bytes between two mutually
   // granted private pools, so a verification failure means the pool peer route delivered wrong
   // bytes, as on platforms whose direct route reports success but leaves stale data.
   registry.register_converter<gpu_table_representation, gpu_table_representation>(
-    convert_gpu_to_gpu);
+    [gpu_to_gpu_options](const idata_representation& source,
+                         const memory::memory_space* target_memory_space,
+                         ::cuda::stream_ref stream,
+                         memory::reservation* reservation) {
+      return convert_gpu_to_gpu(
+        source, target_memory_space, stream, reservation, gpu_to_gpu_options);
+    });
 
   // GPU -> HOST
   registry.register_converter<gpu_table_representation, host_data_packed_representation>(
@@ -1931,5 +1969,7 @@ void register_builtin_converters(representation_converter_registry& registry)
   registry.register_converter<disk_data_representation, gpu_table_representation>(
     convert_disk_to_gpu);
 }
+
+}  // namespace detail
 
 }  // namespace cucascade

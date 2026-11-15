@@ -183,8 +183,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Set include directories
   target_include_directories(
-    cucascade_cudf_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                                 ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+    cucascade_cudf_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+            ${PROJECT_SOURCE_DIR}/src/cudf)
 
   # Link dependencies
   target_link_libraries(

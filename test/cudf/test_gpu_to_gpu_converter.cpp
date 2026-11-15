@@ -3,25 +3,32 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "builtin_converters_detail.hpp"
 #include "cucascade/cudf/builtin_converters.hpp"
 #include "cucascade/cudf/gpu_data_representation.hpp"
 #include "cucascade/data/representation_converter.hpp"
+#include "cucascade/memory/fixed_size_host_memory_resource.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "cucascade/memory/memory_space.hpp"
 #include "cucascade/memory/reservation_manager_configurator.hpp"
 #include "cucascade/utils/cleanup_utils.hpp"
+#include "utils/cuda_device_utils.hpp"
 #include "utils/cuda_test_utils.hpp"
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mixed_table.hpp"
 #include "utils/peer_access_utils.hpp"
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <catch2/catch_all.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <future>
 #include <latch>
+#include <memory>
 #include <utility>
 
 namespace {
@@ -30,6 +37,7 @@ using namespace cucascade::memory;
 
 constexpr uint64_t kKiB = 1024ULL;
 constexpr uint64_t kMiB = 1024ULL * kKiB;
+constexpr uint64_t kGiB = 1024ULL * kMiB;
 
 constexpr int kSourceDevice = 0;
 constexpr int kTargetDevice = 1;
@@ -59,15 +67,109 @@ void require_peer_pools(memory_space const* source, memory_space const* destinat
   }
 }
 
+// Bytes currently handed out by the HOST spaces of @p manager, which staged copies borrow from.
+std::size_t host_bytes_in_use(memory_reservation_manager const& manager)
+{
+  std::size_t bytes = 0;
+  for (memory_space const* space : manager.get_memory_spaces_for_tier(Tier::HOST)) {
+    bytes += space->get_memory_resource_of<Tier::HOST>()->get_total_allocated_bytes();
+  }
+  return bytes;
+}
+
+// Highest number of bytes any HOST space of @p manager has handed out at once.
+std::size_t host_peak_bytes(memory_reservation_manager const& manager)
+{
+  std::size_t bytes = 0;
+  for (memory_space const* space : manager.get_memory_spaces_for_tier(Tier::HOST)) {
+    bytes += space->get_memory_resource_of<Tier::HOST>()->get_peak_total_allocated_bytes();
+  }
+  return bytes;
+}
+
+// Convert a mixed table from @p source_device to @p target_device by the host-staged route and
+// compare it with the same table built on the target. The two devices may be the same.
+void check_staged_conversion(memory_reservation_manager& manager,
+                             int source_device,
+                             int target_device,
+                             cudf::size_type rows)
+{
+  using cucascade::gpu_table_representation;
+  CAPTURE(source_device, target_device, rows);
+
+  cucascade::representation_converter_registry registry;
+  cucascade::detail::register_builtin_converters(
+    registry, cucascade::detail::gpu_to_gpu_converter_options{.force_staged_route = true});
+
+  auto* source_space = manager.get_memory_space(Tier::GPU, source_device);
+  auto* target_space = manager.get_memory_space(Tier::GPU, target_device);
+  REQUIRE(source_space != nullptr);
+  REQUIRE(target_space != nullptr);
+
+  // Streams outlive the tables written on them; each is created with its device current.
+  rmm::cuda_stream producer = [&] {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{source_device}};
+    return rmm::cuda_stream{rmm::cuda_stream::flags::non_blocking};
+  }();
+  rmm::cuda_stream consumer = [&] {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{target_device}};
+    return rmm::cuda_stream{rmm::cuda_stream::flags::non_blocking};
+  }();
+
+  std::unique_ptr<gpu_table_representation> source;
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{source_device}};
+    source = std::make_unique<gpu_table_representation>(
+      cucascade::test::make_mixed_table(rows, producer, source_space->get_default_allocator()),
+      *source_space,
+      producer);
+  }
+
+  std::size_t const host_bytes_before = host_bytes_in_use(manager);
+
+  std::unique_ptr<gpu_table_representation> converted;
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{target_device}};
+    converted = registry.convert<gpu_table_representation>(*source, target_space, consumer);
+    // The converter switches devices for its two legs and must put the caller's device back.
+    CHECK(rmm::get_current_cuda_device().value() == target_device);
+  }
+  REQUIRE(converted != nullptr);
+  CHECK(converted->get_device_id() == target_device);
+
+  // The copy went through this manager's HOST pool and gave every staging block back.
+  CHECK(host_peak_bytes(manager) > host_bytes_before);
+  CHECK(host_bytes_in_use(manager) == host_bytes_before);
+
+  // The result must not depend on the source after the conversion returns.
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{source_device}};
+    source.reset();
+  }
+
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{target_device}};
+    auto expected =
+      cucascade::test::make_mixed_table(rows, consumer, target_space->get_default_allocator());
+    cucascade::test::expect_cudf_tables_equal_on_stream(
+      expected->view(), converted->get_table_view(), consumer);
+    expected.reset();
+    converted.reset();
+    consumer.synchronize();
+  }
+}
+
 }  // namespace
 
 namespace cucascade {
 
-TEST_CASE("gpu_to_gpu conversion copies content correctly across GPUs",
-          "[gpu-to-gpu-converter][multi-device][cross-gpu-correctness]")
-{
-  if (test::cuda_device_count() < 2) { SKIP("requires at least two GPUs"); }
+namespace {
 
+// Two converters read one source whose last write is still held back on the producer stream;
+// both must wait for that write. With @p force_staged_route the copies go through host memory,
+// otherwise the device pair must have peer access.
+void check_conversion_waits_for_writer(bool force_staged_route)
+{
   reservation_manager_configurator builder;
   builder.set_gpu_ids({kSourceDevice, kTargetDevice})
     .set_gpu_usage_limit(64 * kMiB)
@@ -76,11 +178,14 @@ TEST_CASE("gpu_to_gpu conversion copies content correctly across GPUs",
     .set_host_portability(true);
   memory_reservation_manager manager(builder.build());
 
-  require_peer_pools(manager.get_memory_space(Tier::GPU, kSourceDevice),
-                     manager.get_memory_space(Tier::GPU, kTargetDevice));
+  if (!force_staged_route) {
+    require_peer_pools(manager.get_memory_space(Tier::GPU, kSourceDevice),
+                       manager.get_memory_space(Tier::GPU, kTargetDevice));
+  }
 
   representation_converter_registry registry;
-  register_builtin_converters(registry);
+  detail::register_builtin_converters(
+    registry, detail::gpu_to_gpu_converter_options{.force_staged_route = force_staged_route});
 
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{kSourceDevice}};
   rmm::cuda_stream source_producer_stream{rmm::cuda_stream::flags::non_blocking};
@@ -164,6 +269,62 @@ TEST_CASE("gpu_to_gpu conversion copies content correctly across GPUs",
     test::expect_cudf_tables_equal_on_stream(
       expected_table->view(), right->get_table_view(), consumer);
   }
+}
+
+}  // namespace
+
+TEST_CASE("gpu_to_gpu conversion copies content correctly across GPUs",
+          "[gpu-to-gpu-converter][multi-device][cross-gpu-correctness]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires at least two GPUs"); }
+
+  check_conversion_waits_for_writer(/*force_staged_route=*/false);
+}
+
+TEST_CASE("gpu_to_gpu staged route waits for the source's writer across GPUs",
+          "[gpu-to-gpu-converter][staged-copy][multi-device]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires at least two GPUs"); }
+
+  check_conversion_waits_for_writer(/*force_staged_route=*/true);
+}
+
+TEST_CASE("gpu_to_gpu staged route copies a mixed table within one GPU",
+          "[gpu-to-gpu-converter][staged-copy]")
+{
+  if (test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
+
+  // 200,000 rows give buffers of several MiB, so a buffer spans more than one 1 MiB host block.
+  auto const rows = GENERATE(cudf::size_type{1}, cudf::size_type{1024}, cudf::size_type{200'000});
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({kSourceDevice})
+    .set_gpu_usage_limit(1 * kGiB)
+    .use_numa_id_as_host_id()
+    .set_per_numa_region_capacity(256 * kMiB)
+    .set_host_portability(true);
+  memory_reservation_manager manager(builder.build());
+
+  check_staged_conversion(manager, kSourceDevice, kSourceDevice, rows);
+}
+
+TEST_CASE("gpu_to_gpu staged route copies a mixed table across GPUs in both directions",
+          "[gpu-to-gpu-converter][staged-copy][multi-device]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires at least two GPUs"); }
+
+  auto const rows = GENERATE(cudf::size_type{1024}, cudf::size_type{200'000});
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({kSourceDevice, kTargetDevice})
+    .set_gpu_usage_limit(1 * kGiB)
+    .use_numa_id_as_host_id()
+    .set_per_numa_region_capacity(256 * kMiB)
+    .set_host_portability(true);
+  memory_reservation_manager manager(builder.build());
+
+  check_staged_conversion(manager, kSourceDevice, kTargetDevice, rows);
+  check_staged_conversion(manager, kTargetDevice, kSourceDevice, rows);
 }
 
 }  // namespace cucascade

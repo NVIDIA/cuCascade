@@ -59,7 +59,7 @@ add_executable(cucascade_benchmarks ${BENCHMARK_SOURCES})
 target_include_directories(
   cucascade_benchmarks
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../test
-          ${benchmark_SOURCE_DIR}/include)
+          ${PROJECT_SOURCE_DIR}/src/cudf ${benchmark_SOURCE_DIR}/include)
 
 # Apply warning flags to benchmark executable. Suppress -Wnull-dereference:
 # triggered by RAPIDS/CCCL system headers
