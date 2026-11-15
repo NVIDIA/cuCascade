@@ -343,11 +343,12 @@ class templated_ioctx : public ioctx {
           continue;
         }
 
-        slice.rng.size = std::min(slice.rng.size, typed.size() - slice.rng.offset);
-        if (slice.rng.size > std::numeric_limits<std::size_t>::max() - total_bytes) {
+        slice.rng.size     = std::min(slice.rng.size, typed.size() - slice.rng.offset);
+        auto const payload = slice.payload_bytes();
+        if (payload > std::numeric_limits<std::size_t>::max() - total_bytes) {
           throw std::overflow_error("mixed read byte count overflow");
         }
-        total_bytes += slice.rng.size;
+        total_bytes += payload;
 
         if (slice.has_device_request()) {
           has_device_slice = true;

@@ -146,6 +146,12 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// comment).  @throws on a capturing stream or a CUDA failure.
   void prepare_device_slices(io_object const& object, std::vector<prepared_io_slice>& slices);
 
+  /// Replace runs of neighbouring small device slices by fused slices (see
+  /// @c config::fuse_gap_bytes).  Slices outside the file, with a completion
+  /// callback or a host destination are left alone.  May throw @c std::bad_alloc,
+  /// before it changes @p slices.
+  void fuse_device_slices(std::vector<prepared_io_slice>& slices, std::size_t file_size) const;
+
   pool_plan _plan;
   std::vector<group_range> _groups;
 };

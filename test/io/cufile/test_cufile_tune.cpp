@@ -43,6 +43,11 @@
  *   CUCASCADE_IO_TUNE_CHUNK_KIB   Parquet chunk size range "min,max" in KiB (default 1024,8192)
  *   CUCASCADE_IO_TUNE_GPUS        CUDA devices for phase C (default all)
  *   CUCASCADE_IO_TUNE_SUBMITTERS  submitting threads per GPU (default 4)
+ *   CUCASCADE_IO_TUNE_RUN         chunks per run of neighbouring chunks in a call (default 1:
+ *                                 every chunk at a random offset)
+ *   CUCASCADE_IO_TUNE_RUN_GAP_KIB largest gap between the chunks of a run (default 64)
+ *   CUCASCADE_IO_TUNE_FUSE_GAP_KIB  config::fuse_gap_bytes in KiB (default 0: off)
+ *   CUCASCADE_IO_TUNE_GDS_THRESHOLD_KIB  config::gds_threshold in KiB (default 64)
  *   CUCASCADE_IO_TUNE_SKIP        phases to skip, e.g. "A" or "A,C"
  */
 
@@ -362,6 +367,8 @@ struct workload {
   std::size_t chunk_max{8UL << 20};
   std::size_t per_call{32};
   std::size_t submitters{4};
+  std::size_t run{1};               ///< Neighbouring chunks per run within a call.
+  std::size_t run_gap{64UL << 10};  ///< Largest gap between the chunks of a run.
 };
 
 /// Parquet-shaped reads on @p devices for @p seconds: each submitter keeps one
@@ -397,10 +404,16 @@ struct workload {
             std::vector<cucascade::io::slice> slices;
             std::size_t expected = 0;
             std::size_t placed   = 0;
+            std::size_t run_end  = 0;
             for (std::size_t i = 0; i < load.per_call; ++i) {
-              auto const size   = load.chunk_min + next() % (load.chunk_max - load.chunk_min + 1);
-              auto const offset = next() % (file_size - size);
-              auto const where  = (placed + 255) / 256 * 256 + (next() & 1);
+              auto const size = load.chunk_min + next() % (load.chunk_max - load.chunk_min + 1);
+              auto offset     = next() % (file_size - size);
+              if (load.run > 1 && i % load.run != 0) {
+                auto const after = run_end + next() % (load.run_gap + 1);
+                if (after + size <= file_size) offset = after;
+              }
+              run_end          = offset + size;
+              auto const where = (placed + 255) / 256 * 256 + (next() & 1);
               slices.emplace_back(offset, size, base + where);
               placed = where + size;
               expected += size;
@@ -430,12 +443,17 @@ struct workload {
 
 void print_paths(cufile::reactor_stats const& stats)
 {
-  std::printf(" [staged %.1f GB (%llu early), direct %.1f GB, posix %.1f GB, cuFile failures %llu]",
-              static_cast<double>(stats.staged_bytes) / 1e9,
-              static_cast<unsigned long long>(stats.early_staged_reads),
-              static_cast<double>(stats.direct_bytes) / 1e9,
-              static_cast<double>(stats.posix_device_bytes) / 1e9,
-              static_cast<unsigned long long>(stats.cufile_failures));
+  std::printf(
+    " [%llu reads, %llu fused slices, staged %.1f GB (%llu early), direct %.1f GB, posix %.1f GB, "
+    "cuFile failures %llu]",
+    static_cast<unsigned long long>(stats.staged_reads + stats.direct_reads +
+                                    stats.posix_device_reads),
+    static_cast<unsigned long long>(stats.fused_slices),
+    static_cast<double>(stats.staged_bytes) / 1e9,
+    static_cast<unsigned long long>(stats.early_staged_reads),
+    static_cast<double>(stats.direct_bytes) / 1e9,
+    static_cast<double>(stats.posix_device_bytes) / 1e9,
+    static_cast<unsigned long long>(stats.cufile_failures));
 }
 
 struct point {
@@ -475,6 +493,8 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
   load.chunk_min  = chunk.front() << 10;
   load.chunk_max  = chunk.back() << 10;
   load.submitters = env_list("CUCASCADE_IO_TUNE_SUBMITTERS", {4}).front();
+  load.run        = std::max<std::size_t>(1, env_list("CUCASCADE_IO_TUNE_RUN", {1}).front());
+  load.run_gap    = env_list("CUCASCADE_IO_TUNE_RUN_GAP_KIB", {64}).front() << 10;
   std::vector<int> gpus;
   for (auto const id : env_list("CUCASCADE_IO_TUNE_GPUS", {})) {
     gpus.push_back(static_cast<int>(id));
@@ -496,7 +516,8 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
 
   cufile::config base;
   base.storage_hint_path = path;
-  base.gds_threshold     = 64UL << 10;
+  base.gds_threshold     = env_list("CUCASCADE_IO_TUNE_GDS_THRESHOLD_KIB", {64}).front() << 10;
+  base.fuse_gap_bytes    = env_list("CUCASCADE_IO_TUNE_FUSE_GAP_KIB", {0}).front() << 10;
   {
     auto const plan =
       cufile::plan_cufile_pool(base, topology ? &*topology : nullptr, cufile::probe_platform());

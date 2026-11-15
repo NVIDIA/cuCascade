@@ -138,6 +138,8 @@ struct reactor_stats {
   /// Of @c staged_reads, those read before the caller's stream had finished the
   /// work queued ahead of them (only their scatter copy waited for it).
   std::uint64_t early_staged_reads{0};
+  /// Caller slices served through fused staged reads (several per read).
+  std::uint64_t fused_slices{0};
   std::uint64_t direct_reads{0};        ///< Device reads cuFile served into the destination.
   std::uint64_t direct_bytes{0};        ///< Their bytes.
   std::uint64_t posix_device_reads{0};  ///< Device reads served by POSIX + host-to-device copy.
@@ -152,6 +154,7 @@ struct reactor_stats {
     staged_reads += other.staged_reads;
     staged_bytes += other.staged_bytes;
     early_staged_reads += other.early_staged_reads;
+    fused_slices += other.fused_slices;
     direct_reads += other.direct_reads;
     direct_bytes += other.direct_bytes;
     posix_device_reads += other.posix_device_reads;
@@ -534,6 +537,7 @@ class cufile_reactor {
     std::atomic<std::uint64_t> staged_reads{0};
     std::atomic<std::uint64_t> staged_bytes{0};
     std::atomic<std::uint64_t> early_staged_reads{0};
+    std::atomic<std::uint64_t> fused_slices{0};
     std::atomic<std::uint64_t> direct_reads{0};
     std::atomic<std::uint64_t> direct_bytes{0};
     std::atomic<std::uint64_t> posix_device_reads{0};
