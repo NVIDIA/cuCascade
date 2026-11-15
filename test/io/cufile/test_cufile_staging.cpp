@@ -597,6 +597,89 @@ TEST_CASE("cufile staged read that cuFile fails is served by POSIX instead",
   CHECK(stats.staged_reads == 0);
 }
 
+TEST_CASE("cufile fuses neighbouring small device slices into one staged read",
+          "[io][cufile][staging][gpu]")
+{
+  if (device_count() == 0) SKIP("no CUDA device");
+  pattern_file file{4UL << 20};
+  scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
+  auto cfg           = staging_config(slot_class(15));
+  cfg.fuse_gap_bytes = 64UL << 10;
+
+  rmm::cuda_stream stream;
+  constexpr std::size_t size  = 20000;
+  constexpr std::size_t near  = 6;
+  constexpr std::size_t count = near + 1;
+  rmm::device_buffer dst(count * size, ::cuda::stream_ref{stream.value()});
+  auto* const base = static_cast<std::uint8_t*>(dst.data());
+  // Six slices 10000 bytes apart, and one far from them that stays by itself.
+  std::vector<std::size_t> offsets;
+  for (std::size_t i = 0; i < near; ++i) {
+    offsets.push_back(5000 + i * 30000);
+  }
+  offsets.push_back((3UL << 20) + 123);
+  std::vector<cucascade::io::slice> ranges;
+  for (std::size_t i = 0; i < count; ++i) {
+    ranges.emplace_back(offsets[i], size, base + i * size);
+  }
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{cfg, 2};
+  auto object = ioctx.get().open_io_object(file.path());
+  REQUIRE(ioctx.get()
+            .device_readv_async_io(*object, ranges, ::cuda::stream_ref{stream.value()})
+            .get(60s) == count * size);
+  for (std::size_t i = 0; i < count; ++i) {
+    INFO("slice " << i);
+    CHECK(matches_file(bytes_at(base + i * size, size), offsets[i]));
+  }
+  auto const stats = ioctx.get().stats();
+  CHECK(stats.staged_reads == 2);
+  CHECK(stats.fused_slices == near);
+  CHECK(stats.staged_bytes == count * size);
+  CHECK(cufile.calls().size() == 2);
+  check_calls_are_dma_ready(cufile);
+}
+
+TEST_CASE("cufile serves the slices of a fused read separately when cuFile fails it",
+          "[io][cufile][staging][gpu]")
+{
+  if (device_count() == 0) SKIP("no CUDA device");
+  pattern_file file{1UL << 20};
+  scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
+  cufile.fail_call(1);
+  auto cfg           = staging_config(slot_class(16));
+  cfg.fuse_gap_bytes = 64UL << 10;
+
+  rmm::cuda_stream stream;
+  constexpr std::size_t size  = 20000;
+  constexpr std::size_t count = 4;
+  rmm::device_buffer dst(count * size, ::cuda::stream_ref{stream.value()});
+  auto* const base = static_cast<std::uint8_t*>(dst.data());
+  std::vector<cucascade::io::slice> ranges;
+  for (std::size_t i = 0; i < count; ++i) {
+    ranges.emplace_back(4100 + i * 30000, size, base + i * size);
+  }
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{cfg, 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  REQUIRE(ioctx.get()
+            .device_readv_async_io(*object, ranges, ::cuda::stream_ref{stream.value()})
+            .get(60s) == count * size);
+  for (std::size_t i = 0; i < count; ++i) {
+    INFO("slice " << i);
+    CHECK(matches_file(bytes_at(base + i * size, size), 4100 + i * 30000));
+  }
+  auto const stats = ioctx.get().stats();
+  CHECK(stats.cufile_failures == 1);
+  CHECK(stats.fused_slices == 0);
+  CHECK(stats.staged_reads == count);
+  CHECK(stats.staged_bytes == count * size);
+}
+
 TEST_CASE("cufile staged reads continue after short cuFile returns", "[io][cufile][staging][gpu]")
 {
   if (device_count() == 0) SKIP("no CUDA device");

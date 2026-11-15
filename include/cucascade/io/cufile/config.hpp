@@ -151,6 +151,17 @@ struct config {
   /// cuFile's default @c max_direct_io_size_kb (16 MiB).
   std::size_t staging_piece_bytes{8UL << 20};
 
+  /// Fuse neighbouring small device slices of one vectored read into a single
+  /// staged @c cuFileRead: slices of at most half a piece whose gap is at most
+  /// this many bytes, and which together fit one staging slot, are read by one
+  /// aligned call and scattered to their destinations.  A read's cost is mostly
+  /// its fixed latency, so many small reads (Parquet column chunks of a file
+  /// with small row groups) cannot fill a fast link however deep the pool is;
+  /// fusing trades the gap bytes for fewer, larger reads.  0 disables it.  Only
+  /// staged reads are fused; a fused slice that cannot be staged is served as
+  /// its separate slices.
+  std::size_t fuse_gap_bytes{0};
+
   /// Registered slots a reactor keeps per device it stages for.  With two, a read
   /// whose caller's stream is still busy can complete into one slot (its scatter
   /// copy waits on the GPU for that stream) while the other stays free for reads

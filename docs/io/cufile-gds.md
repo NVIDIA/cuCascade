@@ -287,6 +287,7 @@ points.
 | `staging_mode` | `automatic` | Stage through registered slots when cuFile reports GDS (`always` / `never` to force) |
 | `staging_piece_bytes` | 8 MiB | File bytes per staged call; also the split size of large device reads |
 | `staging_slots_per_reactor` | 2 | Slots a reactor holds per GPU; 1 disables early reads |
+| `fuse_gap_bytes` | 0 (off) | Read neighbouring small device slices of one vectored read (each at most half a piece, at most this far apart, together within one slot) with a single staged call. For files with small column chunks: a read's cost is mostly its fixed latency |
 | `max_staging_bytes_per_device` | 1 GiB | Process-wide cap on staging per GPU (0 = no cap) |
 | `reactors_per_device` | 0 (auto) | Reactors per GPU in a planned pool |
 | `pin_to_device_cpus` | true | Pin each group to its GPU's CPUs |

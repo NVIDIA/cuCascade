@@ -21,6 +21,7 @@
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/placement.hpp>
+#include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/cufile/staging.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -33,10 +34,12 @@
 #include <cstddef>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -326,7 +329,10 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
       piece_count += pieces - 1;
     }
   }
-  if (piece_count == 0) return;
+  if (piece_count == 0) {
+    fuse_device_slices(slices, file_size);
+    return;
+  }
   piece_count += slices.size();
 
   // Split on 4 KiB boundaries into near-equal pieces (see split_step): every
@@ -357,6 +363,105 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
     }
   }
   slices = std::move(pieces);
+  fuse_device_slices(slices, file_size);
+}
+
+void cufile_ioctx::fuse_device_slices(std::vector<prepared_io_slice>& slices,
+                                      std::size_t file_size) const
+{
+  if (_config.fuse_gap_bytes == 0 || slices.size() < 2) return;
+  if (_config.staging_mode == staging::never) return;
+  if (_config.staging_mode == staging::automatic && !gds_available()) return;
+
+  // One staged call covers a whole fused window, and a part is small enough that
+  // fusing it is worth more than reading it by itself (the halves of a split
+  // slice are not: they were split to be read side by side).
+  auto const window   = align_down_block(_config.staging_slot_bytes());
+  auto const max_part = _config.staging_piece_bytes / 2;
+  auto const eligible = [&](prepared_io_slice const& slice) {
+    return slice.has_device_request() && !slice.has_host_request() && !slice.is_fused() &&
+           slice.on_complete == nullptr && slice.d_buffer.ready_gate_set && slice.rng.size != 0 &&
+           slice.rng.size <= max_part && slice.rng.offset < file_size &&
+           slice.rng.size <= file_size - slice.rng.offset;
+  };
+
+  std::vector<std::size_t> order;
+  order.reserve(slices.size());
+  for (std::size_t i = 0; i < slices.size(); ++i) {
+    if (eligible(slices[i])) order.push_back(i);
+  }
+  if (order.size() < 2) return;
+  auto const key = [&](std::size_t i) {
+    auto const& slice = slices[i];
+    return std::tuple{slice.d_buffer.device_id,
+                      static_cast<void const*>(slice.d_buffer.stream.get()),
+                      static_cast<void const*>(slice.d_buffer.ready_gate.get()),
+                      slice.priority,
+                      slice.rng.offset};
+  };
+  std::sort(
+    order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return key(a) < key(b); });
+
+  // group_of[i]: the run slice i belongs to, or npos when it stays as it is.
+  constexpr auto npos = std::numeric_limits<std::size_t>::max();
+  std::vector<std::size_t> group_of(slices.size(), npos);
+  std::vector<std::vector<std::size_t>> groups;
+  for (std::size_t first = 0; first < order.size();) {
+    auto const& head = slices[order[first]];
+    auto const begin = align_down_block(head.rng.offset);
+    auto run_end     = head.rng.offset + head.rng.size;
+    std::size_t last = first + 1;
+    for (; last < order.size(); ++last) {
+      auto const& next = slices[order[last]];
+      if (next.d_buffer.device_id != head.d_buffer.device_id ||
+          next.d_buffer.stream.get() != head.d_buffer.stream.get() ||
+          next.d_buffer.ready_gate != head.d_buffer.ready_gate || next.priority != head.priority) {
+        break;
+      }
+      auto const next_end = next.rng.offset + next.rng.size;
+      if (next.rng.offset < run_end || next.rng.offset - run_end > _config.fuse_gap_bytes ||
+          align_up_block(next_end) - begin > window) {
+        break;
+      }
+      run_end = next_end;
+    }
+    if (last - first >= 2) {
+      for (std::size_t i = first; i < last; ++i) {
+        group_of[order[i]] = groups.size();
+      }
+      groups.emplace_back(order.begin() + static_cast<std::ptrdiff_t>(first),
+                          order.begin() + static_cast<std::ptrdiff_t>(last));
+    }
+    first = last;
+  }
+  if (groups.empty()) return;
+
+  // Build the result before touching `slices`, so a failed allocation leaves
+  // every slice with its caller.
+  std::vector<prepared_io_slice> fused;
+  fused.reserve(groups.size());
+  for (auto const& group : groups) {
+    auto const& head = slices[group.front()];
+    auto const& tail = slices[group.back()];
+    prepared_io_slice slice;
+    slice.rng      = range{head.rng.offset, tail.rng.offset + tail.rng.size - head.rng.offset};
+    slice.d_buffer = head.d_buffer;
+    slice.priority = head.priority;
+    slice.fused.reserve(group.size());
+    for (auto const index : group) {
+      slice.fused.push_back(fused_part{slices[index].rng, slices[index].d_buffer.data});
+    }
+    fused.push_back(std::move(slice));
+  }
+  std::vector<prepared_io_slice> out;
+  out.reserve(slices.size() - (order.size() - groups.size()));
+  for (std::size_t i = 0; i < slices.size(); ++i) {
+    if (group_of[i] == npos) out.push_back(std::move(slices[i]));
+  }
+  for (auto& slice : fused) {
+    out.push_back(std::move(slice));
+  }
+  slices = std::move(out);
 }
 
 std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config const& cfg)

@@ -318,6 +318,12 @@ enum class io_priority : std::uint8_t { automatic, high, low };
   return requested == io_priority::automatic ? fallback : requested;
 }
 
+/// One destination of a fused device read (see @ref prepared_io_slice::fused).
+struct fused_part {
+  range rng;                    ///< The caller's range, inside the fused slice's window.
+  std::uint8_t* data{nullptr};  ///< Its device destination.
+};
+
 struct prepared_io_slice {
   /// The logical caller-requested window. A reactor may widen the physical I/O
   /// for alignment or a cached chunk's advertised fill, but device copies and
@@ -329,6 +335,12 @@ struct prepared_io_slice {
   /// Reactor queue for this slice (see @ref io_priority); a request takes its
   /// first slice's value, resolving @c automatic by call shape.
   io_priority priority{io_priority::automatic};
+  /// Non-empty for a fused device read: several device destinations, ordered by
+  /// offset and not overlapping, that one physical read of @c rng serves.  They
+  /// share @c d_buffer's stream, gate and device; @c d_buffer.data is the first
+  /// part's destination.  A backend fuses its own slices at submission (cuFile
+  /// does, see @c cufile::config::fuse_gap_bytes); callers never set this.
+  std::vector<fused_part> fused;
 
   prepared_io_slice() noexcept = default;
   explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}
@@ -353,9 +365,23 @@ struct prepared_io_slice {
     return !h_buffer.needs_staging() && !has_device_request();
   }
 
+  [[nodiscard]] bool is_fused() const noexcept { return !fused.empty(); }
+
   [[nodiscard]] size_t size() const noexcept { return rng.size; }
 
   [[nodiscard]] size_t offset() const noexcept { return rng.offset; }
+
+  /// Bytes the caller asked for: the parts of a fused slice (its window also
+  /// covers the gaps between them), else the window.
+  [[nodiscard]] std::size_t payload_bytes() const noexcept
+  {
+    if (fused.empty()) return rng.size;
+    std::size_t total = 0;
+    for (auto const& part : fused) {
+      total += part.rng.size;
+    }
+    return total;
+  }
 };
 
 }  // namespace cucascade::io

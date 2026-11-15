@@ -488,6 +488,7 @@ struct cufile_reactor::device_staging {
     /// The read whose scatter copy is pending in this slot; null when free.
     std::unique_ptr<io_op_request> owner;
     std::size_t owner_bytes{0};
+    std::size_t owner_parts{0};  ///< Caller slices of a fused read; 0 for an ordinary one.
   };
 
   std::vector<slot_entry> slots;
@@ -584,6 +585,7 @@ reactor_stats cufile_reactor::stats() const noexcept
   out.staged_reads       = load(_counters.staged_reads);
   out.staged_bytes       = load(_counters.staged_bytes);
   out.early_staged_reads = load(_counters.early_staged_reads);
+  out.fused_slices       = load(_counters.fused_slices);
   out.direct_reads       = load(_counters.direct_reads);
   out.direct_bytes       = load(_counters.direct_bytes);
   out.posix_device_reads = load(_counters.posix_device_reads);
@@ -848,9 +850,26 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
     if (gds_path) {
       if (staging != nullptr) {
         if (read_cufile_staged(*file, slice, request, *staging, gate_pending)) return;
-      } else if (read_cufile(*file, slice, request)) {
+      } else if (!slice.is_fused() && read_cufile(*file, slice, request)) {
         return;
       }
+    }
+    if (slice.is_fused()) {
+      // Not staged (no slot, no GDS, or cuFile failed): serve the parts as the
+      // separate slices they were.  Each takes a credit of its own before this
+      // slice gives its one back, so the request cannot settle in between.  The
+      // gate has been waited for by now, or was never pending.
+      coordinator->add_tasks(slice.fused.size());
+      for (auto const& part : slice.fused) {
+        prepared_io_slice single;
+        single.rng           = part.rng;
+        single.d_buffer      = slice.d_buffer;
+        single.d_buffer.data = part.data;
+        single.priority      = slice.priority;
+        dispatch_slice(obj, std::move(single), coordinator, /*stream_ready=*/true);
+      }
+      request->finish_success();
+      return;
     }
     dispatch_posix(*file, slice, std::move(request));
   } catch (...) {
@@ -959,6 +978,7 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
     // Every slot holds a copy waiting for another stream (cannot happen when the
     // gate passed: early reads always leave one free).  Read directly instead.
     if (gate_pending) std::ignore = slice.d_buffer.ready_gate->synchronize_no_throw();
+    if (slice.is_fused()) return false;
     return read_cufile(file, slice, request);
   }
 
@@ -1019,10 +1039,22 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
     auto const stream = entry->stream.stream;
     auto status       = cudaSuccess;
     if (gate_pending) status = cudaStreamWaitEvent(stream, gate->get(), 0);
-    if (status == cudaSuccess) {
+    if (status == cudaSuccess && !slice.is_fused()) {
       status = cudaMemcpyAsync(dst + (pos - offset),
                                entry->slot.base + (pos - aligned_offset),
                                piece_end - pos,
+                               cudaMemcpyDeviceToDevice,
+                               stream);
+    }
+    // A fused slice: each part's share of the bytes this call brought in.
+    for (auto const& part : slice.fused) {
+      if (status != cudaSuccess) break;
+      auto const from = std::max(pos, part.rng.offset);
+      auto const to   = std::min(piece_end, part.rng.offset + part.rng.size);
+      if (to <= from) continue;
+      status = cudaMemcpyAsync(part.data + (from - part.rng.offset),
+                               entry->slot.base + (from - aligned_offset),
+                               to - from,
                                cudaMemcpyDeviceToDevice,
                                stream);
     }
@@ -1040,7 +1072,8 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
       // The whole range is in the slot and its copy waits on the GPU for the
       // caller's stream: hand the request to the slot and serve other reads.
       entry->owner       = std::move(request);
-      entry->owner_bytes = end - offset;
+      entry->owner_bytes = slice.payload_bytes();
+      entry->owner_parts = slice.fused.size();
       ++_staged_inflight;
       return true;
     }
@@ -1058,7 +1091,8 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
     request->finish_error(*failure);
   } else {
     _counters.staged_reads.fetch_add(1, std::memory_order_relaxed);
-    _counters.staged_bytes.fetch_add(end - offset, std::memory_order_relaxed);
+    _counters.staged_bytes.fetch_add(slice.payload_bytes(), std::memory_order_relaxed);
+    _counters.fused_slices.fetch_add(slice.fused.size(), std::memory_order_relaxed);
     request->finish_success();
   }
   return true;
@@ -1541,6 +1575,7 @@ void cufile_reactor::poll_staged(bool wait, grouped_coordinator::error_type cons
         _counters.staged_reads.fetch_add(1, std::memory_order_relaxed);
         _counters.early_staged_reads.fetch_add(1, std::memory_order_relaxed);
         _counters.staged_bytes.fetch_add(entry.owner_bytes, std::memory_order_relaxed);
+        _counters.fused_slices.fetch_add(entry.owner_parts, std::memory_order_relaxed);
         request->finish_success();
       }
     }
