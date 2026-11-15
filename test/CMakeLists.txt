@@ -143,7 +143,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
       cucascade_io_tests
       PRIVATE io/cufile/test_cufile_platform.cpp
               io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp
-              io/cufile/test_cufile_staging.cpp io/cufile/test_cufile_tune.cpp)
+              io/cufile/test_cufile_staging.cpp io/cufile/test_cufile_tune.cpp
+              io/cufile/test_cufile_compare.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
