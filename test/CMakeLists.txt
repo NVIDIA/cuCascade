@@ -37,6 +37,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_reservation_aware_resource_adaptor.cpp
     memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
+    memory/test_staged_copy.cpp
     memory/test_gpu_kernels.cu
     # Data tests
     data/test_data_repository.cpp
@@ -185,7 +186,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   target_include_directories(
     cucascade_cudf_tests
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
-            ${PROJECT_SOURCE_DIR}/src/cudf)
+            ${PROJECT_SOURCE_DIR}/src/cudf ${PROJECT_SOURCE_DIR}/src/memory)
 
   # Link dependencies
   target_link_libraries(

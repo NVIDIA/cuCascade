@@ -31,6 +31,7 @@ if(TARGET cucascade_objects)
             ${CMAKE_CURRENT_SOURCE_DIR}/reservation_aware_resource_adaptor.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/reservation_manager_configurator.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/small_pinned_host_memory_resource.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/staged_copy.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/stream_pool.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/error.cpp)
 endif()
