@@ -137,6 +137,30 @@ class device_bytes {
     REQUIRE(cudaMemcpy(_data, values.data(), _bytes, cudaMemcpyHostToDevice) == cudaSuccess);
   }
 
+  // Write @p values at byte @p offset.
+  void write_at(std::size_t offset, std::vector<std::byte> const& values)
+  {
+    REQUIRE(offset + values.size() <= _bytes);
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
+    REQUIRE(cudaMemcpy(static_cast<std::byte*>(_data) + offset,
+                       values.data(),
+                       values.size(),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+  }
+
+  // Read @p bytes starting at byte @p offset.
+  [[nodiscard]] std::vector<std::byte> read_at(std::size_t offset, std::size_t bytes) const
+  {
+    REQUIRE(offset + bytes <= _bytes);
+    std::vector<std::byte> values(bytes);
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
+    REQUIRE(cudaMemcpy(values.data(),
+                       static_cast<std::byte const*>(_data) + offset,
+                       bytes,
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    return values;
+  }
+
   [[nodiscard]] std::vector<std::byte> read() const
   {
     std::vector<std::byte> values(_bytes);
@@ -458,6 +482,62 @@ TEST_CASE("staged copy waits for its enqueued work when a leg fails", "[staged-c
     CHECK(hooks.abandoned_rings.load() == 1U);
     CHECK(hooks.last_ring_bytes.load() == 2 * kBlock);
     CHECK(pool->get_total_allocated_bytes() == in_use_before + 2 * kBlock);
+  }
+}
+
+TEST_CASE("staged copy moves a segment larger than 2 GiB", "[staged-copy]")
+{
+  if (cucascade::test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
+
+  constexpr std::size_t kBytes = (std::size_t{2} << 30) + 3 * kMiB + 5;
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{0}};
+    std::size_t free_bytes  = 0;
+    std::size_t total_bytes = 0;
+    REQUIRE(cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess);
+    if (free_bytes < 3 * kBytes) { SKIP("requires three times the segment in free device memory"); }
+  }
+
+  auto host        = make_host_space(64 * kMiB);
+  auto* const pool = host->get_memory_resource_of<Tier::HOST>();
+  auto source      = make_stream(0);
+  auto destination = make_stream(0);
+
+  // Both buffers start zeroed. Known bytes go where an offset could go wrong: the start, the
+  // first chunk boundary, the first trip round the default ring, 512 MiB and 2 GiB (where a
+  // 32-bit count of bits and of bytes overflow), and the tail.
+  device_bytes from{0, kBytes};
+  device_bytes to{0, kBytes};
+  constexpr std::size_t kWindow = 128 * kKiB;
+  std::vector<std::size_t> const windows{0,
+                                         4 * kMiB - kWindow / 2,
+                                         16 * kMiB - kWindow / 2,
+                                         (std::size_t{1} << 29) - kWindow / 2,
+                                         (std::size_t{1} << 31) - kWindow / 2,
+                                         kBytes - kWindow};
+  for (std::size_t i = 0; i < windows.size(); ++i) {
+    from.write_at(windows[i], pattern(kWindow, static_cast<std::uint32_t>(100 + i)));
+  }
+
+  std::vector<staged_copy_segment> const segments{{from.data(), to.data(), kBytes}};
+  staged_copy_instrumentation counters;
+  staged_copy(segments, {0, source}, {0, destination}, staged_copy_ring_settings{}, &counters);
+
+  CHECK(counters.final_syncs.load() == 1U);
+  CHECK(counters.last_ring_bytes.load() == 16 * kMiB);
+  CHECK(pool->get_total_allocated_bytes() == 0U);
+  for (std::size_t i = 0; i < windows.size(); ++i) {
+    CAPTURE(i, windows[i]);
+    bool const arrived =
+      to.read_at(windows[i], kWindow) == pattern(kWindow, static_cast<std::uint32_t>(100 + i));
+    CHECK(arrived);
+  }
+  // Between the windows the source is zero, and so must the destination be: nothing was written
+  // twice or to the wrong place.
+  for (std::size_t offset : {std::size_t{1} * kMiB, std::size_t{700} * kMiB, kBytes - 2 * kMiB}) {
+    CAPTURE(offset);
+    bool const untouched = to.read_at(offset, kWindow) == std::vector<std::byte>(kWindow);
+    CHECK(untouched);
   }
 }
 

@@ -27,6 +27,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -351,15 +352,110 @@ struct staged_registry {
   representation_converter_registry registry;
 };
 
-auto one_gpu_spaces()
+auto one_gpu_spaces(std::size_t host_capacity_bytes = 256 * kMiB)
 {
   reservation_manager_configurator builder;
   builder.set_gpu_ids({kSourceDevice})
     .set_gpu_usage_limit(1 * kGiB)
     .use_numa_id_as_host_id()
-    .set_per_numa_region_capacity(256 * kMiB)
+    .set_per_numa_region_capacity(host_capacity_bytes)
     .set_host_portability(true);
   return builder.build();
+}
+
+// Convert one mixed table per entry of @p directions (source device, target device), each
+// @p repeats times on a thread of its own, all starting together, and compare every result with
+// the same table built on its target. Tables are built and compared on the calling thread; only
+// the conversions run concurrently.
+void check_concurrent_staged_conversions(memory_reservation_manager& manager,
+                                         std::vector<std::pair<int, int>> const& directions,
+                                         cudf::size_type rows,
+                                         int repeats)
+{
+  staged_registry staged;
+
+  struct job {
+    int source_device;
+    int target_device;
+    rmm::cuda_stream producer;
+    rmm::cuda_stream consumer;
+    std::unique_ptr<gpu_table_representation> source;
+    std::vector<std::unique_ptr<gpu_table_representation>> converted;
+  };
+  auto const make_stream = [](int device) {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+    return rmm::cuda_stream{rmm::cuda_stream::flags::non_blocking};
+  };
+
+  std::vector<std::unique_ptr<job>> jobs;
+  for (auto const& [source_device, target_device] : directions) {
+    auto* const source_space = manager.get_memory_space(Tier::GPU, source_device);
+    REQUIRE(source_space != nullptr);
+    REQUIRE(manager.get_memory_space(Tier::GPU, target_device) != nullptr);
+    jobs.push_back(std::unique_ptr<job>(new job{source_device,
+                                                target_device,
+                                                make_stream(source_device),
+                                                make_stream(target_device),
+                                                nullptr,
+                                                {}}));
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{source_device}};
+    jobs.back()->source = std::make_unique<gpu_table_representation>(
+      test::make_mixed_table(rows, jobs.back()->producer, source_space->get_default_allocator()),
+      *source_space,
+      jobs.back()->producer);
+  }
+
+  std::size_t const host_before = host_bytes_in_use(manager);
+
+  std::latch ready{static_cast<std::ptrdiff_t>(jobs.size())};
+  std::latch start{1};
+  std::vector<std::future<void>> workers;
+  for (auto& current : jobs) {
+    workers.push_back(std::async(std::launch::async, [&, work = current.get()] {
+      ready.count_down();
+      start.wait();
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{work->target_device}};
+      auto* const target_space = manager.get_memory_space(Tier::GPU, work->target_device);
+      for (int i = 0; i < repeats; ++i) {
+        work->converted.push_back(staged.registry.convert<gpu_table_representation>(
+          *work->source, target_space, work->consumer));
+      }
+    }));
+  }
+  ready.wait();
+  start.count_down();
+  for (auto& worker : workers) {
+    REQUIRE(worker.wait_for(std::chrono::seconds{120}) == std::future_status::ready);
+  }
+  for (auto& worker : workers) {
+    REQUIRE_NOTHROW(worker.get());
+  }
+
+  CHECK(staged.counters.rings.load() == jobs.size() * static_cast<std::size_t>(repeats));
+  CHECK(staged.counters.abandoned_rings.load() == 0U);
+  CHECK(host_bytes_in_use(manager) == host_before);
+
+  for (auto& current : jobs) {
+    CAPTURE(current->source_device, current->target_device);
+    {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{current->source_device}};
+      current->source.reset();
+      current->producer.synchronize();
+    }
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{current->target_device}};
+    auto* const target_space = manager.get_memory_space(Tier::GPU, current->target_device);
+    auto expected =
+      test::make_mixed_table(rows, current->consumer, target_space->get_default_allocator());
+    REQUIRE(current->converted.size() == static_cast<std::size_t>(repeats));
+    for (auto const& converted : current->converted) {
+      REQUIRE(converted != nullptr);
+      test::expect_cudf_tables_equal_on_stream(
+        expected->view(), converted->get_table_view(), current->consumer);
+    }
+    expected.reset();
+    current->converted.clear();
+    current->consumer.synchronize();
+  }
 }
 
 // The six fixed-width columns of test::make_mixed_table(); the other ten have children.
@@ -598,6 +694,106 @@ TEST_CASE("gpu_to_gpu staged route refuses sliced columns it cannot copy whole",
   CHECK(host_bytes_in_use(manager) == host_before);
 
   owner.reset();
+  producer.synchronize();
+  consumer.synchronize();
+}
+
+TEST_CASE("gpu_to_gpu staged route runs concurrent conversions within one GPU",
+          "[gpu-to-gpu-converter][staged-copy]")
+{
+  if (test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
+
+  memory_reservation_manager manager(one_gpu_spaces());
+
+  // Four conversions at a time share the device's stream pool and the HOST pool.
+  check_concurrent_staged_conversions(manager,
+                                      {{kSourceDevice, kSourceDevice},
+                                       {kSourceDevice, kSourceDevice},
+                                       {kSourceDevice, kSourceDevice},
+                                       {kSourceDevice, kSourceDevice}},
+                                      50'000,
+                                      3);
+}
+
+TEST_CASE("gpu_to_gpu staged route runs concurrent conversions in opposite directions",
+          "[gpu-to-gpu-converter][staged-copy][multi-device]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires at least two GPUs"); }
+
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({kSourceDevice, kTargetDevice})
+    .set_gpu_usage_limit(1 * kGiB)
+    .use_numa_id_as_host_id()
+    .set_per_numa_region_capacity(256 * kMiB)
+    .set_host_portability(true);
+  memory_reservation_manager manager(builder.build());
+
+  // Each device is the source of two conversions and the target of two others at once.
+  check_concurrent_staged_conversions(manager,
+                                      {{kSourceDevice, kTargetDevice},
+                                       {kTargetDevice, kSourceDevice},
+                                       {kSourceDevice, kTargetDevice},
+                                       {kTargetDevice, kSourceDevice}},
+                                      50'000,
+                                      3);
+}
+
+TEST_CASE("gpu_to_gpu staged route copes with a HOST pool smaller than its ring",
+          "[gpu-to-gpu-converter][staged-copy]")
+{
+  if (test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
+
+  // Half of what the default ring of four 4 MiB chunks asks for.
+  constexpr std::size_t kHostCapacity = 8 * kMiB;
+  memory_reservation_manager manager(one_gpu_spaces(kHostCapacity));
+  auto* const space = manager.get_memory_space(Tier::GPU, kSourceDevice);
+  REQUIRE(space != nullptr);
+
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kSourceDevice}};
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
+  auto const mr = space->get_default_allocator();
+
+  constexpr cudf::size_type kRows = 200'000;
+  staged_registry staged;
+  gpu_table_representation source{test::make_mixed_table(kRows, producer, mr), *space, producer};
+  auto expected = test::make_mixed_table(kRows, consumer, mr);
+
+  SECTION("it converts through a smaller ring")
+  {
+    auto converted = staged.registry.convert<gpu_table_representation>(source, space, consumer);
+    REQUIRE(converted != nullptr);
+    CHECK(staged.counters.last_ring_bytes.load() <= kHostCapacity);
+    CHECK(staged.counters.last_ring_bytes.load() > 0U);
+    CHECK(host_bytes_in_use(manager) == 0U);
+    test::expect_cudf_tables_equal_on_stream(
+      expected->view(), converted->get_table_view(), consumer);
+  }
+
+  SECTION("it fails with out-of-memory when no block is left, and works again afterwards")
+  {
+    using held_blocks = fixed_size_host_memory_resource::fixed_multiple_blocks_allocation;
+    std::vector<held_blocks> held;
+    for (memory_space const* host_space : manager.get_memory_spaces_for_tier(Tier::HOST)) {
+      auto* const pool = host_space->get_memory_resource_of<Tier::HOST>();
+      held.push_back(pool->allocate_multiple_blocks(pool->get_available_memory()));
+    }
+    std::size_t const host_held = host_bytes_in_use(manager);
+
+    CHECK_THROWS_AS(staged.registry.convert<gpu_table_representation>(source, space, consumer),
+                    rmm::out_of_memory);
+    CHECK(staged.counters.rings.load() == 0U);
+    CHECK(host_bytes_in_use(manager) == host_held);
+
+    held.clear();
+    auto converted = staged.registry.convert<gpu_table_representation>(source, space, consumer);
+    REQUIRE(converted != nullptr);
+    CHECK(host_bytes_in_use(manager) == 0U);
+    test::expect_cudf_tables_equal_on_stream(
+      expected->view(), converted->get_table_view(), consumer);
+  }
+
+  expected.reset();
   producer.synchronize();
   consumer.synchronize();
 }
