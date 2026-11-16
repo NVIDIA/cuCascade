@@ -125,11 +125,16 @@ class reservation_manager_configurator {
   /// @param bytes Memory capacity per NUMA region in bytes.
   builder_reference& set_per_numa_region_capacity(std::size_t bytes);
 
-  /// @brief set the capacity of each NUMA region space as a fraction of that region's capacity
-  /// @param fraction Fraction of the NUMA region memory capacity to use, in (0.0, 1.0].
-  /// @note Requires NUMA capacities in the topology passed to `build()`; `build()` throws
-  ///       if the capacity of a NUMA region backing a space is unknown, or if that region is
-  ///       device memory rather than host memory.
+  /// @brief set the capacity of each NUMA region space as a fraction of that region's
+  ///        available memory
+  /// @param fraction Fraction of the NUMA region's available memory to use, in (0.0, 1.0].
+  /// @note The fraction is taken of the memory that is available when the topology is
+  ///       discovered (`numa_topology_info::available_memory`: free memory plus reclaimable
+  ///       page cache and slab), not of the region's total capacity, so memory already in
+  ///       use by other processes is not handed out.
+  /// @note Requires NUMA available memory in the topology passed to `build()`; `build()`
+  ///       throws if the available memory of a NUMA region backing a space is unknown, or if
+  ///       that region is device memory rather than host memory.
   /// @note The fraction applies per space. With `use_gpu_id_as_host_id()` and several GPUs
   ///       on the same NUMA node, each space gets that fraction of the shared region.
   builder_reference& set_usage_limit_ratio_per_numa_region(double fraction);
@@ -186,8 +191,8 @@ class reservation_manager_configurator {
   struct numa_region_info {
     int space_id{-1};
     int numa_id{-1};
-    std::optional<std::size_t> numa_capacity{};  ///< Nullopt when the region capacity is unknown.
-    bool is_device_memory{false};                ///< True when the region is GPU/device memory.
+    std::optional<std::size_t> numa_available_memory{};  ///< Nullopt when unknown.
+    bool is_device_memory{false};                        ///< True when the region is device memory.
   };
 
   std::vector<gpu_info> extract_gpu_ids(const system_topology_info& topology) const;

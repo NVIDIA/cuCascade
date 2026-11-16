@@ -58,6 +58,7 @@ if (discovery.discover()) {
     // Lookups return nullopt for an unknown node rather than a silent 0.
     topo.get_numa_memory_capacity(0);      // std::optional<std::size_t>
     topo.get_numa_free_memory(0);          // std::optional<std::size_t>
+    topo.get_numa_available_memory(0);     // std::optional<std::size_t>
     topo.get_total_numa_memory_capacity(); // host memory only
     topo.find_numa_node(0);                // numa_topology_info const*
 }
@@ -71,6 +72,7 @@ if (discovery.discover()) {
 | `id` | `int` | NUMA node ID |
 | `memory_capacity` | `std::size_t` | `MemTotal` in bytes (0 if unknown) |
 | `free_memory` | `std::size_t` | `MemFree` in bytes (0 if unknown) |
+| `available_memory` | `std::size_t` | `MemFree` + `Active(file)` + `Inactive(file)` + `SReclaimable` in bytes (0 if unknown) -- a per-node estimate of `MemAvailable` |
 | `has_cpus` | `bool` | Whether `cpulist` names any CPU |
 | `is_device_memory` | `bool` | Node has memory but no CPUs -- device memory, not host memory |
 
@@ -227,7 +229,7 @@ Note: `set_gpu_usage_limit()` and `set_usage_limit_ratio_per_gpu()` are mutually
 | `use_numa_id_as_host_id()` | One host space per NUMA node (production) | `use_numa_id_as_host_id()` |
 | `set_total_host_capacity(bytes)` | Total host memory across all spaces | 4 GB |
 | `set_per_numa_region_capacity(bytes)` | Memory per host space | 4 GB |
-| `set_usage_limit_ratio_per_numa_region(0.25)` | Memory per host space as a fraction of its NUMA region's capacity | N/A |
+| `set_usage_limit_ratio_per_numa_region(0.25)` | Memory per host space as a fraction of its NUMA region's available memory at `build()` time | N/A |
 | `set_reservation_fraction_per_numa_region(0.85)` | Fraction reservable | 0.85 |
 | `set_reservation_limit_per_numa_region(bytes)` | Absolute reservation limit | N/A |
 | `set_downgrade_fractions_per_numa_region(0.85, 0.65)` | (trigger, stop) fractions | (0.85, 0.65) |
@@ -237,6 +239,8 @@ Note: `set_gpu_usage_limit()` and `set_usage_limit_ratio_per_gpu()` are mutually
 Host creation policies:
 - **`use_gpu_id_as_host_id()`** -- creates one host space per GPU and identifies it by the GPU id. The space is still bound to that GPU's NUMA node for allocation; only the space id differs. Useful for testing.
 - **`use_numa_id_as_host_id()`** -- creates one host space per NUMA node, identified by the NUMA node id and shared by GPUs on that node. Default, and optimal for production.
+
+`set_usage_limit_ratio_per_numa_region()` resolves against the memory that is available in the NUMA region when the topology is discovered (`available_memory`: free memory plus the page cache and slab the kernel reclaims on demand), not the region's total capacity, so memory other processes already hold is never handed out. `build()` throws if the region's available memory is unknown.
 
 `set_total_host_capacity()` is the only host-wide setting: it is divided evenly across the host spaces. Every other capacity setting applies per space, i.e. per NUMA region.
 
