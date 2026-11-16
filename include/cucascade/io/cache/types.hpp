@@ -35,6 +35,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -1002,8 +1003,22 @@ struct cached_chunk {
   /// node of the buffer taken.  Not reset when the buffer is reclaimed.
   std::atomic<std::int32_t> numa_node{-1};
   /// Eviction priority: the evictor reclaims lower values first. Raised (never lowered) by every
-  /// request that names the chunk.
+  /// request that names the chunk, and back to 0 once its buffer is reclaimed (see
+  /// @ref reset_eviction_priority).
   std::atomic<std::uint8_t> eviction_priority{0};
+
+  /// Number of distinct values of @ref eviction_priority.
+  static constexpr std::size_t eviction_priority_levels =
+    std::size_t{std::numeric_limits<std::uint8_t>::max()} + 1;
+
+  /// Return the priority to 0 after this thread claimed the chunk's buffer, unless a request
+  /// raised it since @p seen was read: that request is about to refill the chunk, and its
+  /// priority stands.
+  void reset_eviction_priority(std::uint8_t seen) noexcept
+  {
+    std::ignore =
+      eviction_priority.compare_exchange_strong(seen, std::uint8_t{0}, std::memory_order_relaxed);
+  }
 };
 
 static_assert(std::atomic<std::int32_t>::is_always_lock_free,
