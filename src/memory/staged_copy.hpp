@@ -109,6 +109,13 @@ struct staged_copy_ring_geometry {
  */
 [[nodiscard]] bool shrink_staged_copy_ring(staged_copy_ring_geometry& geometry) noexcept;
 
+/**
+ * @brief The NUMA node the PCI device of GPU @p device_id is attached to, or -1 if unknown.
+ *
+ * A staged copy to that GPU takes its ring from the HOST pool registered for this node.
+ */
+[[nodiscard]] int gpu_numa_node(int device_id) noexcept;
+
 /** @brief Which half of a chunk's journey a hook is called for. */
 enum class staged_copy_leg {
   SOURCE,      ///< Device to host, on the source stream

@@ -62,11 +62,13 @@ constexpr std::size_t kMiB   = 1024 * kKiB;
 constexpr std::size_t kBlock = 64 * kKiB;
 
 // A HOST space with small blocks, so a few hundred KiB already cross many block and slot
-// boundaries. Its pool must be the one every staged copy of the test selects.
-std::unique_ptr<memory_space> make_host_space(std::size_t capacity_bytes)
+// boundaries. It is registered for the NUMA node of @p destination_device and is the most recent
+// registration there, which makes its pool the one a staged copy to that device selects.
+std::unique_ptr<memory_space> make_host_space(std::size_t capacity_bytes,
+                                              int destination_device = 0)
 {
   host_memory_space_config config;
-  config.numa_id              = -1;
+  config.numa_id              = gpu_numa_node(destination_device);
   config.memory_capacity      = capacity_bytes;
   config.block_size           = kBlock;
   config.pool_size            = 64;
@@ -77,9 +79,7 @@ std::unique_ptr<memory_space> make_host_space(std::size_t capacity_bytes)
   auto* const pool = space->get_memory_resource_of<Tier::HOST>();
   REQUIRE(pool != nullptr);
   REQUIRE(pool->get_block_size() == kBlock);
-  for (int numa_node = -1; numa_node < 8; ++numa_node) {
-    REQUIRE(find_host_pool(numa_node) == pool);
-  }
+  REQUIRE(find_host_pool(config.numa_id) == pool);
   return space;
 }
 
@@ -497,7 +497,7 @@ TEST_CASE("staged copy takes a smaller ring when the pool is short", "[staged-co
 TEST_CASE("staged copy without a HOST pool pins memory for the call", "[staged-copy]")
 {
   if (cucascade::test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
-  if (find_host_pool(-1) != nullptr) { SKIP("another test left a HOST pool registered"); }
+  if (find_host_pool(gpu_numa_node(0)) != nullptr) { SKIP("a HOST pool is registered"); }
 
   auto source      = make_stream(0);
   auto destination = make_stream(0);
@@ -554,12 +554,12 @@ TEST_CASE("staged copy moves bytes between two GPUs in both directions",
 {
   if (cucascade::test::cuda_device_count() < 2) { SKIP("requires at least two GPUs"); }
 
-  auto host        = make_host_space(64 * kMiB);
-  auto* const pool = host->get_memory_resource_of<Tier::HOST>();
-
   auto const [source_device, destination_device] =
     GENERATE(std::pair<int, int>{0, 1}, std::pair<int, int>{1, 0});
   CAPTURE(source_device, destination_device);
+
+  auto host        = make_host_space(64 * kMiB, destination_device);
+  auto* const pool = host->get_memory_resource_of<Tier::HOST>();
 
   auto source      = make_stream(source_device);
   auto destination = make_stream(destination_device);

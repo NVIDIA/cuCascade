@@ -56,30 +56,6 @@ using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
   return value / divisor + (value % divisor != 0 ? 1U : 0U);
 }
 
-/// The NUMA node a GPU's PCI device is attached to, or -1 if it cannot be determined.
-[[nodiscard]] int gpu_numa_node(int device_id) noexcept
-{
-  if (device_id < 0) { return -1; }
-  char pci_buf[32] = {0};
-  if (cudaDeviceGetPCIBusId(pci_buf, static_cast<int>(sizeof(pci_buf)), device_id) != cudaSuccess) {
-    std::ignore = cudaGetLastError();
-    return -1;
-  }
-  try {
-    // CUDA reports the bus id in upper case; sysfs names the device in lower case.
-    std::string pci(pci_buf);
-    for (auto& c : pci) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    std::ifstream file("/sys/bus/pci/devices/" + pci + "/numa_node");
-    std::string content;
-    if (!std::getline(file, content) || content.empty()) { return -1; }
-    return std::stoi(content);
-  } catch (...) {
-    return -1;
-  }
-}
-
 void require_stream_of_device(staged_copy_endpoint const& endpoint, char const* role)
 {
   int stream_device = -1;
@@ -240,6 +216,29 @@ void call_before_leg(staged_copy_instrumentation* instrumentation,
 }
 
 }  // namespace
+
+int gpu_numa_node(int device_id) noexcept
+{
+  if (device_id < 0) { return -1; }
+  char pci_buf[32] = {0};
+  if (cudaDeviceGetPCIBusId(pci_buf, static_cast<int>(sizeof(pci_buf)), device_id) != cudaSuccess) {
+    std::ignore = cudaGetLastError();
+    return -1;
+  }
+  try {
+    // CUDA reports the bus id in upper case; sysfs names the device in lower case.
+    std::string pci(pci_buf);
+    for (auto& c : pci) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    std::ifstream file("/sys/bus/pci/devices/" + pci + "/numa_node");
+    std::string content;
+    if (!std::getline(file, content) || content.empty()) { return -1; }
+    return std::stoi(content);
+  } catch (...) {
+    return -1;
+  }
+}
 
 staged_copy_ring_geometry plan_staged_copy_ring(std::size_t total_bytes,
                                                 std::size_t block_bytes,
