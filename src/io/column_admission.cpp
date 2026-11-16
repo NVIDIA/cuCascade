@@ -20,7 +20,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <stdexcept>
+#include <utility>
 
 namespace cucascade::io {
 
@@ -103,6 +105,11 @@ void column_admission::register_layout(std::string const& path,
   if (std::ranges::any_of(column_of_chunk, [&](auto c) { return c >= columns.size(); })) {
     throw std::invalid_argument("column_admission: column index out of range");
   }
+  for (std::size_t k = 0; k < offsets.size(); ++k) {
+    if (sizes[k] > std::numeric_limits<std::uint64_t>::max() - offsets[k]) {
+      throw std::invalid_argument("column_admission: column chunk range overflows");
+    }
+  }
   std::lock_guard lock(_mutex);
   if (_layouts.contains(path)) { return; }
 
@@ -140,28 +147,67 @@ bool column_admission::has_layout(std::string const& path) const
   return _layouts.contains(path);
 }
 
-bool column_admission::admit(std::uint32_t column, layout& file)
+std::vector<std::uint32_t> column_admission::replacement_victims(
+  std::uint32_t column,
+  layout const& file,
+  std::vector<std::uint64_t> const& chunks,
+  std::span<std::uint32_t const> in_read) const
+{
+  auto const column_rank = rank(column);
+  std::vector<std::uint32_t> candidates;
+  for (std::uint32_t c = 0; c < _columns.size(); ++c) {
+    if (c == column || _columns[c].admitted_pieces.empty() ||
+        std::ranges::find(in_read, c) != in_read.end()) {
+      continue;
+    }
+    if (column_rank > rank(c) * _config.rank_margin) { candidates.push_back(c); }
+  }
+  std::ranges::stable_sort(candidates, {}, [this](std::uint32_t c) { return rank(c); });
+
+  // Release the candidates one by one on paper, counting the chunks that no admitted piece would
+  // cover any more, until the new piece fits.
+  std::map<std::pair<std::uint32_t, std::uint64_t>, std::uint32_t> dropped;  // (file, chunk)
+  auto const covered = [&](std::uint32_t f, std::uint64_t c) {
+    auto const it = dropped.find({f, c});
+    return _layout_of_file[f]->chunk_refs[c] > (it == dropped.end() ? 0U : it->second);
+  };
+  std::uint64_t freed = 0;
+  std::vector<std::uint32_t> victims;
+  for (auto const victim : candidates) {
+    victims.push_back(victim);
+    for (auto const piece : _columns[victim].admitted_pieces) {
+      auto const f = static_cast<std::uint32_t>(piece & 0xffffffffU);
+      for (auto const c : piece_chunks(*_layout_of_file[f], victim)) {
+        ++dropped[{f, c}];
+        if (!covered(f, c)) { freed += _config.chunk_bytes; }
+      }
+    }
+    auto const needed = static_cast<std::uint64_t>(
+      std::ranges::count_if(chunks, [&](auto c) { return !covered(file.file, c); }));
+    if (_admitted_total - freed + needed * _config.chunk_bytes <= _config.budget_bytes) {
+      return victims;
+    }
+  }
+  return {};
+}
+
+bool column_admission::admit(std::uint32_t column,
+                             layout& file,
+                             std::span<std::uint32_t const> in_read)
 {
   auto const key = key_of(column, file.file);
   if (_admitted.contains(key)) { return true; }
   // A piece is all of one column in one file, however little of it this read touches.
   auto chunks = piece_chunks(file, column);
-  auto bytes  = uncovered_bytes(file, chunks);
+  if (chunks.size() * _config.chunk_bytes > _config.budget_bytes) { return false; }
+  auto bytes = uncovered_bytes(file, chunks);
   if (_admitted_total + bytes > _config.budget_bytes) {
-    // Replace the lowest-ranked admitted column, but only if this column ranks clearly higher.
-    auto lowest      = column;
-    auto lowest_rank = std::numeric_limits<double>::max();
-    for (std::uint32_t c = 0; c < _columns.size(); ++c) {
-      if (c == column || _columns[c].admitted_footprint == 0) { continue; }
-      if (auto const r = rank(c); r < lowest_rank) {
-        lowest_rank = r;
-        lowest      = c;
-      }
+    auto const victims = replacement_victims(column, file, chunks, in_read);
+    if (victims.empty()) { return false; }
+    for (auto const victim : victims) {
+      release(victim);
     }
-    if (lowest == column || rank(column) <= lowest_rank * _config.rank_margin) { return false; }
-    release(lowest);
     bytes = uncovered_bytes(file, chunks);
-    if (_admitted_total + bytes > _config.budget_bytes) { return false; }
   }
   for (auto const c : chunks) {
     ++file.chunk_refs[c];
@@ -192,12 +238,17 @@ admission_advice column_admission::advise(std::string const& path,
       auto const end       = offset + size;
       auto seg             = std::ranges::upper_bound(
         segments, offset, std::less{}, [](segment const& s) { return s.end; });
+      // Columns this read admitted, which a later column of the same read must not replace.
+      std::vector<std::uint32_t> in_read;
       for (; seg != segments.end() && seg->begin < end; ++seg) {
         auto const begin = std::max(offset, seg->begin);
         auto const stop  = std::min(end, seg->end);
         auto& col        = _columns[seg->column];
         col.requested += stop - begin;
-        if (admit(seg->column, file)) {
+        if (admit(seg->column, file, in_read)) {
+          if (std::ranges::find(in_read, seg->column) == in_read.end()) {
+            in_read.push_back(seg->column);
+          }
           wanted.emplace_back(static_cast<std::int64_t>(begin),
                               static_cast<std::int64_t>(stop - begin));
           col.admitted += stop - begin;

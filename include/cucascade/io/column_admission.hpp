@@ -59,7 +59,10 @@ struct admission_advice {
   std::vector<byte_range> ranges;
 
   /// Eviction priority of the chunks in @ref ranges (see @c
-  /// cache::cached_chunk::eviction_priority).
+  /// cache::cached_chunk::eviction_priority). It is per read, not per column: a read that spans
+  /// several admitted columns gives all of its chunks the highest priority among them, and since a
+  /// chunk's priority is never lowered, a colder column read together with a hotter one keeps the
+  /// hotter one's priority.
   std::uint8_t eviction_priority{0};
 };
 
@@ -89,9 +92,10 @@ struct column_stats {
  * Admission is sticky: a (file, column) piece that was admitted stays admitted, because the cache's
  * oldest-first eviction would otherwise evict hot chunks when the policy changed its mind. A new
  * piece is admitted while the admitted footprint fits @ref column_admission_config::budget_bytes.
- * When it does not, a column that ranks clearly higher (by @ref
- * column_admission_config::rank_margin) than the lowest-ranked admitted column replaces that column
- * entirely, and its chunks age out.
+ * When it does not, a column replaces admitted columns that it ranks clearly above (by @ref
+ * column_admission_config::rank_margin), lowest-ranked first, as many as the piece needs to fit;
+ * their chunks age out. If even all of those would not make room, nothing is replaced. A column
+ * that the same read admitted is never replaced by it.
  *
  * Thread-safe.
  */
@@ -108,6 +112,8 @@ class column_admission {
    * @param column_of_chunk For each column chunk, its index into @p columns.
    * @param offsets For each column chunk, its byte offset in the file.
    * @param sizes For each column chunk, its size in bytes.
+   * @throws std::invalid_argument If the arrays differ in length, a column index is out of range,
+   * or a column chunk's end overflows.
    */
   void register_layout(std::string const& path,
                        std::string const& table,
@@ -171,8 +177,15 @@ class column_admission {
                                               std::vector<std::uint64_t> const& chunks) const;
   /// Stop counting the pieces of @p column against the budget.
   void release(std::uint32_t column);
-  /// Admit the piece (@p column, @p file), evicting a lower-ranked column if the budget needs it.
-  bool admit(std::uint32_t column, layout& file);
+  /// The admitted columns that admitting @p chunks of @p file for @p column would replace, lowest
+  /// rank first, or none if they cannot make room. Columns in @p in_read are kept.
+  [[nodiscard]] std::vector<std::uint32_t> replacement_victims(
+    std::uint32_t column,
+    layout const& file,
+    std::vector<std::uint64_t> const& chunks,
+    std::span<std::uint32_t const> in_read) const;
+  /// Admit the piece (@p column, @p file), replacing lower-ranked columns if the budget needs it.
+  bool admit(std::uint32_t column, layout& file, std::span<std::uint32_t const> in_read);
 
   column_admission_config _config;
   mutable std::mutex _mutex;
