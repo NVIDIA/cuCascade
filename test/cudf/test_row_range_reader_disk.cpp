@@ -19,12 +19,14 @@
 #include "utils/cudf_test_utils.hpp"
 
 #include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
-#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/data/row_range_read.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/types.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -51,9 +53,11 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -126,60 +130,86 @@ auto& shared_disk_space()
   return s;
 }
 
-/// Backend that delegates to a real one and records every device read it is asked for.
-class recording_io_backend : public idisk_io_backend {
+/// io context that delegates to a real one and records every read the reader asks for.
+class recording_io_backend final : public io::ioctx {
  public:
-  explicit recording_io_backend(std::shared_ptr<idisk_io_backend> inner) : _inner(std::move(inner))
+  explicit recording_io_backend(std::shared_ptr<io::ioctx> inner) : _inner(std::move(inner)) {}
+
+  [[nodiscard]] io::io_context_type type() const noexcept override { return _inner->type(); }
+  void shutdown() noexcept override {}
+  [[nodiscard]] bool supports(std::string_view path) const noexcept override
   {
+    return _inner->supports(path);
+  }
+  [[nodiscard]] bool supports_device_read() const noexcept override
+  {
+    return _inner->supports_device_read();
+  }
+  [[nodiscard]] bool supports_host_to_device_read() const noexcept override
+  {
+    return _inner->supports_host_to_device_read();
+  }
+  [[nodiscard]] bool supports_vector_host_read() const noexcept override
+  {
+    return _inner->supports_vector_host_read();
+  }
+  [[nodiscard]] bool supports_device_range_read() const noexcept override
+  {
+    return _inner->supports_device_range_read();
+  }
+  [[nodiscard]] std::vector<io::byte_range> align_and_coalesce(
+    std::span<io::byte_range const> ranges,
+    std::optional<std::size_t> alignment) const noexcept override
+  {
+    return _inner->align_and_coalesce(ranges, alignment);
   }
 
-  void write(const std::filesystem::path& path,
-             const void* dev_ptr,
-             std::size_t size,
-             std::size_t file_offset,
-             ::cuda::stream_ref stream) override
-  {
-    _inner->write(path, dev_ptr, size, file_offset, stream);
-  }
-
-  void read(const std::filesystem::path& path,
-            void* dev_ptr,
-            std::size_t size,
-            std::size_t file_offset,
-            ::cuda::stream_ref stream) override
-  {
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _device_read_offsets.push_back(file_offset);
-    }
-    _inner->read(path, dev_ptr, size, file_offset, stream);
-  }
-
-  void write(const std::filesystem::path& path,
-             const void* host_ptr,
-             std::size_t size,
-             std::size_t file_offset) override
-  {
-    _inner->write(path, host_ptr, size, file_offset);
-  }
-
-  void read(const std::filesystem::path& path,
-            void* host_ptr,
-            std::size_t size,
-            std::size_t file_offset) override
+  std::size_t host_read_io(io::io_object const& object,
+                           std::size_t offset,
+                           std::size_t size,
+                           std::uint8_t* dst) override
   {
     {
       std::lock_guard<std::mutex> lock(_mutex);
       ++_host_reads;
       _host_read_bytes += size;
     }
-    _inner->read(path, host_ptr, size, file_offset);
+    return _inner->host_read_io(object, offset, size, dst);
+  }
+
+  exec::semi_future<std::size_t> device_readv_async_io(
+    io::io_object const& object,
+    std::span<io::slice const> slices,
+    ::cuda::stream_ref stream,
+    io::io_priority priority = io::io_priority::automatic) noexcept override
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      ++_device_requests;
+      for (auto const& slice : slices) {
+        _device_read_offsets.push_back(slice.offset());
+      }
+    }
+    return _inner->device_readv_async_io(object, slices, stream, priority);
+  }
+
+  exec::semi_future<std::size_t> mixed_readv_async_io(
+    io::io_object const& object, std::vector<io::prepared_io_slice>&& slices) noexcept override
+  {
+    return _inner->mixed_readv_async_io(object, std::move(slices));
   }
 
   [[nodiscard]] std::vector<std::size_t> device_read_offsets() const
   {
     std::lock_guard<std::mutex> lock(_mutex);
     return _device_read_offsets;
+  }
+
+  /// Vectored device requests issued (one per read_rows_disk call that delivers rows).
+  [[nodiscard]] std::size_t device_requests() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _device_requests;
   }
 
   [[nodiscard]] std::size_t host_reads() const
@@ -194,19 +224,26 @@ class recording_io_backend : public idisk_io_backend {
     return _host_read_bytes;
   }
 
+ protected:
+  std::shared_ptr<io::io_object> create_io_object(std::string path) override
+  {
+    return _inner->open_io_object(std::move(path));
+  }
+
  private:
-  std::shared_ptr<idisk_io_backend> _inner;
+  std::shared_ptr<io::ioctx> _inner;
   mutable std::mutex _mutex;
   std::vector<std::size_t> _device_read_offsets;
+  std::size_t _device_requests{0};
   std::size_t _host_reads{0};
   std::size_t _host_read_bytes{0};
 };
 
 std::shared_ptr<recording_io_backend> make_recording_backend()
 {
-  io_backend_registry registry;
-  register_builtin_io_backends(registry);
-  return std::make_shared<recording_io_backend>(registry.create_backend("pipeline"));
+  // One real context for the whole process (reactors and pinned staging are not cheap to build).
+  static auto inner = make_disk_io_context();
+  return std::make_shared<recording_io_backend>(inner);
 }
 
 //===----------------------------------------------------------------------===//
@@ -579,7 +616,7 @@ row_range_result read_rows(const disk_source& src,
                            std::vector<slot>& slots,
                            std::size_t row_begin,
                            std::size_t max_rows,
-                           std::shared_ptr<idisk_io_backend> io_backend = nullptr)
+                           std::shared_ptr<io::ioctx> io_backend = nullptr)
 {
   std::vector<column_destination> dst;
   dst.reserve(slots.size());
@@ -717,6 +754,8 @@ TEST_CASE("disk row-range reader handles unaligned row ranges", "[row_range_read
   const bool all_aligned =
     std::all_of(offsets.begin(), offsets.end(), [](std::size_t off) { return off % 4096 == 0; });
   CHECK(all_aligned);
+  // All device ranges of the call go out as one vectored request.
+  CHECK(backend->device_requests() == 1);
   // STRING offsets are fitted from a host-side read.
   CHECK(backend->host_reads() > 0);
 }

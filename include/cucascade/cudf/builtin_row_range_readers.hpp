@@ -17,12 +17,15 @@
 
 #pragma once
 
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/row_range_read.hpp>
 
 #include <memory>
 
 namespace cucascade {
+
+namespace io {
+class ioctx;
+}  // namespace io
 
 /**
  * @brief Register the cudf-backed built-in row-range readers.
@@ -34,12 +37,12 @@ namespace cucascade {
  * This is provided by the cucascade-cudf library; the cudf-free core registry ships empty.
  *
  * @param registry The reader registry to register the readers with.
- * @param io_backend I/O backend the disk reader uses. nullptr means the disk reader uses
- *        `source.get_memory_space().get_io_backend()`, so each disk memory_space can use a
- *        different backend.
+ * @param io_context io context the disk reader reads with. nullptr means the disk reader uses
+ *        the io context of the source's DISK memory space (adopting default_disk_io_context()
+ *        when the space has none yet), so each disk memory_space can use a different one.
  * @throws std::invalid_argument if a reader for one of these types is already registered.
  */
 void register_builtin_row_range_readers(row_range_reader_registry& registry,
-                                        std::shared_ptr<idisk_io_backend> io_backend = nullptr);
+                                        std::shared_ptr<io::ioctx> io_context = nullptr);
 
 }  // namespace cucascade

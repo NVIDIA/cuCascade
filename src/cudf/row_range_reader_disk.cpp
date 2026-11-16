@@ -15,11 +15,15 @@
  * limitations under the License.
  */
 
+#include "disk_io.hpp"
 #include "row_range_detail.hpp"
 
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/disk_file_format.hpp>
 #include <cucascade/error.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/types.hpp>
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -33,11 +37,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace cucascade::detail {
@@ -65,6 +69,16 @@ struct host_copy_guard {
   }
 };
 
+/// A read that delivered fewer bytes than asked for: the batch file is truncated.
+[[noreturn]] void throw_short_read(const io::io_object& object,
+                                   std::size_t got,
+                                   std::size_t expected)
+{
+  throw std::runtime_error("row-range read (disk): read of '" + object.object_path() +
+                           "' transferred " + std::to_string(got) + " of " +
+                           std::to_string(expected) + " bytes");
+}
+
 struct host_offsets {
   std::vector<std::byte> bytes;  ///< The offsets read so far, `width` bytes each
   std::uint8_t width{4};         ///< 4 (INT32) or 8 (INT64)
@@ -77,14 +91,45 @@ struct host_offsets {
   }
 
   /// Extend the host copy to the offsets of the first @p rows rows (`rows + 1` offsets).
-  void fetch_up_to(std::size_t rows, idisk_io_backend& backend, const std::filesystem::path& path)
+  void fetch_up_to(std::size_t rows, io::ioctx& ctx, const io::io_object& object)
   {
     const std::size_t have = bytes.size();
     const std::size_t want = (rows + 1) * width;
     if (want <= have) { return; }
     bytes.resize(want);
-    backend.read(path, bytes.data() + have, want - have, file_offset + have);
+    // Synchronous, cache-unaware host read on the calling thread's reactor.
+    const std::size_t got = ctx.host_read_io(object,
+                                             file_offset + have,
+                                             want - have,
+                                             reinterpret_cast<std::uint8_t*>(bytes.data() + have));
+    if (got != want - have) { throw_short_read(object, got, want - have); }
   }
+};
+
+/// Holds the future of the one vectored device read and waits for it if it is destroyed
+/// unconsumed, so the request never outlives the destinations and scratch buffers it writes.
+class pending_read {
+ public:
+  explicit pending_read(exec::semi_future<std::size_t>&& future) noexcept
+    : _future(std::move(future))
+  {
+  }
+  pending_read(const pending_read&)            = delete;
+  pending_read& operator=(const pending_read&) = delete;
+  ~pending_read()
+  {
+    if (!_future.valid()) { return; }
+    try {
+      _future.wait();
+    } catch (...) {
+      // Unwinding from another error already.
+    }
+  }
+
+  [[nodiscard]] std::size_t get() { return std::move(_future).get(); }
+
+ private:
+  exec::semi_future<std::size_t> _future;
 };
 
 /**
@@ -92,15 +137,16 @@ struct host_offsets {
  *
  * Buffers start on a DISK_FILE_ALIGNMENT boundary in the file. Device reads are issued only at
  * file offsets that are a multiple of it, because an O_DIRECT / GDS backend cannot read from an
- * arbitrary file offset. The reads are queued and issued together by submit().
+ * arbitrary file offset. The reads are queued and issued together by submit() as ONE vectored
+ * request on the io context (one future), ordered after the work already queued on the stream.
  */
 class range_reader {
  public:
-  range_reader(idisk_io_backend& backend,
-               const std::filesystem::path& path,
+  range_reader(io::ioctx& ctx,
+               const io::io_object& object,
                memory::reservation* scratch,
                ::cuda::stream_ref stream)
-    : _backend(backend), _path(path), _scratch(scratch), _stream(stream)
+    : _ctx(ctx), _object(object), _scratch(scratch), _stream(stream)
   {
   }
 
@@ -119,7 +165,7 @@ class range_reader {
       size -= head;
       file_offset += head;
     }
-    if (size > 0) { _reads.push_back({out, size, file_offset}); }
+    if (size > 0) { queue(out, size, file_offset); }
   }
 
   /// Queue a read of file bytes [file_offset, file_offset + size) into a scratch buffer owned by
@@ -129,15 +175,22 @@ class range_reader {
   {
     const std::size_t prefix = file_offset % DISK_FILE_ALIGNMENT;
     auto& buffer             = allocate(prefix + size);
-    _reads.push_back({buffer.data(), prefix + size, file_offset - prefix});
+    queue(buffer.data(), prefix + size, file_offset - prefix);
     return static_cast<const std::byte*>(buffer.data()) + prefix;
   }
 
   /// Issue the queued reads as one batch, then move the partial first blocks into place.
   void submit()
   {
-    if (!_reads.empty()) { _backend.read_batch(_path, _reads, _stream); }
+    if (!_reads.empty()) {
+      // The future resolves once every byte is in device memory; no stream synchronization is
+      // needed to finish the read, and the copies below are ordered after it on `_stream`.
+      pending_read request{_ctx.device_readv_async_io(_object, _reads, _stream)};
+      const std::size_t got = request.get();
+      if (got != _read_bytes) { throw_short_read(_object, got, _read_bytes); }
+    }
     _reads.clear();
+    _read_bytes = 0;
     for (const auto& copy : _head_copies) {
       CUCASCADE_CUDA_TRY(
         cudaMemcpyAsync(copy.dst, copy.src, copy.size, cudaMemcpyDeviceToDevice, _stream.get()));
@@ -159,13 +212,20 @@ class range_reader {
     std::size_t size;
   };
 
-  idisk_io_backend& _backend;
-  const std::filesystem::path& _path;
+  void queue(void* dst, std::size_t size, std::size_t file_offset)
+  {
+    _reads.emplace_back(file_offset, size, static_cast<std::uint8_t*>(dst));
+    _read_bytes += size;
+  }
+
+  io::ioctx& _ctx;
+  const io::io_object& _object;
   memory::reservation* _scratch;
   ::cuda::stream_ref _stream;
   // Freed on `_stream` (rmm::device_buffer remembers its stream), after the work that uses them.
   std::vector<rmm::device_buffer> _temporaries;
-  std::vector<io_batch_entry> _reads;
+  std::vector<io::slice> _reads;
+  std::size_t _read_bytes{0};
   std::vector<head_copy> _head_copies;
 };
 
@@ -201,16 +261,25 @@ row_range_result read_rows_disk(const idata_representation& source,
                                 ::cuda::stream_ref stream,
                                 memory::reservation* scratch,
                                 std::unique_ptr<row_range_reader_state>* /*state*/,
-                                std::shared_ptr<idisk_io_backend> io_backend)
+                                std::shared_ptr<io::ioctx> io_context)
 {
   const auto* disk = dynamic_cast<const disk_data_representation*>(&source);
   if (disk == nullptr) {
     throw std::invalid_argument("row-range read (disk): source is not a disk_data_representation");
   }
-  idisk_io_backend& backend =
-    io_backend != nullptr ? *io_backend : source.get_memory_space().get_io_backend();
+  // Held for the whole call, so a concurrent memory_space::set_io_context() cannot tear the
+  // context down underneath the read.
+  const std::shared_ptr<io::ioctx> ctx_owner =
+    io_context != nullptr ? std::move(io_context)
+                          : resolve_disk_io_context(source.get_memory_space());
+  io::ioctx& ctx    = *ctx_owner;
   const auto& table = disk->get_disk_table();
-  const std::filesystem::path path{table.file_path};
+  // Opened lazily, once per call: a call that delivers no rows does no I/O at all.
+  std::shared_ptr<io::io_object> object;
+  auto file = [&]() -> const io::io_object& {
+    if (object == nullptr) { object = ctx.open_io_object(std::string(table.file_path)); }
+    return *object;
+  };
 
   const std::size_t num_columns = request.columns.size();
   const std::size_t num_rows =
@@ -288,7 +357,7 @@ row_range_result read_rows_disk(const idata_representation& source,
       for (std::size_t i = 0; i < num_columns; ++i) {
         if (!fit[i].is_string) { continue; }
         auto& host = offsets[i];
-        host.fetch_up_to(rows, backend, path);
+        host.fetch_up_to(rows, ctx, file());
         const auto& out          = dst[i];
         const std::size_t avail  = out.data.capacity_bytes > out.dst_byte_offset
                                      ? out.data.capacity_bytes - out.dst_byte_offset
@@ -311,7 +380,12 @@ row_range_result read_rows_disk(const idata_representation& source,
   // follow it.
   // Declared before anything is enqueued, so it also runs when a later column throws.
   host_copy_guard host_copies{stream};
-  range_reader reader(backend, path, scratch, stream);
+  if (!ctx.supports_device_read()) {
+    throw std::logic_error(
+      "row-range read (disk): the io context of the DISK memory space cannot read into device "
+      "memory");
+  }
+  range_reader reader(ctx, file(), scratch, stream);
   std::vector<mask_copy> mask_copies;
   for (std::size_t i = 0; i < num_columns; ++i) {
     const auto& meta = *metas[i];

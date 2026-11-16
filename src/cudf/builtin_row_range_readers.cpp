@@ -29,7 +29,7 @@
 namespace cucascade {
 
 void register_builtin_row_range_readers(row_range_reader_registry& registry,
-                                        std::shared_ptr<idisk_io_backend> io_backend)
+                                        std::shared_ptr<io::ioctx> io_context)
 {
   registry.register_reader<gpu_table_representation>(
     [](const idata_representation& source,
@@ -52,13 +52,13 @@ void register_builtin_row_range_readers(row_range_reader_registry& registry,
     });
 
   registry.register_reader<disk_data_representation>(
-    [io_backend = std::move(io_backend)](const idata_representation& source,
+    [io_context = std::move(io_context)](const idata_representation& source,
                                          const row_range_request& request,
                                          std::span<column_destination> dst,
                                          ::cuda::stream_ref stream,
                                          memory::reservation* scratch,
                                          std::unique_ptr<row_range_reader_state>* state) {
-      return detail::read_rows_disk(source, request, dst, stream, scratch, state, io_backend);
+      return detail::read_rows_disk(source, request, dst, stream, scratch, state, io_context);
     });
 }
 

@@ -919,9 +919,8 @@ TEST_CASE("read_rows_gpu refuses a source on another device than the stream",
   // DISK space with id 1 reports another id without touching a CUDA device, so one GPU is enough;
   // the table's memory stays on device 0. A null writer stream leaves the writer unknown, so the
   // constructor accepts the space.
-  auto other_space =
-    make_mock_memory_space(memory::Tier::DISK, 1, std::make_shared<mock_no_io_backend>());
-  const auto data = make_source_data(16);
+  auto other_space = make_mock_memory_space(memory::Tier::DISK, 1);
+  const auto data  = make_source_data(16);
   gpu_table_representation source(
     make_table(data, false), *other_space, ::cuda::stream_ref{cudaStream_t{nullptr}});
   REQUIRE(source.get_device_id() == 1);

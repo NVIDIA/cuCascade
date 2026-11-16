@@ -19,7 +19,6 @@
 
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/common.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/row_range_read.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
@@ -39,6 +38,10 @@
  *
  * The reader contract these functions implement is in cucascade/data/row_range_read.hpp.
  */
+
+namespace cucascade::io {
+class ioctx;
+}  // namespace cucascade::io
 
 namespace cucascade::detail {
 
@@ -76,8 +79,8 @@ row_range_result read_rows_host(const idata_representation& source,
  * Implements the reader contract of row_range_read.hpp. May synchronize @p stream only for the
  * host-side offset read.
  *
- * @param io_backend I/O backend to read with; nullptr means
- *        `source.get_memory_space().get_io_backend()`.
+ * @param io_context io context to read with; nullptr means the io context of the source's DISK
+ *        memory space (see resolve_disk_io_context() in disk_io.hpp).
  */
 row_range_result read_rows_disk(const idata_representation& source,
                                 const row_range_request& request,
@@ -85,7 +88,7 @@ row_range_result read_rows_disk(const idata_representation& source,
                                 ::cuda::stream_ref stream,
                                 memory::reservation* scratch,
                                 std::unique_ptr<row_range_reader_state>* state,
-                                std::shared_ptr<idisk_io_backend> io_backend);
+                                std::shared_ptr<io::ioctx> io_context);
 
 // ---- device helpers (row_range_copy_kernels.cu) ----
 
