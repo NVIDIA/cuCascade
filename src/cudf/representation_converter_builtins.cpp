@@ -732,11 +732,13 @@ struct staged_column {
   std::size_t data_bytes{0};  ///< Unknown for STRING characters until the size probe is read
   std::optional<std::size_t> size_probe;  ///< Which probe holds the size of the characters
 
-  rmm::device_buffer mask;
+  /// Set by the second pass; holds nothing if the column is not nullable.
+  std::optional<cudf_compat::null_mask_buffer> mask;
   rmm::device_buffer data;
   std::vector<staged_column> children;
 
-  /// Set for a column without rows, which is built on the host and copies nothing.
+  /// A column without rows copies nothing: the second pass builds `empty` from `source`.
+  cudf::column_view source;
   std::unique_ptr<cudf::column> empty;
 };
 
@@ -751,6 +753,13 @@ struct staged_table_summary {
   throw std::invalid_argument("host-staged GPU to GPU conversion: " + reason);
 }
 
+/// A null mask that holds nothing, for a column that is not nullable. Allocates no device memory.
+cudf_compat::null_mask_buffer make_absent_null_mask(::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  return cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
+}
+
 /**
  * @brief An empty column with the type of @p view, built without touching the device.
  *
@@ -758,10 +767,13 @@ struct staged_table_summary {
  * element type, a STRUCT has empty fields, and a DICTIONARY32 has empty indices and empty keys of
  * its key type (the keys of a dictionary without rows are not copied). A STRING has no children.
  */
-std::unique_ptr<cudf::column> make_empty_like(cudf::column_view const& view)
+std::unique_ptr<cudf::column> make_empty_like(cudf::column_view const& view,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr)
 {
-  auto const empty_leaf = [](cudf::data_type type) {
-    return std::make_unique<cudf::column>(type, 0, rmm::device_buffer{}, rmm::device_buffer{}, 0);
+  auto const empty_leaf = [&](cudf::data_type type) {
+    return std::make_unique<cudf::column>(
+      type, 0, rmm::device_buffer{}, make_absent_null_mask(stream, mr), 0);
   };
 
   std::vector<std::unique_ptr<cudf::column>> children;
@@ -771,18 +783,22 @@ std::unique_ptr<cudf::column> make_empty_like(cudf::column_view const& view)
       // child 0 is the offsets (LIST) or the indices (DICTIONARY32), a column without children.
       if (view.num_children() == 2) {
         children.push_back(empty_leaf(view.child(0).type()));
-        children.push_back(make_empty_like(view.child(1)));
+        children.push_back(make_empty_like(view.child(1), stream, mr));
       }
       break;
     case cudf::type_id::STRUCT:
       for (cudf::size_type i = 0; i < view.num_children(); ++i) {
-        children.push_back(make_empty_like(view.child(i)));
+        children.push_back(make_empty_like(view.child(i), stream, mr));
       }
       break;
     default: break;
   }
-  return std::make_unique<cudf::column>(
-    view.type(), 0, rmm::device_buffer{}, rmm::device_buffer{}, 0, std::move(children));
+  return std::make_unique<cudf::column>(view.type(),
+                                        0,
+                                        rmm::device_buffer{},
+                                        make_absent_null_mask(stream, mr),
+                                        0,
+                                        std::move(children));
 }
 
 /// An offsets child must be whole: one entry more than its parent has rows, starting at entry 0.
@@ -812,7 +828,7 @@ staged_column plan_staged_column(cudf::column_view const& view, staged_table_sum
   plan.type = view.type();
   plan.rows = view.size();
   if (view.size() == 0) {
-    plan.empty = make_empty_like(view);
+    plan.source = view;
     return plan;
   }
 
@@ -889,8 +905,8 @@ staged_column plan_staged_column(cudf::column_view const& view, staged_table_sum
  * @brief Second pass: allocate the destination buffers of @p plan on @p stream and append one
  * segment per buffer to @p segments, in the order mask, data, children.
  *
- * A destination mask has cudf's padded size but only the words covering the rows are copied, which
- * is all a source mask is sure to hold.
+ * Only the words of a mask that cover the rows are copied, which is all a source mask is sure to
+ * hold. A column without rows gets its empty column here and no segment.
  */
 void allocate_staged_column(staged_column& plan,
                             std::span<std::int64_t const> string_sizes,
@@ -898,11 +914,20 @@ void allocate_staged_column(staged_column& plan,
                             rmm::device_async_resource_ref mr,
                             std::vector<memory::detail::staged_copy_segment>& segments)
 {
-  if (plan.empty) { return; }
+  if (plan.rows == 0) {
+    plan.empty = make_empty_like(plan.source, stream, mr);
+    return;
+  }
 
   if (plan.mask_bytes > 0) {
-    plan.mask = rmm::device_buffer(cudf::bitmask_allocation_size_bytes(plan.rows), stream, mr);
-    segments.push_back({plan.source_mask, plan.mask.data(), plan.mask_bytes});
+    plan.mask.emplace(
+      cudf::create_null_mask(plan.rows, cudf::mask_state::UNINITIALIZED, stream, mr));
+    if (cudf_compat::get_null_mask_size_bytes(*plan.mask) < plan.mask_bytes) {
+      reject_staged_column("a null mask is smaller than its rows need");
+    }
+    segments.push_back({plan.source_mask, plan.mask->data(), plan.mask_bytes});
+  } else {
+    plan.mask.emplace(make_absent_null_mask(stream, mr));
   }
   if (plan.size_probe) {
     std::int64_t const characters = string_sizes[*plan.size_probe];
@@ -930,7 +955,7 @@ void allocate_staged_column(staged_column& plan,
  */
 std::unique_ptr<cudf::column> assemble_staged_column(staged_column&& plan)
 {
-  if (plan.empty) { return std::move(plan.empty); }
+  if (plan.rows == 0) { return std::move(plan.empty); }
 
   std::vector<std::unique_ptr<cudf::column>> children;
   children.reserve(plan.children.size());
@@ -940,7 +965,7 @@ std::unique_ptr<cudf::column> assemble_staged_column(staged_column&& plan)
   return std::make_unique<cudf::column>(plan.type,
                                         plan.rows,
                                         std::move(plan.data),
-                                        std::move(plan.mask),
+                                        std::move(*plan.mask),
                                         plan.null_count,
                                         std::move(children));
 }
