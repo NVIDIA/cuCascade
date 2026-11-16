@@ -414,7 +414,7 @@ TEST_CASE("gpu_to_gpu staged route waits a fixed number of times and borrows a b
   SECTION("fixed-width columns need no sizes from the device")
   {
     gpu_table_representation source{
-      std::make_unique<cudf::table>(table->select(kFixedWidthColumns), producer, mr),
+      std::make_unique<cudf::table>(table->select(kFixedWidthColumns), producer.view(), mr),
       *space,
       producer};
     converted = staged.registry.convert<gpu_table_representation>(source, space, consumer);
@@ -518,7 +518,8 @@ TEST_CASE("gpu_to_gpu staged route builds tables without rows on the host",
 
   SECTION("views without rows that start past row 0 and keep their children")
   {
-    auto const views = cudf::slice(owner->view(), {5, 5}, producer);
+    auto const views =
+      cudf::slice(owner->view(), std::vector<cudf::size_type>{5, 5}, producer.view());
     gpu_table_representation source{
       views.front(), std::shared_ptr<cudf::table>{owner}, std::size_t{0}, *space, producer};
     check_built_on_host(source);
@@ -563,7 +564,8 @@ TEST_CASE("gpu_to_gpu staged route refuses sliced columns it cannot copy whole",
 
   SECTION("a view that starts past row 0, whatever its type")
   {
-    auto const tail = cudf::slice(owner->view(), {1, kRows}, producer).front();
+    auto const tail =
+      cudf::slice(owner->view(), std::vector<cudf::size_type>{1, kRows}, producer.view()).front();
     CHECK_THROWS_AS(convert_view(tail), std::invalid_argument);
     CHECK_THROWS_AS(convert_view(tail.select(kFixedWidthColumns)), std::invalid_argument);
     CHECK(staged.counters.rings.load() == 0U);
@@ -571,7 +573,9 @@ TEST_CASE("gpu_to_gpu staged route refuses sliced columns it cannot copy whole",
 
   SECTION("a view that ends early over a column with children")
   {
-    auto const head = cudf::slice(owner->view(), {0, kRows - 1}, producer).front();
+    auto const head =
+      cudf::slice(owner->view(), std::vector<cudf::size_type>{0, kRows - 1}, producer.view())
+        .front();
     for (cudf::size_type column = 6; column < head.num_columns(); ++column) {
       CAPTURE(column);
       CHECK_THROWS_AS(convert_view(head.select({column})), std::invalid_argument);
@@ -581,8 +585,10 @@ TEST_CASE("gpu_to_gpu staged route refuses sliced columns it cannot copy whole",
 
   SECTION("a view that ends early over fixed-width columns is copied")
   {
-    auto const head =
-      cudf::slice(owner->view().select(kFixedWidthColumns), {0, kRows - 1}, producer).front();
+    auto const head = cudf::slice(owner->view().select(kFixedWidthColumns),
+                                  std::vector<cudf::size_type>{0, kRows - 1},
+                                  producer.view())
+                        .front();
     auto converted = convert_view(head);
     REQUIRE(converted != nullptr);
     test::expect_cudf_tables_equal_on_stream(head, converted->get_table_view(), consumer);
