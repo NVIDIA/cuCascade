@@ -29,7 +29,32 @@
 namespace cucascade::io {
 
 /**
- * @brief Bridge a semi_future into a real (promise-backed) std::future.
+ * @brief Deferred call that owns a read: destroying it waits for the read, so a future returned by
+ * std::async(std::launch::deferred, joining_future{...}) joins its read when it is dropped.
+ */
+template <typename T>
+class joining_future {
+ public:
+  explicit joining_future(std::future<T> read) noexcept : _read(std::move(read)) {}
+
+  joining_future(joining_future&&) noexcept            = default;
+  joining_future& operator=(joining_future&&) noexcept = delete;
+  joining_future(joining_future const&)                = delete;
+  joining_future& operator=(joining_future const&)     = delete;
+
+  ~joining_future()
+  {
+    if (_read.valid()) { _read.wait(); }
+  }
+
+  T operator()() { return _read.get(); }
+
+ private:
+  std::future<T> _read;
+};
+
+/**
+ * @brief Bridge a semi_future into a std::future that joins the read when dropped.
  *
  * Promise, std::future, and the exact type-erased terminal are all built before @p producer may
  * publish IO, so callback installation is a move-only, non-allocating handoff.
@@ -51,7 +76,7 @@ std::future<std::size_t> bridge_semi_to_std(Producer&& producer)
   }};
   auto sf = std::forward<Producer>(producer)();
   std::move(sf).install_callback(std::move(terminal));
-  return fut;
+  return std::async(std::launch::deferred, joining_future<std::size_t>{std::move(fut)});
 }
 
 }  // namespace cucascade::io

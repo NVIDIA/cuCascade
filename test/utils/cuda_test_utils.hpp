@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "cuda_device_utils.hpp"
+
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
@@ -28,15 +30,6 @@
 #include <thread>
 
 namespace cucascade::test {
-
-/// Number of visible CUDA devices; a runtime that cannot enumerate any
-/// (cudaErrorNoDevice, no driver) counts as zero so callers can SKIP.
-inline int cuda_device_count()
-{
-  int count = 0;
-  if (cudaGetDeviceCount(&count) != cudaSuccess) { return 0; }
-  return count;
-}
 
 /// Parks a stream in a host callback until released, so work queued behind it
 /// (a read's H2D copy, a kernel) cannot run until then. The destructor releases

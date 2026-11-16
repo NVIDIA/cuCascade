@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace cucascade {
@@ -96,8 +97,16 @@ class peer_dma_probe_cache {
   [[nodiscard]] int broken_direction_count() noexcept;
 
  private:
+  // The *_locked members run under _mutex. A warning about broken directions is handed back
+  // through @p broken_to_report and emitted by the public caller after the lock is released, so
+  // a log sink may take its own lock or call back into this cache without deadlocking.
+  [[nodiscard]] peer_dma_probe_result result_locked(int source_device,
+                                                    int destination_device,
+                                                    bool retry_errors,
+                                                    std::optional<int>& broken_to_report);
+  [[nodiscard]] int broken_direction_count_locked(std::optional<int>& broken_to_report);
   [[nodiscard]] peer_dma_probe_result& entry(int source_device, int destination_device) noexcept;
-  [[nodiscard]] cudaError_t initialize_locked();
+  [[nodiscard]] cudaError_t initialize_locked(std::optional<int>& broken_to_report);
   [[nodiscard]] int count_broken_locked() const noexcept;
   [[nodiscard]] peer_dma_probe_result probe_direction(int source_device, int destination_device);
 

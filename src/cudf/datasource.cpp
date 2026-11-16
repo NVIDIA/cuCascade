@@ -23,6 +23,7 @@
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/details/std_future.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -42,6 +43,26 @@ using nvtx_range = nvtx3::scoped_range_in<libcucascade_domain>;
 
 struct io_read_to_gpu_message {
   static constexpr char const* message{"io:read_to_gpu"};
+};
+
+// A host read into a buffer that the returned future owns.  The read is declared after the buffer
+// so that it is joined before the buffer is freed.
+class owning_host_read {
+ public:
+  owning_host_read(std::vector<uint8_t> buffer, std::future<size_t> read) noexcept
+    : _buffer(std::move(buffer)), _read(std::move(read))
+  {
+  }
+
+  std::unique_ptr<cudf::io::datasource::buffer> operator()()
+  {
+    _buffer.resize(_read.get());
+    return cudf::io::datasource::buffer::create(std::move(_buffer));
+  }
+
+ private:
+  std::vector<uint8_t> _buffer;
+  std::future<size_t> _read;
 };
 
 }  // namespace
@@ -105,11 +126,7 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
   auto buf       = std::vector<uint8_t>(size);
   auto fut       = host_read_async(offset, size, buf.data());
-  return std::async(std::launch::deferred, [s = std::move(fut), buf = std::move(buf)]() mutable {
-    auto n = s.get();
-    buf.resize(n);
-    return cudf::io::datasource::buffer::create(std::move(buf));
-  });
+  return std::async(std::launch::deferred, owning_host_read{std::move(buf), std::move(fut)});
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(size_t offset,

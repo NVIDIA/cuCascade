@@ -216,6 +216,15 @@ class gpu_table_representation : public idata_representation {
   std::unique_ptr<cudf::table> release_table(::cuda::stream_ref stream);
 
   /**
+   * @brief Whether this representation owns its table, so that release_table() hands it over
+   * without copying it.
+   */
+  [[nodiscard]] bool owns_table() const noexcept
+  {
+    return std::holds_alternative<std::unique_ptr<cudf::table>>(_table);
+  }
+
+  /**
    * @brief Rebind the owned table's device buffers to use @p stream for future deallocation.
    *
    * Applies cudf::rebind_stream to every column (recursively rebinding data buffers, null
