@@ -15,16 +15,23 @@
  * limitations under the License.
  */
 
+#include "numa_affinity.hpp"
+
 #include <cucascade/error.hpp>
+#include <cucascade/log/logging.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
-#include <numa.h>
+#include <linux/mempolicy.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
+#include <climits>
 #include <cstring>
 #include <tuple>
+#include <utility>
 
 namespace cucascade {
 namespace memory {
@@ -48,28 +55,54 @@ int prefault(void* ptr, std::size_t bytes)
   return 0;
 }
 
-/// Runs the calling thread on the CPUs of @p node for the guard's lifetime, then restores its
-/// affinity. Best effort: the affinity is left alone if the thread may not run on that node.
-class scoped_run_on_node {
+/// Owns an anonymous private mapping whose pages are bound to one NUMA node.
+class node_mapping {
  public:
-  explicit scoped_run_on_node(int node) : _saved(numa_allocate_cpumask())
+  /// Maps @p bytes on @p node. Throws rmm::bad_alloc if the mapping fails. The binding is best
+  /// effort: the pages follow the default policy if the node is unknown or not allowed.
+  node_mapping(std::size_t bytes, int node)
+    : _ptr(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)),
+      _bytes(bytes)
   {
-    if (numa_sched_getaffinity(0, _saved) < 0 || numa_run_on_node(node) != 0) {
-      numa_free_cpumask(_saved);
-      _saved = nullptr;
+    if (_ptr == MAP_FAILED) {
+      _ptr = nullptr;
+      throw rmm::bad_alloc(std::strerror(errno));
+    }
+    if (node < 0 || node >= max_nodes) { return; }
+    std::array<unsigned long, max_nodes / detail::kernel_bitmask::bits_per_word> nodes{};
+    auto const id = static_cast<std::size_t>(node);
+    nodes[id / detail::kernel_bitmask::bits_per_word] |=
+      1UL << (id % detail::kernel_bitmask::bits_per_word);
+    // The kernel reads maxnode - 1 bits.
+    if (syscall(SYS_mbind,
+                _ptr,
+                static_cast<unsigned long>(bytes),
+                static_cast<unsigned long>(MPOL_BIND),
+                nodes.data(),
+                static_cast<unsigned long>(max_nodes + 1),
+                0UL) != 0) {
+      int const bind_error = errno;
+      CUCASCADE_LOG_WARN("mbind to NUMA node {} failed: {}", node, std::strerror(bind_error));
     }
   }
-  ~scoped_run_on_node()
+  ~node_mapping()
   {
-    if (_saved == nullptr) { return; }
-    std::ignore = numa_sched_setaffinity(0, _saved);
-    numa_free_cpumask(_saved);
+    if (_ptr != nullptr) { unmap(_ptr, _bytes); }
   }
-  scoped_run_on_node(scoped_run_on_node const&)            = delete;
-  scoped_run_on_node& operator=(scoped_run_on_node const&) = delete;
+  node_mapping(node_mapping const&)            = delete;
+  node_mapping& operator=(node_mapping const&) = delete;
+
+  [[nodiscard]] void* get() const noexcept { return _ptr; }
+  [[nodiscard]] void* release() noexcept { return std::exchange(_ptr, nullptr); }
+
+  static void unmap(void* ptr, std::size_t bytes) noexcept { std::ignore = munmap(ptr, bytes); }
 
  private:
-  bitmask* _saved;
+  // The kernel supports at most 2^10 nodes (CONFIG_NODES_SHIFT).
+  static constexpr int max_nodes = 1 << 10;
+
+  void* _ptr;
+  std::size_t _bytes;
 };
 
 }  // namespace
@@ -106,31 +139,23 @@ void* numa_region_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda:
       cudaHostAlloc(&ptr, bytes, static_cast<unsigned int>(_cuda_host_flags)), bytes);
     return ptr;
   } else {
-    void* ptr = numa_alloc_onnode(bytes, _numa_node);
-    if (ptr == nullptr) { throw rmm::bad_alloc(std::strerror(errno)); }
+    node_mapping mapping(bytes, _numa_node);
     // cudaHostRegister faults in the pages itself, but under a driver lock that serializes
     // concurrent callers. Faulting them in here (with transparent huge pages where allowed)
     // does the zeroing in the calling thread, so concurrent allocations overlap it and the
-    // register only pins resident pages. The pages land on _numa_node regardless of where the
-    // thread runs; running it there too keeps the zeroing off the inter-socket link.
-    std::ignore = madvise(ptr, bytes, MADV_HUGEPAGE);
+    // register only pins resident pages. Once bound, the pages land on _numa_node regardless of
+    // where the thread runs; running it there too keeps the zeroing off the inter-socket link.
+    std::ignore = madvise(mapping.get(), bytes, MADV_HUGEPAGE);
     int err     = 0;
     {
-      scoped_run_on_node const local_cpus(_numa_node);
-      err = prefault(ptr, bytes);
+      detail::scoped_run_on_node const local_cpus(_numa_node);
+      err = prefault(mapping.get(), bytes);
     }
-    if (err != 0) {
-      numa_free(ptr, bytes);
-      if (err == ENOMEM) { throw rmm::out_of_memory(std::strerror(err)); }
-      throw rmm::bad_alloc(std::strerror(err));
-    }
-    if (cudaError_t const status =
-          cudaHostRegister(ptr, bytes, static_cast<unsigned int>(_cuda_host_flags));
-        status != cudaSuccess) {
-      numa_free(ptr, bytes);
-      CUCASCADE_CUDA_TRY_ALLOC(status, bytes);
-    }
-    return ptr;
+    if (err == ENOMEM) { throw rmm::out_of_memory(std::strerror(err)); }
+    if (err != 0) { throw rmm::bad_alloc(std::strerror(err)); }
+    CUCASCADE_CUDA_TRY_ALLOC(
+      cudaHostRegister(mapping.get(), bytes, static_cast<unsigned int>(_cuda_host_flags)), bytes);
+    return mapping.release();
   }
 }
 
@@ -145,7 +170,7 @@ void numa_region_pinned_host_memory_resource::deallocate(
     CUCASCADE_ASSERT_CUDA_SUCCESS(cudaFreeHost(ptr));
   } else {
     CUCASCADE_ASSERT_CUDA_SUCCESS(cudaHostUnregister(ptr));
-    numa_free(ptr, bytes);
+    node_mapping::unmap(ptr, bytes);
   }
 }
 
