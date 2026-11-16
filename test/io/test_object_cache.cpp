@@ -20,8 +20,11 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -45,46 +48,61 @@ class fake_object : public io_object {
 
 }  // namespace
 
-TEST_CASE("an object that was kept is found again", "[io][object_cache]")
+TEST_CASE("an object is opened once and found again", "[io][object_cache]")
 {
   object_cache cache;
-  CHECK(cache.find("s3://b/a") == nullptr);
+  int opens         = 0;
   auto const object = std::make_shared<fake_object>("s3://b/a");
-  CHECK(cache.insert("s3://b/a", object) == object);
-  CHECK(cache.find("s3://b/a") == object);
+  auto const open   = [&] {
+    ++opens;
+    return object;
+  };
+  CHECK(cache.find_or_open("s3://b/a", open) == object);
+  CHECK(cache.find_or_open("s3://b/a", open) == object);
+  CHECK(opens == 1);
   CHECK(cache.size() == 1);
 }
 
-TEST_CASE("the first object kept for a path stays", "[io][object_cache]")
+TEST_CASE("a failed open is not kept", "[io][object_cache]")
 {
   object_cache cache;
-  auto const first  = std::make_shared<fake_object>("s3://b/a");
-  auto const second = std::make_shared<fake_object>("s3://b/a");
-  cache.insert("s3://b/a", first);
-  CHECK(cache.insert("s3://b/a", second) == first);
-  CHECK(cache.find("s3://b/a") == first);
-  CHECK(cache.size() == 1);
+  CHECK_THROWS_AS(cache.find_or_open("s3://b/a",
+                                     []() -> std::shared_ptr<io_object> {
+                                       throw std::runtime_error("unreachable endpoint");
+                                     }),
+                  std::runtime_error);
+  CHECK(cache.size() == 0);
+  auto const object = std::make_shared<fake_object>("s3://b/a");
+  CHECK(cache.find_or_open("s3://b/a", [&] { return object; }) == object);
 }
 
-TEST_CASE("paths are kept separately and concurrent inserts agree", "[io][object_cache]")
+TEST_CASE("concurrent first opens of a path share one open", "[io][object_cache]")
 {
   object_cache cache;
+  std::atomic<int> opens{0};
   std::vector<std::thread> threads;
+  std::vector<std::shared_ptr<io_object>> seen(8 * 100);
   for (int t = 0; t < 8; ++t) {
-    threads.emplace_back([&cache] {
+    threads.emplace_back([&, t] {
       for (int i = 0; i < 100; ++i) {
-        auto const path = "s3://b/" + std::to_string(i);
-        cache.insert(path, std::make_shared<fake_object>(path));
+        auto const path                             = "s3://b/" + std::to_string(i);
+        seen[static_cast<std::size_t>(t * 100 + i)] = cache.find_or_open(path, [&] {
+          ++opens;
+          std::this_thread::sleep_for(std::chrono::microseconds{50});
+          return std::make_shared<fake_object>(path);
+        });
       }
     });
   }
   for (auto& thread : threads) {
     thread.join();
   }
+  CHECK(opens.load() == 100);
   CHECK(cache.size() == 100);
-  for (int i = 0; i < 100; ++i) {
-    auto const path = "s3://b/" + std::to_string(i);
-    REQUIRE(cache.find(path) != nullptr);
-    CHECK(cache.find(path)->object_path() == path);
+  for (int t = 1; t < 8; ++t) {
+    for (int i = 0; i < 100; ++i) {
+      CHECK(seen[static_cast<std::size_t>(t * 100 + i)] == seen[static_cast<std::size_t>(i)]);
+    }
   }
+  CHECK(seen[7]->object_path() == "s3://b/7");
 }

@@ -21,6 +21,8 @@
 #include <cucascade/io/types.hpp>
 
 #include <cstddef>
+#include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -46,24 +48,39 @@ namespace cucascade::io {
  */
 class object_cache {
  public:
-  /// The handle kept for @p path, or null.
-  [[nodiscard]] std::shared_ptr<io_object> find(std::string const& path) const
+  /**
+   * @brief The handle kept for @p path, opening it with @p open on the first call.
+   *
+   * Concurrent first calls for one path share one call of @p open. If it throws, every one of them
+   * rethrows its exception and nothing is kept, so a later call opens again.
+   */
+  template <typename Open>
+  std::shared_ptr<io_object> find_or_open(std::string const& path, Open&& open)
   {
-    std::lock_guard lock(_mutex);
-    auto const it = _objects.find(path);
-    return it == _objects.end() ? nullptr : it->second;
+    std::promise<std::shared_ptr<io_object>> opening;
+    std::shared_future<std::shared_ptr<io_object>> opened;
+    bool first = false;
+    {
+      std::lock_guard lock(_mutex);
+      auto const [it, inserted] = _objects.try_emplace(path);
+      if (inserted) { it->second = opening.get_future().share(); }
+      opened = it->second;
+      first  = inserted;
+    }
+    if (!first) { return opened.get(); }
+    try {
+      opening.set_value(std::forward<Open>(open)());
+    } catch (...) {
+      {
+        std::lock_guard lock(_mutex);
+        _objects.erase(path);
+      }
+      opening.set_exception(std::current_exception());
+    }
+    return opened.get();
   }
 
-  /// Keep @p object for @p path. If another thread kept one first, that one stays.
-  ///
-  /// @return The handle kept for @p path.
-  std::shared_ptr<io_object> insert(std::string const& path, std::shared_ptr<io_object> object)
-  {
-    std::lock_guard lock(_mutex);
-    return _objects.try_emplace(path, std::move(object)).first->second;
-  }
-
-  /// Number of handles kept.
+  /// Number of handles kept or being opened.
   [[nodiscard]] std::size_t size() const
   {
     std::lock_guard lock(_mutex);
@@ -72,7 +89,7 @@ class object_cache {
 
  private:
   mutable std::mutex _mutex;
-  std::unordered_map<std::string, std::shared_ptr<io_object>> _objects;
+  std::unordered_map<std::string, std::shared_future<std::shared_ptr<io_object>>> _objects;
 };
 
 }  // namespace cucascade::io

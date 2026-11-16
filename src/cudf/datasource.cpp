@@ -80,11 +80,8 @@ bool datasource::is_device_read_preferred(size_t) const { return _io_ctx->suppor
 
 size_t datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  if (uses_fs_cache()) {
-    auto* cache = _io_ctx->cache();
-    return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
-  }
-  return std::move(_io_ctx->host_read_async_io(*_io_object, offset, size, dst)).get();
+  return std::move(_io_ctx->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle))
+    .get();
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offset, size_t size)
@@ -97,13 +94,8 @@ std::unique_ptr<cudf::io::datasource::buffer> datasource::host_read(size_t offse
 
 std::future<size_t> datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  return bridge_semi_to_std([&] {
-    if (uses_fs_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
-    }
-    return _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
-  });
+  return bridge_semi_to_std(
+    [&] { return _io_ctx->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle); });
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read_async(
@@ -153,11 +145,7 @@ std::future<size_t> datasource::device_read_async(size_t offset,
 {
   ::cuda::stream_ref stream{stream_arg};
   return bridge_semi_to_std([&] {
-    if (uses_fs_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
-    }
-    return _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
+    return _io_ctx->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
   });
 }
 

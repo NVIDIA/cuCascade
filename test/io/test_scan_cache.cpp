@@ -21,7 +21,9 @@
 #include <catch2/catch_all.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,11 +37,12 @@ using cucascade::io::scan_cache_config;
 /// makes no request.
 scan_cache_config small_cache()
 {
-  return {.cache_bytes = 256UL << 20,
-          .endpoint    = "http://127.0.0.1:9",
-          .region      = "us-east-1",
-          .access_key  = "test",
-          .secret_key  = "test"};
+  scan_cache_config config{.cache_bytes = 256UL << 20};
+  config.object_store.endpoint   = "http://127.0.0.1:9";
+  config.object_store.region     = "us-east-1";
+  config.object_store.access_key = "test";
+  config.object_store.secret_key = "test";
+  return config;
 }
 
 void register_two_columns(scan_cache& cache, std::string const& path)
@@ -58,6 +61,31 @@ TEST_CASE("a scan cache needs a size", "[cache][scan_cache]")
   scan_cache_config options = small_cache();
   options.cache_bytes       = 0;
   CHECK_THROWS_AS(scan_cache(options), std::invalid_argument);
+}
+
+TEST_CASE("a scan cache rejects a chunk size that is zero or larger than a pool",
+          "[cache][scan_cache]")
+{
+  for (std::size_t block_bytes : {std::size_t{0}, std::size_t{256} << 20}) {
+    scan_cache_config options = small_cache();
+    options.block_bytes       = block_bytes;
+    CHECK_THROWS_AS(scan_cache(options), std::invalid_argument);
+  }
+}
+
+TEST_CASE("a scan cache rejects fractions outside [0, 1]", "[cache][scan_cache]")
+{
+  for (double bad : {-0.1, 1.5, std::numeric_limits<double>::quiet_NaN()}) {
+    scan_cache_config threshold  = small_cache();
+    threshold.eviction_threshold = bad;
+    CHECK_THROWS_AS(scan_cache(threshold), std::invalid_argument);
+    scan_cache_config batch = small_cache();
+    batch.eviction_batch    = bad;
+    CHECK_THROWS_AS(scan_cache(batch), std::invalid_argument);
+    scan_cache_config budget = small_cache();
+    budget.admission_budget  = bad;
+    CHECK_THROWS_AS(scan_cache(budget), std::invalid_argument);
+  }
 }
 
 TEST_CASE("a registered layout shows up in the column statistics", "[cache][scan_cache]")

@@ -28,9 +28,6 @@
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <mutex>
-#include <string>
-#include <vector>
 
 namespace cucascade::io {
 
@@ -47,23 +44,23 @@ namespace cucascade::io {
  * It has no libcudf dependency: a class that subclasses @c cudf::io::datasource wraps it, and is
  * built together with the libcudf it runs with.
  *
- * Each advised read gets its own request handle, since an advise attaches to one handle. The
- * handles live until this object is destroyed so that asynchronous reads stay valid. Safe to call
- * from several threads.
+ * Each advised read gets its own request handle, since an advise attaches to one handle. The cache
+ * uses the handle only while it starts the read, so the handle is dropped then, and the chunks it
+ * advised become eligible for eviction, in their priority order, as soon as nothing reads them.
+ * Safe to call from several threads.
  */
 class advising_reader {
  public:
   /**
    * @param context The io context that serves the reads and owns the cache.
    * @param object The opened object.
-   * @param admission Policy that decides what to advise. Shared between all the files of a scan.
-   * @param path Object path of the file, the key into @p admission.
+   * @param admission Policy that decides what to advise, keyed by the object's path. Shared
+   * between all the files of a scan.
    * @param min_advise_bytes Reads smaller than this are not advised. 0 advises nothing.
    */
   advising_reader(std::shared_ptr<ioctx> context,
                   std::shared_ptr<io_object> object,
                   std::shared_ptr<column_admission> admission,
-                  std::string path,
                   std::size_t min_advise_bytes);
   ~advising_reader();
 
@@ -92,17 +89,14 @@ class advising_reader {
                                                            ::cuda::stream_ref stream);
 
  private:
-  /// The request handle a read of [offset, offset + size) must go through: a new one that has
+  /// The request handle a read of [offset, offset + size) must start through: a new one that has
   /// advised the admitted ranges, or null if the read is small, refused, or there is no cache.
-  cache::cache_handle* route(std::size_t offset, std::size_t size);
+  std::unique_ptr<cache::cache_handle> route(std::size_t offset, std::size_t size);
 
   std::shared_ptr<ioctx> _context;
   std::shared_ptr<io_object> _object;
   std::shared_ptr<column_admission> _admission;
-  std::string _path;
   std::size_t _min_advise_bytes;
-  std::mutex _mutex;
-  std::vector<std::unique_ptr<cache::cache_handle>> _handles;
 };
 
 }  // namespace cucascade::io
