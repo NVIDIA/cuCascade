@@ -1012,14 +1012,18 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu_staged(
 
   std::vector<std::int64_t> string_sizes;
   if (reads_source) {
-    // Order the reads after the source's writer. An unknown writer makes this wait for the whole
-    // source device.
-    if (source.get_writer_event() == nullptr) {
-      nvtx_scope readiness_range{"staged:readiness"};
-      source.wait_for_writer(src_stream);
-      if (options.instrumentation != nullptr) { ++options.instrumentation->readiness_syncs; }
-    } else {
-      source.wait_for_writer(src_stream);
+    {
+      // Order the reads after the source's writer. The stream that is made to wait belongs to the
+      // source device, so that device must be current. An unknown writer makes this wait for the
+      // whole source device.
+      rmm::cuda_set_device_raii const source_guard{rmm::cuda_device_id{src_device}};
+      if (source.get_writer_event() == nullptr) {
+        nvtx_scope readiness_range{"staged:readiness"};
+        source.wait_for_writer(src_stream);
+        if (options.instrumentation != nullptr) { ++options.instrumentation->readiness_syncs; }
+      } else {
+        source.wait_for_writer(src_stream);
+      }
     }
     string_sizes =
       memory::detail::read_device_integers(summary.size_probes,
