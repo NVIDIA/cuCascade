@@ -17,13 +17,15 @@
 
 #pragma once
 
+#include "staged_copy.hpp"
+
 #include <cucascade/data/representation_converter.hpp>
 
 namespace cucascade {
 namespace detail {
 
 /**
- * @brief Options for the GPU -> GPU converter that only tests and benchmarks set.
+ * @brief Options of the GPU -> GPU converter beyond what the public registration exposes.
  *
  * They belong to the registry they were registered with, so two registries in one process can
  * route differently.
@@ -36,6 +38,13 @@ struct gpu_to_gpu_converter_options {
    * a machine with a single GPU, or with working peer access, still covers the staged route.
    */
   bool force_staged_route{false};
+
+  /// Bounds on the host memory a staged conversion borrows.
+  memory::detail::staged_copy_ring_settings ring_settings{};
+
+  /// Hooks and counters handed to every staged conversion; must outlive the registry. Null in
+  /// production.
+  memory::detail::staged_copy_instrumentation* instrumentation{nullptr};
 };
 
 /**

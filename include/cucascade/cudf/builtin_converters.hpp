@@ -19,7 +19,43 @@
 
 #include <cucascade/data/representation_converter.hpp>
 
+#include <cstddef>
+
 namespace cucascade {
+
+/**
+ * @brief Bounds on the pinned host memory one GPU -> GPU conversion borrows when the two devices
+ * cannot copy to each other directly.
+ *
+ * Such a conversion moves the table through a ring of host buffers: up to @ref ring_depth chunks
+ * of up to @ref chunk_bytes each are in flight at once, so it never holds more than their product
+ * (rounded up to the HOST pool's block size), and a table smaller than that holds about its own
+ * size. Larger chunks and a deeper ring trade host memory for fewer, longer copies.
+ */
+class staged_copy_settings {
+ public:
+  static constexpr std::size_t default_chunk_bytes = std::size_t{4} << 20;  ///< 4 MiB
+  static constexpr std::size_t default_ring_depth  = 4;
+  static constexpr std::size_t max_chunk_bytes     = std::size_t{1} << 30;  ///< 1 GiB
+  static constexpr std::size_t max_ring_depth      = 64;
+
+  /** @brief The defaults: four chunks of 4 MiB. */
+  staged_copy_settings() = default;
+
+  /**
+   * @param chunk_bytes Most bytes in one chunk, from 1 to @ref max_chunk_bytes
+   * @param ring_depth Most chunks in flight at once, from 1 to @ref max_ring_depth
+   * @throws std::invalid_argument if a value is zero or above its maximum
+   */
+  staged_copy_settings(std::size_t chunk_bytes, std::size_t ring_depth);
+
+  [[nodiscard]] std::size_t chunk_bytes() const noexcept { return _chunk_bytes; }
+  [[nodiscard]] std::size_t ring_depth() const noexcept { return _ring_depth; }
+
+ private:
+  std::size_t _chunk_bytes{default_chunk_bytes};
+  std::size_t _ring_depth{default_ring_depth};
+};
 
 /**
  * @brief Initialize the cudf-backed built-in representation converters.
@@ -40,5 +76,14 @@ namespace cucascade {
  * @param registry The converter registry to register converters with.
  */
 void register_builtin_converters(representation_converter_registry& registry);
+
+/**
+ * @brief register_builtin_converters() with explicit bounds for host-staged GPU -> GPU conversions.
+ *
+ * @param registry The converter registry to register converters with.
+ * @param staged_copy Bounds copied into the registered GPU -> GPU converter.
+ */
+void register_builtin_converters(representation_converter_registry& registry,
+                                 staged_copy_settings const& staged_copy);
 
 }  // namespace cucascade

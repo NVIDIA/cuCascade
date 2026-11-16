@@ -18,6 +18,12 @@
 #include "utils/mixed_table.hpp"
 #include "utils/peer_access_utils.hpp"
 
+#include <cudf/copying.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/type_checks.hpp>
+
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -29,7 +35,9 @@
 #include <future>
 #include <latch>
 #include <memory>
+#include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -325,6 +333,287 @@ TEST_CASE("gpu_to_gpu staged route copies a mixed table across GPUs in both dire
 
   check_staged_conversion(manager, kSourceDevice, kTargetDevice, rows);
   check_staged_conversion(manager, kTargetDevice, kSourceDevice, rows);
+}
+
+namespace {
+
+// A registry whose GPU -> GPU converter always stages, with the counters of its staged copies.
+struct staged_registry {
+  explicit staged_registry(memory::detail::staged_copy_ring_settings ring_settings = {})
+  {
+    detail::register_builtin_converters(
+      registry,
+      detail::gpu_to_gpu_converter_options{
+        .force_staged_route = true, .ring_settings = ring_settings, .instrumentation = &counters});
+  }
+
+  memory::detail::staged_copy_instrumentation counters;
+  representation_converter_registry registry;
+};
+
+auto one_gpu_spaces()
+{
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({kSourceDevice})
+    .set_gpu_usage_limit(1 * kGiB)
+    .use_numa_id_as_host_id()
+    .set_per_numa_region_capacity(256 * kMiB)
+    .set_host_portability(true);
+  return builder.build();
+}
+
+// The six fixed-width columns of test::make_mixed_table(); the other ten have children.
+const std::vector<cudf::size_type> kFixedWidthColumns{0, 1, 2, 3, 4, 5};
+
+}  // namespace
+
+TEST_CASE("gpu_to_gpu staged route waits a fixed number of times and borrows a bounded ring",
+          "[gpu-to-gpu-converter][staged-copy]")
+{
+  if (test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
+
+  memory_reservation_manager manager(one_gpu_spaces());
+  auto* const space = manager.get_memory_space(Tier::GPU, kSourceDevice);
+  REQUIRE(space != nullptr);
+
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kSourceDevice}};
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
+  auto const mr = space->get_default_allocator();
+
+  // Tens of MiB in 16 columns, several of them nested: far more than one ring.
+  constexpr cudf::size_type kRows = 200'000;
+  constexpr std::size_t kLargestRing =
+    staged_copy_settings::default_chunk_bytes * staged_copy_settings::default_ring_depth;
+  auto table = test::make_mixed_table(kRows, producer, mr);
+
+  staged_registry staged;
+  std::size_t const host_before = host_bytes_in_use(manager);
+  std::unique_ptr<gpu_table_representation> converted;
+
+  SECTION("a known writer: one wait for the string sizes and one for the last byte")
+  {
+    gpu_table_representation source{std::move(table), *space, producer};
+    converted = staged.registry.convert<gpu_table_representation>(source, space, consumer);
+
+    CHECK(staged.counters.readiness_syncs.load() == 0U);
+    CHECK(staged.counters.metadata_syncs.load() == 1U);
+  }
+
+  SECTION("an unknown writer adds one wait for the source device")
+  {
+    producer.synchronize();
+    gpu_table_representation source{
+      std::move(table), *space, ::cuda::stream_ref{cudaStream_t{nullptr}}};
+    converted = staged.registry.convert<gpu_table_representation>(source, space, consumer);
+
+    CHECK(staged.counters.readiness_syncs.load() == 1U);
+    CHECK(staged.counters.metadata_syncs.load() == 1U);
+  }
+
+  SECTION("fixed-width columns need no sizes from the device")
+  {
+    gpu_table_representation source{
+      std::make_unique<cudf::table>(table->select(kFixedWidthColumns), producer, mr),
+      *space,
+      producer};
+    converted = staged.registry.convert<gpu_table_representation>(source, space, consumer);
+
+    CHECK(staged.counters.readiness_syncs.load() == 0U);
+    CHECK(staged.counters.metadata_syncs.load() == 0U);
+    test::expect_cudf_tables_equal_on_stream(
+      table->select(kFixedWidthColumns), converted->get_table_view(), consumer);
+  }
+
+  REQUIRE(converted != nullptr);
+  CHECK(converted->get_table_view().num_rows() == kRows);
+  CHECK(staged.counters.final_syncs.load() == 1U);
+  CHECK(staged.counters.rings.load() == 1U);
+  CHECK(staged.counters.last_ring_bytes.load() <= kLargestRing);
+  CHECK(host_peak_bytes(manager) <= host_before + kLargestRing);
+  CHECK(host_bytes_in_use(manager) == host_before);
+
+  converted.reset();
+  table.reset();
+  producer.synchronize();
+  consumer.synchronize();
+}
+
+TEST_CASE("gpu_to_gpu staged route honours its ring settings",
+          "[gpu-to-gpu-converter][staged-copy]")
+{
+  if (test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
+
+  memory_reservation_manager manager(one_gpu_spaces());
+  auto* const space = manager.get_memory_space(Tier::GPU, kSourceDevice);
+  REQUIRE(space != nullptr);
+
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kSourceDevice}};
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
+  auto const mr = space->get_default_allocator();
+
+  constexpr cudf::size_type kRows = 200'000;
+  staged_registry staged{{.chunk_bytes = 1 * kMiB, .depth = 2}};
+
+  auto converted = [&] {
+    gpu_table_representation source{test::make_mixed_table(kRows, producer, mr), *space, producer};
+    return staged.registry.convert<gpu_table_representation>(source, space, consumer);
+  }();
+
+  // Two slots of one 1 MiB block carry the whole table.
+  CHECK(staged.counters.last_ring_bytes.load() == 2 * kMiB);
+  CHECK(staged.counters.final_syncs.load() == 1U);
+
+  auto expected = test::make_mixed_table(kRows, consumer, mr);
+  test::expect_cudf_tables_equal_on_stream(expected->view(), converted->get_table_view(), consumer);
+
+  expected.reset();
+  converted.reset();
+  producer.synchronize();
+  consumer.synchronize();
+}
+
+TEST_CASE("gpu_to_gpu staged route builds tables without rows on the host",
+          "[gpu-to-gpu-converter][staged-copy]")
+{
+  if (test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
+
+  memory_reservation_manager manager(one_gpu_spaces());
+  auto* const space = manager.get_memory_space(Tier::GPU, kSourceDevice);
+  REQUIRE(space != nullptr);
+
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kSourceDevice}};
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
+  auto const mr = space->get_default_allocator();
+
+  auto owner = std::shared_ptr<cudf::table>(test::make_mixed_table(1024, producer, mr));
+  producer.synchronize();
+
+  staged_registry staged;
+  std::size_t const host_peak_before = host_peak_bytes(manager);
+
+  // Nothing is read from the source, so nothing is waited for and no host memory is borrowed.
+  auto const check_built_on_host = [&](gpu_table_representation const& source) {
+    auto converted = staged.registry.convert<gpu_table_representation>(source, space, consumer);
+    REQUIRE(converted != nullptr);
+    auto const result = converted->get_table_view();
+    CHECK(result.num_rows() == 0);
+    CHECK(result.num_columns() == source.get_table_view().num_columns());
+    CHECK(cudf::have_same_types(source.get_table_view(), result));
+    CHECK(staged.counters.rings.load() == 0U);
+    CHECK(staged.counters.readiness_syncs.load() == 0U);
+    CHECK(staged.counters.metadata_syncs.load() == 0U);
+    CHECK(staged.counters.final_syncs.load() == 0U);
+    CHECK(host_peak_bytes(manager) == host_peak_before);
+  };
+
+  SECTION("a table without rows whose writer is unknown")
+  {
+    gpu_table_representation source{
+      cudf::empty_like(owner->view()), *space, ::cuda::stream_ref{cudaStream_t{nullptr}}};
+    check_built_on_host(source);
+  }
+
+  SECTION("views without rows that start past row 0 and keep their children")
+  {
+    auto const views = cudf::slice(owner->view(), {5, 5}, producer);
+    gpu_table_representation source{
+      views.front(), std::shared_ptr<cudf::table>{owner}, std::size_t{0}, *space, producer};
+    check_built_on_host(source);
+  }
+
+  SECTION("a table without columns")
+  {
+    gpu_table_representation source{std::make_unique<cudf::table>(), *space, producer};
+    check_built_on_host(source);
+  }
+
+  owner.reset();
+  producer.synchronize();
+  consumer.synchronize();
+}
+
+TEST_CASE("gpu_to_gpu staged route refuses sliced columns it cannot copy whole",
+          "[gpu-to-gpu-converter][staged-copy]")
+{
+  if (test::cuda_device_count() < 1) { SKIP("requires a GPU"); }
+
+  memory_reservation_manager manager(one_gpu_spaces());
+  auto* const space = manager.get_memory_space(Tier::GPU, kSourceDevice);
+  REQUIRE(space != nullptr);
+
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kSourceDevice}};
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
+  auto const mr = space->get_default_allocator();
+
+  constexpr cudf::size_type kRows = 1024;
+  auto owner = std::shared_ptr<cudf::table>(test::make_mixed_table(kRows, producer, mr));
+
+  staged_registry staged;
+  std::size_t const host_before = host_bytes_in_use(manager);
+
+  auto const convert_view = [&](cudf::table_view const& view) {
+    gpu_table_representation source{
+      view, std::shared_ptr<cudf::table>{owner}, std::size_t{0}, *space, producer};
+    return staged.registry.convert<gpu_table_representation>(source, space, consumer);
+  };
+
+  SECTION("a view that starts past row 0, whatever its type")
+  {
+    auto const tail = cudf::slice(owner->view(), {1, kRows}, producer).front();
+    CHECK_THROWS_AS(convert_view(tail), std::invalid_argument);
+    CHECK_THROWS_AS(convert_view(tail.select(kFixedWidthColumns)), std::invalid_argument);
+    CHECK(staged.counters.rings.load() == 0U);
+  }
+
+  SECTION("a view that ends early over a column with children")
+  {
+    auto const head = cudf::slice(owner->view(), {0, kRows - 1}, producer).front();
+    for (cudf::size_type column = 6; column < head.num_columns(); ++column) {
+      CAPTURE(column);
+      CHECK_THROWS_AS(convert_view(head.select({column})), std::invalid_argument);
+    }
+    CHECK(staged.counters.rings.load() == 0U);
+  }
+
+  SECTION("a view that ends early over fixed-width columns is copied")
+  {
+    auto const head =
+      cudf::slice(owner->view().select(kFixedWidthColumns), {0, kRows - 1}, producer).front();
+    auto converted = convert_view(head);
+    REQUIRE(converted != nullptr);
+    test::expect_cudf_tables_equal_on_stream(head, converted->get_table_view(), consumer);
+  }
+
+  CHECK(host_bytes_in_use(manager) == host_before);
+
+  owner.reset();
+  producer.synchronize();
+  consumer.synchronize();
+}
+
+TEST_CASE("staged copy settings reject values outside their range",
+          "[gpu-to-gpu-converter][staged-copy]")
+{
+  CHECK(staged_copy_settings{}.chunk_bytes() == std::size_t{4} << 20);
+  CHECK(staged_copy_settings{}.ring_depth() == 4U);
+
+  CHECK_NOTHROW(staged_copy_settings{1, 1});
+  CHECK_NOTHROW(staged_copy_settings{staged_copy_settings::max_chunk_bytes,
+                                     staged_copy_settings::max_ring_depth});
+  CHECK_THROWS_AS((staged_copy_settings{0, 4}), std::invalid_argument);
+  CHECK_THROWS_AS((staged_copy_settings{4 * kMiB, 0}), std::invalid_argument);
+  CHECK_THROWS_AS((staged_copy_settings{staged_copy_settings::max_chunk_bytes + 1, 4}),
+                  std::invalid_argument);
+  CHECK_THROWS_AS((staged_copy_settings{4 * kMiB, staged_copy_settings::max_ring_depth + 1}),
+                  std::invalid_argument);
+
+  representation_converter_registry registry;
+  CHECK_NOTHROW(register_builtin_converters(registry, staged_copy_settings{1 * kMiB, 2}));
+  CHECK(registry.has_converter<gpu_table_representation, gpu_table_representation>());
 }
 
 }  // namespace cucascade

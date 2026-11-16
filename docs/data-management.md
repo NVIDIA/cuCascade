@@ -331,8 +331,41 @@ Registered via `register_builtin_converters()`:
 | `host_data_representation` | `gpu_table_representation` | Allocates `rmm::device_buffer` per column buffer, `cudaMemcpyBatchAsync` (H2D), reconstructs `cudf::column` tree |
 | `gpu_table_representation` | `host_data_packed_representation` | `cudf::pack()` on GPU -> `cudaMemcpyAsync` (D2H) to multi-block host allocation |
 | `host_data_packed_representation` | `gpu_table_representation` | `cudaMemcpyAsync` (H2D) from host blocks -> `cudf::unpack()` on device |
-| `gpu_table_representation` | `gpu_table_representation` | `cudf::pack()` -> `cudaMemcpyPeerAsync` -> `cudf::unpack()` (cross-device copy) |
+| `gpu_table_representation` | `gpu_table_representation` | Same device: `clone()`. Verified peer route: `cudaMemcpyPeerAsync` per column buffer. Otherwise a staged copy through pinned host memory (below) |
 | `host_data_packed_representation` | `host_data_packed_representation` | Block-by-block `std::memcpy` + metadata copy (cross-NUMA copy) |
+
+### Staged GPU to GPU Copies
+
+When two devices cannot copy to each other directly (see the peer route verification in
+[memory-management.md](memory-management.md)), the GPU to GPU converter sends the table through
+pinned host memory:
+
+1. It validates the table and records every buffer, without touching the device.
+2. It reads the character sizes of all STRING columns in one device round trip.
+3. It allocates every destination buffer.
+4. It moves all buffers as one stream of chunks through a small ring of host slots. The copy to
+   the host runs on a stream of the source device and the copy from the host on a stream of the
+   destination device, so one chunk is read while an earlier one is still being written.
+5. It builds the `cudf::column` tree on the host from the filled buffers, with no kernels.
+
+The calling thread waits at most three times per conversion, whatever the schema: for the source
+device if the source has no writer event, for the STRING sizes if any STRING column has rows, and
+for the last chunk. A table without rows or columns is built on the host and waits for nothing.
+When the conversion returns, no read of the source is pending.
+
+The two streams are ordered only by events that were recorded before they are waited on, so
+conversions in any mix of directions run concurrently without locks and cannot deadlock.
+
+The ring holds at most `ring_depth` chunks of `chunk_bytes` (four chunks of 4 MiB by default; set
+with `register_builtin_converters(registry, staged_copy_settings{...})`), and about the size of the
+table when the table is smaller. It comes from the HOST pool of the destination device's NUMA
+node. If the pool cannot supply it, smaller rings are tried, down to one block; only then does the
+conversion fail with `rmm::out_of_memory`. Without a HOST memory space the ring is pinned for the
+duration of the call.
+
+Columns must be whole on this route. A view that starts past row 0, or one that ends early over a
+STRING, LIST, STRUCT or DICTIONARY32 column, is rejected with `std::invalid_argument` in every
+build type. The peer route does not check this yet.
 
 ### Conversion Flow
 

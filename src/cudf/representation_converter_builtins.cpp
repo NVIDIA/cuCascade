@@ -17,6 +17,7 @@
 
 #include "builtin_converters_detail.hpp"
 #include "cudf_compat.hpp"
+#include "staged_copy.hpp"
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
@@ -44,6 +45,7 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -65,8 +67,11 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -532,58 +537,10 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
 // =============================================================================
 
 /**
- * @brief Best-effort lookup of the NUMA node a GPU's PCI device is attached to.
- *        Returns -1 if the device id is invalid, the PCI bus id is unknown, or
- *        /sys/bus/pci/devices/<bus>/numa_node is unreadable / -1. Pure topology
- *        query — no allocation, no side effects.
- */
-int resolve_gpu_numa_node(int device_id) noexcept
-{
-  if (device_id < 0) { return -1; }
-  char pci_buf[32] = {0};
-  if (cudaDeviceGetPCIBusId(pci_buf, sizeof(pci_buf), device_id) != cudaSuccess) { return -1; }
-  std::string pci(pci_buf);
-  for (auto& c : pci) {
-    c = static_cast<char>(std::tolower(c));
-  }
-  std::ifstream f("/sys/bus/pci/devices/" + pci + "/numa_node");
-  if (!f.is_open()) { return -1; }
-  std::string content;
-  std::getline(f, content);
-  if (content.empty()) { return -1; }
-  try {
-    return std::stoi(content);
-  } catch (...) {
-    return -1;
-  }
-}
-
-/**
- * @brief How convert_gpu_to_gpu() moves bytes between two devices.
+ * @brief Enqueue a direct copy of @p size_in_bytes bytes from @p src_ptr on @p src_device into
+ * @p buf on @p dst_device, on @p target_stream.
  *
- * convert_gpu_to_gpu() picks the route once per conversion and every buffer of the table follows
- * it. Without a test override the choice comes from cucascade::memory::probe_peer_dma_works(),
- * which verifies a peer copy between two mutually granted private memory pools:
- *   - verified: PEER
- *   - wrong bytes or a CUDA error during verification: STAGED
- */
-enum class gpu_to_gpu_route {
-  PEER,   ///< cudaMemcpyPeerAsync (direct only when the pools are granted peer access)
-  STAGED  ///< Explicit two-leg copy through pinned host memory
-};
-
-/**
- * @brief Copy @p size bytes from @p src_ptr
- * (on @p src_device) into a buffer, by @p route.
- *
- * The host-staged copy goes through the pre-pinned HOST memory_space pool (registered by
- * memory_space's HOST constructor in register_host_pool) and chunks across the pool's fixed block
- * size, exactly like convert_gpu_to_host. We do the staging ourselves rather than relying on the
- * driver's auto-fallback, so the correctness path is identical and observable regardless of
- * driver/CUDA version quirks.
- *
- *   NEVER calls cudaHostAlloc per transfer — the pool is allocated once at
- *   memory_reservation_manager construction time.
+ * Only for device pairs whose direct route cucascade::memory::probe_peer_dma_works() verified.
  */
 template <typename Buffer>
 Buffer peer_copy_into_async(Buffer buf,
@@ -591,133 +548,12 @@ Buffer peer_copy_into_async(Buffer buf,
                             int src_device,
                             std::size_t size_in_bytes,
                             int dst_device,
-                            ::cuda::stream_ref target_stream,
-                            gpu_to_gpu_route route)
+                            ::cuda::stream_ref target_stream)
 {
   if (size_in_bytes == 0 || src_ptr == nullptr) { return buf; }
 
-  if (route == gpu_to_gpu_route::PEER) {
-    // Real peer DMA works on this hardware — direct path.
-    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
-      buf.data(), dst_device, src_ptr, src_device, size_in_bytes, target_stream.get()));
-    return buf;
-  }
-
-  // Peer DMA broken — stage through the pre-pinned HOST pool.
-  //
-  // Block layout: the host pool allocates non-contiguous fixed-size blocks
-  // (1 MB by default). We chunk the D2H and H2D legs across blocks just like
-  // convert_gpu_to_host does. Stream-ordering inside the loop preserves the
-  // same-stream invariant the original implementation relied on.
-  memory::fixed_size_host_memory_resource* host_pool =
-    memory::find_host_pool(resolve_gpu_numa_node(dst_device));
-  // Without working peer DMA, each leg must run with its own device current (the D2H leg
-  // fails with cudaErrorInvalidValue otherwise). Both legs stay on target_stream, so they are
-  // still ordered.
-
-  if (host_pool == nullptr) {
-    // No HOST memory_space has been registered. This should only happen in
-    // standalone test builds that exercise the converter without constructing
-    // a memory_reservation_manager. Fall back to a one-shot pinned allocation
-    // (slow path — preserves correctness).
-    memory::numa_region_pinned_host_memory_resource mr(resolve_gpu_numa_node(dst_device),
-                                                       /*make_portable=*/true);
-    void* host_buf = mr.allocate_sync(size_in_bytes);
-
-    try {
-      {
-        rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
-        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-          host_buf, src_ptr, size_in_bytes, cudaMemcpyDeviceToHost, target_stream.get()));
-      }
-      {
-        rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
-        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-          buf.data(), host_buf, size_in_bytes, cudaMemcpyHostToDevice, target_stream.get()));
-      }
-      target_stream.sync();
-    } catch (...) {
-      // best-effort drain before deallocating host side resources; a second failure must not
-      // replace the original exception or stay pending.
-      if (cudaStreamSynchronize(target_stream.get()) != cudaSuccess) {
-        std::ignore = cudaGetLastError();
-      }
-      mr.deallocate_sync(host_buf, size_in_bytes);
-      throw;
-    }
-    mr.deallocate_sync(host_buf, size_in_bytes);
-    return buf;
-  }
-
-  {
-    auto allocation            = host_pool->allocate_multiple_blocks(size_in_bytes);
-    const std::size_t block_sz = allocation->block_size();
-
-    try {
-      // Pass 1: device-to-host, chunked across blocks. Issued on target_stream
-      {
-        rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
-        std::size_t block_index  = 0;
-        std::size_t block_offset = 0;
-        std::size_t src_offset   = 0;
-        while (src_offset < size_in_bytes) {
-          const std::size_t remaining  = size_in_bytes - src_offset;
-          const std::size_t bytes_left = block_sz - block_offset;
-          const std::size_t to_copy    = std::min(remaining, bytes_left);
-          std::span<std::byte> block   = allocation->at(block_index);
-          CUCASCADE_CUDA_TRY(cudaMemcpyAsync(block.data() + block_offset,
-                                             static_cast<const std::uint8_t*>(src_ptr) + src_offset,
-                                             to_copy,
-                                             cudaMemcpyDeviceToHost,
-                                             target_stream.get()));
-          src_offset += to_copy;
-          block_offset += to_copy;
-          if (block_offset == block_sz) {
-            ++block_index;
-            block_offset = 0;
-          }
-        }
-      }
-
-      // Pass 2: host-to-device, chunked across the same blocks.
-      {
-        rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
-        std::size_t block_index  = 0;
-        std::size_t block_offset = 0;
-        std::size_t dst_offset   = 0;
-        while (dst_offset < size_in_bytes) {
-          const std::size_t remaining  = size_in_bytes - dst_offset;
-          const std::size_t bytes_left = block_sz - block_offset;
-          const std::size_t to_copy    = std::min(remaining, bytes_left);
-          std::span<std::byte> block   = allocation->at(block_index);
-          CUCASCADE_CUDA_TRY(
-            cudaMemcpyAsync(reinterpret_cast<std::uint8_t*>(buf.data()) + dst_offset,
-                            block.data() + block_offset,
-                            to_copy,
-                            cudaMemcpyHostToDevice,
-                            target_stream.get()));
-          dst_offset += to_copy;
-          block_offset += to_copy;
-          if (block_offset == block_sz) {
-            ++block_index;
-            block_offset = 0;
-          }
-        }
-      }
-
-      target_stream.sync();
-    } catch (...) {
-      // best-effort drain before the blocks return to the pool; a second failure must not
-      // replace the original exception or stay pending.
-      if (cudaStreamSynchronize(target_stream.get()) != cudaSuccess) {
-        std::ignore = cudaGetLastError();
-      }
-      throw;
-    }
-
-    // allocation's destructor returns blocks to the host pool — no cudaFreeHost.
-  }
-
+  CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
+    buf.data(), dst_device, src_ptr, src_device, size_in_bytes, target_stream.get()));
   return buf;
 }
 
@@ -738,8 +574,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
                                                            int src_device,
                                                            int dst_device,
                                                            ::cuda::stream_ref stream,
-                                                           rmm::device_async_resource_ref mr,
-                                                           gpu_to_gpu_route route)
+                                                           rmm::device_async_resource_ref mr)
 {
   assert(src.offset() == 0 && "column_view with non-zero offset is not supported");
 
@@ -748,13 +583,8 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     null_mask = cudf::create_null_mask(src.size(), cudf::mask_state::UNINITIALIZED, stream, mr);
     if (std::size_t const size_in_bytes = cudf_compat::get_null_mask_size_bytes(null_mask);
         size_in_bytes > 0) {
-      null_mask = peer_copy_into_async(std::move(null_mask),
-                                       src.null_mask(),
-                                       src_device,
-                                       size_in_bytes,
-                                       dst_device,
-                                       stream,
-                                       route);
+      null_mask = peer_copy_into_async(
+        std::move(null_mask), src.null_mask(), src_device, size_in_bytes, dst_device, stream);
     }
     // no sync needed here since cudf calls are ordered on the explicitly passed stream, and cudf
     // factories that do not take a stream do no GPU side work.
@@ -772,7 +602,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     // Copy offsets as-is (preserve source's INT32 vs INT64 type). make_strings_column
     // accepts either offset type.
     auto offsets_col =
-      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr, route);
+      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr);
 
     rmm::device_buffer chars_buf{};
     if (src.size() > 0 && src.data<char>() != nullptr) {
@@ -813,8 +643,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
                                          src_device,
                                          data_size_in_bytes,
                                          dst_device,
-                                         stream,
-                                         route);
+                                         stream);
       }
     }
     return cudf::make_strings_column(
@@ -828,9 +657,9 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     }
     // Preserve source's offsets type — make_lists_column accepts INT32 or INT64.
     auto offsets_col =
-      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr, route);
+      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr);
     auto values_col =
-      reconstruct_column_p2p_async(src.child(1), src_device, dst_device, stream, mr, route);
+      reconstruct_column_p2p_async(src.child(1), src_device, dst_device, stream, mr);
     return cudf::make_lists_column(
       src.size(), std::move(offsets_col), std::move(values_col), null_count, std::move(null_mask));
   }
@@ -840,7 +669,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     fields.reserve(static_cast<std::size_t>(src.num_children()));
     for (cudf::size_type i = 0; i < src.num_children(); ++i) {
       fields.push_back(
-        reconstruct_column_p2p_async(src.child(i), src_device, dst_device, stream, mr, route));
+        reconstruct_column_p2p_async(src.child(i), src_device, dst_device, stream, mr));
     }
     // Construct directly to skip make_structs_column's superimpose_nulls kernel —
     // our peer-copied null masks are already consistent (mirrors reconstruct_column()).
@@ -861,9 +690,8 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
     // cudf DICTIONARY32 child order: [0]=indices, [1]=keys.
     // make_dictionary_column parameter order: (keys, indices, ...).
     auto indices_col =
-      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr, route);
-    auto keys_col =
-      reconstruct_column_p2p_async(src.child(1), src_device, dst_device, stream, mr, route);
+      reconstruct_column_p2p_async(src.child(0), src_device, dst_device, stream, mr);
+    auto keys_col = reconstruct_column_p2p_async(src.child(1), src_device, dst_device, stream, mr);
     return cudf::make_dictionary_column(
       std::move(keys_col), std::move(indices_col), std::move(null_mask), null_count);
   }
@@ -877,11 +705,326 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
                                     src_device,
                                     data_size,
                                     dst_device,
-                                    stream,
-                                    route);
+                                    stream);
   }
   return std::make_unique<cudf::column>(
     src.type(), src.size(), std::move(data_buf), std::move(null_mask), null_count);
+}
+
+// =============================================================================
+// Host-staged GPU -> GPU converter (device pairs without a working direct route)
+// =============================================================================
+
+/**
+ * @brief One column of a table that is about to be copied through host memory.
+ *
+ * Built in two passes over the source. The first validates the column and records what it holds;
+ * the second, once the sizes of STRING characters are known, allocates the destination buffers.
+ */
+struct staged_column {
+  cudf::data_type type{cudf::type_id::EMPTY};
+  cudf::size_type rows{0};
+  cudf::size_type null_count{0};
+
+  void const* source_mask{nullptr};
+  std::size_t mask_bytes{0};  ///< The bitmask words covering `rows`; zero if not nullable
+  void const* source_data{nullptr};
+  std::size_t data_bytes{0};  ///< Unknown for STRING characters until the size probe is read
+  std::optional<std::size_t> size_probe;  ///< Which probe holds the size of the characters
+
+  rmm::device_buffer mask;
+  rmm::device_buffer data;
+  std::vector<staged_column> children;
+
+  /// Set for a column without rows, which is built on the host and copies nothing.
+  std::unique_ptr<cudf::column> empty;
+};
+
+/** @brief What the first planning pass learns about the table as a whole. */
+struct staged_table_summary {
+  std::vector<memory::detail::device_integer_probe> size_probes;
+  bool reads_source{false};  ///< Whether any byte of the source is read at all
+};
+
+[[noreturn]] void reject_staged_column(std::string const& reason)
+{
+  throw std::invalid_argument("host-staged GPU to GPU conversion: " + reason);
+}
+
+/**
+ * @brief An empty column with the type of @p view, built without touching the device.
+ *
+ * Nested types keep their shape: a LIST has an empty offsets child and an empty child of its
+ * element type, a STRUCT has empty fields, and a DICTIONARY32 has empty indices and empty keys of
+ * its key type (the keys of a dictionary without rows are not copied). A STRING has no children.
+ */
+std::unique_ptr<cudf::column> make_empty_like(cudf::column_view const& view)
+{
+  auto const empty_leaf = [](cudf::data_type type) {
+    return std::make_unique<cudf::column>(type, 0, rmm::device_buffer{}, rmm::device_buffer{}, 0);
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> children;
+  switch (view.type().id()) {
+    case cudf::type_id::LIST:
+    case cudf::type_id::DICTIONARY32:
+      // child 0 is the offsets (LIST) or the indices (DICTIONARY32), a column without children.
+      if (view.num_children() == 2) {
+        children.push_back(empty_leaf(view.child(0).type()));
+        children.push_back(make_empty_like(view.child(1)));
+      }
+      break;
+    case cudf::type_id::STRUCT:
+      for (cudf::size_type i = 0; i < view.num_children(); ++i) {
+        children.push_back(make_empty_like(view.child(i)));
+      }
+      break;
+    default: break;
+  }
+  return std::make_unique<cudf::column>(
+    view.type(), 0, rmm::device_buffer{}, rmm::device_buffer{}, 0, std::move(children));
+}
+
+/// An offsets child must be whole: one entry more than its parent has rows, starting at entry 0.
+void require_whole_offsets(cudf::column_view const& offsets,
+                           cudf::size_type parent_rows,
+                           char const* parent_type)
+{
+  auto const id = offsets.type().id();
+  if ((id != cudf::type_id::INT32 && id != cudf::type_id::INT64) || offsets.offset() != 0 ||
+      static_cast<std::int64_t>(offsets.size()) != static_cast<std::int64_t>(parent_rows) + 1) {
+    reject_staged_column(std::string{"the offsets of a "} + parent_type +
+                         " column are sliced or malformed");
+  }
+}
+
+/**
+ * @brief First pass: validate @p view and record its buffers, without touching the device.
+ *
+ * A column must be whole. A view that starts past row 0 is rejected for every type, and so is a
+ * view that ends early when the column has children, because the children would not match it.
+ *
+ * @throws std::invalid_argument if the column is sliced, malformed or of an unsupported type
+ */
+staged_column plan_staged_column(cudf::column_view const& view, staged_table_summary& summary)
+{
+  staged_column plan;
+  plan.type = view.type();
+  plan.rows = view.size();
+  if (view.size() == 0) {
+    plan.empty = make_empty_like(view);
+    return plan;
+  }
+
+  if (view.offset() != 0) { reject_staged_column("a column view that starts past row 0"); }
+
+  auto const rows = static_cast<std::size_t>(view.size());
+  plan.null_count = view.null_count();
+  if (view.nullable()) {
+    plan.source_mask = view.null_mask();
+    plan.mask_bytes =
+      static_cast<std::size_t>(cudf::num_bitmask_words(view.size())) * sizeof(cudf::bitmask_type);
+    summary.reads_source = true;
+  }
+
+  switch (view.type().id()) {
+    case cudf::type_id::STRING: {
+      if (view.num_children() != 1) {
+        reject_staged_column("a STRING column with rows needs an offsets child");
+      }
+      auto const offsets = view.child(0);
+      require_whole_offsets(offsets, view.size(), "STRING");
+      // The last offset is the size of the characters, known only on the device.
+      plan.source_data = view.head();
+      plan.size_probe  = summary.size_probes.size();
+      auto const width = cudf::size_of(offsets.type());
+      summary.size_probes.push_back(
+        {static_cast<std::byte const*>(offsets.head()) + rows * width, width});
+      plan.children.push_back(plan_staged_column(offsets, summary));
+      break;
+    }
+    case cudf::type_id::LIST: {
+      if (view.num_children() != 2) {
+        reject_staged_column("a LIST column needs an offsets child and a values child");
+      }
+      require_whole_offsets(view.child(0), view.size(), "LIST");
+      plan.children.push_back(plan_staged_column(view.child(0), summary));
+      plan.children.push_back(plan_staged_column(view.child(1), summary));
+      break;
+    }
+    case cudf::type_id::STRUCT: {
+      for (cudf::size_type i = 0; i < view.num_children(); ++i) {
+        if (view.child(i).size() != view.size()) {
+          reject_staged_column("a STRUCT field differs in length from its column");
+        }
+        plan.children.push_back(plan_staged_column(view.child(i), summary));
+      }
+      break;
+    }
+    case cudf::type_id::DICTIONARY32: {
+      if (view.num_children() != 2 || view.child(0).size() != view.size()) {
+        reject_staged_column("the indices of a DICTIONARY32 column are missing or sliced");
+      }
+      plan.children.push_back(plan_staged_column(view.child(0), summary));
+      plan.children.push_back(plan_staged_column(view.child(1), summary));
+      break;
+    }
+    default: {
+      if (cudf::is_fixed_width(view.type())) {
+        if (view.head() == nullptr) { reject_staged_column("a column with rows has no data"); }
+        plan.source_data     = view.head();
+        plan.data_bytes      = rows * cudf::size_of(view.type());
+        summary.reads_source = true;
+      } else if (view.type().id() != cudf::type_id::EMPTY) {
+        reject_staged_column("unsupported column type " +
+                             std::to_string(static_cast<int>(view.type().id())));
+      }
+      break;
+    }
+  }
+  return plan;
+}
+
+/**
+ * @brief Second pass: allocate the destination buffers of @p plan on @p stream and append one
+ * segment per buffer to @p segments, in the order mask, data, children.
+ *
+ * A destination mask has cudf's padded size but only the words covering the rows are copied, which
+ * is all a source mask is sure to hold.
+ */
+void allocate_staged_column(staged_column& plan,
+                            std::span<std::int64_t const> string_sizes,
+                            ::cuda::stream_ref stream,
+                            rmm::device_async_resource_ref mr,
+                            std::vector<memory::detail::staged_copy_segment>& segments)
+{
+  if (plan.empty) { return; }
+
+  if (plan.mask_bytes > 0) {
+    plan.mask = rmm::device_buffer(cudf::bitmask_allocation_size_bytes(plan.rows), stream, mr);
+    segments.push_back({plan.source_mask, plan.mask.data(), plan.mask_bytes});
+  }
+  if (plan.size_probe) {
+    std::int64_t const characters = string_sizes[*plan.size_probe];
+    if (characters < 0) { reject_staged_column("the last offset of a STRING column is negative"); }
+    plan.data_bytes = static_cast<std::size_t>(characters);
+    if (plan.data_bytes > 0 && plan.source_data == nullptr) {
+      reject_staged_column("a STRING column has offsets past its characters");
+    }
+  }
+  if (plan.data_bytes > 0) {
+    plan.data = rmm::device_buffer(plan.data_bytes, stream, mr);
+    segments.push_back({plan.source_data, plan.data.data(), plan.data_bytes});
+  }
+  for (auto& child : plan.children) {
+    allocate_staged_column(child, string_sizes, stream, mr, segments);
+  }
+}
+
+/**
+ * @brief Turn a planned column, whose buffers have been filled, into a cudf column.
+ *
+ * Uses the cudf::column constructor for every type, which only takes ownership. The cudf factory
+ * functions are avoided because some launch kernels that read the buffers, on a stream this
+ * conversion does not control.
+ */
+std::unique_ptr<cudf::column> assemble_staged_column(staged_column&& plan)
+{
+  if (plan.empty) { return std::move(plan.empty); }
+
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.reserve(plan.children.size());
+  for (auto& child : plan.children) {
+    children.push_back(assemble_staged_column(std::move(child)));
+  }
+  return std::make_unique<cudf::column>(plan.type,
+                                        plan.rows,
+                                        std::move(plan.data),
+                                        std::move(plan.mask),
+                                        plan.null_count,
+                                        std::move(children));
+}
+
+/**
+ * @brief Copy @p source to the device of @p target_memory_space through pinned host memory.
+ *
+ * The table is validated and measured first, every destination buffer is allocated next, and all
+ * buffers then travel in one memory::detail::staged_copy() call. The calling thread waits at most
+ * three times, whatever the schema: for the source's writer if that is unknown, for the sizes of
+ * the STRING columns if there are any with rows, and for the last byte to arrive. A table without
+ * rows or without columns is built on the host and waits for nothing.
+ *
+ * The source may be freed as soon as this returns: no read of it is pending.
+ *
+ * @throws std::invalid_argument if a column is sliced, malformed or of an unsupported type
+ */
+std::unique_ptr<idata_representation> convert_gpu_to_gpu_staged(
+  gpu_table_representation const& source,
+  memory::memory_space& target_memory_space,
+  detail::gpu_to_gpu_converter_options const& options)
+{
+  nvtx_scope staged_range{"convert:gpu_to_gpu:host_staging"};
+
+  int const src_device = source.get_device_id();
+  int const dst_device = target_memory_space.get_device_id();
+
+  // Declared before anything that owns destination memory, so that memory is freed with its
+  // device current when an exception unwinds this frame.
+  rmm::cuda_set_device_raii const target_guard{rmm::cuda_device_id{dst_device}};
+
+  // Each leg runs on a stream of the device it reads or writes.
+  ::cuda::stream_ref const src_stream = source.get_memory_space().acquire_stream();
+  ::cuda::stream_ref const dst_stream = target_memory_space.acquire_stream();
+
+  cudf::table_view const src_view = source.get_table_view();
+  staged_table_summary summary;
+  std::vector<staged_column> plans;
+  plans.reserve(static_cast<std::size_t>(src_view.num_columns()));
+  for (cudf::column_view const& column : src_view) {
+    plans.push_back(plan_staged_column(column, summary));
+  }
+  bool const reads_source = summary.reads_source || !summary.size_probes.empty();
+
+  std::vector<std::int64_t> string_sizes;
+  if (reads_source) {
+    // Order the reads after the source's writer. An unknown writer makes this wait for the whole
+    // source device.
+    if (source.get_writer_event() == nullptr) {
+      nvtx_scope readiness_range{"staged:readiness"};
+      source.wait_for_writer(src_stream);
+      if (options.instrumentation != nullptr) { ++options.instrumentation->readiness_syncs; }
+    } else {
+      source.wait_for_writer(src_stream);
+    }
+    string_sizes =
+      memory::detail::read_device_integers(summary.size_probes,
+                                           {src_device, src_stream},
+                                           source.get_memory_space().get_default_allocator(),
+                                           options.instrumentation);
+  }
+
+  std::vector<memory::detail::staged_copy_segment> segments;
+  auto const mr = target_memory_space.get_default_allocator();
+  for (auto& plan : plans) {
+    allocate_staged_column(plan, string_sizes, dst_stream, mr, segments);
+  }
+
+  memory::detail::staged_copy(segments,
+                              {src_device, src_stream},
+                              {dst_device, dst_stream},
+                              options.ring_settings,
+                              options.instrumentation);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(plans.size());
+  for (auto& plan : plans) {
+    columns.push_back(assemble_staged_column(std::move(plan)));
+  }
+
+  // The destination buffers were written on dst_stream; the representation records an event on it
+  // for readers on other streams.
+  return std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(columns)), target_memory_space, dst_stream);
 }
 
 /**
@@ -920,13 +1063,14 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
 
   auto const src_device_id = gpu_source.get_device_id();
   auto const dst_device_id = target_memory_space->get_device_id();
-  auto const route =
-    !options.force_staged_route && memory::probe_peer_dma_works(src_device_id, dst_device_id)
-      ? gpu_to_gpu_route::PEER
-      : gpu_to_gpu_route::STAGED;
-  auto const copy_path = route == gpu_to_gpu_route::PEER ? "convert:gpu_to_gpu:peer_copy"
-                                                         : "convert:gpu_to_gpu:host_staging";
-  nvtx_scope copy_path_range{copy_path};
+
+  // The route is chosen once for the whole table: a direct copy where the pair's peer route is
+  // verified, a copy through pinned host memory otherwise.
+  if (options.force_staged_route || !memory::probe_peer_dma_works(src_device_id, dst_device_id)) {
+    return convert_gpu_to_gpu_staged(
+      gpu_source, *const_cast<memory::memory_space*>(target_memory_space), options);
+  }
+  nvtx_scope copy_path_range{"convert:gpu_to_gpu:peer_copy"};
 
   rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{dst_device_id}};
 
@@ -951,7 +1095,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
     target_columns.reserve(static_cast<std::size_t>(src_view.num_columns()));
     for (const cudf::column_view& col : src_view) {
       target_columns.push_back(
-        reconstruct_column_p2p_async(col, src_device_id, dst_device_id, target_stream, mr, route));
+        reconstruct_column_p2p_async(col, src_device_id, dst_device_id, target_stream, mr));
     }
 
     new_table = std::make_unique<cudf::table>(std::move(target_columns));
@@ -1905,9 +2049,28 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 
 }  // namespace
 
+staged_copy_settings::staged_copy_settings(std::size_t chunk_bytes, std::size_t ring_depth)
+  : _chunk_bytes(chunk_bytes), _ring_depth(ring_depth)
+{
+  if (chunk_bytes == 0 || chunk_bytes > max_chunk_bytes || ring_depth == 0 ||
+      ring_depth > max_ring_depth) {
+    throw std::invalid_argument(
+      "staged_copy_settings: chunk_bytes must be 1 B to 1 GiB and ring_depth 1 to 64");
+  }
+}
+
 void register_builtin_converters(representation_converter_registry& registry)
 {
-  detail::register_builtin_converters(registry, detail::gpu_to_gpu_converter_options{});
+  register_builtin_converters(registry, staged_copy_settings{});
+}
+
+void register_builtin_converters(representation_converter_registry& registry,
+                                 staged_copy_settings const& staged_copy)
+{
+  detail::gpu_to_gpu_converter_options options;
+  options.ring_settings.chunk_bytes = staged_copy.chunk_bytes();
+  options.ring_settings.depth       = staged_copy.ring_depth();
+  detail::register_builtin_converters(registry, options);
 }
 
 namespace detail {
@@ -1917,9 +2080,10 @@ void register_builtin_converters(representation_converter_registry& registry,
 {
   // GPU -> GPU (cross-device copy). convert_gpu_to_gpu copies each column buffer with
   // cudaMemcpyPeerAsync when cucascade::memory::probe_peer_dma_works() verifies the direction, and
-  // stages through pinned host memory otherwise. The cached probe copies bytes between two mutually
-  // granted private pools, so a verification failure means the pool peer route delivered wrong
-  // bytes, as on platforms whose direct route reports success but leaves stale data.
+  // sends the whole table through a ring of pinned host memory otherwise. The cached probe copies
+  // bytes between two mutually granted private pools, so a verification failure means the pool
+  // peer route delivered wrong bytes, as on platforms whose direct route reports success but
+  // leaves stale data.
   registry.register_converter<gpu_table_representation, gpu_table_representation>(
     [gpu_to_gpu_options](const idata_representation& source,
                          const memory::memory_space* target_memory_space,

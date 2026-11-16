@@ -404,6 +404,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
                                                       cudf::cudf)
   target_include_directories(cucascade_cudf_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  # Internal headers of the core library that the converters build on.
+  target_include_directories(cucascade_cudf_objects
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/memory)
   target_compile_definitions(cucascade_cudf_objects
                              PUBLIC ${CUCASCADE_PUBLIC_COMPILE_DEFS})
   target_compile_features(cucascade_cudf_objects PUBLIC cxx_std_20)
