@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "utils/allocation_counter.hpp"
+
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
@@ -22,6 +24,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <catch2/catch_all.hpp>
@@ -30,9 +33,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <set>
 #include <stop_token>
@@ -307,6 +312,59 @@ TEST_CASE("Pool expansion provides more slabs", "[small_pinned]")
   for (auto* p : allocs) {
     f.slab_mr.deallocate(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}, p, alloc_size);
   }
+}
+
+TEST_CASE("A failed pool expansion hands out no slab of the block it gave back", "[small_pinned]")
+{
+  // 128 slabs per block, so publishing them grows an unreserved free list several times.
+  constexpr std::size_t bytes = 512;
+  ::cuda::stream_ref const stream{cudaStream_t{cudaStreamDefault}};
+  test_fixture f;
+  auto const free_before = f.upstream.get_free_blocks();
+
+  // Fail each allocation a fresh pool's first request makes in turn (the upstream block, then
+  // the pool's lists) until a request makes them all. A failed request has given the block back
+  // upstream, which hands it to its next borrower; the pool must then not hand out a slab inside
+  // it as well.
+  std::size_t faults = 0;
+  for (std::size_t n = 1;; ++n) {
+    small_pinned_host_memory_resource mr{f.upstream};
+    void* slab    = nullptr;
+    bool injected = false;  // the fault armed at n, not an exhaustion (rmm::bad_alloc)
+    bool other    = false;
+    std::size_t made{};
+    {
+      cucascade::test::scoped_allocation_counter counter;
+      counter.fail_at(n);
+      try {
+        slab = mr.allocate(stream, bytes);
+      } catch (rmm::bad_alloc const&) {
+        other = true;
+      } catch (std::bad_alloc const&) {
+        injected = true;
+      }
+      made = counter.count();
+    }
+    INFO("fault armed at allocation " << n << " of the first request");
+    REQUIRE_FALSE(other);
+    if (made < n) {  // never reached the fault: the request completed
+      REQUIRE_FALSE(injected);
+      REQUIRE(slab != nullptr);
+      mr.deallocate(stream, slab, bytes);
+      break;
+    }
+    ++faults;
+    REQUIRE(injected);
+    REQUIRE(f.upstream.get_free_blocks() == free_before);
+
+    auto borrowed     = f.upstream.allocate_multiple_blocks(test_fixture::block_size);
+    void* const next  = mr.allocate(stream, bytes);
+    auto const block  = reinterpret_cast<std::uintptr_t>(borrowed->get_blocks().front());
+    auto const reused = reinterpret_cast<std::uintptr_t>(next);
+    CHECK((reused + bytes <= block || block + test_fixture::block_size <= reused));
+    mr.deallocate(stream, next, bytes);
+  }
+  CHECK(faults >= 3);  // the upstream block, the free list and the list of owned blocks
 }
 
 TEST_CASE("Freed slabs are reused", "[small_pinned]")

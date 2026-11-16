@@ -151,7 +151,8 @@ class small_pinned_host_memory_resource {
   static std::size_t slab_index_for(std::size_t bytes) noexcept;
 
   /// Populate the free list for slab @p idx by acquiring one upstream block.
-  /// Must be called with mutex_ held.
+  /// If it throws, no slab was added and the block went back upstream. Must be
+  /// called with mutex_ held.
   void expand_pool_locked(std::size_t slab_idx);
 
   /// A free slab plus, when it was just deallocated, a CUDA event recorded on
