@@ -2269,8 +2269,12 @@ void cufile_reactor::poll_completions() noexcept
           _waiting.push_back(std::move(waiting));
           continue;
         }
-        served_bytes += waiting.slice.size();
+        auto const bytes = waiting.slice.size();
+        served_bytes += bytes;
+        // Counted while its transfer runs, as in a worker pass.
+        _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
         dispatch_slice(waiting.obj, std::move(waiting.slice), waiting.coordinator, true);
+        _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         continue;
       }
       if (status != cudaSuccess) error = status;
@@ -2432,11 +2436,14 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
           cancel_request(scheduler.active, canceled_error());
           break;
         }
-        auto slice = scheduler.active->take_front();
-        pass_bytes += slice.size();
-        _queued_bytes.fetch_sub(slice.size(), std::memory_order_relaxed);
+        auto slice       = scheduler.active->take_front();
+        auto const bytes = slice.size();
+        pass_bytes += bytes;
         scheduler.on_slice_dispatched();
         dispatch_slice(scheduler.active->obj, std::move(slice), scheduler.active->coordinator);
+        // Counted until here: the transfer runs on this worker, and a reactor busy with a long
+        // one must not look idle to the ioctx's reactor selection.
+        _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
       }
       if (scheduler.active != nullptr && scheduler.active->empty()) { scheduler.active.reset(); }
 
