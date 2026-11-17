@@ -53,8 +53,8 @@ struct source_span {
 inline constexpr std::size_t host_page_bytes = 4096;
 
 /**
- * @brief Smallest piece that is moved to a page boundary, so that the padding is at most an eighth
- * of the bytes it aligns.
+ * @brief Smallest piece that is moved to a page boundary, so that the padding (4KiB) is at most an
+ * eighth of the bytes it aligns.
  */
 inline constexpr std::size_t aligned_piece_min_bytes = 32 * 1024;
 

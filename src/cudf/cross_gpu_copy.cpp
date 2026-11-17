@@ -286,13 +286,13 @@ class source_reader {
   }
   if (offsets.empty()) { return {}; }
 
-  constexpr std::size_t slot_bytes              = sizeof(std::int64_t);
-  std::size_t const bytes                       = offsets.size() * slot_bytes;
+  constexpr std::size_t entry_bytes             = sizeof(std::int64_t);
+  std::size_t const bytes                       = offsets.size() * entry_bytes;
   rmm::host_device_async_resource_ref pinned_mr = cudf::get_pinned_memory_resource();
   auto release                                  = [pinned_mr, bytes](void* p) mutable noexcept {
-    pinned_mr.deallocate_sync(p, bytes, slot_bytes);
+    pinned_mr.deallocate_sync(p, bytes, entry_bytes);
   };
-  std::unique_ptr<void, decltype(release)> scratch{pinned_mr.allocate_sync(bytes, slot_bytes),
+  std::unique_ptr<void, decltype(release)> scratch{pinned_mr.allocate_sync(bytes, entry_bytes),
                                                    release};
   auto* const host = static_cast<std::byte*>(scratch.get());
 
@@ -301,7 +301,7 @@ class source_reader {
     rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{reader.get_source().get_device_id()}};
     batch_copy_accumulator batch;
     for (std::size_t i = 0; i < offsets.size(); ++i) {
-      batch.add(host + i * slot_bytes, offsets[i].address, offsets[i].width);
+      batch.add(host + i * entry_bytes, offsets[i].address, offsets[i].width);
     }
     batch.flush(stream, cudaMemcpySrcAccessOrderStream);
     stream.sync();
@@ -317,10 +317,10 @@ class source_reader {
     std::int64_t value = 0;
     if (offsets[i].width == sizeof(std::int32_t)) {
       std::int32_t narrow = 0;
-      std::memcpy(&narrow, host + i * slot_bytes, sizeof(narrow));
+      std::memcpy(&narrow, host + i * entry_bytes, sizeof(narrow));
       value = narrow;
     } else {
-      std::memcpy(&value, host + i * slot_bytes, sizeof(value));
+      std::memcpy(&value, host + i * entry_bytes, sizeof(value));
     }
     sizes.push_back(static_cast<std::size_t>(std::max<std::int64_t>(value, 0)));
   }
@@ -444,8 +444,6 @@ class table_builder {
         for (cudf::size_type i = 0; i < src.num_children(); ++i) {
           fields.push_back(build_column(src.child(i)));
         }
-        // Construct directly to skip make_structs_column's null superimposition: the copied
-        // null masks are already consistent.
         return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRUCT},
                                               src.size(),
                                               rmm::device_buffer{},
@@ -604,8 +602,6 @@ class host_staged_pipeline {
       // The slot just drained is the one the next unfilled chunk uses.
       if (_filled_chunks < chunks) { fill_next(); }
     }
-    // The last chunk drains after every earlier chunk on the target stream, and each chunk drains
-    // after it was filled, so this covers every copy in both legs.
     if (chunks > 0) { _drained[(chunks - 1) % _depth].synchronize(); }
   }
 
@@ -662,6 +658,7 @@ class host_staged_pipeline {
   return *host_space;
 }
 
+//===----------PEER ROUTE----------===//
 [[nodiscard]] std::unique_ptr<cudf::table> copy_over_peer_route(source_reader& reader,
                                                                 cudf::table_view const& view,
                                                                 memory::memory_space const& target,
@@ -676,30 +673,25 @@ class host_staged_pipeline {
   std::optional<nvtx_scope> plan_range{std::in_place, "convert:gpu_to_gpu:plan"};
   std::vector<std::size_t> const chars_sizes = read_chars_sizes(reader, view);
 
-  // Leaf copies in byte-stream order. The first `started` are enqueued; the first `startable`
-  // belong to finished columns. A copy into a column must not start before `columns` owns the
-  // column: one that fails part-way is freed while the stack unwinds, before the handler can
-  // drain.
   std::vector<leaf_copy> copies;
-  std::size_t started   = 0;
-  std::size_t startable = 0;
+  std::size_t started   = 0;  // Copies already submitted
+  std::size_t startable = 0;  // Copies belonging to fully built, owned columns
   auto start_next_copy  = [&] {
     leaf_copy const& copy = copies[started];
     CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
       copy.dst, dst_device, copy.src, src_device, copy.size, target_stream.get()));
     ++started;
   };
+
   // Each buffer that is allocated starts one copy into an earlier, finished column, so copies
-  // and allocations alternate and overlap. Copies enqueued back to back run slower.
+  // and allocations alternate and overlap.
   auto record_copy = [&](leaf_copy const& copy) {
     copies.push_back(copy);
     if (started < startable) { start_next_copy(); }
   };
   table_builder builder{chars_sizes, target_stream, target.get_default_allocator(), record_copy};
 
-  // Owns every finished column. Declared before the try block so that, on a failure, the columns
-  // outlive the drain in the handler.
-  std::vector<std::unique_ptr<cudf::column>> columns;
+  std::vector<std::unique_ptr<cudf::column>> columns;  // Owned, finished columns
   columns.reserve(static_cast<std::size_t>(view.num_columns()));
   try {
     source.wait_for_writer(target_stream);
@@ -711,18 +703,15 @@ class host_staged_pipeline {
     while (started < copies.size()) {
       start_next_copy();
     }
-    // Sync for the source's lifetime: a caller may free the source right after the conversion, on
-    // a stream not ordered with these reads.
     target_stream.sync();
   } catch (...) {
-    // Drain before `columns` frees the destination buffers the copies write, and so that no copy
-    // still reads the source when the exception leaves.
     drain_after_failure(target_stream);
     throw;
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
+//===----------HOST-STAGED ROUTE----------===//
 [[nodiscard]] std::unique_ptr<cudf::table> copy_over_host_staged_route(
   source_reader& reader,
   cudf::table_view const& view,
@@ -760,9 +749,7 @@ class host_staged_pipeline {
   table_builder builder{
     chars_sizes, target_stream, target.get_default_allocator(), record_destination};
 
-  // Owns every finished column. Declared before the staging memory and the try block so that, on
-  // a failure, the columns outlive the drains in the handler.
-  std::vector<std::unique_ptr<cudf::column>> columns;
+  std::vector<std::unique_ptr<cudf::column>> columns;  // Owned, finished columns
   columns.reserve(static_cast<std::size_t>(view.num_columns()));
   auto build_columns = [&] {
     for (cudf::column_view const& col : view) {
@@ -778,13 +765,9 @@ class host_staged_pipeline {
   }
 
   memory::memory_space& host_space = find_staging_space(target);
-
-  // A table that fits one staging slot is a single chunk, and no more slots are held than the
-  // table has chunks. Padding is counted at its upper bound, so a table that only just fits its
-  // slots can hold one slot more than it uses.
-  std::size_t const staged_bytes = total_bytes + detail::alignment_padding_bound(spans);
-  std::size_t const slot_bytes   = std::min(config.chunk_size_bytes, staged_bytes);
-  std::size_t const max_chunks   = ::cuda::ceil_div(staged_bytes, slot_bytes);
+  std::size_t const staged_bytes   = total_bytes + detail::alignment_padding_bound(spans);
+  std::size_t const slot_bytes     = std::min(config.chunk_size_bytes, staged_bytes);
+  std::size_t const max_chunks     = ::cuda::ceil_div(staged_bytes, slot_bytes);
   staging_memory const staging{host_space, slot_bytes, std::min(config.pipeline_depth, max_chunks)};
 
   try {
@@ -793,20 +776,16 @@ class host_staged_pipeline {
                                    .source_stream      = reader.get_ordered_stream(),
                                    .target_stream      = target_stream};
     host_staged_pipeline pipeline{spans, staging.get_layout(), endpoints};
-    // A single chunk is filled and drained back to back instead: its drain is one batch with a
-    // piece per leaf buffer, and such a batch runs piece by piece, several times slower, when it
-    // is enqueued on a target stream that has gone idle because the fill finished long before.
     if (pipeline.get_chunk_count() > 1) { pipeline.prefill(); }
-    // No copy into a destination buffer starts before finish(), so a column that fails part-way
-    // frees buffers that no copy writes.
     build_columns();
     plan_range.reset();
 
     nvtx_scope const pipeline_range{"convert:gpu_to_gpu:host_staged_pipeline"};
     pipeline.finish(destinations);
   } catch (...) {
-    // Drain both legs before `columns` frees the destination buffers they write and before
-    // `staging` returns the staging memory they use to the HOST pool.
+    // Drain both legs before
+    //  a) `columns` frees the destination buffers they write, and
+    //  b) `staging` returns the staging memory they use to the HOST pool.
     drain_after_failure(reader.get_stream_without_ordering());
     drain_after_failure(target_stream);
     throw;

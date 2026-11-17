@@ -21,7 +21,7 @@ _Avoid_: staged copy, pipelined bounce
 
 **Leaf buffer**:
 One contiguous device buffer of a column: its data, validity mask, offsets or chars.
-_Avoid_: segment, span
+_Avoid_: segment
 
 **Chunk**:
 The unit of bytes the host-staged pipeline moves through one staging slot in one pass; it may span leaf-buffer boundaries.
