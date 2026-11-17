@@ -270,7 +270,9 @@ class metadata_store {
   /// That only costs reuse: it never makes a path accept a stale entry.  (An
   /// open fenced this way cannot retire an entry superseded by its identity
   /// either; that entry stays unreachable, because hits compare identities.)
-  static constexpr std::size_t epoch_slots = 256;
+  /// 4096 slots (32 KiB a store) keep that rare: an unchanged path survives a
+  /// hundred written paths with about 98% probability.
+  static constexpr std::size_t epoch_slots = 4096;
   [[nodiscard]] std::atomic<std::uint64_t>& epoch_of(std::string_view object_path) const noexcept;
 
   mutable std::mutex _mutex;
