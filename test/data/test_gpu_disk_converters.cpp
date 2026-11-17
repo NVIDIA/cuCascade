@@ -15,7 +15,9 @@
  * limitations under the License.
  */
 
+#include "utils/cuda_test_utils.hpp"
 #include "utils/cudf_test_utils.hpp"
+#include "utils/disk_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
 #include <cucascade/cudf/builtin_converters.hpp>
@@ -31,14 +33,21 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <set>
+#include <thread>
 #include <vector>
 
 using namespace cucascade;
@@ -52,23 +61,17 @@ auto& shared_gpu_space()
   static auto s = test::make_mock_memory_space(memory::Tier::GPU, 0);
   return s;
 }
-auto& shared_disk_space()
-{
-  static auto s = test::make_mock_memory_space(memory::Tier::DISK, 0);
-  return s;
-}
 ::cuda::stream_ref shared_stream()
 {
   static rmm::cuda_stream s;
   return s;
 }
 
-/// Round-trip test helper: GPU -> disk -> GPU (direct 3-step), compare tables.
+/// Round-trip test helper: GPU -> disk -> GPU (direct 3-step), compare tables. Runs once per
+/// disk io stack (the adopted default and every forced backend that can write device memory).
 void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
 {
-  auto stream      = shared_stream();
-  auto& gpu_space  = shared_gpu_space();
-  auto& disk_space = shared_disk_space();
+  auto& gpu_space = shared_gpu_space();
 
   representation_converter_registry registry;
   register_builtin_converters(registry);
@@ -77,17 +80,30 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
   auto gpu_rep = std::make_unique<gpu_table_representation>(
     std::move(original_table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
 
-  // GPU -> disk (direct via write/write_batch)
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
+  for (auto const backend : test::disk_test_backends) {
+    auto* disk_space = test::shared_disk_space_for(backend);
+    if (disk_space == nullptr) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: unavailable here");
+      continue;
+    }
+    if (!test::disk_space_can_write(*disk_space, /*device=*/true)) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: no device writes");
+      continue;
+    }
+    CAPTURE(test::to_string(backend));
 
-  // disk -> GPU (direct via read)
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
+    // GPU -> disk (one batched device write)
+    auto disk_rep =
+      registry.convert<disk_data_representation>(*gpu_rep, disk_space, shared_stream());
 
-  // Compare original (from gpu_rep) with round-tripped
-  test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
+    // disk -> GPU (one batched device read)
+    auto gpu_rep2 =
+      registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
+
+    // Compare original (from gpu_rep) with round-tripped
+    test::expect_cudf_tables_equal_on_stream(
+      gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
+  }
 }
 
 /// Create a simple column of the given type with uninitialized data.
@@ -146,6 +162,95 @@ std::unique_ptr<cudf::table> make_typed_table_with_nulls(cudf::type_id type,
 }
 
 }  // namespace
+
+TEST_CASE(
+  "gpu disk spill from another current GPU orders after the source's writer on the null stream",
+  "[disk][gpu-converter][multi_gpu]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
+  auto const backend = GENERATE(disk_io_backend::uring, disk_io_backend::cufile);
+  auto* disk_space   = test::shared_disk_space_for(backend);
+  if (disk_space == nullptr || !test::disk_space_can_write(*disk_space, /*device=*/true)) {
+    SKIP("disk backend cannot write device memory here");
+  }
+  CAPTURE(test::to_string(backend));
+  rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{1}};
+  auto gpu1 = test::make_mock_memory_space(memory::Tier::GPU, 1);
+  rmm::cuda_stream writer{rmm::cuda_stream::flags::non_blocking};
+  constexpr cudf::size_type rows = 1 << 20;
+  constexpr std::size_t bytes    = rows * sizeof(std::int32_t);
+  auto column                    = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, rows, cudf::mask_state::UNALLOCATED, writer);
+  auto* data = column->mutable_view().data<std::int32_t>();
+  REQUIRE(cudaMemsetAsync(data, 0x11, bytes, writer.value()) == cudaSuccess);
+  writer.synchronize();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(column));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  REQUIRE(cudaLaunchHostFunc(
+            writer.value(),
+            [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds{300}); },
+            nullptr) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(data, 0x22, bytes, writer.value()) == cudaSuccess);
+  gpu_table_representation source{std::move(table), *gpu1, writer};
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  {
+    rmm::cuda_set_device_raii caller_device{rmm::cuda_device_id{0}};
+    auto disk = registry.convert<disk_data_representation>(
+      source, disk_space, ::cuda::stream_ref{cudaStream_t{nullptr}});
+    int current_device = -1;
+    REQUIRE(cudaGetDevice(&current_device) == cudaSuccess);
+    CHECK(current_device == 0);
+    auto const& allocation = disk->get_disk_table();
+    REQUIRE(allocation.columns.size() == 1);
+    REQUIRE(allocation.columns.front().data_size == bytes);
+    std::vector<std::uint8_t> contents(bytes);
+    std::ifstream in(allocation.file_path, std::ios::binary);
+    in.seekg(allocation.columns.front().data_offset);
+    in.read(reinterpret_cast<char*>(contents.data()), contents.size());
+    REQUIRE(in);
+    CHECK(std::ranges::all_of(contents, [](auto byte) { return byte == 0x22; }));
+  }
+  writer.synchronize();
+}
+
+TEST_CASE("gpu disk spill rejects an explicit stream from another device before creating a file",
+          "[disk][gpu-converter][multi_gpu]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires two CUDA devices"); }
+  auto const backend = GENERATE(disk_io_backend::uring, disk_io_backend::cufile);
+  auto* disk_space   = test::shared_disk_space_for(backend);
+  if (disk_space == nullptr || !test::disk_space_can_write(*disk_space, /*device=*/true)) {
+    SKIP("disk backend cannot write device memory here");
+  }
+  CAPTURE(test::to_string(backend));
+  rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{1}};
+  auto gpu1 = test::make_mock_memory_space(memory::Tier::GPU, 1);
+  rmm::cuda_stream writer{rmm::cuda_stream::flags::non_blocking};
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 1024, cudf::mask_state::UNALLOCATED, writer));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  writer.synchronize();
+  gpu_table_representation source{std::move(table), *gpu1, writer};
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  rmm::cuda_set_device_raii caller_device{rmm::cuda_device_id{0}};
+  rmm::cuda_stream foreign_stream{rmm::cuda_stream::flags::non_blocking};
+  auto files = [&] {
+    std::set<std::filesystem::path> paths;
+    for (auto const& entry :
+         std::filesystem::directory_iterator(disk_space->get_disk_mount_path())) {
+      paths.insert(entry.path());
+    }
+    return paths;
+  };
+  auto const before = files();
+  REQUIRE_THROWS_AS(registry.convert<disk_data_representation>(source, disk_space, foreign_stream),
+                    cucascade::logic_error);
+  CHECK(files() == before);
+}
 
 // =============================================================================
 // Numeric type round-trip tests
@@ -747,37 +852,26 @@ TEST_CASE("gpu disk round-trip sliced column with nulls", "[disk][gpu-converter]
 }
 
 // =============================================================================
-// I/O backend selection tests (TEST-10)
+// io context selection tests
 // =============================================================================
 
-TEST_CASE("gpu disk round-trip with explicit pipeline backend",
-          "[disk][gpu-converter][backend][pipeline]")
+TEST_CASE("gpu disk round-trip with an explicit io context of each backend",
+          "[disk][gpu-converter][backend]")
 {
+  auto const backend = GENERATE(disk_io_backend::uring, disk_io_backend::cufile);
+  CAPTURE(test::to_string(backend));
   auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
-  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
-
-  representation_converter_registry registry;
-  register_builtin_converters(registry);
-
-  // Simple INT32 column, 100 rows
-  auto table   = make_typed_table(cudf::type_id::INT32, 100);
-  auto gpu_rep = std::make_unique<gpu_table_representation>(
-    std::move(table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
-
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*gpu_rep, disk_space.get(), shared_stream());
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());
-
-  test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
-}
-
-TEST_CASE("gpu disk round-trip pipeline with multiple types",
-          "[disk][gpu-converter][backend][pipeline]")
-{
-  auto gpu_space  = test::make_mock_memory_space(memory::Tier::GPU, 0);
-  auto disk_space = test::make_mock_memory_space(memory::Tier::DISK, 0);
+  auto disk_space = test::make_disk_space(backend);
+  if (disk_space == nullptr) {
+    WARN("the " << test::to_string(backend) << " backend cannot run in this process");
+    return;
+  }
+  auto context = disk_space->get_io_context();
+  REQUIRE(context != nullptr);
+  if (!context->supports_device_write()) {
+    WARN("the " << test::to_string(backend) << " context cannot write device memory yet");
+    return;
+  }
 
   representation_converter_registry registry;
   register_builtin_converters(registry);
@@ -793,6 +887,8 @@ TEST_CASE("gpu disk round-trip pipeline with multiple types",
 
   REQUIRE(disk_rep->get_size_in_bytes() > 0);
   REQUIRE(disk_rep->get_uncompressed_data_size_in_bytes() == disk_rep->get_size_in_bytes());
+  // The space kept the context it was configured with.
+  REQUIRE(disk_space->get_io_context() == context);
 
   auto gpu_rep2 =
     registry.convert<gpu_table_representation>(*disk_rep, gpu_space.get(), shared_stream());

@@ -141,7 +141,17 @@ memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_
   build_lookup_tables();
 }
 
-memory_reservation_manager::~memory_reservation_manager() { shutdown(); }
+memory_reservation_manager::~memory_reservation_manager()
+{
+  shutdown();
+  // A DISK space's io context may stage through one of this manager's HOST
+  // pools (a uring context from make_uring_ioctx_factory(*this) does): drop the
+  // DISK spaces, and with them their references to such contexts, before the
+  // HOST spaces go.
+  for (auto& space : _memory_spaces) {
+    if (space->get_tier() == Tier::DISK) { space.reset(); }
+  }
+}
 
 std::unique_ptr<reservation> memory_reservation_manager::request_reservation(
   const reservation_request_strategy& request, size_t size)

@@ -9,6 +9,7 @@ Hardware topology discovery, NUMA-aware memory placement, and system configurati
   - [What Gets Detected](#what-gets-detected)
   - [How Detection Works](#how-detection-works)
   - [CUDA Context Independence](#cuda-context-independence)
+  - [Storage of a File Path](#storage-of-a-file-path)
   - [GPU-to-NUMA Affinity](#gpu-to-numa-affinity)
   - [PCIe Path Types](#pcie-path-types)
 - [Configuring cuCascade](#configuring-cucascade)
@@ -54,6 +55,7 @@ if (discovery.discover()) {
     topo.gpus;               // Per-GPU topology info
     topo.network_devices;    // NICs with NUMA affinity
     topo.storage_devices;    // NVMe/SATA drives with NUMA affinity
+    topo.gds;                // GPUDirect Storage setup: nvidia-fs, peer memory, cufile.json
 
     // Lookups return nullopt for an unknown node rather than a silent 0.
     topo.get_numa_memory_capacity(0);      // std::optional<std::size_t>
@@ -92,8 +94,29 @@ throws rather than sizing a host space from device memory.
 | `cpu_cores` | `vector<int>` | List of optimal CPU core IDs |
 | `memory_binding` | `vector<int>` | NUMA nodes for memory binding |
 | `network_devices` | `vector<string>` | NICs optimal for this GPU |
+| `network_device_path` | `optional<PciePathType>` | PCIe distance to those NICs (unset without a NIC) |
+| `memory_total_bytes` | `size_t` | Device memory (NVML), 0 if unknown |
+| `bar1_total_bytes` / `bar1_free_bytes` | `size_t` | BAR1 aperture and its free part (NVML): GPUDirect DMA reaches GPU memory through it, so it bounds what can be registered with `cuFileBufRegister` (256 MiB on a T4) |
 
-**Network devices** (`network_device_info`): name, NUMA node, PCIe bus ID
+**Network devices** (`network_device_info`): name, NUMA node, PCIe bus ID, backing interface and
+MTU, and for the RDMA ports: `active_ports`, the fastest active port's `link_layer`
+(InfiniBand / Ethernet) and `rate_gbps` (a 400 Gb/s port carries at most about 50 GB/s).
+
+**GPUDirect Storage setup** (`gds_setup_info`, `include/cucascade/memory/gds_topology.hpp`), read
+passively from procfs, sysfs and cuFile's configuration file -- libcufile is never loaded:
+
+| Field | Description |
+|-------|-------------|
+| `nvidia_fs` | `nvidia_fs` module loaded, driver and GDS versions, `PeerDirect` support and per-GPU registered / cache MiB (`/proc/driver/nvidia-fs/stats`) |
+| `peer_memory_loaded` | `nvidia_peermem` (or `nv_peer_mem`) is live: RDMA filesystem clients can register GPU memory with the HCA |
+| `rdma_core_loaded`, `gpfs_client_loaded`, `lustre_client_loaded`, `beegfs_client_loaded`, `wekafs_client_loaded`, `nfs_rdma_loaded` | The matching kernel modules are live |
+| `force_compat_env` | `CUFILE_FORCE_COMPAT_MODE` forces cuFile's compatibility mode |
+| `cufile_json` | `$CUFILE_ENV_PATH_JSON` or `/etc/cufile.json`, parsed (JSON with comments): direct-I/O size, bounce cache, pinned limit, poll / compat mode, RDMA addresses and policy, the execution thread pool, `fs.gpfs.*`, the denylists |
+
+`discover_gds_setup(roots, cufile_json_path)` runs the same discovery against a fixture tree, and
+`read_cufile_config(path)` parses one file. What libcufile itself reports once loaded (effective
+parameters, driver properties) is `cucascade::io::cufile::platform_info`; the cuFile backend's pool
+planner combines both (see [cufile-gds.md](io/cufile-gds.md)).
 
 **Storage devices** (`storage_device_info`): type (NVMe/SATA_SSD/SATA_HDD/UNKNOWN), name, NUMA node, PCIe bus ID
 
@@ -118,6 +141,33 @@ initialized it first. The driver library is loaded dynamically only when runtime
 requested, so passive topology discovery remains available when `libcuda.so.1` is absent. These
 queries do not initialize the driver or create a CUDA context, therefore, unavailable drivers and
 failed queries leave the corresponding runtime attributes unsupported.
+
+### Storage of a File Path
+
+`topology_discovery::discover_storage_for_path(path)` (and
+`discover_storage_for_descriptor(fd, path)` for a file that is already open) describe where one
+regular file is stored, as a `path_storage_info` snapshot:
+
+- the opened file's resolved path and `st_dev`;
+- its mount -- by `statx` mount ID when the kernel reports it, otherwise the longest covering
+  mount point of the file's device -- with mount point, root (bind mounts), filesystem type,
+  source and options from `/proc/self/mountinfo` (escaped fields decoded). A mount ID that
+  mountinfo no longer lists leaves the storage unknown unless a same-device mount covers the
+  path; path-only matching is allowed only when no mount ID is known;
+- the file's preferred I/O size (`st_blksize`; IBM Storage Scale reports its filesystem block size
+  there) and the filesystem block size (`fstatvfs` `f_bsize`);
+- what backs it (`storage_kind`): `local_block` with the leaf disks reached from
+  `/sys/dev/block/<major>:<minor>` through partition parents and device-mapper / md `slaves`
+  (cycle-protected), each with drive class, PCI bus ID and NUMA node; `network` (NFS, Lustre, GPFS,
+  WekaFS, BeeGFS, ...) and `memory` (tmpfs, ...) filesystems, which have no local leaves; or
+  `unknown`.
+
+`path_storage_status` separates `not_found`, `not_regular_file` and `inaccessible` paths from
+`unknown`, which is reported when procfs / sysfs cannot be read, for overlay / FUSE / pseudo
+filesystems, and for stacks that cannot be resolved -- unknown is never a negative answer, and no
+NVMe device is invented. Discovery is passive like the rest of this component (no CUDA, no cuFile,
+no file creation), never throws, and caches nothing: a file can move or a mount change right after
+the snapshot. The cuFile backend's `cufile::probe_path` builds its per-file GDS verdict on it.
 
 ### Network Device Verification
 
