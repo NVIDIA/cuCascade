@@ -165,7 +165,10 @@ class memory_space {
    * @brief Replace the io context that serves this DISK space's files.
    *
    * Thread-safe. Conversions already in flight keep using the context they started with (they
-   * hold their own reference to it). The context must be started and support writes.
+   * hold their own reference to it). The context must be started and support writes. A context
+   * that stages through a HOST space's pool of the same manager must not outlive the manager:
+   * the manager drops its DISK spaces' references before its HOST spaces go, but not references
+   * held elsewhere.
    *
    * @param context The new context (must not be null).
    * @throws std::logic_error if this is not a DISK-tier memory space.
