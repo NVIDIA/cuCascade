@@ -116,6 +116,20 @@ TEST_CASE("Single-Device Memory Space Access", "[memory_space]")
   REQUIRE(gpu_device_0 != host_numa_0);
 }
 
+TEST_CASE("A memory space knows the reservation manager that owns it", "[memory_space]")
+{
+  auto manager = createSingleDeviceMemoryManager();
+  REQUIRE(manager->get_all_memory_spaces().size() == 2);
+  for (const memory_space* space : manager->get_all_memory_spaces()) {
+    CHECK(space->get_reservation_manager() == manager.get());
+  }
+
+  // A space constructed on its own has no manager.
+  const memory_space standalone{
+    cucascade::test::malloc_host_space_config(0, 1UL << 20, 1UL << 16, 4)};
+  CHECK(standalone.get_reservation_manager() == nullptr);
+}
+
 TEST_CASE("Downgrade decisions measure the bytes in use from the capacity", "[memory_space]")
 {
   constexpr std::size_t block_size = 1UL << 20;

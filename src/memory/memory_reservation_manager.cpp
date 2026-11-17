@@ -130,6 +130,7 @@ memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_
     std::visit(utils::overloaded{
                  [&](auto&& specific_config) {
                    _memory_spaces.emplace_back(std::make_unique<memory_space>(specific_config));
+                   _memory_spaces.back()->_reservation_manager = this;
                  },
                  [](std::monostate&) {
                    throw std::invalid_argument("Unknown memory_space configuration type");

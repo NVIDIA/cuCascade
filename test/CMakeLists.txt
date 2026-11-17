@@ -159,6 +159,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_host_converters.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
+    cudf/test_chunk_plan.cpp
     cudf/test_gpu_to_gpu_converter.cpp
     cudf/test_release_table_stream.cpp
     # Main test runner
@@ -183,6 +184,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   target_include_directories(
     cucascade_cudf_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
                                  ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  # Tests of src-private cudf-layer helpers (chunk_plan.hpp) include them from
+  # src/cudf. Not src/ itself: its cudf/ directory would shadow libcudf's
+  # <cudf/...> headers.
+  target_include_directories(cucascade_cudf_tests
+                             PRIVATE ${PROJECT_SOURCE_DIR}/src/cudf)
 
   # Link dependencies
   target_link_libraries(

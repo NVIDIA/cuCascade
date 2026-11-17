@@ -48,6 +48,7 @@ class idisk_io_backend;
 namespace memory {
 
 // Forward declaration
+class memory_reservation_manager;
 class reservation;
 class reservation_aware_resource_adaptor;
 class fixed_size_host_memory_resource;
@@ -154,6 +155,16 @@ class memory_space {
   /** @brief Get the I/O backend for a DISK tier memory space. Throws if not DISK tier. */
   [[nodiscard]] idisk_io_backend& get_io_backend() const;
 
+  /**
+   * @brief Get the memory_reservation_manager that owns this space.
+   *
+   * A space owned by a manager lives exactly as long as that manager, so the manager and its other
+   * memory spaces stay valid for as long as this space does.
+   *
+   * @return The owning manager, or nullptr for a space constructed on its own
+   */
+  [[nodiscard]] memory_reservation_manager* get_reservation_manager() const noexcept;
+
   // Utility methods
   std::string to_string() const;
 
@@ -161,6 +172,7 @@ class memory_space {
 
  protected:
   friend class reservation;
+  friend class memory_reservation_manager;  // sets _reservation_manager
 
   const memory_space_id _id;
   const size_t _capacity;
@@ -181,6 +193,7 @@ class memory_space {
     _reservation_allocator_resource;
   std::unique_ptr<rmm::cuda_stream_pool> _stream_pool;
   std::shared_ptr<idisk_io_backend> _io_backend;  ///< I/O backend for DISK tier (null for others)
+  memory_reservation_manager* _reservation_manager{nullptr};  ///< Owning manager, if any
 };
 
 /**
