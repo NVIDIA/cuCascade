@@ -1398,19 +1398,24 @@ void fs_cache::retire_pins_after_stream(::cuda::stream_ref stream,
   }
 
   try {
-    // The submission lock keeps ticket order identical to stream enqueue order.
-    auto submission            = lane->begin();
-    cudaError_t enqueue_status = cudaErrorUnknown;
-    try {
-      enqueue_status = copies.enqueue(stream);
-    } catch (...) {
-      enqueue_status = cudaErrorUnknown;
+    cudaError_t commit_status = cudaSuccess;
+    {
+      // The submission lock keeps ticket order identical to stream enqueue order.
+      auto submission            = lane->begin();
+      cudaError_t enqueue_status = cudaErrorUnknown;
+      try {
+        enqueue_status = copies.enqueue(stream);
+      } catch (...) {
+        enqueue_status = cudaErrorUnknown;
+      }
+      submission.on_retire([retirement, enqueue_status](cudaError_t stream_status) noexcept {
+        retirement->finish(enqueue_status == cudaSuccess ? stream_status : enqueue_status);
+      });
+      commit_status = submission.commit();
+      retirement->signal_published();
     }
-    submission.on_retire([retirement, enqueue_status](cudaError_t stream_status) noexcept {
-      retirement->finish(enqueue_status == cudaSuccess ? stream_status : enqueue_status);
-    });
-    auto const commit_status = submission.commit();
-    retirement->signal_published();
+    // Logged once the submission lock is released: a host sink may take its own lock, which
+    // another thread may hold while submitting on this lane.
     if (commit_status != cudaSuccess) {
       CUCASCADE_LOG_ERROR("fs_cache: failed to publish cached-copy completion: {}",
                           cudaGetErrorString(commit_status));

@@ -97,6 +97,16 @@ enum class prepare_result : std::uint8_t {
   nothing_to_prepare,
 };
 
+/**
+ * @brief cudf datasource over a cuCascade @c ioctx.
+ *
+ * The future of an asynchronous read owns the read: getting, waiting on or destroying it waits
+ * until the read has finished, so a destination only has to outlive its future.  The futures are
+ * deferred, so @c wait_for and @c wait_until return @c std::future_status::deferred.  A device
+ * read finishes only once its copy has run on the read's stream.  Do not destroy a future on a
+ * thread that completes reads, such as a reactor or cache completion thread, or while the read's
+ * stream waits on the destroying thread.
+ */
 class datasource : public cudf::io::datasource {
  public:
   /// Reads @p io_obj through @p io_ctx, and records the object's identity as

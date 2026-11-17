@@ -55,7 +55,6 @@ namespace cucascade::io::s3rdma {
  * This declaration has no implementation or factory registration. Its deleted
  * constructor prevents accidental use.
  *
- * @see https://github.com/sirius-db/sirius/blob/dev/experimental/s3-rdma-transport-design.md
  */
 class s3rdma_ioctx : public ioctx {
  public:

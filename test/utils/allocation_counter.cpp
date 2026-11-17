@@ -25,9 +25,11 @@
 namespace {
 
 // Constant-initialised, so reading them needs no TLS initialisation from inside operator new.
-thread_local bool counting        = false;
-thread_local std::size_t counted  = 0;
-thread_local std::size_t fault_at = 0;  ///< The counted call that throws; 0 for none.
+thread_local bool counting           = false;
+thread_local std::size_t counted     = 0;
+thread_local std::size_t fault_at    = 0;  ///< The counted call that throws; 0 for none.
+thread_local std::size_t fault_from  = 0;  ///< Every counted call from this one throws; 0 for none.
+thread_local std::size_t fault_until = 0;  ///< ... up to (not including) this one; 0 for no end.
 
 }  // namespace
 
@@ -36,7 +38,13 @@ thread_local std::size_t fault_at = 0;  ///< The counted call that throws; 0 for
 // and the armed fault.
 void* operator new(std::size_t size)
 {
-  if (counting && ++counted == fault_at) { throw std::bad_alloc{}; }
+  if (counting) {
+    ++counted;
+    if (counted == fault_at ||
+        (fault_from != 0 && counted >= fault_from && (fault_until == 0 || counted < fault_until))) {
+      throw std::bad_alloc{};
+    }
+  }
   if (void* p = std::malloc(size == 0 ? 1 : size)) { return p; }
   throw std::bad_alloc{};
 }
@@ -50,19 +58,29 @@ namespace cucascade::test {
 scoped_allocation_counter::scoped_allocation_counter() noexcept
 {
   assert(!counting && "scopes do not nest");
-  counted  = 0;
-  fault_at = 0;
-  counting = true;
+  counted     = 0;
+  fault_at    = 0;
+  fault_from  = 0;
+  fault_until = 0;
+  counting    = true;
 }
 
 scoped_allocation_counter::~scoped_allocation_counter() noexcept
 {
-  counting = false;
-  fault_at = 0;
+  counting    = false;
+  fault_at    = 0;
+  fault_from  = 0;
+  fault_until = 0;
 }
 
 std::size_t scoped_allocation_counter::count() const noexcept { return counted; }
 
 void scoped_allocation_counter::fail_at(std::size_t n) noexcept { fault_at = n; }
+
+void scoped_allocation_counter::fail_from(std::size_t n, std::size_t count) noexcept
+{
+  fault_from  = n;
+  fault_until = n != 0 && count != 0 ? n + count : 0;
+}
 
 }  // namespace cucascade::test

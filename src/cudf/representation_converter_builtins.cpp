@@ -601,28 +601,30 @@ Buffer peer_copy_into_async(Buffer buf,
   // same-stream invariant the original implementation relied on.
   memory::fixed_size_host_memory_resource* host_pool =
     memory::find_host_pool(resolve_gpu_numa_node(dst_device));
-  // No device switching needed via guards, CUDA guide explicitly states:
-  // "A memory copy will succeed even if it is issued to a stream that is not associated to
-  // the current device."
-  // https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html#multi-device-stream-event-and-memory-copy-behavior
-  // And scopes below only call copy APIs on explicitly passed streams and no current-device
-  // sensitive APIs.
+  // Without working peer DMA, each leg must run with its own device current (the D2H leg
+  // fails with cudaErrorInvalidValue otherwise). Both legs stay on target_stream, so they are
+  // still ordered.
 
   if (host_pool == nullptr) {
     // No HOST memory_space has been registered. This should only happen in
     // standalone test builds that exercise the converter without constructing
     // a memory_reservation_manager. Fall back to a one-shot pinned allocation
-    // (slow path — preserves correctness, never reached in production Sirius).
+    // (slow path — preserves correctness).
     memory::numa_region_pinned_host_memory_resource mr(resolve_gpu_numa_node(dst_device),
                                                        /*make_portable=*/true);
     void* host_buf = mr.allocate_sync(size_in_bytes);
 
     try {
-      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-        host_buf, src_ptr, size_in_bytes, cudaMemcpyDeviceToHost, target_stream.get()));
-      // no sync needed, the async copies are on the same stream, and are hence ordered.
-      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-        buf.data(), host_buf, size_in_bytes, cudaMemcpyHostToDevice, target_stream.get()));
+      {
+        rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
+        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+          host_buf, src_ptr, size_in_bytes, cudaMemcpyDeviceToHost, target_stream.get()));
+      }
+      {
+        rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
+        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+          buf.data(), host_buf, size_in_bytes, cudaMemcpyHostToDevice, target_stream.get()));
+      }
       target_stream.sync();
     } catch (...) {
       // best-effort drain before deallocating host side resources; a second failure must not
@@ -644,6 +646,7 @@ Buffer peer_copy_into_async(Buffer buf,
     try {
       // Pass 1: device-to-host, chunked across blocks. Issued on target_stream
       {
+        rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}};
         std::size_t block_index  = 0;
         std::size_t block_offset = 0;
         std::size_t src_offset   = 0;
@@ -668,6 +671,7 @@ Buffer peer_copy_into_async(Buffer buf,
 
       // Pass 2: host-to-device, chunked across the same blocks.
       {
+        rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
         std::size_t block_index  = 0;
         std::size_t block_offset = 0;
         std::size_t dst_offset   = 0;
@@ -866,7 +870,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
  *
  * Replaces the previous cudf::pack-based path. cudf::pack's compute_splits internally
  * launches kernels that read scratch buffers allocated through the current_device
- * resource ref; under sirius's multi-GPU setup the cucascade resource adapter created
+ * resource ref; under a multi-GPU setup the cucascade resource adapter created
  * a stream-ordered race that materialized as uninitialized dst_buf_info reads (caught
  * by compute-sanitizer) and silently produced garbage packed bytes. This path mirrors
  * convert_gpu_to_host_fast / convert_host_fast_to_gpu: walk the source column tree,
