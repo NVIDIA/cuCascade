@@ -375,7 +375,9 @@ class cufile_reactor {
 
   void enqueue(std::unique_ptr<grouped_io_request> request) noexcept;
 
-  /// Approximate bytes not yet dispatched to a physical operation.
+  /// Approximate bytes queued on this reactor plus those of the transfer its worker is running
+  /// (a transfer is synchronous on the worker, so the reactor is busy until it is done).  Slices
+  /// parked behind a busy stream are not counted.
   [[nodiscard]] std::size_t queued_bytes() const noexcept
   {
     return _queued_bytes.load(std::memory_order_relaxed);
