@@ -2,10 +2,10 @@
 
 The [CI workflow](../.github/workflows/ci.yml) runs on pushes to `main`, copied PR
 branches named `pull-request/<number>`, and `merge_group: checks_requested`.
-Copied-PR and merge-group runs perform the full checks. Pushes to `main` run lint and
-the build matrix to publish reusable sccache entries, without packaging artifacts,
-GPU tests, or the summary job. Required merge-group checks cover integration before
-the commit reaches `main`.
+Copied PRs and merge groups run lint, builds, GPU tests, and the summary job.
+Pushes to `main` run only the build matrix to publish reusable sccache entries,
+without packaging artifacts, GPU tests, or the summary job. Required merge-group
+checks cover integration before the commit reaches `main`.
 
 ## Get a PR tested
 
@@ -26,7 +26,9 @@ gh pr view NUMBER --repo NVIDIA/cuCascade --json headRefOid --jq .headRefOid
 gh api repos/NVIDIA/cuCascade/git/ref/heads/pull-request/NUMBER --jq .object.sha
 ```
 
-Lint runs first. Builds cover CUDA 12 and 13 with stable and nightly RAPIDS packages.
+Lint runs first for copied PRs and merge groups. Copied PRs build and test CUDA 12
+with stable RAPIDS and CUDA 13 with nightly RAPIDS. Merge groups build and test all
+four configurations; `main` builds all four to refresh the shared compiler cache.
 For copied-PR and merge-group runs, the GPU test matrix starts after all builds succeed.
 Tests use the single-GPU `linux-amd64-gpu-t4-latest-1` runners; green CI does not
 establish multi-GPU coverage.
