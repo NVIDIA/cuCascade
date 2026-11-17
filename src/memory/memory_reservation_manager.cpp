@@ -16,6 +16,7 @@
  */
 
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/gpu_numa_node.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -175,6 +176,15 @@ const memory_space* memory_reservation_manager::get_memory_space(Tier tier, int3
 memory_space* memory_reservation_manager::get_memory_space(Tier tier, int32_t device_id)
 {
   return get_mutable_memory_space(tier, device_id);
+}
+
+memory_space* memory_reservation_manager::get_host_memory_space_near_gpu(int gpu_device_id)
+{
+  if (memory_space* local = get_mutable_memory_space(Tier::HOST, gpu_numa_node(gpu_device_id))) {
+    return local;
+  }
+  std::span<memory_space*> const hosts = get_mutable_memory_spaces_for_tier(Tier::HOST);
+  return hosts.empty() ? nullptr : hosts.front();
 }
 
 std::span<const memory_space*> memory_reservation_manager::get_memory_spaces_for_tier(

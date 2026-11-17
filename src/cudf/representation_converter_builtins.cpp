@@ -18,7 +18,6 @@
 #include "batch_copy.hpp"
 #include "cross_gpu_copy.hpp"
 #include "cudf_compat.hpp"
-#include "nvtx_scope.hpp"
 
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -33,6 +32,7 @@
 #include <cucascade/memory/disk_access_limiter.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/nvtx.hpp>
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -51,6 +51,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -67,6 +68,8 @@ namespace cucascade {
 // =============================================================================
 
 namespace {
+
+using nvtx_scope = nvtx3::scoped_range_in<libcucascade_domain>;
 
 // memory::column_metadata::type_id is a generic int32_t type tag; the cudf layer interprets it
 // as the numeric value of a cudf::type_id. These helpers convert across that boundary.

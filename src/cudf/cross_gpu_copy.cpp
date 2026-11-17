@@ -19,16 +19,15 @@
 
 #include "batch_copy.hpp"
 #include "chunk_plan.hpp"
-#include "nvtx_scope.hpp"
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/gpu_numa_node.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/nvtx.hpp>
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -45,6 +44,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime_api.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -53,6 +53,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -64,24 +65,35 @@ namespace cucascade {
 namespace {
 
 using detail::source_span;
+using nvtx_scope = nvtx3::scoped_range_in<libcucascade_domain>;
 
 enum class copy_route { peer, host_staged };
 
 /**
- * @brief One leaf buffer: `size` bytes at `src` on the source GPU go to `dst` on the destination
- * GPU.
+ * @brief The copy of one leaf buffer: `size` bytes at `src` on the source GPU go to `dst` on the
+ * destination GPU.
  */
-struct copy_segment {
+struct leaf_copy {
   std::byte const* src;
   std::byte* dst;
   std::size_t size;
 };
 
 /**
- * @brief Receives each segment when its destination buffer is allocated, in byte-stream order.
+ * @brief Receives each leaf copy when its destination buffer is allocated, in byte-stream order.
  */
 template <typename Sink>
-concept segment_sink = requires(Sink& sink, copy_segment const& segment) { sink(segment); };
+concept leaf_copy_sink = requires(Sink& sink, leaf_copy const& copy) { sink(copy); };
+
+/**
+ * @brief The two GPUs of a host-staged pipeline and the stream each of its legs runs on.
+ */
+struct copy_endpoints {
+  int source_device;
+  int destination_device;
+  ::cuda::stream_ref source_stream;  ///< Source-to-host leg; ordered after the source's writer
+  ::cuda::stream_ref target_stream;  ///< Host-to-destination leg
+};
 
 [[nodiscard]] copy_route select_route(copy_route_selection selection,
                                       int src_device,
@@ -172,6 +184,9 @@ void validate_source_column(cudf::column_view const& col)
 /**
  * @brief Whether the copy of @p col descends into its children; fixed-width columns have none to
  * copy.
+ *
+ * This is the only place that decides it: every walk over a column tree asks here, so that all of
+ * them visit the same leaf buffers in the same order.
  */
 [[nodiscard]] bool copies_children(cudf::column_view const& col) noexcept
 {
@@ -232,9 +247,10 @@ class source_reader {
   [[nodiscard]] gpu_table_representation const& get_source() const noexcept { return _source; }
 
   /**
-   * @brief The reading stream, not necessarily ordered yet; only for draining it after a failure.
+   * @brief The reading stream as it is, ordered after the source's writer or not; only for
+   * draining it after a failure.
    */
-  [[nodiscard]] ::cuda::stream_ref get_stream() const noexcept { return _stream; }
+  [[nodiscard]] ::cuda::stream_ref get_stream_without_ordering() const noexcept { return _stream; }
 
   /**
    * @brief The reading stream, ordered after the source's writer.
@@ -264,7 +280,6 @@ class source_reader {
 [[nodiscard]] std::vector<std::size_t> read_chars_sizes(source_reader& reader,
                                                         cudf::table_view const& view)
 {
-  nvtx_scope const range{"convert:gpu_to_gpu:plan"};
   std::vector<last_offset> offsets;
   for (cudf::column_view const& col : view) {
     collect_last_offsets(col, offsets);
@@ -334,7 +349,7 @@ class chars_size_cursor {
 
 /**
  * @brief Append the leaf buffers of @p col's tree in the order table_builder::build_column() hands
- * their segments to its sink.
+ * their leaf copies to its sink.
  */
 void collect_source_spans(cudf::column_view const& col,
                           chars_size_cursor& chars,
@@ -357,14 +372,14 @@ void collect_source_spans(cudf::column_view const& col,
 
 /**
  * @brief Builds the columns of the destination table one at a time, allocating every buffer on the
- * destination GPU and handing the segment that fills each one to a sink.
+ * destination GPU and handing the leaf copy that fills each one to a sink.
  *
  * Only cudf factories that launch no work are used, so a column is assembled before its buffers
  * are written. The builder enqueues nothing either. A column that fails part-way frees the
  * buffers it has allocated while the stack unwinds, so a sink must not start a copy into a column
  * before build_column() has returned it.
  */
-template <segment_sink Sink>
+template <leaf_copy_sink Sink>
 class table_builder {
  public:
   /**
@@ -372,7 +387,7 @@ class table_builder {
    * returns them
    * @param stream Stream on the destination GPU that allocates the buffers
    * @param mr Allocator of the destination buffers
-   * @param sink Receives the segments of each column while build_column() builds it
+   * @param sink Receives the leaf copies of each column while build_column() builds it
    */
   table_builder(std::span<std::size_t const> chars_sizes,
                 ::cuda::stream_ref stream,
@@ -395,14 +410,20 @@ class table_builder {
     auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, _stream, _mr);
     if (src.nullable()) {
       null_mask = cudf::create_null_mask(src.size(), cudf::mask_state::UNINITIALIZED, _stream, _mr);
-      add_segment(src.null_mask(), null_mask.data(), null_mask_bytes(src));
+      add_leaf_copy(src.null_mask(), null_mask.data(), null_mask_bytes(src));
     }
     cudf::size_type const null_count = src.nullable() ? src.null_count() : 0;
+
+    if (!copies_children(src)) {
+      rmm::device_buffer data = allocate_and_add_leaf_copy(src.head(), fixed_width_bytes(src));
+      return std::make_unique<cudf::column>(
+        src.type(), src.size(), std::move(data), std::move(null_mask), null_count);
+    }
 
     switch (src.type().id()) {
       case cudf::type_id::STRING: {
         std::size_t const chars_size = has_chars(src) ? _chars.next() : 0;
-        rmm::device_buffer chars     = allocate_and_add_segment(src.head(), chars_size);
+        rmm::device_buffer chars     = allocate_and_add_leaf_copy(src.head(), chars_size);
         auto offsets                 = build_column(src.child(0));
         return cudf::make_strings_column(
           src.size(), std::move(offsets), std::move(chars), null_count, std::move(null_mask));
@@ -444,25 +465,24 @@ class table_builder {
         return cudf::make_dictionary_column(
           std::move(keys), std::move(indices), std::move(null_mask), null_count);
       }
-      default: {
-        rmm::device_buffer data = allocate_and_add_segment(src.head(), fixed_width_bytes(src));
-        return std::make_unique<cudf::column>(
-          src.type(), src.size(), std::move(data), std::move(null_mask), null_count);
-      }
+      default:
+        CUCASCADE_FAIL(
+          "copy_table_to_gpu: no rule to rebuild a column type whose children are "
+          "copied");
     }
   }
 
  private:
-  void add_segment(void const* src, void* dst, std::size_t size)
+  void add_leaf_copy(void const* src, void* dst, std::size_t size)
   {
     if (size == 0 || src == nullptr) { return; }
-    _sink(copy_segment{static_cast<std::byte const*>(src), static_cast<std::byte*>(dst), size});
+    _sink(leaf_copy{static_cast<std::byte const*>(src), static_cast<std::byte*>(dst), size});
   }
 
-  [[nodiscard]] rmm::device_buffer allocate_and_add_segment(void const* src, std::size_t size)
+  [[nodiscard]] rmm::device_buffer allocate_and_add_leaf_copy(void const* src, std::size_t size)
   {
     rmm::device_buffer buffer{size, _stream, _mr};
-    add_segment(src, buffer.data(), size);
+    add_leaf_copy(src, buffer.data(), size);
     return buffer;
   }
 
@@ -473,17 +493,17 @@ class table_builder {
 };
 
 /**
- * @brief Staging slots of one host-staged pipeline: pinned HOST pool blocks held under a HOST
- * reservation that the pipeline took for itself, cut into slots as detail::staging_slot_layout
- * describes.
+ * @brief Pinned HOST memory that holds the staging slots of one host-staged pipeline: HOST pool
+ * blocks held under a HOST reservation that the pipeline took for itself, cut into slots as
+ * detail::staging_slot_layout describes.
  */
-class staging_slots {
+class staging_memory {
  public:
   /**
    * @brief Reserve and allocate up to @p max_depth slots of @p slot_bytes from @p host_space,
    * falling back to fewer slots as cross_gpu_copy_config describes.
    */
-  staging_slots(memory::memory_space& host_space, std::size_t slot_bytes, std::size_t max_depth)
+  staging_memory(memory::memory_space& host_space, std::size_t slot_bytes, std::size_t max_depth)
   {
     nvtx_scope const range{"convert:gpu_to_gpu:acquire_staging"};
     auto* const pool = host_space.get_memory_resource_of<memory::Tier::HOST>();
@@ -541,26 +561,18 @@ class host_staged_pipeline {
  public:
   host_staged_pipeline(std::span<source_span const> spans,
                        detail::staging_slot_layout const& slots,
-                       int src_device,
-                       int dst_device,
-                       ::cuda::stream_ref source_stream,
-                       ::cuda::stream_ref target_stream)
-    : _spans{spans},
-      _plan{spans, slots},
-      _depth{slots.get_depth()},
-      _src_device{src_device},
-      _source_stream{source_stream},
-      _target_stream{target_stream}
+                       copy_endpoints const& endpoints)
+    : _spans{spans}, _plan{spans, slots}, _depth{slots.get_depth()}, _endpoints{endpoints}
   {
     _filled.reserve(_depth);
     _drained.reserve(_depth);
     {
-      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{src_device}};
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{endpoints.source_device}};
       for (std::size_t i = 0; i < _depth; ++i) {
         _filled.emplace_back();
       }
     }
-    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{dst_device}};
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{endpoints.destination_device}};
     for (std::size_t i = 0; i < _depth; ++i) {
       _drained.emplace_back();
     }
@@ -605,10 +617,10 @@ class host_staged_pipeline {
       _batch.add(p.host, _spans[p.span].src + p.offset, p.size);
     }
 
-    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_src_device}};
-    if (_filled_chunks >= _depth) { _drained[slot].wait(_source_stream); }
-    _batch.flush(_source_stream, cudaMemcpySrcAccessOrderStream);
-    _filled[slot].record(_source_stream);
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_endpoints.source_device}};
+    if (_filled_chunks >= _depth) { _drained[slot].wait(_endpoints.source_stream); }
+    _batch.flush(_endpoints.source_stream, cudaMemcpySrcAccessOrderStream);
+    _filled[slot].record(_endpoints.source_stream);
     ++_filled_chunks;
   }
 
@@ -618,18 +630,16 @@ class host_staged_pipeline {
     for (detail::piece const& p : _plan.get_pieces(_drained_chunks)) {
       _batch.add(destinations[p.span] + p.offset, p.host, p.size);
     }
-    _filled[slot].wait(_target_stream);
-    _batch.flush(_target_stream, cudaMemcpySrcAccessOrderStream);
-    _drained[slot].record(_target_stream);
+    _filled[slot].wait(_endpoints.target_stream);
+    _batch.flush(_endpoints.target_stream, cudaMemcpySrcAccessOrderStream);
+    _drained[slot].record(_endpoints.target_stream);
     ++_drained_chunks;
   }
 
   std::span<source_span const> _spans;
   detail::chunk_plan _plan;
   std::size_t _depth;
-  int _src_device;
-  ::cuda::stream_ref _source_stream;
-  ::cuda::stream_ref _target_stream;
+  copy_endpoints _endpoints;
   std::vector<cuda::cuda_event> _filled;   ///< Per slot, on the source GPU
   std::vector<cuda::cuda_event> _drained;  ///< Per slot, on the destination GPU
   batch_copy_accumulator _batch;
@@ -642,52 +652,50 @@ class host_staged_pipeline {
  */
 [[nodiscard]] memory::memory_space& find_staging_space(memory::memory_space const& target)
 {
-  memory::memory_reservation_manager* manager = target.get_reservation_manager();
-  if (manager != nullptr) {
-    int const numa_node = memory::gpu_numa_node(target.get_device_id());
-    if (memory::memory_space* local = manager->get_memory_space(memory::Tier::HOST, numa_node)) {
-      return *local;
-    }
-    std::span<memory::memory_space const*> const hosts =
-      manager->get_memory_spaces_for_tier(memory::Tier::HOST);
-    if (!hosts.empty()) {
-      return *manager->get_memory_space(memory::Tier::HOST, hosts.front()->get_device_id());
-    }
+  memory::memory_reservation_manager* const manager = target.get_reservation_manager();
+  memory::memory_space* const host_space =
+    manager != nullptr ? manager->get_host_memory_space_near_gpu(target.get_device_id()) : nullptr;
+  if (host_space == nullptr) {
+    CUCASCADE_FAIL(
+      "host-staged route needs a HOST memory_space in the target's reservation manager");
   }
-  CUCASCADE_FAIL("host-staged route needs a HOST memory_space in the target's reservation manager");
+  return *host_space;
 }
 
-[[nodiscard]] std::unique_ptr<cudf::table> copy_over_peer_route(
-  gpu_table_representation const& source,
-  cudf::table_view const& view,
-  std::span<std::size_t const> chars_sizes,
-  memory::memory_space const& target,
-  ::cuda::stream_ref target_stream)
+[[nodiscard]] std::unique_ptr<cudf::table> copy_over_peer_route(source_reader& reader,
+                                                                cudf::table_view const& view,
+                                                                memory::memory_space const& target,
+                                                                ::cuda::stream_ref target_stream)
 {
   nvtx_scope const range{"convert:gpu_to_gpu:peer_route"};
-  int const src_device = source.get_device_id();
-  int const dst_device = target.get_device_id();
+  gpu_table_representation const& source = reader.get_source();
+  int const src_device                   = source.get_device_id();
+  int const dst_device                   = target.get_device_id();
 
-  // Segments in byte-stream order. The first `started` are enqueued; the first `startable`
+  // Planning ends when every destination buffer is allocated.
+  std::optional<nvtx_scope> plan_range{std::in_place, "convert:gpu_to_gpu:plan"};
+  std::vector<std::size_t> const chars_sizes = read_chars_sizes(reader, view);
+
+  // Leaf copies in byte-stream order. The first `started` are enqueued; the first `startable`
   // belong to finished columns. A copy into a column must not start before `columns` owns the
   // column: one that fails part-way is freed while the stack unwinds, before the handler can
   // drain.
-  std::vector<copy_segment> segments;
+  std::vector<leaf_copy> copies;
   std::size_t started   = 0;
   std::size_t startable = 0;
   auto start_next_copy  = [&] {
-    copy_segment const& segment = segments[started];
+    leaf_copy const& copy = copies[started];
     CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
-      segment.dst, dst_device, segment.src, src_device, segment.size, target_stream.get()));
+      copy.dst, dst_device, copy.src, src_device, copy.size, target_stream.get()));
     ++started;
   };
   // Each buffer that is allocated starts one copy into an earlier, finished column, so copies
   // and allocations alternate and overlap. Copies enqueued back to back run slower.
-  auto record_segment = [&](copy_segment const& segment) {
-    segments.push_back(segment);
+  auto record_copy = [&](leaf_copy const& copy) {
+    copies.push_back(copy);
     if (started < startable) { start_next_copy(); }
   };
-  table_builder builder{chars_sizes, target_stream, target.get_default_allocator(), record_segment};
+  table_builder builder{chars_sizes, target_stream, target.get_default_allocator(), record_copy};
 
   // Owns every finished column. Declared before the try block so that, on a failure, the columns
   // outlive the drain in the handler.
@@ -697,9 +705,10 @@ class host_staged_pipeline {
     source.wait_for_writer(target_stream);
     for (cudf::column_view const& col : view) {
       columns.push_back(builder.build_column(col));
-      startable = segments.size();
+      startable = copies.size();
     }
-    while (started < segments.size()) {
+    plan_range.reset();
+    while (started < copies.size()) {
       start_next_copy();
     }
     // Sync for the source's lifetime: a caller may free the source right after the conversion, on
@@ -717,13 +726,15 @@ class host_staged_pipeline {
 [[nodiscard]] std::unique_ptr<cudf::table> copy_over_host_staged_route(
   source_reader& reader,
   cudf::table_view const& view,
-  std::span<std::size_t const> chars_sizes,
   memory::memory_space const& target,
   ::cuda::stream_ref target_stream,
   cross_gpu_copy_config const& config)
 {
-  gpu_table_representation const& source = reader.get_source();
   nvtx_scope const range{"convert:gpu_to_gpu:host_staged_route"};
+  // Planning ends when every destination buffer is allocated, which is after the first chunks
+  // have been started on their way to HOST memory.
+  std::optional<nvtx_scope> plan_range{std::in_place, "convert:gpu_to_gpu:plan"};
+  std::vector<std::size_t> const chars_sizes = read_chars_sizes(reader, view);
 
   std::vector<source_span> spans;
   {
@@ -739,18 +750,18 @@ class host_staged_pipeline {
 
   std::vector<std::byte*> destinations;
   destinations.reserve(spans.size());
-  auto record_destination = [&](copy_segment const& segment) {
+  auto record_destination = [&](leaf_copy const& copy) {
     std::size_t const i = destinations.size();
-    if (i >= spans.size() || spans[i].src != segment.src || spans[i].size != segment.size) {
+    if (i >= spans.size() || spans[i].src != copy.src || spans[i].size != copy.size) {
       CUCASCADE_FAIL("copy_table_to_gpu: destination buffers do not match the planned byte stream");
     }
-    destinations.push_back(segment.dst);
+    destinations.push_back(copy.dst);
   };
   table_builder builder{
     chars_sizes, target_stream, target.get_default_allocator(), record_destination};
 
-  // Owns every finished column. Declared before the staging slots and the try block so that, on a
-  // failure, the columns outlive the drains in the handler.
+  // Owns every finished column. Declared before the staging memory and the try block so that, on
+  // a failure, the columns outlive the drains in the handler.
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(static_cast<std::size_t>(view.num_columns()));
   auto build_columns = [&] {
@@ -766,8 +777,6 @@ class host_staged_pipeline {
     return std::make_unique<cudf::table>(std::move(columns));
   }
 
-  int const src_device             = source.get_device_id();
-  int const dst_device             = target.get_device_id();
   memory::memory_space& host_space = find_staging_space(target);
 
   // A table that fits one staging slot is a single chunk, and no more slots are held than the
@@ -776,13 +785,14 @@ class host_staged_pipeline {
   std::size_t const staged_bytes = total_bytes + detail::alignment_padding_bound(spans);
   std::size_t const slot_bytes   = std::min(config.chunk_size_bytes, staged_bytes);
   std::size_t const max_chunks   = ::cuda::ceil_div(staged_bytes, slot_bytes);
-  staging_slots const slots{host_space, slot_bytes, std::min(config.pipeline_depth, max_chunks)};
+  staging_memory const staging{host_space, slot_bytes, std::min(config.pipeline_depth, max_chunks)};
 
   try {
-    nvtx_scope const pipeline_range{"convert:gpu_to_gpu:host_staged_pipeline"};
-    ::cuda::stream_ref const source_stream = reader.get_ordered_stream();
-    host_staged_pipeline pipeline{
-      spans, slots.get_layout(), src_device, dst_device, source_stream, target_stream};
+    copy_endpoints const endpoints{.source_device      = reader.get_source().get_device_id(),
+                                   .destination_device = target.get_device_id(),
+                                   .source_stream      = reader.get_ordered_stream(),
+                                   .target_stream      = target_stream};
+    host_staged_pipeline pipeline{spans, staging.get_layout(), endpoints};
     // A single chunk is filled and drained back to back instead: its drain is one batch with a
     // piece per leaf buffer, and such a batch runs piece by piece, several times slower, when it
     // is enqueued on a target stream that has gone idle because the fill finished long before.
@@ -790,11 +800,14 @@ class host_staged_pipeline {
     // No copy into a destination buffer starts before finish(), so a column that fails part-way
     // frees buffers that no copy writes.
     build_columns();
+    plan_range.reset();
+
+    nvtx_scope const pipeline_range{"convert:gpu_to_gpu:host_staged_pipeline"};
     pipeline.finish(destinations);
   } catch (...) {
     // Drain both legs before `columns` frees the destination buffers they write and before
-    // `slots` returns the staging memory they use to the HOST pool.
-    drain_after_failure(reader.get_stream());
+    // `staging` returns the staging memory they use to the HOST pool.
+    drain_after_failure(reader.get_stream_without_ordering());
     drain_after_failure(target_stream);
     throw;
   }
@@ -829,18 +842,15 @@ std::unique_ptr<cudf::table> copy_table_to_gpu(gpu_table_representation const& s
     validate_source_column(col);
   }
 
-  int const src_device   = source.get_device_id();
   int const dst_device   = target.get_device_id();
-  copy_route const route = select_route(config.route, src_device, dst_device);
+  copy_route const route = select_route(config.route, source.get_device_id(), dst_device);
 
   source_reader reader{source};
-  std::vector<std::size_t> const chars_sizes = read_chars_sizes(reader, view);
-
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{dst_device}};
   if (route == copy_route::peer) {
-    return copy_over_peer_route(source, view, chars_sizes, target, target_stream);
+    return copy_over_peer_route(reader, view, target, target_stream);
   }
-  return copy_over_host_staged_route(reader, view, chars_sizes, target, target_stream, config);
+  return copy_over_host_staged_route(reader, view, target, target_stream, config);
 }
 
 }  // namespace cucascade
