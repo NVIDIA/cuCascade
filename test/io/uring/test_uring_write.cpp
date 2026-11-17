@@ -1191,6 +1191,8 @@ TEST_CASE("uring a request stalled on its caller's stream does not hold up other
   cuda_stream stream;
   auto const device_data = pattern(4 * MiB, 31);
   device_bytes device{device_data};
+  // Allocated before the gate: device_bytes synchronizes the device.
+  device_bytes large{pattern(64 * MiB, 33)};
   stream_gate gate;
   gate.block(stream.get());
 
@@ -1200,6 +1202,13 @@ TEST_CASE("uring a request stalled on its caller's stream does not hold up other
   {
     stalled_bytes = 4 * MiB;
     stalled       = ctx->device_write_async(*writer, 0, stalled_bytes, device.get(), stream.ref());
+  }
+  SECTION("a staged device write larger than the reactor's staging")
+  {
+    // Planned before its stream is ready, its D2H copies would hold every
+    // staging slot, and the probes below could not get one.
+    stalled_bytes = 64 * MiB;
+    stalled = ctx->device_write_async(*writer, 16 * MiB, stalled_bytes, large.get(), stream.ref());
   }
   SECTION("a device read's host-to-device copy")
   {
