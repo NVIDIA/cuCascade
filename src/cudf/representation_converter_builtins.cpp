@@ -1850,12 +1850,9 @@ static std::unique_ptr<cudf::column> assemble_disk_column(const memory::column_m
     if (buffers.children.empty()) {
       return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
     }
-    // Reconstruct offsets and cast to INT64 if needed (cudf 26.06+ requires INT64 offsets)
+    // Offsets keep the type they were spilled with (INT32, or INT64 for large strings):
+    // make_strings_column accepts either.
     auto offsets_col = assemble_disk_column(meta.children[0], buffers.children[0], stream, mr);
-    if (offsets_col->type().id() == cudf::type_id::INT32) {
-      offsets_col =
-        cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
-    }
     return cudf::make_strings_column(meta.num_rows,
                                      std::move(offsets_col),
                                      std::move(buffers.data),
@@ -1916,12 +1913,6 @@ static std::unique_ptr<cudf::column> assemble_disk_column(const memory::column_m
  * Allocates every device buffer of the table, reads them all from the file with ONE batched
  * device read request, then assembles the cudf columns. Column metadata comes from the in-memory
  * disk_table_allocation.
- *
- * @note Peak device memory: the batched read needs every destination allocated up front, so a
- *       STRING column spilled with INT32 offsets is widened to INT64 (a 4 * (rows + 1) byte
- *       allocation) while the whole table is live, where reading column by column freed the
- *       INT32 offsets first.  The file size, which the restore is sized by, already excluded
- *       that widening; neither path charged it to a reservation.
  */
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   const idata_representation& source,
@@ -1956,7 +1947,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   // Phase 2: one batched device read of the whole table, awaited before returning or unwinding.
   detail::read_disk_file_device(*io_context, file_path, slices, stream);
 
-  // Phase 3: assemble the columns; the casts it may enqueue are ordered on `stream`.
+  // Phase 3: assemble the columns from the filled buffers.
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(disk_columns.size());
   for (std::size_t i = 0; i < disk_columns.size(); ++i) {
@@ -1972,8 +1963,7 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   //  2. A backend writes the destinations only after the work enqueued on `stream` before the read
   //     (uring copies on `stream`; cuFile waits for `stream` before it writes from elsewhere). The
   //     destinations are stream-ordered allocations on `stream`, so this ordering is required.
-  // Everything assemble_disk_column enqueues (offset casts) is ordered on `stream` after that, and
-  // make_written_on() records the table's writer event on `stream` behind it, which every reader
+  // make_written_on() records the table's writer event on `stream` after that, which every reader
   // waits on before touching the data.
   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
   return gpu_table_representation::make_written_on(
