@@ -24,9 +24,10 @@ Check these before upgrading a deployment that used the removed paths. `rest.*` 
   `NO_PROXY`, ...) are ignored, there is no HTTP `CONNECT` tunnelling and no proxy setting. A
   deployment behind an egress proxy needs a direct route to the object store (e.g. a VPC endpoint).
 - **kvikIO is removed.** `io_backend::kvikio`, `io_config::kvikio`, `io_context_type::kvikio` and
-  the kvikIO link dependency are gone. `io_backend::native` is the only backend: local files go
-  to `uring_ioctx` (device reads through pinned bounce staging; there is no GDS path in this
-  backend), `s3://` objects to `rest_ioctx`. The datasource registry has no catch-all any more: a
+  the kvikIO link dependency are gone. `io_backend::native` routes local files to `uring_ioctx`
+  (device reads through pinned bounce staging; no GDS path) and `s3://` objects to `rest_ioctx`;
+  `io_backend::cufile` routes local files to the cuFile / GPUDirect Storage backend instead (see
+  [cufile-gds.md](cufile-gds.md)). The datasource registry has no catch-all any more: a
   path neither claims (not a regular local file, not `s3://`) resolves to no backend
   (`io_context_registry::lookup_path` returns `std::nullopt`) instead of falling back to kvikIO.
 - **AES-GCM cipher suites only by default.** `rest.tls.ciphersuites` (TLS 1.3,
