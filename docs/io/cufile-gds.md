@@ -338,7 +338,7 @@ points.
 | `gds_threshold` | 256 KiB | Smaller device reads use POSIX |
 | `max_op_bytes` | 64 MiB | Largest direct `cuFileRead`; byte quantum of a scheduling pass |
 | `max_inflight` | 32 | Async copies per reactor (parked slices excluded) |
-| `write_split_bytes` | 0 (off) | Write slices larger than this are cut into pieces of this size, spread over the group's reactors |
+| `write_split_bytes` | 64 MiB | Write slices larger than this are cut into pieces of this size, spread over the group's reactors (0 = never) |
 | `poll_interval_us` | 50 | Completion poll period while copies are pending |
 | `use_odirect`, `compat_mode` | true, automatic | O_DIRECT / cuFile registration policy per file |
 
