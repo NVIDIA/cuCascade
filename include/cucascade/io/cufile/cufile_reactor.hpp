@@ -261,10 +261,9 @@ struct reactor_stats {
  * scratch is not shaped like cache chunks, so it opts out of the prefetching
  * cache (@c reactor_traits::supports_vector_host_read is false).
  *
- * @note By default destinations and sources are not registered (see
- *       @ref config::register_min_bytes): registering a one-shot buffer costs
- *       about as much as reading it, and its 4 KiB phase rarely matches the file
- *       offset anyway.  The staging slots are registered once and reused by the
+ * @note Destinations and sources are never registered: registering a one-shot
+ *       buffer costs about as much as reading it, and its 4 KiB phase rarely
+ *       matches the file offset anyway.  The staging slots are registered once and reused by the
  *       whole process (see @c reserve_staging).
  *
  * @note Known gap: a device read below @ref config::gds_threshold, or of a file

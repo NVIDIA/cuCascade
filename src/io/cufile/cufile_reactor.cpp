@@ -57,7 +57,6 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -359,220 +358,6 @@ void write_host_piece(cufile_io_object const& file,
     pwrite_all(file.buffered_fd(), source, piece.size, piece.offset);
   }
 }
-
-/**
- * @brief Process-wide table of the device ranges the reactors registered with
- *        @c cuFileBufRegister, keyed by base address.
- *
- * cuFile identifies a registered buffer by its base pointer, so two transfers
- * that pass the same base share one registration; deregistering it while the
- * other transfer's I/O runs would pull it from under that I/O.  The table makes
- * the sharing explicit (reference counted, the last user deregisters) and
- * refuses a transfer whose range overlaps a live registration any other way.
- */
-class registration_table {
- public:
-  /// What a transfer may do with its buffer.
-  enum class grant {
-    unregistered,  ///< pass the exact pointer, cuFile bounces it
-    registered,    ///< pass the base and an offset; release() when done
-    conflict       ///< overlaps a live registration: do not use cuFile at all
-  };
-
-  static registration_table& instance()
-  {
-    static registration_table table;
-    return table;
-  }
-
-  /// Decide for a transfer of [@p base, @p base + @p bytes); register it when
-  /// @p want_registration and nothing overlaps.  An unregistered grant is
-  /// recorded too (release it with @ref release_unregistered), so a later
-  /// registration never covers memory an unregistered transfer is using.
-  grant acquire(void const* base, std::size_t bytes, bool want_registration)
-  {
-    auto const begin = reinterpret_cast<std::uintptr_t>(base);
-    auto const end   = begin + bytes;
-    std::lock_guard lock(_mutex);
-    if (auto it = _live.find(begin); it != _live.end()) {
-      if (end > it->first + it->second.bytes) return grant::conflict;
-      ++it->second.users;
-      return grant::registered;
-    }
-    if (overlaps(begin, end)) return grant::conflict;
-    if (!want_registration || overlaps_unregistered(begin, end)) {
-      _unregistered.emplace(begin, bytes);
-      return grant::unregistered;
-    }
-    auto const* api = cufile_api::get();
-    if (api == nullptr) return grant::unregistered;
-    auto const status = api->buf_register(base, bytes, 0);
-    if (status.err != CU_FILE_SUCCESS) {
-      static std::atomic<bool> logged{false};
-      if (!logged.exchange(true, std::memory_order_relaxed)) {
-        CUCASCADE_LOG_WARN(
-          "cufile_reactor: cuFileBufRegister of {} bytes failed (err={}); transferring "
-          "unregistered (logged once per process)",
-          bytes,
-          static_cast<int>(status.err));
-      }
-      // Registered by someone outside the table: its owner may deregister it at
-      // any time, so keep cuFile away from it.
-      if (status.err == CU_FILE_MEMORY_ALREADY_REGISTERED) return grant::conflict;
-      _unregistered.emplace(begin, bytes);
-      return grant::unregistered;
-    }
-    try {
-      _live.emplace(begin, entry{bytes, 1});
-    } catch (...) {
-      // Never leave a registration the table does not know about.
-      std::ignore = api->buf_deregister(base);
-      throw;
-    }
-    ++_created;
-    return grant::registered;
-  }
-
-  /// Drop one user of the registration at @p base; the last one deregisters.
-  void release(void const* base) noexcept
-  {
-    std::lock_guard lock(_mutex);
-    auto it = _live.find(reinterpret_cast<std::uintptr_t>(base));
-    if (it == _live.end() || --it->second.users != 0) return;
-    _live.erase(it);
-    // A live registration implies the library loaded, so the table is present.
-    if (auto const* api = cufile_api::get(); api != nullptr) {
-      std::ignore = api->buf_deregister(base);
-    }
-  }
-
-  /// End an unregistered transfer of [@p base, @p base + @p bytes).
-  void release_unregistered(void const* base, std::size_t bytes) noexcept
-  {
-    std::lock_guard lock(_mutex);
-    auto const range = _unregistered.equal_range(reinterpret_cast<std::uintptr_t>(base));
-    for (auto it = range.first; it != range.second; ++it) {
-      if (it->second == bytes) {
-        _unregistered.erase(it);
-        return;
-      }
-    }
-  }
-
-  [[nodiscard]] std::size_t live() const
-  {
-    std::lock_guard lock(_mutex);
-    return _live.size();
-  }
-
-  /// Registrations created so far (tests).
-  [[nodiscard]] std::size_t created() const
-  {
-    std::lock_guard lock(_mutex);
-    return _created;
-  }
-
-  /// Whether [base, base + bytes) overlaps a live registration or an
-  /// unregistered transfer in flight (tests).
-  [[nodiscard]] bool tracked(void const* base, std::size_t bytes) const
-  {
-    auto const begin = reinterpret_cast<std::uintptr_t>(base);
-    std::lock_guard lock(_mutex);
-    return overlaps(begin, begin + bytes) || overlaps_unregistered(begin, begin + bytes);
-  }
-
- private:
-  struct entry {
-    std::size_t bytes;
-    std::size_t users;
-  };
-
-  /// Whether [begin, end) overlaps a live registration (caller holds the lock).
-  [[nodiscard]] bool overlaps(std::uintptr_t begin, std::uintptr_t end) const
-  {
-    auto it = _live.lower_bound(begin);
-    if (it != _live.end() && it->first < end) return true;
-    if (it == _live.begin()) return false;
-    --it;
-    return it->first + it->second.bytes > begin;
-  }
-
-  /// Whether [begin, end) overlaps an unregistered transfer in flight (caller
-  /// holds the lock).  Few transfers are in flight at once: a scan is enough.
-  [[nodiscard]] bool overlaps_unregistered(std::uintptr_t begin, std::uintptr_t end) const
-  {
-    return std::any_of(_unregistered.begin(), _unregistered.end(), [&](auto const& transfer) {
-      return transfer.first < end && transfer.first + transfer.second > begin;
-    });
-  }
-
-  mutable std::mutex _mutex;
-  std::map<std::uintptr_t, entry> _live;
-  std::multimap<std::uintptr_t, std::size_t> _unregistered;
-  std::size_t _created{0};
-};
-
-/**
- * @brief The registration decision for one cuFile transfer, released on
- *        destruction -- before the transfer's request settles, so the caller may
- *        free the buffer as soon as its future resolves.
- *
- * Every non-empty transfer consults the table, whatever @p min_bytes: the table
- * is process-wide, so another context with registration enabled must see this
- * transfer before it registers (and later deregisters) memory it uses.  One
- * that is at least @p min_bytes (0 = never) and whose buffer is 4 KiB-aligned
- * registers (or shares a live registration at the same base); one that
- * overlaps a live registration otherwise is a conflict the caller serves
- * without cuFile; any other is recorded as an unregistered transfer.
- */
-class transfer_registration {
- public:
-  transfer_registration(void const* base,
-                        std::size_t bytes,
-                        bool aligned,
-                        std::size_t min_bytes) noexcept
-  {
-    if (bytes == 0) return;
-    bool const want = min_bytes != 0 && aligned && bytes >= min_bytes &&
-                      reinterpret_cast<std::uintptr_t>(base) % IO_BLOCK_SIZE == 0;
-    try {
-      _grant = registration_table::instance().acquire(base, bytes, want);
-    } catch (...) {
-      _grant = registration_table::grant::conflict;
-    }
-    if (_grant != registration_table::grant::conflict) {
-      _base  = base;
-      _bytes = bytes;
-    }
-  }
-
-  ~transfer_registration()
-  {
-    if (_base == nullptr) return;
-    if (registered()) {
-      registration_table::instance().release(_base);
-    } else {
-      registration_table::instance().release_unregistered(_base, _bytes);
-    }
-  }
-
-  transfer_registration(transfer_registration const&)            = delete;
-  transfer_registration& operator=(transfer_registration const&) = delete;
-
-  [[nodiscard]] bool registered() const noexcept
-  {
-    return _grant == registration_table::grant::registered;
-  }
-  [[nodiscard]] bool conflict() const noexcept
-  {
-    return _grant == registration_table::grant::conflict;
-  }
-
- private:
-  registration_table::grant _grant{registration_table::grant::unregistered};
-  void const* _base{nullptr};  ///< set when the table recorded this transfer
-  std::size_t _bytes{0};
-};
 
 /// Test seams (see cufile/detail.hpp).
 std::atomic<bool> cufile_writes_in_compat{false};
@@ -1528,11 +1313,8 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
   auto* const dst   = slice.d_buffer.data;
   std::optional<std::error_code> failure;
   {
-    // A registered range is addressed by its base plus an offset (cuFile requires
-    // the registered base); an unregistered one by the exact pointer.
-    transfer_registration const registration{
-      dst, request->io_rng.size, offset % IO_BLOCK_SIZE == 0, _config.register_min_bytes};
-    if (registration.conflict()) return false;
+    // The destination is never registered with cuFile: each piece is addressed
+    // by its exact device pointer with a zero buffer offset.
     auto pos = offset;
     while (pos < end) {
       if (_stop_source.stop_requested()) {
@@ -1543,13 +1325,7 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
       run_cufile_transfer_hook();
       errno = 0;
       auto const got =
-        registration.registered()
-          ? api->read(file.cufile_handle(),
-                      dst,
-                      want,
-                      static_cast<off_t>(pos),
-                      static_cast<off_t>(pos - offset))
-          : api->read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
+        api->read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
       if (got < 0) {
         log_cufile_failure_once(file, got, errno);
         _counters.cufile_failures.fetch_add(1, std::memory_order_relaxed);
@@ -2016,11 +1792,7 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
   if (api == nullptr) return false;
 
   auto const max_op = _config.max_op_bytes - _config.max_op_bytes % IO_BLOCK_SIZE;
-  // Deregistered when this function returns or throws, before the request settles.
-  transfer_registration const registration{
-    source, piece.size, /*aligned=*/true, _config.register_min_bytes};
-  if (registration.conflict()) return false;
-  std::size_t done = 0;
+  std::size_t done  = 0;
   int short_writes = 0;
   while (done < piece.size) {
     if (_stop_source.stop_requested()) {
@@ -2031,14 +1803,7 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
     run_cufile_transfer_hook();
     errno = 0;
     auto const got =
-      registration.registered()
-        ? api->write(file.cufile_handle(),
-                     source,
-                     want,
-                     static_cast<off_t>(piece.offset + done),
-                     static_cast<off_t>(done))
-        : api->write(
-            file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
+      api->write(file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
     if (got < 0) {
       auto const saved_errno = errno;
       static std::atomic<bool> logged{false};
@@ -2463,38 +2228,11 @@ std::size_t next_piece(std::size_t pos,
   return stop - pos;
 }
 
-std::size_t live_registrations_for_testing() noexcept
-{
-  try {
-    return registration_table::instance().live();
-  } catch (...) {
-    return 0;
-  }
-}
-
 void set_cufile_transfer_hook_for_testing(void (*hook)(void*), void* arg) noexcept
 {
   cufile_transfer_hook.store(nullptr, std::memory_order_release);
   cufile_transfer_hook_arg.store(arg, std::memory_order_release);
   cufile_transfer_hook.store(hook, std::memory_order_release);
-}
-
-bool transfer_tracked_for_testing(void const* base, std::size_t bytes) noexcept
-{
-  try {
-    return registration_table::instance().tracked(base, bytes);
-  } catch (...) {
-    return false;
-  }
-}
-
-std::size_t registrations_created_for_testing() noexcept
-{
-  try {
-    return registration_table::instance().created();
-  } catch (...) {
-    return 0;
-  }
 }
 
 void set_cufile_writes_in_compat_for_testing(bool enabled) noexcept
