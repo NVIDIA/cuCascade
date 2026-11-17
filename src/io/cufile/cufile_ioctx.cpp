@@ -39,6 +39,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -130,6 +131,75 @@ namespace {
   CUCASCADE_CUDA_TRY(cudaGetDevice(&current));
   return current;
 }
+
+/**
+ * @brief The gates of one submission, one per stream: an event recorded on the
+ *        stream, on the submitting thread, when work queued on it before the
+ *        call has not finished yet; null when it has.
+ *
+ * Reactors wait on the gate instead of resolving the stream on their worker,
+ * where a per-thread default stream names a different stream.  A stream being
+ * captured is refused (querying it would invalidate the capture, and the
+ * transfer could not be part of the graph anyway).
+ */
+class stream_gates {
+ public:
+  /// @p operation ("read" / "write") names the transfer in errors.
+  explicit stream_gates(std::string_view operation) : _operation(operation) {}
+
+  [[nodiscard]] std::shared_ptr<cucascade::cuda::cuda_event> const& of(cudaStream_t stream)
+  {
+    for (auto const& entry : _gates) {
+      if (entry.stream == stream) return entry.gate;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUCASCADE_CUDA_TRY(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+      throw std::invalid_argument(std::string{"cufile_ioctx: a device "} + std::string{_operation} +
+                                  " cannot be issued on a stream that is being captured");
+    }
+    std::shared_ptr<cucascade::cuda::cuda_event> gate;
+    // The legacy default stream (also the null handle) orders after prior
+    // work on every blocking stream, which a query of it does not report:
+    // always record its event and query that instead.
+    bool const legacy = stream == nullptr || stream == cudaStreamLegacy;
+    auto const state  = legacy ? cudaErrorNotReady : cudaStreamQuery(stream);
+    if (state == cudaErrorNotReady) {
+      std::ignore       = cudaGetLastError();
+      int stream_device = 0;
+      CUCASCADE_CUDA_TRY(cudaStreamGetDevice(stream, &stream_device));
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{stream_device}};
+      gate = std::make_shared<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
+      CUCASCADE_CUDA_TRY(cudaEventRecord(gate->get(), stream));
+      if (legacy) {
+        auto const recorded = cudaEventQuery(gate->get());
+        if (recorded == cudaSuccess) {
+          gate.reset();
+        } else if (recorded != cudaErrorNotReady) {
+          std::ignore = cudaGetLastError();
+          throw cucascade::cuda_error(std::string{"cufile_ioctx: cudaEventQuery failed: "} +
+                                      cudaGetErrorString(recorded));
+        } else {
+          std::ignore = cudaGetLastError();
+        }
+      }
+    } else if (state != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+      throw cucascade::cuda_error(std::string{"cufile_ioctx: cudaStreamQuery failed: "} +
+                                  cudaGetErrorString(state));
+    }
+    _gates.push_back(entry{stream, std::move(gate)});
+    return _gates.back().gate;
+  }
+
+ private:
+  struct entry {
+    cudaStream_t stream;
+    std::shared_ptr<cucascade::cuda::cuda_event> gate;
+  };
+  std::string_view _operation;
+  std::vector<entry> _gates;
+};
 
 /// Settle every slice of a request that could not be dispatched: release any
 /// cache chunks and report the slices as not read.
@@ -288,12 +358,7 @@ std::vector<cufile_reactor*> cufile_ioctx::next_reactor(
 void cufile_ioctx::prepare_device_slices(io_object const& object,
                                          std::vector<prepared_io_slice>& slices)
 {
-  // One gate per stream: the work queued on it before this call.
-  struct stream_gate {
-    cudaStream_t stream;
-    std::shared_ptr<cucascade::cuda::cuda_event> gate;
-  };
-  std::vector<stream_gate> gates;
+  stream_gates gates{"read"};
   // Pieces no smaller than cuFile still serves: a piece below gds_threshold would
   // take the POSIX path.
   auto const split_bytes = std::max(
@@ -305,52 +370,7 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
     if (!slice.has_device_request() || slice.d_buffer.ready_gate_set) continue;
     if (slice.d_buffer.device_id < 0) slice.d_buffer.device_id = device_of(slice.d_buffer.data);
 
-    auto const stream = slice.d_buffer.stream.get();
-    auto found        = std::find_if(
-      gates.begin(), gates.end(), [stream](stream_gate const& g) { return g.stream == stream; });
-    if (found == gates.end()) {
-      // Never touch a stream being captured: querying it would invalidate the
-      // capture, and the read could not be part of the graph anyway.
-      cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-      CUCASCADE_CUDA_TRY(cudaStreamIsCapturing(stream, &capture));
-      if (capture != cudaStreamCaptureStatusNone) {
-        throw std::invalid_argument(
-          "cufile_ioctx: a device read cannot be issued on a stream that is being captured");
-      }
-      std::shared_ptr<cucascade::cuda::cuda_event> gate;
-      // The legacy default stream (also the null handle) orders after prior
-      // work on every blocking stream, which a query of it does not report:
-      // always record its event and query that instead.
-      bool const legacy = stream == nullptr || stream == cudaStreamLegacy;
-      auto const state  = legacy ? cudaErrorNotReady : cudaStreamQuery(stream);
-      if (state == cudaErrorNotReady) {
-        std::ignore       = cudaGetLastError();
-        int stream_device = 0;
-        CUCASCADE_CUDA_TRY(cudaStreamGetDevice(stream, &stream_device));
-        rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{stream_device}};
-        gate = std::make_shared<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
-        CUCASCADE_CUDA_TRY(cudaEventRecord(gate->get(), stream));
-        if (legacy) {
-          auto const recorded = cudaEventQuery(gate->get());
-          if (recorded == cudaSuccess) {
-            gate.reset();
-          } else if (recorded != cudaErrorNotReady) {
-            std::ignore = cudaGetLastError();
-            throw cucascade::cuda_error(std::string{"cufile_ioctx: cudaEventQuery failed: "} +
-                                        cudaGetErrorString(recorded));
-          } else {
-            std::ignore = cudaGetLastError();
-          }
-        }
-      } else if (state != cudaSuccess) {
-        std::ignore = cudaGetLastError();
-        throw cucascade::cuda_error(std::string{"cufile_ioctx: cudaStreamQuery failed: "} +
-                                    cudaGetErrorString(state));
-      }
-      gates.push_back(stream_gate{stream, std::move(gate)});
-      found = std::prev(gates.end());
-    }
-    slice.d_buffer.ready_gate     = found->gate;
+    slice.d_buffer.ready_gate     = gates.of(slice.d_buffer.stream.get());
     slice.d_buffer.ready_gate_set = true;
 
     if (auto const pieces = split_pieces(slice, file_size, split_bytes); pieces > 1) {
@@ -539,6 +559,30 @@ exec::semi_future<std::size_t> cufile_ioctx::mixed_readv_async_io(
     return exec::make_semi_future<std::size_t>(error);
   }
   return templated_ioctx<cufile_reactor>::mixed_readv_async_io(object, std::move(input_slices));
+}
+
+void cufile_ioctx::prepare_device_writes(std::vector<prepared_io_slice>& slices)
+{
+  stream_gates gates{"write"};
+  for (auto& slice : slices) {
+    if (!slice.is_write() || !slice.has_device_request() || slice.d_buffer.ready_gate_set) {
+      continue;
+    }
+    if (slice.d_buffer.device_id < 0) slice.d_buffer.device_id = device_of(slice.d_buffer.data);
+    slice.d_buffer.ready_gate     = gates.of(slice.d_buffer.stream.get());
+    slice.d_buffer.ready_gate_set = true;
+  }
+}
+
+exec::semi_future<std::size_t> cufile_ioctx::mixed_writev_async_io(
+  io_object const& object, std::vector<prepared_io_slice>&& input_slices) noexcept
+{
+  try {
+    prepare_device_writes(input_slices);
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+  return templated_ioctx<cufile_reactor>::mixed_writev_async_io(object, std::move(input_slices));
 }
 
 }  // namespace cucascade::io::cufile

@@ -44,9 +44,10 @@ namespace cucascade::io::cufile {
  * staged through each reactor's pinned scratch) and host reads with POSIX
  * @c pread; the pool shares one @c reactor_context.  Writes
  * (@c open_io_object_for_write and the write API) use @c cuFileWrite for large
- * aligned device bodies on a real GDS platform and staged / direct @c pwrite
- * otherwise (see @c cufile_reactor).  Selected by @c io_backend::cufile and
- * registered from the datasource factory like the uring / rest backends.
+ * aligned device bodies on a real GDS platform, staged through the same
+ * registered slots, and staged / direct @c pwrite otherwise (see
+ * @c cufile_reactor).  Selected by @c io_backend::cufile and registered from
+ * the datasource factory like the uring / rest backends.
  *
  * Built from a @ref pool_plan (see @ref plan_cufile_pool), the pool has a group
  * of reactors per GPU, pinned to the CPUs local to that GPU: a device read goes
@@ -63,6 +64,10 @@ namespace cucascade::io::cufile {
  *   worker thread.  A stream being captured is refused;
  * - a device-only read larger than @c config::staging_piece_bytes is split into
  *   pieces on 4 KiB boundaries, so several reactors read it at once.
+ *
+ * A device write is prepared the same way (its GPU from the source pointer, a
+ * gate on its stream), so it reaches its source GPU's group and is staged
+ * through that GPU's slots; it is split by @c config::write_split_bytes.
  *
  * Vectored reads (@c device_readv_async_io, @c host_device_readv_async_io and
  * the datasource's @c device_read_ranges_async on top of them) keep the generic
@@ -112,6 +117,12 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   exec::semi_future<std::size_t> mixed_readv_async_io(
     io_object const& object, std::vector<prepared_io_slice>&& input_slices) noexcept override;
 
+  /// Prepare the device write slices on the calling thread (their GPU from the
+  /// source pointer, and their stream gate, as for reads), then dispatch as
+  /// @c templated_ioctx does: a device write goes to its source GPU's group.
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& object, std::vector<prepared_io_slice>&& input_slices) noexcept override;
+
   /**
    * @brief What GPUDirect Storage can do for reads of @p object, an object this
    *        ioctx opened, under this ioctx's configuration (see @ref probe_object).
@@ -154,6 +165,10 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// Resolve the GPU, stream gate and split of every device slice (see the class
   /// comment).  @throws on a capturing stream or a CUDA failure.
   void prepare_device_slices(io_object const& object, std::vector<prepared_io_slice>& slices);
+
+  /// Resolve the GPU (from the source pointer) and stream gate of every device
+  /// write slice.  @throws on a capturing stream or a CUDA failure.
+  void prepare_device_writes(std::vector<prepared_io_slice>& slices);
 
   /// Replace runs of neighbouring small device slices by fused slices (see
   /// @c config::fuse_gap_bytes).  Slices outside the file, with a completion
