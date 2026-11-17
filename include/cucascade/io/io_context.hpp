@@ -75,6 +75,13 @@ namespace cucascade::io {
  *
  * Holds resources that are shared across all datasources (cache, reactor
  * threads, ...). Extend this class to provide a concrete I/O backend.
+ *
+ * @warning A transfer's future settles on a reactor's worker thread, so a
+ *          continuation that runs inline there (e.g. through
+ *          @c exec::inline_executor) must not drop the last reference to the
+ *          ioctx: destroying a context joins its workers, a worker cannot join
+ *          itself, and the process terminates.  Keep a reference elsewhere until
+ *          the continuation has run.
  */
 class ioctx : public std::enable_shared_from_this<ioctx> {
  public:
