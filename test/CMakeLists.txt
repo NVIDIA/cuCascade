@@ -51,6 +51,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # Utils
     # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp
+    utils/test_worker_group.cpp
     # Main test runner
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20

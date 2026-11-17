@@ -19,6 +19,7 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mixed_table.hpp"
 #include "utils/peer_access_utils.hpp"
+#include "utils/worker_group.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -44,13 +45,10 @@
 #include <cstdlib>
 #include <exception>
 #include <functional>
-#include <future>
-#include <latch>
 #include <memory>
 #include <new>
 #include <span>
 #include <stdexcept>
-#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -67,6 +65,9 @@ constexpr uint64_t kMiB = 1024ULL * kKiB;
 
 constexpr int kSourceDevice = 0;
 constexpr int kTargetDevice = 1;
+
+/// Deadline of every test that converts on several threads at once.
+constexpr std::chrono::seconds kConcurrentTimeout{60};
 
 // SKIP when the hardware cannot give the peer access asked for, FAIL on CUDA errors.
 void require_granted(pool_peer_access_result const& result)
@@ -749,26 +750,25 @@ void check_conversions_wait_for_source_writer(cross_gpu_copy_config const& confi
 
   // the writer event is behind the gate; conversion must honor it before copying.
 
-  std::latch workers_ready{2};
-  auto convert = [&] {
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{kTargetDevice}};
-    rmm::cuda_stream reader{rmm::cuda_stream::flags::non_blocking};
-    auto* target_mem_space = manager.get_memory_space(Tier::GPU, kTargetDevice);
-    workers_ready.count_down();
-    return registry.convert<gpu_table_representation>(*source_data, target_mem_space, reader);
-  };
-
-  std::future<std::unique_ptr<gpu_table_representation>> first;
-  std::future<std::unique_ptr<gpu_table_representation>> second;
+  // Declared before `cleanup`, so that a failure opens the producer gate before the converters are
+  // waited for.
+  cucascade::test::worker_group<std::unique_ptr<gpu_table_representation>> converters{
+    2, kConcurrentTimeout};
 
   // to prevent deadlocks in case of conversion failure
   auto cleanup = cucascade::utils::on_scope_exit([&]() noexcept { producer_gate.release(); });
 
   // two independent converters reading from the same source
-  first  = std::async(std::launch::async, convert);
-  second = std::async(std::launch::async, convert);
-
-  workers_ready.wait();
+  for (int i = 0; i < 2; ++i) {
+    converters.spawn([&](auto& start) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{kTargetDevice}};
+      rmm::cuda_stream reader{rmm::cuda_stream::flags::non_blocking};
+      auto* target_mem_space = manager.get_memory_space(Tier::GPU, kTargetDevice);
+      start.arrive_and_wait();
+      return registry.convert<gpu_table_representation>(*source_data, target_mem_space, reader);
+    });
+  }
+  converters.wait_until_started();
 
   // resume the halted producer after a 100ms grace period. Each converter blocks in its single
   // planning sync (the strings chars-size readback), which is ordered behind the gate. Timing
@@ -776,8 +776,9 @@ void check_conversions_wait_for_source_writer(cross_gpu_copy_config const& confi
   // TODO: make this fully deterministic, eg by using a custom allocator of the test that
   // notifies on first allocation signalling the copies have been enqueued.
   producer_gate.release_after(std::chrono::milliseconds{100});
-  auto left  = first.get();
-  auto right = second.get();
+  auto const converted = converters.join();
+  auto const& left     = converted[0];
+  auto const& right    = converted[1];
 
   // comparisons should not rely on source's existence after the copy
   source_data.reset();
@@ -1221,32 +1222,31 @@ TEST_CASE("host-staged gpu_to_gpu conversions run concurrently",
   representation_converter_registry registry;
   register_builtin_converters(registry, host_staged(16 * kKiB, 3));
 
-  constexpr int kThreads          = 6;
+  constexpr std::size_t kThreads  = 6;
   constexpr cudf::size_type kRows = 4096;
   auto const producer             = make_stream_on(kSourceDevice);
   std::vector<std::unique_ptr<gpu_table_representation>> sources;
-  for (int i = 0; i < kThreads; ++i) {
+  for (std::size_t i = 0; i < kThreads; ++i) {
     sources.push_back(make_source(*manager, table_kind::mixed, kRows, producer));
   }
 
   memory_space* target_space = manager->get_memory_space(Tier::GPU, kTargetDevice);
-  std::latch start{kThreads};
-  std::vector<std::future<std::unique_ptr<gpu_table_representation>>> results;
-  for (int i = 0; i < kThreads; ++i) {
-    results.push_back(std::async(std::launch::async, [&, i] {
+  test::worker_group<std::unique_ptr<gpu_table_representation>> conversions{kThreads,
+                                                                            kConcurrentTimeout};
+  for (std::size_t i = 0; i < kThreads; ++i) {
+    conversions.spawn([&, i](auto& start) {
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kTargetDevice}};
       rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
       start.arrive_and_wait();
-      return registry.convert<gpu_table_representation>(
-        *sources[static_cast<std::size_t>(i)], target_space, stream);
-    }));
+      return registry.convert<gpu_table_representation>(*sources[i], target_space, stream);
+    });
   }
+  auto const results = conversions.join();
 
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kTargetDevice}};
   rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
   auto const expected = make_table(table_kind::mixed, kRows, *target_space, consumer);
-  for (auto& result : results) {
-    auto const converted = result.get();
+  for (auto const& converted : results) {
     converted->wait_for_writer(consumer);
     test::expect_cudf_tables_equal_on_stream(
       expected->view(), converted->get_table_view(), consumer);
@@ -1294,12 +1294,11 @@ TEST_CASE("host-staged gpu_to_gpu conversions in both directions share the strea
     CAPTURE(round);
     // Null where the conversion ran out of HOST memory.
     using outcome = std::unique_ptr<gpu_table_representation>;
-    std::latch start{2 * kPerDirection};
-    std::array<std::vector<std::future<outcome>>, 2> results;  // by destination
+    test::worker_group<outcome> conversions{2 * kPerDirection, kConcurrentTimeout};
     for (std::size_t from = 0; from < 2; ++from) {
       std::size_t const to = 1 - from;
       for (std::size_t i = 0; i < kPerDirection; ++i) {
-        results[to].push_back(std::async(std::launch::async, [&, from, to, i]() -> outcome {
+        conversions.spawn([&, from, to, i](auto& start) -> outcome {
           rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kDevices[to]}};
           rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
           start.arrive_and_wait();
@@ -1309,16 +1308,17 @@ TEST_CASE("host-staged gpu_to_gpu conversions in both directions share the strea
           } catch (cucascade_out_of_memory const&) {
             return nullptr;
           }
-        }));
+        });
       }
     }
 
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{60};
-    for (std::size_t to = 0; to < 2; ++to) {
+    // In spawn order: every conversion from kDevices[0], then every conversion from kDevices[1].
+    std::vector<outcome> const outcomes = conversions.join();
+    for (std::size_t from = 0; from < 2; ++from) {
+      std::size_t const to = 1 - from;
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kDevices[to]}};
-      for (auto& result : results[to]) {
-        REQUIRE(result.wait_until(deadline) == std::future_status::ready);
-        auto const table = result.get();
+      for (std::size_t i = 0; i < kPerDirection; ++i) {
+        outcome const& table = outcomes[from * kPerDirection + i];
         if (table == nullptr) { continue; }
         table->wait_for_writer(streams[to]);
         test::expect_cudf_tables_equal_on_stream(
