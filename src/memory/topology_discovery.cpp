@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -135,7 +136,43 @@ struct NetworkDeviceWithTopology {
   std::string name;
   int numa_node;
   std::string pci_bus_id;
+  std::string net_interface;     ///< Backing network interface; empty if none.
+  int mtu{0};                    ///< MTU of net_interface; 0 if unknown or none.
+  unsigned int active_ports{0};  ///< Ports in the ACTIVE state.
+  std::string link_layer;        ///< Link layer of the fastest active port.
+  unsigned int rate_gbps{0};     ///< Rate of the fastest active port, Gb/s.
 };
+
+/**
+ * @brief The active ports of an InfiniBand / RoCE device and the fastest one's
+ *        link layer and rate.
+ */
+struct rdma_port_summary {
+  unsigned int active_ports{0};
+  std::string link_layer;
+  unsigned int rate_gbps{0};
+};
+
+/**
+ * @brief Leading unsigned number of @p text ("400 Gb/sec (4X NDR)" -> 400; "2.5 Gb/sec" -> 2),
+ *        or 0.
+ */
+unsigned int leading_unsigned(std::string_view text) noexcept
+{
+  std::size_t pos = 0;
+  while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+    ++pos;
+  }
+  unsigned long value = 0;
+  bool any            = false;
+  while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+    value = value * 10 + static_cast<unsigned long>(text[pos] - '0');
+    if (value > 1'000'000UL) { return 0; }  // not a plausible link rate
+    any = true;
+    ++pos;
+  }
+  return any ? static_cast<unsigned int>(value) : 0;
+}
 
 /**
  * @brief Emit a standardized warning for a failed NVML call.
@@ -556,6 +593,37 @@ bool has_active_port(std::string const& device_path)
 }
 
 /**
+ * @brief Summarize the ports of an InfiniBand / RoCE device: how many are
+ *        ACTIVE, and the link layer and rate of the fastest active one.
+ *
+ * Reads @c ports/<n>/{state,link_layer,rate} below @p device_path; the rate file
+ * reads like "400 Gb/sec (4X NDR)".  Unreadable attributes are left empty / 0.
+ */
+rdma_port_summary summarize_rdma_ports(std::string const& device_path)
+{
+  rdma_port_summary summary;
+  try {
+    fs::path const ports_dir = fs::path(device_path) / "ports";
+    std::error_code ec;
+    if (!fs::exists(ports_dir, ec)) { return summary; }
+    for (auto const& port_entry : fs::directory_iterator(ports_dir, ec)) {
+      if (!port_entry.is_directory()) { continue; }
+      std::string const state = read_file_content((port_entry.path() / "state").string());
+      if (state.find("ACTIVE") == std::string::npos) { continue; }
+      ++summary.active_ports;
+      auto const rate = leading_unsigned(read_file_content((port_entry.path() / "rate").string()));
+      if (rate >= summary.rate_gbps) {
+        summary.rate_gbps  = rate;
+        summary.link_layer = read_file_content((port_entry.path() / "link_layer").string());
+      }
+    }
+  } catch (...) {
+    // Best effort: a partial summary is still useful.
+  }
+  return summary;
+}
+
+/**
  * @brief Check whether an InfiniBand device has an accessible userspace verbs device node.
  *
  * Looks up the uverbs device name from
@@ -612,28 +680,88 @@ bool interface_has_ip(std::string const& iface_name)
 }
 
 /**
- * @brief Check whether an InfiniBand device's associated net interface has an IP address.
+ * @brief List the network interfaces backing an InfiniBand/RoCE device.
  *
- * Looks up the net interface name from /sys/class/infiniband/<dev>/device/net/ and
- * then checks for a configured IP address via getifaddrs().  Devices without IPoIB
- * or RoCE networking configured (no IP) are unusable for IP-based transports.
+ * Reads the entries of /sys/class/infiniband/<dev>/device/net/, which name the
+ * kernel network interfaces (RoCE netdevs, IPoIB interfaces) of the device's PCI
+ * function.
  *
  * @param device_path Sysfs path to the InfiniBand device directory.
- * @return true if the device has a net interface with at least one IP address.
+ * @return Interface names sorted ascending; empty if the device has none or the
+ *         directory cannot be read.
  */
-bool has_net_interface_with_ip(std::string const& device_path)
+std::vector<std::string> list_net_interfaces(std::string const& device_path)
 {
+  std::vector<std::string> interfaces;
   fs::path net_dir = fs::path(device_path) / "device" / "net";
-  if (!fs::exists(net_dir)) { return false; }
+  if (!fs::exists(net_dir)) { return interfaces; }
 
   try {
     for (auto const& entry : fs::directory_iterator(net_dir)) {
       if (!entry.is_directory()) { continue; }
-      if (interface_has_ip(entry.path().filename().string())) { return true; }
+      interfaces.push_back(entry.path().filename().string());
     }
   } catch (...) {
+    // Best-effort: keep whatever was listed before the error.
   }
-  return false;
+  std::ranges::sort(interfaces);
+  return interfaces;
+}
+
+/**
+ * @brief Pick the network interface that represents an InfiniBand/RoCE device.
+ *
+ * Prefers the first interface (by name) that has an IP address, since that is the
+ * interface IP-based transports use; otherwise falls back to the first interface by
+ * name so the choice is deterministic.
+ *
+ * @param interfaces Interface names, sorted ascending (see list_net_interfaces).
+ * @return The selected interface; std::nullopt if @p interfaces is empty.
+ */
+std::optional<std::string> select_net_interface(std::vector<std::string> const& interfaces)
+{
+  if (interfaces.empty()) { return std::nullopt; }
+  for (auto const& iface : interfaces) {
+    if (interface_has_ip(iface)) { return iface; }
+  }
+  return interfaces.front();
+}
+
+/**
+ * @brief Read the MTU of a network interface backing an InfiniBand/RoCE device.
+ *
+ * Reads /sys/class/infiniband/<dev>/device/net/<iface>/mtu (the same attribute as
+ * /sys/class/net/<iface>/mtu).
+ *
+ * @param device_path Sysfs path to the InfiniBand device directory.
+ * @param iface Name of the network interface.
+ * @return The MTU in bytes; 0 if the attribute is missing, unreadable or malformed.
+ */
+int read_net_interface_mtu(std::string const& device_path, std::string const& iface)
+{
+  std::string const mtu_str = trim_copy(
+    read_file_content((fs::path(device_path) / "device" / "net" / iface / "mtu").string()));
+  if (!is_numeric_token(mtu_str)) { return 0; }
+  try {
+    return std::stoi(mtu_str);
+  } catch (...) {
+    return 0;
+  }
+}
+
+/**
+ * @brief Check whether an InfiniBand device's associated net interface has an IP address.
+ *
+ * Looks up the net interface names from /sys/class/infiniband/<dev>/device/net/ and
+ * then checks for a configured IP address via getifaddrs().  Devices without IPoIB
+ * or RoCE networking configured (no IP) are unusable for IP-based transports.
+ *
+ * @param interfaces Interface names backing the device (see list_net_interfaces).
+ * @return true if at least one of @p interfaces has an IP address.
+ */
+bool has_net_interface_with_ip(std::vector<std::string> const& interfaces)
+{
+  return std::ranges::any_of(interfaces, interface_has_ip);
 }
 
 /**
@@ -667,8 +795,9 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
         if (!has_active_port(entry.path().string())) { continue; }
         if (!has_uverbs_device(entry.path().string())) { continue; }
       }
+      std::vector<std::string> const interfaces = list_net_interfaces(entry.path().string());
       if (verification <= NetworkDeviceVerification::EXISTS_ACTIVE_IP) {
-        if (!has_net_interface_with_ip(entry.path().string())) { continue; }
+        if (!has_net_interface_with_ip(interfaces)) { continue; }
       }
 
       NetworkDeviceWithTopology dev;
@@ -678,6 +807,16 @@ std::vector<NetworkDeviceWithTopology> discover_network_devices_with_topology(
       std::string numa_str  = read_file_content(numa_path);
       dev.numa_node         = numa_str.empty() ? -1 : std::stoi(numa_str);
       dev.pci_bus_id        = get_pci_bus_id_from_device(entry.path().string());
+
+      if (auto iface = select_net_interface(interfaces)) {
+        dev.mtu           = read_net_interface_mtu(entry.path().string(), *iface);
+        dev.net_interface = std::move(*iface);
+      }
+
+      auto ports       = summarize_rdma_ports(entry.path().string());
+      dev.active_ports = ports.active_ports;
+      dev.link_layer   = std::move(ports.link_layer);
+      dev.rate_gbps    = ports.rate_gbps;
 
       devices.push_back(dev);
     }
@@ -729,6 +868,23 @@ std::vector<storage_device_info> discover_storage_devices_with_topology()
  * @param network_devices Network devices on the system.
  * @return Vector of device names selected for the GPU; possibly empty.
  */
+/**
+ * @brief The best (lowest) PCIe path type between a GPU and any NIC with a PCI
+ *        address; unset when no NIC has one.  It is the path type of the NICs
+ *        @ref map_network_devices_to_gpu selects by PCIe distance.
+ */
+std::optional<PciePathType> best_network_path_type(
+  std::string const& gpu_pci_id, std::vector<network_device_info> const& network_devices)
+{
+  std::optional<PciePathType> best;
+  for (auto const& dev : network_devices) {
+    if (dev.pci_bus_id.empty()) { continue; }
+    auto const path = get_pcie_path_type(gpu_pci_id, dev.pci_bus_id);
+    if (!best || path < *best) { best = path; }
+  }
+  return best;
+}
+
 std::vector<std::string> map_network_devices_to_gpu(
   std::string const& gpu_pci_id,
   int gpu_numa_node,
@@ -929,6 +1085,46 @@ nvmlReturn_t initialize_nvml_for_current_process()
 
 }  // namespace
 
+kernel_tls_info discover_kernel_tls(discovery_roots const& roots)
+{
+  // /proc/modules rows are "<name> <size> <refcount> <deps> <state> <address>"; the
+  // state is Live, Loading or Unloading. Only a Live module has registered its ULP.
+  std::ifstream modules(roots.procfs_root / "proc" / "modules");
+  bool const modules_readable = modules.is_open();
+  bool module_listed          = false;
+  bool module_live            = false;
+  std::string line;
+  while (modules_readable && std::getline(modules, line)) {
+    std::istringstream fields(line);
+    std::string name, size, refcount, deps, state;
+    if (!(fields >> name) || name != "tls") { continue; }
+    module_listed = true;
+    module_live   = (fields >> size >> refcount >> deps >> state) && state == "Live";
+    break;
+  }
+
+  // Space-separated names of the registered TCP ULPs, e.g. "espintcp mptcp tls". It
+  // lists the ULP whether kTLS is a loaded module or built in.
+  std::ifstream ulps(roots.procfs_root / "proc" / "sys" / "net" / "ipv4" / "tcp_available_ulp");
+  bool const ulps_readable = ulps.is_open();
+  bool ulp_registered      = false;
+  std::string ulp;
+  while (ulps_readable && ulps >> ulp) {
+    if (ulp == "tls") {
+      ulp_registered = true;
+      break;
+    }
+  }
+
+  kernel_tls_info info;
+  // The ULP list is authoritative; a live module row stands in when it is unreadable.
+  info.loaded = ulps_readable ? ulp_registered : module_live;
+  // Registered without any module row (in any state) means compiled in. Without a
+  // readable /proc/modules a module cannot be told apart from a built-in.
+  info.built_in = info.loaded && modules_readable && !module_listed;
+  return info;
+}
+
 bool topology_discovery::discover(NetworkDeviceVerification net_verification,
                                   bool with_runtime_attributes)
 {
@@ -976,13 +1172,20 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
   topology.network_devices.clear();
   for (auto const& dev : network_devices_with_topology) {
     network_device_info info;
-    info.name       = dev.name;
-    info.numa_node  = dev.numa_node;
-    info.pci_bus_id = dev.pci_bus_id;
+    info.name          = dev.name;
+    info.numa_node     = dev.numa_node;
+    info.pci_bus_id    = dev.pci_bus_id;
+    info.net_interface = dev.net_interface;
+    info.mtu           = dev.mtu;
+    info.active_ports  = dev.active_ports;
+    info.link_layer    = dev.link_layer;
+    info.rate_gbps     = dev.rate_gbps;
     topology.network_devices.push_back(info);
   }
 
   topology.storage_devices = discover_storage_devices_with_topology();
+  topology.kernel_tls      = discover_kernel_tls();
+  topology.gds             = discover_gds_setup();
 
   topology.gpus.clear();
 
@@ -993,12 +1196,20 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
     // Emit one gpu_topology_info from an NVML device handle (either a physical GPU
     // or a MIG instance). Topology fields (PCI, NUMA, CPU affinity, NICs) come from
     // the physical parent — MIG instances share their parent's physical hardware.
+    // BAR1 and the NIC path are properties of the physical GPU, shared by its MIG
+    // instances; device memory is per instance.
+    struct physical_gpu_facts {
+      std::optional<PciePathType> nic_path;
+      std::size_t bar1_total{0};
+      std::size_t bar1_free{0};
+    };
     auto emit_gpu = [&](nvmlDevice_t handle,
                         std::string const& parent_pci,
                         int parent_numa,
                         std::string const& parent_cpu_affinity,
                         std::vector<int> const& parent_cpu_cores,
-                        std::vector<std::string> const& parent_nics) {
+                        std::vector<std::string> const& parent_nics,
+                        physical_gpu_facts const& parent_facts) {
       gpu_topology_info gpu;
 
       std::array<char, NVML_DEVICE_NAME_BUFFER_SIZE> name{};
@@ -1008,6 +1219,14 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
       std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
       r        = nvmlDeviceGetUUID(handle, uuid.data(), NVML_DEVICE_UUID_BUFFER_SIZE);
       gpu.uuid = (r == NVML_SUCCESS) ? std::string(uuid.data()) : "Unknown";
+
+      nvmlMemory_t memory{};
+      if (nvmlDeviceGetMemoryInfo(handle, &memory) == NVML_SUCCESS) {
+        gpu.memory_total_bytes = static_cast<std::size_t>(memory.total);
+      }
+      gpu.bar1_total_bytes    = parent_facts.bar1_total;
+      gpu.bar1_free_bytes     = parent_facts.bar1_free;
+      gpu.network_device_path = parent_facts.nic_path;
 
       gpu.pci_bus_id        = parent_pci;
       gpu.numa_node         = parent_numa;
@@ -1043,6 +1262,13 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
       std::vector<int> parent_cpu = parse_cpu_list(parent_cpu_aff);
       std::vector<std::string> parent_nics =
         map_network_devices_to_gpu(parent_pci, parent_numa, topology.network_devices);
+      physical_gpu_facts parent_facts;
+      parent_facts.nic_path = best_network_path_type(parent_pci, topology.network_devices);
+      nvmlBAR1Memory_t bar1{};
+      if (nvmlDeviceGetBAR1MemoryInfo(device, &bar1) == NVML_SUCCESS) {
+        parent_facts.bar1_total = static_cast<std::size_t>(bar1.bar1Total);
+        parent_facts.bar1_free  = static_cast<std::size_t>(bar1.bar1Free);
+      }
 
       unsigned int mig_current = NVML_DEVICE_MIG_DISABLE;
       unsigned int mig_pending = NVML_DEVICE_MIG_DISABLE;
@@ -1051,7 +1277,8 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
       bool mig_enabled = (mig_rc == NVML_SUCCESS && mig_current == NVML_DEVICE_MIG_ENABLE);
 
       if (!mig_enabled) {
-        emit_gpu(device, parent_pci, parent_numa, parent_cpu_aff, parent_cpu, parent_nics);
+        emit_gpu(
+          device, parent_pci, parent_numa, parent_cpu_aff, parent_cpu, parent_nics, parent_facts);
         // PCI-based index entries are unambiguous only for physical GPUs.
         nvml_index_by_pci.emplace(normalize_pci_bus_id(parent_pci), nvml_gpus.size() - 1);
         continue;
@@ -1077,7 +1304,13 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
                               std::to_string(mig_idx));
           continue;
         }
-        emit_gpu(mig_device, parent_pci, parent_numa, parent_cpu_aff, parent_cpu, parent_nics);
+        emit_gpu(mig_device,
+                 parent_pci,
+                 parent_numa,
+                 parent_cpu_aff,
+                 parent_cpu,
+                 parent_nics,
+                 parent_facts);
         ++emitted;
       }
 

@@ -79,8 +79,7 @@ set(CUCASCADE_PUBLIC_COMPILE_DEFS
 
 # Swappable third-party backends for the io layer. The io code was ported from a
 # codebase with its own vendored dependencies. These knobs let an embedding host
-# (e.g. sirius) reuse the copies it already links instead of the
-# standalone-build defaults.
+# reuse the copies it already links instead of the standalone-build defaults.
 
 # cucascade::exec::invocable backing: OFF -> in-tree move-only callable; ON ->
 # absl::AnyInvocable (reuses a host project's abseil).
@@ -104,7 +103,7 @@ set(CUCASCADE_ABSEIL_INVOCABLE_TARGET
 # CUCASCADE_MOODYCAMEL_TARGET  - link an existing CMake target that carries the
 # include dirs (e.g. a host-provided interface target). 2.
 # CUCASCADE_MOODYCAMEL_INCLUDE_DIR - a directory already holding
-# blockingconcurrentqueue.h / concurrentqueue.h (e.g. sirius's
+# blockingconcurrentqueue.h / concurrentqueue.h (e.g.
 # duckdb/third_party/concurrentqueue). Nothing is fetched. 3. neither set -
 # fetch cameron314/concurrentqueue.
 set(CUCASCADE_MOODYCAMEL_TARGET
@@ -121,8 +120,8 @@ set(CUCASCADE_MOODYCAMEL_INCLUDE_DIR
       "Directory containing moodycamel concurrentqueue headers (skips fetching; ignored if CUCASCADE_MOODYCAMEL_TARGET is set)"
 )
 
-# C++ namespace of the moodycamel headers. duckdb's fork (used by sirius)
-# renames it to duckdb_moodycamel; upstream cameron314 uses moodycamel.
+# C++ namespace of the moodycamel headers. duckdb's fork renames it to
+# duckdb_moodycamel; upstream cameron314 uses moodycamel.
 set(CUCASCADE_MOODYCAMEL_NAMESPACE
     "moodycamel"
     CACHE STRING "C++ namespace of the moodycamel concurrentqueue headers")
@@ -137,6 +136,17 @@ if(CUCASCADE_BUILD_IO AND CUCASCADE_TOPOLOGY_ONLY)
       CACHE BOOL "Build the cucascade-io library" FORCE)
 endif()
 
+# The cudf layer's DISK-tier converters read and write spill files through the
+# io library's io_context, so a cudf build needs the io library.
+if(CUCASCADE_BUILD_CUDF
+   AND NOT CUCASCADE_TOPOLOGY_ONLY
+   AND NOT CUCASCADE_BUILD_IO)
+  message(
+    FATAL_ERROR
+      "CUCASCADE_BUILD_CUDF=ON requires CUCASCADE_BUILD_IO=ON: the DISK-tier converters in cucascade-cudf perform their I/O through cucascade-io. Enable CUCASCADE_BUILD_IO or disable CUCASCADE_BUILD_CUDF."
+  )
+endif()
+
 # The S3 benchmark needs the io library (rest backend) and the benchmark tree.
 # Checked after the io gating above so a force-disabled io also disables it.
 if(CUCASCADE_BUILD_S3_BENCHMARK
@@ -145,7 +155,7 @@ if(CUCASCADE_BUILD_S3_BENCHMARK
         OR NOT CUCASCADE_BUILD_CUDF))
   message(
     STATUS
-      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf and kvikIO)"
+      "CUCASCADE_BUILD_S3_BENCHMARK disabled: requires CUCASCADE_BUILD_IO=ON, CUCASCADE_BUILD_BENCHMARKS=ON and CUCASCADE_BUILD_CUDF=ON (it links cucascade_cudf)"
   )
   set(CUCASCADE_BUILD_S3_BENCHMARK
       OFF
@@ -195,17 +205,24 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
   if(CUCASCADE_BUILD_IO)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+    # OpenSSL: TLS for the REST transport (handshakes, the user-space record
+    # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
     find_package(OpenSSL REQUIRED)
 
-    # kvikIO — backs the local-file fallback ioctx (kvikio_context). It reaches
-    # the environment only through libcudf's dependency closure (libkvikio is
-    # not a direct dependency), so it is tied to CUCASCADE_BUILD_CUDF: a
-    # cudf-free build drops kvikio_context and its catch-all registry entry,
-    # leaving uring/restful to claim paths. Consumers see the difference via the
-    # CUCASCADE_HAS_KVIKIO definition propagated by cucascade_io_thirdparty.
-    if(CUCASCADE_BUILD_CUDF)
-      find_package(kvikio REQUIRED CONFIG)
+    # cuFile / GPUDirect Storage — the cufile reactor dlopen()s libcufile at run
+    # time and needs only cufile.h to build (it ships with the CUDA toolkit;
+    # libcufile-dev in conda). It does not depend on cudf, so it is built in a
+    # cudf-free build too. Without the header the cufile backend is left out and
+    # CUCASCADE_HAS_CUFILE stays undefined.
+    find_path(CUCASCADE_CUFILE_INCLUDE_DIR cufile.h
+              HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    if(CUCASCADE_CUFILE_INCLUDE_DIR)
+      message(
+        STATUS
+          "cufile.h found in ${CUCASCADE_CUFILE_INCLUDE_DIR}: cufile io backend enabled"
+      )
+    else()
+      message(STATUS "cufile.h not found: cufile io backend disabled")
     endif()
 
     # cucascade_io_thirdparty carries the swappable moodycamel + invocable
@@ -285,21 +302,19 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
                                  INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
     endif()
 
-    # Gates the kvikIO fallback ioctx in io_config and the datasource registry.
-    # Carried on the same INTERFACE target as the definitions above so the io
-    # object library, its installable variants, and installed consumers all
-    # agree on the layout of io_config.
-    if(CUCASCADE_BUILD_CUDF)
+    # Gates the cufile backend in io_config and the datasource registry. Carried
+    # on the same INTERFACE target as the definitions above so the io object
+    # library, its installable variants, and installed consumers all agree on
+    # the layout of io_config. libcufile itself is never linked (see
+    # src/io/cufile/cufile_api).
+    if(CUCASCADE_CUFILE_INCLUDE_DIR)
       target_compile_definitions(cucascade_io_thirdparty
-                                 INTERFACE CUCASCADE_HAS_KVIKIO)
+                                 INTERFACE CUCASCADE_HAS_CUFILE)
+      target_include_directories(
+        cucascade_io_thirdparty
+        INTERFACE $<BUILD_INTERFACE:${CUCASCADE_CUFILE_INCLUDE_DIR}>)
     endif()
   endif()
-
-  # Find numa (provided by numactl-devel or libnuma-dev depending on the package
-  # manager). Uses the bundled FindNuma module, which produces the Numa::Numa
-  # imported target. The same module is installed with the package so consumers
-  # resolve libnuma on their own system rather than inheriting a hardcoded path.
-  find_package(Numa REQUIRED)
 endif()
 
 # Set CUDA architectures
@@ -400,7 +415,7 @@ set(CUCASCADE_PUBLIC_INCLUDE_DIRS
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY)
   set(CUCASCADE_PUBLIC_LINK_LIBS rmm::rmm CUDA::cudart_static CUDA::nvtx3
-                                 Threads::Threads Numa::Numa)
+                                 Threads::Threads)
 
   # Set include directories for the object library
   target_include_directories(cucascade_objects
@@ -424,8 +439,7 @@ endif()
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   # The cudf object library inherits the core usage requirements (include dirs,
-  # rmm/cuda/numa, C++20, NVTX) by linking the core object library, and adds
-  # cudf.
+  # rmm/cuda, C++20, NVTX) by linking the core object library, and adds cudf.
   target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_objects
                                                       cudf::cudf)
   target_include_directories(cucascade_cudf_objects
@@ -441,7 +455,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # The datasource bridge (src/cudf/datasource.cpp) compiles against the io
   # core's headers, which need the io usage requirements (concurrentqueue
-  # include dir, curl/uring types, ...).
+  # include dir, uring types, ...).
   if(CUCASCADE_BUILD_IO)
     target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_io_objects)
   endif()
@@ -450,13 +464,8 @@ endif()
 if(CUCASCADE_BUILD_IO)
   # Link libraries shared by the io object library and the installable io
   # targets. PkgConfig::* imported targets are reconstructed on the consumer
-  # side by cuCascadeConfig.cmake (same names), mirroring the Numa::Numa
-  # approach.
-  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING PkgConfig::CURL
-                             OpenSSL::Crypto)
-  if(CUCASCADE_BUILD_CUDF)
-    list(APPEND CUCASCADE_IO_LINK_LIBS kvikio::kvikio)
-  endif()
+  # side by cuCascadeConfig.cmake (same names).
+  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING OpenSSL::SSL OpenSSL::Crypto)
 
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
@@ -708,8 +717,14 @@ include(CMakePackageConfigHelpers)
 
 # Install headers
 if(CUCASCADE_TOPOLOGY_ONLY)
-  install(FILES include/cucascade/memory/topology_discovery.hpp
-          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
+  # topology_discovery.hpp includes net_topology.hpp (NIC discovery) and
+  # gds_topology.hpp (GPUDirect Storage setup), both built into this library, so
+  # they are part of the installed API.
+  install(
+    FILES include/cucascade/memory/topology_discovery.hpp
+          include/cucascade/memory/gds_topology.hpp
+          include/cucascade/memory/net_topology.hpp
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
   install(FILES include/cucascade/nvtx.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade)
   # Topology discovery logs through the sink, so a topology-only consumer must
@@ -810,14 +825,6 @@ write_basic_package_version_file(
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfig.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/cuCascadeConfigVersion.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade)
-
-# Bundle the FindNuma module so consumers can rerun the same find logic (the
-# full library links the Numa::Numa target it produces). Not needed for
-# topology-only builds, which do not depend on libnuma.
-if(NOT CUCASCADE_TOPOLOGY_ONLY)
-  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules/FindNuma.cmake
-          DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cuCascade/Modules)
-endif()
 
 # =============================================================================
 # Tests

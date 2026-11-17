@@ -101,7 +101,7 @@ TEST_CASE("dispose_on_idle keeps a chunk a live request still shares", "[cache][
 TEST_CASE("a failed prefetch request hand-off rolls back only its own subscriptions",
           "[cache][cache_subscription]")
 {
-  // sirius-db/sirius#2314: a request that subscribed to its chunks but never
+  // A request that subscribed to its chunks but never
   // reached the evictor (allocating or enqueueing it failed) must drop those
   // subscriptions exactly once, and only those.  The failure is injected at
   // the hand-off; the next test fails a request part-way through chunk

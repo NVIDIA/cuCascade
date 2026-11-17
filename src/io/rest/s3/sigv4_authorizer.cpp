@@ -24,6 +24,8 @@
 #include <cctype>
 #include <ctime>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace cucascade::io::rest::s3 {
@@ -74,7 +76,19 @@ std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
   if (remainder.find('@') != std::string::npos) {
     throw credential_error("sigv4_presigned_authorizer: endpoint must not contain user-info");
   }
-  return {std::move(scheme), to_lower(remainder)};
+  // The scheme's default port names the same origin as no port, and the transport sends the
+  // authority without it: drop it here (as the AWS SDKs canonicalize the signed host), so both
+  // signing modes sign exactly the Host that goes on the wire.
+  auto host                  = to_lower(remainder);
+  std::string_view const dft = scheme == "https" ? ":443" : ":80";
+  if (host.ends_with(dft)) {
+    auto const bare = std::string_view{host}.substr(0, host.size() - dft.size());
+    // A bare IPv6 literal is unbracketed only when malformed; never cut into one.
+    if (!bare.empty() && (bare.back() == ']' || bare.find(':') == std::string_view::npos)) {
+      host.resize(bare.size());
+    }
+  }
+  return {std::move(scheme), std::move(host)};
 }
 
 /// Path-style canonical URI "/<bucket>/<key>", RFC3986-encoded. Bucket encodes
