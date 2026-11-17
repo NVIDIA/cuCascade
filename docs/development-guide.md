@@ -49,7 +49,6 @@ Building, testing, benchmarking, and contributing to cuCascade.
 | NVIDIA Driver | Compatible with CUDA 13 |
 | libcudf | 25.10+ |
 | RMM | Via cuDF dependency |
-| numactl | Development headers |
 
 The easiest way to get all dependencies is via [Pixi](https://pixi.sh/), which manages the full environment.
 
@@ -157,7 +156,7 @@ cucascade_objects (OBJECT library)
     └── src/memory/*.cpp
          │
          ├── cucascade_static (STATIC library)
-         │     Links: RMM, cuDF, CUDA runtime, CUDA NVML, pthreads, numa
+         │     Links: RMM, cuDF, CUDA runtime, CUDA NVML, pthreads
          │
          └── cucascade_shared (SHARED library)
                Same links, SOVERSION 0
@@ -392,12 +391,23 @@ Output:
 
 ## CI Pipeline
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on pushes to `main` and pull requests:
+GitHub Actions (`.github/workflows/ci.yml`) runs on pushes to `main`, copied PR
+branches (`pull-request/<number>`), and merge-group commits. `main` runs only
+builds to refresh the shared compiler cache; packaging, uploads, GPU tests, and the
+summary job run only for copied PRs and merge groups. See
+[CI and the merge queue](ci.md) for PR approvals, queue entry, diagnostics, and retries.
 
 | Stage | Runner | What It Does |
 |-------|--------|-------------|
-| **Build** | `linux-amd64-cpu4` (CPU only) | `pixi run build` with sccache, uploads artifacts |
+| **Lint** | `linux-amd64-cpu4` (CPU only) | Runs the project pre-commit hooks |
+| **Build** | `linux-amd64-cpu4` (CPU only) | `pixi run build` with sccache; uploads artifacts for PRs and merge groups |
 | **Test** | `linux-amd64-gpu-t4-latest-1` (T4 GPU) | Downloads build, runs `pixi run test` |
+| **Check** | `ubuntu-slim` | Required summary of lint, build, and test results |
+
+Copied PRs build and test CUDA 12 with stable RAPIDS and CUDA 13 with nightly RAPIDS.
+Merge groups build and test all four configurations; `main` builds all four.
+For copied PRs and merge groups, tests start after every build succeeds. The GPU runners expose one device;
+multi-GPU tests need a separate run with suitable hardware and explicit test selection.
 
 ---
 
