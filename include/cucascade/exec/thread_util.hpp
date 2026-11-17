@@ -18,6 +18,7 @@
 #pragma once
 
 #include <pthread.h>
+#include <sched.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -37,9 +38,9 @@
  * caller the same three lines --- truncate the name because pthread caps it at
  * 16 bytes, populate a @c cpu_set_t from a list of ids, hand-check the return
  * code --- and to give every subsystem the same story about what happens on
- * failure.  Every entry point is @c noexcept and returns @c false on failure:
- * these knobs are best-effort telemetry / tuning, never load-bearing, and a
- * subsystem that decides otherwise can still test the return.
+ * failure.  The non-owning setters are @c noexcept and return @c false on failure:
+ * these knobs are best-effort telemetry / tuning, and a
+ * subsystem that requires placement can test the return or use the throwing scoped guard.
  *
  * The pthread-handle-taking overloads are the primitive; the @c std::thread
  * and @c std::jthread overloads forward to them, and the "current thread"
@@ -92,6 +93,22 @@ inline constexpr std::size_t max_thread_name_len = 15;
 /// Returns an empty vector on failure (including a failed allocation of the list).
 [[nodiscard]] std::vector<int> get_thread_affinity(pthread_t handle) noexcept;
 [[nodiscard]] std::vector<int> get_current_thread_affinity() noexcept;
+
+/// Apply an exact CPU mask to the calling thread for a startup scope, then restore its
+/// original mask. Does not change CUDA/device/TLS state. Empty is a no-op. Construction
+/// throws before user work if the requested mask cannot be applied exactly; destruction
+/// restores without allocating or throwing. Must be destroyed on its constructing thread.
+class scoped_thread_affinity {
+ public:
+  explicit scoped_thread_affinity(std::span<int const> cpus);
+  ~scoped_thread_affinity();
+  scoped_thread_affinity(scoped_thread_affinity const&)            = delete;
+  scoped_thread_affinity& operator=(scoped_thread_affinity const&) = delete;
+
+ private:
+  cpu_set_t _saved{};
+  bool _restore = false;
+};
 
 // ---------------------------------------------------------------------------
 // scheduling policy and priority
