@@ -1,8 +1,11 @@
 # CI and the merge queue
 
-The [CI workflow](../.github/workflows/ci.yml) runs on pushes to `main`, pushes to
-copied PR branches named `pull-request/<number>`, and `merge_group: checks_requested`.
-The workflow is configured to check PR commits and their final integration with `main`.
+The [CI workflow](../.github/workflows/ci.yml) runs on pushes to `main`, copied PR
+branches named `pull-request/<number>`, and `merge_group: checks_requested`.
+Copied-PR and merge-group runs perform the full checks. Pushes to `main` run lint and
+the build matrix to publish reusable sccache entries, without packaging artifacts,
+GPU tests, or the summary job. Required merge-group checks cover integration before
+the commit reaches `main`.
 
 ## Get a PR tested
 
@@ -24,8 +27,9 @@ gh api repos/NVIDIA/cuCascade/git/ref/heads/pull-request/NUMBER --jq .object.sha
 ```
 
 Lint runs first. Builds cover CUDA 12 and 13 with stable and nightly RAPIDS packages.
-All builds must succeed before the GPU test matrix starts. Tests use the single-GPU
-`linux-amd64-gpu-t4-latest-1` runners; green CI does not establish multi-GPU coverage.
+For copied-PR and merge-group runs, the GPU test matrix starts after all builds succeed.
+Tests use the single-GPU `linux-amd64-gpu-t4-latest-1` runners; green CI does not
+establish multi-GPU coverage.
 The required `check` job succeeds only when lint, build, and test jobs all succeed.
 
 ## Enter the merge queue
@@ -50,7 +54,7 @@ Repository settings checked on 2026-11-16 were:
 | Required-check timeout | 60 minutes |
 | Merge strategy | `ALLGREEN` |
 
-The queue was enabled, but a live merge-group CI run had not yet been observed.
+The successful queue path was exercised by [#291](https://github.com/NVIDIA/cuCascade/pull/291).
 Track rollout evidence in [#260](https://github.com/NVIDIA/cuCascade/issues/260).
 Repository settings remain authoritative if these values change.
 
