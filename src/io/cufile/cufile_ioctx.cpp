@@ -46,6 +46,9 @@
 
 namespace cucascade::io::cufile {
 
+// Lets the context be destroyed on one of its reactors' workers (see ~templated_ioctx).
+static_assert(reactor_reports_worker_thread<cufile_reactor>);
+
 namespace {
 
 /// Round @p value down to a multiple of @c IO_BLOCK_SIZE.

@@ -383,6 +383,12 @@ class cufile_reactor {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
 
+  /// Whether the calling thread is this reactor's worker.
+  [[nodiscard]] bool on_worker_thread() const noexcept
+  {
+    return _worker.get_id() == std::this_thread::get_id();
+  }
+
   /// How this reactor has served its reads so far (relaxed snapshot).
   [[nodiscard]] reactor_stats stats() const noexcept;
 

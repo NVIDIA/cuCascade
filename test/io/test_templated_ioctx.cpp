@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/templated_ioctx.hpp>
 
@@ -23,16 +24,23 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <future>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -775,4 +783,180 @@ TEST_CASE("io_op_request raises the object size for writes only", "[io][template
   write.io_rng      = cucascade::io::range{4000, 1000};
   write.finish_success();
   CHECK(object->size() == 5000);
+}
+
+namespace {
+
+using namespace std::chrono_literals;
+
+/// What the threaded reactors of one test saw; shared with the test, so it outlives them.
+struct threaded_record {
+  /// Opened by the test once it is ready for the reactors to serve their requests.
+  std::promise<void> open;
+  std::shared_future<void> opened{open.get_future().share()};
+  std::atomic<int> destroyed{0};
+  /// Destroyed on the reactor's own worker, or before that worker had exited.
+  std::atomic<int> destroyed_on_worker{0};
+  std::atomic<int> destroyed_while_running{0};
+  /// Requests served (counted by each worker after it settled the request).
+  std::atomic<int> served{0};
+};
+
+/// A reactor whose worker thread settles each request and then, like the real reactors, goes on
+/// using its own state.
+class threaded_reactor {
+ public:
+  using io_object_type      = fake_object;
+  using reactor_config_type = fake_config;
+
+  explicit threaded_reactor(std::shared_ptr<threaded_record> record) : _record(std::move(record)) {}
+
+  ~threaded_reactor()
+  {
+    if (on_worker_thread()) _record->destroyed_on_worker.fetch_add(1);
+    if (_worker.joinable() && !_exited.load()) _record->destroyed_while_running.fetch_add(1);
+    shutdown();
+    _record->served.fetch_add(_served);
+    _record->destroyed.fetch_add(1);
+  }
+
+  threaded_reactor(threaded_reactor const&)            = delete;
+  threaded_reactor& operator=(threaded_reactor const&) = delete;
+
+  [[nodiscard]] fake_config const& get_config() const noexcept { return _config; }
+
+  void enqueue(std::unique_ptr<cucascade::io::grouped_io_request> request) noexcept
+  {
+    {
+      std::lock_guard lock(_mutex);
+      _queue.push_back(std::move(request));
+    }
+    _ready.notify_one();
+  }
+
+  [[nodiscard]] std::size_t queued_bytes() const noexcept { return 0; }
+
+  [[nodiscard]] std::size_t staging_block_size() const noexcept { return 0; }
+
+  std::size_t host_read(fake_object const&, std::size_t, std::size_t size, std::uint8_t*) const
+  {
+    return size;
+  }
+
+  void start()
+  {
+    _worker = std::jthread([this](std::stop_token const& stop) { run(stop); });
+  }
+
+  /// Joins the worker: throws std::system_error when called on it.
+  void shutdown()
+  {
+    if (_worker.joinable()) {
+      _worker.request_stop();
+      _worker.join();
+    }
+  }
+
+  void interrupt() {}
+
+  [[nodiscard]] bool on_worker_thread() const noexcept
+  {
+    return _worker.get_id() == std::this_thread::get_id();
+  }
+
+  [[nodiscard]] static std::unique_ptr<fake_object> create_io_object(std::string path)
+  {
+    return std::make_unique<fake_object>(std::move(path), 4096);
+  }
+
+  [[nodiscard]] static bool supports(std::string_view) { return true; }
+
+  [[nodiscard]] static std::vector<cucascade::io::byte_range> align_and_coalesce(
+    std::span<cucascade::io::byte_range const> ranges, std::optional<std::size_t>)
+  {
+    return {ranges.begin(), ranges.end()};
+  }
+
+ private:
+  void run(std::stop_token const& stop)
+  {
+    std::ignore = _record->opened.wait_for(30s);
+    std::unique_lock lock(_mutex);
+    while (_ready.wait(lock, stop, [this] { return !_queue.empty(); })) {
+      auto request = std::move(_queue.front());
+      _queue.pop_front();
+      lock.unlock();
+      complete_request(*request);  // an inline continuation runs here
+      request.reset();
+      ++_served;
+      lock.lock();
+    }
+    _exited.store(true);
+  }
+
+  std::shared_ptr<threaded_record> _record;
+  fake_config _config;
+  std::mutex _mutex;
+  std::condition_variable_any _ready;
+  std::deque<std::unique_ptr<cucascade::io::grouped_io_request>> _queue;
+  int _served{0};
+  std::atomic<bool> _exited{false};
+  std::jthread _worker;
+};
+
+static_assert(cucascade::io::io_reactor_c<threaded_reactor>);
+
+class threaded_context final : public cucascade::io::templated_ioctx<threaded_reactor> {
+ public:
+  using templated_ioctx::templated_ioctx;
+
+  [[nodiscard]] cucascade::io::io_context_type type() const noexcept override
+  {
+    return cucascade::io::io_context_type::uring;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("an ioctx dropped by a continuation on its own worker hands its reactors off",
+          "[io][templated_ioctx]")
+{
+  constexpr int n_reactors = 2;
+  auto record              = std::make_shared<threaded_record>();
+  std::vector<std::unique_ptr<threaded_reactor>> reactors;
+  for (int i = 0; i < n_reactors; ++i) {
+    reactors.push_back(std::make_unique<threaded_reactor>(record));
+  }
+  auto context = std::make_shared<threaded_context>(std::move(reactors));
+  context->start();
+  auto object = std::make_shared<fake_object>("fake", 4096);
+
+  std::uint8_t byte{};
+  std::vector<cucascade::io::prepared_io_slice> slices;
+  slices.emplace_back(cucascade::io::range{0, 64}, cucascade::io::host_buffer{&byte});
+  auto read = context->mixed_readv_async_io(*object, std::move(slices));
+
+  // The continuation holds the only reference and drops it on the worker that settles the read.
+  std::thread::id settled_on;
+  auto done = std::move(read)
+                .via(cucascade::exec::inline_executor::instance())
+                .then_value([context = std::move(context), &settled_on](std::size_t bytes) mutable {
+                  settled_on = std::this_thread::get_id();
+                  context.reset();
+                  return bytes;
+                });
+  record->open.set_value();
+  REQUIRE(std::move(done).semi().get(10s) == 64);
+  CHECK(settled_on != std::this_thread::get_id());
+
+  // The reactors are destroyed elsewhere, once their workers (the settling one included, which
+  // went on to count the request) have exited.
+  auto const deadline = std::chrono::steady_clock::now() + 10s;
+  while (record->destroyed.load() < n_reactors && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(record->destroyed.load() == n_reactors);
+  CHECK(record->destroyed_on_worker.load() == 0);
+  CHECK(record->destroyed_while_running.load() == 0);
+  CHECK(record->served.load() == 1);
 }

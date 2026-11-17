@@ -29,6 +29,7 @@
  * without a GDS stack too.
  */
 
+#include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
@@ -63,6 +64,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -498,6 +501,19 @@ class held_transfer {
     std::ignore = s.changed.wait_for(lock, 30s, [&s] { return s.released; });
   }
 };
+
+/// Threads of this process named @p name.
+[[nodiscard]] std::size_t threads_named(std::string_view name)
+{
+  std::size_t count = 0;
+  std::error_code ec;
+  for (auto const& task : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+    std::ifstream comm(task.path() / "comm");
+    std::string line;
+    if (std::getline(comm, line) && line == name) ++count;
+  }
+  return count;
+}
 
 /// Every call the scripted cuFile saw is what a direct DMA can serve: a 4 KiB
 /// aligned file offset, a whole number of blocks unless it ends exactly at the end
@@ -994,6 +1010,58 @@ TEST_CASE("cufile counts a running transfer in its reactor's backlog until it is
     std::this_thread::sleep_for(1ms);
   }
   CHECK(idle());
+}
+
+TEST_CASE("cufile ioctx dropped by a continuation on its own worker shuts down off that worker",
+          "[io][cufile][staging][gpu]")
+{
+  if (device_count() == 0) SKIP("no CUDA device");
+  pattern_file file{1UL << 20};
+  scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
+  config cfg;
+  cfg.gds_threshold = 1;
+  cfg.staging_mode  = staging::never;
+
+  rmm::cuda_stream stream;
+  constexpr std::size_t size = 256UL << 10;
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  stream.synchronize();
+  auto ioctx =
+    std::make_shared<cufile_ioctx>(2, std::make_shared<cufile_reactor::reactor_context>(cfg));
+  ioctx->start();
+  // The flat pool's workers; a thread they start is named after them too.
+  auto const workers = [] {
+    return threads_named("cufile-0_worker") + threads_named("cufile-1_worker");
+  };
+  REQUIRE(workers() == 2);
+  // Declared after the ioctx, so a failing test lets the held transfer go before the ioctx shuts
+  // down.
+  held_transfer held;
+  auto object = ioctx->open_io_object(file.path());
+  auto read   = ioctx->device_read_async_io(
+    *object, 0, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()});
+  REQUIRE(held.wait_entered());
+
+  // The continuation holds the only reference and drops it on the worker that settles the read.
+  std::thread::id settled_on;
+  auto done = std::move(read)
+                .via(cucascade::exec::inline_executor::instance())
+                .then_value([ioctx = std::move(ioctx), &settled_on](std::size_t bytes) mutable {
+                  settled_on = std::this_thread::get_id();
+                  ioctx.reset();
+                  return bytes;
+                });
+  held.release();
+  REQUIRE(std::move(done).semi().get(10s) == size);
+  CHECK(settled_on != std::this_thread::get_id());
+  CHECK(matches_file(bytes_at(dst.data(), size), 0));
+
+  auto const deadline = std::chrono::steady_clock::now() + 10s;
+  while (workers() != 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(workers() == 0);
 }
 
 TEST_CASE("cufile reads a destination on another GPU than the calling thread's",
