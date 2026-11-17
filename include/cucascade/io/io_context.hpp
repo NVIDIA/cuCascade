@@ -78,10 +78,13 @@ namespace cucascade::io {
  *
  * @warning A transfer's future settles on a reactor's worker thread, so a
  *          continuation that runs inline there (e.g. through
- *          @c exec::inline_executor) must not drop the last reference to the
- *          ioctx: destroying a context joins its workers, a worker cannot join
- *          itself, and the process terminates.  Keep a reference elsewhere until
- *          the continuation has run.
+ *          @c exec::inline_executor) may drop the last reference to the ioctx.
+ *          A worker cannot join itself: a @c templated_ioctx destroyed there
+ *          leaves its reactors to a detached thread that joins and destroys
+ *          them, so whatever they borrow must outlive them, and an armed
+ *          prefetching cache must already be shut down (see
+ *          @ref shutdown_cache).  Keeping a reference elsewhere until the
+ *          continuation has run avoids both.
  */
 class ioctx : public std::enable_shared_from_this<ioctx> {
  public:
@@ -309,10 +312,10 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// (e.g. a parquet footer) park it here so a later scan of the same
   /// path can skip the parse without depending on whether the
   /// prefetching machinery has been wired up.
-  [[nodiscard]] cache::metadata_store& metadata_store() noexcept { return _metadata_store; }
+  [[nodiscard]] cache::metadata_store& metadata_store() noexcept { return *_metadata_store; }
   [[nodiscard]] cache::metadata_store const& metadata_store() const noexcept
   {
-    return _metadata_store;
+    return *_metadata_store;
   }
 
   // -- Physical range alignment ------------------------------------------------
@@ -595,8 +598,10 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// reactors stay alive while workers drain).
   std::unique_ptr<cache::fs_cache> _cache;
 
-  /// Independent of the prefetching machinery — exposed via @c metadata_store().
-  cache::metadata_store _metadata_store;
+  /// Independent of the prefetching machinery — exposed via @c metadata_store().  Shared with
+  /// the completions of asynchronous writes, which can outlive the ioctx (see
+  /// @c ~templated_ioctx).
+  std::shared_ptr<cache::metadata_store> _metadata_store{std::make_shared<cache::metadata_store>()};
 
  private:
   /// Shared body of the asynchronous write forms: validate, build the write
@@ -615,7 +620,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Stamp a freshly opened object with its path's metadata epoch.
   std::shared_ptr<io_object> stamped(std::shared_ptr<io_object> object) noexcept
   {
-    if (object != nullptr) _metadata_store.stamp(*object);
+    if (object != nullptr) _metadata_store->stamp(*object);
     return object;
   }
 };

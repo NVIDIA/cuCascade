@@ -311,6 +311,12 @@ class uring_reactor {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
 
+  /// Whether the calling thread is this reactor's worker.
+  [[nodiscard]] bool on_worker_thread() const noexcept
+  {
+    return _worker.get_id() == std::this_thread::get_id();
+  }
+
   /// Log2 histogram of queue delays: bucket b counts delays d (microseconds) with
   /// std::bit_width(d) == b, i.e. [2^(b-1), 2^b) us; the last bucket is open-ended.
   static constexpr std::size_t queue_delay_buckets = 26;

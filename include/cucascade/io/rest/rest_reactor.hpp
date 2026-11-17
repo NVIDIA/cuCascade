@@ -460,6 +460,12 @@ class rest_reactor {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
 
+  /// Whether the calling thread is this reactor's worker.
+  [[nodiscard]] bool on_worker_thread() const noexcept
+  {
+    return _worker.get_id() == std::this_thread::get_id();
+  }
+
   /// Synchronous host read: served from the footer stash when it covers the range, else a
   /// ranged GET through the worker.  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);

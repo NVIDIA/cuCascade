@@ -43,6 +43,9 @@
 
 namespace cucascade::io::rest {
 
+// Lets the context be destroyed on one of its reactors' workers (see ~templated_ioctx).
+static_assert(reactor_reports_worker_thread<rest_reactor>);
+
 namespace {
 
 /// Size the pool (rest_n_reactors 0 = auto from the egress NIC's IRQ steering) and compute the
