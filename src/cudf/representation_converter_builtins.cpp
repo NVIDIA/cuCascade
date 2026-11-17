@@ -1916,6 +1916,12 @@ static std::unique_ptr<cudf::column> assemble_disk_column(const memory::column_m
  * Allocates every device buffer of the table, reads them all from the file with ONE batched
  * device read request, then assembles the cudf columns. Column metadata comes from the in-memory
  * disk_table_allocation.
+ *
+ * @note Peak device memory: the batched read needs every destination allocated up front, so a
+ *       STRING column spilled with INT32 offsets is widened to INT64 (a 4 * (rows + 1) byte
+ *       allocation) while the whole table is live, where reading column by column freed the
+ *       INT32 offsets first.  The file size, which the restore is sized by, already excluded
+ *       that widening; neither path charged it to a reservation.
  */
 static std::unique_ptr<idata_representation> convert_disk_to_gpu(
   const idata_representation& source,
