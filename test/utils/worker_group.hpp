@@ -59,7 +59,8 @@ class start_gate_broken : public std::runtime_error {
  *   objects of the test that is about to end. join() and the destructor then write a message to
  *   stderr and abort the process.
  *
- * The destructor breaks a gate that is still closed and waits for the workers as join() does, so
+ * The destructor breaks a gate that is still closed and waits for the workers as join() does,
+ * without allocating, so
  * a test may leave the group's scope at any point, also by an exception.
  *
  * @tparam Result What a worker returns; not void
@@ -103,7 +104,13 @@ class worker_group {
 
   ~worker_group()
   {
-    break_gate_if_closed();
+    {
+      // Unlike join(), record no reason: nothing reads it any more, and a destructor must not
+      // allocate.
+      std::scoped_lock lock{_mutex};
+      if (_gate == gate_state::closed) { _gate = gate_state::broken; }
+      _changed.notify_all();
+    }
     wait_for_workers_or_abort();
   }
 

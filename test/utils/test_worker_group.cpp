@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "utils/allocation_counter.hpp"
 #include "utils/child_test_runner.hpp"
 #include "utils/worker_group.hpp"
 
@@ -27,6 +28,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
@@ -134,6 +136,18 @@ TEST_CASE("workers that are not all spawned leave the start gate when the group 
   }
   CHECK(gate_broken);
   CHECK(clock_type::now() - started < prompt);
+}
+
+TEST_CASE("destroying a group whose start gate is still closed does not allocate", "[worker_group]")
+{
+  std::optional<worker_group<int>> group{std::in_place, 2, generous_timeout};
+  group->spawn([](gate& start) {
+    start.arrive_and_wait();
+    return 1;
+  });
+  cucascade::test::scoped_allocation_counter const allocations;
+  group.reset();
+  CHECK(allocations.count() == 0);
 }
 
 TEST_CASE("a start gate that does not open by the deadline fails the group", "[worker_group]")
