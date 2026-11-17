@@ -338,8 +338,7 @@ Registered via `register_builtin_converters()`:
 
 The GPU -> GPU converter rebuilds the column tree on the destination GPU and copies every leaf
 buffer (data, validity mask, offsets, chars) into a newly allocated destination buffer. It does not
-pack or unpack the table. The bytes take one of two copy routes (terms as in the
-[glossary](../GLOSSARY.md)):
+pack or unpack the table. The bytes take one of two copy routes:
 
 - **Peer route**: each leaf buffer is copied directly between the two GPUs with
   `cudaMemcpyPeerAsync` on the target stream.
@@ -367,9 +366,7 @@ register_builtin_converters(
 
 Both routes learn the chars size of every strings column up front with one batched read, reject a
 source table whose column views are sliced, and have completed every copy when the conversion
-returns. The design decisions are recorded in
-[ADR 0001](adr/0001-host-staged-pipeline-whole-table-stream.md) and
-[ADR 0002](adr/0002-host-staging-from-reserved-host-pool.md).
+returns.
 
 ### Conversion Flow
 
