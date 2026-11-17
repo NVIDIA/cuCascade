@@ -51,9 +51,11 @@ if (discovery.discover()) {
     topo.num_gpus;           // Total GPU count
     topo.num_numa_nodes;     // Total NUMA node count
     topo.numa_nodes;         // Per-NUMA-node capacity and memory kind
-    topo.gpus;               // Per-GPU topology info
+    topo.gpus;               // GPUs visible to this process (CUDA_VISIBLE_DEVICES applied)
+    topo.all_gpus;           // Every GPU / MIG instance on the host, unfiltered
     topo.network_devices;    // NICs with NUMA affinity
     topo.storage_devices;    // NVMe/SATA drives with NUMA affinity
+    topo.network_mounts;     // Mounted network file systems (NFS, Lustre, CIFS, ...)
 
     // Lookups return nullopt for an unknown node rather than a silent 0.
     topo.get_numa_memory_capacity(0);      // std::optional<std::size_t>
