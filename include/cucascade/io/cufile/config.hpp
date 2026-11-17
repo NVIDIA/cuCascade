@@ -133,9 +133,12 @@ struct config {
 
   /// Write slices larger than this are cut by @c templated_ioctx into pieces of
   /// this size (rounded down to the write granule) and spread over the selected
-  /// reactors; 0 = never cut.  cuFile prefers large submissions (one call splits
-  /// internally across cuFile's own threads), so the default is no split.
-  std::size_t write_split_bytes{0};
+  /// reactors; 0 = never cut.  A reactor serves a slice to completion, so an
+  /// uncut multi-GiB write would hold it (and the reads queued behind it) for
+  /// hundreds of milliseconds while its backlog no longer shows in the reactor
+  /// selection.  The default equals @c max_op_bytes, so no cuFile call gets
+  /// smaller than an uncut slice's.
+  std::size_t write_split_bytes{64UL << 20};
 
   /// Device reads below this size use POSIX pread (through the reactor's pinned
   /// scratch) instead of cuFile.  256 KiB
