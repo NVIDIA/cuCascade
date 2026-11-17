@@ -276,12 +276,21 @@ exec::semi_future<size_t> ioctx::device_readv_async_io(const io_object& obj,
 std::shared_ptr<io_object> ioctx::open_io_object_for_write(std::string path,
                                                            write_open_options options)
 {
-  auto object = create_io_object_for_write(strip_file_scheme(path), options);
-  if (object == nullptr) return object;
-  // Truncating (or replacing) the file changes its bytes as much as a write.
-  if (options.mode == write_mode::create_or_truncate || options.mode == write_mode::create_new) {
-    invalidate_cached(object->object_path());
+  auto stripped = strip_file_scheme(path);
+  // Truncating (or replacing) the file changes its bytes as much as a write.  A
+  // backend can truncate and still fail afterwards (building the object), so the
+  // path is invalidated on that exit too.
+  bool const destructive =
+    options.mode == write_mode::create_or_truncate || options.mode == write_mode::create_new;
+  std::shared_ptr<io_object> object;
+  try {
+    object = create_io_object_for_write(stripped, options);
+  } catch (...) {
+    if (destructive) invalidate_cached(stripped);
+    throw;
   }
+  if (object == nullptr) return object;
+  if (destructive) invalidate_cached(object->object_path());
   return stamped(std::move(object));
 }
 

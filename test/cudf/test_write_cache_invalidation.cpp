@@ -26,6 +26,8 @@
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <catch2/catch_all.hpp>
 #include <unistd.h>
@@ -37,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <new>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -117,7 +120,47 @@ struct write_cache_fixture {
   std::string path;
 };
 
+/// A uring ioctx whose write opens fail after the backend opened (and so
+/// truncated) the file, as a failed object allocation would.
+class failing_write_open_ioctx : public cucascade::io::uring::uring_ioctx {
+ public:
+  using uring_ioctx::uring_ioctx;
+
+ protected:
+  std::shared_ptr<cucascade::io::io_object> create_io_object_for_write(
+    std::string path, cucascade::io::write_open_options options) override
+  {
+    std::ignore = uring_ioctx::create_io_object_for_write(std::move(path), options);
+    throw std::bad_alloc{};
+  }
+};
+
 }  // namespace
+
+TEST_CASE("a truncating open that fails still invalidates its path", "[cache][write][uring]")
+{
+  write_cache_fixture fixture;
+  auto* const host = fixture.memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)
+                       .front()
+                       ->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  cucascade::io::uring::config cfg;
+  failing_write_open_ioctx ctx{
+    1, std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(cfg, host)};
+  ctx.start();
+
+  auto reader = ctx.open_io_object(fixture.path);
+  ctx.metadata_store().register_metadata(*reader,
+                                         std::make_shared<cucascade::io::io_object_metadata>());
+  REQUIRE(ctx.metadata_store().has_path(fixture.path));
+
+  REQUIRE_THROWS_AS(
+    ctx.open_io_object_for_write(fixture.path,
+                                 {.mode = cucascade::io::write_mode::create_or_truncate}),
+    std::bad_alloc);
+  CHECK(std::filesystem::file_size(fixture.path) == 0);
+  CHECK_FALSE(ctx.metadata_store().has_path(fixture.path));
+  ctx.shutdown();
+}
 
 TEST_CASE("a write retires the cached generations of its path", "[cache][write][uring]")
 {
