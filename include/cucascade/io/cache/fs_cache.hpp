@@ -656,6 +656,14 @@ class fs_cache {
                                 cucascade::cuda::device_copy_batch const& copies,
                                 std::shared_ptr<cached_copy_retirement> retirement) noexcept;
 
+  /// Settle every retirement on @c _event_retirements whose event has completed
+  /// (or failed).  Any waiter may settle any of them, so a waiter whose own
+  /// request is held by a busy stream never keeps a ready one waiting.
+  void poll_event_retirements() noexcept;
+
+  /// Wait, polling, until @p retirement has settled (see the waiter pool).
+  void wait_for_retirement(cached_copy_retirement& retirement) noexcept;
+
   /// Pop every request still sitting in @p queue and retire its producer on
   /// @c producer_stage::abandoned, so a shutdown never leaves a request parked
   /// in a transient stage with waiters asleep on it.
@@ -770,6 +778,12 @@ class fs_cache {
   /// future can settle even when no later cache operation arrives to drain it.
   /// Declared before the waiters so their threads stop before its destructor.
   exec::cuda_event_completion_poll _completion_poll;
+  /// Cache-hit retirements tracked by their own event (per-thread default
+  /// stream; see retire_pins_after_stream), polled by every waiter.  Room for an
+  /// entry is reserved before its copies are enqueued, so adding it never throws.
+  std::mutex _event_retirements_mutex;
+  std::vector<std::shared_ptr<cached_copy_retirement>> _event_retirements;
+  std::size_t _event_retirements_reserved{0};
   exec::static_thread_pool _completion_waiters{2, "cache_complete"};
 };
 
