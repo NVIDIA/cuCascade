@@ -30,9 +30,39 @@ Lint runs first for copied PRs and merge groups. Copied PRs build and test CUDA 
 with stable RAPIDS and CUDA 13 with nightly RAPIDS. Merge groups build and test all
 four configurations; `main` builds all four to refresh the shared compiler cache.
 For copied-PR and merge-group runs, the GPU test matrix starts after all builds succeed.
-Tests use the single-GPU `linux-amd64-gpu-t4-latest-1` runners; green CI does not
-establish multi-GPU coverage.
+The regular test matrix uses single-GPU `linux-amd64-gpu-t4-latest-1` runners.
 The required `check` job succeeds only when lint, build, and test jobs all succeed.
+
+## Multi-GPU qualification
+
+Merge groups also run `multi-gpu-test` on `linux-amd64-gpu-t4-latest-2`, using the
+existing CUDA 13 stable build artifact after all builds succeed. The job records
+hardware and topology, then runs `[multi-device]` in the core, cuDF, and topology
+test executables. The core peer-access tests verify real transfers in both
+directions; unsupported hardware, any skipped case or section, empty selection,
+process failure, or timeout fails the job.
+
+This qualification job is initially outside the required `check`. A green `check`
+does not establish multi-GPU coverage until qualification is complete and the job
+is added to that summary. Inspect the separate job and its diagnostics artifact.
+
+After building, run the checks in the matching Pixi environment. For the default
+build:
+
+```bash
+pixi run python scripts/run_multi_gpu_tests.py
+```
+
+Use `--build-dir` for other build directories, for example:
+
+```bash
+pixi run -e cuda-13-stable python scripts/run_multi_gpu_tests.py --build-dir build/cuda-13-stable
+```
+
+Reports and logs are written under the chosen build directory in
+`multi-gpu-results/`. The runner allows five minutes per executable and runs them
+sequentially. The CI test step has a separate timeout so failure diagnostics can
+upload before the job's overall timeout.
 
 ## Enter the merge queue
 
