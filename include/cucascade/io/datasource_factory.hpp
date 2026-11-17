@@ -177,8 +177,9 @@ io_context_registry::factory_type make_uring_ioctx_factory(
 /// cuFile / GPUDirect Storage local-disk read backend.  Builds a
 /// @c cufile_reactor::reactor_context from @c config.cufile and a pool of
 /// @c config.cufile_n_reactors reactors.  Takes no reservation manager: the
-/// reactor stages through its own pooled pinned scratch.  Declared only in a
-/// build that found @c cufile.h.
+/// reactors borrow their pinned host scratch from the registered HOST memory
+/// pools (@c memory::find_host_pool), or keep their own when there are none.
+/// Declared only in a build that found @c cufile.h.
 io_context_registry::factory_type make_cufile_ioctx_factory();
 #endif
 
