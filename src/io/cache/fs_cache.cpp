@@ -272,13 +272,10 @@ struct fs_cache::cached_copy_retirement {
     if (!published.try_wait()) { published.count_down(); }
   }
 
+  /// Wait for a lane-retired request (see fs_cache::wait_for_retirement for
+  /// one retired by its own event).
   void wait_and_finish(exec::cuda_event_completion_poll& poll) noexcept
   {
-    published.wait();
-    if (copies_done != nullptr) {
-      finish(copies_done->synchronize_no_throw());
-      return;
-    }
     while (!finished.load(std::memory_order_acquire)) {
       switch (poll.wait_for_progress()) {
         case exec::cuda_event_completion_poll::progress::made: break;
@@ -1444,7 +1441,7 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
         retirement->coordinator = coordinator;
 
         exec::invocable<void()> completion_task{
-          [this, retirement]() noexcept { retirement->wait_and_finish(_completion_poll); }};
+          [this, retirement]() noexcept { wait_for_retirement(*retirement); }};
         _completion_waiters.schedule(std::move(completion_task));
       }
     }
@@ -1482,6 +1479,49 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
   return exec::make_semi_future<std::size_t>(logical_bytes);
 }
 
+void fs_cache::poll_event_retirements() noexcept
+{
+  // One at a time, settled outside the lock: settling resolves the read's
+  // future, whose continuations may issue more reads.
+  for (;;) {
+    std::shared_ptr<cached_copy_retirement> ready;
+    cudaError_t status = cudaSuccess;
+    {
+      std::lock_guard lock(_event_retirements_mutex);
+      for (auto& entry : _event_retirements) {
+        status = entry->copies_done->query_raw_status();
+        if (status == cudaErrorNotReady) continue;
+        ready = std::move(entry);
+        entry = std::move(_event_retirements.back());
+        _event_retirements.pop_back();
+        break;
+      }
+    }
+    if (ready == nullptr) return;
+    if (status != cudaSuccess) std::ignore = cudaGetLastError();
+    ready->finish(status);
+  }
+}
+
+void fs_cache::wait_for_retirement(cached_copy_retirement& retirement) noexcept
+{
+  retirement.published.wait();
+  if (retirement.copies_done == nullptr) {
+    retirement.wait_and_finish(_completion_poll);
+    return;
+  }
+  // Poll rather than block on this request's event: a held stream would keep
+  // this waiter, and with it every request queued behind it, from settling
+  // reads whose copies are done.
+  constexpr auto poll_interval = std::chrono::microseconds{50};
+  while (!retirement.finished.load(std::memory_order_acquire)) {
+    poll_event_retirements();
+    if (retirement.finished.load(std::memory_order_acquire)) return;
+    std::ignore = _completion_poll.drain_all();
+    std::this_thread::sleep_for(poll_interval);
+  }
+}
+
 void fs_cache::retire_pins_after_stream(::cuda::stream_ref stream,
                                         cucascade::cuda::device_copy_batch const& copies,
                                         std::shared_ptr<cached_copy_retirement> retirement) noexcept
@@ -1497,6 +1537,9 @@ void fs_cache::retire_pins_after_stream(::cuda::stream_ref stream,
     std::unique_ptr<cucascade::cuda::cuda_event> done;
     try {
       done = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
+      std::lock_guard lock(_event_retirements_mutex);
+      _event_retirements.reserve(_event_retirements.size() + _event_retirements_reserved + 1);
+      ++_event_retirements_reserved;
     } catch (...) {
       done.reset();
     }
@@ -1508,8 +1551,15 @@ void fs_cache::retire_pins_after_stream(::cuda::stream_ref stream,
         status = cudaErrorUnknown;
       }
       if (status == cudaSuccess) { status = cudaEventRecord(done->get(), cudaStreamPerThread); }
+      {
+        std::lock_guard lock(_event_retirements_mutex);
+        --_event_retirements_reserved;
+        if (status == cudaSuccess) {
+          retirement->copies_done = std::move(done);
+          _event_retirements.push_back(retirement);  // within the reserved capacity
+        }
+      }
       if (status == cudaSuccess) {
-        retirement->copies_done = std::move(done);
         retirement->signal_published();
         return;
       }
