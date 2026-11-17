@@ -13,6 +13,9 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
 | [CI and the Merge Queue](ci.md) | PR testing, approvals, queue entry, diagnostics, and retries |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
+| [Glossary](../GLOSSARY.md) | The project's terms, such as copy route, chunk and staging slot; code and docs use these words |
+| [ADR 0001: Host-staged pipeline streams the whole table, sized up front](adr/0001-host-staged-pipeline-whole-table-stream.md) | Why a cross-GPU copy through host memory moves a table as one chunked byte stream |
+| [ADR 0002: Staging slots come from the reserved HOST pool, per conversion](adr/0002-host-staging-from-reserved-host-pool.md) | Why each host-staged pipeline reserves its own staging memory from the HOST pool |
 
 ## Reading Paths
 

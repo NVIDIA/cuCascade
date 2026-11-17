@@ -265,7 +265,7 @@ The `representation_converter_registry` provides type-indexed conversion between
 | Host (direct) | GPU table | `cudaMemcpyBatchAsync` (H2D) — reconstructs `cudf::column` tree from metadata |
 | GPU table | Host (packed) | `cudf::pack()` -> `cudaMemcpyAsync` (D2H) -> multi-block host allocation |
 | Host (packed) | GPU table | `cudaMemcpyAsync` (H2D) -> `cudf::unpack()` on device |
-| GPU table | GPU table | `cudf::pack()` -> `cudaMemcpyPeerAsync` -> `cudf::unpack()` (cross-device) |
+| GPU table | GPU table | Cross-GPU copy of each leaf buffer over the peer route (`cudaMemcpyPeerAsync`) or the host-staged pipeline |
 | Host (packed) | Host (packed) | Block-by-block `std::memcpy` (cross-NUMA) |
 
 "Host (direct)" = `host_data_representation` — preferred, no intermediate GPU allocation.
