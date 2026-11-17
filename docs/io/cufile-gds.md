@@ -1,10 +1,10 @@
-# cuFile / GPUDirect Storage read backend
+# cuFile / GPUDirect Storage backend
 
 The cuFile backend (`io_backend::cufile`, `cufile_ioctx`) reads local and
-network-filesystem files into GPU memory through NVIDIA cuFile (GPUDirect
-Storage). It is read-only and is built when `cufile.h` is found at configure
-time (`CUCASCADE_HAS_CUFILE`). `libcufile.so.0` is `dlopen`ed at run time, so a
-host without it serves every read through POSIX.
+network-filesystem files into GPU memory, and writes them from it, through
+NVIDIA cuFile (GPUDirect Storage). It is built when `cufile.h` is found at
+configure time (`CUCASCADE_HAS_CUFILE`). `libcufile.so.0` is `dlopen`ed at run
+time, so a host without it serves every transfer through POSIX.
 
 It is tuned for Parquet scans: 1–8 MB column chunks at arbitrary file offsets,
 read into RMM-allocated buffers, from IBM Storage Scale (GPFS) over RDMA or
@@ -14,6 +14,7 @@ from local NVMe.
 
 - [Routing](#routing)
 - [How a device read is served](#how-a-device-read-is-served)
+- [How a device write is served](#how-a-device-write-is-served)
 - [Ordering against the caller's stream](#ordering-against-the-callers-stream)
 - [Sizing the pool: one group of reactors per GPU](#sizing-the-pool-one-group-of-reactors-per-gpu)
 - [Registered staging memory](#registered-staging-memory)
@@ -73,6 +74,37 @@ GDS reads of the same file cost the GDS reads their performance.
 The `cufile_ioctx` splits device-only reads larger than `staging_piece_bytes`
 into pieces on 4 KiB boundaries, so several reactors of the GPU read one large
 range at once. Every piece after the first starts aligned and fits one slot.
+
+## How a device write is served
+
+A write is cut at the write granule (4 KiB, or the O_DIRECT block or page size
+when larger). The aligned body of a device source of at least `gds_threshold`
+bytes, written to a cuFile-registered file, goes to `cuFileWrite` when cuFile
+reports a GDS mode:
+
+| Path | When | What happens |
+|------|------|--------------|
+| **staged** | the reactor holds a free staging slot on the source's GPU (same `staging_mode` rule as reads) | A slot-sized piece at a time: a device-to-device copy into the registered, aligned slot, then one `cuFileWrite` from it. |
+| **direct** | otherwise | `cuFileWrite` from the source itself; cuFile bounces an unregistered source through its own GPU buffers. |
+
+Everything else is written with `pwrite` (O_DIRECT for aligned pieces):
+- the sub-granule head and tail, bodies below `gds_threshold`, files cuFile
+  does not serve, and a body whose `cuFileWrite` failed (counted in
+  `cufile_failures`), all staged through the reactor's pinned host scratch by
+  device-to-host copies;
+- on a compatibility-only platform, every device body: cuFile would bounce it
+  through host memory anyway, and its 1 MiB writes measured about half as fast
+  as the staged path when they extend a file;
+- host sources: a body of at least 4 MiB congruent with its file offset goes
+  O_DIRECT from the caller; anything else goes through the page cache with its
+  writeback started at once (`sync_file_range`).
+
+As for reads, the `cufile_ioctx` takes a write's GPU from the source pointer, so
+it reaches that GPU's group and slots, and records its stream gate on the
+submitting thread. Device sources are never registered per write (NVIDIA
+advises against registering a one-shot buffer); the staging slots are what
+cuFile DMAs from. A flush is `fdatasync`. `write_split_bytes` cuts large write
+slices into pieces spread over the group's reactors.
 
 ## Ordering against the caller's stream
 
@@ -221,8 +253,10 @@ Two user-level claims proved wrong when checked against the docs:
 
 - `cufile_ioctx::stats()` (`reactor_stats`), or `stats(device)` for one GPU's
   group: staged, direct and POSIX reads and bytes, `early_staged_reads`,
-  `cufile_failures`, `parked_slices`. On a GDS host, Parquet device reads should
-  land in `staged_bytes`.
+  `cufile_failures`, `parked_slices`, and the staged and direct `cuFileWrite`
+  bodies (`staged_writes`, `direct_writes` and their bytes). On a GDS host,
+  Parquet device reads should land in `staged_bytes` and device-write bodies in
+  `staged_write_bytes`.
 - `gds_stats -p <pid> -l 3`: per-GPU `n_nvfs_reads` / `n_p2p_reads`
   (direct) versus `n_posix_reads` (compat), bounce-pool use, per-NIC RDMA
   bytes. `cufile.json` `profile.cufile_stats: 3` enables it.
@@ -296,6 +330,7 @@ points.
 | `gds_threshold` | 256 KiB | Smaller device reads use POSIX |
 | `max_op_bytes` | 64 MiB | Largest direct `cuFileRead`; byte quantum of a scheduling pass |
 | `max_inflight` | 32 | Async copies per reactor (parked slices excluded) |
+| `write_split_bytes` | 0 (off) | Write slices larger than this are cut into pieces of this size, spread over the group's reactors |
 | `poll_interval_us` | 50 | Completion poll period while copies are pending |
 | `use_odirect`, `compat_mode` | true, automatic | O_DIRECT / cuFile registration policy per file |
 
@@ -304,8 +339,8 @@ that many reactors.
 
 ## Known limitations
 
-- Reads only; batch (`cuFileBatchIO*`) and stream (`cuFileReadAsync`) APIs are
-  not used. On Storage Scale both run in compatibility mode, so concurrency
+- Batch (`cuFileBatchIO*`) and stream (`cuFileReadAsync` / `cuFileWriteAsync`)
+  APIs are not used. On Storage Scale both run in compatibility mode, so concurrency
   comes from reactor threads.
 - The per-path verdict does not yet see NVMe multipath heads, NVMe/TCP, or
   RAID levels and encryption inside device-mapper / md stacks. It is advisory:

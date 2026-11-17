@@ -140,9 +140,10 @@ struct reactor_placement {
 };
 
 /**
- * @brief How a cuFile reactor (or a pool, summed) served its reads.
+ * @brief How a cuFile reactor (or a pool, summed) served its reads and the
+ *        cuFile parts of its writes.
  *
- * Counted when a read settles successfully, except @c cufile_failures and
+ * Counted when a transfer settles successfully, except @c cufile_failures and
  * @c parked_slices.  A test or a deployment check can tell from them which path
  * served the bytes: a GDS-capable file whose device reads all land in
  * @c posix_device_bytes is not using cuFile at all.
@@ -161,8 +162,14 @@ struct reactor_stats {
   std::uint64_t posix_device_bytes{0};  ///< Their bytes.
   std::uint64_t host_reads{0};          ///< Host-only reads.
   std::uint64_t host_bytes{0};          ///< Their bytes.
-  std::uint64_t cufile_failures{0};     ///< cuFileRead errors that sent a read to POSIX.
+  std::uint64_t cufile_failures{0};     ///< cuFile errors that sent a transfer to POSIX.
   std::uint64_t parked_slices{0};       ///< Device slices that waited for their stream to start.
+  /// Device-write bodies cuFile wrote from a staging slot (after a device copy).
+  std::uint64_t staged_writes{0};
+  std::uint64_t staged_write_bytes{0};  ///< Their bytes.
+  /// Device-write bodies cuFile wrote from the caller's source directly.
+  std::uint64_t direct_writes{0};
+  std::uint64_t direct_write_bytes{0};  ///< Their bytes.
 
   reactor_stats& operator+=(reactor_stats const& other) noexcept
   {
@@ -178,6 +185,10 @@ struct reactor_stats {
     host_bytes += other.host_bytes;
     cufile_failures += other.cufile_failures;
     parked_slices += other.parked_slices;
+    staged_writes += other.staged_writes;
+    staged_write_bytes += other.staged_write_bytes;
+    direct_writes += other.direct_writes;
+    direct_write_bytes += other.direct_write_bytes;
     return *this;
   }
 };
@@ -210,7 +221,11 @@ struct reactor_stats {
  * Writes (on objects from @ref create_io_object_for_write) are split at the
  * write granule like the uring reactor's: the granule-aligned body of a device
  * source of at least @ref config::gds_threshold bytes goes to synchronous
- * @c cuFileWrite calls (after the work queued on the source's stream), while
+ * @c cuFileWrite calls (after the work queued on the source's stream) --
+ * staged like a read when the reactor holds slots on the source's GPU: copied
+ * device-to-device into a registered slot a piece at a time and written from
+ * there, so cuFile can DMA it rather than bounce the unregistered source --
+ * while
  * the sub-granule head and tail, smaller bodies and host sources are written
  * with @c pwrite -- O_DIRECT for aligned pieces, buffered otherwise -- device
  * bytes being staged through the reactor's pinned scratch by D2H copies.  A
@@ -546,7 +561,8 @@ class cufile_reactor {
                                  std::unique_ptr<io_op_request>& request);
 
   /// Serve a write slice: host sources by @c pwrite, device sources by
-  /// @c cuFileWrite for the aligned body and staged @c pwrite for the rest.
+  /// @c cuFileWrite for the aligned body (from a registered staging slot when
+  /// the reactor has one) and staged @c pwrite for the rest.
   void dispatch_write(cufile_io_object const& file,
                       prepared_io_slice const& slice,
                       io_op_request& request);
@@ -563,6 +579,16 @@ class cufile_reactor {
   [[nodiscard]] bool write_cufile(cufile_io_object const& file,
                                   std::uint8_t const* source,
                                   range piece);
+
+  /// Write the 4 KiB-aligned @p piece from device memory @p source through a
+  /// free slot of @p staging: a device copy into the slot, then @c cuFileWrite
+  /// from it, a slot at a time.  Writes directly (@ref write_cufile) when no slot
+  /// is free.  Returns false when cuFile failed and the caller must stage the
+  /// piece through POSIX instead.
+  [[nodiscard]] bool write_cufile_staged(cufile_io_object const& file,
+                                         std::uint8_t const* source,
+                                         range piece,
+                                         device_staging& staging);
 
   /// The scratch, allocated on first use.
   [[nodiscard]] std::uint8_t* scratch();
@@ -617,7 +643,7 @@ class cufile_reactor {
   std::string _tname;
   reactor_placement _placement;
 
-  /// Read counters (see @ref reactor_stats); written by the worker, read by any
+  /// Transfer counters (see @ref reactor_stats); written by the worker, read by any
   /// thread.
   struct counters {
     std::atomic<std::uint64_t> staged_reads{0};
@@ -632,6 +658,10 @@ class cufile_reactor {
     std::atomic<std::uint64_t> host_bytes{0};
     std::atomic<std::uint64_t> cufile_failures{0};
     std::atomic<std::uint64_t> parked_slices{0};
+    std::atomic<std::uint64_t> staged_writes{0};
+    std::atomic<std::uint64_t> staged_write_bytes{0};
+    std::atomic<std::uint64_t> direct_writes{0};
+    std::atomic<std::uint64_t> direct_write_bytes{0};
   };
   counters _counters;
 

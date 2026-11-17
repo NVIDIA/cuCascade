@@ -689,6 +689,10 @@ reactor_stats cufile_reactor::stats() const noexcept
   out.host_bytes         = load(_counters.host_bytes);
   out.cufile_failures    = load(_counters.cufile_failures);
   out.parked_slices      = load(_counters.parked_slices);
+  out.staged_writes      = load(_counters.staged_writes);
+  out.staged_write_bytes = load(_counters.staged_write_bytes);
+  out.direct_writes      = load(_counters.direct_writes);
+  out.direct_write_bytes = load(_counters.direct_write_bytes);
   return out;
 }
 
@@ -1759,9 +1763,11 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
   if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
 
-  // The granule-aligned body goes to cuFile (whatever the source pointer's
-  // alignment: cuFile bounces an unaligned one inside the GPU); the sub-granule
-  // head and tail, and a body cuFile cannot or should not take, are staged.
+  // The granule-aligned body goes to cuFile; the sub-granule head and tail, and
+  // a body cuFile cannot or should not take, are staged through host memory.
+  // When the reactor holds staging slots on the source's GPU the body is copied
+  // into a registered, aligned slot first (as staged reads are), so cuFile can
+  // DMA it instead of bouncing an unregistered source through its own buffers.
   auto const& body = pieces[1];
   std::array<range, 3> staged{pieces[0], range{}, pieces[2]};
   // In compatibility mode (including one forced by the environment) cuFile
@@ -1774,9 +1780,11 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
   if (try_cufile) {
     // The slice passed its stream gate in dispatch_slice, so the work queued on
     // the source's stream before the call has finished: cuFile may read it.
-    if (!write_cufile(file, slice.d_buffer.data + (body.offset - slice.rng.offset), body)) {
-      staged[1] = body;
-    }
+    auto const* source = slice.d_buffer.data + (body.offset - slice.rng.offset);
+    auto* staging      = staging_for(device_id);
+    bool const written = staging != nullptr ? write_cufile_staged(file, source, body, *staging)
+                                            : write_cufile(file, source, body);
+    if (!written) staged[1] = body;
   } else {
     staged[1] = body;
   }
@@ -1814,6 +1822,7 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
           file.object_path(),
           describe_cufile_failure(got, saved_errno));
       }
+      _counters.cufile_failures.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
     if (got == 0 || static_cast<std::size_t>(got) > want || ++short_writes > max_short_writes) {
@@ -1823,6 +1832,82 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
     if (static_cast<std::size_t>(got) == want) short_writes = 0;
     done += static_cast<std::size_t>(got);
   }
+  _counters.direct_writes.fetch_add(1, std::memory_order_relaxed);
+  _counters.direct_write_bytes.fetch_add(piece.size, std::memory_order_relaxed);
+  return true;
+}
+
+bool cufile_reactor::write_cufile_staged(cufile_io_object const& file,
+                                         std::uint8_t const* source,
+                                         range piece,
+                                         device_staging& staging)
+{
+  auto const* api = cufile_api::get();
+  auto* entry     = staging.free_slot();
+  if (api == nullptr || entry == nullptr) return write_cufile(file, source, piece);
+
+  // The piece is block-aligned in the file and a slot holds whole blocks, so
+  // every call writes an aligned length from an aligned address.  cuFile
+  // addresses a registered slot by its base plus an offset; an unregistered one
+  // (forced staging) by the exact pointer.
+  auto const slot_size = align_down_block(entry->slot.bytes);
+  auto const stream    = entry->stream.stream;
+  std::size_t done     = 0;
+  while (done < piece.size) {
+    if (_stop_source.stop_requested()) {
+      throw std::system_error(canceled_error(), "cufile_reactor: write canceled by shutdown");
+    }
+    auto const want = std::min(slot_size, piece.size - done);
+    // The slice passed its stream gate: the source is ready.  The copy runs on
+    // the slot's own stream and is finished before cuFile reads the slot.
+    auto status = cudaMemcpyAsync(
+      entry->slot.base, source + done, want, cudaMemcpyDeviceToDevice, stream);
+    if (status == cudaSuccess) status = cudaEventRecord(entry->done.get(), stream);
+    if (status == cudaSuccess) status = entry->done.synchronize_no_throw();
+    if (status != cudaSuccess) {
+      // The copy may be queued without an event to wait on: drain the slot's
+      // stream (it carries only this slot's copies) before the slot is reused.
+      std::ignore = cudaStreamSynchronize(stream);
+      std::ignore = cudaGetLastError();
+      throw cucascade::cuda_error(std::string{"cufile_reactor: staging copy failed: "} +
+                                  cudaGetErrorString(status));
+    }
+    int short_writes = 0;
+    for (std::size_t written = 0; written < want;) {
+      cufile_write_calls.fetch_add(1, std::memory_order_relaxed);
+      run_cufile_transfer_hook();
+      errno          = 0;
+      bool const registered = entry->slot.registered;
+      auto const got        = api->write(file.cufile_handle(),
+                                  registered ? entry->slot.base : entry->slot.base + written,
+                                  want - written,
+                                  static_cast<off_t>(piece.offset + done + written),
+                                  registered ? static_cast<off_t>(written) : 0);
+      if (got < 0) {
+        auto const saved_errno = errno;
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+          CUCASCADE_LOG_WARN(
+            "cufile_reactor: staged cuFileWrite of '{}' failed: {}; staging such writes through "
+            "POSIX (logged once per process)",
+            file.object_path(),
+            describe_cufile_failure(got, saved_errno));
+        }
+        _counters.cufile_failures.fetch_add(1, std::memory_order_relaxed);
+        // The caller rewrites the whole piece through POSIX, identically.
+        return false;
+      }
+      if (got == 0 || static_cast<std::size_t>(got) > want - written ||
+          ++short_writes > max_short_writes) {
+        throw std::system_error(std::make_error_code(std::errc::io_error),
+                                "cufile_reactor: cuFileWrite wrote nothing or too much");
+      }
+      written += static_cast<std::size_t>(got);
+    }
+    done += want;
+  }
+  _counters.staged_writes.fetch_add(1, std::memory_order_relaxed);
+  _counters.staged_write_bytes.fetch_add(piece.size, std::memory_order_relaxed);
   return true;
 }
 

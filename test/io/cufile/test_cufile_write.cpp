@@ -28,6 +28,8 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <catch2/catch_all.hpp>
@@ -46,6 +48,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -273,6 +276,8 @@ struct write_path {
   config cufile_body{};
   cufile_body.gds_threshold = IO_BLOCK_SIZE;  // every aligned body goes to cuFile
   cufile_body.max_op_bytes  = 1 * MiB;        // ... in several cuFileWrite calls
+  config cufile_slots = cufile_body;
+  cufile_slots.staging_mode = cucascade::io::cufile::staging::always;  // via the device slots
   config staged{};
   staged.gds_threshold = 1UL << 40;  // nothing goes to cuFile
   config unregistered{};
@@ -282,6 +287,7 @@ struct write_path {
   buffered.compat_mode   = cucascade::io::cufile::compat::on;
   buffered.gds_threshold = IO_BLOCK_SIZE;
   return {{"cuFile body", cufile_body, true},
+          {"cuFile body through device slots", cufile_slots, true},
           {"default policy", cufile_body, false},
           {"staged", staged},
           {"unregistered file", unregistered},
@@ -526,6 +532,69 @@ TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][
     CHECK(object->size() == shadow.bytes().size());
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
+}
+
+TEST_CASE("cufile device write bodies go through the registered staging slots",
+          "[io][cufile][write][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  force_cufile_writes const force;
+  config cfg{};
+  cfg.gds_threshold       = IO_BLOCK_SIZE;
+  cfg.staging_mode        = cucascade::io::cufile::staging::always;
+  cfg.staging_piece_bytes = 1 * MiB;  // several slot-sized pieces per body
+  write_context ctx{cfg, 1};
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+  cuda_stream stream;
+  shadow_file shadow;
+
+  // A source that is not congruent with its file offset: the slot aligns it.
+  auto const bytes = pattern(5 * MiB + 3, 7);
+  device_bytes const src{bytes, 256};
+  REQUIRE(ctx->device_write_async(*object, 4096, bytes.size(), src.get(), stream.ref()).get(60s) ==
+          bytes.size());
+  shadow.write(4096, bytes);
+  check_same(read_back(ctx.get(), path.str()), shadow.bytes());
+  auto const stats = ctx->stats();
+  CHECK(stats.staged_writes == 1);
+  CHECK(stats.staged_write_bytes > 4 * MiB);
+  CHECK(stats.direct_writes == 0);
+}
+
+TEST_CASE("cufile device writes go to their source GPU's group, whatever the caller's device",
+          "[io][cufile][write][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
+    SKIP("needs two CUDA devices");
+  }
+  force_cufile_writes const force;
+  config cfg{};
+  cfg.reactors_per_device = 1;
+  cfg.gds_threshold       = IO_BLOCK_SIZE;
+  cfg.staging_mode        = cucascade::io::cufile::staging::always;
+  auto const bytes        = pattern(2 * MiB, 11);
+  std::optional<device_bytes> src;
+  std::optional<cuda_stream> stream;
+  {
+    rmm::cuda_set_device_raii const on_one{rmm::cuda_device_id{1}};
+    src.emplace(bytes);
+    stream.emplace();
+  }
+  auto ctx = cucascade::io::cufile::make_cufile_ioctx(0, cfg);
+  ctx->start();
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+  {
+    rmm::cuda_set_device_raii const on_zero{rmm::cuda_device_id{0}};
+    REQUIRE(ctx->device_write_async(*object, 0, bytes.size(), src->get(), stream->ref()).get(60s) ==
+            bytes.size());
+  }
+  check_same(read_back(*ctx, path.str()), bytes);
+  CHECK(ctx->stats(1).staged_writes == 1);
+  CHECK(ctx->stats(0).staged_writes == 0);
+  ctx->shutdown();
 }
 
 TEST_CASE("cufile staged device writes wait for their copies", "[io][cufile][write][gpu]")
@@ -1031,6 +1100,14 @@ TEST_CASE("cufile write throughput probe", "[.cufile-write-bench]")
   if (which == "all" || which == "cufile") {
     write_context ctx{config{}, reactors};
     run_write_probe("cufile", ctx.get(), dir, total, rounds);
+  }
+  if (which == "all" || which == "cufile-direct") {
+    // cuFileWrite straight from the source (cuFile bounces it), against the
+    // default above, which stages bodies through the device slots on a GDS host.
+    config cfg{};
+    cfg.staging_mode = cucascade::io::cufile::staging::never;
+    write_context ctx{cfg, reactors};
+    run_write_probe("cufile-direct", ctx.get(), dir, total, rounds);
   }
   if (which == "all" || which == "cufile-split") {
     config cfg{};
