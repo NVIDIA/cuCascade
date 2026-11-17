@@ -16,6 +16,7 @@
  */
 
 #include "utils/allocation_counter.hpp"
+#include "utils/cuda_test_utils.hpp"
 
 #include <cucascade/cuda/stream.hpp>
 #include <cucascade/error.hpp>
@@ -63,42 +64,7 @@ struct test_fixture {
   small_pinned_host_memory_resource slab_mr{upstream};
 };
 
-// Keeps queued work pending until the test releases it. Cleanup also releases the callback when
-// an assertion aborts the test, so stream destruction cannot leave it blocked.
-class pending_stream_work {
- public:
-  explicit pending_stream_work(rmm::cuda_stream const& stream) : _stream(stream)
-  {
-    CUCASCADE_CUDA_TRY(::cudaLaunchHostFunc(
-      _stream.value(),
-      [](void* context) {
-        auto& gate = *static_cast<pending_stream_work*>(context);
-        gate._released.wait(false);
-      },
-      this));
-  }
-
-  pending_stream_work(pending_stream_work const&)            = delete;
-  pending_stream_work& operator=(pending_stream_work const&) = delete;
-  pending_stream_work(pending_stream_work&&)                 = delete;
-  pending_stream_work& operator=(pending_stream_work&&)      = delete;
-
-  ~pending_stream_work()
-  {
-    release();
-    _stream.synchronize_no_throw();
-  }
-
-  void release() noexcept
-  {
-    _released.store(true);
-    _released.notify_all();
-  }
-
- private:
-  rmm::cuda_stream const& _stream;
-  std::atomic<bool> _released{false};
-};
+using cucascade::test::stream_gate;
 
 // Takes every slab of `bytes` that a pool still has free after it handed out `taken` slabs and
 // freed none: the unused rest of the last upstream block it carved. The next request of that size
@@ -118,8 +84,7 @@ class pending_stream_work {
 // Synchronizes `stream` and reports whether that finished while `gate` still held its work back.
 // If the stream wrongly depends on the gated work, the gate opens at the deadline, so the caller's
 // assertion fails instead of the test hanging.
-[[nodiscard]] bool synchronizes_before_release(rmm::cuda_stream const& stream,
-                                               pending_stream_work& gate)
+[[nodiscard]] bool synchronizes_before_release(rmm::cuda_stream const& stream, stream_gate& gate)
 {
   std::atomic<bool> deadline_reached{false};
   std::jthread watchdog{[&](std::stop_token stop) {
@@ -164,10 +129,11 @@ void check_ready_slab_is_preferred(int producer_device)
   consumer.synchronize();
   std::memset(newest, 0x31, bytes);
   // Declared after both devices' buffers and streams so a failed assertion releases the gate first.
-  std::optional<pending_stream_work> gate;
+  std::optional<stream_gate> gate;
   {
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{producer_device}};
-    gate.emplace(producer);
+    gate.emplace(producer.value());
+    gate->arm();
     CUCASCADE_CUDA_TRY(::cudaMemcpyAsync(
       producer_data.data(), newest, bytes, cudaMemcpyHostToDevice, producer.value()));
     f.slab_mr.deallocate(producer, newest, bytes);
@@ -511,7 +477,8 @@ TEST_CASE("Slab reuse takes an unused slab before a pending one", "[small_pinned
   rmm::device_buffer device{bytes, ::cuda::stream_ref{producer.value()}};
   auto* original = f.slab_mr.allocate_sync(bytes);
   std::memset(original, 0x31, bytes);
-  pending_stream_work gate{producer};
+  stream_gate gate{producer.value()};
+  gate.arm();
   CUCASCADE_CUDA_TRY(
     ::cudaMemcpyAsync(device.data(), original, bytes, cudaMemcpyHostToDevice, producer.value()));
   f.slab_mr.deallocate(producer, original, bytes);
@@ -549,7 +516,8 @@ TEST_CASE("Slab reuse checks a bounded number of pending slabs", "[small_pinned]
   auto const held_slabs = hold_remaining_slabs(f.slab_mr, bytes, pending + 1);
   f.slab_mr.deallocate(consumer, older, bytes);
   consumer.synchronize();
-  pending_stream_work gate{producer};
+  stream_gate gate{producer.value()};
+  gate.arm();
   for (auto* slab : pending_slabs) {
     f.slab_mr.deallocate(producer, slab, bytes);
   }
@@ -671,7 +639,8 @@ TEST_CASE("Slab pool destruction waits for a pending slab's work",
   std::optional<small_pinned_host_memory_resource> mr{std::in_place, f.upstream};
   auto* slab = mr->allocate_sync(bytes);
   std::memset(slab, 0x31, bytes);
-  pending_stream_work gate{producer};
+  stream_gate gate{producer.value()};
+  gate.arm();
   CUCASCADE_CUDA_TRY(
     ::cudaMemcpyAsync(device.data(), slab, bytes, cudaMemcpyHostToDevice, producer.value()));
   mr->deallocate(producer, slab, bytes);
