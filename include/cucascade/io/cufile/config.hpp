@@ -131,30 +131,6 @@ struct config {
   ///       bounced in @c per_buffer_cache_size_kb pieces whatever this is.
   std::size_t max_op_bytes{64UL << 20};
 
-  /// Register device buffers with @c cuFileBufRegister for the duration of one
-  /// transfer when the transfer is at least this many bytes and the buffer (and,
-  /// for a read, the file offset) is 4 KiB-aligned; 0 (the default) never
-  /// registers.  The registration is dropped before the transfer's future
-  /// resolves.
-  ///
-  /// Registrations are shared through a process-wide table keyed by base
-  /// address: a transfer whose buffer starts at a live registration's base and
-  /// fits inside it reuses that registration (the last user deregisters); one
-  /// whose buffer otherwise overlaps a live registration takes the staged POSIX
-  /// path, and a range an unregistered cuFile transfer is using is not registered
-  /// until it completes, so no cuFile call ever addresses memory a concurrent
-  /// transfer may deregister.  Every cuFile transfer takes part in that table,
-  /// also with this knob at 0 (which only stops this context from creating
-  /// registrations), so contexts with different settings stay safe together.
-  ///
-  /// @note Off by default on purpose: NVIDIA advises against registering a
-  ///       one-shot destination (the cost is not amortised and BAR1 space is
-  ///       shared), and in compatibility mode it measured no gain here.  It
-  ///       exists to A/B on a host with
-  ///       a real GDS stack, where an aligned registered buffer is DMA'd directly
-  ///       instead of through cuFile's GPU bounce buffers.
-  std::size_t register_min_bytes{0};
-
   /// Write slices larger than this are cut by @c templated_ioctx into pieces of
   /// this size (rounded down to the write granule) and spread over the selected
   /// reactors; 0 = never cut.  cuFile prefers large submissions (one call splits

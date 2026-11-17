@@ -113,19 +113,8 @@ void set_copy_event_record_failure_for_testing(bool enabled) noexcept;
 /// @c cuFileWrite calls issued by every cuFile reactor so far.
 [[nodiscard]] std::size_t cufile_write_calls_for_testing() noexcept;
 
-/// Buffers currently registered with cuFile through the reactors' registration
-/// table (@c config::register_min_bytes).
-[[nodiscard]] std::size_t live_registrations_for_testing() noexcept;
-
 /// Run @p hook(@p arg) on the worker just before every @c cuFileRead /
 /// @c cuFileWrite call (null removes it).  Process-wide.
 void set_cufile_transfer_hook_for_testing(void (*hook)(void*), void* arg) noexcept;
-
-/// Whether [@p base, @p base + @p bytes) overlaps a live registration or a
-/// cuFile transfer in flight, as the registration table sees it.
-[[nodiscard]] bool transfer_tracked_for_testing(void const* base, std::size_t bytes) noexcept;
-
-/// Buffer registrations the reactors' registration table has created so far.
-[[nodiscard]] std::size_t registrations_created_for_testing() noexcept;
 
 }  // namespace cucascade::io::cufile::detail
