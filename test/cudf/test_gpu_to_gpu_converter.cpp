@@ -14,12 +14,14 @@
 #include "cucascade/memory/memory_space.hpp"
 #include "cucascade/memory/reservation_manager_configurator.hpp"
 #include "cucascade/utils/cleanup_utils.hpp"
+#include "utils/allocation_counter.hpp"
 #include "utils/cuda_test_utils.hpp"
 #include "utils/cudf_test_utils.hpp"
 #include "utils/mixed_table.hpp"
 #include "utils/peer_access_utils.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/null_mask.hpp>
@@ -40,6 +42,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
+#include <functional>
 #include <future>
 #include <latch>
 #include <memory>
@@ -64,16 +68,9 @@ constexpr uint64_t kMiB = 1024ULL * kKiB;
 constexpr int kSourceDevice = 0;
 constexpr int kTargetDevice = 1;
 
-// Grant two-way pool peer access; SKIP when the hardware cannot, FAIL on CUDA errors.
-void require_peer_pools(memory_space const* source, memory_space const* destination)
+// SKIP when the hardware cannot give the peer access asked for, FAIL on CUDA errors.
+void require_granted(pool_peer_access_result const& result)
 {
-  REQUIRE(source != nullptr);
-  REQUIRE(destination != nullptr);
-
-  const pool_peer_access_result result =
-    cucascade::test::grant_two_way_pool_access(*source, *destination);
-
-  CAPTURE(source->get_device_id(), destination->get_device_id());
   switch (result.status()) {
     case pool_peer_access_status::GRANTED: break;
     case pool_peer_access_status::UNSUPPORTED:
@@ -87,6 +84,16 @@ void require_peer_pools(memory_space const* source, memory_space const* destinat
                                                << cudaGetErrorString(result.error()));
       break;
   }
+}
+
+// Grant two-way pool peer access; SKIP when the hardware cannot, FAIL on CUDA errors.
+void require_peer_pools(memory_space const* source, memory_space const* destination)
+{
+  REQUIRE(source != nullptr);
+  REQUIRE(destination != nullptr);
+
+  CAPTURE(source->get_device_id(), destination->get_device_id());
+  require_granted(cucascade::test::grant_two_way_pool_access(*source, *destination));
 }
 
 cross_gpu_copy_config host_staged(std::size_t chunk_size_bytes, std::size_t pipeline_depth)
@@ -424,6 +431,112 @@ std::unique_ptr<memory_reservation_manager> make_two_gpu_manager_with_exhaustibl
 }
 
 /**
+ * @brief GPU upstream for a memory_space that counts the buffers freed while the stream they are
+ * freed on still has work enqueued. It can also fail one chosen allocation, and reports every
+ * allocation it serves.
+ */
+class recording_device_resource {
+ public:
+  /**
+   * @brief What the resource has seen and what it is told to do, shared with the test.
+   */
+  struct record {
+    std::atomic<long> served_before_failure{-1};  ///< Negative: no allocation fails
+    std::atomic<std::size_t> allocations{0};      ///< Allocations served
+    std::atomic<std::size_t> freed_while_stream_busy{0};
+    cudaMemPool_t pool{};  ///< CUDA pool the buffers come from
+    /// Called with `allocations` after each one is served; set only while no conversion runs.
+    std::function<void(std::size_t)> after_allocation;
+  };
+
+  recording_device_resource(std::size_t capacity, std::shared_ptr<record> record)
+    : _upstream{std::make_shared<rmm::mr::cuda_async_memory_resource>(capacity)},
+      _record{std::move(record)}
+  {
+    _record->pool = _upstream->pool_handle();
+  }
+
+  void* allocate(::cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t))
+  {
+    if (_record->served_before_failure.load() >= 0 &&
+        _record->served_before_failure.fetch_sub(1) == 0) {
+      throw rmm::out_of_memory("recording_device_resource: exhausted");
+    }
+    void* const p            = _upstream->allocate(stream, bytes, alignment);
+    std::size_t const served = _record->allocations.fetch_add(1) + 1;
+    if (_record->after_allocation) { _record->after_allocation(served); }
+    return p;
+  }
+
+  void deallocate(::cuda::stream_ref stream,
+                  void* p,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    if (cudaStreamQuery(stream.get()) != cudaSuccess) {
+      // cudaErrorNotReady is not an error: clear it so that a later CUDA check does not report it.
+      std::ignore = cudaGetLastError();
+      ++_record->freed_while_stream_busy;
+    }
+    _upstream->deallocate(stream, p, bytes, alignment);
+  }
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    return allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+  }
+
+  void deallocate_sync(void* p,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, p, bytes, alignment);
+  }
+
+  bool operator==(recording_device_resource const& other) const noexcept
+  {
+    return _upstream == other._upstream;
+  }
+
+  friend void get_property(recording_device_resource const&, ::cuda::mr::device_accessible) noexcept
+  {
+  }
+
+ private:
+  std::shared_ptr<rmm::mr::cuda_async_memory_resource> _upstream;
+  std::shared_ptr<record> _record;
+};
+
+/**
+ * @brief Two GPUs of 1 GiB plus NUMA-local HOST spaces; the buffers of kTargetDevice come from a
+ * recording_device_resource that shares @p record.
+ */
+std::unique_ptr<memory_reservation_manager> make_two_gpu_manager_with_recording_destination(
+  std::shared_ptr<recording_device_resource::record> record)
+{
+  reservation_manager_configurator builder;
+  builder.set_gpu_ids({kSourceDevice, kTargetDevice})
+    .set_gpu_usage_limit(1024 * kMiB)
+    .use_numa_id_as_host_id()
+    .set_per_numa_region_capacity(64 * kMiB)
+    .set_host_pool_features(1 * kMiB, 4, 1)
+    .set_host_portability(true)
+    .set_gpu_memory_resource_factory(
+      [record = std::move(record)](int device_id, std::size_t capacity) {
+        rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+        if (device_id == kTargetDevice) {
+          return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+            recording_device_resource{capacity, record}};
+        }
+        return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+          rmm::mr::cuda_async_memory_resource{capacity}};
+      });
+  return std::make_unique<memory_reservation_manager>(builder.build());
+}
+
+/**
  * @brief Every stream of @p space's stream pool, which hands its streams out in turn.
  */
 std::vector<cudaStream_t> pool_streams(memory_space const& space)
@@ -456,7 +569,7 @@ bool any_stream_busy(std::span<cudaStream_t const> streams)
   return busy;
 }
 
-enum class table_kind { mixed, zero_rows, no_columns, int64_sequence };
+enum class table_kind { mixed, zero_rows, no_columns, int64_sequence, int64_and_nullable_int8 };
 
 /**
  * @brief Deterministic table of @p kind; the same call on another device yields equal contents.
@@ -483,6 +596,20 @@ std::unique_ptr<cudf::table> make_table(table_kind kind,
       cudf::numeric_scalar<int64_t> const step{3, true, stream};
       std::vector<std::unique_ptr<cudf::column>> columns;
       columns.push_back(cudf::sequence(rows, init, step, stream, mr));
+      table = std::make_unique<cudf::table>(std::move(columns));
+      break;
+    }
+    case table_kind::int64_and_nullable_int8: {
+      cudf::numeric_scalar<int64_t> const init{7, true, stream};
+      cudf::numeric_scalar<int64_t> const step{3, true, stream};
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(cudf::sequence(rows, init, step, stream, mr));
+      for (int8_t value : {int8_t{11}, int8_t{-5}}) {
+        cudf::numeric_scalar<int8_t> const fill{value, true, stream};
+        columns.push_back(cudf::make_column_from_scalar(fill, rows, stream, mr));
+        columns.back()->set_null_mask(
+          cudf::create_null_mask(rows, cudf::mask_state::ALL_VALID, stream, mr), 0);
+      }
       table = std::make_unique<cudf::table>(std::move(columns));
       break;
     }
@@ -961,6 +1088,110 @@ TEST_CASE(
     convert_and_expect_equal(registry, *manager, *small, table_kind::mixed, 4096);
   }
   convert_and_expect_equal(registry, *manager, *source, table_kind::mixed, kRows);
+}
+
+TEST_CASE("gpu_to_gpu conversion that fails frees no destination buffer its copies still write",
+          "[gpu-to-gpu-converter][multi-device][host-staged]")
+{
+  if (test::cuda_device_count() < 2) { SKIP("requires at least two GPUs"); }
+
+  auto const record          = std::make_shared<recording_device_resource::record>();
+  auto manager               = make_two_gpu_manager_with_recording_destination(record);
+  memory_space* target_space = manager->get_memory_space(Tier::GPU, kTargetDevice);
+  auto const producer        = make_stream_on(kSourceDevice);
+
+  SECTION("peer route: the destination runs out of memory with part of the table allocated")
+  {
+    // The destination's pool sits behind the recording resource, so it is granted by its handle.
+    require_granted(
+      test::grant_pool_access(*manager->get_memory_space(Tier::GPU, kSourceDevice), *target_space));
+    require_granted(grant_pool_peer_access(record->pool, kTargetDevice, kSourceDevice));
+    if (!probe_peer_dma_works(kSourceDevice, kTargetDevice)) { SKIP("peer DMA does not work"); }
+    representation_converter_registry registry;
+    register_builtin_converters(registry, {.route = copy_route_selection::peer});
+
+    // About 80 MiB of mixed columns. A copy into a buffer takes far longer than the allocations
+    // that follow it, so when the destination runs out of memory, the copies into the columns
+    // before the failing one are still running.
+    constexpr cudf::size_type kRows = 1 << 19;
+    auto const source               = make_source(*manager, table_kind::mixed, kRows, producer);
+    auto const served_allocations   = GENERATE(5L, 20L);
+    CAPTURE(served_allocations);
+
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kTargetDevice}};
+    rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
+    record->served_before_failure = served_allocations;
+    CHECK_THROWS_AS(registry.convert<gpu_table_representation>(*source, target_space, consumer),
+                    cucascade_out_of_memory);
+    record->served_before_failure = -1;
+    CHECK(record->freed_while_stream_busy == 0);
+  }
+
+  SECTION("host-staged route: a host allocation fails after every destination buffer exists")
+  {
+    representation_converter_registry registry;
+    register_builtin_converters(registry, {.route = copy_route_selection::host_staged});
+
+    // 64 MiB of INT64 and two nullable INT8 columns at the default 8 MiB chunks and depth 4. The
+    // row count is odd, so the chunks behind the INT64 column are cut into more pieces than the
+    // chunks before them, and the pipeline allocates host memory to list those pieces while the
+    // host-to-destination copies of earlier chunks are running.
+    constexpr auto kKind            = table_kind::int64_and_nullable_int8;
+    constexpr cudf::size_type kRows = (1 << 23) + 12345;
+    auto const source               = make_source(*manager, kKind, kRows, producer);
+    auto const source_streams = pool_streams(*manager->get_memory_space(Tier::GPU, kSourceDevice));
+    auto const target_streams = pool_streams(*target_space);
+
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kTargetDevice}};
+    rmm::cuda_stream consumer{rmm::cuda_stream::flags::non_blocking};
+    auto const expected = make_table(kKind, kRows, *target_space, consumer);
+
+    // A conversion without a failure tells how many destination buffers there are.
+    std::size_t const allocations_before = record->allocations;
+    std::ignore = registry.convert<gpu_table_representation>(*source, target_space, consumer);
+    std::size_t const destination_buffers = record->allocations - allocations_before;
+    REQUIRE(destination_buffers > 0);
+    REQUIRE(record->freed_while_stream_busy == 0);
+    std::size_t const host_allocated_before = host_allocated_bytes(*manager);
+
+    // Fail the first host allocation after the last destination buffer, then the second, and so
+    // on, until a conversion makes fewer host allocations than that and succeeds.
+    std::size_t failed_conversions = 0;
+    for (std::size_t later = 1;; ++later) {
+      CAPTURE(later);
+      REQUIRE(later < 1000);
+      std::unique_ptr<gpu_table_representation> result;
+      std::exception_ptr failure;
+      {
+        test::scoped_allocation_counter allocations;
+        std::size_t const first  = record->allocations;
+        record->after_allocation = [&](std::size_t served) {
+          if (served - first == destination_buffers) {
+            allocations.fail_at(allocations.count() + later);
+          }
+        };
+        try {
+          result = registry.convert<gpu_table_representation>(*source, target_space, consumer);
+        } catch (...) {
+          failure = std::current_exception();
+        }
+        record->after_allocation = nullptr;
+      }
+      CHECK(record->freed_while_stream_busy == 0);
+      CHECK_FALSE(any_stream_busy(source_streams));
+      CHECK_FALSE(any_stream_busy(target_streams));
+      CHECK(host_allocated_bytes(*manager) == host_allocated_before);
+      if (!failure) {
+        REQUIRE(result != nullptr);
+        result->wait_for_writer(consumer);
+        test::expect_cudf_tables_equal_on_stream(
+          expected->view(), result->get_table_view(), consumer);
+        break;
+      }
+      ++failed_conversions;
+    }
+    CHECK(failed_conversions > 0);
+  }
 }
 
 TEST_CASE("host-staged gpu_to_gpu conversion uses fewer staging slots when HOST memory is tight",

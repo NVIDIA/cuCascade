@@ -52,25 +52,27 @@ void validate_cross_gpu_copy_config(cross_gpu_copy_config const& config);
  * (the planning read and the host-staged route) or on @p target_stream (peer route), each ordered
  * after the source's writer as gpu_table_representation::wait_for_writer() describes.
  *
+ * Both copy routes build the destination table column by column and start no copy into a column
+ * before that column is finished. The peer route copies the leaf buffers of the finished columns
+ * directly on @p target_stream, while the columns after them are allocated.
+ *
  * The host-staged pipeline takes its staging slots as cross_gpu_copy_config describes and releases
  * them before returning. Each staging slot has a "filled" event recorded after its source-to-host
  * copy and a "drained" event recorded after its host-to-destination copy on @p target_stream; the
  * next source-to-host copy into that slot waits for "drained". When the table has more than one
- * chunk, the first chunks are staged before the destination buffers are allocated, so the
- * allocations overlap those copies.
+ * chunk, the first chunks are staged while the destination columns are allocated; the
+ * host-to-destination copies start once the last column is finished.
  *
  * Every copy has completed when this returns, so the caller may free @p source right away. Readers
  * of the result on streams other than @p target_stream must be ordered after it, for example
  * through the writer event that the gpu_table_representation constructor records on @p
  * target_stream.
  *
- * On an exception no table is returned and no copy is still running when the exception leaves: the
- * source stream and @p target_stream are drained first, and the staging slots return to the HOST
- * pool only after that. Destination buffers that were already allocated are freed earlier, while
- * the stack unwinds, through @p target's default allocator on @p target_stream, possibly with
- * copies into them still enqueued on that stream. The allocator must therefore free in stream
- * order, as rmm::mr::cuda_async_memory_resource does, or wait for work pending on the buffer, as
- * cudaFree does.
+ * On an exception no table is returned and no copy is still running when the exception leaves. A
+ * column that fails while it is being built frees its buffers right away, and nothing writes them
+ * yet. The finished columns are freed, and the staging slots returned to the HOST pool, only after
+ * the source stream and @p target_stream have been drained. @p target's default allocator therefore
+ * never frees a buffer that a copy still writes.
  *
  * @pre No column view of @p source's table is sliced: each has offset 0, at every nesting level.
  *

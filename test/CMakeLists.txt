@@ -30,6 +30,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     cucascade_tests
     # Memory tests
     memory/test_fixed_size_host_memory_resource.cpp
+    memory/test_gpu_numa_node.cpp
     memory/test_numa_affinity.cpp
     memory/test_memory_reservation_manager.cpp
     memory/test_pool_peer_access.cpp
@@ -154,6 +155,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     cucascade_cudf_tests
     # Utils
     utils/cudf_test_utils.cpp
+    # Replaces the global operator new for the whole test binary
+    utils/allocation_counter.cpp
     # Data tests (cudf-backed representations / converters / profiler)
     data/test_bandwidth_profiler.cpp
     data/test_data_batch.cpp

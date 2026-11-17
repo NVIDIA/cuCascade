@@ -26,6 +26,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/gpu_numa_node.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -46,11 +47,9 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <memory>
 #include <new>
@@ -79,57 +78,10 @@ struct copy_segment {
 };
 
 /**
- * @brief Receives each segment as soon as its destination buffer is allocated, in byte-stream
- * order.
+ * @brief Receives each segment when its destination buffer is allocated, in byte-stream order.
  */
 template <typename Sink>
 concept segment_sink = requires(Sink& sink, copy_segment const& segment) { sink(segment); };
-
-/**
- * @brief NUMA node of a GPU's PCI device, or -1 when it is unknown.
- */
-[[nodiscard]] int resolve_gpu_numa_node(int device_id) noexcept
-{
-  if (device_id < 0) { return -1; }
-  char pci_buf[32] = {0};
-  if (cudaDeviceGetPCIBusId(pci_buf, sizeof(pci_buf), device_id) != cudaSuccess) { return -1; }
-  std::string pci(pci_buf);
-  for (auto& c : pci) {
-    c = static_cast<char>(std::tolower(c));
-  }
-  std::ifstream f("/sys/bus/pci/devices/" + pci + "/numa_node");
-  if (!f.is_open()) { return -1; }
-  std::string content;
-  std::getline(f, content);
-  if (content.empty()) { return -1; }
-  try {
-    return std::stoi(content);
-  } catch (...) {
-    return -1;
-  }
-}
-
-/**
- * @brief resolve_gpu_numa_node() of @p device_id, resolved once per process for every visible GPU.
- */
-[[nodiscard]] int gpu_numa_node(int device_id)
-{
-  static std::vector<int> const nodes = [] {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess) {
-      std::ignore = cudaGetLastError();
-      count       = 0;
-    }
-    std::vector<int> resolved(static_cast<std::size_t>(count));
-    for (int device = 0; device < count; ++device) {
-      resolved[static_cast<std::size_t>(device)] = resolve_gpu_numa_node(device);
-    }
-    return resolved;
-  }();
-  return device_id >= 0 && static_cast<std::size_t>(device_id) < nodes.size()
-           ? nodes[static_cast<std::size_t>(device_id)]
-           : -1;
-}
 
 [[nodiscard]] copy_route select_route(copy_route_selection selection,
                                       int src_device,
@@ -242,7 +194,7 @@ struct last_offset {
 
 /**
  * @brief Collect the last offset of every strings column in @p col's tree, in the order
- * table_builder::build() and collect_source_spans() consume them.
+ * table_builder::build_column() and collect_source_spans() consume them.
  */
 void collect_last_offsets(cudf::column_view const& col, std::vector<last_offset>& out)
 {
@@ -381,8 +333,8 @@ class chars_size_cursor {
 };
 
 /**
- * @brief Append the leaf buffers of @p col's tree in the order table_builder::build() hands their
- * segments to its sink.
+ * @brief Append the leaf buffers of @p col's tree in the order table_builder::build_column() hands
+ * their segments to its sink.
  */
 void collect_source_spans(cudf::column_view const& col,
                           chars_size_cursor& chars,
@@ -404,16 +356,24 @@ void collect_source_spans(cudf::column_view const& col,
 }
 
 /**
- * @brief Builds the destination column tree, allocating every buffer on the destination GPU and
- * handing each segment that fills one to a sink as soon as the buffer exists, so copies overlap the
- * remaining allocations.
+ * @brief Builds the columns of the destination table one at a time, allocating every buffer on the
+ * destination GPU and handing the segment that fills each one to a sink.
  *
- * Only cudf factories that launch no work are used, so the tree may be assembled before its buffers
- * are written.
+ * Only cudf factories that launch no work are used, so a column is assembled before its buffers
+ * are written. The builder enqueues nothing either. A column that fails part-way frees the
+ * buffers it has allocated while the stack unwinds, so a sink must not start a copy into a column
+ * before build_column() has returned it.
  */
 template <segment_sink Sink>
 class table_builder {
  public:
+  /**
+   * @param chars_sizes Chars size of every strings column of the table, as read_chars_sizes()
+   * returns them
+   * @param stream Stream on the destination GPU that allocates the buffers
+   * @param mr Allocator of the destination buffers
+   * @param sink Receives the segments of each column while build_column() builds it
+   */
   table_builder(std::span<std::size_t const> chars_sizes,
                 ::cuda::stream_ref stream,
                 rmm::device_async_resource_ref mr,
@@ -422,18 +382,11 @@ class table_builder {
   {
   }
 
-  [[nodiscard]] std::unique_ptr<cudf::table> build(cudf::table_view const& view)
-  {
-    std::vector<std::unique_ptr<cudf::column>> columns;
-    columns.reserve(static_cast<std::size_t>(view.num_columns()));
-    for (cudf::column_view const& col : view) {
-      columns.push_back(build(col));
-    }
-    return std::make_unique<cudf::table>(std::move(columns));
-  }
-
- private:
-  [[nodiscard]] std::unique_ptr<cudf::column> build(cudf::column_view const& src)
+  /**
+   * @brief Build the destination column of @p src, a column of the source table or one of its
+   * descendants. The top-level columns must be built in table order.
+   */
+  [[nodiscard]] std::unique_ptr<cudf::column> build_column(cudf::column_view const& src)
   {
     if (is_degenerate_string(src)) {
       return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
@@ -450,7 +403,7 @@ class table_builder {
       case cudf::type_id::STRING: {
         std::size_t const chars_size = has_chars(src) ? _chars.next() : 0;
         rmm::device_buffer chars     = allocate_and_add_segment(src.head(), chars_size);
-        auto offsets                 = build(src.child(0));
+        auto offsets                 = build_column(src.child(0));
         return cudf::make_strings_column(
           src.size(), std::move(offsets), std::move(chars), null_count, std::move(null_mask));
       }
@@ -459,8 +412,8 @@ class table_builder {
           CUCASCADE_FAIL("copy_table_to_gpu: LIST column must have two children (offsets, values)",
                          std::invalid_argument);
         }
-        auto offsets = build(src.child(0));
-        auto values  = build(src.child(1));
+        auto offsets = build_column(src.child(0));
+        auto values  = build_column(src.child(1));
         return cudf::make_lists_column(
           src.size(), std::move(offsets), std::move(values), null_count, std::move(null_mask));
       }
@@ -468,7 +421,7 @@ class table_builder {
         std::vector<std::unique_ptr<cudf::column>> fields;
         fields.reserve(static_cast<std::size_t>(src.num_children()));
         for (cudf::size_type i = 0; i < src.num_children(); ++i) {
-          fields.push_back(build(src.child(i)));
+          fields.push_back(build_column(src.child(i)));
         }
         // Construct directly to skip make_structs_column's null superimposition: the copied
         // null masks are already consistent.
@@ -486,8 +439,8 @@ class table_builder {
             std::invalid_argument);
         }
         // Child order is [0] = indices, [1] = keys; make_dictionary_column takes keys first.
-        auto indices = build(src.child(0));
-        auto keys    = build(src.child(1));
+        auto indices = build_column(src.child(0));
+        auto keys    = build_column(src.child(1));
         return cudf::make_dictionary_column(
           std::move(keys), std::move(indices), std::move(null_mask), null_count);
       }
@@ -499,6 +452,7 @@ class table_builder {
     }
   }
 
+ private:
   void add_segment(void const* src, void* dst, std::size_t size)
   {
     if (size == 0 || src == nullptr) { return; }
@@ -516,28 +470,6 @@ class table_builder {
   ::cuda::stream_ref _stream;
   rmm::device_async_resource_ref _mr;
   Sink& _sink;
-};
-
-/**
- * @brief Peer route: copies each segment directly between the GPUs on the target stream.
- */
-class peer_copier {
- public:
-  peer_copier(int src_device, int dst_device, ::cuda::stream_ref target_stream) noexcept
-    : _src_device{src_device}, _dst_device{dst_device}, _target_stream{target_stream}
-  {
-  }
-
-  void operator()(copy_segment const& segment)
-  {
-    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
-      segment.dst, _dst_device, segment.src, _src_device, segment.size, _target_stream.get()));
-  }
-
- private:
-  int _src_device;
-  int _dst_device;
-  ::cuda::stream_ref _target_stream;
 };
 
 /**
@@ -712,7 +644,7 @@ class host_staged_pipeline {
 {
   memory::memory_reservation_manager* manager = target.get_reservation_manager();
   if (manager != nullptr) {
-    int const numa_node = gpu_numa_node(target.get_device_id());
+    int const numa_node = memory::gpu_numa_node(target.get_device_id());
     if (memory::memory_space* local = manager->get_memory_space(memory::Tier::HOST, numa_node)) {
       return *local;
     }
@@ -733,21 +665,53 @@ class host_staged_pipeline {
   ::cuda::stream_ref target_stream)
 {
   nvtx_scope const range{"convert:gpu_to_gpu:peer_route"};
-  peer_copier copier{source.get_device_id(), target.get_device_id(), target_stream};
-  table_builder builder{chars_sizes, target_stream, target.get_default_allocator(), copier};
+  int const src_device = source.get_device_id();
+  int const dst_device = target.get_device_id();
+
+  // Segments in byte-stream order. The first `started` are enqueued; the first `startable`
+  // belong to finished columns. A copy into a column must not start before `columns` owns the
+  // column: one that fails part-way is freed while the stack unwinds, before the handler can
+  // drain.
+  std::vector<copy_segment> segments;
+  std::size_t started   = 0;
+  std::size_t startable = 0;
+  auto start_next_copy  = [&] {
+    copy_segment const& segment = segments[started];
+    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
+      segment.dst, dst_device, segment.src, src_device, segment.size, target_stream.get()));
+    ++started;
+  };
+  // Each buffer that is allocated starts one copy into an earlier, finished column, so copies
+  // and allocations alternate and overlap. Copies enqueued back to back run slower.
+  auto record_segment = [&](copy_segment const& segment) {
+    segments.push_back(segment);
+    if (started < startable) { start_next_copy(); }
+  };
+  table_builder builder{chars_sizes, target_stream, target.get_default_allocator(), record_segment};
+
+  // Owns every finished column. Declared before the try block so that, on a failure, the columns
+  // outlive the drain in the handler.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(static_cast<std::size_t>(view.num_columns()));
   try {
     source.wait_for_writer(target_stream);
-    auto table = builder.build(view);
+    for (cudf::column_view const& col : view) {
+      columns.push_back(builder.build_column(col));
+      startable = segments.size();
+    }
+    while (started < segments.size()) {
+      start_next_copy();
+    }
     // Sync for the source's lifetime: a caller may free the source right after the conversion, on
     // a stream not ordered with these reads.
     target_stream.sync();
-    return table;
   } catch (...) {
-    // The destination buffers were freed on the target stream while the stack unwound, behind the
-    // copies into them. Drain so that no copy still reads the source when the exception leaves.
+    // Drain before `columns` frees the destination buffers the copies write, and so that no copy
+    // still reads the source when the exception leaves.
     drain_after_failure(target_stream);
     throw;
   }
+  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 [[nodiscard]] std::unique_ptr<cudf::table> copy_over_host_staged_route(
@@ -760,7 +724,6 @@ class host_staged_pipeline {
 {
   gpu_table_representation const& source = reader.get_source();
   nvtx_scope const range{"convert:gpu_to_gpu:host_staged_route"};
-  rmm::device_async_resource_ref const mr = target.get_default_allocator();
 
   std::vector<source_span> spans;
   {
@@ -783,8 +746,24 @@ class host_staged_pipeline {
     }
     destinations.push_back(segment.dst);
   };
+  table_builder builder{
+    chars_sizes, target_stream, target.get_default_allocator(), record_destination};
+
+  // Owns every finished column. Declared before the staging slots and the try block so that, on a
+  // failure, the columns outlive the drains in the handler.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(static_cast<std::size_t>(view.num_columns()));
+  auto build_columns = [&] {
+    for (cudf::column_view const& col : view) {
+      columns.push_back(builder.build_column(col));
+    }
+    if (destinations.size() != spans.size()) {
+      CUCASCADE_FAIL("copy_table_to_gpu: destination buffers do not match the planned byte stream");
+    }
+  };
   if (total_bytes == 0) {
-    return table_builder{chars_sizes, target_stream, mr, record_destination}.build(view);
+    build_columns();
+    return std::make_unique<cudf::table>(std::move(columns));
   }
 
   int const src_device             = source.get_device_id();
@@ -796,7 +775,7 @@ class host_staged_pipeline {
   // slots can hold one slot more than it uses.
   std::size_t const staged_bytes = total_bytes + detail::alignment_padding_bound(spans);
   std::size_t const slot_bytes   = std::min(config.chunk_size_bytes, staged_bytes);
-  std::size_t const max_chunks   = (staged_bytes + slot_bytes - 1) / slot_bytes;
+  std::size_t const max_chunks   = ::cuda::ceil_div(staged_bytes, slot_bytes);
   staging_slots const slots{host_space, slot_bytes, std::min(config.pipeline_depth, max_chunks)};
 
   try {
@@ -808,19 +787,18 @@ class host_staged_pipeline {
     // piece per leaf buffer, and such a batch runs piece by piece, several times slower, when it
     // is enqueued on a target stream that has gone idle because the fill finished long before.
     if (pipeline.get_chunk_count() > 1) { pipeline.prefill(); }
-    auto table = table_builder{chars_sizes, target_stream, mr, record_destination}.build(view);
-    if (destinations.size() != spans.size()) {
-      CUCASCADE_FAIL("copy_table_to_gpu: destination buffers do not match the planned byte stream");
-    }
+    // No copy into a destination buffer starts before finish(), so a column that fails part-way
+    // frees buffers that no copy writes.
+    build_columns();
     pipeline.finish(destinations);
-    return table;
   } catch (...) {
-    // Drain both legs before `slots` returns the staging memory they use to the HOST pool. The
-    // destination buffers were already freed on the target stream while the stack unwound.
+    // Drain both legs before `columns` frees the destination buffers they write and before
+    // `slots` returns the staging memory they use to the HOST pool.
     drain_after_failure(reader.get_stream());
     drain_after_failure(target_stream);
     throw;
   }
+  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 }  // namespace
