@@ -131,12 +131,13 @@ class cufile_io_object final : public io_object {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Where a cuFile reactor runs: the GPU it mainly serves and the CPUs its
- *        worker is pinned to.
+ * @brief Where a cuFile reactor runs: the GPU it mainly serves, the CPUs its
+ *        worker is pinned to, and the NUMA node its host scratch comes from.
  */
 struct reactor_placement {
   int device{-1};         ///< Home GPU (CUDA ordinal); -1 = serves any device.
   std::vector<int> cpus;  ///< CPUs the worker is pinned to; empty = not pinned.
+  int numa_node{-1};      ///< The home GPU's NUMA node; -1 = unknown.
 };
 
 /**
@@ -237,7 +238,10 @@ struct reactor_stats {
  * transiently occupy the page cache (clean and reclaimable once written back;
  * durability still needs a flush).
  * Host-only reads go O_DIRECT, through the scratch when not block-aligned.  A
- * flush is an @c fdatasync.  On a platform where cuFile
+ * flush is an @c fdatasync.  A transfer's pinned host scratch is borrowed from
+ * the HOST memory space pool of the reactor's NUMA node when one is registered
+ * (@c memory::find_host_pool), so it counts against that space only while the
+ * transfer runs; otherwise the reactor keeps scratch of its own.  On a platform where cuFile
  * runs only in compatibility mode (@c probe_platform().compat_only) aligned
  * device bodies are staged too: cuFile then bounces through host memory itself,
  * and its 1 MiB writes measured about half as fast as the staged path when they
@@ -590,8 +594,18 @@ class cufile_reactor {
                                          range piece,
                                          device_staging& staging);
 
-  /// The scratch, allocated on first use.
+  /// The reactor's own scratch, allocated on first use.
   [[nodiscard]] std::uint8_t* scratch();
+
+  /// Pinned host memory one transfer stages through (see @ref lease_scratch).
+  struct scratch_lease;
+
+  /// Up to @p slots slots of at least @p bytes each (capped at the scratch slot
+  /// size) for one transfer: borrowed from the HOST memory space pool of this
+  /// reactor's NUMA node (@c memory::find_host_pool), so the bytes count against
+  /// that space and are back in it before the transfer settles; or the reactor's
+  /// own scratch when no pool is registered or it cannot lend them.
+  [[nodiscard]] scratch_lease lease_scratch(std::size_t bytes, std::size_t slots);
 
   /// POSIX pread into the slice's host buffer, then the H2D copy when a device
   /// destination was asked for too; a device-only slice goes to
@@ -694,7 +708,8 @@ class cufile_reactor {
   /// Gated pair-copy streams, indexed by device id.
   std::vector<owned_stream> _pair_streams;
   /// Pinned (portable) staging for device-only POSIX reads and writes and
-  /// unaligned host reads, taken from a process-wide pool on first use (so a
+  /// unaligned host reads when no HOST memory space pool can lend it (see
+  /// @ref lease_scratch), taken from a process-wide pool on first use (so a
   /// reactor that never stages holds no pinned memory) and given back to it at
   /// shutdown.
   pinned_scratch _scratch;

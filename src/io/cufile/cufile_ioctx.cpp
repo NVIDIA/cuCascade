@@ -106,7 +106,7 @@ namespace {
   }
   for (auto const& group : plan.groups) {
     for (std::size_t i = 0; i < group.n_reactors; ++i) {
-      reactor_placement placement{group.device, group.cpus};
+      reactor_placement placement{group.device, group.cpus, group.numa_node};
       reactors.push_back(std::make_unique<cufile_reactor>(
         ctx,
         "cufile-g" + std::to_string(group.device) + "-" + std::to_string(i),

@@ -25,7 +25,10 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -595,6 +598,53 @@ TEST_CASE("cufile device writes go to their source GPU's group, whatever the cal
   CHECK(ctx->stats(1).staged_writes == 1);
   CHECK(ctx->stats(0).staged_writes == 0);
   ctx->shutdown();
+}
+
+TEST_CASE("cufile stages through a HOST memory space's pool when one is registered",
+          "[io][cufile][write][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  // Small blocks, so a scratch slot spans several of them, and no pool up front,
+  // so the pool's growth shows the reactors borrowed from it.
+  cucascade::memory::host_memory_space_config host_cfg;
+  host_cfg.memory_capacity      = 256 * MiB;
+  host_cfg.block_size           = 64UL << 10;
+  host_cfg.pool_size            = 64;
+  host_cfg.initial_number_pools = 0;
+  host_cfg.mr_factory_fn        = [](int, std::size_t) {
+    return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+      cucascade::memory::numa_region_pinned_host_memory_resource{-1}};
+  };
+  cucascade::memory::memory_space const host{host_cfg};
+  auto* const pool = host.get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(cucascade::memory::find_host_pool(-1) == pool);
+
+  config cfg{};
+  cfg.gds_threshold = 1UL << 40;  // every device transfer staged through host memory
+  write_context ctx{cfg, 1};
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+  cuda_stream stream;
+  shadow_file shadow;
+
+  // A staged device write, unaligned at both ends.
+  auto const bytes = pattern(3 * MiB + 77, 21);
+  device_bytes const src{bytes, 256};
+  REQUIRE(ctx->device_write_async(*object, 5, bytes.size(), src.get(), stream.ref()).get(60s) ==
+          bytes.size());
+  shadow.write(5, bytes);
+  // An unaligned host read (whole blocks through the scratch) ...
+  check_same(read_back(ctx.get(), path.str()), shadow.bytes());
+  // ... and a device read below gds_threshold (POSIX through the scratch).
+  auto const n = shadow.bytes().size();
+  device_bytes const dst{std::vector<std::uint8_t>(n)};
+  REQUIRE(ctx->device_read_async_io(*object, 0, n, dst.get(), stream.ref()).get(60s) == n);
+  std::vector<std::uint8_t> got(n);
+  REQUIRE(cudaMemcpy(got.data(), dst.get(), n, cudaMemcpyDeviceToHost) == cudaSuccess);
+  check_same(got, shadow.bytes());
+
+  CHECK(pool->get_total_blocks() > 0);
+  CHECK(pool->get_free_blocks() == pool->get_total_blocks());
 }
 
 TEST_CASE("cufile staged device writes wait for their copies", "[io][cufile][write][gpu]")

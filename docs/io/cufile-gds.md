@@ -71,6 +71,14 @@ For a cuFile-registered file these POSIX reads go through the O_DIRECT
 descriptor too. IBM documents that buffered reads running concurrently with
 GDS reads of the same file cost the GDS reads their performance.
 
+The pinned scratch of a transfer (two slots of up to 8 MiB) is borrowed from
+the HOST memory space pool of the reactor's NUMA node when one is registered
+(`memory::find_host_pool`; a HOST `memory_space` registers its pool), and given
+back before the transfer settles. It then counts against that space's budget
+only while the transfer runs, and a pool block's 4 KiB alignment lets the
+O_DIRECT reads and writes use the blocks directly (`preadv` / `pwritev`).
+Without a registered pool each reactor keeps 16 MiB of its own.
+
 The `cufile_ioctx` splits device-only reads larger than `staging_piece_bytes`
 into pieces on 4 KiB boundaries, so several reactors of the GPU read one large
 range at once. Every piece after the first starts aligned and fits one slot.
