@@ -27,7 +27,10 @@
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/config.hpp>
+#include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
@@ -273,6 +276,40 @@ TEST_CASE("make_disk_io_context resolves automatic to a concrete backend", "[dis
   REQUIRE(context != nullptr);
   auto const type = context->type();
   REQUIRE((type == io::io_context_type::uring || type == io::io_context_type::cufile));
+}
+
+TEST_CASE("a manager drops its DISK spaces' contexts before its HOST pools",
+          "[disk][io][context]")
+{
+  // A uring context staging through the manager's own HOST pool, installed on
+  // the manager's DISK space and referenced nowhere else: destroying the manager
+  // must destroy the context (returning its staging blocks) while the pool lives.
+  memory::host_memory_space_config host;
+  host.numa_id         = 0;
+  host.memory_capacity = 256UL << 20;
+  host.mr_factory_fn   = [](int, std::size_t) {
+    return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+      memory::numa_region_pinned_host_memory_resource{-1}};
+  };
+  memory::disk_memory_space_config disk;
+  disk.disk_id         = 0;
+  disk.memory_capacity = 1UL << 30;
+  disk.mount_paths     = std::filesystem::temp_directory_path().string();
+  std::vector<memory::memory_space_config> configs;
+  configs.emplace_back(host);
+  configs.emplace_back(disk);
+  auto manager = std::make_unique<memory::memory_reservation_manager>(std::move(configs));
+
+  io::io_config config;
+  config.uring_n_reactors = 1;
+  auto context            = io::make_uring_ioctx_factory(*manager)(config);
+  REQUIRE(context != nullptr);
+  context->start();
+  // The manager hands out const spaces; installing a context is the caller's call.
+  auto const* space = manager->get_memory_space(memory::Tier::DISK, 0);
+  REQUIRE(space != nullptr);
+  const_cast<memory::memory_space*>(space)->set_io_context(std::move(context));
+  REQUIRE_NOTHROW(manager.reset());
 }
 
 TEST_CASE("make_disk_io_context rejects a uring backend without reactors", "[disk][io][context]")
