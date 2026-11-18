@@ -32,19 +32,35 @@ namespace cucascade {
 
 class gpu_table_representation;
 
-/// Column buffer offsets and payload size before rounding to HOST blocks.
+/**
+ * @brief Column buffer offsets and payload size before rounding to HOST blocks.
+ */
 struct gpu_to_host_copy_layout {
   std::vector<memory::column_metadata> columns;
   std::size_t bytes;
 };
 
-/// Plan the HOST buffer layout for a table whose columns have zero offsets.
-/// The caller must keep the source alive and order the stream after its writer.
+/**
+ * @brief Plan the HOST buffer layout for a GPU table.
+ *
+ * @param view GPU table view whose columns have zero offsets
+ * @param stream CUDA stream used to read column metadata
+ * @return Column buffer offsets and total payload size before rounding to HOST blocks
+ * @pre Keep the source alive and order @p stream after its writer.
+ */
 [[nodiscard]] gpu_to_host_copy_layout plan_gpu_to_host_copy(const cudf::table_view& view,
                                                             ::cuda::stream_ref stream);
 
-/// Bytes copied by the GPU-to-HOST table converter, before rounding to HOST blocks.
-/// Respects the source's writer event. The caller must hold the batch against mutation.
+/**
+ * @brief Calculate the GPU-to-HOST copy size.
+ *
+ * Orders the metadata reads after the source's writer.
+ *
+ * @param source GPU table representation to size
+ * @param stream CUDA stream used to read column metadata
+ * @return Number of payload bytes before rounding to HOST blocks
+ * @pre Hold the source batch against mutation for the duration of the call.
+ */
 [[nodiscard]] std::size_t gpu_to_host_staging_bytes(const gpu_table_representation& source,
                                                     ::cuda::stream_ref stream);
 
