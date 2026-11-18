@@ -58,10 +58,11 @@ struct scan_cache_config {
   std::size_t min_advise_bytes{default_cache_chunk_bytes};
 
   /// REST reactor threads.
-  std::size_t reactors{16};
+  std::size_t reactors{4};
 
-  /// Connections each REST reactor drives.
-  std::size_t connections{128};
+  /// Connections each REST reactor drives. Reading from S3, 4 x 256 was faster than 16 x 128,
+  /// which spent time on connect and stall retries.
+  std::size_t connections{256};
 
   /// A GET that moves under 64 KiB/s for this many seconds is aborted and retried, so a request
   /// that gets no bytes does not hold a query up for the 30 s default.
