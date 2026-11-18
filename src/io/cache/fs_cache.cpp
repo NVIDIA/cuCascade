@@ -239,6 +239,49 @@ struct generation_deleter {
     }
   }
 };
+
+/// Largest slice that contiguous chunk fills are merged into: the REST reactor's largest GET. A
+/// slice's chunks are published together when its last byte lands, so a larger run would hold
+/// finished chunks back.
+constexpr std::size_t max_merged_fill_bytes = 16UL << 20;
+
+/**
+ * @brief Merge the fill @p rng of @p chunk into the last slice of @p prepared when that slice
+ *        holds cache chunks and ends exactly where @p rng starts.
+ *
+ * One slice per chunk makes the reactor issue one GET per chunk: a 256 KiB GET spends most of
+ * its time waiting for the first byte. A slice holding a run of contiguous fills lets it issue
+ * one GET for the whole run.
+ *
+ * @param device_dst Where @p rng lands on the device, or null for a host-only slice. A device
+ *        slice is merged only when its destination continues the last slice's.
+ * @param first Index of the first slice that may be merged into (an earlier one belongs to
+ *        another request).
+ * @param chunk_size The cache's chunk size: @p chunk must directly follow the last slice's last
+ *        chunk, and @p rng must start at @p chunk's start.
+ * @return Whether @p rng was merged; if not, the caller appends its own slice.
+ */
+bool merge_fill(std::vector<prepared_io_slice>& prepared,
+                std::size_t first,
+                range rng,
+                cached_chunk* chunk,
+                std::uint8_t const* device_dst,
+                std::size_t chunk_size)
+{
+  if (prepared.size() <= first) { return false; }
+  auto& last = prepared.back();
+  if (!last.is_fragmented() || last.rng.end() != rng.offset || rng.offset != chunk->offset ||
+      last.rng.size + rng.size > max_merged_fill_bytes) {
+    return false;
+  }
+  auto& chunks = std::get<std::vector<cached_chunk*>>(last.h_buffer.buffer);
+  if (chunks.back()->offset + chunk_size != chunk->offset) { return false; }
+  if ((device_dst == nullptr) != (last.d_buffer.data == nullptr)) { return false; }
+  if (device_dst != nullptr && last.d_buffer.data + last.rng.size != device_dst) { return false; }
+  chunks.push_back(chunk);
+  last.rng.size += rng.size;
+  return true;
+}
 }  // namespace
 
 struct fs_cache::cached_copy_retirement {
@@ -1081,10 +1124,11 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
       range const request_rng{raw.offset(), request_size};
       auto chunks = ranges_in_cache(
         generation.get(), request_rng.offset, request_rng.size, coverage_policy::partial, handle);
-      std::size_t ci       = 0;
-      auto const first     = (request_rng.offset / _chunk_size) * _chunk_size;
-      auto const last      = ((request_rng.end() - 1) / _chunk_size) * _chunk_size;
-      auto const positions = ((last - first) / _chunk_size) + 1;
+      std::size_t ci           = 0;
+      auto const first         = (request_rng.offset / _chunk_size) * _chunk_size;
+      auto const last          = ((request_rng.end() - 1) / _chunk_size) * _chunk_size;
+      auto const positions     = ((last - first) / _chunk_size) + 1;
+      auto const request_first = prepared.size();  // this request's slices start here
 
       for (std::size_t position = 0; position < positions; ++position) {
         auto const off = first + position * _chunk_size;
@@ -1108,9 +1152,17 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
             chunk->state.take_loading_merging(
               needed_fill(off, _chunk_size, needed.offset, needed.end()), fill)) {
           claimed.push_back(chunk);
-          auto completion = std::make_shared<prepared_io_completion>(
-            [this, needed, piece_dst, lifetime](std::span<cached_chunk* const> completed,
-                                                bool host_ok) noexcept {
+          ++n_loads;
+          if (!merge_fill(prepared, request_first, needed, chunk, nullptr, _chunk_size)) {
+            prepared.emplace_back(needed, host_buffer{std::vector<cached_chunk*>{chunk}});
+          }
+          // The slice's window (this chunk's piece, or the run it was merged into) and where that
+          // window lands in the caller's buffer.
+          auto const window           = prepared.back().rng;
+          auto* window_dst            = raw.dst + (window.offset - request_rng.offset);
+          prepared.back().on_complete = std::make_shared<prepared_io_completion>(
+            [this, window, window_dst, lifetime](std::span<cached_chunk* const> completed,
+                                                 bool host_ok) noexcept {
               std::ignore = lifetime;
               if (!host_ok) {
                 for (auto* current : completed) {
@@ -1119,9 +1171,9 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
                 return;
               }
               for (auto* current : completed) {
-                auto const copy_rng = intersect(needed, range{current->offset, _chunk_size});
+                auto const copy_rng = intersect(window, range{current->offset, _chunk_size});
                 if (!copy_rng.empty()) {
-                  std::memcpy(piece_dst + (copy_rng.offset - needed.offset),
+                  std::memcpy(window_dst + (copy_rng.offset - window.offset),
                               current->data + (copy_rng.offset - current->offset),
                               copy_rng.size);
                 }
@@ -1130,10 +1182,6 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
                 std::ignore = current->state.mark_cached();
               }
             });
-          prepared_io_slice io_slice{needed, host_buffer{std::vector<cached_chunk*>{chunk}}};
-          io_slice.on_complete = std::move(completion);
-          prepared.push_back(std::move(io_slice));
-          ++n_loads;
           continue;
         }
 
@@ -1303,12 +1351,13 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
             chunk->state.take_loading_merging(
               needed_fill(off, _chunk_size, needed.offset, needed.end()), fill)) {
           claimed.push_back(chunk);
+          ++loads;
+          if (merge_fill(prepared, 0, needed, chunk, device_dst, _chunk_size)) { continue; }
           prepared_io_slice io_slice{needed,
                                      host_buffer{std::vector<cached_chunk*>{chunk}},
                                      device_buffer{device_dst, stream, device_id.value()}};
           io_slice.on_complete = completion;
           prepared.push_back(std::move(io_slice));
-          ++loads;
           continue;
         }
 
@@ -1654,8 +1703,10 @@ bool fs_cache::prefetch(cache_handle& handle,
         auto const [seg_lo, seg_hi] = fill_span(fill, c->offset, _chunk_size);
         covered = covered && covers(fill, c->offset, _chunk_size, needed_lo, needed_hi);
         claimed_chunks.push_back(c);
-        prepared.emplace_back(range{seg_lo, seg_hi - seg_lo},
-                              host_buffer{std::vector<cached_chunk*>{c}});
+        range const seg{seg_lo, seg_hi - seg_lo};
+        if (!merge_fill(prepared, 0, seg, c, nullptr, _chunk_size)) {
+          prepared.emplace_back(seg, host_buffer{std::vector<cached_chunk*>{c}});
+        }
       } else if (covered) {
         // Read state and extent together. A loading chunk belongs to another
         // IO, whose completion this prefetch does not observe. Never promote
