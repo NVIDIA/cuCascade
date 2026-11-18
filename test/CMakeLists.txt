@@ -88,6 +88,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   # IO test executable - links the cudf-free cucascade-io datasource layer.
   add_executable(
     cucascade_io_tests
+    exec/test_thread_util.cpp
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
     io/test_io_utils.cpp

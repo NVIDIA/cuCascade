@@ -113,6 +113,14 @@ std::optional<std::vector<int>> read_cgroup_cpu_allowance(std::istream& membersh
              return part == ".." || part == ".";
            });
   };
+  auto normalize = [](fs::path path) {
+    path = path.lexically_normal();
+    // lexically_normal() can retain a trailing separator, which makes /cg/
+    // compare unequal to its child's parent /cg. Preserve only the root slash.
+    while (path != path.root_path() && path.filename().empty())
+      path = path.parent_path();
+    return path;
+  };
   fs::path group;
   std::string line;
   while (std::getline(membership, line)) {
@@ -122,6 +130,7 @@ std::optional<std::vector<int>> read_cgroup_cpu_allowance(std::istream& membersh
     }
   }
   if (!valid(group)) return std::nullopt;
+  group = normalize(std::move(group));
   fs::path mount, relative;
   size_t specificity = 0;
   while (std::getline(mounts, line)) {
@@ -135,6 +144,8 @@ std::optional<std::vector<int>> read_cgroup_cpu_allowance(std::istream& membersh
     if (!(fields >> id >> parent >> device >> root_text >> mount_text)) continue;
     fs::path root = unescape_mount_path(root_text), point = unescape_mount_path(mount_text);
     if (!valid(root) || !valid(point)) continue;
+    root        = normalize(std::move(root));
+    point       = normalize(std::move(point));
     auto within = group.lexically_relative(root);
     if (within.empty() || *within.begin() == "..") continue;
     if (root.native().size() >= specificity) {
@@ -144,11 +155,17 @@ std::optional<std::vector<int>> read_cgroup_cpu_allowance(std::istream& membersh
     }
   }
   if (mount.empty()) return std::nullopt;  // No proven mapping: use inherited thread affinity.
-  auto current = (mount / relative).lexically_normal();
+  auto current = normalize(mount / relative);
   for (;;) {
+    // Compare path components, not string prefixes (/cg must not contain /cg2).
+    if (std::mismatch(mount.begin(), mount.end(), current.begin(), current.end()).first !=
+        mount.end())
+      return std::nullopt;
     if (auto cpus = read((current / "cpuset.cpus.effective").string())) return cpus;
     if (current == mount) return std::nullopt;
-    current = current.parent_path();
+    auto parent = current.parent_path();
+    if (parent == current) return std::nullopt;
+    current = std::move(parent);
   }
 }
 

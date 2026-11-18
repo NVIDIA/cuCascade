@@ -20,6 +20,7 @@
 #include <cucascade/memory/cpu_constraints.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <sched.h>
 
 #include <cstdlib>
@@ -100,6 +101,16 @@ TEST_CASE("metadata cpuset discovery respects ancestor restrictions and mount ro
     membership = "0::/../parent/child\n";
     expected.reset();
   }
+  SECTION("mount root traversal rejected before normalization")
+  {
+    mounts = "31 20 0:28 /parent/../parent /cgroup rw - cgroup2 cgroup rw\n";
+    expected.reset();
+  }
+  SECTION("mount point traversal rejected before normalization")
+  {
+    mounts = "31 20 0:28 / /other/../cgroup/ rw - cgroup2 cgroup rw\n";
+    expected.reset();
+  }
   std::istringstream groups(membership), mountinfo(mounts);
   std::vector<std::string> reads;
   auto read = [&](std::string const& path) -> std::optional<cpus> {
@@ -119,6 +130,62 @@ TEST_CASE("metadata cpuset discovery respects ancestor restrictions and mount ro
     REQUIRE(reads.size() == 2);
     CHECK(reads.back() == "/cgroup/parent/cpuset.cpus.effective");
   }
+}
+
+TEST_CASE("cgroup ancestor discovery stays inside normalized mount boundaries",
+          "[cpu_constraints][cpuset_discovery][mount_boundary]")
+{
+  using namespace cucascade::memory;
+  using cpus        = std::vector<int>;
+  bool const found  = GENERATE(false, true);
+  std::string group = "/child", root = "/", mount = "/cg/";
+  std::vector<std::string> expected_reads{"/cg/child/cpuset.cpus.effective",
+                                          "/cg/cpuset.cpus.effective"};
+  SECTION("trailing mount separator") {}
+  SECTION("repeated mount separators") { mount = "/cg///"; }
+  SECTION("trailing membership separator") { group = "/child/"; }
+  SECTION("trailing bind-mount root separator")
+  {
+    group = "/parent/child/";
+    root  = "/parent/";
+  }
+  SECTION("membership equals bind-mount root")
+  {
+    group          = "/parent/";
+    root           = "/parent/";
+    expected_reads = {"/cg/cpuset.cpus.effective"};
+  }
+  SECTION("escaped mount with trailing separator")
+  {
+    mount          = "/restricted\\040cpus/";
+    expected_reads = {"/restricted cpus/child/cpuset.cpus.effective",
+                      "/restricted cpus/cpuset.cpus.effective"};
+  }
+  SECTION("filesystem root is also the mount boundary")
+  {
+    mount          = "/";
+    expected_reads = {"/child/cpuset.cpus.effective", "/cpuset.cpus.effective"};
+  }
+  SECTION("membership and mount are both filesystem root")
+  {
+    mount = group  = "/";
+    expected_reads = {"/cpuset.cpus.effective"};
+  }
+  std::istringstream membership("0::" + group + "\n");
+  std::istringstream mounts("31 20 0:28 " + root + " " + mount + " rw - cgroup2 cgroup rw\n");
+  std::vector<std::string> reads;
+  auto read = [&](std::string const& path) -> std::optional<cpus> {
+    // Fail before an out-of-mount read or an unbounded root-parent loop. This
+    // enforces the exact permitted ancestor sequence without accessing /proc.
+    REQUIRE(reads.size() < expected_reads.size());
+    REQUIRE(path == expected_reads[reads.size()]);
+    reads.push_back(path);
+    if (found && reads.size() == expected_reads.size()) return cpus{1, 3};
+    return std::nullopt;
+  };
+  auto const expected = found ? std::optional<cpus>{cpus{1, 3}} : std::nullopt;
+  CHECK(read_cgroup_cpu_allowance(membership, mounts, read) == expected);
+  CHECK(reads == expected_reads);
 }
 
 TEST_CASE("CPU constraints preserve rank binding within a broader deployment", "[cpu_constraints]")
