@@ -28,8 +28,6 @@
 #include <cucascade/io/uring/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
-#include <cudf/io/text/byte_range_info.hpp>
-
 #include <cuda_runtime.h>
 
 #include <liburing.h>

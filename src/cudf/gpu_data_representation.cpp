@@ -18,6 +18,7 @@
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/error.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <cudf/column/column_stream.hpp>
 #include <cudf/copying.hpp>
@@ -245,9 +246,14 @@ cudaEvent_t gpu_table_representation::get_writer_event() const { return _writer_
 void gpu_table_representation::wait_for_writer(::cuda::stream_ref reader_stream) const
 {
   if (_writer_event != nullptr) {
-    cucascade::cuda::cuda_event_view{_writer_event}.wait(reader_stream);
+    cuda::cuda_event_view{_writer_event}.wait(reader_stream);
   } else {
-    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{get_device_id()}};
+    const int device_id = get_device_id();
+    CUCASCADE_LOG_WARN(
+      "No writer event found for gpu_table_representation on device {};"
+      " syncing the entire device, stalling all streams.",
+      device_id);
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{device_id}};
     CUCASCADE_CUDA_TRY(cudaDeviceSynchronize());
   }
 }

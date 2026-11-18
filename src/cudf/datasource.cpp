@@ -22,6 +22,7 @@
 #include <cucascade/exec/try.hpp>
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -43,7 +44,50 @@ struct io_read_to_gpu_message {
   static constexpr char const* message{"io:read_to_gpu"};
 };
 
-// Bridge a semi_future into a real (promise-backed) std::future. Promise,
+// Deferred call that owns a read: destroying it waits for the read, so a future returned by
+// std::async(std::launch::deferred, joining_future{...}) joins its read when it is dropped.
+template <typename T>
+class joining_future {
+ public:
+  explicit joining_future(std::future<T> read) noexcept : _read(std::move(read)) {}
+
+  joining_future(joining_future&&) noexcept            = default;
+  joining_future& operator=(joining_future&&) noexcept = delete;
+  joining_future(joining_future const&)                = delete;
+  joining_future& operator=(joining_future const&)     = delete;
+
+  ~joining_future()
+  {
+    if (_read.valid()) { _read.wait(); }
+  }
+
+  T operator()() { return _read.get(); }
+
+ private:
+  std::future<T> _read;
+};
+
+// A host read into a buffer that the returned future owns.  The read is declared after the buffer
+// so that it is joined before the buffer is freed.
+class owning_host_read {
+ public:
+  owning_host_read(std::vector<uint8_t> buffer, std::future<size_t> read) noexcept
+    : _buffer(std::move(buffer)), _read(std::move(read))
+  {
+  }
+
+  std::unique_ptr<cudf::io::datasource::buffer> operator()()
+  {
+    _buffer.resize(_read.get());
+    return cudf::io::datasource::buffer::create(std::move(_buffer));
+  }
+
+ private:
+  std::vector<uint8_t> _buffer;
+  std::future<size_t> _read;
+};
+
+// Bridge a semi_future into a std::future that joins the read when dropped. Promise,
 // std::future, and the exact type-erased terminal are all built before
 // producer() may publish IO, so callback installation is a move-only,
 // non-allocating handoff.
@@ -62,7 +106,7 @@ std::future<size_t> bridge_semi_to_std(Producer&& producer)
   }};
   auto sf = std::forward<Producer>(producer)();
   std::move(sf).install_callback(std::move(terminal));
-  return fut;
+  return std::async(std::launch::deferred, joining_future<size_t>{std::move(fut)});
 }
 
 }  // namespace
@@ -134,11 +178,7 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> datasource::host_read
   size           = std::min(size, file_size > offset ? file_size - offset : size_t{0});
   auto buf       = std::vector<uint8_t>(size);
   auto fut       = host_read_async(offset, size, buf.data());
-  return std::async(std::launch::deferred, [s = std::move(fut), buf = std::move(buf)]() mutable {
-    auto n = s.get();
-    buf.resize(n);
-    return cudf::io::datasource::buffer::create(std::move(buf));
-  });
+  return std::async(std::launch::deferred, owning_host_read{std::move(buf), std::move(fut)});
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> datasource::device_read(size_t offset,

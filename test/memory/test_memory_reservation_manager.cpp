@@ -32,9 +32,11 @@
 #include "utils/test_memory_resources.hpp"
 
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
@@ -112,6 +114,46 @@ TEST_CASE("Single-Device Memory Space Access", "[memory_space]")
 
   // Verify all memory spaces are different objects
   REQUIRE(gpu_device_0 != host_numa_0);
+}
+
+TEST_CASE("Downgrade decisions measure the bytes in use from the capacity", "[memory_space]")
+{
+  constexpr std::size_t block_size = 1UL << 20;
+  constexpr std::size_t capacity   = 100 * block_size;
+  auto config = cucascade::test::malloc_host_space_config(0, capacity, block_size, 4);
+  // The library defaults, with the reservation limit below the capacity.
+  config.reservation_limit_fraction = 0.9;
+  config.downgrade_trigger_fraction = 0.75;
+  config.downgrade_stop_fraction    = 0.65;
+  memory_space space{config};
+  REQUIRE(space.get_available_memory() == capacity);
+  CHECK_FALSE(space.should_downgrade_memory());
+  CHECK(space.should_stop_downgrading_memory());
+  CHECK(space.get_amount_to_downgrade() == 0);
+
+  // 80% in use: past the 75% trigger, and 80% - 65% of the capacity to move.
+  auto res = space.make_reservation_or_null(80 * block_size);
+  REQUIRE(res != nullptr);
+  REQUIRE(space.get_available_memory() == capacity - 80 * block_size);
+  CHECK(space.should_downgrade_memory());
+  CHECK_FALSE(space.should_stop_downgrading_memory());
+  CHECK(space.get_amount_to_downgrade() == 80 * block_size - config.downgrade_stop_threshold());
+
+  // 70% in use: below the trigger but above the 65% stop, so downgrading goes on.
+  res.reset();
+  res = space.make_reservation_or_null(70 * block_size);
+  REQUIRE(res != nullptr);
+  CHECK_FALSE(space.should_downgrade_memory());
+  CHECK_FALSE(space.should_stop_downgrading_memory());
+  CHECK(space.get_amount_to_downgrade() == 70 * block_size - config.downgrade_stop_threshold());
+
+  // 60% in use: below the stop.
+  res.reset();
+  res = space.make_reservation_or_null(60 * block_size);
+  REQUIRE(res != nullptr);
+  CHECK_FALSE(space.should_downgrade_memory());
+  CHECK(space.should_stop_downgrading_memory());
+  CHECK(space.get_amount_to_downgrade() == 0);
 }
 
 TEST_CASE("Device-Specific Memory Reservations", "[memory_space]")
