@@ -44,7 +44,7 @@ pixi run benchmarks
 
 - **OS/Arch**: Linux (x86_64, aarch64)
 - **Compiler**: C++20 compatible compiler
-- **Build Tools**: CMake 4.1+, Ninja
+- **Build Tools**: CMake 4.3+, Ninja
 - **GPU/Drivers**: CUDA 13+, compatible NVIDIA driver
 - **Dependencies**: RMM (core); libcudf 25.10+ (only for the optional `cucascade-cudf` library)
 

@@ -43,7 +43,7 @@ Building, testing, benchmarking, and contributing to cuCascade.
 |-------------|---------|
 | OS | Linux (x86_64 or aarch64) |
 | C++ Compiler | C++20 compatible |
-| CMake | 4.1+ |
+| CMake | 4.3+ |
 | Ninja | Any |
 | CUDA Toolkit | 13+ |
 | NVIDIA Driver | Compatible with CUDA 13 |
