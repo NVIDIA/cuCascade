@@ -22,8 +22,6 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <numa.h>
-
 #include <algorithm>
 #include <memory>
 #include <numeric>

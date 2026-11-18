@@ -38,6 +38,7 @@
 #include "cache_test_fixture.hpp"
 #include "io/rest/loopback_range_server.hpp"
 #include "io/rest/mock_authorizer.hpp"
+#include "launched_read.hpp"
 #include "utils/test_memory_resources.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
@@ -562,8 +563,13 @@ TEST_CASE("cache identity pins retired bytes until a gated device copy completes
 
   // A device read of the resident chunks: the copy to the GPU is queued behind the
   // gate, so the read stays in flight while it holds the chunks.
-  auto copying = first->device_read_async(
-    0, object_bytes, static_cast<std::uint8_t*>(destination.data()), consumer);
+  auto copying = cucascade::test::launched(first->device_read_async(
+    0, object_bytes, static_cast<std::uint8_t*>(destination.data()), consumer));
+  // Declared after the read, so a failed assertion releases the copy before the read is joined.
+  struct release_on_exit {
+    stream_gate& gate;
+    ~release_on_exit() { gate.release.store(true); }
+  } const release{gate};
   CHECK(copying.wait_for(0ms) == std::future_status::timeout);
   CHECK(server.get_count() == 1);
 
@@ -867,7 +873,7 @@ TEST_CASE("cache identity retains a retired generation until a held fill release
   // The current generation kept its own bytes throughout.  Bounded: a read that
   // missed the cache would go to the held backend, which nothing serves.
   std::vector<std::uint8_t> bytes(second->size());
-  auto read = second->host_read_async(0, bytes.size(), bytes.data());
+  auto read = cucascade::test::launched(second->host_read_async(0, bytes.size(), bytes.data()));
   if (read.wait_for(2s) != std::future_status::ready) {
     // Cancel the stranded backend request so the read settles before `bytes`
     // goes away; the failure then unwinds without anything left parked.
