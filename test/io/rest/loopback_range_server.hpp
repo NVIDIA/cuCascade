@@ -18,10 +18,16 @@
 
 #pragma once
 
+#include "../tls/tls_test_pki.hpp"
+
 #include <cucascade/io/rest/authorizer.hpp>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <pthread.h>
+#include <signal.h>  // NOLINT(modernize-deprecated-headers): POSIX pthread_sigmask
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -31,9 +37,11 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -47,6 +55,19 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+/**
+ * @file loopback_range_server.hpp
+ * @brief Raw-socket HTTP/1.1 loopback server for the REST read tests (header-only).
+ *
+ * Ranged / suffix / full GET, HEAD and ListObjectsV2 of one fixture object (any key), with the
+ * fault policies of @ref cucascade::test::range_fault_policy and per-key scripts (including a
+ * chunked-framed GET body).  HTTPS: with @ref cucascade::test::loopback_tls enabled every
+ * accepted socket is wrapped in an OpenSSL server `SSL*` (blocking `SSL_accept`) presenting the
+ * test PKI's server certificate (`io/tls/tls_test_pki.hpp`); the same request handling runs over
+ * `SSL_read` / `SSL_write`, and a body may carry a mid-body KeyUpdate or end without
+ * close_notify.
+ */
 
 namespace cucascade::test {
 
@@ -167,6 +188,10 @@ struct response_body_policy {
   /// Observes header/body progress and owns the hold; the server rejects a
   /// policy that violates these rules in its constructor (`invalid_argument`).
   std::shared_ptr<range_response_control> control;
+  /// Close the connection (no close_notify) once this many body bytes were sent.
+  std::optional<std::size_t> drop_after_bytes;
+  /// HTTPS (TLS 1.3): send a KeyUpdate (update_requested) once this many body bytes were sent.
+  std::optional<std::size_t> key_update_after_bytes;
 };
 
 struct range_fault_policy {
@@ -219,11 +244,106 @@ struct scripted_response {
   std::uint8_t body_xor{0};
   std::optional<std::string> content_range;
   std::optional<response_body_policy> body;
+  /// Answer this ranged GET with a 200 carrying the whole object (as
+  /// `range_fault_policy::ignore_range_with_200` does for every GET).
+  bool ignore_range{false};
+  /// Frame a successful GET body with `Transfer-Encoding: chunked` (one chunk, then the last
+  /// chunk) instead of `Content-Length`, as CloudFront or S3 Object Lambda may.  GET only.
+  bool chunked_transfer_encoding{false};
+  /// Send this many extra bytes after a successful GET body (a desynchronising server).
+  std::size_t trailing_garbage{0};
 };
 
 struct key_response_script {
   std::vector<scripted_response> gets;
   std::vector<scripted_response> heads;
+};
+
+/// HTTPS mode of @ref loopback_range_server.
+struct loopback_tls {
+  bool enabled{false};
+  /// Server context (owned by the server, freed with it); null: the test PKI's default server
+  /// context (`tls::make_server_ctx(tls::default_pki())`).
+  SSL_CTX* ctx{nullptr};
+};
+
+/// One accepted connection: plain TCP, or TLS over it (HTTPS mode).
+class loopback_connection {
+ public:
+  loopback_connection(int fd, SSL* ssl) noexcept : _fd(fd), _ssl(ssl) {}
+
+  [[nodiscard]] int fd() const noexcept { return _fd; }
+  [[nodiscard]] bool tls() const noexcept { return _ssl != nullptr; }
+
+  /// @return bytes read (> 0), 0 at the end of the stream, < 0 on an error or a timeout.
+  ssize_t recv_some(char* buf, std::size_t n)
+  {
+    if (_ssl == nullptr) {
+      for (;;) {
+        ssize_t const r = ::recv(_fd, buf, n, 0);
+        if (r < 0 && errno == EINTR) { continue; }
+        return r;
+      }
+    }
+    ERR_clear_error();
+    int const r = SSL_read(_ssl, buf, static_cast<int>(std::min<std::size_t>(n, INT_MAX)));
+    if (r > 0) { return r; }
+    return SSL_get_error(_ssl, r) == SSL_ERROR_ZERO_RETURN ? 0 : -1;
+  }
+
+  /// @return the bytes sent (fewer than @p size on an error).
+  std::size_t send_all(std::uint8_t const* bytes, std::size_t size)
+  {
+    std::size_t sent = 0;
+    if (_ssl == nullptr) {
+      // Fault tests can disconnect mid-response; suppress SIGPIPE so send() reports the failure.
+      while (sent < size) {
+        ssize_t const n = ::send(_fd, bytes + sent, size - sent, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) { continue; }
+        if (n <= 0) { break; }
+        sent += static_cast<std::size_t>(n);
+      }
+      return sent;
+    }
+    while (sent < size) {
+      ERR_clear_error();
+      int const n = SSL_write(
+        _ssl, bytes + sent, static_cast<int>(std::min<std::size_t>(size - sent, 1 << 30)));
+      if (n <= 0) { break; }
+      sent += static_cast<std::size_t>(n);
+    }
+    return sent;
+  }
+
+  /// A fault drops the connection: no close_notify.
+  void drop() noexcept { _dropped = true; }
+  [[nodiscard]] bool dropped() const noexcept { return _dropped; }
+
+  /// TLS: send close_notify (one-way) before the socket is closed.
+  void close_notify() noexcept
+  {
+    if (_ssl != nullptr) {
+      ERR_clear_error();
+      (void)SSL_shutdown(_ssl);
+      ERR_clear_error();
+    }
+  }
+
+  /// TLS 1.3: schedule a KeyUpdate asking the peer to update too (sent with the next write).
+  /// @return false on plain TCP, TLS 1.2 or a library refusal.
+  bool key_update() noexcept
+  {
+    if (_ssl == nullptr || SSL_version(_ssl) != TLS1_3_VERSION) { return false; }
+    ERR_clear_error();
+    bool const ok = SSL_key_update(_ssl, SSL_KEY_UPDATE_REQUESTED) == 1;
+    ERR_clear_error();
+    return ok;
+  }
+
+ private:
+  int _fd;
+  SSL* _ssl;
+  bool _dropped{false};
 };
 
 class loopback_range_server {
@@ -244,7 +364,8 @@ class loopback_range_server {
   explicit loopback_range_server(std::vector<std::uint8_t> object,
                                  range_fault_policy fault                                     = {},
                                  std::vector<listed_object> listed                            = {},
-                                 std::unordered_map<std::string, key_response_script> scripts = {})
+                                 std::unordered_map<std::string, key_response_script> scripts = {},
+                                 loopback_tls tls                                             = {})
     : _object(std::move(object)),
       _fault(std::move(fault)),
       _listed(std::move(listed)),
@@ -256,6 +377,9 @@ class loopback_range_server {
       for (auto const& response : script.gets) {
         if (response.body) { add_body_control(*response.body); }
       }
+    }
+    if (tls.enabled) {
+      _tls_ctx = tls.ctx != nullptr ? tls.ctx : tls::make_server_ctx(tls::default_pki());
     }
 
     _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -286,7 +410,11 @@ class loopback_range_server {
     _thread             = std::thread([this, listen_fd] { accept_loop(listen_fd); });
   }
 
-  ~loopback_range_server() { stop(); }
+  ~loopback_range_server()
+  {
+    stop();
+    if (_tls_ctx != nullptr) { SSL_CTX_free(_tls_ctx); }
+  }
 
   void stop()
   {
@@ -324,7 +452,13 @@ class loopback_range_server {
   loopback_range_server(loopback_range_server const&)            = delete;
   loopback_range_server& operator=(loopback_range_server const&) = delete;
 
-  [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
+  /// "http://127.0.0.1:<port>", or "https://..." in HTTPS mode.
+  [[nodiscard]] std::string endpoint() const
+  {
+    return std::string{_tls_ctx != nullptr ? "https" : "http"} +
+           "://127.0.0.1:" + std::to_string(_port);
+  }
+  [[nodiscard]] bool https() const noexcept { return _tls_ctx != nullptr; }
   [[nodiscard]] std::uint16_t port() const noexcept { return _port; }
 
   [[nodiscard]] std::size_t head_count() const noexcept { return _head_count.load(); }
@@ -348,6 +482,15 @@ class loopback_range_server {
   [[nodiscard]] std::size_t active_data_gets() const noexcept { return _active_data_gets.load(); }
   [[nodiscard]] std::size_t peak_active_gets() const noexcept { return _peak_active_gets.load(); }
   [[nodiscard]] std::size_t body_bytes_sent() const noexcept { return _body_bytes_sent.load(); }
+  [[nodiscard]] std::size_t tls_handshake_count() const noexcept { return _tls_handshakes.load(); }
+  [[nodiscard]] std::size_t tls_handshake_failure_count() const noexcept
+  {
+    return _tls_handshake_failures.load();
+  }
+  /// KeyUpdates sent mid-body (response_body_policy::key_update_after_bytes).
+  [[nodiscard]] std::size_t key_updates_sent() const noexcept { return _key_updates_sent.load(); }
+  /// Responses cut off mid-body (response_body_policy::drop_after_bytes).
+  [[nodiscard]] std::size_t body_drops() const noexcept { return _body_drops.load(); }
 
   bool wait_for_active_gets(std::size_t count, std::chrono::milliseconds timeout)
   {
@@ -445,7 +588,7 @@ class loopback_range_server {
     response += ": " + value;
   }
 
-  static void send_interim_headers(int fd,
+  static void send_interim_headers(loopback_connection& conn,
                                    std::string const& etag,
                                    std::string const& content_range,
                                    std::string const& retry_after)
@@ -456,7 +599,7 @@ class loopback_range_server {
     append_header(response, "Content-Range", content_range);
     append_header(response, "Retry-After", retry_after);
     response += "\r\n\r\n";
-    send_all(fd, response);
+    send_all(conn, response);
   }
 
   static void append_connection_header(std::string& response, bool close_connection)
@@ -493,14 +636,37 @@ class loopback_range_server {
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
+    SSL* ssl = nullptr;
+    if (_tls_ctx != nullptr) {
+      // The client may hang up while the server writes: EPIPE, never a process-wide SIGPIPE
+      // (SSL_write has no MSG_NOSIGNAL).
+      sigset_t block;
+      sigemptyset(&block);
+      sigaddset(&block, SIGPIPE);
+      pthread_sigmask(SIG_BLOCK, &block, nullptr);
+      ssl = SSL_new(_tls_ctx);
+      if (ssl == nullptr || SSL_set_fd(ssl, fd) != 1 || SSL_accept(ssl) != 1) {
+        _tls_handshake_failures.fetch_add(1, std::memory_order_relaxed);
+        ERR_clear_error();
+        if (ssl != nullptr) { SSL_free(ssl); }
+        return;
+      }
+      _tls_handshakes.fetch_add(1, std::memory_order_relaxed);
+    }
+    loopback_connection conn{fd, ssl};
     std::string pending;
     std::string request;
-    while (!_stop.load(std::memory_order_relaxed) && read_request(fd, pending, request)) {
-      if (handle_request(fd, request)) { return; }
+    while (!_stop.load(std::memory_order_relaxed) && read_request(conn, pending, request)) {
+      if (handle_request(conn, request)) { break; }
+    }
+    if (ssl != nullptr) {
+      if (!conn.dropped()) { conn.close_notify(); }
+      SSL_free(ssl);
+      ERR_clear_error();
     }
   }
 
-  bool handle_request(int fd, std::string const& request)
+  bool handle_request(loopback_connection& conn, std::string const& request)
   {
     bool const close_connection = requests_connection_close(request);
     bool const is_head          = request.rfind("HEAD ", 0) == 0;
@@ -513,7 +679,7 @@ class loopback_range_server {
       auto const key_idx  = increment_request_count(_head_counts_by_key, key);
       auto const scripted = scripted_step(key, false, key_idx);
       delay_response(scripted);
-      send_interim_headers(fd, _fault.interim_head_etag, {}, _fault.interim_head_retry_after);
+      send_interim_headers(conn, _fault.interim_head_etag, {}, _fault.interim_head_retry_after);
       bool const scripted_failure = scripted && scripted->status >= 400;
       bool const policy_failure =
         !scripted && (_fault.fail_all_heads || head_idx < _fault.fail_first_heads);
@@ -525,14 +691,14 @@ class loopback_range_server {
           response, "Retry-After", response_retry_after(scripted, _fault.failed_head_retry_after));
         append_connection_header(response, close_connection);
         response += "\r\n\r\n";
-        send_all(fd, response);
+        send_all(conn, response);
         return close_connection;
       }
       std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
       append_etag_header(response, response_etag(scripted, _fault.successful_head_etag));
       append_connection_header(response, close_connection);
       response += "\r\n\r\n";
-      send_all(fd, response);
+      send_all(conn, response);
       return close_connection;
     }
 
@@ -546,7 +712,7 @@ class loopback_range_server {
       append_connection_header(response, close_connection);
       response += "\r\n\r\n";
       bool const sent = send_response(
-        fd, response, {reinterpret_cast<std::uint8_t const*>(body.data()), body.size()}, {});
+        conn, response, {reinterpret_cast<std::uint8_t const*>(body.data()), body.size()}, {});
       return close_connection || !sent;
     }
 
@@ -554,7 +720,7 @@ class loopback_range_server {
       std::string response{"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0"};
       append_connection_header(response, close_connection);
       response += "\r\n\r\n";
-      send_all(fd, response);
+      send_all(conn, response);
       return close_connection;
     }
 
@@ -585,9 +751,11 @@ class loopback_range_server {
     wait_at_get_response_barrier();
     auto const scripted = scripted_step(key, true, key_idx);
     delay_response(scripted);
-    auto const& body_policy = scripted && scripted->body ? *scripted->body : _fault.body;
-    auto const body_xor     = scripted ? scripted->body_xor : std::uint8_t{0};
-    send_interim_headers(fd,
+    auto const& body_policy   = scripted && scripted->body ? *scripted->body : _fault.body;
+    auto const body_xor       = scripted ? scripted->body_xor : std::uint8_t{0};
+    bool const chunked        = scripted && scripted->chunked_transfer_encoding;
+    std::size_t const garbage = scripted ? scripted->trailing_garbage : 0;
+    send_interim_headers(conn,
                          _fault.interim_get_etag,
                          _fault.interim_get_content_range,
                          _fault.interim_get_retry_after);
@@ -606,7 +774,7 @@ class loopback_range_server {
       response += "\r\n\r\n";
       std::string_view const body = truncate ? "short" : "";
       bool const sent =
-        send_response(fd,
+        send_response(conn,
                       response,
                       {reinterpret_cast<std::uint8_t const*>(body.data()), body.size()},
                       body_policy);
@@ -619,16 +787,17 @@ class loopback_range_server {
         append_etag_header(response, _fault.failed_get_etag);
         append_connection_header(response, close_connection);
         response += "\r\n\r\n";
-        bool const sent = send_response(fd, response, {}, body_policy);
+        bool const sent = send_response(conn, response, {}, body_policy);
         return close_connection || !sent;
       }
-      if (_fault.ignore_range_with_200) {
+      if (_fault.ignore_range_with_200 || (scripted && scripted->ignore_range)) {
         std::string response =
           "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
         append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
         append_connection_header(response, close_connection);
         response += "\r\n\r\n";
-        bool const sent = send_body(fd, response, 0, _object.size(), body_xor, body_policy);
+        bool const sent =
+          send_body(conn, response, 0, _object.size(), body_xor, body_policy, chunked, garbage);
         return close_connection || !sent;
       }
       auto const [start, end] = *range;
@@ -651,7 +820,8 @@ class loopback_range_server {
       }
       append_connection_header(response, close_connection);
       response += "\r\n\r\n";
-      bool const sent = send_body(fd, response, start, size, body_xor, body_policy);
+      bool const sent =
+        send_body(conn, response, start, size, body_xor, body_policy, chunked, garbage);
       return close_connection || !sent;
     }
 
@@ -659,11 +829,12 @@ class loopback_range_server {
     append_etag_header(response, response_etag(scripted, _fault.successful_get_etag));
     append_connection_header(response, close_connection);
     response += "\r\n\r\n";
-    bool const sent = send_body(fd, response, 0, _object.size(), body_xor, body_policy);
+    bool const sent =
+      send_body(conn, response, 0, _object.size(), body_xor, body_policy, chunked, garbage);
     return close_connection || !sent;
   }
 
-  static bool read_request(int fd, std::string& pending, std::string& request)
+  static bool read_request(loopback_connection& conn, std::string& pending, std::string& request)
   {
     constexpr std::size_t max_header_bytes = 64 * 1024;
     while (true) {
@@ -676,7 +847,7 @@ class loopback_range_server {
       if (pending.size() >= max_header_bytes) { return false; }
 
       char bytes[8192];
-      ssize_t const n = ::recv(fd, bytes, sizeof(bytes), 0);
+      ssize_t const n = conn.recv_some(bytes, sizeof(bytes));
       if (n <= 0) { return false; }
       pending.append(bytes, static_cast<std::size_t>(n));
     }
@@ -843,42 +1014,95 @@ class loopback_range_server {
     }
   }
 
-  bool send_body(int fd,
+  bool send_body(loopback_connection& conn,
                  std::string_view headers,
                  std::size_t start,
                  std::size_t size,
                  std::uint8_t mask,
-                 response_body_policy const& policy)
+                 response_body_policy const& policy,
+                 bool chunked        = false,
+                 std::size_t garbage = 0)
   {
-    if (mask == 0) { return send_response(fd, headers, {_object.data() + start, size}, policy); }
-    std::vector<std::uint8_t> masked(_object.begin() + static_cast<std::ptrdiff_t>(start),
-                                     _object.begin() + static_cast<std::ptrdiff_t>(start + size));
-    for (auto& byte : masked) {
-      byte = static_cast<std::uint8_t>(byte ^ mask);
+    std::span<std::uint8_t const> const object{_object};
+    if (chunked) { return send_chunked(conn, headers, object.subspan(start, size), mask); }
+    bool sent = false;
+    if (mask == 0) {
+      sent = send_response(conn, headers, object.subspan(start, size), policy);
+    } else {
+      std::vector<std::uint8_t> masked(object.begin() + static_cast<std::ptrdiff_t>(start),
+                                       object.begin() + static_cast<std::ptrdiff_t>(start + size));
+      for (auto& byte : masked) {
+        byte = static_cast<std::uint8_t>(byte ^ mask);
+      }
+      sent = send_response(conn, headers, masked, policy);
     }
-    return send_response(fd, headers, masked, policy);
+    if (sent && garbage > 0) {
+      std::string const junk(garbage, 'x');
+      sent = send_all(conn, junk) == junk.size();
+    }
+    return sent;
   }
 
-  bool send_response(int fd,
+  /// @p headers (which carry `Content-Length`) re-framed as `Transfer-Encoding: chunked`, and
+  /// @p body sent as one chunk followed by the last chunk.
+  bool send_chunked(loopback_connection& conn,
+                    std::string_view headers,
+                    std::span<std::uint8_t const> body,
+                    std::uint8_t mask)
+  {
+    std::string head{headers};
+    auto const at = head.find("\r\nContent-Length: ");
+    if (at != std::string::npos) {
+      auto const eol = head.find("\r\n", at + 2);
+      head.replace(at, eol - at, "\r\nTransfer-Encoding: chunked");
+    }
+    std::string framed = head;
+    if (!body.empty()) {
+      std::array<char, 32> size_line{};
+      std::snprintf(size_line.data(), size_line.size(), "%zx\r\n", body.size());
+      framed += size_line.data();
+      for (auto const byte : body) {
+        framed.push_back(static_cast<char>(byte ^ mask));
+      }
+      framed += "\r\n";
+    }
+    framed += "0\r\n\r\n";
+    auto const sent = send_all(conn, framed);
+    _body_bytes_sent.fetch_add(body.size(), std::memory_order_relaxed);
+    return sent == framed.size();
+  }
+
+  bool send_response(loopback_connection& conn,
                      std::string_view headers,
                      std::span<std::uint8_t const> body,
                      response_body_policy const& policy)
   {
-    if (send_all(fd, headers) != headers.size()) { return false; }
+    if (send_all(conn, headers) != headers.size()) { return false; }
     if (policy.control) { policy.control->headers_sent(); }
-    if (!policy.control && policy.chunk_bytes == 0 && policy.chunk_delay.count() == 0) {
-      auto const sent = send_all(fd, body.data(), body.size());
+    if (!policy.control && policy.chunk_bytes == 0 && policy.chunk_delay.count() == 0 &&
+        !policy.drop_after_bytes && !policy.key_update_after_bytes) {
+      auto const sent = send_all(conn, body.data(), body.size());
       _body_bytes_sent.fetch_add(sent, std::memory_order_relaxed);
       return sent == body.size();
     }
 
     std::size_t sent = 0;
     bool held        = false;
+    bool key_updated = false;
     while (true) {
       if (_stop.load(std::memory_order_relaxed)) { return false; }
       if (!held && policy.hold_after_bytes && sent == *policy.hold_after_bytes) {
         held = true;
         if (!policy.control->hold()) { return false; }
+      }
+      if (policy.drop_after_bytes && sent == *policy.drop_after_bytes && sent < body.size()) {
+        _body_drops.fetch_add(1, std::memory_order_relaxed);
+        conn.drop();
+        return false;
+      }
+      if (!key_updated && policy.key_update_after_bytes && sent == *policy.key_update_after_bytes) {
+        key_updated = true;
+        if (conn.key_update()) { _key_updates_sent.fetch_add(1, std::memory_order_relaxed); }
       }
       if (sent == body.size()) { return true; }
       if (sent != 0 && !pause_response(policy.chunk_delay)) { return false; }
@@ -887,7 +1111,13 @@ class loopback_range_server {
       if (!held && policy.hold_after_bytes && *policy.hold_after_bytes > sent) {
         bytes = std::min(bytes, *policy.hold_after_bytes - sent);
       }
-      auto const wrote = send_all(fd, body.data() + sent, bytes);
+      if (policy.drop_after_bytes && *policy.drop_after_bytes > sent) {
+        bytes = std::min(bytes, *policy.drop_after_bytes - sent);
+      }
+      if (!key_updated && policy.key_update_after_bytes && *policy.key_update_after_bytes > sent) {
+        bytes = std::min(bytes, *policy.key_update_after_bytes - sent);
+      }
+      auto const wrote = send_all(conn, body.data() + sent, bytes);
       _body_bytes_sent.fetch_add(wrote, std::memory_order_relaxed);
       if (policy.control) { policy.control->body_sent(wrote); }
       sent += wrote;
@@ -895,22 +1125,16 @@ class loopback_range_server {
     }
   }
 
-  static std::size_t send_all(int fd, std::string_view bytes)
+  static std::size_t send_all(loopback_connection& conn, std::string_view bytes)
   {
-    return send_all(fd, reinterpret_cast<std::uint8_t const*>(bytes.data()), bytes.size());
+    return conn.send_all(reinterpret_cast<std::uint8_t const*>(bytes.data()), bytes.size());
   }
 
-  static std::size_t send_all(int fd, std::uint8_t const* bytes, std::size_t size)
+  static std::size_t send_all(loopback_connection& conn,
+                              std::uint8_t const* bytes,
+                              std::size_t size)
   {
-    std::size_t sent = 0;
-    // Fault tests can disconnect mid-response; suppress SIGPIPE so send() reports the failure.
-    while (sent < size) {
-      ssize_t const n = ::send(fd, bytes + sent, size - sent, MSG_NOSIGNAL);
-      if (n < 0 && errno == EINTR) { continue; }
-      if (n <= 0) { break; }
-      sent += static_cast<std::size_t>(n);
-    }
-    return sent;
+    return conn.send_all(bytes, size);
   }
 
   int _listen_fd{-1};
@@ -929,6 +1153,11 @@ class loopback_range_server {
   std::atomic<std::size_t> _active_data_gets{0};
   std::atomic<std::size_t> _peak_active_gets{0};
   std::atomic<std::size_t> _body_bytes_sent{0};
+  std::atomic<std::size_t> _tls_handshakes{0};
+  std::atomic<std::size_t> _tls_handshake_failures{0};
+  std::atomic<std::size_t> _key_updates_sent{0};
+  std::atomic<std::size_t> _body_drops{0};
+  SSL_CTX* _tls_ctx{nullptr};
   std::mutex _data_get_mutex;
   std::condition_variable _data_get_cv;
   std::mutex _get_response_mutex;
