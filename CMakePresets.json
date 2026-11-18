@@ -17,6 +17,7 @@
           "value": "$env{CMAKE_PREFIX_PATH}"
         },
         "CMAKE_CXX_COMPILER_LAUNCHER": "sccache",
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
         "CMAKE_CUDA_COMPILER_LAUNCHER": "sccache"
       }
     },

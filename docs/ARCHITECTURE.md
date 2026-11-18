@@ -36,7 +36,7 @@ Rather than failing when GPU memory runs out, cuCascade provides:
 
 cuCascade is built as several libraries:
 
-- **`cucascade`** (core) -- the memory and data modules described here, including the disk tier. It depends on RMM, CUDA and libnuma, not on cuDF.
+- **`cucascade`** (core) -- the memory and data modules described here, including the disk tier. It depends on RMM and CUDA, not on cuDF.
 - **`cucascade_topology_discovery`** -- NVML/sysfs topology discovery (`topology_discovery.hpp`); linked by the core and buildable alone with `CUCASCADE_TOPOLOGY_ONLY`.
 - **`cucascade_cudf`** (on by default; `CUCASCADE_BUILD_CUDF=OFF` disables it) -- the cuDF-backed GPU and host representations, the built-in converters, the bandwidth profiler and, with `CUCASCADE_BUILD_IO`, a cuDF datasource bridge (`include/cucascade/cudf/`).
 - **`cucascade_io`** (on by default; `CUCASCADE_BUILD_IO=OFF` disables it) -- an asynchronous I/O layer (`include/cucascade/io/`, `include/cucascade/exec/`) with local and object-store datasources and a prefetching cache. It is not covered in this document.

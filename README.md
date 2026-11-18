@@ -47,10 +47,10 @@ pixi run benchmarks
 - **Compiler**: C++20 compatible compiler
 - **Build Tools**: CMake 4.0+, Ninja, sccache (used by the CMake presets)
 - **GPU/Drivers**: CUDA 12.9+ or 13+, compatible NVIDIA driver
-- **Dependencies**: RMM and libnuma (core); libcudf (only for the optional `cucascade-cudf` library); liburing and OpenSSL (only for the optional `cucascade-io` library)
+- **Dependencies**: RMM (core); libcudf (only for the optional `cucascade-cudf` library); liburing and OpenSSL (only for the optional `cucascade-io` library)
 
 > **Library layout:** the core `cuCascade::cucascade` target is cudf-free and depends only on
-> RMM, CUDA, libnuma and Threads. The cudf-backed representations, converters, and bandwidth profiler
+> RMM, CUDA and Threads. The cudf-backed representations, converters, and bandwidth profiler
 > live in a separate `cuCascade::cucascade_cudf` target (headers under `include/cucascade/cudf/`).
 > The io layer (headers under `include/cucascade/io/` and `include/cucascade/exec/`) lives in the
 > cudf-free `cuCascade::cucascade_io` target. These libraries can be turned off at configure time

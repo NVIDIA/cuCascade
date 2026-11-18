@@ -53,7 +53,6 @@ Building, testing, benchmarking, and contributing to cuCascade.
 | NVIDIA Driver | Compatible with the CUDA Toolkit |
 | RMM | Required by the core library (installed with libcudf) |
 | libcudf | Nightly or stable RAPIDS release (see `pixi.toml`); only for `CUCASCADE_BUILD_CUDF` |
-| numactl | Development headers |
 | liburing, OpenSSL, pkg-config | Required by `CUCASCADE_BUILD_IO` (ON by default) |
 
 The easiest way to get all dependencies is via [Pixi](https://pixi.sh/), which manages the full environment.
@@ -179,7 +178,7 @@ cucascade_topology_discovery_objects    src/memory/topology_discovery.cpp
 
 cucascade_objects (core)                src/{cuda,memory,data}/*.cpp (except topology discovery)
     -> cucascade_{static,shared}
-         Links: RMM, CUDA runtime, NVTX, pthreads, numa, topology discovery
+         Links: RMM, CUDA runtime, NVTX, pthreads, topology discovery
 
 cucascade_io_objects                    src/{exec,io}/*.cpp            (CUCASCADE_BUILD_IO)
     -> cucascade_io_{static,shared}
@@ -472,15 +471,23 @@ Output:
 
 ## CI Pipeline
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on pushes to `main` and to the `pull-request/<N>` branches that copy-pr-bot creates for pull requests. Jobs run in order lint -> build -> test:
+GitHub Actions (`.github/workflows/ci.yml`) runs on pushes to `main`, copied PR
+branches (`pull-request/<number>`), and merge-group commits. `main` runs only
+builds to refresh the shared compiler cache; packaging, uploads, GPU tests, and the
+summary job run only for copied PRs and merge groups. See
+[CI and the merge queue](ci.md) for PR approvals, queue entry, diagnostics, and retries.
 
-| Job | Runner | What It Does |
-|-----|--------|-------------|
-| **lint** | `linux-amd64-cpu4` (CPU only) | Runs the pre-commit hooks |
-| **build** | `linux-amd64-cpu4` (CPU only) | For each `cuda-{12,13}-{nightly,stable}` Pixi environment: `pixi run -e <env> build` with sccache, uploads `build/release` |
-| **test** | `linux-amd64-gpu-t4-latest-1` (T4 GPU) | For each environment: downloads its build, runs `pixi run -e <env> test` |
+| Stage | Runner | What It Does |
+|-------|--------|-------------|
+| **Lint** | `linux-amd64-cpu4` (CPU only) | Runs the project pre-commit hooks |
+| **Build** | `linux-amd64-cpu4` (CPU only) | `pixi run build` with sccache; uploads artifacts for PRs and merge groups |
+| **Test** | `linux-amd64-gpu-t4-latest-1` (T4 GPU) | Downloads build, runs `pixi run test` |
+| **Check** | `ubuntu-slim` | Required summary of lint, build, and test results |
 
-Benchmarks are not run in CI.
+Copied PRs build and test CUDA 12 with stable RAPIDS and CUDA 13 with nightly RAPIDS.
+Merge groups build and test all four configurations; `main` builds all four.
+For copied PRs and merge groups, tests start after every build succeeds. The GPU runners expose one device;
+multi-GPU tests need a separate run with suitable hardware and explicit test selection.
 
 ---
 
@@ -505,7 +512,7 @@ Available targets (each name prefers the shared library if available; append `_s
 - `cuCascade::cucascade_io` -- I/O layer (`io` component; installed with `CUCASCADE_BUILD_IO`)
 - `cuCascade::cucascade_topology_discovery` -- topology discovery only (also the only library in a `CUCASCADE_TOPOLOGY_ONLY` install)
 
-Transitive dependencies of the core (CUDA Toolkit, RMM, Threads, numa) are found automatically. cuDF is only looked up when the `cudf` component is requested, and liburing and OpenSSL when `io` is requested or when `cudf` is requested from an install built with I/O support. The moodycamel `concurrentqueue` headers used by the I/O headers are not installed; consumers of the I/O layer must provide them.
+Transitive dependencies of the core (CUDA Toolkit, RMM, Threads) are found automatically. cuDF is only looked up when the `cudf` component is requested, and liburing and OpenSSL when `io` is requested or when `cudf` is requested from an install built with I/O support. The moodycamel `concurrentqueue` headers used by the I/O headers are not installed; consumers of the I/O layer must provide them.
 
 ---
 
