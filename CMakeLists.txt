@@ -309,8 +309,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # src/io/cufile/cufile_api).
     if(CUCASCADE_CUFILE_INCLUDE_DIR)
       include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConfigureCuFile.cmake)
-      target_compile_definitions(cucascade_io_thirdparty
-                                 INTERFACE CUCASCADE_HAS_CUFILE ${CUCASCADE_CUFILE_FEATURE_DEFINITIONS})
+      target_compile_definitions(
+        cucascade_io_thirdparty
+        INTERFACE CUCASCADE_HAS_CUFILE ${CUCASCADE_CUFILE_FEATURE_DEFINITIONS})
       target_include_directories(
         cucascade_io_thirdparty
         INTERFACE $<BUILD_INTERFACE:${CUCASCADE_CUFILE_INCLUDE_DIR}>)
@@ -708,6 +709,56 @@ elseif(CUCASCADE_BUILD_STATIC_LIBS)
               cucascade_topology_discovery_static)
   add_library(cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_static)
+endif()
+
+# =============================================================================
+# Standalone GDS diagnostics (no cuDF or benchmark-framework dependency)
+# =============================================================================
+if(CUCASCADE_BUILD_IO AND CUCASCADE_CUFILE_INCLUDE_DIR)
+  # Reuse the loader without pulling in the reactor or the core's dependencies.
+  add_executable(
+    cucascade_cufile_async_qd EXCLUDE_FROM_ALL
+    tools/gds/cufile_async_qd.cpp src/io/cufile/cufile_api.cpp
+    src/log/logging.cpp)
+  target_include_directories(
+    cucascade_cufile_async_qd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                      ${CUCASCADE_CUFILE_INCLUDE_DIR})
+  target_link_libraries(cucascade_cufile_async_qd
+                        PRIVATE CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+  target_compile_features(cucascade_cufile_async_qd PRIVATE cxx_std_20)
+  target_compile_definitions(cucascade_cufile_async_qd
+                             PRIVATE ${CUCASCADE_CUFILE_FEATURE_DEFINITIONS})
+  target_compile_options(cucascade_cufile_async_qd
+                         PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+  set_target_properties(cucascade_cufile_async_qd PROPERTIES CXX_EXTENSIONS OFF)
+
+  add_executable(cucascade_legacy_compat_bench EXCLUDE_FROM_ALL
+                 tools/gds/legacy_compat_bench.cpp)
+  target_link_libraries(cucascade_legacy_compat_bench PRIVATE cucascade_io
+                                                              CUDA::cudart)
+  target_compile_features(cucascade_legacy_compat_bench PRIVATE cxx_std_20)
+  target_compile_definitions(cucascade_legacy_compat_bench
+                             PRIVATE B10_NEW_ENGINE)
+  target_compile_options(cucascade_legacy_compat_bench
+                         PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+
+  add_executable(
+    cucascade_cufile_engine_bench EXCLUDE_FROM_ALL
+    tools/gds/cufile_engine_bench.cpp test/io/cufile/transport_simulator.cpp
+    test/io/cufile/transport_simulator_kernels.cu)
+  target_include_directories(cucascade_cufile_engine_bench
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/io/cufile)
+  target_link_libraries(cucascade_cufile_engine_bench PRIVATE cucascade_io
+                                                              CUDA::cudart)
+  target_compile_features(cucascade_cufile_engine_bench PRIVATE cxx_std_20)
+  target_compile_options(
+    cucascade_cufile_engine_bench
+    PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>)
+  set_target_properties(
+    cucascade_cufile_engine_bench
+    PROPERTIES CXX_EXTENSIONS OFF
+               CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON)
 endif()
 
 # =============================================================================
