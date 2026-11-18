@@ -27,6 +27,9 @@
 
 #include <cucascade/io/cufile/platform.hpp>
 
+#include <cuda_runtime_api.h>
+#include <memory>
+#include <cstdint>
 #include <chrono>
 #include <cstddef>
 #include <optional>
@@ -36,6 +39,12 @@ struct cufile_api;
 }  // namespace cucascade::io::cufile
 
 namespace cucascade::io::cufile::detail {
+[[nodiscard]] std::uint64_t submit_fence_records_for_testing() noexcept;
+
+/// Lease a portable 16 MiB scratch; return to the process pool, never cudaFreeHost.
+[[nodiscard]] std::shared_ptr<void> lease_pinned_scratch();
+
+
 
 /// Serve every cuFile call of the process from @p api instead of libcufile
 /// (null restores libcufile), so tests can script reads, failures and short
@@ -116,5 +125,29 @@ void set_copy_event_record_failure_for_testing(bool enabled) noexcept;
 /// Run @p hook(@p arg) on the worker just before every @c cuFileRead /
 /// @c cuFileWrite call (null removes it).  Process-wide.
 void set_cufile_transfer_hook_for_testing(void (*hook)(void*), void* arg) noexcept;
+
+/// Persistent registry arena gauges, per device. Unlike transient entries these survive ioctx
+/// shutdown.
+[[nodiscard]] std::size_t persistent_registered_bytes_for_testing(int device = 0) noexcept;
+[[nodiscard]] std::size_t arena_slab_counts_for_testing(int device = 0) noexcept;
+
+enum class completion_outcome : std::uint8_t { validated, short_read, error };
+struct completion_observation {
+  std::uintptr_t operation_id;
+  std::uint64_t generation;
+  std::int64_t bytes_done;
+  completion_outcome outcome;
+};
+/// Called on the reaper after I/O validation (including retries), before any destination copy.
+/// Observers must be noexcept, nonblocking; uninstall only after observed operations retire.
+void set_completion_observer_for_testing(void (*observer)(completion_observation const&,
+                                                          void*) noexcept,
+                                         void* arg) noexcept;
+
+// Shared seam consumers. No blocking host waits; the delay injects test-only GPU-side work.
+void before_engine_transfer_for_testing() noexcept;
+[[nodiscard]] cudaError_t delay_engine_copy_for_testing(cudaStream_t stream) noexcept;
+[[nodiscard]] bool engine_copy_record_failure_for_testing() noexcept;
+void observe_engine_completion_for_testing(completion_observation const&) noexcept;
 
 }  // namespace cucascade::io::cufile::detail

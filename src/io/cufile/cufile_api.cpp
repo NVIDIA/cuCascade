@@ -22,8 +22,6 @@
 
 #include <dlfcn.h>
 
-#include <atomic>
-#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -39,9 +37,12 @@ using get_version_fn = decltype(&cuFileGetVersion);
 
 /// Resolve @p name from @p library into @p out; whether it resolved.
 template <class Fn>
-bool resolve(Fn& out, void* library, char const* name) noexcept
+bool resolve(Fn& out,
+             cufile_api::symbol_resolver resolver,
+             void* context,
+             char const* name) noexcept
 {
-  void* const symbol = ::dlsym(library, name);
+  void* const symbol = resolver(context, name);
   // POSIX guarantees the object-pointer to function-pointer conversion of a dlsym result.
   out = reinterpret_cast<Fn>(symbol);  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
   return symbol != nullptr;
@@ -64,36 +65,9 @@ struct loaded_library {
     return loaded;
   }
 
-  cufile_api api{};
-  bool complete = true;
-  auto need     = [&](auto& member, char const* name) noexcept {
-    if (!resolve(member, library, name)) {
-      complete = false;
-      CUCASCADE_LOG_INFO("cufile: required symbol {} not found; cuFile unavailable", name);
-    }
-  };
-  need(api.driver_open, "cuFileDriverOpen");
-  need(api.driver_get_properties, "cuFileDriverGetProperties");
-  need(api.handle_register, "cuFileHandleRegister");
-  need(api.handle_deregister, "cuFileHandleDeregister");
-  need(api.read, "cuFileRead");
-  need(api.write, "cuFileWrite");
-  if (!complete) { return loaded; }
-
-  // Optional entry points: a library without them still serves reads and writes.  Buffer registration is
-  // usable only as a pair, so a library exporting one without the other gets neither.
-  bool const has_register   = resolve(api.buf_register, library, "cuFileBufRegister");
-  bool const has_deregister = resolve(api.buf_deregister, library, "cuFileBufDeregister");
-  if (!has_register || !has_deregister) {
-    api.buf_register   = nullptr;
-    api.buf_deregister = nullptr;
-  }
-  std::ignore = resolve(api.get_size_parameter, library, "cuFileGetParameterSizeT");
-  std::ignore = resolve(api.get_bool_parameter, library, "cuFileGetParameterBool");
-  std::ignore = resolve(api.get_string_parameter, library, "cuFileGetParameterString");
-
-  loaded.api  = api;
-  std::ignore = resolve(loaded.get_version, library, "cuFileGetVersion");
+  loaded.api = cufile_api::resolve_symbols(::dlsym, library);
+  if (!loaded.api.has_value()) { return loaded; }
+  std::ignore = resolve(loaded.get_version, ::dlsym, library, "cuFileGetVersion");
   return loaded;
 }
 
@@ -109,6 +83,7 @@ std::atomic<cufile_api const*> api_for_testing{nullptr};
 std::atomic<std::uint64_t> api_generation{0};
 std::atomic<std::uint64_t> next_generation{1};
 
+
 }  // namespace
 
 namespace detail {
@@ -121,6 +96,120 @@ void set_cufile_api_for_testing(cufile_api const* api) noexcept
 }
 
 }  // namespace detail
+
+std::optional<cufile_api> cufile_api::resolve_symbols(symbol_resolver resolver,
+                                                      void* context) noexcept
+{
+  if (resolver == nullptr) { return std::nullopt; }
+  cufile_api api{};
+  bool complete = true;
+  auto need     = [&](auto& member, char const* name) noexcept {
+    if (!resolve(member, resolver, context, name)) {
+      complete = false;
+      CUCASCADE_LOG_INFO("cufile: required symbol {} not found; cuFile unavailable", name);
+    }
+  };
+  need(api.driver_open, "cuFileDriverOpen");
+  need(api.driver_get_properties, "cuFileDriverGetProperties");
+  need(api.handle_register, "cuFileHandleRegister");
+  need(api.handle_deregister, "cuFileHandleDeregister");
+  need(api.read, "cuFileRead");
+  need(api.write, "cuFileWrite");
+  if (!complete) { return std::nullopt; }
+
+  auto resolve_optional = [&](auto& member, char const* name) noexcept {
+    return resolve(member, resolver, context, name);
+  };
+  bool const has_register = resolve_optional(api.buf_register, "cuFileBufRegister");
+  bool const has_deregister = resolve_optional(api.buf_deregister, "cuFileBufDeregister");
+  if (!has_register || !has_deregister) {
+    api.buf_register = nullptr;
+    api.buf_deregister = nullptr;
+  }
+  std::ignore = resolve_optional(api.get_size_parameter, "cuFileGetParameterSizeT");
+  std::ignore = resolve_optional(api.get_bool_parameter, "cuFileGetParameterBool");
+  std::ignore = resolve_optional(api.get_string_parameter, "cuFileGetParameterString");
+  api.has_async_read  = resolve_optional(api.read_async, "cuFileReadAsync");
+  api.has_async_write = resolve_optional(api.write_async, "cuFileWriteAsync");
+
+  api.has_stream_register = resolve_optional(api.stream_register, "cuFileStreamRegister");
+  api.has_stream_register &= resolve_optional(api.stream_deregister, "cuFileStreamDeregister");
+  if (!api.has_stream_register) {
+    api.stream_register   = nullptr;
+    api.stream_deregister = nullptr;
+  }
+
+  api.has_batch = resolve_optional(api.batch_setup, "cuFileBatchIOSetUp");
+  api.has_batch &= resolve_optional(api.batch_submit, "cuFileBatchIOSubmit");
+  api.has_batch &= resolve_optional(api.batch_get_status, "cuFileBatchIOGetStatus");
+  api.has_batch &= resolve_optional(api.batch_cancel, "cuFileBatchIOCancel");
+  api.has_batch &= resolve_optional(api.batch_destroy, "cuFileBatchIODestroy");
+  if (!api.has_batch) {
+    api.batch_setup      = nullptr;
+    api.batch_submit     = nullptr;
+    api.batch_get_status = nullptr;
+    api.batch_cancel     = nullptr;
+    api.batch_destroy    = nullptr;
+  }
+
+  // Keep individual parameter adapters available, but report the group complete only if every
+  // parameter function declared by the build-time header resolved. Never guess enum values.
+  api.has_parameters = true;
+  bool any_parameter = false;
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERSIZET
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_size_t, "cuFileSetParameterSizeT");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERBOOL
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_bool, "cuFileSetParameterBool");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERSTRING
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_string, "cuFileSetParameterString");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERSIZET
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_size_t, "cuFileGetParameterSizeT");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERBOOL
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_bool, "cuFileGetParameterBool");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERSTRING
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_string, "cuFileGetParameterString");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERMINMAXVALUE
+  any_parameter = true;
+  api.has_parameters &=
+    resolve_optional(api.get_parameter_min_max_value, "cuFileGetParameterMinMaxValue");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERPOSIXPOOLSLABARRAY
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_posix_pool_slab_array,
+                                         "cuFileSetParameterPosixPoolSlabArray");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERPOSIXPOOLSLABARRAY
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_posix_pool_slab_array,
+                                         "cuFileGetParameterPosixPoolSlabArray");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERGPUBOUNCEBUFFERSLABARRAY
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_gpu_bounce_buffer_slab_array,
+                                         "cuFileSetParameterGpuBounceBufferSlabArray");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERGPUBOUNCEBUFFERSLABARRAY
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_gpu_bounce_buffer_slab_array,
+                                         "cuFileGetParameterGpuBounceBufferSlabArray");
+#endif
+  api.has_parameters &= any_parameter;
+  return api;
+}
+
+std::size_t cufile_api::abi_size() noexcept { return sizeof(cufile_api); }
 
 cufile_api const* cufile_api::get() noexcept
 {
@@ -142,30 +231,55 @@ cufile_api const* cufile_api::loaded() noexcept
   return library_state.api.has_value() ? &*library_state.api : nullptr;
 }
 
-bool cufile_api::open_driver() noexcept
+driver_open_state& driver_open_state::process() noexcept
 {
-  if (auto const* substitute = api_for_testing.load(std::memory_order_acquire);
-      substitute != nullptr) {
-    return substitute->driver_open != nullptr && substitute->driver_open().err == CU_FILE_SUCCESS;
-  }
-  return open_loaded_driver();
+  static auto* const state = new driver_open_state;
+  return *state;
 }
 
+driver_open_state::transaction::~transaction() noexcept
+{
+  if (_state._result.attempted) {
+    _state._outcome.store(_state._result.opened ? 1 : 0, std::memory_order_release);
+  }
+}
+
+bool driver_open_state::open(cufile_api const* api) noexcept
+{
+  auto const outcome = _outcome.load(std::memory_order_acquire);
+  if (outcome >= 0) { return outcome != 0; }
+  auto transaction = acquire();
+  return transaction.open(api).opened;
+}
+
+driver_open_state::result driver_open_state::transaction::open(cufile_api const* api) noexcept
+{
+  if (!_state._result.attempted) {
+    _state._result.attempted = true;
+    if (api != nullptr && api->driver_open != nullptr) {
+      auto const status     = api->driver_open();
+      _state._result.status = status;
+      _state._result.opened =
+        status.err == CU_FILE_SUCCESS || status.err == CU_FILE_DRIVER_ALREADY_OPEN;
+      if (!_state._result.opened) {
+        CUCASCADE_LOG_WARN("cufile: cuFileDriverOpen failed: {} ({}); GDS fast path disabled",
+                           cufileop_status_error(status.err),
+                           static_cast<int>(status.err));
+      }
+    }
+  }
+  return _state._result;
+}
+
+bool cufile_api::open_driver() noexcept
+{
+  if (auto* substitute = api_for_testing.load(std::memory_order_acquire); substitute)
+    return substitute->driver_open && substitute->driver_open().err == CU_FILE_SUCCESS;
+  return open_loaded_driver();
+}
 bool cufile_api::open_loaded_driver() noexcept
 {
-  static bool const opened = [] {
-    auto const* api = loaded();
-    if (api == nullptr) { return false; }
-    auto const status = api->driver_open();
-    if (status.err != CU_FILE_SUCCESS) {
-      CUCASCADE_LOG_WARN("cufile: cuFileDriverOpen failed: {} ({}); GDS fast path disabled",
-                         cufileop_status_error(status.err),
-                         static_cast<int>(status.err));
-      return false;
-    }
-    return true;
-  }();
-  return opened;
+  return driver_open_state::process().open(loaded());
 }
 
 int cufile_api::version() noexcept

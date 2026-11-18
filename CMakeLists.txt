@@ -308,8 +308,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # the layout of io_config. libcufile itself is never linked (see
     # src/io/cufile/cufile_api).
     if(CUCASCADE_CUFILE_INCLUDE_DIR)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConfigureCuFile.cmake)
       target_compile_definitions(cucascade_io_thirdparty
-                                 INTERFACE CUCASCADE_HAS_CUFILE)
+                                 INTERFACE CUCASCADE_HAS_CUFILE ${CUCASCADE_CUFILE_FEATURE_DEFINITIONS})
       target_include_directories(
         cucascade_io_thirdparty
         INTERFACE $<BUILD_INTERFACE:${CUCASCADE_CUFILE_INCLUDE_DIR}>)

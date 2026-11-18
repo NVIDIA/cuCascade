@@ -145,7 +145,19 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// The plan the pool was built from (one flat group when built from a count).
   [[nodiscard]] pool_plan const& plan() const noexcept { return _plan; }
 
+  std::size_t host_write_io(io_object const& object,
+                            std::size_t offset,
+                            std::size_t size,
+                            std::uint8_t const* source) override;
+  exec::semi_future<void> flush_async_io(io_object const& object,
+                                         io_priority priority) noexcept override;
+
  protected:
+  std::vector<cufile_reactor*> select_reactors(cufile_io_object const& object,
+                                               std::span<prepared_io_slice const> slices,
+                                               io_op_type operation,
+                                               int device_id) override;
+
   /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the
   /// static @c cufile_reactor::create_io_object(path) cannot see.
   std::shared_ptr<io_object> create_io_object(std::string path) override;

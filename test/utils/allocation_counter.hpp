@@ -29,10 +29,10 @@ namespace cucascade::test {
  * live scope, so a test can assert that a code path does not allocate, or make one of its
  * allocations fail (fail_at()).  Other threads are not counted.  Scopes do not nest.
  *
- * Only the unaligned scalar `operator new(std::size_t)` is replaced and counted.  The aligned
- * forms (`std::align_val_t`) are not counted.  The array and nothrow forms are counted only
- * because libstdc++'s default implementations forward to the replaced scalar form; that does
- * not hold where another allocator supplies all the forms itself (ASan, valgrind, tcmalloc).
+ * The complete unaligned scalar/array/nothrow family is replaced and counted.
+ * Aligned forms (`std::align_val_t`) are not replaced or counted. Explicit forwarding
+ * avoids mixing independently interposed sanitizer nothrow allocations with our free.
+ * These custom allocations use malloc/free tags, not ASan's standard C++ family tags.
  */
 class scoped_allocation_counter {
  public:

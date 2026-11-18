@@ -18,9 +18,7 @@
 #pragma once
 
 #include <cucascade/io/cache/config.hpp>
-#ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/config.hpp>
-#endif
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/uring/config.hpp>
@@ -60,8 +58,8 @@ enum class io_backend {
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
  *  - @c cufile  — cuFile / GDS read reactor tunables (local-disk GDS path);
- *    present only when the library is built with @c cufile.h
- *    (@c CUCASCADE_HAS_CUFILE).
+ *    always present for ABI stability; backend availability is gated by
+ *    @c CUCASCADE_HAS_CUFILE.
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -87,7 +85,6 @@ struct io_config {
   /// worker-owned.
   rest::config rest{};
 
-#ifdef CUCASCADE_HAS_CUFILE
   /// cuFile reactor worker threads for the GDS local-disk IO path.  Each reactor
   /// keeps one synchronous transfer in flight, so this is the backend's queue
   /// depth.  0 (the default) plans the pool from the discovered topology: a
@@ -101,7 +98,6 @@ struct io_config {
   /// @c backend == @ref io_backend::cufile.  Not derived from @ref cache: the
   /// cuFile backend never arms the prefetching cache.
   cufile::config cufile{};
-#endif
 
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the

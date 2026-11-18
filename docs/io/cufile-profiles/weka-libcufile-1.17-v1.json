@@ -1,0 +1,25 @@
+// cuCascade example profile v1, libcufile 1.17+ (WEKA kernel client).
+// Not a vendor-certified tuning prescription. Strip full-line comments before deployment.
+// Engine preference: QD 64 / 2 MiB / 80 lanes. Client-version write qualification required.
+// max_direct_io_size_kb controls libcufile, NOT the engine's effective operation size.
+// [verify] All numeric values must be qualified against this client, GDS stack and BAR1 budget.
+// Reference: https://docs.nvidia.com/gpudirect-storage/configuration-guide/index.html
+{
+  "logging": {
+    "level": "WARN"
+  },
+  "profile": {
+    "cufile_stats": 0
+  },
+  "properties": {
+    "allow_compat_mode": true,
+    "max_direct_io_size_kb": 2048,
+    "max_device_cache_size_kb": 131072,
+    "max_device_pinned_mem_size_kb": 1048576,
+    // Documented network keys; [verify] supported policy/address syntax for the installed release.
+    // Empty addresses defer selection to the client/library; supply real local RDMA addresses.
+    // CPU affinity / mount_override.nic does NOT set these values.
+    "rdma_dev_addr_list": [],
+    "rdma_load_balancing_policy": "RoundRobin"
+  }
+}

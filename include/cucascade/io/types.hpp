@@ -48,6 +48,8 @@ struct cached_chunk;
 class metadata_store;
 }  // namespace cucascade::io::cache
 
+namespace cucascade::io::cufile { struct file_write_ticket; }
+
 namespace cucascade::io {
 class ioctx;
 }  // namespace cucascade::io
@@ -352,6 +354,12 @@ struct host_buffer {
   std::variant<std::monostate, std::uint8_t*, std::vector<cache::cached_chunk*>> buffer;
 };
 
+/// Caller-recorded input dependency. The owner returns its event to a per-device pool.
+struct submit_fence {
+  cudaEvent_t event{};
+  std::shared_ptr<void> owner;
+};
+
 struct device_buffer {
   device_buffer() noexcept = default;
 
@@ -383,6 +391,9 @@ struct device_buffer {
   /// (see @c detail::resolve_default_streams in templated_ioctx.hpp); null
   /// when @c stream is the caller's own.
   std::shared_ptr<void> stream_owner;
+  std::shared_ptr<submit_fence> fence;
+  bool original_stream_was_ptds{false};
+  bool original_stream_was_null{false};
 };
 
 class prepared_io_completion final {
@@ -461,6 +472,8 @@ struct prepared_io_slice {
   /// Read (default), write or flush.  A write slice carries exactly one source:
   /// a contiguous host buffer or a device buffer, which the reactor only reads.
   io_op_kind kind{io_op_kind::read};
+  /// Inode sequencing ticket for opt-in engine write contexts.
+  std::shared_ptr<cufile::file_write_ticket> backend_owner;
 
   prepared_io_slice() noexcept = default;
   explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}

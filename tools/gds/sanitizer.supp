@@ -1,0 +1,6 @@
+# Optional ASan interceptor suppressions for uninstrumented vendor libraries.
+# NOT used by default. Enable only after preserving and reviewing the raw report:
+# ASAN_OPTIONS=...:suppressions=$PWD/tools/gds/sanitizer.supp
+# These do not suppress instrumented cucascade code or UBSan diagnostics.
+interceptor_via_lib:libcuda.so
+interceptor_via_lib:libcufile.so

@@ -46,6 +46,16 @@
 #include <vector>
 
 namespace cucascade::io::cufile {
+struct mount_identity;
+struct file_async_policy;
+struct mount_policy_key;
+class mount_policy;
+class device_engine;
+class file_write_state;
+class device_arena;
+class cufile_transport;
+
+
 
 // ---------------------------------------------------------------------------
 // cufile_io_object
@@ -114,7 +124,21 @@ class cufile_io_object final : public io_object {
   /// unavailable for this file.
   [[nodiscard]] CUfileHandle_t cufile_handle() const noexcept { return _cufile_handle; }
 
+  [[nodiscard]] std::shared_ptr<file_write_state> write_state() const;
+
   [[nodiscard]] bool cufile_registered() const noexcept { return _cufile_handle != nullptr; }
+
+  /// Resolve descriptor-derived mount metadata once, only when engine routing requests it.
+  /// Legacy opens never inspect mountinfo. This does not initialize CUDA or cuFile.
+  [[nodiscard]] mount_identity const& mount_identity_info() const;
+  /// Caller-side snapshot only; never performs discovery or waits on call_once.
+  [[nodiscard]] mount_identity const* cached_mount_identity() const noexcept
+  {
+    return _mount_identity_ready.load(std::memory_order_acquire) ? _mount_identity.get() : nullptr;
+  }
+  [[nodiscard]] std::shared_ptr<file_async_policy> async_policy() const;
+  [[nodiscard]] mount_policy_key policy_key(std::string device_uuid,
+                                            std::uint64_t generation) const;
 
  private:
   std::string _path;
@@ -124,6 +148,13 @@ class cufile_io_object final : public io_object {
   mutable std::atomic<std::size_t> _file_size{0};
   io_access _access{io_access::read_only};
   std::optional<object_identity> _identity;
+  mutable std::once_flag _write_state_once;
+  mutable std::shared_ptr<file_write_state> _write_state;
+  mutable std::once_flag _mount_identity_once;
+  mutable std::atomic<bool> _mount_identity_ready{false};
+  mutable std::unique_ptr<mount_identity> _mount_identity;
+  mutable std::shared_ptr<file_async_policy> _async_policy;
+
 };
 
 // ---------------------------------------------------------------------------
@@ -297,11 +328,12 @@ class cufile_reactor {
   /// A read here is a syscall against NVMe (POSIX fallback) or a synchronous
   /// cuFile call (GDS fast path); batching either buys little.
   static constexpr bool prefers_bulk_io = false;
+  static constexpr bool wants_submit_fence = true;
 
   /// Shared, immutable config for a pool of reactors.  A dedicated type so a
   /// future iteration can add shared state (a registered-buffer cache, a stream
   /// registry, ...) without changing the reactor constructor's shape.
-  class reactor_context {
+  class reactor_context : public std::enable_shared_from_this<reactor_context> {
    public:
     explicit reactor_context(config cfg) : _config(std::move(cfg)) {}
 
@@ -315,6 +347,24 @@ class cufile_reactor {
 
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
 
+    struct engine_binding {
+      device_engine* engine{};
+      device_arena* arena{};
+      std::shared_ptr<cufile_transport> transport;
+      std::string device_uuid;
+      std::uint64_t generation{};
+      bool simulated{false};
+      /// Injection only; production engines have process lifetime.
+      std::shared_ptr<device_engine> owner;
+    };
+    /// Control-thread publication; injecting a simulator never changes process runtime state.
+    void install_engine(int device, std::shared_ptr<engine_binding> binding);
+    [[nodiscard]] std::shared_ptr<engine_binding> engine_for_device(int device) const noexcept;
+    [[nodiscard]] bool has_simulated_engine() const noexcept { return _simulated_engine.load(); }
+    /// Per-active-device asynchronous warm-up; rejected submissions are logged and retried.
+    void ensure_engine(int device) noexcept;
+    void notify_engines() const noexcept;
+
     /// The registered-staging cap of @p device, in bytes (0 = none).
     [[nodiscard]] std::size_t staging_cap(int device) const noexcept
     {
@@ -326,6 +376,12 @@ class cufile_reactor {
    private:
     config _config;
     std::vector<std::size_t> _staging_caps;
+    mutable std::mutex _engine_mutex;
+    using engine_bindings = std::vector<std::shared_ptr<engine_binding>>;
+    std::atomic<std::shared_ptr<const engine_bindings>> _engines;
+    std::vector<int> _warming;
+    std::atomic<bool> _simulated_engine{false};
+
   };
 
   using native_handle_type   = int;
@@ -353,6 +409,13 @@ class cufile_reactor {
   /// Open the process-wide cuFile driver (once) and launch the worker thread.
   /// Idempotent: a second call while the worker is running is a no-op.
   void start();
+
+  [[nodiscard]] bool submit_fence_enabled() const noexcept;
+  void record_submit_fences(cufile_io_object const& file, std::vector<prepared_io_slice>& slices);
+  /// Single-reactor batching is allowed only for currently eligible small device reads.
+  [[nodiscard]] bool coalescing_candidate(cufile_io_object const& object,
+                                          std::span<prepared_io_slice const> slices) const noexcept;
+  [[nodiscard]] std::shared_ptr<reactor_context> context() const noexcept { return _ctx; }
 
   /// Present for reactor-concept symmetry with the uring reactor; does nothing.
   void interrupt() noexcept;
@@ -455,6 +518,10 @@ class cufile_reactor {
                          std::size_t size,
                          std::uint8_t const* source);
 
+  /// Nonblocking eligibility snapshot used to track queued engine writes before flush capture.
+  bool engine_write_candidate(std::shared_ptr<const io_object> const& object,
+                              prepared_io_slice const& slice) noexcept;
+
   /// @c fdatasync the file on the calling thread.  @throws std::system_error.
   static void flush(cufile_io_object const& file);
 
@@ -469,6 +536,17 @@ class cufile_reactor {
   /// A device-only slice parked until the work queued on its stream before the
   /// read has finished (@c gate fires): the submission-time event, or one the
   /// worker recorded at dispatch for a slice that came without one.
+  struct pending_write {
+    std::shared_ptr<const io_object> obj;
+    prepared_io_slice slice;
+    std::shared_ptr<grouped_coordinator> coordinator;
+    std::shared_ptr<std::atomic<bool>> ready;
+  };
+  struct write_wakeup {
+    std::mutex mutex;
+    std::function<void()> notify;
+  };
+  std::shared_ptr<write_wakeup> _write_wakeup = std::make_shared<write_wakeup>();
   struct waiting_slice {
     std::shared_ptr<const io_object> obj;
     prepared_io_slice slice;
@@ -506,6 +584,28 @@ class cufile_reactor {
 
   void worker_loop(std::stop_token const& stop_token);
 
+  /// Lazily opened only by real handoffs; legacy I/O publishes before blocking.
+  struct engine_publication {
+    reactor_context& context;
+    std::shared_ptr<std::atomic<bool>> ready;
+    std::shared_ptr<std::atomic<bool>> take() noexcept
+    {
+      try {
+        if (!ready) ready = std::make_shared<std::atomic<bool>>(false);
+      } catch (...) { /* Coalescing is optional under metadata pressure. */
+      }
+      return ready;
+    }
+    void publish() noexcept
+    {
+      if (!ready) return;
+      ready->store(true, std::memory_order_release);
+      context.notify_engines();
+      ready.reset();
+    }
+    ~engine_publication() { publish(); }
+  };
+
   /// Turn one slice into cuFile reads or a POSIX pread.  Never throws --
   /// errors are reported through the slice's completion and coordinator.  A
   /// device-only slice whose stream still has queued work is parked (see
@@ -513,7 +613,9 @@ class cufile_reactor {
   void dispatch_slice(std::shared_ptr<const io_object> const& obj,
                       prepared_io_slice slice,
                       std::shared_ptr<grouped_coordinator> const& coordinator,
-                      bool stream_ready = false) noexcept;
+                      bool stream_ready = false,
+                      bool* handed_off = nullptr,
+                      engine_publication* publication = nullptr) noexcept;
 
   /// When the slice's stream still has queued work, record an event on it and
   /// park the slice in @ref _waiting; returns whether it was parked.  For a slice
@@ -660,6 +762,17 @@ class cufile_reactor {
     return _inflight_copy.size() + _staged_inflight;
   }
 
+  struct engine_admission {
+    std::shared_ptr<std::atomic<bool>> cancel{std::make_shared<std::atomic<bool>>(false)};
+    std::atomic<std::size_t> outstanding{0};
+  };
+  struct engine_retirement_ticket;
+  struct engine_route_result;
+  [[nodiscard]] engine_route_result engine_route(std::shared_ptr<const io_object> const& obj,
+                                                 prepared_io_slice const& slice) noexcept;
+  /// Shared tickets, not early AM-1 futures, determine facade drain completion.
+  std::shared_ptr<engine_admission> _engine_outstanding;
+
   std::shared_ptr<reactor_context> _ctx;
   reactor_config_type _config;
   std::string _tname;
@@ -711,6 +824,7 @@ class cufile_reactor {
   // shutdown() once the worker has been joined).
   std::vector<inflight_copy> _inflight_copy;
   std::vector<waiting_slice> _waiting;
+  std::vector<pending_write> _write_waiting;
   /// Staging-copy streams, indexed by device id.
   std::vector<owned_stream> _copy_streams;
   /// Gated pair-copy streams, indexed by device id.

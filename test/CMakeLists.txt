@@ -98,6 +98,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_thread_pool_construction.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
+    io/cufile/transport_simulator.cpp
+    io/cufile/transport_simulator_kernels.cu
+    io/cufile/test_transport_simulator.cpp
     io/cache/test_buffer_pool.cpp
     io/cache/test_chunk_state.cpp
     io/cache/test_metadata_store.cpp
@@ -128,7 +131,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   target_sources(
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
-            io/test_io_request.cpp)
+            io/test_io_request.cpp io/test_range_plan.cpp)
   # A PTDS-built caller must still get legacy null-stream I/O ordering.
   set_source_files_properties(
     io/test_null_stream_ptds.cpp PROPERTIES COMPILE_DEFINITIONS
@@ -150,7 +153,29 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
       PRIVATE io/cufile/test_cufile_platform.cpp
               io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp
               io/cufile/test_cufile_staging.cpp io/cufile/test_cufile_tune.cpp
-              io/cufile/test_cufile_compare.cpp io/cufile/test_cufile_write.cpp)
+              io/cufile/test_cufile_compare.cpp io/cufile/test_cufile_write.cpp
+              io/cufile/test_cufile_api_optional.cpp
+              io/cufile/test_async_engine_config.cpp
+              io/cufile/test_device_arena.cpp
+              io/cufile/test_capacity.cpp
+              io/cufile/test_runtime_params.cpp
+              io/cufile/test_parameters_production.cpp
+              io/cufile/test_cufile_abi.cpp
+              io/cufile/test_cufile_abi_reference.cpp
+              io/cufile/test_topology.cpp
+              io/cufile/test_lustre_layout.cpp
+              io/cufile/test_lane_pool.cpp
+              io/cufile/test_operation.cpp
+              io/cufile/test_mount_policy.cpp
+              io/cufile/test_engine_coalesce.cpp
+              io/cufile/test_engine_read.cpp
+              io/cufile/test_engine_write.cpp
+              io/cufile/test_engine_failure.cpp
+              io/cufile/test_engine_sched.cpp
+              io/cufile/test_engine_hardening.cpp
+              io/cufile/test_phase6_review.cpp
+              io/cufile/test_engine_ioctx.cpp)
+    set_source_files_properties(io/cufile/test_lustre_layout.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/io/cufile/lustre_shim")
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

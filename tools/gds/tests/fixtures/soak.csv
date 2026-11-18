@@ -1,0 +1,5 @@
+step,mount,device,variant,elapsed_s,epoch,phase,arena_bytes,registered_bytes,unregistered_bytes,pinned_host_bytes,op_pool_live,lane_count,thread_count,quarantines,late_copy_failures,data_mismatches,verify,fd_count,device_used_bytes,completed_ops
+G-7,nvme,0,registered,0,0,quiescent,1024,1024,0,1024,0,40,12,0,0,0,1,10,1024,200
+G-7,nvme,0,registered,60,0,quiescent,1024,1024,0,1024,0,40,12,0,0,0,1,10,1024,300
+G-7,nvme,0,registered,120,1,quiescent,1024,1024,0,1024,0,40,12,0,0,0,1,10,1024,400
+G-7,nvme,0,registered,3600,2,quiescent,1024,1024,0,1024,0,40,12,0,0,0,1,10,1024,500

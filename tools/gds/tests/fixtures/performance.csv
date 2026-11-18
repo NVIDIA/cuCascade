@@ -1,0 +1,6 @@
+step,mount,device,direction,engine,workload,variant,qd,op_mib,gib_s,Q_eff_max,Q_eff_min,S_eff_max,backlog_mean_qd,backlog_ns,queries_per_op,residence_p99_us,data_mismatches,verify,engine_logical_bytes,legacy_bytes,sync_bytes,completed_ops,refill_gap_ns,seconds,repetitions,flush
+B-2,nvme,0,read,gdsio,baseline,gdsio,32,4,10,,,,,,,,,,1,1000000,0,0,100,0,30,3,1
+B-2,nvme,0,write,gdsio,baseline,gdsio,32,4,5,,,,,,,,,,1,1000000,0,0,100,0,30,3,1
+B-2,other,0,read,gdsio,baseline,gdsio,32,4,100,,,,,,,,,,1,1000000,0,0,100,0,30,3,1
+B-3,nvme,0,read,async,sustained,registered,32,4,8,32,32,4194304,29,1000000000,70,512,0,1,1000000,0,0,100,0,30,3,1
+B-6,nvme,0,write,async,spill,registered,32,4,3,32,32,4194304,20,1000000000,71,1024,0,1,1000000,0,0,100,0,30,3,1

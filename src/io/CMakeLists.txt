@@ -21,6 +21,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/object_identity.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/cufile/async_transport.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/detail/local_descriptor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/config.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
@@ -57,6 +58,14 @@ if(CUCASCADE_CUFILE_INCLUDE_DIR)
   target_sources(
     cucascade_io_objects
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_api.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/runtime.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/parameters.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/topology.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/device_arena.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/lane_pool.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/device_engine.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/file_write_state.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/mount_policy.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_ioctx.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_reactor.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/placement.cpp

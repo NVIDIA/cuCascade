@@ -20,8 +20,11 @@
 
 #include <cufile.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 
 namespace cucascade::io::cufile {
 
@@ -83,30 +86,22 @@ enum class string_parameter : int {
  * keeps the library mapped for the life of the process (it can crash at `dlclose` with statistics
  * enabled).
  *
- * The read and write entry points are required; a library that lacks one is treated as absent.
- * The optional members are null when the loaded library predates them, and every caller checks:
- * without @c buf_register / @c buf_deregister the reactor reads and writes unregistered memory,
- * and without the parameter getters the platform probe reports cuFile's driver properties only.
- * The members are plain C function pointers: no state, no virtual call.
+ * The eight legacy entry points are required. Async reads, async writes, stream registration,
+ * batch I/O and parameters are independent optional groups. Check the corresponding capability
+ * before calling an optional member. Loading the table does not open the driver or call setters.
  *
  * This is a private detail of the cuFile backend; nothing outside the backend and its tests
  * should include this header.
  */
 struct cufile_api {
-  // -- required -------------------------------------------------------------
   decltype(&cuFileDriverOpen) driver_open{nullptr};
   decltype(&cuFileDriverGetProperties) driver_get_properties{nullptr};
   decltype(&cuFileHandleRegister) handle_register{nullptr};
   decltype(&cuFileHandleDeregister) handle_deregister{nullptr};
+  decltype(&cuFileBufRegister) buf_register{nullptr};
+  decltype(&cuFileBufDeregister) buf_deregister{nullptr};
   decltype(&cuFileRead) read{nullptr};
   decltype(&cuFileWrite) write{nullptr};
-
-  // -- optional -------------------------------------------------------------
-  /// @c cuFileBufRegister: pins device memory for direct DMA (every libcufile has it, but a
-  /// library without it still serves reads and writes).
-  decltype(&cuFileBufRegister) buf_register{nullptr};
-  /// @c cuFileBufDeregister; resolved together with @c buf_register (both or neither).
-  decltype(&cuFileBufDeregister) buf_deregister{nullptr};
 
   using get_size_parameter_fn   = CUfileError_t (*)(size_parameter, std::size_t*);
   using get_bool_parameter_fn   = CUfileError_t (*)(bool_parameter, bool*);
@@ -118,9 +113,34 @@ struct cufile_api {
   /// @c cuFileGetParameterString.
   get_string_parameter_fn get_string_parameter{nullptr};
 
+  decltype(&cuFileReadAsync) read_async{nullptr};
+  decltype(&cuFileWriteAsync) write_async{nullptr};
+  decltype(&cuFileStreamRegister) stream_register{nullptr};
+  decltype(&cuFileStreamDeregister) stream_deregister{nullptr};
+  decltype(&cuFileBatchIOSetUp) batch_setup{nullptr};
+  decltype(&cuFileBatchIOSubmit) batch_submit{nullptr};
+  decltype(&cuFileBatchIOGetStatus) batch_get_status{nullptr};
+  decltype(&cuFileBatchIOCancel) batch_cancel{nullptr};
+  decltype(&cuFileBatchIODestroy) batch_destroy{nullptr};
+  bool has_async_read{false};
+  bool has_async_write{false};
+  bool has_stream_register{false};
+  bool has_batch{false};
+  bool has_parameters{false};
+
+  /// Resolver test seam: the context belongs to the caller; no global loader state is changed.
+  using symbol_resolver = void* (*)(void* context, char const* name) noexcept;
+
   /**
-   * @brief The table every cuFile call goes through: libcufile's, loaded on first
-   *        call, unless a test substituted its own (@c detail::set_cufile_api_for_testing).
+   * @brief Resolve a table without opening a library or calling any resolved function.
+   * @return nullopt for a null resolver or any missing required symbol. Optional groups are
+   *         independent; parameter pointers remain individually usable when their group is partial.
+   */
+  [[nodiscard]] static std::optional<cufile_api> resolve_symbols(symbol_resolver resolver,
+                                                                 void* context) noexcept;
+
+  /**
+   * @brief The process-wide table, loaded on first call.
    *
    * Thread-safe; never throws.
    *
@@ -128,29 +148,20 @@ struct cufile_api {
    *         reason is logged once).
    */
   [[nodiscard]] static cufile_api const* get() noexcept;
-
-  /// libcufile's own table, never a test substitute: what the process-wide
-  /// platform probe describes.  Null when the library is unavailable.
   [[nodiscard]] static cufile_api const* loaded() noexcept;
-
-  /// Which table @ref get returns: 0 for libcufile's, a fresh number for every
-  /// test substitute installed, so state kept per table (e.g. a failed
-  /// registration) never carries over to another one at the same address.
   [[nodiscard]] static std::uint64_t generation() noexcept;
+  [[nodiscard]] static bool open_loaded_driver() noexcept;
 
   /**
-   * @brief Open the cuFile driver once per process (the test substitute's
-   *        @c driver_open, every call, while one is installed).
+   * @brief Open the cuFile driver once per process.
    *
    * Later calls return the first call's outcome.  The driver is never closed: cuFile releases it
    * at process exit.  Thread-safe; never throws.
    *
-   * @return Whether `cuFileDriverOpen` succeeded (false when the library is unavailable).
+   * @return Whether the driver is open, including an external already-open driver (false when
+   * the library is unavailable). An external driver's parameters remain unverified.
    */
   [[nodiscard]] static bool open_driver() noexcept;
-
-  /// As @ref open_driver, always for libcufile itself.
-  [[nodiscard]] static bool open_loaded_driver() noexcept;
 
   /**
    * @brief `cuFileGetVersion`, e.g. 1170 for libcufile 1.17.
@@ -158,6 +169,66 @@ struct cufile_api {
    * @return The version, or 0 when the library is unavailable or does not report one.
    */
   [[nodiscard]] static int version() noexcept;
+
+  // ABI slots are unconditional, even with no optional declarations/detection macros.
+  // Only implementation adapters cast these back to a header-validated exact signature.
+  using opaque_function = void (*)();
+  opaque_function set_parameter_size_t{nullptr};
+  opaque_function set_parameter_bool{nullptr};
+  opaque_function set_parameter_string{nullptr};
+  opaque_function get_parameter_size_t{nullptr};
+  opaque_function get_parameter_bool{nullptr};
+  opaque_function get_parameter_string{nullptr};
+  opaque_function get_parameter_min_max_value{nullptr};
+  opaque_function set_parameter_posix_pool_slab_array{nullptr};
+  opaque_function get_parameter_posix_pool_slab_array{nullptr};
+  opaque_function set_parameter_gpu_bounce_buffer_slab_array{nullptr};
+  opaque_function get_parameter_gpu_bounce_buffer_slab_array{nullptr};
+
+  /// Layout fingerprint from the compiled library, for cross-detection consumer tests.
+  [[nodiscard]] static std::size_t abi_size() noexcept;
+};
+
+/**
+ * @brief Shared, single-attempt driver-open coordinator.
+ *
+ * Both legacy open_driver() and runtime initialization acquire this transaction. Keeping it
+ * alive across setters, open, properties and readback prevents legacy registration from racing
+ * pre-open configuration. Independent instances isolate injected runtimes in tests. Calls to
+ * cuFileDriverOpen outside cuCascade cannot be serialized here; its already-open status is
+ * retained, never treated as permission to close/reopen the driver.
+ */
+class driver_open_state {
+ public:
+  struct result {
+    bool attempted{false};
+    bool opened{false};
+    std::optional<CUfileError_t> status;
+  };
+
+  class transaction {
+   public:
+    ~transaction() noexcept;
+    [[nodiscard]] bool attempted() const noexcept { return _state._result.attempted; }
+    [[nodiscard]] result open(cufile_api const* api) noexcept;
+
+   private:
+    friend class driver_open_state;
+    explicit transaction(driver_open_state& state) : _state(state), _lock(state._mutex) {}
+    driver_open_state& _state;
+    std::unique_lock<std::mutex> _lock;
+  };
+
+  [[nodiscard]] transaction acquire() { return transaction{*this}; }
+  /// Lock-free after the first complete initialization transaction, including failed opens.
+  [[nodiscard]] bool open(cufile_api const* api) noexcept;
+  [[nodiscard]] static driver_open_state& process() noexcept;
+
+ private:
+  std::mutex _mutex;
+  result _result;
+  // Published only when the opening transaction ends, after properties and readback.
+  std::atomic<int> _outcome{-1};
 };
 
 }  // namespace cucascade::io::cufile
