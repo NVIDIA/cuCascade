@@ -51,6 +51,7 @@
 namespace cucascade::io {
 class ioctx;
 class datasource;
+class advising_reader;
 }  // namespace cucascade::io
 
 namespace cucascade::cuda {
@@ -309,11 +310,12 @@ class cache_handle {
 
 class fs_cache {
   // The cache only accepts new prefetch requests through
-  // datasource::fadvise — that's the single entry point for the
-  // fadvise(scan_stage) protocol.  Friending the
-  // datasource keeps insert() out of the public API while still letting
+  // datasource::fadvise (or advising_reader, which is its cudf-free counterpart) — that's the
+  // entry point for the fadvise(scan_stage) protocol.  Friending them
+  // keeps insert() out of the public API while still letting
   // fadvise dispatch through it.
   friend class cucascade::io::datasource;
+  friend class cucascade::io::advising_reader;
   friend class cache_handle;
   friend struct fs_cache_test_access;
 
@@ -543,7 +545,8 @@ class fs_cache {
 
   [[nodiscard]] cache_handle initiate_prefetching_request(const io_object& obj,
                                                           std::span<const byte_range> ranges,
-                                                          std::optional<int> gpu_id = {});
+                                                          std::optional<int> gpu_id      = {},
+                                                          std::uint8_t eviction_priority = 0);
 
   /// Attach staging buffers to @p handle's request, so a following @ref prefetch
   /// has chunks it can claim: a chunk without a buffer cannot be taken for

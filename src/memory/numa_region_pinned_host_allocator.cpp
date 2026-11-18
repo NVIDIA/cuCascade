@@ -21,15 +21,20 @@
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
+#include <cuda_runtime.h>
+
 #include <linux/mempolicy.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -191,6 +196,28 @@ bool numa_region_pinned_host_memory_resource::operator==(
 {
   return this == &other && _numa_node == other._numa_node &&
          _cuda_host_flags == other._cuda_host_flags;
+}
+
+int gpu_numa_node(int device_id) noexcept
+{
+  if (device_id < 0) { return -1; }
+  char pci_buf[32] = {0};
+  if (cudaDeviceGetPCIBusId(pci_buf, sizeof(pci_buf), device_id) != cudaSuccess) { return -1; }
+  // CUDA returns IDs like "0000:65:00.0"; sysfs uses lower-case form.
+  std::string pci(pci_buf);
+  for (auto& c : pci) {
+    c = static_cast<char>(std::tolower(c));
+  }
+  std::ifstream f("/sys/bus/pci/devices/" + pci + "/numa_node");
+  if (!f.is_open()) { return -1; }
+  std::string content;
+  std::getline(f, content);
+  if (content.empty()) { return -1; }
+  try {
+    return std::stoi(content);
+  } catch (...) {
+    return -1;
+  }
 }
 
 }  // namespace memory

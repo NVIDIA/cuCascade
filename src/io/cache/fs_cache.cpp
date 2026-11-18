@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -182,6 +183,7 @@ reclaim_outcome reclaim_chunk_buffers(
     }
     if (only_unsubscribed && snap.subscribers() != 0) { continue; }
     if (before_claim != nullptr && *before_claim) { (*before_claim)(*c); }
+    auto const priority = c->eviction_priority.load(std::memory_order_relaxed);
     chunk_state::value prior{};
     if (!c->state.mark_evicting(only_unsubscribed, prior)) {
       ++outcome.stuck;  // pinned, loading, or already being evicted by someone else
@@ -196,6 +198,7 @@ reclaim_outcome reclaim_chunk_buffers(
       assert(restored && "only this claimant can move the chunk out of evicting");
       continue;
     }
+    c->reset_eviction_priority(priority);
     claimed.push_back(c);  // capacity reserved at creation: one per slot
   }
   std::ranges::sort(claimed, {}, node_of);
@@ -236,6 +239,49 @@ struct generation_deleter {
     }
   }
 };
+
+/// Largest slice that contiguous chunk fills are merged into: the REST reactor's largest GET. A
+/// slice's chunks are published together when its last byte lands, so a larger run would hold
+/// finished chunks back.
+constexpr std::size_t max_merged_fill_bytes = 16UL << 20;
+
+/**
+ * @brief Merge the fill @p rng of @p chunk into the last slice of @p prepared when that slice
+ *        holds cache chunks and ends exactly where @p rng starts.
+ *
+ * One slice per chunk makes the reactor issue one GET per chunk: a 256 KiB GET spends most of
+ * its time waiting for the first byte. A slice holding a run of contiguous fills lets it issue
+ * one GET for the whole run.
+ *
+ * @param device_dst Where @p rng lands on the device, or null for a host-only slice. A device
+ *        slice is merged only when its destination continues the last slice's.
+ * @param first Index of the first slice that may be merged into (an earlier one belongs to
+ *        another request).
+ * @param chunk_size The cache's chunk size: @p chunk must directly follow the last slice's last
+ *        chunk, and @p rng must start at @p chunk's start.
+ * @return Whether @p rng was merged; if not, the caller appends its own slice.
+ */
+bool merge_fill(std::vector<prepared_io_slice>& prepared,
+                std::size_t first,
+                range rng,
+                cached_chunk* chunk,
+                std::uint8_t const* device_dst,
+                std::size_t chunk_size)
+{
+  if (prepared.size() <= first) { return false; }
+  auto& last = prepared.back();
+  if (!last.is_fragmented() || last.rng.end() != rng.offset || rng.offset != chunk->offset ||
+      last.rng.size + rng.size > max_merged_fill_bytes) {
+    return false;
+  }
+  auto& chunks = std::get<std::vector<cached_chunk*>>(last.h_buffer.buffer);
+  if (chunks.back()->offset + chunk_size != chunk->offset) { return false; }
+  if ((device_dst == nullptr) != (last.d_buffer.data == nullptr)) { return false; }
+  if (device_dst != nullptr && last.d_buffer.data + last.rng.size != device_dst) { return false; }
+  chunks.push_back(chunk);
+  last.rng.size += rng.size;
+  return true;
+}
 }  // namespace
 
 struct fs_cache::cached_copy_retirement {
@@ -669,7 +715,8 @@ std::size_t fs_cache::retired_generation_count() const noexcept
 
 cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
                                                     std::span<const byte_range> ranges,
-                                                    std::optional<int> gpu_id)
+                                                    std::optional<int> gpu_id,
+                                                    std::uint8_t eviction_priority)
 {
   if (!_armed) { return cache_handle(); }
 
@@ -789,6 +836,12 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
   }
   chunks_to_fetch.resize(count);
   desired.resize(count);
+  // Raise (never lower) the eviction priority of every chunk this request names.
+  for (auto* c : chunks_to_fetch) {
+    auto cur = c->eviction_priority.load(std::memory_order_relaxed);
+    while (cur < eviction_priority && !c->eviction_priority.compare_exchange_weak(
+                                        cur, eviction_priority, std::memory_order_relaxed)) {}
+  }
   req.required_fills = std::make_shared<const std::vector<chunk_fill>>(std::move(desired));
   req.chunks         = subscribed;
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
@@ -1071,10 +1124,11 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
       range const request_rng{raw.offset(), request_size};
       auto chunks = ranges_in_cache(
         generation.get(), request_rng.offset, request_rng.size, coverage_policy::partial, handle);
-      std::size_t ci       = 0;
-      auto const first     = (request_rng.offset / _chunk_size) * _chunk_size;
-      auto const last      = ((request_rng.end() - 1) / _chunk_size) * _chunk_size;
-      auto const positions = ((last - first) / _chunk_size) + 1;
+      std::size_t ci           = 0;
+      auto const first         = (request_rng.offset / _chunk_size) * _chunk_size;
+      auto const last          = ((request_rng.end() - 1) / _chunk_size) * _chunk_size;
+      auto const positions     = ((last - first) / _chunk_size) + 1;
+      auto const request_first = prepared.size();  // this request's slices start here
 
       for (std::size_t position = 0; position < positions; ++position) {
         auto const off = first + position * _chunk_size;
@@ -1098,9 +1152,17 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
             chunk->state.take_loading_merging(
               needed_fill(off, _chunk_size, needed.offset, needed.end()), fill)) {
           claimed.push_back(chunk);
-          auto completion = std::make_shared<prepared_io_completion>(
-            [this, needed, piece_dst, lifetime](std::span<cached_chunk* const> completed,
-                                                bool host_ok) noexcept {
+          ++n_loads;
+          if (!merge_fill(prepared, request_first, needed, chunk, nullptr, _chunk_size)) {
+            prepared.emplace_back(needed, host_buffer{std::vector<cached_chunk*>{chunk}});
+          }
+          // The slice's window (this chunk's piece, or the run it was merged into) and where that
+          // window lands in the caller's buffer.
+          auto const window           = prepared.back().rng;
+          auto* window_dst            = raw.dst + (window.offset - request_rng.offset);
+          prepared.back().on_complete = std::make_shared<prepared_io_completion>(
+            [this, window, window_dst, lifetime](std::span<cached_chunk* const> completed,
+                                                 bool host_ok) noexcept {
               std::ignore = lifetime;
               if (!host_ok) {
                 for (auto* current : completed) {
@@ -1109,9 +1171,9 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
                 return;
               }
               for (auto* current : completed) {
-                auto const copy_rng = intersect(needed, range{current->offset, _chunk_size});
+                auto const copy_rng = intersect(window, range{current->offset, _chunk_size});
                 if (!copy_rng.empty()) {
-                  std::memcpy(piece_dst + (copy_rng.offset - needed.offset),
+                  std::memcpy(window_dst + (copy_rng.offset - window.offset),
                               current->data + (copy_rng.offset - current->offset),
                               copy_rng.size);
                 }
@@ -1120,10 +1182,6 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
                 std::ignore = current->state.mark_cached();
               }
             });
-          prepared_io_slice io_slice{needed, host_buffer{std::vector<cached_chunk*>{chunk}}};
-          io_slice.on_complete = std::move(completion);
-          prepared.push_back(std::move(io_slice));
-          ++n_loads;
           continue;
         }
 
@@ -1293,12 +1351,13 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
             chunk->state.take_loading_merging(
               needed_fill(off, _chunk_size, needed.offset, needed.end()), fill)) {
           claimed.push_back(chunk);
+          ++loads;
+          if (merge_fill(prepared, 0, needed, chunk, device_dst, _chunk_size)) { continue; }
           prepared_io_slice io_slice{needed,
                                      host_buffer{std::vector<cached_chunk*>{chunk}},
                                      device_buffer{device_dst, stream, device_id.value()}};
           io_slice.on_complete = completion;
           prepared.push_back(std::move(io_slice));
-          ++loads;
           continue;
         }
 
@@ -1644,8 +1703,10 @@ bool fs_cache::prefetch(cache_handle& handle,
         auto const [seg_lo, seg_hi] = fill_span(fill, c->offset, _chunk_size);
         covered = covered && covers(fill, c->offset, _chunk_size, needed_lo, needed_hi);
         claimed_chunks.push_back(c);
-        prepared.emplace_back(range{seg_lo, seg_hi - seg_lo},
-                              host_buffer{std::vector<cached_chunk*>{c}});
+        range const seg{seg_lo, seg_hi - seg_lo};
+        if (!merge_fill(prepared, 0, seg, c, nullptr, _chunk_size)) {
+          prepared.emplace_back(seg, host_buffer{std::vector<cached_chunk*>{c}});
+        }
       } else if (covered) {
         // Read state and extent together. A loading chunk belongs to another
         // IO, whose completion this prefetch does not observe. Never promote
@@ -1722,6 +1783,8 @@ void fs_cache::evict_loop(const std::stop_token& st)
   // Reclaimed buffers grouped by their origin NUMA node so each group can be
   // returned to the arena it came from.
   std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
+  // Reclaim candidates by eviction priority, refilled every round.
+  std::array<std::vector<cached_chunk*>, cached_chunk::eviction_priority_levels> by_priority;
   while (!_shutting_down && !st.stop_requested()) {
     cache_request entry;
     _eviction_queue.wait_dequeue(entry);
@@ -1833,7 +1896,10 @@ void fs_cache::evict_loop(const std::stop_token& st)
       need = std::numeric_limits<size_t>::max();
     } else {
       if (_pool->should_start_evicting()) {
-        need = static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
+        need = std::max<size_t>(
+          1,
+          static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) *
+                              _cfg.eviction_batch_fraction));
       }
       // Rounded up: freeing whole chunks is the only granularity there is, so a
       // demand for part of one still costs the whole thing.  Without adding first,
@@ -1859,12 +1925,27 @@ void fs_cache::evict_loop(const std::stop_token& st)
     // is still subscribed to is not idle.
     size_t reclaimed   = 0;
     int const n_passes = _cfg.dispose_on_idle ? 1 : 2;
+    // Chunks carry an eviction priority (raised by the requests that name them); lower priorities
+    // are reclaimed first, and within one priority the oldest request first. One sweep sorts the
+    // chunks that hold a buffer into a bucket per priority, keeping that order within each.
+    for (auto& bucket : by_priority) {
+      bucket.clear();
+    }
+    for (auto& er : eviction_batch) {
+      if (!er.released || !er.req || !er.req.chunks) { continue; }
+      for (cached_chunk* c : *er.req.chunks) {
+        if (!c->state.load().is_reclaimable()) { continue; }
+        by_priority[c->eviction_priority.load(std::memory_order_relaxed)].push_back(c);
+      }
+    }
     for (int pass = 0; pass < n_passes && reclaimed < need; ++pass) {
       bool const respect_subscribers = (pass == 0);
-      for (auto& er : eviction_batch) {
-        if (!er.released || !er.req || !er.req.chunks) { continue; }
-        for (cached_chunk* c : *er.req.chunks) {
+      for (std::size_t level = 0; level < by_priority.size() && reclaimed < need; ++level) {
+        auto const priority = static_cast<std::uint8_t>(level);
+        for (cached_chunk* c : by_priority[level]) {
           if (reclaimed >= need) { break; }
+          // A request raised it since the sweep: not a candidate this round.
+          if (c->eviction_priority.load(std::memory_order_relaxed) != priority) { continue; }
           // A single relaxed load answers the whole question: does this chunk
           // hold a reclaimable buffer, and is anybody still subscribed to it?
           auto const snap = c->state.load();
@@ -1876,6 +1957,7 @@ void fs_cache::evict_loop(const std::stop_token& st)
             reinterpret_cast<std::byte*>(c->data));
           c->data     = nullptr;
           std::ignore = c->state.mark_empty();  // also clears the populated extent
+          c->reset_eviction_priority(priority);
           ++reclaimed;
           _counters.evictions.fetch_add(1, std::memory_order_relaxed);
         }
