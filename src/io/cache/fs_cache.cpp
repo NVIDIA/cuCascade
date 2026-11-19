@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -182,6 +183,7 @@ reclaim_outcome reclaim_chunk_buffers(
     }
     if (only_unsubscribed && snap.subscribers() != 0) { continue; }
     if (before_claim != nullptr && *before_claim) { (*before_claim)(*c); }
+    auto const priority = c->eviction_priority.load(std::memory_order_relaxed);
     chunk_state::value prior{};
     if (!c->state.mark_evicting(only_unsubscribed, prior)) {
       ++outcome.stuck;  // pinned, loading, or already being evicted by someone else
@@ -196,6 +198,7 @@ reclaim_outcome reclaim_chunk_buffers(
       assert(restored && "only this claimant can move the chunk out of evicting");
       continue;
     }
+    c->reset_eviction_priority(priority);
     claimed.push_back(c);  // capacity reserved at creation: one per slot
   }
   std::ranges::sort(claimed, {}, node_of);
@@ -669,7 +672,8 @@ std::size_t fs_cache::retired_generation_count() const noexcept
 
 cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
                                                     std::span<const byte_range> ranges,
-                                                    std::optional<int> gpu_id)
+                                                    std::optional<int> gpu_id,
+                                                    std::uint8_t eviction_priority)
 {
   if (!_armed) { return cache_handle(); }
 
@@ -789,6 +793,12 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
   }
   chunks_to_fetch.resize(count);
   desired.resize(count);
+  // Raise (never lower) the eviction priority of every chunk this request names.
+  for (auto* c : chunks_to_fetch) {
+    auto cur = c->eviction_priority.load(std::memory_order_relaxed);
+    while (cur < eviction_priority && !c->eviction_priority.compare_exchange_weak(
+                                        cur, eviction_priority, std::memory_order_relaxed)) {}
+  }
   req.required_fills = std::make_shared<const std::vector<chunk_fill>>(std::move(desired));
   req.chunks         = subscribed;
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
@@ -1722,6 +1732,8 @@ void fs_cache::evict_loop(const std::stop_token& st)
   // Reclaimed buffers grouped by their origin NUMA node so each group can be
   // returned to the arena it came from.
   std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
+  // Reclaim candidates by eviction priority, refilled every round.
+  std::array<std::vector<cached_chunk*>, cached_chunk::eviction_priority_levels> by_priority;
   while (!_shutting_down && !st.stop_requested()) {
     cache_request entry;
     _eviction_queue.wait_dequeue(entry);
@@ -1833,7 +1845,10 @@ void fs_cache::evict_loop(const std::stop_token& st)
       need = std::numeric_limits<size_t>::max();
     } else {
       if (_pool->should_start_evicting()) {
-        need = static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
+        need = std::max<size_t>(
+          1,
+          static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) *
+                              _cfg.eviction_batch_fraction));
       }
       // Rounded up: freeing whole chunks is the only granularity there is, so a
       // demand for part of one still costs the whole thing.  Without adding first,
@@ -1859,12 +1874,27 @@ void fs_cache::evict_loop(const std::stop_token& st)
     // is still subscribed to is not idle.
     size_t reclaimed   = 0;
     int const n_passes = _cfg.dispose_on_idle ? 1 : 2;
+    // Chunks carry an eviction priority (raised by the requests that name them); lower priorities
+    // are reclaimed first, and within one priority the oldest request first. One sweep sorts the
+    // chunks that hold a buffer into a bucket per priority, keeping that order within each.
+    for (auto& bucket : by_priority) {
+      bucket.clear();
+    }
+    for (auto& er : eviction_batch) {
+      if (!er.released || !er.req || !er.req.chunks) { continue; }
+      for (cached_chunk* c : *er.req.chunks) {
+        if (!c->state.load().is_reclaimable()) { continue; }
+        by_priority[c->eviction_priority.load(std::memory_order_relaxed)].push_back(c);
+      }
+    }
     for (int pass = 0; pass < n_passes && reclaimed < need; ++pass) {
       bool const respect_subscribers = (pass == 0);
-      for (auto& er : eviction_batch) {
-        if (!er.released || !er.req || !er.req.chunks) { continue; }
-        for (cached_chunk* c : *er.req.chunks) {
+      for (std::size_t level = 0; level < by_priority.size() && reclaimed < need; ++level) {
+        auto const priority = static_cast<std::uint8_t>(level);
+        for (cached_chunk* c : by_priority[level]) {
           if (reclaimed >= need) { break; }
+          // A request raised it since the sweep: not a candidate this round.
+          if (c->eviction_priority.load(std::memory_order_relaxed) != priority) { continue; }
           // A single relaxed load answers the whole question: does this chunk
           // hold a reclaimable buffer, and is anybody still subscribed to it?
           auto const snap = c->state.load();
@@ -1876,6 +1906,7 @@ void fs_cache::evict_loop(const std::stop_token& st)
             reinterpret_cast<std::byte*>(c->data));
           c->data     = nullptr;
           std::ignore = c->state.mark_empty();  // also clears the populated extent
+          c->reset_eviction_priority(priority);
           ++reclaimed;
           _counters.evictions.fetch_add(1, std::memory_order_relaxed);
         }
