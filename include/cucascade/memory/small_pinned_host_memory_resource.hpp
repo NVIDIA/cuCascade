@@ -61,6 +61,11 @@ class small_pinned_host_memory_resource {
   /// Requests larger than this use pageable memory.
   static constexpr std::size_t MAX_SLAB_SIZE = 8192;
 
+  /// Most pending slabs a slab allocation checks while looking for one whose
+  /// GPU use has finished. Past this it takes the most recently freed slab and
+  /// waits, which bounds the driver calls made under the pool's mutex.
+  static constexpr std::size_t MAX_READINESS_QUERIES = 64;
+
   /**
    * @brief Construct with the upstream fixed-size host memory resource.
    *
@@ -81,7 +86,11 @@ class small_pinned_host_memory_resource {
    *
    * For @p bytes <= MAX_SLAB_SIZE: rounds up to the next slab boundary
    * (512 / 1 KB / 2 KB / 4 KB / 8 KB) and returns a pointer from the matching
-   * free list, expanding the pool from upstream if the list is empty.
+   * free list, expanding the pool from upstream if the list is empty. A free
+   * slab whose previous GPU use has finished is preferred and handed out
+   * without a wait, so @p stream waits on another stream's or device's work
+   * only when none of the MAX_READINESS_QUERIES most recently freed slabs of
+   * that size is ready.
    *
    * For @p bytes > MAX_SLAB_SIZE: falls back to cudaMallocHost (pinned).
    */
@@ -143,7 +152,8 @@ class small_pinned_host_memory_resource {
   static std::size_t slab_index_for(std::size_t bytes) noexcept;
 
   /// Populate the free list for slab @p idx by acquiring one upstream block.
-  /// Must be called with mutex_ held.
+  /// If it throws, no slab was added and the block went back upstream. Must be
+  /// called with mutex_ held.
   void expand_pool_locked(std::size_t slab_idx);
 
   /// A free slab plus, when it was just deallocated, a CUDA event recorded on
@@ -163,6 +173,24 @@ class small_pinned_host_memory_resource {
     cudaEvent_t ready_event;
     int event_device;
   };
+
+  /// A free slab picked by select_slab_locked. @c ready is true when the slab's
+  /// previous GPU use is known to have finished: it has no event, or its event
+  /// was seen complete. Otherwise the reusing stream must wait on its event.
+  struct slab_choice {
+    std::vector<free_slab>::iterator slab;
+    bool ready;
+  };
+
+  /// The free slab to hand out next from a non-empty @p free_list: the most
+  /// recently freed one with no pending GPU use (no event, or an event that
+  /// has completed), or the most recently freed one if none is found within
+  /// MAX_READINESS_QUERIES readiness queries, which is not ready. Leaves the
+  /// list unchanged, so a throw loses neither a slab nor its event. Must be
+  /// called with mutex_ held.
+  /// @throws cucascade::cuda_error if a readiness query fails with anything
+  /// other than cudaErrorNotReady.
+  static slab_choice select_slab_locked(std::vector<free_slab>& free_list);
 
   /// The device @p stream belongs to, or the current device if that cannot be
   /// determined. Events must be created on, and recorded against, this device.
