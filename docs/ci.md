@@ -36,15 +36,16 @@ The required `check` job succeeds only when lint, build, and test jobs all succe
 ## Multi-GPU qualification
 
 Merge groups also run `multi-gpu-test` on `linux-amd64-gpu-t4-latest-2`, using the
-existing CUDA 13 stable build artifact after all builds succeed. The job records
-hardware and topology, then runs `[multi-device]` in the core, cuDF, and topology
-test executables. The core peer-access tests verify real transfers in both
-directions; unsupported hardware, any skipped case or section, empty selection,
-process failure, or timeout fails the job.
+existing CUDA 13 stable build artifact after all builds succeed. The job runs
+`[multi-device]` in the core, cuDF, and topology test executables. The core
+peer-access tests verify real transfers in both directions; unsupported hardware,
+any skipped case or section, empty selection, process failure, or timeout fails
+the job.
 
 This qualification job is initially outside the required `check`. A green `check`
 does not establish multi-GPU coverage until qualification is complete and the job
-is added to that summary. Inspect the separate job and its diagnostics artifact.
+is added to that summary. Inspect the separate job and its diagnostics artifact,
+when available.
 
 After building, run the checks in the matching Pixi environment. For the default
 build:

@@ -148,17 +148,7 @@ jobs:
     runs-on: linux-amd64-gpu-t4-latest-2
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Record multi-GPU hardware
-        run: |
-          mkdir -p build/release/multi-gpu-results
-          {
-            printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES-<unset>}"
-            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv
-            nvidia-smi topo -m
-          } > build/release/multi-gpu-results/hardware.txt
-          cat build/release/multi-gpu-results/hardware.txt
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
@@ -198,7 +188,7 @@ jobs:
             echo "## Multi-GPU tests: CUDA 13, stable RAPIDS"
             echo "Test result: **${TEST_RESULT}**"
             echo
-            echo "[Download hardware details and test reports](${ARTIFACT_URL})"
+            echo "[Download test reports](${ARTIFACT_URL})"
           } >> "$GITHUB_STEP_SUMMARY"
 
   check:
