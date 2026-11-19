@@ -41,6 +41,13 @@ class uring_ioctx : public templated_ioctx<uring_reactor> {
   /// the reactors themselves — see @c templated_ioctx.
   uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx);
 
+  /// Build one reactor per placement of @p layout, all sharing @p ctx.  Each
+  /// reactor stages through its placement's pinned resource (the context's when
+  /// it has none) and pins its worker to the placement's CPUs; device requests
+  /// prefer the reactors of their GPU's NUMA node (see
+  /// @c templated_ioctx::next_reactor).
+  uring_ioctx(reactor_layout const& layout, std::shared_ptr<uring_reactor::reactor_context> ctx);
+
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
 
   /// One gauge snapshot per reactor, in reactor order.  Each call restarts the

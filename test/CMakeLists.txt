@@ -35,14 +35,14 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     memory/test_pool_peer_access.cpp
     memory/test_pool_peer_access_regression.cpp
     memory/test_reservation_aware_resource_adaptor.cpp
+    memory/test_remote_memory_space.cpp
     memory/test_reservation_manager_configurator.cpp
     memory/test_small_pinned_host_memory_resource.cpp
     memory/test_gpu_kernels.cu
     # Data tests
     data/test_data_repository.cpp
     data/test_data_repository_manager.cpp
-    data/test_disk_io_backend.cpp
-    data/test_io_worker.cpp
+    data/test_disk_memory_space.cpp
     # Logging tests
     log/test_logging.cpp
     log/test_logging_pruned.cpp
@@ -93,6 +93,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_io_utils.cpp
     io/test_object_identity.cpp
     io/test_semi_future_callback.cpp
+    io/test_null_stream_ptds.cpp
+    io/test_reactor_placement.cpp
     io/test_templated_ioctx.cpp
     io/test_thread_pool_construction.cpp
     io/test_tiered_queue.cpp
@@ -109,13 +111,20 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_rest_pool_plan.cpp
     io/rest/test_rest_read_robustness.cpp
     io/rest/test_rest_validation_tag.cpp
+    io/rest/test_rest_delete.cpp
+    io/rest/test_rest_write.cpp
     io/rest/test_shared_byte_span.cpp
+    io/rest/s3/test_loopback_s3_server.cpp
+    io/rest/s3/test_multipart.cpp
     io/rest/s3/test_sigv4.cpp
     io/rest/s3/test_sigv4_authorizer.cpp
+    io/rest/s3/test_sigv4_write.cpp
     io/rest/s3/test_static_credentials.cpp
+    io/rest/s3/test_upload_state.cpp
     io/rest/net/test_net_dns.cpp
     io/rest/net/test_net_transport.cpp
     io/uring/test_uring_readv.cpp
+    io/uring/test_uring_write.cpp
     # Utils
     # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp
@@ -126,6 +135,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
             io/test_io_request.cpp)
+  # A PTDS-built caller must still get legacy null-stream I/O ordering.
+  set_source_files_properties(
+    io/test_null_stream_ptds.cpp PROPERTIES COMPILE_DEFINITIONS
+                                            CUDA_API_PER_THREAD_DEFAULT_STREAM)
   # Tests of the io_uring REST transport modules.
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)
@@ -133,6 +146,17 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   # them from src/.
   target_include_directories(cucascade_io_tests
                              PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+  # The cuFile backend exists only when cufile.h was found
+  # (CUCASCADE_HAS_CUFILE); see src/io/CMakeLists.txt.  It does not depend on
+  # cudf.
+  if(CUCASCADE_CUFILE_INCLUDE_DIR)
+    target_sources(
+      cucascade_io_tests
+      PRIVATE io/cufile/test_cufile_platform.cpp
+              io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp
+              io/cufile/test_cufile_write.cpp)
+  endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
                                                       CUDA_STANDARD_REQUIRED ON)
@@ -159,7 +183,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_data_batch.cpp
     data/test_data_representation.cpp
     data/test_disk_host_converters.cpp
+    data/test_disk_io_context.cpp
+    data/test_disk_randomized.cpp
     data/test_gpu_disk_converters.cpp
+    data/test_remote_converters.cpp
+    data/test_remote_io_context.cpp
     data/test_representation_converter.cpp
     cudf/test_gpu_to_gpu_converter.cpp
     cudf/test_release_table_stream.cpp
@@ -175,7 +203,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
               cudf/test_cache_read_arbitration.cpp
               cudf/test_datasource_read_lifetime.cpp
               cudf/test_dispose_eviction.cpp
-              cudf/test_explicit_eviction.cpp)
+              cudf/test_explicit_eviction.cpp
+              cudf/test_write_cache_invalidation.cpp)
   endif()
 
   set_target_properties(cucascade_cudf_tests
@@ -199,15 +228,19 @@ endif()
 # Create topology discovery test executable
 add_executable(
   cucascade_topology_discovery_tests
-  memory/test_topology_discovery.cpp memory/test_net_topology.cpp
-  unittest_topology_discovery.cpp)
+  memory/test_path_storage.cpp memory/test_topology_discovery.cpp
+  memory/test_net_topology.cpp unittest_topology_discovery.cpp)
 set_target_properties(cucascade_topology_discovery_tests
                       PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
 # Set include directories
 target_include_directories(
-  cucascade_topology_discovery_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                                             ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  cucascade_topology_discovery_tests
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+          ${CMAKE_CURRENT_SOURCE_DIR}/utils
+          # Tests of src-private helpers (memory/detail/...) include them from
+          # src/.
+          ${PROJECT_SOURCE_DIR}/src)
 
 # Link dependencies
 target_link_libraries(

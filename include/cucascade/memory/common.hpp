@@ -100,10 +100,11 @@ class pool_peer_access_result {
  * Ordered roughly by performance (fastest to slowest access).
  */
 enum class Tier : int32_t {
-  GPU,   // GPU device memory (fastest but limited)
-  HOST,  // Host system memory (fast, larger capacity)
-  DISK,  // Disk/storage memory (slowest but largest capacity)
-  SIZE   // Value = size of the enum, allows code to be more dynamic
+  GPU,     // GPU device memory (fastest but limited)
+  HOST,    // Host system memory (fast, larger capacity)
+  DISK,    // Local disk/storage (slower, large capacity)
+  REMOTE,  // Remote object store, e.g. S3 (slowest, effectively unbounded)
+  SIZE     // Value = size of the enum, allows code to be more dynamic
 };
 
 /**

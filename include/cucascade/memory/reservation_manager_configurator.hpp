@@ -23,6 +23,7 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <list>
+#include <memory>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -160,11 +161,32 @@ class reservation_manager_configurator {
 
   // --- disk settings ---
 
-  /// \brief set the function that takes in the numa node id and create cpu memory resource
-  /// @param mr_fn Function to create CPU memory resource.
+  /// \brief add a DISK memory space backed by files under a mount point
+  /// @param uuid Disk memory space id.
+  /// @param capacity Capacity of the disk memory space in bytes.
+  /// @param mounting_point Directory the space's files are created in.
+  /// @param io_context io context serving the space's files (must be started and support
+  ///        writes); null adopts the process-shared default on first use.
   builder_reference& set_disk_mounting_point(int uuid,
                                              std::size_t capacity,
-                                             std::string mounting_point);
+                                             std::string mounting_point,
+                                             std::shared_ptr<io::ioctx> io_context = nullptr);
+
+  // --- remote settings ---
+
+  /// \brief add a REMOTE memory space backed by objects under an object-store prefix
+  /// @param remote_id REMOTE memory space id.
+  /// @param uri_prefix Where the space's objects live, `s3://bucket[/prefix]`; validated and
+  ///        normalized with validate_remote_uri_prefix().
+  /// @param capacity Bound on the bytes of spills in flight (not on the bytes stored).
+  /// @param io_context io context serving the space's objects (a started, write-capable REST
+  ///        context, see make_remote_io_context()); null: set it later with
+  ///        memory_space::set_io_context() (until then the REMOTE converters throw).
+  /// @throws std::invalid_argument if @p uri_prefix is malformed.
+  builder_reference& add_remote_space(int remote_id,
+                                      std::string uri_prefix,
+                                      std::size_t capacity = unbounded_remote_capacity,
+                                      std::shared_ptr<io::ioctx> io_context = nullptr);
 
   /// \brief build the memory space configurations based on the provided system topology
   /// @param topology System topology information.
@@ -254,7 +276,8 @@ class reservation_manager_configurator {
   mutable DeviceMemoryResourceFactoryFn _cpu_mr_fn{};
   std::optional<bool> _host_memory_portability;
 
-  std::vector<std::tuple<int, std::size_t, std::string>> _disk_mounting_points{};
+  std::vector<disk_memory_space_config> _disk_mounting_points{};
+  std::vector<remote_memory_space_config> _remote_spaces{};
 };
 
 }  // namespace memory

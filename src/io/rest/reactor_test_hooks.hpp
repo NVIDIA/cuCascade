@@ -45,10 +45,28 @@ struct reactor_events {
   /// Called right before a data GET is handed to the transport (worker thread); a throw is
   /// treated as a failure of the transport's submit.
   std::function<void(std::string_view key)> before_get_submit;
+  /// An S3 write call attempt (PUT, CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
+  /// the commit-recovery HEAD) was handed to the transport (worker thread): its kind
+  /// ("put_object", "create_upload", "upload_part", "complete_upload", "head_object"), key,
+  /// attempt (0 = first, retries of every kind counted) and the worker's wait count.
+  std::function<void(
+    std::string_view kind, std::string_view key, std::size_t attempt, std::uint64_t waits)>
+    on_call_started;
+  /// An S3 write call attempt completed, before its retry or follow-up is scheduled: kind, key,
+  /// attempt, HTTP status (0 = transport failure), wait count.
+  std::function<void(std::string_view kind,
+                     std::string_view key,
+                     std::size_t attempt,
+                     unsigned status,
+                     std::uint64_t waits)>
+    on_call_finished;
 };
 
 /// Install @p events (nullptr removes them).  Not synchronized with running reactors: install
 /// before starting the reactor under test and remove after shutting it down.
 void set_reactor_events(reactor_events const* events) noexcept;
+
+/// The installed events (nullptr when none); for the worker.
+[[nodiscard]] reactor_events const* current_reactor_events() noexcept;
 
 }  // namespace cucascade::io::rest::testing
