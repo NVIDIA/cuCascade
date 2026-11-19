@@ -865,11 +865,16 @@ std::string get_hostname()
 }
 
 /**
- * @brief Read the total and free memory of a NUMA node.
+ * @brief Read the total, free and available memory of a NUMA node.
  *
  * Parses /sys/devices/system/node/node<id>/meminfo, whose lines have the form
  * "Node 0 MemTotal:       263950224 kB". Values are reported in kB and converted
  * to bytes. Missing entries are reported as 0.
+ *
+ * The per-node file has no `MemAvailable` entry, so available memory is estimated as
+ * `MemFree` plus what the kernel can reclaim on demand: the file-backed page cache
+ * (`Active(file)` + `Inactive(file)`) and reclaimable slab (`SReclaimable`). It stays 0
+ * when `MemFree` is not reported.
  *
  * @param numa_path Path to the NUMA node directory.
  * @param info NUMA node info to populate.
@@ -879,6 +884,8 @@ void read_numa_node_memory(fs::path const& numa_path, numa_topology_info& info)
   std::ifstream meminfo(numa_path / "meminfo");
   if (!meminfo.is_open()) { return; }
 
+  std::size_t reclaimable = 0;
+  bool has_free           = false;
   std::string line;
   while (std::getline(meminfo, line)) {
     // Each line is "Node <id> <key>: <value> kB".
@@ -888,7 +895,9 @@ void read_numa_node_memory(fs::path const& numa_path, numa_topology_info& info)
     std::size_t const key_end   = colon;
     std::size_t const key_start = line.find_last_of(' ', key_end) + 1;
     std::string const key       = line.substr(key_start, key_end - key_start);
-    if (key != "MemTotal" && key != "MemFree") { continue; }
+    bool const is_reclaimable =
+      key == "Active(file)" || key == "Inactive(file)" || key == "SReclaimable";
+    if (key != "MemTotal" && key != "MemFree" && !is_reclaimable) { continue; }
 
     std::size_t value_kb = 0;
     try {
@@ -899,10 +908,15 @@ void read_numa_node_memory(fs::path const& numa_path, numa_topology_info& info)
 
     if (key == "MemTotal") {
       info.memory_capacity = value_kb * 1024;
-    } else {
+    } else if (key == "MemFree") {
       info.free_memory = value_kb * 1024;
+      has_free         = true;
+    } else {
+      reclaimable += value_kb * 1024;
     }
   }
+
+  if (has_free) { info.available_memory = info.free_memory + reclaimable; }
 }
 
 /**

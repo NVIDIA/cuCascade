@@ -98,8 +98,11 @@ struct numa_topology_info {
   int id{-1};                      ///< NUMA node ID.
   std::size_t memory_capacity{0};  ///< Total memory of the node in bytes (0 if unknown).
   std::size_t free_memory{0};      ///< Currently free memory of the node in bytes (0 if unknown).
-  bool has_cpus{false};            ///< Whether any CPU is assigned to this node.
-  bool is_device_memory{false};    ///< Whether this node is device memory rather than host memory.
+  /// Memory obtainable without swapping, in bytes (0 if unknown): `free_memory` plus the
+  /// file-backed page cache and reclaimable slab, which the kernel gives up on demand.
+  std::size_t available_memory{0};
+  bool has_cpus{false};          ///< Whether any CPU is assigned to this node.
+  bool is_device_memory{false};  ///< Whether this node is device memory rather than host memory.
 };
 
 /**
@@ -194,6 +197,23 @@ struct system_topology_info {
     auto const* node = find_numa_node(numa_id);
     if (node == nullptr || node->free_memory == 0) { return std::nullopt; }
     return node->free_memory;
+  }
+
+  /**
+   * @brief Get the available memory of a NUMA node.
+   *
+   * Available memory is free memory plus what the kernel reclaims on demand (file-backed
+   * page cache and reclaimable slab); it is the per-node counterpart of `MemAvailable`.
+   *
+   * @param numa_id NUMA node ID to look up.
+   * @return Available memory of the node in bytes, or `std::nullopt` if the node was not
+   *         discovered or the kernel did not report its free memory.
+   */
+  [[nodiscard]] std::optional<std::size_t> get_numa_available_memory(int numa_id) const
+  {
+    auto const* node = find_numa_node(numa_id);
+    if (node == nullptr || node->available_memory == 0) { return std::nullopt; }
+    return node->available_memory;
   }
 
   /**

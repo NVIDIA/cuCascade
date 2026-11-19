@@ -247,6 +247,9 @@ TEST_CASE("Topology Discovery reports NUMA node capacities", "[hw_topology]")
     // /sys/devices/system/node/node<id>/meminfo always reports MemTotal and MemFree.
     REQUIRE(node.memory_capacity > 0);
     REQUIRE(node.free_memory <= node.memory_capacity);
+    // Available memory adds reclaimable page cache and slab on top of free memory.
+    REQUIRE(node.available_memory >= node.free_memory);
+    REQUIRE(node.available_memory <= node.memory_capacity);
 
     // A node with memory but no CPUs is device memory (GPU HBM, CXL), not host memory.
     REQUIRE(node.is_device_memory == !node.has_cpus);
@@ -254,6 +257,7 @@ TEST_CASE("Topology Discovery reports NUMA node capacities", "[hw_topology]")
     REQUIRE(topology.find_numa_node(node.id) != nullptr);
     REQUIRE(topology.get_numa_memory_capacity(node.id).value() == node.memory_capacity);
     REQUIRE(topology.get_numa_free_memory(node.id).value_or(0) == node.free_memory);
+    REQUIRE(topology.get_numa_available_memory(node.id).value_or(0) == node.available_memory);
     if (!node.is_device_memory) { summed_host_capacity += node.memory_capacity; }
   }
 
