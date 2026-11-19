@@ -423,6 +423,19 @@ static memory::column_metadata plan_column_copy(const cudf::column_view& col,
   return meta;
 }
 
+static std::size_t plan_host_copy(const cudf::table_view& view,
+                                  ::cuda::stream_ref stream,
+                                  std::vector<memory::column_metadata>* columns)
+{
+  if (columns) { columns->reserve(static_cast<std::size_t>(view.num_columns())); }
+  std::size_t bytes = 0;
+  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+    auto column = plan_column_copy(view.column(i), bytes, stream);
+    if (columns) { columns->push_back(std::move(column)); }
+  }
+  return bytes;
+}
+
 /**
  * @brief Append block-boundary-split copy ops for @p size device bytes → host allocation.
  *
@@ -492,19 +505,12 @@ std::unique_ptr<idata_representation> convert_gpu_to_host_fast(
   memory::reservation* reservation)
 {
   nvtx_scope convert_range{"convert:gpu_to_host"};
-  auto& gpu_source = source.cast<gpu_table_representation>();
-  // Planning reads string offsets on the device, so it must already be ordered after the writer.
+  auto const& gpu_source = source.cast<gpu_table_representation>();
   gpu_source.wait_for_writer(stream);
   const cudf::table_view view = gpu_source.get_table_view();
 
   // --- Pass 1: plan the allocation layout ---
-  std::size_t current_offset = 0;
-  std::vector<memory::column_metadata> columns;
-  columns.reserve(static_cast<std::size_t>(view.num_columns()));
-  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-    columns.push_back(plan_column_copy(view.column(i), current_offset, stream));
-  }
-  const std::size_t total_size = current_offset;
+  auto [columns, total_size] = plan_gpu_to_host_copy(view, stream);
 
   // --- Pass 2: allocate pinned host blocks ---
   auto mr = target_memory_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
@@ -1880,6 +1886,22 @@ static std::unique_ptr<idata_representation> convert_disk_to_gpu(
 }
 
 }  // namespace
+
+gpu_to_host_copy_layout plan_gpu_to_host_copy(const cudf::table_view& view,
+                                              ::cuda::stream_ref stream)
+{
+  gpu_to_host_copy_layout layout;
+  layout.bytes = plan_host_copy(view, stream, &layout.columns);
+  return layout;
+}
+
+std::size_t gpu_to_host_staging_bytes(const gpu_table_representation& source,
+                                      ::cuda::stream_ref stream)
+{
+  // Planning reads string offsets on the device, so it must run after the writer.
+  source.wait_for_writer(stream);
+  return plan_host_copy(source.get_table_view(), stream, nullptr);
+}
 
 void register_builtin_converters(representation_converter_registry& registry)
 {

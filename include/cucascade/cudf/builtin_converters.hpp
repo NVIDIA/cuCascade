@@ -17,9 +17,52 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/column_metadata.hpp>
+
+#include <cstddef>
+#include <vector>
+
+namespace cudf {
+class table_view;
+}
 
 namespace cucascade {
+
+class gpu_table_representation;
+
+/**
+ * @brief Column buffer offsets and payload size before rounding to HOST blocks.
+ */
+struct gpu_to_host_copy_layout {
+  std::vector<memory::column_metadata> columns;
+  std::size_t bytes;
+};
+
+/**
+ * @brief Plan the HOST buffer layout for a GPU table.
+ *
+ * @param view GPU table view whose columns have zero offsets
+ * @param stream CUDA stream used to read column metadata
+ * @return Column buffer offsets and total payload size before rounding to HOST blocks
+ * @pre Keep the source alive and order @p stream after its writer.
+ */
+[[nodiscard]] gpu_to_host_copy_layout plan_gpu_to_host_copy(const cudf::table_view& view,
+                                                            ::cuda::stream_ref stream);
+
+/**
+ * @brief Calculate the GPU-to-HOST copy size.
+ *
+ * Orders the metadata reads after the source's writer.
+ *
+ * @param source GPU table representation to size
+ * @param stream CUDA stream used to read column metadata
+ * @return Number of payload bytes before rounding to HOST blocks
+ * @pre Hold the source batch against mutation for the duration of the call.
+ */
+[[nodiscard]] std::size_t gpu_to_host_staging_bytes(const gpu_table_representation& source,
+                                                    ::cuda::stream_ref stream);
 
 /**
  * @brief Initialize the cudf-backed built-in representation converters.
