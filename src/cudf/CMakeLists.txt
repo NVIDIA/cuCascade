@@ -20,6 +20,8 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_data_representation.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/host_data_representation.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/bandwidth_profiler.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/disk_io.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/disk_io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter_builtins.cpp)
 
 # The cudf::io::datasource bridge over the cudf-free io core — only built when
