@@ -28,7 +28,9 @@
 #include <concepts>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <variant>
@@ -42,8 +44,12 @@
 
 namespace cucascade {
 
-// Forward declaration for disk I/O backend owned by DISK-tier memory spaces
-class idisk_io_backend;
+// Forward declaration: DISK- and REMOTE-tier memory spaces hold the io context that serves their
+// files / objects. The core library only stores the pointer; all I/O through it happens in the
+// cucascade-cudf layer.
+namespace io {
+class ioctx;
+}  // namespace io
 
 namespace memory {
 
@@ -71,16 +77,20 @@ class memory_space {
    */
   explicit memory_space(const gpu_memory_space_config& config);
   explicit memory_space(const host_memory_space_config& config);
-  explicit memory_space(const disk_memory_space_config& config);
-
   /**
-   * Construct a DISK-tier memory_space with a specific I/O backend.
+   * Construct a DISK-tier memory_space.
    *
-   * @param config Configuration for the disk memory space
-   * @param io_backend The I/O backend to use for this disk space (must not be null)
+   * The io context in @p config (if any) serves this space's files; without one, the DISK
+   * converters adopt the process-shared default on first use (see get_or_init_io_context()).
    */
-  memory_space(const disk_memory_space_config& config,
-               std::shared_ptr<idisk_io_backend> io_backend);
+  explicit memory_space(const disk_memory_space_config& config);
+  /**
+   * Construct a REMOTE-tier memory_space (objects under an object-store prefix).
+   *
+   * @throws std::invalid_argument if `config.uri_prefix` is malformed
+   *         (see validate_remote_uri_prefix()); the space keeps the normalized prefix.
+   */
+  explicit memory_space(const remote_memory_space_config& config);
 
   // Disable copy/move to ensure stable addresses for reservations
   memory_space(const memory_space&)            = delete;
@@ -151,8 +161,48 @@ class memory_space {
   /** @brief Get the mount path for a DISK tier memory space. Throws if not DISK tier. */
   [[nodiscard]] std::string_view get_disk_mount_path() const;
 
-  /** @brief Get the I/O backend for a DISK tier memory space. Throws if not DISK tier. */
-  [[nodiscard]] idisk_io_backend& get_io_backend() const;
+  /**
+   * @brief Get the (normalized) object URI prefix of a REMOTE memory space, e.g.
+   *        "s3://bucket/spill".
+   * @throws std::logic_error if this is not a REMOTE-tier memory space.
+   */
+  [[nodiscard]] std::string_view get_remote_uri_prefix() const;
+
+  /**
+   * @brief Get the io context that serves this DISK or REMOTE space's files / objects.
+   *
+   * @return The configured or adopted context; null if none has been set yet.
+   * @throws std::logic_error if this is neither a DISK- nor a REMOTE-tier memory space.
+   */
+  [[nodiscard]] std::shared_ptr<io::ioctx> get_io_context() const;
+
+  /**
+   * @brief Replace the io context that serves this DISK or REMOTE space's files / objects.
+   *
+   * Thread-safe. Conversions already in flight keep using the context they started with (they
+   * hold their own reference to it), and so do REMOTE representations created before (they
+   * delete their objects through it). The context must be started and support writes.
+   *
+   * @param context The new context (must not be null).
+   * @throws std::logic_error if this is neither a DISK- nor a REMOTE-tier memory space.
+   * @throws std::invalid_argument if @p context is null.
+   */
+  void set_io_context(std::shared_ptr<io::ioctx> context);
+
+  /**
+   * @brief Get the io context, installing `make_default()` first when none is set.
+   *
+   * Thread-safe: `make_default` runs at most once per successful installation, under this space's
+   * lock, so concurrent callers all observe the same context. (The REMOTE converters do not use
+   * it: a REMOTE space has no default context.)
+   *
+   * @param make_default Factory for the context to adopt when none is set.
+   * @return The (possibly just installed) context; never null.
+   * @throws std::logic_error if this is neither a DISK- nor a REMOTE-tier memory space.
+   * @throws std::runtime_error if `make_default` returns null (nothing is installed).
+   */
+  std::shared_ptr<io::ioctx> get_or_init_io_context(
+    const std::function<std::shared_ptr<io::ioctx>()>& make_default) const;
 
   // Utility methods
   std::string to_string() const;
@@ -180,7 +230,10 @@ class memory_space {
   std::optional<::cuda::mr::any_resource<::cuda::mr::device_accessible>>
     _reservation_allocator_resource;
   std::unique_ptr<rmm::cuda_stream_pool> _stream_pool;
-  std::shared_ptr<idisk_io_backend> _io_backend;  ///< I/O backend for DISK tier (null for others)
+  /// io context serving a DISK or REMOTE space (null for other tiers and until set or adopted).
+  /// Mutable: get_or_init_io_context() lazily adopts a default on a const space.
+  mutable std::shared_ptr<io::ioctx> _io_context;
+  mutable std::mutex _io_context_mutex;  ///< Guards _io_context
 };
 
 /**

@@ -7,7 +7,7 @@ A high-performance GPU memory management library for data-intensive applications
 
 
 **Key Features:**
-- **Tiered Memory Management**: Seamlessly manage GPU (fastest), pinned host (medium), and disk (largest capacity) memory tiers, provides numa aware allocators
+- **Tiered Memory Management**: Seamlessly manage GPU (fastest), pinned host (medium), disk (large capacity) and remote object-store (S3, effectively unbounded) memory tiers, provides numa aware allocators
 - **Memory Reservation System**: Avoid oversubscribing your GPU by making reservations and using allocators that respect reservations
 - **Hardware Topology Discovery**: Automatic detection of NUMA regions and GPU-CPU affinity for optimal memory placement
 - **Stream-Aware Tracking**: Per-stream memory usage tracking and reservation enforcement
