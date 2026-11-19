@@ -16,6 +16,7 @@
  */
 
 #include "utils/cudf_test_utils.hpp"
+#include "utils/disk_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
 
 #include <cucascade/cudf/builtin_converters.hpp>
@@ -59,24 +60,18 @@ auto& shared_host_space()
   static auto s = test::make_mock_memory_space(memory::Tier::HOST, 0);
   return s;
 }
-auto& shared_disk_space()
-{
-  static auto s = test::make_mock_memory_space(memory::Tier::DISK, 0);
-  return s;
-}
 ::cuda::stream_ref shared_stream()
 {
   static rmm::cuda_stream s;
   return s;
 }
 
-/// Round-trip test helper: GPU -> host_data -> disk -> host_data -> GPU, compare tables.
+/// Round-trip test helper: GPU -> host_data -> disk -> host_data -> GPU, compare tables. The
+/// disk leg runs once per disk io stack (the adopted default and every forced backend).
 void round_trip_test(std::unique_ptr<cudf::table> original_table)
 {
-  auto stream      = shared_stream();
   auto& gpu_space  = shared_gpu_space();
   auto& host_space = shared_host_space();
-  auto& disk_space = shared_disk_space();
 
   representation_converter_registry registry;
   register_builtin_converters(registry);
@@ -89,21 +84,34 @@ void round_trip_test(std::unique_ptr<cudf::table> original_table)
   auto host_rep =
     registry.convert<host_data_representation>(*gpu_rep, host_space.get(), shared_stream());
 
-  // host_data -> disk
-  auto disk_rep =
-    registry.convert<disk_data_representation>(*host_rep, disk_space.get(), shared_stream());
+  for (auto const backend : test::disk_test_backends) {
+    auto* disk_space = test::shared_disk_space_for(backend);
+    if (disk_space == nullptr) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: unavailable here");
+      continue;
+    }
+    if (!test::disk_space_can_write(*disk_space, /*device=*/false)) {
+      WARN("skipping the " << test::to_string(backend) << " disk backend: no host writes");
+      continue;
+    }
+    CAPTURE(test::to_string(backend));
 
-  // disk -> host_data
-  auto host_rep2 =
-    registry.convert<host_data_representation>(*disk_rep, host_space.get(), shared_stream());
+    // host_data -> disk (one batched host write)
+    auto disk_rep =
+      registry.convert<disk_data_representation>(*host_rep, disk_space, shared_stream());
 
-  // host_data -> GPU
-  auto gpu_rep2 =
-    registry.convert<gpu_table_representation>(*host_rep2, gpu_space.get(), shared_stream());
+    // disk -> host_data (one batched host read)
+    auto host_rep2 =
+      registry.convert<host_data_representation>(*disk_rep, host_space.get(), shared_stream());
 
-  // Compare original (from gpu_rep) with round-tripped
-  test::expect_cudf_tables_equal_on_stream(
-    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
+    // host_data -> GPU
+    auto gpu_rep2 =
+      registry.convert<gpu_table_representation>(*host_rep2, gpu_space.get(), shared_stream());
+
+    // Compare original (from gpu_rep) with round-tripped
+    test::expect_cudf_tables_equal_on_stream(
+      gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
+  }
 }
 
 /// Create a simple column of the given type with uninitialized data.
