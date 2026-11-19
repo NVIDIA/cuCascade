@@ -20,12 +20,12 @@
  * [memory_space] - Basic memory space functionality tests
  * [threading] - Multi-threaded tests
  * [gpu] - GPU-specific tests requiring CUDA
- * [.multi-device] - Tests requiring multiple GPU devices (hidden by default)
+ * [multi-device] - Tests requiring multiple GPU devices
  *
  * Running tests:
  * - Default (includes single GPU): ./test_executable
- * - Include multi-device tests: ./test_executable "[.multi-device]"
- * - Exclude multi-device tests: ./test_executable "~[.multi-device]"
+ * - Include multi-device tests: ./test_executable "[multi-device]"
+ * - Exclude multi-device tests: ./test_executable "~[multi-device]"
  * - Run all tests: ./test_executable "[memory_space]"
  */
 
@@ -306,7 +306,7 @@ TEST_CASE("Topology Discovery rejects overflow CUDA_VISIBLE_DEVICES", "[hw_topol
 }
 
 TEST_CASE("Default Topology Discovery does not initialize CUDA while visibility is widened",
-          "[hw_topology][cuda-context]")
+          "[hw_topology][cuda-context][multi-device]")
 {
   auto const child = fork();
   REQUIRE(child >= 0);
@@ -344,8 +344,7 @@ TEST_CASE("Default Topology Discovery does not initialize CUDA while visibility 
   int status = 0;
   REQUIRE(waitpid(child, &status, 0) == child);
   if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
-    SUCCEED("Skipped: requires NVML and at least two visible GPUs");
-    return;
+    SKIP("requires NVML and at least two visible GPUs");
   }
   REQUIRE(WIFEXITED(status));
   REQUIRE(WEXITSTATUS(status) == 0);
