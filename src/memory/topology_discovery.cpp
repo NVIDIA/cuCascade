@@ -27,6 +27,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -995,7 +996,80 @@ nvmlReturn_t initialize_nvml_for_current_process()
   return init_result;
 }
 
+/**
+ * @brief Decode the octal escapes the kernel applies to mountinfo path fields.
+ *
+ * The kernel writes space, tab, newline and backslash as `\040`, `\011`, `\012` and
+ * `\134`. Anything that is not a backslash followed by three octal digits is kept as is.
+ *
+ * @param field Raw mountinfo field.
+ * @return The decoded field.
+ */
+std::string unescape_mountinfo_field(std::string_view field)
+{
+  auto const is_octal = [](char c) { return c >= '0' && c <= '7'; };
+
+  std::string decoded;
+  decoded.reserve(field.size());
+  for (std::size_t i = 0; i < field.size(); ++i) {
+    if (field[i] == '\\' && i + 3 < field.size() && is_octal(field[i + 1]) &&
+        is_octal(field[i + 2]) && is_octal(field[i + 3])) {
+      int const value =
+        ((field[i + 1] - '0') << 6) | ((field[i + 2] - '0') << 3) | (field[i + 3] - '0');
+      decoded.push_back(static_cast<char>(value));
+      i += 3;
+    } else {
+      decoded.push_back(field[i]);
+    }
+  }
+  return decoded;
+}
+
+/// `/proc/self/mountinfo` name of each recognized network file system type.
+struct network_fs_type_name {
+  std::string_view name;
+  NetworkFsType type;
+};
+constexpr std::array<network_fs_type_name, 14> network_fs_type_names{{
+  {"nfs", NetworkFsType::NFS},
+  {"nfs4", NetworkFsType::NFS4},
+  {"cifs", NetworkFsType::CIFS},
+  {"smb3", NetworkFsType::SMB3},
+  {"smbfs", NetworkFsType::SMBFS},
+  {"ceph", NetworkFsType::CEPH},
+  {"lustre", NetworkFsType::LUSTRE},
+  {"gpfs", NetworkFsType::GPFS},
+  {"beegfs", NetworkFsType::BEEGFS},
+  {"glusterfs", NetworkFsType::GLUSTERFS},
+  {"afs", NetworkFsType::AFS},
+  {"fuse.glusterfs", NetworkFsType::FUSE_GLUSTERFS},
+  {"fuse.sshfs", NetworkFsType::FUSE_SSHFS},
+  {"fuse.s3fs", NetworkFsType::FUSE_S3FS},
+}};
+
+/**
+ * @brief Parse a mountinfo file system type into a network file system type.
+ *
+ * An explicit allow-list: only types known to be network-backed are recognized, so FUSE
+ * mounts in general (portals, fusectl, ...) and local pseudo file systems are not.
+ *
+ * @param fs_type File system type as written in mountinfo (e.g. "nfs4", "fuse.sshfs").
+ * @return The type; `std::nullopt` if @p fs_type is not a recognized network file system.
+ */
+std::optional<NetworkFsType> parse_network_fs_type(std::string_view fs_type)
+{
+  auto const it = std::ranges::find(network_fs_type_names, fs_type, &network_fs_type_name::name);
+  if (it == network_fs_type_names.end()) { return std::nullopt; }
+  return it->type;
+}
+
 }  // namespace
+
+std::string_view to_string(NetworkFsType type)
+{
+  auto const it = std::ranges::find(network_fs_type_names, type, &network_fs_type_name::type);
+  return it == network_fs_type_names.end() ? std::string_view{"unknown"} : it->name;
+}
 
 kernel_tls_info discover_kernel_tls(discovery_roots const& roots)
 {
@@ -1035,6 +1109,42 @@ kernel_tls_info discover_kernel_tls(discovery_roots const& roots)
   // readable /proc/modules a module cannot be told apart from a built-in.
   info.built_in = info.loaded && modules_readable && !module_listed;
   return info;
+}
+
+std::vector<network_fs_mount_info> discover_network_mounts(discovery_roots const& roots)
+{
+  std::vector<network_fs_mount_info> mounts;
+  std::ifstream mountinfo(roots.procfs_root / "proc" / "self" / "mountinfo");
+
+  // A row is
+  //   <id> <parent> <major:minor> <root> <mount point> <mount options> [<optional>...]
+  //   - <fs type> <source> <super options>
+  // Paths escape whitespace as octal, so splitting on whitespace is safe. The lone "-"
+  // separates the variable-length optional fields from the fixed tail.
+  std::string line;
+  while (std::getline(mountinfo, line)) {
+    std::istringstream row(line);
+    std::vector<std::string> tokens;
+    for (std::string token; row >> token;) {
+      tokens.push_back(std::move(token));
+    }
+    if (tokens.size() < 7) { continue; }
+
+    auto const separator = std::find(tokens.begin() + 6, tokens.end(), std::string{"-"});
+    auto const tail      = static_cast<std::size_t>(tokens.end() - separator);
+    if (tail < 3) { continue; }  // needs "-", fs type and source
+
+    auto const fs_type = parse_network_fs_type(*(separator + 1));
+    if (!fs_type) { continue; }
+
+    network_fs_mount_info mount;
+    mount.mount_point = unescape_mountinfo_field(tokens[4]);
+    mount.fs_type     = *fs_type;
+    mount.source      = unescape_mountinfo_field(*(separator + 2));
+    if (tail >= 4) { mount.options = *(separator + 3); }
+    mounts.push_back(std::move(mount));
+  }
+  return mounts;
 }
 
 bool topology_discovery::discover(NetworkDeviceVerification net_verification,
@@ -1093,8 +1203,10 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
   }
 
   topology.storage_devices = discover_storage_devices_with_topology();
+  topology.network_mounts  = discover_network_mounts();
   topology.kernel_tls      = discover_kernel_tls();
 
+  topology.all_gpus.clear();
   topology.gpus.clear();
 
   std::vector<gpu_topology_info> nvml_gpus;
@@ -1208,6 +1320,10 @@ bool topology_discovery::discover(NetworkDeviceVerification net_verification,
     gpu.id   = static_cast<unsigned int>(visible_idx);
     topology.gpus.push_back(std::move(gpu));
   }
+  for (size_t nvml_idx = 0; nvml_idx < nvml_gpus.size(); ++nvml_idx) {
+    nvml_gpus[nvml_idx].id = static_cast<unsigned int>(nvml_idx);
+  }
+  topology.all_gpus = std::move(nvml_gpus);
 
   // Do not call nvmlShutdown here — NVML is initialized once per process via
   // the static-local in this function. See the comment at the top of discover().
