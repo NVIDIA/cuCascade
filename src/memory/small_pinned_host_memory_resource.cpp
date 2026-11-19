@@ -188,25 +188,33 @@ void* small_pinned_host_memory_resource::allocate([[maybe_unused]] ::cuda::strea
   // Prefer a slab with no pending GPU use. Always taking the most recently
   // freed slab makes this stream wait on whatever the freeing stream still has
   // queued, possibly on another GPU, while older free slabs sit idle.
-  auto const chosen = select_slab_locked(free_list);
-  free_slab slab    = *chosen;
+  auto const [chosen, ready] = select_slab_locked(free_list);
+  free_slab slab             = *chosen;
   // Erasing keeps the list in the order slabs were freed, and shifts only the
   // pending slabs the search already passed.
   free_list.erase(chosen);
   // If this slab was recently deallocated, its ready_event captures the freeing
   // stream's last use (e.g. an in-flight async H2D copy still reading the slab).
-  // Make the reusing stream wait for it so we cannot overwrite the slab before
-  // that copy completes. Recording the event again (on a later deallocate) does
-  // not disturb this already-enqueued wait, so the event is safe to recycle.
   if (slab.ready_event != nullptr) {
-    // cudaStreamWaitEvent is legal across devices, so the reusing stream may
-    // belong to a different GPU than the one that recorded the event.
-    cudaError_t const wait_status = ::cudaStreamWaitEvent(stream.get(), slab.ready_event, 0);
-    if (wait_status != cudaSuccess) {
-      // The wait was not established, so returning this pointer would recreate
-      // the unordered-reuse race. Keep the slab tracked and propagate the error.
-      free_list.push_back(slab);
-      CUCASCADE_CUDA_TRY(wait_status);
+    // A slab the search saw complete needs no wait: that use has finished, and
+    // nothing records the event again while the slab is free. Waiting anyway
+    // costs a driver call under the mutex and adds a dependency, possibly on
+    // another GPU, to the reusing stream.
+    if (!ready) {
+      // Make the reusing stream wait for the event so it cannot overwrite the
+      // slab before that copy completes. Recording the event again (on a later
+      // deallocate) does not disturb this already-enqueued wait, so the event
+      // is safe to recycle. cudaStreamWaitEvent is legal across devices, so the
+      // reusing stream may belong to a different GPU than the one that
+      // recorded the event.
+      cudaError_t const wait_status = ::cudaStreamWaitEvent(stream.get(), slab.ready_event, 0);
+      if (wait_status != cudaSuccess) {
+        // The wait was not established, so returning this pointer would
+        // recreate the unordered-reuse race. Keep the slab tracked and
+        // propagate the error.
+        free_list.push_back(slab);
+        CUCASCADE_CUDA_TRY(wait_status);
+      }
     }
     release_event_locked(slab.ready_event, slab.event_device);
   }
@@ -269,7 +277,7 @@ std::size_t small_pinned_host_memory_resource::slab_index_for(std::size_t bytes)
   return SLAB_SIZES.size() - 1;
 }
 
-std::vector<small_pinned_host_memory_resource::free_slab>::iterator
+small_pinned_host_memory_resource::slab_choice
 small_pinned_host_memory_resource::select_slab_locked(std::vector<free_slab>& free_list)
 {
   // Search newest first, so the slab found is the most recently used one whose
@@ -278,21 +286,21 @@ small_pinned_host_memory_resource::select_slab_locked(std::vector<free_slab>& fr
   std::size_t queries = 0;
   for (auto candidate = free_list.end(); candidate != free_list.begin();) {
     --candidate;
-    if (candidate->ready_event == nullptr) { return candidate; }
+    if (candidate->ready_event == nullptr) { return {candidate, true}; }
     // Each query is a driver call made under the mutex every device shares, and
     // a stream stalled behind long GPU work can leave a long run of pending
     // slabs that each allocation would otherwise search past.
     if (queries == MAX_READINESS_QUERIES) { break; }
     ++queries;
     cudaError_t const status = ::cudaEventQuery(candidate->ready_event);
-    if (status == cudaSuccess) { return candidate; }
+    if (status == cudaSuccess) { return {candidate, true}; }
     // Nothing has left the list, so a failed query loses neither the slab nor
     // its event. cudaErrorNotReady only means the slab is still in use.
     if (status != cudaErrorNotReady) { CUCASCADE_CUDA_TRY(status); }
   }
   // No slab within reach is ready: fall back to the most recently freed one,
   // which the caller orders behind its event.
-  return std::prev(free_list.end());
+  return {std::prev(free_list.end()), false};
 }
 
 void small_pinned_host_memory_resource::expand_pool_locked(std::size_t slab_idx)

@@ -87,9 +87,10 @@ class small_pinned_host_memory_resource {
    * For @p bytes <= MAX_SLAB_SIZE: rounds up to the next slab boundary
    * (512 / 1 KB / 2 KB / 4 KB / 8 KB) and returns a pointer from the matching
    * free list, expanding the pool from upstream if the list is empty. A free
-   * slab whose previous GPU use has finished is preferred, so @p stream waits
-   * on another stream's or device's work only when none of the
-   * MAX_READINESS_QUERIES most recently freed slabs of that size is ready.
+   * slab whose previous GPU use has finished is preferred and handed out
+   * without a wait, so @p stream waits on another stream's or device's work
+   * only when none of the MAX_READINESS_QUERIES most recently freed slabs of
+   * that size is ready.
    *
    * For @p bytes > MAX_SLAB_SIZE: falls back to cudaMallocHost (pinned).
    */
@@ -173,16 +174,23 @@ class small_pinned_host_memory_resource {
     int event_device;
   };
 
+  /// A free slab picked by select_slab_locked. @c ready is true when the slab's
+  /// previous GPU use is known to have finished: it has no event, or its event
+  /// was seen complete. Otherwise the reusing stream must wait on its event.
+  struct slab_choice {
+    std::vector<free_slab>::iterator slab;
+    bool ready;
+  };
+
   /// The free slab to hand out next from a non-empty @p free_list: the most
   /// recently freed one with no pending GPU use (no event, or an event that
   /// has completed), or the most recently freed one if none is found within
-  /// MAX_READINESS_QUERIES readiness queries. In that case the caller must make
-  /// the reusing stream wait on the slab's event. Leaves the list unchanged, so
-  /// a throw loses neither a slab nor its event. Must be called with mutex_
-  /// held.
+  /// MAX_READINESS_QUERIES readiness queries, which is not ready. Leaves the
+  /// list unchanged, so a throw loses neither a slab nor its event. Must be
+  /// called with mutex_ held.
   /// @throws cucascade::cuda_error if a readiness query fails with anything
   /// other than cudaErrorNotReady.
-  static std::vector<free_slab>::iterator select_slab_locked(std::vector<free_slab>& free_list);
+  static slab_choice select_slab_locked(std::vector<free_slab>& free_list);
 
   /// The device @p stream belongs to, or the current device if that cannot be
   /// determined. Events must be created on, and recorded against, this device.
