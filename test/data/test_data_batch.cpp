@@ -1372,8 +1372,7 @@ TEST_CASE("reader event pools remain device-local across representation replacem
 {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
-    SUCCEED("Fewer than two CUDA devices available; skipping cross-device reader-event test");
-    return;
+    SKIP("requires at least two CUDA devices");
   }
 
   auto batch =
