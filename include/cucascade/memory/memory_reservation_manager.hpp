@@ -223,6 +223,19 @@ class memory_reservation_manager {
   memory_space* get_memory_space(Tier tier, int32_t device_id);
 
   /**
+   * @brief Get the HOST memory_space to use for pinned host memory that GPU @p gpu_device_id
+   * copies to or from.
+   *
+   * That is the HOST space on the GPU's NUMA node: the one whose device id is gpu_numa_node() of
+   * the GPU. When this manager has no HOST space on that node, or the node is unknown, it is the
+   * first HOST space in the order the spaces were configured.
+   *
+   * @param gpu_device_id CUDA device ordinal of the GPU
+   * @return The HOST space, or nullptr if this manager has no HOST space
+   */
+  [[nodiscard]] memory_space* get_host_memory_space_near_gpu(int gpu_device_id);
+
+  /**
    * Get all memory_spaces for a specific tier.
    * Returns empty vector if no spaces exist for that tier.
    */

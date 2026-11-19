@@ -34,6 +34,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/gpu_numa_node.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -47,6 +48,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <cstdlib>
+#include <initializer_list>
 #include <memory>
 #include <vector>
 
@@ -114,6 +116,65 @@ TEST_CASE("Single-Device Memory Space Access", "[memory_space]")
 
   // Verify all memory spaces are different objects
   REQUIRE(gpu_device_0 != host_numa_0);
+}
+
+TEST_CASE("A memory space knows the reservation manager that owns it", "[memory_space]")
+{
+  auto manager = createSingleDeviceMemoryManager();
+  REQUIRE(manager->get_all_memory_spaces().size() == 2);
+  for (const memory_space* space : manager->get_all_memory_spaces()) {
+    CHECK(space->get_reservation_manager() == manager.get());
+  }
+
+  // A space constructed on its own has no manager.
+  const memory_space standalone{
+    cucascade::test::malloc_host_space_config(0, 1UL << 20, 1UL << 16, 4)};
+  CHECK(standalone.get_reservation_manager() == nullptr);
+}
+
+TEST_CASE("The HOST space near a GPU is the one on its NUMA node, else the first", "[memory_space]")
+{
+  constexpr std::size_t capacity   = 1UL << 20;
+  constexpr std::size_t block_size = 1UL << 16;
+  auto make_manager                = [&](std::initializer_list<int> host_numa_ids) {
+    std::vector<memory_space_config> configs;
+    configs.emplace_back(gpu_memory_space_config{
+                     .device_id       = 0,
+                     .memory_capacity = 64UL << 20,
+                     .mr_factory_fn   = cucascade::test::make_shared_current_device_resource});
+    for (int numa_id : host_numa_ids) {
+      configs.emplace_back(
+        cucascade::test::malloc_host_space_config(numa_id, capacity, block_size, 4));
+    }
+    return std::make_unique<memory_reservation_manager>(std::move(configs));
+  };
+  // -1 on a machine that does not report the node of GPU 0.
+  int const gpu_node = cucascade::memory::gpu_numa_node(0);
+
+  SECTION("no HOST space")
+  {
+    auto manager = make_manager({});
+    CHECK(manager->get_host_memory_space_near_gpu(0) == nullptr);
+  }
+  SECTION("HOST spaces on other NUMA nodes only: the first one configured")
+  {
+    auto manager = make_manager({gpu_node + 7, gpu_node + 3});
+    CHECK(manager->get_host_memory_space_near_gpu(0) ==
+          manager->get_memory_space(Tier::HOST, gpu_node + 7));
+  }
+  SECTION("a HOST space on the GPU's NUMA node, configured last")
+  {
+    if (gpu_node < 0) { SKIP("the NUMA node of GPU 0 is unknown"); }
+    auto manager = make_manager({gpu_node + 7, gpu_node});
+    CHECK(manager->get_host_memory_space_near_gpu(0) ==
+          manager->get_memory_space(Tier::HOST, gpu_node));
+  }
+  SECTION("a GPU that does not exist: the first HOST space")
+  {
+    auto manager = make_manager({5, 2});
+    CHECK(manager->get_host_memory_space_near_gpu(1 << 20) ==
+          manager->get_memory_space(Tier::HOST, 5));
+  }
 }
 
 TEST_CASE("Downgrade decisions measure the bytes in use from the capacity", "[memory_space]")

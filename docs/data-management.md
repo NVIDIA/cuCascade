@@ -331,8 +331,42 @@ Registered via `register_builtin_converters()`:
 | `host_data_representation` | `gpu_table_representation` | Allocates `rmm::device_buffer` per column buffer, `cudaMemcpyBatchAsync` (H2D), reconstructs `cudf::column` tree |
 | `gpu_table_representation` | `host_data_packed_representation` | `cudf::pack()` on GPU -> `cudaMemcpyAsync` (D2H) to multi-block host allocation |
 | `host_data_packed_representation` | `gpu_table_representation` | `cudaMemcpyAsync` (H2D) from host blocks -> `cudf::unpack()` on device |
-| `gpu_table_representation` | `gpu_table_representation` | `cudf::pack()` -> `cudaMemcpyPeerAsync` -> `cudf::unpack()` (cross-device copy) |
+| `gpu_table_representation` | `gpu_table_representation` | Cross-GPU copy of each leaf buffer over one of two copy routes: the peer route (`cudaMemcpyPeerAsync`) or the host-staged pipeline (see below) |
 | `host_data_packed_representation` | `host_data_packed_representation` | Block-by-block `std::memcpy` + metadata copy (cross-NUMA copy) |
+
+### GPU to GPU: Copy Routes
+
+The GPU -> GPU converter rebuilds the column tree on the destination GPU and copies every leaf
+buffer (data, validity mask, offsets, chars) into a newly allocated destination buffer. It does not
+pack or unpack the table. The bytes take one of two copy routes:
+
+- **Peer route**: each leaf buffer is copied directly between the two GPUs with
+  `cudaMemcpyPeerAsync` on the target stream.
+- **Host-staged route**: the bytes go from the source GPU into pinned host memory and from there to
+  the destination GPU. It runs as the host-staged pipeline: the table's leaf buffers are treated as
+  one byte stream and cut into chunks, and each chunk passes through one of a few staging slots, so
+  that the source-to-host copy of one chunk overlaps the host-to-destination copy of another. The
+  staging slots are reserved from a HOST memory space for the duration of the conversion.
+
+`register_builtin_converters(registry, config)` takes a `cross_gpu_copy_config` with the chunk
+size, the pipeline depth (number of staging slots) and the route selection. By default the route is
+chosen per device pair: the peer route when a byte-verified peer copy between the two GPUs works,
+the host-staged route otherwise. `copy_route_selection::peer` and
+`copy_route_selection::host_staged` force one route.
+
+```cpp
+// Defaults: automatic route, 8 MiB chunks, 4 staging slots.
+register_builtin_converters(registry);
+
+// Always stage through host memory, with 16 MiB chunks.
+register_builtin_converters(
+    registry,
+    {.chunk_size_bytes = 16ULL << 20, .route = copy_route_selection::host_staged});
+```
+
+Both routes learn the chars size of every strings column up front with one batched read, reject a
+source table whose column views are sliced, and have completed every copy when the conversion
+returns.
 
 ### Conversion Flow
 

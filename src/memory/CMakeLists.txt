@@ -21,6 +21,7 @@ if(TARGET cucascade_objects)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/disk_access_limiter.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/fixed_size_host_memory_resource.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/gpu_numa_node.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/memory_reservation.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/memory_reservation_manager.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/memory_space.cpp
