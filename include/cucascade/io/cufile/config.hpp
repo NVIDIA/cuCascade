@@ -316,6 +316,195 @@ struct async_engine_config {
   }
 };
 
+/// How a fused lane learns that its read and copies finished (see @ref fused_read_config).
+enum class lane_completion : std::uint8_t {
+  /// A stream callback queued behind the copies marks the lane done and wakes the reactor.
+  callback,
+  /// The reactor polls an event recorded behind the copies.  A field fallback for a stack
+  /// where stream callbacks misbehave: same results, more CPU, up to one poll interval of
+  /// refill latency.
+  poll,
+};
+
+/**
+ * @brief Fused asynchronous device reads on registered stream lanes.
+ *
+ * A lane is a registered device slot plus a reactor-owned stream.  On the submitting thread
+ * the device slices of one request are packed, in file order, into 4 KiB-aligned windows of at
+ * most @ref slot_bytes (neighbours are fused, long slices are split).  A lane reactor issues
+ * each window as one @c cuFileReadAsync into a free lane's slot, queues the device-to-device
+ * copies to the callers' destinations on the lane's stream, and learns of completion from a
+ * stream callback.  A stream carries one read at a time, and a few reactors feed many lanes,
+ * which is the shape that reached NIC line rate on GPFS over RDMA (88 GiB/s on one GPU with
+ * 4 x 32 lanes of 8 MiB).  A read costs a few milliseconds almost regardless of its size, so
+ * fewer, larger reads win.  Futures stay host-complete: a successful read's bytes are in
+ * place when its future resolves.
+ *
+ * Off by default.  Mutually exclusive with the async engine (@c async_engine.mode must be
+ * @c legacy).  See docs/io/cufile-fused-lanes.md.
+ */
+struct fused_read_config {
+  bool enabled{false};
+
+  /// Lane reactors (submitting threads) per GPU in a pool planned per device.  A flat pool
+  /// (reactor count given) lets every reactor own lanes instead.
+  std::size_t reactors_per_device{4};
+
+  /// Lanes each lane reactor owns per GPU it reads into, 1 to 64.  Reads in flight per GPU =
+  /// @ref reactors_per_device x this.
+  std::size_t lanes_per_reactor{32};
+
+  /// Process-wide ceiling on lanes per GPU, over every ioctx together.  It guards the
+  /// storage: 128 asynchronous reads in flight is what was qualified on GPFS (a deeper run of
+  /// small reads crashed that client).  Lane sets that find the budget spent run with fewer
+  /// lanes, or serve through the synchronous paths.
+  std::size_t max_lanes_per_device{128};
+
+  /// Bytes of a lane's registered slot: the largest single read.  A multiple of 64 KiB.
+  /// Registered memory per GPU = lanes x (this + 64 KiB), inside
+  /// @c config::max_staging_bytes_per_device.
+  std::size_t slot_bytes{8UL << 20};
+
+  /// Fuse neighbouring slices into one read.  When false a slice is only split at the slot
+  /// size, and every slice costs at least one read.
+  bool fuse{true};
+
+  /// Largest gap between two slices still fused into one read; the gap is read and dropped.
+  /// 0 fuses only contiguous slices.  Worth raising only where the waste costs less than
+  /// another read's fixed latency.
+  std::size_t fuse_gap_bytes{0};
+
+  /// Register lane streams with cuFile (fixed offsets and sizes, page-aligned inputs), which
+  /// cuts the setup and teardown of every read.
+  bool register_streams{true};
+
+  /// How a lane's completion reaches the reactor.
+  lane_completion completion{lane_completion::callback};
+
+  /// Lanes per reactor that may hold a read whose copies wait, on the GPU, for work queued
+  /// earlier on the caller's stream.  Further such reads are parked until their stream is
+  /// ready, so a stalled caller cannot take every lane.  0 = half the lanes.
+  std::size_t max_gated_lanes{0};
+
+  /// Continuations of one read after short reads, before it falls back.
+  unsigned max_resubmits{8};
+
+  /// Consecutive failed lane reads after which a reactor stops using lanes for
+  /// @ref cooldown_s seconds.  A failed read is always re-served synchronously.
+  unsigned failure_limit{8};
+  unsigned cooldown_s{30};
+
+  /// Warn once when a read has been in flight this many seconds (a hung storage client is
+  /// otherwise invisible).  0 = never.
+  unsigned stall_warn_s{30};
+
+  bool operator==(fused_read_config const&) const = default;
+
+  /// @throws std::invalid_argument naming the first invalid field.  Checked only when enabled.
+  void validate() const
+  {
+    if (!enabled) return;
+    if (reactors_per_device == 0 || reactors_per_device > 64) {
+      throw std::invalid_argument("fused_reads.reactors_per_device must be in [1, 64]");
+    }
+    if (lanes_per_reactor == 0 || lanes_per_reactor > 64) {
+      throw std::invalid_argument("fused_reads.lanes_per_reactor must be in [1, 64]");
+    }
+    if (max_lanes_per_device == 0) {
+      throw std::invalid_argument("fused_reads.max_lanes_per_device must be positive");
+    }
+    constexpr std::size_t gpu_page = 64UL << 10;
+    if (slot_bytes < gpu_page || slot_bytes % gpu_page != 0 || slot_bytes > (1UL << 30)) {
+      throw std::invalid_argument(
+        "fused_reads.slot_bytes must be a multiple of 64 KiB in [64 KiB, 1 GiB]");
+    }
+    if (fuse_gap_bytes >= slot_bytes) {
+      throw std::invalid_argument("fused_reads.fuse_gap_bytes must be smaller than slot_bytes");
+    }
+    if (max_gated_lanes > lanes_per_reactor) {
+      throw std::invalid_argument(
+        "fused_reads.max_gated_lanes must not exceed lanes_per_reactor");
+    }
+    if (failure_limit == 0) {
+      throw std::invalid_argument("fused_reads.failure_limit must be positive");
+    }
+    switch (completion) {
+      case lane_completion::callback:
+      case lane_completion::poll: break;
+      default: throw std::invalid_argument("fused_reads.completion is invalid");
+    }
+  }
+
+  /// Lanes per reactor that may wait on a caller's stream (see @ref max_gated_lanes).
+  [[nodiscard]] std::size_t gated_lane_limit() const noexcept
+  {
+    return max_gated_lanes != 0 ? max_gated_lanes
+                                : (lanes_per_reactor > 1 ? lanes_per_reactor / 2 : 1);
+  }
+};
+
+/**
+ * @brief Host reads through cuFile's batch API.
+ *
+ * A host-only read whose body is 4 KiB-aligned in file offset, length and destination
+ * address is cut into entries of at most @ref max_entry_bytes and submitted with
+ * @c cuFileBatchIOSubmit, straight into the destination, so one reactor keeps @ref depth host
+ * reads in flight instead of one blocking @c pread.  Sub-block heads and tails, unaligned
+ * destinations and small reads keep the synchronous path, and an entry cuFile fails or cuts
+ * short is finished synchronously.  Measured equal to io_uring into pinned host memory.
+ *
+ * Off by default.  See docs/io/cufile-fused-lanes.md.
+ */
+struct host_batch_config {
+  bool enabled{false};
+
+  /// Batch reactors in a pool planned per device; they serve the host reads of every GPU.  A
+  /// flat pool lets every reactor batch instead.
+  std::size_t reactors{2};
+
+  /// Entries in flight per reactor, 1 to 1024 (further capped by cuFile's
+  /// @c max_batch_io_size).
+  unsigned depth{64};
+
+  /// Largest entry.  A multiple of @c io::IO_BLOCK_SIZE.
+  std::size_t max_entry_bytes{8UL << 20};
+
+  /// Aligned bodies smaller than this keep the synchronous path.
+  std::size_t min_bytes{64UL << 10};
+
+  /// Longest the reactor blocks in @c cuFileBatchIOGetStatus waiting for a completion, in
+  /// microseconds: a request queued meanwhile waits at most this long to be seen.
+  unsigned poll_us{200};
+
+  /// Consecutive rejected submits after which a reactor gives up batching for good.
+  unsigned failure_limit{4};
+
+  bool operator==(host_batch_config const&) const = default;
+
+  /// @throws std::invalid_argument naming the first invalid field.  Checked only when enabled.
+  void validate() const
+  {
+    if (!enabled) return;
+    if (reactors == 0 || reactors > 64) {
+      throw std::invalid_argument("host_batch.reactors must be in [1, 64]");
+    }
+    if (depth == 0 || depth > 1024) {
+      throw std::invalid_argument("host_batch.depth must be in [1, 1024]");
+    }
+    if (max_entry_bytes < io::IO_BLOCK_SIZE || max_entry_bytes % io::IO_BLOCK_SIZE != 0 ||
+        max_entry_bytes > (1UL << 30)) {
+      throw std::invalid_argument(
+        "host_batch.max_entry_bytes must be a multiple of IO_BLOCK_SIZE in [4 KiB, 1 GiB]");
+    }
+    if (poll_us == 0 || poll_us > 1'000'000) {
+      throw std::invalid_argument("host_batch.poll_us must be in [1, 1000000]");
+    }
+    if (failure_limit == 0) {
+      throw std::invalid_argument("host_batch.failure_limit must be positive");
+    }
+  }
+};
+
 /// Config/API ABI diagnostic compiled into the library.
 [[nodiscard]] std::array<std::size_t, 6> cufile_config_library_abi_reference() noexcept;
 
@@ -383,6 +572,12 @@ enum class staging : std::uint8_t {
 struct config {
   /// Opt-in engine; legacy retains the planned synchronous staging path.
   async_engine_config async_engine{};
+
+  /// Opt-in fused asynchronous device reads on stream lanes (see @ref fused_read_config).
+  fused_read_config fused_reads{};
+
+  /// Opt-in host reads through cuFile's batch API (see @ref host_batch_config).
+  host_batch_config host_batch{};
   /// How many scan tasks the readahead manager may keep in flight against this
   /// backend at once.  Zero disables readahead for it entirely.  This backend
   /// never arms the prefetching cache, so a scan here only bounds how many
