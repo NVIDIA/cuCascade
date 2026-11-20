@@ -162,6 +162,8 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_parameters_production.cpp
               io/cufile/test_cufile_abi.cpp
               io/cufile/test_cufile_abi_reference.cpp
+              io/cufile/test_fused_read_plan.cpp
+              io/cufile/test_fused_pool_plan.cpp
               io/cufile/test_topology.cpp
               io/cufile/test_lustre_layout.cpp
               io/cufile/test_lane_pool.cpp

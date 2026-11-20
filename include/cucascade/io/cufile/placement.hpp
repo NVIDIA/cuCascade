@@ -47,12 +47,26 @@ struct device_group_plan {
   int device{-1};                ///< CUDA ordinal.
   std::string pci_bus_id;        ///< As CUDA reports it, e.g. "0000:1B:00.0".
   int numa_node{-1};             ///< The GPU's NUMA node (-1 if unknown).
-  std::size_t n_reactors{0};     ///< Reactors serving it: its queue depth.
+  /// Synchronous reactors serving it (one read in flight each), not counting
+  /// @ref lane_reactors.
+  std::size_t n_reactors{0};
   std::vector<int> cpus;         ///< CPUs those reactors are pinned to; empty = unpinned.
   std::size_t staging_slots{0};  ///< Registered staging slots reserved for it at start.
   /// Cap on registered staging for this device, in bytes (0 = none): the config's
   /// cap, half of the BAR1 free at planning time, and cuFile's pinned-memory limit.
+  /// Computed when the pool stages or runs fused-read lanes (both lease from the
+  /// same pool); 0 otherwise.
   std::size_t staging_cap_bytes{0};
+  /// Fused-read lane reactors serving it (@c fused_read_config::reactors_per_device);
+  /// 0 when fused reads are off.  Built before the synchronous reactors.
+  std::size_t lane_reactors{0};
+  /// Lanes each lane reactor owns for this GPU (@c fused_read_config::lanes_per_reactor).
+  std::size_t lanes_per_reactor{0};
+  /// Registered lane slots (of @ref pool_plan::lane_slot_bytes) to reserve for this GPU
+  /// at start: at most @ref lane_reactors x @ref lanes_per_reactor, at most
+  /// @c fused_read_config::max_lanes_per_device, and within @ref staging_cap_bytes.
+  /// The synchronous @ref staging_slots are sized from what the cap has left.
+  std::size_t lane_slots{0};
   std::string reason;  ///< How the numbers were chosen, in words.
 };
 
@@ -68,19 +82,27 @@ struct pool_plan {
   /// @c max_direct_io_size (cuFile issues a larger call as sequential chunks of
   /// that size, so smaller pieces spread over more reactors read faster).
   std::size_t staging_piece_bytes{0};
+  /// Host-batch reactors serving the host reads of every GPU, built after the groups
+  /// (@c host_batch_config::reactors when enabled).  0 for a flat pool, where every
+  /// reactor batches.
+  std::size_t host_batch_reactors{0};
+  /// Bytes of one registered fused-read lane slot (@c fused_read_config::slot_bytes);
+  /// 0 when fused reads are off.
+  std::size_t lane_slot_bytes{0};
   std::string reason;  ///< Overall summary, in words.
   /// Setup problems found while planning that cost GDS throughput, each a
   /// sentence an operator can act on (e.g. an empty @c rdma_dev_addr_list with a
   /// GDS-enabled Storage Scale client).  Logged as warnings by the factory.
   std::vector<std::string> warnings;
 
-  /// Reactors the pool runs.
+  /// Reactors the pool runs: for a planned pool the lane and synchronous reactors of
+  /// every group plus the host-batch reactors; @ref flat_reactors for a flat one.
   [[nodiscard]] std::size_t total_reactors() const noexcept
   {
     if (groups.empty()) return flat_reactors;
-    std::size_t total = 0;
+    std::size_t total = host_batch_reactors;
     for (auto const& group : groups) {
-      total += group.n_reactors;
+      total += group.n_reactors + group.lane_reactors;
     }
     return total;
   }
@@ -104,6 +126,16 @@ struct pool_plan {
  * - Reactors per GPU: @c cfg.reactors_per_device, or, when 0,
  *   @ref network_reactors_per_device / @ref local_reactors_per_device /
  *   @ref default_reactors_per_device by what @c cfg.storage_hint_path is stored on.
+ *   With @c cfg.fused_reads enabled the automatic count is
+ *   @ref local_reactors_per_device: the lanes carry the device reads, the
+ *   synchronous reactors serve writes and fallbacks.
+ * - Fused-read lanes (@c cfg.fused_reads enabled): per GPU, @c reactors_per_device
+ *   lane reactors of @c lanes_per_reactor lanes, and as many registered lane slots
+ *   as @c max_lanes_per_device and the staging cap allow; they are budgeted before
+ *   the synchronous staging slots.  An invalid @c fused_reads or @c host_batch
+ *   block is reported in the warnings and planned as disabled.
+ * - Host batch (@c cfg.host_batch enabled): @c host_batch.reactors reactors shared
+ *   by every GPU.
  * - CPUs: the GPU's CPU affinity from @p topology (matched by PCI bus ID, not by
  *   index), intersected with the calling thread's affinity; unpinned when
  *   @c cfg.pin_to_device_cpus is off, the topology is unknown or the
