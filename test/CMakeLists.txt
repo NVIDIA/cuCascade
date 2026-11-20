@@ -170,6 +170,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_fused_lanes.cpp
               io/cufile/test_fused_ioctx.cpp
               io/cufile/test_operation.cpp
+              io/cufile/test_host_batch.cpp
               io/cufile/test_mount_policy.cpp
               io/cufile/test_engine_coalesce.cpp
               io/cufile/test_engine_read.cpp
