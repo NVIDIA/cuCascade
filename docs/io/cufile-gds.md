@@ -10,6 +10,12 @@ It is tuned for Parquet scans: 1–8 MB column chunks at arbitrary file offsets,
 read into RMM-allocated buffers, from IBM Storage Scale (GPFS) over RDMA or
 from local NVMe.
 
+This page describes the default, synchronous read paths: one read in flight per reactor. Two
+opt-in features keep many reads in flight per thread instead. **Fused stream lanes**
+(`fused_reads`) serve device reads with fused `cuFileReadAsync` calls. **Host batch**
+(`host_batch`) serves aligned host reads with cuFile's batch API. Both are described in
+[cufile-fused-lanes.md](cufile-fused-lanes.md).
+
 ## Table of contents
 
 - [Routing](#routing)
@@ -23,6 +29,7 @@ from local NVMe.
 - [Verifying the path a read took](#verifying-the-path-a-read-took)
 - [Configuration reference](#configuration-reference)
 - [Known limitations](#known-limitations)
+- Opt-in: [fused stream lanes and host batch reads](cufile-fused-lanes.md)
 
 ## Routing
 
@@ -341,15 +348,22 @@ points.
 | `write_split_bytes` | 64 MiB | Write slices larger than this are cut into pieces of this size, spread over the group's reactors (0 = never) |
 | `poll_interval_us` | 50 | Completion poll period while copies are pending |
 | `use_odirect`, `compat_mode` | true, automatic | O_DIRECT / cuFile registration policy per file |
+| `fused_reads` | disabled | Opt-in fused `cuFileReadAsync` device reads on stream lanes, budgeted on top of `max_staging_bytes_per_device`; see [cufile-fused-lanes.md](cufile-fused-lanes.md#configuration-reference) |
+| `host_batch` | disabled | Opt-in cuFile-batch host reads of aligned bodies; see [cufile-fused-lanes.md](cufile-fused-lanes.md#configuration-reference) |
 
 `io_config::cufile_n_reactors`: 0 = plan per GPU from the topology; > 0 = a flat pool of
 that many reactors.
 
 ## Known limitations
 
-- Batch (`cuFileBatchIO*`) and stream (`cuFileReadAsync` / `cuFileWriteAsync`)
-  APIs are not used. On Storage Scale both run in compatibility mode, so concurrency
-  comes from reactor threads.
+- By default, the batch (`cuFileBatchIO*`) and stream (`cuFileReadAsync` /
+  `cuFileWriteAsync`) APIs are not used. Concurrency comes from reactor threads, one read in
+  flight each, so a GPU's queue depth is its reactor count. The opt-in fused stream lanes
+  (`cuFileReadAsync`, device reads) and host batch (`cuFileBatchIO*`, aligned host reads)
+  lift that limit; see [cufile-fused-lanes.md](cufile-fused-lanes.md). IBM documents both APIs
+  as compatibility mode on Storage Scale. On the reference GPFS-over-RoCE host,
+  `cuFileReadAsync` measured on the GDS fast path, while batch entries for GPU memory took the
+  POSIX fallback. Writes use neither.
 - The per-path verdict does not yet see NVMe multipath heads, NVMe/TCP, or
   RAID levels and encryption inside device-mapper / md stacks. It is advisory:
   reads never depend on it.
