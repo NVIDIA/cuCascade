@@ -97,7 +97,7 @@ TEST_CASE("async engine configuration defaults preserve legacy routing", "[io][c
   CHECK(reactor.gds_threshold == 256UL << 10);
   CHECK(reactor.use_odirect);
   CHECK_FALSE(reactor.compat_mode.has_value());
-  CHECK(reactor.poll_interval_us == 200);
+  CHECK(reactor.poll_interval_us == 50);
   CHECK(reactor.low_service_interval == 4);
 }
 
