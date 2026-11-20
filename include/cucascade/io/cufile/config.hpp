@@ -342,10 +342,10 @@ enum class lane_completion : std::uint8_t {
  * polling (or from a stream callback, see @ref lane_completion).  A stream carries one read at
  * a time, and a few reactors feed many lanes, which is the shape that reached NIC line rate on
  * GPFS over RDMA (raw cuFile, 4 threads x 32 streams of 8 MiB).  The defaults, 8 lane reactors
- * x 16 lanes, measured 84.3 GiB/s on one GB200 GPU over GPFS/RoCE, against 79.0 for that raw
- * shape and 79.7 for 4 x 32 lanes in the same hour.  A read costs a few milliseconds almost
- * regardless of its size, so fewer, larger reads win.  Futures stay host-complete: a successful
- * read's bytes are in place when its future resolves.
+ * x 16 lanes, measured 86.6 GiB/s on one GB200 GPU over GPFS/RoCE (the line rate of its two
+ * 400 Gb/s NICs), against 84.4 for that raw shape minutes later.  A read costs a few milliseconds
+ * almost regardless of its size, so fewer, larger reads win.  Futures stay host-complete: a
+ * successful read's bytes are in place when its future resolves.
  *
  * Off by default.  Mutually exclusive with the async engine (@c async_engine.mode must be
  * @c legacy).  See docs/io/cufile-fused-lanes.md.
@@ -364,12 +364,13 @@ struct fused_read_config {
   /// (reactor count given) lets every reactor own lanes instead.
   ///
   /// 8 (with 16 lanes each) rather than 4 x 32: on a real GDS path @c cuFileReadAsync costs
-  /// about 0.28 ms of the calling thread per read (it submits to the kernel there; about
-  /// 0.03 ms in compatibility mode), so a reactor feeding 32 lanes is busy submitting about
-  /// 65% of the time and its lanes queue behind it.  Measured on a GB200 GPU over GPFS/RoCE
-  /// (8 MiB reads, 1/2/5 MiB chunks, medians of 5 passes): 8 x 16 polled 84.3 GiB/s,
-  /// 4 x 32 polled 79.7, 4 x 32 with callbacks 65.1; raw cuFile with 4 threads x 32 streams
-  /// 79.0.
+  /// the calling thread a fraction of a millisecond per read (it submits to the kernel there:
+  /// 0.28-0.62 ms measured, about 0.03 ms in compatibility mode), so a lane reactor is busy
+  /// submitting most of the time and its lanes queue behind it; more reactors with fewer lanes
+  /// each spread that cost.  Measured on a GB200 GPU over GPFS/RoCE (8 MiB reads, 1/2/5 MiB
+  /// chunks, medians of 5 passes), in one hour: 8 x 16 polled 84.3 GiB/s, 4 x 32 polled 79.7,
+  /// 4 x 32 with callbacks 65.1, raw cuFile with 4 threads x 32 streams 79.0.  The final build
+  /// with these defaults: 86.6 GiB/s, against 84.4 for raw cuFile.
   std::size_t reactors_per_device{8};
 
   /// Lanes each lane reactor owns per GPU it reads into, 1 to 64.  Reads in flight per GPU =
@@ -507,9 +508,9 @@ enum class batch_submit_policy : std::uint8_t {
   exclusive,
   /// Whole waves per reader: a reader submits a wave only when its own previous wave was fully
   /// reaped; readers do not coordinate, so waves of different readers overlap.  The default: the
-  /// shape measured on the GDS host (GB200, GPFS: 37.9 GiB/s with 2 reactors x 64, equal to
-  /// exclusive) and never crashed in compatibility mode on libcufile 1.17.1 (also with heap
-  /// spraying).
+  /// shape measured on the GDS host (GB200, GPFS: 38.9 GiB/s with 2 reactors x 64, against
+  /// 38.5 for exclusive) and never crashed in compatibility mode on libcufile 1.17.1 (also
+  /// with heap spraying).
   per_reader,
   /// Refill while entries are pending (libaio style): staged entries are submitted at once and
   /// completions reaped as they come (@c min_nr 1).  Opt-in; crashes in compatibility mode on
