@@ -167,6 +167,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_topology.cpp
               io/cufile/test_lustre_layout.cpp
               io/cufile/test_lane_pool.cpp
+              io/cufile/test_fused_lanes.cpp
               io/cufile/test_operation.cpp
               io/cufile/test_mount_policy.cpp
               io/cufile/test_engine_coalesce.cpp

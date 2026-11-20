@@ -63,6 +63,7 @@ if(CUCASCADE_CUFILE_INCLUDE_DIR)
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/topology.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/device_arena.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/lane_pool.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/fused_lanes.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/device_engine.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/file_write_state.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/mount_policy.cpp
