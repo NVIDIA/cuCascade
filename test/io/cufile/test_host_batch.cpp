@@ -237,6 +237,9 @@ struct batch_script {
   bool params_ok{true};
   bool null_timeout{false};
   bool over_capacity{false};
+  bool force_partial{false};       ///< Fake: the next GetStatus returns what is ready at once.
+  int partial_returns{0};
+  std::vector<std::size_t> submit_sizes;  ///< Entries per accepted submit.
 
   // Fake batch: submitted and completed entries.
   struct fake_entry {
@@ -275,6 +278,9 @@ struct batch_script {
     params_ok             = true;
     null_timeout          = false;
     over_capacity         = false;
+    force_partial         = false;
+    partial_returns       = 0;
+    submit_sizes.clear();
     pending.clear();
     ready.clear();
     next_handle = 1;
@@ -336,6 +342,7 @@ CUfileError_t scripted_submit(CUfileBatchHandle_t handle,
     }
     if (s.outstanding > 0) { ++s.submits_while_pending; }
     if (s.outstanding + nr > s.capacity) { s.over_capacity = true; }
+    s.submit_sizes.push_back(nr);
     if (s.fake) {
       for (unsigned i = 0; i < nr; ++i) {
         s.pending.push_back(
@@ -379,24 +386,37 @@ CUfileError_t scripted_get_status(CUfileBatchHandle_t handle,
                           : std::chrono::seconds{timeout->tv_sec} +
                               std::chrono::nanoseconds{timeout->tv_nsec};
       // A test that failed before completing its entries must not hang in the reader's
-      // destructor: entries pending for 10 s complete as cancelled.
-      auto const now = std::chrono::steady_clock::now();
-      for (auto it = s.pending.begin(); it != s.pending.end();) {
-        if (it->handle == handle && now - it->submitted > 10s) {
-          CUfileIOEvents_t event{};
-          event.cookie = it->cookie;
-          event.status = CUFILE_CANCELED;
-          s.ready.emplace_back(handle, event);
-          it = s.pending.erase(it);
-        } else {
-          ++it;
+      // destructor: entries pending for 10 s complete as cancelled (checked while waiting).
+      auto expire = [&] {
+        auto const now = std::chrono::steady_clock::now();
+        for (auto it = s.pending.begin(); it != s.pending.end();) {
+          if (it->handle == handle && now - it->submitted > 10s) {
+            CUfileIOEvents_t event{};
+            event.cookie = it->cookie;
+            event.status = CUFILE_CANCELED;
+            s.ready.emplace_back(handle, event);
+            it = s.pending.erase(it);
+          } else {
+            ++it;
+          }
         }
-      }
+      };
       auto ready_for_handle = [&] {
         return static_cast<std::size_t>(std::count_if(
           s.ready.begin(), s.ready.end(), [&](auto const& e) { return e.first == handle; }));
       };
-      s.cv.wait_for(lock, wait, [&] { return ready_for_handle() >= min_nr; });
+      auto const deadline = std::chrono::steady_clock::now() + wait;
+      for (;;) {
+        expire();
+        if (ready_for_handle() >= min_nr || s.force_partial) break;
+        auto const now = std::chrono::steady_clock::now();
+        if (now >= deadline) break;
+        s.cv.wait_for(lock, std::min<std::chrono::nanoseconds>(deadline - now, 100ms));
+      }
+      if (s.force_partial) {
+        s.force_partial = false;
+        ++s.partial_returns;
+      }
       unsigned count = 0;
       for (auto it = s.ready.begin(); it != s.ready.end() && count < *nr;) {
         if (it->first != handle) {
@@ -643,7 +663,7 @@ TEST_CASE("host batch reader refills entries as they complete", "[io][cufile][ho
     host_batch_reader reader(depth, 4);
     REQUIRE(reader.available());
     REQUIRE(reader.capacity() == depth);
-    REQUIRE(reader.policy() == batch_submit_policy::exclusive);
+    REQUIRE(reader.policy() == batch_submit_policy::per_reader);  // the default
 
     // Each read goes into a destination slot a completed read freed.
     std::vector<std::size_t> free_slots;
@@ -744,8 +764,14 @@ TEST_CASE("host batch readers take turns under the exclusive policy", "[io][cufi
 {
   scripted_batch fake(true);
   host_memory memory(8 * block, false);
-  host_batch_reader a(4, 4);
-  host_batch_reader b(4, 4);
+  std::atomic<int> b_woken{0};
+  host_batch_reader a(4, 4, batch_submit_policy::exclusive);
+  host_batch_reader b(
+    4,
+    4,
+    batch_submit_policy::exclusive,
+    [](void* context) noexcept { static_cast<std::atomic<int>*>(context)->fetch_add(1); },
+    &b_woken);
   REQUIRE(a.available());
   REQUIRE(b.available());
   result_log log_a, log_b;
@@ -754,15 +780,17 @@ TEST_CASE("host batch readers take turns under the exclusive policy", "[io][cufi
   a.add(fake_read(memory.data() + block, 1));
   a.flush();
   CHECK(a.in_flight() == 2);
+  REQUIRE(fake.wait_pending(2));
 
   // Another reader's wave is in flight: b's flush is deferred.
   b.add(fake_read(memory.data() + 4 * block, 10));
   b.flush();
   CHECK(b.in_flight() == 0);
   CHECK(b.staged() == 1);
+  CHECK(b.deferred());
   CHECK(b.counters().deferred_flushes == 1);
   auto t0 = clock_type::now();
-  CHECK(b.reap(50ms, log_b) == 0);  // sleeps at most ~100 us for the gate
+  CHECK(b.reap(50ms, log_b) == 0);  // nothing of b in flight: returns at once
   CHECK(clock_type::now() - t0 < 20ms);
   CHECK(b.staged() == 1);
 
@@ -772,16 +800,23 @@ TEST_CASE("host batch readers take turns under the exclusive policy", "[io][cufi
   CHECK(a.in_flight() == 2);
   CHECK(a.staged() == 1);
 
+  auto const woken_before = b_woken.load();
   fake.complete(2);
-  CHECK(a.reap(1s, log_a) >= 1);
-  REQUIRE(reap_all(a, log_a, 5s));  // returns once a's first wave is reported
-  // a released the gate to the waiting b and yields it: b goes next.
-  CHECK(a.staged() == 1);
-  CHECK(b.reap(1ms, log_b) == 0);
+  CHECK(a.reap(5s, log_a) == 2);
+  CHECK(a.staged() == 1);  // reap never hands anything over
+  CHECK(a.in_flight() == 0);
+  // a's helper released the gate and woke the waiting b.
+  auto const deadline = clock_type::now() + 5s;
+  while (b_woken.load() == woken_before && clock_type::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(b_woken.load() > woken_before);
+  b.flush();
   CHECK(b.in_flight() == 1);
   CHECK(b.staged() == 0);
   a.flush();
   CHECK(a.staged() == 1);  // b's wave is in flight
+  REQUIRE(fake.wait_pending(1));
   fake.complete(1);
   REQUIRE(reap_all(b, log_b, 5s));
   CHECK(log_b.results.size() == 1);
@@ -1145,7 +1180,8 @@ TEST_CASE("host batch readers under per_reader submit waves independently",
   CHECK(a.in_flight() == 1);
   fake.complete(2);
   CHECK(a.reap(5s, log) == 1);
-  // Reporting a's wave handed the deferred entry over.
+  CHECK(a.staged() == 1);  // reap never hands anything over
+  a.flush();
   CHECK(a.staged() == 0);
   CHECK(a.in_flight() == 1);
   REQUIRE(reap_all(b, log, 5s));
@@ -1177,11 +1213,17 @@ TEST_CASE("host batch config validates the submit policy", "[io][cufile][host_ba
 {
   cucascade::io::cufile::host_batch_config config;
   config.enabled = true;
-  CHECK(config.submit_policy == batch_submit_policy::exclusive);
+  CHECK(config.submit_policy == batch_submit_policy::per_reader);
+  CHECK(config.max_wave_bytes == (256UL << 20));
   CHECK_NOTHROW(config.validate());
   config.submit_policy = batch_submit_policy::per_reader;
   CHECK_NOTHROW(config.validate());
   config.submit_policy = static_cast<batch_submit_policy>(7);
+  CHECK_THROWS_AS(config.validate(), std::invalid_argument);
+  config.submit_policy  = batch_submit_policy::exclusive;
+  config.max_wave_bytes = 0;
+  CHECK_NOTHROW(config.validate());
+  config.max_wave_bytes = block + 1;
   CHECK_THROWS_AS(config.validate(), std::invalid_argument);
 }
 
@@ -1310,22 +1352,19 @@ TEST_CASE("host batch reader reap honours the wait", "[io][cufile][host_batch]")
   CHECK(waited >= 45ms);
   CHECK(waited < 1s);
 
-  // Something completes meanwhile: returns early.
+  // The wave completes meanwhile: returns early (waves are reaped whole).
   std::thread completer([&] {
     std::this_thread::sleep_for(20ms);
-    fake.complete(1);
+    fake.complete(2);
   });
   t0 = clock_type::now();
   auto const got = reader.reap(5s, log);
   auto const early = clock_type::now() - t0;
   completer.join();
-  CHECK(got == 1);
+  CHECK(got == 2);
   CHECK(early < 2s);
-  CHECK(reader.in_flight() == 1);
-  CHECK(reader.free_entries() == 3);
-
-  fake.complete(1);
-  REQUIRE(reap_all(reader, log, 5s));
+  CHECK(reader.in_flight() == 0);
+  CHECK(reader.free_entries() == 4);
   REQUIRE(log.results.size() == 2);
   CHECK(log.count(batch_result::status::ok) == 2);
   fake.with([](batch_script& s) {
@@ -1573,7 +1612,8 @@ TEST_CASE("host batch reader aborts the handle on a GetStatus error", "[io][cufi
     CHECK(reported == 6);
     CHECK(log.count(batch_result::status::failed) == 6);
     for (auto const& r : log.results) {
-      CHECK(r.error == static_cast<int>(CU_FILE_INTERNAL_ERROR));
+      // The staged entry was never handed over: it is dropped, not aborted.
+      CHECK(r.error == (r.token == 5 ? static_cast<int>(CUFILE_CANCELED) : static_cast<int>(CU_FILE_INTERNAL_ERROR)));
     }
     CHECK_FALSE(reader.available());
     CHECK(reader.in_flight() == 0);
@@ -1653,6 +1693,195 @@ TEST_CASE("host batch reader maps real event failures", "[io][cufile][host_batch
       CHECK(file.matches(memory.data() + r.token * entry_bytes, r.token * entry_bytes, entry_bytes));
     }
   }
+}
+
+TEST_CASE("host batch reader reaps a slow wave in one GetStatus call", "[io][cufile][host_batch]")
+{
+  // A wave slower than any short timeout: the helper must not return early (a partial return is
+  // the libcufile use-after-free trigger), so exactly one GetStatus per wave.
+  scripted_batch fake(true);
+  host_memory memory(4 * block, false);
+  host_batch_reader reader(4, 4);
+  REQUIRE(reader.policy() == batch_submit_policy::per_reader);
+  result_log log;
+  for (int wave = 0; wave < 2; ++wave) {
+    for (std::size_t i = 0; i < 3; ++i) {
+      reader.add(fake_read(memory.data() + i * block, i));
+    }
+    reader.flush();
+    REQUIRE(fake.wait_pending(3));
+    std::thread completer([&] {
+      std::this_thread::sleep_for(1500ms);
+      fake.complete(3);
+    });
+    REQUIRE(reap_all(reader, log, 10s));
+    completer.join();
+  }
+  CHECK(log.count(batch_result::status::ok) == 6);
+  CHECK(fake.with([](batch_script& s) { return s.get_status_calls; }) == 2);
+  CHECK(reader.counters().partial_status == 0);
+  CHECK(reader.available());
+}
+
+TEST_CASE("host batch reader is poisoned by a partial wave return", "[io][cufile][host_batch]")
+{
+  scripted_batch fake(true);
+  host_memory memory(4 * block, false);
+  result_log log;
+  {
+    host_batch_reader reader(4, 4);
+    reader.add(fake_read(memory.data(), 0));
+    reader.add(fake_read(memory.data() + block, 1));
+    fake.with([](batch_script& s) { return s.force_partial = true; });
+    reader.flush();
+    REQUIRE(fake.wait_pending(2));
+    // Nothing completed when the call returns: the whole wave stays cuFile's.
+    REQUIRE(reap_all(reader, log, 0s) == false);  // in flight for good
+    auto const deadline = clock_type::now() + 5s;
+    while (reader.available() && clock_type::now() < deadline) {
+      std::ignore = reader.reap(10ms, log);
+    }
+    CHECK_FALSE(reader.available());
+    CHECK(reader.poisoned());
+    CHECK(reader.in_flight() == 2);  // never reported, never freed
+    CHECK(log.results.empty());
+    CHECK(reader.counters().partial_status == 1);
+    auto const calls = fake.with([](batch_script& s) { return s.get_status_calls; });
+    std::this_thread::sleep_for(100ms);
+    CHECK(fake.with([](batch_script& s) { return s.get_status_calls; }) == calls);  // no more
+    reader.add(fake_read(memory.data() + 2 * block, 2));  // free_entries() == 0: dropped
+    CHECK(reader.staged() == 0);
+  }
+  // The poisoned handle was never destroyed.
+  CHECK(fake.with([](batch_script& s) { return s.destroys; }) == 0);
+}
+
+TEST_CASE("host batch reader reports every entry once when a wave follows an abort",
+          "[io][cufile][host_batch]")
+{
+  scripted_batch fake(true);
+  host_memory memory(8 * block, false);
+  host_batch_reader reader(8, 4, batch_submit_policy::continuous);
+  reader.add(fake_read(memory.data(), 0));
+  reader.add(fake_read(memory.data() + block, 1));
+  reader.flush();
+  REQUIRE(fake.wait_pending(2));
+  fake.with([](batch_script& s) { return s.get_status_error = true; });
+  // The helper aborts and publishes; before the owner collects, another wave is flushed.
+  auto const deadline = clock_type::now() + 5s;
+  while (!reader.completions_pending() && clock_type::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(reader.completions_pending());
+  reader.add(fake_read(memory.data() + 2 * block, 2));
+  reader.add(fake_read(memory.data() + 3 * block, 3));
+  reader.flush();
+  result_log log;
+  CHECK(reader.reap(1s, log) == 4);
+  CHECK(reader.reap(10ms, log) == 0);
+  REQUIRE(log.results.size() == 4);
+  std::vector<int> seen(4, 0);
+  for (auto const& r : log.results) {
+    REQUIRE(r.token < 4);
+    ++seen[r.token];
+    CHECK(r.outcome == batch_result::status::failed);
+  }
+  CHECK(seen == std::vector<int>{1, 1, 1, 1});
+  CHECK_FALSE(reader.completions_pending());  // the wait point does not spin
+  CHECK_FALSE(reader.available());
+  CHECK(reader.in_flight() == 0);
+  CHECK(fake.with([](batch_script& s) { return s.submits; }) == 1);
+}
+
+TEST_CASE("host batch reader tops waves up instead of ping-ponging", "[io][cufile][host_batch]")
+{
+  scripted_batch fake(true);
+  constexpr unsigned depth = 16;
+  host_memory memory(depth * block, false);
+  host_batch_reader reader(depth, 4);
+  result_log log;
+  // A lone entry first, then a sustained queue: the owner reaps, stages what it can, then
+  // flushes once, as the reactor's pass does.
+  reader.add(fake_read(memory.data(), 0));
+  reader.flush();
+  std::size_t issued = 1;
+  auto stage = [&] {
+    while (reader.free_entries() > 0 && issued < 400) {
+      reader.add(fake_read(memory.data() + (issued % depth) * block, issued));
+      ++issued;
+    }
+  };
+  stage();      // staged behind the lone entry's wave
+  reader.flush();  // deferred: the wave is in flight
+  auto const deadline = clock_type::now() + 30s;
+  while (log.results.size() < issued && clock_type::now() < deadline) {
+    fake.complete(scripted_batch::all);
+    std::ignore = reader.reap(1s, log);
+    stage();
+    reader.flush();
+    if (reader.in_flight() > 0) REQUIRE(fake.wait_pending(reader.in_flight()));
+  }
+  REQUIRE(log.results.size() == issued);
+  auto const sizes = fake.with([](batch_script& s) { return s.submit_sizes; });
+  REQUIRE(sizes.size() > 4);
+  double total = 0;
+  for (std::size_t i = 2; i + 1 < sizes.size(); ++i) {  // after warm-up, before the tail
+    total += static_cast<double>(sizes[i]);
+  }
+  auto const mean = total / static_cast<double>(sizes.size() - 3);
+  INFO("mean wave " << mean);
+  CHECK(mean >= 0.9 * depth);
+}
+
+TEST_CASE("host batch reader caps a wave at max_wave_bytes", "[io][cufile][host_batch]")
+{
+  scripted_batch fake(true);
+  host_memory memory(8 * block, false);
+  cucascade::io::cufile::detail::host_batch_options options;
+  options.depth          = 8;
+  options.max_wave_bytes = 2 * block;
+  host_batch_reader reader(options);
+  for (std::size_t i = 0; i < 5; ++i) {
+    reader.add(fake_read(memory.data() + i * block, i));
+  }
+  result_log log;
+  reader.flush();
+  CHECK(reader.in_flight() == 2);
+  CHECK(reader.staged() == 3);
+  CHECK(reader.deferred());
+  for (int wave = 0; wave < 3; ++wave) {
+    REQUIRE(fake.wait_pending(reader.in_flight()));
+    fake.complete(scripted_batch::all);
+    REQUIRE(reap_all(reader, log, 5s));
+    reader.flush();
+  }
+  CHECK(log.results.size() == 5);
+  CHECK(fake.with([](batch_script& s) { return s.submit_sizes; }) ==
+        std::vector<std::size_t>{2, 2, 1});
+}
+
+TEST_CASE("host batch reader discards staged entries without submitting them",
+          "[io][cufile][host_batch]")
+{
+  scripted_batch fake(true);
+  host_memory memory(4 * block, false);
+  host_batch_reader reader(4, 4);
+  for (std::size_t i = 0; i < 3; ++i) {
+    reader.add(fake_read(memory.data() + i * block, i));
+  }
+  reader.discard_staged_if([](std::uint64_t token) noexcept { return token == 1; });
+  CHECK(reader.staged() == 2);
+  reader.discard_staged();
+  CHECK(reader.staged() == 0);
+  reader.flush();
+  result_log log;
+  CHECK(reader.reap(0us, log) == 3);
+  CHECK(log.count(batch_result::status::failed) == 3);
+  for (auto const& r : log.results) {
+    CHECK(r.error == static_cast<int>(CUFILE_CANCELED));
+  }
+  CHECK(fake.with([](batch_script& s) { return s.submits; }) == 0);
+  CHECK(reader.free_entries() == 4);
 }
 
 #ifdef NDEBUG

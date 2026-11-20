@@ -227,6 +227,14 @@ struct reactor_stats {
   std::uint64_t batch_reads{0};     ///< Host reads served by cuFile batch entries.
   std::uint64_t batch_bytes{0};     ///< Their bytes.
   std::uint64_t batch_failures{0};  ///< Batch entries that failed or came back short.
+  std::uint64_t batch_waves{0};     ///< cuFileBatchIOSubmit calls (waves) of the batch readers.
+  std::uint64_t batch_entries{0};   ///< Entries those waves carried (wave fill = entries / waves).
+  std::uint64_t batch_rejected_submits{0};  ///< Waves cuFile rejected.
+  /// Wave GetStatus calls that returned less than the wave (each poisons its reader).
+  std::uint64_t batch_partial_status{0};
+  std::uint64_t batch_handle_resets{0};  ///< Batch handles recreated after a rejection.
+  std::uint64_t batch_deferred{0};       ///< Flushes that left entries staged for a later wave.
+  std::uint64_t batch_submit_ns{0};      ///< Time the batch helpers spent in Submit.
 
   /// Every counter, so the arithmetic below cannot miss one.
   [[nodiscard]] static constexpr auto fields() noexcept
@@ -243,7 +251,12 @@ struct reactor_stats {
                       &reactor_stats::lane_issued_bytes,  &reactor_stats::lane_parts,
                       &reactor_stats::lane_resubmits,     &reactor_stats::lane_failures,
                       &reactor_stats::lane_gated_reads,   &reactor_stats::batch_reads,
-                      &reactor_stats::batch_bytes,        &reactor_stats::batch_failures};
+                      &reactor_stats::batch_bytes,        &reactor_stats::batch_failures,
+                      &reactor_stats::batch_waves,        &reactor_stats::batch_entries,
+                      &reactor_stats::batch_rejected_submits,
+                      &reactor_stats::batch_partial_status,
+                      &reactor_stats::batch_handle_resets, &reactor_stats::batch_deferred,
+                      &reactor_stats::batch_submit_ns};
   }
 
   reactor_stats& operator+=(reactor_stats const& other) noexcept
@@ -458,9 +471,17 @@ class cufile_reactor {
     /// (@c fused_lane_staging_bytes), 0 staying 0.
     [[nodiscard]] std::size_t staging_cap(int device) const noexcept;
 
+    /// True for the first caller only: the reactors of one ioctx (which share this context)
+    /// log the effective host-batch submit policy once.
+    [[nodiscard]] bool claim_batch_policy_log() const noexcept
+    {
+      return !_batch_policy_logged.exchange(true, std::memory_order_relaxed);
+    }
+
    private:
     config _config;
     std::vector<std::size_t> _staging_caps;
+    mutable std::atomic<bool> _batch_policy_logged{false};
     mutable std::mutex _engine_mutex;
     using engine_bindings = std::vector<std::shared_ptr<engine_binding>>;
     std::atomic<std::shared_ptr<const engine_bindings>> _engines;
@@ -899,6 +920,13 @@ class cufile_reactor {
     std::atomic<std::uint64_t> batch_reads{0};
     std::atomic<std::uint64_t> batch_bytes{0};
     std::atomic<std::uint64_t> batch_failures{0};
+    std::atomic<std::uint64_t> batch_waves{0};
+    std::atomic<std::uint64_t> batch_entries{0};
+    std::atomic<std::uint64_t> batch_rejected_submits{0};
+    std::atomic<std::uint64_t> batch_partial_status{0};
+    std::atomic<std::uint64_t> batch_handle_resets{0};
+    std::atomic<std::uint64_t> batch_deferred{0};
+    std::atomic<std::uint64_t> batch_submit_ns{0};
   };
   counters _counters;
 
@@ -975,8 +1003,9 @@ class cufile_reactor {
   [[nodiscard]] bool lanes_in_flight() const noexcept;
   /// Whether an asynchronous facility has completions to reap now.
   [[nodiscard]] bool async_completions_pending() const noexcept;
-  /// Whether a slice waits for an asynchronous facility (the lane or batch backlog): the
-  /// worker then takes no more slices.
+  /// Whether a slice waits for a free lane (the lane backlog): the worker then takes no more
+  /// slices.  (The batch backlog holds back only further batch reads, see
+  /// @ref batch_front_blocked.)
   [[nodiscard]] bool async_backlog_pending() const noexcept;
   /// How long the worker may sleep while asynchronous I/O is in flight (-1: no constraint).
   [[nodiscard]] std::int64_t async_wait_limit_us() const noexcept;
@@ -1006,11 +1035,23 @@ class cufile_reactor {
     taken,     ///< its body is staged as batch entries (or waits in the batch backlog)
   };
 
-  /// Serve a host-only read through the batch reader when it is eligible: synchronous
-  /// head and tail (each under 4 KiB) through @ref read_host_direct, the aligned body as
-  /// entries of at most @c host_batch_config::max_entry_bytes straight into the destination.
-  /// One coordinator credit per slice, given back when its last entry settled.
-  /// @p count_queued: the caller counts the slice in @c queued_bytes until it settles.
+  /// Whether @p slice (clamped to @p clamped bytes) is a batch read by its shape: a host-only,
+  /// contiguous read without @c on_complete on a cuFile-registered O_DIRECT file, whose aligned
+  /// body is at least @c host_batch_config::min_bytes and whose destination is congruent.
+  [[nodiscard]] bool batch_eligible(cufile_io_object const& file,
+                                    prepared_io_slice const& slice,
+                                    std::size_t clamped) const noexcept;
+  /// Whether the front slice of @p request must wait for the batch backlog: it is a batch read
+  /// and another slice occupies the backlog.  Other slices dispatch past the backlog.
+  [[nodiscard]] bool batch_front_blocked(grouped_io_request& request) const noexcept;
+  /// Create the batch reader on first use (on the worker); false while it is unusable.  A reader
+  /// that could not be set up is retried after a cooldown, a bounded number of times.
+  [[nodiscard]] bool ensure_batch_reader() noexcept;
+  /// Serve a batch read: its body as entries of at most @c host_batch_config::max_entry_bytes
+  /// straight into the destination, its sub-block head and tail synchronously once the pass
+  /// handed the wave over (they overlap it).  One coordinator credit per slice, given back when
+  /// all of it settled.  @p count_queued: the caller counts the slice in @c queued_bytes until
+  /// it settles.
   /// @throws only while the slice is still the caller's (before any I/O).
   [[nodiscard]] batch_dispatch try_batch_read(std::shared_ptr<const io_object> const& obj,
                                               cufile_io_object const& file,
@@ -1019,20 +1060,32 @@ class cufile_reactor {
                                               std::size_t clamped,
                                               bool count_queued);
   /// Stage the next entries of batch slice @p index while the reader has room; it waits in
-  /// the batch backlog otherwise.  Serves the rest synchronously when the reader became
+  /// the batch backlog otherwise.  Owes the rest synchronously when the reader became
   /// unavailable, and stops (settling with the cancellation) when its request stopped.
   void stage_batch_entries(std::uint32_t index) noexcept;
-  /// Collect what the reader's helper published (waiting up to @p wait when nothing is),
-  /// settle what finished, continue the backlog.
-  void poll_batch(std::chrono::microseconds wait) noexcept;
+  /// Collect what the reader's helper published, settle what finished, continue the backlog.
+  void poll_batch() noexcept;
   /// Turn the results the reader reported into slice progress; with @p terminal (shutdown) a
   /// failed entry fails its slice with that error instead of being re-read synchronously.
   void process_batch_results(grouped_coordinator::error_type const* terminal) noexcept;
+  /// Owe the synchronous read of @p rng for batch slice @p index (head, tail, a failed entry's
+  /// missing bytes, the rest of a body the reader can no longer take).
+  void owe_batch_read(std::uint32_t index, range rng) noexcept;
+  /// Run owed synchronous reads, at most @p budget bytes (a pass's worth; the rest waits).
+  void run_batch_owed(std::size_t budget) noexcept;
+  /// Shutdown: fail every owed read with @p error instead of running it.
+  void fail_batch_owed(grouped_coordinator::error_type const& error) noexcept;
+  /// Give batch slice @p index's credit back once nothing of it is outstanding.
+  void maybe_settle_batch(std::uint32_t index) noexcept;
   /// Give batch slice @p index's credit back, with its error if it has one.
   void settle_batch(std::uint32_t index) noexcept;
-  /// Whether the batch reader has entries in flight or staged.
+  /// Add the reader's counter increments to the reactor's.
+  void export_batch_counters() noexcept;
+  /// Whether batch work is outstanding: entries staged, in flight or unreported, or owed
+  /// synchronous reads.
   [[nodiscard]] bool batch_has_work() const noexcept;
-  /// Submit what the pass staged (one @c cuFileBatchIOSubmit, possibly deferred).
+  /// End of a pass: drop the staged entries of stopped requests, then hand what is staged
+  /// (deferred and new together) to the helper.
   void flush_batch() noexcept;
 
   /// Serve @p slice through a lane of @p device_id when it is a lane read and lanes are

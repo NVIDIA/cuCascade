@@ -381,6 +381,7 @@ struct intercept_state {
   int fail_events{0};
   int short_events{0};
   bool get_status_error{false};
+  std::chrono::milliseconds submit_delay{0};  ///< Slows every wave down (on the helper thread).
   int submits{0};
   int setups{0};
   int cancels{0};
@@ -438,6 +439,9 @@ CUfileError_t intercepted_submit(CUfileBatchHandle_t handle,
       return status_of(CU_FILE_BATCH_FULL);
     }
     s.entries += nr;
+  }
+  if (auto const delay = intercept().submit_delay; delay.count() > 0) {
+    std::this_thread::sleep_for(delay);
   }
   return s.real.batch_submit(handle, nr, params, flags);
 }
@@ -507,6 +511,7 @@ class batch_intercept {
       s.fail_events      = 0;
       s.short_events     = 0;
       s.get_status_error = false;
+      s.submit_delay     = std::chrono::milliseconds{0};
       s.submits = s.setups = s.cancels = s.destroys = 0;
       s.entries                                     = 0;
       s.max_entry_end                               = 0;
@@ -680,6 +685,13 @@ TEST_CASE("host batch ioctx: a large read takes many waves", "[io][cufile][host_
     CHECK(stats.batch_bytes == file.size() - 777);
     CHECK(stats.batch_failures == 0);
     CHECK(stats.host_reads == 0);
+    // The helper's counters are exported through reactor_stats.
+    CHECK(stats.batch_entries == 256);
+    CHECK(stats.batch_waves >= 32);
+    CHECK(stats.batch_waves <= 256);
+    CHECK(stats.batch_rejected_submits == 0);
+    CHECK(stats.batch_partial_status == 0);
+    CHECK(stats.batch_submit_ns > 0);
     require_queued_bytes_zero(ctx);
   }
   watch.with([](intercept_state& s) {
@@ -927,6 +939,75 @@ TEST_CASE("host batch ioctx: a flat pool mixes batch reads, large writes and dev
   CHECK(clock_type::now() - start < 120s);
   auto const stats = ctx.stats();
   CHECK(stats.batch_reads > 0);
+  require_queued_bytes_zero(ctx);
+  written.reset();
+  object.reset();
+  ctx.shutdown();
+  std::error_code ec;
+  std::filesystem::remove(out_path, ec);
+}
+
+TEST_CASE("host batch ioctx: a batch backlog does not hold back other traffic",
+          "[io][cufile][host_batch_ioctx]")
+{
+  require_batch_cufile();
+  if (!has_cuda_device()) SKIP("requires a CUDA device");
+  pattern_file const file{(64 * MiB) + 1234};
+  auto const out_path = std::filesystem::temp_directory_path() /
+                        ("cucascade_host_batch_backlog_" + std::to_string(::getpid()) + ".bin");
+  batch_intercept watch;
+  // Slow waves of 4 x 256 KiB: a 32 MiB read keeps the batch backlog occupied for ~1 s.
+  watch.with([](intercept_state& s) { return s.submit_delay = std::chrono::milliseconds{30}; });
+  auto cfg                       = batch_config(4, 256 * KiB);
+  cfg.host_batch.submit_policy   = batch_submit_policy::exclusive;
+  started_ioctx ioctx{cfg, 1};  // one reactor: everything below lands on it
+  auto& ctx    = ioctx.get();
+  auto object  = open_registered(ctx, file);
+  auto written = ctx.open_io_object_for_write(out_path.string());
+  host_memory big{32 * MiB, false};
+  auto const start = clock_type::now();
+  auto long_read   = ctx.host_read_async_io(*object, 0, 32 * MiB, big.data(), io_priority::low);
+  std::this_thread::sleep_for(50ms);  // the long read now sits in the batch backlog
+
+  using ms = std::chrono::duration<double, std::milli>;
+  // A write, a device read and a small high-priority host read on the same reactor.
+  std::vector<std::uint8_t> source(4 * MiB, 0x5A);
+  auto t0         = clock_type::now();
+  auto const wrote = ctx.host_write_async(*written, 0, source.size(), source.data()).get(30s);
+  auto const write_ms = ms(clock_type::now() - t0).count();
+  CHECK(wrote == source.size());
+
+  void* device = nullptr;
+  REQUIRE(cudaMalloc(&device, 4 * MiB) == cudaSuccess);
+  t0              = clock_type::now();
+  auto const read = ctx.device_read_async_io(*object, 333, 4 * MiB,
+                                             static_cast<std::uint8_t*>(device),
+                                             ::cuda::stream_ref{cudaStreamPerThread})
+                      .get(30s);
+  auto const device_ms = ms(clock_type::now() - t0).count();
+  CHECK(read == 4 * MiB);
+  std::vector<std::uint8_t> host(4 * MiB);
+  REQUIRE(cudaMemcpy(host.data(), device, 4 * MiB, cudaMemcpyDeviceToHost) == cudaSuccess);
+  CHECK(std::memcmp(host.data(), file.data() + 333, 4 * MiB) == 0);
+  std::ignore = cudaFree(device);
+
+  host_memory small{8 * KiB, false};
+  t0 = clock_type::now();
+  auto const small_read =
+    ctx.host_read_async_io(*object, 5 * MiB + 7, 8 * KiB, small.data(), io_priority::high).get(30s);
+  auto const small_ms = ms(clock_type::now() - t0).count();
+  CHECK(small_read == 8 * KiB);
+  CHECK(std::memcmp(small.data(), file.data() + 5 * MiB + 7, 8 * KiB) == 0);
+
+  CHECK(std::move(long_read).get(60s) == 32 * MiB);
+  auto const long_ms = ms(clock_type::now() - start).count();
+  CHECK(std::memcmp(big.data(), file.data(), 32 * MiB) == 0);
+  INFO("write " << write_ms << " ms, device read " << device_ms << " ms, small host read "
+                << small_ms << " ms, long batch read " << long_ms << " ms");
+  CHECK(long_ms > 600);  // the backlog really was there
+  CHECK(write_ms < 400);
+  CHECK(device_ms < 400);
+  CHECK(small_ms < 400);
   require_queued_bytes_zero(ctx);
   written.reset();
   object.reset();

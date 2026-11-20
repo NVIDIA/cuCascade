@@ -1292,6 +1292,13 @@ reactor_stats cufile_reactor::stats() const noexcept
   out.batch_reads        = load(_counters.batch_reads);
   out.batch_bytes        = load(_counters.batch_bytes);
   out.batch_failures     = load(_counters.batch_failures);
+  out.batch_waves            = load(_counters.batch_waves);
+  out.batch_entries          = load(_counters.batch_entries);
+  out.batch_rejected_submits = load(_counters.batch_rejected_submits);
+  out.batch_partial_status   = load(_counters.batch_partial_status);
+  out.batch_handle_resets    = load(_counters.batch_handle_resets);
+  out.batch_deferred         = load(_counters.batch_deferred);
+  out.batch_submit_ns        = load(_counters.batch_submit_ns);
   return out;
 }
 
@@ -2976,12 +2983,12 @@ void cufile_reactor::drain_inflight(grouped_coordinator::error_type const& termi
 // cufile_reactor: host batch reads
 // ---------------------------------------------------------------------------
 
-/// Worker-only state of the host batch path: the reader (created at the first eligible read),
-/// a slab of batch-slice records (an entry's token is its record index in the high 32 bits
-/// and its entry number within the slice's body in the low 32), the one-element backlog, and
-/// the results of one reap.
+/// Worker-only state of the host batch path: the reader (created at the first batch read), a
+/// slab of batch-slice records (an entry's token is its record index in the high 32 bits and its
+/// entry number within the slice's body in the low 32), the one-element backlog, the synchronous
+/// reads still owed, and the results of one reap.
 struct cufile_reactor::batch_state {
-  /// What one batch slice owns until its last entry settled.
+  /// What one batch slice owns until all of it settled.
   struct op {
     std::shared_ptr<const io_object> obj;  ///< Keeps @c file alive.
     cufile_io_object const* file{nullptr};
@@ -2990,18 +2997,34 @@ struct cufile_reactor::batch_state {
     range rng;                               ///< The slice, clamped to the file.
     range body;                              ///< Its 4 KiB-aligned part, served by entries.
     std::size_t next{0};                     ///< File offset of the next entry to stage.
-    std::size_t outstanding{0};              ///< Entries staged or in flight, not reaped.
+    /// Entries staged or in flight, and owed synchronous reads, not finished yet.
+    std::size_t outstanding{0};
     std::size_t queued_bytes{0};  ///< What it holds in @c _queued_bytes until it settles.
     std::optional<grouped_coordinator::error_type> error;  ///< First failure.
   };
 
+  /// A synchronous read owed to a slice.
+  struct owed {
+    std::uint32_t op;
+    range rng;
+  };
+
+  /// A reader that could not be set up is retried this much later, this many times.
+  static constexpr std::chrono::seconds setup_retry{30};
+  static constexpr unsigned setup_attempts{5};
+
   std::vector<op> ops;
   std::vector<std::uint32_t> free_ops;
   std::unique_ptr<detail::host_batch_reader> reader;
-  bool unavailable{false};  ///< The reader cannot serve (logged once): synchronous paths.
+  bool unavailable{false};  ///< For good (logged): synchronous paths.
+  unsigned failed_setups{0};
+  std::chrono::steady_clock::time_point retry_at{};
   std::optional<std::uint32_t> backlog;
   /// Results of one reap; reserved to the reader's capacity (one per entry, at most).
   std::vector<detail::batch_result> results;
+  std::vector<owed> owed_reads;  ///< FIFO from @c owed_head.
+  std::size_t owed_head{0};
+  detail::host_batch_counters exported;  ///< The reader's counters already exported.
   std::unordered_set<std::string> failed_files;  ///< Logged once each.
 
   [[nodiscard]] std::uint32_t acquire_op()
@@ -3027,11 +3050,99 @@ struct cufile_reactor::batch_state {
     free_ops.push_back(index);  // capacity reserved in acquire_op
   }
 
+  [[nodiscard]] bool owes() const noexcept { return owed_head < owed_reads.size(); }
+
   [[nodiscard]] static std::uint64_t token(std::uint32_t index, std::size_t entry) noexcept
   {
     return (static_cast<std::uint64_t>(index) << 32) | static_cast<std::uint64_t>(entry);
   }
 };
+
+bool cufile_reactor::batch_eligible(cufile_io_object const& file,
+                                    prepared_io_slice const& slice,
+                                    std::size_t clamped) const noexcept
+{
+  if (slice.is_write() || slice.is_flush() || clamped == 0 || slice.on_complete != nullptr ||
+      slice.has_device_request() || !slice.is_contiguous() || !file.cufile_registered() ||
+      file.cufile_handle() == nullptr ||
+      !uring::detail::odirect_available(_config.use_odirect, file.direct_fd())) {
+    return false;
+  }
+  auto const* const* dst = std::get_if<std::uint8_t*>(&slice.h_buffer.buffer);
+  if (dst == nullptr || *dst == nullptr) return false;
+  auto const offset     = slice.rng.offset;
+  auto const body_begin = align_up_block(offset);
+  auto const body_end   = align_down_block(offset + clamped);
+  return body_end > body_begin && body_end - body_begin >= _config.host_batch.min_bytes &&
+         is_block_aligned(*dst + (body_begin - offset));
+}
+
+bool cufile_reactor::batch_front_blocked(grouped_io_request& request) const noexcept
+{
+  if (_batch == nullptr || !_batch->backlog.has_value() || request.empty()) return false;
+  auto const* file = dynamic_cast<cufile_io_object const*>(request.obj.get());
+  if (file == nullptr) return false;
+  auto const& slice = request.front();
+  return batch_eligible(*file, slice, clamp_to_file(file->size(), slice.rng.offset, slice.rng.size));
+}
+
+bool cufile_reactor::ensure_batch_reader() noexcept
+{
+  auto& batch = *_batch;
+  if (batch.reader != nullptr) {
+    if (batch.reader->available()) return true;
+    batch.unavailable = true;  // disabled for good (it logged why); its entries still drain
+    return false;
+  }
+  if (batch.unavailable) return false;
+  auto const now = std::chrono::steady_clock::now();
+  if (batch.failed_setups != 0 && now < batch.retry_at) return false;
+  auto const& conf = _config.host_batch;
+  try {
+    detail::host_batch_options options;
+    options.depth          = conf.depth;
+    options.failure_limit  = conf.failure_limit;
+    options.policy         = conf.submit_policy;
+    options.max_wave_bytes = conf.max_wave_bytes;
+    options.wake = [](void* context) noexcept { static_cast<cufile_reactor*>(context)->notify_worker(); };
+    options.wake_context = this;
+    auto reader          = std::make_unique<detail::host_batch_reader>(options);
+    if (!reader->available()) {
+      if (++batch.failed_setups >= batch_state::setup_attempts) {
+        batch.unavailable = true;
+        CUCASCADE_LOG_INFO(
+          "cufile_reactor '{}': the cuFile batch API is unusable here ({} attempts); host reads "
+          "take the synchronous path",
+          _tname,
+          batch.failed_setups);
+      } else {
+        batch.retry_at = now + batch_state::setup_retry;
+        CUCASCADE_LOG_INFO(
+          "cufile_reactor '{}': the cuFile batch API is unusable now; host reads take the "
+          "synchronous path, retrying in {} s",
+          _tname,
+          batch_state::setup_retry.count());
+      }
+      return false;
+    }
+    batch.results.reserve(reader->capacity());
+    batch.reader   = std::move(reader);
+    batch.exported = {};
+  } catch (...) {
+    // Out of memory for the bookkeeping: this read takes the synchronous path.
+    return false;
+  }
+  if (_ctx->claim_batch_policy_log()) {
+    CUCASCADE_LOG_INFO(
+      "cufile: host batch submit policy '{}' (configured '{}'; the first batch reader alive in "
+      "the process fixes it)",
+      detail::batch_policy_name(batch.reader->policy()),
+      detail::batch_policy_name(conf.submit_policy));
+  }
+  CUCASCADE_LOG_DEBUG(
+    "cufile_reactor '{}': host batch reader of {} entries", _tname, batch.reader->capacity());
+  return true;
+}
 
 cufile_reactor::batch_dispatch cufile_reactor::try_batch_read(
   std::shared_ptr<const io_object> const& obj,
@@ -3041,52 +3152,19 @@ cufile_reactor::batch_dispatch cufile_reactor::try_batch_read(
   std::size_t clamped,
   bool count_queued)
 {
-  auto& batch      = *_batch;
-  auto const& conf = _config.host_batch;
-  if (batch.unavailable || batch.backlog.has_value()) return batch_dispatch::declined;
-  if (slice.on_complete != nullptr || slice.has_device_request() || !slice.is_contiguous() ||
-      !file.cufile_registered() || file.cufile_handle() == nullptr ||
-      !uring::detail::odirect_available(_config.use_odirect, file.direct_fd())) {
+  auto& batch = *_batch;
+  // The worker never dispatches a batch read while the backlog is occupied
+  // (batch_front_blocked); one from elsewhere takes the synchronous path.
+  if (batch.backlog.has_value() || !batch_eligible(file, slice, clamped)) {
     return batch_dispatch::declined;
   }
-  auto* const dst = std::get<std::uint8_t*>(slice.h_buffer.buffer);
-  if (dst == nullptr) return batch_dispatch::declined;
+  if (!ensure_batch_reader()) return batch_dispatch::declined;
+
+  auto* const dst       = std::get<std::uint8_t*>(slice.h_buffer.buffer);
   auto const offset     = slice.rng.offset;
   auto const end        = offset + clamped;  // clamped to the file
   auto const body_begin = align_up_block(offset);
   auto const body_end   = align_down_block(end);
-  if (body_end <= body_begin || body_end - body_begin < conf.min_bytes) {
-    return batch_dispatch::declined;
-  }
-  if (!is_block_aligned(dst + (body_begin - offset))) return batch_dispatch::declined;
-
-  if (batch.reader == nullptr) {
-    // Created here, on the worker, at the first eligible read.
-    auto reader = std::make_unique<detail::host_batch_reader>(
-      conf.depth,
-      conf.failure_limit,
-      conf.submit_policy,
-      [](void* context) noexcept { static_cast<cufile_reactor*>(context)->notify_worker(); },
-      this);
-    if (!reader->available()) {
-      batch.unavailable = true;
-      CUCASCADE_LOG_INFO(
-        "cufile_reactor '{}': the cuFile batch API is unusable here; host reads take the "
-        "synchronous path",
-        _tname);
-      return batch_dispatch::declined;
-    }
-    batch.results.reserve(reader->capacity());
-    batch.reader = std::move(reader);
-    CUCASCADE_LOG_DEBUG("cufile_reactor '{}': host batch reader of {} entries",
-                        _tname,
-                        batch.reader->capacity());
-  }
-  if (!batch.reader->available()) {
-    // Disabled for good (it logged why); entries it still holds drain through poll_batch.
-    batch.unavailable = true;
-    return batch_dispatch::declined;
-  }
 
   // Everything that can throw happens before the slice is taken.
   auto request         = std::make_unique<io_op_request>();
@@ -3094,27 +3172,6 @@ cufile_reactor::batch_dispatch cufile_reactor::try_batch_read(
   request->coordinator = coordinator;
   request->io_rng      = range{offset, clamped};
   auto const index     = batch.acquire_op();
-
-  // The sub-block head and tail, synchronously and before any entry: a failure settles the
-  // slice with nothing submitted.
-  try {
-    if (body_begin > offset) {
-      auto const size = body_begin - offset;
-      if (read_host_direct(file, dst, range{offset, size}) != size) {
-        throw std::system_error(std::make_error_code(std::errc::io_error));
-      }
-    }
-    if (end > body_end) {
-      auto const size = end - body_end;
-      if (read_host_direct(file, dst + (body_end - offset), range{body_end, size}) != size) {
-        throw std::system_error(std::make_error_code(std::errc::io_error));
-      }
-    }
-  } catch (...) {
-    batch.release_op(index);
-    request->finish_error(std::current_exception());
-    return batch_dispatch::served;
-  }
 
   auto& op        = batch.ops[index];
   op.obj          = obj;
@@ -3127,6 +3184,10 @@ cufile_reactor::batch_dispatch cufile_reactor::try_batch_read(
   op.outstanding  = 0;
   op.queued_bytes = count_queued ? slice.size() : 0;
   op.error.reset();
+  // The sub-block head and tail are owed synchronously: run after the pass handed the wave over,
+  // so they overlap it.  A failure fails the slice once its entries drained.
+  if (body_begin > offset) owe_batch_read(index, range{offset, body_begin - offset});
+  if (end > body_end) owe_batch_read(index, range{body_end, end - body_end});
   stage_batch_entries(index);
   return batch_dispatch::taken;
 }
@@ -3144,15 +3205,8 @@ void cufile_reactor::stage_batch_entries(std::uint32_t index) noexcept
   if (op.error.has_value()) {
     op.next = end;  // stop: what is in flight finishes, nothing more is read
   } else if (op.next < end && (batch.reader == nullptr || !batch.reader->available())) {
-    // The reader gave up (or is gone): the rest of the body is read synchronously.
-    auto const rest = range{op.next, end - op.next};
-    try {
-      if (read_host_direct(*op.file, op.dst + (rest.offset - op.rng.offset), rest) != rest.size) {
-        op.error = std::make_error_code(std::errc::io_error);
-      }
-    } catch (...) {
-      op.error = std::current_exception();
-    }
+    // The reader gave up (or is gone): the rest of the body is owed synchronously.
+    owe_batch_read(index, range{op.next, end - op.next});
     op.next = end;
   }
   auto* const reader = batch.reader.get();
@@ -3160,9 +3214,9 @@ void cufile_reactor::stage_batch_entries(std::uint32_t index) noexcept
     auto const size  = std::min(limit, end - op.next);
     auto const entry = (op.next - op.body.offset) / limit;
     reader->add(detail::batch_read{op.file->cufile_handle(),
-                                  op.dst + (op.next - op.rng.offset),
-                                  range{op.next, size},
-                                  batch_state::token(index, entry)});
+                                   op.dst + (op.next - op.rng.offset),
+                                   range{op.next, size},
+                                   batch_state::token(index, entry)});
     ++op.outstanding;
     op.next += size;
   }
@@ -3171,22 +3225,94 @@ void cufile_reactor::stage_batch_entries(std::uint32_t index) noexcept
     return;
   }
   if (batch.backlog == index) batch.backlog.reset();
-  if (op.outstanding == 0) settle_batch(index);
+  maybe_settle_batch(index);
 }
 
-void cufile_reactor::poll_batch(std::chrono::microseconds wait) noexcept
+void cufile_reactor::owe_batch_read(std::uint32_t index, range rng) noexcept
 {
   auto& batch = *_batch;
-  if (batch.reader == nullptr) return;
-  auto& reader = *batch.reader;
-  if (reader.in_flight() != 0 || reader.staged() != 0 || reader.pending_failures() != 0) {
-    batch.results.clear();
-    std::ignore = reader.reap(wait, [&](detail::batch_result const& result) noexcept {
-      batch.results.push_back(result);  // capacity reserved: one per entry
-    });
-    process_batch_results(nullptr);
+  auto& op    = batch.ops[index];
+  if (rng.size == 0) return;
+  try {
+    batch.owed_reads.push_back(batch_state::owed{index, rng});
+    ++op.outstanding;
+  } catch (...) {
+    if (!op.error.has_value()) op.error = std::current_exception();
   }
-  // Continue the slice waiting for room first.
+}
+
+void cufile_reactor::run_batch_owed(std::size_t budget) noexcept
+{
+  auto& batch = *_batch;
+  while (batch.owes() && budget > 0) {
+    auto& owed = batch.owed_reads[batch.owed_head];
+    auto& op   = batch.ops[owed.op];
+    bool done  = true;
+    if (!op.error.has_value() && !op.request->coordinator->should_continue()) {
+      op.error = canceled_error();
+    }
+    if (!op.error.has_value()) {
+      // At most the budget now; the rest on the following passes, so high-priority requests
+      // and the lane and batch reaping are not held up by one large repair.
+      auto const piece = range{owed.rng.offset, std::min(owed.rng.size, budget)};
+      try {
+        if (read_host_direct(*op.file, op.dst + (piece.offset - op.rng.offset), piece) !=
+            piece.size) {
+          op.error = std::make_error_code(std::errc::io_error);
+        }
+      } catch (...) {
+        op.error = std::current_exception();
+      }
+      budget -= piece.size;
+      owed.rng.offset += piece.size;
+      owed.rng.size -= piece.size;
+      done = owed.rng.size == 0 || op.error.has_value();
+    }
+    if (!done) break;
+    auto const index = owed.op;
+    ++batch.owed_head;
+    --op.outstanding;
+    maybe_settle_batch(index);
+  }
+  if (!batch.owes()) {
+    batch.owed_reads.clear();
+    batch.owed_head = 0;
+  }
+}
+
+void cufile_reactor::fail_batch_owed(grouped_coordinator::error_type const& error) noexcept
+{
+  auto& batch = *_batch;
+  while (batch.owes()) {
+    auto const index = batch.owed_reads[batch.owed_head++].op;
+    auto& op         = batch.ops[index];
+    if (!op.error.has_value()) op.error = error;
+    --op.outstanding;
+    maybe_settle_batch(index);
+  }
+  batch.owed_reads.clear();
+  batch.owed_head = 0;
+}
+
+void cufile_reactor::poll_batch() noexcept
+{
+  auto& batch = *_batch;
+  if (batch.reader != nullptr) {
+    auto& reader = *batch.reader;
+    // Also when only a publication is pending (e.g. a dead helper's verdict): collecting clears
+    // it, so the wait point does not spin on it.
+    if (reader.in_flight() != 0 || reader.pending_failures() != 0 ||
+        reader.completions_pending()) {
+      batch.results.clear();
+      std::ignore = reader.reap(std::chrono::microseconds{0},
+                                [&](detail::batch_result const& result) noexcept {
+                                  batch.results.push_back(result);  // capacity reserved
+                                });
+      process_batch_results(nullptr);
+      export_batch_counters();
+    }
+  }
+  // Continue the slice waiting for room first (the pass's own batch reads come after it).
   if (batch.backlog.has_value()) stage_batch_entries(*batch.backlog);
 }
 
@@ -3207,11 +3333,10 @@ void cufile_reactor::process_batch_results(grouped_coordinator::error_type const
         if (!op.request->coordinator->should_continue()) {
           op.error = canceled_error();
         } else {
-          // Finish the entry's missing bytes synchronously.
+          // The entry's missing bytes are owed synchronously.
           auto const entry_offset = op.body.offset + entry * limit;
           auto const entry_size   = std::min(limit, op.body.end() - entry_offset);
           auto const done         = std::min(result.bytes, entry_size);
-          auto const missing      = range{entry_offset + done, entry_size - done};
           try {
             if (batch.failed_files.insert(op.obj->object_path()).second) {
               CUCASCADE_LOG_WARN(
@@ -3226,22 +3351,23 @@ void cufile_reactor::process_batch_results(grouped_coordinator::error_type const
           } catch (...) {
             // Logging is best effort.
           }
-          try {
-            if (read_host_direct(*op.file, op.dst + (missing.offset - op.rng.offset), missing) !=
-                missing.size) {
-              op.error = std::make_error_code(std::errc::io_error);
-            }
-          } catch (...) {
-            op.error = std::current_exception();
-          }
+          owe_batch_read(index, range{entry_offset + done, entry_size - done});
         }
       }
     }
-    if (op.outstanding == 0 && op.next >= op.body.end() && batch.backlog != index) {
-      settle_batch(index);
-    }
+    maybe_settle_batch(index);
   }
   batch.results.clear();
+}
+
+void cufile_reactor::maybe_settle_batch(std::uint32_t index) noexcept
+{
+  auto& batch = *_batch;
+  auto& op    = batch.ops[index];
+  if (op.request != nullptr && op.outstanding == 0 && op.next >= op.body.end() &&
+      batch.backlog != index) {
+    settle_batch(index);
+  }
 }
 
 void cufile_reactor::settle_batch(std::uint32_t index) noexcept
@@ -3263,16 +3389,50 @@ void cufile_reactor::settle_batch(std::uint32_t index) noexcept
   _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
+void cufile_reactor::export_batch_counters() noexcept
+{
+  auto& batch = *_batch;
+  if (batch.reader == nullptr) return;
+  auto const& now  = batch.reader->counters();
+  auto& was        = batch.exported;
+  auto const delta = [](std::uint64_t current, std::uint64_t previous) noexcept {
+    return current > previous ? current - previous : std::uint64_t{0};
+  };
+  auto constexpr relaxed = std::memory_order_relaxed;
+  _counters.batch_waves.fetch_add(delta(now.submits, was.submits), relaxed);
+  _counters.batch_entries.fetch_add(delta(now.submitted_entries, was.submitted_entries), relaxed);
+  _counters.batch_rejected_submits.fetch_add(delta(now.rejected_submits, was.rejected_submits),
+                                             relaxed);
+  _counters.batch_partial_status.fetch_add(delta(now.partial_status, was.partial_status), relaxed);
+  _counters.batch_handle_resets.fetch_add(delta(now.handle_resets, was.handle_resets), relaxed);
+  _counters.batch_deferred.fetch_add(delta(now.deferred_flushes, was.deferred_flushes), relaxed);
+  _counters.batch_submit_ns.fetch_add(delta(now.submit_ns, was.submit_ns), relaxed);
+  was = now;
+}
+
 bool cufile_reactor::batch_has_work() const noexcept
 {
-  if (_batch == nullptr || _batch->reader == nullptr) return false;
+  if (_batch == nullptr) return false;
+  if (_batch->owes()) return true;
+  if (_batch->reader == nullptr) return false;
   auto const& reader = *_batch->reader;
   return reader.in_flight() != 0 || reader.staged() != 0 || reader.pending_failures() != 0;
 }
 
 void cufile_reactor::flush_batch() noexcept
 {
-  if (_batch != nullptr && _batch->reader != nullptr) _batch->reader->flush();
+  if (_batch == nullptr || _batch->reader == nullptr) return;
+  auto& batch  = *_batch;
+  auto& reader = *batch.reader;
+  if (reader.staged() != 0) {
+    // Entries of stopped requests are not submitted only to be failed.
+    reader.discard_staged_if([&](std::uint64_t token) noexcept {
+      auto const& op = batch.ops[static_cast<std::uint32_t>(token >> 32)];
+      return op.error.has_value() || !op.request->coordinator->should_continue();
+    });
+    reader.flush();
+  }
+  export_batch_counters();
 }
 
 // ---------------------------------------------------------------------------
@@ -3487,7 +3647,7 @@ cufile_reactor::lane_dispatch cufile_reactor::try_lane_read(
 
 void cufile_reactor::reap_async() noexcept
 {
-  if (_batch != nullptr) poll_batch(std::chrono::microseconds{0});
+  if (_batch != nullptr) poll_batch();
   if (_lanes == nullptr) return;
   auto& lanes = *_lanes;
   lanes.results.clear();
@@ -3644,7 +3804,8 @@ bool cufile_reactor::async_in_flight() const noexcept
 
 bool cufile_reactor::async_completions_pending() const noexcept
 {
-  if (_batch != nullptr && _batch->reader != nullptr && _batch->reader->completions_pending()) {
+  if (_batch != nullptr &&
+      (_batch->owes() || (_batch->reader != nullptr && _batch->reader->completions_pending()))) {
     return true;
   }
   if (_lanes == nullptr) return false;
@@ -3658,8 +3819,7 @@ bool cufile_reactor::async_completions_pending() const noexcept
 
 bool cufile_reactor::async_backlog_pending() const noexcept
 {
-  return (_lanes != nullptr && _lanes->backlog.has_value()) ||
-         (_batch != nullptr && _batch->backlog.has_value());
+  return _lanes != nullptr && _lanes->backlog.has_value();
 }
 
 std::int64_t cufile_reactor::async_wait_limit_us() const noexcept
@@ -3673,14 +3833,11 @@ std::int64_t cufile_reactor::async_wait_limit_us() const noexcept
     limit = _config.fused_reads.completion == lane_completion::poll ? poll_us : 1000;
   }
   if (batch_has_work()) {
-    // The batch helper wakes the worker when a wave completed; host_batch.poll_us only bounds
-    // a lost wake-up.  A wave waiting for another reader's gate (exclusive policy) is retried
-    // every poll interval.
+    // The batch helper wakes the worker when a wave completed, and a reader releasing the
+    // exclusive gate wakes the waiting ones: host_batch.poll_us only bounds a lost wake-up.
     auto const batch_limit =
-      _batch->reader->deferred()
-        ? poll_us
-        : std::max<std::int64_t>(1, static_cast<std::int64_t>(_config.host_batch.poll_us));
-    limit                  = limit < 0 ? batch_limit : std::min(limit, batch_limit);
+      std::max<std::int64_t>(1, static_cast<std::int64_t>(_config.host_batch.poll_us));
+    limit = limit < 0 ? batch_limit : std::min(limit, batch_limit);
   }
   return limit;
 }
@@ -3689,21 +3846,26 @@ void cufile_reactor::drain_async(grouped_coordinator::error_type const& terminal
 {
   if (_batch != nullptr) {
     auto& batch = *_batch;
-    // A slice waiting for room stages nothing more; it settles once its entries drained.
+    // Nothing is submitted at shutdown only to be failed: staged entries are dropped, and a
+    // slice waiting for room stages nothing more; each settles once its entries drained.
+    if (batch.reader != nullptr) batch.reader->discard_staged();
     if (batch.backlog.has_value()) {
       auto const index = *batch.backlog;
       batch.backlog.reset();
       auto& op = batch.ops[index];
       if (!op.error.has_value()) op.error = terminal_error;
       op.next = op.body.end();
-      if (op.outstanding == 0) settle_batch(index);
     }
+    fail_batch_owed(terminal_error);
     if (batch.reader != nullptr) {
       batch.results.clear();
+      // Never returns while cuFile may still write a destination (nor for a poisoned reader).
       batch.reader->drain([&](detail::batch_result const& result) noexcept {
         batch.results.push_back(result);  // capacity reserved: one per entry
       });
       process_batch_results(&terminal_error);
+      fail_batch_owed(terminal_error);  // process_batch_results owes nothing with a terminal
+      export_batch_counters();
       // Destroyed here, on the worker, with nothing in flight.
       batch.reader.reset();
     }
@@ -3839,6 +4001,10 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
            scheduler.active != nullptr && !scheduler.active->empty() &&
            inflight_count() < _config.max_inflight && !async_backlog_pending() &&
            !stop_token.stop_requested();) {
+        // A batch read waits while the batch backlog is occupied; any other slice goes past it.
+        // Slices of one request are independent (each has its own credit and destination), so
+        // stopping here only delays the request's later slices, never reorders a completion.
+        if (batch_front_blocked(*scheduler.active)) break;
         if (!scheduler.active->coordinator->should_continue()) {
           cancel_request(scheduler.active, canceled_error());
           break;
@@ -3866,13 +4032,17 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
         if (!lane_owned) _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
       }
       publication.publish();
-      // One submit for every batch entry the pass staged.
+      // One submit for every batch entry the pass staged (the deferred ones included), then the
+      // synchronous reads the batch path owes, a pass's worth at most.
       flush_batch();
+      if (_batch != nullptr) run_batch_owed(_config.max_op_bytes);
       if (scheduler.active != nullptr && scheduler.active->empty()) { scheduler.active.reset(); }
 
       // A full in-flight window or a lane read waiting for a lane stops the worker from
       // taking more slices until something completes.
-      bool const has_capacity = inflight_count() < _config.max_inflight && !async_backlog_pending();
+      bool const has_capacity =
+        inflight_count() < _config.max_inflight && !async_backlog_pending() &&
+        !(scheduler.active != nullptr && batch_front_blocked(*scheduler.active));
       if (scheduler.active != nullptr && has_capacity) {
         continue;  // The quantum ran out with slices left: take another pass.
       }

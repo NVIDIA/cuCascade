@@ -457,29 +457,33 @@ struct fused_read_config {
  * later @c GetStatus once the calling thread's allocator reused that memory (measured on 2x RTX
  * 6000 Ada: 5 of 5 runs of a raw-API reproducer, and of a refill-while-pending workload).  The
  * wave policies avoid such returns: a reader submits a wave only once its previous wave was fully
- * reaped and waits for the whole wave in one call.
+ * reaped and waits for the whole wave in ONE call with a one-hour timeout.  A wave that outlives
+ * even that poisons its reader: its unreported entries stay in flight for good (cuFile may still
+ * write their destinations), the reactor serves host reads synchronously from then on and cannot
+ * shut down cleanly.  @ref host_batch_config::max_wave_bytes keeps waves far below that.
  *
- * Anything but @ref exclusive must first be qualified on the target stack (library, mode,
- * filesystem) with the hidden test `cucascade_io_tests "[host_batch_quirk]"`, which runs each
- * policy (and the raw reproducer) in child processes and reports their crash counts.  Mixing
- * policies among the batch readers alive at the same time in one process is unsupported: the
- * readers that exist first fix the process policy, and a reader configured differently meanwhile
- * logs a warning once and uses the process policy.
+ * Anything but @ref per_reader and @ref exclusive must first be qualified on the target stack
+ * (library, mode, filesystem) with the hidden test `cucascade_io_tests "[host_batch_quirk]"`,
+ * which runs each policy (and the raw reproducer) in child processes and reports their crash
+ * counts.  Mixing policies among the batch readers alive at the same time in one process is
+ * unsupported: the readers that exist first fix the process policy, and a reader configured
+ * differently meanwhile logs a warning once and uses the process policy.  Each copy of the
+ * library (a static and a shared one in the same process) keeps its own registry.
  */
 enum class batch_submit_policy : std::uint8_t {
   /// Whole waves, one in flight process-wide: a reader submits only while no other reader's wave
-  /// is in flight (a process-wide gate, released as soon as the wave completed).  Readers
-  /// alternate; entries staged meanwhile wait.  The default and the most conservative shape.
+  /// is in flight (a process-wide gate, released as soon as the wave completed, waking the
+  /// readers waiting for it).  Readers alternate.  The conservative knob.
   exclusive,
   /// Whole waves per reader: a reader submits a wave only when its own previous wave was fully
-  /// reaped; readers do not coordinate, so waves of different readers overlap.  The shape the
-  /// raw GDS-host benchmark ran (threads x waves on separate handles) at io_uring parity.  Never
-  /// crashed in compatibility mode on libcufile 1.17.1 (also with heap spraying), but qualify it
-  /// on the target stack first.
+  /// reaped; readers do not coordinate, so waves of different readers overlap.  The default: the
+  /// shape measured on the GDS host (GB200, GPFS: 37.9 GiB/s with 2 reactors x 64, equal to
+  /// exclusive) and never crashed in compatibility mode on libcufile 1.17.1 (also with heap
+  /// spraying).
   per_reader,
   /// Refill while entries are pending (libaio style): staged entries are submitted at once and
-  /// completions reaped as they come (@c min_nr 1).  Fastest where the library supports it;
-  /// crashes in compatibility mode on libcufile 1.17.1 (the partial returns above).
+  /// completions reaped as they come (@c min_nr 1).  Opt-in; crashes in compatibility mode on
+  /// libcufile 1.17.1 (the partial returns above).
   continuous,
 };
 
@@ -512,18 +516,23 @@ struct host_batch_config {
   /// Aligned bodies smaller than this keep the synchronous path.
   std::size_t min_bytes{64UL << 10};
 
-  /// Longest the reactor worker sleeps, in microseconds, while batch entries are in flight
-  /// without hearing from them.  The reader's helper thread wakes the worker when a wave
-  /// completed, so this only bounds a lost wake-up; it never delays a request (the worker
-  /// never blocks in cuFile for the batch).
+  /// Longest the reactor worker sleeps, in microseconds, while batch work is outstanding
+  /// without hearing from the batch helper.  The helper wakes the worker when a wave completed
+  /// (and a reader releasing the exclusive gate wakes the waiting ones), so this only bounds a
+  /// lost wake-up; it never delays a request (the worker never blocks in cuFile for the batch).
   unsigned poll_us{200};
 
   /// Consecutive rejected submits after which a reactor gives up batching for good.
   unsigned failure_limit{4};
 
-  /// When submits may run.  Keep @c exclusive unless the target stack was qualified for
-  /// another policy (see @ref batch_submit_policy).
-  batch_submit_policy submit_policy{batch_submit_policy::exclusive};
+  /// When submits may run (see @ref batch_submit_policy).  Qualify @c continuous on the target
+  /// stack before using it.
+  batch_submit_policy submit_policy{batch_submit_policy::per_reader};
+
+  /// Most bytes one wave carries (0 = no cap; else a multiple of @c io::IO_BLOCK_SIZE, at least
+  /// one entry is always handed over).  Bounds how long one wave can take, which must stay far
+  /// below the reader's one-hour wave timeout (see @ref batch_submit_policy).
+  std::size_t max_wave_bytes{256UL << 20};
 
   bool operator==(host_batch_config const&) const = default;
 
@@ -552,6 +561,10 @@ struct host_batch_config {
         submit_policy != batch_submit_policy::per_reader &&
         submit_policy != batch_submit_policy::continuous) {
       throw std::invalid_argument("host_batch.submit_policy is not a batch_submit_policy");
+    }
+    if (max_wave_bytes % io::IO_BLOCK_SIZE != 0) {
+      throw std::invalid_argument(
+        "host_batch.max_wave_bytes must be 0 or a multiple of IO_BLOCK_SIZE");
     }
   }
 };
