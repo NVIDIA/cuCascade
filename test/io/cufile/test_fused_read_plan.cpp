@@ -95,8 +95,8 @@ struct key {
 {
   prepared_io_slice slice{
     range{offset, size},
-    device_buffer{address(dst), ::cuda::stream_ref{reinterpret_cast<cudaStream_t>(k.stream)},
-                  k.device}};
+    device_buffer{
+      address(dst), ::cuda::stream_ref{reinterpret_cast<cudaStream_t>(k.stream)}, k.device}};
   slice.d_buffer.ready_gate     = fake_gate(k.gate);
   slice.d_buffer.ready_gate_set = true;
   slice.priority                = k.priority;
@@ -270,8 +270,7 @@ TEST_CASE("fused plan bridges gaps up to gap_bytes only", "[io][cufile][fused_pl
   }
 }
 
-TEST_CASE("fused plan keeps unaligned windows within the window size",
-          "[io][cufile][fused_plan]")
+TEST_CASE("fused plan keeps unaligned windows within the window size", "[io][cufile][fused_plan]")
 {
   // Starts 100 bytes into a block: the window is the aligned span, never wider than 8 MiB.
   auto slices      = device_slices({{100, 8 * MiB}, {8 * MiB + 100, 300}});
@@ -306,9 +305,9 @@ TEST_CASE("fused plan never puts overlapping or duplicate ranges in one window",
 
 TEST_CASE("fused plan with fuse off only splits", "[io][cufile][fused_plan]")
 {
-  auto options = window_of(8 * MiB);
-  options.fuse = false;
-  auto slices  = device_slices({{0, 1 * MiB}, {1 * MiB, 2 * MiB}, {3 * MiB, 20 * MiB}});
+  auto options     = window_of(8 * MiB);
+  options.fuse     = false;
+  auto slices      = device_slices({{0, 1 * MiB}, {1 * MiB, 2 * MiB}, {3 * MiB, 20 * MiB}});
   auto const stats = plan_fused_reads(slices, 64 * MiB, options);
   REQUIRE(slices.size() == 5);
   CHECK(stats.reads == 5);
@@ -393,13 +392,13 @@ TEST_CASE("fused plan never fuses across stream, gate, device or priority",
           "[io][cufile][fused_plan]")
 {
   key const base{};
-  auto other_stream   = base;
-  other_stream.stream = 0x200;
-  auto other_gate     = base;
-  other_gate.gate     = 0x300;
-  auto other_device   = base;
-  other_device.device = 1;
-  auto other_priority = base;
+  auto other_stream       = base;
+  other_stream.stream     = 0x200;
+  auto other_gate         = base;
+  other_gate.gate         = 0x300;
+  auto other_device       = base;
+  other_device.device     = 1;
+  auto other_priority     = base;
   other_priority.priority = io_priority::low;
 
   for (auto const& other : {other_stream, other_gate, other_device, other_priority}) {
@@ -418,20 +417,19 @@ TEST_CASE("fused plan never fuses across stream, gate, device or priority",
     CHECK(fused->fused[1].data == address(base_of(2)));
   }
   // The same gate pointer does fuse.
-  auto gated   = base;
-  gated.gate   = 0x300;
-  auto slices  = device_slices({{0, 1 * MiB}, {1 * MiB, 1 * MiB}}, gated);
+  auto gated  = base;
+  gated.gate  = 0x300;
+  auto slices = device_slices({{0, 1 * MiB}, {1 * MiB, 1 * MiB}}, gated);
   CHECK(plan_fused_reads(slices, 64 * MiB, window_of(8 * MiB)).reads == 1);
   REQUIRE(slices.size() == 1);
   CHECK(slices[0].d_buffer.ready_gate.get() ==
         reinterpret_cast<cucascade::cuda::cuda_event*>(0x300));
 }
 
-TEST_CASE("fused plan passes ineligible slices through in their order",
-          "[io][cufile][fused_plan]")
+TEST_CASE("fused plan passes ineligible slices through in their order", "[io][cufile][fused_plan]")
 {
   std::vector<prepared_io_slice> slices;
-  slices.push_back(device_slice(0, 1 * MiB, base_of(0)));                    // planned
+  slices.push_back(device_slice(0, 1 * MiB, base_of(0)));                      // planned
   slices.emplace_back(range{1 * MiB, 1 * MiB}, host_buffer{address(0x1000)});  // host only
   slices.push_back(device_slice(2 * MiB, 1 * MiB, base_of(2)));
   slices.back().h_buffer = host_buffer{address(0x2000)};  // host + device
@@ -445,8 +443,8 @@ TEST_CASE("fused plan passes ineligible slices through in their order",
   slices.back().fused = {fused_part{range{5 * MiB, 1 * MiB}, address(base_of(5))},
                          fused_part{range{6 * MiB, 1 * MiB}, address(base_of(6))}};
   slices.push_back(device_slice(7 * MiB, 1 * MiB, base_of(7)));
-  slices.back().d_buffer.ready_gate_set = false;  // gate not resolved
-  slices.push_back(device_slice(8 * MiB, 0, base_of(8)));  // empty
+  slices.back().d_buffer.ready_gate_set = false;                 // gate not resolved
+  slices.push_back(device_slice(8 * MiB, 0, base_of(8)));        // empty
   slices.push_back(device_slice(8 * MiB, 1 * MiB, base_of(9)));  // planned
 
   auto const stats = plan_fused_reads(slices, 64 * MiB, window_of(16 * MiB, 7 * MiB));
@@ -603,8 +601,7 @@ TEST_CASE("lane_window and is_lane_read edge cases", "[io][cufile][fused_plan]")
   };
   CHECK(is_lane_read(fused({part(0, 1 * MiB), part(1 * MiB, 1 * MiB)}), file_size, 8 * MiB));
   CHECK(is_lane_read(fused({part(4 * KiB, 4 * KiB), part(1 * MiB, 4 * KiB)}), file_size, 8 * MiB));
-  CHECK_FALSE(
-    is_lane_read(fused({part(1 * MiB, 1 * MiB), part(0, 1 * MiB)}), file_size, 8 * MiB));
+  CHECK_FALSE(is_lane_read(fused({part(1 * MiB, 1 * MiB), part(0, 1 * MiB)}), file_size, 8 * MiB));
   CHECK_FALSE(
     is_lane_read(fused({part(0, 1 * MiB), part(1 * MiB - 1, 4 * KiB)}), file_size, 8 * MiB));
   CHECK_FALSE(is_lane_read(fused({part(0, 1 * MiB), part(2 * MiB, 1)}), file_size, 8 * MiB));
@@ -644,15 +641,14 @@ TEST_CASE("fused plan post-conditions hold on random inputs", "[io][cufile][fuse
     for (std::size_t i = 0; i < n; ++i) {
       std::size_t offset = 0;
       switch (pick(0, 3)) {
-        case 0: offset = cursor; break;                                  // contiguous
+        case 0: offset = cursor; break;                                         // contiguous
         case 1: offset = cursor + pick(0, options.gap_bytes + 8 * KiB); break;  // gap
         case 2: offset = cursor > 0 ? cursor - pick(0, std::min(cursor, window)) : 0; break;
         default: offset = pick(0, span); break;
       }
-      std::size_t const size =
-        pick(0, 3) == 0 ? IO_BLOCK_SIZE * pick(1, 3 * window / IO_BLOCK_SIZE)
-                        : pick(1, pick(0, 1) == 0 ? 16 * KiB : 3 * window);
-      cursor = offset + size;
+      std::size_t const size = pick(0, 3) == 0 ? IO_BLOCK_SIZE * pick(1, 3 * window / IO_BLOCK_SIZE)
+                                               : pick(1, pick(0, 1) == 0 ? 16 * KiB : 3 * window);
+      cursor                 = offset + size;
       if (pick(0, 6) == 0) {
         slices.emplace_back(range{offset, size}, host_buffer{address(base_of(i))});
         host.push_back(true);
@@ -669,10 +665,9 @@ TEST_CASE("fused plan post-conditions hold on random inputs", "[io][cufile][fuse
     auto const input = [&] {
       std::vector<std::pair<range, std::uintptr_t>> out;
       for (auto const& slice : slices) {
-        out.emplace_back(slice.rng,
-                         slice.has_device_request()
-                           ? reinterpret_cast<std::uintptr_t>(slice.d_buffer.data)
-                           : 0);
+        out.emplace_back(
+          slice.rng,
+          slice.has_device_request() ? reinterpret_cast<std::uintptr_t>(slice.d_buffer.data) : 0);
       }
       return out;
     }();
@@ -749,8 +744,7 @@ TEST_CASE("fused plan post-conditions hold on random inputs", "[io][cufile][fuse
         REQUIRE(index < n);
         REQUIRE_FALSE(host[index]);
         // The same key as the slice it came from.
-        CHECK(keys[index].stream ==
-              reinterpret_cast<std::uintptr_t>(slice.d_buffer.stream.get()));
+        CHECK(keys[index].stream == reinterpret_cast<std::uintptr_t>(slice.d_buffer.stream.get()));
         CHECK(keys[index].gate ==
               reinterpret_cast<std::uintptr_t>(slice.d_buffer.ready_gate.get()));
         CHECK(keys[index].device == slice.d_buffer.device_id);
@@ -824,8 +818,8 @@ TEST_CASE("fused plan: a slice whose end overflows is clamped to the file",
           "[io][cufile][fused_plan]")
 {
   constexpr std::size_t file_size = (3 * MiB) + 100;
-  auto slices = device_slices({{5000, std::numeric_limits<std::size_t>::max() - 1000}});
-  auto const stats = plan_fused_reads(slices, file_size, window_of(1 * MiB));
+  auto slices         = device_slices({{5000, std::numeric_limits<std::size_t>::max() - 1000}});
+  auto const stats    = plan_fused_reads(slices, file_size, window_of(1 * MiB));
   std::size_t payload = 0;
   for (auto const& slice : slices) {
     for (auto const& p : pieces_of(slice)) {

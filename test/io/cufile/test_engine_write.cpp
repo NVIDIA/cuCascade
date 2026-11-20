@@ -619,9 +619,9 @@ TEST_CASE("opt-in context buffered fallbacks serialize against engine granules a
   auto body = w.write({0, mib});
   REQUIRE(until([&] { return w.r.transport->snapshot().blocked_completions == 1; }));
   config cfg;
-  cfg.async_engine.mode = engine_mode::async_auto;
+  cfg.async_engine.mode         = engine_mode::async_auto;
   cfg.async_engine.async_writes = true;
-  auto shared = std::make_shared<cufile_reactor::reactor_context>(cfg);
+  auto shared                   = std::make_shared<cufile_reactor::reactor_context>(cfg);
   cufile_ioctx legacy(1, shared);
   legacy.start();
   std::vector<prepared_io_slice> edges;
@@ -741,10 +741,10 @@ TEST_CASE("opt-in context host and legacy device fallbacks wait for engine granu
   auto body = w.write({0, mib});
   REQUIRE(until([&] { return w.r.transport->snapshot().blocked_completions == 1; }));
   config cfg;
-  cfg.max_inflight = 1;
-  cfg.async_engine.mode = engine_mode::async_auto;
+  cfg.max_inflight              = 1;
+  cfg.async_engine.mode         = engine_mode::async_auto;
   cfg.async_engine.async_writes = true;
-  auto shared      = std::make_shared<cufile_reactor::reactor_context>(cfg);
+  auto shared                   = std::make_shared<cufile_reactor::reactor_context>(cfg);
   cufile_ioctx legacy(1, shared);
   legacy.start();
   auto pending = std::async(std::launch::async, [&] {

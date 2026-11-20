@@ -168,8 +168,7 @@ class device_memory {
   cudaStream_t other{};
   REQUIRE(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking) == cudaSuccess);
   std::vector<std::uint8_t> out(bytes);
-  REQUIRE(cudaMemcpyAsync(out.data(), device, bytes, cudaMemcpyDeviceToHost, other) ==
-          cudaSuccess);
+  REQUIRE(cudaMemcpyAsync(out.data(), device, bytes, cudaMemcpyDeviceToHost, other) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(other) == cudaSuccess);
   REQUIRE(cudaStreamDestroy(other) == cudaSuccess);
   return out;
@@ -238,8 +237,7 @@ std::vector<lane_result> reap_n(fused_lane_set& set,
     std::ignore = set.reap([&](lane_result const& r) { results.push_back(r); });
     if (results.size() >= count) break;
     if (std::chrono::steady_clock::now() > deadline) {
-      FAIL("timed out waiting for lane completions (" << results.size() << " of " << count
-                                                      << ")");
+      FAIL("timed out waiting for lane completions (" << results.size() << " of " << count << ")");
     }
     std::this_thread::sleep_for(100us);
   }
@@ -251,13 +249,13 @@ std::vector<lane_result> reap_n(fused_lane_set& set,
                                   range window,
                                   std::vector<std::pair<std::size_t, std::size_t>> const& parts,
                                   std::uint8_t* dst,
-                                  std::size_t gap      = 17,
-                                  std::uint64_t token  = 0)
+                                  std::size_t gap     = 17,
+                                  std::uint64_t token = 0)
 {
   lane_read read;
-  read.handle = handle;
-  read.window = window;
-  read.token  = token;
+  read.handle     = handle;
+  read.window     = window;
+  read.token      = token;
   std::size_t pos = 3;
   for (auto const& [offset, bytes] : parts) {
     read.copies.push_back(lane_copy{dst + pos, offset, bytes});
@@ -283,7 +281,6 @@ void require_async_cufile()
     SKIP("libcufile with cuFileReadAsync is unavailable");
   }
 }
-
 
 // ---------------------------------------------------------------------------
 // A scripted cuFile: plain functions over one process-wide state.
@@ -311,7 +308,7 @@ struct fake_handle {
 struct fake_state {
   std::mutex mutex;
   std::vector<fake_call> calls;
-  std::vector<fake_action> script;  ///< per call; later calls are normal
+  std::vector<fake_action> script;   ///< per call; later calls are normal
   std::optional<fake_action> every;  ///< overrides the script for every call
   std::deque<std::vector<std::uint8_t>> keep_alive;
   std::size_t stream_registers{0};
@@ -396,7 +393,7 @@ CUfileError_t fake_read_async(CUfileHandle_t handle,
                                   base,
                                   stream});
   auto const index  = state.calls.size() - 1;
-  auto const action = state.every ? *state.every
+  auto const action = state.every                   ? *state.every
                       : index < state.script.size() ? state.script[index]
                                                     : fake_action{};
   if (action.what == fake_action::kind::refuse) {
@@ -410,14 +407,14 @@ CUfileError_t fake_read_async(CUfileHandle_t handle,
   }
   auto limit = *size_p;
   if (action.what == fake_action::kind::short_read) limit = std::min(limit, action.bytes);
-  auto& host     = state.keep_alive.emplace_back(limit);
-  auto const got = ::pread(static_cast<fake_handle*>(handle)->fd, host.data(), limit, *file_offset_p);
-  if (got > 0 &&
-      cudaMemcpyAsync(static_cast<std::uint8_t*>(base) + *buffer_offset_p,
-                      host.data(),
-                      static_cast<std::size_t>(got),
-                      cudaMemcpyHostToDevice,
-                      static_cast<cudaStream_t>(stream)) != cudaSuccess) {
+  auto& host = state.keep_alive.emplace_back(limit);
+  auto const got =
+    ::pread(static_cast<fake_handle*>(handle)->fd, host.data(), limit, *file_offset_p);
+  if (got > 0 && cudaMemcpyAsync(static_cast<std::uint8_t*>(base) + *buffer_offset_p,
+                                 host.data(),
+                                 static_cast<std::size_t>(got),
+                                 cudaMemcpyHostToDevice,
+                                 static_cast<cudaStream_t>(stream)) != cudaSuccess) {
     *bytes_read_p = -5;
     return fake_ok();
   }
@@ -541,14 +538,13 @@ TEST_CASE("fused lanes: one read with several copies lands the file's bytes",
   device_memory dst{2 * MiB};
   range const window{64 * KiB, 512 * KiB};
   // Unaligned parts inside the aligned window, the last ending at the window's end.
-  auto read = make_read(object->cufile_handle(),
-                        window,
-                        {{window.offset + 5, 1000},
-                         {window.offset + 100'000, 77'777},
-                         {window.end() - 3000, 3000}},
-                        dst.get(),
-                        4099,
-                        42);
+  auto read = make_read(
+    object->cufile_handle(),
+    window,
+    {{window.offset + 5, 1000}, {window.offset + 100'000, 77'777}, {window.end() - 3000, 3000}},
+    dst.get(),
+    4099,
+    42);
   auto const copies = read.copies;
   REQUIRE(set.submit(std::move(read)));
   CHECK(set.in_flight() == 1);
@@ -589,7 +585,7 @@ TEST_CASE("fused lanes: more reads than lanes, round-robin lane use",
       range const window{i * 512 * KiB, 256 * KiB};
       auto read   = make_read(object->cufile_handle(),
                             window,
-                            {{window.offset + 1, 100 * KiB}, {window.offset + 150 * KiB, 7}},
+                                     {{window.offset + 1, 100 * KiB}, {window.offset + 150 * KiB, 7}},
                             dst.get() + i * 256 * KiB,
                             3,
                             i);
@@ -630,12 +626,8 @@ TEST_CASE("fused lanes: more reads than lanes, round-robin lane use",
     std::vector<unsigned> lanes;
     for (std::size_t i = 0; i < 9; ++i) {
       range const window{i * 256 * KiB, 64 * KiB};
-      auto read = make_read(object->cufile_handle(),
-                            window,
-                            {{window.offset + 10, 5000}},
-                            dst.get(),
-                            1,
-                            i);
+      auto read =
+        make_read(object->cufile_handle(), window, {{window.offset + 10, 5000}}, dst.get(), 1, i);
       auto const copies = read.copies;
       REQUIRE(set.submit(std::move(read)));
       auto const results = reap_n(set, 1);
@@ -675,9 +667,9 @@ TEST_CASE("fused lanes: held reads", "[io][cufile][fused_lanes][gpu]")
   device_memory dst{1 * MiB};
   dst.fill(0xAB);
   range const window{256 * KiB, 512 * KiB};
-  auto read = make_read(object->cufile_handle(),
+  auto read         = make_read(object->cufile_handle(),
                         window,
-                        {{window.offset + 3, 200 * KiB}, {window.offset + 300 * KiB, 1000}},
+                                {{window.offset + 3, 200 * KiB}, {window.offset + 300 * KiB, 1000}},
                         dst.get(),
                         5,
                         7);
@@ -736,8 +728,7 @@ TEST_CASE("fused lanes: held reads", "[io][cufile][fused_lanes][gpu]")
   CHECK(wake.count.load() >= 1);
 }
 
-TEST_CASE("fused lanes: scripted cuFile failures and short reads",
-          "[io][cufile][fused_lanes][gpu]")
+TEST_CASE("fused lanes: scripted cuFile failures and short reads", "[io][cufile][fused_lanes][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
   scripted_cufile cufile;
@@ -854,7 +845,8 @@ TEST_CASE("fused lanes: scripted cuFile failures and short reads",
   {
     // Short first part, then the continuation is refused.  copy_out queues the first part's
     // copies before the continuation: the lane must not be reported while they may run.
-    cufile.script({{fake_action::kind::short_read, 2 * block + 100}, {fake_action::kind::refuse, 0}});
+    cufile.script(
+      {{fake_action::kind::short_read, 2 * block + 100}, {fake_action::kind::refuse, 0}});
     auto r            = read();
     auto copies       = make_held(r);
     auto const wanted = copies;
@@ -863,10 +855,11 @@ TEST_CASE("fused lanes: scripted cuFile failures and short reads",
     REQUIRE(results[0].held);
     // Keep the lane's stream busy for 300 ms on the GPU, so the copies run late.
     void* raw = nullptr;
-    REQUIRE(cudaHostAlloc(&raw, sizeof(cucascade::io::cufile::simulator_copy_args),
+    REQUIRE(cudaHostAlloc(&raw,
+                          sizeof(cucascade::io::cufile::simulator_copy_args),
                           cudaHostAllocMapped) == cudaSuccess);
-    auto* delay = static_cast<cucascade::io::cufile::simulator_copy_args*>(raw);
-    *delay      = cucascade::io::cufile::simulator_copy_args{};
+    auto* delay                  = static_cast<cucascade::io::cufile::simulator_copy_args*>(raw);
+    *delay                       = cucascade::io::cufile::simulator_copy_args{};
     delay->released              = 1;
     delay->completion_latency_ns = 300'000'000;
     auto const lane_stream       = static_cast<cudaStream_t>(cufile.calls()[0].stream);
@@ -891,8 +884,8 @@ TEST_CASE("fused lanes: scripted cuFile failures and short reads",
   SECTION("a held short read continues after copy_out")
   {
     cufile.script({{fake_action::kind::short_read, 2 * block + 100}});
-    auto r      = read();
-    auto copies = make_held(r);
+    auto r            = read();
+    auto copies       = make_held(r);
     auto const wanted = copies;
     REQUIRE(set->submit(std::move(r)));
     auto results = reap_n(*set, 1);
@@ -913,7 +906,7 @@ TEST_CASE("fused lanes: scripted cuFile failures and short reads",
   SECTION("a held read without progress fails without being held")
   {
     cufile.script({{fake_action::kind::short_read, 100}});
-    auto r = read();
+    auto r      = read();
     std::ignore = make_held(r);
     REQUIRE(set->submit(std::move(r)));
     auto const results = reap_n(*set, 1);
@@ -960,19 +953,20 @@ TEST_CASE("fused lanes: callback and copy enqueue failures are device_failed",
   require_async_cufile();
   seam_reset const reset;
   pattern_file const file{2 * MiB};
-  auto const object = open_registered(file);
-  auto const mode   = GENERATE(lane_completion::callback, lane_completion::poll);
-  auto options      = make_options(1, 512 * KiB);
+  auto const object  = open_registered(file);
+  auto const mode    = GENERATE(lane_completion::callback, lane_completion::poll);
+  auto options       = make_options(1, 512 * KiB);
   options.completion = mode;
   fused_lane_set set{options};
   REQUIRE(set.capacity() == 1);
   device_memory dst{1 * MiB};
   range const window{512 * KiB, 512 * KiB};
   auto read = [&] {
-    return make_read(object->cufile_handle(),
-                     window,
-                     {{window.offset + 1, 1000}, {window.offset + 2000, 3000}, {window.end() - 1, 1}},
-                     dst.get());
+    return make_read(
+      object->cufile_handle(),
+      window,
+      {{window.offset + 1, 1000}, {window.offset + 2000, 3000}, {window.end() - 1, 1}},
+      dst.get());
   };
 
   SECTION("callback installation") { set_lane_callback_failure_for_testing(1); }
@@ -1021,8 +1015,9 @@ TEST_CASE("fused lanes: a caller on another device", "[io][cufile][fused_lanes][
     CHECK(current() == 1);
     REQUIRE(set.capacity() == 2);
     range const window{256 * KiB, 1 * MiB};
-    auto read = make_read(object->cufile_handle(), window, {{window.offset + 9, 600 * KiB}}, dst.get());
-    copies    = read.copies;
+    auto read =
+      make_read(object->cufile_handle(), window, {{window.offset + 9, 600 * KiB}}, dst.get());
+    copies = read.copies;
     REQUIRE(set.submit(std::move(read)));
     CHECK(current() == 1);
     auto const results = reap_n(set, 1);
@@ -1175,7 +1170,7 @@ TEST_CASE("fused lanes: stress with random windows and copies",
     std::size_t used{0};
   };
   std::vector<pending> reads(total);
-  std::size_t next = 0;
+  std::size_t next      = 0;
   std::size_t completed = 0;
   std::size_t bytes     = 0;
   std::size_t failures  = 0;
@@ -1239,8 +1234,8 @@ TEST_CASE("fused lanes: stress with random windows and copies",
     std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
   CHECK(failures == 0);
   CHECK(set.in_flight() == 0);
-  WARN("fused lanes stress: " << total << " reads, " << bytes / MiB << " MiB copied in "
-                              << seconds << " s (" << static_cast<double>(total) / seconds
+  WARN("fused lanes stress: " << total << " reads, " << bytes / MiB << " MiB copied in " << seconds
+                              << " s (" << static_cast<double>(total) / seconds
                               << " reads/s, includes per-read verification)");
 }
 
@@ -1283,7 +1278,8 @@ TEST_CASE("fused lanes: a lane keeps working across files opened and closed",
     pattern_file const file{2 * MiB};
     auto object = open_registered(file);
     range const window{256 * KiB, 512 * KiB};
-    auto read = make_read(object->cufile_handle(), window, {{window.offset + 3, 100 * KiB}}, dst.get());
+    auto read =
+      make_read(object->cufile_handle(), window, {{window.offset + 3, 100 * KiB}}, dst.get());
     auto const copies = read.copies;
     REQUIRE(set.submit(std::move(read)));
     auto const results = reap_n(set, 1);
@@ -1302,17 +1298,21 @@ TEST_CASE("fused lanes: lane sets on threads of their own, one after another",
   for (int round = 0; round < 6; ++round) {
     INFO("round " << round);
     pattern_file const file{2 * MiB};
-    auto object = open_registered(file);
-    std::size_t failures = 0;
+    auto object            = open_registered(file);
+    std::size_t failures   = 0;
     std::size_t mismatches = 0;
     // Each round's set lives on a thread of its own, as each reactor's does.
     std::thread worker{[&] {
       fused_lane_set set{make_options(2, 1 * MiB)};
       for (int i = 0; i < 2; ++i) {
         range const window{256 * KiB, 512 * KiB};
-        auto read = make_read(object->cufile_handle(), window, {{window.offset + 3, 100 * KiB}}, dst.get());
+        auto read =
+          make_read(object->cufile_handle(), window, {{window.offset + 3, 100 * KiB}}, dst.get());
         auto const copies = read.copies;
-        if (!set.submit(std::move(read))) { ++failures; continue; }
+        if (!set.submit(std::move(read))) {
+          ++failures;
+          continue;
+        }
         std::vector<lane_result> results;
         auto const deadline = std::chrono::steady_clock::now() + 30s;
         while (results.empty() && std::chrono::steady_clock::now() < deadline) {

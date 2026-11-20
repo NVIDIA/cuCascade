@@ -76,11 +76,11 @@ namespace {
 using namespace std::chrono_literals;
 using clock_type = std::chrono::steady_clock;
 
-constexpr std::size_t block           = 4096;
-constexpr std::size_t KiB             = 1024;
-constexpr std::size_t MiB             = 1024 * KiB;
-constexpr std::uint8_t guard_fill     = 0xA5;
-constexpr std::size_t default_min     = 64 * KiB;  // host_batch_config::min_bytes below
+constexpr std::size_t block       = 4096;
+constexpr std::size_t KiB         = 1024;
+constexpr std::size_t MiB         = 1024 * KiB;
+constexpr std::uint8_t guard_fill = 0xA5;
+constexpr std::size_t default_min = 64 * KiB;  // host_batch_config::min_bytes below
 
 [[nodiscard]] std::uint8_t pattern_byte(std::size_t offset) noexcept
 {
@@ -152,8 +152,8 @@ class host_memory {
       auto const address = reinterpret_cast<std::uintptr_t>(_allocation);
       _data              = reinterpret_cast<std::uint8_t*>((address + block - 1) / block * block);
     } else {
-      _data = static_cast<std::uint8_t*>(
-        std::aligned_alloc(block, (bytes + block - 1) / block * block));
+      _data =
+        static_cast<std::uint8_t*>(std::aligned_alloc(block, (bytes + block - 1) / block * block));
     }
     REQUIRE(_data != nullptr);
     REQUIRE(reinterpret_cast<std::uintptr_t>(_data) % block == 0);
@@ -201,7 +201,10 @@ class host_plan {
   [[nodiscard]] std::size_t offset_of(std::size_t i) const noexcept { return _entries[i].offset; }
   [[nodiscard]] std::size_t size_of(std::size_t i) const noexcept { return _entries[i].size; }
   /// Where slice @p i's destination sits within a 4 KiB block.
-  [[nodiscard]] std::size_t misalign(std::size_t i) const noexcept { return _entries[i].at % block; }
+  [[nodiscard]] std::size_t misalign(std::size_t i) const noexcept
+  {
+    return _entries[i].at % block;
+  }
   [[nodiscard]] std::size_t count() const noexcept { return _entries.size(); }
 
   [[nodiscard]] std::vector<io_slice> slices(std::uint8_t* arena) const
@@ -433,9 +436,7 @@ CUfileError_t intercepted_submit(CUfileBatchHandle_t handle,
           static_cast<std::size_t>(p.file_offset) % block != 0 || p.size % block != 0) {
         s.params_ok = false;
       }
-      s.max_entry_end =
-        std::max(s.max_entry_end, static_cast<std::size_t>(p.file_offset) + p.size);
-
+      s.max_entry_end = std::max(s.max_entry_end, static_cast<std::size_t>(p.file_offset) + p.size);
     }
     if (s.reject_submits > 0) {
       --s.reject_submits;
@@ -580,7 +581,7 @@ TEST_CASE("host batch ioctx: every alignment lands the file's bytes; stats tell 
 
   auto const plan = alignment_plan(file.size());
   // Single reads, one per matrix entry.
-  auto const before = ctx.stats();
+  auto const before    = ctx.stats();
   std::size_t eligible = 0, others = 0, eligible_bytes = 0, other_bytes = 0;
   for (std::size_t i = 0; i < plan.count(); ++i) {
     auto const size = plan.clamped(i, file.size());
@@ -598,9 +599,10 @@ TEST_CASE("host batch ioctx: every alignment lands the file's bytes; stats tell 
       ctx.host_read_async_io(*object, plan.offset_of(i), plan.size_of(i), dst).get(30s);
     CHECK(got == size);
     CHECK(std::memcmp(dst, file.data() + plan.offset_of(i), size) == 0);
-    bool const guards =
-      std::all_of(memory.data(), dst, [](auto b) { return b == guard_fill; }) &&
-      std::all_of(dst + size, memory.data() + memory.size(), [](auto b) { return b == guard_fill; });
+    bool const guards = std::all_of(memory.data(), dst, [](auto b) { return b == guard_fill; }) &&
+                        std::all_of(dst + size, memory.data() + memory.size(), [](auto b) {
+                          return b == guard_fill;
+                        });
     CHECK(guards);
   }
   auto const single = ctx.stats() - before;
@@ -774,8 +776,8 @@ TEST_CASE("host batch ioctx: shutdown with reads in flight settles every future"
   CAPTURE(destroy);
   for (int round = 0; round < 3; ++round) {
     started_ioctx ioctx{batch_config(8, 1 * MiB), 2};
-    auto& ctx   = ioctx.get();
-    auto object = open_registered(ctx, file);
+    auto& ctx                   = ioctx.get();
+    auto object                 = open_registered(ctx, file);
     constexpr std::size_t reads = 24;
     host_memory memory{reads * 4 * MiB, false};
     std::vector<cucascade::exec::semi_future<std::size_t>> futures;
@@ -821,8 +823,8 @@ TEST_CASE("host batch ioctx: several batch reactors take turns", "[io][cufile][h
   CAPTURE(pool);
   pattern_file const file{(32 * MiB) + 1234};
   started_ioctx ioctx{batch_config(8, 512 * KiB, 3), pool};
-  auto& ctx   = ioctx.get();
-  auto object = open_registered(ctx, file);
+  auto& ctx             = ioctx.get();
+  auto object           = open_registered(ctx, file);
   constexpr int threads = 4;
   std::atomic<int> bad{0};
   std::vector<std::thread> workers;
@@ -900,9 +902,11 @@ TEST_CASE("host batch ioctx: a flat pool mixes batch reads, large writes and dev
     std::vector<std::uint8_t> source(16 * MiB, 0x3C);
     for (int i = 0; i < 6; ++i) {
       try {
-        auto const got = ctx.host_write_async(*written, static_cast<std::size_t>(i) * 16 * MiB,
-                                              source.size(), source.data())
-                           .get(60s);
+        auto const got =
+          ctx
+            .host_write_async(
+              *written, static_cast<std::size_t>(i) * 16 * MiB, source.size(), source.data())
+            .get(60s);
         if (got != source.size()) ++bad;
       } catch (...) {
         ++bad;
@@ -920,9 +924,12 @@ TEST_CASE("host batch ioctx: a flat pool mixes batch reads, large writes and dev
     for (int i = 0; i < 12; ++i) {
       auto const offset = static_cast<std::size_t>(i) * 2 * MiB + 333;
       try {
-        auto const got = ctx.device_read_async_io(*object, offset, 4 * MiB,
-                                                  static_cast<std::uint8_t*>(device),
-                                                  ::cuda::stream_ref{cudaStreamPerThread})
+        auto const got = ctx
+                           .device_read_async_io(*object,
+                                                 offset,
+                                                 4 * MiB,
+                                                 static_cast<std::uint8_t*>(device),
+                                                 ::cuda::stream_ref{cudaStreamPerThread})
                            .get(60s);
         if (got != 4 * MiB ||
             cudaMemcpy(host.data(), device, 4 * MiB, cudaMemcpyDeviceToHost) != cudaSuccess ||
@@ -961,8 +968,8 @@ TEST_CASE("host batch ioctx: a batch backlog does not hold back other traffic",
   batch_intercept watch;
   // Slow waves of 4 x 256 KiB: a 32 MiB read keeps the batch backlog occupied for ~1 s.
   watch.with([](intercept_state& s) { return s.submit_delay = std::chrono::milliseconds{30}; });
-  auto cfg                       = batch_config(4, 256 * KiB);
-  cfg.host_batch.submit_policy   = batch_submit_policy::exclusive;
+  auto cfg                     = batch_config(4, 256 * KiB);
+  cfg.host_batch.submit_policy = batch_submit_policy::exclusive;
   started_ioctx ioctx{cfg, 1};  // one reactor: everything below lands on it
   auto& ctx    = ioctx.get();
   auto object  = open_registered(ctx, file);
@@ -975,17 +982,20 @@ TEST_CASE("host batch ioctx: a batch backlog does not hold back other traffic",
   using ms = std::chrono::duration<double, std::milli>;
   // A write, a device read and a small high-priority host read on the same reactor.
   std::vector<std::uint8_t> source(4 * MiB, 0x5A);
-  auto t0         = clock_type::now();
-  auto const wrote = ctx.host_write_async(*written, 0, source.size(), source.data()).get(30s);
+  auto t0             = clock_type::now();
+  auto const wrote    = ctx.host_write_async(*written, 0, source.size(), source.data()).get(30s);
   auto const write_ms = ms(clock_type::now() - t0).count();
   CHECK(wrote == source.size());
 
   void* device = nullptr;
   REQUIRE(cudaMalloc(&device, 4 * MiB) == cudaSuccess);
   t0              = clock_type::now();
-  auto const read = ctx.device_read_async_io(*object, 333, 4 * MiB,
-                                             static_cast<std::uint8_t*>(device),
-                                             ::cuda::stream_ref{cudaStreamPerThread})
+  auto const read = ctx
+                      .device_read_async_io(*object,
+                                            333,
+                                            4 * MiB,
+                                            static_cast<std::uint8_t*>(device),
+                                            ::cuda::stream_ref{cudaStreamPerThread})
                       .get(30s);
   auto const device_ms = ms(clock_type::now() - t0).count();
   CHECK(read == 4 * MiB);
@@ -1216,8 +1226,8 @@ TEST_CASE("host batch ioctx: host read throughput, batch on and off", "[.][host_
         variant{"sync, flat 4", false, 0, 4},
         variant{"batch, flat 4", true, 0, 4},
         variant{"batch, flat 4, per_reader", true, 0, 4, batch_submit_policy::per_reader}}) {
-    auto cfg = batch_config(64, 8 * MiB, std::max<std::size_t>(1, v.batch_reactors));
-    cfg.host_batch.enabled       = v.batch;
+    auto cfg               = batch_config(64, 8 * MiB, std::max<std::size_t>(1, v.batch_reactors));
+    cfg.host_batch.enabled = v.batch;
     cfg.host_batch.submit_policy = v.policy;
     started_ioctx ioctx{cfg, v.pool};
     auto& ctx   = ioctx.get();
@@ -1246,4 +1256,3 @@ TEST_CASE("host batch ioctx: host read throughput, batch on and off", "[.][host_
                 << stats.batch_reads << ", host_reads " << stats.host_reads << ")");
   }
 }
-

@@ -224,8 +224,9 @@ template <typename Block>
 std::size_t fused_lane_staging_bytes(config const& cfg) noexcept
 {
   if (!cfg.fused_reads.enabled) return 0;
-  auto const lanes = std::min(cfg.fused_reads.reactors_per_device * cfg.fused_reads.lanes_per_reactor,
-                              cfg.fused_reads.max_lanes_per_device);
+  auto const lanes =
+    std::min(cfg.fused_reads.reactors_per_device * cfg.fused_reads.lanes_per_reactor,
+             cfg.fused_reads.max_lanes_per_device);
   return lanes * (cfg.fused_reads.slot_bytes + fused_lane_overhead_bytes);
 }
 
@@ -361,21 +362,19 @@ pool_plan plan_cufile_pool(config const& cfg,
         group.lane_reactors     = cfg.fused_reads.reactors_per_device;
         group.lanes_per_reactor = cfg.fused_reads.lanes_per_reactor;
         auto const lanes_wanted = fused_lane_staging_bytes(cfg) / lane_footprint;
-        group.lane_slots =
-          hard != 0 ? std::min(lanes_wanted, hard / lane_footprint) : lanes_wanted;
-        lane_bytes = group.lane_slots * lane_footprint;
-        lanes_why  = std::to_string(group.lane_reactors) + " lane reactors x " +
-                    std::to_string(group.lanes_per_reactor) + " lanes, " +
-                    std::to_string(group.lane_slots) + " lane slots of " +
-                    std::to_string(cfg.fused_reads.slot_bytes >> 10) + " KiB (" +
-                    std::to_string(lane_bytes >> 20) +
-                    " MiB registered, on top of the staging cap)";
+        group.lane_slots = hard != 0 ? std::min(lanes_wanted, hard / lane_footprint) : lanes_wanted;
+        lane_bytes       = group.lane_slots * lane_footprint;
+        lanes_why =
+          std::to_string(group.lane_reactors) + " lane reactors x " +
+          std::to_string(group.lanes_per_reactor) + " lanes, " + std::to_string(group.lane_slots) +
+          " lane slots of " + std::to_string(cfg.fused_reads.slot_bytes >> 10) + " KiB (" +
+          std::to_string(lane_bytes >> 20) + " MiB registered, on top of the staging cap)";
         if (group.lane_slots < lanes_wanted) {
           lanes_why += "; " + hard_name + " binds";
           plan.warnings.push_back(
-            "GPU " + std::to_string(device) + ": " + hard_name + " (" +
-            std::to_string(hard >> 20) + " MiB) holds only " + std::to_string(group.lane_slots) +
-            " of " + std::to_string(lanes_wanted) + " fused-read lanes of " +
+            "GPU " + std::to_string(device) + ": " + hard_name + " (" + std::to_string(hard >> 20) +
+            " MiB) holds only " + std::to_string(group.lane_slots) + " of " +
+            std::to_string(lanes_wanted) + " fused-read lanes of " +
             std::to_string(cfg.fused_reads.slot_bytes >> 10) +
             " KiB, so fewer lanes run and fewer reads are in flight; raise that limit or lower "
             "fused_reads.lanes_per_reactor / slot_bytes");
@@ -439,19 +438,18 @@ pool_plan plan_cufile_pool(config const& cfg,
         sync_total += group.n_reactors;
       }
       plan.reason += " (" + std::to_string(lane_total) + " lane, " + std::to_string(sync_total) +
-                     " synchronous, " + std::to_string(plan.host_batch_reactors) +
-                     " host-batch)";
+                     " synchronous, " + std::to_string(plan.host_batch_reactors) + " host-batch)";
     }
   } catch (std::exception const& e) {
     plan.groups.clear();
     plan.host_batch_reactors = 0;
     plan.flat_reactors       = default_reactors_per_device;
-    plan.reason        = std::string{"planning failed ("} + e.what() + "): one flat pool";
+    plan.reason              = std::string{"planning failed ("} + e.what() + "): one flat pool";
   } catch (...) {
     plan.groups.clear();
     plan.host_batch_reactors = 0;
     plan.flat_reactors       = default_reactors_per_device;
-    plan.reason        = "planning failed: one flat pool";
+    plan.reason              = "planning failed: one flat pool";
   }
   return plan;
 }

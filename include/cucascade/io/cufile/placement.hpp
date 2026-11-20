@@ -44,9 +44,9 @@ inline constexpr std::size_t default_reactors_per_device = 16;
  * @brief One GPU's share of a planned cuFile pool.
  */
 struct device_group_plan {
-  int device{-1};                ///< CUDA ordinal.
-  std::string pci_bus_id;        ///< As CUDA reports it, e.g. "0000:1B:00.0".
-  int numa_node{-1};             ///< The GPU's NUMA node (-1 if unknown).
+  int device{-1};          ///< CUDA ordinal.
+  std::string pci_bus_id;  ///< As CUDA reports it, e.g. "0000:1B:00.0".
+  int numa_node{-1};       ///< The GPU's NUMA node (-1 if unknown).
   /// Synchronous reactors serving it (one read in flight each), not counting
   /// @ref lane_reactors.
   std::size_t n_reactors{0};

@@ -115,13 +115,13 @@ TEST_CASE("fused_read_config validates only when enabled", "[io][cufile][fused_p
   rejects([](fused_read_config& c) { c.completion = static_cast<lane_completion>(7); });
 
   // Edges that are valid.
-  auto edge                 = enabled;
-  edge.reactors_per_device  = 64;
-  edge.lanes_per_reactor    = 64;
-  edge.slot_bytes           = 64 * KiB;
-  edge.fuse_gap_bytes       = 64 * KiB - 1;
-  edge.max_gated_lanes      = 64;
-  edge.completion           = lane_completion::poll;
+  auto edge                = enabled;
+  edge.reactors_per_device = 64;
+  edge.lanes_per_reactor   = 64;
+  edge.slot_bytes          = 64 * KiB;
+  edge.fuse_gap_bytes      = 64 * KiB - 1;
+  edge.max_gated_lanes     = 64;
+  edge.completion          = lane_completion::poll;
   CHECK_NOTHROW(edge.validate());
 
   // Gated lanes: half the lanes by default, at least one, or the configured number.
@@ -273,7 +273,7 @@ TEST_CASE("pool plan budgets fused lanes on top of the staging cap",
   {
     auto platform                          = quiet_platform();
     platform.max_device_pinned_mem_size_kb = 64 * 1024;  // 64 MiB
-    auto const plan = plan_cufile_pool(fused_config(), nullptr, platform);
+    auto const plan                        = plan_cufile_pool(fused_config(), nullptr, platform);
     INFO(describe(plan));
     REQUIRE(plan.groups.size() == 1);
     CHECK(plan.groups.front().lane_slots == 7);
@@ -416,7 +416,7 @@ TEST_CASE("pool plan plans an invalid feature block as disabled, with a warning"
   CHECK(any_contains(plan.warnings, "fused_reads is invalid"));
   CHECK(any_contains(plan.warnings, "host_batch is invalid"));
   // Planned as without the feature: the automatic synchronous count is the usual one.
-  auto plain = cfg;
+  auto plain        = cfg;
   plain.fused_reads = {};
   plain.host_batch  = {};
   CHECK(plan.groups.front().n_reactors ==
@@ -437,7 +437,7 @@ TEST_CASE("pool plan with both features off is the legacy plan",
     disabled.fused_reads.slot_bytes          = 1;
     disabled.host_batch.reactors             = 7;
     disabled.host_batch.depth                = 0;
-    auto const a = plan_cufile_pool(legacy, nullptr, quiet_platform());
+    auto const a                             = plan_cufile_pool(legacy, nullptr, quiet_platform());
     auto const b = plan_cufile_pool(disabled, nullptr, quiet_platform());
     INFO(describe(a));
     CHECK(describe(a) == describe(b));
@@ -469,8 +469,8 @@ TEST_CASE("describe names the lanes, their slots and the batch reactors",
   if (device_count() == 0) SKIP("no CUDA device");
   auto cfg               = fused_config();
   cfg.host_batch.enabled = true;
-  auto const plan                  = plan_cufile_pool(cfg, nullptr, quiet_platform());
-  auto const text                  = describe(plan);
+  auto const plan        = plan_cufile_pool(cfg, nullptr, quiet_platform());
+  auto const text        = describe(plan);
   INFO(text);
   CHECK(text.find("8 lane reactors x 16 lanes") != std::string::npos);
   CHECK(text.find("128 lane slots of 8192 KiB (1032 MiB registered, on top of the staging cap)") !=

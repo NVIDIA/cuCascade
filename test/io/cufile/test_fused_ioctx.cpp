@@ -83,9 +83,9 @@ namespace {
 
 using namespace std::chrono_literals;
 
-constexpr std::size_t block = 4096;
-constexpr std::size_t KiB   = 1024;
-constexpr std::size_t MiB   = 1024 * KiB;
+constexpr std::size_t block       = 4096;
+constexpr std::size_t KiB         = 1024;
+constexpr std::size_t MiB         = 1024 * KiB;
 constexpr std::uint8_t guard_fill = 0xA5;
 
 [[nodiscard]] std::uint8_t pattern_byte(std::size_t offset) noexcept
@@ -189,7 +189,10 @@ class device_memory {
 /// A non-blocking stream destroyed on scope exit.
 class stream_holder {
  public:
-  stream_holder() { REQUIRE(cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking) == cudaSuccess); }
+  stream_holder()
+  {
+    REQUIRE(cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking) == cudaSuccess);
+  }
   ~stream_holder()
   {
     std::ignore = cudaStreamSynchronize(_stream);
@@ -296,15 +299,15 @@ class read_plan {
   std::size_t previous = uniform(0, file_size - 1);
   std::size_t last_end = previous;
   for (std::size_t i = 0; i < n && total < budget; ++i) {
-    auto size = uniform(0, 9) == 0 ? uniform(block, max_size) : uniform(block, 256 * KiB);
-    size      = std::min(size, budget - total + block);
+    auto size          = uniform(0, 9) == 0 ? uniform(block, max_size) : uniform(block, 256 * KiB);
+    size               = std::min(size, budget - total + block);
     std::size_t offset = 0;
     switch (uniform(0, 4)) {
-      case 0: offset = last_end; break;                                  // contiguous
-      case 1: offset = last_end + uniform(1, 64 * KiB); break;           // gap
-      case 2: offset = previous + uniform(0, 8 * KiB); break;            // overlap
-      case 3: offset = previous; break;                                  // duplicate
-      default: offset = uniform(0, file_size - 1); break;                // anywhere
+      case 0: offset = last_end; break;                         // contiguous
+      case 1: offset = last_end + uniform(1, 64 * KiB); break;  // gap
+      case 2: offset = previous + uniform(0, 8 * KiB); break;   // overlap
+      case 3: offset = previous; break;                         // duplicate
+      default: offset = uniform(0, file_size - 1); break;       // anywhere
     }
     offset = std::min(offset, file_size - 1);
     size   = std::min(size, file_size - offset);
@@ -389,9 +392,10 @@ class stream_latch {
   stream_latch()
   {
     void* raw = nullptr;
-    REQUIRE(cudaHostAlloc(&raw, sizeof(cucascade::io::cufile::simulator_copy_args),
+    REQUIRE(cudaHostAlloc(&raw,
+                          sizeof(cucascade::io::cufile::simulator_copy_args),
                           cudaHostAllocMapped) == cudaSuccess);
-    _args = static_cast<cucascade::io::cufile::simulator_copy_args*>(raw);
+    _args  = static_cast<cucascade::io::cufile::simulator_copy_args*>(raw);
     *_args = cucascade::io::cufile::simulator_copy_args{};
   }
   ~stream_latch()
@@ -562,8 +566,8 @@ CUfileError_t fake_read_async(CUfileHandle_t handle,
     return fake_ok();
   }
   if (action.what == fake_action::kind::latched && state.latch != nullptr &&
-      cucascade::io::cufile::launch_simulator_gate(state.latch, static_cast<cudaStream_t>(stream)) !=
-        cudaSuccess) {
+      cucascade::io::cufile::launch_simulator_gate(
+        state.latch, static_cast<cudaStream_t>(stream)) != cudaSuccess) {
     CUfileError_t status{};
     status.err = CU_FILE_IO_ERROR;
     return status;
@@ -728,8 +732,8 @@ TEST_CASE("fused ioctx: random vectored device reads land the file's bytes",
 
   // Contiguous chunks fuse: 64 x 100 KiB is about 7 reads of 1 MiB, not 64.
   auto const fused_before = ioctx.get().stats();
-  run_and_verify(ioctx.get(), *object, file, strided_plan(3 * MiB + 5, 64, 100 * KiB, 100 * KiB),
-                 stream.ref());
+  run_and_verify(
+    ioctx.get(), *object, file, strided_plan(3 * MiB + 5, 64, 100 * KiB, 100 * KiB), stream.ref());
   auto const fused = ioctx.get().stats() - fused_before;
   CHECK(fused.lane_parts >= 64);
   CHECK(fused.lane_reads <= 10);
@@ -748,8 +752,11 @@ TEST_CASE("fused ioctx: default 8 MiB slots", "[io][cufile][fused_ioctx][gpu]")
   std::mt19937_64 rng{88};
   auto const before = ioctx.get().stats();
   for (int round = 0; round < 6; ++round) {
-    run_and_verify(
-      ioctx.get(), *object, file, random_plan(rng, file.size(), 30, 24 * MiB, 40 * MiB), stream.ref());
+    run_and_verify(ioctx.get(),
+                   *object,
+                   file,
+                   random_plan(rng, file.size(), 30, 24 * MiB, 40 * MiB),
+                   stream.ref());
   }
   auto const delta = ioctx.get().stats() - before;
   CHECK(delta.lane_reads > 0);
@@ -770,17 +777,18 @@ TEST_CASE("fused ioctx: reads at the end of a file", "[io][cufile][fused_ioctx][
   stream_holder stream;
 
   read_plan plan;
-  plan.add(size - 200 * KiB, 300 * KiB);   // crosses EOF: clamped
-  plan.add(size - 500, 400);               // inside the last partial block
-  plan.add(size / block * block, 2000);    // from the partial block's start, crossing EOF
-  plan.add(0, size);                       // the whole file
-  plan.add(2 * MiB + 1, 1 * MiB);          // ends inside the partial block
+  plan.add(size - 200 * KiB, 300 * KiB);  // crosses EOF: clamped
+  plan.add(size - 500, 400);              // inside the last partial block
+  plan.add(size / block * block, 2000);   // from the partial block's start, crossing EOF
+  plan.add(0, size);                      // the whole file
+  plan.add(2 * MiB + 1, 1 * MiB);         // ends inside the partial block
   run_and_verify(ioctx.get(), *object, file, plan, stream.ref());
 
   // Entirely past EOF: zero bytes, destination untouched.
   device_memory dst{block};
-  CHECK(ioctx.get().device_read_async_io(*object, size + 10, 100, dst.get(), stream.ref()).get(30s) ==
-        0);
+  CHECK(
+    ioctx.get().device_read_async_io(*object, size + 10, 100, dst.get(), stream.ref()).get(30s) ==
+    0);
   auto const after = dst.host_copy();
   CHECK(std::all_of(after.begin(), after.end(), [](std::uint8_t b) { return b == guard_fill; }));
   require_queued_bytes_zero(ioctx.get());
@@ -823,7 +831,7 @@ TEST_CASE("fused ioctx: a busy caller stream gates the copies", "[io][cufile][fu
 
   SECTION("gated reads beyond the limit park; idle streams are served meanwhile")
   {
-    auto const before = ioctx.get().stats();
+    auto const before           = ioctx.get().stats();
     constexpr std::size_t reads = 5;
     std::vector<read_plan> plans(reads);
     std::vector<std::unique_ptr<device_memory>> arenas;
@@ -869,7 +877,7 @@ TEST_CASE("fused ioctx: a busy caller stream gates the copies", "[io][cufile][fu
   {
     // Limit 2 of 4 lanes: a burst of pending-gate reads, submitted back to back before any
     // read completes, never takes more than two lanes; idle streams keep the other two.
-    auto const before = ioctx.get().stats();
+    auto const before           = ioctx.get().stats();
     constexpr std::size_t reads = 8;
     std::vector<read_plan> plans(reads);
     std::vector<std::unique_ptr<device_memory>> arenas;
@@ -939,8 +947,8 @@ TEST_CASE("fused ioctx: failed lane reads fall back; the cooldown trips and ends
 
   SECTION("refused, failed and short-without-progress reads still succeed")
   {
-    auto const kind = GENERATE(fake_action::kind::refuse, fake_action::kind::negative,
-                               fake_action::kind::short_read);
+    auto const kind = GENERATE(
+      fake_action::kind::refuse, fake_action::kind::negative, fake_action::kind::short_read);
     cufile.script({fake_action{kind, 100}});
     auto const before = ioctx.get().stats();
     one_read(5000);
@@ -999,7 +1007,7 @@ TEST_CASE("fused ioctx: shutdown with reads queued and in flight settles every f
     auto const destroy = repetition == 2;  // last round: destroy instead of shutdown
     std::optional<started_ioctx> ioctx;
     ioctx.emplace(fused_config(2, 1 * MiB), 2);
-    auto object = ioctx->get().open_io_object(file.path());
+    auto object                    = ioctx->get().open_io_object(file.path());
     constexpr std::size_t requests = 60;
     std::vector<read_plan> plans(requests);
     std::vector<std::unique_ptr<device_memory>> arenas;
@@ -1099,15 +1107,15 @@ TEST_CASE("fused ioctx: a planned pool routes by role", "[io][cufile][fused_ioct
   REQUIRE_FALSE(pool.plan().groups.empty());
   auto const& group = pool.plan().groups.front();
   CHECK(group.lane_reactors == 2);
-  auto object = pool.open_io_object(file.path());
+  auto object       = pool.open_io_object(file.path());
   auto const& typed = dynamic_cast<cucascade::io::cufile::cufile_io_object const&>(*object);
   stream_holder stream;
 
   // Lane reads on GPU 0, host reads, small device reads below the threshold.
   std::mt19937_64 rng{7};
   for (int round = 0; round < 4; ++round) {
-    run_and_verify(pool, *object, file, random_plan(rng, file.size(), 20, 4 * MiB, 16 * MiB),
-                   stream.ref());
+    run_and_verify(
+      pool, *object, file, random_plan(rng, file.size(), 20, 4 * MiB, 16 * MiB), stream.ref());
   }
   std::vector<std::uint8_t> host(256 * KiB);
   CHECK(pool.host_read_async_io(*object, 4096, host.size(), host.data()).get(30s) == host.size());
@@ -1168,23 +1176,20 @@ TEST_CASE("fused ioctx: configuration", "[io][cufile][fused_ioctx][gpu]")
   {
     auto cfg              = fused_config();
     cfg.async_engine.mode = engine_mode::async_auto;
-    CHECK_THROWS_AS(
-      cufile_ioctx(1, std::make_shared<cufile_reactor::reactor_context>(cfg)),
-      std::invalid_argument);
+    CHECK_THROWS_AS(cufile_ioctx(1, std::make_shared<cufile_reactor::reactor_context>(cfg)),
+                    std::invalid_argument);
   }
 
   SECTION("an invalid fused_reads block is refused")
   {
     auto cfg                          = fused_config();
     cfg.fused_reads.lanes_per_reactor = 0;
-    CHECK_THROWS_AS(
-      cufile_ioctx(1, std::make_shared<cufile_reactor::reactor_context>(cfg)),
-      std::invalid_argument);
+    CHECK_THROWS_AS(cufile_ioctx(1, std::make_shared<cufile_reactor::reactor_context>(cfg)),
+                    std::invalid_argument);
     cfg                        = fused_config();
     cfg.fused_reads.slot_bytes = 100 * KiB;
-    CHECK_THROWS_AS(
-      cufile_ioctx(1, std::make_shared<cufile_reactor::reactor_context>(cfg)),
-      std::invalid_argument);
+    CHECK_THROWS_AS(cufile_ioctx(1, std::make_shared<cufile_reactor::reactor_context>(cfg)),
+                    std::invalid_argument);
   }
 
   SECTION("fused reads off: legacy behaviour, no lane counters")
@@ -1197,7 +1202,10 @@ TEST_CASE("fused ioctx: configuration", "[io][cufile][fused_ioctx][gpu]")
     stream_holder stream;
     std::mt19937_64 rng{3};
     for (int round = 0; round < 3; ++round) {
-      run_and_verify(ioctx.get(), *object, file, random_plan(rng, file.size(), 20, 4 * MiB, 8 * MiB),
+      run_and_verify(ioctx.get(),
+                     *object,
+                     file,
+                     random_plan(rng, file.size(), 20, 4 * MiB, 8 * MiB),
                      stream.ref());
     }
     auto const stats = ioctx.get().stats();
@@ -1218,8 +1226,8 @@ TEST_CASE("fused ioctx: configuration", "[io][cufile][fused_ioctx][gpu]")
       a.*field = 5;
     }
     reactor_stats b;
-    b.lane_reads  = 7;
-    b.batch_bytes = 2;
+    b.lane_reads   = 7;
+    b.batch_bytes  = 2;
     auto const sum = a + b;
     CHECK(sum.lane_reads == 12);
     CHECK(sum.batch_bytes == 7);
@@ -1242,8 +1250,8 @@ TEST_CASE("fused ioctx: multi-threaded stress", "[io][cufile][fused_ioctx][gpu][
   auto cfg                   = fused_config(6, 1 * MiB);
   cfg.fused_reads.completion = GENERATE(lane_completion::poll, lane_completion::callback);
   started_ioctx ioctx{cfg, 4};
-  auto object = ioctx.get().open_io_object(file.path());
-  constexpr int threads        = 4;
+  auto object                    = ioctx.get().open_io_object(file.path());
+  constexpr int threads          = 4;
   constexpr int reads_per_thread = 150;
   std::atomic<std::size_t> failures{0};
   std::atomic<std::size_t> completed{0};
@@ -1263,9 +1271,9 @@ TEST_CASE("fused ioctx: multi-threaded stress", "[io][cufile][fused_ioctx][gpu][
           ++failures;
           break;
         }
-        auto* arena = static_cast<std::uint8_t*>(raw);
-        std::ignore = cudaMemset(arena, guard_fill, plan.arena_bytes());
-        std::ignore = cudaDeviceSynchronize();
+        auto* arena         = static_cast<std::uint8_t*>(raw);
+        std::ignore         = cudaMemset(arena, guard_fill, plan.arena_bytes());
+        std::ignore         = cudaDeviceSynchronize();
         auto const priority = (i % 3 == 0) ? io_priority::low : io_priority::high;
         auto future         = ioctx.get().device_readv_async_io(
           *object, plan.slices(arena), ::cuda::stream_ref{stream}, priority);
@@ -1310,13 +1318,16 @@ TEST_CASE("fused ioctx: per-thread and legacy default stream callers",
   require_async_cufile();
   pattern_file const file{16 * MiB + 9};
   started_ioctx ioctx{fused_config(4, 1 * MiB), 2};
-  auto object = ioctx.get().open_io_object(file.path());
+  auto object       = ioctx.get().open_io_object(file.path());
   auto const stream = GENERATE(cudaStreamPerThread, static_cast<cudaStream_t>(nullptr));
   CAPTURE(stream == nullptr);
   std::mt19937_64 rng{11};
   auto const before = ioctx.get().stats();
   for (int round = 0; round < 4; ++round) {
-    run_and_verify(ioctx.get(), *object, file, random_plan(rng, file.size(), 20, 4 * MiB, 16 * MiB),
+    run_and_verify(ioctx.get(),
+                   *object,
+                   file,
+                   random_plan(rng, file.size(), 20, 4 * MiB, 16 * MiB),
                    ::cuda::stream_ref{stream});
   }
   CHECK((ioctx.get().stats() - before).lane_reads > 0);
@@ -1429,8 +1440,7 @@ TEST_CASE("fused ioctx: shutdown with a gated read on a held stream settles prom
   latch.release();
 }
 
-TEST_CASE("fused ioctx: a sibling failure cancels a held read",
-          "[io][cufile][fused_ioctx][gpu]")
+TEST_CASE("fused ioctx: a sibling failure cancels a held read", "[io][cufile][fused_ioctx][gpu]")
 {
   require_async_cufile();
   pattern_file const file{8 * MiB};
@@ -1454,7 +1464,7 @@ TEST_CASE("fused ioctx: a sibling failure cancels a held read",
   auto future = pool.get().mixed_readv_async_io(*object, std::move(slices));
   std::this_thread::sleep_for(300ms);  // the lane read is held, the small one parked
   CHECK_FALSE(future.is_ready());
-  sync_latch.release();  // the small read runs and fails: the request stops
+  sync_latch.release();                  // the small read runs and fails: the request stops
   REQUIRE(std::move(future).wait(10s));  // while the lane read's stream is still held
   CHECK_THROWS(std::move(future).get());
   CHECK(all_fill(lane_dst.host_copy()));
@@ -1511,8 +1521,8 @@ TEST_CASE("fused ioctx: cancel while a read sits in the lane backlog",
   pattern_file const file{8 * MiB};
   stream_holder idle;
   stream_holder held;
-  auto cfg                          = fused_config(1, 1 * MiB);
-  cfg.gds_threshold                 = 64 * KiB;
+  auto cfg          = fused_config(1, 1 * MiB);
+  cfg.gds_threshold = 64 * KiB;
   manual_pool pool{cfg, 1, 1, 1};
   auto object = pool.get().open_io_object(file.path());
   read_plan first;
@@ -1534,7 +1544,7 @@ TEST_CASE("fused ioctx: cancel while a read sits in the lane backlog",
   auto future = pool.get().mixed_readv_async_io(*object, std::move(slices));
   std::this_thread::sleep_for(200ms);  // the lane read waits in the backlog
   std::filesystem::resize_file(file.path(), 2 * MiB);
-  sync_latch.release();  // the small read fails: the request stops
+  sync_latch.release();                  // the small read fails: the request stops
   REQUIRE(std::move(future).wait(10s));  // the lane is still busy: cancelled from the backlog
   CHECK_THROWS(std::move(future).get());
   CHECK_FALSE(busy_lane.is_ready());
@@ -1612,8 +1622,11 @@ TEST_CASE("fused ioctx: the plan's lane quota bounds the lanes", "[io][cufile][f
   }};
   std::mt19937_64 rng{41};
   for (int round = 0; round < 6; ++round) {
-    run_and_verify(
-      pool.get(), *object, file, random_plan(rng, file.size(), 24, 4 * MiB, 16 * MiB), stream.ref());
+    run_and_verify(pool.get(),
+                   *object,
+                   file,
+                   random_plan(rng, file.size(), 24, 4 * MiB, 16 * MiB),
+                   stream.ref());
   }
   done = true;
   watcher.join();
@@ -1627,8 +1640,7 @@ TEST_CASE("fused ioctx: the plan's lane quota bounds the lanes", "[io][cufile][f
   if (slot) staging.release(slot);
 }
 
-TEST_CASE("fused ioctx: a cooling lane reactor is routed around",
-          "[io][cufile][fused_ioctx][gpu]")
+TEST_CASE("fused ioctx: a cooling lane reactor is routed around", "[io][cufile][fused_ioctx][gpu]")
 {
   if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
   scripted_cufile cufile;
@@ -1685,14 +1697,17 @@ TEST_CASE("fused ioctx: an ioctx whose GPU lane budget is spent serves through t
   auto second_object = second.get().open_io_object(file.path());
   // The first request finds no lanes on either reactor; afterwards neither is a lane
   // candidate and requests take the legacy path.
-  run_and_verify(second.get(), *second_object, file, strided_plan(3, 6, 100 * KiB, MiB),
-                 stream.ref());
+  run_and_verify(
+    second.get(), *second_object, file, strided_plan(3, 6, 100 * KiB, MiB), stream.ref());
   CHECK_FALSE(second.get().reactor(0).lanes_usable(0));
   CHECK_FALSE(second.get().reactor(1).lanes_usable(0));
   std::mt19937_64 rng{9};
   for (int round = 0; round < 3; ++round) {
-    run_and_verify(second.get(), *second_object, file,
-                   random_plan(rng, file.size(), 16, 4 * MiB, 8 * MiB), stream.ref());
+    run_and_verify(second.get(),
+                   *second_object,
+                   file,
+                   random_plan(rng, file.size(), 16, 4 * MiB, 8 * MiB),
+                   stream.ref());
   }
   CHECK(second.get().stats().lane_reads == 0);
   require_queued_bytes_zero(second.get());
@@ -1719,8 +1734,11 @@ TEST_CASE("fused ioctx: a flat pool with more reactors than the lane budget",
   auto const before = ioctx.get().stats();
   std::mt19937_64 rng{13};
   for (int round = 0; round < 4; ++round) {
-    run_and_verify(
-      ioctx.get(), *object, file, random_plan(rng, file.size(), 16, 4 * MiB, 8 * MiB), stream.ref());
+    run_and_verify(ioctx.get(),
+                   *object,
+                   file,
+                   random_plan(rng, file.size(), 16, 4 * MiB, 8 * MiB),
+                   stream.ref());
   }
   CHECK((ioctx.get().stats() - before).lane_reads > 0);
   require_queued_bytes_zero(ioctx.get());
@@ -1738,10 +1756,10 @@ TEST_CASE("fused ioctx: a mixed request keeps its synchronous slices off the lan
   manual_pool pool{cfg, 1, 1, 4};
   auto object = pool.get().open_io_object(file.path());
   read_plan plan;
-  plan.add(4096 + 1, 300 * KiB);      // lane read
-  plan.add(1 * MiB + 5, 400 * KiB);   // lane read
-  plan.add(3 * MiB + 10, 500);        // EOF tail: partial last block
-  plan.add(2 * MiB + 3, 8 * KiB);     // below gds_threshold
+  plan.add(4096 + 1, 300 * KiB);     // lane read
+  plan.add(1 * MiB + 5, 400 * KiB);  // lane read
+  plan.add(3 * MiB + 10, 500);       // EOF tail: partial last block
+  plan.add(2 * MiB + 3, 8 * KiB);    // below gds_threshold
   run_and_verify(pool.get(), *object, file, plan, stream.ref());
   auto const lane = pool.get().reactor(0).stats();
   auto const sync = pool.get().reactor(1).stats();
@@ -1774,8 +1792,6 @@ TEST_CASE("fused ioctx: contiguous slices into one buffer cost one copy per wind
   CHECK(copies == delta.lane_reads);
   CHECK(delta.lane_parts >= 48);
 }
-
-
 
 TEST_CASE("fused ioctx: lane timing counters", "[io][cufile][fused_ioctx][gpu]")
 {
@@ -1813,7 +1829,7 @@ TEST_CASE("fused ioctx: a GPU the plan gave no lanes is never planned for lanes"
   pattern_file const file{8 * MiB};
   stream_holder stream;
   manual_pool pool{fused_config(4, 1 * MiB), 1, 1, 0};  // a lane reactor, but 0 lane slots
-  CHECK_FALSE(pool.get().reactor(0).lanes_usable(0));    // from the start
+  CHECK_FALSE(pool.get().reactor(0).lanes_usable(0));   // from the start
   auto object = pool.get().open_io_object(file.path());
   std::mt19937_64 rng{17};
   for (int round = 0; round < 3; ++round) {

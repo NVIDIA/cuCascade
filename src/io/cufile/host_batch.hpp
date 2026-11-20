@@ -46,9 +46,9 @@ namespace cucascade::io::cufile::detail {
  * sporadically fails them in compatibility mode; the caller cuts its reads so they never are.
  */
 struct batch_read {
-  void* handle{};       ///< @c CUfileHandle_t of the file (cufile_io_object::cufile_handle()).
-  std::uint8_t* dst{};  ///< Host destination; submitted as @c devPtr_base with a zero offset.
-  range rng;            ///< File range.
+  void* handle{};         ///< @c CUfileHandle_t of the file (cufile_io_object::cufile_handle()).
+  std::uint8_t* dst{};    ///< Host destination; submitted as @c devPtr_base with a zero offset.
+  range rng;              ///< File range.
   std::uint64_t token{};  ///< The owner's; returned unchanged in the result.
 };
 
@@ -56,8 +56,9 @@ struct batch_read {
 struct batch_result {
   enum class status : std::uint8_t {
     ok,          ///< All of @c rng.size bytes were read.
-    short_read,  ///< cuFile completed the entry with fewer bytes (@c bytes of them, from the start).
-    failed,  ///< Nothing usable was read (cuFile failed, rejected or the reader was torn down).
+    short_read,  ///< cuFile completed the entry with fewer bytes (@c bytes of them, from the
+                 ///< start).
+    failed,      ///< Nothing usable was read (cuFile failed, rejected or the reader was torn down).
   };
   std::uint64_t token{};
   status outcome{status::ok};
@@ -95,8 +96,8 @@ using batch_wake_fn = void (*)(void* context) noexcept;
 
 /// Construction parameters of a @ref host_batch_reader.
 struct host_batch_options {
-  unsigned depth{64};          ///< Entries in flight at most (clamped to max_batch_io_size).
-  unsigned failure_limit{4};   ///< Consecutive rejected submits before giving up (0 = 1).
+  unsigned depth{64};         ///< Entries in flight at most (clamped to max_batch_io_size).
+  unsigned failure_limit{4};  ///< Consecutive rejected submits before giving up (0 = 1).
   batch_submit_policy policy{batch_submit_policy::per_reader};
   std::size_t max_wave_bytes{0};  ///< Most bytes handed over per wave; 0 = no cap.
   batch_wake_fn wake{nullptr};    ///< Called after completions were published, or the gate freed.

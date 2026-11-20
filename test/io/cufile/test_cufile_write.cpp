@@ -279,7 +279,7 @@ struct write_path {
   config cufile_body{};
   cufile_body.gds_threshold = IO_BLOCK_SIZE;  // every aligned body goes to cuFile
   cufile_body.max_op_bytes  = 1 * MiB;        // ... in several cuFileWrite calls
-  config cufile_slots = cufile_body;
+  config cufile_slots       = cufile_body;
   cufile_slots.staging_mode = cucascade::io::cufile::staging::always;  // via the device slots
   config staged{};
   staged.gds_threshold = 1UL << 40;  // nothing goes to cuFile

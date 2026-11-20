@@ -472,7 +472,7 @@ void host_batch_reader::start_waiting() noexcept
 {
   if (_waiting || _shared == nullptr) { return; }
   std::lock_guard lock(gate_mutex());
-  auto& head                   = gate_waiters_head();
+  auto& head           = gate_waiters_head();
   _shared->waiter_prev = nullptr;
   _shared->waiter_next = head;
   if (head != nullptr) head->waiter_prev = _shared.get();
@@ -790,9 +790,7 @@ void host_batch_reader::helper_loop() noexcept
       auto const min_nr = wave_policy ? s.in_flight : std::size_t{1};
       auto events       = static_cast<unsigned>(s.capacity);
       timespec timeout  = continuous_timeout;
-      if (wave_policy) {
-        timeout = timespec{static_cast<std::time_t>(wave_timeout.count()), 0};
-      }
+      if (wave_policy) { timeout = timespec{static_cast<std::time_t>(wave_timeout.count()), 0}; }
       auto const status = api->batch_get_status(
         s.handle, static_cast<unsigned>(min_nr), &events, s.wave_events.get(), &timeout);
       if (status.err != CU_FILE_SUCCESS) {
@@ -807,8 +805,8 @@ void host_batch_reader::helper_loop() noexcept
         s.pending_rejected_count = 0;
         {
           std::lock_guard relock(s.mutex);
-          s.aborted     = true;
-          s.abort_error = static_cast<int>(status.err);
+          s.aborted      = true;
+          s.abort_error  = static_cast<int>(status.err);
           s.submit_count = 0;  // handed over, never submitted: failed with the rest by the owner
           s.dead         = true;
           s.publish_locked();

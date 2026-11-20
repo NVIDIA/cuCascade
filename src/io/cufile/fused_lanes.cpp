@@ -28,6 +28,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+
 #include <cufile.h>
 
 #include <algorithm>
@@ -86,9 +87,9 @@ lane_budget& budget() noexcept
   try {
     auto& state = budget();
     std::lock_guard lock(state.mutex);
-    auto& used        = state.used[device];
-    auto const grant  = used < limit ? std::min(wanted, limit - used) : std::size_t{0};
-    used             += grant;
+    auto& used       = state.used[device];
+    auto const grant = used < limit ? std::min(wanted, limit - used) : std::size_t{0};
+    used += grant;
     return grant;
   } catch (...) {
     return 0;
@@ -348,9 +349,7 @@ void fused_lane_set::destroy_lane(unsigned index) noexcept
   if (l.stream != nullptr) {
     // Also waits for a completion callback still returning from its wake call.  Waits only
     // for the lane's own read and copies: a lane stream never waits on a foreign event.
-    if (cudaStreamSynchronize(l.stream) != cudaSuccess) {
-      std::ignore = cudaGetLastError();
-    }
+    if (cudaStreamSynchronize(l.stream) != cudaSuccess) { std::ignore = cudaGetLastError(); }
   }
   retire_stream(l);
   if (l.event != nullptr) {
@@ -391,7 +390,7 @@ fused_lane_set::~fused_lane_set()
 unsigned fused_lane_set::pick_lane() noexcept
 {
   // The first free lane at or after the cursor, cyclically: rotate the cursor to bit 0.
-  auto const rotated = std::rotr(_free, static_cast<int>(_cursor));
+  auto const rotated   = std::rotr(_free, static_cast<int>(_cursor));
   constexpr auto lanes = static_cast<unsigned>(max_lanes);
   auto const index     = (static_cast<unsigned>(std::countr_zero(rotated)) + _cursor) % lanes;
   _cursor              = (index + 1U) % lanes;
@@ -445,8 +444,7 @@ bool fused_lane_set::copy_out(unsigned lane_index, std::vector<lane_copy>&& copi
     auto const progress = l.held_progress;
     l.held_progress     = 0;
     l.callback.status   = cudaSuccess;
-    if (auto const error = queue_copies(lane_index, win.offset + progress);
-        error != cudaSuccess) {
+    if (auto const error = queue_copies(lane_index, win.offset + progress); error != cudaSuccess) {
       fail_queued(lane_index, error);
       return true;
     }
@@ -490,9 +488,9 @@ void fused_lane_set::fail_early(unsigned index,
 
 void fused_lane_set::issue(unsigned index, bool first) noexcept
 {
-  auto& l     = _lanes[index];
-  auto& read  = l.read;
-  auto& win   = read.window;
+  auto& l                 = _lanes[index];
+  auto& read              = l.read;
+  auto& win               = read.window;
   auto const fail_invalid = [&] {
     fail_early(index, early_failure::io_failed, -EINVAL, cudaSuccess, false);
   };
@@ -505,15 +503,14 @@ void fused_lane_set::issue(unsigned index, bool first) noexcept
       fail_invalid();
       return;
     }
-    if (l.holding && (!read.copies.empty() || read.needed_bytes == 0 ||
-                      read.needed_bytes > win.size)) {
+    if (l.holding &&
+        (!read.copies.empty() || read.needed_bytes == 0 || read.needed_bytes > win.size)) {
       fail_invalid();
       return;
     }
     for (auto const& copy : read.copies) {
       if (copy.offset < win.offset || copy.offset > win.end() ||
-          copy.bytes > win.end() - copy.offset ||
-          (copy.bytes != 0 && copy.dst == nullptr)) {
+          copy.bytes > win.end() - copy.offset || (copy.bytes != 0 && copy.dst == nullptr)) {
         fail_invalid();
         return;
       }
@@ -524,28 +521,28 @@ void fused_lane_set::issue(unsigned index, bool first) noexcept
   // the part read before it.  If cuFile refuses it the lane is reported only once those ran.
   if (!start_read(index, /*work_queued=*/!first)) return;
   // A held read queues only its completion: its copies come with copy_out.
-  auto error = l.holding ? cudaSuccess
-                         : queue_copies(index, std::numeric_limits<std::size_t>::max());
+  auto error =
+    l.holding ? cudaSuccess : queue_copies(index, std::numeric_limits<std::size_t>::max());
   if (error == cudaSuccess) error = queue_completion(index);
   if (error != cudaSuccess) fail_queued(index, error);
 }
 
 bool fused_lane_set::start_read(unsigned index, bool work_queued) noexcept
 {
-  auto& l          = _lanes[index];
-  auto const& win  = l.read.window;
+  auto& l         = _lanes[index];
+  auto const& win = l.read.window;
   // The arguments cuFile reads at execution; buffer_offset is always 0 (libcufile ignores a
   // non-zero one on some paths and lands the data at the base).
-  l.size            = win.size;
-  l.file_offset     = static_cast<off_t>(win.offset);
-  l.buffer_offset   = 0;
+  l.size                  = win.size;
+  l.file_offset           = static_cast<off_t>(win.offset);
+  l.buffer_offset         = 0;
   l.bytes_done            = bytes_sentinel;
   l.callback.status       = cudaSuccess;
   l.callback.completed_ns = 0;
   auto const timed        = _options.read_async_ns != nullptr;
-  auto const started      = timed ? std::chrono::steady_clock::now()
-                                  : std::chrono::steady_clock::time_point{};
-  auto const status       = _api->read_async(static_cast<CUfileHandle_t>(l.read.handle),
+  auto const started =
+    timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  auto const status = _api->read_async(static_cast<CUfileHandle_t>(l.read.handle),
                                        l.slot.base,
                                        &l.size,
                                        &l.file_offset,
@@ -573,9 +570,11 @@ bool fused_lane_set::start_read(unsigned index, bool work_queued) noexcept
 
 cudaError_t fused_lane_set::queue_copies(unsigned index, std::size_t limit) noexcept
 {
-  auto& l         = _lanes[index];
-  auto const& win = l.read.window;
-  auto const source = [&](lane_copy const& copy) { return l.slot.base + (copy.offset - win.offset); };
+  auto& l           = _lanes[index];
+  auto const& win   = l.read.window;
+  auto const source = [&](lane_copy const& copy) {
+    return l.slot.base + (copy.offset - win.offset);
+  };
   auto const bytes_of = [&](lane_copy const& copy) -> std::size_t {
     if (copy.offset >= limit) return 0;
     return std::min(copy.bytes, limit - copy.offset);
@@ -591,7 +590,8 @@ cudaError_t fused_lane_set::queue_copies(unsigned index, std::size_t limit) noex
     try {
       l.batch.clear();
       for (auto const& copy : l.read.copies) {
-        if (auto const bytes = bytes_of(copy); bytes != 0) l.batch.add(copy.dst, source(copy), bytes);
+        if (auto const bytes = bytes_of(copy); bytes != 0)
+          l.batch.add(copy.dst, source(copy), bytes);
       }
       copy_calls.fetch_add(1, std::memory_order_relaxed);
       auto const error = l.batch.enqueue(::cuda::stream_ref{l.stream});
@@ -607,9 +607,10 @@ cudaError_t fused_lane_set::queue_copies(unsigned index, std::size_t limit) noex
     auto const bytes = bytes_of(copy);
     if (bytes == 0) continue;
     copy_calls.fetch_add(1, std::memory_order_relaxed);
-    auto const error = consume(copy_failure_countdown)
-                         ? cudaErrorInvalidValue
-                         : cudaMemcpyAsync(copy.dst, source(copy), bytes, cudaMemcpyDeviceToDevice, l.stream);
+    auto const error =
+      consume(copy_failure_countdown)
+        ? cudaErrorInvalidValue
+        : cudaMemcpyAsync(copy.dst, source(copy), bytes, cudaMemcpyDeviceToDevice, l.stream);
     if (error != cudaSuccess) return error;
   }
   return cudaSuccess;
@@ -620,7 +621,8 @@ cudaError_t fused_lane_set::queue_completion(unsigned index) noexcept
   auto& l             = _lanes[index];
   bool const injected = consume(callback_failure_countdown);
   if (_options.completion == lane_completion::poll) {
-    auto const error = injected ? cudaErrorInvalidResourceHandle : cudaEventRecord(l.event, l.stream);
+    auto const error =
+      injected ? cudaErrorInvalidResourceHandle : cudaEventRecord(l.event, l.stream);
     if (error == cudaSuccess) _event_pending |= l.callback.bit;
     return error;
   }
@@ -683,8 +685,8 @@ std::uint64_t fused_lane_set::take_finished() noexcept
 
 void fused_lane_set::release_lane(unsigned index) noexcept
 {
-  auto& l   = _lanes[index];
-  auto const bit = l.callback.bit;
+  auto& l         = _lanes[index];
+  auto const bit  = l.callback.bit;
   l.early         = early_failure::none;
   l.holding       = false;
   l.held_progress = 0;
@@ -871,4 +873,3 @@ std::chrono::steady_clock::duration fused_lane_set::oldest_in_flight() const noe
 }
 
 }  // namespace cucascade::io::cufile::detail
-

@@ -278,8 +278,7 @@ TEST_CASE("make_disk_io_context resolves automatic to a concrete backend", "[dis
   REQUIRE((type == io::io_context_type::uring || type == io::io_context_type::cufile));
 }
 
-TEST_CASE("a manager drops its DISK spaces' contexts before its HOST pools",
-          "[disk][io][context]")
+TEST_CASE("a manager drops its DISK spaces' contexts before its HOST pools", "[disk][io][context]")
 {
   // A uring context staging through the manager's own HOST pool, installed on
   // the manager's DISK space and referenced nowhere else: destroying the manager

@@ -151,9 +151,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     target_sources(
       cucascade_io_tests
       PRIVATE io/cufile/test_cufile_platform.cpp
-              io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp
-              io/cufile/test_cufile_staging.cpp io/cufile/test_cufile_tune.cpp
-              io/cufile/test_cufile_compare.cpp io/cufile/test_cufile_write.cpp
+              io/cufile/test_cufile_probe.cpp
+              io/cufile/test_cufile_reactor.cpp
+              io/cufile/test_cufile_staging.cpp
+              io/cufile/test_cufile_tune.cpp
+              io/cufile/test_cufile_compare.cpp
+              io/cufile/test_cufile_write.cpp
               io/cufile/test_cufile_api_optional.cpp
               io/cufile/test_async_engine_config.cpp
               io/cufile/test_device_arena.cpp
@@ -181,7 +184,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_engine_hardening.cpp
               io/cufile/test_phase6_review.cpp
               io/cufile/test_engine_ioctx.cpp)
-    set_source_files_properties(io/cufile/test_lustre_layout.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/io/cufile/lustre_shim")
+    set_source_files_properties(
+      io/cufile/test_lustre_layout.cpp
+      PROPERTIES INCLUDE_DIRECTORIES
+                 "${CMAKE_CURRENT_SOURCE_DIR}/io/cufile/lustre_shim")
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

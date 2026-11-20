@@ -30,16 +30,14 @@
 #include <cucascade/io/cufile/device_engine.hpp>
 #include <cucascade/io/cufile/fused_read_plan.hpp>
 #include <cucascade/io/cufile/mount_policy.hpp>
-#include <cucascade/io/cufile/runtime.hpp>
-#include <cucascade/io/range_plan.hpp>
-#include <array>
-#include <map>
 #include <cucascade/io/cufile/placement.hpp>
 #include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/io/cufile/runtime.hpp>
 #include <cucascade/io/cufile/staging.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/object_identity.hpp>
+#include <cucascade/io/range_plan.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
@@ -59,10 +57,10 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <climits>
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -70,6 +68,7 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -79,8 +78,8 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
-#include <unordered_set>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -441,8 +440,7 @@ void write_host_piece(cufile_io_object const& file,
                       std::uint8_t const* source,
                       range piece)
 {
-  write_piece(
-    file, direct, [&](int fd) { pwrite_all(fd, source, piece.size, piece.offset); });
+  write_piece(file, direct, [&](int fd) { pwrite_all(fd, source, piece.size, piece.offset); });
 }
 
 /// Test seams (see cufile/detail.hpp).
@@ -470,8 +468,6 @@ std::array<std::atomic<copy_delay_gate*>, 128> engine_copy_gates{};
 std::mutex engine_copy_gate_setup_mutex;
 std::atomic<void (*)(detail::completion_observation const&, void*) noexcept> completion_observer{};
 std::atomic<void*> completion_observer_arg{};
-
-
 
 /// Record @p event on @p stream after a copy was enqueued there; tests can make
 /// the record fail (@ref detail::set_copy_event_record_failure_for_testing).
@@ -738,7 +734,10 @@ struct cufile_reactor::scratch_lease {
   }
 
   /// Read up to @p bytes at file @p offset into slot @p slot; short only at EOF.
-  [[nodiscard]] std::size_t read(int fd, std::size_t slot, std::size_t bytes, std::size_t offset) const
+  [[nodiscard]] std::size_t read(int fd,
+                                 std::size_t slot,
+                                 std::size_t bytes,
+                                 std::size_t offset) const
   {
     if (own != nullptr) return pread_all(fd, run(slot, 0), bytes, offset);
     return preadv_all(fd, iov(slot, bytes), offset);
@@ -1046,7 +1045,8 @@ void cufile_reactor::record_submit_fences(cufile_io_object const& file,
   } catch (...) {
     return;  // Optional routing metadata must never fail the user's I/O.
   }
-  struct device_route {    int device;
+  struct device_route {
+    int device;
     bool allowed;
   };
   std::vector<device_route> routes;
@@ -1091,8 +1091,9 @@ void cufile_reactor::record_submit_fences(cufile_io_object const& file,
       });
       if (found == events.end()) {
         auto fence = buffer.ready_gate
-          ? std::make_shared<submit_fence>(submit_fence{buffer.ready_gate->get(), buffer.ready_gate})
-          : submit_event_pool::instance().record(buffer.device_id, stream);
+                       ? std::make_shared<submit_fence>(
+                           submit_fence{buffer.ready_gate->get(), buffer.ready_gate})
+                       : submit_event_pool::instance().record(buffer.device_id, stream);
         events.push_back({buffer.device_id, stream, fence});
         buffer.fence = std::move(fence);
       } else {
@@ -1154,9 +1155,10 @@ cufile_reactor::engine_route_result cufile_reactor::engine_route(
 {
   if (_config.async_engine.mode == engine_mode::legacy ||
       (slice.is_write() ? !_config.async_engine.async_writes : !_config.async_engine.async_reads) ||
-      slice.is_flush() || slice.is_fused() || !slice.has_device_request() || slice.has_host_request() ||
-      !slice.d_buffer.fence || (!slice.is_write() && slice.d_buffer.original_stream_was_null) ||
-      slice.on_complete || !_engine_outstanding || _engine_outstanding->cancel->load())
+      slice.is_flush() || slice.is_fused() || !slice.has_device_request() ||
+      slice.has_host_request() || !slice.d_buffer.fence ||
+      (!slice.is_write() && slice.d_buffer.original_stream_was_null) || slice.on_complete ||
+      !_engine_outstanding || _engine_outstanding->cancel->load())
     return {};
   auto const* file = dynamic_cast<cufile_io_object const*>(obj.get());
   if (!file || !file->cufile_registered() || file->direct_fd() < 0 ||
@@ -1274,32 +1276,32 @@ reactor_stats cufile_reactor::stats() const noexcept
     return value.load(std::memory_order_relaxed);
   };
   reactor_stats out;
-  out.staged_reads       = load(_counters.staged_reads);
-  out.staged_bytes       = load(_counters.staged_bytes);
-  out.early_staged_reads = load(_counters.early_staged_reads);
-  out.fused_slices       = load(_counters.fused_slices);
-  out.direct_reads       = load(_counters.direct_reads);
-  out.direct_bytes       = load(_counters.direct_bytes);
-  out.posix_device_reads = load(_counters.posix_device_reads);
-  out.posix_device_bytes = load(_counters.posix_device_bytes);
-  out.host_reads         = load(_counters.host_reads);
-  out.host_bytes         = load(_counters.host_bytes);
-  out.cufile_failures    = load(_counters.cufile_failures);
-  out.parked_slices      = load(_counters.parked_slices);
-  out.staged_writes      = load(_counters.staged_writes);
-  out.staged_write_bytes = load(_counters.staged_write_bytes);
-  out.direct_writes      = load(_counters.direct_writes);
-  out.direct_write_bytes = load(_counters.direct_write_bytes);
-  out.lane_reads         = load(_counters.lane_reads);
-  out.lane_bytes         = load(_counters.lane_bytes);
-  out.lane_issued_bytes  = load(_counters.lane_issued_bytes);
-  out.lane_parts         = load(_counters.lane_parts);
-  out.lane_resubmits     = load(_counters.lane_resubmits);
-  out.lane_failures      = load(_counters.lane_failures);
-  out.lane_gated_reads   = load(_counters.lane_gated_reads);
-  out.batch_reads        = load(_counters.batch_reads);
-  out.batch_bytes        = load(_counters.batch_bytes);
-  out.batch_failures     = load(_counters.batch_failures);
+  out.staged_reads           = load(_counters.staged_reads);
+  out.staged_bytes           = load(_counters.staged_bytes);
+  out.early_staged_reads     = load(_counters.early_staged_reads);
+  out.fused_slices           = load(_counters.fused_slices);
+  out.direct_reads           = load(_counters.direct_reads);
+  out.direct_bytes           = load(_counters.direct_bytes);
+  out.posix_device_reads     = load(_counters.posix_device_reads);
+  out.posix_device_bytes     = load(_counters.posix_device_bytes);
+  out.host_reads             = load(_counters.host_reads);
+  out.host_bytes             = load(_counters.host_bytes);
+  out.cufile_failures        = load(_counters.cufile_failures);
+  out.parked_slices          = load(_counters.parked_slices);
+  out.staged_writes          = load(_counters.staged_writes);
+  out.staged_write_bytes     = load(_counters.staged_write_bytes);
+  out.direct_writes          = load(_counters.direct_writes);
+  out.direct_write_bytes     = load(_counters.direct_write_bytes);
+  out.lane_reads             = load(_counters.lane_reads);
+  out.lane_bytes             = load(_counters.lane_bytes);
+  out.lane_issued_bytes      = load(_counters.lane_issued_bytes);
+  out.lane_parts             = load(_counters.lane_parts);
+  out.lane_resubmits         = load(_counters.lane_resubmits);
+  out.lane_failures          = load(_counters.lane_failures);
+  out.lane_gated_reads       = load(_counters.lane_gated_reads);
+  out.batch_reads            = load(_counters.batch_reads);
+  out.batch_bytes            = load(_counters.batch_bytes);
+  out.batch_failures         = load(_counters.batch_failures);
   out.batch_waves            = load(_counters.batch_waves);
   out.batch_entries          = load(_counters.batch_entries);
   out.batch_rejected_submits = load(_counters.batch_rejected_submits);
@@ -1307,13 +1309,13 @@ reactor_stats cufile_reactor::stats() const noexcept
   out.batch_handle_resets    = load(_counters.batch_handle_resets);
   out.batch_deferred         = load(_counters.batch_deferred);
   out.batch_submit_ns        = load(_counters.batch_submit_ns);
-  out.lane_submit_ns     = load(_counters.lane_submit_ns);
-  out.lane_read_async_ns = load(_counters.lane_read_async_ns);
-  out.lane_flight_ns     = load(_counters.lane_flight_ns);
-  out.lane_notify_ns     = load(_counters.lane_notify_ns);
-  out.lane_idle_ns       = load(_counters.lane_idle_ns);
-  out.worker_wait_ns     = load(_counters.worker_wait_ns);
-  out.worker_passes      = load(_counters.worker_passes);
+  out.lane_submit_ns         = load(_counters.lane_submit_ns);
+  out.lane_read_async_ns     = load(_counters.lane_read_async_ns);
+  out.lane_flight_ns         = load(_counters.lane_flight_ns);
+  out.lane_notify_ns         = load(_counters.lane_notify_ns);
+  out.lane_idle_ns           = load(_counters.lane_idle_ns);
+  out.worker_wait_ns         = load(_counters.worker_wait_ns);
+  out.worker_passes          = load(_counters.worker_passes);
   return out;
 }
 
@@ -1657,7 +1659,8 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
       adopted.write_ticket             = slice.backend_owner;
       adopted.granule                  = file->mount_identity_info().geometry.granule;
       adopted.geometry_bytes           = file->mount_identity_info().geometry.geometry_bytes;
-      adopted.file_policy              = file->async_policy();      adopted.logical                  = slice.rng;
+      adopted.file_policy              = file->async_policy();
+      adopted.logical                  = slice.rng;
       adopted.user_ptr                 = slice.d_buffer.data;
       adopted.device_id                = slice.d_buffer.device_id;
       adopted.user_stream              = slice.d_buffer.stream.get();
@@ -2424,8 +2427,8 @@ cufile_reactor::scratch_lease cufile_reactor::lease_scratch(std::size_t bytes, s
     if (block != 0 && block % IO_BLOCK_SIZE == 0) {
       auto const per_slot = (bytes + block - 1) / block;
       try {
-        auto blocks  = pool->allocate_multiple_blocks(per_slot * block * slots);
-        bool usable  = blocks->size() == per_slot * slots;
+        auto blocks = pool->allocate_multiple_blocks(per_slot * block * slots);
+        bool usable = blocks->size() == per_slot * slots;
         for (auto* const start : blocks->get_blocks()) {
           usable = usable && is_block_aligned(start);
         }
@@ -2628,7 +2631,7 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
 
   auto const max_op = _config.max_op_bytes - _config.max_op_bytes % IO_BLOCK_SIZE;
   std::size_t done  = 0;
-  int short_writes = 0;
+  int short_writes  = 0;
   while (done < piece.size) {
     if (_stop_source.stop_requested()) {
       throw std::system_error(canceled_error(), "cufile_reactor: write canceled by shutdown");
@@ -2636,9 +2639,9 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
     auto const want = std::min(max_op, piece.size - done);
     cufile_write_calls.fetch_add(1, std::memory_order_relaxed);
     run_cufile_transfer_hook();
-    errno = 0;
-    auto const got =
-      api->write(file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
+    errno          = 0;
+    auto const got = api->write(
+      file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
     if (got < 0) {
       auto const saved_errno = errno;
       static std::atomic<bool> logged{false};
@@ -2687,8 +2690,8 @@ bool cufile_reactor::write_cufile_staged(cufile_io_object const& file,
     auto const want = std::min(slot_size, piece.size - done);
     // The slice passed its stream gate: the source is ready.  The copy runs on
     // the slot's own stream and is finished before cuFile reads the slot.
-    auto status = cudaMemcpyAsync(
-      entry->slot.base, source + done, want, cudaMemcpyDeviceToDevice, stream);
+    auto status =
+      cudaMemcpyAsync(entry->slot.base, source + done, want, cudaMemcpyDeviceToDevice, stream);
     if (status == cudaSuccess) status = cudaEventRecord(entry->done.get(), stream);
     if (status == cudaSuccess) status = entry->done.synchronize_no_throw();
     if (status != cudaSuccess) {
@@ -2703,7 +2706,7 @@ bool cufile_reactor::write_cufile_staged(cufile_io_object const& file,
     for (std::size_t written = 0; written < want;) {
       cufile_write_calls.fetch_add(1, std::memory_order_relaxed);
       run_cufile_transfer_hook();
-      errno          = 0;
+      errno                 = 0;
       bool const registered = entry->slot.registered;
       auto const got        = api->write(file.cufile_handle(),
                                   registered ? entry->slot.base : entry->slot.base + written,
@@ -2756,10 +2759,9 @@ void cufile_reactor::write_device_staged(cufile_io_object const& file,
   // Chunks of at most one slot rounded down to the write granule, never crossing
   // a piece boundary, so a granule-aligned piece yields granule-aligned chunks
   // that can go O_DIRECT.
-  auto const granule     = write_granule();
-  auto const chunk_bytes = lease.slot_bytes >= granule
-                             ? lease.slot_bytes - lease.slot_bytes % granule
-                             : lease.slot_bytes;
+  auto const granule = write_granule();
+  auto const chunk_bytes =
+    lease.slot_bytes >= granule ? lease.slot_bytes - lease.slot_bytes % granule : lease.slot_bytes;
   std::vector<range> chunks;
   for (auto const& piece : pieces) {
     for (std::size_t done = 0; done < piece.size; done += chunk_bytes) {
@@ -2992,7 +2994,8 @@ void cufile_reactor::cancel_waiting(grouped_coordinator::error_type const& error
     waiting.coordinator->report_error(error);
   }
   _waiting.clear();
-  for (auto& waiting : _write_waiting) waiting.coordinator->report_error(error);
+  for (auto& waiting : _write_waiting)
+    waiting.coordinator->report_error(error);
   _write_waiting.clear();
 }
 
@@ -3050,7 +3053,7 @@ struct cufile_reactor::batch_state {
   std::vector<detail::batch_result> results;
   std::vector<owed> owed_reads;  ///< FIFO from @c owed_head.
   std::size_t owed_head{0};
-  detail::host_batch_counters exported;  ///< The reader's counters already exported.
+  detail::host_batch_counters exported;          ///< The reader's counters already exported.
   std::unordered_set<std::string> failed_files;  ///< Logged once each.
 
   [[nodiscard]] std::uint32_t acquire_op()
@@ -3109,7 +3112,8 @@ bool cufile_reactor::batch_front_blocked(grouped_io_request& request) const noex
   auto const* file = dynamic_cast<cufile_io_object const*>(request.obj.get());
   if (file == nullptr) return false;
   auto const& slice = request.front();
-  return batch_eligible(*file, slice, clamp_to_file(file->size(), slice.rng.offset, slice.rng.size));
+  return batch_eligible(
+    *file, slice, clamp_to_file(file->size(), slice.rng.offset, slice.rng.size));
 }
 
 bool cufile_reactor::ensure_batch_reader() noexcept
@@ -3130,7 +3134,9 @@ bool cufile_reactor::ensure_batch_reader() noexcept
     options.failure_limit  = conf.failure_limit;
     options.policy         = conf.submit_policy;
     options.max_wave_bytes = conf.max_wave_bytes;
-    options.wake = [](void* context) noexcept { static_cast<cufile_reactor*>(context)->notify_worker(); };
+    options.wake           = [](void* context) noexcept {
+      static_cast<cufile_reactor*>(context)->notify_worker();
+    };
     options.wake_context = this;
     auto reader          = std::make_unique<detail::host_batch_reader>(options);
     if (!reader->available()) {
@@ -3327,13 +3333,12 @@ void cufile_reactor::poll_batch() noexcept
     auto& reader = *batch.reader;
     // Also when only a publication is pending (e.g. a dead helper's verdict): collecting clears
     // it, so the wait point does not spin on it.
-    if (reader.in_flight() != 0 || reader.pending_failures() != 0 ||
-        reader.completions_pending()) {
+    if (reader.in_flight() != 0 || reader.pending_failures() != 0 || reader.completions_pending()) {
       batch.results.clear();
-      std::ignore = reader.reap(std::chrono::microseconds{0},
-                                [&](detail::batch_result const& result) noexcept {
-                                  batch.results.push_back(result);  // capacity reserved
-                                });
+      std::ignore =
+        reader.reap(std::chrono::microseconds{0}, [&](detail::batch_result const& result) noexcept {
+          batch.results.push_back(result);  // capacity reserved
+        });
       process_batch_results(nullptr);
       export_batch_counters();
     }
@@ -3371,7 +3376,7 @@ void cufile_reactor::process_batch_results(grouped_coordinator::error_type const
                 _tname,
                 op.obj->object_path(),
                 result.outcome == detail::batch_result::status::short_read ? "came back short"
-                                                                          : "failed",
+                                                                           : "failed",
                 result.error);
             }
           } catch (...) {
@@ -3731,12 +3736,12 @@ cufile_reactor::lane_dispatch cufile_reactor::try_lane_read(
   // Everything that can throw happens before the slice is taken.
   auto const index = lanes.acquire_op();
   try {
-    auto& record         = lanes.ops[index];
-    auto request         = std::make_unique<io_op_request>();
-    request->obj         = obj;
-    request->coordinator = coordinator;
-    request->io_rng      = range{slice.rng.offset, clamped};
-    request->device_copy = std::make_unique<device_cpy_request>();
+    auto& record                    = lanes.ops[index];
+    auto request                    = std::make_unique<io_op_request>();
+    request->obj                    = obj;
+    request->coordinator            = coordinator;
+    request->io_rng                 = range{slice.rng.offset, clamped};
+    request->device_copy            = std::make_unique<device_cpy_request>();
     request->device_copy->req_rng   = slice.rng;
     request->device_copy->d_buffer  = slice.d_buffer;
     request->device_copy->device_id = device_id;
@@ -3853,13 +3858,13 @@ void cufile_reactor::fail_lane_op(std::uint32_t index,
 
 void cufile_reactor::serve_lane_op_synchronously(std::uint32_t index) noexcept
 {
-  auto& lanes             = *_lanes;
-  auto& record            = lanes.ops[index];
-  auto request            = std::move(record.request);
-  auto obj                = std::move(record.obj);
-  auto slice              = std::move(record.slice);
-  bool const check_gate   = record.gate_pending && !record.gate_fired;
-  auto const bytes        = record.queued_bytes;
+  auto& lanes           = *_lanes;
+  auto& record          = lanes.ops[index];
+  auto request          = std::move(record.request);
+  auto obj              = std::move(record.obj);
+  auto slice            = std::move(record.slice);
+  bool const check_gate = record.gate_pending && !record.gate_fired;
+  auto const bytes      = record.queued_bytes;
   lanes.release_op(index);
   auto const& coordinator = request->coordinator;
 
@@ -3962,8 +3967,8 @@ void cufile_reactor::settle_lane_result(std::size_t result_index) noexcept
     _counters.lane_resubmits.fetch_add(result.resubmits, std::memory_order_relaxed);
     if (record.held_once) _counters.lane_gated_reads.fetch_add(1, std::memory_order_relaxed);
     lanes.consecutive_failures = 0;
-    auto request     = std::move(record.request);
-    auto const bytes = record.queued_bytes;
+    auto request               = std::move(record.request);
+    auto const bytes           = record.queued_bytes;
     lanes.release_op(index);
     request->finish_success();
     _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
@@ -4029,9 +4034,8 @@ void cufile_reactor::poll_held_lanes() noexcept
     }
     auto const* gate = record.slice.d_buffer.ready_gate.get();
     auto status      = cudaErrorNotReady;
-    auto const known = std::find_if(lanes.gates.begin(), lanes.gates.end(), [gate](auto const& e) {
-      return e.first == gate;
-    });
+    auto const known = std::find_if(
+      lanes.gates.begin(), lanes.gates.end(), [gate](auto const& e) { return e.first == gate; });
     if (known != lanes.gates.end()) {
       status = known->second;
     } else {
@@ -4080,9 +4084,8 @@ void cufile_reactor::reap_lanes() noexcept
   for (auto const& set : lanes.sets) {
     if (set == nullptr || set->in_flight() == 0) continue;
     // Capacity reserved in set_for: collecting a result never allocates.
-    std::ignore = set->reap([&](detail::lane_result const& result) noexcept {
-      lanes.results.push_back(result);
-    });
+    std::ignore = set->reap(
+      [&](detail::lane_result const& result) noexcept { lanes.results.push_back(result); });
     if (set->capacity() == 0) publish_lane_state(set->device(), false);
   }
 
@@ -4096,7 +4099,8 @@ void cufile_reactor::reap_lanes() noexcept
       if (result.completed_ns != 0 && now_ns > result.completed_ns) {
         auto const late = static_cast<std::uint64_t>(now_ns - result.completed_ns);
         _counters.lane_notify_ns.fetch_add(late, std::memory_order_relaxed);
-        if (waiting && !result.held) _counters.lane_idle_ns.fetch_add(late, std::memory_order_relaxed);
+        if (waiting && !result.held)
+          _counters.lane_idle_ns.fetch_add(late, std::memory_order_relaxed);
       }
       auto const& record = lanes.ops[static_cast<std::uint32_t>(result.token)];
       if (!result.held && record.submitted != std::chrono::steady_clock::time_point{}) {
@@ -4162,9 +4166,8 @@ void cufile_reactor::drain_lanes(grouped_coordinator::error_type const& terminal
   for (auto const& set : lanes.sets) {
     if (set == nullptr) continue;
     lanes.results.clear();
-    set->drain([&](detail::lane_result const& result) noexcept {
-      lanes.results.push_back(result);
-    });
+    set->drain(
+      [&](detail::lane_result const& result) noexcept { lanes.results.push_back(result); });
     for (auto const& result : lanes.results) {
       auto const index = static_cast<std::uint32_t>(result.token);
       if (result.held) {
@@ -4393,11 +4396,11 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
           ? &publication
           : nullptr;
       std::size_t pass_bytes = 0;
-      for (std::size_t dispatched = 0;
-           dispatched < pass_slices && pass_bytes < _config.max_op_bytes &&
-           scheduler.active != nullptr && !scheduler.active->empty() &&
-           inflight_count() < _config.max_inflight && !async_backlog_pending() &&
-           !stop_token.stop_requested();) {
+      for (std::size_t dispatched = 0; dispatched < pass_slices &&
+                                       pass_bytes < _config.max_op_bytes &&
+                                       scheduler.active != nullptr && !scheduler.active->empty() &&
+                                       inflight_count() < _config.max_inflight &&
+                                       !async_backlog_pending() && !stop_token.stop_requested();) {
         // A batch read waits while the batch backlog is occupied; any other slice goes past it.
         // Slices of one request are independent (each has its own credit and destination), so
         // stopping here only delays the request's later slices, never reorders a completion.
@@ -4434,8 +4437,8 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
       flush_batch();
       if (_batch != nullptr) run_batch_owed(_config.max_op_bytes);
       if (scheduler.active != nullptr && scheduler.active->empty()) { scheduler.active.reset(); }
-      _lane_work_waiting = scheduler.active != nullptr || async_backlog_pending() ||
-                           _requests.size_approx() != 0;
+      _lane_work_waiting =
+        scheduler.active != nullptr || async_backlog_pending() || _requests.size_approx() != 0;
 
       // A full in-flight window or a lane read waiting for a lane stops the worker from
       // taking more slices until something completes.
@@ -4449,9 +4452,8 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
 
       // Nothing can be dispatched now: sleep at the one wait point, only as long as in-flight
       // copies, parked slices and asynchronous reads can afford to wait.
-      bool const polling =
-        inflight_count() != 0 || !_waiting.empty() || !_write_waiting.empty();
-      auto timeout_us = polling ? poll_interval_us : idle_wait_us;
+      bool const polling = inflight_count() != 0 || !_waiting.empty() || !_write_waiting.empty();
+      auto timeout_us    = polling ? poll_interval_us : idle_wait_us;
       if (auto const limit = async_wait_limit_us(); limit >= 0) {
         timeout_us = std::min(timeout_us, limit);
       }
@@ -4529,7 +4531,8 @@ cudaError_t delay_engine_copy_for_testing(cudaStream_t stream) noexcept
   if (status == cudaSuccess) status = cudaStreamWaitEvent(stream, gate->event, 0);
   return status;
 }
-bool engine_copy_record_failure_for_testing() noexcept{
+bool engine_copy_record_failure_for_testing() noexcept
+{
   return fail_copy_event_record.load(std::memory_order_relaxed);
 }
 void set_completion_observer_for_testing(void (*observer)(completion_observation const&,
@@ -4648,4 +4651,3 @@ void set_copy_event_record_failure_for_testing(bool enabled) noexcept
 }  // namespace detail
 
 }  // namespace cucascade::io::cufile
-

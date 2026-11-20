@@ -20,9 +20,9 @@
 #include <cucascade/error.hpp>
 #include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/device_engine.hpp>
 #include <cucascade/io/cufile/fused_read_plan.hpp>
-#include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/placement.hpp>
 #include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/cufile/staging.hpp>
@@ -495,8 +495,7 @@ std::vector<cufile_reactor*> cufile_ioctx::rank(std::vector<std::size_t> const& 
   // interleaving writers of one file only contends on its inode.
   bool const fan_out_all = type == io_op_type::host_vector_async && n_slices > 2 && count > 2;
   bool const host_write  = type == io_op_type::write_vector_async && device_id < 0;
-  auto const selected =
-    fan_out_all ? count : std::min<std::size_t>(count, host_write ? 1 : 2);
+  auto const selected    = fan_out_all ? count : std::min<std::size_t>(count, host_write ? 1 : 2);
   std::partial_sort(
     ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(selected), ranked.end());
   std::vector<cufile_reactor*> result;
@@ -564,7 +563,6 @@ std::size_t cufile_ioctx::host_write_io(io_object const& object,
   auto interval    = state->acquire_legacy({offset, size}, write_granule(), mode);
   return templated_ioctx<cufile_reactor>::host_write_io(object, offset, size, source);
 }
-
 
 exec::semi_future<void> cufile_ioctx::flush_async_io(io_object const& object,
                                                      io_priority priority) noexcept
@@ -791,10 +789,10 @@ std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config c
   for (auto const& group : plan.groups) {
     auto const index = static_cast<std::size_t>(group.device);
     // Devices the plan does not cover get what reactor_context::staging_cap gives them.
-    auto const unplanned = effective.max_staging_bytes_per_device == 0
-                             ? std::size_t{0}
-                             : effective.max_staging_bytes_per_device +
-                                 fused_lane_staging_bytes(effective);
+    auto const unplanned =
+      effective.max_staging_bytes_per_device == 0
+        ? std::size_t{0}
+        : effective.max_staging_bytes_per_device + fused_lane_staging_bytes(effective);
     if (caps.size() <= index) caps.resize(index + 1, unplanned);
     caps[index] = group.staging_cap_bytes;
   }
@@ -815,7 +813,7 @@ std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config c
     plan.host_batch_reactors = 0;
     plan.lane_slot_bytes     = 0;
     plan.flat_reactors       = n_reactors;
-    plan.reason        = "flat pool of " + std::to_string(n_reactors) + " reactors (configured)";
+    plan.reason = "flat pool of " + std::to_string(n_reactors) + " reactors (configured)";
   }
   CUCASCADE_LOG_INFO("{}", describe(plan));
   for (auto const& warning : plan.warnings) {
@@ -861,7 +859,8 @@ exec::semi_future<std::size_t> cufile_ioctx::mixed_writev_async_io(
       auto const* file = dynamic_cast<cufile_io_object const*>(&object);
       if (file && file->writable() && !input_slices.empty()) {
         auto ticket = file->write_state()->begin();
-        for (auto& slice : input_slices) slice.backend_owner = ticket;
+        for (auto& slice : input_slices)
+          slice.backend_owner = ticket;
       }
     }
   } catch (...) {

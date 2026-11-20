@@ -83,7 +83,6 @@ std::atomic<cufile_api const*> api_for_testing{nullptr};
 std::atomic<std::uint64_t> api_generation{0};
 std::atomic<std::uint64_t> next_generation{1};
 
-
 }  // namespace
 
 namespace detail {
@@ -120,15 +119,15 @@ std::optional<cufile_api> cufile_api::resolve_symbols(symbol_resolver resolver,
   auto resolve_optional = [&](auto& member, char const* name) noexcept {
     return resolve(member, resolver, context, name);
   };
-  bool const has_register = resolve_optional(api.buf_register, "cuFileBufRegister");
+  bool const has_register   = resolve_optional(api.buf_register, "cuFileBufRegister");
   bool const has_deregister = resolve_optional(api.buf_deregister, "cuFileBufDeregister");
   if (!has_register || !has_deregister) {
-    api.buf_register = nullptr;
+    api.buf_register   = nullptr;
     api.buf_deregister = nullptr;
   }
-  std::ignore = resolve_optional(api.get_size_parameter, "cuFileGetParameterSizeT");
-  std::ignore = resolve_optional(api.get_bool_parameter, "cuFileGetParameterBool");
-  std::ignore = resolve_optional(api.get_string_parameter, "cuFileGetParameterString");
+  std::ignore         = resolve_optional(api.get_size_parameter, "cuFileGetParameterSizeT");
+  std::ignore         = resolve_optional(api.get_bool_parameter, "cuFileGetParameterBool");
+  std::ignore         = resolve_optional(api.get_string_parameter, "cuFileGetParameterString");
   api.has_async_read  = resolve_optional(api.read_async, "cuFileReadAsync");
   api.has_async_write = resolve_optional(api.write_async, "cuFileWriteAsync");
 

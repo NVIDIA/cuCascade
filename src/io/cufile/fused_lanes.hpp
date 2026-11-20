@@ -29,11 +29,11 @@
 #include "io/cufile/staging_pool.hpp"
 
 #include <cucascade/cuda/device_copy_batch.hpp>
-
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/types.hpp>
 
 #include <cuda_runtime_api.h>
+
 #include <sys/types.h>
 
 #include <array>
@@ -98,7 +98,7 @@ struct lane_result {
   /// Callback completion: when the completion callback ran (steady clock, ns since its
   /// epoch); 0 in poll mode and for failures at submission.
   std::int64_t completed_ns{0};
-  unsigned lane{0};       ///< the lane that served it (diagnostics, tests)
+  unsigned lane{0};  ///< the lane that served it (diagnostics, tests)
 };
 
 /// Construction parameters of a @ref fused_lane_set.
@@ -212,8 +212,8 @@ class fused_lane_set {
    * Short reads are resubmitted on their lane (which stays busy) and not reported.  For each
    * finished read, @p done(lane_result const&) is called after its lane was freed -- or, for
    * a @c held result, after the lane entered the held state -- so @p done may @ref submit,
-   * @ref copy_out or @ref release_held.  A throwing @p done is the caller's bug: the exception propagates and the
-   * lanes not yet reported are reported by the next call.
+   * @ref copy_out or @ref release_held.  A throwing @p done is the caller's bug: the exception
+   * propagates and the lanes not yet reported are reported by the next call.
    *
    * @return The number of results reported.
    */
@@ -314,7 +314,7 @@ class fused_lane_set {
     /// Held after a short read: bytes of the window in the slot, copied before the rest of
     /// the window is read (0: the whole needed range is in the slot).
     std::size_t held_progress{0};
-    cudaError_t sync_error{cudaSuccess};  ///< drain: the stream reported this
+    cudaError_t sync_error{cudaSuccess};       ///< drain: the stream reported this
     cucascade::cuda::device_copy_batch batch;  ///< a window's copies as one call
     unsigned resubmits{0};
     std::chrono::steady_clock::time_point started{};
@@ -363,12 +363,12 @@ class fused_lane_set {
 
   lane_set_options _options;
   cufile_api const* _api{nullptr};
-  std::size_t _built{0};          ///< lanes [0, _built) hold resources
-  std::uint64_t _usable{0};       ///< built and not broken
-  std::uint64_t _free{0};         ///< usable and idle
-  std::uint64_t _held{0};         ///< reported held, waiting for the owner
+  std::size_t _built{0};            ///< lanes [0, _built) hold resources
+  std::uint64_t _usable{0};         ///< built and not broken
+  std::uint64_t _free{0};           ///< usable and idle
+  std::uint64_t _held{0};           ///< reported held, waiting for the owner
   std::uint64_t _event_pending{0};  ///< poll mode: event recorded, not yet seen complete
-  unsigned _cursor{0};            ///< round-robin start of the next free-lane search
+  unsigned _cursor{0};              ///< round-robin start of the next free-lane search
   std::atomic<std::uint64_t> _completed{0};
   std::array<lane, max_lanes> _lanes{};
 };

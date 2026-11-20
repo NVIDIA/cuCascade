@@ -1545,8 +1545,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
     // or null when that work has finished.  The legacy default stream orders
     // after every blocking stream, which a query of it does not report, so it is
     // checked through the event.
-    auto write_gate = [&](prepared_io_slice const& slice)
-      -> std::unique_ptr<cucascade::cuda::cuda_event> {
+    auto write_gate =
+      [&](prepared_io_slice const& slice) -> std::unique_ptr<cucascade::cuda::cuda_event> {
       int device = slice.d_buffer.device_id;
       if (device < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device)); }
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
@@ -1843,11 +1843,11 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           reap_completions();
         } else if (copies_pending) {
           // Nothing in the kernel; device copies on callers' streams (or writes
-          // gated on them) are what remains.  Never block on them (a stalled caller stream would stall
-          // every request of this reactor): wait for a new request for one poll
-          // interval instead, and let the next pass poll the copies.  Work that
-          // waits for a slot backs off for the interval; an active request that
-          // can still expand goes straight to the next pass.
+          // gated on them) are what remains.  Never block on them (a stalled caller stream would
+          // stall every request of this reactor): wait for a new request for one poll interval
+          // instead, and let the next pass poll the copies.  Work that waits for a slot backs off
+          // for the interval; an active request that can still expand goes straight to the next
+          // pass.
           if (pending.empty() && active == nullptr) {
             std::unique_ptr<grouped_io_request> next;
             if (_requests.wait_dequeue_timed(next, COPY_POLL_INTERVAL_US)) {

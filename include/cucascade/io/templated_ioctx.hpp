@@ -757,8 +757,6 @@ class templated_ioctx : public ioctx {
       }
     }
 
-
-
     // One call site issues one priority, so the first slice speaks for the
     // request; stamp the resolved value on every slice so each queue entry
     // built below carries it.
@@ -848,8 +846,8 @@ class templated_ioctx : public ioctx {
 
       std::vector<std::pair<Reactor*, std::unique_ptr<grouped_io_request>>> requests;
       for (std::size_t route = 0; route < routes.size(); ++route) {
-        auto const& reactors      = routes[route];
-        auto const [first, last]  = spans[route];
+        auto const& reactors       = routes[route];
+        auto const [first, last]   = spans[route];
         auto const partition_count = std::min(reactors.size(), last - first);
         std::vector<std::vector<prepared_io_slice>> partitions(partition_count);
         std::vector<std::size_t> partition_bytes(partition_count, 0);

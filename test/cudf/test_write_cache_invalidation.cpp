@@ -153,10 +153,9 @@ TEST_CASE("a truncating open that fails still invalidates its path", "[cache][wr
                                          std::make_shared<cucascade::io::io_object_metadata>());
   REQUIRE(ctx.metadata_store().has_path(fixture.path));
 
-  REQUIRE_THROWS_AS(
-    ctx.open_io_object_for_write(fixture.path,
-                                 {.mode = cucascade::io::write_mode::create_or_truncate}),
-    std::bad_alloc);
+  REQUIRE_THROWS_AS(ctx.open_io_object_for_write(
+                      fixture.path, {.mode = cucascade::io::write_mode::create_or_truncate}),
+                    std::bad_alloc);
   CHECK(std::filesystem::file_size(fixture.path) == 0);
   CHECK_FALSE(ctx.metadata_store().has_path(fixture.path));
   ctx.shutdown();

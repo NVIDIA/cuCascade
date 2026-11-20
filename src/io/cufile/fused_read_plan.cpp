@@ -103,8 +103,8 @@ class planner {
     auto const& slice = _slices[index];
     auto pos          = slice.rng.offset;
     // offset < file_size (eligible): no overflow, whatever the size.
-    auto const end    = pos + std::min(slice.rng.size, _file_size - pos);
-    bool const whole  = slice.rng.size <= _file_size - pos;
+    auto const end     = pos + std::min(slice.rng.size, _file_size - pos);
+    bool const whole   = slice.rng.size <= _file_size - pos;
     std::size_t pieces = 0;
     while (pos < end) {
       ++pieces;
@@ -153,7 +153,7 @@ class planner {
   void close()
   {
     if (!_open) return;
-    _open = false;
+    _open             = false;
     auto const window = align_up_block(_data_end) - _start;
     if (window < _options.min_read_bytes) {
       for (auto const& part : _parts) {
@@ -315,8 +315,8 @@ bool is_lane_read(prepared_io_slice const& slice,
                   std::size_t file_size,
                   std::size_t window_bytes) noexcept
 {
-  if (slice.kind != io_op_kind::read || !slice.has_device_request() ||
-      slice.has_host_request() || slice.on_complete != nullptr || slice.rng.size == 0) {
+  if (slice.kind != io_op_kind::read || !slice.has_device_request() || slice.has_host_request() ||
+      slice.on_complete != nullptr || slice.rng.size == 0) {
     return false;
   }
   auto const body_end = align_down_block(file_size);

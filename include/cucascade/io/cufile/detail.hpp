@@ -28,10 +28,11 @@
 #include <cucascade/io/cufile/platform.hpp>
 
 #include <cuda_runtime_api.h>
-#include <memory>
-#include <cstdint>
+
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <optional>
 
 namespace cucascade::io::cufile {
@@ -43,8 +44,6 @@ namespace cucascade::io::cufile::detail {
 
 /// Lease a portable 16 MiB scratch; return to the process pool, never cudaFreeHost.
 [[nodiscard]] std::shared_ptr<void> lease_pinned_scratch();
-
-
 
 /// Serve every cuFile call of the process from @p api instead of libcufile
 /// (null restores libcufile), so tests can script reads, failures and short

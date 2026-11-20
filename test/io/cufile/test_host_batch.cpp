@@ -57,9 +57,9 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
-#include <limits>
 #include <optional>
 #include <random>
 #include <string>
@@ -149,7 +149,8 @@ class host_memory {
       auto const address = reinterpret_cast<std::uintptr_t>(_allocation);
       _data              = reinterpret_cast<std::uint8_t*>((address + block - 1) / block * block);
     } else {
-      _data = static_cast<std::uint8_t*>(std::aligned_alloc(block, (bytes + block - 1) / block * block));
+      _data =
+        static_cast<std::uint8_t*>(std::aligned_alloc(block, (bytes + block - 1) / block * block));
     }
     REQUIRE(_data != nullptr);
     REQUIRE(reinterpret_cast<std::uintptr_t>(_data) % block == 0);
@@ -197,7 +198,9 @@ class host_memory {
  * Never leaves this function with cuFile still writing unless the deadline passed.
  */
 template <typename Done>
-[[nodiscard]] bool reap_all(host_batch_reader& reader, Done&& done, clock_type::duration limit = 20s)
+[[nodiscard]] bool reap_all(host_batch_reader& reader,
+                            Done&& done,
+                            clock_type::duration limit = 20s)
 {
   auto const deadline = clock_type::now() + limit;
   while (reader.in_flight() > 0 || reader.pending_failures() > 0) {
@@ -224,13 +227,13 @@ struct batch_script {
   bool fake{false};
 
   // Scripted failures.
-  int setup_error{0};                     ///< Non-zero: SetUp fails with it.
-  int setup_fail_after{0};                ///< SetUp calls that succeed before setup_error applies.
-  int reject_submits{0};                  ///< Next submits rejected.
+  int setup_error{0};       ///< Non-zero: SetUp fails with it.
+  int setup_fail_after{0};  ///< SetUp calls that succeed before setup_error applies.
+  int reject_submits{0};    ///< Next submits rejected.
   int reject_code{static_cast<int>(CU_FILE_BATCH_FULL)};
-  bool get_status_error{false};           ///< GetStatus fails.
-  int fail_events{0};                     ///< Next final real events turned CUFILE_FAILED.
-  int short_events{0};                    ///< Next final real events cut to short_ret bytes.
+  bool get_status_error{false};  ///< GetStatus fails.
+  int fail_events{0};            ///< Next final real events turned CUFILE_FAILED.
+  int short_events{0};           ///< Next final real events cut to short_ret bytes.
   std::size_t short_ret{block};
 
   // Observations.
@@ -240,7 +243,7 @@ struct batch_script {
   bool params_ok{true};
   bool null_timeout{false};
   bool over_capacity{false};
-  bool force_partial{false};       ///< Fake: the next GetStatus returns what is ready at once.
+  bool force_partial{false};  ///< Fake: the next GetStatus returns what is ready at once.
   int partial_returns{0};
   std::vector<std::size_t> submit_sizes;  ///< Entries per accepted submit.
 
@@ -384,10 +387,9 @@ CUfileError_t scripted_get_status(CUfileBatchHandle_t handle,
     if (timeout == nullptr) { s.null_timeout = true; }
     if (s.get_status_error) { return status_of(CU_FILE_INTERNAL_ERROR); }
     if (s.fake) {
-      auto const wait = timeout == nullptr
-                          ? std::chrono::nanoseconds{5s}
-                          : std::chrono::seconds{timeout->tv_sec} +
-                              std::chrono::nanoseconds{timeout->tv_nsec};
+      auto const wait = timeout == nullptr ? std::chrono::nanoseconds{5s}
+                                           : std::chrono::seconds{timeout->tv_sec} +
+                                               std::chrono::nanoseconds{timeout->tv_nsec};
       // A test that failed before completing its entries must not hang in the reader's
       // destructor: entries pending for 10 s complete as cancelled (checked while waiting).
       auto expire = [&] {
@@ -539,7 +541,9 @@ class scripted_batch {
     return s.cv.wait_for(lock, 5s, [&] { return s.pending.size() >= n; });
   }
 
-  void complete(std::size_t n, CUfileStatus_t status = CUFILE_COMPLETE, std::optional<std::size_t> ret = {})
+  void complete(std::size_t n,
+                CUfileStatus_t status          = CUFILE_COMPLETE,
+                std::optional<std::size_t> ret = {})
   {
     auto& s = script();
     {
@@ -566,7 +570,8 @@ class scripted_batch {
 /// A fully aligned fake read (fake mode does no I/O; the destination is never written).
 [[nodiscard]] batch_read fake_read(std::uint8_t* dst, std::size_t index, std::size_t size = block)
 {
-  return batch_read{reinterpret_cast<void*>(std::uintptr_t{0x1000}), dst, range{index * size, size}, index};
+  return batch_read{
+    reinterpret_cast<void*>(std::uintptr_t{0x1000}), dst, range{index * size, size}, index};
 }
 
 struct result_log {
@@ -607,7 +612,8 @@ TEST_CASE("host batch reader reads several entries into distinct destinations",
   // Reverse file order into the destinations, so a mix-up shows.
   for (std::size_t i = 0; i < entries; ++i) {
     auto const offset = (entries - 1 - i) * entry_bytes;
-    reader.add(batch_read{object->cufile_handle(), memory.data() + i * entry_bytes, range{offset, entry_bytes}, i});
+    reader.add(batch_read{
+      object->cufile_handle(), memory.data() + i * entry_bytes, range{offset, entry_bytes}, i});
   }
   CHECK(reader.staged() == entries);
   CHECK(reader.in_flight() == 0);
@@ -631,7 +637,8 @@ TEST_CASE("host batch reader reads several entries into distinct destinations",
   }
   for (std::size_t i = 0; i < entries; ++i) {
     INFO("entry " << i);
-    CHECK(file.matches(memory.data() + i * entry_bytes, (entries - 1 - i) * entry_bytes, entry_bytes));
+    CHECK(
+      file.matches(memory.data() + i * entry_bytes, (entries - 1 - i) * entry_bytes, entry_bytes));
   }
   CHECK(reader.in_flight() == 0);
   CHECK(reader.free_entries() == capacity);
@@ -641,7 +648,8 @@ TEST_CASE("host batch reader reads several entries into distinct destinations",
 
   // A read ending exactly at the file's last whole block.
   auto const body_end = file.size() / block * block;
-  reader.add(batch_read{object->cufile_handle(), memory.data(), range{body_end - 2 * block, 2 * block}, 99});
+  reader.add(
+    batch_read{object->cufile_handle(), memory.data(), range{body_end - 2 * block, 2 * block}, 99});
   reader.flush();
   log.results.clear();
   REQUIRE(reap_all(reader, log));
@@ -684,7 +692,10 @@ TEST_CASE("host batch reader refills entries as they complete", "[io][cufile][ho
         auto const offset = (rng() % (file.size() / block - entry_bytes / block)) * block;
         slot_of[issued]   = slot;
         offset_of[issued] = offset;
-        reader.add(batch_read{object->cufile_handle(), memory.data() + slot * entry_bytes, range{offset, entry_bytes}, issued});
+        reader.add(batch_read{object->cufile_handle(),
+                              memory.data() + slot * entry_bytes,
+                              range{offset, entry_bytes},
+                              issued});
         ++issued;
       }
       max_used = std::max(max_used, reader.in_flight() + reader.staged());
@@ -851,7 +862,10 @@ TEST_CASE("host batch reader drains entries in flight before destruction",
     REQUIRE(reader.available());
     auto const n = std::min<std::size_t>(reader.capacity(), 32);
     for (std::size_t i = 0; i < n; ++i) {
-      reader.add(batch_read{object->cufile_handle(), memory.data() + i * entry_bytes, range{i * entry_bytes, entry_bytes}, i});
+      reader.add(batch_read{object->cufile_handle(),
+                            memory.data() + i * entry_bytes,
+                            range{i * entry_bytes, entry_bytes},
+                            i});
     }
     reader.flush();
     // One more staged, never flushed by the test: drain() submits and drains it too.
@@ -887,7 +901,10 @@ TEST_CASE("host batch reader polls without blocking on real entries", "[io][cufi
   REQUIRE(reader.available());
   auto const n = std::min<std::size_t>(reader.capacity(), 16);
   for (std::size_t i = 0; i < n; ++i) {
-    reader.add(batch_read{object->cufile_handle(), memory.data() + i * entry_bytes, range{i * entry_bytes, entry_bytes}, i});
+    reader.add(batch_read{object->cufile_handle(),
+                          memory.data() + i * entry_bytes,
+                          range{i * entry_bytes, entry_bytes},
+                          i});
   }
   reader.flush();
   result_log log;
@@ -1002,8 +1019,14 @@ TEST_CASE("host batch reader stress: mixed aligned sizes with content checks",
   auto const object = open_registered(file);
   if (!object) { SKIP("cuFile cannot register the test file"); }
   constexpr std::size_t reads = 3000;
-  auto const out = run_stress(file, object->cufile_handle(), reads, 64, 4UL << 20, 20260423,
-                              batch_submit_policy::exclusive, has_cuda_device());
+  auto const out              = run_stress(file,
+                              object->cufile_handle(),
+                              reads,
+                              64,
+                              4UL << 20,
+                              20260423,
+                              batch_submit_policy::exclusive,
+                              has_cuda_device());
   REQUIRE(out.available);
   CHECK_FALSE(out.timed_out);
   CHECK(out.reads == reads);
@@ -1012,8 +1035,8 @@ TEST_CASE("host batch reader stress: mixed aligned sizes with content checks",
   CHECK(out.max_used <= out.capacity);
   WARN("host batch stress: " << out.reads << " reads, " << (out.bytes >> 20) << " MiB in "
                              << out.seconds << " s ("
-                             << static_cast<double>(out.bytes) / out.seconds / 1e9
-                             << " GB/s), " << out.submits << " submits");
+                             << static_cast<double>(out.bytes) / out.seconds / 1e9 << " GB/s), "
+                             << out.submits << " submits");
 }
 
 TEST_CASE("host batch readers on several threads stay exclusive", "[io][cufile][host_batch]")
@@ -1030,8 +1053,14 @@ TEST_CASE("host batch readers on several threads stay exclusive", "[io][cufile][
     std::vector<std::thread> workers;
     for (std::size_t t = 0; t < threads; ++t) {
       workers.emplace_back([&, t] {
-        outcomes[t] = run_stress(file, object->cufile_handle(), reads, 32, 1UL << 20, 100 + t,
-                                 batch_submit_policy::exclusive, false);
+        outcomes[t] = run_stress(file,
+                                 object->cufile_handle(),
+                                 reads,
+                                 32,
+                                 1UL << 20,
+                                 100 + t,
+                                 batch_submit_policy::exclusive,
+                                 false);
       });
     }
     for (auto& w : workers) {
@@ -1065,7 +1094,7 @@ TEST_CASE("host batch submit-policy crash probe (child)", "[.][host_batch_crash_
     // The library bug itself, through the raw API: a GetStatus that returns fewer events than
     // are in flight, then any allocation on this thread reusing the chunk cuFile freed, then the
     // next GetStatus.
-    auto const* api   = cufile_api::get();
+    auto const* api = cufile_api::get();
     pattern_file const file{64UL << 20};
     auto const object = open_registered(file);
     if (!object) { SKIP("cuFile cannot register the test file"); }
@@ -1077,13 +1106,14 @@ TEST_CASE("host batch submit-policy crash probe (child)", "[.][host_batch_crash_
       std::array<CUfileIOParams_t, 4> params{};
       std::array<std::size_t, 4> const sizes{block, 4UL << 20, 8UL << 20, 1UL << 20};
       for (std::size_t i = 0; i < 4; ++i) {
-        params[i].mode                  = CUFILE_BATCH;
-        params[i].opcode                = CUFILE_READ;
-        params[i].fh                    = object->cufile_handle();
-        params[i].u.batch.devPtr_base   = memory.data() + i * (8UL << 20);
-        params[i].u.batch.file_offset   = static_cast<off_t>(((static_cast<std::size_t>(round) * 4 + i) % 6) * (8UL << 20));
-        params[i].u.batch.size          = sizes[i];
-        params[i].cookie                = reinterpret_cast<void*>(i + 1);
+        params[i].mode                = CUFILE_BATCH;
+        params[i].opcode              = CUFILE_READ;
+        params[i].fh                  = object->cufile_handle();
+        params[i].u.batch.devPtr_base = memory.data() + i * (8UL << 20);
+        params[i].u.batch.file_offset =
+          static_cast<off_t>(((static_cast<std::size_t>(round) * 4 + i) % 6) * (8UL << 20));
+        params[i].u.batch.size = sizes[i];
+        params[i].cookie       = reinterpret_cast<void*>(i + 1);
       }
       REQUIRE(api->batch_submit(handle, 4, params.data(), 0).err == CU_FILE_SUCCESS);
       unsigned done = 0;
@@ -1091,7 +1121,8 @@ TEST_CASE("host batch submit-policy crash probe (child)", "[.][host_batch_crash_
       while (done < 4) {
         unsigned nr = 8;
         timespec timeout{2, 0};
-        REQUIRE(api->batch_get_status(handle, 1, &nr, events.data(), &timeout).err == CU_FILE_SUCCESS);
+        REQUIRE(api->batch_get_status(handle, 1, &nr, events.data(), &timeout).err ==
+                CU_FILE_SUCCESS);
         done += nr;
         if (done < 4) {
           for (std::size_t size = 16; size <= 2048; size += 16) {
@@ -1103,7 +1134,8 @@ TEST_CASE("host batch submit-policy crash probe (child)", "[.][host_batch_crash_
       }
     }
     api->batch_destroy(handle);
-    for (auto* chunk : spray) std::free(chunk);
+    for (auto* chunk : spray)
+      std::free(chunk);
     return;
   }
   auto const policy = std::string{name} == "continuous"   ? batch_submit_policy::continuous
@@ -1270,7 +1302,8 @@ TEST_CASE("cuFile batch ignores devPtr_offset on host memory (why entries use of
       REQUIRE(clock_type::now() < deadline);
       unsigned nr = entries;
       timespec timeout{0, 10'000'000};
-      REQUIRE(api->batch_get_status(handle, 1, &nr, events.data(), &timeout).err == CU_FILE_SUCCESS);
+      REQUIRE(api->batch_get_status(handle, 1, &nr, events.data(), &timeout).err ==
+              CU_FILE_SUCCESS);
       for (unsigned k = 0; k < nr; ++k) {
         if (final_status(events[k].status)) { ++reported; }
       }
@@ -1310,7 +1343,8 @@ TEST_CASE("host batch reader is unavailable without a batch group or a handle",
   SECTION("SetUp fails")
   {
     scripted_batch fake(true);
-    fake.with([](batch_script& s) { return s.setup_error = static_cast<int>(CU_FILE_INTERNAL_ERROR); });
+    fake.with(
+      [](batch_script& s) { return s.setup_error = static_cast<int>(CU_FILE_INTERNAL_ERROR); });
     host_batch_reader reader(8, 4);
     CHECK_FALSE(reader.available());
     CHECK(reader.free_entries() == 0);
@@ -1360,8 +1394,8 @@ TEST_CASE("host batch reader reap honours the wait", "[io][cufile][host_batch]")
     std::this_thread::sleep_for(20ms);
     fake.complete(2);
   });
-  t0 = clock_type::now();
-  auto const got = reader.reap(5s, log);
+  t0               = clock_type::now();
+  auto const got   = reader.reap(5s, log);
   auto const early = clock_type::now() - t0;
   completer.join();
   CHECK(got == 2);
@@ -1386,14 +1420,16 @@ TEST_CASE("host batch reader classifies failed and short entries", "[io][cufile]
     reader.add(fake_read(memory.data() + i * 2 * block, i, 2 * block));
   }
   reader.flush();
-  fake.complete(1);                                      // token 0: ok
-  fake.complete(1, CUFILE_FAILED);                       // token 1: failed
-  fake.complete(1, CUFILE_COMPLETE, block);              // token 2: short, 4 KiB of 8
-  fake.complete(1, CUFILE_CANCELED);                     // token 3: failed
+  fake.complete(1);                          // token 0: ok
+  fake.complete(1, CUFILE_FAILED);           // token 1: failed
+  fake.complete(1, CUFILE_COMPLETE, block);  // token 2: short, 4 KiB of 8
+  fake.complete(1, CUFILE_CANCELED);         // token 3: failed
   result_log log;
   REQUIRE(reap_all(reader, log, 5s));
   REQUIRE(log.results.size() == 4);
-  std::sort(log.results.begin(), log.results.end(), [](auto const& a, auto const& b) { return a.token < b.token; });
+  std::sort(log.results.begin(), log.results.end(), [](auto const& a, auto const& b) {
+    return a.token < b.token;
+  });
   CHECK(log.results[0].outcome == batch_result::status::ok);
   CHECK(log.results[0].bytes == 2 * block);
   CHECK(log.results[1].outcome == batch_result::status::failed);
@@ -1449,7 +1485,10 @@ TEST_CASE("host batch reader recovers from a rejected submit", "[io][cufile][hos
   host_batch_reader reader(8, 3);
   REQUIRE(reader.available());
   auto read_at = [&](std::size_t i) {
-    return batch_read{object->cufile_handle(), memory.data() + i * entry_bytes, range{i * entry_bytes, entry_bytes}, i};
+    return batch_read{object->cufile_handle(),
+                      memory.data() + i * entry_bytes,
+                      range{i * entry_bytes, entry_bytes},
+                      i};
   };
   result_log log;
 
@@ -1616,7 +1655,8 @@ TEST_CASE("host batch reader aborts the handle on a GetStatus error", "[io][cufi
     CHECK(log.count(batch_result::status::failed) == 6);
     for (auto const& r : log.results) {
       // The staged entry was never handed over: it is dropped, not aborted.
-      CHECK(r.error == (r.token == 5 ? static_cast<int>(CUFILE_CANCELED) : static_cast<int>(CU_FILE_INTERNAL_ERROR)));
+      CHECK(r.error == (r.token == 5 ? static_cast<int>(CUFILE_CANCELED)
+                                     : static_cast<int>(CU_FILE_INTERNAL_ERROR)));
     }
     CHECK_FALSE(reader.available());
     CHECK(reader.in_flight() == 0);
@@ -1638,7 +1678,10 @@ TEST_CASE("host batch reader aborts the handle on a GetStatus error", "[io][cufi
       host_batch_reader reader(8, 4);
       REQUIRE(reader.available());
       for (std::size_t i = 0; i < 8; ++i) {
-        reader.add(batch_read{object->cufile_handle(), memory.data() + i * entry_bytes, range{i * entry_bytes, entry_bytes}, i});
+        reader.add(batch_read{object->cufile_handle(),
+                              memory.data() + i * entry_bytes,
+                              range{i * entry_bytes, entry_bytes},
+                              i});
       }
       intercept.with([](batch_script& s) { return s.get_status_error = true; });
       reader.flush();
@@ -1652,9 +1695,8 @@ TEST_CASE("host batch reader aborts the handle on a GetStatus error", "[io][cufi
       // Cancelled and destroyed: cuFile no longer writes the destinations.
       std::memset(memory.data(), 0xEE, memory.size());
       std::this_thread::sleep_for(200ms);
-      CHECK(std::all_of(memory.data(), memory.data() + memory.size(), [](std::uint8_t b) {
-        return b == 0xEE;
-      }));
+      CHECK(std::all_of(
+        memory.data(), memory.data() + memory.size(), [](std::uint8_t b) { return b == 0xEE; }));
     }
     CHECK(intercept.with([](batch_script& s) { return s.destroys; }) == 1);  // not again
   }
@@ -1678,7 +1720,10 @@ TEST_CASE("host batch reader maps real event failures", "[io][cufile][host_batch
     return 0;
   });
   for (std::size_t i = 0; i < 4; ++i) {
-    reader.add(batch_read{object->cufile_handle(), memory.data() + i * entry_bytes, range{i * entry_bytes, entry_bytes}, i});
+    reader.add(batch_read{object->cufile_handle(),
+                          memory.data() + i * entry_bytes,
+                          range{i * entry_bytes, entry_bytes},
+                          i});
   }
   reader.flush();
   result_log log;
@@ -1693,7 +1738,8 @@ TEST_CASE("host batch reader maps real event failures", "[io][cufile][host_batch
       CHECK(file.matches(memory.data() + r.token * entry_bytes, r.token * entry_bytes, r.bytes));
     }
     if (r.outcome == batch_result::status::ok) {
-      CHECK(file.matches(memory.data() + r.token * entry_bytes, r.token * entry_bytes, entry_bytes));
+      CHECK(
+        file.matches(memory.data() + r.token * entry_bytes, r.token * entry_bytes, entry_bytes));
     }
   }
 }
@@ -1853,13 +1899,13 @@ TEST_CASE("host batch reader tops waves up instead of ping-ponging", "[io][cufil
   reader.add(fake_read(memory.data(), 0));
   reader.flush();
   std::size_t issued = 1;
-  auto stage = [&] {
+  auto stage         = [&] {
     while (reader.free_entries() > 0 && issued < 400) {
       reader.add(fake_read(memory.data() + (issued % depth) * block, issued));
       ++issued;
     }
   };
-  stage();      // staged behind the lone entry's wave
+  stage();         // staged behind the lone entry's wave
   reader.flush();  // deferred: the wave is in flight
   auto const deadline = clock_type::now() + 30s;
   while (log.results.size() < issued && clock_type::now() < deadline) {
@@ -1939,9 +1985,12 @@ TEST_CASE("host batch reader fails misaligned entries without submitting them",
   scripted_batch fake(true);
   host_memory memory(4 * block, false);
   host_batch_reader reader(4, 4);
-  reader.add(batch_read{reinterpret_cast<void*>(std::uintptr_t{0x1000}), memory.data() + 512, range{0, block}, 1});
-  reader.add(batch_read{reinterpret_cast<void*>(std::uintptr_t{0x1000}), memory.data(), range{512, block}, 2});
-  reader.add(batch_read{reinterpret_cast<void*>(std::uintptr_t{0x1000}), memory.data(), range{0, 100}, 3});
+  reader.add(batch_read{
+    reinterpret_cast<void*>(std::uintptr_t{0x1000}), memory.data() + 512, range{0, block}, 1});
+  reader.add(batch_read{
+    reinterpret_cast<void*>(std::uintptr_t{0x1000}), memory.data(), range{512, block}, 2});
+  reader.add(
+    batch_read{reinterpret_cast<void*>(std::uintptr_t{0x1000}), memory.data(), range{0, 100}, 3});
   reader.flush();
   CHECK(fake.with([](batch_script& s) { return s.submits; }) == 0);
   result_log log;
@@ -1982,7 +2031,10 @@ TEST_CASE("host batch reader throughput vs pread", "[.][host_batch_bench]")
         auto const slot = free_slots.back();
         free_slots.pop_back();
         slot_of[next] = slot;
-        reader.add(batch_read{object->cufile_handle(), memory.data() + slot * entry_bytes, range{next * entry_bytes, entry_bytes}, next});
+        reader.add(batch_read{object->cufile_handle(),
+                              memory.data() + slot * entry_bytes,
+                              range{next * entry_bytes, entry_bytes},
+                              next});
         ++next;
       }
       reader.flush();
@@ -1993,7 +2045,8 @@ TEST_CASE("host batch reader throughput vs pread", "[.][host_batch_bench]")
     CHECK(bad == 0);
     auto const& c = reader.counters();
     WARN("batch depth " << depth << ": " << static_cast<double>(file_bytes) / s / 1e9 << " GB/s, "
-                        << c.submits << " submits of " << c.submitted_entries << " entries, mean submit "
+                        << c.submits << " submits of " << c.submitted_entries
+                        << " entries, mean submit "
                         << static_cast<double>(c.submit_ns) / 1e3 / static_cast<double>(c.submits)
                         << " us, " << static_cast<double>(c.submit_ns) / 1e9 / s * 100
                         << "% of the time in Submit");
@@ -2004,12 +2057,12 @@ TEST_CASE("host batch reader throughput vs pread", "[.][host_batch_bench]")
     host_memory memory(entry_bytes, false);
     auto const start = clock_type::now();
     for (std::size_t off = 0; off < file_bytes; off += entry_bytes) {
-      REQUIRE(::pread(fd, memory.data(), entry_bytes, static_cast<off_t>(off)) == static_cast<ssize_t>(entry_bytes));
+      REQUIRE(::pread(fd, memory.data(), entry_bytes, static_cast<off_t>(off)) ==
+              static_cast<ssize_t>(entry_bytes));
     }
     auto const s = std::chrono::duration<double>(clock_type::now() - start).count();
     ::close(fd);
-    WARN("pread" << (direct ? " O_DIRECT" : "") << " 1 thread: " << static_cast<double>(file_bytes) / s / 1e9
-                 << " GB/s");
+    WARN("pread" << (direct ? " O_DIRECT" : "")
+                 << " 1 thread: " << static_cast<double>(file_bytes) / s / 1e9 << " GB/s");
   }
 }
-

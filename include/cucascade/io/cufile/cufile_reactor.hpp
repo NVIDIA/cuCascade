@@ -58,8 +58,6 @@ class file_write_state;
 class device_arena;
 class cufile_transport;
 
-
-
 // ---------------------------------------------------------------------------
 // cufile_io_object
 // ---------------------------------------------------------------------------
@@ -157,7 +155,6 @@ class cufile_io_object final : public io_object {
   mutable std::atomic<bool> _mount_identity_ready{false};
   mutable std::unique_ptr<mount_identity> _mount_identity;
   mutable std::shared_ptr<file_async_policy> _async_policy;
-
 };
 
 // ---------------------------------------------------------------------------
@@ -220,7 +217,7 @@ struct reactor_stats {
   /// Caller pieces they served: one per part of a fused read, one for an unfused slice; a
   /// caller slice split across windows counts once per piece.
   std::uint64_t lane_parts{0};
-  std::uint64_t lane_resubmits{0};     ///< Short-read continuations they needed.
+  std::uint64_t lane_resubmits{0};  ///< Short-read continuations they needed.
   /// Lane reads that failed and were re-served through the synchronous paths (also counted
   /// in @c cufile_failures).
   std::uint64_t lane_failures{0};
@@ -259,27 +256,45 @@ struct reactor_stats {
   /// Every counter, so the arithmetic below cannot miss one.
   [[nodiscard]] static constexpr auto fields() noexcept
   {
-    return std::array{&reactor_stats::staged_reads,       &reactor_stats::staged_bytes,
-                      &reactor_stats::early_staged_reads, &reactor_stats::fused_slices,
-                      &reactor_stats::direct_reads,       &reactor_stats::direct_bytes,
-                      &reactor_stats::posix_device_reads, &reactor_stats::posix_device_bytes,
-                      &reactor_stats::host_reads,         &reactor_stats::host_bytes,
-                      &reactor_stats::cufile_failures,    &reactor_stats::parked_slices,
-                      &reactor_stats::staged_writes,      &reactor_stats::staged_write_bytes,
-                      &reactor_stats::direct_writes,      &reactor_stats::direct_write_bytes,
-                      &reactor_stats::lane_reads,         &reactor_stats::lane_bytes,
-                      &reactor_stats::lane_issued_bytes,  &reactor_stats::lane_parts,
-                      &reactor_stats::lane_resubmits,     &reactor_stats::lane_failures,
-                      &reactor_stats::lane_gated_reads,   &reactor_stats::batch_reads,
-                      &reactor_stats::batch_bytes,        &reactor_stats::batch_failures,
-                      &reactor_stats::batch_waves,        &reactor_stats::batch_entries,
+    return std::array{&reactor_stats::staged_reads,
+                      &reactor_stats::staged_bytes,
+                      &reactor_stats::early_staged_reads,
+                      &reactor_stats::fused_slices,
+                      &reactor_stats::direct_reads,
+                      &reactor_stats::direct_bytes,
+                      &reactor_stats::posix_device_reads,
+                      &reactor_stats::posix_device_bytes,
+                      &reactor_stats::host_reads,
+                      &reactor_stats::host_bytes,
+                      &reactor_stats::cufile_failures,
+                      &reactor_stats::parked_slices,
+                      &reactor_stats::staged_writes,
+                      &reactor_stats::staged_write_bytes,
+                      &reactor_stats::direct_writes,
+                      &reactor_stats::direct_write_bytes,
+                      &reactor_stats::lane_reads,
+                      &reactor_stats::lane_bytes,
+                      &reactor_stats::lane_issued_bytes,
+                      &reactor_stats::lane_parts,
+                      &reactor_stats::lane_resubmits,
+                      &reactor_stats::lane_failures,
+                      &reactor_stats::lane_gated_reads,
+                      &reactor_stats::batch_reads,
+                      &reactor_stats::batch_bytes,
+                      &reactor_stats::batch_failures,
+                      &reactor_stats::batch_waves,
+                      &reactor_stats::batch_entries,
                       &reactor_stats::batch_rejected_submits,
                       &reactor_stats::batch_partial_status,
-                      &reactor_stats::batch_handle_resets, &reactor_stats::batch_deferred,
+                      &reactor_stats::batch_handle_resets,
+                      &reactor_stats::batch_deferred,
                       &reactor_stats::batch_submit_ns,
-                      &reactor_stats::lane_submit_ns,     &reactor_stats::lane_read_async_ns,
-                      &reactor_stats::lane_flight_ns,     &reactor_stats::lane_notify_ns,
-                      &reactor_stats::lane_idle_ns,       &reactor_stats::worker_wait_ns,
+                      &reactor_stats::lane_submit_ns,
+                      &reactor_stats::lane_read_async_ns,
+                      &reactor_stats::lane_flight_ns,
+                      &reactor_stats::lane_notify_ns,
+                      &reactor_stats::lane_idle_ns,
+                      &reactor_stats::worker_wait_ns,
                       &reactor_stats::worker_passes};
   }
 
@@ -409,8 +424,9 @@ struct reactor_stats {
  * worker queues the copies once it sees the gate fire.  The worker keeps up to a lane set's
  * capacity of such reads in flight per device and settles each once its lane completed: a
  * lane read's slice settles only once its copies completed, so the contract is the
- * synchronous path's (host-complete, the bytes visible from any stream).  A short read is continued on its lane; a failed one is re-served
- * through the synchronous paths (and counted in @c lane_failures); after
+ * synchronous path's (host-complete, the bytes visible from any stream).  A short read is continued
+ * on its lane; a failed one is re-served through the synchronous paths (and counted in @c
+ * lane_failures); after
  * @c fused_read_config::failure_limit consecutive failures the reactor stops using lanes for
  * @c fused_read_config::cooldown_s.  A lane read that finds no free lane waits in a
  * one-element backlog and the worker stops taking slices until a lane frees, so excess reads
@@ -453,7 +469,7 @@ class cufile_reactor {
  public:
   /// A read here is a syscall against NVMe (POSIX fallback) or a synchronous
   /// cuFile call (GDS fast path); batching either buys little.
-  static constexpr bool prefers_bulk_io = false;
+  static constexpr bool prefers_bulk_io    = false;
   static constexpr bool wants_submit_fence = true;
 
   /// Shared, immutable config for a pool of reactors.  A dedicated type so a
@@ -532,7 +548,6 @@ class cufile_reactor {
     std::atomic<std::shared_ptr<const engine_bindings>> _engines;
     std::vector<int> _warming;
     std::atomic<bool> _simulated_engine{false};
-
   };
 
   using native_handle_type   = int;
@@ -777,11 +792,11 @@ class cufile_reactor {
   void dispatch_slice(std::shared_ptr<const io_object> const& obj,
                       prepared_io_slice slice,
                       std::shared_ptr<grouped_coordinator> const& coordinator,
-                      bool stream_ready = false,
-                      bool* handed_off = nullptr,
+                      bool stream_ready               = false,
+                      bool* handed_off                = nullptr,
                       engine_publication* publication = nullptr,
-                      bool allow_lanes = true,
-                      bool* lane_owned = nullptr) noexcept;
+                      bool allow_lanes                = true,
+                      bool* lane_owned                = nullptr) noexcept;
 
   /// When the slice's stream still has queued work, record an event on it and
   /// park the slice in @ref _waiting; returns whether it was parked.  For a slice
@@ -1137,12 +1152,13 @@ class cufile_reactor {
   /// all of it settled.  @p count_queued: the caller counts the slice in @c queued_bytes until
   /// it settles.
   /// @throws only while the slice is still the caller's (before any I/O).
-  [[nodiscard]] batch_dispatch try_batch_read(std::shared_ptr<const io_object> const& obj,
-                                              cufile_io_object const& file,
-                                              prepared_io_slice& slice,
-                                              std::shared_ptr<grouped_coordinator> const& coordinator,
-                                              std::size_t clamped,
-                                              bool count_queued);
+  [[nodiscard]] batch_dispatch try_batch_read(
+    std::shared_ptr<const io_object> const& obj,
+    cufile_io_object const& file,
+    prepared_io_slice& slice,
+    std::shared_ptr<grouped_coordinator> const& coordinator,
+    std::size_t clamped,
+    bool count_queued);
   /// Stage the next entries of batch slice @p index while the reader has room; it waits in
   /// the batch backlog otherwise.  Owes the rest synchronously when the reader became
   /// unavailable, and stops (settling with the cancellation) when its request stopped.
@@ -1176,12 +1192,12 @@ class cufile_reactor {
   /// usable.  The calling thread's current device must be @p device_id.
   /// @throws as @ref dispatch_slice's body does, only while the slice is still the caller's.
   [[nodiscard]] lane_dispatch try_lane_read(std::shared_ptr<const io_object> const& obj,
-                                   cufile_io_object const& file,
-                                   prepared_io_slice& slice,
-                                   std::shared_ptr<grouped_coordinator> const& coordinator,
-                                   int device_id,
-                                   std::size_t clamped,
-                                   bool stream_ready);
+                                            cufile_io_object const& file,
+                                            prepared_io_slice& slice,
+                                            std::shared_ptr<grouped_coordinator> const& coordinator,
+                                            int device_id,
+                                            std::size_t clamped,
+                                            bool stream_ready);
 };
 
 }  // namespace cucascade::io::cufile

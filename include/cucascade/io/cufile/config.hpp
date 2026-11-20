@@ -22,11 +22,11 @@
 #include <cucascade/io/types.hpp>
 
 #include <array>
-#include <limits>
-#include <stdexcept>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -344,8 +344,8 @@ enum class lane_completion : std::uint8_t {
  * GPFS over RDMA (raw cuFile, 4 threads x 32 streams of 8 MiB).  The defaults, 8 lane reactors
  * x 16 lanes, measured 84.3 GiB/s on one GB200 GPU over GPFS/RoCE, against 79.0 for that raw
  * shape and 79.7 for 4 x 32 lanes in the same hour.  A read costs a few milliseconds almost
- * regardless of its size, so fewer, larger reads win.  Futures stay host-complete: a successful read's bytes are in
- * place when its future resolves.
+ * regardless of its size, so fewer, larger reads win.  Futures stay host-complete: a successful
+ * read's bytes are in place when its future resolves.
  *
  * Off by default.  Mutually exclusive with the async engine (@c async_engine.mode must be
  * @c legacy).  See docs/io/cufile-fused-lanes.md.
@@ -454,8 +454,7 @@ struct fused_read_config {
       throw std::invalid_argument("fused_reads.fuse_gap_bytes must be smaller than slot_bytes");
     }
     if (max_gated_lanes > lanes_per_reactor) {
-      throw std::invalid_argument(
-        "fused_reads.max_gated_lanes must not exceed lanes_per_reactor");
+      throw std::invalid_argument("fused_reads.max_gated_lanes must not exceed lanes_per_reactor");
     }
     if (failure_limit == 0) {
       throw std::invalid_argument("fused_reads.failure_limit must be positive");

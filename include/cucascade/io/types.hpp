@@ -48,7 +48,9 @@ struct cached_chunk;
 class metadata_store;
 }  // namespace cucascade::io::cache
 
-namespace cucascade::io::cufile { struct file_write_ticket; }
+namespace cucascade::io::cufile {
+struct file_write_ticket;
+}
 
 namespace cucascade::io {
 class ioctx;

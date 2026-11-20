@@ -332,10 +332,9 @@ TEST_CASE("cached reads held on two per-thread streams do not keep a ready one w
   REQUIRE(prefetched.load(std::memory_order_acquire));
 
   rmm::cuda_stream allocation_stream;
-  std::array<rmm::device_buffer, 3> destinations{
-    rmm::device_buffer(read_size, allocation_stream),
-    rmm::device_buffer(read_size, allocation_stream),
-    rmm::device_buffer(read_size, allocation_stream)};
+  std::array<rmm::device_buffer, 3> destinations{rmm::device_buffer(read_size, allocation_stream),
+                                                 rmm::device_buffer(read_size, allocation_stream),
+                                                 rmm::device_buffer(read_size, allocation_stream)};
   allocation_stream.synchronize();
   auto const per_thread = ::cuda::stream_ref{cudaStreamPerThread};
 
