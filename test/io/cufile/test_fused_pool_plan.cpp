@@ -125,7 +125,7 @@ TEST_CASE("fused_read_config validates only when enabled", "[io][cufile][fused_p
   CHECK_NOTHROW(edge.validate());
 
   // Gated lanes: half the lanes by default, at least one, or the configured number.
-  CHECK(enabled.gated_lane_limit() == 16);
+  CHECK(enabled.gated_lane_limit() == 8);  // half of the default 16 lanes
   auto one              = enabled;
   one.lanes_per_reactor = 1;
   CHECK(one.gated_lane_limit() == 1);
@@ -211,15 +211,15 @@ TEST_CASE("pool plan budgets fused lanes on top of the staging cap",
     INFO(describe(plan));
     REQUIRE(plan.groups.size() == 1);
     auto const& group = plan.groups.front();
-    CHECK(group.lane_reactors == 4);
-    CHECK(group.lanes_per_reactor == 32);
+    CHECK(group.lane_reactors == 8);
+    CHECK(group.lanes_per_reactor == 16);
     CHECK(group.lane_slots == 128);
     CHECK(group.staging_slots == 0);  // staging never
     // The staging pool's cap counts the lanes on top of the configured cap.
     CHECK(group.staging_cap_bytes == cfg.max_staging_bytes_per_device + 1032 * MiB);
     // The lanes carry the device reads: the synchronous reactors fall to the local count.
     CHECK(group.n_reactors == local_reactors_per_device);
-    CHECK(plan.total_reactors() == local_reactors_per_device + 4);
+    CHECK(plan.total_reactors() == local_reactors_per_device + 8);
     CHECK(plan.lane_slot_bytes == 8 * MiB);
     CHECK(plan.host_batch_reactors == 0);
     CHECK(plan.warnings.empty());
@@ -267,7 +267,7 @@ TEST_CASE("pool plan budgets fused lanes on top of the staging cap",
     auto const plan         = plan_cufile_pool(cfg, nullptr, quiet_platform());
     REQUIRE(plan.groups.size() == 1);
     CHECK(plan.groups.front().n_reactors == 3);
-    CHECK(plan.total_reactors() == 3 + 4);
+    CHECK(plan.total_reactors() == 3 + 8);
   }
   SECTION("cuFile's pinned limit cuts lanes: the warning names it")
   {
@@ -472,12 +472,12 @@ TEST_CASE("describe names the lanes, their slots and the batch reactors",
   auto const plan                  = plan_cufile_pool(cfg, nullptr, quiet_platform());
   auto const text                  = describe(plan);
   INFO(text);
-  CHECK(text.find("4 lane reactors x 32 lanes") != std::string::npos);
+  CHECK(text.find("8 lane reactors x 16 lanes") != std::string::npos);
   CHECK(text.find("128 lane slots of 8192 KiB (1032 MiB registered, on top of the staging cap)") !=
         std::string::npos);
   CHECK(text.find("registered staging cap 2056 MiB, lanes included") != std::string::npos);
   CHECK(text.find("lane slots of 8192 KiB") != std::string::npos);
   CHECK(text.find("2 host-batch reactors") != std::string::npos);
-  CHECK(text.find("(4 lane, 8 synchronous, 2 host-batch)") != std::string::npos);
+  CHECK(text.find("(8 lane, 8 synchronous, 2 host-batch)") != std::string::npos);
   CHECK(text.find("lanes carry the device reads") != std::string::npos);
 }

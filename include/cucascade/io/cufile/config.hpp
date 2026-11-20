@@ -319,8 +319,9 @@ struct async_engine_config {
 /// How a fused lane learns that its read and copies finished (see @ref fused_read_config).
 enum class lane_completion : std::uint8_t {
   /// A stream callback queued behind the copies marks the lane done and wakes the reactor.
-  /// Less CPU, but about 5% slower than @ref poll on GB200 + GPFS (CUDA's host-callback
-  /// delivery), and every lane completion of the process stalls while anything blocks
+  /// Less CPU, but slower than @ref poll on GB200 + GPFS (CUDA's host-callback delivery
+  /// lengthens every lane cycle: 4 x 32 lanes measured 65.1 GiB/s against 79.7 polled), and
+  /// every lane completion of the process stalls while anything blocks
   /// CUDA's host-callback thread (a caller's blocking @c cudaLaunchHostFunc, say).
   callback,
   /// The default: the reactor queries the events recorded behind the busy lanes' copies,
@@ -337,11 +338,13 @@ enum class lane_completion : std::uint8_t {
  * the device slices of one request are packed, in file order, into 4 KiB-aligned windows of at
  * most @ref slot_bytes (neighbours are fused, long slices are split).  A lane reactor issues
  * each window as one @c cuFileReadAsync into a free lane's slot, queues the device-to-device
- * copies to the callers' destinations on the lane's stream, and learns of completion from a
- * stream callback.  A stream carries one read at a time, and a few reactors feed many lanes,
- * which is the shape that reached NIC line rate on GPFS over RDMA (88 GiB/s on one GPU with
- * 4 x 32 lanes of 8 MiB).  A read costs a few milliseconds almost regardless of its size, so
- * fewer, larger reads win.  Futures stay host-complete: a successful read's bytes are in
+ * copies to the callers' destinations on the lane's stream, and learns of completion by
+ * polling (or from a stream callback, see @ref lane_completion).  A stream carries one read at
+ * a time, and a few reactors feed many lanes, which is the shape that reached NIC line rate on
+ * GPFS over RDMA (raw cuFile, 4 threads x 32 streams of 8 MiB).  The defaults, 8 lane reactors
+ * x 16 lanes, measured 84.3 GiB/s on one GB200 GPU over GPFS/RoCE, against 79.0 for that raw
+ * shape and 79.7 for 4 x 32 lanes in the same hour.  A read costs a few milliseconds almost
+ * regardless of its size, so fewer, larger reads win.  Futures stay host-complete: a successful read's bytes are in
  * place when its future resolves.
  *
  * Off by default.  Mutually exclusive with the async engine (@c async_engine.mode must be
@@ -359,11 +362,19 @@ struct fused_read_config {
 
   /// Lane reactors (submitting threads) per GPU in a pool planned per device.  A flat pool
   /// (reactor count given) lets every reactor own lanes instead.
-  std::size_t reactors_per_device{4};
+  ///
+  /// 8 (with 16 lanes each) rather than 4 x 32: on a real GDS path @c cuFileReadAsync costs
+  /// about 0.28 ms of the calling thread per read (it submits to the kernel there; about
+  /// 0.03 ms in compatibility mode), so a reactor feeding 32 lanes is busy submitting about
+  /// 65% of the time and its lanes queue behind it.  Measured on a GB200 GPU over GPFS/RoCE
+  /// (8 MiB reads, 1/2/5 MiB chunks, medians of 5 passes): 8 x 16 polled 84.3 GiB/s,
+  /// 4 x 32 polled 79.7, 4 x 32 with callbacks 65.1; raw cuFile with 4 threads x 32 streams
+  /// 79.0.
+  std::size_t reactors_per_device{8};
 
   /// Lanes each lane reactor owns per GPU it reads into, 1 to 64.  Reads in flight per GPU =
-  /// @ref reactors_per_device x this.
-  std::size_t lanes_per_reactor{32};
+  /// @ref reactors_per_device x this = 128 by default (see @ref max_lanes_per_device).
+  std::size_t lanes_per_reactor{16};
 
   /// Process-wide ceiling on lanes per GPU, counted over every ioctx together.  It guards
   /// the storage: 128 asynchronous reads in flight is what was qualified on GPFS (a deeper
