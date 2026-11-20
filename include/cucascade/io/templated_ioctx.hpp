@@ -43,6 +43,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -260,6 +261,14 @@ concept reactor_declares_device_write_support = requires {
   { R::supports_device_write } -> std::convertible_to<bool>;
 };
 
+/// A reactor whose @c on_worker_thread() tells whether the calling thread is its worker.  A
+/// reactor with a worker thread should model it, so that @c templated_ioctx can be destroyed on
+/// that thread (see @c ~templated_ioctx).
+template <class R>
+concept reactor_reports_worker_thread = requires(R const& reactor) {
+  { reactor.on_worker_thread() } noexcept -> std::same_as<bool>;
+};
+
 /// Write capabilities of a reactor.  Kept apart from @ref reactor_traits so a
 /// reactor's existing full specialization of that template stays complete.
 template <class R>
@@ -329,9 +338,25 @@ class templated_ioctx : public ioctx {
     if (!_reactors.empty()) _config = _reactors.front()->get_config();
   }
 
+  /**
+   * @brief Shut the reactors down and destroy them.
+   *
+   * A continuation running inline on one of the reactors' workers may drop the last reference
+   * to the context.  That worker cannot join itself and, once the continuation returns, keeps
+   * running in its reactor, so the reactors (when they model @ref reactor_reports_worker_thread)
+   * are then handed to a detached thread that joins their workers and destroys them: they
+   * briefly outlive the context, and whatever they borrow (e.g. a host memory resource of their
+   * reactor context) must outlive them.
+   */
   ~templated_ioctx() override
   {
     this->pre_destroy();
+    if (destroyed_on_own_worker()) {
+      std::thread([reactors = std::move(_reactors)]() mutable {
+        shutdown_reactors(reactors);
+      }).detach();
+      return;
+    }
     shutdown();
   }
 
@@ -344,18 +369,7 @@ class templated_ioctx : public ioctx {
     _started = true;
   }
 
-  void shutdown() noexcept override
-  {
-    for (auto& reactor : _reactors) {
-      try {
-        reactor->shutdown();
-      } catch (std::exception const& error) {
-        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", error.what());
-      } catch (...) {
-        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
-      }
-    }
-  }
+  void shutdown() noexcept override { shutdown_reactors(_reactors); }
 
   [[nodiscard]] bool supports(std::string_view path) const noexcept final
   {
@@ -909,6 +923,31 @@ class templated_ioctx : public ioctx {
   bool _started{false};
 
  private:
+  /// Whether the calling thread is the worker of one of the reactors.
+  [[nodiscard]] bool destroyed_on_own_worker() const noexcept
+  {
+    if constexpr (reactor_reports_worker_thread<Reactor>) {
+      return std::any_of(_reactors.begin(), _reactors.end(), [](auto const& reactor) {
+        return reactor->on_worker_thread();
+      });
+    } else {
+      return false;
+    }
+  }
+
+  static void shutdown_reactors(std::vector<std::unique_ptr<Reactor>>& reactors) noexcept
+  {
+    for (auto& reactor : reactors) {
+      try {
+        reactor->shutdown();
+      } catch (std::exception const& error) {
+        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: {}", error.what());
+      } catch (...) {
+        CUCASCADE_LOG_ERROR("templated_ioctx: reactor shutdown failed: unknown error");
+      }
+    }
+  }
+
   static io_object_type const& as_typed(io_object const& object)
   {
     auto const* typed = dynamic_cast<io_object_type const*>(&object);

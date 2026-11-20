@@ -103,6 +103,15 @@ void gpu_disk_round_trip_test(std::unique_ptr<cudf::table> original_table)
     // Compare original (from gpu_rep) with round-tripped
     test::expect_cudf_tables_equal_on_stream(
       gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
+
+    // The comparison above normalizes string offsets; the restore must also keep their type.
+    auto const original = gpu_rep->get_table_view();
+    auto const restored = gpu_rep2->get_table_view();
+    for (cudf::size_type i = 0; i < original.num_columns(); ++i) {
+      auto const& column = original.column(i);
+      if (column.type().id() != cudf::type_id::STRING || column.num_children() == 0) { continue; }
+      CHECK(restored.column(i).child(0).type().id() == column.child(0).type().id());
+    }
   }
 }
 

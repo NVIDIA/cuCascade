@@ -297,7 +297,7 @@ std::shared_ptr<io_object> ioctx::open_io_object_for_write(std::string path,
 void ioctx::invalidate_cached(std::string_view object_path) noexcept
 {
   if (_cache) { _cache->invalidate(object_path); }
-  _metadata_store.invalidate_written(object_path);
+  _metadata_store->invalidate_written(object_path);
 }
 
 std::size_t ioctx::host_write(const io_object& obj,
@@ -409,9 +409,9 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
     // attaching the second invalidation pass.  That pass runs once the write
     // settled, before the caller sees it: a prefetch that raced the write may
     // have cached pre-write bytes.  It runs on the completing thread; `pending`
-    // keeps the cache alive until then, and the metadata store is a member of
-    // this ioctx, which outlives every completion of its own backend (reactors
-    // are joined in its destructor).
+    // keeps the cache alive until then, and the metadata store is shared: a
+    // completion can run after this ioctx is gone, when it was destroyed on one
+    // of its own reactors' workers (see ~templated_ioctx).
     exec::promise<std::size_t> bridge;
     auto result = bridge.get_semi_future();
     // The future's exact callback type, so installing it moves it in without
@@ -419,7 +419,7 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
     using terminal_type = exec::invocable<void(exec::try_t<std::size_t>&&)>;
     terminal_type terminal{
       [pending  = std::move(pending),
-       metadata = &_metadata_store,
+       metadata = _metadata_store,
        path     = std::string{path},
        bridge   = std::move(bridge)](exec::try_t<std::size_t>&& outcome) mutable {
         pending.fire();
