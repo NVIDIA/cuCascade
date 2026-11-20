@@ -1217,7 +1217,7 @@ TEST_CASE("host batch config validates the submit policy", "[io][cufile][host_ba
   cucascade::io::cufile::host_batch_config config;
   config.enabled = true;
   CHECK(config.submit_policy == batch_submit_policy::per_reader);
-  CHECK(config.max_wave_bytes == (256UL << 20));
+  CHECK(config.max_wave_bytes == (1UL << 30));  // a default wave (64 x 8 MiB) is never cut
   CHECK_NOTHROW(config.validate());
   config.submit_policy = batch_submit_policy::per_reader;
   CHECK_NOTHROW(config.validate());
@@ -1794,6 +1794,51 @@ TEST_CASE("host batch reader reports every entry once when a wave follows an abo
   CHECK_FALSE(reader.available());
   CHECK(reader.in_flight() == 0);
   CHECK(fake.with([](batch_script& s) { return s.submits; }) == 1);
+}
+
+TEST_CASE("host batch reader does not reset or re-report a rejected wave after an abort",
+          "[io][cufile][host_batch]")
+{
+  // Continuous: wave A in flight, wave B rejected (its reset waits for A), then GetStatus fails.
+  // The abort fails A and B once; the dead helper must not re-create the handle nor publish B.
+  scripted_batch fake(true);
+  host_memory memory(8 * block, false);
+  host_batch_reader reader(8, 4, batch_submit_policy::continuous);
+  reader.add(fake_read(memory.data(), 0));
+  reader.add(fake_read(memory.data() + block, 1));
+  reader.flush();
+  REQUIRE(fake.wait_pending(2));
+  fake.with([](batch_script& s) { return s.reject_submits = 1; });
+  reader.add(fake_read(memory.data() + 2 * block, 2));
+  reader.add(fake_read(memory.data() + 3 * block, 3));
+  reader.flush();
+  auto deadline = clock_type::now() + 5s;
+  while (fake.with([](batch_script& s) { return s.rejected; }) == 0 &&
+         clock_type::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(fake.with([](batch_script& s) { return s.rejected; }) == 1);
+  fake.with([](batch_script& s) { return s.get_status_error = true; });
+  // Collect in several calls: a second report of any token would trip mark_failed.
+  result_log log;
+  deadline = clock_type::now() + 5s;
+  while (log.results.size() < 4 && clock_type::now() < deadline) {
+    std::ignore = reader.reap(10ms, log);
+  }
+  std::this_thread::sleep_for(50ms);
+  std::ignore = reader.reap(10ms, log);
+  REQUIRE(log.results.size() == 4);
+  std::vector<int> seen(4, 0);
+  for (auto const& r : log.results) {
+    REQUIRE(r.token < 4);
+    ++seen[r.token];
+    CHECK(r.outcome == batch_result::status::failed);
+  }
+  CHECK(seen == std::vector<int>{1, 1, 1, 1});
+  CHECK_FALSE(reader.available());
+  CHECK_FALSE(reader.completions_pending());
+  CHECK(fake.with([](batch_script& s) { return s.setups; }) == 1);  // no reset after the abort
+  CHECK(reader.counters().handle_resets == 0);
 }
 
 TEST_CASE("host batch reader tops waves up instead of ping-ponging", "[io][cufile][host_batch]")

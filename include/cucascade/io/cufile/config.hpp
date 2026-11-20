@@ -550,7 +550,7 @@ struct host_batch_config {
   /// Most bytes one wave carries (0 = no cap; else a multiple of @c io::IO_BLOCK_SIZE, at least
   /// one entry is always handed over).  Bounds how long one wave can take, which must stay far
   /// below the reader's one-hour wave timeout (see @ref batch_submit_policy).
-  std::size_t max_wave_bytes{256UL << 20};
+  std::size_t max_wave_bytes{1UL << 30};
 
   bool operator==(host_batch_config const&) const = default;
 

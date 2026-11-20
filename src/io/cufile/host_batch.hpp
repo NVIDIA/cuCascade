@@ -135,6 +135,10 @@ struct host_batch_options {
  * heap spraying).  @ref batch_submit_policy::continuous refills while entries are pending and reaps
  * with @c min_nr 1, which exposes the bug on that library.
  *
+ * Signals cannot poison (or abort) a healthy reader: the helper thread blocks every signal.  An
+ * @c io_getevents interrupted by a signal makes compatibility-mode @c GetStatus fail with
+ * @c CU_FILE_IO_ERROR (verified by injecting @c EINTR), which would otherwise abort the handle.
+ *
  * Every entry passes its own destination as @c devPtr_base with @c devPtr_offset 0: libcufile
  * 1.17 in compatibility mode silently ignores a non-zero @c devPtr_offset on host memory and
  * lands every entry at the base.

@@ -25,6 +25,8 @@
 #include <cucascade/log/logging.hpp>
 
 #include <cufile.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/types.h>
 
 #include <algorithm>
@@ -660,17 +662,31 @@ void host_batch_reader::log_drain_stall(std::chrono::steady_clock::duration elap
       _in_flight,
       _staged);
   } else {
-    CUCASCADE_LOG_ERROR(
-      "cufile: draining host batch reads for {} s: {} entries in flight{}; waiting for the "
-      "storage to complete them (a destination cuFile may still write is never abandoned)",
-      seconds,
-      _in_flight,
-      _poisoned ? " on a poisoned reader (they will never be reported)" : "");
+    if (_poisoned) {
+      CUCASCADE_LOG_ERROR(
+        "cufile: host batch shutdown is blocked for {} s: cuFile returned a partial batch status "
+        "and may still write {} destinations; the reader never reports them and the reactor "
+        "cannot shut down",
+        seconds,
+        _in_flight);
+    } else {
+      CUCASCADE_LOG_ERROR(
+        "cufile: draining host batch reads for {} s: {} entries in flight; waiting for the "
+        "storage to complete them (a destination cuFile may still write is never abandoned)",
+        seconds,
+        _in_flight);
+    }
   }
 }
 
 void host_batch_reader::helper_loop() noexcept
 {
+  // No signal is ever delivered to this thread: an interrupted io_getevents surfaces from
+  // cuFileBatchIOGetStatus as an error (CU_FILE_IO_ERROR, verified by injecting EINTR), which
+  // would abort a healthy reader.  Process-directed signals go to other threads.
+  sigset_t all;
+  sigfillset(&all);
+  std::ignore = pthread_sigmask(SIG_BLOCK, &all, nullptr);
   // No allocation, no logging on this thread: see the class comment.
   auto& s                = *_shared;
   auto const* api        = s.api;
@@ -786,6 +802,9 @@ void host_batch_reader::helper_loop() noexcept
         api->batch_destroy(s.handle);
         s.handle    = nullptr;
         s.in_flight = 0;
+        // A rejected wave waiting for the reset is failed by the owner with everything else
+        // in flight: it must not be reported again.
+        s.pending_rejected_count = 0;
         {
           std::lock_guard relock(s.mutex);
           s.aborted     = true;
@@ -827,7 +846,7 @@ void host_batch_reader::helper_loop() noexcept
         if (finals > 0 || partial) s.notify_owner();
       }
     }
-    if (s.pending_rejected_count > 0 && s.in_flight == 0 && !s.helper_poisoned) {
+    if (s.pending_rejected_count > 0 && s.in_flight == 0 && !s.helper_poisoned && !s.dead) {
       reset_and_report_rejected();
     }
     lock.lock();
