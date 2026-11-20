@@ -324,9 +324,9 @@ enum class lane_completion : std::uint8_t {
   /// CUDA's host-callback thread (a caller's blocking @c cudaLaunchHostFunc, say).
   callback,
   /// The default: the reactor queries the events recorded behind the busy lanes' copies,
-  /// every @c config::poll_interval_us while lanes are in flight (a lane whose read was
-  /// submitted less than half the recent mean read time ago is not queried yet).  At parity
-  /// with the raw benchmark on GB200 + GPFS; costs some CPU per lane reactor.
+  /// every @c config::poll_interval_us while lanes are in flight (every busy lane on every
+  /// poll).  At parity with the raw benchmark on GB200 + GPFS; costs some CPU per lane
+  /// reactor.
   poll,
 };
 
@@ -396,9 +396,11 @@ struct fused_read_config {
   /// How a lane's completion reaches the reactor (see @ref lane_completion).
   lane_completion completion{lane_completion::poll};
 
-  /// Lanes per reactor that may hold a read whose copies wait, on the GPU, for work queued
-  /// earlier on the caller's stream.  Further such reads are parked until their stream is
-  /// ready, so a stalled caller cannot take every lane.  0 = half the lanes.
+  /// Two-phase reads a lane set (one per reactor and GPU) may have at once: reads whose
+  /// caller's stream still had work queued before the call, so their copies wait -- on the
+  /// host, the lane holding the data -- until that work is done.  Counted from the moment such
+  /// a read takes a lane until its copies are queued; further ones are parked until their
+  /// stream is ready, so a stalled caller cannot take every lane.  0 = half the lanes.
   std::size_t max_gated_lanes{0};
 
   /// Continuations of one read after short reads, before it falls back.

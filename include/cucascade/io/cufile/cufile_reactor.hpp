@@ -224,7 +224,8 @@ struct reactor_stats {
   /// Lane reads that failed and were re-served through the synchronous paths (also counted
   /// in @c cufile_failures).
   std::uint64_t lane_failures{0};
-  /// Of @c lane_reads, those whose copies waited on the GPU for the caller's stream.
+  /// Of @c lane_reads, those that held their data until the caller's stream reached its gate
+  /// (two-phase: the copies waited on the host, the lane holding the data).
   std::uint64_t lane_gated_reads{0};
   std::uint64_t batch_reads{0};     ///< Host reads served by cuFile batch entries.
   std::uint64_t batch_bytes{0};     ///< Their bytes.

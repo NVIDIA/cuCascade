@@ -428,6 +428,7 @@ bool fused_lane_set::copy_out(unsigned lane_index, std::vector<lane_copy>&& copi
   auto& l = _lanes[lane_index];
   _held &= ~l.callback.bit;
   l.holding = false;
+  l.started = std::chrono::steady_clock::now();  // the stall clock restarts: held time is not I/O
   std::swap(l.read.copies, copies);
   copies.clear();
   auto const& win = l.read.window;
@@ -456,7 +457,6 @@ bool fused_lane_set::copy_out(unsigned lane_index, std::vector<lane_copy>&& copi
   }
   l.callback.status       = cudaSuccess;
   l.callback.completed_ns = 0;
-  l.read_issued           = {};  // copies only: polled at once
   auto error              = queue_copies(lane_index, std::numeric_limits<std::size_t>::max());
   if (error == cudaSuccess) error = queue_completion(lane_index);
   if (error != cudaSuccess) fail_queued(lane_index, error);
@@ -520,7 +520,9 @@ void fused_lane_set::issue(unsigned index, bool first) noexcept
     }
   }
 
-  if (!start_read(index)) return;
+  // A continuation (first == false) follows work already queued on the lane: the copies of
+  // the part read before it.  If cuFile refuses it the lane is reported only once those ran.
+  if (!start_read(index, /*work_queued=*/!first)) return;
   // A held read queues only its completion: its copies come with copy_out.
   auto error = l.holding ? cudaSuccess
                          : queue_copies(index, std::numeric_limits<std::size_t>::max());
@@ -528,7 +530,7 @@ void fused_lane_set::issue(unsigned index, bool first) noexcept
   if (error != cudaSuccess) fail_queued(index, error);
 }
 
-bool fused_lane_set::start_read(unsigned index) noexcept
+bool fused_lane_set::start_read(unsigned index, bool work_queued) noexcept
 {
   auto& l          = _lanes[index];
   auto const& win  = l.read.window;
@@ -540,11 +542,9 @@ bool fused_lane_set::start_read(unsigned index) noexcept
   l.bytes_done            = bytes_sentinel;
   l.callback.status       = cudaSuccess;
   l.callback.completed_ns = 0;
-  auto const timed        = _options.read_async_ns != nullptr ||
-                     _options.completion == lane_completion::poll;
+  auto const timed        = _options.read_async_ns != nullptr;
   auto const started      = timed ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
-  l.read_issued           = started;
   auto const status       = _api->read_async(static_cast<CUfileHandle_t>(l.read.handle),
                                        l.slot.base,
                                        &l.size,
@@ -560,7 +560,12 @@ bool fused_lane_set::start_read(unsigned index) noexcept
       std::memory_order_relaxed);
   }
   if (status.err == CU_FILE_SUCCESS) return true;
-  // Nothing was queued.
+  // Nothing was queued by this call; earlier work of the lane (a continuation's first-part
+  // copies) must have run before the lane is reported, so the owner never frees or rewrites a
+  // destination a copy may still write.
+  if (work_queued && cudaStreamSynchronize(l.stream) != cudaSuccess) {
+    std::ignore = cudaGetLastError();
+  }
   auto const code = static_cast<ssize_t>(status.err);
   fail_early(index, early_failure::io_failed, code > 0 ? -code : -EIO, cudaSuccess, false);
   return false;
@@ -658,27 +663,15 @@ std::uint64_t fused_lane_set::take_finished() noexcept
 {
   auto mask = _completed.exchange(0, std::memory_order_acq_rel);
   if (_options.completion != lane_completion::poll) return mask;
+  // Every busy lane is queried on every poll.
   auto pending = _event_pending & ~mask;
-  if (pending == 0) return mask;
-  // A read is not queried before half the recent mean read time passed since it was issued
-  // (it is almost never done by then); unknown mean, or copies only: queried every time.
-  // Skipping a query only delays seeing a completion, never loses it.
-  auto const now        = std::chrono::steady_clock::now();
-  auto const not_before = std::chrono::nanoseconds{_read_ewma_ns / 2};
   while (pending != 0) {
     auto const index = static_cast<unsigned>(std::countr_zero(pending));
     pending &= pending - 1;
-    auto& l          = _lanes[index];
-    bool const timed = l.read_issued != std::chrono::steady_clock::time_point{};
-    if (timed && _read_ewma_ns != 0 && now - l.read_issued < not_before) continue;
+    auto& l           = _lanes[index];
     auto const status = cudaEventQuery(l.event);
     if (status == cudaErrorNotReady) continue;
     if (status != cudaSuccess) std::ignore = cudaGetLastError();
-    if (timed && status == cudaSuccess) {
-      auto const seen =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now - l.read_issued).count();
-      _read_ewma_ns = _read_ewma_ns == 0 ? seen : _read_ewma_ns + (seen - _read_ewma_ns) / 8;
-    }
     l.callback.status = status;
     _event_pending &= ~l.callback.bit;
     mask |= l.callback.bit;

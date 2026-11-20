@@ -315,9 +315,6 @@ class fused_lane_set {
     /// the window is read (0: the whole needed range is in the slot).
     std::size_t held_progress{0};
     cudaError_t sync_error{cudaSuccess};  ///< drain: the stream reported this
-    /// Poll mode: when the lane's current read was issued; epoch while it runs copies only
-    /// (a held read's copy_out), which are never skipped by the poll.
-    std::chrono::steady_clock::time_point read_issued{};
     cucascade::cuda::device_copy_batch batch;  ///< a window's copies as one call
     unsigned resubmits{0};
     std::chrono::steady_clock::time_point started{};
@@ -341,7 +338,9 @@ class fused_lane_set {
   [[nodiscard]] unsigned pick_lane() noexcept;
   [[nodiscard]] std::uint64_t active_mask() const noexcept { return _usable & ~_free & ~_held; }
   void issue(unsigned index, bool first) noexcept;
-  [[nodiscard]] bool start_read(unsigned index) noexcept;
+  /// Queue the lane's read.  On a refusal the lane is failed (reported by a later reap),
+  /// after its stream drained when @p work_queued.
+  [[nodiscard]] bool start_read(unsigned index, bool work_queued) noexcept;
   /// Queue the copies of the lane's read, each clipped to end at or before @p limit (a
   /// file offset).
   [[nodiscard]] cudaError_t queue_copies(unsigned index, std::size_t limit) noexcept;
@@ -371,8 +370,6 @@ class fused_lane_set {
   std::uint64_t _event_pending{0};  ///< poll mode: event recorded, not yet seen complete
   unsigned _cursor{0};            ///< round-robin start of the next free-lane search
   std::atomic<std::uint64_t> _completed{0};
-  /// Poll mode: running mean (EWMA, 1/8) of read issue -> completion seen, ns; 0 = unknown.
-  std::int64_t _read_ewma_ns{0};
   std::array<lane, max_lanes> _lanes{};
 };
 

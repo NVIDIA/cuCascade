@@ -850,57 +850,66 @@ TEST_CASE("fused ioctx: a busy caller stream gates the copies", "[io][cufile][fu
     for (auto& future : futures) {
       CHECK_FALSE(future.is_ready());
     }
-    // Five pending-gate reads on four lanes: those that took a lane hold their data, the
-    // rest wait parked; the idle read was served even with every lane held.
+    // Five pending-gate reads, limit 2: two take lanes (two-phase), three park; the idle
+    // read got one of the two other lanes.
     auto const held = ioctx.get().stats() - before;
-    CHECK(held.parked_slices >= 1);
+    CHECK(held.parked_slices == reads - 2);
+    CHECK(held.lane_reads == 1);
     latch.release();
     for (std::size_t i = 0; i < reads; ++i) {
       CHECK(std::move(futures[i]).get(30s) == 300 * KiB);
       CHECK(plans[i].verify(arenas[i]->host_copy(), file));
     }
     auto const delta = ioctx.get().stats() - before;
-    CHECK(delta.lane_gated_reads >= 2);
-    CHECK(delta.lane_gated_reads <= 4);
+    CHECK(delta.lane_gated_reads == 2);
+    CHECK(delta.lane_reads == reads + 1);  // the parked ones took lanes once their gate fired
   }
 
-  SECTION("a pending gate counts against the limit only once its read is held")
+  SECTION("at most the limit of lanes ever wait for gates, whatever the burst")
   {
-    // Limit 2: the first two busy reads become held; the third, dispatched after them, is
-    // parked; an idle read still gets a lane.
+    // Limit 2 of 4 lanes: a burst of pending-gate reads, submitted back to back before any
+    // read completes, never takes more than two lanes; idle streams keep the other two.
     auto const before = ioctx.get().stats();
-    std::vector<read_plan> plans(3);
+    constexpr std::size_t reads = 8;
+    std::vector<read_plan> plans(reads);
     std::vector<std::unique_ptr<device_memory>> arenas;
-    for (std::size_t i = 0; i < 3; ++i) {
-      plans[i].add(i * MiB + 7, 100 * KiB);
+    for (std::size_t i = 0; i < reads; ++i) {
+      plans[i].add(i * MiB / 2 + 7, 100 * KiB);
       arenas.push_back(std::make_unique<device_memory>(plans[i].arena_bytes()));
     }
-    read_plan other;
-    other.add(6 * MiB + 1, 200 * KiB);
-    device_memory other_arena{other.arena_bytes()};
+    std::vector<read_plan> others(4);
+    std::vector<std::unique_ptr<device_memory>> other_arenas;
+    for (std::size_t i = 0; i < others.size(); ++i) {
+      others[i].add(5 * MiB + i * 300 * KiB + 1, 200 * KiB);
+      other_arenas.push_back(std::make_unique<device_memory>(others[i].arena_bytes()));
+    }
     stream_latch latch;
     latch.hold(busy.get());
     std::vector<cucascade::exec::semi_future<std::size_t>> futures;
-    for (std::size_t i = 0; i < 3; ++i) {
+    for (std::size_t i = 0; i < reads; ++i) {
       futures.push_back(
         ioctx.get().device_readv_async_io(*object, plans[i].slices(arenas[i]->get()), busy.ref()));
-      std::this_thread::sleep_for(150ms);  // its read completes: held
     }
-    auto const parked = ioctx.get().stats() - before;
-    CHECK(parked.parked_slices == 1);
-    CHECK(ioctx.get()
-            .device_readv_async_io(*object, other.slices(other_arena.get()), idle.ref())
-            .get(20s) == 200 * KiB);
-    CHECK(other.verify(other_arena.host_copy(), file));
-    CHECK((ioctx.get().stats() - before).lane_reads == 1);  // the idle read, on a lane
+    for (std::size_t i = 0; i < others.size(); ++i) {
+      CHECK(ioctx.get()
+              .device_readv_async_io(*object, others[i].slices(other_arenas[i]->get()), idle.ref())
+              .get(20s) == 200 * KiB);
+      CHECK(others[i].verify(other_arenas[i]->host_copy(), file));
+    }
+    auto const held = ioctx.get().stats() - before;
+    CHECK(held.parked_slices == reads - 2);
+    CHECK(held.lane_reads == others.size());
+    for (auto& future : futures) {
+      CHECK_FALSE(future.is_ready());
+    }
     latch.release();
-    for (std::size_t i = 0; i < 3; ++i) {
+    for (std::size_t i = 0; i < reads; ++i) {
       CHECK(std::move(futures[i]).get(30s) == 100 * KiB);
       CHECK(plans[i].verify(arenas[i]->host_copy(), file));
     }
     auto const delta = ioctx.get().stats() - before;
     CHECK(delta.lane_gated_reads == 2);
-    CHECK(delta.lane_reads == 4);  // the parked one took a lane once its gate fired
+    CHECK(delta.lane_reads == reads + others.size());
   }
   require_queued_bytes_zero(ioctx.get());
 }
@@ -1795,4 +1804,24 @@ TEST_CASE("fused ioctx: lane timing counters", "[io][cufile][fused_ioctx][gpu]")
   CHECK(delta.lane_idle_ns <= delta.lane_notify_ns);
   CHECK(delta.worker_passes > 0);
   CHECK(delta.worker_wait_ns > 0);
+}
+
+TEST_CASE("fused ioctx: a GPU the plan gave no lanes is never planned for lanes",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  pattern_file const file{8 * MiB};
+  stream_holder stream;
+  manual_pool pool{fused_config(4, 1 * MiB), 1, 1, 0};  // a lane reactor, but 0 lane slots
+  CHECK_FALSE(pool.get().reactor(0).lanes_usable(0));    // from the start
+  auto object = pool.get().open_io_object(file.path());
+  std::mt19937_64 rng{17};
+  for (int round = 0; round < 3; ++round) {
+    run_and_verify(
+      pool.get(), *object, file, random_plan(rng, file.size(), 16, 2 * MiB, 6 * MiB), stream.ref());
+  }
+  auto const stats = pool.get().stats();
+  CHECK(stats.lane_reads == 0);
+  CHECK(stats.fused_slices == 0);  // the legacy planner did not fuse for lanes either
+  require_queued_bytes_zero(pool.get());
 }

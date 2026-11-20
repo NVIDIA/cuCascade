@@ -28,6 +28,7 @@
  */
 
 #include "io/cufile/fused_lanes.hpp"
+#include "transport_simulator_kernels.hpp"
 
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_api.hpp>
@@ -847,6 +848,44 @@ TEST_CASE("fused lanes: scripted cuFile failures and short reads",
     results = reap_n(*set, 1);
     CHECK(results[0].outcome == lane_result::status::io_failed);
     CHECK(cufile.calls().empty());
+  }
+
+  SECTION("a refused continuation is reported only after the queued copies ran")
+  {
+    // Short first part, then the continuation is refused.  copy_out queues the first part's
+    // copies before the continuation: the lane must not be reported while they may run.
+    cufile.script({{fake_action::kind::short_read, 2 * block + 100}, {fake_action::kind::refuse, 0}});
+    auto r            = read();
+    auto copies       = make_held(r);
+    auto const wanted = copies;
+    REQUIRE(set->submit(std::move(r)));
+    auto results = reap_n(*set, 1);
+    REQUIRE(results[0].held);
+    // Keep the lane's stream busy for 300 ms on the GPU, so the copies run late.
+    void* raw = nullptr;
+    REQUIRE(cudaHostAlloc(&raw, sizeof(cucascade::io::cufile::simulator_copy_args),
+                          cudaHostAllocMapped) == cudaSuccess);
+    auto* delay = static_cast<cucascade::io::cufile::simulator_copy_args*>(raw);
+    *delay      = cucascade::io::cufile::simulator_copy_args{};
+    delay->released              = 1;
+    delay->completion_latency_ns = 300'000'000;
+    auto const lane_stream       = static_cast<cudaStream_t>(cufile.calls()[0].stream);
+    REQUIRE(cucascade::io::cufile::launch_simulator_gate(delay, lane_stream) == cudaSuccess);
+    auto const started = std::chrono::steady_clock::now();
+    REQUIRE(set->copy_out(results[0].lane, std::move(copies)));
+    results = reap_n(*set, 1);
+    CHECK(std::chrono::steady_clock::now() - started >= 250ms);
+    CHECK(results[0].outcome == lane_result::status::io_failed);
+    // The first part's bytes landed before the lane was reported.
+    for (auto const& copy : wanted) {
+      auto const end = std::min(copy.offset + copy.bytes, window.offset + 2 * block);
+      if (copy.offset >= end) continue;
+      auto const got = bytes_at(copy.dst, end - copy.offset);
+      CHECK(std::memcmp(got.data(), file.data() + copy.offset, got.size()) == 0);
+    }
+    REQUIRE(cudaStreamSynchronize(lane_stream) == cudaSuccess);
+    REQUIRE(cudaFreeHost(raw) == cudaSuccess);
+    CHECK(set->in_flight() == 0);
   }
 
   SECTION("a held short read continues after copy_out")

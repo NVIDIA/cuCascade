@@ -3493,6 +3493,9 @@ struct cufile_reactor::lane_state {
     bool gate_pending{false};  ///< The gate was pending at dispatch: a two-phase read.
     bool gate_fired{false};    ///< The gate has fired since (its copies may be queued).
     bool held_once{false};     ///< Reported held at least once (lane_gated_reads).
+    /// Counted in @c holds: a two-phase read not yet copied out or released (in the
+    /// backlog, reading, or held).
+    bool counted_hold{false};
     /// When it was first handed to a lane (lane_flight_ns); epoch until then.
     std::chrono::steady_clock::time_point submitted{};
   };
@@ -3501,6 +3504,9 @@ struct cufile_reactor::lane_state {
   std::vector<std::uint32_t> free_ops;
   /// Lane sets by device id; a set of capacity 0 means "no lanes on that device".
   std::vector<std::unique_ptr<detail::fused_lane_set>> sets;
+  /// Per device (like @ref sets): two-phase reads taken and not yet copied out or released.
+  /// At most @c gated_lane_limit() at any time; further pending-gate slices are parked.
+  std::vector<std::size_t> holds;
   std::size_t total_capacity{0};
   std::optional<std::uint32_t> backlog;
   /// Results reaped in one pass; reserved to @ref total_capacity.
@@ -3532,10 +3538,30 @@ struct cufile_reactor::lane_state {
     return index;
   }
 
+  void begin_hold(op& record) noexcept
+  {
+    record.counted_hold = true;
+    ++holds[static_cast<std::size_t>(record.device)];
+  }
+
+  void end_hold(op& record) noexcept
+  {
+    if (!record.counted_hold) return;
+    record.counted_hold = false;
+    --holds[static_cast<std::size_t>(record.device)];
+  }
+
+  [[nodiscard]] std::size_t holds_on(int device) const noexcept
+  {
+    auto const index = static_cast<std::size_t>(device);
+    return index < holds.size() ? holds[index] : 0;
+  }
+
   /// Return a record; keeps its copy buffers.
   void release_op(std::uint32_t index) noexcept
   {
     auto& record = ops[index];
+    end_hold(record);
     record.obj.reset();
     record.slice = prepared_io_slice{};
     record.request.reset();
@@ -3576,7 +3602,10 @@ struct cufile_reactor::lane_state {
   [[nodiscard]] detail::fused_lane_set* set_for(cufile_reactor& reactor, int device)
   {
     auto const index = static_cast<std::size_t>(device);
-    if (sets.size() <= index) sets.resize(index + 1);
+    if (sets.size() <= index) {
+      sets.resize(index + 1);
+      holds.resize(index + 1, 0);
+    }
     auto& set = sets[index];
     if (set == nullptr) {
       auto const& fused = reactor._config.fused_reads;
@@ -3627,6 +3656,8 @@ struct cufile_reactor::lane_state {
 bool cufile_reactor::lanes_usable(int device) const noexcept
 {
   if (_lanes == nullptr) return false;  // fused reads off, or not this reactor's role
+  // A GPU the plan gave no lanes never has any: not usable from the start.
+  if (device >= 0 && _ctx->lane_quota(device) == 0) return false;
   if (auto const until = _lane_cooldown_until_ns.load(std::memory_order_relaxed); until != 0) {
     auto const now = std::chrono::steady_clock::now().time_since_epoch();
     if (std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() < until) return false;
@@ -3682,7 +3713,10 @@ cufile_reactor::lane_dispatch cufile_reactor::try_lane_read(
     switch (gate_of(slice)) {
       case gate_state::ready: break;
       case gate_state::pending:
-        if (set->held() < fused.gated_lane_limit()) {
+        // Counted from the moment the read takes a lane (or the backlog) until its copies
+        // are queued or it is released: a burst of pending-gate reads never takes more
+        // lanes than the limit.
+        if (lanes.holds_on(device_id) < fused.gated_lane_limit()) {
           gate_pending = true;
           break;
         }
@@ -3750,6 +3784,7 @@ cufile_reactor::lane_dispatch cufile_reactor::try_lane_read(
   record.held_once    = false;
   record.obj          = obj;
   record.slice        = std::move(slice);
+  if (gate_pending) lanes.begin_hold(record);
 
   if (!issue_lane_op(index)) lanes.backlog = index;
   return lane_dispatch::taken;
@@ -3765,6 +3800,7 @@ bool cufile_reactor::issue_lane_op(std::uint32_t index) noexcept
     auto const status = record.slice.d_buffer.ready_gate->query_raw_status();
     if (status == cudaSuccess) {
       record.gate_fired = true;
+      lanes.end_hold(record);
     } else if (status != cudaErrorNotReady) {
       std::ignore = cudaGetLastError();  // reported when the held read is checked again
     }
@@ -3794,6 +3830,7 @@ void cufile_reactor::copy_out_lane_op(std::uint32_t index) noexcept
   auto& lanes       = *_lanes;
   auto& record      = lanes.ops[index];
   record.gate_fired = true;
+  lanes.end_hold(record);
   auto const started = std::chrono::steady_clock::now();
   bool const queued  = lanes.set_of(record).copy_out(record.lane, std::move(record.copies));
   add_ns(_counters.lane_submit_ns, std::chrono::steady_clock::now() - started);
@@ -4075,6 +4112,9 @@ void cufile_reactor::reap_lanes() noexcept
   }
   lanes.results.clear();
   poll_held_lanes();
+  // Settling, releasing a held read or a cancel above may have freed a lane: retry the backlog
+  // in this pass rather than after a sleep.
+  issue_lane_backlog();
 
   // A hung storage client is otherwise invisible: warn, at most once per stall_warn_s.
   // Checked every 64 passes and at most every 100 ms.
@@ -4203,6 +4243,10 @@ std::int64_t cufile_reactor::async_wait_limit_us() const noexcept
     std::max<std::int64_t>(1, static_cast<std::int64_t>(_config.poll_interval_us));
   std::int64_t limit = -1;
   if (_lanes != nullptr) {
+    if (_lanes->backlog.has_value() &&
+        _lanes->set_of(_lanes->ops[*_lanes->backlog]).free_lanes() != 0) {
+      return 0;  // a lane read waits and a lane is free: do not sleep
+    }
     if (!_lanes->held.empty()) {
       // Held reads wait for their callers' gates, which only polling sees.
       limit = poll_us;
