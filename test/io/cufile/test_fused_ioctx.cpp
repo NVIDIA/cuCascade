@@ -1230,7 +1230,9 @@ TEST_CASE("fused ioctx: multi-threaded stress", "[io][cufile][fused_ioctx][gpu][
 {
   require_async_cufile();
   pattern_file const file{(64 * MiB) + 4321};
-  started_ioctx ioctx{fused_config(6, 1 * MiB), 4};
+  auto cfg                   = fused_config(6, 1 * MiB);
+  cfg.fused_reads.completion = GENERATE(lane_completion::poll, lane_completion::callback);
+  started_ioctx ioctx{cfg, 4};
   auto object = ioctx.get().open_io_object(file.path());
   constexpr int threads        = 4;
   constexpr int reads_per_thread = 150;
@@ -1771,7 +1773,10 @@ TEST_CASE("fused ioctx: lane timing counters", "[io][cufile][fused_ioctx][gpu]")
   require_async_cufile();
   pattern_file const file{16 * MiB};
   stream_holder stream;
-  started_ioctx ioctx{fused_config(4, 1 * MiB), 1};
+  auto const completion      = GENERATE(lane_completion::callback, lane_completion::poll);
+  auto cfg                   = fused_config(4, 1 * MiB);
+  cfg.fused_reads.completion = completion;
+  started_ioctx ioctx{cfg, 1};
   auto object       = ioctx.get().open_io_object(file.path());
   auto const before = ioctx.get().stats();
   run_and_verify(ioctx.get(), *object, file, strided_plan(7, 12, 300 * KiB, MiB), stream.ref());
@@ -1781,7 +1786,11 @@ TEST_CASE("fused ioctx: lane timing counters", "[io][cufile][fused_ioctx][gpu]")
   CHECK(delta.lane_read_async_ns > 0);
   CHECK(delta.lane_read_async_ns <= delta.lane_submit_ns);
   CHECK(delta.lane_flight_ns > 0);
-  CHECK(delta.lane_notify_ns > 0);  // callback completion
+  if (completion == lane_completion::callback) {
+    CHECK(delta.lane_notify_ns > 0);
+  } else {
+    CHECK(delta.lane_notify_ns == 0);  // no callback time to measure from
+  }
   CHECK(delta.lane_notify_ns <= delta.lane_flight_ns);
   CHECK(delta.lane_idle_ns <= delta.lane_notify_ns);
   CHECK(delta.worker_passes > 0);

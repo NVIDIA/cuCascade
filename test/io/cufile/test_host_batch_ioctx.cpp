@@ -146,9 +146,11 @@ class host_memory {
   host_memory(std::size_t bytes, bool pinned) : _bytes(bytes), _pinned(pinned)
   {
     if (pinned) {
-      void* p = nullptr;
-      REQUIRE(cudaMallocHost(&p, bytes) == cudaSuccess);
-      _data = static_cast<std::uint8_t*>(p);
+      // cudaMallocHost does not promise 4 KiB alignment (small pinned allocations of the
+      // process sub-allocate): over-allocate and align.
+      REQUIRE(cudaMallocHost(&_allocation, bytes + block) == cudaSuccess);
+      auto const address = reinterpret_cast<std::uintptr_t>(_allocation);
+      _data              = reinterpret_cast<std::uint8_t*>((address + block - 1) / block * block);
     } else {
       _data = static_cast<std::uint8_t*>(
         std::aligned_alloc(block, (bytes + block - 1) / block * block));
@@ -160,7 +162,7 @@ class host_memory {
   ~host_memory()
   {
     if (_pinned) {
-      std::ignore = cudaFreeHost(_data);
+      std::ignore = cudaFreeHost(_allocation);
     } else {
       std::free(_data);
     }
@@ -173,6 +175,7 @@ class host_memory {
 
  private:
   std::uint8_t* _data{nullptr};
+  void* _allocation{nullptr};  ///< pinned: what cudaMallocHost returned
   std::size_t _bytes{0};
   bool _pinned{false};
 };

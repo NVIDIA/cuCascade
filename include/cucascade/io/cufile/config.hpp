@@ -319,10 +319,14 @@ struct async_engine_config {
 /// How a fused lane learns that its read and copies finished (see @ref fused_read_config).
 enum class lane_completion : std::uint8_t {
   /// A stream callback queued behind the copies marks the lane done and wakes the reactor.
+  /// Less CPU, but about 5% slower than @ref poll on GB200 + GPFS (CUDA's host-callback
+  /// delivery), and every lane completion of the process stalls while anything blocks
+  /// CUDA's host-callback thread (a caller's blocking @c cudaLaunchHostFunc, say).
   callback,
-  /// The reactor polls an event recorded behind the copies.  A field fallback for a stack
-  /// where stream callbacks misbehave: same results, more CPU, up to one poll interval of
-  /// refill latency.
+  /// The default: the reactor queries the events recorded behind the busy lanes' copies,
+  /// every @c config::poll_interval_us while lanes are in flight (a lane whose read was
+  /// submitted less than half the recent mean read time ago is not queried yet).  At parity
+  /// with the raw benchmark on GB200 + GPFS; costs some CPU per lane reactor.
   poll,
 };
 
@@ -342,6 +346,13 @@ enum class lane_completion : std::uint8_t {
  *
  * Off by default.  Mutually exclusive with the async engine (@c async_engine.mode must be
  * @c legacy).  See docs/io/cufile-fused-lanes.md.
+ *
+ * @warning Lifetime: lane streams are never deregistered.  When a lane set goes (its ioctx
+ * shuts down) its streams stay registered with cuFile, idle, until the process exits:
+ * @c cuFileStreamDeregister synchronizes the whole device and stalls every other cuFile call
+ * of the process meanwhile, and a stream cannot be handed to another reactor thread.  Build
+ * one cuFile ioctx per process; every ioctx built and destroyed leaves one stream per lane
+ * behind (a warning is logged once a process has retired more than 1024).
  */
 struct fused_read_config {
   bool enabled{false};
@@ -382,8 +393,8 @@ struct fused_read_config {
   /// cuts the setup and teardown of every read.
   bool register_streams{true};
 
-  /// How a lane's completion reaches the reactor.
-  lane_completion completion{lane_completion::callback};
+  /// How a lane's completion reaches the reactor (see @ref lane_completion).
+  lane_completion completion{lane_completion::poll};
 
   /// Lanes per reactor that may hold a read whose copies wait, on the GPU, for work queued
   /// earlier on the caller's stream.  Further such reads are parked until their stream is

@@ -401,12 +401,14 @@ struct reactor_stats {
  * @c cufile_ioctx packs the device reads of a request into 4 KiB-aligned windows of at most
  * a lane slot (@c plan_fused_reads), and the reactor issues each such lane read as one
  * @c cuFileReadAsync into a free lane's registered slot on the lane's own registered stream,
- * followed on that stream by the device-to-device copies into the caller's destinations
- * (waiting on the GPU for the caller's stream when its gate is still pending) and a stream
- * callback.  The worker keeps up to a lane set's capacity of such reads in flight per device
- * and settles each when its callback reported it: a lane read's slice settles only once its
- * copies completed, so the contract is the synchronous path's (host-complete, the bytes
- * visible from any stream).  A short read is continued on its lane; a failed one is re-served
+ * followed on that stream by the device-to-device copies into the caller's destinations and
+ * a completion: an event the worker polls (@c lane_completion::poll, the default) or a stream
+ * callback that wakes it.  A lane stream never waits on a caller's event: when the caller's
+ * stream has not reached the read's gate yet, the lane holds the data after the read and the
+ * worker queues the copies once it sees the gate fire.  The worker keeps up to a lane set's
+ * capacity of such reads in flight per device and settles each once its lane completed: a
+ * lane read's slice settles only once its copies completed, so the contract is the
+ * synchronous path's (host-complete, the bytes visible from any stream).  A short read is continued on its lane; a failed one is re-served
  * through the synchronous paths (and counted in @c lane_failures); after
  * @c fused_read_config::failure_limit consecutive failures the reactor stops using lanes for
  * @c fused_read_config::cooldown_s.  A lane read that finds no free lane waits in a

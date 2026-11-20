@@ -147,6 +147,8 @@ constexpr std::size_t batch_copies_from = 5;
 // ---------------------------------------------------------------------------
 
 std::atomic<std::size_t> retired_stream_count{0};
+/// Past this many retired streams the process is warned once.
+constexpr std::size_t retired_stream_warning = 1025;
 
 std::atomic<bool> warned_stream_register{false};
 std::atomic<bool> warned_no_async{false};
@@ -296,7 +298,16 @@ void fused_lane_set::retire_stream(lane& l) noexcept
 {
   if (l.stream == nullptr) return;
   // Kept for the life of the process (see "Retired lane streams" above).
-  retired_stream_count.fetch_add(1, std::memory_order_relaxed);
+  if (retired_stream_count.fetch_add(1, std::memory_order_relaxed) + 1 == retired_stream_warning) {
+    try {
+      CUCASCADE_LOG_WARN(
+        "cufile: this process has retired {} fused-lane streams; build one cuFile ioctx per "
+        "process: lane streams of destroyed ioctxs stay registered with cuFile until exit",
+        retired_stream_warning);
+    } catch (...) {
+      // Logging is best effort.
+    }
+  }
   l.stream            = nullptr;
   l.stream_registered = false;
 }
@@ -445,6 +456,7 @@ bool fused_lane_set::copy_out(unsigned lane_index, std::vector<lane_copy>&& copi
   }
   l.callback.status       = cudaSuccess;
   l.callback.completed_ns = 0;
+  l.read_issued           = {};  // copies only: polled at once
   auto error              = queue_copies(lane_index, std::numeric_limits<std::size_t>::max());
   if (error == cudaSuccess) error = queue_completion(lane_index);
   if (error != cudaSuccess) fail_queued(lane_index, error);
@@ -528,9 +540,11 @@ bool fused_lane_set::start_read(unsigned index) noexcept
   l.bytes_done            = bytes_sentinel;
   l.callback.status       = cudaSuccess;
   l.callback.completed_ns = 0;
-  auto const timed        = _options.read_async_ns != nullptr;
+  auto const timed        = _options.read_async_ns != nullptr ||
+                     _options.completion == lane_completion::poll;
   auto const started      = timed ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
+  l.read_issued           = started;
   auto const status       = _api->read_async(static_cast<CUfileHandle_t>(l.read.handle),
                                        l.slot.base,
                                        &l.size,
@@ -538,7 +552,7 @@ bool fused_lane_set::start_read(unsigned index) noexcept
                                        &l.buffer_offset,
                                        &l.bytes_done,
                                        static_cast<CUstream>(l.stream));
-  if (timed) {
+  if (_options.read_async_ns != nullptr) {
     auto const spent = std::chrono::steady_clock::now() - started;
     _options.read_async_ns->fetch_add(
       static_cast<std::uint64_t>(
@@ -645,13 +659,26 @@ std::uint64_t fused_lane_set::take_finished() noexcept
   auto mask = _completed.exchange(0, std::memory_order_acq_rel);
   if (_options.completion != lane_completion::poll) return mask;
   auto pending = _event_pending & ~mask;
+  if (pending == 0) return mask;
+  // A read is not queried before half the recent mean read time passed since it was issued
+  // (it is almost never done by then); unknown mean, or copies only: queried every time.
+  // Skipping a query only delays seeing a completion, never loses it.
+  auto const now        = std::chrono::steady_clock::now();
+  auto const not_before = std::chrono::nanoseconds{_read_ewma_ns / 2};
   while (pending != 0) {
     auto const index = static_cast<unsigned>(std::countr_zero(pending));
     pending &= pending - 1;
-    auto& l           = _lanes[index];
+    auto& l          = _lanes[index];
+    bool const timed = l.read_issued != std::chrono::steady_clock::time_point{};
+    if (timed && _read_ewma_ns != 0 && now - l.read_issued < not_before) continue;
     auto const status = cudaEventQuery(l.event);
     if (status == cudaErrorNotReady) continue;
     if (status != cudaSuccess) std::ignore = cudaGetLastError();
+    if (timed && status == cudaSuccess) {
+      auto const seen =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - l.read_issued).count();
+      _read_ewma_ns = _read_ewma_ns == 0 ? seen : _read_ewma_ns + (seen - _read_ewma_ns) / 8;
+    }
     l.callback.status = status;
     _event_pending &= ~l.callback.bit;
     mask |= l.callback.bit;
