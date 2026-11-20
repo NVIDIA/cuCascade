@@ -3754,23 +3754,17 @@ cufile_reactor::lane_dispatch cufile_reactor::try_lane_read(
   }
 
   auto& record = lanes.ops[index];
-  // One copy per run of parts contiguous in the file and in the destination.
-  auto add_copy = [&record](std::uint8_t* dst, std::size_t offset, std::size_t bytes) {
-    if (!record.copies.empty()) {
-      auto& last = record.copies.back();
-      if (last.offset + last.bytes == offset && last.dst + last.bytes == dst) {
-        last.bytes += bytes;
-        return;
-      }
-    }
-    record.copies.push_back(detail::lane_copy{dst, offset, bytes});  // reserved: no allocation
-  };
+  // One copy per part.  Parts contiguous in the file and in the destination are not merged
+  // into one copy: they may be two allocations of the caller that happen to touch (one
+  // buffer per Parquet column chunk), and CUDA rejects a copy spanning two allocations of a
+  // stream-ordered pool with cudaErrorInvalidValue.  A window of many parts is still one
+  // call (see fused_lane_set::queue_copies).  Reserved above: no allocation.
   if (slice.is_fused()) {
     for (auto const& part : slice.fused) {
-      add_copy(part.data, part.rng.offset, part.rng.size);
+      record.copies.push_back(detail::lane_copy{part.data, part.rng.offset, part.rng.size});
     }
   } else {
-    add_copy(slice.d_buffer.data, slice.rng.offset, clamped);
+    record.copies.push_back(detail::lane_copy{slice.d_buffer.data, slice.rng.offset, clamped});
   }
   std::size_t needed = 0;
   for (auto const& copy : record.copies) {

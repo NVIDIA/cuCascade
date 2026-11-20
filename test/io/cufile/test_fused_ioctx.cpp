@@ -1771,7 +1771,107 @@ TEST_CASE("fused ioctx: a mixed request keeps its synchronous slices off the lan
   require_queued_bytes_zero(pool.get());
 }
 
-TEST_CASE("fused ioctx: contiguous slices into one buffer cost one copy per window",
+TEST_CASE("fused ioctx: contiguous parts are copied one by one and never merged",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  // Parts contiguous in the file and in the destination are still separate copies: the
+  // reactor cannot tell one caller buffer from two adjacent ones.
+  require_async_cufile();
+  pattern_file const file{4 * MiB};
+  stream_holder stream;
+  started_ioctx ioctx{fused_config(4, 1 * MiB), 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  read_plan plan;
+  for (std::size_t i = 0; i < 3; ++i) {
+    plan.add(5 + i * 64 * KiB, 64 * KiB, /*guard=*/0);
+  }
+  auto const before        = ioctx.get().stats();
+  auto const copies_before = cucascade::io::cufile::detail::lane_copy_calls_for_testing();
+  run_and_verify(ioctx.get(), *object, file, plan, stream.ref());
+  auto const delta  = ioctx.get().stats() - before;
+  auto const copies = cucascade::io::cufile::detail::lane_copy_calls_for_testing() - copies_before;
+  CHECK(delta.lane_reads == 1);
+  CHECK(delta.lane_parts == 3);
+  CHECK(copies == 3);
+  CHECK(delta.lane_failures == 0);
+}
+
+TEST_CASE("fused ioctx: adjacent allocations of a stream-ordered pool are separate copies",
+          "[io][cufile][fused_ioctx][gpu]")
+{
+  // Two destinations from cudaMallocAsync that happen to touch (one buffer per Parquet column
+  // chunk, sizes a multiple of the pool's granularity): CUDA rejects a copy that spans both
+  // with cudaErrorInvalidValue, so their parts must not be issued as one copy.
+  require_async_cufile();
+  constexpr std::size_t size = 512 * KiB;
+  pattern_file const file{4 * MiB};
+  stream_holder stream;
+  started_ioctx ioctx{fused_config(4, 2 * MiB), 1};
+  auto object = ioctx.get().open_io_object(file.path());
+
+  struct pool_buffers {
+    explicit pool_buffers(cudaStream_t s) : stream(s) {}
+    ~pool_buffers()
+    {
+      for (auto* p : all) {
+        std::ignore = cudaFreeAsync(p, stream);
+      }
+      std::ignore = cudaStreamSynchronize(stream);
+    }
+    pool_buffers(pool_buffers const&)            = delete;
+    pool_buffers& operator=(pool_buffers const&) = delete;
+    cudaStream_t stream;
+    std::vector<void*> all;
+  } buffers{stream.get()};
+
+  std::uint8_t* low  = nullptr;
+  std::uint8_t* high = nullptr;
+  for (std::size_t i = 0; i < 32 && low == nullptr; ++i) {
+    void* raw = nullptr;
+    if (cudaMallocAsync(&raw, size, stream.get()) != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+      break;
+    }
+    auto* const fresh = static_cast<std::uint8_t*>(raw);
+    for (auto* const other_raw : buffers.all) {
+      auto* const other = static_cast<std::uint8_t*>(other_raw);
+      if (other + size == fresh) {
+        low  = other;
+        high = fresh;
+      } else if (fresh + size == other) {
+        low  = fresh;
+        high = other;
+      }
+      if (low != nullptr) break;
+    }
+    buffers.all.push_back(raw);
+  }
+  if (low == nullptr) { SKIP("the stream-ordered pool handed out no two adjacent allocations"); }
+  REQUIRE(cudaMemsetAsync(low, guard_fill, size, stream.get()) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(high, guard_fill, size, stream.get()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+
+  constexpr std::size_t offset = block + 7;
+  std::vector<io_slice> slices;
+  slices.emplace_back(offset, size, low);
+  slices.emplace_back(offset + size, size, high);
+  auto const before = ioctx.get().stats();
+  auto const got    = ioctx.get().device_readv_async_io(*object, slices, stream.ref()).get(60s);
+  auto const delta  = ioctx.get().stats() - before;
+  CHECK(got == 2 * size);
+  CHECK(delta.lane_reads == 1);
+  CHECK(delta.lane_parts == 2);
+  CHECK(delta.lane_failures == 0);
+  CHECK(delta.cufile_failures == 0);
+
+  std::vector<std::uint8_t> host(2 * size);
+  REQUIRE(cudaMemcpy(host.data(), low, size, cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(cudaMemcpy(host.data() + size, high, size, cudaMemcpyDeviceToHost) == cudaSuccess);
+  CHECK(std::memcmp(host.data(), file.data() + offset, 2 * size) == 0);
+  require_queued_bytes_zero(ioctx.get());
+}
+
+TEST_CASE("fused ioctx: a window of many contiguous parts costs one copy call",
           "[io][cufile][fused_ioctx][gpu]")
 {
   require_async_cufile();
