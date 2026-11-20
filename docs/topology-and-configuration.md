@@ -442,3 +442,22 @@ memory_reservation_manager manager(std::move(configs));
 | `include/cucascade/memory/numa_region_pinned_host_allocator.hpp` | NUMA-aware pinned host allocation |
 | `src/memory/topology_discovery.cpp` | NVML loading and `/sys` queries |
 | `src/memory/reservation_manager_configurator.cpp` | Builder implementation |
+
+## Process CPU constraints
+
+`memory/cpu_constraints.hpp` describes execution restrictions independently of hardware
+`topology_index`. `discover_cpu_constraints()` snapshots the process main thread's affinity,
+reads cgroup-v2 membership and mount roots, and intersects the mask with the nearest effective
+cpuset. Its result includes the original masks, effective `allowed_cpus`, fallback provenance
+and a diagnostic. A broader deployment cpuset never expands a taskset/numactl rank binding.
+The main-thread mask is sampled when called; this is not historical launch-state recovery.
+Applications should capture once before changing that main mask and pass the snapshot to lazy
+worker construction instead of using an incidentally narrowed caller mask. Missing deployment
+information falls back to the process boundary; a known empty intersection throws. No CUDA or
+NVML initialization is needed.
+
+`exec::thread_util::scoped_thread_affinity` applies an exact mask for a thread-startup scope,
+then restores the original mask without allocating or throwing. It fails construction if the
+kernel cannot apply the requested mask exactly. It never changes the calling thread's CUDA or
+other thread-local state. This is a startup primitive, not a worker-placement policy: embedders
+still choose pool masks, CPU reservations and GPU-local domains inside the saved boundary.

@@ -13,6 +13,7 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | [cuFile / GPUDirect Storage backend](io/cufile-gds.md) | GDS read paths, per-GPU pool planning, registered staging, Storage Scale checklist |
 | [REST transport](io/rest-transport.md) | The io_uring S3 / REST read reactor |
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
+| [CI and the Merge Queue](ci.md) | PR testing, approvals, queue entry, diagnostics, and retries |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
 
 ## Reading Paths
