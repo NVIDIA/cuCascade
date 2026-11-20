@@ -96,6 +96,14 @@ using request_queue = tiered_blocking_queue<request_ptr>;
 /// bounds how quickly a stop request is noticed; a new request wakes it at once.
 constexpr std::int64_t idle_wait_us = 2000;
 
+/// Add a non-negative duration to a nanosecond counter.
+template <typename Duration>
+void add_ns(std::atomic<std::uint64_t>& counter, Duration elapsed) noexcept
+{
+  auto const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+  if (ns > 0) counter.fetch_add(static_cast<std::uint64_t>(ns), std::memory_order_relaxed);
+}
+
 [[nodiscard]] std::error_code canceled_error() noexcept
 {
   return std::make_error_code(std::errc::operation_canceled);
@@ -1299,6 +1307,13 @@ reactor_stats cufile_reactor::stats() const noexcept
   out.batch_handle_resets    = load(_counters.batch_handle_resets);
   out.batch_deferred         = load(_counters.batch_deferred);
   out.batch_submit_ns        = load(_counters.batch_submit_ns);
+  out.lane_submit_ns     = load(_counters.lane_submit_ns);
+  out.lane_read_async_ns = load(_counters.lane_read_async_ns);
+  out.lane_flight_ns     = load(_counters.lane_flight_ns);
+  out.lane_notify_ns     = load(_counters.lane_notify_ns);
+  out.lane_idle_ns       = load(_counters.lane_idle_ns);
+  out.worker_wait_ns     = load(_counters.worker_wait_ns);
+  out.worker_passes      = load(_counters.worker_passes);
   return out;
 }
 
@@ -3478,6 +3493,8 @@ struct cufile_reactor::lane_state {
     bool gate_pending{false};  ///< The gate was pending at dispatch: a two-phase read.
     bool gate_fired{false};    ///< The gate has fired since (its copies may be queued).
     bool held_once{false};     ///< Reported held at least once (lane_gated_reads).
+    /// When it was first handed to a lane (lane_flight_ns); epoch until then.
+    std::chrono::steady_clock::time_point submitted{};
   };
 
   std::vector<op> ops;
@@ -3527,6 +3544,7 @@ struct cufile_reactor::lane_state {
     record.gate_pending = false;
     record.gate_fired   = false;
     record.held_once    = false;
+    record.submitted    = {};
     free_ops.push_back(index);  // capacity reserved in acquire_op
   }
 
@@ -3583,8 +3601,9 @@ struct cufile_reactor::lane_state {
       options.wake             = [](void* context) noexcept {
         static_cast<cufile_reactor*>(context)->notify_worker();
       };
-      options.wake_context = &reactor;
-      set                  = std::make_unique<detail::fused_lane_set>(options);
+      options.wake_context  = &reactor;
+      options.read_async_ns = &reactor._counters.lane_read_async_ns;
+      set                   = std::make_unique<detail::fused_lane_set>(options);
       total_capacity += set->capacity();
       reactor.publish_lane_state(device, set->capacity() != 0);
       if (set->capacity() == 0) {
@@ -3759,7 +3778,13 @@ bool cufile_reactor::issue_lane_op(std::uint32_t index) noexcept
   read.needed_bytes = hold ? record.needed : 0;
   read.copies.clear();
   if (!hold) std::swap(read.copies, record.copies);
-  if (set.submit(std::move(read))) return true;
+  auto const started   = std::chrono::steady_clock::now();
+  bool const submitted = set.submit(std::move(read));
+  add_ns(_counters.lane_submit_ns, std::chrono::steady_clock::now() - started);
+  if (submitted) {
+    if (record.submitted == std::chrono::steady_clock::time_point{}) record.submitted = started;
+    return true;
+  }
   if (!hold) std::swap(read.copies, record.copies);  // untouched: give the copies back
   return false;
 }
@@ -3769,7 +3794,10 @@ void cufile_reactor::copy_out_lane_op(std::uint32_t index) noexcept
   auto& lanes       = *_lanes;
   auto& record      = lanes.ops[index];
   record.gate_fired = true;
-  if (!lanes.set_of(record).copy_out(record.lane, std::move(record.copies))) {
+  auto const started = std::chrono::steady_clock::now();
+  bool const queued  = lanes.set_of(record).copy_out(record.lane, std::move(record.copies));
+  add_ns(_counters.lane_submit_ns, std::chrono::steady_clock::now() - started);
+  if (!queued) {
     // Not held (cannot happen): serve it without lanes rather than lose it.
     serve_lane_op_synchronously(index);
   }
@@ -4019,6 +4047,25 @@ void cufile_reactor::reap_lanes() noexcept
       lanes.results.push_back(result);
     });
     if (set->capacity() == 0) publish_lane_state(set->device(), false);
+  }
+
+  if (!lanes.results.empty()) {
+    // Where the lane cycle goes: one clock read per reap.
+    auto const now = std::chrono::steady_clock::now();
+    auto const now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    bool const waiting = _lane_work_waiting || lanes.backlog.has_value();
+    for (auto const& result : lanes.results) {
+      if (result.completed_ns != 0 && now_ns > result.completed_ns) {
+        auto const late = static_cast<std::uint64_t>(now_ns - result.completed_ns);
+        _counters.lane_notify_ns.fetch_add(late, std::memory_order_relaxed);
+        if (waiting && !result.held) _counters.lane_idle_ns.fetch_add(late, std::memory_order_relaxed);
+      }
+      auto const& record = lanes.ops[static_cast<std::uint32_t>(result.token)];
+      if (!result.held && record.submitted != std::chrono::steady_clock::time_point{}) {
+        add_ns(_counters.lane_flight_ns, now - record.submitted);
+      }
+    }
   }
 
   // Refill first: the backlog's read takes a lane freed above, or settles if cancelled.
@@ -4275,6 +4322,7 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
   std::exception_ptr fatal_error;
   try {
     while (!stop_token.stop_requested()) {
+      _counters.worker_passes.fetch_add(1, std::memory_order_relaxed);
       poll_completions();
       // Settle finished asynchronous reads and refill their lanes before taking new work.
       reap_async();
@@ -4342,6 +4390,8 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
       flush_batch();
       if (_batch != nullptr) run_batch_owed(_config.max_op_bytes);
       if (scheduler.active != nullptr && scheduler.active->empty()) { scheduler.active.reset(); }
+      _lane_work_waiting = scheduler.active != nullptr || async_backlog_pending() ||
+                           _requests.size_approx() != 0;
 
       // A full in-flight window or a lane read waiting for a lane stops the worker from
       // taking more slices until something completes.
@@ -4361,7 +4411,9 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
       if (auto const limit = async_wait_limit_us(); limit >= 0) {
         timeout_us = std::min(timeout_us, limit);
       }
+      auto const wait_started = std::chrono::steady_clock::now();
       wait_for_work(timeout_us, scheduler.active == nullptr && has_capacity, stop_token);
+      add_ns(_counters.worker_wait_ns, std::chrono::steady_clock::now() - wait_started);
     }
   } catch (...) {
     fatal_error = std::current_exception();

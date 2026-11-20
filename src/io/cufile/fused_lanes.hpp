@@ -95,6 +95,9 @@ struct lane_result {
   /// A @c hold read's I/O finished (@c outcome ok): the lane keeps the data in its slot until
   /// the owner calls @c copy_out or @c release_held.  A final result follows a @c copy_out.
   bool held{false};
+  /// Callback completion: when the completion callback ran (steady clock, ns since its
+  /// epoch); 0 in poll mode and for failures at submission.
+  std::int64_t completed_ns{0};
   unsigned lane{0};       ///< the lane that served it (diagnostics, tests)
 };
 
@@ -115,6 +118,8 @@ struct lane_set_options {
   /// call into the set.  @ref wake_context must outlive the set.
   wake_fn wake{nullptr};
   void* wake_context{nullptr};
+  /// When set, time spent inside @c cuFileReadAsync is added here (relaxed, ns).
+  std::atomic<std::uint64_t>* read_async_ns{nullptr};
 };
 
 /**
@@ -289,6 +294,7 @@ class fused_lane_set {
     fused_lane_set* set{nullptr};
     std::uint64_t bit{0};
     cudaError_t status{cudaSuccess};  ///< written by the callback before it publishes the bit
+    std::int64_t completed_ns{0};     ///< likewise: when it ran (steady clock, ns)
   };
 
   struct lane {

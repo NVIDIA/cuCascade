@@ -471,8 +471,12 @@ struct fake_state {
   fake_action every{};
   std::deque<std::vector<std::uint8_t>> keep_alive;
   cucascade::io::cufile::simulator_copy_args* latch{nullptr};
-  std::vector<void*> pinned;  ///< latched reads copy from pinned memory (never blocks)
+  std::vector<void*> pinned;  ///< reads copy from these, round robin
+  std::size_t next_buffer{0};
 };
+
+/// Largest read the scripted cuFileReadAsync serves (the scripted tests use 1 MiB slots).
+constexpr std::size_t fake_buffer_bytes = 1 * MiB;
 
 fake_state& fake() noexcept
 {
@@ -567,17 +571,15 @@ CUfileError_t fake_read_async(CUfileHandle_t handle,
   auto limit = *size_p;
   if (action.what == fake_action::kind::short_read) limit = std::min(limit, action.bytes);
   std::uint8_t* host = nullptr;
-  if (action.what == fake_action::kind::latched) {
-    void* raw = nullptr;
-    if (cudaMallocHost(&raw, std::max<std::size_t>(limit, 1)) != cudaSuccess) {
-      *bytes_read_p = -5;
-      return fake_ok();
-    }
-    state.pinned.push_back(raw);
-    host = static_cast<std::uint8_t*>(raw);
-  } else {
-    host = state.keep_alive.emplace_back(limit).data();
+  // Pinned: a pageable copy queued on a stream that cannot run yet would hold the driver's
+  // pageable staging and stall every other pageable copy of the process meanwhile.
+  // From pinned buffers allocated up front: allocating pinned memory, or copying from
+  // pageable memory, can synchronize the device, which would wait for a held stream.
+  if (limit > fake_buffer_bytes || state.pinned.empty()) {
+    *bytes_read_p = -5;
+    return fake_ok();
   }
+  host = static_cast<std::uint8_t*>(state.pinned[state.next_buffer++ % state.pinned.size()]);
   auto const got = ::pread(static_cast<fake_handle*>(handle)->fd, host, limit, *file_offset_p);
   if (got > 0 && cudaMemcpyAsync(static_cast<std::uint8_t*>(base) + *buffer_offset_p,
                                  host,
@@ -616,6 +618,14 @@ class scripted_cufile {
     _api.stream_register       = &fake_stream_register;
     _api.stream_deregister     = &fake_stream_deregister;
     _api.has_stream_register   = true;
+    {
+      std::lock_guard lock(fake().mutex);
+      for (std::size_t i = 0; i < 32; ++i) {
+        void* raw = nullptr;
+        REQUIRE(cudaMallocHost(&raw, fake_buffer_bytes) == cudaSuccess);
+        fake().pinned.push_back(raw);
+      }
+    }
     cucascade::io::cufile::detail::set_cufile_api_for_testing(&_api);
   }
   ~scripted_cufile()
@@ -1355,6 +1365,19 @@ class manual_pool {
   return std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t b) { return b == guard_fill; });
 }
 
+/// @p stats without the worker's timing and pass counters, which move even when idle.
+[[nodiscard]] reactor_stats traffic(reactor_stats stats)
+{
+  stats.lane_submit_ns     = 0;
+  stats.lane_read_async_ns = 0;
+  stats.lane_flight_ns     = 0;
+  stats.lane_notify_ns     = 0;
+  stats.lane_idle_ns       = 0;
+  stats.worker_wait_ns     = 0;
+  stats.worker_passes      = 0;
+  return stats;
+}
+
 /// Disarms the lane failure seams on scope exit.
 struct seam_reset {
   seam_reset()                             = default;
@@ -1444,6 +1467,9 @@ TEST_CASE("fused ioctx: a refused gated read falls back without blocking the rea
   other.add(5 * MiB + 1, 200 * KiB);
   device_memory gated_arena{gated.arena_bytes()};
   device_memory other_arena{other.arena_bytes()};
+  // The lane set exists before the stream is held: creating it may allocate device memory,
+  // which can synchronize the device.
+  warm_up(ioctx.get(), *object, file);
   cufile.script({fake_action{fake_action::kind::refuse, 0}});
   auto const before = ioctx.get().stats();
   stream_latch latch;
@@ -1620,7 +1646,8 @@ TEST_CASE("fused ioctx: a cooling lane reactor is routed around",
   }
   CHECK(cufile.async_calls() == calls);
   for (std::size_t i = 0; i < 2; ++i) {
-    CHECK(pool.get().reactor(i).stats() == before[i]);  // lane reactors untouched
+    // Lane reactors served nothing (their workers still pass and wait).
+    CHECK(traffic(pool.get().reactor(i).stats()) == traffic(before[i]));
   }
   reactor_stats sync_delta;
   for (std::size_t i = 2; i < pool.get().reactor_count(); ++i) {
@@ -1737,3 +1764,26 @@ TEST_CASE("fused ioctx: contiguous slices into one buffer cost one copy per wind
   CHECK(delta.lane_parts >= 48);
 }
 
+
+
+TEST_CASE("fused ioctx: lane timing counters", "[io][cufile][fused_ioctx][gpu]")
+{
+  require_async_cufile();
+  pattern_file const file{16 * MiB};
+  stream_holder stream;
+  started_ioctx ioctx{fused_config(4, 1 * MiB), 1};
+  auto object       = ioctx.get().open_io_object(file.path());
+  auto const before = ioctx.get().stats();
+  run_and_verify(ioctx.get(), *object, file, strided_plan(7, 12, 300 * KiB, MiB), stream.ref());
+  auto const delta = ioctx.get().stats() - before;
+  CHECK(delta.lane_reads == 12);
+  CHECK(delta.lane_submit_ns > 0);
+  CHECK(delta.lane_read_async_ns > 0);
+  CHECK(delta.lane_read_async_ns <= delta.lane_submit_ns);
+  CHECK(delta.lane_flight_ns > 0);
+  CHECK(delta.lane_notify_ns > 0);  // callback completion
+  CHECK(delta.lane_notify_ns <= delta.lane_flight_ns);
+  CHECK(delta.lane_idle_ns <= delta.lane_notify_ns);
+  CHECK(delta.worker_passes > 0);
+  CHECK(delta.worker_wait_ns > 0);
+}

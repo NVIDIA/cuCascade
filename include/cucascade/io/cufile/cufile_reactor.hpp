@@ -217,7 +217,9 @@ struct reactor_stats {
   std::uint64_t lane_reads{0};
   std::uint64_t lane_bytes{0};         ///< Their caller payload bytes.
   std::uint64_t lane_issued_bytes{0};  ///< Bytes their aligned windows covered.
-  std::uint64_t lane_parts{0};         ///< Caller pieces they served (one per unfused slice).
+  /// Caller pieces they served: one per part of a fused read, one for an unfused slice; a
+  /// caller slice split across windows counts once per piece.
+  std::uint64_t lane_parts{0};
   std::uint64_t lane_resubmits{0};     ///< Short-read continuations they needed.
   /// Lane reads that failed and were re-served through the synchronous paths (also counted
   /// in @c cufile_failures).
@@ -235,6 +237,23 @@ struct reactor_stats {
   std::uint64_t batch_handle_resets{0};  ///< Batch handles recreated after a rejection.
   std::uint64_t batch_deferred{0};       ///< Flushes that left entries staged for a later wave.
   std::uint64_t batch_submit_ns{0};      ///< Time the batch helpers spent in Submit.
+
+  // Always-on timing of the lane path (steady clock, ns; relaxed counters).
+  /// Time inside @c fused_lane_set::submit and @c copy_out (the issue path).
+  std::uint64_t lane_submit_ns{0};
+  /// Of @c lane_submit_ns, time inside @c cuFileReadAsync alone (continuations included).
+  std::uint64_t lane_read_async_ns{0};
+  /// Sum over finished lane reads of (reap - first submit): lane residence, held time
+  /// included.  With @c lane_reads + @c lane_failures it gives the mean lane cycle.
+  std::uint64_t lane_flight_ns{0};
+  /// Callback completion only: sum over reaped results of (reap - completion callback), the
+  /// wake-up plus worker-busy latency.
+  std::uint64_t lane_notify_ns{0};
+  /// Of @c lane_notify_ns, the part spent while the reactor had lane work waiting (a backlog
+  /// or slices of an active request): a lane that had finished sat unused.
+  std::uint64_t lane_idle_ns{0};
+  std::uint64_t worker_wait_ns{0};  ///< Time the worker slept in its wait point.
+  std::uint64_t worker_passes{0};   ///< Worker loop passes.
 
   /// Every counter, so the arithmetic below cannot miss one.
   [[nodiscard]] static constexpr auto fields() noexcept
@@ -256,7 +275,11 @@ struct reactor_stats {
                       &reactor_stats::batch_rejected_submits,
                       &reactor_stats::batch_partial_status,
                       &reactor_stats::batch_handle_resets, &reactor_stats::batch_deferred,
-                      &reactor_stats::batch_submit_ns};
+                      &reactor_stats::batch_submit_ns,
+                      &reactor_stats::lane_submit_ns,     &reactor_stats::lane_read_async_ns,
+                      &reactor_stats::lane_flight_ns,     &reactor_stats::lane_notify_ns,
+                      &reactor_stats::lane_idle_ns,       &reactor_stats::worker_wait_ns,
+                      &reactor_stats::worker_passes};
   }
 
   reactor_stats& operator+=(reactor_stats const& other) noexcept
@@ -954,6 +977,13 @@ class cufile_reactor {
     std::atomic<std::uint64_t> batch_handle_resets{0};
     std::atomic<std::uint64_t> batch_deferred{0};
     std::atomic<std::uint64_t> batch_submit_ns{0};
+    std::atomic<std::uint64_t> lane_submit_ns{0};
+    std::atomic<std::uint64_t> lane_read_async_ns{0};
+    std::atomic<std::uint64_t> lane_flight_ns{0};
+    std::atomic<std::uint64_t> lane_notify_ns{0};
+    std::atomic<std::uint64_t> lane_idle_ns{0};
+    std::atomic<std::uint64_t> worker_wait_ns{0};
+    std::atomic<std::uint64_t> worker_passes{0};
   };
   counters _counters;
 
@@ -1025,6 +1055,8 @@ class cufile_reactor {
   static constexpr std::size_t max_lane_devices = 64;
   std::array<std::atomic<std::uint8_t>, max_lane_devices> _lane_device_state{};
   std::atomic<std::int64_t> _lane_cooldown_until_ns{0};
+  /// Worker-only: whether the last pass ended with lane work waiting (lane_idle_ns).
+  bool _lane_work_waiting{false};
 
   // Lane-specific helpers (called from the generic async hooks below).
   void reap_lanes() noexcept;

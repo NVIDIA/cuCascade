@@ -224,9 +224,13 @@ fused_lane_set::fused_lane_set(lane_set_options const& options) noexcept : _opti
   if (_api == nullptr || !_api->has_async_read || _api->read_async == nullptr ||
       !cufile_api::open_driver()) {
     if (!warned_no_async.exchange(true)) {
-      CUCASCADE_LOG_INFO(
-        "cufile: cuFileReadAsync unavailable (library missing, too old or driver closed); "
-        "fused lane reads disabled");
+      try {
+        CUCASCADE_LOG_INFO(
+          "cufile: cuFileReadAsync unavailable (library missing, too old or driver closed); "
+          "fused lane reads disabled");
+      } catch (...) {
+        // Logging is best effort.
+      }
     }
     _api = nullptr;
     return;
@@ -242,11 +246,15 @@ fused_lane_set::fused_lane_set(lane_set_options const& options) noexcept : _opti
   _free = _usable;
   release_lanes(_options.device, granted - _built);
   if (_built < wanted) {
-    CUCASCADE_LOG_INFO("cufile: fused lane set on GPU {} runs {} of {} lanes (budget granted {})",
-                       _options.device,
-                       _built,
-                       wanted,
-                       granted);
+    try {
+      CUCASCADE_LOG_INFO("cufile: fused lane set on GPU {} runs {} of {} lanes (budget granted {})",
+                         _options.device,
+                         _built,
+                         wanted,
+                         granted);
+    } catch (...) {
+      // Logging is best effort.
+    }
   }
 }
 
@@ -272,9 +280,13 @@ bool fused_lane_set::create_stream(lane& l) noexcept
     auto const status   = _api->stream_register(l.stream, stream_flags);
     l.stream_registered = status.err == CU_FILE_SUCCESS;
     if (!l.stream_registered && !warned_stream_register.exchange(true)) {
-      CUCASCADE_LOG_WARN(
-        "cufile: cuFileStreamRegister failed ({}); lane streams run unregistered",
-        static_cast<int>(status.err));
+      try {
+        CUCASCADE_LOG_WARN(
+          "cufile: cuFileStreamRegister failed ({}); lane streams run unregistered",
+          static_cast<int>(status.err));
+      } catch (...) {
+        // Logging is best effort.
+      }
     }
   }
   return true;
@@ -346,9 +358,13 @@ fused_lane_set::~fused_lane_set()
   device_guard const guard{_options.device};
   assert(in_flight() == 0 && "fused_lane_set destroyed with reads in flight");
   if (in_flight() != 0) {
-    CUCASCADE_LOG_ERROR("cufile: fused lane set on GPU {} destroyed with {} reads in flight",
-                        _options.device,
-                        in_flight());
+    try {
+      CUCASCADE_LOG_ERROR("cufile: fused lane set on GPU {} destroyed with {} reads in flight",
+                          _options.device,
+                          in_flight());
+    } catch (...) {
+      // Logging is best effort.
+    }
   }
   // destroy_lane synchronizes each stream before anything is released.
   for (unsigned index = 0; index < _built; ++index) {
@@ -427,8 +443,9 @@ bool fused_lane_set::copy_out(unsigned lane_index, std::vector<lane_copy>&& copi
     issue(lane_index, /*first=*/false);
     return true;
   }
-  l.callback.status = cudaSuccess;
-  auto error        = queue_copies(lane_index, std::numeric_limits<std::size_t>::max());
+  l.callback.status       = cudaSuccess;
+  l.callback.completed_ns = 0;
+  auto error              = queue_copies(lane_index, std::numeric_limits<std::size_t>::max());
   if (error == cudaSuccess) error = queue_completion(lane_index);
   if (error != cudaSuccess) fail_queued(lane_index, error);
   return true;
@@ -508,15 +525,26 @@ bool fused_lane_set::start_read(unsigned index) noexcept
   l.size            = win.size;
   l.file_offset     = static_cast<off_t>(win.offset);
   l.buffer_offset   = 0;
-  l.bytes_done      = bytes_sentinel;
-  l.callback.status = cudaSuccess;
-  auto const status = _api->read_async(static_cast<CUfileHandle_t>(l.read.handle),
+  l.bytes_done            = bytes_sentinel;
+  l.callback.status       = cudaSuccess;
+  l.callback.completed_ns = 0;
+  auto const timed        = _options.read_async_ns != nullptr;
+  auto const started      = timed ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+  auto const status       = _api->read_async(static_cast<CUfileHandle_t>(l.read.handle),
                                        l.slot.base,
                                        &l.size,
                                        &l.file_offset,
                                        &l.buffer_offset,
                                        &l.bytes_done,
                                        static_cast<CUstream>(l.stream));
+  if (timed) {
+    auto const spent = std::chrono::steady_clock::now() - started;
+    _options.read_async_ns->fetch_add(
+      static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(spent).count()),
+      std::memory_order_relaxed);
+  }
   if (status.err == CU_FILE_SUCCESS) return true;
   // Nothing was queued.
   auto const code = static_cast<ssize_t>(status.err);
@@ -601,6 +629,9 @@ void fused_lane_set::on_done(cudaStream_t, cudaError_t status, void* context) no
   auto const wake         = set->_options.wake;
   auto* const wake_target = set->_options.wake_context;
   callback->status        = status;
+  callback->completed_ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
   set->_completed.fetch_or(callback->bit, std::memory_order_acq_rel);
   if (wake != nullptr) wake(wake_target);
 }
@@ -679,9 +710,10 @@ bool fused_lane_set::settle(unsigned index, lane_result& result) noexcept
 {
   auto& l = _lanes[index];
   if ((_usable & ~_free & l.callback.bit) == 0) return false;  // not in flight: stale bit
-  result.token     = l.read.token;
-  result.resubmits = l.resubmits;
-  result.lane      = index;
+  result.token        = l.read.token;
+  result.resubmits    = l.resubmits;
+  result.lane         = index;
+  result.completed_ns = l.callback.completed_ns;
 
   auto const finish = [&](lane_result::status outcome) {
     result.outcome = outcome;
